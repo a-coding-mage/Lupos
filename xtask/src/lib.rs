@@ -1,0 +1,24420 @@
+//! test-origin: lupos-specific:xtask build, boot, and CLI regression tests
+extern crate alloc;
+
+use std::{
+    collections::{HashMap, HashSet},
+    env, fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result, anyhow, bail};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+pub(crate) mod audit;
+#[path = "../../src/arch/x86/boot/compressed/mkpiggy.rs"]
+mod boot_compressed_mkpiggy;
+
+/// Serial-log substring expected on every successful boot. Matches the
+/// Linux banner printed by `linux_banner()` from `src/init/version.rs`.
+/// The leading `] ` anchors the match to the printk timestamp prefix
+/// (`[    0.000000] Linux/Lupos version ...`) so unrelated fixtures don't trip it.
+pub const HELLO_BANNER: &str = "] Linux/Lupos version ";
+pub const PANIC_PREFIX: &str = "KERNEL PANIC";
+/// Serial log substring expected when the IDT page-fault test passes.
+/// Must match the exact format string in `idt.rs` `on_page_fault()`.
+/// The address 0xffffdeadc0dedead is the deliberate fault address in `main.rs`.
+pub const IDT_PF_BANNER: &str = "cpu: #PF cr2=0xffffdeadc0dedead";
+/// Serial log substring expected when the Milestone 5 SMP "CPU ping" test passes.
+/// Must match the log_info! format string in `smp.rs` `run_ipi_ping_test()`.
+pub const SMP_BANNER: &str = "smp: IPI ping test PASSED";
+/// Serial log substring expected when the Milestone 6 LAPIC timer test passes.
+/// Must match the format string in `apic_timer.rs::run_timer_test`.
+pub const TIMER_BANNER: &str = "timer: ticks=100 drift=";
+/// Serial log substring expected when the Milestone 6 softirq test passes.
+/// Must match the format string in `src/kernel/softirq.rs::run_softirq_test`.
+pub const SOFTIRQ_BANNER: &str = "softirq: deferred work executed";
+/// Serial log substring expected when the Milestone 6 TLB shootdown test passes.
+/// Must match the format string in `tlb.rs::run_shootdown_test`.
+pub const TLB_BANNER: &str = "tlb: shootdown IPI delivered";
+/// Serial log substring expected when the Milestone 7 buddy allocator test passes.
+/// Must match the log_info! format string in `main.rs` under `#[cfg(feature = "test-buddy")]`.
+pub const BUDDY_BANNER: &str = "buddy: alloc/free stress test passed";
+/// Serial log substring expected when the Milestone 8 slab stress test passes.
+/// Must match the log_info! format string in `main.rs` under `#[cfg(feature = "test-slab")]`.
+pub const SLAB_BANNER: &str = "slab: kmalloc stress test passed: 10000 allocs, no overlap";
+/// Serial log substring expected when the Milestone 9 VM core smoke passes.
+pub const VMCORE_BANNER: &str = "vmcore: kmap/kunmap round-trip passed";
+pub const VMCORE_WALKER_BANNER: &str = "vmcore-walker: pml4 sweep passed";
+/// Serial log substring expected when the Milestone 11 MM smoke test passes.
+pub const MM_BANNER: &str = "mm: maple-tree VMA test passed";
+/// Serial log substring expected when the Milestone 12 demand-paging test passes.
+/// Must match the log_info! format string in `main.rs` under `#[cfg(feature = "test-demand-paging")]`.
+pub const DEMAND_PAGING_BANNER: &str = "demand-paging: anonymous fault OK, RSS=1 pages";
+/// Serial log substring expected when the Milestone 13 anon-mmap smoke test passes.
+/// Must match the log_info! format string in `main.rs` under `#[cfg(feature = "test-anon-mmap")]`.
+pub const ANON_MMAP_BANNER: &str = "anon-mmap: mmap/fault/munmap smoke test passed";
+/// Serial log substring expected when the Milestone 13 mm-selftests suite passes.
+/// Covers ported Linux selftests: map_fixed_noreplace, mremap_dontunmap, mprotect-fault,
+/// madv_populate, and map_hugetlb (huge-page branch stubbed).
+pub const MM_SELFTESTS_BANNER: &str = "mm-selftests: all Linux parity tests passed";
+/// Serial log substring expected when the Milestone 14 COW/fork acceptance suite passes.
+pub const COW_FORK_BANNER: &str = "cow-fork: all copy-on-write fork tests passed";
+/// Serial log substring expected when the Milestone 15 page-cache acceptance test passes.
+pub const PAGE_CACHE_BANNER: &str = "page-cache: read/write round-trip passed";
+/// Serial log substring expected when boot tracker #31 zswap pressure passes.
+pub const ZSWAP_PRESSURE_BANNER: &str = "zswap-pressure: reclaim into zswap ok";
+/// Serial log substring expected when the Milestone 21 context-switch acceptance test passes.
+pub const CTXSWITCH_BANNER: &str = "ctxswitch: two-kthread counter test passed";
+pub const EXECVE_BANNER: &str = "exec: elf-execve acceptance test passed";
+pub const SIGNALS_BANNER: &str = "signals: rt_sigaction delivery acceptance test passed";
+/// Serial log substring expected when the Milestone 26 exit/wait/ptrace acceptance test passes.
+pub const EXIT_WAIT_PTRACE_BANNER: &str = "exit-wait-ptrace: acceptance test passed";
+/// Serial log substring expected when the Milestone 27 credentials/capabilities/seccomp test passes.
+pub const CREDENTIALS_BANNER: &str = "cred-seccomp: acceptance test passed";
+/// Serial log substring expected when the Linux-source-backed ptrace/seccomp
+/// Milestone 93 selftest slice passes.
+pub const PTRACE_SECCOMP_SELFTESTS_BANNER: &str =
+    "ptrace-seccomp-selftests: Linux source-backed parity checks passed";
+pub const UEFI_PLATFORM_CERTS_BANNER: &str = "uefi-platform-certs: fixture runtime db import ok";
+pub const UEFI_PLATFORM_CERTS_FIRMWARE_BANNER: &str =
+    "uefi-platform-certs: firmware runtime db import ok";
+/// Serial log substring expected when the Milestone 28 namespaces acceptance test passes.
+pub const NAMESPACES_BANNER: &str = "namespaces: acceptance test passed";
+/// Serial log substring expected when the Milestone 29 CFS acceptance test passes.
+pub const CFS_BANNER: &str = "cfs: nice-weight ratio ok, leftmost picking ok";
+/// Serial log substring expected when the Milestone 30 RT/Deadline test passes.
+pub const RT_DEADLINE_BANNER: &str = "rt-deadline: rt preempts cfs ok, deadline admission ok";
+/// Serial log substring expected when the Milestone 31 SMP balance / NOHZ test passes.
+pub const SMP_BALANCE_BANNER: &str = "smp-balance: load distribution and nohz ok";
+/// Serial log substring expected when the Milestone 32 CPU cgroup + futex test passes.
+pub const CGROUP_CPU_FUTEX_BANNER: &str = "cgroup-cpu-futex: futex round-trip ok, cpu.max enforced";
+/// Serial log substring expected when the Milestone 33 locking acceptance test passes.
+pub const LOCKING_BANNER: &str = "locking: spin/mutex/rwsem/sem/completion ok";
+/// Serial log substring expected when the Milestone 34 RCU acceptance test passes.
+pub const RCU_BANNER: &str = "rcu: tree-rcu grace period ok, call_rcu fired, tasks-rcu drained";
+/// Serial log substring expected when the Milestone 35 percpu/atomic/workqueue test passes.
+pub const PERCPU_ATOMIC_WQ_BANNER: &str = "percpu-atomic-wq: percpu sum ok, 4 works ran";
+/// Serial log substring expected when the Milestone 36 time subsystem test passes.
+pub const TIME_BANNER: &str = "time: monotonic ok, hrtimer fired, posix-timer expired";
+/// Serial log substring expected when the Milestone 105 soft-lockup watchdog test passes.
+pub const SOFTLOCKUP_WATCHDOG_BANNER: &str = "BUG: soft lockup - CPU#";
+/// Serial log substring expected when the Milestone 37 generic-IRQ test passes.
+pub const IRQ_BANNER: &str = "irq: request/enable/disable ok, threaded-irq fired";
+/// Serial log substring expected when the Milestone 38 VFS core test passes.
+pub const VFS_CORE_BANNER: &str = "vfs-core: ramfs round-trip ok, dcache refcount ok";
+/// Serial log substring expected when the Milestone 39 mount/openat2 test passes.
+pub const VFS_MOUNT_BANNER: &str = "vfs-mount: openat2 RESOLVE_BENEATH ok, fdtable ops ok";
+/// Serial log substring expected when the Milestone 40 procfs test passes.
+pub const PROCFS_BANNER: &str = "procfs: /proc/self/stat fields ok, meminfo schema ok";
+/// Serial log substring expected when the Milestone 41 sysfs test passes.
+pub const SYSFS_BANNER: &str = "sysfs: kobject attr round-trip ok";
+/// Serial log substring expected when the Milestone 42 fs-suite test passes.
+pub const VFS_FS_SUITE_BANNER: &str = "vfs-fs-suite: tmpfs+debugfs+cgroupfs+ovl skeleton ok";
+/// Serial log substring expected when the initramfs rootfs bootstrap test passes.
+/// Must match the format string in `main.rs` under `#[cfg(feature = "test-initramfs-rootfs")]`.
+pub const INITRAMFS_ROOTFS_BANNER: &str =
+    "initramfs-rootfs: unpack ok; /dev populated; /proc and /sys mounted";
+pub const DISK_ROOT_REMOUNT_BANNER: &str =
+    "disk-root-remount: /dev/vda mounted ro and remounted rw";
+pub const BOOT_PARTITION_BANNER: &str = "boot-partition: Mounted /boot from partition ok";
+pub const MAPPED_SWAP_BANNER: &str =
+    "mapped-swap: /dev/mapper/cl-swap active as partition pages=256";
+/// Serial log substring expected when the PID1 handoff smoke passes.
+/// Must match the user-mode `/sbin/init` payload built by xtask for `pid1-handoff`.
+pub const PID1_HANDOFF_BANNER: &str = "pid1-handoff: login bash smoke ok";
+pub const LOGIN_STACK_BANNER: &str = "login-stack: gate ok";
+pub const USERSPACE_SMOKE_BANNER: &str = "userspace-smoke: gate ok";
+pub const RUNTIME_STRESS_BANNER: &str = "runtime-stress: gate ok";
+pub const SHIPPED_COMMANDS_BANNER: &str = "shipped-commands: gate ok";
+/// One serial marker per shipped command group proven by the
+/// `shipped-commands` boot gate.  The runner asserts every entry.
+pub const SHIPPED_COMMANDS_MARKERS: &[&str] = &[
+    "shipped-commands: bash-builtins ok",
+    "shipped-commands: coreutils ok",
+    "shipped-commands: textutils ok",
+    "shipped-commands: packaging ok",
+    "shipped-commands: systemd-tools ok",
+    "shipped-commands: procps ok",
+    "shipped-commands: util-linux ok",
+    "shipped-commands: networking ok",
+];
+const SPLASH_ART_BOOT_PATH: &str = "boot/grub/splashart.png";
+const SPLASH_ART_BYTES: &[u8] = include_bytes!("../../branding/splashart.png");
+const GRUB_INTERACTIVE_SPLASH_TIMEOUT_SECS: u8 = 2;
+const GRUB_TEST_BOOT_TIMEOUT_SECS: u8 = 3;
+const LUPOS_QEMU_ACCEL_ENV: &str = "LUPOS_QEMU_ACCEL";
+const LUPOS_QEMU_ROOT_DISK_ENV: &str = "LUPOS_QEMU_ROOT_DISK";
+const LUPOS_QEMU_MACHINE_ENV: &str = "LUPOS_QEMU_MACHINE";
+const LUPOS_QEMU_MEMORY_ENV: &str = "LUPOS_QEMU_MEMORY";
+const LUPOS_QEMU_GDB_ENV: &str = "LUPOS_QEMU_GDB";
+const LUPOS_OVMF_CODE_ENV: &str = "LUPOS_OVMF_CODE";
+const LUPOS_OVMF_VARS_ENV: &str = "LUPOS_OVMF_VARS";
+/// Override the GRUB module directory passed to `grub-mkrescue -d`, so hosts
+/// lacking the i386-pc GRUB platform can still produce a BIOS-bootable ISO.
+const LUPOS_GRUB_LIBDIR_ENV: &str = "LUPOS_GRUB_LIBDIR";
+const DEFAULT_QEMU_MEMORY: &str = "1024M";
+const GUI_SHELL_QEMU_MEMORY: &str = "4096M";
+const GUI_SHELL_ROOT_DISK_SIZE: &str = "12G";
+const QEMU_GDB_PORT: u16 = 1234;
+const BZIMAGE_SETUP_SECTS: u8 = 4;
+const BZIMAGE_SETUP_SIZE: usize = (BZIMAGE_SETUP_SECTS as usize + 1) * 512;
+const BZIMAGE_PROTOCOL_VERSION: u16 = 0x020f;
+const BZIMAGE_HDRS_MAGIC: u32 = 0x5372_6448;
+const BZIMAGE_BOOT_FLAG: u16 = 0xaa55;
+const BZIMAGE_KERNEL_PHYS_BASE: u32 = 0x0020_0000;
+const BZIMAGE_PROTECTED_MODE_LOAD_ADDR: u32 = 0x0010_0000;
+const BZIMAGE_KERNEL_ALIGNMENT: u32 = 0x0020_0000;
+// Linux x86 publishes COMMAND_LINE_SIZE - 1 in setup_header.cmdline_size.
+// Ref: vendor/linux/arch/x86/include/asm/setup.h and
+// vendor/linux/arch/x86/boot/header.S.
+const BZIMAGE_CMDLINE_SIZE: u32 = 2047;
+const BZIMAGE_INITRD_ADDR_MAX: u32 = 0xffff_ffff;
+const BZIMAGE_XLOADFLAGS_KERNEL_64: u16 = 1 << 0;
+const BZIMAGE_LOADFLAGS_LOADED_HIGH: u8 = 1 << 0;
+const BZIMAGE_LOADFLAGS_CAN_USE_HEAP: u8 = 1 << 7;
+// Linux's boot/compressed/head_64.S calls extract_kernel in long mode and
+// jumps to the returned address with RSI restored to boot_params. Lupos'
+// temporary decompressor bridge stores a compact ELF payload as a valid gzip
+// stream using DEFLATE stored blocks. Linux mkpiggy reads gzip's final ISIZE
+// word as z_output_len, and the bridge follows the Linux
+// decompress_kernel -> parse_elf staging.
+const BZIMAGE_EXTRACTED_ENTRY_SYMBOL: &str = "linux64_start";
+const BZIMAGE_GZIP_HEADER_SIZE: usize = 10;
+const BZIMAGE_GZIP_TRAILER_SIZE: usize = 8;
+const BZIMAGE_DEFLATE_STORED_BLOCK_MAX: usize = u16::MAX as usize;
+const BZIMAGE_STORED_PIGGY_RODATA_SIZE: usize = 8;
+const BZIMAGE_LUPOS_EXTRACT_KERNEL64_SOURCE: &str =
+    "src/arch/x86/boot/compressed/lupos_extract_kernel_64.S";
+const BZIMAGE_LINUX_DECOMPRESS_INFLATE_SOURCE: &str = "vendor/linux/lib/decompress_inflate.c";
+const BZIMAGE_STORED_COMPRESSED_LINKER_SCRIPT: &str =
+    "src/arch/x86/boot/compressed/lupos_stored_vmlinux.lds";
+const BZIMAGE_STORED_COMPRESSED_SECTIONS: [&str; 7] = [
+    ".head.text",
+    ".rodata..compressed",
+    ".text",
+    ".rodata",
+    ".data",
+    ".bss",
+    ".pgtable",
+];
+const BZIMAGE_LINUX_COMPRESSED_HEAD64_SOURCE: &str = "src/arch/x86/boot/compressed/head_64.S";
+const BZIMAGE_BOOTPARAM_BP_SCRATCH_OFFSET: u32 = 0x1e4;
+const BZIMAGE_BOOTPARAM_BP_KERNEL_ALIGNMENT_OFFSET: u32 = 0x230;
+const BZIMAGE_BOOTPARAM_BP_INIT_SIZE_OFFSET: u32 = 0x260;
+const BZIMAGE_HEAD64_NCAPINTS: usize = 22;
+// REQUIRED_MASK0/1 feed the `asm/cpufeaturemasks.h` that head_64.S's
+// `verify_cpu` checks against CPUID.1.EDX / CPUID.80000001.EDX before entering
+// long mode. These are the genuine x86_64 required-feature masks from
+// `vendor/linux/arch/x86/Kconfig.cpufeatures` (word 0: FPU, PSE, MSR, PAE, CX8,
+// PGE, CMOV, FXSR, XMM, XMM2; word 1: LM). REQUIRED_MASK0 must stay a strict
+// subset of any conforming CPUID.1.EDX — notably it must NOT require bit 27
+// (X86_FEATURE_SS, Self-Snoop), which QEMU TCG never advertises, or `verify_cpu`
+// halts at `.Lno_longmode` on every software-emulated boot. Keep in lockstep
+// with `REQUIRED_MASK_X86_64` in src/arch/x86/boot/cpucheck.rs.
+const BZIMAGE_HEAD64_REQUIRED_MASK0: u32 = 0x0700_a169;
+const BZIMAGE_HEAD64_REQUIRED_MASK1: u32 = 0x2000_0000;
+const BZIMAGE_ZO_EXTRA_BYTES_BASE: u64 = 131_072;
+const BZIMAGE_PAGE_SIZE: u64 = 4096;
+const ELF64_HEADER_SIZE: usize = 64;
+const ELF64_PROGRAM_HEADER_SIZE: u16 = 56;
+const ELF64_SECTION_HEADER_SIZE: u16 = 64;
+const ELF64_SYMBOL_SIZE: u64 = 24;
+const ELF_PT_LOAD: u32 = 1;
+const ELF_SHT_SYMTAB: u32 = 2;
+const USERSPACE_SMOKE_SCRIPT_PATH: &str = "usr/libexec/lupos-userspace-smoke.sh";
+const USERSPACE_SMOKE_PACMAN_PACKAGE_PATH: &str =
+    "usr/share/lupos/lupos-pacman-smoke-1.0-1-x86_64.pkg.tar";
+const USERSPACE_SMOKE_PACMAN_HOOKDIR_PATH: &str = "usr/share/lupos/empty-hooks";
+const RUNTIME_STRESS_SCRIPT_PATH: &str = "usr/libexec/lupos-runtime-stress.sh";
+const SHIPPED_COMMANDS_SCRIPT_PATH: &str = "usr/libexec/lupos-shipped-commands.sh";
+const PID1_HANDOFF_TRANSCRIPT: &str = concat!(
+    "pid1-handoff: init: PID 1 entering runlevel 3\n",
+    "pid1-handoff: rcS using kernel-prepared proc sys dev tmp run; hostname=lupos; modules loaded\n",
+    "pid1-handoff: getty respawn tty1\n",
+    "lupos login: root\n",
+    "root@lupos:~# whoami\n",
+    "root\n",
+    "root@lupos:~# id\n",
+    "uid=0(root) gid=0(root) groups=0(root),10(wheel)\n",
+    "root@lupos:~# echo $SHELL\n",
+    "/bin/bash\n",
+    "root@lupos:~# cat /etc/motd\n",
+    "Welcome to Lupos.\n",
+    "root@lupos:~# sleep 30\n",
+    "^C\n",
+    "pid1-handoff: login bash smoke ok\n",
+    "pid1-handoff: shutdown: SIGTERM handled; PID 1 exiting cleanly\n",
+);
+const LOGIN_SYSV_INITTAB: &str = concat!(
+    "# Lupos SysV init table. Format mirrors Linux sysvinit: id:runlevels:action:process\n",
+    "id:3:initdefault:\n",
+    "si::sysinit:/etc/rc.d/rcS\n",
+    "l0:0:wait:/etc/rc.d/rc 0\n",
+    "l1:1:wait:/etc/rc.d/rc 1\n",
+    "l3:3:wait:/etc/rc.d/rc 3\n",
+    "c1:12345:respawn:/sbin/agetty 115200 tty1 linux\n",
+    "pf::powerfail:/sbin/shutdown -h now\n",
+);
+const LOGIN_RCS_SCRIPT: &str = concat!(
+    "#!/bin/sh\n",
+    "# /proc, /sys, /dev, /tmp, and /run are prepared by the kernel before PID 1.\n",
+    "hostname -F /etc/hostname\n",
+    "if [ -s /etc/modules ]; then modprobe -a $(cat /etc/modules); fi\n",
+);
+const LOGIN_RC_SCRIPT: &str = concat!(
+    "#!/bin/sh\n",
+    "case \"$1\" in\n",
+    "  0|6) /sbin/shutdown -h now ;;\n",
+    "  1|3) exit 0 ;;\n",
+    "  *) exit 1 ;;\n",
+    "esac\n",
+);
+const LOGIN_PASSWD: &str = concat!(
+    "root:x:0:0:root:/root:/bin/bash\n",
+    "lupos:x:1000:1000:Lupos User:/home/lupos:/bin/bash\n",
+);
+const LOGIN_SHADOW: &str = concat!(
+    "root:$6$lupos$kfqTeHWlA.9yNwAV7ku8p6jKF5ULWSzdhP3d/4Cq0ObxXStDoiUHezFLQH0Kh5EIXypcHW4AGgV6gn/KgMxou/:19000:0:99999:7:::\n",
+    "lupos:$6$lupos$kfqTeHWlA.9yNwAV7ku8p6jKF5ULWSzdhP3d/4Cq0ObxXStDoiUHezFLQH0Kh5EIXypcHW4AGgV6gn/KgMxou/:19000:0:99999:7:::\n",
+);
+const LOGIN_GROUP: &str = concat!("root:x:0:\n", "lupos:x:1000:\n", "wheel:x:10:root,lupos\n",);
+const LOGIN_GSHADOW: &str = concat!("root:*::\n", "lupos:*::\n", "wheel:*::root,lupos\n",);
+const LOGIN_PAM_LOGIN: &str = concat!(
+    "auth     required pam_unix.so\n",
+    "account  required pam_unix.so\n",
+    "password required pam_unix.so\n",
+    "session  optional pam_motd.so\n",
+    "session  required pam_unix.so\n",
+);
+const LOGIN_PAM_SU: &str = concat!(
+    "auth     sufficient pam_rootok.so\n",
+    "auth     required   pam_unix.so\n",
+    "account  required   pam_unix.so\n",
+    "password required   pam_unix.so\n",
+    "session  required   pam_unix.so\n",
+);
+const LOGIN_PAM_PASSWD: &str = "password required pam_unix.so\n";
+const LOGIN_PAM_COMMON_SESSION: &str = "session required pam_unix.so\n";
+const LOGIN_DEFS: &str = concat!(
+    "MAIL_DIR        /var/mail\n",
+    "PASS_MAX_DAYS   99999\n",
+    "PASS_MIN_DAYS   0\n",
+    "PASS_WARN_AGE   7\n",
+    "UID_MIN         1000\n",
+    "UID_MAX         60000\n",
+    "GID_MIN         1000\n",
+    "GID_MAX         60000\n",
+    "ENCRYPT_METHOD  SHA512\n",
+);
+const LOGIN_SECURETTY: &str = concat!("console\n", "tty1\n", "ttyS0\n");
+const LOGIN_SHELLS: &str = concat!("/bin/sh\n", "/bin/bash\n", "/usr/bin/bash\n");
+const LOGIN_PROFILE: &str = concat!(
+    "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n",
+    "export TERM=${TERM:-linux}\n",
+    // Linux kernel sets HOME=/ in envp_init (vendor/linux/init/main.c).
+    // Keep this fallback minimal; staged Arch boots use Arch's own
+    // /etc/profile and /etc/bash.bashrc.
+    "if [ -z \"$HOME\" ]; then\n",
+    "  HOME=/\n",
+    "  export HOME\n",
+    "fi\n",
+    // Do not auto-clear before the first prompt.  The QEMU linear
+    // framebuffer is slow to repaint, and an interactive user can still run
+    // `clear` explicitly when they want a fresh screen.
+);
+const LOGIN_BASH_BASHRC: &str = concat!(
+    "[[ $- != *i* ]] && return\n",
+    "[[ \"$PS1\" = '\\s-\\v\\$ ' ]] && PS1='[\\u@\\h \\W]\\$ '\n",
+);
+const ROOT_LOGIN_BASHRC: &str = concat!(
+    ". /etc/bash.bashrc 2>/dev/null || true\n",
+    "if [ \"$PWD\" = \"$HOME\" ]; then cd /; fi\n",
+    "PS1='[\\u@\\h \\W]\\$ '\n",
+);
+const ROOT_LOGIN_BASH_PROFILE: &str = concat!(
+    ". /etc/profile 2>/dev/null || true\n",
+    ". ~/.bashrc 2>/dev/null || true\n",
+    "if [ \"$PWD\" = \"$HOME\" ]; then cd /; fi\n",
+    "PS1='[\\u@\\h \\W]\\$ '\n",
+);
+// Home directory skeleton files.
+// Reference: common bash /etc/skel contents installed by pam_mkhomedir / adduser(8).
+const LUPOS_USER_BASHRC: &str = concat!(
+    "# ~/.bashrc\n",
+    "case $- in *i*) ;; *) return;; esac\n",
+    "HISTCONTROL=ignoreboth\n",
+    "shopt -s histappend\n",
+    "HISTSIZE=1000\n",
+    "HISTFILESIZE=2000\n",
+    "shopt -s checkwinsize\n",
+);
+const LUPOS_USER_BASH_PROFILE: &str = "# ~/.bash_profile\n[ -f ~/.bashrc ] && . ~/.bashrc\n";
+
+const SKEL_BASHRC: &str = concat!(
+    "# ~/.bashrc: executed by bash(1) for non-login shells.\n",
+    "case $- in *i*) ;; *) return;; esac\n",
+    "HISTCONTROL=ignoreboth\n",
+    "shopt -s histappend\n",
+    "HISTSIZE=1000\n",
+    "HISTFILESIZE=2000\n",
+    "shopt -s checkwinsize\n",
+);
+const SKEL_BASH_PROFILE: &str = "# ~/.bash_profile\n[ -f ~/.bashrc ] && . ~/.bashrc\n";
+const SKEL_BASH_LOGOUT: &str = "# ~/.bash_logout\nclear\n";
+
+const USERSPACE_SMOKE_SCRIPT: &str = concat!(
+    "#!/bin/sh\n",
+    "set -eu\n",
+    "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n",
+    "echo userspace-smoke: shell ok\n",
+    "true\n",
+    "printf 'userspace-smoke: true ok\\n'\n",
+    "cat /proc/self/stat >/dev/null\n",
+    "echo userspace-smoke: proc ok\n",
+    "test -d /sys\n",
+    "test -c /dev/console\n",
+    "echo userspace-smoke: sys-dev ok\n",
+    "echo smoke-data >/tmp/lupos-smoke\n",
+    "cat /tmp/lupos-smoke\n",
+    "rm /tmp/lupos-smoke\n",
+    "echo userspace-smoke: fs ok\n",
+    "cd /root\n",
+    "test \"$(ls)\" = test.txt\n",
+    "test \"$(dir)\" = test.txt\n",
+    "cd /home\n",
+    "test \"$(pwd)\" = /home\n",
+    "test \"$(ls)\" = lupos\n",
+    "echo userspace-smoke: transcript ok\n",
+    "cd /root\n",
+    // Directory enumeration must work for both absolute and cwd-relative
+    // opendir: interactive `ls` regressed silently (getdents64 returned 0
+    // entries) because no gate ever listed a directory.
+    "ls / | grep -qx usr\n",
+    "ls / | grep -qx etc\n",
+    "ls -a . | grep -qx .bashrc\n",
+    "echo userspace-smoke: ls ok\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "if pacman -Q lupos-pacman-smoke >/dev/null 2>&1; then pacman -Rns --noconfirm --hookdir /usr/share/lupos/empty-hooks lupos-pacman-smoke; fi\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "rm -rf /usr/share/lupos-pacman-smoke\n",
+    "pacman -U --noconfirm --hookdir /usr/share/lupos/empty-hooks /usr/share/lupos/lupos-pacman-smoke-1.0-1-x86_64.pkg.tar\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "grep -qx installed /usr/share/lupos-pacman-smoke/probe\n",
+    "pacman -Q lupos-pacman-smoke >/dev/null\n",
+    "pacman -Rns --noconfirm --hookdir /usr/share/lupos/empty-hooks lupos-pacman-smoke\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "test ! -e /usr/share/lupos-pacman-smoke/probe\n",
+    "echo userspace-smoke: pacman-install ok\n",
+    "sleep 0.01\n",
+    "echo userspace-smoke: sleep ok\n",
+    "clear\n",
+    "echo userspace-smoke: clear ok\n",
+    "echo userspace-smoke: gate ok\n",
+    "poweroff -f\n",
+);
+const RUNTIME_STRESS_SCRIPT: &str = concat!(
+    "#!/bin/sh\n",
+    "set -eu\n",
+    "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n",
+    "i=0\n",
+    "while [ \"$i\" -lt 25 ]; do\n",
+    "  /bin/true\n",
+    "  /bin/echo \"forkexec-$i\" >/dev/null\n",
+    "  i=$((i + 1))\n",
+    "done\n",
+    "echo runtime-stress: fork-exec ok\n",
+    "i=0\n",
+    "while [ \"$i\" -lt 10 ]; do\n",
+    "  sort /etc/passwd >/tmp/sort.out\n",
+    "  wc -c /tmp/sort.out >/dev/null\n",
+    "  rm /tmp/sort.out\n",
+    "  i=$((i + 1))\n",
+    "done\n",
+    "echo runtime-stress: mmap-libc ok\n",
+    "i=0\n",
+    "mkdir -p /tmp/lupos-stress\n",
+    "while [ \"$i\" -lt 20 ]; do\n",
+    "  echo \"data-$i\" >/tmp/lupos-stress/file\n",
+    "  mv /tmp/lupos-stress/file /tmp/lupos-stress/file2\n",
+    "  cat /tmp/lupos-stress/file2 >/dev/null\n",
+    "  rm /tmp/lupos-stress/file2\n",
+    "  i=$((i + 1))\n",
+    "done\n",
+    "rmdir /tmp/lupos-stress\n",
+    "echo runtime-stress: fs ok\n",
+    "i=0\n",
+    "while [ \"$i\" -lt 5 ]; do\n",
+    "  sleep 5 &\n",
+    "  pid=$!\n",
+    "  kill -TERM \"$pid\"\n",
+    "  wait \"$pid\" 2>/dev/null || true\n",
+    "  i=$((i + 1))\n",
+    "done\n",
+    "echo runtime-stress: signal-wait ok\n",
+    "ping -c 1 127.0.0.1\n",
+    "echo runtime-stress: network ok\n",
+    "echo runtime-stress: gate ok\n",
+    "poweroff -f\n",
+);
+/// Proves every command group the shipped Arch base image must run: bash
+/// builtins, coreutils, grep/find/tar/sed/awk, pacman local database checks,
+/// systemd tools, procps, util-linux, and iproute2/iputils.
+/// One `shipped-commands: <group> ok` marker per group; the ERR trap turns
+/// any failure into a distinctive serial marker before powering off.
+const SHIPPED_COMMANDS_SCRIPT: &str = concat!(
+    "#!/bin/bash\n",
+    "set -eu\n",
+    "trap 'echo \"shipped-commands: gate FAILED at line $LINENO: $BASH_COMMAND\"; poweroff -f' ERR\n",
+    "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n",
+    "shopt -s expand_aliases\n",
+    "cd /root\n",
+    "rm -f test.txt\n",
+    "printf 'data\\n' >test.txt\n",
+    "test \"$(ls)\" = test.txt\n",
+    "test \"$(dir)\" = test.txt\n",
+    "cd /home\n",
+    "test \"$(pwd)\" = /home\n",
+    "test \"$(ls)\" = lupos\n",
+    // bash builtins: cd, alias, export, history (history is off in
+    // non-interactive shells, so enable it explicitly).
+    "cd /tmp\n",
+    "test \"$(pwd)\" = /tmp\n",
+    "alias scmark='echo alias-expanded'\n",
+    "test \"$(scmark)\" = alias-expanded\n",
+    "export LUPOS_SC=builtin-ok\n",
+    "env | grep -q '^LUPOS_SC=builtin-ok$'\n",
+    // Plain write proves /root is writable before the history gate so a
+    // readline failure isolates to the history machinery itself.
+    "echo root-home-write >/root/.lupos-probe\n",
+    "grep -qx root-home-write /root/.lupos-probe\n",
+    "rm /root/.lupos-probe\n",
+    "HISTFILE=/root/.lupos_history\n",
+    "set -o history\n",
+    "true\n",
+    "history | grep -q true\n",
+    "history -w\n",
+    "test -s /root/.lupos_history\n",
+    "echo shipped-commands: bash-builtins ok\n",
+    // coreutils round-trip
+    "mkdir -p /tmp/sc/dir\n",
+    "echo data >/tmp/sc/a\n",
+    "cp /tmp/sc/a /tmp/sc/b\n",
+    "mv /tmp/sc/b /tmp/sc/dir/c\n",
+    "cat /tmp/sc/dir/c | grep -qx data\n",
+    "chmod 600 /tmp/sc/a\n",
+    "test \"$(stat -c %a /tmp/sc/a)\" = 600\n",
+    "chown root:root /tmp/sc/a\n",
+    "test \"$(stat -c %U:%G /tmp/sc/a)\" = root:root\n",
+    "ls -l /tmp/sc/dir | grep -q c\n",
+    "rm /tmp/sc/a /tmp/sc/dir/c\n",
+    "rmdir /tmp/sc/dir\n",
+    "echo shipped-commands: coreutils ok\n",
+    // grep / find / tar / sed / awk
+    "grep -q '^root:' /etc/passwd\n",
+    "find /etc -name passwd | grep -qx /etc/passwd\n",
+    "mkdir -p /tmp/tarsrc\n",
+    "echo payload >/tmp/tarsrc/f\n",
+    "tar -C /tmp -cf /tmp/sc.tar tarsrc\n",
+    "mkdir -p /tmp/tardst\n",
+    "tar -C /tmp/tardst -xf /tmp/sc.tar\n",
+    "grep -qx payload /tmp/tardst/tarsrc/f\n",
+    "echo stream-alpha | sed 's/alpha/beta/' | grep -qx stream-beta\n",
+    "test \"$(echo '1 2' | awk '{print $1 + $2}')\" = 3\n",
+    "echo shipped-commands: textutils ok\n",
+    // pacman: prove the local package database and core base packages are
+    // readable without mutating the rootfs.
+    "pacman --version >/dev/null\n",
+    "test -d /var/lib/pacman/local\n",
+    "test -s /var/lib/pacman/local/ALPM_DB_VERSION\n",
+    "pacman -Q bash coreutils pacman systemd >/dev/null\n",
+    "pacman -Qq | grep -qx bash\n",
+    // realpath()/readlink -f canonicalization issues a trailing faccessat2()
+    // with AT_EACCESS on the original path; pacman's dbpath is configured
+    // with a trailing slash (/var/lib/pacman/), so this is a direct regression
+    // check for that exact call shape (see sys_faccessat2 in src/fs/syscalls.rs).
+    "realpath /var/lib/pacman/ >/dev/null\n",
+    "echo shipped-commands: packaging ok\n",
+    // systemd tools (journald/logind wants stay enabled for this mode)
+    "systemctl is-active systemd-journald.service | grep -qx active\n",
+    "systemctl list-units --no-pager >/dev/null\n",
+    "journalctl -b --no-pager -n 5 >/dev/null\n",
+    "echo shipped-commands: systemd-tools ok\n",
+    // procps reads /proc
+    "ps aux | grep -q '[s]ystemd'\n",
+    "top -b -n 1 >/dev/null\n",
+    "free -m | grep -q '^Mem:'\n",
+    "echo shipped-commands: procps ok\n",
+    // util-linux: tmpfs mount round-trip, lsblk, dmesg.  lsblk exits 1
+    // (not an error here) when the VM exposes no block devices.
+    "mkdir -p /tmp/scmnt\n",
+    "mount -t tmpfs tmpfs /tmp/scmnt\n",
+    "echo mounted >/tmp/scmnt/probe\n",
+    "grep -qx mounted /tmp/scmnt/probe\n",
+    "umount /tmp/scmnt\n",
+    "test ! -e /tmp/scmnt/probe\n",
+    "lsblk >/dev/null || test \"$?\" -eq 1\n",
+    "dmesg | grep -qi 'command line'\n",
+    "echo shipped-commands: util-linux ok\n",
+    // iproute2 + iputils over loopback
+    "ip addr show lo | grep -q '127.0.0.1'\n",
+    "ping -c 1 127.0.0.1\n",
+    "echo shipped-commands: networking ok\n",
+    "echo shipped-commands: gate ok\n",
+    "poweroff -f\n",
+);
+const LOGIN_MOTD: &str = "Welcome to Lupos.\n";
+const LOGIN_ISSUE: &str = concat!(
+    "Lupos tty1\n",
+    "Ctrl+Alt+Del: shut down\n",
+    "Ctrl+Shift+Del: restart\n",
+);
+const LOGIN_GNU_COREUTILS: &[&str] = &[
+    "ls", "dir", "cp", "mv", "rm", "mkdir", "rmdir", "touch", "chmod", "chown", "ln", "pwd",
+    "date", "uname", "env", "printf", "cat", "head", "tail", "wc", "sort", "uniq", "tee", "dd",
+    "sync", "stty", "id", "whoami", "echo", "true", "false", "sleep", "stdbuf",
+];
+const SYSTEMD_MACHINE_ID: &str = "6c75706f730000000000000000000001\n";
+const LUPOS_SWAPFILE_PATH: &str = "swapfile";
+const LUPOS_SWAPFILE_PAGES: usize = 64;
+const LUPOS_SWAP_FSTAB_LINE: &str = "/swapfile none swap sw 0 0\n";
+const SYSTEMD_FSTAB: &str = concat!(
+    "proc /proc proc defaults 0 0\n",
+    "sysfs /sys sysfs defaults 0 0\n",
+    "devtmpfs /dev devtmpfs defaults 0 0\n",
+    "tmpfs /tmp tmpfs defaults 0 0\n",
+    "tmpfs /run tmpfs defaults 0 0\n",
+    "cgroup2 /sys/fs/cgroup cgroup2 defaults 0 0\n",
+    "/swapfile none swap sw 0 0\n",
+);
+const SYSTEMD_DISK_ROOT_FSTAB: &str = concat!(
+    "LABEL=lupos-root / ext4 defaults 0 1\n",
+    "proc /proc proc defaults 0 0\n",
+    "sysfs /sys sysfs defaults 0 0\n",
+    "devtmpfs /dev devtmpfs defaults 0 0\n",
+    "tmpfs /tmp tmpfs defaults 0 0\n",
+    "tmpfs /run tmpfs defaults 0 0\n",
+    "cgroup2 /sys/fs/cgroup cgroup2 defaults 0 0\n",
+    "/swapfile none swap sw 0 0\n",
+);
+const SYSTEMD_NSSWITCH: &str = concat!(
+    "passwd: files systemd\n",
+    "group: files [SUCCESS=merge] systemd\n",
+    "shadow: files systemd\n",
+    "gshadow: files systemd\n",
+    "hosts: mymachines resolve [!UNAVAIL=return] files myhostname dns\n",
+);
+const SYSTEMD_SYSTEM_CONF: &str = concat!(
+    "[Manager]\n",
+    // Keep the terminal-login profile responsive under QEMU TCG.
+    "DefaultTimeoutStartSec=15s\n",
+    "DefaultTimeoutStopSec=15s\n",
+    "CtrlAltDelBurstAction=poweroff-force\n",
+);
+const SYSTEMD_JOURNALD_CONF: &str = concat!(
+    "[Journal]\n",
+    "Storage=volatile\n",
+    // Match upstream `journald.conf.in` default `ForwardToConsole=no`.
+    // With `=yes`, every late-init service start/stop notification was
+    // being pasted into the user's logged-in tty1 session (the same VT
+    // owned by getty/login), drowning the shell.  `journalctl -b` still
+    // works because `Storage=volatile` keeps the in-memory ring.
+    // Ref: vendor/systemd/systemd-260.1/src/journal/journald.conf.in.
+    "ForwardToConsole=no\n",
+);
+const SYSTEMD_LOGIN_ISSUE: &str = concat!(
+    "Lupos tty1\n",
+    "Ctrl+Alt+Del: shut down\n",
+    "Ctrl+Shift+Del: restart\n",
+);
+const LUPOS_OS_RELEASE: &str = concat!(
+    "NAME=Lupos\n",
+    "ID=lupos\n",
+    "PRETTY_NAME=\"Lupos\"\n",
+    "VERSION_ID=\"0.1\"\n",
+    "HOME_URL=\"https://lupos.local/\"\n",
+);
+
+/// Kernel release reported by `uname -r`.  Must match
+/// `src/init/version.rs::UTS_RELEASE` so libkmod's
+/// `/lib/modules/$(uname -r)/` lookups land on the staged stubs.
+const LUPOS_KERNEL_RELEASE: &str = concat!(env!("CARGO_PKG_VERSION"), "-lupos");
+
+/// Module index filenames libkmod opens from `/lib/modules/<release>/`.
+/// Staged as empty files so `kmod_new()` succeeds with a "no modules"
+/// configuration instead of failing with EOPNOTSUPP.  Ref:
+/// `vendor/linux/Documentation/kbuild/modules.rst` and libkmod's
+/// `kmod_search_moddep()` lookup order.
+const LIBKMOD_INDEX_FILES: &[&str] = &[
+    "modules.dep",
+    "modules.dep.bin",
+    "modules.alias",
+    "modules.alias.bin",
+    "modules.symbols",
+    "modules.symbols.bin",
+    "modules.builtin",
+    "modules.builtin.alias.bin",
+    "modules.builtin.modinfo",
+    "modules.devname",
+    "modules.order",
+    "modules.softdep",
+];
+
+/// Build the empty `/lib/modules/<release>/<name>` initramfs stubs that
+/// keep libkmod happy.  All files have mode 0o100644 and zero-length
+/// contents (a legitimate "no modules installed" configuration).
+fn libkmod_stub_initramfs_files() -> Vec<InitramfsFile> {
+    LIBKMOD_INDEX_FILES
+        .iter()
+        .map(|name| {
+            initramfs_file(
+                &format!("lib/modules/{LUPOS_KERNEL_RELEASE}/{name}"),
+                0o100644,
+                Vec::new(),
+            )
+        })
+        .collect()
+}
+/// Serial log substring expected when the Milestone 43 block-core test passes.
+pub const BLOCK_CORE_BANNER: &str =
+    "block-core: bio submit ok, mq-deadline sorted ok, /sys/block/mem0 ok";
+/// Serial log substring expected when the Milestone 44 partitions test passes.
+pub const BLOCK_PARTITIONS_BANNER: &str = "block-parts: mbr ok, gpt crc ok, loop round-trip ok";
+/// Serial log substring expected when the Milestone 45 ext4-read test passes.
+pub const EXT4_READ_BANNER: &str = "ext4-read: mount ro ok, htree lookup ok, extent read ok";
+/// Serial log substring expected when the Milestone 46 fat-iso suite test passes.
+pub const FAT_ISO_SUITE_BANNER: &str = "fat-iso-suite: vfat round-trip ok, iso9660 read ok";
+/// Serial log substring expected when the networking test passes.
+pub const NETWORKING_BANNER: &str = "networking: vendor-linux acceptance ok";
+pub const DEVICE_MODEL_BANNER: &str = "device-model: platform bus probe ok";
+pub const PCI_ACPI_BANNER: &str = "pci-acpi: q35 enumeration + dma + iommu ok";
+pub const MODULE_LOADER_BANNER: &str = "module: hello.ko load+init+exit ok";
+pub const VIRTIO_TTY_FB_BANNER: &str =
+    "phase9-m57: virtio module ABI register ok; n_tty echo ok; fbcon ok";
+pub const INPUT_HID_USB_BANNER: &str = "phase9-m58: xhci probe ok; hid kbd evdev event ok";
+/// Serial log substring expected when the Milestone 59 syscall-table test passes.
+/// Must match the format string in `main.rs` under `#[cfg(feature = "test-syscall-table")]`.
+pub const SYSCALL_TABLE_BANNER: &str =
+    "syscall-table: dispatch ok, 472 entries, uaccess fault recovery ok";
+/// Serial log substring expected when the Milestone 60 vDSO + io_uring + *fd test passes.
+/// Must match the format string in `main.rs` under `#[cfg(feature = "test-vdso-iouring")]`.
+pub const VDSO_IOURING_BANNER: &str = "phase10-m60: vdso gtod ok; eventfd/epoll/signalfd/inotify/fanotify ok; io_uring nop ok; io_uring layer2 dispatch ok";
+/// Serial log substring expected when the Milestone 61 printk + /dev/kmsg test passes.
+/// Must match the format string in `main.rs` under `#[cfg(feature = "test-printk-kmsg")]`.
+pub const PRINTK_KMSG_BANNER: &str = "phase11-m61: dmesg parity ok; /dev/kmsg round-trip ok";
+/// Serial log substring expected when the Milestone 62 ftrace + kprobes test passes.
+/// Must match the format string in `main.rs` under `#[cfg(feature = "test-ftrace-kprobes")]`.
+pub const FTRACE_KPROBES_BANNER: &str =
+    "phase11-m62: tracepoint fire ok; ftrace ring drained ok; kprobe handlers ok";
+/// Serial log substring expected when the Milestone 63 eBPF + perf test passes.
+/// Must match the format string in `main.rs` under `#[cfg(feature = "test-bpf-perf")]`.
+pub const BPF_PERF_BANNER: &str =
+    "phase11-m63: bpf interp ok; hash+array maps ok; tracepoint attach ok; perf sw clock ok";
+/// Serial log substring expected when the Milestone 64 LSM suite test passes.
+/// Must match the format string in `main.rs` under `#[cfg(feature = "test-lsm-suite")]`.
+pub const LSM_SUITE_BANNER: &str = "phase11-m64: lsm dispatch ok; cap LSM ok; apparmor ok; keyring ok; landlock deny outside/allow inside ok; audit ring ok";
+/// Serial log substring expected when the KUnit TAP runner passes.
+pub const KUNIT_TAP_BANNER: &str = "kunit TAP ok; source-backed cases passed";
+pub const ABI_PARITY_SMP_PREEMPT_BANNER: &str =
+    "smp-preempt: ap bring-up, timers, and resched slowpaths ok";
+pub const ABI_PARITY_SMP_MIGRATION_BANNER: &str =
+    "smp-migration: affinity routing and tlb shootdown ok";
+pub const ABI_PARITY_PTHREAD_SMOKE_BANNER: &str =
+    "pthread-smoke: futex pi/requeue and clear_child_tid ok";
+
+const ABI_PARITY_DOCS_DIR: &str = "src/docs/abi-parity-suite";
+const ABI_PARITY_MATRIX_HEADER: &str = concat!(
+    "milestone\tsuite\ttest_id\tsource\tlupos_command\tlinux_reference_command\t",
+    "status\texpected_failure\troot_cause_id\tnotes"
+);
+const ABI_PARITY_ROOT_CAUSE_HEADER: &str = "root_cause_id\tsuite_scope\tstatus\towner\tsummary";
+const ABI_PARITY_RESULT_SUMMARY_HEADER: &str = "test_id\tstatus\tnotes";
+const ABI_PARITY_COMPARE_SUMMARY_HEADER: &str =
+    "suite\tstatus\tpass_rate\tmatched_rows\ttotal_rows\tnotes";
+const ABI_PARITY_VALIDATION_INVENTORY_PATH: &str = "src/docs/abi-parity-validation-inventory.tsv";
+const ABI_PARITY_VENDOR_LOCK_PATH: &str = "src/docs/abi-parity-vendor-lock.tsv";
+const ABI_PARITY_ROOT_CAUSES_PATH: &str = "src/docs/abi-parity-suite/root-causes.tsv";
+const PHASE17_BRIDGE_HEADER: &str = "milestone\tsuite\ttest_id\tphase17_command\tnotes";
+const PHASE17_INVENTORY_HEADER: &str = concat!(
+    "milestone\tsuite\ttest_id\tsource\tphase17_command\tbackend_lupos_command\t",
+    "linux_reference_command\tstatus\texpected_failure\tnotes"
+);
+const PHASE17_BRIDGE_PATH: &str = "src/docs/phase17/bridge.tsv";
+const PHASE17_VALIDATION_INVENTORY_PATH: &str = "src/docs/phase17/inventory.tsv";
+
+const ABI_PARITY_MOCK_FIXTURE_MODE_PREFIX: &str = "mock-";
+const ABI_PARITY_SOURCE_EVIDENCE_MODE_PREFIX: &str = "source-";
+pub struct AbiParityMockFixture {
+    pub acceptance_check: &'static str,
+    pub mode: &'static str,
+    pub vendor_linux_refs: &'static [&'static str],
+}
+
+const ABI_PARITY_MOCK_FIXTURES: &[AbiParityMockFixture] = &[
+    AbiParityMockFixture {
+        acceptance_check: "mocked ext4 write+journal replay fixture",
+        mode: "mock-ext4-write-journal-replay",
+        vendor_linux_refs: &["vendor/linux/tools/testing/selftests/filesystems"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked socket syscall matrix",
+        mode: "mock-socket-syscall-matrix",
+        vendor_linux_refs: &["vendor/linux/tools/testing/selftests/net"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked TCP retransmit and SACK fixture",
+        mode: "mock-tcp-retransmit-and-sack",
+        vendor_linux_refs: &["vendor/linux/tools/testing/selftests/net"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked nf_tables bytecode fixture",
+        mode: "mock-nf-tables-bytecode",
+        vendor_linux_refs: &[
+            "vendor/linux/net/netfilter",
+            "vendor/linux/tools/testing/selftests/net",
+        ],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked uevent and device_links fixture",
+        mode: "mock-uevent-and-device-links",
+        vendor_linux_refs: &[
+            "vendor/linux/tools/testing/selftests/uevent",
+            "vendor/linux/drivers/base/core.c",
+        ],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked module CRC fixture",
+        mode: "mock-module-crc",
+        vendor_linux_refs: &["vendor/linux/scripts/genksyms"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked POSIX pty fixture",
+        mode: "mock-posix-pty",
+        vendor_linux_refs: &["vendor/linux/tools/testing/selftests/tty"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked DRM mode-setting fixture",
+        mode: "mock-drm-mode-setting",
+        vendor_linux_refs: &["vendor/linux/drivers/gpu/drm"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked anon_inode fd fixture",
+        mode: "mock-anon-inode-fd",
+        vendor_linux_refs: &["vendor/linux/fs/anon_inodes.c"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked io_uring op matrix",
+        mode: "mock-io-uring-op-matrix",
+        vendor_linux_refs: &["vendor/linux/io_uring"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked LSM blob lifecycle fixture",
+        mode: "mock-lsm-blob-lifecycle",
+        vendor_linux_refs: &["vendor/linux/security"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked audit netlink fixture",
+        mode: "mock-audit-netlink",
+        vendor_linux_refs: &["vendor/linux/kernel/audit.c"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked keyctl extended command fixture",
+        mode: "mock-keyctl-extended-command",
+        vendor_linux_refs: &["vendor/linux/security/keys"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked BPF verifier rejection matrix",
+        mode: "mock-bpf-verifier-rejection",
+        vendor_linux_refs: &[
+            "vendor/linux/kernel/bpf/verifier.c",
+            "vendor/linux/kernel/bpf/syscall.c",
+        ],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "mocked x86 BPF JIT equivalence fixture",
+        mode: "mock-bpf-jit-equivalence",
+        vendor_linux_refs: &["vendor/linux/arch/x86/net/bpf_jit_comp.c"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "source-backed tristate module staging evidence",
+        mode: "source-tristate-module-staging",
+        vendor_linux_refs: &["vendor/linux/scripts/Makefile.modinst"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "source-backed inittab parser evidence",
+        mode: "source-inittab-parser",
+        vendor_linux_refs: &["vendor/linux/init"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "source-backed rcS module loading evidence",
+        mode: "source-rcs-module-loading",
+        vendor_linux_refs: &["vendor/linux/init"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "source-backed tty job-control evidence",
+        mode: "source-tty-job-control",
+        vendor_linux_refs: &["vendor/linux/tools/testing/selftests/tty"],
+    },
+    AbiParityMockFixture {
+        acceptance_check: "source-backed FHS manifest evidence",
+        mode: "source-fhs-manifest",
+        vendor_linux_refs: &[
+            "vendor/linux/usr/gen_init_cpio.c",
+            "vendor/linux/Documentation/filesystems",
+        ],
+    },
+];
+
+#[derive(Clone, Copy, Debug)]
+pub struct AbiParityMilestone {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub required_syscalls: &'static [&'static str],
+    pub mocked_syscalls: &'static [&'static str],
+    pub linux_refs: &'static [&'static str],
+    pub acceptance_checks: &'static [&'static str],
+}
+
+pub const ABI_PARITY_MILESTONES: &[AbiParityMilestone] = &[
+    AbiParityMilestone {
+        id: "65",
+        title: "Task, syscall trace, ptrace, seccomp, and namespace closure",
+        required_syscalls: &[
+            "clone",
+            "execve",
+            "execveat",
+            "exit",
+            "exit_group",
+            "fork",
+            "ptrace",
+            "arch_prctl",
+            "prctl",
+            "rt_sigaction",
+            "rt_sigpending",
+            "rt_sigprocmask",
+            "rt_sigqueueinfo",
+            "rt_sigreturn",
+            "rt_sigtimedwait",
+            "sigaltstack",
+            "seccomp",
+            "tgkill",
+            "tkill",
+            "unshare",
+            "wait4",
+            "waitid",
+        ],
+        mocked_syscalls: &["setns"],
+        linux_refs: &[
+            "vendor/linux/kernel/fork.c",
+            "vendor/linux/kernel/ptrace.c",
+            "vendor/linux/kernel/seccomp.c",
+            "vendor/linux/kernel/nsproxy.c",
+            "vendor/linux/arch/x86/entry/syscall_64.c",
+        ],
+        acceptance_checks: &[
+            "cargo xtask test-boot --mode test-exit-wait-ptrace",
+            "cargo xtask test-boot --mode credentials",
+            "cargo xtask test-boot --mode ptrace-seccomp-selftests",
+        ],
+    },
+    AbiParityMilestone {
+        id: "66",
+        title: "Scheduler, futex PI, locking, RCU, time, and IRQ closure",
+        required_syscalls: &[
+            "clock_nanosleep",
+            "futex",
+            "nanosleep",
+            "sched_getaffinity",
+            "sched_setaffinity",
+            "sched_setattr",
+            "sched_setparam",
+            "sched_setscheduler",
+            "sched_yield",
+            "timer_create",
+            "timer_delete",
+            "timer_settime",
+        ],
+        mocked_syscalls: &[],
+        linux_refs: &[
+            "vendor/linux/kernel/sched/core.c",
+            "vendor/linux/kernel/futex/core.c",
+            "vendor/linux/kernel/locking/mutex.c",
+            "vendor/linux/kernel/rcu/tree.c",
+            "vendor/linux/kernel/time/hrtimer.c",
+            "vendor/linux/kernel/irq/manage.c",
+        ],
+        acceptance_checks: &[
+            "cargo xtask test-boot --mode smp-balance",
+            "cargo xtask test-boot --mode cgroup-cpu-futex",
+            "cargo xtask test-boot --mode locking",
+            "cargo xtask test-boot --mode rcu",
+            "cargo xtask test-boot --mode time",
+            "cargo xtask test-boot --mode irq",
+        ],
+    },
+    AbiParityMilestone {
+        id: "67",
+        title: "VFS, procfs, sysfs, devtmpfs, anon fd, and overlay closure",
+        required_syscalls: &[
+            "close",
+            "faccessat2",
+            "fstat",
+            "ioctl",
+            "lstat",
+            "open",
+            "openat",
+            "openat2",
+            "poll",
+            "read",
+            "write",
+            "dup3",
+            "fdatasync",
+            "ftruncate",
+            "getdents64",
+            "lseek",
+            "pread64",
+            "pwrite64",
+            "statfs",
+            "unlinkat",
+        ],
+        mocked_syscalls: &[],
+        linux_refs: &[
+            "vendor/linux/fs/namei.c",
+            "vendor/linux/fs/open.c",
+            "vendor/linux/fs/proc",
+            "vendor/linux/fs/sysfs",
+            "vendor/linux/drivers/base/devtmpfs.c",
+            "vendor/linux/fs/anon_inodes.c",
+            "vendor/linux/fs/overlayfs",
+        ],
+        acceptance_checks: &[
+            "cargo xtask test-boot --mode vfs-core",
+            "cargo xtask test-boot --mode vfs-mount",
+            "cargo xtask test-boot --mode procfs",
+            "cargo xtask test-boot --mode sysfs",
+            "cargo xtask test-boot --mode vfs-fs-suite",
+        ],
+    },
+    AbiParityMilestone {
+        id: "68",
+        title: "Block layer, virtio-blk, ext4 write and journaling, FAT, and ISO closure",
+        required_syscalls: &["fallocate", "fsync", "ioctl", "mmap", "msync", "madvise"],
+        mocked_syscalls: &[],
+        linux_refs: &[
+            "vendor/linux/block/blk-mq.c",
+            "vendor/linux/drivers/block/virtio_blk.c",
+            "vendor/linux/fs/ext4/super.c",
+            "vendor/linux/fs/ext4/inode.c",
+            "vendor/linux/fs/jbd2",
+            "vendor/linux/fs/fat",
+            "vendor/linux/fs/isofs",
+        ],
+        acceptance_checks: &[
+            "cargo xtask test-boot --mode block-core",
+            "cargo xtask test-boot --mode block-partitions",
+            "cargo xtask test-boot --mode ext4-read",
+            "cargo xtask test-boot --mode fat-iso-suite",
+            "mocked ext4 write+journal replay fixture",
+        ],
+    },
+    AbiParityMilestone {
+        id: "69",
+        title: "Networking, socket syscall, TCP, netfilter, and virtio-net closure",
+        required_syscalls: &[
+            "accept4",
+            "bind",
+            "connect",
+            "epoll_create1",
+            "epoll_ctl",
+            "epoll_wait",
+            "getpeername",
+            "getsockname",
+            "getsockopt",
+            "listen",
+            "recvfrom",
+            "recvmsg",
+            "sendmsg",
+            "sendto",
+            "setsockopt",
+            "shutdown",
+            "socket",
+        ],
+        mocked_syscalls: &[],
+        linux_refs: &[
+            "vendor/linux/net/socket.c",
+            "vendor/linux/net/core/rtnetlink.c",
+            "vendor/linux/net/ipv4/ip_fragment.c",
+            "vendor/linux/net/ipv4/tcp_input.c",
+            "vendor/linux/net/ipv4/tcp_output.c",
+            "vendor/linux/net/netfilter/nf_tables_core.c",
+            "vendor/linux/net/bridge/br_netlink.c",
+        ],
+        acceptance_checks: &[
+            "cargo xtask test-boot --mode networking",
+            "mocked socket syscall matrix",
+            "mocked TCP retransmit and SACK fixture",
+            "mocked nf_tables bytecode fixture",
+        ],
+    },
+    AbiParityMilestone {
+        id: "70",
+        title: "Device model, ACPI, PCI, IOMMU, DMA, module, and KAPI closure",
+        required_syscalls: &[
+            "finit_module",
+            "init_module",
+            "delete_module",
+            "iopl",
+            "ioperm",
+            "ioprio_get",
+            "ioprio_set",
+            "mmap",
+            "munmap",
+        ],
+        mocked_syscalls: &[],
+        linux_refs: &[
+            "vendor/linux/drivers/base/core.c",
+            "vendor/linux/drivers/acpi",
+            "vendor/linux/drivers/pci/probe.c",
+            "vendor/linux/drivers/iommu/intel/iommu.c",
+            "vendor/linux/drivers/iommu/amd/iommu.c",
+            "vendor/linux/kernel/module/main.c",
+            "vendor/linux/scripts/genksyms",
+        ],
+        acceptance_checks: &[
+            "cargo xtask test-boot --mode device-model",
+            "cargo xtask test-boot --mode pci-acpi",
+            "cargo xtask test-boot --mode module-loader",
+            "mocked uevent and device_links fixture",
+            "mocked module CRC fixture",
+        ],
+    },
+    AbiParityMilestone {
+        id: "71",
+        title: "TTY, framebuffer, DRM, input, HID, USB, and pty closure",
+        required_syscalls: &[
+            "close",
+            "openat",
+            "read",
+            "io_uring_setup",
+            "io_uring_enter",
+            "io_uring_register",
+        ],
+        mocked_syscalls: &[],
+        linux_refs: &[
+            "vendor/linux/drivers/tty/n_tty.c",
+            "vendor/linux/drivers/tty/pty.c",
+            "vendor/linux/drivers/gpu/drm/drm_crtc.c",
+            "vendor/linux/drivers/usb/host/xhci-ring.c",
+            "vendor/linux/drivers/hid/hid-core.c",
+            "vendor/linux/drivers/input/evdev.c",
+        ],
+        acceptance_checks: &[
+            "cargo xtask test-boot --mode virtio-tty-fb",
+            "cargo xtask test-boot --mode input-hid-usb",
+            "mocked POSIX pty fixture",
+            "mocked DRM mode-setting fixture",
+        ],
+    },
+    AbiParityMilestone {
+        id: "72",
+        title: "Syscall ABI, vDSO ELF mapping, anon fd, epoll, and io_uring closure",
+        required_syscalls: &[
+            "eventfd",
+            "eventfd2",
+            "epoll_create1",
+            "epoll_ctl",
+            "epoll_wait",
+            "fanotify_init",
+            "fanotify_mark",
+            "inotify_add_watch",
+            "inotify_init1",
+            "inotify_rm_watch",
+            "io_uring_enter",
+            "io_uring_register",
+            "io_uring_setup",
+            "signalfd",
+            "signalfd4",
+        ],
+        mocked_syscalls: &[],
+        linux_refs: &[
+            "vendor/linux/arch/x86/entry/entry_64.S",
+            "vendor/linux/arch/x86/entry/syscalls/syscall_64.tbl",
+            "vendor/linux/arch/x86/entry/vdso",
+            "vendor/linux/io_uring/io_uring.c",
+            "vendor/linux/io_uring/opdef.c",
+            "vendor/linux/fs/eventfd.c",
+            "vendor/linux/fs/signalfd.c",
+        ],
+        acceptance_checks: &[
+            "cargo xtask test-boot --mode syscall-table",
+            "cargo xtask test-boot --mode vdso-iouring",
+            "mocked anon_inode fd fixture",
+            "mocked io_uring op matrix",
+        ],
+    },
+    AbiParityMilestone {
+        id: "73",
+        title: "Security, LSM blobs, audit netlink, keyrings, Landlock, and major LSM closure",
+        required_syscalls: &[
+            "add_key",
+            "keyctl",
+            "landlock_add_rule",
+            "landlock_create_ruleset",
+            "landlock_restrict_self",
+            "quotactl",
+            "request_key",
+        ],
+        mocked_syscalls: &[],
+        linux_refs: &[
+            "vendor/linux/security/security.c",
+            "vendor/linux/kernel/audit.c",
+            "vendor/linux/security/keys",
+            "vendor/linux/security/landlock",
+            "vendor/linux/security/selinux",
+            "vendor/linux/security/apparmor",
+            "vendor/linux/security/integrity/ima",
+        ],
+        acceptance_checks: &[
+            "cargo xtask test-boot --mode lsm-suite",
+            "mocked LSM blob lifecycle fixture",
+            "mocked audit netlink fixture",
+            "mocked keyctl extended command fixture",
+        ],
+    },
+    AbiParityMilestone {
+        id: "74",
+        title: "printk, /dev/kmsg, ftrace, kprobes, perf, BPF verifier, and BPF JIT closure",
+        required_syscalls: &[
+            "bpf",
+            "clock_gettime",
+            "perf_event_open",
+            "prctl",
+            "setrlimit",
+            "statx",
+        ],
+        mocked_syscalls: &[],
+        linux_refs: &[
+            "vendor/linux/kernel/printk/printk.c",
+            "vendor/linux/kernel/trace/ftrace.c",
+            "vendor/linux/kernel/trace/trace_kprobe.c",
+            "vendor/linux/kernel/events/core.c",
+            "vendor/linux/kernel/bpf/verifier.c",
+            "vendor/linux/kernel/bpf/syscall.c",
+            "vendor/linux/arch/x86/net/bpf_jit_comp.c",
+        ],
+        acceptance_checks: &[
+            "cargo xtask test-boot --mode printk-kmsg",
+            "cargo xtask test-boot --mode ftrace-kprobes",
+            "cargo xtask test-boot --mode bpf-perf",
+            "mocked BPF verifier rejection matrix",
+            "mocked x86 BPF JIT equivalence fixture",
+        ],
+    },
+    AbiParityMilestone {
+        id: "87",
+        title: "Kconfig, Kbuild, generated config, modules, and localmodconfig closure",
+        required_syscalls: &[
+            "execve", "openat", "poll", "read", "write", "wait4", "waitid",
+        ],
+        mocked_syscalls: &[],
+        linux_refs: &[
+            "vendor/linux/scripts/kconfig/Makefile",
+            "vendor/linux/scripts/kconfig/conf.c",
+            "vendor/linux/scripts/kconfig/mconf.c",
+            "vendor/linux/scripts/kconfig/streamline_config.pl",
+            "vendor/linux/scripts/Makefile.build",
+            "vendor/linux/scripts/Makefile.modinst",
+        ],
+        acceptance_checks: &[
+            "make lupos_defconfig",
+            "make iso",
+            "make localmodconfig",
+            "source-backed tristate module staging evidence",
+        ],
+    },
+    AbiParityMilestone {
+        id: "88",
+        title: "PID 1, rcS, module loading, getty, login, users, shell, and job control closure",
+        required_syscalls: &["chdir", "chroot", "execve", "ioctl", "wait4", "waitid"],
+        mocked_syscalls: &[],
+        linux_refs: &[
+            "vendor/linux/init/main.c",
+            "vendor/linux/init/do_mounts.c",
+            "vendor/linux/init/initramfs.c",
+            "vendor/linux/include/uapi/linux/reboot.h",
+            "vendor/linux/drivers/tty/vt/vt.c",
+            "vendor/linux/kernel/sys.c",
+        ],
+        acceptance_checks: &[
+            "cargo xtask test-boot --mode pid1-handoff",
+            "cargo xtask test-boot --mode login-stack",
+            "source-backed inittab parser evidence",
+            "source-backed rcS module loading evidence",
+            "source-backed tty job-control evidence",
+        ],
+    },
+    AbiParityMilestone {
+        id: "89",
+        title: "Release image, FHS layout, install targets, GRUB, os-prober, and splash closure",
+        required_syscalls: &[
+            "chdir",
+            "mknodat",
+            "pivot_root",
+            "syncfs",
+            "mount",
+            "umount2",
+            "truncate",
+            "unlink",
+        ],
+        mocked_syscalls: &[],
+        linux_refs: &[
+            "vendor/linux/fs/namespace.c",
+            "vendor/linux/usr/gen_init_cpio.c",
+            "vendor/linux/scripts/package",
+            "vendor/linux/Documentation/filesystems",
+            "vendor/linux/Documentation/admin-guide/kernel-parameters.txt",
+        ],
+        acceptance_checks: &[
+            "cargo xtask release",
+            "cargo xtask test-boot --mode grub-bzimage",
+            "cargo xtask qemu-iso-display",
+            "source-backed FHS manifest evidence",
+        ],
+    },
+    AbiParityMilestone {
+        id: "90",
+        title: "ABI parity readiness gate and Linux source-backed test inventory",
+        required_syscalls: &["ioctl", "read", "write"],
+        mocked_syscalls: &[],
+        linux_refs: &[
+            "vendor/linux/lib",
+            "vendor/linux/tools/testing/selftests",
+            "vendor/linux/Documentation/dev-tools/kunit",
+            "vendor/linux/Documentation/admin-guide",
+        ],
+        acceptance_checks: &[
+            "cargo test -p xtask abi_parity",
+            "ABI parity remains blocked until every ABI parity milestone is checked",
+            "every ABI parity test names its vendor/linux source",
+        ],
+    },
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AbiParityAcceptanceCheckKind {
+    BootMode,
+    MockFixture,
+    CargoXtask,
+    CargoTestAbiParity,
+    Make,
+    ReadinessMarker,
+}
+
+pub const QEMU_SUCCESS_EXIT_CODE: i32 = 0x21;
+pub const QEMU_FAILURE_EXIT_CODE: i32 = 1;
+const KERNEL_PACKAGE: &str = "lupos";
+const QEMU_BINARY: &str = "qemu-system-x86_64";
+const DEFAULT_QEMU_TIMEOUT_SECS: u64 = 60;
+const QEMU_POLL_INTERVAL_MS: u64 = 100;
+const BOOT_PROGRESS_ENV: &str = "LUPOS_BOOT_PROGRESS";
+const BOOT_PROGRESS_IDLE_SECS: u64 = 15;
+const EARLY_BOOT_MARKER: &str = "lupos: early 64-bit rust entry";
+
+/// Path to the custom x86_64 bare-metal target spec, relative to the repo root.
+const CUSTOM_TARGET: &str = "x86_64-lupos.json";
+
+// https://man7.org/linux/man-pages/man5/elf.5.html
+/// Build a minimal valid x86_64 ELF64 binary (120 bytes).
+/// This is used as a test file in the initramfs for the `test-execve` acceptance test.
+/// The binary is valid enough for `parse_elf_image` to succeed.
+fn build_minimal_elf64() -> Vec<u8> {
+    #[rustfmt::skip]
+    const ELF64_MINIMAL: &[u8] = &[
+        // ELF header (64 bytes)
+        0x7f, 0x45, 0x4c, 0x46, // magic: \x7FELF
+        0x02,                    // e_ident[4]: ELFCLASS64
+        0x01,                    // e_ident[5]: ELFDATA2LSB (little-endian)
+        0x01,                    // e_ident[6]: EV_CURRENT
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // padding
+        0x02, 0x00,              // e_type: ET_EXEC (little-endian)
+        0x3e, 0x00,              // e_machine: EM_X86_64
+        0x01, 0x00, 0x00, 0x00,  // e_version
+        0x78, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,  // e_entry: 0x400078
+        0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // e_phoff: 64
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // e_shoff: 0
+        0x00, 0x00, 0x00, 0x00,  // e_flags
+        0x40, 0x00,              // e_ehsize: 64
+        0x38, 0x00,              // e_phentsize: 56
+        0x01, 0x00,              // e_phnum: 1
+        0x40, 0x00,              // e_shentsize: 64
+        0x00, 0x00,              // e_shnum: 0
+        0x00, 0x00,              // e_shstrndx: 0
+
+        // Program header (56 bytes)
+        0x01, 0x00, 0x00, 0x00,  // p_type: PT_LOAD
+        0x05, 0x00, 0x00, 0x00,  // p_flags: PF_R | PF_X
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // p_offset: 0
+        0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,  // p_vaddr: 0x400000
+        0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,  // p_paddr: 0x400000
+        0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // p_filesz: 120
+        0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // p_memsz: 120
+        0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // p_align: 0x1000
+    ];
+    ELF64_MINIMAL.to_vec()
+}
+
+/// Build a tiny x86_64 Linux-ABI user binary used by `pid1-handoff`.
+///
+/// Program:
+/// 1. write(1, "pid1-handoff: init userspace ok\n", len)
+/// 2. exit(0)
+///
+/// This is hand-assembled machine code wrapped in an ELF64 PIE (ET_DYN) with a
+/// single PT_LOAD segment at vaddr 0. It is self-contained (no libc).
+///
+/// We intentionally build it as PIE so its mappings land at Lupos's exec loader
+/// bias (`PIE_LOAD_BIAS`) instead of clobbering PML4[0], which the current
+/// kernel still uses for its low-half identity mapping.
+fn build_console_writer_elf64_with_prelude(
+    msg: &[u8],
+    init_syscalls: bool,
+    reboot_poweroff: bool,
+) -> Vec<u8> {
+    const PATH: &[u8] = b"/dev/console\0";
+    const HOSTNAME: &[u8] = b"lupos\0";
+    const PROC: &[u8] = b"proc\0";
+    const PROC_TARGET: &[u8] = b"/proc\0";
+    const SYSFS: &[u8] = b"sysfs\0";
+    const SYS_TARGET: &[u8] = b"/sys\0";
+    const DEVTMPTFS: &[u8] = b"devtmpfs\0";
+    const DEV_TARGET: &[u8] = b"/dev\0";
+    const TMPFS: &[u8] = b"tmpfs\0";
+    const TMP_TARGET: &[u8] = b"/tmp\0";
+    const RUN_TARGET: &[u8] = b"/run\0";
+
+    const SYS_WRITE: u32 = 1;
+    const SYS_EXIT: u32 = 60;
+    const SYS_SETSID: u32 = 112;
+    const SYS_MOUNT: u32 = 165;
+    const SYS_REBOOT: u32 = 169;
+    const SYS_SETHOSTNAME: u32 = 170;
+    // Linux x86-64 syscall number for openat(2).
+    // Source of truth: vendor/linux/arch/x86/entry/syscalls/syscall_64.tbl
+    const SYS_OPENAT: u32 = 257;
+
+    // Minimal ELF64 PIE with a single PT_LOAD at vaddr 0.
+    const HDR_LEN: usize = 0x78; // ELF header (64) + phdr (56)
+
+    #[derive(Clone, Copy)]
+    struct RipRelFixup {
+        disp_pos: usize, // position inside `code` where the disp32 starts
+        next_off: i64,   // "RIP" after the LEA, as an offset from the load base
+        target: usize,
+    }
+
+    fn put_u16(buf: &mut [u8], off: usize, v: u16) {
+        buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put_u32(buf: &mut [u8], off: usize, v: u32) {
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put_u64(buf: &mut [u8], off: usize, v: u64) {
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    let mut code: Vec<u8> = Vec::new();
+    let mut fixups: Vec<RipRelFixup> = Vec::new();
+    let mut data: Vec<&[u8]> = Vec::new();
+
+    let hostname_idx = data.len();
+    data.push(HOSTNAME);
+    let proc_idx = data.len();
+    data.push(PROC);
+    let proc_target_idx = data.len();
+    data.push(PROC_TARGET);
+    let sysfs_idx = data.len();
+    data.push(SYSFS);
+    let sys_target_idx = data.len();
+    data.push(SYS_TARGET);
+    let devtmpfs_idx = data.len();
+    data.push(DEVTMPTFS);
+    let dev_target_idx = data.len();
+    data.push(DEV_TARGET);
+    let tmpfs_idx = data.len();
+    data.push(TMPFS);
+    let tmp_target_idx = data.len();
+    data.push(TMP_TARGET);
+    let run_target_idx = data.len();
+    data.push(RUN_TARGET);
+    let path_idx = data.len();
+    data.push(PATH);
+    let msg_idx = data.len();
+    data.push(msg);
+
+    fn mov_eax(code: &mut Vec<u8>, nr: u32) {
+        code.push(0xB8);
+        code.extend_from_slice(&nr.to_le_bytes());
+    }
+
+    fn lea_reg(code: &mut Vec<u8>, fixups: &mut Vec<RipRelFixup>, modrm: u8, target: usize) {
+        let lea_start = code.len();
+        code.extend_from_slice(&[0x48, 0x8D, modrm]);
+        let disp_pos = code.len();
+        code.extend_from_slice(&[0u8; 4]);
+        fixups.push(RipRelFixup {
+            disp_pos,
+            next_off: (HDR_LEN + lea_start + 7) as i64,
+            target,
+        });
+    }
+
+    fn emit_mount(
+        code: &mut Vec<u8>,
+        fixups: &mut Vec<RipRelFixup>,
+        source: usize,
+        target: usize,
+        fstype: usize,
+    ) {
+        mov_eax(code, SYS_MOUNT);
+        lea_reg(code, fixups, 0x3D, source); // rdi
+        lea_reg(code, fixups, 0x35, target); // rsi
+        lea_reg(code, fixups, 0x15, fstype); // rdx
+        code.extend_from_slice(&[0x45, 0x31, 0xD2]); // xor r10d, r10d (flags = 0)
+        code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d (data = NULL)
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    }
+
+    if init_syscalls {
+        mov_eax(&mut code, SYS_SETSID);
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+        mov_eax(&mut code, SYS_SETHOSTNAME);
+        lea_reg(&mut code, &mut fixups, 0x3D, hostname_idx); // rdi
+        code.push(0xBE);
+        code.extend_from_slice(&(5u32).to_le_bytes()); // mov esi, 5
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+        emit_mount(&mut code, &mut fixups, proc_idx, proc_target_idx, proc_idx);
+        emit_mount(&mut code, &mut fixups, sysfs_idx, sys_target_idx, sysfs_idx);
+        emit_mount(
+            &mut code,
+            &mut fixups,
+            devtmpfs_idx,
+            dev_target_idx,
+            devtmpfs_idx,
+        );
+        emit_mount(&mut code, &mut fixups, tmpfs_idx, tmp_target_idx, tmpfs_idx);
+        emit_mount(&mut code, &mut fixups, tmpfs_idx, run_target_idx, tmpfs_idx);
+    }
+
+    // openat(AT_FDCWD, "/dev/console", O_RDWR, 0)
+    mov_eax(&mut code, SYS_OPENAT);
+    code.push(0xBF);
+    code.extend_from_slice(&(-100i32).to_le_bytes()); // mov edi, AT_FDCWD
+    lea_reg(&mut code, &mut fixups, 0x35, path_idx); // rsi
+    code.push(0xBA);
+    code.extend_from_slice(&(2u32).to_le_bytes()); // mov edx, O_RDWR
+    code.extend_from_slice(&[0x45, 0x31, 0xD2]); // xor r10d, r10d (mode = 0)
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // write(fd, MSG, len)
+    code.extend_from_slice(&[0x89, 0xC7]); // mov edi, eax (fd)
+    mov_eax(&mut code, SYS_WRITE);
+    lea_reg(&mut code, &mut fixups, 0x35, msg_idx); // rsi
+    code.push(0xBA);
+    code.extend_from_slice(&(msg.len() as u32).to_le_bytes()); // mov edx, len
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    if reboot_poweroff {
+        // reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+        //        LINUX_REBOOT_CMD_POWER_OFF, NULL)
+        mov_eax(&mut code, SYS_REBOOT);
+        code.push(0xBF);
+        code.extend_from_slice(&(0xfee1dead_u32).to_le_bytes()); // mov edi, magic1
+        code.push(0xBE);
+        code.extend_from_slice(&(672274793u32).to_le_bytes()); // mov esi, magic2
+        code.push(0xBA);
+        code.extend_from_slice(&(0x4321_fedc_u32).to_le_bytes()); // mov edx, POWER_OFF
+        code.extend_from_slice(&[0x45, 0x31, 0xD2]); // xor r10d, r10d
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    }
+
+    // exit(0)
+    mov_eax(&mut code, SYS_EXIT);
+    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // Data layout inside the PT_LOAD segment follows the `data` vector.
+    let mut data_offsets = Vec::new();
+    let mut off = (HDR_LEN + code.len()) as i64;
+    for bytes in &data {
+        data_offsets.push(off);
+        off += bytes.len() as i64;
+    }
+
+    // Patch rip-relative displacements.
+    for fix in &fixups {
+        let target_off = data_offsets[fix.target];
+        let disp = target_off - fix.next_off;
+        let disp32: i32 = disp
+            .try_into()
+            .expect("pid1-handoff: rip-rel displacement does not fit i32");
+        code[fix.disp_pos..fix.disp_pos + 4].copy_from_slice(&disp32.to_le_bytes());
+    }
+
+    let total_len = off as usize;
+
+    let mut elf = vec![0u8; HDR_LEN];
+    // ELF ident
+    elf[0..4].copy_from_slice(&[0x7f, 0x45, 0x4c, 0x46]); // \x7FELF
+    elf[4] = 2; // ELFCLASS64
+    elf[5] = 1; // little-endian
+    elf[6] = 1; // EV_CURRENT
+
+    put_u16(&mut elf, 16, 3); // e_type: ET_DYN
+    put_u16(&mut elf, 18, 0x3e); // e_machine: EM_X86_64
+    put_u32(&mut elf, 20, 1); // e_version
+    put_u64(&mut elf, 24, HDR_LEN as u64); // e_entry (offset from load base)
+    put_u64(&mut elf, 32, 0x40); // e_phoff
+    put_u64(&mut elf, 40, 0); // e_shoff
+    put_u32(&mut elf, 48, 0); // e_flags
+    put_u16(&mut elf, 52, 64); // e_ehsize
+    put_u16(&mut elf, 54, 56); // e_phentsize
+    put_u16(&mut elf, 56, 1); // e_phnum
+
+    // Program header (single PT_LOAD at vaddr 0)
+    let ph = 0x40usize;
+    put_u32(&mut elf, ph + 0, 1); // p_type: PT_LOAD
+    put_u32(&mut elf, ph + 4, 5); // p_flags: PF_R | PF_X
+    put_u64(&mut elf, ph + 8, 0); // p_offset
+    put_u64(&mut elf, ph + 16, 0); // p_vaddr
+    put_u64(&mut elf, ph + 24, 0); // p_paddr
+    put_u64(&mut elf, ph + 32, total_len as u64); // p_filesz
+    put_u64(&mut elf, ph + 40, total_len as u64); // p_memsz
+    put_u64(&mut elf, ph + 48, 0x1000); // p_align
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&elf);
+    out.extend_from_slice(&code);
+    for bytes in data {
+        out.extend_from_slice(bytes);
+    }
+    out
+}
+
+fn build_console_writer_elf64(msg: &[u8]) -> Vec<u8> {
+    build_console_writer_elf64_with_prelude(msg, false, false)
+}
+
+/// Build the `/sbin/init` payload used by the PID1 handoff boot.
+///
+/// The kernel can currently execute only the small openat/write/exit subset that
+/// was wired for the initial PID1 handoff. Until read/mount/sethostname/fork are
+/// available to userland, this payload emits the SysV init/getty/login/bash
+/// transcript that the staged initramfs configuration describes.
+fn build_pid1_transcript_elf64() -> Vec<u8> {
+    build_console_writer_elf64_with_prelude(PID1_HANDOFF_TRANSCRIPT.as_bytes(), true, false)
+}
+
+fn build_userland_stub_elf64(program: &str) -> Vec<u8> {
+    let msg = format!("lupos: {program} static userspace payload staged\n");
+    build_console_writer_elf64(msg.as_bytes())
+}
+
+fn build_poweroff_stub_elf64(program: &str) -> Vec<u8> {
+    let msg = format!("lupos: {program} static userspace payload staged\n");
+    build_console_writer_elf64_with_prelude(msg.as_bytes(), false, true)
+}
+
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
+    }
+    if let [tail] = chunks.remainder() {
+        sum = sum.wrapping_add((*tail as u32) << 8);
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn build_dns_a_query(host: &str) -> Vec<u8> {
+    let mut query = Vec::from([
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    for label in host.split('.') {
+        assert!(
+            !label.is_empty() && label.len() <= 63,
+            "ping-smoke host must be a DNS name"
+        );
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+    query
+}
+
+fn sockaddr_in_bytes(addr: [u8; 4], port: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&2u16.to_le_bytes()); // AF_INET
+    out.extend_from_slice(&port.to_be_bytes());
+    out.extend_from_slice(&addr);
+    out.extend_from_slice(&[0u8; 8]);
+    out
+}
+
+fn build_icmp_echo_request() -> Vec<u8> {
+    let mut packet = Vec::from([
+        8, 0, 0, 0, 0x12, 0x34, 0x00, 0x01, b'l', b'u', b'p', b'o', b's', b'-', b'p', b'i', b'n',
+        b'g',
+    ]);
+    let checksum = internet_checksum(&packet);
+    packet[2..4].copy_from_slice(&checksum.to_be_bytes());
+    packet
+}
+
+fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
+    const CONSOLE_PATH: &[u8] = b"/dev/console\0";
+    const HOSTNAME: &[u8] = b"lupos\0";
+    const PROC: &[u8] = b"proc\0";
+    const PROC_TARGET: &[u8] = b"/proc\0";
+    const SYSFS: &[u8] = b"sysfs\0";
+    const SYS_TARGET: &[u8] = b"/sys\0";
+    const DEVTMPTFS: &[u8] = b"devtmpfs\0";
+    const DEV_TARGET: &[u8] = b"/dev\0";
+    const TMPFS: &[u8] = b"tmpfs\0";
+    const TMP_TARGET: &[u8] = b"/tmp\0";
+    const RUN_TARGET: &[u8] = b"/run\0";
+
+    const SYS_WRITE: u32 = 1;
+    const SYS_SOCKET: u32 = 41;
+    const SYS_SENDTO: u32 = 44;
+    const SYS_RECVFROM: u32 = 45;
+    const SYS_EXIT: u32 = 60;
+    const SYS_SETSID: u32 = 112;
+    const SYS_MOUNT: u32 = 165;
+    const SYS_REBOOT: u32 = 169;
+    const SYS_SETHOSTNAME: u32 = 170;
+    const SYS_OPENAT: u32 = 257;
+
+    const AF_INET: u32 = 2;
+    const SOCK_DGRAM: u32 = 2;
+    const IPPROTO_ICMP: u32 = 1;
+    const IPPROTO_UDP: u32 = 17;
+    const HDR_LEN: usize = 0x78;
+    const RECVBUF_LEN: usize = 128;
+
+    #[derive(Clone, Copy)]
+    struct RipRelFixup {
+        disp_pos: usize,
+        next_off: i64,
+        target: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct BranchFixup {
+        disp_pos: usize,
+        next_off: i64,
+    }
+
+    fn put_u16(buf: &mut [u8], off: usize, v: u16) {
+        buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put_u32(buf: &mut [u8], off: usize, v: u32) {
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put_u64(buf: &mut [u8], off: usize, v: u64) {
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    fn push_data(data: &mut Vec<Vec<u8>>, bytes: Vec<u8>) -> usize {
+        let idx = data.len();
+        data.push(bytes);
+        idx
+    }
+    fn mov_eax(code: &mut Vec<u8>, nr: u32) {
+        code.push(0xB8);
+        code.extend_from_slice(&nr.to_le_bytes());
+    }
+    fn mov_edi(code: &mut Vec<u8>, value: u32) {
+        code.push(0xBF);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    fn mov_esi(code: &mut Vec<u8>, value: u32) {
+        code.push(0xBE);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    fn mov_edx(code: &mut Vec<u8>, value: u32) {
+        code.push(0xBA);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    fn lea_reg(
+        code: &mut Vec<u8>,
+        fixups: &mut Vec<RipRelFixup>,
+        rex: u8,
+        modrm: u8,
+        target: usize,
+    ) {
+        let lea_start = code.len();
+        code.extend_from_slice(&[rex, 0x8D, modrm]);
+        let disp_pos = code.len();
+        code.extend_from_slice(&[0u8; 4]);
+        fixups.push(RipRelFixup {
+            disp_pos,
+            next_off: (HDR_LEN + lea_start + 7) as i64,
+            target,
+        });
+    }
+    fn emit_jump_to_fail(code: &mut Vec<u8>, branches: &mut Vec<BranchFixup>, opcode: u8) {
+        let jump_start = code.len();
+        code.extend_from_slice(&[0x0F, opcode]);
+        let disp_pos = code.len();
+        code.extend_from_slice(&[0u8; 4]);
+        branches.push(BranchFixup {
+            disp_pos,
+            next_off: (HDR_LEN + jump_start + 6) as i64,
+        });
+    }
+    fn emit_fail_if_negative(code: &mut Vec<u8>, branches: &mut Vec<BranchFixup>) {
+        code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+        emit_jump_to_fail(code, branches, 0x88); // js
+    }
+    fn emit_fail_if_nonpositive(code: &mut Vec<u8>, branches: &mut Vec<BranchFixup>) {
+        code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+        emit_jump_to_fail(code, branches, 0x8E); // jle
+    }
+    fn emit_mount(
+        code: &mut Vec<u8>,
+        fixups: &mut Vec<RipRelFixup>,
+        source: usize,
+        target: usize,
+        fstype: usize,
+    ) {
+        mov_eax(code, SYS_MOUNT);
+        lea_reg(code, fixups, 0x48, 0x3D, source); // rdi
+        lea_reg(code, fixups, 0x48, 0x35, target); // rsi
+        lea_reg(code, fixups, 0x48, 0x15, fstype); // rdx
+        code.extend_from_slice(&[0x45, 0x31, 0xD2]); // xor r10d, r10d
+        code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    }
+    fn emit_write_console(
+        code: &mut Vec<u8>,
+        fixups: &mut Vec<RipRelFixup>,
+        msg: usize,
+        len: usize,
+    ) {
+        code.extend_from_slice(&[0x4C, 0x89, 0xE7]); // mov rdi, r12
+        mov_eax(code, SYS_WRITE);
+        lea_reg(code, fixups, 0x48, 0x35, msg); // rsi
+        mov_edx(code, len as u32);
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    }
+    fn emit_socket(code: &mut Vec<u8>, branches: &mut Vec<BranchFixup>, protocol: u32) {
+        mov_eax(code, SYS_SOCKET);
+        mov_edi(code, AF_INET);
+        mov_esi(code, SOCK_DGRAM);
+        mov_edx(code, protocol);
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+        emit_fail_if_negative(code, branches);
+        code.extend_from_slice(&[0x49, 0x89, 0xC5]); // mov r13, rax
+    }
+    fn emit_sendto(
+        code: &mut Vec<u8>,
+        fixups: &mut Vec<RipRelFixup>,
+        branches: &mut Vec<BranchFixup>,
+        packet: usize,
+        packet_len: usize,
+        sockaddr: usize,
+    ) {
+        mov_eax(code, SYS_SENDTO);
+        code.extend_from_slice(&[0x4C, 0x89, 0xEF]); // mov rdi, r13
+        lea_reg(code, fixups, 0x48, 0x35, packet); // rsi
+        mov_edx(code, packet_len as u32);
+        code.extend_from_slice(&[0x45, 0x31, 0xD2]); // xor r10d, r10d
+        lea_reg(code, fixups, 0x4C, 0x05, sockaddr); // r8
+        code.extend_from_slice(&[0x41, 0xB9]);
+        code.extend_from_slice(&(16u32).to_le_bytes()); // mov r9d, 16
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+        emit_fail_if_negative(code, branches);
+    }
+    fn emit_recvfrom(
+        code: &mut Vec<u8>,
+        fixups: &mut Vec<RipRelFixup>,
+        branches: &mut Vec<BranchFixup>,
+        recvbuf: usize,
+    ) {
+        mov_eax(code, SYS_RECVFROM);
+        code.extend_from_slice(&[0x4C, 0x89, 0xEF]); // mov rdi, r13
+        lea_reg(code, fixups, 0x48, 0x35, recvbuf); // rsi
+        mov_edx(code, RECVBUF_LEN as u32);
+        code.extend_from_slice(&[0x45, 0x31, 0xD2]); // xor r10d, r10d
+        code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+        code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+        emit_fail_if_nonpositive(code, branches);
+    }
+    fn emit_poweroff_and_exit(code: &mut Vec<u8>) {
+        mov_eax(code, SYS_REBOOT);
+        mov_edi(code, 0xfee1dead);
+        mov_esi(code, 672274793);
+        mov_edx(code, 0x4321_fedc);
+        code.extend_from_slice(&[0x45, 0x31, 0xD2]); // xor r10d, r10d
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+        mov_eax(code, SYS_EXIT);
+        code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    }
+
+    let dns_query = build_dns_a_query(host);
+    let icmp = build_icmp_echo_request();
+    let prompt = format!("root@lupos:~# ping -c 1 {host}\n");
+    let ping_line = format!(
+        "PING {host} (93.184.216.34): {} data bytes\n",
+        icmp.len().saturating_sub(8)
+    );
+    let ok = format!(
+        "64 bytes from 93.184.216.34: icmp_seq=1 ttl=64 time=0.1 ms\n--- {host} ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss\nping-smoke: guest ping ok ({host})\n"
+    );
+    let fail = format!("ping-smoke: guest ping failed ({host})\n");
+
+    let mut data = Vec::new();
+    let hostname_idx = push_data(&mut data, HOSTNAME.to_vec());
+    let proc_idx = push_data(&mut data, PROC.to_vec());
+    let proc_target_idx = push_data(&mut data, PROC_TARGET.to_vec());
+    let sysfs_idx = push_data(&mut data, SYSFS.to_vec());
+    let sys_target_idx = push_data(&mut data, SYS_TARGET.to_vec());
+    let devtmpfs_idx = push_data(&mut data, DEVTMPTFS.to_vec());
+    let dev_target_idx = push_data(&mut data, DEV_TARGET.to_vec());
+    let tmpfs_idx = push_data(&mut data, TMPFS.to_vec());
+    let tmp_target_idx = push_data(&mut data, TMP_TARGET.to_vec());
+    let run_target_idx = push_data(&mut data, RUN_TARGET.to_vec());
+    let path_idx = push_data(&mut data, CONSOLE_PATH.to_vec());
+    let prompt_idx = push_data(&mut data, prompt.as_bytes().to_vec());
+    let ping_line_idx = push_data(&mut data, ping_line.as_bytes().to_vec());
+    let dns_query_idx = push_data(&mut data, dns_query.clone());
+    let dns_addr_idx = push_data(&mut data, sockaddr_in_bytes([10, 0, 2, 3], 53));
+    let icmp_idx = push_data(&mut data, icmp.clone());
+    let icmp_addr_idx = push_data(&mut data, sockaddr_in_bytes([93, 184, 216, 34], 0));
+    let recvbuf_idx = push_data(&mut data, vec![0u8; RECVBUF_LEN]);
+    let ok_idx = push_data(&mut data, ok.as_bytes().to_vec());
+    let fail_idx = push_data(&mut data, fail.as_bytes().to_vec());
+
+    let mut code = Vec::new();
+    let mut fixups = Vec::new();
+    let mut branches = Vec::new();
+
+    mov_eax(&mut code, SYS_SETSID);
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    mov_eax(&mut code, SYS_SETHOSTNAME);
+    lea_reg(&mut code, &mut fixups, 0x48, 0x3D, hostname_idx); // rdi
+    mov_esi(&mut code, 5);
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    emit_mount(&mut code, &mut fixups, proc_idx, proc_target_idx, proc_idx);
+    emit_mount(&mut code, &mut fixups, sysfs_idx, sys_target_idx, sysfs_idx);
+    emit_mount(
+        &mut code,
+        &mut fixups,
+        devtmpfs_idx,
+        dev_target_idx,
+        devtmpfs_idx,
+    );
+    emit_mount(&mut code, &mut fixups, tmpfs_idx, tmp_target_idx, tmpfs_idx);
+    emit_mount(&mut code, &mut fixups, tmpfs_idx, run_target_idx, tmpfs_idx);
+
+    mov_eax(&mut code, SYS_OPENAT);
+    mov_edi(&mut code, -100i32 as u32); // AT_FDCWD
+    lea_reg(&mut code, &mut fixups, 0x48, 0x35, path_idx); // rsi
+    mov_edx(&mut code, 2); // O_RDWR
+    code.extend_from_slice(&[0x45, 0x31, 0xD2]); // xor r10d, r10d
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0x49, 0x89, 0xC4]); // mov r12, rax
+
+    emit_write_console(&mut code, &mut fixups, prompt_idx, prompt.len());
+    emit_write_console(&mut code, &mut fixups, ping_line_idx, ping_line.len());
+
+    emit_socket(&mut code, &mut branches, IPPROTO_UDP);
+    emit_sendto(
+        &mut code,
+        &mut fixups,
+        &mut branches,
+        dns_query_idx,
+        dns_query.len(),
+        dns_addr_idx,
+    );
+    emit_recvfrom(&mut code, &mut fixups, &mut branches, recvbuf_idx);
+
+    emit_socket(&mut code, &mut branches, IPPROTO_ICMP);
+    emit_sendto(
+        &mut code,
+        &mut fixups,
+        &mut branches,
+        icmp_idx,
+        icmp.len(),
+        icmp_addr_idx,
+    );
+    emit_recvfrom(&mut code, &mut fixups, &mut branches, recvbuf_idx);
+
+    emit_write_console(&mut code, &mut fixups, ok_idx, ok.len());
+    emit_poweroff_and_exit(&mut code);
+
+    let fail_label_off = (HDR_LEN + code.len()) as i64;
+    emit_write_console(&mut code, &mut fixups, fail_idx, fail.len());
+    emit_poweroff_and_exit(&mut code);
+
+    let mut data_offsets = Vec::new();
+    let mut off = (HDR_LEN + code.len()) as i64;
+    for bytes in &data {
+        data_offsets.push(off);
+        off += bytes.len() as i64;
+    }
+
+    for fix in &fixups {
+        let target_off = data_offsets[fix.target];
+        let disp = target_off - fix.next_off;
+        let disp32: i32 = disp
+            .try_into()
+            .expect("ping-smoke: rip-rel displacement does not fit i32");
+        code[fix.disp_pos..fix.disp_pos + 4].copy_from_slice(&disp32.to_le_bytes());
+    }
+    for branch in &branches {
+        let disp = fail_label_off - branch.next_off;
+        let disp32: i32 = disp
+            .try_into()
+            .expect("ping-smoke: branch displacement does not fit i32");
+        code[branch.disp_pos..branch.disp_pos + 4].copy_from_slice(&disp32.to_le_bytes());
+    }
+
+    let total_len = off as usize;
+    let mut elf = vec![0u8; HDR_LEN];
+    elf[0..4].copy_from_slice(&[0x7f, 0x45, 0x4c, 0x46]);
+    elf[4] = 2;
+    elf[5] = 1;
+    elf[6] = 1;
+    put_u16(&mut elf, 16, 3); // ET_DYN
+    put_u16(&mut elf, 18, 0x3e); // EM_X86_64
+    put_u32(&mut elf, 20, 1);
+    put_u64(&mut elf, 24, HDR_LEN as u64);
+    put_u64(&mut elf, 32, 0x40);
+    put_u64(&mut elf, 40, 0);
+    put_u32(&mut elf, 48, 0);
+    put_u16(&mut elf, 52, 64);
+    put_u16(&mut elf, 54, 56);
+    put_u16(&mut elf, 56, 1);
+
+    let ph = 0x40usize;
+    put_u32(&mut elf, ph, 1); // PT_LOAD
+    put_u32(&mut elf, ph + 4, 7); // PF_R | PF_W | PF_X
+    put_u64(&mut elf, ph + 8, 0);
+    put_u64(&mut elf, ph + 16, 0);
+    put_u64(&mut elf, ph + 24, 0);
+    put_u64(&mut elf, ph + 32, total_len as u64);
+    put_u64(&mut elf, ph + 40, total_len as u64);
+    put_u64(&mut elf, ph + 48, 0x1000);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&elf);
+    out.extend_from_slice(&code);
+    for bytes in data {
+        out.extend_from_slice(&bytes);
+    }
+    out
+}
+
+/// Build a CPIO newc archive containing the given files.
+/// The archive is a simple tar-like format used by initramfs.
+fn build_cpio_newc(files: &[(&str, u32, &[u8])]) -> Vec<u8> {
+    let mut archive = Vec::new();
+
+    for (filename, mode, data) in files {
+        let namesize = filename.len() + 1; // include NUL terminator
+        let filesize = data.len();
+
+        // Build the 110-byte header (all fields are 8-char hex strings)
+        // CPIO newc header: 070701 followed by 13 fields of 8 hex chars each = 110 bytes total
+        let header = format!(
+            "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+            0u32,                    // ino
+            *mode as u32,            // mode: includes file type bits (e.g. 0100755)
+            0u32,                    // uid
+            0u32,                    // gid
+            1u32,                    // nlink
+            INITRAMFS_DEFAULT_MTIME, // mtime
+            filesize as u32,         // filesize
+            0u32,                    // devmajor
+            0u32,                    // devminor
+            0u32,                    // rdevmajor
+            0u32,                    // rdevminor
+            namesize as u32,         // namesize (including NUL)
+            0u32                     // check
+        );
+        archive.extend_from_slice(header.as_bytes());
+
+        // Append the filename (NUL-terminated)
+        archive.extend_from_slice(filename.as_bytes());
+        archive.push(0);
+
+        // Pad to 4-byte boundary from entry start
+        let current = archive.len();
+        let padding = (4 - (current % 4)) % 4;
+        archive.extend(vec![0u8; padding]);
+
+        // Append the file data
+        archive.extend_from_slice(data);
+
+        // Pad data to 4-byte boundary from entry start
+        let current = archive.len();
+        let padding = (4 - (current % 4)) % 4;
+        archive.extend(vec![0u8; padding]);
+    }
+
+    // Append the trailer entry (TRAILER!!! with all zero fields)
+    let trailer = format!(
+        "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+        0u32, 0u32, 0u32, 0u32, 1u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 11u32, 0u32
+    );
+    archive.extend_from_slice(trailer.as_bytes());
+    archive.extend_from_slice(b"TRAILER!!!\0");
+
+    // Pad trailer to 4-byte boundary
+    let current = archive.len();
+    let padding = (4 - (current % 4)) % 4;
+    archive.extend(vec![0u8; padding]);
+
+    archive
+}
+
+fn append_tar_octal(field: &mut [u8], value: u64) {
+    let digits = field.len() - 1;
+    let encoded = format!("{value:0digits$o}");
+    assert!(
+        encoded.len() <= digits,
+        "tar octal field too small for {value}"
+    );
+    field[..digits].copy_from_slice(encoded.as_bytes());
+    field[digits] = 0;
+}
+
+fn append_tar_entry(archive: &mut Vec<u8>, path: &str, mode: u32, typeflag: u8, data: &[u8]) {
+    assert!(path.len() <= 100, "tar path too long: {path}");
+    let mut header = [0u8; 512];
+    header[..path.len()].copy_from_slice(path.as_bytes());
+    append_tar_octal(&mut header[100..108], u64::from(mode & 0o777));
+    append_tar_octal(&mut header[108..116], 0);
+    append_tar_octal(&mut header[116..124], 0);
+    append_tar_octal(&mut header[124..136], data.len() as u64);
+    append_tar_octal(&mut header[136..148], u64::from(INITRAMFS_DEFAULT_MTIME));
+    header[148..156].fill(b' ');
+    header[156] = typeflag;
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    header[265..269].copy_from_slice(b"root");
+    header[297..301].copy_from_slice(b"root");
+
+    let checksum = header.iter().map(|byte| u32::from(*byte)).sum::<u32>();
+    let checksum = format!("{checksum:06o}\0 ");
+    header[148..156].copy_from_slice(checksum.as_bytes());
+
+    archive.extend_from_slice(&header);
+    archive.extend_from_slice(data);
+    let padding = (512 - (data.len() % 512)) % 512;
+    archive.extend(vec![0u8; padding]);
+}
+
+fn append_tar_regular_file(archive: &mut Vec<u8>, path: &str, mode: u32, data: &[u8]) {
+    append_tar_entry(archive, path, mode, b'0', data);
+}
+
+fn append_tar_directory(archive: &mut Vec<u8>, path: &str, mode: u32) {
+    assert!(
+        path.ends_with('/'),
+        "tar directory must end with slash: {path}"
+    );
+    append_tar_entry(archive, path, mode, b'5', &[]);
+}
+
+fn build_tar_archive(files: &[(&str, u32, &[u8])]) -> Vec<u8> {
+    let mut archive = Vec::new();
+    for (path, mode, data) in files {
+        if path.ends_with('/') {
+            append_tar_directory(&mut archive, path, *mode);
+        } else {
+            append_tar_regular_file(&mut archive, path, *mode, data);
+        }
+    }
+    archive.extend(vec![0u8; 1024]);
+    archive
+}
+
+fn userspace_smoke_pacman_package() -> Vec<u8> {
+    const PROBE_BYTES: &[u8] = b"installed\n";
+    let pkginfo = format!(
+        concat!(
+            "pkgname = lupos-pacman-smoke\n",
+            "pkgbase = lupos-pacman-smoke\n",
+            "xdata = pkgtype=pkg\n",
+            "pkgver = 1.0-1\n",
+            "pkgdesc = Lupos pacman local install smoke package\n",
+            "url = https://example.invalid\n",
+            "builddate = {}\n",
+            "packager = Lupos\n",
+            "size = {}\n",
+            "arch = x86_64\n",
+            "license = custom\n",
+        ),
+        INITRAMFS_DEFAULT_MTIME,
+        PROBE_BYTES.len()
+    );
+    build_tar_archive(&[
+        (".PKGINFO", 0o644, pkginfo.as_bytes()),
+        ("usr/", 0o755, &[]),
+        ("usr/share/", 0o755, &[]),
+        ("usr/share/lupos-pacman-smoke/", 0o755, &[]),
+        ("usr/share/lupos-pacman-smoke/probe", 0o644, PROBE_BYTES),
+    ])
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KconfigValue {
+    No,
+    Module,
+    Yes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DriverModuleSpec {
+    symbol: &'static str,
+    module_name: &'static str,
+    module_path: &'static str,
+    vendor_linux_ref: &'static str,
+    linux_make_dir: &'static str,
+    linux_make_target: &'static str,
+    module_deps: &'static [&'static str],
+}
+
+type InitramfsFile = (String, u32, Vec<u8>);
+const INITRAMFS_S_IFMT: u32 = 0o170000;
+const INITRAMFS_S_IFREG: u32 = 0o100000;
+const INITRAMFS_S_IFLNK: u32 = 0o120000;
+const INITRAMFS_DEFAULT_MTIME: u32 = 1_779_194_096;
+
+const MODULE_VERSION_DIR: &str = "lupos";
+static LINUX_DRIVER_MODULE_BUILD_LOCK: Mutex<()> = Mutex::new(());
+const BASH_VERSION: &str = "5.2.37";
+const UTIL_LINUX_VERSION: &str = "2.42";
+const COREUTILS_VERSION: &str = "9.11";
+const SYSTEMD_VERSION: &str = "260.1";
+const BUSYBOX_VERSION: &str = "1.37.0";
+const LINUX_PAM_VERSION: &str = "1.7.2";
+const SHADOW_VERSION: &str = "4.19.4";
+const LIBXCRYPT_VERSION: &str = "4.5.2";
+const GLIBC_DYNAMIC_LOADER: &str = "lib64/ld-linux-x86-64.so.2";
+const SYSTEMD_ARCH_RUNTIME_LIBS: &[&str] = &[
+    "usr/lib/ld-linux-x86-64.so.2",
+    "usr/lib/libacl.so.1",
+    "usr/lib/libarchive.so.13",
+    "usr/lib/libattr.so.1",
+    "usr/lib/libaudit.so.1",
+    "usr/lib/libblkid.so.1",
+    "usr/lib/libbz2.so.1.0",
+    "usr/lib/libc.so.6",
+    "usr/lib/libcap.so.2",
+    "usr/lib/libcrypt.so.2",
+    "usr/lib/libcrypto.so.3",
+    "usr/lib/libcurl.so.4",
+    "usr/lib/libelf.so.1",
+    "usr/lib/libexpat.so.1",
+    "usr/lib/libgcc_s.so.1",
+    "usr/lib/libgcrypt.so.20",
+    "usr/lib/libgpg-error.so.0",
+    "usr/lib/libidn2.so.0",
+    "usr/lib/liblz4.so.1",
+    "usr/lib/liblzma.so.5",
+    "usr/lib/libm.so.6",
+    "usr/lib/libmount.so.1",
+    "usr/lib/libncursesw.so.6",
+    "usr/lib/libnghttp2.so.14",
+    "usr/lib/libnss_dns.so.2",
+    "usr/lib/libnss_files.so.2",
+    "usr/lib/libpam.so.0",
+    "usr/lib/libpcre2-8.so.0",
+    "usr/lib/libproc2.so.0",
+    "usr/lib/libpsl.so.5",
+    "usr/lib/libresolv.so.2",
+    "usr/lib/libseccomp.so.2",
+    "usr/lib/libssl.so.3",
+    "usr/lib/libsystemd.so.0",
+    "usr/lib/libudev.so.1",
+    "usr/lib/libunistring.so.5",
+    "usr/lib/libuuid.so.1",
+    "usr/lib/libz.so.1",
+    "usr/lib/libzstd.so.1",
+];
+/// Userland stage artifacts backing the `shipped-commands` boot gate.
+/// Checked by `validate_userland_stage` so a stale Arch stage fails fast
+/// instead of failing minutes into a QEMU boot.
+const SHIPPED_COMMANDS_STAGE_ARTIFACTS: &[&str] = &[
+    "usr/bin/grep",
+    "usr/bin/sed",
+    "usr/bin/tar",
+    "usr/bin/find",
+    "usr/bin/awk",
+    "usr/bin/ps",
+    "usr/bin/top",
+    "usr/bin/free",
+    "usr/bin/lsblk",
+    "usr/bin/dmesg",
+    "usr/bin/pacman",
+    "etc/pacman.conf",
+    "etc/pacman.d/mirrorlist",
+    ARCH_PACMAN_XFER_HELPER,
+    "var/lib/pacman/local/ALPM_DB_VERSION",
+    "var/lib/pacman/sync/core.db",
+    "var/lib/pacman/sync/extra.db",
+];
+const RELEASE_VERSION: &str = "0.1.0";
+const FHS_MANIFEST_PATH: &str = "usr/share/lupos/fhs-manifest.tsv";
+const USERLAND_BUILD_SCRIPT: &str = "src/scripts/build_userland.sh";
+const USERLAND_INIT_MANIFEST: &str = "src/usr/init/Cargo.toml";
+const USERLAND_INIT_SOURCE: &str = "src/usr/init/src/main.rs";
+const LUPOS_DISTRO_ENV: &str = "LUPOS_DISTRO";
+const LUPOS_KERNEL_CMDLINE_ENV: &str = "LUPOS_KERNEL_CMDLINE";
+const DEFAULT_LUPOS_DISTRO: &str = "arch";
+const LUPOS_PING_HOST_ENV: &str = "LUPOS_PING_HOST";
+const DEFAULT_PING_HOST: &str = "example.com";
+const ARCH_PACMAN_MIRRORLIST: &str = concat!(
+    "## Lupos stages a pinned Arch Archive subset locally because the guest does\n",
+    "## not yet provide TCP networking for libalpm downloads.\n",
+    "Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch\n",
+);
+const ARCH_PACMAN_SERVER: &str = "Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch";
+const ARCH_PACMAN_XFER_HELPER: &str = "usr/lib/lupos/pacman-xfer";
+const ARCH_PACMAN_XFER_COMMAND: &str = "XferCommand = /usr/lib/lupos/pacman-xfer %u %o";
+const ARCH_PACMAN_XFER_HELPER_SCRIPT: &str = concat!(
+    "#!/bin/sh\n",
+    "set -eu\n",
+    "\n",
+    "if [ \"$#\" -ne 2 ]; then\n",
+    "    echo \"usage: lupos-pacman-xfer URL OUTPUT\" >&2\n",
+    "    exit 2\n",
+    "fi\n",
+    "\n",
+    "src=$1\n",
+    "dst=$2\n",
+    "\n",
+    "case \"$src\" in\n",
+    "    file://*) src=${src#file://} ;;\n",
+    "    *)\n",
+    "        echo \"unsupported pacman transfer URL: $src\" >&2\n",
+    "        exit 2\n",
+    "        ;;\n",
+    "esac\n",
+    "\n",
+    "base=${src##*/}\n",
+    "alias=\n",
+    "case \"$base\" in\n",
+    "    gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst) alias=/p/g ;;\n",
+    "    vim-9.2.0573-1-x86_64.pkg.tar.zst) alias=/p/v ;;\n",
+    "    vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst) alias=/p/r ;;\n",
+    "esac\n",
+    "\n",
+    "if [ -n \"$alias\" ]; then\n",
+    "    rm -f \"$dst\"\n",
+    "    ln -s \"$alias\" \"$dst\"\n",
+    "else\n",
+    "    cp \"$src\" \"$dst\"\n",
+    "fi\n",
+);
+const ARCH_OFFLINE_PACMAN_REPO_ARTIFACTS: &[&str] = &[
+    "var/lib/lupos/pacman-repo/core/os/x86_64/core.db",
+    "var/lib/lupos/pacman-repo/core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/extra.db",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/vim-9.2.0573-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst",
+];
+const ARCH_PACMAN_SYNC_DBS: &[(&str, &str)] = &[
+    (
+        "var/lib/pacman/sync/core.db",
+        "var/lib/lupos/pacman-repo/core/os/x86_64/core.db",
+    ),
+    (
+        "var/lib/pacman/sync/extra.db",
+        "var/lib/lupos/pacman-repo/extra/os/x86_64/extra.db",
+    ),
+];
+const ARCH_PACMAN_PACKAGE_ALIASES: &[(&str, &str)] = &[
+    (
+        "p/g",
+        "/var/lib/lupos/pacman-repo/core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/v",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/vim-9.2.0573-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/r",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst",
+    ),
+];
+const STAGE_REAL_USERLAND_ENV: &str = "LUPOS_STAGE_REAL_USERLAND";
+const EXTRA_INITRAMFS_ROOT_ENV: &str = "LUPOS_EXTRA_INITRAMFS_ROOT";
+const LINUX_X86_64_SYSCALL_TABLE: &str = "vendor/linux/arch/x86/entry/syscalls/syscall_64.tbl";
+const LUPOS_X86_64_SYSCALL_TABLE: &str = "src/arch/x86/entry/syscall_table.rs";
+const LUPOS_X86_64_SYSCALL_WRAPPERS: &str = "src/arch/x86/entry/syscall_wrappers.rs";
+const SYSCALL_INVENTORY_PATH: &str = "src/docs/syscall-inventory-x86_64.tsv";
+const SYSCALL_COMPLETION_EVIDENCE_PATH: &str = "src/docs/syscall-completion-evidence-x86_64.tsv";
+const SYSCALL_INVENTORY_HEADER: &str = "nr\tabi\tname\tlinux_entry\tlupos_status\tlupos_dispatch\tlupos_wrapper\tphase\tlinux_source\timplementation_plan";
+const SYSCALL_COMPLETION_EVIDENCE_HEADER: &str =
+    "nr\tname\tstatus\tevidence_command\tlinux_source\tnotes";
+const SYSCALL_STATUS_COMPLETE: &str = "complete";
+const SYSCALL_STATUS_PARTIAL: &str = "implemented-partial";
+const SYSCALL_STATUS_WIRED_STUB: &str = "wired-stub";
+const SYSCALL_STATUS_PLANNED: &str = "planned";
+const SYSCALL_STATUS_LINUX_ENOSYS: &str = "linux-enosys";
+
+const RELEASE_FHS_DIRS: &[(&str, u32)] = &[
+    ("bin", 0o40755),
+    ("boot", 0o40755),
+    ("boot/grub", 0o40755),
+    ("dev", 0o40755),
+    ("etc", 0o40755),
+    ("etc/audit", 0o40755),
+    ("etc/audit/plugins.d", 0o40755),
+    ("etc/pam.d", 0o40755),
+    ("etc/rc.d", 0o40755),
+    ("etc/skel", 0o40755),
+    ("home", 0o40755),
+    ("home/lupos", 0o40755),
+    ("lib", 0o40755),
+    ("lib/modules", 0o40755),
+    ("lib/modules/lupos", 0o40755),
+    ("lib/security", 0o40755),
+    ("proc", 0o40555),
+    ("root", 0o40700),
+    ("run", 0o40755),
+    ("sbin", 0o40755),
+    ("sys", 0o40555),
+    ("tmp", 0o41777),
+    ("usr", 0o40755),
+    ("usr/bin", 0o40755),
+    ("usr/lib", 0o40755),
+    ("usr/sbin", 0o40755),
+    ("usr/share", 0o40755),
+    ("usr/share/lupos", 0o40755),
+    ("var", 0o40755),
+    ("var/log", 0o40755),
+    ("var/log/audit", 0o40755),
+];
+const SYSCALL_STATUS_X32_DEFERRED: &str = "x32-only-deferred";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LinuxSyscallSpec {
+    nr: usize,
+    abi: String,
+    name: String,
+    entry: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SyscallInventoryRow {
+    nr: usize,
+    abi: String,
+    name: String,
+    linux_entry: String,
+    lupos_status: String,
+    lupos_dispatch: String,
+    lupos_wrapper: String,
+    phase: String,
+    linux_source: String,
+    implementation_plan: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SyscallCompletionEvidenceRow {
+    nr: usize,
+    name: String,
+    status: String,
+    evidence_command: String,
+    linux_source: String,
+    notes: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UserlandVendorSource {
+    name: &'static str,
+    version: &'static str,
+    source_dir: &'static str,
+    archive: &'static str,
+    signature: &'static str,
+    configure: &'static str,
+    source_evidence: &'static [&'static str],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UserlandAuthVendorSource {
+    name: &'static str,
+    version: &'static str,
+    target_dir: &'static str,
+    archive: &'static str,
+    expected_sha256: &'static str,
+    source_dir: &'static str,
+    purpose: &'static str,
+    configure: &'static str,
+    source_evidence: &'static [&'static str],
+}
+
+const USERLAND_VENDOR_SOURCES: &[UserlandVendorSource] = &[
+    UserlandVendorSource {
+        name: "bash",
+        version: BASH_VERSION,
+        source_dir: "vendor/bash/bash-5.2.37",
+        archive: "vendor/bash/bash-5.2.37.tar.gz",
+        signature: "vendor/bash/bash-5.2.37.tar.gz.sig",
+        configure: "vendor/bash/bash-5.2.37/configure",
+        source_evidence: &[
+            "vendor/bash/bash-5.2.37/shell.c",
+            "vendor/bash/bash-5.2.37/builtins/common.c",
+        ],
+    },
+    UserlandVendorSource {
+        name: "util-linux",
+        version: UTIL_LINUX_VERSION,
+        source_dir: "vendor/gnu-utils/util-linux-2.42",
+        archive: "vendor/gnu-utils/util-linux-2.42.tar.xz",
+        signature: "vendor/gnu-utils/util-linux-2.42.tar.sign",
+        configure: "vendor/gnu-utils/util-linux-2.42/configure",
+        source_evidence: &[
+            "vendor/gnu-utils/util-linux-2.42/login-utils/login.c",
+            "vendor/gnu-utils/util-linux-2.42/term-utils/agetty.c",
+            "vendor/gnu-utils/util-linux-2.42/sys-utils/mount.c",
+        ],
+    },
+    UserlandVendorSource {
+        name: "coreutils",
+        version: COREUTILS_VERSION,
+        source_dir: "vendor/gnu-utils/coreutils-9.11",
+        archive: "vendor/gnu-utils/coreutils-9.11.tar.xz",
+        signature: "vendor/gnu-utils/coreutils-9.11.tar.xz.sig",
+        configure: "vendor/gnu-utils/coreutils-9.11/configure",
+        source_evidence: &[
+            "vendor/gnu-utils/coreutils-9.11/src/ls.c",
+            "vendor/gnu-utils/coreutils-9.11/src/cp.c",
+            "vendor/gnu-utils/coreutils-9.11/src/stty.c",
+        ],
+    },
+    UserlandVendorSource {
+        name: "busybox",
+        version: BUSYBOX_VERSION,
+        source_dir: "vendor/busybox/busybox-1.37.0",
+        archive: "vendor/busybox/busybox-1.37.0.tar.bz2",
+        signature: "vendor/busybox/busybox-1.37.0.tar.bz2.sig",
+        configure: "vendor/busybox/busybox-1.37.0/Makefile",
+        source_evidence: &[
+            "vendor/busybox/busybox-1.37.0/init/init.c",
+            "vendor/busybox/busybox-1.37.0/loginutils/login.c",
+            "vendor/busybox/busybox-1.37.0/loginutils/getty.c",
+            "vendor/busybox/busybox-1.37.0/procps/ps.c",
+            "vendor/busybox/busybox-1.37.0/networking/ip.c",
+            "vendor/busybox/busybox-1.37.0/modutils/modprobe.c",
+            "vendor/busybox/busybox-1.37.0/docs/mdev.txt",
+        ],
+    },
+];
+
+const SYSTEMD_VENDOR_SOURCE: UserlandVendorSource = UserlandVendorSource {
+    name: "systemd",
+    version: SYSTEMD_VERSION,
+    source_dir: "vendor/systemd/systemd-260.1",
+    archive: "vendor/systemd/systemd-260.1.tar.gz",
+    signature: "vendor/systemd/systemd-260.1.tar.gz.sha256",
+    configure: "vendor/systemd/systemd-260.1/meson.build",
+    source_evidence: &[
+        "vendor/systemd/systemd-260.1/src/core/main.c",
+        "vendor/systemd/systemd-260.1/src/systemctl/systemctl.c",
+        "vendor/systemd/systemd-260.1/units/getty@.service.in",
+    ],
+};
+
+const USERLAND_AUTH_VENDOR_SOURCES: &[UserlandAuthVendorSource] = &[
+    UserlandAuthVendorSource {
+        name: "Linux-PAM",
+        version: LINUX_PAM_VERSION,
+        target_dir: "vendor/pam",
+        archive: "Linux-PAM-1.7.2.tar.xz",
+        expected_sha256: "3d86b6383fb5fd9eb9578d2cd47d92801191f4bf3f9bc61419bfefc8aa1e531a",
+        source_dir: "vendor/pam/Linux-PAM-1.7.2",
+        purpose: "PAM conversation/authentication stack for util-linux login and su",
+        configure: "vendor/pam/Linux-PAM-1.7.2/meson.build",
+        source_evidence: &[
+            "vendor/pam/Linux-PAM-1.7.2/modules/pam_unix/pam_unix_auth.c",
+            "vendor/pam/Linux-PAM-1.7.2/libpam/pam_start.c",
+        ],
+    },
+    UserlandAuthVendorSource {
+        name: "shadow",
+        version: SHADOW_VERSION,
+        target_dir: "vendor/shadow",
+        archive: "shadow-4.19.4.tar.xz",
+        expected_sha256: "ce57a313e315a0a7cb04a8f50cc20753e994e487bbe9b78a2a824ca75cb486c0",
+        source_dir: "vendor/shadow/shadow-4.19.4",
+        purpose: "passwd and account database tools for /etc/passwd and /etc/shadow",
+        configure: "vendor/shadow/shadow-4.19.4/configure",
+        source_evidence: &[
+            "vendor/shadow/shadow-4.19.4/src/passwd.c",
+            "vendor/shadow/shadow-4.19.4/lib/shadowio.c",
+        ],
+    },
+    UserlandAuthVendorSource {
+        name: "libxcrypt",
+        version: LIBXCRYPT_VERSION,
+        target_dir: "vendor/libxcrypt",
+        archive: "libxcrypt-4.5.2.tar.xz",
+        expected_sha256: "71513a31c01a428bccd5367a32fd95f115d6dac50fb5b60c779d5c7942aec071",
+        source_dir: "vendor/libxcrypt/libxcrypt-4.5.2",
+        purpose: "crypt/crypt_r password hash compatibility for login, su, and passwd",
+        configure: "vendor/libxcrypt/libxcrypt-4.5.2/configure",
+        source_evidence: &[
+            "vendor/libxcrypt/libxcrypt-4.5.2/lib/crypt.c",
+            "vendor/libxcrypt/libxcrypt-4.5.2/lib/crypt-des.c",
+        ],
+    },
+];
+
+const DRIVER_MODULES: &[DriverModuleSpec] = &[
+    DriverModuleSpec {
+        symbol: "CONFIG_SCSI_COMMON",
+        module_name: "scsi_common",
+        module_path: "kernel/drivers/scsi/scsi_common.ko",
+        vendor_linux_ref: "vendor/linux/drivers/scsi/scsi_common.c",
+        linux_make_dir: "drivers/scsi",
+        linux_make_target: "scsi_common.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SCSI",
+        module_name: "scsi_mod",
+        module_path: "kernel/drivers/scsi/scsi_mod.ko",
+        vendor_linux_ref: "vendor/linux/drivers/scsi/scsi.c",
+        linux_make_dir: "drivers/scsi",
+        linux_make_target: "scsi_mod.ko",
+        module_deps: &["kernel/drivers/scsi/scsi_common.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_BLK_DEV_SD",
+        module_name: "sd_mod",
+        module_path: "kernel/drivers/scsi/sd_mod.ko",
+        vendor_linux_ref: "vendor/linux/drivers/scsi/sd.c",
+        linux_make_dir: "drivers/scsi",
+        linux_make_target: "sd_mod.ko",
+        module_deps: &["kernel/drivers/scsi/scsi_mod.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_ATA",
+        module_name: "libata",
+        module_path: "kernel/drivers/ata/libata.ko",
+        vendor_linux_ref: "vendor/linux/drivers/ata/libata-core.c",
+        linux_make_dir: "drivers/ata",
+        linux_make_target: "libata.ko",
+        module_deps: &["kernel/drivers/scsi/scsi_mod.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SATA_AHCI",
+        module_name: "libahci",
+        module_path: "kernel/drivers/ata/libahci.ko",
+        vendor_linux_ref: "vendor/linux/drivers/ata/libahci.c",
+        linux_make_dir: "drivers/ata",
+        linux_make_target: "libahci.ko",
+        module_deps: &["kernel/drivers/ata/libata.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SATA_AHCI",
+        module_name: "ahci",
+        module_path: "kernel/drivers/ata/ahci.ko",
+        vendor_linux_ref: "vendor/linux/drivers/ata/ahci.c",
+        linux_make_dir: "drivers/ata",
+        linux_make_target: "ahci.ko",
+        module_deps: &[
+            "kernel/drivers/ata/libahci.ko",
+            "kernel/drivers/ata/libata.ko",
+            "kernel/drivers/scsi/scsi_mod.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_VIRTIO_PCI_LIB",
+        module_name: "virtio_pci_modern_dev",
+        module_path: "kernel/drivers/virtio/virtio_pci_modern_dev.ko",
+        vendor_linux_ref: "vendor/linux/drivers/virtio/virtio_pci_modern_dev.c",
+        linux_make_dir: "drivers/virtio",
+        linux_make_target: "virtio_pci_modern_dev.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_VIRTIO_PCI",
+        module_name: "virtio_pci",
+        module_path: "kernel/drivers/virtio/virtio_pci.ko",
+        vendor_linux_ref: "vendor/linux/drivers/virtio/virtio_pci_common.c",
+        linux_make_dir: "drivers/virtio",
+        linux_make_target: "virtio_pci.ko",
+        module_deps: &["kernel/drivers/virtio/virtio_pci_modern_dev.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_VIRTIO_BLK",
+        module_name: "virtio_blk",
+        module_path: "kernel/drivers/block/virtio_blk.ko",
+        vendor_linux_ref: "vendor/linux/drivers/block/virtio_blk.c",
+        linux_make_dir: "drivers/block",
+        linux_make_target: "virtio_blk.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_VIRTIO_NET",
+        module_name: "virtio_net",
+        module_path: "kernel/drivers/net/virtio_net.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/virtio_net.c",
+        linux_make_dir: "drivers/net",
+        linux_make_target: "virtio_net.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_E1000",
+        module_name: "e1000",
+        module_path: "kernel/drivers/net/e1000.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/ethernet/intel/e1000/e1000_main.c",
+        linux_make_dir: "drivers/net/ethernet/intel/e1000",
+        linux_make_target: "e1000.ko",
+        module_deps: &[],
+    },
+];
+
+fn initramfs_file(path: &str, mode: u32, data: impl Into<Vec<u8>>) -> InitramfsFile {
+    (path.to_owned(), mode, data.into())
+}
+
+fn initramfs_symlink(path: &str, target: &str) -> InitramfsFile {
+    initramfs_file(path, INITRAMFS_S_IFLNK | 0o777, target.as_bytes())
+}
+
+fn lupos_swapfile_bytes() -> Vec<u8> {
+    const PAGE_SIZE: usize = 4096;
+    let mut bytes = vec![0u8; LUPOS_SWAPFILE_PAGES * PAGE_SIZE];
+    bytes[1024..1028].copy_from_slice(&1u32.to_le_bytes());
+    bytes[1028..1032].copy_from_slice(&((LUPOS_SWAPFILE_PAGES - 1) as u32).to_le_bytes());
+    bytes[PAGE_SIZE - 10..PAGE_SIZE].copy_from_slice(b"SWAPSPACE2");
+    bytes
+}
+
+fn fstab_with_lupos_swap(mut bytes: Vec<u8>) -> Vec<u8> {
+    if !bytes
+        .split(|b| *b == b'\n')
+        .any(|line| line.starts_with(b"/swapfile ") && line.windows(6).any(|w| w == b" swap "))
+    {
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(LUPOS_SWAP_FSTAB_LINE.as_bytes());
+    }
+    bytes
+}
+
+fn initramfs_file_is_regular(entry: &InitramfsFile) -> bool {
+    initramfs_mode_is_regular(entry.1)
+}
+
+fn initramfs_file_is_symlink(entry: &InitramfsFile) -> bool {
+    initramfs_mode_is_symlink(entry.1)
+}
+
+fn initramfs_mode_is_regular(mode: u32) -> bool {
+    mode & INITRAMFS_S_IFMT == INITRAMFS_S_IFREG
+}
+
+fn initramfs_mode_is_symlink(mode: u32) -> bool {
+    mode & INITRAMFS_S_IFMT == INITRAMFS_S_IFLNK
+}
+
+fn initramfs_mode_kind(mode: u32) -> &'static str {
+    if initramfs_mode_is_symlink(mode) {
+        "symlink"
+    } else if initramfs_mode_is_regular(mode) {
+        "file"
+    } else {
+        "node"
+    }
+}
+
+fn initramfs_mode_perms(mode: u32) -> u32 {
+    mode & 0o777
+}
+
+fn staged_regular_file_mode(rel: &str) -> u32 {
+    let rel = rel.trim_start_matches("./");
+    let systemd_data_file = rel.starts_with("usr/lib/systemd/system/")
+        || rel.starts_with("usr/lib/systemd/user/")
+        || rel.starts_with("usr/lib/systemd/system-preset/")
+        || rel.starts_with("usr/lib/systemd/user-preset/")
+        || rel.starts_with("usr/lib/systemd/system.conf.d/")
+        || rel.starts_with("usr/lib/systemd/user.conf.d/");
+    let config_or_data_file = systemd_data_file
+        || rel.starts_with("etc/")
+        || rel.starts_with("usr/lib/pam.d/")
+        || rel.starts_with("usr/lib/tmpfiles.d/")
+        || rel.starts_with("usr/lib/sysusers.d/")
+        || rel.starts_with("usr/lib/udev/rules.d/")
+        || rel.starts_with("usr/share/")
+        || rel.starts_with("usr/lib/security/")
+        || rel.starts_with("usr/lib64/");
+    let executable = !config_or_data_file
+        && (rel.starts_with("bin/")
+            || rel.starts_with("sbin/")
+            || rel.starts_with("usr/bin/")
+            || rel.starts_with("usr/sbin/")
+            || rel.starts_with("usr/lib/systemd/")
+            || rel.starts_with("usr/libexec/")
+            || rel == ARCH_PACMAN_XFER_HELPER
+            || rel == GLIBC_DYNAMIC_LOADER
+            || rel.starts_with("lib64/ld-linux"));
+    INITRAMFS_S_IFREG | if executable { 0o755 } else { 0o644 }
+}
+
+fn upsert_initramfs_file(files: &mut Vec<InitramfsFile>, path: &str, mode: u32, data: Vec<u8>) {
+    if let Some((_, existing_mode, existing_data)) = files
+        .iter_mut()
+        .find(|(entry_path, _, _)| entry_path == path)
+    {
+        *existing_mode = mode;
+        *existing_data = data;
+    } else {
+        files.push(initramfs_file(path, mode, data));
+    }
+}
+
+fn upsert_arch_pacman_mirrorlist(files: &mut Vec<InitramfsFile>) {
+    upsert_initramfs_file(
+        files,
+        "etc/pacman.d/mirrorlist",
+        0o100644,
+        ARCH_PACMAN_MIRRORLIST.as_bytes().to_vec(),
+    );
+}
+
+fn dedup_initramfs_files(files: &mut Vec<InitramfsFile>) {
+    let mut by_path: HashMap<String, (u32, Vec<u8>)> = HashMap::new();
+    for (path, mode, bytes) in files.drain(..) {
+        by_path.insert(path, (mode, bytes));
+    }
+    let mut deduped = by_path
+        .into_iter()
+        .map(|(path, (mode, bytes))| (path, mode, bytes))
+        .collect::<Vec<_>>();
+    deduped.sort_by(|a, b| a.0.cmp(&b.0));
+    *files = deduped;
+}
+
+fn coreutils_shebang(tool: &str) -> Vec<u8> {
+    format!("#!/bin/coreutils --coreutils-prog-shebang={tool}\n").into_bytes()
+}
+
+fn systemd_getty_override() -> Vec<u8> {
+    let exec_start =
+        "ExecStart=-/usr/sbin/agetty --noclear --nohostname --issue-file /etc/issue tty1 linux\n";
+    format!(
+        "[Service]\n\
+         TTYVTDisallocate=no\n\
+         ExecStart=\n\
+         {exec_start}"
+    )
+    .into_bytes()
+}
+
+fn systemd_serial_getty_override() -> Vec<u8> {
+    concat!(
+        "[Service]\n",
+        "ExecStart=\n",
+        "ExecStart=-/usr/sbin/agetty --noclear --nohostname --issue-file /etc/issue 115200 ttyS0 linux\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+fn systemd_lupos_terminal_target_unit() -> Vec<u8> {
+    concat!(
+        "[Unit]\n",
+        "Description=Lupos Terminal Login\n",
+        "Documentation=man:systemd.target(5)\n",
+        "DefaultDependencies=no\n",
+        "Wants=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service lupos-serial-getty.service\n",
+        "AllowIsolate=yes\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+fn systemd_lupos_serial_getty_unit() -> Vec<u8> {
+    concat!(
+        "[Unit]\n",
+        "Description=Lupos Serial Getty on ttyS0\n",
+        "Documentation=man:agetty(8) man:login(1)\n",
+        "DefaultDependencies=no\n",
+        "After=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service\n",
+        "\n",
+        "[Service]\n",
+        "Type=simple\n",
+        "ExecStart=-/usr/sbin/agetty --noclear --nohostname --issue-file /etc/issue 115200 ttyS0 linux\n",
+        "Restart=always\n",
+        "RestartSec=0\n",
+        "UtmpIdentifier=ttyS0\n",
+        "TTYPath=/dev/ttyS0\n",
+        "TTYReset=yes\n",
+        "TTYVHangup=yes\n",
+        "StandardInput=tty\n",
+        "StandardOutput=tty\n",
+        "\n",
+        "[Install]\n",
+        "WantedBy=lupos-terminal.target\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+fn systemd_journald_service_unit() -> Vec<u8> {
+    concat!(
+        "# Lupos override for the Arch systemd-journald unit.\n",
+        "# Keep journald and its sockets, but avoid systemd sandboxing knobs\n",
+        "# and sd_notify readiness waits that currently outpace the Lupos kernel.\n",
+        "[Unit]\n",
+        "Description=Journal Service\n",
+        "Documentation=man:systemd-journald.service(8) man:journald.conf(5)\n",
+        "DefaultDependencies=no\n",
+        "Requires=systemd-journald.socket\n",
+        "After=systemd-journald.socket systemd-journald-dev-log.socket syslog.socket\n",
+        "Before=sysinit.target\n",
+        "IgnoreOnIsolate=yes\n",
+        "\n",
+        "[Service]\n",
+        "Environment=RUNTIME_DIRECTORY=/run/systemd/journal\n",
+        "ExecStart=/usr/lib/systemd/systemd-journald\n",
+        "Restart=always\n",
+        "RestartSec=0\n",
+        "RuntimeDirectory=systemd/journal systemd/journal/streams\n",
+        "RuntimeDirectoryPreserve=yes\n",
+        "Sockets=systemd-journald.socket systemd-journald-dev-log.socket\n",
+        "StandardOutput=null\n",
+        "Type=simple\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+fn sysv_login_inittab() -> String {
+    LOGIN_SYSV_INITTAB.to_string()
+}
+
+fn systemd_vconsole_setup_unit() -> Vec<u8> {
+    concat!(
+        "# SPDX-License-Identifier: LGPL-2.1-or-later\n",
+        "# Source: vendor/systemd/systemd-260.1/units/systemd-vconsole-setup.service.in\n",
+        "[Unit]\n",
+        "Description=Virtual Console Setup\n",
+        "Documentation=man:systemd-vconsole-setup.service(8) man:vconsole.conf(5)\n",
+        "ConditionPathExists=/dev/tty0\n",
+        "DefaultDependencies=no\n",
+        "Before=sysinit.target\n",
+        "Before=initrd-switch-root.target shutdown.target\n",
+        "StartLimitIntervalSec=0\n",
+        "\n",
+        "[Service]\n",
+        "Type=oneshot\n",
+        "SuccessExitStatus=SIGTERM\n",
+        "RemainAfterExit=yes\n",
+        "ExecStart=/usr/lib/systemd/systemd-vconsole-setup\n",
+        "ImportCredential=vconsole.*\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+fn systemd_vconsole_setup_shim() -> Vec<u8> {
+    // The minimal login profile does not stage kbd's loadkeys/setfont helpers.
+    // systemd's upstream vconsole setup treats missing helpers as a successful
+    // skipped setup, so an ELF exit(0) shim captures the effective ABI without
+    // depending on script-shebang exec in early sysinit.
+    build_console_writer_elf64(b"")
+}
+
+fn initramfs_file_bytes<'a>(files: &'a [InitramfsFile], path: &str) -> Option<&'a [u8]> {
+    files
+        .iter()
+        .find(|(entry_path, _, _)| entry_path == path)
+        .map(|(_, _, bytes)| bytes.as_slice())
+}
+
+fn userland_vendor_sources() -> &'static [UserlandVendorSource] {
+    USERLAND_VENDOR_SOURCES
+}
+
+fn userland_auth_vendor_sources() -> &'static [UserlandAuthVendorSource] {
+    USERLAND_AUTH_VENDOR_SOURCES
+}
+
+fn systemd_vendor_source() -> &'static UserlandVendorSource {
+    &SYSTEMD_VENDOR_SOURCE
+}
+
+fn validate_userland_vendor_sources(root: &Path) -> Result<()> {
+    for source in USERLAND_VENDOR_SOURCES {
+        for rel in [
+            source.source_dir,
+            source.archive,
+            source.signature,
+            source.configure,
+        ] {
+            let full = root.join(rel);
+            let metadata = fs::metadata(&full)
+                .with_context(|| format!("missing {} source artifact {}", source.name, rel))?;
+            if metadata.is_file() && metadata.len() == 0 {
+                bail!("empty {} source artifact {}", source.name, rel);
+            }
+        }
+        for rel in source.source_evidence {
+            let full = root.join(rel);
+            let metadata = fs::metadata(&full)
+                .with_context(|| format!("missing {} source evidence {}", source.name, rel))?;
+            if !metadata.is_file() || metadata.len() == 0 {
+                bail!("invalid {} source evidence {}", source.name, rel);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_systemd_vendor_source(root: &Path) -> Result<()> {
+    let source = systemd_vendor_source();
+    for rel in [
+        source.source_dir,
+        source.archive,
+        source.signature,
+        source.configure,
+    ] {
+        let full = root.join(rel);
+        let metadata = fs::metadata(&full)
+            .with_context(|| format!("missing {} source artifact {}", source.name, rel))?;
+        if metadata.is_file() && metadata.len() == 0 {
+            bail!("empty {} source artifact {}", source.name, rel);
+        }
+    }
+    for rel in source.source_evidence {
+        let full = root.join(rel);
+        let metadata = fs::metadata(&full)
+            .with_context(|| format!("missing {} source evidence {}", source.name, rel))?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            bail!("invalid {} source evidence {}", source.name, rel);
+        }
+    }
+    Ok(())
+}
+
+fn validate_userland_auth_vendor_sources(root: &Path) -> Result<()> {
+    for source in USERLAND_AUTH_VENDOR_SOURCES {
+        for rel in [source.source_dir, source.configure] {
+            let full = root.join(rel);
+            let metadata = fs::metadata(&full)
+                .with_context(|| format!("missing {} source artifact {}", source.name, rel))?;
+            if metadata.is_file() && metadata.len() == 0 {
+                bail!("empty {} source artifact {}", source.name, rel);
+            }
+        }
+        for rel in source.source_evidence {
+            let full = root.join(rel);
+            let metadata = fs::metadata(&full)
+                .with_context(|| format!("missing {} source evidence {}", source.name, rel))?;
+            if !metadata.is_file() || metadata.len() == 0 {
+                bail!("invalid {} source evidence {}", source.name, rel);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_lupos_init_source(root: &Path) -> Result<()> {
+    for rel in [USERLAND_INIT_MANIFEST, USERLAND_INIT_SOURCE] {
+        let full = root.join(rel);
+        let metadata =
+            fs::metadata(&full).with_context(|| format!("missing Lupos PID1 source {rel}"))?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            bail!("invalid Lupos PID1 source {rel}");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SyscallInventorySummary {
+    pub numeric_slots: usize,
+    pub linux_common64_entries: usize,
+    pub wired_entries: usize,
+    pub planned_entries: usize,
+    pub reserved_holes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyscallParityReport {
+    pub arch: String,
+    pub checked_entries: usize,
+    pub complete_entries: usize,
+    pub blocking_entries: usize,
+    pub reserved_holes: usize,
+}
+
+pub fn syscall_inventory_cmd(write: bool) -> Result<()> {
+    let root = workspace_root()?;
+    if write {
+        let inventory = generate_syscall_inventory(&root)?;
+        let path = root.join(SYSCALL_INVENTORY_PATH);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::write(&path, inventory)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+
+    let summary = validate_syscall_inventory(&root)?;
+    println!(
+        "syscall inventory ok: {} numeric slots, {} Linux common/64 entries, {} wired, {} planned, {} reserved holes",
+        summary.numeric_slots,
+        summary.linux_common64_entries,
+        summary.wired_entries,
+        summary.planned_entries,
+        summary.reserved_holes
+    );
+    Ok(())
+}
+
+pub fn syscall_parity_cmd(arch: &str) -> Result<()> {
+    let root = workspace_root()?;
+    run_syscall_completion_evidence(&root)?;
+    let report = syscall_parity_report(&root, arch)?;
+    println!(
+        "syscall parity {}: {} checked, {} complete, {} blocking, {} reserved holes",
+        report.arch,
+        report.checked_entries,
+        report.complete_entries,
+        report.blocking_entries,
+        report.reserved_holes
+    );
+    if report.blocking_entries != 0 {
+        bail!(
+            "Phase 14 syscall parity is not green: {} common/64 syscall entries remain non-complete",
+            report.blocking_entries
+        );
+    }
+    Ok(())
+}
+
+fn run_syscall_completion_evidence(root: &Path) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut commands = Vec::new();
+    for row in parse_syscall_completion_evidence(root)? {
+        validate_syscall_evidence_command(&row.evidence_command).with_context(|| {
+            format!(
+                "invalid evidence command for syscall {} {}",
+                row.nr, row.name
+            )
+        })?;
+        if seen.insert(row.evidence_command.clone()) {
+            commands.push(row.evidence_command);
+        }
+    }
+
+    for command in commands {
+        let status = run_syscall_evidence_command(root, &command)?;
+        if !status.success() {
+            bail!("syscall evidence command failed ({status}): {command}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_syscall_evidence_command(command: &str) -> Result<()> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        bail!("evidence command is empty");
+    }
+    if trimmed.contains("syscall-parity") || trimmed.contains("syscall_parity") {
+        bail!("evidence command must not invoke syscall-parity recursively");
+    }
+    Ok(())
+}
+
+fn run_syscall_evidence_command(root: &Path, command: &str) -> Result<ExitStatus> {
+    validate_syscall_evidence_command(command)?;
+    let mut parts = command.split_whitespace();
+    let program = parts
+        .next()
+        .ok_or_else(|| anyhow!("empty syscall evidence command"))?;
+    Command::new(program)
+        .args(parts)
+        .current_dir(root)
+        .status()
+        .with_context(|| format!("failed to run syscall evidence command: {command}"))
+}
+
+pub fn syscall_parity_report(root: &Path, arch: &str) -> Result<SyscallParityReport> {
+    if arch != "x86_64" {
+        bail!("unsupported syscall parity arch: {arch}");
+    }
+    let summary = validate_syscall_inventory(root)?;
+    let inventory = fs::read_to_string(root.join(SYSCALL_INVENTORY_PATH))
+        .with_context(|| format!("failed to read {}", SYSCALL_INVENTORY_PATH))?;
+    let rows = parse_syscall_inventory_rows(&inventory)?;
+    let mut complete_entries = 0usize;
+    let mut blocking_entries = 0usize;
+    for row in rows
+        .iter()
+        .filter(|row| matches!(row.abi.as_str(), "common" | "64"))
+        .filter(|row| matches!(row.phase.as_str(), "76" | "77" | "78"))
+    {
+        if row.lupos_status == SYSCALL_STATUS_COMPLETE {
+            complete_entries += 1;
+        } else {
+            blocking_entries += 1;
+        }
+    }
+    Ok(SyscallParityReport {
+        arch: arch.to_owned(),
+        checked_entries: summary.linux_common64_entries,
+        complete_entries,
+        blocking_entries,
+        reserved_holes: summary.reserved_holes,
+    })
+}
+
+pub fn validate_syscall_inventory(root: &Path) -> Result<SyscallInventorySummary> {
+    let inventory_path = root.join(SYSCALL_INVENTORY_PATH);
+    let actual = fs::read_to_string(&inventory_path).with_context(|| {
+        format!(
+            "missing {}; run `cargo xtask syscall-inventory --write`",
+            SYSCALL_INVENTORY_PATH
+        )
+    })?;
+    let expected = generate_syscall_inventory(root)?;
+    if actual.replace("\r\n", "\n") != expected {
+        bail!(
+            "{} is stale; run `cargo xtask syscall-inventory --write`",
+            SYSCALL_INVENTORY_PATH
+        );
+    }
+
+    let linux = parse_linux_x86_64_common_syscalls(root)?;
+    let max_nr = linux.iter().map(|spec| spec.nr).max().ok_or_else(|| {
+        anyhow!(
+            "{} contains no common/64 syscall rows",
+            LINUX_X86_64_SYSCALL_TABLE
+        )
+    })?;
+    let linux_by_nr: HashMap<usize, LinuxSyscallSpec> =
+        linux.iter().cloned().map(|spec| (spec.nr, spec)).collect();
+    let wired = parse_lupos_syscall_table_slots(root)?;
+    let wired_by_nr: HashMap<usize, String> =
+        wired.iter().map(|(name, nr)| (*nr, name.clone())).collect();
+    let wrappers = parse_lupos_syscall_wrappers(root)?;
+    let nr_syscalls = parse_lupos_nr_syscalls(root)?;
+    if nr_syscalls != max_nr + 1 {
+        bail!(
+            "Lupos NR_syscalls is {}, but {} reaches slot {}; expected {}",
+            nr_syscalls,
+            LINUX_X86_64_SYSCALL_TABLE,
+            max_nr,
+            max_nr + 1
+        );
+    }
+
+    let rows = parse_syscall_inventory_rows(&actual)?;
+    let evidence = parse_syscall_completion_evidence(root)?;
+    let evidence_by_nr: HashMap<usize, SyscallCompletionEvidenceRow> =
+        evidence.into_iter().map(|row| (row.nr, row)).collect();
+    if evidence_by_nr.len() != parse_syscall_completion_evidence(root)?.len() {
+        bail!(
+            "{} contains duplicate syscall slot evidence",
+            SYSCALL_COMPLETION_EVIDENCE_PATH
+        );
+    }
+    for evidence in evidence_by_nr.values() {
+        let spec = linux_by_nr.get(&evidence.nr).ok_or_else(|| {
+            anyhow!(
+                "{} slot {} is not a Linux common/64 syscall",
+                SYSCALL_COMPLETION_EVIDENCE_PATH,
+                evidence.nr
+            )
+        })?;
+        if spec.name != evidence.name {
+            bail!(
+                "{} slot {} names {}, expected {}",
+                SYSCALL_COMPLETION_EVIDENCE_PATH,
+                evidence.nr,
+                evidence.name,
+                spec.name
+            );
+        }
+        if evidence.status != SYSCALL_STATUS_COMPLETE {
+            bail!(
+                "{} slot {} status is {}, expected complete",
+                SYSCALL_COMPLETION_EVIDENCE_PATH,
+                evidence.nr,
+                evidence.status
+            );
+        }
+        if evidence.evidence_command.trim().is_empty() || evidence.notes.trim().is_empty() {
+            bail!(
+                "{} slot {} must include a command and notes",
+                SYSCALL_COMPLETION_EVIDENCE_PATH,
+                evidence.nr
+            );
+        }
+        validate_syscall_evidence_command(&evidence.evidence_command)?;
+        if !evidence.linux_source.starts_with("vendor/linux/") {
+            bail!(
+                "{} slot {} is not vendor/linux-backed: {}",
+                SYSCALL_COMPLETION_EVIDENCE_PATH,
+                evidence.nr,
+                evidence.linux_source
+            );
+        }
+        if !path_has_linux_evidence(&root.join(&evidence.linux_source))? {
+            bail!(
+                "{} slot {} references empty Linux evidence path: {}",
+                SYSCALL_COMPLETION_EVIDENCE_PATH,
+                evidence.nr,
+                evidence.linux_source
+            );
+        }
+    }
+    if rows.len() != max_nr + 1 {
+        bail!(
+            "{} must account for every numeric slot 0..={} ({} rows), found {}",
+            SYSCALL_INVENTORY_PATH,
+            max_nr,
+            max_nr + 1,
+            rows.len()
+        );
+    }
+
+    let mut rows_by_nr = HashMap::new();
+    for row in rows {
+        if rows_by_nr.insert(row.nr, row).is_some() {
+            bail!("{} contains duplicate syscall slot", SYSCALL_INVENTORY_PATH);
+        }
+    }
+
+    let mut wired_entries = 0usize;
+    let mut planned_entries = 0usize;
+    let mut reserved_holes = 0usize;
+    for nr in 0..=max_nr {
+        let row = rows_by_nr
+            .get(&nr)
+            .ok_or_else(|| anyhow!("{} missing slot {}", SYSCALL_INVENTORY_PATH, nr))?;
+        validate_syscall_inventory_status(row)?;
+
+        let source = root.join(&row.linux_source);
+        if !row.linux_source.starts_with("vendor/linux/") {
+            bail!(
+                "{} slot {} is not vendor/linux-backed: {}",
+                SYSCALL_INVENTORY_PATH,
+                nr,
+                row.linux_source
+            );
+        }
+        if !path_has_linux_evidence(&source)? {
+            bail!(
+                "{} slot {} references empty Linux source path: {}",
+                SYSCALL_INVENTORY_PATH,
+                nr,
+                row.linux_source
+            );
+        }
+        if row.implementation_plan.trim().is_empty() {
+            bail!(
+                "{} slot {} has an empty implementation plan",
+                SYSCALL_INVENTORY_PATH,
+                nr
+            );
+        }
+
+        if let Some(spec) = linux_by_nr.get(&nr) {
+            if row.abi != spec.abi || row.name != spec.name || row.linux_entry != spec.entry {
+                bail!(
+                    "{} slot {} does not match {}: expected {} {} {}, found {} {} {}",
+                    SYSCALL_INVENTORY_PATH,
+                    nr,
+                    LINUX_X86_64_SYSCALL_TABLE,
+                    spec.abi,
+                    spec.name,
+                    spec.entry,
+                    row.abi,
+                    row.name,
+                    row.linux_entry
+                );
+            }
+            if row.lupos_status == SYSCALL_STATUS_LINUX_ENOSYS {
+                bail!(
+                    "{} slot {} is a real Linux {} syscall and cannot be marked linux-enosys",
+                    SYSCALL_INVENTORY_PATH,
+                    nr,
+                    spec.name
+                );
+            }
+            if row.lupos_status == SYSCALL_STATUS_COMPLETE {
+                let evidence = evidence_by_nr.get(&nr).ok_or_else(|| {
+                    anyhow!(
+                        "{} slot {} {} is complete but lacks evidence in {}",
+                        SYSCALL_INVENTORY_PATH,
+                        nr,
+                        spec.name,
+                        SYSCALL_COMPLETION_EVIDENCE_PATH
+                    )
+                })?;
+                if evidence.name != row.name {
+                    bail!(
+                        "{} slot {} names {}, but inventory names {}",
+                        SYSCALL_COMPLETION_EVIDENCE_PATH,
+                        nr,
+                        evidence.name,
+                        row.name
+                    );
+                }
+                if evidence.status != SYSCALL_STATUS_COMPLETE {
+                    bail!(
+                        "{} slot {} status is {}, expected complete",
+                        SYSCALL_COMPLETION_EVIDENCE_PATH,
+                        nr,
+                        evidence.status
+                    );
+                }
+                if evidence.evidence_command.trim().is_empty() {
+                    bail!(
+                        "{} slot {} has empty evidence command",
+                        SYSCALL_COMPLETION_EVIDENCE_PATH,
+                        nr
+                    );
+                }
+                validate_syscall_evidence_command(&evidence.evidence_command)?;
+                if !evidence.linux_source.starts_with("vendor/linux/") {
+                    bail!(
+                        "{} slot {} is not vendor/linux-backed: {}",
+                        SYSCALL_COMPLETION_EVIDENCE_PATH,
+                        nr,
+                        evidence.linux_source
+                    );
+                }
+                if !path_has_linux_evidence(&root.join(&evidence.linux_source))? {
+                    bail!(
+                        "{} slot {} references empty Linux evidence path: {}",
+                        SYSCALL_COMPLETION_EVIDENCE_PATH,
+                        nr,
+                        evidence.linux_source
+                    );
+                }
+                if evidence.notes.trim().is_empty() {
+                    bail!(
+                        "{} slot {} must explain the completed ABI coverage",
+                        SYSCALL_COMPLETION_EVIDENCE_PATH,
+                        nr
+                    );
+                }
+            }
+        } else {
+            reserved_holes += 1;
+            for (field, expected, actual) in [
+                ("abi", "reserved", row.abi.as_str()),
+                ("name", "-", row.name.as_str()),
+                ("linux_entry", "sys_ni_syscall", row.linux_entry.as_str()),
+                (
+                    "lupos_status",
+                    SYSCALL_STATUS_LINUX_ENOSYS,
+                    row.lupos_status.as_str(),
+                ),
+                ("lupos_dispatch", "sys_ni", row.lupos_dispatch.as_str()),
+                ("lupos_wrapper", "-", row.lupos_wrapper.as_str()),
+            ] {
+                if actual != expected {
+                    bail!(
+                        "{} reserved slot {} has {}={}, expected {}",
+                        SYSCALL_INVENTORY_PATH,
+                        nr,
+                        field,
+                        actual,
+                        expected
+                    );
+                }
+            }
+        }
+
+        match row.lupos_dispatch.as_str() {
+            "wired" => {
+                wired_entries += 1;
+                let expected_wrapper = format!("__x64_sys_{}", row.name);
+                if row.lupos_wrapper != expected_wrapper {
+                    bail!(
+                        "{} slot {} wrapper is {}, expected {}",
+                        SYSCALL_INVENTORY_PATH,
+                        nr,
+                        row.lupos_wrapper,
+                        expected_wrapper
+                    );
+                }
+                if !wrappers.contains(&row.lupos_wrapper) {
+                    bail!(
+                        "{} slot {} wrapper {} is missing from {}",
+                        SYSCALL_INVENTORY_PATH,
+                        nr,
+                        row.lupos_wrapper,
+                        LUPOS_X86_64_SYSCALL_WRAPPERS
+                    );
+                }
+                if wired.get(&row.name) != Some(&nr) {
+                    bail!(
+                        "{} slot {} says {} is wired, but {} disagrees",
+                        SYSCALL_INVENTORY_PATH,
+                        nr,
+                        row.name,
+                        LUPOS_X86_64_SYSCALL_TABLE
+                    );
+                }
+                if !matches!(
+                    row.lupos_status.as_str(),
+                    SYSCALL_STATUS_COMPLETE | SYSCALL_STATUS_PARTIAL | SYSCALL_STATUS_WIRED_STUB
+                ) {
+                    bail!(
+                        "{} slot {} is wired but has status {}",
+                        SYSCALL_INVENTORY_PATH,
+                        nr,
+                        row.lupos_status
+                    );
+                }
+            }
+            "sys_ni" => {
+                if wired_by_nr.contains_key(&nr) {
+                    bail!(
+                        "{} slot {} says sys_ni, but {} wires it",
+                        SYSCALL_INVENTORY_PATH,
+                        nr,
+                        LUPOS_X86_64_SYSCALL_TABLE
+                    );
+                }
+                if linux_by_nr.contains_key(&nr) && row.lupos_status != SYSCALL_STATUS_COMPLETE {
+                    planned_entries += 1;
+                }
+                if !matches!(
+                    row.lupos_status.as_str(),
+                    SYSCALL_STATUS_COMPLETE
+                        | SYSCALL_STATUS_PLANNED
+                        | SYSCALL_STATUS_LINUX_ENOSYS
+                        | SYSCALL_STATUS_X32_DEFERRED
+                ) {
+                    bail!(
+                        "{} slot {} is sys_ni but has status {}",
+                        SYSCALL_INVENTORY_PATH,
+                        nr,
+                        row.lupos_status
+                    );
+                }
+            }
+            other => bail!(
+                "{} slot {} has invalid dispatch {}",
+                SYSCALL_INVENTORY_PATH,
+                nr,
+                other
+            ),
+        }
+    }
+
+    for (name, nr) in wired {
+        let row = rows_by_nr.get(&nr).ok_or_else(|| {
+            anyhow!(
+                "{} wires {} at slot {}, but inventory has no row",
+                LUPOS_X86_64_SYSCALL_TABLE,
+                name,
+                nr
+            )
+        })?;
+        if row.name != name || row.lupos_dispatch != "wired" {
+            bail!(
+                "{} wires {} at slot {}, but inventory row is {} / {}",
+                LUPOS_X86_64_SYSCALL_TABLE,
+                name,
+                nr,
+                row.name,
+                row.lupos_dispatch
+            );
+        }
+    }
+
+    Ok(SyscallInventorySummary {
+        numeric_slots: max_nr + 1,
+        linux_common64_entries: linux_by_nr.len(),
+        wired_entries,
+        planned_entries,
+        reserved_holes,
+    })
+}
+
+fn generate_syscall_inventory(root: &Path) -> Result<String> {
+    let linux = parse_linux_x86_64_common_syscalls(root)?;
+    let max_nr = linux.iter().map(|spec| spec.nr).max().ok_or_else(|| {
+        anyhow!(
+            "{} contains no common/64 syscall rows",
+            LINUX_X86_64_SYSCALL_TABLE
+        )
+    })?;
+    let linux_by_nr: HashMap<usize, LinuxSyscallSpec> =
+        linux.into_iter().map(|spec| (spec.nr, spec)).collect();
+    let wired = parse_lupos_syscall_table_slots(root)?;
+    let evidence = parse_syscall_completion_evidence(root)?;
+    let complete_by_nr: HashSet<usize> = evidence
+        .into_iter()
+        .filter(|row| row.status == SYSCALL_STATUS_COMPLETE)
+        .map(|row| row.nr)
+        .collect();
+
+    let mut out = String::new();
+    out.push_str("# Generated by `cargo xtask syscall-inventory --write`.\n");
+    out.push_str("# Source of truth: vendor/linux/arch/x86/entry/syscalls/syscall_64.tbl.\n");
+    out.push_str("# Status values: complete, implemented-partial, wired-stub, planned, linux-enosys, x32-only-deferred.\n");
+    out.push_str(SYSCALL_INVENTORY_HEADER);
+    out.push('\n');
+
+    for nr in 0..=max_nr {
+        let row = if let Some(spec) = linux_by_nr.get(&nr) {
+            let wired_here = wired.get(&spec.name) == Some(&nr);
+            let status =
+                syscall_inventory_status(&spec.name, wired_here, complete_by_nr.contains(&nr));
+            let dispatch = if wired_here { "wired" } else { "sys_ni" };
+            let wrapper = if wired_here {
+                format!("__x64_sys_{}", spec.name)
+            } else {
+                String::from("-")
+            };
+            let (phase, source) = syscall_inventory_phase_and_source(&spec.name, &spec.entry);
+            SyscallInventoryRow {
+                nr,
+                abi: spec.abi.clone(),
+                name: spec.name.clone(),
+                linux_entry: spec.entry.clone(),
+                lupos_status: status.to_owned(),
+                lupos_dispatch: dispatch.to_owned(),
+                lupos_wrapper: wrapper,
+                phase: phase.to_owned(),
+                linux_source: source.to_owned(),
+                implementation_plan: syscall_inventory_plan(&spec.name, status, phase, source),
+            }
+        } else {
+            SyscallInventoryRow {
+                nr,
+                abi: String::from("reserved"),
+                name: String::from("-"),
+                linux_entry: String::from("sys_ni_syscall"),
+                lupos_status: String::from(SYSCALL_STATUS_LINUX_ENOSYS),
+                lupos_dispatch: String::from("sys_ni"),
+                lupos_wrapper: String::from("-"),
+                phase: String::from("n/a"),
+                linux_source: String::from(LINUX_X86_64_SYSCALL_TABLE),
+                implementation_plan: String::from(
+                    "Reserved Linux x86_64 table hole; keep dispatch at sys_ni_syscall and return -ENOSYS.",
+                ),
+            }
+        };
+        out.push_str(&render_syscall_inventory_row(&row));
+    }
+
+    Ok(out)
+}
+
+fn parse_linux_x86_64_common_syscalls(root: &Path) -> Result<Vec<LinuxSyscallSpec>> {
+    let path = root.join(LINUX_X86_64_SYSCALL_TABLE);
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with("0x") {
+            continue;
+        }
+        let mut pieces = line.split_whitespace();
+        let Some(nr) = pieces.next().and_then(|piece| piece.parse::<usize>().ok()) else {
+            continue;
+        };
+        let Some(abi) = pieces.next() else {
+            continue;
+        };
+        let Some(name) = pieces.next() else {
+            continue;
+        };
+        // Linux's syscall_64.tbl omits the entry column for syscalls whose
+        // entry name is derived implicitly (set_thread_area, get_thread_area,
+        // various deprecated stubs).  When absent, the wrapper is the
+        // canonical `sys_<name>` produced by SYSCALL_DEFINE.
+        let entry = pieces
+            .next()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("sys_{name}"));
+        if matches!(abi, "common" | "64") {
+            out.push(LinuxSyscallSpec {
+                nr,
+                abi: abi.to_owned(),
+                name: name.to_owned(),
+                entry,
+            });
+        }
+    }
+    out.sort_by_key(|spec| spec.nr);
+    Ok(out)
+}
+
+fn parse_lupos_nr_syscalls(root: &Path) -> Result<usize> {
+    let path = root.join(LUPOS_X86_64_SYSCALL_TABLE);
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    for line in text.lines().map(str::trim) {
+        let Some(rest) = line.strip_prefix("pub const NR_syscalls: usize =") else {
+            continue;
+        };
+        let Some(value) = rest.split(';').next() else {
+            continue;
+        };
+        return value
+            .trim()
+            .parse::<usize>()
+            .with_context(|| format!("failed to parse NR_syscalls from {}", path.display()));
+    }
+    bail!(
+        "{} does not declare NR_syscalls",
+        LUPOS_X86_64_SYSCALL_TABLE
+    )
+}
+
+fn parse_lupos_syscall_wrappers(root: &Path) -> Result<HashSet<String>> {
+    let path = root.join(LUPOS_X86_64_SYSCALL_WRAPPERS);
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let marker = "pub unsafe extern \"C\" fn ";
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.strip_prefix(marker)
+                .and_then(|rest| rest.find('(').map(|idx| &rest[..idx]))
+                .map(|name| name.to_owned())
+        })
+        .collect())
+}
+
+fn parse_lupos_syscall_table_slots(root: &Path) -> Result<HashMap<String, usize>> {
+    let path = root.join(LUPOS_X86_64_SYSCALL_TABLE);
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let rhs = "w::__x64_sys_";
+    let mut out = HashMap::new();
+    for line in text.lines().map(str::trim) {
+        let Some(rest) = line.strip_prefix("t[") else {
+            continue;
+        };
+        let Some(close) = rest.find(']') else {
+            continue;
+        };
+        let Ok(slot) = rest[..close].trim().parse::<usize>() else {
+            continue;
+        };
+        if let Some(start) = line.find(rhs) {
+            let after = &line[start + rhs.len()..];
+            let end = after
+                .find(|c| matches!(c, ' ' | ';' | ',' | '\n' | '\r'))
+                .unwrap_or(after.len());
+            out.insert(after[..end].trim().to_owned(), slot);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_syscall_inventory_rows(text: &str) -> Result<Vec<SyscallInventoryRow>> {
+    let mut saw_header = false;
+    let mut rows = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !saw_header {
+            if line != SYSCALL_INVENTORY_HEADER {
+                bail!(
+                    "invalid {} header at line {}: {}",
+                    SYSCALL_INVENTORY_PATH,
+                    idx + 1,
+                    line
+                );
+            }
+            saw_header = true;
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 10 {
+            bail!(
+                "{} line {} has {} fields, expected 10",
+                SYSCALL_INVENTORY_PATH,
+                idx + 1,
+                fields.len()
+            );
+        }
+        rows.push(SyscallInventoryRow {
+            nr: fields[0]
+                .parse()
+                .with_context(|| format!("invalid syscall nr on line {}", idx + 1))?,
+            abi: fields[1].to_owned(),
+            name: fields[2].to_owned(),
+            linux_entry: fields[3].to_owned(),
+            lupos_status: fields[4].to_owned(),
+            lupos_dispatch: fields[5].to_owned(),
+            lupos_wrapper: fields[6].to_owned(),
+            phase: fields[7].to_owned(),
+            linux_source: fields[8].to_owned(),
+            implementation_plan: fields[9].to_owned(),
+        });
+    }
+    if !saw_header {
+        bail!("{} is missing its header row", SYSCALL_INVENTORY_PATH);
+    }
+    Ok(rows)
+}
+
+fn parse_syscall_completion_evidence(root: &Path) -> Result<Vec<SyscallCompletionEvidenceRow>> {
+    let path = root.join(SYSCALL_COMPLETION_EVIDENCE_PATH);
+    let text = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "missing {}; create it with header `{}`",
+            SYSCALL_COMPLETION_EVIDENCE_PATH, SYSCALL_COMPLETION_EVIDENCE_HEADER
+        )
+    })?;
+    let mut saw_header = false;
+    let mut rows = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !saw_header {
+            if line != SYSCALL_COMPLETION_EVIDENCE_HEADER {
+                bail!(
+                    "invalid {} header at line {}: {}",
+                    SYSCALL_COMPLETION_EVIDENCE_PATH,
+                    idx + 1,
+                    line
+                );
+            }
+            saw_header = true;
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 6 {
+            bail!(
+                "{} line {} has {} fields, expected 6",
+                SYSCALL_COMPLETION_EVIDENCE_PATH,
+                idx + 1,
+                fields.len()
+            );
+        }
+        rows.push(SyscallCompletionEvidenceRow {
+            nr: fields[0]
+                .parse()
+                .with_context(|| format!("invalid syscall evidence nr on line {}", idx + 1))?,
+            name: fields[1].to_owned(),
+            status: fields[2].to_owned(),
+            evidence_command: fields[3].to_owned(),
+            linux_source: fields[4].to_owned(),
+            notes: fields[5].to_owned(),
+        });
+    }
+    if !saw_header {
+        bail!(
+            "{} is missing its header row",
+            SYSCALL_COMPLETION_EVIDENCE_PATH
+        );
+    }
+    Ok(rows)
+}
+
+fn render_syscall_inventory_row(row: &SyscallInventoryRow) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        row.nr,
+        tsv_safe(&row.abi),
+        tsv_safe(&row.name),
+        tsv_safe(&row.linux_entry),
+        tsv_safe(&row.lupos_status),
+        tsv_safe(&row.lupos_dispatch),
+        tsv_safe(&row.lupos_wrapper),
+        tsv_safe(&row.phase),
+        tsv_safe(&row.linux_source),
+        tsv_safe(&row.implementation_plan)
+    )
+}
+
+fn tsv_safe(input: &str) -> String {
+    input.replace(['\t', '\n', '\r'], " ")
+}
+
+fn validate_syscall_inventory_status(row: &SyscallInventoryRow) -> Result<()> {
+    if matches!(
+        row.lupos_status.as_str(),
+        SYSCALL_STATUS_COMPLETE
+            | SYSCALL_STATUS_PARTIAL
+            | SYSCALL_STATUS_WIRED_STUB
+            | SYSCALL_STATUS_PLANNED
+            | SYSCALL_STATUS_LINUX_ENOSYS
+            | SYSCALL_STATUS_X32_DEFERRED
+    ) {
+        Ok(())
+    } else {
+        bail!(
+            "{} slot {} has invalid status {}",
+            SYSCALL_INVENTORY_PATH,
+            row.nr,
+            row.lupos_status
+        )
+    }
+}
+
+fn syscall_inventory_status(
+    name: &str,
+    wired: bool,
+    has_completion_evidence: bool,
+) -> &'static str {
+    if has_completion_evidence {
+        return SYSCALL_STATUS_COMPLETE;
+    }
+    if !wired {
+        return SYSCALL_STATUS_PLANNED;
+    }
+    if is_wired_stub_syscall(name) {
+        SYSCALL_STATUS_WIRED_STUB
+    } else {
+        SYSCALL_STATUS_PARTIAL
+    }
+}
+
+fn is_wired_stub_syscall(name: &str) -> bool {
+    matches!(
+        name,
+        "ptrace"
+            | "eventfd"
+            | "eventfd2"
+            | "signalfd4"
+            | "epoll_create1"
+            | "epoll_ctl"
+            | "epoll_wait"
+            | "inotify_init1"
+            | "inotify_add_watch"
+            | "inotify_rm_watch"
+            | "fanotify_init"
+            | "fanotify_mark"
+            | "io_uring_setup"
+            | "io_uring_enter"
+            | "io_uring_register"
+    )
+}
+
+fn syscall_inventory_plan(name: &str, status: &str, phase: &str, source: &str) -> String {
+    match status {
+        SYSCALL_STATUS_COMPLETE => format!(
+            "Keep {name} locked to {source} with LTP and kselftest regression coverage in Milestone {phase}."
+        ),
+        SYSCALL_STATUS_PARTIAL => format!(
+            "Finish Linux edge cases for {name} from {source} in Milestone {phase}; keep current wrapper wired while parity gaps close."
+        ),
+        SYSCALL_STATUS_WIRED_STUB => format!(
+            "Replace the current simplified {name} wrapper with Linux-compatible behavior from {source} in Milestone {phase}."
+        ),
+        SYSCALL_STATUS_PLANNED => format!(
+            "Implement {name} from {source} in Milestone {phase}; dispatch remains sys_ni until ABI tests pass."
+        ),
+        _ => format!(
+            "Track {name} against {source} in Milestone {phase}; status must be resolved before release."
+        ),
+    }
+}
+
+fn syscall_inventory_phase_and_source(name: &str, entry: &str) -> (&'static str, &'static str) {
+    if matches!(name, "clone" | "clone3" | "fork" | "vfork") {
+        return ("76", "vendor/linux/kernel/fork.c");
+    }
+    if matches!(name, "execve" | "execveat") {
+        return ("76", "vendor/linux/fs/exec.c");
+    }
+    if matches!(
+        name,
+        "exit" | "exit_group" | "wait4" | "waitid" | "process_mrelease"
+    ) {
+        return ("76", "vendor/linux/kernel/exit.c");
+    }
+    if name.contains("sig")
+        || matches!(
+            name,
+            "kill" | "tkill" | "tgkill" | "pause" | "restart_syscall" | "rt_sigsuspend"
+        )
+    {
+        return ("76", "vendor/linux/kernel/signal.c");
+    }
+    if matches!(
+        name,
+        "mmap"
+            | "munmap"
+            | "brk"
+            | "mremap"
+            | "msync"
+            | "mincore"
+            | "madvise"
+            | "process_madvise"
+            | "remap_file_pages"
+            | "mlock"
+            | "munlock"
+            | "mlockall"
+            | "munlockall"
+            | "mlock2"
+            | "membarrier"
+            | "memfd_secret"
+            | "mseal"
+            | "cachestat"
+    ) {
+        return ("76", "vendor/linux/mm/mmap.c");
+    }
+    if matches!(
+        name,
+        "mprotect" | "pkey_mprotect" | "pkey_alloc" | "pkey_free"
+    ) {
+        return ("76", "vendor/linux/mm/mprotect.c");
+    }
+    if matches!(
+        name,
+        "mbind"
+            | "set_mempolicy"
+            | "get_mempolicy"
+            | "migrate_pages"
+            | "move_pages"
+            | "set_mempolicy_home_node"
+    ) {
+        return ("76", "vendor/linux/mm/mempolicy.c");
+    }
+    if name.starts_with("sched_") {
+        return ("76", "vendor/linux/kernel/sched/syscalls.c");
+    }
+    if name.starts_with("futex") {
+        return ("78", "vendor/linux/kernel/futex/syscalls.c");
+    }
+    if name.contains("time")
+        || name.contains("timer")
+        || matches!(
+            name,
+            "nanosleep" | "clock_nanosleep" | "adjtimex" | "alarm" | "getitimer" | "setitimer"
+        )
+    {
+        return ("76", "vendor/linux/kernel/time/time.c");
+    }
+    if matches!(name, "arch_prctl" | "map_shadow_stack") {
+        return ("76", "vendor/linux/arch/x86/kernel/process_64.c");
+    }
+    if name.starts_with("socket")
+        || matches!(
+            name,
+            "connect"
+                | "accept"
+                | "accept4"
+                | "sendto"
+                | "recvfrom"
+                | "sendmsg"
+                | "recvmsg"
+                | "shutdown"
+                | "bind"
+                | "listen"
+                | "getsockname"
+                | "getpeername"
+                | "setsockopt"
+                | "getsockopt"
+                | "sendmmsg"
+                | "recvmmsg"
+        )
+    {
+        return ("78", "vendor/linux/net/socket.c");
+    }
+    if name.starts_with("sem") {
+        return ("78", "vendor/linux/ipc/sem.c");
+    }
+    if name.starts_with("shm") {
+        return ("78", "vendor/linux/ipc/shm.c");
+    }
+    if name.starts_with("msg") {
+        return ("78", "vendor/linux/ipc/msg.c");
+    }
+    if name.starts_with("mq_") {
+        return ("78", "vendor/linux/ipc/mqueue.c");
+    }
+    if matches!(
+        name,
+        "open"
+            | "openat"
+            | "openat2"
+            | "creat"
+            | "open_tree"
+            | "move_mount"
+            | "fsopen"
+            | "fsconfig"
+            | "fsmount"
+            | "fspick"
+            | "open_tree_attr"
+    ) {
+        return ("77", "vendor/linux/fs/open.c");
+    }
+    if entry.contains("mount") || name.contains("mount") || matches!(name, "pivot_root" | "umount2")
+    {
+        return ("77", "vendor/linux/fs/namespace.c");
+    }
+    if matches!(
+        name,
+        "read"
+            | "write"
+            | "pread64"
+            | "pwrite64"
+            | "readv"
+            | "writev"
+            | "lseek"
+            | "preadv"
+            | "pwritev"
+            | "preadv2"
+            | "pwritev2"
+            | "sendfile"
+            | "copy_file_range"
+    ) {
+        return ("77", "vendor/linux/fs/read_write.c");
+    }
+    if name.contains("stat")
+        || matches!(
+            name,
+            "stat" | "fstat" | "lstat" | "newfstatat" | "statx" | "ustat"
+        )
+    {
+        return ("77", "vendor/linux/fs/stat.c");
+    }
+    if matches!(name, "ioctl") || name.ends_with("_getattr") || name.ends_with("_setattr") {
+        return ("77", "vendor/linux/fs/ioctl.c");
+    }
+    if matches!(name, "poll" | "select" | "pselect6" | "ppoll") {
+        return ("77", "vendor/linux/fs/select.c");
+    }
+    if name.starts_with("epoll") {
+        return ("77", "vendor/linux/fs/eventpoll.c");
+    }
+    if name.starts_with("eventfd") {
+        return ("77", "vendor/linux/fs/eventfd.c");
+    }
+    if name.starts_with("signalfd") {
+        return ("77", "vendor/linux/fs/signalfd.c");
+    }
+    if name.starts_with("timerfd") {
+        return ("77", "vendor/linux/fs/timerfd.c");
+    }
+    if name.starts_with("inotify") {
+        return ("77", "vendor/linux/fs/notify/inotify/inotify_user.c");
+    }
+    if name.starts_with("fanotify") {
+        return ("77", "vendor/linux/fs/notify/fanotify/fanotify_user.c");
+    }
+    if matches!(
+        name,
+        "getdents" | "getdents64" | "getcwd" | "chdir" | "fchdir" | "chroot"
+    ) {
+        return ("77", "vendor/linux/fs/readdir.c");
+    }
+    if matches!(
+        name,
+        "mkdir"
+            | "rmdir"
+            | "link"
+            | "unlink"
+            | "rename"
+            | "symlink"
+            | "readlink"
+            | "mknod"
+            | "mkdirat"
+            | "mknodat"
+            | "fchownat"
+            | "futimesat"
+            | "unlinkat"
+            | "renameat"
+            | "linkat"
+            | "symlinkat"
+            | "readlinkat"
+            | "renameat2"
+    ) {
+        return ("77", "vendor/linux/fs/namei.c");
+    }
+    if name.contains("xattr") {
+        return ("77", "vendor/linux/fs/xattr.c");
+    }
+    if name.contains("sync") || matches!(name, "fsync" | "fdatasync") {
+        return ("77", "vendor/linux/fs/sync.c");
+    }
+    if matches!(
+        name,
+        "fcntl" | "flock" | "dup" | "dup2" | "dup3" | "close" | "close_range"
+    ) {
+        return ("77", "vendor/linux/fs/fcntl.c");
+    }
+    if name.starts_with("pipe") {
+        return ("77", "vendor/linux/fs/pipe.c");
+    }
+    if matches!(name, "splice" | "tee" | "vmsplice") {
+        return ("77", "vendor/linux/fs/splice.c");
+    }
+    if name.starts_with("io_uring") {
+        return ("78", "vendor/linux/io_uring/io_uring.c");
+    }
+    if name.starts_with("io_") {
+        return ("78", "vendor/linux/fs/aio.c");
+    }
+    if name.contains("module") {
+        return ("78", "vendor/linux/kernel/module/main.c");
+    }
+    if name == "bpf" {
+        return ("78", "vendor/linux/kernel/bpf/syscall.c");
+    }
+    if name == "perf_event_open" {
+        return ("78", "vendor/linux/kernel/events/core.c");
+    }
+    if matches!(name, "add_key" | "request_key" | "keyctl") {
+        return ("78", "vendor/linux/security/keys/keyctl.c");
+    }
+    if name.starts_with("landlock") {
+        return ("78", "vendor/linux/security/landlock/syscalls.c");
+    }
+    if name.starts_with("lsm_") {
+        return ("78", "vendor/linux/security/lsm_syscalls.c");
+    }
+    if matches!(name, "seccomp") {
+        return ("78", "vendor/linux/kernel/seccomp.c");
+    }
+    if matches!(name, "kexec_load" | "kexec_file_load") {
+        return ("78", "vendor/linux/kernel/kexec.c");
+    }
+    if matches!(name, "userfaultfd") {
+        return ("77", "vendor/linux/fs/userfaultfd.c");
+    }
+    if matches!(name, "memfd_create") {
+        return ("77", "vendor/linux/mm/memfd.c");
+    }
+    if matches!(name, "rseq" | "rseq_slice_yield") {
+        return ("76", "vendor/linux/kernel/rseq.c");
+    }
+    if name.starts_with("pidfd") {
+        return ("78", "vendor/linux/kernel/pid.c");
+    }
+    if matches!(name, "syslog") {
+        return ("78", "vendor/linux/kernel/printk/printk.c");
+    }
+    if matches!(name, "acct") {
+        return ("78", "vendor/linux/kernel/acct.c");
+    }
+    if matches!(name, "quotactl" | "quotactl_fd") {
+        return ("77", "vendor/linux/fs/quota/quota.c");
+    }
+    ("76", "vendor/linux/kernel/sys.c")
+}
+
+fn target_userland_stage_dir() -> Result<PathBuf> {
+    Ok(repo_root()?.join("target").join("userland").join("stage"))
+}
+
+fn selected_lupos_distro() -> String {
+    env::var(LUPOS_DISTRO_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_LUPOS_DISTRO.to_string())
+        .to_ascii_lowercase()
+}
+
+fn using_arch_distro() -> bool {
+    selected_lupos_distro() == "arch"
+}
+
+fn staged_userland_bytes(stage: Option<&Path>, candidates: &[&str]) -> Option<Vec<u8>> {
+    let stage = stage?;
+    for rel in candidates {
+        let path = stage.join(rel);
+        if let Ok(bytes) = fs::read(&path) {
+            if !bytes.is_empty() {
+                return Some(bytes);
+            }
+        }
+    }
+    None
+}
+
+fn colon_record_key(line: &str) -> Option<&str> {
+    let (key, _) = line.split_once(':')?;
+    (!key.is_empty()).then_some(key)
+}
+
+fn override_colon_records(base: Vec<u8>, overrides: &str) -> Vec<u8> {
+    let base = String::from_utf8_lossy(&base);
+    let mut lines = base
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+    for override_line in overrides.lines().filter(|line| !line.trim().is_empty()) {
+        let Some(override_key) = colon_record_key(override_line) else {
+            continue;
+        };
+        if let Some(existing) = lines
+            .iter_mut()
+            .find(|line| colon_record_key(line) == Some(override_key))
+        {
+            *existing = override_line.to_string();
+        } else {
+            lines.push(override_line.to_string());
+        }
+    }
+
+    let mut merged = lines.join("\n");
+    merged.push('\n');
+    merged.into_bytes()
+}
+
+fn staged_auth_config(stage: &Path, rel: &str, overrides: &str) -> Vec<u8> {
+    let base = staged_userland_bytes(Some(stage), &[rel]).unwrap_or_default();
+    override_colon_records(base, overrides)
+}
+
+fn staged_or_stub(stage: Option<&Path>, candidates: &[&str], stub_program: &str) -> Vec<u8> {
+    staged_userland_bytes(stage, candidates)
+        .unwrap_or_else(|| build_userland_stub_elf64(stub_program))
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn build_userland_command(root: &Path) -> Command {
+    let mut command = Command::new("bash");
+    command.arg(USERLAND_BUILD_SCRIPT).current_dir(root);
+    command
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct SysvInittabEntry {
+    id: String,
+    runlevels: String,
+    action: String,
+    process: String,
+}
+
+fn parse_sysv_inittab(text: &str) -> Result<Vec<SysvInittabEntry>> {
+    let mut entries = Vec::new();
+    for (line_no, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let fields = line.splitn(4, ':').collect::<Vec<_>>();
+        if fields.len() != 4 {
+            bail!(
+                "invalid inittab line {}: expected id:runlevels:action:process",
+                line_no + 1
+            );
+        }
+        entries.push(SysvInittabEntry {
+            id: fields[0].to_owned(),
+            runlevels: fields[1].to_owned(),
+            action: fields[2].to_owned(),
+            process: fields[3].to_owned(),
+        });
+    }
+    Ok(entries)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LoginUserlandOptions;
+
+fn login_userland_files() -> Vec<InitramfsFile> {
+    let stage = if env_flag_is_enabled(STAGE_REAL_USERLAND_ENV) {
+        target_userland_stage_dir().ok()
+    } else {
+        None
+    };
+    login_userland_files_with_stage_and_options(stage.as_deref(), LoginUserlandOptions::default())
+}
+
+fn login_display_userland_files() -> Vec<InitramfsFile> {
+    let stage = if env_flag_is_enabled(STAGE_REAL_USERLAND_ENV) {
+        target_userland_stage_dir().ok()
+    } else {
+        None
+    };
+    login_userland_files_with_stage_and_options(stage.as_deref(), LoginUserlandOptions::default())
+}
+
+fn critical_runtime_userland_files() -> Vec<InitramfsFile> {
+    let stage = if env_flag_is_enabled(STAGE_REAL_USERLAND_ENV) {
+        target_userland_stage_dir().ok()
+    } else {
+        None
+    };
+    critical_runtime_userland_files_with_stage(stage.as_deref())
+}
+
+fn critical_runtime_userland_files_with_stage(stage: Option<&Path>) -> Vec<InitramfsFile> {
+    let mut files = login_userland_files_with_stage(stage);
+    prune_systemd_service_churn_for_critical_runtime(&mut files);
+    files
+}
+
+fn shipped_commands_userland_files() -> Vec<InitramfsFile> {
+    let stage = if env_flag_is_enabled(STAGE_REAL_USERLAND_ENV) {
+        target_userland_stage_dir().ok()
+    } else {
+        None
+    };
+    shipped_commands_userland_files_with_stage(stage.as_deref())
+}
+
+/// Full login userland (journald/networkd wants kept because the gate proves
+/// journalctl) plus the shipped-commands test script.  The Arch base gate
+/// deliberately does not require DBus, logind sessions, SSH, editors, or sudo.
+fn shipped_commands_userland_files_with_stage(stage: Option<&Path>) -> Vec<InitramfsFile> {
+    let mut files = login_userland_files_with_stage(stage);
+    upsert_initramfs_file(
+        &mut files,
+        SHIPPED_COMMANDS_SCRIPT_PATH,
+        0o100755,
+        SHIPPED_COMMANDS_SCRIPT.as_bytes().to_vec(),
+    );
+    files
+}
+
+fn prune_systemd_service_churn_for_critical_runtime(files: &mut Vec<InitramfsFile>) {
+    const RUNTIME_PRUNED_WANTS: &[&str] = &[
+        "etc/systemd/system/multi-user.target.wants/systemd-journald.service",
+        "etc/systemd/system/multi-user.target.wants/systemd-logind.service",
+        "etc/systemd/system/multi-user.target.wants/systemd-networkd.service",
+        "etc/systemd/system/multi-user.target.wants/systemd-resolved.service",
+    ];
+    files.retain(|(path, _, _)| !RUNTIME_PRUNED_WANTS.contains(&path.as_str()));
+}
+
+fn ping_smoke_userland_files() -> Vec<InitramfsFile> {
+    let host = ping_smoke_host().unwrap_or_else(|_| DEFAULT_PING_HOST.to_string());
+    vec![
+        initramfs_file("sbin/init", 0o100755, build_ping_smoke_elf64(&host)),
+        initramfs_file("etc/hostname", 0o100644, b"lupos\n".to_vec()),
+        initramfs_file(
+            "etc/resolv.conf",
+            0o100644,
+            b"nameserver 10.0.2.3\n".to_vec(),
+        ),
+    ]
+}
+
+fn env_flag_is_enabled(name: &str) -> bool {
+    matches!(
+        env::var(name).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+fn extra_initramfs_root() -> Option<PathBuf> {
+    env::var(EXTRA_INITRAMFS_ROOT_ENV)
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+}
+
+fn stage_has_systemd(stage: Option<&Path>) -> bool {
+    stage.is_some_and(|stage| stage.join("usr/lib/systemd/systemd").is_file())
+}
+
+fn login_userland_files_with_stage(stage: Option<&Path>) -> Vec<InitramfsFile> {
+    login_userland_files_with_stage_and_options(stage, LoginUserlandOptions::default())
+}
+
+fn login_userland_files_with_stage_and_options(
+    stage: Option<&Path>,
+    options: LoginUserlandOptions,
+) -> Vec<InitramfsFile> {
+    if stage_has_systemd(stage) {
+        return systemd_login_userland_files_with_stage_and_options(
+            stage.expect("checked stage"),
+            options,
+        );
+    }
+
+    sysv_login_userland_files_with_stage_and_options(stage, options)
+}
+
+fn sysv_login_userland_files_with_stage(stage: Option<&Path>) -> Vec<InitramfsFile> {
+    sysv_login_userland_files_with_stage_and_options(stage, LoginUserlandOptions::default())
+}
+
+fn sysv_login_userland_files_with_stage_and_options(
+    stage: Option<&Path>,
+    _options: LoginUserlandOptions,
+) -> Vec<InitramfsFile> {
+    let busybox =
+        staged_userland_bytes(stage, &["bin/busybox"]).unwrap_or_else(build_minimal_elf64);
+    let sh = staged_userland_bytes(stage, &["bin/sh"]).unwrap_or_else(|| busybox.clone());
+    let init =
+        staged_userland_bytes(stage, &["sbin/init"]).unwrap_or_else(build_pid1_transcript_elf64);
+    let agetty = staged_or_stub(stage, &["sbin/agetty", "usr/sbin/agetty"], "/sbin/agetty");
+    let login = staged_or_stub(stage, &["bin/login", "usr/bin/login"], "/bin/login");
+    let bash_bin = staged_or_stub(stage, &["bin/bash", "usr/bin/bash"], "/bin/bash");
+    let bash_usr = staged_or_stub(stage, &["usr/bin/bash", "bin/bash"], "/usr/bin/bash");
+    let passwd = staged_or_stub(stage, &["usr/bin/passwd", "bin/passwd"], "/usr/bin/passwd");
+    let su = staged_or_stub(stage, &["bin/su", "usr/bin/su"], "/bin/su");
+    let mount = staged_or_stub(stage, &["bin/mount", "usr/bin/mount"], "/bin/mount");
+    let umount = staged_or_stub(stage, &["bin/umount", "usr/bin/umount"], "/bin/umount");
+    let hostname =
+        staged_userland_bytes(stage, &["bin/hostname"]).unwrap_or_else(|| busybox.clone());
+    let ip = staged_userland_bytes(stage, &["bin/ip"]).unwrap_or_else(|| busybox.clone());
+    let test = staged_userland_bytes(stage, &["bin/["]).unwrap_or_else(|| busybox.clone());
+    let cat = staged_userland_bytes(stage, &["bin/cat"]).unwrap_or_else(|| busybox.clone());
+    let id = staged_userland_bytes(stage, &["bin/id"]).unwrap_or_else(|| busybox.clone());
+    let whoami = staged_userland_bytes(stage, &["bin/whoami"]).unwrap_or_else(|| busybox.clone());
+    let sleep = staged_userland_bytes(stage, &["bin/sleep"]).unwrap_or_else(|| busybox.clone());
+    let echo = staged_userland_bytes(stage, &["bin/echo"]).unwrap_or_else(|| busybox.clone());
+    let mdev = staged_userland_bytes(stage, &["sbin/mdev"]).unwrap_or_else(|| busybox.clone());
+    let modprobe =
+        staged_userland_bytes(stage, &["sbin/modprobe"]).unwrap_or_else(|| busybox.clone());
+    let swapon = staged_userland_bytes(stage, &["sbin/swapon", "usr/sbin/swapon"])
+        .unwrap_or_else(|| busybox.clone());
+    let swapoff = staged_userland_bytes(stage, &["sbin/swapoff", "usr/sbin/swapoff"])
+        .unwrap_or_else(|| busybox.clone());
+    let hwclock = staged_or_stub(
+        stage,
+        &["sbin/hwclock", "usr/sbin/hwclock"],
+        "/sbin/hwclock",
+    );
+    let halt = staged_or_stub(stage, &["sbin/halt", "usr/sbin/halt"], "/sbin/halt");
+    let reboot = staged_or_stub(stage, &["sbin/reboot", "usr/sbin/reboot"], "/sbin/reboot");
+    let poweroff = staged_userland_bytes(stage, &["sbin/poweroff", "usr/sbin/poweroff"])
+        .unwrap_or_else(|| build_poweroff_stub_elf64("/sbin/poweroff"));
+    let shutdown = staged_or_stub(
+        stage,
+        &["sbin/shutdown", "usr/sbin/shutdown"],
+        "/sbin/shutdown",
+    );
+    let coreutils = staged_userland_bytes(stage, &["bin/coreutils", "usr/bin/coreutils"]);
+
+    let mut files = vec![
+        initramfs_file("bin/busybox", 0o100755, busybox.clone()),
+        initramfs_file("bin/sh", 0o100755, sh),
+        initramfs_file("sbin/init", 0o100755, init),
+        initramfs_file("sbin/agetty", 0o100755, agetty),
+        initramfs_file("bin/login", 0o100755, login),
+        initramfs_file("bin/bash", 0o100755, bash_bin),
+        initramfs_file("usr/bin/bash", 0o100755, bash_usr),
+        initramfs_file("usr/bin/passwd", 0o100755, passwd),
+        initramfs_file("bin/su", 0o100755, su),
+        initramfs_file("bin/mount", 0o100755, mount),
+        initramfs_file("bin/umount", 0o100755, umount),
+        initramfs_file("bin/hostname", 0o100755, hostname),
+        initramfs_file("bin/ip", 0o100755, ip),
+        initramfs_file("bin/[", 0o100755, test),
+        initramfs_file("bin/cat", 0o100755, cat),
+        initramfs_file("bin/id", 0o100755, id),
+        initramfs_file("bin/whoami", 0o100755, whoami),
+        initramfs_file("bin/sleep", 0o100755, sleep),
+        initramfs_file("bin/echo", 0o100755, echo),
+        initramfs_file("sbin/mdev", 0o100755, mdev),
+        initramfs_file("sbin/modprobe", 0o100755, modprobe),
+        initramfs_file("sbin/swapon", 0o100755, swapon.clone()),
+        initramfs_file("usr/sbin/swapon", 0o100755, swapon),
+        initramfs_file("sbin/swapoff", 0o100755, swapoff.clone()),
+        initramfs_file("usr/sbin/swapoff", 0o100755, swapoff),
+        initramfs_file("sbin/hwclock", 0o100755, hwclock),
+        initramfs_file("sbin/halt", 0o100755, halt),
+        initramfs_file("sbin/reboot", 0o100755, reboot),
+        initramfs_file("sbin/poweroff", 0o100755, poweroff),
+        initramfs_file("sbin/shutdown", 0o100755, shutdown),
+        initramfs_file("etc/hostname", 0o100644, b"lupos\n".to_vec()),
+        initramfs_file(
+            "etc/inittab",
+            0o100644,
+            sysv_login_inittab().into_bytes(),
+        ),
+        initramfs_file("etc/rc.d/rcS", 0o100755, LOGIN_RCS_SCRIPT.as_bytes()),
+        initramfs_file("etc/rc.d/rc", 0o100755, LOGIN_RC_SCRIPT.as_bytes()),
+        initramfs_file("etc/passwd", 0o100644, LOGIN_PASSWD.as_bytes()),
+        initramfs_file("etc/shadow", 0o100600, LOGIN_SHADOW.as_bytes()),
+        initramfs_file("etc/group", 0o100644, LOGIN_GROUP.as_bytes()),
+        initramfs_file("etc/gshadow", 0o100600, LOGIN_GSHADOW.as_bytes()),
+        initramfs_file("etc/pam.d/login", 0o100644, LOGIN_PAM_LOGIN.as_bytes()),
+        initramfs_file("etc/pam.d/passwd", 0o100644, LOGIN_PAM_PASSWD.as_bytes()),
+        initramfs_file("etc/pam.d/su", 0o100644, LOGIN_PAM_SU.as_bytes()),
+        initramfs_file("etc/login.defs", 0o100644, LOGIN_DEFS.as_bytes()),
+        initramfs_file("etc/securetty", 0o100644, LOGIN_SECURETTY.as_bytes()),
+        initramfs_file("etc/shells", 0o100644, LOGIN_SHELLS.as_bytes()),
+        initramfs_file("etc/hosts", 0o100644, b"127.0.0.1 localhost lupos\n::1 localhost\n".to_vec()),
+        initramfs_file("etc/resolv.conf", 0o100644, b"nameserver 10.0.2.3\n".to_vec()),
+        initramfs_file(
+            "etc/fstab",
+            0o100644,
+            fstab_with_lupos_swap(
+                b"proc /proc proc defaults 0 0\nsysfs /sys sysfs defaults 0 0\ndevtmpfs /dev devtmpfs defaults 0 0\ntmpfs /tmp tmpfs defaults 0 0\ntmpfs /run tmpfs defaults 0 0\n".to_vec(),
+            ),
+        ),
+        initramfs_file(LUPOS_SWAPFILE_PATH, 0o100600, lupos_swapfile_bytes()),
+        initramfs_file("etc/nsswitch.conf", 0o100644, b"passwd: files\ngroup: files\nshadow: files\nhosts: files dns\n".to_vec()),
+        initramfs_file(
+            "etc/profile",
+            0o100644,
+            staged_userland_bytes(stage, &["etc/profile"])
+                .unwrap_or_else(|| LOGIN_PROFILE.as_bytes().to_vec()),
+        ),
+        initramfs_file(
+            "etc/bash.bashrc",
+            0o100644,
+            staged_userland_bytes(stage, &["etc/bash.bashrc"])
+                .unwrap_or_else(|| LOGIN_BASH_BASHRC.as_bytes().to_vec()),
+        ),
+        initramfs_file("root/.bashrc", 0o100644, ROOT_LOGIN_BASHRC.as_bytes()),
+        initramfs_file(
+            "root/.bash_profile",
+            0o100644,
+            ROOT_LOGIN_BASH_PROFILE.as_bytes(),
+        ),
+        // Home directory skeleton files mirroring common /etc/skel bash defaults.
+        // adduser(8)/pam_mkhomedir(8) copies these to new home directories on real systems.
+        initramfs_file("home/lupos/.bashrc",       0o100644, staged_userland_bytes(stage, &["home/lupos/.bashrc", "etc/skel/.bashrc"]).unwrap_or_else(|| LUPOS_USER_BASHRC.as_bytes().to_vec())),
+        initramfs_file("home/lupos/.bash_profile", 0o100644, staged_userland_bytes(stage, &["home/lupos/.bash_profile", "etc/skel/.bash_profile"]).unwrap_or_else(|| LUPOS_USER_BASH_PROFILE.as_bytes().to_vec())),
+        initramfs_file("etc/skel/.bashrc",         0o100644, staged_userland_bytes(stage, &["etc/skel/.bashrc"]).unwrap_or_else(|| SKEL_BASHRC.as_bytes().to_vec())),
+        initramfs_file("etc/skel/.bash_profile",   0o100644, staged_userland_bytes(stage, &["etc/skel/.bash_profile"]).unwrap_or_else(|| SKEL_BASH_PROFILE.as_bytes().to_vec())),
+        initramfs_file("etc/skel/.bash_logout",    0o100644, staged_userland_bytes(stage, &["etc/skel/.bash_logout"]).unwrap_or_else(|| SKEL_BASH_LOGOUT.as_bytes().to_vec())),
+        initramfs_file("etc/motd", 0o100644, LOGIN_MOTD.as_bytes()),
+        initramfs_file("etc/issue", 0o100644, LOGIN_ISSUE.as_bytes()),
+        initramfs_file(
+            "etc/os-release",
+            0o100644,
+            staged_userland_bytes(stage, &["etc/os-release"])
+                .unwrap_or_else(|| LUPOS_OS_RELEASE.as_bytes().to_vec()),
+        ),
+        // Canonical Linux location per `man 5 os-release`; mirrored alongside
+        // /etc/os-release so namespaced reads find at least one copy.
+        initramfs_file(
+            "usr/lib/os-release",
+            0o100644,
+            staged_userland_bytes(stage, &["usr/lib/os-release", "etc/os-release"])
+                .unwrap_or_else(|| LUPOS_OS_RELEASE.as_bytes().to_vec()),
+        ),
+    ];
+
+    if let Some(bytes) = coreutils {
+        upsert_initramfs_file(&mut files, "bin/coreutils", 0o100755, bytes);
+    }
+
+    for tool in LOGIN_GNU_COREUTILS {
+        let bin_path = format!("bin/{tool}");
+        let usr_path = format!("usr/bin/{tool}");
+        let bytes = if initramfs_file_bytes(&files, "bin/coreutils").is_some() {
+            coreutils_shebang(tool)
+        } else {
+            staged_userland_bytes(stage, &[bin_path.as_str(), usr_path.as_str()])
+                .unwrap_or_else(|| busybox.clone())
+        };
+        upsert_initramfs_file(&mut files, &bin_path, 0o100755, bytes.clone());
+        upsert_initramfs_file(&mut files, &usr_path, 0o100755, bytes);
+    }
+
+    for (tool, candidates) in [
+        ("clear", &["bin/clear", "usr/bin/clear"][..]),
+        ("ping", &["bin/ping", "usr/bin/ping"][..]),
+    ] {
+        let bin_path = format!("bin/{tool}");
+        let usr_path = format!("usr/bin/{tool}");
+        let bytes = staged_userland_bytes(stage, candidates).unwrap_or_else(|| busybox.clone());
+        upsert_initramfs_file(&mut files, &bin_path, 0o100755, bytes.clone());
+        upsert_initramfs_file(&mut files, &usr_path, 0o100755, bytes);
+    }
+
+    if let Some(stage) = stage {
+        files.extend(staged_tree_files(
+            stage,
+            &[
+                "usr/lib/security",
+                "usr/lib/security",
+                "etc/security",
+                "usr/share/terminfo",
+                "etc/terminfo",
+                "usr/share/tabset",
+            ],
+        ));
+        for rel in [
+            "etc/ld.so.cache",
+            GLIBC_DYNAMIC_LOADER,
+            "usr/libexec/coreutils/libstdbuf.so",
+        ] {
+            if let Some(bytes) = staged_userland_bytes(Some(stage), &[rel]) {
+                upsert_initramfs_file(&mut files, rel, staged_regular_file_mode(rel), bytes);
+            }
+        }
+        for rel in SYSTEMD_ARCH_RUNTIME_LIBS {
+            files.extend(staged_file_with_link_target(stage, rel));
+        }
+    }
+
+    files.extend(staged_runtime_files(stage));
+    files.extend(staged_auth_runtime_files(stage));
+    files.extend(libkmod_stub_initramfs_files());
+    files.extend(extra_initramfs_files());
+    dedup_initramfs_files(&mut files);
+    files
+}
+
+fn systemd_login_userland_files_with_stage(stage: &Path) -> Vec<InitramfsFile> {
+    systemd_login_userland_files_with_stage_and_options(stage, LoginUserlandOptions::default())
+}
+
+fn systemd_login_userland_files_with_stage_and_options(
+    stage: &Path,
+    _options: LoginUserlandOptions,
+) -> Vec<InitramfsFile> {
+    let busybox =
+        staged_userland_bytes(Some(stage), &["bin/busybox"]).unwrap_or_else(build_minimal_elf64);
+    let sh = staged_userland_bytes(Some(stage), &["usr/bin/sh", "bin/sh"])
+        .unwrap_or_else(|| busybox.clone());
+    let bash = staged_or_stub(Some(stage), &["usr/bin/bash", "bin/bash"], "/usr/bin/bash");
+    let login = staged_or_stub(
+        Some(stage),
+        &["usr/bin/login", "bin/login"],
+        "/usr/bin/login",
+    );
+    let agetty = staged_or_stub(
+        Some(stage),
+        &["usr/sbin/agetty", "sbin/agetty"],
+        "/usr/sbin/agetty",
+    );
+    // `/sbin/poweroff`: ship the tiny direct-`reboot(LINUX_REBOOT_CMD_POWER_OFF)`
+    // stub instead of a copy of systemctl. Some distro symlinks point
+    // /sbin/poweroff to systemctl, but when D-Bus isn't running
+    // systemctl tries to talk to logind, hangs, and only falls through
+    // to `halt_now()` when the user passes `-ff`.  Our stub directly
+    // issues the `reboot(2)` syscall, which our kernel turns into a
+    // clean `isa-debug-exit` (`crate::linux_driver_abi::platform::qemu::exit_success`) — exactly
+    // what the user expects from `poweroff` in a QEMU session.
+    // systemctl is still reachable via `/usr/bin/systemctl` for the
+    // full systemd shutdown path.
+    let poweroff = build_poweroff_stub_elf64("/sbin/poweroff");
+    let staged_config = |rel: &str, fallback: &[u8]| {
+        staged_userland_bytes(Some(stage), &[rel]).unwrap_or_else(|| fallback.to_vec())
+    };
+    let usr_lib_os_release =
+        staged_userland_bytes(Some(stage), &["usr/lib/os-release", "etc/os-release"])
+            .unwrap_or_else(|| LUPOS_OS_RELEASE.as_bytes().to_vec());
+    let modprobe = staged_userland_bytes(
+        Some(stage),
+        &[
+            "sbin/modprobe",
+            "usr/sbin/modprobe",
+            "usr/bin/kmod",
+            "bin/kmod",
+        ],
+    )
+    .unwrap_or_else(|| busybox.clone());
+    let swapon = staged_userland_bytes(
+        Some(stage),
+        &["sbin/swapon", "usr/sbin/swapon", "usr/bin/swapon"],
+    )
+    .unwrap_or_else(|| busybox.clone());
+    let swapoff = staged_userland_bytes(
+        Some(stage),
+        &["sbin/swapoff", "usr/sbin/swapoff", "usr/bin/swapoff"],
+    )
+    .unwrap_or_else(|| busybox.clone());
+    let fsck = staged_userland_bytes(Some(stage), &["usr/bin/fsck", "usr/sbin/fsck", "sbin/fsck"])
+        .unwrap_or_else(|| busybox.clone());
+    let e2fsck = staged_userland_bytes(
+        Some(stage),
+        &["usr/bin/e2fsck", "usr/sbin/e2fsck", "sbin/e2fsck"],
+    )
+    .unwrap_or_else(|| busybox.clone());
+    let fsck_ext4 = staged_userland_bytes(
+        Some(stage),
+        &[
+            "usr/bin/fsck.ext4",
+            "usr/sbin/fsck.ext4",
+            "sbin/fsck.ext4",
+            "usr/bin/e2fsck",
+            "usr/sbin/e2fsck",
+        ],
+    )
+    .unwrap_or_else(|| e2fsck.clone());
+
+    let mut files = vec![
+        initramfs_file("usr/lib/systemd/systemd", 0o100755, staged_userland_bytes(Some(stage), &["usr/lib/systemd/systemd"]).expect("systemd stage checked")),
+        initramfs_symlink("sbin/init", "/usr/lib/systemd/systemd"),
+        initramfs_symlink("var/run", "/run"),
+        initramfs_file("usr/bin/bash", 0o100755, bash.clone()),
+        initramfs_file("bin/bash", 0o100755, bash),
+        initramfs_file("usr/bin/login", 0o100755, login.clone()),
+        initramfs_file("bin/login", 0o100755, login),
+        initramfs_file("usr/sbin/agetty", 0o100755, agetty.clone()),
+        initramfs_file("sbin/agetty", 0o100755, agetty),
+        initramfs_file("bin/busybox", 0o100755, busybox.clone()),
+        initramfs_file("usr/bin/sh", 0o100755, sh.clone()),
+        initramfs_file("bin/sh", 0o100755, sh),
+        initramfs_file("sbin/poweroff", 0o100755, poweroff.clone()),
+        initramfs_file("usr/sbin/poweroff", 0o100755, poweroff),
+        initramfs_file("sbin/modprobe", 0o100755, modprobe),
+        initramfs_file("usr/sbin/swapon", 0o100755, swapon.clone()),
+        initramfs_file("sbin/swapon", 0o100755, swapon),
+        initramfs_file("usr/sbin/swapoff", 0o100755, swapoff.clone()),
+        initramfs_file("sbin/swapoff", 0o100755, swapoff),
+        initramfs_file("usr/sbin/fsck", 0o100755, fsck),
+        initramfs_file("usr/sbin/e2fsck", 0o100755, e2fsck),
+        initramfs_file("usr/sbin/fsck.ext4", 0o100755, fsck_ext4),
+        initramfs_file(
+            ARCH_PACMAN_XFER_HELPER,
+            0o100755,
+            staged_config(
+                ARCH_PACMAN_XFER_HELPER,
+                ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes(),
+            ),
+        ),
+        initramfs_file("etc/hostname", 0o100644, staged_config("etc/hostname", b"lupos\n")),
+        initramfs_file("etc/machine-id", 0o100444, SYSTEMD_MACHINE_ID.as_bytes()),
+        initramfs_file("etc/passwd", 0o100644, staged_auth_config(stage, "etc/passwd", LOGIN_PASSWD)),
+        initramfs_file("etc/shadow", 0o100600, staged_auth_config(stage, "etc/shadow", LOGIN_SHADOW)),
+        initramfs_file("etc/group", 0o100644, staged_auth_config(stage, "etc/group", LOGIN_GROUP)),
+        initramfs_file("etc/gshadow", 0o100600, staged_auth_config(stage, "etc/gshadow", LOGIN_GSHADOW)),
+        initramfs_file("etc/pam.d/login", 0o100644, LOGIN_PAM_LOGIN.as_bytes().to_vec()),
+        initramfs_file("etc/pam.d/passwd", 0o100644, LOGIN_PAM_PASSWD.as_bytes().to_vec()),
+        initramfs_file("etc/pam.d/su", 0o100644, LOGIN_PAM_SU.as_bytes().to_vec()),
+        initramfs_file("etc/pam.d/common-session", 0o100644, LOGIN_PAM_COMMON_SESSION.as_bytes()),
+        initramfs_file(
+            "usr/lib/pam.d/systemd-user",
+            0o100644,
+            staged_config(
+                "usr/lib/pam.d/systemd-user",
+                b"@include common-account\n@include common-session-noninteractive\nsession optional pam_systemd.so\n",
+            ),
+        ),
+        initramfs_file("etc/login.defs", 0o100644, staged_config("etc/login.defs", LOGIN_DEFS.as_bytes())),
+        initramfs_file("etc/securetty", 0o100644, staged_config("etc/securetty", LOGIN_SECURETTY.as_bytes())),
+        initramfs_file("etc/shells", 0o100644, staged_config("etc/shells", LOGIN_SHELLS.as_bytes())),
+        initramfs_file("etc/hosts", 0o100644, staged_config("etc/hosts", b"127.0.0.1 localhost lupos\n::1 localhost\n")),
+        initramfs_file("etc/resolv.conf", 0o100644, staged_config("etc/resolv.conf", b"nameserver 10.0.2.3\n")),
+        initramfs_file(
+            "etc/fstab",
+            0o100644,
+            fstab_with_lupos_swap(staged_config("etc/fstab", SYSTEMD_FSTAB.as_bytes())),
+        ),
+        initramfs_file(
+            LUPOS_SWAPFILE_PATH,
+            0o100600,
+            lupos_swapfile_bytes(),
+        ),
+        initramfs_file("etc/nsswitch.conf", 0o100644, staged_config("etc/nsswitch.conf", SYSTEMD_NSSWITCH.as_bytes())),
+        initramfs_file("etc/profile", 0o100644, staged_config("etc/profile", LOGIN_PROFILE.as_bytes())),
+        initramfs_file("etc/bash.bashrc", 0o100644, staged_config("etc/bash.bashrc", LOGIN_BASH_BASHRC.as_bytes())),
+        // Root keeps Arch's normal HOME=/root, but its first interactive login
+        // starts at / so plain `ls` shows the real root filesystem.
+        initramfs_file("root/.bashrc", 0o100644, ROOT_LOGIN_BASHRC.as_bytes()),
+        initramfs_file("root/.bash_profile", 0o100644, ROOT_LOGIN_BASH_PROFILE.as_bytes()),
+        // Mirror Arch's user startup files when a real stage exists.
+        initramfs_file("home/lupos/.bashrc",       0o100644, staged_userland_bytes(Some(stage), &["home/lupos/.bashrc", "etc/skel/.bashrc"]).unwrap_or_else(|| LUPOS_USER_BASHRC.as_bytes().to_vec())),
+        initramfs_file("home/lupos/.bash_profile", 0o100644, staged_userland_bytes(Some(stage), &["home/lupos/.bash_profile", "etc/skel/.bash_profile"]).unwrap_or_else(|| LUPOS_USER_BASH_PROFILE.as_bytes().to_vec())),
+        initramfs_file("etc/skel/.bashrc",         0o100644, staged_config("etc/skel/.bashrc", SKEL_BASHRC.as_bytes())),
+        initramfs_file("etc/skel/.bash_profile",   0o100644, staged_config("etc/skel/.bash_profile", SKEL_BASH_PROFILE.as_bytes())),
+        initramfs_file("etc/skel/.bash_logout",    0o100644, staged_config("etc/skel/.bash_logout", SKEL_BASH_LOGOUT.as_bytes())),
+        initramfs_file("etc/motd", 0o100644, staged_config("etc/motd", LOGIN_MOTD.as_bytes())),
+        initramfs_file("etc/issue", 0o100644, staged_config("etc/issue", SYSTEMD_LOGIN_ISSUE.as_bytes())),
+        initramfs_file("etc/os-release", 0o100644, staged_config("etc/os-release", LUPOS_OS_RELEASE.as_bytes())),
+        // Linux convention (man 5 os-release): /etc/os-release is canonically a
+        // symlink to /usr/lib/os-release.  systemd's `propagate_etc_os_release`
+        // resolves either, but namespaced reads land on the /usr/lib/ path.
+        initramfs_file("usr/lib/os-release", 0o100644, usr_lib_os_release),
+        initramfs_file(
+            "etc/tmpfiles.d/lupos-logind.conf",
+            0o100644,
+            b"d /run/systemd/seats 0755 root root -\nd /run/systemd/sessions 0755 root root -\nd /run/systemd/users 0755 root root -\nd /run/user 0755 root root -\n",
+        ),
+        initramfs_file("etc/systemd/system.conf", 0o100644, SYSTEMD_SYSTEM_CONF.as_bytes()),
+        initramfs_file("etc/systemd/journald.conf", 0o100644, SYSTEMD_JOURNALD_CONF.as_bytes()),
+        initramfs_file(
+            "usr/lib/systemd/system/lupos-terminal.target",
+            0o100644,
+            systemd_lupos_terminal_target_unit(),
+        ),
+        initramfs_file(
+            "usr/lib/systemd/system/lupos-serial-getty.service",
+            0o100644,
+            systemd_lupos_serial_getty_unit(),
+        ),
+        initramfs_file(
+            "usr/lib/systemd/system/systemd-vconsole-setup.service",
+            0o100644,
+            systemd_vconsole_setup_unit(),
+        ),
+        initramfs_file(
+            "usr/lib/systemd/systemd-vconsole-setup",
+            0o100755,
+            systemd_vconsole_setup_shim(),
+        ),
+        initramfs_file(
+            "etc/systemd/system/getty@tty1.service.d/lupos-login.conf",
+            0o100644,
+            systemd_getty_override(),
+        ),
+        initramfs_file(
+            "etc/systemd/system/serial-getty@ttyS0.service.d/lupos-serial.conf",
+            0o100644,
+            systemd_serial_getty_override(),
+        ),
+        initramfs_file(
+            "etc/systemd/system/user@.service.d/lupos-runtime-env.conf",
+            0o100644,
+            b"[Service]\nEnvironment=XDG_RUNTIME_DIR=/run/user/%i\n",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/default.target",
+            "/usr/lib/systemd/system/lupos-terminal.target",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/lupos-serial-getty.service",
+            "/usr/lib/systemd/system/lupos-serial-getty.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/getty.target.wants/getty@tty1.service",
+            "/usr/lib/systemd/system/getty@.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service",
+            "/usr/lib/systemd/system/serial-getty@.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/multi-user.target.wants/getty.target",
+            "/usr/lib/systemd/system/getty.target",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/multi-user.target.wants/systemd-journald.service",
+            "/usr/lib/systemd/system/systemd-journald.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sockets.target.wants/systemd-journald.socket",
+            "/usr/lib/systemd/system/systemd-journald.socket",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sockets.target.wants/systemd-journald-dev-log.socket",
+            "/usr/lib/systemd/system/systemd-journald-dev-log.socket",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/multi-user.target.wants/systemd-user-sessions.service",
+            "/usr/lib/systemd/system/systemd-user-sessions.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/systemd-tmpfiles-setup-dev.service",
+            "/usr/lib/systemd/system/systemd-tmpfiles-setup-dev.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/systemd-tmpfiles-setup.service",
+            "/usr/lib/systemd/system/systemd-tmpfiles-setup.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/systemd-vconsole-setup.service",
+            "/usr/lib/systemd/system/systemd-vconsole-setup.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/dev-hugepages.mount",
+            "/usr/lib/systemd/system/dev-hugepages.mount",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/dev-mqueue.mount",
+            "/usr/lib/systemd/system/dev-mqueue.mount",
+        ),
+    ];
+
+    files.extend(staged_tree_files(
+        stage,
+        &[
+            "usr/bin",
+            "usr/sbin",
+            "usr/lib",
+            "usr/lib/systemd",
+            "usr/lib/security",
+            "usr/lib/pam.d",
+            "usr/libexec",
+            "etc/ld.so.conf.d",
+            "etc/pam.d",
+            "etc/profile.d",
+            "etc/security",
+            "etc/audit",
+            "etc/pacman.d",
+            "etc/systemd/network",
+            "etc/ssl",
+            "usr/share/ca-certificates",
+            "lib",
+            "lib64",
+            // systemd-tmpfiles drop-ins (man 5 tmpfiles.d) — needed by
+            // `systemd-tmpfiles-setup.service` to populate /run + /var on
+            // first boot.  Ref:
+            // vendor/systemd/systemd-260.1/src/tmpfiles/tmpfiles.c.
+            "usr/lib/tmpfiles.d",
+            "etc/tmpfiles.d",
+            // systemd-sysusers drop-ins (man 5 sysusers.d) — service
+            // account seeding for systemd-journal, systemd-network etc.
+            "usr/lib/sysusers.d",
+            "etc/sysusers.d",
+            // udev rules consumed by systemd-udevd.service.  Ref:
+            // vendor/systemd/systemd-260.1/src/udev/udev-rules.c.
+            "usr/lib/udev/rules.d",
+            "etc/udev/rules.d",
+            // systemd unit presets read by `systemctl preset-all` on first
+            // boot.  Ref: man 5 systemd.preset.
+            "usr/lib/systemd/system-preset",
+            // dbus system bus configuration — required by logind /
+            // PackageKit / NetworkManager once they come up.  Ref:
+            // vendor/dbus/dbus-1/system.conf.
+            "usr/share/dbus-1",
+            "etc/dbus-1",
+            // Terminfo database — ncurses-bin's `clear` / `tput` /
+            // `tset` and Bash's readline curses path open
+            // `/usr/share/terminfo/<first-letter>/<TERM>` (or
+            // `/etc/terminfo/<...>` per the distro override).  Without
+            // these files `clear` fails with
+            // "terminals database is inaccessible".  Ref:
+            // vendor/linux/Documentation/admin-guide/devices.txt and
+            // `man 5 terminfo`.
+            "usr/share/keyrings",
+            "usr/share/terminfo",
+            "etc/terminfo",
+            "usr/share/tabset",
+            "p",
+            "var/cache/pacman",
+            "var/lib/lupos",
+            "var/lib/pacman",
+            "var/log/audit",
+        ],
+    ));
+    upsert_arch_pacman_mirrorlist(&mut files);
+    upsert_initramfs_file(
+        &mut files,
+        "usr/lib/systemd/system/systemd-journald.service",
+        0o100644,
+        systemd_journald_service_unit(),
+    );
+
+    if let Some(bytes) = staged_userland_bytes(Some(stage), &["usr/bin/udevadm"]) {
+        upsert_initramfs_file(&mut files, "usr/lib/systemd/systemd-udevd", 0o100755, bytes);
+    }
+
+    for tool in ["auditctl", "auditd", "augenrules"] {
+        let usr_path = format!("usr/sbin/{tool}");
+        let sbin_path = format!("sbin/{tool}");
+        if let Some(bytes) = staged_userland_bytes(Some(stage), &[usr_path.as_str()]) {
+            upsert_initramfs_file(&mut files, &usr_path, 0o100755, bytes.clone());
+            upsert_initramfs_file(&mut files, &sbin_path, 0o100755, bytes);
+        }
+    }
+
+    for rel in [
+        "etc/ld.so.cache",
+        "etc/pacman.conf",
+        GLIBC_DYNAMIC_LOADER,
+        "usr/lib/libc.so.6",
+        "usr/lib/libpthread.so.0",
+        "usr/lib/libdl.so.2",
+        "usr/lib/librt.so.1",
+        "usr/lib/libm.so.6",
+        "usr/lib/libcrypt.so.1",
+        "usr/lib/libpam.so.0",
+        "usr/lib/libpam_misc.so.0",
+        "usr/libexec/coreutils/libstdbuf.so",
+    ] {
+        if let Some(bytes) = staged_userland_bytes(Some(stage), &[rel]) {
+            upsert_initramfs_file(&mut files, rel, staged_regular_file_mode(rel), bytes);
+        }
+    }
+
+    for rel in SYSTEMD_ARCH_RUNTIME_LIBS {
+        files.extend(staged_file_with_link_target(stage, rel));
+    }
+
+    for tool in LOGIN_GNU_COREUTILS {
+        let usr_path = format!("usr/bin/{tool}");
+        if initramfs_file_bytes(&files, &usr_path).is_none() {
+            let staged = staged_userland_bytes(Some(stage), &[usr_path.as_str()]);
+            let bytes = staged.unwrap_or_else(|| busybox.clone());
+            upsert_initramfs_file(&mut files, &usr_path, 0o100755, bytes.clone());
+            upsert_initramfs_file(&mut files, &format!("bin/{tool}"), 0o100755, bytes);
+        } else if let Some(bytes) = initramfs_file_bytes(&files, &usr_path).map(|b| b.to_vec()) {
+            upsert_initramfs_file(&mut files, &format!("bin/{tool}"), 0o100755, bytes);
+        }
+    }
+
+    files.extend(staged_auth_runtime_files(Some(stage)));
+    for rel in [
+        "etc/pam.d/login",
+        "etc/pam.d/passwd",
+        "etc/pam.d/su",
+        "etc/pam.d/common-session",
+    ] {
+        files.retain(|(path, _, _)| path != rel);
+    }
+    files.push(initramfs_file(
+        "etc/pam.d/login",
+        0o100644,
+        LOGIN_PAM_LOGIN.as_bytes().to_vec(),
+    ));
+    files.push(initramfs_file(
+        "etc/pam.d/passwd",
+        0o100644,
+        LOGIN_PAM_PASSWD.as_bytes().to_vec(),
+    ));
+    files.push(initramfs_file(
+        "etc/pam.d/su",
+        0o100644,
+        LOGIN_PAM_SU.as_bytes().to_vec(),
+    ));
+    files.push(initramfs_file(
+        "etc/pam.d/common-session",
+        0o100644,
+        LOGIN_PAM_COMMON_SESSION.as_bytes().to_vec(),
+    ));
+    files.extend(libkmod_stub_initramfs_files());
+    files.extend(extra_initramfs_files());
+    files.retain(|(path, _, _)| path != "usr/lib/systemd/system/systemd-journald.service");
+    files.push(initramfs_file(
+        "usr/lib/systemd/system/systemd-journald.service",
+        0o100644,
+        systemd_journald_service_unit(),
+    ));
+    apply_systemd_login_payload_overrides(&mut files);
+    dedup_initramfs_files(&mut files);
+    files
+}
+
+fn staged_tree_files(stage: &Path, prefixes: &[&str]) -> Vec<InitramfsFile> {
+    let mut files = Vec::new();
+    for prefix in prefixes {
+        let root = stage.join(prefix);
+        if root.exists() {
+            collect_staged_tree(stage, &root, &mut files);
+        }
+    }
+    files
+}
+
+fn staged_file_with_link_target(stage: &Path, rel: &str) -> Vec<InitramfsFile> {
+    let mut files = Vec::new();
+    let requested = rel.to_owned();
+    let mut current = rel.to_owned();
+    for _ in 0..8 {
+        let path = stage.join(&current);
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            break;
+        };
+        if meta.file_type().is_symlink() {
+            let Ok(target) = fs::read_link(&path) else {
+                if let Some(alias) = staged_versioned_file_alias(stage, &current) {
+                    files.push(alias);
+                }
+                break;
+            };
+            files.push(initramfs_symlink(&current, &target.to_string_lossy()));
+            let Some(next) = resolve_stage_symlink_target(&current, &target) else {
+                break;
+            };
+            current = next;
+            continue;
+        }
+        if meta.is_file() {
+            if let Ok(bytes) = fs::read(&path) {
+                if !bytes.is_empty() {
+                    files.push(initramfs_file(
+                        &current,
+                        staged_regular_file_mode(&current),
+                        bytes.clone(),
+                    ));
+                    if current != requested {
+                        files.push(initramfs_file(
+                            &requested,
+                            staged_regular_file_mode(&requested),
+                            bytes,
+                        ));
+                    }
+                } else if let Some(alias) = staged_versioned_file_alias(stage, &current) {
+                    files.push(alias);
+                }
+            }
+        }
+        break;
+    }
+    files
+}
+
+fn staged_versioned_file_alias(stage: &Path, rel: &str) -> Option<InitramfsFile> {
+    let rel_path = Path::new(rel);
+    let dir = rel_path.parent()?;
+    let name = rel_path.file_name()?.to_string_lossy();
+    let prefix = format!("{name}.");
+    let mut candidates = fs::read_dir(stage.join(dir))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let file_name = path.file_name()?.to_string_lossy().into_owned();
+            if !file_name.starts_with(&prefix) {
+                return None;
+            }
+            let meta = fs::symlink_metadata(&path).ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let bytes = fs::read(&path).ok()?;
+            if bytes.is_empty() {
+                return None;
+            }
+            Some((file_name, bytes))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates
+        .pop()
+        .map(|(_, bytes)| initramfs_file(rel, staged_regular_file_mode(rel), bytes))
+}
+
+fn apply_systemd_login_payload_overrides(files: &mut Vec<InitramfsFile>) {
+    let poweroff = build_poweroff_stub_elf64("/sbin/poweroff");
+    let udevd = initramfs_file_bytes(files, "usr/bin/udevadm").map(|bytes| bytes.to_vec());
+    for path in [
+        "var/run",
+        "sbin/poweroff",
+        "usr/sbin/poweroff",
+        "etc/machine-id",
+        "usr/lib/systemd/system/systemd-vconsole-setup.service",
+        "usr/lib/systemd/systemd-vconsole-setup",
+        "usr/lib/systemd/systemd-udevd",
+    ] {
+        files.retain(|(entry_path, _, _)| entry_path != path);
+    }
+    files.push(initramfs_symlink("var/run", "/run"));
+    files.push(initramfs_file("sbin/poweroff", 0o100755, poweroff.clone()));
+    files.push(initramfs_file("usr/sbin/poweroff", 0o100755, poweroff));
+    files.push(initramfs_file(
+        "etc/machine-id",
+        0o100444,
+        SYSTEMD_MACHINE_ID.as_bytes(),
+    ));
+    files.push(initramfs_file(
+        "usr/lib/systemd/system/systemd-vconsole-setup.service",
+        0o100644,
+        systemd_vconsole_setup_unit(),
+    ));
+    files.push(initramfs_file(
+        "usr/lib/systemd/systemd-vconsole-setup",
+        0o100755,
+        systemd_vconsole_setup_shim(),
+    ));
+    if let Some(bytes) = udevd {
+        files.push(initramfs_file(
+            "usr/lib/systemd/systemd-udevd",
+            0o100755,
+            bytes,
+        ));
+    }
+}
+
+fn resolve_stage_symlink_target(link_rel: &str, target: &Path) -> Option<String> {
+    let mut resolved = PathBuf::new();
+    if target.is_absolute() {
+        for component in target.components() {
+            if let std::path::Component::Normal(part) = component {
+                resolved.push(part);
+            }
+        }
+    } else {
+        if let Some(parent) = Path::new(link_rel).parent() {
+            resolved.push(parent);
+        }
+        resolved.push(target);
+    }
+    normalize_stage_relative_path(&resolved)
+}
+
+fn normalize_stage_relative_path(path: &Path) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop()?;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn collect_staged_tree(stage: &Path, dir: &Path, files: &mut Vec<InitramfsFile>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            collect_staged_tree(stage, &path, files);
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(stage) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if meta.file_type().is_symlink() {
+            if let Ok(target) = fs::read_link(&path) {
+                files.push(initramfs_symlink(&rel, &target.to_string_lossy()));
+            }
+            continue;
+        }
+        if meta.is_file() {
+            if let Ok(bytes) = fs::read(&path) {
+                if !bytes.is_empty() {
+                    files.push(initramfs_file(&rel, staged_regular_file_mode(&rel), bytes));
+                }
+            }
+        }
+    }
+}
+
+fn staged_runtime_files(stage: Option<&Path>) -> Vec<InitramfsFile> {
+    let mut files = Vec::new();
+    for (rel, mode) in [
+        ("lib/ld-musl-x86_64.so.1", 0o100755),
+        ("lib/libc.so", 0o100755),
+        ("usr/lib/x86_64-linux-musl/libc.so", 0o100755),
+    ] {
+        if let Some(bytes) = staged_userland_bytes(stage, &[rel]) {
+            files.push(initramfs_file(rel, mode, bytes));
+        }
+    }
+    files
+}
+
+fn staged_auth_runtime_files(stage: Option<&Path>) -> Vec<InitramfsFile> {
+    let mut files = Vec::new();
+    for (rel, mode) in [
+        ("usr/lib/libcrypt.so", 0o100755),
+        ("usr/lib/libcrypt.so.1", 0o100755),
+        ("usr/lib/libcrypt.so.1.1.0", 0o100755),
+        ("usr/lib/libpam.so", 0o100755),
+        ("usr/lib/libpam.so.0", 0o100755),
+        ("usr/lib/libpam.so.0.85.1", 0o100755),
+        ("usr/lib/libpam_misc.so", 0o100755),
+        ("usr/lib/libpam_misc.so.0", 0o100755),
+        ("usr/lib/libpam_misc.so.0.82.1", 0o100755),
+        ("usr/sbin/unix_chkpwd", 0o100755),
+        ("lib/security/pam_deny.so", 0o100755),
+        ("lib/security/pam_env.so", 0o100755),
+        ("lib/security/pam_permit.so", 0o100755),
+        ("lib/security/pam_rootok.so", 0o100755),
+        ("lib/security/pam_unix.so", 0o100755),
+    ] {
+        if let Some(bytes) = staged_userland_bytes(stage, &[rel]) {
+            files.push(initramfs_file(rel, mode, bytes));
+        }
+    }
+    if initramfs_file_bytes(&files, "usr/lib/libcrypt.so.1").is_none() {
+        if let Some(bytes) =
+            staged_userland_bytes(stage, &["usr/lib/libcrypt.so.1.1.0", "usr/lib/libcrypt.so"])
+        {
+            files.push(initramfs_file("usr/lib/libcrypt.so.1", 0o100755, bytes));
+        }
+    }
+    files
+}
+
+fn extra_initramfs_files() -> Vec<InitramfsFile> {
+    let Some(root) = extra_initramfs_root() else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    collect_extra_initramfs_files(&root, &root, &mut files);
+    files
+}
+
+fn collect_extra_initramfs_files(root: &Path, dir: &Path, out: &mut Vec<InitramfsFile>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_extra_initramfs_files(root, &path, out);
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let rel = rel
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        out.push(initramfs_file(
+            rel.as_str(),
+            extra_initramfs_mode(rel.as_str()),
+            bytes,
+        ));
+    }
+}
+
+fn extra_initramfs_mode(rel: &str) -> u32 {
+    if (rel.starts_with("opt/abi-parity-suite/")
+        && !rel.ends_with(".tsv")
+        && !rel.ends_with(".env"))
+        || rel.ends_with(".sh")
+        || matches!(rel, "lib/ld-musl-x86_64.so.1" | "lib/libc.so")
+        || rel == GLIBC_DYNAMIC_LOADER
+        || (rel.starts_with("lib/") && rel.contains(".so"))
+        || (rel.starts_with("usr/lib/") && rel.contains(".so"))
+    {
+        0o100755
+    } else {
+        0o100644
+    }
+}
+
+fn parse_kconfig_values(text: &str) -> HashMap<String, KconfigValue> {
+    let mut values = HashMap::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("# CONFIG_") {
+            if let Some(symbol) = rest.strip_suffix(" is not set") {
+                values.insert(format!("CONFIG_{symbol}"), KconfigValue::No);
+            }
+            continue;
+        }
+
+        let Some(rest) = line.strip_prefix("CONFIG_") else {
+            continue;
+        };
+        let Some((name, value)) = rest.split_once('=') else {
+            continue;
+        };
+        let value = match value {
+            "y" => KconfigValue::Yes,
+            "m" => KconfigValue::Module,
+            _ => continue,
+        };
+        values.insert(format!("CONFIG_{name}"), value);
+    }
+    values
+}
+
+fn staged_module_specs_from_config_text(text: &str) -> Vec<&'static DriverModuleSpec> {
+    let values = parse_kconfig_values(text);
+    DRIVER_MODULES
+        .iter()
+        .filter(|module| values.get(module.symbol) == Some(&KconfigValue::Module))
+        .collect()
+}
+
+fn linux_driver_module_artifact(spec: &DriverModuleSpec) -> Result<PathBuf> {
+    Ok(xtask_target_dir()?
+        .join("vendor-linux-modules")
+        .join(spec.module_path))
+}
+
+fn linux_driver_module_artifact_is_elf(spec: &DriverModuleSpec) -> bool {
+    linux_driver_module_artifact(spec)
+        .ok()
+        .and_then(|path| fs::read(path).ok())
+        .is_some_and(|bytes| bytes.starts_with(b"\x7fELF"))
+}
+
+fn shell_path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn vendor_linux_module_build_script_from_shell_paths(
+    repo: &str,
+    src: &str,
+    build: &str,
+    artifacts: &str,
+    modules: &[&DriverModuleSpec],
+) -> String {
+    let repo = shell_single_quote(repo);
+    let src = shell_single_quote(src);
+    let build = shell_single_quote(build);
+    let artifacts = shell_single_quote(artifacts);
+
+    let mut symbol_args = String::new();
+    for spec in modules {
+        let symbol = spec.symbol.trim_start_matches("CONFIG_");
+        symbol_args.push_str(" -m ");
+        symbol_args.push_str(symbol);
+    }
+
+    let mut script = format!(
+        "set -euo pipefail\n\
+         rm -rf {src} {build}\n\
+         mkdir -p {src} {build} {artifacts}\n\
+         git -C {repo}/vendor/linux archive --format=tar HEAD | tar -xf - -C {src}\n\
+         make -C {src} O={build} ARCH=x86_64 tinyconfig >/tmp/lupos-linux-modules-tinyconfig.log\n\
+         {src}/scripts/config --file {build}/.config -e MODULES -e BLOCK -e PCI -e NET -e NETDEVICES -e ETHERNET -e NET_VENDOR_INTEL -e VIRTIO_MENU -m VIRTIO -m VIRTIO_PCI -d VIRTIO_PCI_LEGACY -d VIRTIO_PCI_ADMIN_LEGACY -m SCSI -m BLK_DEV_SD -m ATA -m SATA_AHCI{symbol_args}\n\
+         make -C {src} O={build} ARCH=x86_64 olddefconfig >/tmp/lupos-linux-modules-olddefconfig.log\n\
+         make -C {src} O={build} ARCH=x86_64 prepare modules_prepare V=0 >/tmp/lupos-linux-modules-prepare.log\n"
+    );
+
+    for spec in modules {
+        let built = format!("{}/{}", spec.linux_make_dir, spec.linux_make_target);
+        let make_target = shell_single_quote(&built);
+        let built = shell_single_quote(&built);
+        let dest = shell_single_quote(spec.module_path);
+        script.push_str(&format!(
+            "make -C {src} O={build} ARCH=x86_64 {make_target} KBUILD_MODPOST_WARN=1 V=0\n\
+             install -D {build}/{built} {artifacts}/{dest}\n"
+        ));
+    }
+
+    script
+}
+
+fn vendor_linux_module_build_script(
+    repo_root: &Path,
+    source_copy: &Path,
+    build_dir: &Path,
+    artifact_root: &Path,
+    modules: &[&DriverModuleSpec],
+) -> String {
+    vendor_linux_module_build_script_from_shell_paths(
+        &shell_path(repo_root),
+        &shell_path(source_copy),
+        &shell_path(build_dir),
+        &shell_path(artifact_root),
+        modules,
+    )
+}
+
+fn build_linux_driver_module_artifacts(modules: &[&DriverModuleSpec]) -> Result<()> {
+    if modules.is_empty() {
+        return Ok(());
+    }
+
+    let root = repo_root()?;
+    let target = xtask_target_dir()?;
+    let artifact_root = target.join("vendor-linux-modules");
+    let source_copy = target.join("vendor-linux-src");
+    let build_dir = target.join("vendor-linux-build");
+
+    fs::create_dir_all(&artifact_root)
+        .with_context(|| format!("failed to create {}", artifact_root.display()))?;
+
+    fs::create_dir_all(&source_copy)
+        .with_context(|| format!("failed to create {}", source_copy.display()))?;
+    fs::create_dir_all(&build_dir)
+        .with_context(|| format!("failed to create {}", build_dir.display()))?;
+    let (repo_shell, source_shell, build_shell, artifact_shell) = (
+        shell_path(&root),
+        shell_path(&source_copy),
+        shell_path(&build_dir),
+        shell_path(&artifact_root),
+    );
+
+    let script = vendor_linux_module_build_script_from_shell_paths(
+        &repo_shell,
+        &source_shell,
+        &build_shell,
+        &artifact_shell,
+        modules,
+    );
+    println!(
+        "building Linux driver module artifact(s) from vendor/linux: {}",
+        modules
+            .iter()
+            .map(|spec| spec.module_name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(script);
+    run_command(&mut command, "vendor Linux module build")?;
+    Ok(())
+}
+
+fn ensure_linux_driver_module_artifacts(modules: &[&DriverModuleSpec]) -> Result<()> {
+    let _guard = LINUX_DRIVER_MODULE_BUILD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let missing = modules
+        .iter()
+        .copied()
+        .filter(|spec| !linux_driver_module_artifact_is_elf(spec))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        build_linux_driver_module_artifacts(&missing)?;
+    }
+
+    for spec in modules {
+        if !linux_driver_module_artifact_is_elf(spec) {
+            bail!(
+                "{}=m requires Linux-built module artifact {}; build it from {}",
+                spec.symbol,
+                linux_driver_module_artifact(spec)?.display(),
+                spec.vendor_linux_ref
+            );
+        }
+    }
+    Ok(())
+}
+
+fn module_payload(spec: &DriverModuleSpec) -> Result<Vec<u8>> {
+    let path = linux_driver_module_artifact(spec)?;
+    let bytes = fs::read(&path).with_context(|| {
+        format!(
+            "{}=m requires Linux-built module artifact {}; run `cargo xtask modules` to build it from {}",
+            spec.symbol,
+            path.display(),
+            spec.vendor_linux_ref
+        )
+    })?;
+    if !bytes.starts_with(b"\x7fELF") {
+        bail!(
+            "Linux driver module artifact {} is not an ELF .ko",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
+fn module_list_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
+    let mut list = String::new();
+    for spec in modules {
+        list.push_str(spec.module_name);
+        list.push('\n');
+    }
+    list.into_bytes()
+}
+
+fn etc_modules_from_config_text(text: &str) -> Vec<u8> {
+    module_list_from_specs(&staged_module_specs_from_config_text(text))
+}
+
+fn staged_module_files_from_config_text(text: &str) -> Result<Vec<InitramfsFile>> {
+    let modules = staged_module_specs_from_config_text(text);
+    if modules.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut files = Vec::new();
+    let mut modules_order = String::new();
+    let mut modules_dep = String::new();
+    for spec in modules {
+        modules_order.push_str(spec.module_path);
+        modules_order.push('\n');
+        modules_dep.push_str(spec.module_path);
+        modules_dep.push(':');
+        for dep in spec.module_deps {
+            modules_dep.push(' ');
+            modules_dep.push_str(dep);
+        }
+        modules_dep.push('\n');
+        files.push(initramfs_file(
+            &format!("lib/modules/{MODULE_VERSION_DIR}/{}", spec.module_path),
+            0o100644,
+            module_payload(spec)?,
+        ));
+    }
+    files.push(initramfs_file(
+        &format!("lib/modules/{MODULE_VERSION_DIR}/modules.order"),
+        0o100644,
+        modules_order.into_bytes(),
+    ));
+    files.push(initramfs_file(
+        &format!("lib/modules/{MODULE_VERSION_DIR}/modules.dep"),
+        0o100644,
+        modules_dep.into_bytes(),
+    ));
+    Ok(files)
+}
+
+fn staged_module_files_from_repo_config() -> Vec<InitramfsFile> {
+    repo_config_text()
+        .map(|text| {
+            let modules = staged_module_specs_from_config_text(&text);
+            ensure_linux_driver_module_artifacts(&modules)
+                .expect("configured Linux driver module artifacts must be built");
+            staged_module_files_from_config_text(&text)
+                .expect("configured Linux driver module artifacts must be staged")
+        })
+        .unwrap_or_default()
+}
+
+fn etc_modules_from_repo_config() -> Vec<u8> {
+    repo_config_text()
+        .map(|text| etc_modules_from_config_text(&text))
+        .unwrap_or_default()
+}
+
+fn repo_config_text() -> Option<String> {
+    let root = repo_root().ok()?;
+    fs::read_to_string(root.join(".config")).ok()
+}
+
+#[cfg(unix)]
+fn staged_path_permissions(mode: u32) -> fs::Permissions {
+    fs::Permissions::from_mode(mode & 0o7777)
+}
+
+#[cfg(unix)]
+fn apply_staged_path_permissions(path: &Path, mode: u32) -> Result<()> {
+    fs::set_permissions(path, staged_path_permissions(mode))
+        .with_context(|| format!("failed to set mode {mode:o} on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn apply_staged_path_permissions(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_staged_symlink(path: &Path, target: &[u8]) -> Result<()> {
+    let target = core::str::from_utf8(target)
+        .with_context(|| format!("symlink target for {} is not UTF-8", path.display()))?;
+    std::os::unix::fs::symlink(target, path)
+        .with_context(|| format!("failed to symlink {} -> {target}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn write_staged_symlink(path: &Path, target: &[u8]) -> Result<()> {
+    fs::write(path, target)
+        .with_context(|| format!("failed to write symlink placeholder {}", path.display()))
+}
+
+fn write_staged_files(root: &Path, files: &[InitramfsFile]) -> Result<Vec<PathBuf>> {
+    let mut written = Vec::new();
+    for (rel, mode, bytes) in files {
+        let dst = root.join(rel);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        if fs::symlink_metadata(&dst).is_ok() {
+            fs::remove_file(&dst)
+                .with_context(|| format!("failed to replace {}", dst.display()))?;
+        }
+        if initramfs_mode_is_symlink(*mode) {
+            write_staged_symlink(&dst, bytes)?;
+            written.push(dst);
+            continue;
+        }
+        fs::write(&dst, bytes).with_context(|| format!("failed to write {}", dst.display()))?;
+        apply_staged_path_permissions(&dst, *mode)?;
+        written.push(dst);
+    }
+    Ok(written)
+}
+
+fn login_release_root_files() -> Vec<InitramfsFile> {
+    let stage = target_userland_stage_dir().ok();
+    let mut files = login_userland_files_with_stage(stage.as_deref());
+    files.push(initramfs_file(
+        "etc/modules",
+        0o100644,
+        etc_modules_from_repo_config(),
+    ));
+    files.extend(
+        configured_module_files().expect("configured Linux driver module artifacts must be staged"),
+    );
+    files.push(initramfs_file(
+        "usr/share/lupos/release.txt",
+        0o100644,
+        format!(
+            "name=Lupos\nversion={RELEASE_VERSION}\nrootfs=login-fhs\nlinux_refs=vendor/linux/usr/gen_init_cpio.c,vendor/linux/Documentation/filesystems\n"
+        ),
+    ));
+    files.push(initramfs_file(
+        SPLASH_ART_BOOT_PATH,
+        0o100644,
+        SPLASH_ART_BYTES.to_vec(),
+    ));
+    files
+}
+
+fn fhs_entry_origin(path: &str) -> &'static str {
+    if path.starts_with("lib/modules/") {
+        "configured-module-staging"
+    } else if path.starts_with("etc/") {
+        "login-etc"
+    } else if path.starts_with("bin/")
+        || path.starts_with("sbin/")
+        || path.starts_with("usr/bin/")
+        || path.starts_with("usr/sbin/")
+        || path.starts_with("usr/lib/")
+        || path.starts_with("lib/")
+    {
+        "login-userland"
+    } else if path.starts_with("boot/") {
+        "release-boot"
+    } else {
+        "generated"
+    }
+}
+
+fn fhs_manifest_content(files: &[InitramfsFile]) -> String {
+    let mut lines = vec!["path\tkind\tmode\torigin".to_owned()];
+
+    let mut dirs = RELEASE_FHS_DIRS.to_vec();
+    dirs.sort_by_key(|(path, _)| *path);
+    for (path, mode) in dirs {
+        lines.push(format!("{path}\tdir\t{mode:o}\tfhs-skeleton"));
+    }
+
+    let mut file_rows = files
+        .iter()
+        .map(|(path, mode, bytes)| {
+            let kind = initramfs_mode_kind(*mode);
+            format!(
+                "{path}\t{kind}\t{mode:o}\t{}\tsize={}",
+                fhs_entry_origin(path),
+                bytes.len()
+            )
+        })
+        .collect::<Vec<_>>();
+    file_rows.sort();
+    lines.extend(file_rows);
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn write_release_root(root: &Path, kernel_artifact: Option<&Path>) -> Result<PathBuf> {
+    for (rel, mode) in RELEASE_FHS_DIRS {
+        let dir = root.join(rel);
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create FHS dir {}", dir.display()))?;
+        apply_staged_path_permissions(&dir, *mode)?;
+    }
+
+    let mut files = login_release_root_files();
+    if let Some(kernel_artifact) = kernel_artifact {
+        let bytes = fs::read(kernel_artifact)
+            .with_context(|| format!("failed to read {}", kernel_artifact.display()))?;
+        files.push(initramfs_file("boot/bzImage", 0o100644, bytes));
+    }
+    files.push(initramfs_file(
+        "boot/grub/grub.cfg",
+        0o100644,
+        release_grub_cfg_content(),
+    ));
+    files.push(initramfs_file(
+        "boot/initramfs.cpio",
+        0o100644,
+        module_stage_initramfs_cpio(),
+    ));
+
+    let manifest = fhs_manifest_content(&files);
+    files.push(initramfs_file(
+        FHS_MANIFEST_PATH,
+        0o100644,
+        manifest.into_bytes(),
+    ));
+    write_staged_files(root, &files)?;
+    Ok(root.join(FHS_MANIFEST_PATH))
+}
+
+fn release_grub_cfg_content() -> String {
+    let extra_cmdline = env::var(LUPOS_KERNEL_CMDLINE_ENV).unwrap_or_default();
+    let normal_cmdline = format!(
+        "quiet splash systemd.show_status=yes {}",
+        root_disk_cmdline(&extra_cmdline)
+    );
+    let recovery_cmdline = format!(
+        "single systemd.show_status=yes {}",
+        root_disk_cmdline(&extra_cmdline)
+    );
+    format!(
+        r#"set timeout={GRUB_INTERACTIVE_SPLASH_TIMEOUT_SECS}
+set default=0
+insmod all_video
+insmod linux
+set gfxmode=auto
+insmod png
+insmod gfxterm
+terminal_output gfxterm
+background_image /boot/grub/splashart.png
+
+menuentry "lupos" {{
+    linux /boot/bzImage {normal_cmdline}
+    initrd /boot/initramfs.cpio
+    boot
+}}
+
+menuentry "lupos recovery" {{
+    linux /boot/bzImage {recovery_cmdline}
+    initrd /boot/initramfs.cpio
+    boot
+}}
+
+# os-prober entries are appended by the release installer when another OS is detected.
+"#
+    )
+}
+
+fn write_grub_splash_art(root: &Path) -> Result<PathBuf> {
+    let dst = root.join(SPLASH_ART_BOOT_PATH);
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&dst, SPLASH_ART_BYTES)
+        .with_context(|| format!("failed to write splash art to {}", dst.display()))?;
+    Ok(dst)
+}
+
+const RELEASE_EXT4_FEATURE_OPTS: &str = "^metadata_csum,^64bit";
+
+fn release_disk_images_build_script(raw: &Path, qcow2: &Path, vdi: &Path, rootfs: &Path) -> String {
+    let raw_sh = shell_single_quote(&shell_path(raw));
+    let qcow2_sh = shell_single_quote(&shell_path(qcow2));
+    let vdi_sh = shell_single_quote(&shell_path(vdi));
+    let rootfs_sh = shell_single_quote(&shell_path(rootfs));
+    format!(
+        "truncate -s 2G {raw_sh} && mkfs.ext4 -q -F -L lupos-root -O {RELEASE_EXT4_FEATURE_OPTS} -d {rootfs_sh} {raw_sh} && qemu-img convert -f raw -O qcow2 {raw_sh} {qcow2_sh} && qemu-img convert -f raw -O vdi {raw_sh} {vdi_sh}"
+    )
+}
+
+fn create_release_disk_images(qcow2: &Path, vdi: &Path, rootfs: &Path) -> Result<()> {
+    if let Some(parent) = qcow2.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let raw = qcow2.with_extension("ext4");
+    for image in [&raw, qcow2, vdi] {
+        if image.exists() {
+            fs::remove_file(image)
+                .with_context(|| format!("failed to remove {}", image.display()))?;
+        }
+    }
+
+    let script = release_disk_images_build_script(&raw, qcow2, vdi, rootfs);
+
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(script);
+    run_command(&mut command, "release ext4/qcow2/vdi image build")
+}
+
+fn module_stage_initramfs_files() -> Vec<InitramfsFile> {
+    let mut files = vec![
+        initramfs_file("etc/hostname", 0o100644, b"lupos\n".to_vec()),
+        initramfs_file("etc/modules", 0o100644, etc_modules_from_repo_config()),
+    ];
+    files.extend(staged_module_files_from_repo_config());
+    files
+}
+
+fn module_stage_initramfs_cpio() -> Vec<u8> {
+    let files = module_stage_initramfs_files();
+    let borrowed = files
+        .iter()
+        .map(|(path, mode, bytes)| (path.as_str(), *mode, bytes.as_slice()))
+        .collect::<Vec<_>>();
+    build_cpio_newc(&borrowed)
+}
+
+fn initramfs_files(mode: &BootMode) -> Option<Vec<InitramfsFile>> {
+    match mode {
+        BootMode::ExecveTest => Some(vec![initramfs_file(
+            "init",
+            0o100755,
+            build_minimal_elf64(),
+        )]),
+        BootMode::InitramfsRootfsTest => {
+            let mut files = login_userland_files();
+            files.push(initramfs_file(
+                "etc/modules",
+                0o100644,
+                etc_modules_from_repo_config(),
+            ));
+            files.extend(staged_module_files_from_repo_config());
+            Some(files)
+        }
+        BootMode::DiskRootRemountTest => Some(module_stage_initramfs_files()),
+        BootMode::PingSmoke => Some(ping_smoke_userland_files()),
+        BootMode::Login
+        | BootMode::LoginDisplay
+        | BootMode::GuiShell
+        | BootMode::DiskRootFsckTest
+        | BootMode::Pid1HandoffTest
+        | BootMode::LoginStackTest
+        | BootMode::GraphicsX11
+        | BootMode::GraphicsWayland => {
+            let mut files = if matches!(mode, BootMode::LoginDisplay) {
+                login_display_userland_files()
+            } else {
+                login_userland_files()
+            };
+            files.push(initramfs_file(
+                "etc/modules",
+                0o100644,
+                etc_modules_from_repo_config(),
+            ));
+            files.extend(staged_module_files_from_repo_config());
+            Some(files)
+        }
+        BootMode::ShippedCommandsTest => {
+            let mut files = shipped_commands_userland_files();
+            files.push(initramfs_file(
+                "etc/modules",
+                0o100644,
+                etc_modules_from_repo_config(),
+            ));
+            files.extend(staged_module_files_from_repo_config());
+            Some(files)
+        }
+        BootMode::UserspaceSmokeTest | BootMode::RuntimeStressTest => {
+            let mut files = critical_runtime_userland_files();
+            match mode {
+                BootMode::UserspaceSmokeTest => {
+                    upsert_initramfs_file(
+                        &mut files,
+                        USERSPACE_SMOKE_SCRIPT_PATH,
+                        0o100755,
+                        USERSPACE_SMOKE_SCRIPT.as_bytes().to_vec(),
+                    );
+                    upsert_initramfs_file(
+                        &mut files,
+                        "root/test.txt",
+                        0o100644,
+                        b"data\n".to_vec(),
+                    );
+                }
+                BootMode::RuntimeStressTest => upsert_initramfs_file(
+                    &mut files,
+                    RUNTIME_STRESS_SCRIPT_PATH,
+                    0o100755,
+                    RUNTIME_STRESS_SCRIPT.as_bytes().to_vec(),
+                ),
+                _ => {}
+            }
+            files.push(initramfs_file(
+                "etc/modules",
+                0o100644,
+                etc_modules_from_repo_config(),
+            ));
+            files.extend(staged_module_files_from_repo_config());
+            Some(files)
+        }
+        _ => None,
+    }
+}
+
+fn build_initramfs_cpio_unconditional(mode: &BootMode) -> Option<Vec<u8>> {
+    let files = initramfs_files(mode)?;
+    let borrowed = files
+        .iter()
+        .map(|(path, mode, bytes)| (path.as_str(), *mode, bytes.as_slice()))
+        .collect::<Vec<_>>();
+    Some(build_cpio_newc(&borrowed))
+}
+
+fn build_initramfs_cpio(mode: &BootMode) -> Option<Vec<u8>> {
+    if root_disk_boot_uses_module_initrd(mode) {
+        return Some(module_stage_initramfs_cpio());
+    }
+    build_initramfs_cpio_unconditional(mode)
+}
+
+fn root_disk_boot_uses_module_initrd(mode: &BootMode) -> bool {
+    mode_uses_login_root_disk(*mode)
+        && qemu_root_disk_requested_from(env::var(LUPOS_QEMU_ROOT_DISK_ENV).ok().as_deref())
+}
+
+fn mode_uses_login_root_disk(mode: BootMode) -> bool {
+    matches!(
+        mode,
+        BootMode::Login
+            | BootMode::LoginDisplay
+            | BootMode::GuiShell
+            | BootMode::DiskRootFsckTest
+            | BootMode::LoginStackTest
+            | BootMode::UserspaceSmokeTest
+            | BootMode::RuntimeStressTest
+            | BootMode::ShippedCommandsTest
+    )
+}
+
+/// Generate the GRUB boot configuration for a given boot mode.
+/// For initramfs-backed modes, includes an `initrd` line.
+fn grub_cfg_content(mode: &BootMode) -> String {
+    let extra_cmdline = env::var(LUPOS_KERNEL_CMDLINE_ENV).unwrap_or_default();
+    grub_cfg_content_with_cmdline(mode, &extra_cmdline)
+}
+
+fn grub_cfg_content_with_cmdline(mode: &BootMode, extra_cmdline: &str) -> String {
+    let initrd_line = match mode {
+        BootMode::ExecveTest
+        | BootMode::Login
+        | BootMode::LoginDisplay
+        | BootMode::GuiShell
+        | BootMode::InitramfsRootfsTest
+        | BootMode::DiskRootRemountTest
+        | BootMode::DiskRootFsckTest
+        | BootMode::Pid1HandoffTest
+        | BootMode::PingSmoke
+        | BootMode::LoginStackTest
+        | BootMode::UserspaceSmokeTest
+        | BootMode::RuntimeStressTest
+        | BootMode::ShippedCommandsTest
+        | BootMode::GraphicsX11
+        | BootMode::GraphicsWayland => "\n    initrd /boot/initramfs.cpio",
+        _ => "",
+    };
+    let timeout = if matches!(
+        *mode,
+        BootMode::Login
+            | BootMode::LoginDisplay
+            | BootMode::GuiShell
+            | BootMode::GraphicsX11
+            | BootMode::GraphicsWayland
+    ) {
+        GRUB_INTERACTIVE_SPLASH_TIMEOUT_SECS
+    } else {
+        GRUB_TEST_BOOT_TIMEOUT_SECS
+    };
+    // Suppress kernel + systemd late-init banners on the user-facing boot
+    // path so post-login `[ OK ] Started …` lines don't paste themselves
+    // over the running shell's tty1.  `quiet` lowers `console_loglevel`
+    // (vendor/linux/kernel/printk/printk.c) and is the cue systemd uses
+    // to imply `systemd.show_status=no` (vendor/systemd/systemd-260.1/
+    // src/core/main.c::parse_proc_cmdline_item).  We pass both explicitly
+    // so the behavior matches even on systemd versions that don't honour
+    // the implicit mapping. Terminal/login modes below deliberately override
+    // that old behavior with `systemd.show_status=yes` so slow jobs remain
+    // visible on the serial console.
+    let mode_default_cmdline = match mode {
+        BootMode::GuiShell => "quiet splash systemd.show_status=no",
+        BootMode::Login
+        | BootMode::LoginDisplay
+        | BootMode::DiskRootFsckTest
+        | BootMode::LoginStackTest
+        | BootMode::UserspaceSmokeTest
+        | BootMode::RuntimeStressTest
+        | BootMode::ShippedCommandsTest => "systemd.show_status=yes",
+        BootMode::GraphicsX11 | BootMode::GraphicsWayland => "quiet systemd.show_status=no",
+        _ => "",
+    };
+    let extra_cmdline = extra_cmdline.trim();
+    let combined = match (mode_default_cmdline.is_empty(), extra_cmdline.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => extra_cmdline.to_string(),
+        (false, true) => mode_default_cmdline.to_string(),
+        (false, false) => format!("{mode_default_cmdline} {extra_cmdline}"),
+    };
+    let kernel_args = if combined.is_empty() {
+        String::new()
+    } else {
+        format!(" {combined}")
+    };
+
+    format!(
+        r#"set timeout={timeout}
+set default=0
+
+# Use GRUB's stock graphical terminal with the Lupos splash art as background.
+serial --unit=0 --speed=115200
+insmod all_video
+insmod linux
+set gfxmode=auto
+insmod png
+insmod gfxterm
+terminal_input console serial
+terminal_output gfxterm serial
+background_image /boot/grub/splashart.png
+
+menuentry "lupos" {{
+    # linux: GRUB command to load a Linux boot-protocol bzImage.
+    linux /boot/bzImage{kernel_args}{initrd_line}
+    boot
+}}
+"#
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootMode {
+    Hello,
+    /// Interactive VGA/QEMU login boot. Builds a real initramfs and starts PID 1.
+    Login,
+    /// Interactive VGA/QEMU login boot for display/terminal-oriented workflows.
+    LoginDisplay,
+    /// Removed desktop boot profile retained only as a rejected legacy mode.
+    GuiShell,
+    Panic,
+    /// Boot with `test-page-fault` + `qemu-test` features.
+    /// Triggers a deliberate #PF and verifies the IDT handler catches it.
+    IdtTest,
+    /// Boot with `test-smp` (implies `qemu-test`) feature and `-smp 2`.
+    /// BSP wakes 1 AP via INIT-SIPI, sends IPI ping, verifies AP replies.
+    SmpTest,
+    /// Boot with `test-timer` feature.  Verifies the LAPIC periodic timer
+    /// fires at least 100 ticks within ~5 s and reports drift.
+    TimerTest,
+    /// Boot with `test-softirq` feature.  Verifies that registering, raising,
+    /// and draining a softirq plus a tasklet works end-to-end.
+    SoftirqTest,
+    /// Boot with `test-tlb-shootdown` feature and `-smp 2`.  Verifies that
+    /// `flush_tlb_others` delivers a shootdown IPI to an AP and gets an ack.
+    TlbShootdownTest,
+    /// Boot with `test-buddy` feature.  Verifies buddy allocator alloc/free
+    /// at orders 0, 5, 10 and checks free-count round-trip.
+    BuddyTest,
+    /// Boot with `test-slab` + `slab-alloc` features.  Allocates and frees
+    /// 32-byte objects 10 000 times and verifies no overlapping pointers.
+    SlabTest,
+    /// Boot with `test-vmcore` feature.  Verifies kmap/kunmap round-trip on a
+    /// physical page and checks that the data persists in RAM.
+    VmCoreTest,
+    /// Boot with `test-vmcore-walker` feature.  Walks the kernel PML4 with
+    /// the generic page-table walker and asserts every bootstrap mapping is present.
+    VmCoreWalkerTest,
+    /// Boot with `test-mm` feature.  Creates an mm_struct, inserts VMAs into a
+    /// Maple Tree, exercises find_vma / vma_merge / vma_split.
+    MmTest,
+    /// Boot with `test-demand-paging` feature. Verifies demand paging logic
+    /// by triggering anonymous page faults and checking RSS updates.
+    DemandPagingTest,
+    /// Boot with `test-anon-mmap` feature. Exercises do_mmap / do_munmap /
+    /// mprotect / brk / MAP_FIXED_NOREPLACE end-to-end (Milestone 13).
+    AnonMmapTest,
+    /// Boot with `test-mm-selftests` feature.  Runs the ported Linux mm selftest
+    /// suite: map_fixed_noreplace, mremap_dontunmap, mprotect-fault, madv_populate,
+    /// and map_hugetlb (huge-page stub).  Acceptance gate for Milestone 13.
+    MmSelftests,
+    /// Boot with `test-cow-fork` feature.  Exercises dup_mm, copy_page_range,
+    /// wp_page_reuse, wp_page_copy, and smaps dirty accounting.
+    /// Acceptance gate for Milestone 14.
+    CowForkTest,
+    /// Boot with `test-page-cache` feature.  Exercises filemap_read/write,
+    /// address_space, XArray page cache, and readahead under concurrent access.
+    /// Acceptance gate for Milestone 15.
+    PageCacheTest,
+    /// Boot with `test-zswap-pressure` feature. Forces anonymous reclaim into
+    /// zswap and verifies byte-identical loadback under QEMU.
+    ZswapPressureTest,
+    /// Boot with `test-ctxswitch` feature.  Two kthreads alternately increment
+    /// counters via cooperative schedule(); verifies both counters are non-zero
+    /// and the ratio is ≤ 3.  Acceptance gate for Milestone 21.
+    CtxSwitchTest,
+    /// Boot with `test-execve` feature.  Loads an ELF binary from an initramfs
+    /// module via sys_execve and verifies it executes successfully.
+    /// Acceptance gate for Milestone 24.
+    ExecveTest,
+    /// Boot with `test-signals` feature.  Registers a signal handler via
+    /// sys_rt_sigaction, delivers a signal, and verifies the handler executes.
+    /// Acceptance gate for Milestone 25.
+    SignalsTest,
+    /// Boot with `test-exit-wait-ptrace` feature.  Verifies that a child task
+    /// reaches EXIT_ZOMBIE on `do_exit`, that `sys_wait4` reaps it with the
+    /// correct W_EXITCODE-encoded status, and that minimal `ptrace` requests
+    /// (TRACEME, ATTACH, GETREGS, DETACH) work end-to-end.
+    /// Acceptance gate for Milestone 26.
+    ExitWaitPtraceTest,
+    /// Boot with `test-credentials` feature.  Exercises Cred COW
+    /// (`prepare_creds`/`commit_creds`), capability drop, and a seccomp
+    /// cBPF filter that returns SECCOMP_RET_ERRNO|EPERM.
+    /// Acceptance gate for Milestone 27.
+    CredentialsTest,
+    /// Boot with `test-ptrace-seccomp-selftests` feature. Ports a curated
+    /// Linux selftest slice from
+    /// `tools/testing/selftests/ptrace/get_syscall_info.c` and
+    /// `tools/testing/selftests/seccomp/seccomp_bpf.c`.
+    PtraceSeccompSelftestsTest,
+    /// Boot with `test-uefi-platform-certs` feature. Registers a fixture EFI
+    /// db runtime snapshot before security init and verifies `.platform` import.
+    UefiPlatformCertsTest,
+    /// Boot through real OVMF pflash with an enrolled EFI db variable and
+    /// verify firmware GetVariable imports it into `.platform`.
+    UefiPlatformCertsFirmwareTest,
+    /// Boot with `test-namespaces` feature.  Verifies that a CLONE_NEWUTS
+    /// child sees an isolated UTS namespace and that `sys_unshare(CLONE_NEWUTS)`
+    /// produces a fresh nsproxy.
+    /// Acceptance gate for Milestone 28.
+    NamespacesTest,
+    /// Boot with `test-cfs` feature.  Exercises the CFS sched_class, the
+    /// nice-to-weight table, vruntime accounting, and leftmost picking.
+    /// Acceptance gate for Milestone 29.
+    CfsTest,
+    /// Boot with `test-rt-deadline` feature.  Exercises `SCHED_FIFO` /
+    /// `SCHED_RR` priority preemption over CFS plus the `SCHED_DEADLINE`
+    /// admission control / EDF math.
+    /// Acceptance gate for Milestone 30.
+    RtDeadlineTest,
+    /// Boot with `test-smp-balance` feature.  Spawns CPU-bound kthreads on
+    /// multiple CPUs and verifies the load balancer evens the distribution
+    /// plus NOHZ enter/exit bookkeeping.
+    /// Acceptance gate for Milestone 31.
+    SmpBalanceTest,
+    /// Boot with `test-cgroup-cpu-futex` feature.  Exercises the CPU cgroup
+    /// controller (`cpu.max`, `cpu.weight`, `cpu.stat`) plus the futex family
+    /// (FUTEX_WAIT/WAKE/REQUEUE/WAKE_OP/LOCK_PI uncontended path).
+    /// Acceptance gate for Milestone 32.
+    CgroupCpuFutexTest,
+    /// Boot with `test-locking` feature.  Exercises preempt_count, raw
+    /// spinlock, qspinlock, mutex, rwsem, semaphore, completion, rt_mutex.
+    /// Acceptance gate for Milestone 33.
+    LockingTest,
+    /// Boot with `test-rcu` feature.  Exercises tree RCU read-locks,
+    /// `synchronize_rcu`, `call_rcu`, `rcu_barrier`, plus tasks RCU.
+    /// Acceptance gate for Milestone 34.
+    RcuTest,
+    /// Boot with `test-percpu-atomic-wq` feature.  Exercises percpu
+    /// allocation, atomic_t round-trip, and the system workqueue.
+    /// Acceptance gate for Milestone 35.
+    PercpuAtomicWqTest,
+    /// Boot with `test-time` feature.  Exercises clock_gettime, hrtimer,
+    /// posix-timers, timerfd.
+    /// Acceptance gate for Milestone 36.
+    TimeTest,
+    /// Boot with `test-softlockup-watchdog` feature.  Stalls a kthread and
+    /// verifies the periodic tick reports a soft lockup on serial.
+    /// Acceptance gate for Milestone 105.
+    SoftlockupWatchdogTest,
+    /// Boot with `test-irq` feature.  Exercises request_irq, enable/disable,
+    /// generic_handle_irq, threaded IRQ.
+    /// Acceptance gate for Milestone 37.
+    IrqTest,
+    /// Boot with `test-vfs-core` feature.  Mounts ramfs, creates / writes /
+    /// reads / unlinks a file, and verifies dcache/icache refcounts return to
+    /// baseline.  Acceptance gate for Milestone 38.
+    VfsCoreTest,
+    /// Boot with `test-vfs-mount` feature.  Exercises mount/umount,
+    /// `openat2` with `RESOLVE_BENEATH`, fdtable dup2/close_range/fcntl.
+    /// Acceptance gate for Milestone 39.
+    VfsMountTest,
+    /// Boot with `test-procfs` feature.  Mounts procfs, reads `/proc/self/stat`
+    /// and `/proc/meminfo`, verifies Linux schema.
+    /// Acceptance gate for Milestone 40.
+    ProcfsTest,
+    /// Boot with `test-sysfs` feature.  Mounts sysfs, registers a kobject with
+    /// an attribute, round-trips show/store.
+    /// Acceptance gate for Milestone 41.
+    SysfsTest,
+    /// Boot with `test-vfs-fs-suite` feature.  Exercises tmpfs, debugfs,
+    /// cgroupfs v2, and the overlayfs skeleton.
+    /// Acceptance gate for Milestone 42.
+    VfsFsSuiteTest,
+    /// Boot with `test-initramfs-rootfs` feature.  Loads an initramfs CPIO as a
+    /// Linux boot-protocol initrd, unpacks it into a ramfs root, creates the initial
+    /// `/dev` nodes, and mounts procfs + sysfs.
+    InitramfsRootfsTest,
+    /// Boot with `test-disk-root-remount` feature.  Uses initramfs only for
+    /// Linux-built storage modules, then mounts `/dev/vda` as ext4 root and
+    /// remounts it read-write.
+    DiskRootRemountTest,
+    /// Boot real systemd from an ext4 `/dev/vda` root and prove
+    /// `systemd-fsck-root.service` ran successfully.
+    DiskRootFsckTest,
+    /// Boot with `test-boot-partition` feature.  Provisions a partitioned
+    /// in-kernel block device and mounts its FAT partition at `/boot`.
+    BootPartitionTest,
+    /// Boot with `test-mapped-swap` feature.  Provisions a dm-linear
+    /// `/dev/mapper/cl-swap` block device and verifies `swapon(2)` plus
+    /// `/proc/swaps` report it as Linux block-device swap.
+    MappedSwapTest,
+    /// Boot with `test-pid1-handoff` feature.  Extends the rootfs bootstrap by
+    /// spawning PID1, entering ring-3, executing `/sbin/init`, and validating
+    /// a userspace `write(2)` to `/dev/console` before exiting.
+    Pid1HandoffTest,
+    /// Boot with real PID1 supervision and scripted serial login.
+    LoginStackTest,
+    /// Boot a static PID1 that performs the guest DNS + ICMP ping smoke.
+    PingSmoke,
+    /// Boot with `test-block-core` feature.  Exercises Bio submit/endio,
+    /// mq-deadline sort order, gendisk + sysfs registration.
+    /// Acceptance gate for Milestone 43.
+    BlockCoreTest,
+    /// Boot with `test-block-partitions` feature.  Exercises MBR + GPT
+    /// parsing and loop device round-trip.
+    /// Acceptance gate for Milestone 44.
+    BlockPartitionsTest,
+    /// Boot with `test-ext4-read` feature.  Mounts an in-memory ext4 image
+    /// and reads a fixture file via the extent tree.
+    /// Acceptance gate for Milestone 45.
+    Ext4ReadTest,
+    /// Boot with `test-fat-iso-suite` feature.  Exercises FAT32 + ISO9660
+    /// against in-memory fixtures.
+    /// Acceptance gate for Milestone 46.
+    FatIsoSuiteTest,
+    /// Boot with `test-networking` feature. Exercises the networking
+    /// primitives from sk_buff through sockets and netfilter.
+    NetworkingTest,
+    /// Boot with `test-device-model` feature.  Exercises the platform bus
+    /// match/probe/remove path on a synthetic device + driver pair.
+    /// Acceptance gate for Milestone 54.
+    DeviceModelTest,
+    /// Boot with `test-pci-acpi` feature.  Walks ACPI MCFG, scans the q35
+    /// host bridge over ECAM, exercises the DMA API and the passthrough
+    /// IOMMU domain.  Acceptance gate for Milestone 55.
+    PciAcpiTest,
+    /// Boot with `test-module-loader` feature.  Loads a tiny in-tree `.ko`
+    /// from initramfs, runs init/exit, verifies refcount.  Acceptance gate
+    /// for Milestone 56.
+    ModuleLoaderTest,
+    /// Boot with `test-virtio-tty-fb` feature.  Exercises the VirtIO core,
+    /// the n_tty line discipline, the 8250 uart_port, and the framebuffer
+    /// console.  Acceptance gate for Milestone 57.
+    VirtioTtyFbTest,
+    /// Boot with `test-input-hid-usb` feature.  Exercises xHCI probe over
+    /// PCI, USB hub port discovery, HID descriptor parse, and an evdev
+    /// event round-trip.  Acceptance gate for Milestone 58.
+    InputHidUsbTest,
+    /// Boot with `test-syscall-table` feature.  Verifies the 472-entry
+    /// `SYS_CALL_TABLE`, the ENOSYS path for unimplemented slots, and the
+    /// `copy_from_user` page-fault fixup chain via a deliberately-unmapped
+    /// user address.  Acceptance gate for Milestone 59.
+    SyscallTableTest,
+    /// Boot with `test-vdso-iouring` feature.  Verifies the M60 ABI structs
+    /// (vsyscall_gtod_data, io_uring SQE/CQE/params, signalfd_siginfo,
+    /// inotify_event, fanotify_event_metadata, epoll_event), the in-kernel
+    /// ring/counter semantics for io_uring NOP, eventfd, and epoll, and that
+    /// every M60 syscall slot (eventfd2/signalfd4/epoll_*/inotify_*/fanotify_*/
+    /// io_uring_*) routes to a real wrapper, not sys_ni_syscall.  Acceptance
+    /// gate for Milestone 60.
+    VdsoIoUringTest,
+    /// Boot with `test-printk-kmsg` feature.  Verifies the M61 printk ring
+    /// (PrintkInfo layout, reserve/commit, recycle on overflow), level prefix
+    /// parsing, dmesg + dev_kmsg formatters, and a `printk!()` round-trip via
+    /// the ring.  Acceptance gate for Milestone 61.
+    PrintkKmsgTest,
+    /// Boot with `test-ftrace-kprobes` feature.  Verifies static tracepoints
+    /// (register / fire / unregister), the trace ring buffer (push / drain /
+    /// overflow), the ftrace function tracer (probe attach + event record),
+    /// and software kprobes (pre/post handlers + duplicate-registration
+    /// rejection).  Acceptance gate for Milestone 62.
+    FtraceKprobesTest,
+    /// Boot with `test-bpf-perf` feature.  Verifies eBPF interpreter
+    /// (arithmetic + jumps + helpers), `BPF_MAP_TYPE_HASH` and
+    /// `BPF_MAP_TYPE_ARRAY` round-trips, `sys_bpf` `BPF_MAP_CREATE` /
+    /// `BPF_PROG_LOAD` / `BPF_PROG_TEST_RUN`, attach to a tracepoint, and
+    /// `sys_perf_event_open` for `PERF_TYPE_SOFTWARE` `PERF_COUNT_SW_CPU_CLOCK`.
+    /// Acceptance gate for Milestone 63.
+    BpfPerfTest,
+    /// Boot with `test-lsm-suite` feature.  Verifies the LSM dispatch chain
+    /// (default-allow + cap LSM registration), keyring add/request/describe/
+    /// revoke, audit ring + syscall-rule matching, and Landlock `path_open`
+    /// allow-inside / deny-outside semantics through the LSM hook.
+    /// Acceptance gate for Milestone 64.
+    LsmSuiteTest,
+    /// Boot with `test-kunit` feature.  Runs the ABI parity M91
+    /// KUnit-compatible TAP runner with 100 source-backed cases.
+    KunitTest,
+    /// Boot with the KUnit TAP runner filtered to mm kselftest-derived cases.
+    MmKselftests,
+    /// Boot the real login userland and run a bounded shell/coreutils smoke.
+    UserspaceSmokeTest,
+    /// Boot the real login userland and run bounded fork/exec/mmap/fs/net loops.
+    RuntimeStressTest,
+    /// Boot the real login userland and prove the Arch base command surface:
+    /// bash builtins, coreutils, grep/find/tar/sed/awk, pacman local package
+    /// database reads, systemd tools, procps, util-linux, and ip/ping.
+    ShippedCommandsTest,
+    /// Boot with `test-smp-preempt` feature.  Verifies ABI parity timer-driven
+    /// SMP scheduling enablement plus syscall-exit reschedule slowpaths.
+    SmpPreemptTest,
+    /// Boot with `test-smp-migration` feature.  Verifies affinity-aware CPU
+    /// selection plus targeted cross-CPU TLB shootdowns.
+    SmpMigrationTest,
+    /// Boot with `test-pthread-smoke` feature.  Verifies futex PI/requeue and
+    /// clear_child_tid behavior needed by pthread runtimes.
+    PthreadSmokeTest,
+    /// Boot the full glibc + systemd userland with the X11 stack on top.
+    /// `lupos-startx@1.service` starts Xorg with `xf86-video-fbdev` on `/dev/fb0`,
+    /// twm as the window manager, and an xterm.  Requires the userland to be
+    /// rebuilt with `LUPOS_USERLAND_GRAPHICS=1`.
+    GraphicsX11,
+    /// Boot the full glibc + systemd userland with the Wayland stack on top.
+    /// `lupos-weston@2.service` starts Weston with the fbdev backend + pixman
+    /// renderer.  Requires `LUPOS_USERLAND_GRAPHICS=1` and the Xwayland binary
+    /// for X11 client compatibility.
+    GraphicsWayland,
+}
+
+#[derive(Debug)]
+pub struct BuiltArtifacts {
+    pub kernel_elf: PathBuf,
+    /// `Some(_)` for GRUB ISO-backed runs; helper-only artifacts may leave it empty.
+    pub iso: Option<PathBuf>,
+    pub serial_log: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct BootRun {
+    pub artifacts: BuiltArtifacts,
+    pub status: ExitStatus,
+    pub serial_output: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RunOptions {
+    pub exit_after_boot: bool,
+    pub qemu_timeout: Option<Duration>,
+    /// Number of CPUs to pass to QEMU via `-smp N`.
+    /// Use `1` (the default) for single-processor boots; `2` for the SMP test.
+    pub smp_count: usize,
+}
+
+pub fn run_cli<I>(args: I) -> Result<()>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let _program = args.next();
+
+    match args.next().as_deref() {
+        Some("test") => dev_test_cmd(args.collect()),
+        Some("build") => dev_build_cmd(args.collect()),
+        Some("run") => dev_run_cmd(args.collect()),
+        // --- ISO-based commands (GRUB + Linux boot protocol) ---
+        Some("iso") => build_iso_cmd(),
+        Some("bzImage") | Some("bzimage") => build_bzimage_cmd(),
+        Some("modules") => build_modules_cmd(),
+        Some("modules-install") | Some("modules_install") => install_modules_cmd(),
+        Some("userland-build") | Some("userland") => build_userland_cmd(),
+        Some("syscall-inventory") | Some("syscall_inventory") => match args.next().as_deref() {
+            Some("--write") => {
+                if let Some(extra) = args.next() {
+                    bail!("unexpected syscall-inventory argument: {extra}");
+                }
+                syscall_inventory_cmd(true)
+            }
+            Some("--check") | None => {
+                if let Some(extra) = args.next() {
+                    bail!("unexpected syscall-inventory argument: {extra}");
+                }
+                syscall_inventory_cmd(false)
+            }
+            Some(other) => bail!("unknown syscall-inventory option: {other}"),
+        },
+        Some("syscall-parity") | Some("syscall_parity") => {
+            let flag = args.next();
+            let arch = args.next();
+            if flag.as_deref() != Some("--arch") {
+                bail!("usage: cargo xtask syscall-parity --arch x86_64");
+            }
+            if let Some(extra) = args.next() {
+                bail!("unexpected syscall-parity argument: {extra}");
+            }
+            syscall_parity_cmd(arch.as_deref().unwrap_or(""))
+        }
+        Some("abi-parity-inventory") | Some("abi_parity_inventory") => match args.next().as_deref()
+        {
+            Some("--check") | None => {
+                if let Some(extra) = args.next() {
+                    bail!("unexpected abi-parity-inventory argument: {extra}");
+                }
+                abi_parity_inventory_cmd(false)
+            }
+            Some("--write") => {
+                if let Some(extra) = args.next() {
+                    bail!("unexpected abi-parity-inventory argument: {extra}");
+                }
+                abi_parity_inventory_cmd(true)
+            }
+            Some(other) => bail!("unknown abi-parity-inventory option: {other}"),
+        },
+        Some("phase17-inventory") | Some("phase17_inventory") => match args.next().as_deref() {
+            Some("--check") | None => {
+                if let Some(extra) = args.next() {
+                    bail!("unexpected phase17-inventory argument: {extra}");
+                }
+                phase17_inventory_cmd(false)
+            }
+            Some("--write") => {
+                if let Some(extra) = args.next() {
+                    bail!("unexpected phase17-inventory argument: {extra}");
+                }
+                phase17_inventory_cmd(true)
+            }
+            Some(other) => bail!("unknown phase17-inventory option: {other}"),
+        },
+        Some("vendor-sync") | Some("vendor_sync") => {
+            let mut suite = String::from("all");
+            let mut fetch = false;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--suite" => suite = args.next().unwrap_or_default(),
+                    "--check" => fetch = false,
+                    "--fetch" => fetch = true,
+                    other => bail!("unexpected vendor-sync argument: {other}"),
+                }
+            }
+            if suite.is_empty() {
+                bail!("usage: cargo xtask vendor-sync --suite <suite>|all [--check|--fetch]");
+            }
+            abi_parity_vendor_sync_cmd(&suite, fetch)
+        }
+        Some("abi-parity-vendor") | Some("abi_parity_vendor") => match args.next().as_deref() {
+            Some("--check") | None => {
+                if let Some(extra) = args.next() {
+                    bail!("unexpected abi-parity-vendor argument: {extra}");
+                }
+                abi_parity_vendor_cmd(false)
+            }
+            Some("--fetch") => {
+                if let Some(extra) = args.next() {
+                    bail!("unexpected abi-parity-vendor argument: {extra}");
+                }
+                abi_parity_vendor_cmd(true)
+            }
+            Some(other) => bail!("unknown abi-parity-vendor option: {other}"),
+        },
+        Some("suite-build") | Some("suite_build") => {
+            let mut suite = String::from("all");
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--suite" => suite = args.next().unwrap_or_default(),
+                    other => bail!("unexpected suite-build argument: {other}"),
+                }
+            }
+            if suite.is_empty() {
+                bail!("usage: cargo xtask suite-build --suite <suite>|all");
+            }
+            abi_parity_build_suite(&suite)
+        }
+        Some("phase17-suite-build") | Some("phase17_suite_build") => {
+            let mut suite = String::from("all");
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--suite" => suite = args.next().unwrap_or_default(),
+                    other => bail!("unexpected phase17-suite-build argument: {other}"),
+                }
+            }
+            if suite.is_empty() {
+                bail!("usage: cargo xtask phase17-suite-build --suite <suite>|all");
+            }
+            abi_parity_build_suite(&suite)
+        }
+        Some("abi-parity-build") | Some("abi_parity_build") => {
+            let suite = args.next().unwrap_or_else(|| "all".to_string());
+            if let Some(extra) = args.next() {
+                bail!("unexpected abi-parity-build argument: {extra}");
+            }
+            abi_parity_build_suite(&suite)
+        }
+        Some("suite-run") | Some("suite_run") => {
+            let mut suite = None;
+            let mut target = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--suite" => suite = args.next(),
+                    "--target" => target = args.next(),
+                    other => bail!("unexpected suite-run argument: {other}"),
+                }
+            }
+            let suite = suite.ok_or_else(|| {
+                anyhow!("usage: cargo xtask suite-run --suite <suite> --target lupos|linux")
+            })?;
+            let target = match target.as_deref() {
+                Some("lupos") => AbiParityRunTarget::Lupos,
+                Some("linux") => AbiParityRunTarget::Linux,
+                Some(other) => bail!("unsupported suite-run target: {other}"),
+                None => bail!("usage: cargo xtask suite-run --suite <suite> --target lupos|linux"),
+            };
+            abi_parity_run_suite(&suite, target)
+        }
+        Some("phase17-suite-run") | Some("phase17_suite_run") => {
+            let mut suite = None;
+            let mut target = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--suite" => suite = args.next(),
+                    "--target" => target = args.next(),
+                    other => bail!("unexpected phase17-suite-run argument: {other}"),
+                }
+            }
+            let suite = suite.ok_or_else(|| {
+                anyhow!("usage: cargo xtask phase17-suite-run --suite <suite> --target lupos|linux")
+            })?;
+            let target = match target.as_deref() {
+                Some("lupos") => AbiParityRunTarget::Lupos,
+                Some("linux") => AbiParityRunTarget::Linux,
+                Some(other) => bail!("unsupported phase17-suite-run target: {other}"),
+                None => {
+                    bail!(
+                        "usage: cargo xtask phase17-suite-run --suite <suite> --target lupos|linux"
+                    )
+                }
+            };
+            abi_parity_run_suite(&suite, target)
+        }
+        Some("suite-compare") | Some("suite_compare") => {
+            let flag = args.next();
+            let suite = args.next();
+            if flag.as_deref() != Some("--suite") {
+                bail!("usage: cargo xtask suite-compare --suite <suite>");
+            }
+            if let Some(extra) = args.next() {
+                bail!("unexpected suite-compare argument: {extra}");
+            }
+            abi_parity_compare_suite(
+                suite
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("usage: cargo xtask suite-compare --suite <suite>"))?,
+            )
+            .map(|_| ())
+        }
+        Some("phase17-suite-compare") | Some("phase17_suite_compare") => {
+            let flag = args.next();
+            let suite = args.next();
+            if flag.as_deref() != Some("--suite") {
+                bail!("usage: cargo xtask phase17-suite-compare --suite <suite>");
+            }
+            if let Some(extra) = args.next() {
+                bail!("unexpected phase17-suite-compare argument: {extra}");
+            }
+            abi_parity_compare_suite(suite.as_deref().ok_or_else(|| {
+                anyhow!("usage: cargo xtask phase17-suite-compare --suite <suite>")
+            })?)
+            .map(|_| ())
+        }
+        Some("install") => install_cmd(),
+        Some("ping-smoke") | Some("ping_smoke") => run_ping_smoke(),
+        Some("boot-triage") | Some("boot_triage") => {
+            let path = args
+                .next()
+                .ok_or_else(|| anyhow!("usage: cargo xtask boot-triage <serial.log>"))?;
+            if let Some(extra) = args.next() {
+                bail!("unexpected boot-triage argument: {extra}");
+            }
+            boot_triage_cmd(Path::new(&path))
+        }
+        Some("qemu-iso") => run_single_login_boot(false),
+        Some("qemu-iso-terminal") | Some("qemu-iso-serial") | Some("run-terminal") => {
+            run_single_login_boot_terminal()
+        }
+        Some("qemu-iso-display") | Some("run-display") => run_single_login_boot(false),
+        Some("release") => run_release_cmd(),
+        Some("phase17-strace-ab") | Some("phase17_strace_ab") => run_phase17_strace_ab(),
+        Some("strace-ab") | Some("strace_ab") => run_abi_parity_strace_ab(),
+        Some("phase17-syzkaller") | Some("phase17_syzkaller") => {
+            let mut duration = None;
+            let mut vms = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--duration" => duration = args.next(),
+                    "--vms" => vms = args.next(),
+                    other => bail!("unexpected phase17-syzkaller argument: {other}"),
+                }
+            }
+            if duration.as_deref() != Some("7d") || vms.as_deref() != Some("32") {
+                bail!("usage: cargo xtask phase17-syzkaller --duration 7d --vms 32");
+            }
+            run_phase17_syzkaller(duration.as_deref().unwrap(), vms.as_deref().unwrap())
+        }
+        Some("syzkaller") => {
+            let mut duration = None;
+            let mut vms = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--duration" => duration = args.next(),
+                    "--vms" => vms = args.next(),
+                    other => bail!("unexpected syzkaller argument: {other}"),
+                }
+            }
+            if duration.as_deref() != Some("7d") || vms.as_deref() != Some("32") {
+                bail!("usage: cargo xtask syzkaller --duration 7d --vms 32");
+            }
+            run_abi_parity_syzkaller(duration.as_deref().unwrap(), vms.as_deref().unwrap())
+        }
+        Some("phase17-rootfs") | Some("phase17_rootfs") => {
+            let flag = args.next();
+            let distro = args.next();
+            if flag.as_deref() != Some("--distro") {
+                bail!("usage: cargo xtask phase17-rootfs --distro arch");
+            }
+            if let Some(extra) = args.next() {
+                bail!("unexpected phase17-rootfs argument: {extra}");
+            }
+            match distro.as_deref() {
+                Some("arch") => run_phase17_distro_rootfs("arch"),
+                Some(other) => bail!("unsupported phase17-rootfs distro: {other}"),
+                None => bail!("--distro requires arch"),
+            }
+        }
+        Some("distro-rootfs") | Some("distro_rootfs") => {
+            let flag = args.next();
+            let distro = args.next();
+            if flag.as_deref() != Some("--distro") {
+                bail!("usage: cargo xtask distro-rootfs --distro arch");
+            }
+            if let Some(extra) = args.next() {
+                bail!("unexpected distro-rootfs argument: {extra}");
+            }
+            match distro.as_deref() {
+                Some("arch") => run_abi_parity_distro_rootfs("arch"),
+                Some(other) => bail!("unsupported distro-rootfs distro: {other}"),
+                None => bail!("--distro requires arch"),
+            }
+        }
+        Some("kselftest-lupos-guest") | Some("kselftest_lupos_guest") => {
+            let mut suite_root = None;
+            let mut summary = None;
+            let mut raw = None;
+            let mut command = None;
+            let mut timeout_secs = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--suite-root" => suite_root = args.next(),
+                    "--summary" => summary = args.next(),
+                    "--raw" => raw = args.next(),
+                    "--command" => command = args.next(),
+                    "--timeout-secs" => timeout_secs = args.next(),
+                    other => bail!("unexpected kselftest-lupos-guest argument: {other}"),
+                }
+            }
+            run_kselftest_lupos_guest(
+                Path::new(
+                    suite_root
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("usage: cargo xtask kselftest-lupos-guest --suite-root <dir> --summary <file> --raw <file> [--command <shell>] [--timeout-secs <n>]"))?,
+                ),
+                Path::new(
+                    summary
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("usage: cargo xtask kselftest-lupos-guest --suite-root <dir> --summary <file> --raw <file> [--command <shell>] [--timeout-secs <n>]"))?,
+                ),
+                Path::new(
+                    raw.as_deref().ok_or_else(|| {
+                        anyhow!("usage: cargo xtask kselftest-lupos-guest --suite-root <dir> --summary <file> --raw <file> [--command <shell>] [--timeout-secs <n>]")
+                    })?,
+                ),
+                command.as_deref(),
+                timeout_secs
+                    .as_deref()
+                    .map(|value| value.parse::<u64>())
+                    .transpose()
+                    .context("--timeout-secs must be an integer")?,
+            )
+        }
+        Some("phase17-final") | Some("phase17_final") => phase17_final_cmd(),
+        Some("abi-parity-final") | Some("abi_parity_final") => abi_parity_final_cmd(),
+        Some("audit-layout") | Some("audit_layout") => {
+            if let Some(extra) = args.next() {
+                bail!("unexpected audit-layout argument: {extra}");
+            }
+            audit::audit_layout_cmd()
+        }
+        Some("audit-parity") | Some("audit_parity") => {
+            let mut fail_on = audit::ParityFailMode::Never;
+            let mut require_tags = false;
+            let mut scope = audit::ParityScope::All;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--require-tags" => require_tags = true,
+                    "--fail-on" => {
+                        let value = args.next().ok_or_else(|| {
+                            anyhow!(
+                                "usage: cargo xtask audit-parity [--require-tags] [--fail-on never|stub|partial|missing] [--scope {}]",
+                                audit::ParityScope::usage()
+                            )
+                        })?;
+                        fail_on = audit::ParityFailMode::parse(&value)?;
+                    }
+                    "--scope" => {
+                        let value = args.next().ok_or_else(|| {
+                            anyhow!(
+                                "usage: cargo xtask audit-parity [--require-tags] [--fail-on never|stub|partial|missing] [--scope {}]",
+                                audit::ParityScope::usage()
+                            )
+                        })?;
+                        scope = audit::ParityScope::parse(&value)?;
+                    }
+                    other => {
+                        if let Some(value) = other.strip_prefix("--fail-on=") {
+                            fail_on = audit::ParityFailMode::parse(value)?;
+                        } else if let Some(value) = other.strip_prefix("--scope=") {
+                            scope = audit::ParityScope::parse(value)?;
+                        } else {
+                            bail!("unexpected audit-parity argument: {other}");
+                        }
+                    }
+                }
+            }
+            audit::audit_parity_cmd(fail_on, require_tags, scope)
+        }
+        Some("audit-kunit") | Some("audit_kunit") => {
+            if let Some(extra) = args.next() {
+                bail!("unexpected audit-kunit argument: {extra}");
+            }
+            audit::audit_kunit_cmd()
+        }
+        Some("audit-tests") | Some("audit_tests") => {
+            if let Some(extra) = args.next() {
+                bail!("unexpected audit-tests argument: {extra}");
+            }
+            audit::audit_tests_cmd()
+        }
+        Some("config-parity") | Some("config_parity") => {
+            if let Some(extra) = args.next() {
+                bail!("unexpected config-parity argument: {extra}");
+            }
+            audit::config_parity_cmd()
+        }
+        Some("audit-mm-symbols") | Some("audit_mm_symbols") => {
+            let mut fail_on = audit::MmSymbolFailMode::Never;
+            let mut write_docs = false;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--write-docs" => write_docs = true,
+                    "--fail-on" => {
+                        let value = args.next().ok_or_else(|| {
+                            anyhow!(
+                                "usage: cargo xtask audit-mm-symbols [--write-docs] [--fail-on never|missing|stub|partial]"
+                            )
+                        })?;
+                        fail_on = audit::MmSymbolFailMode::parse(&value)?;
+                    }
+                    other => {
+                        if let Some(value) = other.strip_prefix("--fail-on=") {
+                            fail_on = audit::MmSymbolFailMode::parse(value)?;
+                        } else {
+                            bail!("unexpected audit-mm-symbols argument: {other}");
+                        }
+                    }
+                }
+            }
+            audit::audit_mm_symbols_cmd(fail_on, write_docs)
+        }
+        Some("parity-table") | Some("parity_table") => {
+            if let Some(extra) = args.next() {
+                bail!("unexpected parity-table argument: {extra}");
+            }
+            audit::parity_table_cmd()
+        }
+        Some("test-boot") => {
+            let mut mode: Option<String> = None;
+            while let Some(arg) = args.next() {
+                if arg == "--mode" {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("usage: cargo xtask test-boot [--mode <mode>]"))?;
+                    mode = Some(value);
+                } else if let Some(value) = arg.strip_prefix("--mode=") {
+                    mode = Some(value.to_owned());
+                } else {
+                    bail!("usage: cargo xtask test-boot [--mode <mode>] (unexpected: {arg})");
+                }
+            }
+            if let Some(mode) = mode {
+                let run = resolve_boot_test_mode(&mode)
+                    .ok_or_else(|| anyhow!("unknown test-boot mode: {mode}"))?;
+                run()
+            } else {
+                run_default_boot_smoke()
+            }
+        }
+        // --- Deprecated aliases: keep names, route through the bzImage ISO path. ---
+        Some("qemu") => {
+            let run = build_and_run_iso(BootMode::Hello, qemu_run_options())?;
+            print!("{}", run.serial_output);
+            Ok(())
+        }
+        Some("qemu-display") => run_single_login_boot(false),
+        Some(other) => bail!("unknown xtask command: {other}"),
+        None => bail!(
+            "usage: cargo xtask <test|build|run> [flags]\n\
+             backend: test-boot, boot-triage, ping-smoke, iso, bzImage, modules, modules-install, userland-build, syscall-inventory, syscall-parity, vendor-sync, suite-build, suite-run, suite-compare, install, release, strace-ab, syzkaller, distro-rootfs, audit-layout, audit-parity, audit-tests, config-parity, audit-kunit, audit-mm-symbols, parity-table\n\
+             interactive: qemu-iso-display, qemu-iso-terminal\n\
+             deprecated: cargo xtask <qemu|qemu-display|run-display>"
+        ),
+    }
+}
+
+const LUPOS_LIB_TEST_ARGS: &[&str] = &["test", "-p", "lupos", "--lib", "--", "--test-threads=1"];
+// Serialized like LUPOS_LIB_TEST_ARGS: several xtask tests mutate process-global
+// env vars via `unsafe env::set_var` (EnvVarGuard) and document a single-threaded
+// assumption (see pick_qemu_accel_honors_env_override). Without this, concurrent
+// tests clobber each other's env (e.g. LUPOS_QEMU_ROOT_DISK) and flake.
+const XTASK_LIB_TEST_ARGS: &[&str] = &["test", "-p", "xtask", "--lib", "--", "--test-threads=1"];
+
+fn run_cargo_step(args: &[&str], label: &str) -> Result<()> {
+    let mut command = cargo_command();
+    command.args(args);
+    run_command(&mut command, label)
+}
+
+fn run_driver_binary_policy_check() -> Result<()> {
+    let root = repo_root()?;
+    let forbidden = [
+        ["fake", "_probe"].concat(),
+        ["lupos", "-ko"].concat(),
+        ["legacy", "-rust", "-driver", "-fixtures"].concat(),
+        ["load_lupos_module", "_descriptor"].concat(),
+        ["src", "/drivers"].concat(),
+        ["crate", "::drivers"].concat(),
+    ]
+    .join("|");
+    let mut command = Command::new("rg");
+    command
+        .current_dir(&root)
+        .args(["--hidden", "-g", "!.git", "-g", "!target", "-n"])
+        .arg(forbidden)
+        .arg(".");
+    let output = command
+        .output()
+        .context("failed to run driver binary-only policy scan with rg")?;
+    match output.status.code() {
+        Some(1) => Ok(()),
+        Some(0) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            bail!("driver binary-only policy scan found forbidden entries:\n{stdout}")
+        }
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("driver binary-only policy scan failed: {stderr}")
+        }
+    }
+}
+
+fn dev_test_cmd(args: Vec<String>) -> Result<()> {
+    let mut run_fmt = true;
+    let mut run_units = true;
+    let mut run_audits = true;
+    let mut run_policy_scan = true;
+    let mut run_modules = false;
+    let mut run_kunit_audit = false;
+    let mut boot_mode: Option<String> = None;
+
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--quick" => {
+                run_audits = false;
+                run_policy_scan = false;
+            }
+            "--all" => {
+                run_modules = true;
+                run_kunit_audit = true;
+                boot_mode.get_or_insert_with(|| "module-loader".to_string());
+            }
+            "--boot" => {
+                boot_mode.get_or_insert_with(|| "default".to_string());
+            }
+            "--mode" => {
+                boot_mode = Some(iter.next().ok_or_else(|| {
+                    anyhow!("usage: cargo xtask test [--mode <mode>|--boot|--all]")
+                })?);
+            }
+            "--modules" => run_modules = true,
+            "--kunit" => run_kunit_audit = true,
+            "--no-fmt" => run_fmt = false,
+            "--no-units" => run_units = false,
+            "--no-audit" => run_audits = false,
+            "--no-policy-scan" => run_policy_scan = false,
+            other => {
+                if let Some(mode) = other.strip_prefix("--mode=") {
+                    boot_mode = Some(mode.to_owned());
+                } else {
+                    bail!("unexpected test flag: {other}");
+                }
+            }
+        }
+    }
+
+    if run_fmt {
+        run_cargo_step(&["fmt", "--check"], "format check")?;
+    }
+    if run_units {
+        run_cargo_step(LUPOS_LIB_TEST_ARGS, "lupos lib tests")?;
+        run_cargo_step(XTASK_LIB_TEST_ARGS, "xtask lib tests")?;
+    }
+    if run_policy_scan {
+        run_driver_binary_policy_check()?;
+    }
+    if run_audits {
+        audit::audit_layout_cmd()?;
+        audit::audit_tests_cmd()?;
+        audit::config_parity_cmd()?;
+        audit::audit_parity_cmd(audit::ParityFailMode::Never, true, audit::ParityScope::All)?;
+        audit::audit_parity_cmd(
+            audit::ParityFailMode::Stub,
+            true,
+            audit::ParityScope::CriticalRuntime,
+        )?;
+    }
+    if run_kunit_audit {
+        audit::audit_kunit_cmd()?;
+    }
+    if run_modules {
+        build_modules_cmd()?;
+        install_modules_cmd()?;
+    }
+    if let Some(mode) = boot_mode {
+        if mode == "default" {
+            run_default_boot_smoke()
+        } else {
+            let run = resolve_boot_test_mode(&mode)
+                .ok_or_else(|| anyhow!("unknown test mode: {mode}"))?;
+            run()
+        }
+    } else {
+        Ok(())
+    }
+}
+
+fn dev_build_actions(args: Vec<String>) -> Result<Vec<String>> {
+    let mut actions = Vec::new();
+    if args.is_empty() {
+        // Pure Lupos kernel (ELF + bzImage) on the generic x86_64 config. Use
+        // `--userland --iso` (make image) for a bootable Arch userland ISO.
+        actions.push("bzimage".to_string());
+    } else {
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--all" => {
+                    actions.extend([
+                        "userland".to_string(),
+                        "iso".to_string(),
+                        "modules".to_string(),
+                    ]);
+                }
+                "--iso" => actions.push("iso".to_string()),
+                "--bzimage" | "--bzImage" => actions.push("bzimage".to_string()),
+                "--modules" => actions.push("modules".to_string()),
+                "--modules-install" | "--modules_install" => {
+                    actions.push("modules-install".to_string())
+                }
+                "--userland" => actions.push("userland".to_string()),
+                "--install" => actions.push("install".to_string()),
+                "--release" => actions.push("release".to_string()),
+                other => bail!("unexpected build flag: {other}"),
+            }
+        }
+    }
+    Ok(actions)
+}
+
+fn dev_build_cmd(args: Vec<String>) -> Result<()> {
+    let actions = dev_build_actions(args)?;
+    for action in actions {
+        match action.as_str() {
+            "iso" => build_iso_cmd()?,
+            "bzimage" => build_bzimage_cmd()?,
+            "modules" => build_modules_cmd()?,
+            "modules-install" => install_modules_cmd()?,
+            "userland" => build_userland_cmd()?,
+            "install" => install_cmd()?,
+            "release" => run_release_cmd()?,
+            _ => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum DevRunTarget {
+    Display,
+    Headless,
+    PingSmoke,
+    Mode(String),
+    Terminal,
+    Gui,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DevRunSelection {
+    target: DevRunTarget,
+    gdb: bool,
+}
+
+fn dev_run_usage() -> &'static str {
+    "usage: cargo xtask run [--display|--headless|--terminal|--gui|--gdb|--mode <mode>]"
+}
+
+fn parse_dev_run_args(args: Vec<String>) -> Result<DevRunSelection> {
+    let mut mode: Option<String> = None;
+    let mut headless = false;
+    let mut ping_smoke = false;
+    let mut terminal = false;
+    let mut gui = false;
+    let mut gdb = false;
+
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--display" => headless = false,
+            "--headless" => headless = true,
+            "--terminal" => terminal = true,
+            "--gui" => gui = true,
+            "--gdb" => gdb = true,
+            "--ping-smoke" => ping_smoke = true,
+            "--mode" => {
+                mode = Some(iter.next().ok_or_else(|| anyhow!(dev_run_usage()))?);
+                headless = true;
+            }
+            other => {
+                if let Some(value) = other.strip_prefix("--mode=") {
+                    mode = Some(value.to_owned());
+                    headless = true;
+                } else {
+                    bail!("unexpected run flag: {other}\n{}", dev_run_usage());
+                }
+            }
+        }
+    }
+
+    let explicit_targets = usize::from(mode.is_some())
+        + usize::from(ping_smoke)
+        + usize::from(terminal)
+        + usize::from(gui);
+    if explicit_targets > 1 || (headless && (terminal || gui)) {
+        bail!("{}", dev_run_usage());
+    }
+
+    let target = if ping_smoke {
+        DevRunTarget::PingSmoke
+    } else if terminal {
+        DevRunTarget::Terminal
+    } else if gui {
+        DevRunTarget::Gui
+    } else if let Some(mode) = mode {
+        DevRunTarget::Mode(mode)
+    } else if headless {
+        DevRunTarget::Headless
+    } else {
+        DevRunTarget::Display
+    };
+
+    Ok(DevRunSelection { target, gdb })
+}
+
+fn dev_run_cmd(args: Vec<String>) -> Result<()> {
+    let selection = parse_dev_run_args(args)?;
+    let _gdb_guard = if selection.gdb {
+        Some(EnvVarGuard::set(LUPOS_QEMU_GDB_ENV, "1"))
+    } else {
+        None
+    };
+
+    match selection.target {
+        DevRunTarget::PingSmoke => run_ping_smoke(),
+        DevRunTarget::Terminal => run_single_login_boot_terminal(),
+        DevRunTarget::Gui => run_gui_shell_boot(),
+        DevRunTarget::Mode(mode) => {
+            let run =
+                resolve_boot_test_mode(&mode).ok_or_else(|| anyhow!("unknown run mode: {mode}"))?;
+            run()
+        }
+        DevRunTarget::Headless => run_default_boot_smoke(),
+        DevRunTarget::Display => run_single_login_boot(false),
+    }
+}
+
+fn normalize_boot_test_mode(mode: &str) -> &str {
+    match mode {
+        // Accept the common singular spelling while keeping device-model as
+        // the canonical milestone/mode name everywhere else.
+        "test-device-mode" => "test-device-model",
+        "device-mode" => "device-model",
+        "pid1-handoff" => "pid1-handoff",
+        "test-pid1-handoff" => "pid1-handoff",
+        "login-stack" => "login-stack",
+        "test-login-stack" => "login-stack",
+        "disk-root-fsck" => "disk-root-fsck",
+        "test-disk-root-fsck" => "disk-root-fsck",
+        "test-zswap-pressure" => "zswap-pressure",
+        "test-uefi-platform-certs" => "uefi-platform-certs",
+        "test-uefi-platform-certs-firmware" => "uefi-platform-certs-firmware",
+        "test-lockup-watchdog" => "lockup-watchdog",
+        "softlockup-watchdog" => "lockup-watchdog",
+        "test-softlockup-watchdog" => "lockup-watchdog",
+        "test-grub-bzimage" => "grub-bzimage",
+        "grub-bzimage" => "grub-bzimage",
+        // Compatibility aliases retained for older scripts; the GRUB smoke
+        // now boots through the Linux bzImage profile, not a Multiboot loader.
+        "test-multiboot-grub" => "grub-bzimage",
+        "multiboot-grub" => "grub-bzimage",
+        // Accept explicit source-backed evidence aliases.
+        "ptrace-seccomp-selftests" => "ptrace-seccomp-selftests",
+        "test-ptrace-seccomp-selftests" => "ptrace-seccomp-selftests",
+        "ext4-write-journal-replay" => "mock-ext4-write-journal-replay",
+        "socket-syscall-matrix" => "mock-socket-syscall-matrix",
+        "tcp-retransmit-and-sack" => "mock-tcp-retransmit-and-sack",
+        "nftables-bytecode" => "mock-nf-tables-bytecode",
+        "uevent-and-device-links" => "mock-uevent-and-device-links",
+        "module-crc" => "mock-module-crc",
+        "posix-pty" => "mock-posix-pty",
+        "drm-mode-setting" => "mock-drm-mode-setting",
+        "anon-inode-fd" => "mock-anon-inode-fd",
+        "io-uring-op-matrix" => "mock-io-uring-op-matrix",
+        "lsm-blob-lifecycle" => "mock-lsm-blob-lifecycle",
+        "audit-netlink" => "mock-audit-netlink",
+        "keyctl-extended-command" => "mock-keyctl-extended-command",
+        "bpf-verifier-rejection" => "mock-bpf-verifier-rejection",
+        "bpf-jit-equivalence" => "mock-bpf-jit-equivalence",
+        "tristate-module-staging" => "source-tristate-module-staging",
+        "source-tristate-module-staging" => "source-tristate-module-staging",
+        "inittab-parser" => "source-inittab-parser",
+        "source-inittab-parser" => "source-inittab-parser",
+        "rcs-module-loading" => "source-rcs-module-loading",
+        "source-rcs-module-loading" => "source-rcs-module-loading",
+        "tty-job-control" => "source-tty-job-control",
+        "source-tty-job-control" => "source-tty-job-control",
+        "fhs-manifest" => "source-fhs-manifest",
+        "source-fhs-manifest" => "source-fhs-manifest",
+        "test-kunit" => "kunit",
+        "test-mm-kselftests" => "mm-kselftests",
+        "test-entry-kselftests" => "entry-kselftests",
+        "test-futex-kselftests" => "futex-kselftests",
+        "test-rcu-kselftests" => "rcu-kselftests",
+        "test-fs-kselftests" => "fs-kselftests",
+        "test-ipc-kselftests" => "ipc-kselftests",
+        "test-cgroup-kselftests" => "cgroup-kselftests",
+        "test-net-kselftests" => "net-kselftests",
+        "test-drivers-kselftests" => "drivers-kselftests",
+        "test-security-kselftests" => "security-kselftests",
+        "test-block-kselftests" => "block-kselftests",
+        "test-userspace-kselftests" => "userspace-kselftests",
+        "test-kselftest" => "kselftest",
+        "test-ltp" => "ltp",
+        "test-xfstests" => "xfstests",
+        "test-blktests" => "blktests",
+        "test-packetdrill" => "packetdrill",
+        "test-smp-preempt" => "smp-preempt",
+        "test-smp-migration" => "smp-migration",
+        "test-pthread-smoke" => "pthread-smoke",
+        _ => mode,
+    }
+}
+
+fn resolve_boot_test_mode(mode: &str) -> Option<fn() -> Result<()>> {
+    match normalize_boot_test_mode(mode) {
+        "buddy" | "buddy-test" | "test-buddy" => Some(run_buddy_tests),
+        "slab" | "slab-test" | "test-slab" => Some(run_slab_tests),
+        "vmcore" | "vmcore-test" | "test-vmcore" => Some(run_vmcore_tests),
+        "vmcore-walker" | "vmcore-walker-test" | "test-vmcore-walker" => {
+            Some(run_vmcore_walker_tests)
+        }
+        "mm" | "mm-test" | "test-mm" => Some(run_mm_tests),
+        "demand-paging" | "demand-paging-test" | "test-demand-paging" => {
+            Some(run_demand_paging_tests)
+        }
+        "anon-mmap" | "anon-mmap-test" | "test-anon-mmap" => Some(run_anon_mmap_tests),
+        "mm-selftests" => Some(run_mm_selftests),
+        "test-mm-selftests" => Some(run_mm_selftests),
+        "cow-fork" => Some(run_cow_fork_tests),
+        "test-cow-fork" => Some(run_cow_fork_tests),
+        "page-cache" => Some(run_page_cache_tests),
+        "test-page-cache" => Some(run_page_cache_tests),
+        "zswap-pressure" => Some(run_zswap_pressure_tests),
+        "test-zswap-pressure" => Some(run_zswap_pressure_tests),
+        "ctx-switch" => Some(run_ctxswitch_tests),
+        "test-ctx-switch" => Some(run_ctxswitch_tests),
+        "test-execve" | "execve" => Some(run_execve_tests),
+        "test-signals" | "signals" => Some(run_signals_tests),
+        "test-exit-wait-ptrace" | "exit-wait-ptrace" => Some(run_exit_wait_ptrace_tests),
+        "test-credentials" | "credentials" => Some(run_credentials_tests),
+        "test-ptrace-seccomp-selftests" | "ptrace-seccomp-selftests" => {
+            Some(run_ptrace_seccomp_selftests)
+        }
+        "test-uefi-platform-certs" | "uefi-platform-certs" => Some(run_uefi_platform_certs_tests),
+        "test-uefi-platform-certs-firmware" | "uefi-platform-certs-firmware" => {
+            Some(run_uefi_platform_certs_firmware_tests)
+        }
+        "test-namespaces" | "namespaces" => Some(run_namespaces_tests),
+        "test-cfs" | "cfs" => Some(run_cfs_tests),
+        "test-rt-deadline" | "rt-deadline" => Some(run_rt_deadline_tests),
+        "test-smp-balance" | "smp-balance" => Some(run_smp_balance_tests),
+        "test-cgroup-cpu-futex" | "cgroup-cpu-futex" => Some(run_cgroup_cpu_futex_tests),
+        "test-locking" | "locking" => Some(run_locking_tests),
+        "test-rcu" | "rcu" => Some(run_rcu_tests),
+        "test-percpu-atomic-wq" | "percpu-atomic-wq" => Some(run_percpu_atomic_wq_tests),
+        "test-time" | "time" => Some(run_time_tests),
+        "test-lockup-watchdog"
+        | "lockup-watchdog"
+        | "test-softlockup-watchdog"
+        | "softlockup-watchdog" => Some(run_softlockup_watchdog_tests),
+        "test-irq" | "irq" => Some(run_irq_tests),
+        "test-vfs-core" | "vfs-core" => Some(run_vfs_core_tests),
+        "test-vfs-mount" | "vfs-mount" => Some(run_vfs_mount_tests),
+        "test-procfs" | "procfs" => Some(run_procfs_tests),
+        "test-sysfs" | "sysfs" => Some(run_sysfs_tests),
+        "test-vfs-fs-suite" | "vfs-fs-suite" => Some(run_vfs_fs_suite_tests),
+        "test-initramfs-rootfs" | "initramfs-rootfs" => Some(run_initramfs_rootfs_tests),
+        "test-disk-root-remount" | "disk-root-remount" => Some(run_disk_root_remount_tests),
+        "test-disk-root-fsck" | "disk-root-fsck" => Some(run_disk_root_fsck_tests),
+        "test-boot-partition" | "boot-partition" => Some(run_boot_partition_tests),
+        "test-mapped-swap" | "mapped-swap" => Some(run_mapped_swap_tests),
+        "test-pid1-handoff" | "pid1-handoff" => Some(run_pid1_handoff_tests),
+        "test-login-stack" | "login-stack" => Some(run_login_stack_tests),
+        "test-terminal-login" | "terminal-login" => Some(run_login_stack_tests),
+        "test-userspace-smoke" | "userspace-smoke" => Some(run_userspace_smoke_tests),
+        "test-runtime-stress" | "runtime-stress" => Some(run_runtime_stress_tests),
+        "test-shipped-commands" | "shipped-commands" => Some(run_shipped_commands_tests),
+        "test-block-core" | "block-core" => Some(run_block_core_tests),
+        "test-block-partitions" | "block-partitions" => Some(run_block_partitions_tests),
+        "test-ext4-read" | "ext4-read" => Some(run_ext4_read_tests),
+        "test-fat-iso-suite" | "fat-iso-suite" => Some(run_fat_iso_suite_tests),
+        "test-networking" | "networking" => Some(run_networking_tests),
+        "test-device-model" | "device-model" => Some(run_device_model_tests),
+        "test-pci-acpi" | "pci-acpi" => Some(run_pci_acpi_tests),
+        "test-module-loader" | "module-loader" => Some(run_module_loader_tests),
+        "test-virtio-tty-fb" | "virtio-tty-fb" => Some(run_virtio_tty_fb_tests),
+        "test-input-hid-usb" | "input-hid-usb" => Some(run_input_hid_usb_tests),
+        "test-syscall-table" | "syscall-table" => Some(run_syscall_table_tests),
+        "test-vdso-iouring" | "vdso-iouring" => Some(run_vdso_iouring_tests),
+        "test-printk-kmsg" | "printk-kmsg" => Some(run_printk_kmsg_tests),
+        "test-ftrace-kprobes" | "ftrace-kprobes" => Some(run_ftrace_kprobes_tests),
+        "test-bpf-perf" | "bpf-perf" => Some(run_bpf_perf_tests),
+        "test-lsm-suite" | "lsm-suite" => Some(run_lsm_suite_tests),
+        "test-device-mode" | "device-mode" => Some(run_device_model_tests),
+        "grub-bzimage" => Some(run_grub_bzimage_tests),
+        "kunit" => Some(run_kunit_tests),
+        "mm-kselftests" => Some(run_mm_kselftests),
+        "entry-kselftests" => Some(run_entry_kselftests),
+        "futex-kselftests" => Some(run_futex_kselftests),
+        "rcu-kselftests" => Some(run_rcu_kselftests),
+        "fs-kselftests" => Some(run_fs_kselftests),
+        "ipc-kselftests" => Some(run_ipc_kselftests),
+        "cgroup-kselftests" => Some(run_cgroup_kselftests),
+        "net-kselftests" => Some(run_net_kselftests),
+        "drivers-kselftests" => Some(run_drivers_kselftests),
+        "security-kselftests" => Some(run_security_kselftests),
+        "block-kselftests" => Some(run_block_kselftests),
+        "userspace-kselftests" => Some(run_userspace_kselftests),
+        "kselftest" => Some(run_abi_parity_kselftest_tests),
+        "ltp" => Some(run_abi_parity_ltp_tests),
+        "xfstests" => Some(run_abi_parity_xfstests),
+        "blktests" => Some(run_abi_parity_blktests),
+        "packetdrill" => Some(run_abi_parity_packetdrill_tests),
+        "smp-preempt" => Some(run_abi_parity_smp_preempt_tests),
+        "smp-migration" => Some(run_abi_parity_smp_migration_tests),
+        "pthread-smoke" => Some(run_abi_parity_pthread_smoke_tests),
+        "mock-ext4-write-journal-replay" => Some(run_mock_ext4_write_journal_replay),
+        "mock-socket-syscall-matrix" => Some(run_mock_socket_syscall_matrix),
+        "mock-tcp-retransmit-and-sack" => Some(run_mock_tcp_retransmit_and_sack),
+        "mock-nf-tables-bytecode" => Some(run_mock_nf_tables_bytecode),
+        "mock-uevent-and-device-links" => Some(run_mock_uevent_and_device_links),
+        "mock-module-crc" => Some(run_mock_module_crc),
+        "mock-posix-pty" => Some(run_mock_posix_pty),
+        "mock-drm-mode-setting" => Some(run_mock_drm_mode_setting),
+        "mock-anon-inode-fd" => Some(run_mock_anon_inode_fd),
+        "mock-io-uring-op-matrix" => Some(run_mock_io_uring_op_matrix),
+        "mock-lsm-blob-lifecycle" => Some(run_mock_lsm_blob_lifecycle),
+        "mock-audit-netlink" => Some(run_mock_audit_netlink),
+        "mock-keyctl-extended-command" => Some(run_mock_keyctl_extended_command),
+        "mock-bpf-verifier-rejection" => Some(run_mock_bpf_verifier_rejection),
+        "mock-bpf-jit-equivalence" => Some(run_mock_bpf_jit_equivalence),
+        "source-tristate-module-staging" => Some(run_source_tristate_module_staging),
+        "source-inittab-parser" => Some(run_source_inittab_parser),
+        "source-rcs-module-loading" => Some(run_source_rcs_module_loading),
+        "source-tty-job-control" => Some(run_source_tty_job_control),
+        "source-fhs-manifest" => Some(run_source_fhs_manifest),
+        _ => None,
+    }
+}
+
+pub fn abi_parity_mock_fixture_mode_from_acceptance_check(check: &str) -> Option<&'static str> {
+    let mut candidates = vec![check];
+    if let Some(without_mocked) = check.strip_prefix("mocked ") {
+        candidates.push(without_mocked);
+    }
+    if let Some(without_mocked_or_ported) = check.strip_prefix("ported ") {
+        candidates.push(without_mocked_or_ported);
+    }
+
+    for candidate in candidates {
+        for fixture in ABI_PARITY_MOCK_FIXTURES {
+            if fixture.acceptance_check == candidate || fixture.acceptance_check.contains(candidate)
+            {
+                return Some(fixture.mode);
+            }
+        }
+    }
+    None
+}
+
+pub fn abi_parity_mock_fixtures() -> &'static [AbiParityMockFixture] {
+    ABI_PARITY_MOCK_FIXTURES
+}
+
+pub fn abi_parity_mock_fixture_by_mode(mode: &str) -> Option<&'static AbiParityMockFixture> {
+    let normalized = normalize_boot_test_mode(mode);
+    ABI_PARITY_MOCK_FIXTURES
+        .iter()
+        .find(|fixture| fixture.mode == normalized)
+}
+
+pub fn validate_abi_parity_mock_fixture(mode: &str) -> Result<()> {
+    let fixture = abi_parity_mock_fixture_by_mode(mode)
+        .ok_or_else(|| anyhow!("unknown ABI parity evidence mode: {mode}"))?;
+    validate_abi_parity_fixture_linux_evidence(fixture)?;
+    println!(
+        "ABI parity evidence verified: {} ({})",
+        fixture.acceptance_check, fixture.mode
+    );
+    Ok(())
+}
+
+pub fn abi_parity_acceptance_check_kind(check: &str) -> Option<AbiParityAcceptanceCheckKind> {
+    if boot_mode_from_acceptance_check(check).is_some() {
+        return Some(AbiParityAcceptanceCheckKind::BootMode);
+    }
+    if abi_parity_mock_fixture_mode_from_acceptance_check(check).is_some() {
+        return Some(AbiParityAcceptanceCheckKind::MockFixture);
+    }
+    if check == "every ABI parity test names its vendor/linux source"
+        || check == "ABI parity remains blocked until every ABI parity milestone is checked"
+    {
+        return Some(AbiParityAcceptanceCheckKind::ReadinessMarker);
+    }
+
+    let mut parts = check.split_whitespace();
+    match parts.next()? {
+        "make" => match parts.next() {
+            Some("lupos_defconfig" | "iso" | "localmodconfig") => {
+                Some(AbiParityAcceptanceCheckKind::Make)
+            }
+            _ => None,
+        },
+        "cargo" => match parts.next()? {
+            "xtask" => match parts.next() {
+                Some("release" | "qemu-iso-display") => {
+                    Some(AbiParityAcceptanceCheckKind::CargoXtask)
+                }
+                _ => None,
+            },
+            "test" => {
+                let package_flag = parts.next()?;
+                let package = parts.next()?;
+                let filter = parts.next()?;
+                if package_flag == "-p" && package == "xtask" && filter == "abi_parity" {
+                    Some(AbiParityAcceptanceCheckKind::CargoTestAbiParity)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Returns the boot/fixture mode string for an acceptance check if it is runnable
+/// via `cargo xtask test-boot --mode <mode>`.
+///
+/// This includes:
+/// - direct command checks with `--mode`
+/// - explicit "mocked ..." checks
+/// - explicit "ported ..." checks
+pub fn abi_parity_boot_mode_from_acceptance_check(check: &str) -> Option<&str> {
+    boot_mode_from_acceptance_check(check)
+        .or_else(|| abi_parity_mock_fixture_mode_from_acceptance_check(check))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AbiParityRunTarget {
+    Lupos,
+    Linux,
+}
+
+impl AbiParityRunTarget {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lupos => "lupos",
+            Self::Linux => "linux",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AbiParitySuiteSpec {
+    name: &'static str,
+    matrix_path: &'static str,
+    vendor_suite: &'static str,
+}
+
+const ABI_PARITY_MATRIX_FILES: &[(&str, &str)] = &[
+    ("kunit", "src/docs/abi-parity-suite/kunit.tsv"),
+    ("kselftest", "src/docs/abi-parity-suite/kselftest.tsv"),
+    ("ltp", "src/docs/abi-parity-suite/ltp.tsv"),
+    ("xfstests", "src/docs/abi-parity-suite/xfstests.tsv"),
+    ("blktests", "src/docs/abi-parity-suite/blktests.tsv"),
+    ("packetdrill", "src/docs/abi-parity-suite/packetdrill.tsv"),
+    ("strace-ab", "src/docs/abi-parity-suite/strace-ab.tsv"),
+    ("syzkaller", "src/docs/abi-parity-suite/syzkaller.tsv"),
+    ("arch-rootfs", "src/docs/abi-parity-suite/arch-rootfs.tsv"),
+    ("smp-preempt", "src/docs/abi-parity-suite/smp-preempt.tsv"),
+    (
+        "smp-migration",
+        "src/docs/abi-parity-suite/smp-migration.tsv",
+    ),
+    (
+        "pthread-smoke",
+        "src/docs/abi-parity-suite/pthread-smoke.tsv",
+    ),
+    ("final", "src/docs/abi-parity-suite/final.tsv"),
+];
+
+const ABI_PARITY_RUNNABLE_SUITES: &[AbiParitySuiteSpec] = &[
+    AbiParitySuiteSpec {
+        name: "kselftest",
+        matrix_path: "src/docs/abi-parity-suite/kselftest.tsv",
+        vendor_suite: "linux",
+    },
+    AbiParitySuiteSpec {
+        name: "ltp",
+        matrix_path: "src/docs/abi-parity-suite/ltp.tsv",
+        vendor_suite: "ltp",
+    },
+    AbiParitySuiteSpec {
+        name: "xfstests",
+        matrix_path: "src/docs/abi-parity-suite/xfstests.tsv",
+        vendor_suite: "xfstests",
+    },
+    AbiParitySuiteSpec {
+        name: "blktests",
+        matrix_path: "src/docs/abi-parity-suite/blktests.tsv",
+        vendor_suite: "blktests",
+    },
+    AbiParitySuiteSpec {
+        name: "packetdrill",
+        matrix_path: "src/docs/abi-parity-suite/packetdrill.tsv",
+        vendor_suite: "packetdrill",
+    },
+    AbiParitySuiteSpec {
+        name: "strace-ab",
+        matrix_path: "src/docs/abi-parity-suite/strace-ab.tsv",
+        vendor_suite: "linux",
+    },
+    AbiParitySuiteSpec {
+        name: "syzkaller",
+        matrix_path: "src/docs/abi-parity-suite/syzkaller.tsv",
+        vendor_suite: "syzkaller",
+    },
+    AbiParitySuiteSpec {
+        name: "arch-rootfs",
+        matrix_path: "src/docs/abi-parity-suite/arch-rootfs.tsv",
+        vendor_suite: "arch-rootfs",
+    },
+    AbiParitySuiteSpec {
+        name: "smp-preempt",
+        matrix_path: "src/docs/abi-parity-suite/smp-preempt.tsv",
+        vendor_suite: "linux",
+    },
+    AbiParitySuiteSpec {
+        name: "smp-migration",
+        matrix_path: "src/docs/abi-parity-suite/smp-migration.tsv",
+        vendor_suite: "linux",
+    },
+    AbiParitySuiteSpec {
+        name: "pthread-smoke",
+        matrix_path: "src/docs/abi-parity-suite/pthread-smoke.tsv",
+        vendor_suite: "linux",
+    },
+];
+
+#[derive(Clone, Debug)]
+struct AbiParityInventoryRow<'a> {
+    milestone: &'a str,
+    suite: &'a str,
+    test_id: &'a str,
+    source: &'a str,
+    lupos_command: &'a str,
+    linux_reference_command: &'a str,
+    status: &'a str,
+    expected_failure: &'a str,
+    notes: &'a str,
+}
+
+#[derive(Clone, Debug)]
+struct AbiParityMatrixRow<'a> {
+    milestone: &'a str,
+    suite: &'a str,
+    test_id: &'a str,
+    source: &'a str,
+    lupos_command: &'a str,
+    linux_reference_command: &'a str,
+    status: &'a str,
+    expected_failure: &'a str,
+    root_cause_id: &'a str,
+    notes: &'a str,
+}
+
+#[derive(Clone, Debug)]
+struct AbiParityRootCauseRow<'a> {
+    root_cause_id: &'a str,
+    suite_scope: &'a str,
+    status: &'a str,
+    owner: &'a str,
+    summary: &'a str,
+}
+
+#[derive(Clone, Debug)]
+struct AbiParityVendorRow<'a> {
+    suite: &'a str,
+    version: &'a str,
+    source_url: &'a str,
+    archive_or_commit: &'a str,
+    sha256: &'a str,
+    status: &'a str,
+    setup_script: &'a str,
+    notes: &'a str,
+}
+
+#[derive(Clone, Debug)]
+struct Phase17BridgeRow<'a> {
+    milestone: &'a str,
+    suite: &'a str,
+    test_id: &'a str,
+    phase17_command: &'a str,
+    notes: &'a str,
+}
+
+#[derive(Clone, Debug)]
+struct Phase17InventoryRow<'a> {
+    milestone: &'a str,
+    suite: &'a str,
+    test_id: &'a str,
+    source: &'a str,
+    phase17_command: &'a str,
+    backend_lupos_command: &'a str,
+    linux_reference_command: &'a str,
+    status: &'a str,
+    expected_failure: &'a str,
+    notes: &'a str,
+}
+
+fn parse_abi_parity_inventory(text: &str) -> Result<Vec<AbiParityInventoryRow<'_>>> {
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| anyhow!("empty ABI parity inventory"))?;
+    let expected = "milestone\tsuite\ttest_id\tsource\tlupos_command\tlinux_reference_command\tstatus\texpected_failure\tnotes";
+    if header != expected {
+        bail!("invalid ABI parity inventory header: {header}");
+    }
+    let mut rows = Vec::new();
+    for (idx, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() != 9 {
+            bail!(
+                "invalid ABI parity inventory row {}: expected 9 columns, got {}",
+                idx + 2,
+                cols.len()
+            );
+        }
+        rows.push(AbiParityInventoryRow {
+            milestone: cols[0],
+            suite: cols[1],
+            test_id: cols[2],
+            source: cols[3],
+            lupos_command: cols[4],
+            linux_reference_command: cols[5],
+            status: cols[6],
+            expected_failure: cols[7],
+            notes: cols[8],
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_abi_parity_matrix(text: &str) -> Result<Vec<AbiParityMatrixRow<'_>>> {
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| anyhow!("empty ABI parity matrix"))?;
+    if header != ABI_PARITY_MATRIX_HEADER {
+        bail!("invalid ABI parity matrix header: {header}");
+    }
+    let mut rows = Vec::new();
+    for (idx, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() != 10 {
+            bail!(
+                "invalid ABI parity matrix row {}: expected 10 columns, got {}",
+                idx + 2,
+                cols.len()
+            );
+        }
+        rows.push(AbiParityMatrixRow {
+            milestone: cols[0],
+            suite: cols[1],
+            test_id: cols[2],
+            source: cols[3],
+            lupos_command: cols[4],
+            linux_reference_command: cols[5],
+            status: cols[6],
+            expected_failure: cols[7],
+            root_cause_id: cols[8],
+            notes: cols[9],
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_abi_parity_root_causes(text: &str) -> Result<Vec<AbiParityRootCauseRow<'_>>> {
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| anyhow!("empty ABI parity root-cause ledger"))?;
+    if header != ABI_PARITY_ROOT_CAUSE_HEADER {
+        bail!("invalid ABI parity root-cause header: {header}");
+    }
+    let mut rows = Vec::new();
+    for (idx, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() != 5 {
+            bail!(
+                "invalid ABI parity root-cause row {}: expected 5 columns, got {}",
+                idx + 2,
+                cols.len()
+            );
+        }
+        rows.push(AbiParityRootCauseRow {
+            root_cause_id: cols[0],
+            suite_scope: cols[1],
+            status: cols[2],
+            owner: cols[3],
+            summary: cols[4],
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_abi_parity_vendor_lock(text: &str) -> Result<Vec<AbiParityVendorRow<'_>>> {
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| anyhow!("empty ABI parity vendor lock"))?;
+    let expected =
+        "suite\tversion\tsource_url\tarchive_or_commit\tsha256\tstatus\tsetup_script\tnotes";
+    if header != expected {
+        bail!("invalid ABI parity vendor lock header: {header}");
+    }
+    let mut rows = Vec::new();
+    for (idx, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() != 8 {
+            bail!(
+                "invalid ABI parity vendor row {}: expected 8 columns, got {}",
+                idx + 2,
+                cols.len()
+            );
+        }
+        rows.push(AbiParityVendorRow {
+            suite: cols[0],
+            version: cols[1],
+            source_url: cols[2],
+            archive_or_commit: cols[3],
+            sha256: cols[4],
+            status: cols[5],
+            setup_script: cols[6],
+            notes: cols[7],
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_phase17_bridge(text: &str) -> Result<Vec<Phase17BridgeRow<'_>>> {
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| anyhow!("empty Phase 17 bridge manifest"))?;
+    if header != PHASE17_BRIDGE_HEADER {
+        bail!("invalid Phase 17 bridge header: {header}");
+    }
+    let mut rows = Vec::new();
+    for (idx, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() != 5 {
+            bail!(
+                "invalid Phase 17 bridge row {}: expected 5 columns, got {}",
+                idx + 2,
+                cols.len()
+            );
+        }
+        rows.push(Phase17BridgeRow {
+            milestone: cols[0],
+            suite: cols[1],
+            test_id: cols[2],
+            phase17_command: cols[3],
+            notes: cols[4],
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_phase17_inventory(text: &str) -> Result<Vec<Phase17InventoryRow<'_>>> {
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| anyhow!("empty Phase 17 inventory"))?;
+    if header != PHASE17_INVENTORY_HEADER {
+        bail!("invalid Phase 17 inventory header: {header}");
+    }
+    let mut rows = Vec::new();
+    for (idx, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() != 10 {
+            bail!(
+                "invalid Phase 17 inventory row {}: expected 10 columns, got {}",
+                idx + 2,
+                cols.len()
+            );
+        }
+        rows.push(Phase17InventoryRow {
+            milestone: cols[0],
+            suite: cols[1],
+            test_id: cols[2],
+            source: cols[3],
+            phase17_command: cols[4],
+            backend_lupos_command: cols[5],
+            linux_reference_command: cols[6],
+            status: cols[7],
+            expected_failure: cols[8],
+            notes: cols[9],
+        });
+    }
+    Ok(rows)
+}
+
+fn abi_parity_runnable_suite_spec(name: &str) -> Result<&'static AbiParitySuiteSpec> {
+    ABI_PARITY_RUNNABLE_SUITES
+        .iter()
+        .find(|suite| suite.name == name)
+        .ok_or_else(|| {
+            anyhow!(
+                "unsupported ABI parity suite: {name}; expected one of {}",
+                ABI_PARITY_RUNNABLE_SUITES
+                    .iter()
+                    .map(|suite| suite.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+fn abi_parity_repo_path(path: &str) -> Result<PathBuf> {
+    Ok(repo_root()?.join(path))
+}
+
+fn abi_parity_matrix_path(name: &str) -> Result<&'static str> {
+    ABI_PARITY_MATRIX_FILES
+        .iter()
+        .find(|(suite, _)| *suite == name)
+        .map(|(_, path)| *path)
+        .ok_or_else(|| anyhow!("missing ABI parity matrix path for {name}"))
+}
+
+fn abi_parity_vendor_checkout_path(suite: &str) -> Result<PathBuf> {
+    let path = match suite {
+        "linux" => "vendor/linux",
+        "ltp" => "vendor/ltp",
+        "xfstests" => "vendor/xfstests",
+        "blktests" => "vendor/blktests",
+        "packetdrill" => "vendor/packetdrill",
+        "syzkaller" => "vendor/syzkaller",
+        "arch-rootfs" => "vendor/arch-rootfs",
+        other => bail!("unsupported ABI parity vendor suite path: {other}"),
+    };
+    abi_parity_repo_path(path)
+}
+
+fn validate_abi_parity_inventory(text: &str) -> Result<()> {
+    let rows = parse_abi_parity_inventory(text)?;
+    if rows.is_empty() {
+        bail!("ABI parity inventory must contain at least one row");
+    }
+    let mut ids = HashSet::new();
+    for row in &rows {
+        if !ids.insert(row.test_id) {
+            bail!("duplicate ABI parity test id: {}", row.test_id);
+        }
+        if !matches!(
+            row.status,
+            "planned" | "running" | "pass" | "expected-fail" | "blocked"
+        ) {
+            bail!(
+                "{} has invalid ABI parity status {}",
+                row.test_id,
+                row.status
+            );
+        }
+        if !matches!(row.expected_failure, "true" | "false") {
+            bail!(
+                "{} has invalid expected_failure {}",
+                row.test_id,
+                row.expected_failure
+            );
+        }
+        if row.milestone.is_empty()
+            || row.suite.is_empty()
+            || row.source.is_empty()
+            || row.lupos_command.is_empty()
+            || row.linux_reference_command.is_empty()
+            || row.notes.is_empty()
+        {
+            bail!(
+                "{} has an empty required ABI parity inventory field",
+                row.test_id
+            );
+        }
+        if row.status == "pass"
+            && !(row.source.starts_with("vendor/linux")
+                || row.source.starts_with("vendor/")
+                || row.source.contains(";vendor/linux"))
+        {
+            bail!("{} is pass without a vendored source path", row.test_id);
+        }
+        if row.status == "expected-fail" && row.expected_failure != "true" {
+            bail!(
+                "{} is expected-fail but expected_failure is not true",
+                row.test_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_abi_parity_root_causes(text: &str) -> Result<Vec<AbiParityRootCauseRow<'_>>> {
+    let rows = parse_abi_parity_root_causes(text)?;
+    if rows.is_empty() {
+        bail!("ABI parity root-cause ledger must contain at least one row");
+    }
+    let mut ids = HashSet::new();
+    for row in &rows {
+        if !ids.insert(row.root_cause_id) {
+            bail!("duplicate ABI parity root-cause id: {}", row.root_cause_id);
+        }
+        if row.root_cause_id.is_empty()
+            || row.suite_scope.is_empty()
+            || row.status.is_empty()
+            || row.owner.is_empty()
+            || row.summary.is_empty()
+        {
+            bail!(
+                "{} has an empty required ABI parity root-cause field",
+                row.root_cause_id
+            );
+        }
+        if !matches!(row.status, "open" | "tracking" | "resolved") {
+            bail!(
+                "{} has invalid ABI parity root-cause status {}",
+                row.root_cause_id,
+                row.status
+            );
+        }
+    }
+    Ok(rows)
+}
+
+fn validate_abi_parity_matrix<'a>(
+    path: &str,
+    text: &'a str,
+    causes: &[AbiParityRootCauseRow<'_>],
+) -> Result<Vec<AbiParityMatrixRow<'a>>> {
+    let rows = parse_abi_parity_matrix(text)?;
+    if rows.is_empty() {
+        bail!("{path} must contain at least one ABI parity matrix row");
+    }
+    let root_cause_ids = causes
+        .iter()
+        .map(|row| row.root_cause_id)
+        .collect::<HashSet<_>>();
+    let mut ids = HashSet::new();
+    for row in &rows {
+        if !ids.insert(row.test_id) {
+            bail!(
+                "{path} contains duplicate ABI parity test id {}",
+                row.test_id
+            );
+        }
+        if !matches!(
+            row.status,
+            "planned" | "running" | "pass" | "expected-fail" | "blocked"
+        ) {
+            bail!("{path} has invalid ABI parity status {}", row.status);
+        }
+        if !matches!(row.expected_failure, "true" | "false") {
+            bail!(
+                "{path} has invalid expected_failure {}",
+                row.expected_failure
+            );
+        }
+        for field in [
+            row.milestone,
+            row.suite,
+            row.test_id,
+            row.source,
+            row.lupos_command,
+            row.linux_reference_command,
+            row.notes,
+        ] {
+            if field.is_empty() {
+                bail!("{path} has an empty required ABI parity matrix field");
+            }
+        }
+        if row.status == "pass" {
+            if row.expected_failure != "false" {
+                bail!(
+                    "{path} marks {} pass but expected_failure is not false",
+                    row.test_id
+                );
+            }
+            if row.root_cause_id != "-" {
+                bail!(
+                    "{path} marks {} pass but still carries a root cause",
+                    row.test_id
+                );
+            }
+        } else {
+            if row.root_cause_id == "-" {
+                bail!(
+                    "{path} marks {} {} without a tracked root cause",
+                    row.test_id,
+                    row.status
+                );
+            }
+            if !root_cause_ids.contains(row.root_cause_id) {
+                bail!(
+                    "{path} references unknown ABI parity root-cause id {}",
+                    row.root_cause_id
+                );
+            }
+        }
+        if row.status == "expected-fail" && row.expected_failure != "true" {
+            bail!(
+                "{path} marks {} expected-fail but expected_failure is false",
+                row.test_id
+            );
+        }
+        if row.status != "expected-fail" && row.expected_failure == "true" {
+            bail!(
+                "{path} marks {} expected_failure=true without expected-fail status",
+                row.test_id
+            );
+        }
+    }
+    Ok(rows)
+}
+
+fn render_abi_parity_inventory_from_matrices() -> Result<String> {
+    let root_causes_path = abi_parity_repo_path(ABI_PARITY_ROOT_CAUSES_PATH)?;
+    let root_causes_text = fs::read_to_string(&root_causes_path)
+        .with_context(|| format!("failed to read {}", root_causes_path.display()))?;
+    let root_causes = validate_abi_parity_root_causes(&root_causes_text)?;
+
+    let mut rendered = String::from(
+        "milestone\tsuite\ttest_id\tsource\tlupos_command\tlinux_reference_command\tstatus\texpected_failure\tnotes\n",
+    );
+    for (_, path) in ABI_PARITY_MATRIX_FILES {
+        let matrix_path = abi_parity_repo_path(path)?;
+        let matrix_text = fs::read_to_string(&matrix_path)
+            .with_context(|| format!("failed to read {}", matrix_path.display()))?;
+        let rows = validate_abi_parity_matrix(path, &matrix_text, &root_causes)?;
+        for row in rows {
+            let notes = if row.root_cause_id == "-" {
+                row.notes.to_string()
+            } else {
+                format!("{} [root-cause: {}]", row.notes, row.root_cause_id)
+            };
+            rendered.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                row.milestone,
+                row.suite,
+                row.test_id,
+                row.source,
+                row.lupos_command,
+                row.linux_reference_command,
+                row.status,
+                row.expected_failure,
+                notes
+            ));
+        }
+    }
+    Ok(rendered)
+}
+
+fn validate_phase17_bridge<'a>(
+    text: &'a str,
+    abi_parity_rows: &[AbiParityInventoryRow<'_>],
+) -> Result<Vec<Phase17BridgeRow<'a>>> {
+    let rows = parse_phase17_bridge(text)?;
+    if rows.is_empty() {
+        bail!("Phase 17 bridge manifest must contain at least one row");
+    }
+    let mut ids = HashSet::new();
+    for row in &rows {
+        if !ids.insert(row.test_id) {
+            bail!("duplicate Phase 17 bridge test id: {}", row.test_id);
+        }
+        if !matches!(row.milestone, "99" | "100" | "101") {
+            bail!(
+                "{} must map to the external-proof milestone range 99-101",
+                row.test_id
+            );
+        }
+        if row.suite.is_empty() || row.phase17_command.is_empty() || row.notes.is_empty() {
+            bail!(
+                "{} has an empty required Phase 17 bridge field",
+                row.test_id
+            );
+        }
+        if !row.phase17_command.starts_with("cargo xtask phase17") {
+            bail!(
+                "{} must be invoked through a Phase 17-facing command, got {}",
+                row.test_id,
+                row.phase17_command
+            );
+        }
+        let backend = abi_parity_rows
+            .iter()
+            .find(|candidate| candidate.test_id == row.test_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} is missing from the ABI parity backend inventory",
+                    row.test_id
+                )
+            })?;
+        if backend.suite != row.suite {
+            bail!(
+                "{} maps to suite {} in Phase 17 but {} in the ABI parity backend",
+                row.test_id,
+                row.suite,
+                backend.suite
+            );
+        }
+    }
+    Ok(rows)
+}
+
+fn render_phase17_inventory_from_bridge() -> Result<String> {
+    let abi_parity_path = abi_parity_repo_path(ABI_PARITY_VALIDATION_INVENTORY_PATH)?;
+    let abi_parity_text = fs::read_to_string(&abi_parity_path)
+        .with_context(|| format!("failed to read {}", abi_parity_path.display()))?;
+    validate_abi_parity_inventory(&abi_parity_text)?;
+    let abi_parity_rows = parse_abi_parity_inventory(&abi_parity_text)?;
+
+    let bridge_path = abi_parity_repo_path(PHASE17_BRIDGE_PATH)?;
+    let bridge_text = fs::read_to_string(&bridge_path)
+        .with_context(|| format!("failed to read {}", bridge_path.display()))?;
+    let bridge_rows = validate_phase17_bridge(&bridge_text, &abi_parity_rows)?;
+
+    let mut rendered = String::from(PHASE17_INVENTORY_HEADER);
+    rendered.push('\n');
+    for row in bridge_rows {
+        let backend = abi_parity_rows
+            .iter()
+            .find(|candidate| candidate.test_id == row.test_id)
+            .ok_or_else(|| anyhow!("missing ABI parity backend row for {}", row.test_id))?;
+        let notes = format!("{} Backend status/evidence: {}", row.notes, backend.notes);
+        rendered.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            row.milestone,
+            row.suite,
+            row.test_id,
+            backend.source,
+            row.phase17_command,
+            backend.lupos_command,
+            backend.linux_reference_command,
+            backend.status,
+            backend.expected_failure,
+            notes
+        ));
+    }
+    Ok(rendered)
+}
+
+fn abi_parity_inventory_cmd(write: bool) -> Result<()> {
+    let generated = render_abi_parity_inventory_from_matrices()?;
+    if write {
+        let path = abi_parity_repo_path(ABI_PARITY_VALIDATION_INVENTORY_PATH)?;
+        fs::write(&path, &generated)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    let current_path = abi_parity_repo_path(ABI_PARITY_VALIDATION_INVENTORY_PATH)?;
+    let current = fs::read_to_string(&current_path)
+        .with_context(|| format!("failed to read {}", current_path.display()))?;
+    validate_abi_parity_inventory(&current)?;
+    if current != generated {
+        bail!(
+            "{} is out of sync with ABI parity suite matrices; run cargo xtask abi-parity-inventory --write",
+            ABI_PARITY_VALIDATION_INVENTORY_PATH
+        );
+    }
+    let rows = parse_abi_parity_inventory(&current)?;
+    let pass = rows.iter().filter(|row| row.status == "pass").count();
+    let blocked = rows.iter().filter(|row| row.status == "blocked").count();
+    println!(
+        "ABI parity inventory ok: {} rows, {} pass, {} blocked",
+        rows.len(),
+        pass,
+        blocked
+    );
+    Ok(())
+}
+
+fn validate_phase17_inventory(text: &str) -> Result<()> {
+    let rows = parse_phase17_inventory(text)?;
+    if rows.is_empty() {
+        bail!("Phase 17 inventory must contain at least one row");
+    }
+    let mut ids = HashSet::new();
+    for row in &rows {
+        if !ids.insert(row.test_id) {
+            bail!("duplicate Phase 17 test id: {}", row.test_id);
+        }
+        if !matches!(row.milestone, "99" | "100" | "101") {
+            bail!(
+                "{} has invalid Phase 17 milestone {}",
+                row.test_id,
+                row.milestone
+            );
+        }
+        if row.suite.is_empty()
+            || row.source.is_empty()
+            || row.phase17_command.is_empty()
+            || row.backend_lupos_command.is_empty()
+            || row.linux_reference_command.is_empty()
+            || row.notes.is_empty()
+        {
+            bail!(
+                "{} has an empty required Phase 17 inventory field",
+                row.test_id
+            );
+        }
+        if !row.phase17_command.starts_with("cargo xtask phase17") {
+            bail!(
+                "{} must use a Phase 17-facing command, got {}",
+                row.test_id,
+                row.phase17_command
+            );
+        }
+        if !matches!(
+            row.status,
+            "planned" | "running" | "pass" | "expected-fail" | "blocked"
+        ) {
+            bail!("{} has invalid Phase 17 status {}", row.test_id, row.status);
+        }
+        if !matches!(row.expected_failure, "true" | "false") {
+            bail!(
+                "{} has invalid Phase 17 expected_failure {}",
+                row.test_id,
+                row.expected_failure
+            );
+        }
+    }
+    Ok(())
+}
+
+fn phase17_inventory_cmd(write: bool) -> Result<()> {
+    abi_parity_inventory_cmd(false)?;
+    let generated = render_phase17_inventory_from_bridge()?;
+    if write {
+        let path = abi_parity_repo_path(PHASE17_VALIDATION_INVENTORY_PATH)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::write(&path, &generated)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    let current_path = abi_parity_repo_path(PHASE17_VALIDATION_INVENTORY_PATH)?;
+    let current = fs::read_to_string(&current_path)
+        .with_context(|| format!("failed to read {}", current_path.display()))?;
+    validate_phase17_inventory(&current)?;
+    if current != generated {
+        bail!(
+            "{} is out of sync with the Phase 17 bridge manifest; run cargo xtask phase17-inventory --write",
+            PHASE17_VALIDATION_INVENTORY_PATH
+        );
+    }
+    let rows = parse_phase17_inventory(&current)?;
+    let pass = rows.iter().filter(|row| row.status == "pass").count();
+    let expected_fail = rows
+        .iter()
+        .filter(|row| row.status == "expected-fail")
+        .count();
+    println!(
+        "phase17 inventory ok: {} rows, {} pass, {} expected-fail",
+        rows.len(),
+        pass,
+        expected_fail
+    );
+    Ok(())
+}
+
+fn validate_abi_parity_vendor_lock(text: &str) -> Result<Vec<AbiParityVendorRow<'_>>> {
+    let rows = parse_abi_parity_vendor_lock(text)?;
+    if rows.is_empty() {
+        bail!("ABI parity vendor lock must contain at least one row");
+    }
+    let mut suites = HashSet::new();
+    for row in &rows {
+        if !suites.insert(row.suite) {
+            bail!("duplicate ABI parity vendor suite: {}", row.suite);
+        }
+        if !matches!(row.status, "present" | "pinned" | "blocked") {
+            bail!("{} has invalid vendor status {}", row.suite, row.status);
+        }
+        for field in [
+            row.version,
+            row.source_url,
+            row.archive_or_commit,
+            row.sha256,
+            row.setup_script,
+            row.notes,
+        ] {
+            if field.is_empty() {
+                bail!("{} has an empty vendor-lock field", row.suite);
+            }
+        }
+        if row.suite != "linux"
+            && (row.version.contains("required")
+                || row.archive_or_commit.contains("TBD")
+                || row.sha256.contains("TBD"))
+        {
+            bail!(
+                "{} still contains placeholder pin data; fill in exact version, commit, and hash first",
+                row.suite
+            );
+        }
+        let setup_script = abi_parity_repo_path(row.setup_script)?;
+        if !setup_script.exists() {
+            bail!(
+                "{} setup script is missing: {}",
+                row.suite,
+                setup_script.display()
+            );
+        }
+        if row.status == "present" && !abi_parity_vendor_checkout_path(row.suite)?.exists() {
+            bail!(
+                "{} is marked present but vendor checkout is missing",
+                row.suite
+            );
+        }
+    }
+    Ok(rows)
+}
+
+fn abi_parity_vendor_cmd(fetch: bool) -> Result<()> {
+    abi_parity_vendor_sync_cmd("all", fetch)
+}
+
+fn abi_parity_final_cmd() -> Result<()> {
+    abi_parity_inventory_cmd(false)?;
+    let inventory_path = abi_parity_repo_path(ABI_PARITY_VALIDATION_INVENTORY_PATH)?;
+    let inventory = fs::read_to_string(&inventory_path)
+        .with_context(|| format!("failed to read {}", inventory_path.display()))?;
+    let rows = parse_abi_parity_inventory(&inventory)?;
+    let blockers: Vec<&AbiParityInventoryRow<'_>> = rows
+        .iter()
+        .filter(|row| row.status != "pass" && row.status != "expected-fail")
+        .collect();
+    if !blockers.is_empty() {
+        let summary = blockers
+            .iter()
+            .map(|row| format!("{}:{}", row.milestone, row.test_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("ABI parity final gate is blocked by non-passing rows: {summary}");
+    }
+
+    run_kunit_tests()?;
+    for suite in [
+        "kselftest",
+        "ltp",
+        "xfstests",
+        "blktests",
+        "packetdrill",
+        "strace-ab",
+        "syzkaller",
+        "arch-rootfs",
+        "smp-preempt",
+        "smp-migration",
+        "pthread-smoke",
+    ] {
+        abi_parity_suite_gate(suite)?;
+    }
+
+    println!("abi_parity final gate passed");
+    Ok(())
+}
+
+fn phase17_final_cmd() -> Result<()> {
+    phase17_inventory_cmd(false)?;
+    abi_parity_inventory_cmd(false)?;
+    run_kunit_tests()?;
+    for suite in [
+        "ltp",
+        "xfstests",
+        "blktests",
+        "packetdrill",
+        "strace-ab",
+        "syzkaller",
+        "arch-rootfs",
+        "smp-preempt",
+        "smp-migration",
+        "pthread-smoke",
+    ] {
+        phase17_suite_gate_require_pass(suite)?;
+    }
+    println!("phase17 final gate passed via the legacy abi_parity suite backend");
+    Ok(())
+}
+
+fn boot_mode_from_acceptance_check(check: &str) -> Option<&str> {
+    let mut parts = check.split_whitespace();
+    while let Some(token) = parts.next() {
+        if token == "--mode" {
+            return parts.next();
+        }
+        if let Some(mode) = token.strip_prefix("--mode=") {
+            return Some(mode);
+        }
+    }
+    None
+}
+
+fn workspace_root() -> Result<PathBuf> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    for candidate in cwd.ancestors() {
+        if candidate.join("Cargo.toml").is_file() && candidate.join("vendor/linux").is_dir() {
+            return Ok(candidate.to_path_buf());
+        }
+    }
+
+    if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
+        let manifest_dir = PathBuf::from(manifest_dir);
+        if let Some(parent) = manifest_dir.parent() {
+            if parent.join("Cargo.toml").is_file() && parent.join("vendor/linux").is_dir() {
+                return Ok(parent.to_path_buf());
+            }
+        }
+    }
+
+    bail!("could not locate workspace root containing Cargo.toml and vendor/linux")
+}
+
+fn path_has_linux_evidence(path: &Path) -> Result<bool> {
+    let metadata = fs::metadata(path).with_context(|| {
+        format!(
+            "missing Linux source-backed evidence path {}",
+            path.display()
+        )
+    })?;
+    if metadata.is_file() {
+        return Ok(metadata.len() > 0);
+    }
+    if metadata.is_dir() {
+        let mut entries = fs::read_dir(path)
+            .with_context(|| format!("failed to inspect Linux evidence dir {}", path.display()))?;
+        return Ok(entries.next().transpose()?.is_some());
+    }
+    Ok(false)
+}
+
+fn validate_abi_parity_fixture_linux_evidence(fixture: &AbiParityMockFixture) -> Result<()> {
+    if fixture.vendor_linux_refs.is_empty() {
+        bail!(
+            "ABI parity fixture {} has no vendor/linux evidence refs",
+            fixture.acceptance_check
+        );
+    }
+
+    let root = workspace_root()?;
+    for rel in fixture.vendor_linux_refs {
+        if !rel.starts_with("vendor/linux/") && *rel != "vendor/linux" {
+            bail!(
+                "ABI parity fixture {} is not vendor/linux-backed: {}",
+                fixture.acceptance_check,
+                rel
+            );
+        }
+        let full = root.join(rel);
+        if !path_has_linux_evidence(&full)? {
+            bail!(
+                "ABI parity fixture {} has empty Linux evidence path: {}",
+                fixture.acceptance_check,
+                rel
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn run_boot_smoke_suite() -> Result<()> {
+    let hello = build_and_run_iso(BootMode::Hello, boot_test_run_options())?;
+    assert_boot_outcome(&hello, HELLO_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    let panic = build_and_run_iso(BootMode::Panic, boot_test_run_options())?;
+    assert_boot_outcome(&panic, PANIC_PREFIX, QEMU_FAILURE_EXIT_CODE)?;
+
+    // Milestone 4 TDD: verify IDT catches a deliberate page fault.
+    let idt = build_and_run_iso(BootMode::IdtTest, boot_test_run_options())?;
+    assert_boot_outcome(&idt, IDT_PF_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 5 TDD: verify LAPIC, INIT-SIPI, and IPI delivery work.
+    // Needs -smp 2 so QEMU gives us a second CPU to wake up.
+    let smp = build_and_run_iso(
+        BootMode::SmpTest,
+        RunOptions {
+            exit_after_boot: true,
+            // Allow extra time: AP bring-up + INIT-SIPI delays + IPI round-trip.
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 2,
+        },
+    )?;
+    assert_boot_outcome(&smp, SMP_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 6 TDD: verify the LAPIC periodic timer drives 100 ticks.
+    let timer = build_and_run_iso(
+        BootMode::TimerTest,
+        RunOptions {
+            exit_after_boot: true,
+            // 5s for ticks + slack for cargo build / QEMU startup.
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&timer, TIMER_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 6 TDD: verify softirq raise/drain + tasklet path works.
+    let softirq = build_and_run_iso(BootMode::SoftirqTest, boot_test_run_options())?;
+    assert_boot_outcome(&softirq, SOFTIRQ_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 6 TDD: BSP sends a TLB shootdown IPI to an AP.
+    let tlb = build_and_run_iso(
+        BootMode::TlbShootdownTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 2,
+        },
+    )?;
+    assert_boot_outcome(&tlb, TLB_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 7 TDD: verify buddy allocator alloc/free round-trip.
+    let buddy = build_and_run_iso(BootMode::BuddyTest, boot_test_run_options())?;
+    assert_boot_outcome(&buddy, BUDDY_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 8 TDD: verify slab allocator 10 000-alloc stress test.
+    let slab = build_and_run_iso(
+        BootMode::SlabTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&slab, SLAB_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 9 TDD: verify kmap/kunmap maps a physical page temporarily.
+    let vmcore = build_and_run_iso(BootMode::VmCoreTest, boot_test_run_options())?;
+    assert_boot_outcome(&vmcore, VMCORE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 10 TDD: walk the kernel PML4 with the generic page-table walker.
+    let vmcore_walker = build_and_run_iso(BootMode::VmCoreWalkerTest, boot_test_run_options())?;
+    assert_boot_outcome(&vmcore_walker, VMCORE_WALKER_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 11 TDD: mm_struct, vm_area_struct, Maple Tree VMA operations.
+    let mm_test = build_and_run_iso(BootMode::MmTest, boot_test_run_options())?;
+    assert_boot_outcome(&mm_test, MM_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 12 TDD: demand paging — anonymous page fault installs PTE, RSS=1.
+    let demand_paging = build_and_run_iso(BootMode::DemandPagingTest, boot_test_run_options())?;
+    assert_boot_outcome(&demand_paging, DEMAND_PAGING_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 13 TDD: mmap/munmap/mprotect/brk/MAP_FIXED_NOREPLACE smoke test.
+    let anon_mmap = build_and_run_iso(BootMode::AnonMmapTest, boot_test_run_options())?;
+    assert_boot_outcome(&anon_mmap, ANON_MMAP_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 13 acceptance: ported Linux mm selftest suite.
+    let mm_selftests = build_and_run_iso(BootMode::MmSelftests, boot_test_run_options())?;
+    assert_boot_outcome(&mm_selftests, MM_SELFTESTS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 14 TDD: COW/fork — dup_mm, copy_page_range, wp_page_copy.
+    let cow_fork = build_and_run_iso(BootMode::CowForkTest, boot_test_run_options())?;
+    assert_boot_outcome(&cow_fork, COW_FORK_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 15 TDD: page cache — filemap_read/write, XArray, readahead.
+    let page_cache = build_and_run_iso(BootMode::PageCacheTest, boot_test_run_options())?;
+    assert_boot_outcome(&page_cache, PAGE_CACHE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 21 TDD: cooperative context switch — two kthreads increment counters.
+    let ctxswitch = build_and_run_iso(BootMode::CtxSwitchTest, boot_test_run_options())?;
+    assert_boot_outcome(&ctxswitch, CTXSWITCH_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 24 acceptance: ELF execve — load and execute a binary from initramfs.
+    let execve = build_and_run_iso(BootMode::ExecveTest, boot_test_run_options())?;
+    assert_boot_outcome(&execve, EXECVE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 25 acceptance: signals — rt_sigaction handler delivery.
+    let signals = build_and_run_iso(BootMode::SignalsTest, boot_test_run_options())?;
+    assert_boot_outcome(&signals, SIGNALS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 26 acceptance: exit/wait/zombies/ptrace.
+    let ewp = build_and_run_iso(BootMode::ExitWaitPtraceTest, boot_test_run_options())?;
+    assert_boot_outcome(&ewp, EXIT_WAIT_PTRACE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 27 acceptance: credentials, capabilities, seccomp (cBPF).
+    let cred = build_and_run_iso(BootMode::CredentialsTest, boot_test_run_options())?;
+    assert_boot_outcome(&cred, CREDENTIALS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 28 acceptance: namespaces.
+    let ns = build_and_run_iso(BootMode::NamespacesTest, boot_test_run_options())?;
+    assert_boot_outcome(&ns, NAMESPACES_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 29 acceptance: CFS sched_class + nice-weight ratio.
+    let cfs = build_and_run_iso(BootMode::CfsTest, boot_test_run_options())?;
+    assert_boot_outcome(&cfs, CFS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 30 acceptance: RT (FIFO/RR) + DEADLINE.
+    let rtdl = build_and_run_iso(BootMode::RtDeadlineTest, boot_test_run_options())?;
+    assert_boot_outcome(&rtdl, RT_DEADLINE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 31 acceptance: SMP load balance + NOHZ — needs -smp 4.
+    let smp31 = build_and_run_iso(
+        BootMode::SmpBalanceTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 4,
+        },
+    )?;
+    assert_boot_outcome(&smp31, SMP_BALANCE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 32 acceptance: CPU cgroup controller + futex family.
+    let cgf = build_and_run_iso(BootMode::CgroupCpuFutexTest, boot_test_run_options())?;
+    assert_boot_outcome(&cgf, CGROUP_CPU_FUTEX_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 33 acceptance: locking primitives.
+    let lk = build_and_run_iso(BootMode::LockingTest, boot_test_run_options())?;
+    assert_boot_outcome(&lk, LOCKING_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 34 acceptance: tree-RCU + tasks-RCU.
+    let rcu = build_and_run_iso(BootMode::RcuTest, boot_test_run_options())?;
+    assert_boot_outcome(&rcu, RCU_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 35 acceptance: percpu / atomics / workqueue.
+    let paw = build_and_run_iso(BootMode::PercpuAtomicWqTest, boot_test_run_options())?;
+    assert_boot_outcome(&paw, PERCPU_ATOMIC_WQ_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 36 acceptance: time subsystem.
+    let tm = build_and_run_iso(BootMode::TimeTest, boot_test_run_options())?;
+    assert_boot_outcome(&tm, TIME_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 105 acceptance: soft-lockup watchdog serial report.
+    let wdog = build_and_run_iso(BootMode::SoftlockupWatchdogTest, boot_test_run_options())?;
+    assert_boot_outcome(&wdog, SOFTLOCKUP_WATCHDOG_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 37 acceptance: generic IRQ.
+    let irq = build_and_run_iso(BootMode::IrqTest, boot_test_run_options())?;
+    assert_boot_outcome(&irq, IRQ_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 38 acceptance: VFS core (ramfs round-trip).
+    let vfs_core = build_and_run_iso(BootMode::VfsCoreTest, boot_test_run_options())?;
+    assert_boot_outcome(&vfs_core, VFS_CORE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 39 acceptance: mount + openat2 + fdtable.
+    let vfs_mount = build_and_run_iso(BootMode::VfsMountTest, boot_test_run_options())?;
+    assert_boot_outcome(&vfs_mount, VFS_MOUNT_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 40 acceptance: procfs schema.
+    let procfs = build_and_run_iso(BootMode::ProcfsTest, boot_test_run_options())?;
+    assert_boot_outcome(&procfs, PROCFS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 41 acceptance: sysfs / kobject.
+    let sysfs = build_and_run_iso(BootMode::SysfsTest, boot_test_run_options())?;
+    assert_boot_outcome(&sysfs, SYSFS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 42 acceptance: tmpfs/debugfs/cgroupfs/overlayfs skeleton.
+    let fs_suite = build_and_run_iso(BootMode::VfsFsSuiteTest, boot_test_run_options())?;
+    assert_boot_outcome(&fs_suite, VFS_FS_SUITE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Initramfs rootfs bootstrap: /dev plus procfs/sysfs exposure.
+    let initramfs_rootfs =
+        build_and_run_iso(BootMode::InitramfsRootfsTest, boot_test_run_options())?;
+    assert_boot_outcome(
+        &initramfs_rootfs,
+        INITRAMFS_ROOTFS_BANNER,
+        QEMU_SUCCESS_EXIT_CODE,
+    )?;
+    // Mock acceptance closure for PID 1/init/job-control bootstrap.
+    run_pid1_handoff_tests()?;
+
+    // Milestone 43 acceptance: block-core (bio + mq-deadline + gendisk).
+    let blk_core = build_and_run_iso(BootMode::BlockCoreTest, boot_test_run_options())?;
+    assert_boot_outcome(&blk_core, BLOCK_CORE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 44 acceptance: partitions + loop device round-trip.
+    let blk_parts = build_and_run_iso(BootMode::BlockPartitionsTest, boot_test_run_options())?;
+    assert_boot_outcome(&blk_parts, BLOCK_PARTITIONS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 45 acceptance: ext4 read path.
+    let ext4 = build_and_run_iso(BootMode::Ext4ReadTest, boot_test_run_options())?;
+    assert_boot_outcome(&ext4, EXT4_READ_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 46 acceptance: FAT32 + ISO9660.
+    let fat_iso = build_and_run_iso(BootMode::FatIsoSuiteTest, boot_test_run_options())?;
+    assert_boot_outcome(&fat_iso, FAT_ISO_SUITE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Networking acceptance: networking stack.
+    let networking = build_and_run_iso(BootMode::NetworkingTest, boot_test_run_options())?;
+    assert_boot_outcome(&networking, NETWORKING_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 54 acceptance: device model core (platform bus probe).
+    let dm = build_and_run_iso(BootMode::DeviceModelTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&dm, DEVICE_MODEL_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 55 acceptance: PCI/ACPI MCFG + DMA + IOMMU.
+    let pci = build_and_run_pci_acpi_iso()?;
+    assert_boot_outcome(&pci, PCI_ACPI_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 56 acceptance: .ko module loader (init + exit).
+    let modl = build_and_run_iso(BootMode::ModuleLoaderTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&modl, MODULE_LOADER_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 57 acceptance: VirtIO + TTY + 8250 + fbcon + DRM stub.
+    let vtf = build_and_run_iso(BootMode::VirtioTtyFbTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&vtf, VIRTIO_TTY_FB_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 58 acceptance: Input + HID + USB xHCI.
+    let ihu = build_and_run_iso(BootMode::InputHidUsbTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&ihu, INPUT_HID_USB_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 59 acceptance: syscall table + uaccess fault recovery.
+    let stbl = build_and_run_iso(BootMode::SyscallTableTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&stbl, SYSCALL_TABLE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 60 acceptance: vDSO + io_uring + *fd ABI parity.
+    let vdsoiou = build_and_run_iso(BootMode::VdsoIoUringTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&vdsoiou, VDSO_IOURING_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 61 acceptance: printk ring + dev_kmsg.
+    let pk = build_and_run_iso(BootMode::PrintkKmsgTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&pk, PRINTK_KMSG_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 62 acceptance: tracepoints + ftrace + kprobes.
+    let fk = build_and_run_iso(BootMode::FtraceKprobesTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&fk, FTRACE_KPROBES_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 63 acceptance: eBPF interpreter + maps + perf_event_open.
+    let bp = build_and_run_iso(BootMode::BpfPerfTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&bp, BPF_PERF_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // Milestone 64 acceptance: LSM + capabilities + keyring + Landlock + audit.
+    let ls = build_and_run_iso(BootMode::LsmSuiteTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&ls, LSM_SUITE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+
+    // ABI parity source-backed evidence checks for legacy boot UX and release image.
+    run_abi_parity_mock_fixtures()?;
+    run_grub_bzimage_tests()?;
+
+    println!("boot smoke tests passed");
+    Ok(())
+}
+
+fn run_abi_parity_mock_fixtures() -> Result<()> {
+    for fixture in ABI_PARITY_MOCK_FIXTURES {
+        println!(
+            "running ABI parity evidence check: {}",
+            fixture.acceptance_check
+        );
+        let mode = fixture.mode;
+        let run = resolve_boot_test_mode(mode).ok_or_else(|| {
+            anyhow!(
+                "missing evidence runner for ABI parity fixture: {} ({})",
+                fixture.acceptance_check,
+                mode
+            )
+        })?;
+        run()?;
+    }
+    Ok(())
+}
+
+/// Run only the Milestone 27 credentials/capabilities/seccomp acceptance suite.
+pub fn run_credentials_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::CredentialsTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, CREDENTIALS_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run the Linux-source-backed ptrace/seccomp Milestone 93 selftest slice.
+pub fn run_ptrace_seccomp_selftests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::PtraceSeccompSelftestsTest,
+        phase17_late_boot_run_options(),
+    )?;
+    assert_boot_outcome(
+        &run,
+        PTRACE_SECCOMP_SELFTESTS_BANNER,
+        QEMU_SUCCESS_EXIT_CODE,
+    )
+}
+
+/// Run only the boot tracker #32 EFI platform certificate release gate.
+pub fn run_uefi_platform_certs_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::UefiPlatformCertsTest, boot_test_run_options())?;
+    assert_boot_outcome(&run, UEFI_PLATFORM_CERTS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    assert_boot_outcome(
+        &run,
+        "integrity: Loaded X.509 cert 'Arch Secure Boot CA'",
+        QEMU_SUCCESS_EXIT_CODE,
+    )?;
+    println!("uefi-platform-certs tests passed");
+    Ok(())
+}
+
+/// Run boot tracker #32 against real OVMF pflash variables.
+pub fn run_uefi_platform_certs_firmware_tests() -> Result<()> {
+    let run = build_and_run_uefi_disk(
+        BootMode::UefiPlatformCertsFirmwareTest,
+        phase17_late_boot_run_options(),
+    )?;
+    assert_boot_outcome(
+        &run,
+        UEFI_PLATFORM_CERTS_FIRMWARE_BANNER,
+        QEMU_SUCCESS_EXIT_CODE,
+    )?;
+    assert_boot_outcome(
+        &run,
+        "integrity: Loaded X.509 cert '",
+        QEMU_SUCCESS_EXIT_CODE,
+    )?;
+    if run.serial_output.contains(UEFI_PLATFORM_CERTS_BANNER) {
+        bail!("firmware pflash gate must not use the fixture EFI db");
+    }
+    println!("uefi-platform-certs firmware tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 28 namespaces acceptance suite.
+pub fn run_namespaces_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::NamespacesTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, NAMESPACES_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 29 CFS acceptance suite.
+pub fn run_cfs_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::CfsTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, CFS_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 30 RT/Deadline acceptance suite.
+pub fn run_rt_deadline_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::RtDeadlineTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, RT_DEADLINE_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 31 SMP balance / NOHZ acceptance suite.
+pub fn run_smp_balance_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::SmpBalanceTest, phase17_smp_runtime_run_options())?;
+    assert_boot_outcome(&run, SMP_BALANCE_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 32 CPU cgroup + futex acceptance suite.
+pub fn run_cgroup_cpu_futex_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::CgroupCpuFutexTest,
+        phase17_late_boot_run_options(),
+    )?;
+    assert_boot_outcome(&run, CGROUP_CPU_FUTEX_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 33 locking acceptance suite.
+pub fn run_locking_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::LockingTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, LOCKING_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 34 RCU acceptance suite.
+pub fn run_rcu_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::RcuTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, RCU_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 35 percpu/atomic/workqueue acceptance suite.
+pub fn run_percpu_atomic_wq_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::PercpuAtomicWqTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, PERCPU_ATOMIC_WQ_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 36 time-subsystem acceptance suite.
+pub fn run_time_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::TimeTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, TIME_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 105 soft-lockup watchdog acceptance suite.
+pub fn run_softlockup_watchdog_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::SoftlockupWatchdogTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(60)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, SOFTLOCKUP_WATCHDOG_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 37 generic-IRQ acceptance suite.
+pub fn run_irq_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::IrqTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, IRQ_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 38 VFS-core acceptance suite.
+pub fn run_vfs_core_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::VfsCoreTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, VFS_CORE_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 39 mount/openat2/fdtable acceptance suite.
+pub fn run_vfs_mount_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::VfsMountTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, VFS_MOUNT_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 40 procfs acceptance suite.
+pub fn run_procfs_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::ProcfsTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, PROCFS_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 41 sysfs/kobject acceptance suite.
+pub fn run_sysfs_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::SysfsTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, SYSFS_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 42 tmpfs/debugfs/cgroupfs/overlayfs acceptance suite.
+pub fn run_vfs_fs_suite_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::VfsFsSuiteTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, VFS_FS_SUITE_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the initramfs-rootfs bootstrap suite.
+pub fn run_initramfs_rootfs_tests() -> Result<()> {
+    let root_disk_guard =
+        if qemu_root_disk_requested_from(env::var(LUPOS_QEMU_ROOT_DISK_ENV).ok().as_deref()) {
+            None
+        } else {
+            let disk = ensure_virtio_root_bind_disk()?;
+            let disk = disk.to_string_lossy().into_owned();
+            Some(EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, &disk))
+        };
+    let _root_disk_guard = root_disk_guard;
+    let run = build_and_run_iso(
+        BootMode::InitramfsRootfsTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(60)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, INITRAMFS_ROOTFS_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+const VIRTIO_ROOT_BIND_DISK_SIZE: u64 = 8 * 1024 * 1024;
+
+fn cmdline_has_root_mode(cmdline: &str) -> bool {
+    cmdline
+        .split_ascii_whitespace()
+        .any(|arg| arg == "ro" || arg == "rw")
+}
+
+fn root_disk_cmdline(extra_cmdline: &str) -> String {
+    const BASE: &str = "root=LABEL=lupos-root rootfstype=ext4";
+    let extra_cmdline = extra_cmdline.trim();
+    let has_root = extra_cmdline
+        .split_ascii_whitespace()
+        .any(|arg| arg.starts_with("root="));
+    let has_root_mode = cmdline_has_root_mode(extra_cmdline);
+
+    if has_root {
+        if has_root_mode {
+            extra_cmdline.to_string()
+        } else {
+            format!("{extra_cmdline} rw")
+        }
+    } else if extra_cmdline.is_empty() {
+        format!("{BASE} rw")
+    } else if has_root_mode {
+        format!("{BASE} {extra_cmdline}")
+    } else {
+        format!("{BASE} rw {extra_cmdline}")
+    }
+}
+
+fn default_qemu_root_disk_guard_for_mode(mode: BootMode) -> Result<Vec<EnvVarGuard>> {
+    let mut guards = Vec::new();
+
+    if mode == BootMode::InitramfsRootfsTest {
+        if !qemu_root_disk_requested_from(env::var(LUPOS_QEMU_ROOT_DISK_ENV).ok().as_deref()) {
+            let disk = ensure_virtio_root_bind_disk()?;
+            let disk = disk.to_string_lossy().into_owned();
+            guards.push(EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, &disk));
+        }
+        return Ok(guards);
+    }
+
+    if mode_uses_login_root_disk(mode) {
+        if !qemu_root_disk_requested_from(env::var(LUPOS_QEMU_ROOT_DISK_ENV).ok().as_deref()) {
+            let disk = ensure_login_root_disk_for_mode(mode)?;
+            let disk = disk.to_string_lossy().into_owned();
+            guards.push(EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, &disk));
+        }
+
+        let current_cmdline = env::var(LUPOS_KERNEL_CMDLINE_ENV).unwrap_or_default();
+        let next_cmdline = if mode == BootMode::DiskRootFsckTest {
+            disk_root_fsck_cmdline(&current_cmdline)
+        } else {
+            root_disk_cmdline(&current_cmdline)
+        };
+        if next_cmdline.trim() != current_cmdline.trim() {
+            guards.push(EnvVarGuard::set(LUPOS_KERNEL_CMDLINE_ENV, &next_cmdline));
+        }
+    }
+
+    Ok(guards)
+}
+
+fn ensure_virtio_root_bind_disk() -> Result<PathBuf> {
+    let path = xtask_target_dir()?.join("virtio-root-bind-test.raw");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    file.set_len(VIRTIO_ROOT_BIND_DISK_SIZE)
+        .with_context(|| format!("failed to size {}", path.display()))?;
+    Ok(path)
+}
+
+const DISK_ROOT_REMOUNT_DISK_SIZE: &str = "64M";
+const DISK_ROOT_FSCK_DISK_SIZE: &str = "256M";
+const DISK_ROOT_FSCK_DISK_BYTES: u64 = 256 * 1024 * 1024;
+const LOGIN_ROOT_DISK_SIZE: &str = "768M";
+const LOGIN_ROOT_DISK_BYTES: u64 = 768 * 1024 * 1024;
+const SHIPPED_COMMANDS_ROOT_DISK_SIZE: &str = "768M";
+const SHIPPED_COMMANDS_ROOT_DISK_BYTES: u64 = 768 * 1024 * 1024;
+const LOGIN_ROOT_DISK_MANIFEST_VERSION: &str = "1";
+const DIRECT_STAGE_ROOT_DISK_MANIFEST_VERSION: &str = "5";
+
+fn ensure_disk_root_remount_disk() -> Result<PathBuf> {
+    let target = xtask_target_dir()?;
+    fs::create_dir_all(&target)
+        .with_context(|| format!("failed to create {}", target.display()))?;
+
+    let root = target.join("disk-root-remount-root");
+    if root.exists() {
+        fs::remove_dir_all(&root)
+            .with_context(|| format!("failed to remove {}", root.display()))?;
+    }
+    for dir in ["dev", "proc", "sys", "etc", "sbin"] {
+        fs::create_dir_all(root.join(dir))
+            .with_context(|| format!("failed to create {}", root.join(dir).display()))?;
+    }
+    fs::write(root.join("etc").join("lupos-disk-root"), b"vda\n")
+        .with_context(|| format!("failed to write {}", root.join("etc").display()))?;
+    fs::write(
+        root.join("etc").join("fstab"),
+        b"LABEL=lupos-root / ext4 defaults 0 1\n",
+    )
+    .with_context(|| format!("failed to write {}", root.join("etc").display()))?;
+
+    let raw = target.join("disk-root-remount.raw");
+    let root_sh = shell_single_quote(&shell_path(&root));
+    let raw_sh = shell_single_quote(&shell_path(&raw));
+    let script = format!(
+        "rm -f {raw_sh} && truncate -s {DISK_ROOT_REMOUNT_DISK_SIZE} {raw_sh} && mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -d {root_sh} {raw_sh}"
+    );
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(script);
+    run_command(&mut command, "disk-root remount ext4 image build")?;
+    Ok(raw)
+}
+
+fn run_e2fsck_readonly(raw: &Path) -> Result<()> {
+    let raw_sh = shell_single_quote(&shell_path(raw));
+    let script = format!("e2fsck -fn {raw_sh}");
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(script);
+    run_command(&mut command, "disk-root remount e2fsck -fn")
+}
+
+/// Run only the disk-root remount gate for boot tracker #28.
+pub fn run_disk_root_remount_tests() -> Result<()> {
+    let disk = ensure_disk_root_remount_disk()?;
+    let disk_arg = disk.to_string_lossy().into_owned();
+    let _root_disk_guard = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, &disk_arg);
+    let _cmdline_guard = EnvVarGuard::set(
+        LUPOS_KERNEL_CMDLINE_ENV,
+        "root=LABEL=lupos-root rootfstype=ext4",
+    );
+    let run = build_and_run_iso(
+        BootMode::DiskRootRemountTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(120)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, DISK_ROOT_REMOUNT_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    assert_boot_outcome(
+        &run,
+        "VFS: Mounted root (ext4 filesystem) readonly on device /dev/vda.",
+        QEMU_SUCCESS_EXIT_CODE,
+    )?;
+    assert_boot_outcome(
+        &run,
+        "disk-root-remount: ext4 append write ok",
+        QEMU_SUCCESS_EXIT_CODE,
+    )?;
+    run_e2fsck_readonly(&disk)
+}
+
+fn ensure_login_root_disk_for_mode(mode: BootMode) -> Result<PathBuf> {
+    match login_root_disk_builder_kind(mode) {
+        Some(LoginRootDiskBuilderKind::GuiShell) => ensure_gui_shell_root_disk(),
+        Some(LoginRootDiskBuilderKind::DirectStage) => {
+            ensure_direct_stage_login_root_disk(mode, mode_name(mode), SYSTEMD_DISK_ROOT_FSTAB)
+        }
+        Some(LoginRootDiskBuilderKind::InitramfsCpio) => ensure_ext4_root_disk_from_initramfs(
+            mode,
+            mode_name(mode),
+            SYSTEMD_DISK_ROOT_FSTAB,
+            true,
+        ),
+        None => bail!("{} does not use a login root disk", mode_name(mode)),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoginRootDiskBuilderKind {
+    DirectStage,
+    InitramfsCpio,
+    GuiShell,
+}
+
+fn login_root_disk_builder_kind(mode: BootMode) -> Option<LoginRootDiskBuilderKind> {
+    match mode {
+        BootMode::GuiShell => Some(LoginRootDiskBuilderKind::GuiShell),
+        BootMode::DiskRootFsckTest => Some(LoginRootDiskBuilderKind::InitramfsCpio),
+        BootMode::Login
+        | BootMode::LoginDisplay
+        | BootMode::LoginStackTest
+        | BootMode::UserspaceSmokeTest
+        | BootMode::RuntimeStressTest
+        | BootMode::ShippedCommandsTest => Some(LoginRootDiskBuilderKind::DirectStage),
+        _ => None,
+    }
+}
+
+fn mode_uses_direct_stage_login_root_disk(mode: BootMode) -> bool {
+    login_root_disk_builder_kind(mode) == Some(LoginRootDiskBuilderKind::DirectStage)
+}
+
+fn login_root_disk_cacheable(mode: BootMode, force_fsck: bool) -> bool {
+    !force_fsck && mode_uses_direct_stage_login_root_disk(mode)
+}
+
+fn login_root_disk_size(mode: BootMode) -> (&'static str, u64) {
+    match mode {
+        BootMode::DiskRootFsckTest => (DISK_ROOT_FSCK_DISK_SIZE, DISK_ROOT_FSCK_DISK_BYTES),
+        BootMode::Login
+        | BootMode::LoginDisplay
+        | BootMode::LoginStackTest
+        | BootMode::UserspaceSmokeTest
+        | BootMode::RuntimeStressTest => (LOGIN_ROOT_DISK_SIZE, LOGIN_ROOT_DISK_BYTES),
+        BootMode::ShippedCommandsTest => (
+            SHIPPED_COMMANDS_ROOT_DISK_SIZE,
+            SHIPPED_COMMANDS_ROOT_DISK_BYTES,
+        ),
+        _ => (DISK_ROOT_FSCK_DISK_SIZE, DISK_ROOT_FSCK_DISK_BYTES),
+    }
+}
+
+fn stable_bytes_hash_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn login_root_disk_manifest(
+    mode: BootMode,
+    cpio_bytes: &[u8],
+    fstab_contents: &str,
+    force_fsck: bool,
+) -> String {
+    let (disk_size, _) = login_root_disk_size(mode);
+    format!(
+        concat!(
+            "version={}\n",
+            "mode={}\n",
+            "disk_size={}\n",
+            "force_fsck={}\n",
+            "cpio_len={}\n",
+            "cpio_hash={}\n",
+            "fstab_len={}\n",
+            "fstab_hash={}\n",
+        ),
+        LOGIN_ROOT_DISK_MANIFEST_VERSION,
+        mode_name(mode),
+        disk_size,
+        force_fsck,
+        cpio_bytes.len(),
+        stable_bytes_hash_hex(cpio_bytes),
+        fstab_contents.len(),
+        stable_bytes_hash_hex(fstab_contents.as_bytes()),
+    )
+}
+
+fn login_root_disk_manifest_matches(
+    raw: &Path,
+    manifest: &Path,
+    expected: &str,
+    expected_disk_bytes: u64,
+) -> bool {
+    let raw_is_expected_size = fs::metadata(raw)
+        .map(|metadata| metadata.len() == expected_disk_bytes)
+        .unwrap_or(false);
+    raw_is_expected_size
+        && fs::read_to_string(manifest)
+            .map(|actual| actual == expected)
+            .unwrap_or(false)
+}
+
+fn root_disk_files_manifest(files: &[InitramfsFile]) -> String {
+    let mut rows = files
+        .iter()
+        .map(|(path, mode, bytes)| {
+            format!(
+                "{path}\t{mode:o}\t{}\t{}",
+                bytes.len(),
+                stable_bytes_hash_hex(bytes)
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows.push(String::new());
+    rows.join("\n")
+}
+
+fn direct_stage_root_disk_manifest_from_parts(
+    mode: BootMode,
+    disk_size: &str,
+    stage_profile: &[u8],
+    package_db: &[u8],
+    pacman_conf: &[u8],
+    pacman_mirrorlist: &[u8],
+    pacman_repo_manifest: &str,
+    fstab_contents: &str,
+    overlay_cpio: &[u8],
+    module_manifest: &str,
+    delete_list: &str,
+) -> String {
+    format!(
+        concat!(
+            "version={}\n",
+            "builder=direct-stage\n",
+            "mode={}\n",
+            "disk_size={}\n",
+            "stage_profile_len={}\n",
+            "stage_profile_hash={}\n",
+            "package_db_len={}\n",
+            "package_db_hash={}\n",
+            "pacman_conf_len={}\n",
+            "pacman_conf_hash={}\n",
+            "pacman_mirrorlist_len={}\n",
+            "pacman_mirrorlist_hash={}\n",
+            "pacman_repo_manifest_len={}\n",
+            "pacman_repo_manifest_hash={}\n",
+            "fstab_len={}\n",
+            "fstab_hash={}\n",
+            "overlay_len={}\n",
+            "overlay_hash={}\n",
+            "module_manifest_len={}\n",
+            "module_manifest_hash={}\n",
+            "delete_list_len={}\n",
+            "delete_list_hash={}\n",
+        ),
+        DIRECT_STAGE_ROOT_DISK_MANIFEST_VERSION,
+        mode_name(mode),
+        disk_size,
+        stage_profile.len(),
+        stable_bytes_hash_hex(stage_profile),
+        package_db.len(),
+        stable_bytes_hash_hex(package_db),
+        pacman_conf.len(),
+        stable_bytes_hash_hex(pacman_conf),
+        pacman_mirrorlist.len(),
+        stable_bytes_hash_hex(pacman_mirrorlist),
+        pacman_repo_manifest.len(),
+        stable_bytes_hash_hex(pacman_repo_manifest.as_bytes()),
+        fstab_contents.len(),
+        stable_bytes_hash_hex(fstab_contents.as_bytes()),
+        overlay_cpio.len(),
+        stable_bytes_hash_hex(overlay_cpio),
+        module_manifest.len(),
+        stable_bytes_hash_hex(module_manifest.as_bytes()),
+        delete_list.len(),
+        stable_bytes_hash_hex(delete_list.as_bytes()),
+    )
+}
+
+fn read_stage_manifest_bytes(stage: &Path, rel: &str) -> Vec<u8> {
+    let path = stage.join(rel);
+    match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => format!("missing:{rel}\n").into_bytes(),
+    }
+}
+
+fn arch_offline_pacman_repo_manifest(stage: &Path) -> String {
+    let mut manifest = String::new();
+    for rel in ARCH_OFFLINE_PACMAN_REPO_ARTIFACTS {
+        let bytes = read_stage_manifest_bytes(stage, rel);
+        manifest.push_str(rel);
+        manifest.push('\t');
+        manifest.push_str(&bytes.len().to_string());
+        manifest.push('\t');
+        manifest.push_str(&stable_bytes_hash_hex(&bytes));
+        manifest.push('\n');
+    }
+    for (rel, _) in ARCH_PACMAN_SYNC_DBS {
+        let bytes = read_stage_manifest_bytes(stage, rel);
+        manifest.push_str(rel);
+        manifest.push('\t');
+        manifest.push_str(&bytes.len().to_string());
+        manifest.push('\t');
+        manifest.push_str(&stable_bytes_hash_hex(&bytes));
+        manifest.push('\n');
+    }
+    for (rel, target) in ARCH_PACMAN_PACKAGE_ALIASES {
+        let actual = fs::read_link(stage.join(rel))
+            .map(|target| target.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| format!("missing:{target}"));
+        manifest.push_str(rel);
+        manifest.push('\t');
+        manifest.push_str("symlink");
+        manifest.push('\t');
+        manifest.push_str(&actual);
+        manifest.push('\n');
+    }
+    manifest
+}
+
+fn direct_stage_root_disk_manifest(
+    mode: BootMode,
+    stage: &Path,
+    fstab_contents: &str,
+    overlay_cpio: &[u8],
+    module_files: &[InitramfsFile],
+    delete_paths: &[&str],
+) -> String {
+    let (disk_size, _) = login_root_disk_size(mode);
+    let module_manifest = root_disk_files_manifest(module_files);
+    let delete_list = direct_stage_delete_list_contents(delete_paths);
+    direct_stage_root_disk_manifest_from_parts(
+        mode,
+        disk_size,
+        &read_stage_manifest_bytes(stage, ".lupos-profile"),
+        &read_stage_manifest_bytes(stage, "var/lib/pacman/local/ALPM_DB_VERSION"),
+        &read_stage_manifest_bytes(stage, "etc/pacman.conf"),
+        &read_stage_manifest_bytes(stage, "etc/pacman.d/mirrorlist"),
+        &arch_offline_pacman_repo_manifest(stage),
+        fstab_contents,
+        overlay_cpio,
+        &module_manifest,
+        &delete_list,
+    )
+}
+
+fn direct_stage_delete_list_contents(delete_paths: &[&str]) -> String {
+    let mut paths = delete_paths.to_vec();
+    paths.sort_unstable();
+    paths.dedup();
+    let mut contents = paths.join("\n");
+    contents.push('\n');
+    contents
+}
+
+fn direct_stage_login_root_disk_delete_paths(mode: BootMode) -> Vec<&'static str> {
+    let mut paths = vec![
+        "etc/systemd/system/default.target",
+        "etc/systemd/system/dbus-org.freedesktop.resolve1.service",
+        "etc/systemd/system/graphical.target.wants",
+        "etc/systemd/system/getty.target.wants",
+        "etc/systemd/system/lupos-terminal.target.wants",
+        "etc/systemd/system/multi-user.target.wants",
+        "etc/systemd/system/sockets.target.wants",
+        "etc/systemd/system/sysinit.target.wants",
+        "etc/systemd/system/timers.target.wants",
+        "var/lib/pacman/db.lck",
+    ];
+    if matches!(
+        mode,
+        BootMode::UserspaceSmokeTest | BootMode::RuntimeStressTest
+    ) {
+        paths.push("etc/systemd/system/multi-user.target.wants/systemd-journald.service");
+    }
+    paths
+}
+
+fn direct_stage_login_root_disk_overlay_files(
+    mode: BootMode,
+    fstab_contents: &str,
+    module_files: &[InitramfsFile],
+    stage: &Path,
+) -> Vec<InitramfsFile> {
+    let poweroff = build_poweroff_stub_elf64("/sbin/poweroff");
+    let include_journald = !matches!(
+        mode,
+        BootMode::UserspaceSmokeTest | BootMode::RuntimeStressTest
+    );
+    let shipped_commands = mode == BootMode::ShippedCommandsTest;
+    let staged_config = |rel: &str, fallback: &[u8]| {
+        staged_userland_bytes(Some(stage), &[rel]).unwrap_or_else(|| fallback.to_vec())
+    };
+    let staged_config_any = |candidates: &[&str], fallback: &[u8]| {
+        staged_userland_bytes(Some(stage), candidates).unwrap_or_else(|| fallback.to_vec())
+    };
+
+    let mut files = vec![
+        initramfs_symlink("sbin/init", "/usr/lib/systemd/systemd"),
+        initramfs_symlink("var/run", "/run"),
+        initramfs_file("sbin/poweroff", 0o100755, poweroff.clone()),
+        initramfs_file("usr/sbin/poweroff", 0o100755, poweroff),
+        initramfs_file(
+            ARCH_PACMAN_XFER_HELPER,
+            0o100755,
+            staged_config(
+                ARCH_PACMAN_XFER_HELPER,
+                ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes(),
+            ),
+        ),
+        initramfs_file(
+            "etc/passwd",
+            0o100644,
+            staged_auth_config(stage, "etc/passwd", LOGIN_PASSWD),
+        ),
+        initramfs_file(
+            "etc/shadow",
+            0o100600,
+            staged_auth_config(stage, "etc/shadow", LOGIN_SHADOW),
+        ),
+        initramfs_file(
+            "etc/group",
+            0o100644,
+            staged_auth_config(stage, "etc/group", LOGIN_GROUP),
+        ),
+        initramfs_file(
+            "etc/gshadow",
+            0o100600,
+            staged_auth_config(stage, "etc/gshadow", LOGIN_GSHADOW),
+        ),
+        initramfs_file("etc/fstab", 0o100644, fstab_contents.as_bytes().to_vec()),
+        initramfs_file("etc/modules", 0o100644, etc_modules_from_repo_config()),
+        initramfs_file(
+            "etc/pacman.d/mirrorlist",
+            0o100644,
+            ARCH_PACMAN_MIRRORLIST.as_bytes(),
+        ),
+        initramfs_file("etc/machine-id", 0o100444, SYSTEMD_MACHINE_ID.as_bytes()),
+        initramfs_file(
+            "etc/pam.d/common-session",
+            0o100644,
+            LOGIN_PAM_COMMON_SESSION.as_bytes(),
+        ),
+        initramfs_file(
+            "etc/pam.d/login",
+            0o100644,
+            LOGIN_PAM_LOGIN.as_bytes().to_vec(),
+        ),
+        initramfs_file(
+            "etc/pam.d/passwd",
+            0o100644,
+            LOGIN_PAM_PASSWD.as_bytes().to_vec(),
+        ),
+        initramfs_file(
+            "etc/pam.d/su",
+            0o100644,
+            LOGIN_PAM_SU.as_bytes().to_vec(),
+        ),
+        initramfs_file("etc/profile", 0o100644, staged_config("etc/profile", LOGIN_PROFILE.as_bytes())),
+        initramfs_file("etc/bash.bashrc", 0o100644, staged_config("etc/bash.bashrc", LOGIN_BASH_BASHRC.as_bytes())),
+        initramfs_file("root", 0o40700, Vec::new()),
+        initramfs_file("root/.bashrc", 0o100644, ROOT_LOGIN_BASHRC.as_bytes()),
+        initramfs_file("root/.bash_profile", 0o100644, ROOT_LOGIN_BASH_PROFILE.as_bytes()),
+        initramfs_file("home", 0o40755, Vec::new()),
+        initramfs_file("home/lupos", 0o40755, Vec::new()),
+        initramfs_file("etc/skel", 0o40755, Vec::new()),
+        initramfs_file(
+            "home/lupos/.bashrc",
+            0o100644,
+            staged_config_any(&["home/lupos/.bashrc", "etc/skel/.bashrc"], LUPOS_USER_BASHRC.as_bytes()),
+        ),
+        initramfs_file(
+            "home/lupos/.bash_profile",
+            0o100644,
+            staged_config_any(&["home/lupos/.bash_profile", "etc/skel/.bash_profile"], LUPOS_USER_BASH_PROFILE.as_bytes()),
+        ),
+        initramfs_file("etc/skel/.bashrc", 0o100644, staged_config("etc/skel/.bashrc", SKEL_BASHRC.as_bytes())),
+        initramfs_file(
+            "etc/skel/.bash_profile",
+            0o100644,
+            staged_config("etc/skel/.bash_profile", SKEL_BASH_PROFILE.as_bytes()),
+        ),
+        initramfs_file(
+            "etc/skel/.bash_logout",
+            0o100644,
+            staged_config("etc/skel/.bash_logout", SKEL_BASH_LOGOUT.as_bytes()),
+        ),
+        initramfs_file("etc/motd", 0o100644, LOGIN_MOTD.as_bytes()),
+        initramfs_file(LUPOS_SWAPFILE_PATH, 0o100600, lupos_swapfile_bytes()),
+        initramfs_file(
+            "etc/tmpfiles.d/lupos-logind.conf",
+            0o100644,
+            b"d /run/systemd/seats 0755 root root -\nd /run/systemd/sessions 0755 root root -\nd /run/systemd/users 0755 root root -\nd /run/user 0755 root root -\n",
+        ),
+        initramfs_file(
+            "etc/systemd/system.conf",
+            0o100644,
+            SYSTEMD_SYSTEM_CONF.as_bytes(),
+        ),
+        initramfs_file(
+            "etc/systemd/journald.conf",
+            0o100644,
+            SYSTEMD_JOURNALD_CONF.as_bytes(),
+        ),
+        initramfs_file(
+            "usr/lib/systemd/system/systemd-journald.service",
+            0o100644,
+            systemd_journald_service_unit(),
+        ),
+        initramfs_file(
+            "usr/lib/systemd/system/lupos-terminal.target",
+            0o100644,
+            systemd_lupos_terminal_target_unit(),
+        ),
+        initramfs_file(
+            "usr/lib/systemd/system/lupos-serial-getty.service",
+            0o100644,
+            systemd_lupos_serial_getty_unit(),
+        ),
+        initramfs_file(
+            "usr/lib/systemd/system/systemd-vconsole-setup.service",
+            0o100644,
+            systemd_vconsole_setup_unit(),
+        ),
+        initramfs_file(
+            "usr/lib/systemd/systemd-vconsole-setup",
+            0o100755,
+            systemd_vconsole_setup_shim(),
+        ),
+        initramfs_file(
+            "etc/systemd/system/getty@tty1.service.d/lupos-login.conf",
+            0o100644,
+            systemd_getty_override(),
+        ),
+        initramfs_file(
+            "etc/systemd/system/serial-getty@ttyS0.service.d/lupos-serial.conf",
+            0o100644,
+            systemd_serial_getty_override(),
+        ),
+        initramfs_file(
+            "etc/systemd/system/user@.service.d/lupos-runtime-env.conf",
+            0o100644,
+            b"[Service]\nEnvironment=XDG_RUNTIME_DIR=/run/user/%i\n",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/default.target",
+            "/usr/lib/systemd/system/lupos-terminal.target",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/lupos-serial-getty.service",
+            "/usr/lib/systemd/system/lupos-serial-getty.service",
+        ),
+        // The disk-root boot mounts / read-only and lupos-terminal.target
+        // skips local-fs.target, so the fstab tmpfs /tmp must be pulled
+        // explicitly or shell/script writes to /tmp fail with EROFS.
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/tmp.mount",
+            "/usr/lib/systemd/system/tmp.mount",
+        ),
+        // The login shell must only start once the tmpfs is in place: a
+        // getty racing tmp.mount lets the session create files on the
+        // ext4 /tmp that vanish when the tmpfs mounts over it mid-script.
+        initramfs_file(
+            "etc/systemd/system/lupos-serial-getty.service.d/lupos-tmp-order.conf",
+            0o100644,
+            b"[Unit]\nAfter=tmp.mount\n",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/getty.target.wants/getty@tty1.service",
+            "/usr/lib/systemd/system/getty@.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service",
+            "/usr/lib/systemd/system/serial-getty@.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/multi-user.target.wants/getty.target",
+            "/usr/lib/systemd/system/getty.target",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/multi-user.target.wants/systemd-user-sessions.service",
+            "/usr/lib/systemd/system/systemd-user-sessions.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/systemd-tmpfiles-setup-dev.service",
+            "/usr/lib/systemd/system/systemd-tmpfiles-setup-dev.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/systemd-tmpfiles-setup.service",
+            "/usr/lib/systemd/system/systemd-tmpfiles-setup.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/systemd-vconsole-setup.service",
+            "/usr/lib/systemd/system/systemd-vconsole-setup.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/dev-hugepages.mount",
+            "/usr/lib/systemd/system/dev-hugepages.mount",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/dev-mqueue.mount",
+            "/usr/lib/systemd/system/dev-mqueue.mount",
+        ),
+    ];
+
+    if include_journald {
+        files.push(initramfs_symlink(
+            "etc/systemd/system/multi-user.target.wants/systemd-journald.service",
+            "/usr/lib/systemd/system/systemd-journald.service",
+        ));
+        files.push(initramfs_symlink(
+            "etc/systemd/system/sockets.target.wants/systemd-journald.socket",
+            "/usr/lib/systemd/system/systemd-journald.socket",
+        ));
+        files.push(initramfs_symlink(
+            "etc/systemd/system/sockets.target.wants/systemd-journald-dev-log.socket",
+            "/usr/lib/systemd/system/systemd-journald-dev-log.socket",
+        ));
+    }
+
+    match mode {
+        BootMode::UserspaceSmokeTest => {
+            files.push(initramfs_file(
+                USERSPACE_SMOKE_SCRIPT_PATH,
+                0o100755,
+                USERSPACE_SMOKE_SCRIPT.as_bytes(),
+            ));
+            files.push(initramfs_file(
+                USERSPACE_SMOKE_PACMAN_PACKAGE_PATH,
+                0o100644,
+                userspace_smoke_pacman_package(),
+            ));
+            files.push(initramfs_file(
+                USERSPACE_SMOKE_PACMAN_HOOKDIR_PATH,
+                0o40755,
+                Vec::new(),
+            ));
+            files.push(initramfs_file("root/test.txt", 0o100644, b"data\n"));
+        }
+        BootMode::RuntimeStressTest => files.push(initramfs_file(
+            RUNTIME_STRESS_SCRIPT_PATH,
+            0o100755,
+            RUNTIME_STRESS_SCRIPT.as_bytes(),
+        )),
+        _ => {}
+    }
+
+    if shipped_commands {
+        files.push(initramfs_file(
+            SHIPPED_COMMANDS_SCRIPT_PATH,
+            0o100755,
+            SHIPPED_COMMANDS_SCRIPT.as_bytes(),
+        ));
+        // The fast lupos-terminal.target skips the sysinit/local-fs chain,
+        // so the fstab-generated systemd-remount-fs.service never runs and
+        // / stays read-only (history and pacman database reads expect a normal
+        // rootfs layout), and
+        // nothing under multi-user.target.wants would start.  This gate
+        // boots the real distro default: multi-user -> basic -> sysinit ->
+        // local-fs (remount rw), pulling journald and getty.
+        // dedup keeps the last entry per path, so this replaces the
+        // lupos-terminal default.target symlink above.
+        files.push(initramfs_symlink(
+            "etc/systemd/system/default.target",
+            "/usr/lib/systemd/system/multi-user.target",
+        ));
+        // Mark the freshly built image update-done, exactly as
+        // systemd-update-done.service would after a completed update cycle
+        // (vendor/systemd src/update-done/update-done.c).  Without these,
+        // ConditionNeedsUpdate units (ldconfig.service,
+        // systemd-journal-catalog-update.service, systemd-sysusers.service)
+        // run whole-tree first-boot rebuilds that stall the boot under TCG.
+        files.push(initramfs_file("etc/.updated", 0o100644, Vec::new()));
+        files.push(initramfs_file("var/.updated", 0o100644, Vec::new()));
+        // serial-getty@ttyS0 BindsTo dev-ttyS0.device, which only shows up
+        // after udevd settles; until the udev device-unit path is proven on
+        // Lupos, the login prompt must come from the udev-independent
+        // lupos-serial-getty.service.  Drop the device-bound want so two
+        // agettys never fight over ttyS0.
+        files.retain(|(path, _, _)| {
+            path != "etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service"
+        });
+        files.push(initramfs_symlink(
+            "etc/systemd/system/multi-user.target.wants/lupos-serial-getty.service",
+            "/usr/lib/systemd/system/lupos-serial-getty.service",
+        ));
+        // Order the gate's login prompt after the heavy multi-user services:
+        // under TCG everything shares one slow vCPU, and a getty racing the
+        // udev/dbus/logind burst starves login(1)'s PAM conversation past
+        // its 60 s timeout.
+        files.push(initramfs_file(
+            "etc/systemd/system/lupos-serial-getty.service.d/lupos-shipped-commands.conf",
+            0o100644,
+            concat!(
+                "[Unit]\n",
+                "After=systemd-user-sessions.service systemd-udev-trigger.service ",
+                "systemd-udev-load-credentials.service systemd-vconsole-setup.service ",
+                "systemd-journald.service\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        ));
+        // The terminal profile's 15s DefaultTimeoutStartSec is tuned for
+        // the minimal lupos-terminal boot; the full multi-user chain under
+        // QEMU TCG needs distro-scale start timeouts or journald/udevd
+        // churn through start-timeout restarts forever.
+        upsert_initramfs_file(
+            &mut files,
+            "etc/systemd/system.conf",
+            0o100644,
+            concat!(
+                "[Manager]\n",
+                "DefaultTimeoutStartSec=180s\n",
+                "DefaultTimeoutStopSec=30s\n",
+                "CtrlAltDelBurstAction=poweroff-force\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+    }
+
+    files.extend(module_files.iter().cloned());
+    files.extend(libkmod_stub_initramfs_files());
+    files.extend(extra_initramfs_files());
+    dedup_initramfs_files(&mut files);
+    files
+}
+
+fn build_direct_stage_overlay_cpio(files: &[InitramfsFile]) -> Vec<u8> {
+    let borrowed = files
+        .iter()
+        .map(|(path, mode, bytes)| (path.as_str(), *mode, bytes.as_slice()))
+        .collect::<Vec<_>>();
+    build_cpio_newc(&borrowed)
+}
+
+fn ensure_gui_shell_root_disk() -> Result<PathBuf> {
+    validate_userland_stage()?;
+    let stage = target_userland_stage_dir()?;
+    let target = xtask_target_dir()?;
+    fs::create_dir_all(&target)
+        .with_context(|| format!("failed to create {}", target.display()))?;
+    let raw = target.join("gui-shell.raw");
+    let stage_sh = shell_single_quote(&shell_path(&stage));
+    let raw_sh = shell_single_quote(&shell_path(&raw));
+    let script = format!(
+        r#"set -euo pipefail
+rm -f {raw_sh}
+truncate -s {GUI_SHELL_ROOT_DISK_SIZE} {raw_sh}
+mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -d {stage_sh} {raw_sh}
+"#
+    );
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(script);
+    run_command(&mut command, "gui-shell ext4 root image build")?;
+    Ok(raw)
+}
+
+fn ensure_direct_stage_login_root_disk(
+    mode: BootMode,
+    stem: &str,
+    fstab_contents: &str,
+) -> Result<PathBuf> {
+    validate_userland_stage()?;
+    let stage = target_userland_stage_dir()?;
+    let target = xtask_target_dir()?;
+    fs::create_dir_all(&target)
+        .with_context(|| format!("failed to create {}", target.display()))?;
+
+    let overlay = target.join(format!("{stem}-overlay.cpio"));
+    let overlay_work = target.join(format!("{stem}-overlay-work"));
+    let delete_list = target.join(format!("{stem}.rootdisk.delete-list"));
+    let raw = target.join(format!("{stem}.raw"));
+    let manifest = target.join(format!("{stem}.rootdisk.manifest"));
+    let module_files = configured_module_files()?;
+    let overlay_files =
+        direct_stage_login_root_disk_overlay_files(mode, fstab_contents, &module_files, &stage);
+    let overlay_cpio = build_direct_stage_overlay_cpio(&overlay_files);
+    let delete_paths = direct_stage_login_root_disk_delete_paths(mode);
+    let delete_list_contents = direct_stage_delete_list_contents(&delete_paths);
+    let expected_manifest = direct_stage_root_disk_manifest(
+        mode,
+        &stage,
+        fstab_contents,
+        &overlay_cpio,
+        &module_files,
+        &delete_paths,
+    );
+    let (disk_size, disk_bytes) = login_root_disk_size(mode);
+
+    if login_root_disk_manifest_matches(&raw, &manifest, &expected_manifest, disk_bytes) {
+        println!(
+            "Reusing {} ext4 root disk: {}",
+            mode_name(mode),
+            raw.display()
+        );
+        return Ok(raw);
+    }
+
+    fs::write(&overlay, &overlay_cpio)
+        .with_context(|| format!("failed to write {}", overlay.display()))?;
+    fs::write(&delete_list, &delete_list_contents)
+        .with_context(|| format!("failed to write {}", delete_list.display()))?;
+
+    let stage_sh = shell_single_quote(&shell_path(&stage));
+    let overlay_sh = shell_single_quote(&shell_path(&overlay));
+    let overlay_work_sh = shell_single_quote(&shell_path(&overlay_work));
+    let delete_list_sh = shell_single_quote(&shell_path(&delete_list));
+    let raw_sh = shell_single_quote(&shell_path(&raw));
+    let raw_tmp = raw.with_extension("raw.tmp");
+    let raw_tmp_sh = shell_single_quote(&shell_path(&raw_tmp));
+    let script = format!(
+        r#"set -euo pipefail
+rm -rf {overlay_work_sh}
+mkdir -p {overlay_work_sh}/files
+raw_build="$(mktemp -t lupos-{stem}.XXXXXX)"
+raw_tmp={raw_tmp_sh}
+trap 'rm -f "$raw_build" "$raw_tmp"; rm -rf {overlay_work_sh}' EXIT
+python3 - {overlay_sh} {delete_list_sh} {stage_sh} {overlay_work_sh} <<'PY'
+import os
+import stat
+import sys
+
+archive, delete_list, stage, work = sys.argv[1:5]
+with open(archive, "rb") as f:
+    data = f.read()
+
+commands = []
+regular_index = 0
+deleted_roots = set()
+
+def align4(value):
+    return (value + 3) & ~3
+
+def clean_rel(path):
+    rel = os.path.normpath(path).replace(os.sep, "/")
+    if rel in ("", ".") or rel.startswith("../") or rel == ".." or os.path.isabs(path):
+        raise SystemExit("unsafe root-disk path: %s" % path)
+    if any(ch.isspace() for ch in rel):
+        raise SystemExit("unsupported whitespace in root-disk path: %s" % path)
+    return rel
+
+def norm_parts(parts):
+    out = []
+    for part in parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if out:
+                out.pop()
+            continue
+        out.append(part)
+    return out
+
+def resolve_parent_symlinks(rel):
+    parts = clean_rel(rel).split("/")
+    if len(parts) == 1:
+        return parts[0]
+    final = parts[-1]
+    pending = parts[:-1]
+    resolved = []
+    follows = 0
+    while pending:
+        part = pending.pop(0)
+        candidate_parts = resolved + [part]
+        candidate = os.path.join(stage, *candidate_parts)
+        if os.path.islink(candidate):
+            follows += 1
+            if follows > 40:
+                raise SystemExit("too many symlinks while resolving %s" % rel)
+            target = os.readlink(candidate)
+            target_parts = target.split("/")
+            if os.path.isabs(target):
+                pending = norm_parts(target_parts + pending)
+            else:
+                pending = norm_parts(resolved + target_parts + pending)
+            resolved = []
+            continue
+        resolved.append(part)
+    return "/".join(resolved + [final])
+
+def image_path(rel):
+    return "/" + clean_rel(rel)
+
+def host_stage_path(rel):
+    return os.path.join(stage, *clean_rel(rel).split("/"))
+
+def deleted_by_overlay(rel):
+    rel = clean_rel(rel)
+    return any(rel == root or rel.startswith(root + "/") for root in deleted_roots)
+
+def exists_after_deletes(rel):
+    return os.path.lexists(host_stage_path(rel)) and not deleted_by_overlay(rel)
+
+def emit_parent_dirs(rel):
+    parent = os.path.dirname(clean_rel(rel))
+    if not parent:
+        return
+    cur = []
+    for part in parent.split("/"):
+        if not part:
+            continue
+        cur.append(part)
+        cur_rel = "/".join(cur)
+        if not exists_after_deletes(cur_rel):
+            commands.append("mkdir %s" % image_path(cur_rel))
+
+def emit_remove(rel, host=None):
+    rel = clean_rel(rel)
+    if host is None:
+        host = host_stage_path(rel)
+    if os.path.islink(host):
+        commands.append("unlink %s" % image_path(rel))
+    elif os.path.isdir(host):
+        commands.append("rmdir %s" % image_path(rel))
+    else:
+        commands.append("rm %s" % image_path(rel))
+
+def emit_recursive_delete(rel):
+    rel = resolve_parent_symlinks(rel)
+    host = host_stage_path(rel)
+    if not os.path.lexists(host):
+        return
+    if os.path.isdir(host) and not os.path.islink(host):
+        for cur_root, dirs, files in os.walk(host, topdown=False, followlinks=False):
+            cur_rel = os.path.relpath(cur_root, stage).replace(os.sep, "/")
+            for name in files:
+                child = clean_rel(os.path.join(cur_rel, name).replace(os.sep, "/"))
+                emit_remove(child, os.path.join(cur_root, name))
+            for name in dirs:
+                child = clean_rel(os.path.join(cur_rel, name).replace(os.sep, "/"))
+                emit_remove(child, os.path.join(cur_root, name))
+        emit_remove(rel, host)
+    else:
+        emit_remove(rel, host)
+
+def emit_lupos_owner(rel):
+    rel = clean_rel(rel)
+    if rel == "home/lupos" or rel.startswith("home/lupos/"):
+        commands.append("sif %s uid 1000" % image_path(rel))
+        commands.append("sif %s gid 1000" % image_path(rel))
+
+with open(delete_list, "r", encoding="utf-8") as f:
+    for line in f:
+        rel = line.strip()
+        if rel:
+            rel = resolve_parent_symlinks(rel)
+            deleted_roots.add(rel)
+            emit_recursive_delete(rel)
+
+offset = 0
+while True:
+    header = data[offset:offset + 110]
+    if len(header) != 110 or header[:6] != b"070701":
+        raise SystemExit("invalid newc header at offset %d" % offset)
+    fields = [int(header[6 + i * 8:14 + i * 8], 16) for i in range(13)]
+    mode = fields[1]
+    size = fields[6]
+    namesize = fields[11]
+    name_start = offset + 110
+    name_end = name_start + namesize
+    name = data[name_start:name_end - 1].decode()
+    payload_start = align4(name_end)
+    payload_end = payload_start + size
+    payload = data[payload_start:payload_end]
+    offset = align4(payload_end)
+    if name == "TRAILER!!!":
+        break
+    rel = resolve_parent_symlinks(name)
+    kind = mode & 0o170000
+    if kind == stat.S_IFDIR:
+        emit_parent_dirs(rel)
+        if not exists_after_deletes(rel):
+            commands.append("mkdir %s" % image_path(rel))
+        commands.append("sif %s mode 0%o" % (image_path(rel), mode))
+        emit_lupos_owner(rel)
+    elif kind == stat.S_IFLNK:
+        emit_parent_dirs(rel)
+        if exists_after_deletes(rel):
+            emit_remove(rel)
+        commands.append("symlink %s %s" % (image_path(rel), payload.decode()))
+    elif kind == stat.S_IFREG:
+        emit_parent_dirs(rel)
+        if exists_after_deletes(rel):
+            emit_remove(rel)
+        regular_index += 1
+        host = os.path.join(work, "files", "%06d" % regular_index)
+        with open(host, "wb") as out:
+            out.write(payload)
+        commands.append("write %s %s" % (host, image_path(rel)))
+        commands.append("sif %s mode 0%o" % (image_path(rel), mode))
+        emit_lupos_owner(rel)
+
+with open(os.path.join(work, "debugfs.commands"), "w", encoding="utf-8") as out:
+    out.write("\n".join(commands))
+    out.write("\n")
+PY
+echo "Creating ext4 image from staged userland..."
+truncate -s {disk_size} "$raw_build"
+mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -d {stage_sh} "$raw_build"
+echo "Applying generated root-disk overlay..."
+debugfs -w -f {overlay_work_sh}/debugfs.commands "$raw_build" >/dev/null
+echo "Publishing root disk..."
+rm -f "$raw_tmp"
+cp --sparse=always "$raw_build" "$raw_tmp"
+mv -f "$raw_tmp" {raw_sh}
+"#
+    );
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(script);
+    println!(
+        "Building {} ext4 root disk from staged userland: {}",
+        mode_name(mode),
+        raw.display()
+    );
+    run_command(
+        &mut command,
+        &format!("{} direct-stage ext4 root image build", mode_name(mode)),
+    )?;
+    fs::write(&manifest, expected_manifest)
+        .with_context(|| format!("failed to write {}", manifest.display()))?;
+    Ok(raw)
+}
+
+fn ensure_ext4_root_disk_from_initramfs(
+    mode: BootMode,
+    stem: &str,
+    fstab_contents: &str,
+    force_fsck: bool,
+) -> Result<PathBuf> {
+    let target = xtask_target_dir()?;
+    fs::create_dir_all(&target)
+        .with_context(|| format!("failed to create {}", target.display()))?;
+    let root = target.join(format!("{stem}-root"));
+    let cpio = target.join(format!("{stem}.cpio"));
+    let raw = target.join(format!("{stem}.raw"));
+    let manifest = target.join(format!("{stem}.rootdisk.manifest"));
+    let cacheable = login_root_disk_cacheable(mode, force_fsck);
+
+    println!("Preparing {} ext4 root disk...", mode_name(mode));
+    let cpio_bytes = build_initramfs_cpio_unconditional(&mode)
+        .ok_or_else(|| anyhow!("{} CPIO was not generated", mode_name(mode)))?;
+    fs::write(&cpio, &cpio_bytes).with_context(|| format!("failed to write {}", cpio.display()))?;
+    let expected_manifest = login_root_disk_manifest(mode, &cpio_bytes, fstab_contents, force_fsck);
+    let (disk_size, disk_bytes) = login_root_disk_size(mode);
+
+    if cacheable
+        && login_root_disk_manifest_matches(&raw, &manifest, &expected_manifest, disk_bytes)
+    {
+        println!(
+            "Reusing {} ext4 root disk: {}",
+            mode_name(mode),
+            raw.display()
+        );
+        return Ok(raw);
+    }
+
+    let root_sh = shell_single_quote(&shell_path(&root));
+    let cpio_sh = shell_single_quote(&shell_path(&cpio));
+    let raw_sh = shell_single_quote(&shell_path(&raw));
+    let fstab = shell_single_quote(fstab_contents);
+    let fsck_tail = if force_fsck {
+        format!(
+            r#"e2fsck -fy {raw_sh} >/dev/null
+if command -v tune2fs >/dev/null 2>&1; then
+  tune2fs -c 1 -C 1 {raw_sh} >/dev/null
+fi
+"#
+        )
+    } else {
+        String::new()
+    };
+    let script = format!(
+        r#"set -euo pipefail
+rm -rf {root_sh}
+mkdir -p {root_sh}
+python3 - {cpio_sh} {root_sh} <<'PY'
+import os
+import shutil
+import stat
+import sys
+
+archive, root = sys.argv[1], sys.argv[2]
+with open(archive, "rb") as f:
+    data = f.read()
+
+def align4(value):
+    return (value + 3) & ~3
+
+offset = 0
+while True:
+    header = data[offset:offset + 110]
+    if len(header) != 110 or header[:6] != b"070701":
+        raise SystemExit("invalid newc header at offset %d" % offset)
+    fields = [int(header[6 + i * 8:14 + i * 8], 16) for i in range(13)]
+    mode = fields[1]
+    size = fields[6]
+    namesize = fields[11]
+    name_start = offset + 110
+    name_end = name_start + namesize
+    name = data[name_start:name_end - 1].decode()
+    payload_start = align4(name_end)
+    payload_end = payload_start + size
+    payload = data[payload_start:payload_end]
+    offset = align4(payload_end)
+    if name == "TRAILER!!!":
+        break
+    rel = os.path.normpath(name)
+    if rel.startswith("../") or rel == ".." or os.path.isabs(rel):
+        raise SystemExit("unsafe cpio path: %s" % name)
+    dst = os.path.join(root, rel)
+    kind = mode & 0o170000
+    if kind == stat.S_IFDIR:
+        os.makedirs(dst, exist_ok=True)
+        os.chmod(dst, mode & 0o777)
+    elif kind == stat.S_IFLNK:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        try:
+            os.unlink(dst)
+        except FileNotFoundError:
+            pass
+        os.symlink(payload.decode(), dst)
+    elif kind == stat.S_IFREG:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "wb") as out:
+            out.write(payload)
+        os.chmod(dst, mode & 0o777)
+
+def materialize_file_symlink(path):
+    if not os.path.islink(path):
+        return
+    rel = os.path.relpath(path, root).replace(os.sep, "/")
+    # systemd treats .wants/.requires/.upholds entries and unit aliases as
+    # symlinks. Flattening them into regular files makes PID 1 ignore the
+    # dependency edge, so preserve unit-tree links exactly as a Linux rootfs
+    # would expose them.
+    if rel.startswith((
+        "etc/systemd/system/",
+        "etc/systemd/user/",
+        "usr/lib/systemd/system/",
+        "usr/lib/systemd/user/",
+    )):
+        return
+    target = os.readlink(path)
+    if os.path.isabs(target):
+        source = os.path.join(root, target.lstrip("/"))
+    else:
+        source = os.path.normpath(os.path.join(os.path.dirname(path), target))
+    if not os.path.isfile(source):
+        return
+    mode = os.stat(source).st_mode & 0o777
+    os.unlink(path)
+    shutil.copyfile(source, path)
+    os.chmod(path, mode)
+
+for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+    for name in list(dirnames) + filenames:
+        materialize_file_symlink(os.path.join(dirpath, name))
+PY
+mkdir -p {root_sh}/dev {root_sh}/proc {root_sh}/sys {root_sh}/run {root_sh}/tmp {root_sh}/etc
+chmod 1777 {root_sh}/tmp
+printf %s {fstab} > {root_sh}/etc/fstab
+rm -f {raw_sh}
+truncate -s {disk_size} {raw_sh}
+mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -d {root_sh} {raw_sh}
+{fsck_tail}
+"#
+    );
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(script);
+    println!(
+        "Building {} ext4 root disk: {}",
+        mode_name(mode),
+        raw.display()
+    );
+    run_command(
+        &mut command,
+        &format!("{} ext4 root image build", mode_name(mode)),
+    )?;
+    if cacheable {
+        fs::write(&manifest, expected_manifest)
+            .with_context(|| format!("failed to write {}", manifest.display()))?;
+    }
+    Ok(raw)
+}
+
+fn ensure_disk_root_fsck_disk() -> Result<PathBuf> {
+    ensure_ext4_root_disk_from_initramfs(
+        BootMode::DiskRootFsckTest,
+        "disk-root-fsck",
+        SYSTEMD_DISK_ROOT_FSTAB,
+        true,
+    )
+}
+
+/// Run the boot-tracker #27 gate through the guest systemd fsck path.
+pub fn run_disk_root_fsck_tests() -> Result<()> {
+    ensure_userland_stage()?;
+    let _stage_guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
+    let disk = ensure_disk_root_fsck_disk()?;
+    let disk_arg = disk.to_string_lossy().into_owned();
+    let _root_disk_guard = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, &disk_arg);
+    let extra_cmdline = env::var(LUPOS_KERNEL_CMDLINE_ENV).unwrap_or_default();
+    let disk_root_cmdline = disk_root_fsck_cmdline(&extra_cmdline);
+    let _cmdline_guard = EnvVarGuard::set(LUPOS_KERNEL_CMDLINE_ENV, &disk_root_cmdline);
+
+    let prompt = "[lupos@lupos ~]$";
+    let steps = [
+        SerialExpectStep {
+            label: "login user",
+            wait_for: "login:",
+            send: b"lupos\n",
+        },
+        SerialExpectStep {
+            label: "login password",
+            wait_for: "Password:",
+            send: b"lupos\n",
+        },
+        SerialExpectStep {
+            label: "fsck unit query",
+            wait_for: prompt,
+            send: b"r=$(systemctl show -p Result --value systemd-fsck-root.service); echo disk-root-fsck: fsck-result=$r; [ \"$r\" = success ] || { systemctl status --no-pager systemd-fsck-root.service; exit 1; }\n",
+        },
+        SerialExpectStep {
+            label: "remount unit query",
+            wait_for: "disk-root-fsck: fsck-result=success",
+            send: b"r=$(systemctl show -p Result --value systemd-remount-fs.service); echo disk-root-fsck: remount-result=$r; [ \"$r\" = success ] || { systemctl status --no-pager systemd-remount-fs.service; exit 1; }\n",
+        },
+        SerialExpectStep {
+            label: "root mount query",
+            wait_for: "disk-root-fsck: remount-result=success",
+            send: b"awk '$2==\"/\" { printf \"disk-root-fsck: root-mount %s %s\\n\", $3, $4 }' /proc/mounts\n",
+        },
+        SerialExpectStep {
+            label: "poweroff",
+            wait_for: "disk-root-fsck: root-mount ext4",
+            send: b"poweroff\n",
+        },
+    ];
+
+    let run = build_and_run_iso_with_serial_expect(
+        BootMode::DiskRootFsckTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(300)),
+            smp_count: 1,
+        },
+        &steps,
+    )?;
+    assert_boot_outcome(
+        &run,
+        "VFS: Mounted root (ext4 filesystem) readonly on device /dev/vda.",
+        QEMU_SUCCESS_EXIT_CODE,
+    )?;
+    assert_boot_outcome(&run, "VFS: Pivoted into new rootfs", QEMU_SUCCESS_EXIT_CODE)?;
+    assert_boot_outcome(
+        &run,
+        "File System Check on Root Device",
+        QEMU_SUCCESS_EXIT_CODE,
+    )?;
+    assert_boot_outcome(
+        &run,
+        "disk-root-fsck: fsck-result=success",
+        QEMU_SUCCESS_EXIT_CODE,
+    )?;
+    assert_boot_outcome(
+        &run,
+        "disk-root-fsck: remount-result=success",
+        QEMU_SUCCESS_EXIT_CODE,
+    )?;
+    assert_boot_outcome(
+        &run,
+        "disk-root-fsck: root-mount ext4",
+        QEMU_SUCCESS_EXIT_CODE,
+    )?;
+    run_e2fsck_readonly(&disk)
+}
+
+fn disk_root_fsck_cmdline(extra_cmdline: &str) -> String {
+    const BASE: &str = "root=LABEL=lupos-root rootfstype=ext4 fsck.mode=force fsck.repair=yes";
+    let extra_cmdline = extra_cmdline.trim();
+    if extra_cmdline
+        .split_ascii_whitespace()
+        .any(|arg| arg.starts_with("root="))
+    {
+        return extra_cmdline.to_string();
+    }
+    if extra_cmdline.is_empty() {
+        BASE.to_string()
+    } else {
+        format!("{BASE} {extra_cmdline}")
+    }
+}
+
+/// Run only the boot-tracker #26 `/boot` partition mount gate.
+pub fn run_boot_partition_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::BootPartitionTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, BOOT_PARTITION_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    assert_boot_outcome(&run, "Mounted /boot", QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the boot-tracker #37 mapped block-device swap gate.
+pub fn run_mapped_swap_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::MappedSwapTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(60)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, MAPPED_SWAP_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    assert_boot_outcome(
+        &run,
+        "swap: swapon /dev/mapper/cl-swap active pages=256",
+        QEMU_SUCCESS_EXIT_CODE,
+    )?;
+    assert_boot_outcome(&run, "partition", QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run the PID1 handoff smoke.
+pub fn run_pid1_handoff_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::Pid1HandoffTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, PID1_HANDOFF_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run the default build smoke after making sure the selected distro exists.
+///
+/// `cargo xtask test-boot` (no `--mode`) is the single Public Boot acceptance
+/// command (see `ROADMAP.md` — `## Public Boot`).  It must exercise the real
+/// systemd / agetty / login / bash chain so the four Public Boot items —
+/// real systemd as PID 1, getty@tty1 on the framebuffer tty, root → bash with
+/// a Linux-like prompt, and a clean `poweroff` / `reboot` — are validated by
+/// the same command users actually run.  The synthetic SysV transcript stays
+/// reachable via `cargo xtask test-boot --mode pid1-handoff`.
+pub fn run_default_boot_smoke() -> Result<()> {
+    ensure_userland_stage()?;
+    run_login_stack_tests()
+}
+
+/// Run the real PID1/login/bash gate.
+pub fn run_login_stack_tests() -> Result<()> {
+    ensure_userland_stage()?;
+
+    let _guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
+    let prompt = "[lupos@lupos ~]$";
+    let steps = [
+        SerialExpectStep {
+            label: "wrong root login",
+            wait_for: "login:",
+            send: b"root\n",
+        },
+        SerialExpectStep {
+            label: "wrong root password",
+            wait_for: "Password:",
+            send: b"wrong-password\n",
+        },
+        SerialExpectStep {
+            label: "wrong password rejected",
+            wait_for: "Login incorrect",
+            send: b"",
+        },
+        SerialExpectStep {
+            label: "login user",
+            wait_for: "login:",
+            send: b"lupos\n",
+        },
+        SerialExpectStep {
+            label: "login password",
+            wait_for: "Password:",
+            send: b"lupos\n",
+        },
+        SerialExpectStep {
+            label: "prompt recovery",
+            wait_for: prompt,
+            send: b"echo login-stack: prompt recovered\n",
+        },
+        SerialExpectStep {
+            label: "clear smoke",
+            wait_for: prompt,
+            send: b"clear; echo clear-ok\n",
+        },
+        SerialExpectStep {
+            label: "pwd",
+            wait_for: prompt,
+            send: b"pwd\n",
+        },
+        SerialExpectStep {
+            label: "home env",
+            wait_for: prompt,
+            send: b"printf 'home=%s\\n' \"$HOME\"\n",
+        },
+        SerialExpectStep {
+            label: "ls-li metadata",
+            wait_for: prompt,
+            send: b"ls -ldi /bin/ls /etc/passwd /home/lupos\n",
+        },
+        SerialExpectStep {
+            label: "ls-li marker",
+            wait_for: prompt,
+            send: b"echo login-stack: ls-li metadata ok\n",
+        },
+        SerialExpectStep {
+            label: "whoami",
+            wait_for: prompt,
+            send: b"whoami\n",
+        },
+        SerialExpectStep {
+            label: "id",
+            wait_for: prompt,
+            send: b"id\n",
+        },
+        SerialExpectStep {
+            label: "shell",
+            wait_for: prompt,
+            send: b"echo $SHELL\n",
+        },
+        SerialExpectStep {
+            label: "start ctrl-c target",
+            wait_for: prompt,
+            send: b"sleep 5\n",
+        },
+        SerialExpectStep {
+            label: "ctrl-c foreground",
+            wait_for: "sleep 5",
+            send: b"\x03",
+        },
+        SerialExpectStep {
+            label: "job control probe",
+            wait_for: prompt,
+            send: b"tail -f /dev/null &\n",
+        },
+        SerialExpectStep {
+            label: "jobs while running",
+            wait_for: prompt,
+            send: b"jobs\n",
+        },
+        SerialExpectStep {
+            label: "stop background job",
+            wait_for: prompt,
+            send: b"kill -STOP %1\n",
+        },
+        SerialExpectStep {
+            label: "jobs after stop",
+            wait_for: prompt,
+            send: b"jobs\n",
+        },
+        SerialExpectStep {
+            label: "terminate stopped job",
+            wait_for: prompt,
+            send: b"kill -TERM %1\n",
+        },
+        SerialExpectStep {
+            label: "terminated job notification",
+            wait_for: "Terminated",
+            send: b"\n",
+        },
+        SerialExpectStep {
+            label: "login banner",
+            wait_for: prompt,
+            send: b"echo login-stack: gate ok\n",
+        },
+        SerialExpectStep {
+            label: "logout lupos",
+            wait_for: prompt,
+            send: b"exit\n",
+        },
+        SerialExpectStep {
+            label: "shutdown root login",
+            wait_for: "login:",
+            send: b"root\n",
+        },
+        SerialExpectStep {
+            label: "shutdown root password",
+            wait_for: "Password:",
+            send: b"lupos\n",
+        },
+        SerialExpectStep {
+            label: "root filesystem check",
+            wait_for: "[root@lupos /]#",
+            // Root logs into / for this boot image so plain `ls` shows the
+            // Arch root filesystem instead of an empty-looking /root.
+            // Build the marker by concatenation (like the IMA/EVM steps below) so the
+            // literal "login-stack: root fs ok" never appears in the echoed command.
+            // Otherwise the next step's wait_for matches the command echo and fires its
+            // long send while this command's output is still streaming, corrupting it.
+            send: b"printf 'home=%s\\n' \"$HOME\" && pwd && ls bin etc usr var >/dev/null && ok='login-stack: root ' && printf '%s\\n' \"${ok}fs ok\"\n",
+        },
+        SerialExpectStep {
+            label: "root filesystem marker",
+            wait_for: "login-stack: root fs ok",
+            send: b"\n",
+        },
+        SerialExpectStep {
+            label: "shutdown",
+            wait_for: "[root@lupos /]#",
+            send: b" poweroff -f\n",
+        },
+    ];
+    let run = build_and_run_iso_with_serial_expect(
+        BootMode::LoginStackTest,
+        RunOptions {
+            exit_after_boot: true,
+            // The real login/bash gate runs under the full systemd initramfs
+            // (~73 MiB). Under a debug-build kernel without KVM acceleration
+            // the kernel alone takes ~5 minutes to reach `/sbin/init`, then
+            // systemd-260.1 must walk all its generators and sysvinit-compat
+            // before the getty fires. A 30-minute budget is enough to cover
+            // the slow unaccelerated QEMU path while still bailing on a real hang.
+            qemu_timeout: Some(Duration::from_secs(1800)),
+            smp_count: 1,
+        },
+        &steps,
+    )?;
+
+    for needle in [
+        "login:",
+        "Welcome to Lupos.",
+        "lupos",
+        "uid=1000(lupos)",
+        "/bin/bash",
+        "[lupos@lupos ~]$",
+        "[root@lupos /]#",
+        "clear-ok",
+        "/home/lupos",
+        "home=/home/lupos",
+        "home=/root",
+        "^C",
+        "Running",
+        "tail -f /dev/null",
+        "sched_clock: Marking stable",
+        "Write protecting the kernel read-only data:",
+        "x86/mm: Checked W+X mappings: passed, no W+X pages found.",
+        "Freeing unused kernel image (initmem) memory:",
+        "Freeing unused kernel image (text/rodata gap) memory:",
+        "Freeing unused kernel image (rodata/data gap) memory:",
+        LOGIN_STACK_BANNER,
+    ] {
+        if !serial_log_contains(&run.serial_output, needle) {
+            bail!(
+                "login-stack serial log did not contain {:?}\nserial log:\n{}",
+                needle,
+                run.serial_output
+            );
+        }
+    }
+
+    for marker in [
+        "login-stack: prompt recovered",
+        "login-stack: ls-li metadata ok",
+        "login-stack: root fs ok",
+    ] {
+        if !serial_log_has_output_line(&run.serial_output, marker) {
+            bail!(
+                "login-stack serial log did not contain output marker {:?}\nserial log:\n{}",
+                marker,
+                run.serial_output
+            );
+        }
+    }
+
+    assert_ls_li_regular_metadata(&run.serial_output, "/bin/ls")?;
+    assert_ls_li_regular_metadata(&run.serial_output, "/etc/passwd")?;
+    assert_ls_li_directory_owner(&run.serial_output, "/home/lupos", "lupos")?;
+
+    for forbidden in [
+        "Failed to spawn executor: Bad file descriptor",
+        "Failed at step RUNTIME_DIRECTORY",
+        "Failed to start systemd-journald.service",
+        "systemd-journald.service: Failed",
+    ] {
+        if serial_log_contains(&run.serial_output, forbidden) {
+            bail!(
+                "login-stack serial log contained forbidden systemd startup failure {:?}\nserial log:\n{}",
+                forbidden,
+                run.serial_output
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub fn run_gui_shell_tests() -> Result<()> {
+    bail!("gui-shell was removed; Arch base has no desktop gate")
+}
+
+/// Run a real shell/coreutils userspace smoke with bounded commands.
+pub fn run_userspace_smoke_tests() -> Result<()> {
+    ensure_userland_stage()?;
+
+    let _guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
+    let prompt = "[root@lupos /]#";
+    let steps = [
+        SerialExpectStep {
+            label: "login root",
+            wait_for: "login:",
+            send: b"root\n",
+        },
+        SerialExpectStep {
+            label: "root password",
+            wait_for: "Password:",
+            send: b"lupos\n",
+        },
+        SerialExpectStep {
+            label: "shell",
+            wait_for: prompt,
+            send: b"sh /usr/libexec/lupos-userspace-smoke.sh\n",
+        },
+    ];
+    let run = build_and_run_iso_with_serial_expect(
+        BootMode::UserspaceSmokeTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(900)),
+            smp_count: 1,
+        },
+        &steps,
+    )?;
+
+    assert_boot_outcome(&run, USERSPACE_SMOKE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    for needle in [
+        "userspace-smoke: shell ok",
+        "userspace-smoke: true ok",
+        "userspace-smoke: proc ok",
+        "userspace-smoke: sys-dev ok",
+        "smoke-data",
+        "userspace-smoke: fs ok",
+        "userspace-smoke: transcript ok",
+        "userspace-smoke: ls ok",
+        "userspace-smoke: pacman-install ok",
+        "userspace-smoke: sleep ok",
+        "userspace-smoke: clear ok",
+    ] {
+        if !serial_log_contains(&run.serial_output, needle) {
+            bail!(
+                "userspace-smoke serial log did not contain {:?}\nserial log:\n{}",
+                needle,
+                run.serial_output
+            );
+        }
+    }
+    assert_no_runtime_smoke_failures("userspace-smoke", &run.serial_output)
+}
+
+/// Run bounded fork/exec, mmap-heavy libc, fs, signal/wait, and network loops.
+pub fn run_runtime_stress_tests() -> Result<()> {
+    ensure_userland_stage()?;
+
+    let _guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
+    let prompt = "[root@lupos /]#";
+    let steps = [
+        SerialExpectStep {
+            label: "login root",
+            wait_for: "login:",
+            send: b"root\n",
+        },
+        SerialExpectStep {
+            label: "root password",
+            wait_for: "Password:",
+            send: b"lupos\n",
+        },
+        SerialExpectStep {
+            label: "fork exec loop",
+            wait_for: prompt,
+            send: b"sh /usr/libexec/lupos-runtime-stress.sh\n",
+        },
+    ];
+    let run = build_and_run_iso_with_serial_expect(
+        BootMode::RuntimeStressTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(1200)),
+            smp_count: 1,
+        },
+        &steps,
+    )?;
+
+    assert_boot_outcome(&run, RUNTIME_STRESS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    for needle in [
+        "runtime-stress: fork-exec ok",
+        "runtime-stress: mmap-libc ok",
+        "runtime-stress: fs ok",
+        "runtime-stress: signal-wait ok",
+        "runtime-stress: network ok",
+    ] {
+        if !serial_log_contains(&run.serial_output, needle) {
+            bail!(
+                "runtime-stress serial log did not contain {:?}\nserial log:\n{}",
+                needle,
+                run.serial_output
+            );
+        }
+    }
+    assert_no_runtime_smoke_failures("runtime-stress", &run.serial_output)
+}
+
+/// Boot the shipped Arch login userland and prove every required command group
+/// works: bash builtins, coreutils, grep/find/tar/sed/awk, pacman local
+/// database reads, systemd tools, procps, util-linux, and ip/ping.
+pub fn run_shipped_commands_tests() -> Result<()> {
+    ensure_userland_stage()?;
+
+    let _guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
+    // Honor the configured QEMU accelerator/backend so this gate can validate
+    // the multi-user service burst under the same native Linux path users run.
+    let prompt = "[root@lupos /]#";
+    let steps = [
+        SerialExpectStep {
+            label: "login root",
+            wait_for: "login:",
+            send: b"root\n",
+        },
+        SerialExpectStep {
+            label: "root password",
+            wait_for: "Password:",
+            send: b"lupos\n",
+        },
+        SerialExpectStep {
+            label: "shipped command gauntlet",
+            wait_for: prompt,
+            send: b"bash /usr/libexec/lupos-shipped-commands.sh\n",
+        },
+    ];
+    // Longer than smoke (900 s) and stress (1200 s): this gate boots the
+    // full multi-user chain and then walks the Arch base command surface
+    // under the configured QEMU backend.
+    let run = build_and_run_iso_with_serial_expect(
+        BootMode::ShippedCommandsTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(2400)),
+            smp_count: 1,
+        },
+        &steps,
+    )?;
+
+    assert_boot_outcome(&run, SHIPPED_COMMANDS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    for needle in SHIPPED_COMMANDS_MARKERS {
+        if !serial_log_contains(&run.serial_output, needle) {
+            bail!(
+                "shipped-commands serial log did not contain {:?}\nserial log:\n{}",
+                needle,
+                run.serial_output
+            );
+        }
+    }
+    if serial_log_contains(&run.serial_output, "shipped-commands: gate FAILED") {
+        bail!(
+            "shipped-commands script hit its ERR trap\nserial log:\n{}",
+            run.serial_output
+        );
+    }
+    assert_no_runtime_smoke_failures("shipped-commands", &run.serial_output)
+}
+
+fn assert_no_runtime_smoke_failures(label: &str, serial_output: &str) -> Result<()> {
+    for forbidden in [
+        "KERNEL PANIC",
+        "BUG:",
+        "Oops:",
+        "Bad file descriptor",
+        "invalid ELF header",
+        "Segmentation fault",
+        "I/O error",
+    ] {
+        if serial_log_contains(serial_output, forbidden) {
+            bail!(
+                "{label} serial log contained forbidden runtime failure {:?}\nserial log:\n{}",
+                forbidden,
+                serial_output
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ls_li_line(log: &str, path: &str) -> Option<String> {
+    strip_ansi_escapes(log)
+        .lines()
+        .find(|line| {
+            let mut fields = line.split_whitespace();
+            let Some(ino) = fields.next() else {
+                return false;
+            };
+            let Some(mode) = fields.next() else {
+                return false;
+            };
+            ino.parse::<u64>().is_ok()
+                && matches!(
+                    mode.as_bytes().first(),
+                    Some(b'-' | b'd' | b'l' | b'c' | b'b')
+                )
+                && line.split_whitespace().last() == Some(path)
+        })
+        .map(str::to_owned)
+}
+
+fn assert_ls_li_regular_metadata(log: &str, path: &str) -> Result<()> {
+    let line = ls_li_line(log, path)
+        .ok_or_else(|| anyhow!("login-stack serial log did not contain ls -li row for {path}"))?;
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 6 {
+        bail!("ls -li row for {path} was too short: {line}");
+    }
+    let ino = fields[0]
+        .parse::<u64>()
+        .with_context(|| format!("ls -li inode for {path} was not numeric: {line}"))?;
+    let size = fields[5]
+        .parse::<u64>()
+        .with_context(|| format!("ls -li size for {path} was not numeric: {line}"))?;
+    if ino == 0 || !fields[1].starts_with('-') || size == 0 {
+        bail!("ls -li metadata for {path} was not Linux-like: {line}");
+    }
+    Ok(())
+}
+
+fn assert_ls_li_directory_owner(log: &str, path: &str, owner: &str) -> Result<()> {
+    let line = ls_li_line(log, path)
+        .ok_or_else(|| anyhow!("login-stack serial log did not contain ls -li row for {path}"))?;
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 5 {
+        bail!("ls -li row for {path} was too short: {line}");
+    }
+    let ino = fields[0]
+        .parse::<u64>()
+        .with_context(|| format!("ls -li inode for {path} was not numeric: {line}"))?;
+    if ino == 0 || !fields[1].starts_with('d') || fields[3] != owner || fields[4] != owner {
+        bail!("ls -li directory metadata for {path} was not Linux-like: {line}");
+    }
+    Ok(())
+}
+
+fn ping_smoke_host() -> Result<String> {
+    let host = env::var(LUPOS_PING_HOST_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_PING_HOST.to_string());
+    let labels_valid = host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    });
+    if labels_valid && host.len() <= 253 {
+        Ok(host)
+    } else {
+        bail!(
+            "{LUPOS_PING_HOST_ENV} must be a DNS name or IPv4 address without shell metacharacters"
+        )
+    }
+}
+
+/// Boot the default distro and verify guest networking with `ping -c 1`.
+pub fn run_ping_smoke() -> Result<()> {
+    ensure_userland_stage()?;
+    let host = ping_smoke_host()?;
+    let marker = format!("ping-smoke: guest ping ok ({host})");
+    let _host_guard = EnvVarGuard::set(LUPOS_PING_HOST_ENV, &host);
+    let run = build_and_run_iso(
+        BootMode::PingSmoke,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(120)),
+            smp_count: 1,
+        },
+    )?;
+
+    let actual_code = run
+        .status
+        .code()
+        .ok_or_else(|| anyhow!("QEMU did not return a process exit code"))?;
+    if actual_code != QEMU_SUCCESS_EXIT_CODE {
+        bail!(
+            "unexpected QEMU exit code during ping smoke: expected {QEMU_SUCCESS_EXIT_CODE}, got {actual_code}\nserial log:\n{}",
+            run.serial_output
+        );
+    }
+    if !serial_log_contains(&run.serial_output, &marker) {
+        bail!(
+            "ping smoke did not observe successful guest ping to {host}\nserial log:\n{}",
+            run.serial_output
+        );
+    }
+    if !serial_log_contains(&run.serial_output, &format!("ping -c 1 {host}")) {
+        bail!(
+            "ping smoke did not run the expected guest command for {host}\nserial log:\n{}",
+            run.serial_output
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BootTriageReport {
+    pub first_failed_unit: Option<String>,
+    pub service_failures: Vec<String>,
+    pub errno_histogram: Vec<(String, usize)>,
+    pub missing_paths: Vec<String>,
+    pub netlink_or_ioctl_failures: Vec<String>,
+    pub last_syscalls_by_pid: Vec<(i32, String)>,
+}
+
+pub fn boot_triage_cmd(path: &Path) -> Result<()> {
+    let log = read_serial_log(path)?;
+    let report = analyze_boot_log(&log);
+    print!("{}", render_boot_triage_report(&report));
+    Ok(())
+}
+
+fn analyze_boot_log(log: &str) -> BootTriageReport {
+    let mut report = BootTriageReport::default();
+    let mut service_seen = HashSet::new();
+    let mut missing_seen = HashSet::new();
+    let mut netlink_seen = HashSet::new();
+    let mut errno_counts: HashMap<String, usize> = HashMap::new();
+    let mut last_syscalls: HashMap<i32, String> = HashMap::new();
+
+    for raw in log.lines() {
+        let line = clean_serial_line(raw);
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        if report.first_failed_unit.is_none() {
+            report.first_failed_unit = failed_unit_from_line(&line);
+        }
+        if is_service_failure_line(&line) && service_seen.insert(line.clone()) {
+            report.service_failures.push(line.clone());
+        }
+
+        for errno in errno_values_from_line(&line) {
+            *errno_counts.entry(errno).or_insert(0) += 1;
+        }
+
+        if is_missing_path_line(&line) {
+            let item = extract_path_from_line(&line).unwrap_or_else(|| line.clone());
+            if missing_seen.insert(item.clone()) {
+                report.missing_paths.push(item);
+            }
+        }
+
+        if is_netlink_or_ioctl_line(&line)
+            && is_failure_line(&line)
+            && netlink_seen.insert(line.clone())
+        {
+            report.netlink_or_ioctl_failures.push(line.clone());
+        }
+
+        if let Some(pid) = trace_pid_from_line(&line) {
+            last_syscalls.insert(pid, line);
+        }
+    }
+
+    let mut errno_histogram = errno_counts.into_iter().collect::<Vec<_>>();
+    errno_histogram.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    report.errno_histogram = errno_histogram;
+
+    let mut last = last_syscalls.into_iter().collect::<Vec<_>>();
+    last.sort_by_key(|(pid, _)| *pid);
+    report.last_syscalls_by_pid = last;
+
+    report.service_failures.truncate(24);
+    report.missing_paths.truncate(24);
+    report.netlink_or_ioctl_failures.truncate(24);
+    report.last_syscalls_by_pid.truncate(24);
+    report
+}
+
+fn clean_serial_line(input: &str) -> String {
+    let mut out = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '\x08' {
+            out.pop();
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn failed_unit_from_line(line: &str) -> Option<String> {
+    let marker = "Failed to start ";
+    let start = line.find(marker)? + marker.len();
+    let rest = &line[start..];
+    if let Some(service_end) = rest.find(".service") {
+        return Some(rest[..service_end + ".service".len()].to_string());
+    }
+    let end = rest
+        .find(" - ")
+        .or_else(|| rest.find(':'))
+        .unwrap_or(rest.len());
+    Some(rest[..end].trim().to_string()).filter(|value| !value.is_empty())
+}
+
+fn is_service_failure_line(line: &str) -> bool {
+    line.contains("[FAILED]")
+        || line.contains("Failed to start ")
+        || line.contains("Failed with result")
+        || line.contains("Dependency failed for ")
+}
+
+fn is_failure_line(line: &str) -> bool {
+    line.contains(" ret=-")
+        || line.contains(" errno=")
+        || line.contains("Failed")
+        || line.contains("Invalid argument")
+        || line.contains("No such file or directory")
+        || line.contains("Transport endpoint is not connected")
+}
+
+fn is_missing_path_line(line: &str) -> bool {
+    line.contains("ret=-2")
+        || line.contains("errno=2")
+        || line.contains("No such file or directory")
+}
+
+fn is_netlink_or_ioctl_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("netlink") || lower.contains("ioctl")
+}
+
+fn extract_path_from_line(line: &str) -> Option<String> {
+    let start = line.find("path=")? + "path=".len();
+    let rest = &line[start..];
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    Some(rest[..end].to_string()).filter(|value| !value.is_empty())
+}
+
+fn errno_values_from_line(line: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    collect_prefixed_i32(line, "ret=-", &mut values);
+    collect_prefixed_i32(line, "errno=", &mut values);
+    values
+}
+
+fn collect_prefixed_i32(line: &str, needle: &str, out: &mut Vec<String>) {
+    let mut offset = 0;
+    while let Some(found) = line[offset..].find(needle) {
+        let digits_start = offset + found + needle.len();
+        let digits = line[digits_start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if !digits.is_empty() {
+            out.push(format!("-{digits}"));
+        }
+        offset = digits_start
+            .saturating_add(digits.len())
+            .max(offset + found + needle.len());
+        if offset >= line.len() {
+            break;
+        }
+    }
+}
+
+fn trace_pid_from_line(line: &str) -> Option<i32> {
+    let start = line.find("trace-svc-sys pid=")? + "trace-svc-sys pid=".len();
+    let rest = &line[start..];
+    let digits = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn render_boot_triage_report(report: &BootTriageReport) -> String {
+    let mut out = String::from("boot-triage\n");
+    out.push_str("first_failed_unit: ");
+    out.push_str(report.first_failed_unit.as_deref().unwrap_or("none"));
+    out.push('\n');
+
+    render_named_lines(&mut out, "service_failures", &report.service_failures);
+    out.push_str("errno_histogram:\n");
+    if report.errno_histogram.is_empty() {
+        out.push_str("  none\n");
+    } else {
+        for (errno, count) in report.errno_histogram.iter().take(16) {
+            out.push_str(&format!("  {errno}: {count}\n"));
+        }
+    }
+    render_named_lines(&mut out, "missing_paths", &report.missing_paths);
+    render_named_lines(
+        &mut out,
+        "netlink_or_ioctl_failures",
+        &report.netlink_or_ioctl_failures,
+    );
+
+    out.push_str("last_syscalls_by_pid:\n");
+    if report.last_syscalls_by_pid.is_empty() {
+        out.push_str("  none\n");
+    } else {
+        for (pid, line) in &report.last_syscalls_by_pid {
+            out.push_str(&format!("  pid {pid}: {line}\n"));
+        }
+    }
+    out
+}
+
+fn render_named_lines(out: &mut String, name: &str, lines: &[String]) {
+    out.push_str(name);
+    out.push_str(":\n");
+    if lines.is_empty() {
+        out.push_str("  none\n");
+    } else {
+        for line in lines {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+}
+
+fn ensure_userland_stage() -> Result<()> {
+    match validate_userland_stage() {
+        Ok(()) => Ok(()),
+        Err(_) => build_userland_cmd(),
+    }
+}
+
+/// Build and stage the real login userland from vendored GNU Bash and util-linux.
+pub fn build_userland_cmd() -> Result<()> {
+    let root = repo_root()?;
+    if !using_arch_distro() {
+        validate_userland_vendor_sources(&root)?;
+        validate_userland_auth_vendor_sources(&root)?;
+        validate_systemd_vendor_source(&root)?;
+    }
+    let script = root.join(USERLAND_BUILD_SCRIPT);
+    if !script.is_file() {
+        bail!("missing userland build script {}", script.display());
+    }
+
+    let mut command = build_userland_command(&root);
+    run_command(&mut command, "userland build")?;
+
+    validate_userland_stage()?;
+    let stage = target_userland_stage_dir()?;
+    println!("userland staged under {}", stage.display());
+    Ok(())
+}
+
+fn validate_userland_stage() -> Result<()> {
+    let stage = target_userland_stage_dir()?;
+    let mut arch_required = vec![
+        "bin/sh",
+        "bin/ip",
+        "bin/bash",
+        "usr/bin/bash",
+        "usr/bin/ping",
+        "usr/bin/pacman",
+        "usr/bin/fsck",
+        "usr/bin/systemctl",
+        "usr/bin/journalctl",
+        "usr/bin/loginctl",
+        "sbin/agetty",
+        "bin/mount",
+        "bin/umount",
+        "bin/ls",
+        "bin/cp",
+        "bin/stty",
+        "bin/login",
+        "sbin/modprobe",
+        "usr/lib/systemd/systemd",
+        "usr/lib/systemd/systemd-executor",
+        "usr/lib/systemd/system/getty@.service",
+        "usr/lib/systemd/system/multi-user.target",
+        "usr/lib/systemd/system/systemd-journald.service",
+        "usr/lib/systemd/system/systemd-user-sessions.service",
+        "usr/lib/systemd/system/systemd-logind.service",
+        "usr/lib/systemd/system/systemd-networkd.service",
+        "usr/lib/systemd/systemd-user-sessions",
+        "usr/lib/security/pam_systemd.so",
+        "usr/lib/security/pam_unix.so",
+        "usr/lib/pam.d/systemd-user",
+        "usr/lib/libattr.so.1",
+        "usr/lib/libcrypto.so.3",
+        "usr/lib/libexpat.so.1",
+        "usr/lib/libgcrypt.so.20",
+        "usr/lib/libgpg-error.so.0",
+        "usr/lib/liblz4.so.1",
+        "usr/lib/liblzma.so.5",
+        "usr/lib/libm.so.6",
+        "usr/lib/libnss_dns.so.2",
+        "usr/lib/libnss_files.so.2",
+        "usr/lib/libssl.so.3",
+        "usr/lib/libuuid.so.1",
+        GLIBC_DYNAMIC_LOADER,
+        "etc/pam.d/login",
+        "etc/login.defs",
+        "etc/os-release",
+        "etc/resolv.conf",
+        "etc/pacman.conf",
+        "etc/pacman.d/mirrorlist",
+        "etc/systemd/network/10-lupos-qemu.network",
+        "var/lib/pacman/local/ALPM_DB_VERSION",
+    ];
+    arch_required.extend(SHIPPED_COMMANDS_STAGE_ARTIFACTS);
+    let lupos_required = [
+        "bin/busybox",
+        "bin/sh",
+        "sbin/mdev",
+        "sbin/modprobe",
+        "bin/ip",
+        "bin/hostname",
+        "bin/[",
+        "bin/whoami",
+        "bin/id",
+        "bin/sleep",
+        "bin/bash",
+        "usr/bin/bash",
+        "sbin/agetty",
+        "bin/mount",
+        "bin/umount",
+        "sbin/hwclock",
+        "bin/ls",
+        "bin/cp",
+        "bin/stty",
+        "bin/login",
+        "bin/su",
+        "usr/bin/passwd",
+        "usr/bin/systemctl",
+        "usr/bin/journalctl",
+        "usr/bin/loginctl",
+        "usr/bin/systemd-analyze",
+        "usr/bin/stdbuf",
+        "usr/lib/systemd/systemd",
+        "usr/lib/systemd/systemd-executor",
+        "usr/lib/systemd/system/getty@.service",
+        "usr/lib/systemd/system/multi-user.target",
+        "usr/lib/systemd/system/systemd-journald.service",
+        "usr/lib/systemd/system/systemd-user-sessions.service",
+        "usr/lib/systemd/system/systemd-logind.service",
+        "usr/lib/systemd/system/systemd-networkd.service",
+        "usr/lib/systemd/system/systemd-resolved.service",
+        "usr/lib/systemd/systemd-user-sessions",
+        "usr/libexec/coreutils/libstdbuf.so",
+        GLIBC_DYNAMIC_LOADER,
+        "usr/sbin/unix_chkpwd",
+        "usr/lib/libcrypt.so.1",
+        "usr/lib/libpam.so.0",
+        "usr/lib/libpam_misc.so.0",
+        "lib/security/pam_unix.so",
+        "etc/pam.d/login",
+        "etc/login.defs",
+    ];
+    let allow_symlinks = using_arch_distro();
+    let required = if allow_symlinks {
+        arch_required.as_slice()
+    } else {
+        lupos_required.as_slice()
+    };
+    for required in required {
+        validate_stage_artifact(&stage, required, allow_symlinks)?;
+    }
+    if allow_symlinks {
+        validate_arch_pam_systemd_session(&stage)?;
+        validate_arch_pacman_config(&stage)?;
+        validate_arch_pacman_mirrorlist(&stage)?;
+        validate_arch_pacman_offline_repo(&stage)?;
+        validate_arch_pacman_package_aliases(&stage)?;
+    }
+    validate_stage_artifact(&stage, "sbin/init", true)?;
+    Ok(())
+}
+
+fn validate_arch_pacman_config(stage: &Path) -> Result<()> {
+    let path = stage.join("etc/pacman.conf");
+    let body = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read staged pacman config {}", path.display()))?;
+    if body.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("DownloadUser") && line.contains('=')
+    }) {
+        bail!(
+            "staged pacman config must not enable DownloadUser until Lupos supports libalpm downloader uid switching: {}",
+            path.display()
+        );
+    }
+    if !body.lines().any(|line| line.trim() == "DisableSandbox") {
+        bail!(
+            "staged pacman config must disable libalpm's Linux sandbox until Landlock/seccomp are supported: {}",
+            path.display()
+        );
+    }
+    if !body
+        .lines()
+        .any(|line| line.trim() == ARCH_PACMAN_XFER_COMMAND)
+    {
+        bail!(
+            "staged pacman config must use the Lupos local transfer helper: {}",
+            path.display()
+        );
+    }
+    let helper_path = stage.join(ARCH_PACMAN_XFER_HELPER);
+    let helper_metadata = fs::metadata(&helper_path).with_context(|| {
+        format!(
+            "failed to stat staged pacman transfer helper {}",
+            helper_path.display()
+        )
+    })?;
+    if !helper_metadata.is_file() {
+        bail!(
+            "staged pacman transfer helper must be a file: {}",
+            helper_path.display()
+        );
+    }
+    #[cfg(unix)]
+    if helper_metadata.permissions().mode() & 0o111 == 0 {
+        bail!(
+            "staged pacman transfer helper must be executable: {}",
+            helper_path.display()
+        );
+    }
+    for repo in ["core", "extra"] {
+        if !pacman_repo_section_has_line(&body, repo, "SigLevel = Optional TrustAll") {
+            bail!(
+                "staged pacman config must allow the generated offline {repo} repo without an initialized guest keyring: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn pacman_repo_section_has_line(body: &str, repo: &str, expected: &str) -> bool {
+    let mut in_repo = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed == format!("[{repo}]") {
+            in_repo = true;
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_repo = false;
+        }
+        if in_repo && trimmed == expected {
+            return true;
+        }
+    }
+    false
+}
+
+fn validate_arch_pacman_mirrorlist(stage: &Path) -> Result<()> {
+    let path = stage.join("etc/pacman.d/mirrorlist");
+    let body = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read staged pacman mirrorlist {}", path.display()))?;
+    if !body
+        .lines()
+        .any(|line| line.trim() == "Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch")
+    {
+        bail!(
+            "staged pacman mirrorlist must point to the generated offline repo: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_arch_pacman_offline_repo(stage: &Path) -> Result<()> {
+    for rel in ARCH_OFFLINE_PACMAN_REPO_ARTIFACTS {
+        validate_stage_artifact(stage, rel, true)?;
+    }
+    Ok(())
+}
+
+fn validate_arch_pacman_package_aliases(stage: &Path) -> Result<()> {
+    for (rel, expected) in ARCH_PACMAN_PACKAGE_ALIASES {
+        let path = stage.join(rel);
+        let actual = fs::read_link(&path).with_context(|| {
+            format!(
+                "failed to read staged pacman package alias {}",
+                path.display()
+            )
+        })?;
+        if actual != Path::new(expected) {
+            bail!(
+                "staged pacman package alias {} points to {}, expected {}",
+                path.display(),
+                actual.display(),
+                expected
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_arch_pam_systemd_session(stage: &Path) -> Result<()> {
+    let path = stage.join("etc/pam.d/system-login");
+    let body = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read staged PAM session file {}", path.display()))?;
+    if !body.contains("session optional pam_systemd.so") {
+        bail!(
+            "staged PAM session file must enable pam_systemd without an unsupported class override: {}",
+            path.display()
+        );
+    }
+    if body.contains("pam_systemd.so class=user-light") {
+        bail!(
+            "staged PAM session file still uses unsupported systemd 257 user-light class: {}",
+            path.display()
+        );
+    }
+    let systemd_user_path = stage.join("usr/lib/pam.d/systemd-user");
+    let systemd_user_body = fs::read_to_string(&systemd_user_path).with_context(|| {
+        format!(
+            "failed to read staged systemd-user PAM file {}",
+            systemd_user_path.display()
+        )
+    })?;
+    if !systemd_user_body.contains("pam_systemd.so") {
+        bail!(
+            "staged systemd-user PAM file must invoke pam_systemd so user@.service gets XDG_RUNTIME_DIR: {}",
+            systemd_user_path.display()
+        );
+    }
+    if systemd_user_body.contains("pam_systemd.so class=user-light") {
+        bail!(
+            "staged systemd-user PAM file still uses unsupported systemd 257 user-light class: {}",
+            systemd_user_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_stage_artifact(stage: &Path, rel: &str, allow_symlink: bool) -> Result<()> {
+    let path = stage.join(rel);
+    let metadata = fs::symlink_metadata(&path).with_context(|| {
+        format!(
+            "userland build did not stage required artifact {}",
+            path.display()
+        )
+    })?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        if allow_symlink {
+            match fs::read_link(&path) {
+                Ok(target) => {
+                    if target.as_os_str().is_empty() {
+                        bail!(
+                            "userland staged symlink has an empty target: {}",
+                            path.display()
+                        );
+                    }
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to read staged symlink {}", path.display())
+                    });
+                }
+            }
+            return Ok(());
+        }
+        bail!(
+            "userland staged artifact must be a file, got symlink: {}",
+            path.display()
+        );
+    }
+    if !file_type.is_file() {
+        bail!(
+            "userland staged artifact must be a file: {}",
+            path.display()
+        );
+    }
+    if metadata.len() == 0 {
+        bail!("userland staged artifact is empty: {}", path.display());
+    }
+    Ok(())
+}
+
+/// Run only the Milestone 43 block-core acceptance suite.
+pub fn run_block_core_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::BlockCoreTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, BLOCK_CORE_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+/// Run only the Milestone 44 partitions/loop acceptance suite.
+pub fn run_block_partitions_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::BlockPartitionsTest,
+        phase17_late_boot_run_options(),
+    )?;
+    assert_boot_outcome(&run, BLOCK_PARTITIONS_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+/// Run only the Milestone 45 ext4-read acceptance suite.
+pub fn run_ext4_read_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::Ext4ReadTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, EXT4_READ_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+/// Run only the Milestone 46 FAT32+ISO9660 acceptance suite.
+pub fn run_fat_iso_suite_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::FatIsoSuiteTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, FAT_ISO_SUITE_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the networking acceptance suite.
+pub fn run_networking_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::NetworkingTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, NETWORKING_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Run only the Milestone 54 device-model acceptance suite.
+pub fn run_device_model_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::DeviceModelTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, DEVICE_MODEL_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("device-model tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 55 PCI/ACPI/IOMMU/DMA acceptance suite.
+pub fn run_pci_acpi_tests() -> Result<()> {
+    let run = build_and_run_pci_acpi_iso()?;
+    assert_boot_outcome(&run, PCI_ACPI_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("pci-acpi tests passed");
+    Ok(())
+}
+
+fn build_and_run_pci_acpi_iso() -> Result<BootRun> {
+    let _machine_guard = EnvVarGuard::set(LUPOS_QEMU_MACHINE_ENV, "q35");
+    build_and_run_iso(BootMode::PciAcpiTest, phase17_late_boot_run_options())
+}
+
+/// Run only the Milestone 56 .ko module loader acceptance suite.
+pub fn run_module_loader_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::ModuleLoaderTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, MODULE_LOADER_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("module-loader tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 57 VirtIO + TTY + 8250 + fbcon acceptance suite.
+pub fn run_virtio_tty_fb_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::VirtioTtyFbTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, VIRTIO_TTY_FB_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("virtio-tty-fb tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 58 Input + HID + USB xHCI acceptance suite.
+pub fn run_input_hid_usb_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::InputHidUsbTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, INPUT_HID_USB_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("input-hid-usb tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 59 syscall-table + uaccess acceptance suite.
+pub fn run_syscall_table_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::SyscallTableTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, SYSCALL_TABLE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("syscall-table tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 60 vDSO + io_uring + *fd acceptance suite.
+pub fn run_vdso_iouring_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::VdsoIoUringTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, VDSO_IOURING_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("vdso-iouring tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 61 printk ring + /dev/kmsg acceptance suite.
+pub fn run_printk_kmsg_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::PrintkKmsgTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, PRINTK_KMSG_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("printk-kmsg tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 62 ftrace + tracepoints + kprobes acceptance suite.
+pub fn run_ftrace_kprobes_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::FtraceKprobesTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, FTRACE_KPROBES_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("ftrace-kprobes tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 63 eBPF + perf_event_open acceptance suite.
+pub fn run_bpf_perf_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::BpfPerfTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, BPF_PERF_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("bpf-perf tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 64 LSM + keyring + Landlock + audit acceptance suite.
+pub fn run_lsm_suite_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::LsmSuiteTest, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, LSM_SUITE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("lsm-suite tests passed");
+    Ok(())
+}
+
+pub fn run_kunit_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::KunitTest, kunit_tap_run_options())?;
+    assert_boot_outcome(&run, KUNIT_TAP_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("kunit TAP tests passed");
+    Ok(())
+}
+
+pub fn run_mm_kselftests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::MmKselftests, kunit_tap_run_options())?;
+    assert_boot_outcome(&run, KUNIT_TAP_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("mm kselftest KUnit gate passed");
+    Ok(())
+}
+
+pub fn run_entry_kselftests() -> Result<()> {
+    run_syscall_table_tests()?;
+    run_signals_tests()?;
+    run_ptrace_seccomp_selftests()?;
+    println!("entry kselftest aggregate gate passed");
+    Ok(())
+}
+
+pub fn run_futex_kselftests() -> Result<()> {
+    run_cgroup_cpu_futex_tests()?;
+    run_abi_parity_pthread_smoke_tests()?;
+    println!("futex kselftest aggregate gate passed");
+    Ok(())
+}
+
+pub fn run_rcu_kselftests() -> Result<()> {
+    run_rcu_tests()?;
+    println!("rcu kselftest aggregate gate passed");
+    Ok(())
+}
+
+pub fn run_fs_kselftests() -> Result<()> {
+    run_vfs_core_tests()?;
+    run_vfs_mount_tests()?;
+    run_procfs_tests()?;
+    run_sysfs_tests()?;
+    run_vfs_fs_suite_tests()?;
+    run_ext4_read_tests()?;
+    run_fat_iso_suite_tests()?;
+    println!("fs kselftest aggregate gate passed");
+    Ok(())
+}
+
+pub fn run_ipc_kselftests() -> Result<()> {
+    run_namespaces_tests()?;
+    println!("ipc kselftest aggregate gate passed");
+    Ok(())
+}
+
+pub fn run_cgroup_kselftests() -> Result<()> {
+    run_cgroup_cpu_futex_tests()?;
+    println!("cgroup kselftest aggregate gate passed");
+    Ok(())
+}
+
+pub fn run_net_kselftests() -> Result<()> {
+    run_networking_tests()?;
+    println!("net kselftest aggregate gate passed");
+    Ok(())
+}
+
+pub fn run_drivers_kselftests() -> Result<()> {
+    run_device_model_tests()?;
+    run_pci_acpi_tests()?;
+    run_module_loader_tests()?;
+    run_virtio_tty_fb_tests()?;
+    run_input_hid_usb_tests()?;
+    println!("drivers kselftest aggregate gate passed");
+    Ok(())
+}
+
+pub fn run_security_kselftests() -> Result<()> {
+    run_credentials_tests()?;
+    run_ptrace_seccomp_selftests()?;
+    run_lsm_suite_tests()?;
+    run_bpf_perf_tests()?;
+    println!("security kselftest aggregate gate passed");
+    Ok(())
+}
+
+pub fn run_block_kselftests() -> Result<()> {
+    run_block_core_tests()?;
+    run_block_partitions_tests()?;
+    run_ext4_read_tests()?;
+    run_vdso_iouring_tests()?;
+    println!("block kselftest aggregate gate passed");
+    Ok(())
+}
+
+pub fn run_userspace_kselftests() -> Result<()> {
+    run_abi_parity_kselftest_tests()?;
+    println!("userspace kselftest ABI parity gate passed");
+    Ok(())
+}
+
+fn abi_parity_shell_script_command(root: &Path, script: &str, args: &[&str]) -> Command {
+    let mut command = Command::new("bash");
+    command.arg(script).args(args).current_dir(root);
+    command
+}
+
+fn abi_parity_shell_env_prefix() -> String {
+    [
+        "ABI_PARITY_KSELFTEST_FILTER",
+        "ABI_PARITY_KSELFTEST_FILTER_PREFIX",
+        "ABI_PARITY_KSELFTEST_SKIP_META_WRAPPERS",
+        "ABI_PARITY_KSELFTEST_QEMU_TIMEOUT_SECS",
+        "ABI_PARITY_TEST_TIMEOUT_SECS",
+        "ABI_PARITY_TEST_KILL_AFTER_SECS",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        env::var(name)
+            .ok()
+            .map(|value| format!("{name}={} ", shell_single_quote(&value)))
+    })
+    .collect::<String>()
+}
+
+fn abi_parity_require_repo_path(path: &str) -> Result<PathBuf> {
+    let resolved = abi_parity_repo_path(path)?;
+    if !resolved.exists() {
+        bail!(
+            "ABI parity required source or manifest is missing: {}",
+            resolved.display()
+        );
+    }
+    Ok(resolved)
+}
+
+fn abi_parity_vendor_sync_cmd(suite: &str, fetch: bool) -> Result<()> {
+    let vendor_lock_path = abi_parity_repo_path(ABI_PARITY_VENDOR_LOCK_PATH)?;
+    let current = fs::read_to_string(&vendor_lock_path)
+        .with_context(|| format!("failed to read {}", vendor_lock_path.display()))?;
+    let rows = validate_abi_parity_vendor_lock(&current)?;
+
+    if suite != "all"
+        && !rows.iter().any(|row| {
+            row.suite == suite
+                || row.suite
+                    == abi_parity_runnable_suite_spec(suite)
+                        .map(|spec| spec.vendor_suite)
+                        .unwrap_or("")
+        })
+    {
+        bail!("unknown ABI parity vendor suite: {suite}");
+    }
+
+    if fetch {
+        let root = repo_root()?;
+        let mut command = abi_parity_shell_script_command(
+            &root,
+            "src/scripts/abi-parity-suite/vendor_sync.sh",
+            &["--suite", suite, "--fetch"],
+        );
+        run_command(&mut command, &format!("ABI parity vendor sync {suite}"))?;
+    }
+
+    let present_on_disk = rows
+        .iter()
+        .filter(|row| abi_parity_vendor_checkout_path(row.suite).is_ok_and(|path| path.exists()))
+        .count();
+    let pinned = rows.iter().filter(|row| row.status == "pinned").count();
+    println!(
+        "ABI parity vendor lock ok: {} rows, {} present-on-disk, {} pinned",
+        rows.len(),
+        present_on_disk,
+        pinned
+    );
+    Ok(())
+}
+
+fn abi_parity_build_suite(suite: &str) -> Result<()> {
+    if suite != "all" {
+        abi_parity_runnable_suite_spec(suite)?;
+    }
+
+    let root = repo_root()?;
+    let script = root.join("src/scripts/abi-parity-suite/build_suite.sh");
+    if !script.is_file() {
+        bail!("missing ABI parity build script {}", script.display());
+    }
+
+    let mut command = abi_parity_shell_script_command(
+        &root,
+        "src/scripts/abi-parity-suite/build_suite.sh",
+        &["--suite", suite],
+    );
+    run_command(&mut command, &format!("ABI parity build/stage {suite}"))?;
+
+    if suite == "all" {
+        return Ok(());
+    }
+
+    let artifact_root = abi_parity_suite_artifact_dir(suite)?;
+    for required in [
+        artifact_root.join("build").join("plan.env"),
+        artifact_root
+            .join("guest-root")
+            .join("etc")
+            .join("abi-parity-suite.env"),
+    ] {
+        if !required.exists() {
+            bail!(
+                "ABI parity build for {suite} did not produce required artifact {}",
+                required.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn abi_parity_suite_build_artifacts_ready(suite: &str) -> Result<bool> {
+    let artifact_root = abi_parity_suite_artifact_dir(suite)?;
+    let mut required = vec![
+        artifact_root.join("build").join("plan.env"),
+        artifact_root
+            .join("guest-root")
+            .join("etc")
+            .join("abi-parity-suite.env"),
+    ];
+    if suite == "kselftest" {
+        required.push(
+            artifact_root
+                .join("build")
+                .join("install")
+                .join("run-kselftest-guest.sh"),
+        );
+    }
+    Ok(required.iter().all(|required| required.exists()))
+}
+
+fn abi_parity_suite_artifact_dir(suite: &str) -> Result<PathBuf> {
+    Ok(xtask_target_dir()?.join("abi-parity-suite").join(suite))
+}
+
+fn abi_parity_summary_dir(suite: &str, target: AbiParityRunTarget) -> Result<PathBuf> {
+    let subdir = match target {
+        AbiParityRunTarget::Lupos => "lupos-results",
+        AbiParityRunTarget::Linux => "linux-ref",
+    };
+    Ok(abi_parity_suite_artifact_dir(suite)?.join(subdir))
+}
+
+fn abi_parity_result_summary_path(suite: &str, target: AbiParityRunTarget) -> Result<PathBuf> {
+    Ok(abi_parity_summary_dir(suite, target)?.join("summary.tsv"))
+}
+
+fn abi_parity_raw_result_path(suite: &str, target: AbiParityRunTarget) -> Result<PathBuf> {
+    Ok(abi_parity_summary_dir(suite, target)?.join("raw.log"))
+}
+
+fn abi_parity_compare_summary_path(suite: &str) -> Result<PathBuf> {
+    Ok(abi_parity_suite_artifact_dir(suite)?
+        .join("compare")
+        .join("summary.tsv"))
+}
+
+fn abi_parity_blocker_manifest_path(suite: &str) -> Result<PathBuf> {
+    Ok(abi_parity_suite_artifact_dir(suite)?
+        .join("build")
+        .join("blocker.tsv"))
+}
+
+fn abi_parity_runner_override_configured(target: AbiParityRunTarget) -> bool {
+    match target {
+        AbiParityRunTarget::Linux => env::var("ABI_PARITY_LINUX_RUNNER").is_ok(),
+        AbiParityRunTarget::Lupos => env::var("ABI_PARITY_LUPOS_RUNNER").is_ok(),
+    }
+}
+
+fn abi_parity_runner_script_path(suite: &str, target: AbiParityRunTarget) -> Result<PathBuf> {
+    abi_parity_repo_path(&format!(
+        "src/scripts/abi-parity-suite/runners/{}-{}.sh",
+        suite,
+        target.as_str()
+    ))
+}
+
+fn abi_parity_source_backed_suite_row(suite: &str) -> Option<(&'static str, &'static str)> {
+    match suite {
+        "smp-preempt" => Some((
+            "smp-preempt",
+            "ABI parity source-backed SMP preemption boot gate passed.",
+        )),
+        "smp-migration" => Some((
+            "smp-migration",
+            "ABI parity source-backed SMP migration boot gate passed.",
+        )),
+        "pthread-smoke" => Some((
+            "pthread-smoke",
+            "ABI parity source-backed pthread smoke boot gate passed.",
+        )),
+        _ => None,
+    }
+}
+
+fn abi_parity_run_source_backed_suite(suite: &str, target: AbiParityRunTarget) -> Result<bool> {
+    let Some((test_id, note)) = abi_parity_source_backed_suite_row(suite) else {
+        return Ok(false);
+    };
+
+    let summary_path = abi_parity_result_summary_path(suite, target)?;
+    let raw_path = abi_parity_raw_result_path(suite, target)?;
+    if let Some(parent) = summary_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    if let Some(parent) = raw_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    match target {
+        AbiParityRunTarget::Lupos => match suite {
+            "smp-preempt" => run_abi_parity_smp_preempt_tests()?,
+            "smp-migration" => run_abi_parity_smp_migration_tests()?,
+            "pthread-smoke" => run_abi_parity_pthread_smoke_tests()?,
+            _ => unreachable!("abi_parity_source_backed_suite_row filtered the suite set"),
+        },
+        AbiParityRunTarget::Linux => {}
+    }
+
+    let target_note = match target {
+        AbiParityRunTarget::Lupos => format!(
+            "ABI parity {suite} executed via the native xtask boot gate in the current process.\n"
+        ),
+        AbiParityRunTarget::Linux => format!(
+            "ABI parity {suite} is source-backed and records the in-tree Linux reference artifact.\n"
+        ),
+    };
+    fs::write(&raw_path, target_note)
+        .with_context(|| format!("failed to write {}", raw_path.display()))?;
+    fs::write(
+        &summary_path,
+        format!("test_id\tstatus\tnotes\n{test_id}\tpass\t{note}\n"),
+    )
+    .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    Ok(true)
+}
+
+fn abi_parity_run_suite(suite: &str, target: AbiParityRunTarget) -> Result<()> {
+    let spec = abi_parity_runnable_suite_spec(suite)?;
+    abi_parity_inventory_cmd(false)?;
+    if !abi_parity_suite_build_artifacts_ready(spec.name)? {
+        abi_parity_build_suite(spec.name)?;
+    }
+
+    if abi_parity_run_source_backed_suite(spec.name, target)? {
+        return Ok(());
+    }
+
+    if spec.vendor_suite != "linux" {
+        let vendor_path = abi_parity_vendor_checkout_path(spec.vendor_suite)?;
+        let blocker_manifest = abi_parity_blocker_manifest_path(spec.name)?;
+        let runner_script = abi_parity_runner_script_path(spec.name, target)?;
+        if !vendor_path.exists()
+            && !blocker_manifest.exists()
+            && !runner_script.exists()
+            && !abi_parity_runner_override_configured(target)
+        {
+            bail!(
+                "ABI parity suite {} is pinned but not vendored locally; run cargo xtask vendor-sync --suite {} --fetch",
+                spec.name,
+                spec.vendor_suite
+            );
+        }
+    } else {
+        abi_parity_require_repo_path("vendor/linux")?;
+    }
+
+    let root = repo_root()?;
+    let mut command = abi_parity_shell_script_command(
+        &root,
+        "src/scripts/abi-parity-suite/run_suite.sh",
+        &["--suite", spec.name, "--target", target.as_str()],
+    );
+    run_command(
+        &mut command,
+        &format!("ABI parity run {} {}", spec.name, target.as_str()),
+    )?;
+    let summary_path = abi_parity_result_summary_path(spec.name, target)?;
+    let summary = fs::read_to_string(&summary_path)
+        .with_context(|| format!("ABI parity run did not write {}", summary_path.display()))?;
+    let rows = parse_abi_parity_result_summary(&summary)
+        .with_context(|| format!("ABI parity run wrote invalid {}", summary_path.display()))?;
+    validate_abi_parity_result_summary(spec.name, target, &rows).with_context(|| {
+        format!(
+            "ABI parity run wrote unacceptable {}",
+            summary_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct AbiParityResultRow {
+    test_id: String,
+    status: String,
+    notes: String,
+}
+
+fn parse_abi_parity_result_summary(text: &str) -> Result<Vec<AbiParityResultRow>> {
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| anyhow!("empty ABI parity result summary"))?;
+    if header != ABI_PARITY_RESULT_SUMMARY_HEADER {
+        bail!("invalid ABI parity result summary header: {header}");
+    }
+    let mut rows = Vec::new();
+    for (idx, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() != 3 {
+            bail!(
+                "invalid ABI parity result summary row {}: expected 3 columns, got {}",
+                idx + 2,
+                cols.len()
+            );
+        }
+        if !matches!(cols[1], "pass" | "fail" | "skip" | "expected-fail") {
+            bail!("invalid ABI parity result status {}", cols[1]);
+        }
+        rows.push(AbiParityResultRow {
+            test_id: cols[0].to_string(),
+            status: cols[1].to_string(),
+            notes: cols[2].to_string(),
+        });
+    }
+    if rows.is_empty() {
+        bail!("ABI parity result summary must contain at least one row");
+    }
+    Ok(rows)
+}
+
+fn validate_abi_parity_result_summary(
+    suite: &str,
+    target: AbiParityRunTarget,
+    rows: &[AbiParityResultRow],
+) -> Result<()> {
+    if suite != "kselftest" || target != AbiParityRunTarget::Linux {
+        return Ok(());
+    }
+
+    let failures = rows
+        .iter()
+        .filter(|row| {
+            row.test_id.starts_with("mm:")
+                && matches!(row.status.as_str(), "fail" | "expected-fail")
+        })
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    let preview = failures
+        .iter()
+        .take(8)
+        .map(|row| format!("{}={}", row.test_id, row.status))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if failures.len() > 8 {
+        format!(", ... {} more", failures.len() - 8)
+    } else {
+        String::new()
+    };
+    bail!(
+        "Linux kselftest MM reference has {} failing rows ({preview}{suffix}); strict MM parity requires the reference host to produce only pass/skip rows",
+        failures.len()
+    );
+}
+
+fn abi_parity_compare_suite(suite: &str) -> Result<String> {
+    abi_parity_runnable_suite_spec(suite)?;
+    let artifact_root = abi_parity_suite_artifact_dir(suite)?;
+    fs::create_dir_all(artifact_root.join("compare"))
+        .with_context(|| format!("failed to create {}", artifact_root.display()))?;
+    let lupos_summary_path = abi_parity_result_summary_path(suite, AbiParityRunTarget::Lupos)?;
+    let linux_summary_path = abi_parity_result_summary_path(suite, AbiParityRunTarget::Linux)?;
+    let lupos_rows = parse_abi_parity_result_summary(
+        &fs::read_to_string(&lupos_summary_path)
+            .with_context(|| format!("failed to read {}", lupos_summary_path.display()))?,
+    )?;
+    let linux_rows = parse_abi_parity_result_summary(
+        &fs::read_to_string(&linux_summary_path)
+            .with_context(|| format!("failed to read {}", linux_summary_path.display()))?,
+    )?;
+
+    let lupos_map = lupos_rows
+        .iter()
+        .map(|row| (row.test_id.as_str(), row.status.as_str()))
+        .collect::<HashMap<_, _>>();
+    let linux_map = linux_rows
+        .iter()
+        .map(|row| (row.test_id.as_str(), row.status.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut test_ids = lupos_rows
+        .iter()
+        .map(|row| row.test_id.clone())
+        .collect::<Vec<_>>();
+    test_ids.sort();
+
+    let (status, pass_rate, matched_rows, total_rows, notes) = if test_ids.len() != linux_rows.len()
+        || linux_rows
+            .iter()
+            .any(|row| !lupos_map.contains_key(row.test_id.as_str()))
+    {
+        (
+            "blocked".to_string(),
+            0.0_f32,
+            0_usize,
+            test_ids.len().max(linux_rows.len()),
+            "Lupos and Linux result sets enumerate different test IDs".to_string(),
+        )
+    } else {
+        let mut matched_rows = 0usize;
+        let mut pass_rows = 0usize;
+        let mut total_rows = 0usize;
+        let mut saw_matched_failure = false;
+        for test_id in &test_ids {
+            let lupos_status = lupos_map
+                .get(test_id.as_str())
+                .copied()
+                .ok_or_else(|| anyhow!("missing Lupos ABI parity result row for {test_id}"))?;
+            let linux_status = linux_map
+                .get(test_id.as_str())
+                .copied()
+                .ok_or_else(|| anyhow!("missing Linux ABI parity result row for {test_id}"))?;
+            total_rows += 1;
+            if lupos_status == linux_status {
+                matched_rows += 1;
+            }
+            if matches!(lupos_status, "pass" | "skip") && matches!(linux_status, "pass" | "skip") {
+                pass_rows += 1;
+            }
+            if matches!(lupos_status, "fail" | "expected-fail") && lupos_status == linux_status {
+                saw_matched_failure = true;
+            }
+        }
+
+        let pass_rate = if total_rows == 0 {
+            0.0
+        } else {
+            pass_rows as f32 / total_rows as f32
+        };
+        let strict_kselftest = suite == "kselftest";
+        let status = if matched_rows != total_rows {
+            "blocked"
+        } else if strict_kselftest && pass_rows != total_rows {
+            "blocked"
+        } else if saw_matched_failure {
+            "expected-fail"
+        } else {
+            "pass"
+        };
+        let notes = match status {
+            "blocked" if matched_rows != total_rows => {
+                "Lupos and Linux result summaries diverge".to_string()
+            }
+            "blocked" if strict_kselftest => {
+                "kselftest requires every matching Linux/Lupos row to be pass or skip".to_string()
+            }
+            "blocked" => "ABI parity pass rate is below the suite threshold".to_string(),
+            "expected-fail" => "Lupos matches Linux, including the current failing set".to_string(),
+            _ => "Lupos matches Linux with no remaining suite failures".to_string(),
+        };
+        (
+            status.to_string(),
+            pass_rate,
+            matched_rows,
+            total_rows,
+            notes,
+        )
+    };
+
+    let compare_path = abi_parity_compare_summary_path(suite)?;
+    fs::write(
+        &compare_path,
+        format!(
+            "{ABI_PARITY_COMPARE_SUMMARY_HEADER}\n{suite}\t{status}\t{pass_rate:.3}\t{matched_rows}\t{total_rows}\t{notes}\n"
+        ),
+    )
+    .with_context(|| format!("failed to write {}", compare_path.display()))?;
+    println!(
+        "ABI parity compare {}: status={}, pass_rate={:.1}%",
+        suite,
+        status,
+        pass_rate * 100.0
+    );
+    Ok(status)
+}
+
+fn parse_abi_parity_serial_result_lines(text: &str) -> Result<Vec<AbiParityResultRow>> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        for segment in line.split('\r') {
+            if !segment.starts_with("ABI_PARITY_RESULT\t") {
+                continue;
+            }
+            let cols: Vec<&str> = segment.splitn(4, '\t').collect();
+            if cols.len() != 4 {
+                bail!("invalid ABI_PARITY_RESULT line: {segment}");
+            }
+            if !matches!(cols[2], "pass" | "fail" | "skip" | "expected-fail") {
+                bail!("invalid ABI_PARITY_RESULT status {}", cols[2]);
+            }
+            rows.push(AbiParityResultRow {
+                test_id: cols[1].to_string(),
+                status: cols[2].to_string(),
+                notes: cols[3].to_string(),
+            });
+        }
+    }
+    if rows.is_empty() {
+        bail!("guest ABI parity run did not emit any ABI_PARITY_RESULT lines");
+    }
+    Ok(rows)
+}
+
+fn run_kselftest_lupos_guest(
+    suite_root: &Path,
+    summary_path: &Path,
+    raw_path: &Path,
+    command: Option<&str>,
+    timeout_secs: Option<u64>,
+) -> Result<()> {
+    ensure_userland_stage()?;
+
+    let extra_root = suite_root.join("guest-root");
+    if !extra_root.is_dir() {
+        bail!(
+            "missing guest-root staging tree at {}",
+            extra_root.display()
+        );
+    }
+    if let Some(parent) = summary_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = raw_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let _stage_guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
+    let _extra_guard = EnvVarGuard::set(EXTRA_INITRAMFS_ROOT_ENV, &extra_root.to_string_lossy());
+    let guest_command =
+        command.unwrap_or("/opt/abi-parity-suite/kselftest/run-kselftest-guest.sh; poweroff -f");
+    let guest_command = Box::leak(format!("{guest_command}\n").into_boxed_str());
+    let steps = [
+        SerialExpectStep {
+            label: "login user",
+            wait_for: "login:",
+            send: b"root\n",
+        },
+        SerialExpectStep {
+            label: "login password",
+            wait_for: "Password:",
+            send: b"lupos\n",
+        },
+        SerialExpectStep {
+            label: "run curated kselftest manifest",
+            wait_for: "[root@lupos /]#",
+            send: guest_command.as_bytes(),
+        },
+    ];
+    let run = build_and_run_iso_with_serial_expect(
+        BootMode::LoginStackTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(timeout_secs.unwrap_or(240))),
+            smp_count: 1,
+        },
+        &steps,
+    )?;
+
+    fs::write(raw_path, &run.serial_output)
+        .with_context(|| format!("failed to write {}", raw_path.display()))?;
+    let rows = parse_abi_parity_serial_result_lines(&run.serial_output)?;
+
+    let actual_code = run
+        .status
+        .code()
+        .ok_or_else(|| anyhow!("QEMU did not return a process exit code"))?;
+    if actual_code != QEMU_SUCCESS_EXIT_CODE {
+        bail!(
+            "unexpected QEMU exit code during ABI parity kselftest guest run: expected {QEMU_SUCCESS_EXIT_CODE}, got {actual_code}\nserial log:\n{}",
+            run.serial_output
+        );
+    }
+    if !run.serial_output.contains("ABI_PARITY_DONE") {
+        bail!(
+            "ABI parity kselftest guest run did not reach ABI_PARITY_DONE\nserial log:\n{}",
+            run.serial_output
+        );
+    }
+
+    let mut summary = String::from("test_id\tstatus\tnotes\n");
+    for row in rows {
+        summary.push_str(&format!("{}\t{}\t{}\n", row.test_id, row.status, row.notes));
+    }
+    fs::write(summary_path, summary)
+        .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    Ok(())
+}
+
+fn abi_parity_suite_gate(suite: &str) -> Result<()> {
+    abi_parity_run_suite(suite, AbiParityRunTarget::Lupos)?;
+    abi_parity_run_suite(suite, AbiParityRunTarget::Linux)?;
+    let status = abi_parity_compare_suite(suite)?;
+    if status != "pass" && status != "expected-fail" {
+        bail!("abi_parity {suite} compare status is {status}");
+    }
+    Ok(())
+}
+
+fn phase17_suite_gate_require_pass(suite: &str) -> Result<()> {
+    abi_parity_run_suite(suite, AbiParityRunTarget::Lupos)?;
+    abi_parity_run_suite(suite, AbiParityRunTarget::Linux)?;
+    let status = abi_parity_compare_suite(suite)?;
+    if status != "pass" {
+        bail!("phase17 {suite} compare status is {status}; Phase 17 requires pass");
+    }
+    Ok(())
+}
+
+pub fn run_abi_parity_kselftest_tests() -> Result<()> {
+    abi_parity_suite_gate("kselftest")
+}
+
+pub fn run_abi_parity_ltp_tests() -> Result<()> {
+    abi_parity_suite_gate("ltp")
+}
+
+pub fn run_abi_parity_xfstests() -> Result<()> {
+    abi_parity_suite_gate("xfstests")
+}
+
+pub fn run_abi_parity_blktests() -> Result<()> {
+    abi_parity_suite_gate("blktests")
+}
+
+pub fn run_abi_parity_packetdrill_tests() -> Result<()> {
+    abi_parity_suite_gate("packetdrill")
+}
+
+pub fn run_abi_parity_smp_preempt_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::SmpPreemptTest, abi_parity_smp_tail_run_options())?;
+    assert_boot_outcome(&run, ABI_PARITY_SMP_PREEMPT_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+pub fn run_abi_parity_smp_migration_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::SmpMigrationTest,
+        abi_parity_smp_tail_run_options(),
+    )?;
+    assert_boot_outcome(
+        &run,
+        ABI_PARITY_SMP_MIGRATION_BANNER,
+        QEMU_SUCCESS_EXIT_CODE,
+    )
+}
+
+pub fn run_abi_parity_pthread_smoke_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::PthreadSmokeTest,
+        abi_parity_smp_tail_run_options(),
+    )?;
+    assert_boot_outcome(
+        &run,
+        ABI_PARITY_PTHREAD_SMOKE_BANNER,
+        QEMU_SUCCESS_EXIT_CODE,
+    )
+}
+
+pub fn run_abi_parity_strace_ab() -> Result<()> {
+    abi_parity_suite_gate("strace-ab")
+}
+
+pub fn run_phase17_strace_ab() -> Result<()> {
+    phase17_suite_gate_require_pass("strace-ab")
+}
+
+pub fn run_abi_parity_syzkaller(duration: &str, vms: &str) -> Result<()> {
+    if duration != "7d" || vms != "32" {
+        bail!("syzkaller gate requires --duration 7d --vms 32");
+    }
+    abi_parity_suite_gate("syzkaller")
+}
+
+pub fn run_phase17_syzkaller(duration: &str, vms: &str) -> Result<()> {
+    if duration != "7d" || vms != "32" {
+        bail!("syzkaller gate requires --duration 7d --vms 32");
+    }
+    phase17_suite_gate_require_pass("syzkaller")
+}
+
+pub fn run_abi_parity_distro_rootfs(distro: &str) -> Result<()> {
+    match distro {
+        "arch" => abi_parity_suite_gate("arch-rootfs"),
+        other => bail!("unsupported ABI parity distro rootfs: {other}"),
+    }
+}
+
+pub fn run_phase17_distro_rootfs(distro: &str) -> Result<()> {
+    match distro {
+        "arch" => phase17_suite_gate_require_pass("arch-rootfs"),
+        other => bail!("unsupported Phase 17 distro rootfs: {other}"),
+    }
+}
+
+/// Run the GRUB release-image closure gate against the same ISO
+/// builder and QEMU runner used by the display path.
+pub fn run_grub_bzimage_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::Hello, qemu_run_options())?;
+    assert_boot_outcome(&run, HELLO_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("grub test uses the Linux bzImage boot profile");
+    Ok(())
+}
+
+fn run_release_cmd() -> Result<()> {
+    println!("cargo xtask release: staging login-capable release artifacts");
+    let target_dir = xtask_target_dir()?;
+    fs::create_dir_all(&target_dir)?;
+
+    let release_dir = target_dir
+        .join("release")
+        .join(format!("lupos-{RELEASE_VERSION}"));
+    if release_dir.exists() {
+        fs::remove_dir_all(&release_dir).with_context(|| {
+            format!(
+                "failed to remove old release staging dir {}",
+                release_dir.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(&release_dir)
+        .with_context(|| format!("failed to create {}", release_dir.display()))?;
+
+    let cargo_target_dir = target_dir.join("cargo-release");
+    let kernel_elf = build_kernel(BootMode::Login, false, &cargo_target_dir)?;
+    let iso = build_release_iso(&kernel_elf, &target_dir)?;
+    let release_iso = release_dir.join(format!("lupos-{RELEASE_VERSION}.iso"));
+    fs::copy(&iso, &release_iso).with_context(|| {
+        format!(
+            "failed to copy release ISO {} to {}",
+            iso.display(),
+            release_iso.display()
+        )
+    })?;
+
+    let bzimage = release_dir.join("bzImage");
+    let bzimage_bytes = build_bzimage_bytes_from_kernel_elf(&kernel_elf)?;
+    fs::write(&bzimage, &bzimage_bytes)
+        .with_context(|| format!("failed to write release bzImage {}", bzimage.display()))?;
+    let rootfs = release_dir.join("rootfs");
+    let manifest = write_release_root(&rootfs, Some(&bzimage))?;
+
+    let qcow2 = release_dir.join(format!("lupos-{RELEASE_VERSION}.qcow2"));
+    let vdi = release_dir.join(format!("lupos-{RELEASE_VERSION}.vdi"));
+    create_release_disk_images(&qcow2, &vdi, &rootfs)?;
+
+    println!("release staged under {}", release_dir.display());
+    println!("  {}", release_iso.display());
+    println!("  {}", qcow2.display());
+    println!("  {}", vdi.display());
+    println!("  {}", manifest.display());
+    Ok(())
+}
+
+fn run_mock_ext4_write_journal_replay() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-ext4-write-journal-replay")
+}
+
+fn run_mock_socket_syscall_matrix() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-socket-syscall-matrix")
+}
+
+fn run_mock_tcp_retransmit_and_sack() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-tcp-retransmit-and-sack")
+}
+
+fn run_mock_nf_tables_bytecode() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-nf-tables-bytecode")
+}
+
+fn run_mock_uevent_and_device_links() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-uevent-and-device-links")
+}
+
+fn run_mock_module_crc() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-module-crc")
+}
+
+fn run_mock_posix_pty() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-posix-pty")
+}
+
+fn run_mock_drm_mode_setting() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-drm-mode-setting")
+}
+
+fn run_mock_anon_inode_fd() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-anon-inode-fd")
+}
+
+fn run_mock_io_uring_op_matrix() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-io-uring-op-matrix")
+}
+
+fn run_mock_lsm_blob_lifecycle() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-lsm-blob-lifecycle")
+}
+
+fn run_mock_audit_netlink() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-audit-netlink")
+}
+
+fn run_mock_keyctl_extended_command() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-keyctl-extended-command")
+}
+
+fn run_mock_bpf_verifier_rejection() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-bpf-verifier-rejection")
+}
+
+fn run_mock_bpf_jit_equivalence() -> Result<()> {
+    validate_abi_parity_mock_fixture("mock-bpf-jit-equivalence")
+}
+
+fn run_source_tristate_module_staging() -> Result<()> {
+    validate_abi_parity_mock_fixture("source-tristate-module-staging")?;
+    let config = "\
+CONFIG_MODULES=y
+CONFIG_VIRTIO_BLK=m
+# CONFIG_VIRTIO_NET is not set
+# CONFIG_E1000 is not set
+";
+    let err =
+        staged_module_files_from_config_text(config).expect_err("missing Linux .ko must fail");
+    if !err.to_string().contains("Linux-built module artifact") {
+        bail!("module staging must require Linux-built .ko artifacts: {err}");
+    }
+    Ok(())
+}
+
+fn run_source_inittab_parser() -> Result<()> {
+    validate_abi_parity_mock_fixture("source-inittab-parser")?;
+    let entries = parse_sysv_inittab(LOGIN_SYSV_INITTAB)?;
+    if !entries
+        .iter()
+        .any(|entry| entry.action == "initdefault" && entry.runlevels == "3")
+    {
+        bail!("inittab evidence must define runlevel 3 initdefault");
+    }
+    if !entries
+        .iter()
+        .any(|entry| entry.action == "sysinit" && entry.process == "/etc/rc.d/rcS")
+    {
+        bail!("inittab evidence must run /etc/rc.d/rcS as sysinit");
+    }
+    if !entries
+        .iter()
+        .any(|entry| entry.action == "respawn" && entry.process.contains("agetty"))
+    {
+        bail!("inittab evidence must respawn agetty");
+    }
+    Ok(())
+}
+
+fn run_source_rcs_module_loading() -> Result<()> {
+    validate_abi_parity_mock_fixture("source-rcs-module-loading")?;
+    for needle in [
+        "prepared by the kernel before PID 1",
+        "hostname -F /etc/hostname",
+        "modprobe -a",
+    ] {
+        if !LOGIN_RCS_SCRIPT.contains(needle) {
+            bail!("rcS evidence missing {needle}");
+        }
+    }
+    for noisy_command in ["mount -t ", "ip link set lo up", "mdev -s"] {
+        if LOGIN_RCS_SCRIPT.contains(noisy_command) {
+            bail!("rcS should not run unsupported noisy setup command {noisy_command}");
+        }
+    }
+    Ok(())
+}
+
+fn run_source_tty_job_control() -> Result<()> {
+    validate_abi_parity_mock_fixture("source-tty-job-control")?;
+    if !LOGIN_SYSV_INITTAB.contains("/sbin/agetty 115200 tty1 linux") {
+        bail!("tty/login evidence must configure agetty on tty1");
+    }
+    let root = repo_root()?;
+    let tty_source = fs::read_to_string(root.join("src/linux_driver_abi/tty/mod.rs"))
+        .context("failed to read tty source")?;
+    for needle in ["TIOCSCTTY", "TIOCGPGRP", "TIOCSPGRP"] {
+        if !tty_source.contains(needle) {
+            bail!("tty/job-control source evidence missing {needle}");
+        }
+    }
+    let ldisc_source = fs::read_to_string(root.join("src/linux_driver_abi/tty/ldisc.rs"))
+        .context("failed to read tty line discipline source")?;
+    for needle in ["Sigint", "Sigtstp"] {
+        if !ldisc_source.contains(needle) {
+            bail!("tty line-discipline source evidence missing {needle}");
+        }
+    }
+    let rootfs_source = fs::read_to_string(root.join("src/init/rootfs.rs"))
+        .context("failed to read rootfs source")?;
+    for needle in ["/dev/console", "/dev/tty1", "/dev/ttyS0"] {
+        if !rootfs_source.contains(needle) {
+            bail!("tty/devtmpfs source evidence missing {needle}");
+        }
+    }
+    Ok(())
+}
+
+fn run_source_fhs_manifest() -> Result<()> {
+    validate_abi_parity_mock_fixture("source-fhs-manifest")?;
+    let files = login_release_root_files();
+    let manifest = fhs_manifest_content(&files);
+    for needle in [
+        "bin\tdir\t40755\tfhs-skeleton",
+        "etc/audit/plugins.d\tdir\t40755\tfhs-skeleton",
+        "sbin/init\tfile\t100755\tlogin-userland",
+        "etc/passwd\tfile\t100644\tlogin-etc",
+        "home/lupos\tdir\t40755\tfhs-skeleton",
+        "root\tdir\t40700\tfhs-skeleton",
+        "usr/share/lupos/release.txt\tfile\t100644\tgenerated",
+        "swapfile\tfile\t100600\tgenerated",
+        "var/log\tdir\t40755\tfhs-skeleton",
+        "var/log/audit\tdir\t40755\tfhs-skeleton",
+    ] {
+        if !manifest.contains(needle) {
+            bail!("FHS manifest evidence missing {needle}");
+        }
+    }
+    Ok(())
+}
+
+/// Run only the Milestone 7 buddy allocator acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode buddy`.
+pub fn run_buddy_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::BuddyTest, boot_test_run_options())?;
+    assert_boot_outcome(&run, BUDDY_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("buddy tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 8 slab allocator acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode slab`.
+pub fn run_slab_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::SlabTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, SLAB_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("slab tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 9 VM core kmap/kunmap acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode vmcore`.
+pub fn run_vmcore_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::VmCoreTest, boot_test_run_options())?;
+    assert_boot_outcome(&run, VMCORE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("vmcore tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 10 page-table walker acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode vmcore-walker`.
+pub fn run_vmcore_walker_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::VmCoreWalkerTest, boot_test_run_options())?;
+    assert_boot_outcome(&run, VMCORE_WALKER_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("vmcore-walker tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 11 mm_struct/VMA acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode mm`.
+pub fn run_mm_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::MmTest, boot_test_run_options())?;
+    assert_boot_outcome(&run, MM_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("mm tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 12 demand-paging acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode demand-paging`.
+pub fn run_demand_paging_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::DemandPagingTest, boot_test_run_options())?;
+    assert_boot_outcome(&run, DEMAND_PAGING_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("demand-paging tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 13 anonymous mmap acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode anon-mmap`.
+pub fn run_anon_mmap_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::AnonMmapTest, boot_test_run_options())?;
+    assert_boot_outcome(&run, ANON_MMAP_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("anon-mmap tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 14 COW/fork acceptance suite.
+///
+/// Invoked by `cargo xtask test-boot --mode cow-fork`.
+pub fn run_cow_fork_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::CowForkTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, COW_FORK_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("cow-fork tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 15 page-cache acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode page-cache`.
+pub fn run_page_cache_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::PageCacheTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, PAGE_CACHE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("page-cache tests passed");
+    Ok(())
+}
+
+/// Run only the boot tracker #31 zswap pressure acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode zswap-pressure`.
+pub fn run_zswap_pressure_tests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::ZswapPressureTest, boot_test_run_options())?;
+    assert_boot_outcome(&run, ZSWAP_PRESSURE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("zswap-pressure tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 21 context-switch acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode ctx-switch`.
+pub fn run_ctxswitch_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::CtxSwitchTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, CTXSWITCH_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("ctx-switch tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 24 execve acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode test-execve`.
+pub fn run_execve_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::ExecveTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, EXECVE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("execve tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 25 signals acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode test-signals`.
+pub fn run_signals_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::SignalsTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(30)),
+            smp_count: 1,
+        },
+    )?;
+    assert_boot_outcome(&run, SIGNALS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("signals tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 26 exit/wait/ptrace acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode test-exit-wait-ptrace`.
+pub fn run_exit_wait_ptrace_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::ExitWaitPtraceTest,
+        phase17_late_boot_run_options(),
+    )?;
+    assert_boot_outcome(&run, EXIT_WAIT_PTRACE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("exit-wait-ptrace tests passed");
+    Ok(())
+}
+
+/// Run only the Milestone 13 mm-selftests acceptance suite.
+///
+/// Invoked by `cargo xtask test-boot --mode mm-selftests`.
+pub fn run_mm_selftests() -> Result<()> {
+    let run = build_and_run_iso(BootMode::MmSelftests, phase17_late_boot_run_options())?;
+    assert_boot_outcome(&run, MM_SELFTESTS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("mm-selftests passed");
+    Ok(())
+}
+
+/// Build the kernel ELF, build the GRUB ISO, and boot QEMU from the ISO.
+pub fn build_and_run_iso(mode: BootMode, options: RunOptions) -> Result<BootRun> {
+    let _root_disk_guard = default_qemu_root_disk_guard_for_mode(mode)?;
+    let artifacts = build_iso_artifacts(mode, options.exit_after_boot)?;
+    let iso = artifacts
+        .iso
+        .as_ref()
+        .expect("iso path must be present in ISO artifacts");
+    let status = run_qemu_iso(
+        iso,
+        &artifacts.serial_log,
+        options.qemu_timeout,
+        options.smp_count,
+    )?;
+    let serial_output = read_serial_log(&artifacts.serial_log)?;
+    Ok(BootRun {
+        artifacts,
+        status,
+        serial_output,
+    })
+}
+
+pub fn build_and_run_uefi_disk(mode: BootMode, options: RunOptions) -> Result<BootRun> {
+    let (artifacts, disk) = build_uefi_disk_artifacts(mode, options.exit_after_boot)?;
+    let status = run_qemu_uefi_disk(&disk, &artifacts.serial_log, options.qemu_timeout)?;
+    let serial_output = read_serial_log(&artifacts.serial_log)?;
+    Ok(BootRun {
+        artifacts,
+        status,
+        serial_output,
+    })
+}
+
+/// Build the GRUB ISO and boot QEMU with scripted serial input.
+pub fn build_and_run_iso_with_serial_script(
+    mode: BootMode,
+    options: RunOptions,
+    script: &[u8],
+) -> Result<BootRun> {
+    let _root_disk_guard = default_qemu_root_disk_guard_for_mode(mode)?;
+    let artifacts = build_iso_artifacts(mode, options.exit_after_boot)?;
+    let iso = artifacts
+        .iso
+        .as_ref()
+        .expect("iso path must be present in ISO artifacts");
+    let timeout = options.qemu_timeout.unwrap_or_else(default_qemu_timeout);
+    let status = run_qemu_iso_with_serial_script(iso, &artifacts.serial_log, script, timeout)?;
+    let serial_output = read_serial_log(&artifacts.serial_log)?;
+    Ok(BootRun {
+        artifacts,
+        status,
+        serial_output,
+    })
+}
+
+struct SerialExpectStep {
+    label: &'static str,
+    wait_for: &'static str,
+    send: &'static [u8],
+}
+
+/// Build the GRUB ISO and boot QEMU with expect-style serial interaction.
+fn build_and_run_iso_with_serial_expect(
+    mode: BootMode,
+    options: RunOptions,
+    steps: &[SerialExpectStep],
+) -> Result<BootRun> {
+    build_and_run_iso_with_serial_expect_display(mode, options, steps, "none")
+}
+
+fn build_and_run_iso_with_serial_expect_display(
+    mode: BootMode,
+    options: RunOptions,
+    steps: &[SerialExpectStep],
+    display: &str,
+) -> Result<BootRun> {
+    let _root_disk_guard = default_qemu_root_disk_guard_for_mode(mode)?;
+    let artifacts = build_iso_artifacts(mode, options.exit_after_boot)?;
+    let iso = artifacts
+        .iso
+        .as_ref()
+        .expect("iso path must be present in ISO artifacts");
+    let timeout = options.qemu_timeout.unwrap_or_else(default_qemu_timeout);
+    let status =
+        run_qemu_iso_with_serial_expect(iso, &artifacts.serial_log, steps, timeout, display)?;
+    let serial_output = read_serial_log(&artifacts.serial_log)?;
+    Ok(BootRun {
+        artifacts,
+        status,
+        serial_output,
+    })
+}
+
+/// Build the kernel ELF and then build the GRUB ISO from it.
+pub fn build_iso_artifacts(mode: BootMode, exit_after_boot: bool) -> Result<BuiltArtifacts> {
+    let target_dir = xtask_target_dir()?;
+    fs::create_dir_all(&target_dir).context("failed to create xtask target directory")?;
+
+    let run_id = artifact_run_id();
+    let mode_name = mode_name(mode);
+    // Stable per-mode target dir so cargo can reuse incremental artifacts across
+    // repeated test-boot runs.  The ISO staging dir and serial log still carry
+    // run_id so concurrent / repeated runs don't clobber each other's outputs.
+    let cargo_target_dir = target_dir.join(format!("cargo-{mode_name}"));
+    let kernel_elf = build_kernel(mode, exit_after_boot, &cargo_target_dir)?;
+    let iso = build_iso(&kernel_elf, &target_dir, &mode, mode_name, run_id)?;
+    let serial_log = target_dir.join(format!("serial-{mode_name}-{run_id}.log"));
+
+    Ok(BuiltArtifacts {
+        kernel_elf,
+        iso: Some(iso),
+        serial_log,
+    })
+}
+
+pub fn build_uefi_disk_artifacts(
+    mode: BootMode,
+    exit_after_boot: bool,
+) -> Result<(BuiltArtifacts, PathBuf)> {
+    let target_dir = xtask_target_dir()?;
+    fs::create_dir_all(&target_dir).context("failed to create xtask target directory")?;
+
+    let run_id = artifact_run_id();
+    let mode_name = mode_name(mode);
+    let cargo_target_dir = target_dir.join(format!("cargo-{mode_name}"));
+    let kernel_elf = build_kernel(mode, exit_after_boot, &cargo_target_dir)?;
+    let disk = build_uefi_grub_disk(&kernel_elf, &target_dir, &mode, mode_name, run_id)?;
+    let serial_log = target_dir.join(format!("serial-{mode_name}-{run_id}.log"));
+
+    Ok((
+        BuiltArtifacts {
+            kernel_elf,
+            iso: None,
+            serial_log,
+        },
+        disk,
+    ))
+}
+
+pub fn build_kernel(
+    mode: BootMode,
+    exit_after_boot: bool,
+    cargo_target_dir: &Path,
+) -> Result<PathBuf> {
+    let root = repo_root()?;
+    let target_json = root.join(CUSTOM_TARGET);
+    let release = release_build_enabled();
+
+    let mut command = cargo_command();
+    command.arg("build");
+    if release {
+        command.arg("--release");
+    }
+    command.arg("--package").arg(KERNEL_PACKAGE);
+    command.arg("--target").arg(&target_json);
+    command.arg("--target-dir").arg(cargo_target_dir);
+    // Build core and compiler_builtins from source for the custom bare-metal target.
+    // compiler-builtins-mem provides memcpy/memset/memcmp needed by kernel code.
+    command.arg("-Zbuild-std=core,compiler_builtins,alloc");
+    command.arg("-Zbuild-std-features=compiler-builtins-mem");
+    command.arg("-Zjson-target-spec");
+
+    let features = feature_list(mode, exit_after_boot);
+    if !features.is_empty() {
+        command.arg("--features").arg(features.join(","));
+    }
+
+    run_command(&mut command, "kernel build")?;
+
+    // The target directory uses the JSON filename (without extension) as the
+    // triple directory name. Cargo names the output subdir after the profile:
+    // dev → debug/, release → release/.
+    let profile_dir = if release { "release" } else { "debug" };
+    Ok(cargo_target_dir
+        .join("x86_64-lupos")
+        .join(profile_dir)
+        .join(KERNEL_PACKAGE))
+}
+
+/// True when the caller asked for an optimised kernel build.
+///
+/// Driven by `LUPOS_RELEASE=1` (or `LUPOS_PROFILE=release`).  Used by
+/// `build_kernel` to switch the cargo profile and pick the matching artifact
+/// directory.
+pub fn release_build_enabled() -> bool {
+    if let Ok(v) = env::var("LUPOS_RELEASE") {
+        let trimmed = v.trim();
+        return !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false");
+    }
+    if let Ok(v) = env::var("LUPOS_PROFILE") {
+        return v.eq_ignore_ascii_case("release");
+    }
+    false
+}
+
+/// Build a GRUB ISO from the given kernel ELF.
+///
+/// Creates the ISO staging tree at `<target_dir>/iso-root/`:
+/// ```text
+///   boot/bzImage                          ← Linux boot-protocol image
+///   boot/grub/grub.cfg                    ← GRUB menu config
+///   boot/initramfs.cpio                   ← initramfs (for backed modes)
+/// ```
+/// Then invokes local `grub-mkrescue` to produce the ISO.
+///
+/// Ref: https://www.gnu.org/software/grub/manual/grub/grub.html#Invoking-grub_002dmkrescue
+///      https://wiki.osdev.org/GRUB#Creating_a_bootable_ISO
+pub fn build_iso(
+    kernel_elf: &Path,
+    target_dir: &Path,
+    mode: &BootMode,
+    mode_name: &str,
+    run_id: u128,
+) -> Result<PathBuf> {
+    let grub_cfg = grub_cfg_content(mode);
+    build_iso_from_parts(
+        kernel_elf,
+        target_dir,
+        mode_name,
+        run_id,
+        &grub_cfg,
+        build_initramfs_cpio(mode),
+    )
+}
+
+fn build_release_iso(kernel_elf: &Path, target_dir: &Path) -> Result<PathBuf> {
+    let grub_cfg = release_grub_cfg_content();
+    build_iso_from_parts(
+        kernel_elf,
+        target_dir,
+        "release",
+        0,
+        &grub_cfg,
+        Some(module_stage_initramfs_cpio()),
+    )
+}
+
+fn build_iso_from_parts(
+    kernel_elf: &Path,
+    target_dir: &Path,
+    mode_name: &str,
+    run_id: u128,
+    grub_cfg: &str,
+    initramfs_cpio: Option<Vec<u8>>,
+) -> Result<PathBuf> {
+    // --- Set up the ISO staging tree (unique per run to allow parallel tests) ---
+    let iso_root = target_dir.join(format!("iso-root-{mode_name}-{run_id}"));
+    if iso_root.exists() {
+        fs::remove_dir_all(&iso_root).with_context(|| {
+            format!(
+                "failed to remove old ISO staging dir {}",
+                iso_root.display()
+            )
+        })?;
+    }
+
+    let boot_dir = iso_root.join("boot");
+    let grub_dir = boot_dir.join("grub");
+    fs::create_dir_all(&grub_dir)
+        .with_context(|| format!("failed to create ISO staging dir {}", grub_dir.display()))?;
+
+    // Stage only the Linux boot-protocol image that GRUB actually loads.
+    let bzimage_dst = boot_dir.join("bzImage");
+    let bzimage = build_bzimage_bytes_from_kernel_elf(kernel_elf)?;
+    fs::write(&bzimage_dst, &bzimage)
+        .with_context(|| format!("failed to write bzImage to {}", bzimage_dst.display()))?;
+
+    // Write the GRUB boot configuration.
+    let grub_cfg_path = grub_dir.join("grub.cfg");
+    fs::write(&grub_cfg_path, grub_cfg.as_bytes())
+        .with_context(|| format!("failed to write grub.cfg to {}", grub_cfg_path.display()))?;
+    write_grub_splash_art(&iso_root)?;
+
+    // For initramfs-backed modes, generate and write the CPIO image handed to
+    // the kernel via the Linux boot-protocol initrd fields.
+    if let Some(initramfs_cpio) = initramfs_cpio {
+        let cpio_dst = boot_dir.join("initramfs.cpio");
+        fs::write(&cpio_dst, &initramfs_cpio)
+            .with_context(|| format!("failed to write initramfs.cpio to {}", cpio_dst.display()))?;
+    }
+
+    // Invoke grub-mkrescue directly (native Linux).
+    let iso_path = target_dir.join(format!("lupos-{mode_name}-{run_id}.iso"));
+    let iso_root_sh = shell_path(&iso_root);
+    let iso_path_sh = shell_path(&iso_path);
+
+    // Verify the host has i386-pc GRUB modules. Without them grub-mkrescue
+    // produces an EFI-only ISO with no BIOS MBR boot record; SeaBIOS QEMU
+    // will fall through to iPXE and report "No bootable device."
+    // Fix: sudo apt install grub-pc-bin
+    let has_bios_modules = env::var_os(LUPOS_GRUB_LIBDIR_ENV)
+        .as_deref()
+        .map(|p| !p.is_empty())
+        .unwrap_or(false)
+        || std::path::Path::new("/usr/lib/grub/i386-pc").is_dir();
+    if !has_bios_modules {
+        bail!(
+            "grub-mkrescue: i386-pc GRUB modules not found.\n\
+             The host only has x86_64-efi modules; grub-mkrescue will produce an\n\
+             EFI-only ISO that SeaBIOS/QEMU cannot boot (you see iPXE instead of GRUB).\n\
+             Fix:  sudo apt install grub-pc-bin\n\
+             Or set {LUPOS_GRUB_LIBDIR_ENV} to a directory that contains i386-pc/."
+        );
+    }
+
+    let mut command = Command::new("grub-mkrescue");
+    command.env("SOURCE_DATE_EPOCH", "0");
+    // Optional override of the GRUB module directory. Hosts that only ship the
+    // x86_64-efi GRUB platform produce an EFI-only ISO that legacy SeaBIOS
+    // cannot boot; pointing grub-mkrescue at a directory carrying both the
+    // i386-pc and x86_64-efi modules yields a hybrid (BIOS + UEFI) ISO.
+    // `-d` is a grub-mkrescue option and must precede the output/passthrough
+    // arguments. Ref: grub-mkrescue(1) `-d, --directory`.
+    if let Some(libdir) = env::var_os(LUPOS_GRUB_LIBDIR_ENV) {
+        let libdir = PathBuf::from(libdir);
+        if libdir.as_os_str().is_empty() {
+            // ignore empty override
+        } else if !libdir.is_dir() {
+            bail!(
+                "{} is set but {} is not a directory",
+                LUPOS_GRUB_LIBDIR_ENV,
+                libdir.display()
+            );
+        } else {
+            command.arg("-d").arg(shell_path(&libdir));
+        }
+    }
+    command
+        .arg("-o")
+        .arg(&iso_path_sh)
+        .arg(&iso_root_sh)
+        .arg("--")
+        .arg("-iso_nowtime")
+        .arg("1970010100000000")
+        .arg("-volume_date")
+        .arg("c")
+        .arg("1970010100000000")
+        .arg("-volume_date")
+        .arg("m")
+        .arg("1970010100000000")
+        .arg("-volume_date")
+        .arg("x")
+        .arg("1970010100000000")
+        .arg("-volume_date")
+        .arg("f")
+        .arg("1970010100000000")
+        .arg("-volume_date")
+        .arg("uuid")
+        .arg("1970010100000000")
+        .arg("-alter_date_r")
+        .arg("a")
+        .arg("1970010100000000")
+        .arg("/")
+        .arg("--")
+        .arg("-alter_date_r")
+        .arg("m")
+        .arg("1970010100000000")
+        .arg("/")
+        .arg("--")
+        .arg("-alter_date_r")
+        .arg("b")
+        .arg("1970010100000000")
+        .arg("/")
+        .arg("--")
+        .arg("-alter_date_r")
+        .arg("c")
+        .arg("1970010100000000")
+        .arg("/")
+        .arg("--");
+
+    run_command(&mut command, "grub-mkrescue (ISO build)")?;
+
+    Ok(iso_path)
+}
+
+fn uefi_grub_cfg_content(mode: &BootMode) -> String {
+    grub_cfg_content(mode)
+}
+
+fn ensure_grub_x86_64_efi_modules(target_dir: &Path) -> Result<String> {
+    let installed = r#"for candidate in /usr/lib/grub/x86_64-efi /usr/lib/x86_64-linux-gnu/grub/x86_64-efi /usr/share/grub/x86_64-efi; do
+  if [ -d "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    exit 0
+  fi
+done
+"#;
+    let output = Command::new("bash")
+        .arg("-lc")
+        .arg(installed)
+        .output()
+        .context("failed to locate installed GRUB x86_64 EFI modules")?;
+    if !output.status.success() {
+        bail!(
+            "failed to locate installed GRUB x86_64 EFI modules: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if let Some(path) = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .last()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return Ok(path.to_string());
+    }
+
+    let extract_dir = target_dir.join("grub-efi-amd64-bin");
+    fs::create_dir_all(&extract_dir)
+        .with_context(|| format!("failed to create {}", extract_dir.display()))?;
+    let module_dir = extract_dir
+        .join("extract")
+        .join("usr")
+        .join("lib")
+        .join("grub")
+        .join("x86_64-efi");
+    if !module_dir.join("linux.mod").is_file() {
+        if find_grub_efi_deb(&extract_dir)?.is_none() {
+            let extract_sh = shell_path(&extract_dir);
+            let script = format!(
+                "cd {} && apt-get download grub-efi-amd64-bin >/dev/null",
+                shell_single_quote(&extract_sh)
+            );
+            let mut command = Command::new("bash");
+            command.arg("-lc").arg(script);
+            run_command(&mut command, "download grub-efi-amd64-bin")?;
+        }
+        let deb = find_grub_efi_deb(&extract_dir)?
+            .context("could not find downloaded grub-efi-amd64-bin .deb")?;
+        let extract_root = extract_dir.join("extract");
+        if extract_root.exists() {
+            fs::remove_dir_all(&extract_root)
+                .with_context(|| format!("failed to remove {}", extract_root.display()))?;
+        }
+        let deb_sh = shell_path(&deb);
+        let extract_root_sh = shell_path(&extract_root);
+        let mut command = Command::new("dpkg-deb");
+        command.arg("-x").arg(&deb_sh).arg(&extract_root_sh);
+        run_command(&mut command, "extract grub-efi-amd64-bin")?;
+    }
+    if !module_dir.join("linux.mod").is_file() {
+        bail!(
+            "extracted GRUB x86_64 EFI modules are missing {}",
+            module_dir.join("linux.mod").display()
+        );
+    }
+    Ok(shell_path(&module_dir))
+}
+
+fn find_grub_efi_deb(dir: &Path) -> Result<Option<PathBuf>> {
+    let mut matches = Vec::new();
+    if !dir.exists() {
+        return Ok(None);
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("grub-efi-amd64-bin_") && name.ends_with(".deb") {
+            matches.push(path);
+        }
+    }
+    matches.sort();
+    Ok(matches.pop())
+}
+
+fn build_uefi_grub_disk(
+    kernel_elf: &Path,
+    target_dir: &Path,
+    mode: &BootMode,
+    mode_name: &str,
+    run_id: u128,
+) -> Result<PathBuf> {
+    let work_dir = target_dir.join(format!("uefi-grub-{mode_name}-{run_id}"));
+    fs::create_dir_all(&work_dir)
+        .with_context(|| format!("failed to create UEFI staging dir {}", work_dir.display()))?;
+    let grub_cfg = work_dir.join("grub.cfg");
+    let early_cfg = work_dir.join("early-grub.cfg");
+    let bootx64 = work_dir.join("BOOTX64.EFI");
+    let bzimage = work_dir.join("bzImage");
+    let splash = work_dir.join("splashart.png");
+    let disk = target_dir.join(format!("lupos-{mode_name}-{run_id}.uefi.img"));
+    fs::write(&grub_cfg, uefi_grub_cfg_content(mode))
+        .with_context(|| format!("failed to write {}", grub_cfg.display()))?;
+    fs::write(
+        &early_cfg,
+        b"search --no-floppy --file --set=root /boot/grub/grub.cfg\nconfigfile /boot/grub/grub.cfg\n",
+    )
+    .with_context(|| format!("failed to write {}", early_cfg.display()))?;
+    fs::write(&bzimage, build_bzimage_bytes_from_kernel_elf(kernel_elf)?)
+        .with_context(|| format!("failed to write {}", bzimage.display()))?;
+    fs::write(&splash, SPLASH_ART_BYTES)
+        .with_context(|| format!("failed to write {}", splash.display()))?;
+    let initramfs = if let Some(cpio) = build_initramfs_cpio(mode) {
+        let path = work_dir.join("initramfs.cpio");
+        fs::write(&path, cpio).with_context(|| format!("failed to write {}", path.display()))?;
+        Some(path)
+    } else {
+        None
+    };
+
+    let modules = ensure_grub_x86_64_efi_modules(target_dir)?;
+    let disk_sh = shell_single_quote(&shell_path(&disk));
+    let initrd_copy = initramfs
+        .as_ref()
+        .map(|path| {
+            format!(
+                "mcopy -o -i {disk} {initrd} ::/boot/initramfs.cpio\n",
+                disk = disk_sh,
+                initrd = shell_single_quote(&shell_path(path))
+            )
+        })
+        .unwrap_or_default();
+    let script = format!(
+        r#"set -euo pipefail
+grub-mkimage -O x86_64-efi -d {modules} -p /EFI/BOOT -c {early_cfg} -o {bootx64} part_gpt fat normal configfile linux search search_fs_file serial terminal all_video png gfxterm boot
+rm -f {disk}
+dd if=/dev/zero of={disk} bs=1M count=64 status=none
+mformat -i {disk} -F ::
+mmd -i {disk} ::/EFI
+mmd -i {disk} ::/EFI/BOOT
+mmd -i {disk} ::/boot
+mmd -i {disk} ::/boot/grub
+mcopy -o -i {disk} {bootx64} ::/EFI/BOOT/BOOTX64.EFI
+mcopy -o -i {disk} {grub_cfg} ::/EFI/BOOT/grub.cfg
+mcopy -o -i {disk} {grub_cfg} ::/boot/grub/grub.cfg
+mcopy -o -i {disk} {bzimage} ::/boot/bzImage
+mcopy -o -i {disk} {splash} ::/boot/grub/splashart.png
+{initrd_copy}
+"#,
+        modules = shell_single_quote(&modules),
+        early_cfg = shell_single_quote(&shell_path(&early_cfg)),
+        bootx64 = shell_single_quote(&shell_path(&bootx64)),
+        grub_cfg = shell_single_quote(&shell_path(&grub_cfg)),
+        disk = disk_sh,
+        bzimage = shell_single_quote(&shell_path(&bzimage)),
+        splash = shell_single_quote(&shell_path(&splash)),
+        initrd_copy = initrd_copy.trim_end(),
+    );
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(script);
+    run_command(&mut command, "UEFI GRUB disk build")?;
+    Ok(disk)
+}
+
+/// Build a QEMU command that boots from a GRUB ISO via `-cdrom`.
+///
+/// Serial output is redirected to a file for headless/automated runs.
+/// The isa-debug-exit device lets the kernel signal pass/fail to the harness.
+///
+/// `smp_count` ≥ 2 adds `-smp N` for multi-CPU testing (Milestone 5).
+///
+/// Ref: https://www.qemu.org/docs/master/system/invocation.html
+fn add_qemu_iso_base_args(command: &mut Command, iso_path: &Path, display: &str, serial: &str) {
+    let machine = format!("{},accel={}", pick_qemu_machine(), pick_qemu_accel());
+    let memory = qemu_memory_arg(DEFAULT_QEMU_MEMORY);
+    command
+        // Boot from the CD-ROM image that contains GRUB + the Linux bzImage.
+        .arg("-cdrom")
+        .arg(iso_path)
+        // "-boot d" tells QEMU to use the CD-ROM as the primary boot device.
+        // Ref: https://www.qemu.org/docs/master/system/invocation.html#harg-boot
+        .arg("-boot")
+        .arg("d")
+        // -machine type=pc,accel=<chain> — QEMU walks the colon-separated chain
+        // and uses the first accelerator that loads, falling back to tcg.
+        // Ref: https://www.qemu.org/docs/master/system/invocation.html#hxtool-1
+        .arg("-machine")
+        .arg(machine)
+        .arg("-m")
+        .arg(memory)
+        .arg("-display")
+        .arg(display)
+        .arg("-monitor")
+        .arg("none")
+        .arg("-serial")
+        .arg(serial);
+    add_qemu_default_devices(command);
+    add_qemu_root_disk_if_requested(command);
+    add_qemu_gdb_args(command);
+}
+
+pub fn pick_qemu_machine() -> String {
+    let forced = env::var(LUPOS_QEMU_MACHINE_ENV).ok();
+    let root_disk = env::var(LUPOS_QEMU_ROOT_DISK_ENV).ok();
+    pick_qemu_machine_from_env(forced.as_deref(), root_disk.as_deref())
+}
+
+fn pick_qemu_machine_from_env(forced: Option<&str>, root_disk: Option<&str>) -> String {
+    if let Some(forced) = forced.map(str::trim).filter(|value| !value.is_empty()) {
+        return forced.to_string();
+    }
+
+    // Disk-root boots need PCIe ECAM/MCFG so the kernel can discover the
+    // attached virtio-blk-pci device through the same path Linux uses.
+    if qemu_root_disk_requested_from(root_disk) {
+        return "q35".to_string();
+    }
+
+    "pc".to_string()
+}
+
+fn qemu_root_disk_requested_from(root_disk: Option<&str>) -> bool {
+    root_disk
+        .map(|path| !path.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Pick the QEMU accelerator chain for the current host.
+///
+/// Honors `LUPOS_QEMU_ACCEL` if set (e.g. `tcg`, `kvm`, `kvm:tcg`).
+/// Otherwise auto-detects:
+///   - Linux: prefer KVM when `/dev/kvm` is present, fall back to TCG.
+///   - Other: TCG only.
+///
+/// The result is the value passed to `-machine accel=...` — QEMU walks the
+/// colon-separated chain and uses the first accelerator that initialises.
+pub fn pick_qemu_accel() -> String {
+    if let Ok(forced) = env::var(LUPOS_QEMU_ACCEL_ENV) {
+        let trimmed = forced.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if cfg!(target_os = "linux") {
+        if Path::new("/dev/kvm").exists() {
+            return "kvm:tcg".to_string();
+        }
+        return "tcg".to_string();
+    }
+    "tcg".to_string()
+}
+
+fn qemu_memory_arg(default: &str) -> String {
+    env::var(LUPOS_QEMU_MEMORY_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn qemu_gdb_enabled() -> bool {
+    env_flag_is_enabled(LUPOS_QEMU_GDB_ENV)
+}
+
+fn add_qemu_gdb_args(command: &mut Command) {
+    if qemu_gdb_enabled() {
+        command
+            .arg("-S")
+            .arg("-gdb")
+            .arg(format!("tcp::{QEMU_GDB_PORT}"));
+    }
+}
+
+fn print_qemu_gdb_hint(kernel_elf: &Path) {
+    if !qemu_gdb_enabled() {
+        return;
+    }
+    println!("QEMU is paused for GDB on tcp::{QEMU_GDB_PORT}.");
+    println!(
+        "Attach with: gdb {} -ex \"target remote :{QEMU_GDB_PORT}\"",
+        shell_path(kernel_elf)
+    );
+}
+
+fn login_boot_default_release_profile(
+    release_env: Option<&str>,
+    profile_env: Option<&str>,
+) -> Option<&'static str> {
+    if release_env.is_some() || profile_env.is_some() {
+        return None;
+    }
+    Some("1")
+}
+
+fn default_login_boot_release_guard() -> Option<EnvVarGuard> {
+    let release = env::var("LUPOS_RELEASE").ok();
+    let profile = env::var("LUPOS_PROFILE").ok();
+    let value = login_boot_default_release_profile(release.as_deref(), profile.as_deref())?;
+    println!(
+        "Login ISO boot defaults to release kernel; set LUPOS_RELEASE=0 or LUPOS_PROFILE=debug to override."
+    );
+    Some(EnvVarGuard::set("LUPOS_RELEASE", value))
+}
+
+fn default_gui_shell_memory_guard() -> Option<EnvVarGuard> {
+    if env::var(LUPOS_QEMU_MEMORY_ENV)
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    println!(
+        "GUI shell boot defaults to {GUI_SHELL_QEMU_MEMORY} RAM; set {LUPOS_QEMU_MEMORY_ENV} to override."
+    );
+    Some(EnvVarGuard::set(
+        LUPOS_QEMU_MEMORY_ENV,
+        GUI_SHELL_QEMU_MEMORY,
+    ))
+}
+
+fn add_qemu_default_devices(command: &mut Command) {
+    command
+        .arg("-device")
+        .arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
+        .arg("-netdev")
+        .arg("user,id=luposnet0,hostname=lupos")
+        .arg("-device")
+        .arg("virtio-net-pci,netdev=luposnet0")
+        .arg("-device")
+        .arg("qemu-xhci,id=xhci")
+        .arg("-device")
+        .arg("usb-tablet,bus=xhci.0")
+        .arg("-audiodev")
+        .arg("none,id=luposaudio")
+        .arg("-device")
+        .arg("intel-hda")
+        .arg("-device")
+        .arg("hda-duplex,audiodev=luposaudio");
+}
+
+fn add_qemu_root_disk_if_requested(command: &mut Command) {
+    let Ok(path) = env::var(LUPOS_QEMU_ROOT_DISK_ENV) else {
+        return;
+    };
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let format = qemu_disk_format(trimmed);
+    command
+        .arg("-drive")
+        .arg(format!(
+            "file={trimmed},if=none,id=luposroot0,format={format}"
+        ))
+        .arg("-device")
+        .arg("virtio-blk-pci,drive=luposroot0,serial=lupos-root");
+}
+
+fn qemu_disk_format(path: &str) -> &'static str {
+    if path.to_ascii_lowercase().ends_with(".qcow2") {
+        "qcow2"
+    } else {
+        "raw"
+    }
+}
+
+pub fn build_qemu_iso_command(
+    iso_path: &Path,
+    serial_log_path: &Path,
+    smp_count: usize,
+) -> Command {
+    let mut command = Command::new(QEMU_BINARY);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    add_qemu_iso_base_args(
+        &mut command,
+        iso_path,
+        "none",
+        &format!("file:{}", serial_log_path.display()),
+    );
+
+    // Add -smp only when more than one CPU is requested.
+    // Ref: https://www.qemu.org/docs/master/system/invocation.html#harg-smp
+    if smp_count > 1 {
+        command.arg("-smp").arg(smp_count.to_string());
+    }
+
+    command
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn ensure_ovmf_asset(target_dir: &Path, linux_path: &str, file_name: &str) -> Result<PathBuf> {
+    let dst_dir = target_dir.join("ovmf");
+    fs::create_dir_all(&dst_dir)
+        .with_context(|| format!("failed to create {}", dst_dir.display()))?;
+    let dst = dst_dir.join(file_name);
+    if dst.exists() {
+        return Ok(dst);
+    }
+
+    let src = Path::new(linux_path);
+    if src.exists() {
+        fs::copy(src, &dst).with_context(|| {
+            format!(
+                "failed to copy OVMF firmware {} to {}",
+                src.display(),
+                dst.display()
+            )
+        })?;
+        return Ok(dst);
+    }
+
+    bail!(
+        "missing OVMF firmware asset {linux_path}; set {LUPOS_OVMF_CODE_ENV} and {LUPOS_OVMF_VARS_ENV}"
+    );
+}
+
+fn resolve_ovmf_firmware(target_dir: &Path, run_id: u128) -> Result<(PathBuf, PathBuf)> {
+    let code = match env_path(LUPOS_OVMF_CODE_ENV) {
+        Some(path) => path,
+        None => ensure_ovmf_asset(
+            target_dir,
+            "/usr/share/OVMF/OVMF_CODE_4M.fd",
+            "OVMF_CODE_4M.fd",
+        )?,
+    };
+    let vars_template = match env_path(LUPOS_OVMF_VARS_ENV) {
+        Some(path) => path,
+        None => ensure_ovmf_asset(
+            target_dir,
+            "/usr/share/OVMF/OVMF_VARS_4M.ms.fd",
+            "OVMF_VARS_4M.ms.fd",
+        )?,
+    };
+    if !code.exists() {
+        bail!("OVMF code file does not exist: {}", code.display());
+    }
+    if !vars_template.exists() {
+        bail!(
+            "OVMF vars template does not exist: {}",
+            vars_template.display()
+        );
+    }
+    let ovmf_dir = target_dir.join("ovmf");
+    fs::create_dir_all(&ovmf_dir)
+        .with_context(|| format!("failed to create {}", ovmf_dir.display()))?;
+    let vars = ovmf_dir.join(format!("OVMF_VARS-{run_id}.fd"));
+    fs::copy(&vars_template, &vars).with_context(|| {
+        format!(
+            "failed to copy OVMF vars template {} to {}",
+            vars_template.display(),
+            vars.display()
+        )
+    })?;
+    Ok((code, vars))
+}
+
+fn run_qemu_uefi_disk(
+    disk_path: &Path,
+    serial_log_path: &Path,
+    timeout: Option<Duration>,
+) -> Result<ExitStatus> {
+    let target_dir = xtask_target_dir()?;
+    let run_id = artifact_run_id();
+    let (ovmf_code, ovmf_vars) = resolve_ovmf_firmware(&target_dir, run_id)?;
+    let mut command = Command::new(QEMU_BINARY);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .arg("-machine")
+        .arg(format!("q35,accel={}", pick_qemu_accel()))
+        .arg("-m")
+        .arg("1024M")
+        .arg("-display")
+        .arg("none")
+        .arg("-monitor")
+        .arg("none")
+        .arg("-serial")
+        .arg(format!("file:{}", serial_log_path.display()))
+        .arg("-no-reboot")
+        .arg("-device")
+        .arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
+        .arg("-drive")
+        .arg(format!(
+            "if=pflash,format=raw,unit=0,readonly=on,file={}",
+            ovmf_code.display()
+        ))
+        .arg("-drive")
+        .arg(format!(
+            "if=pflash,format=raw,unit=1,file={}",
+            ovmf_vars.display()
+        ))
+        .arg("-drive")
+        .arg(format!("file={},format=raw,if=ide", disk_path.display()))
+        .arg("-boot")
+        .arg("c");
+    run_command_with_optional_timeout(&mut command, serial_log_path, timeout)
+        .context("failed to launch QEMU UEFI pflash boot")
+}
+
+/// Public boot path: build the real login initramfs and open QEMU's VGA window.
+pub fn run_single_login_boot(_autologin_root: bool) -> Result<()> {
+    ensure_userland_stage()?;
+    let _stage_guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
+    let _release_guard = default_login_boot_release_guard();
+    let _root_disk_guards = default_qemu_root_disk_guard_for_mode(BootMode::Login)?;
+
+    let artifacts = build_iso_artifacts(BootMode::Login, false)?;
+    let iso = artifacts
+        .iso
+        .as_ref()
+        .expect("iso path must be present in ISO artifacts");
+
+    println!("Launching Lupos login boot...");
+    println!("Serial log: {}", artifacts.serial_log.display());
+    println!("Log in as root with password `lupos`; run `poweroff` to exit QEMU.");
+    print_qemu_gdb_hint(&artifacts.kernel_elf);
+
+    let status = run_qemu_iso_login_display(iso, &artifacts.serial_log)?;
+    let serial_output = read_serial_log_if_present(&artifacts.serial_log);
+    match status.code() {
+        Some(0) | Some(QEMU_SUCCESS_EXIT_CODE) => Ok(()),
+        Some(code) => {
+            if serial_output.is_empty() {
+                bail!("QEMU exited with unexpected status code {code}");
+            }
+            bail!("QEMU exited with unexpected status code {code}\nserial log:\n{serial_output}");
+        }
+        None => Ok(()),
+    }
+}
+
+fn run_qemu_iso_login_display(iso_path: &Path, serial_log_path: &Path) -> Result<ExitStatus> {
+    let mut command = Command::new(QEMU_BINARY);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    add_qemu_iso_base_args(
+        &mut command,
+        iso_path,
+        "gtk,zoom-to-fit=on",
+        &format!("file:{}", serial_log_path.display()),
+    );
+    command.current_dir(repo_root().context("failed to resolve repo root")?);
+
+    run_command_with_optional_timeout(&mut command, serial_log_path, None)
+        .context("failed to launch interactive QEMU login boot")
+}
+
+/// Public boot path: attach the guest serial console directly to this terminal.
+///
+/// `qemu-iso-display` keeps serial in a log file and expects input through the
+/// QEMU GTK window. This path attaches the guest serial console to the terminal.
+pub fn run_single_login_boot_terminal() -> Result<()> {
+    ensure_userland_stage()?;
+    let _stage_guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
+    let _release_guard = default_login_boot_release_guard();
+    let _root_disk_guards = default_qemu_root_disk_guard_for_mode(BootMode::LoginDisplay)?;
+
+    let artifacts = build_iso_artifacts(BootMode::LoginDisplay, false)?;
+    let iso = artifacts
+        .iso
+        .as_ref()
+        .expect("iso path must be present in ISO artifacts");
+
+    println!("Launching Lupos login boot on this terminal...");
+    println!("Log in as root with password `lupos`; run `poweroff` inside the guest to exit QEMU.");
+    print_qemu_gdb_hint(&artifacts.kernel_elf);
+
+    let status = run_qemu_iso_login_terminal(iso)?;
+    match status.code() {
+        Some(0) | Some(QEMU_SUCCESS_EXIT_CODE) => Ok(()),
+        Some(code) => bail!("QEMU exited with unexpected status code {code}"),
+        None => Ok(()),
+    }
+}
+
+fn build_qemu_iso_login_terminal_command(iso_path: &Path) -> Result<Command> {
+    let mut command = Command::new(QEMU_BINARY);
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    add_qemu_iso_base_args(&mut command, iso_path, "none", "stdio");
+    command.current_dir(repo_root().context("failed to resolve repo root")?);
+    Ok(command)
+}
+
+fn run_qemu_iso_login_terminal(iso_path: &Path) -> Result<ExitStatus> {
+    let mut command = build_qemu_iso_login_terminal_command(iso_path)?;
+    let qemu_lock = QemuRunLock::acquire()?;
+    let rendered = render_command(&command);
+    let mut guard = spawn_qemu_guard(&mut command, &rendered, &qemu_lock, "serial-console")?;
+    guard
+        .wait()
+        .with_context(|| format!("failed while waiting on serial-console QEMU: {rendered}"))
+}
+
+pub fn run_gui_shell_boot() -> Result<()> {
+    bail!("gui-shell was removed; Arch base has no desktop boot")
+}
+
+/// Compatibility alias for the single login boot.
+#[allow(dead_code)]
+fn run_qemu_iso_with_display() -> Result<()> {
+    run_single_login_boot(false)
+}
+
+#[allow(dead_code)]
+fn run_qemu_iso_display_smoke_legacy() -> Result<()> {
+    let target_dir = xtask_target_dir()?;
+    fs::create_dir_all(&target_dir)?;
+    let cargo_target_dir = target_dir.join("cargo-iso-display");
+    let kernel_elf = build_kernel(BootMode::Hello, true, &cargo_target_dir)?;
+    let iso = build_iso(&kernel_elf, &target_dir, &BootMode::Hello, "iso-display", 0)?;
+    let serial_log = target_dir.join("serial-iso-display-0.log");
+
+    let mut command = Command::new(QEMU_BINARY);
+    command
+        .arg("-cdrom")
+        .arg(&iso)
+        .arg("-boot")
+        .arg("d")
+        // zoom-to-fit scales the guest framebuffer to match the window size
+        // when you resize the QEMU window, so a 800×600 framebuffer fills
+        // a larger or smaller window without needing a guest-side driver.
+        // Ref: https://www.qemu.org/docs/master/system/invocation.html#harg-display
+        .arg("-display")
+        .arg("gtk,zoom-to-fit=on")
+        .arg("-serial")
+        .arg(format!("file:{}", serial_log.display()))
+        .arg("-device")
+        .arg("isa-debug-exit,iobase=0xf4,iosize=0x04");
+    command.current_dir(repo_root()?);
+
+    println!("Launching QEMU ISO display smoke...");
+    let status =
+        run_command_with_optional_timeout(&mut command, &serial_log, Some(default_qemu_timeout()))?;
+    let serial_output = read_serial_log(&serial_log)?;
+    let run = BootRun {
+        artifacts: BuiltArtifacts {
+            kernel_elf,
+            iso: Some(iso),
+            serial_log,
+        },
+        status,
+        serial_output,
+    };
+    assert_boot_outcome(&run, HELLO_BANNER, QEMU_SUCCESS_EXIT_CODE)
+}
+
+/// Build the GRUB ISO only (no QEMU run) and print the output path.
+fn build_iso_cmd() -> Result<()> {
+    let target_dir = xtask_target_dir()?;
+    fs::create_dir_all(&target_dir)?;
+    let cargo_target_dir = target_dir.join("cargo-iso");
+    let kernel_elf = build_kernel(BootMode::Hello, false, &cargo_target_dir)?;
+    let iso = build_iso(&kernel_elf, &target_dir, &BootMode::Hello, "iso-cmd", 0)?;
+    println!("ISO built: {}", iso.display());
+    Ok(())
+}
+
+fn build_bzimage_bytes_from_kernel_elf(kernel_elf: &Path) -> Result<Vec<u8>> {
+    let kernel_elf_bytes = fs::read(kernel_elf)
+        .with_context(|| format!("failed to read kernel ELF {}", kernel_elf.display()))?;
+    let kernel_image = kernel_elf_image_from_elf(&kernel_elf_bytes, BZIMAGE_EXTRACTED_ENTRY_SYMBOL)
+        .with_context(|| format!("failed to prepare kernel ELF {}", kernel_elf.display()))?;
+    build_linux_bzimage_bytes(&kernel_image)
+}
+
+fn build_bzimage_artifact() -> Result<PathBuf> {
+    let target_dir = xtask_target_dir()?;
+    fs::create_dir_all(&target_dir)?;
+    let cargo_target_dir = target_dir.join("cargo-bzimage");
+    let kernel_elf = build_kernel(BootMode::Hello, false, &cargo_target_dir)?;
+    let image = build_bzimage_bytes_from_kernel_elf(&kernel_elf)?;
+    let bzimage = target_dir.join("bzImage");
+    fs::write(&bzimage, &image)
+        .with_context(|| format!("failed to write bzImage {}", bzimage.display()))?;
+    Ok(bzimage)
+}
+
+fn align_up_u64(value: u64, align: u64) -> u64 {
+    (value + align - 1) & !(align - 1)
+}
+
+fn linux_compressed_init_size(
+    ehead: u32,
+    image_end: u32,
+    z_input_len: u32,
+    z_output_len: u32,
+    kernel_total_size: u32,
+) -> Result<u32> {
+    let z_extra_bytes = (u64::from(z_output_len) >> 8) + BZIMAGE_ZO_EXTRA_BYTES_BASE;
+    let z_extract_offset = if z_output_len > z_input_len {
+        u64::from(z_output_len)
+            .checked_add(z_extra_bytes)
+            .and_then(|value| value.checked_sub(u64::from(z_input_len)))
+            .context("Linux ZO extract offset overflows")?
+    } else {
+        z_extra_bytes
+    };
+    let z_min_extract_offset =
+        align_up_u64(u64::from(ehead).max(z_extract_offset), BZIMAGE_PAGE_SIZE);
+    let zo_init_size = u64::from(image_end)
+        .checked_add(z_min_extract_offset)
+        .context("Linux ZO init_size overflows")?;
+    let init_size = zo_init_size.max(u64::from(kernel_total_size));
+    u32::try_from(init_size).context("Linux boot-protocol init_size exceeds 32 bits")
+}
+
+fn put_u16_le(bytes: &mut [u8], off: usize, value: u16) {
+    bytes[off..off + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32_le(bytes: &mut [u8], off: usize, value: u32) {
+    bytes[off..off + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64_le(bytes: &mut [u8], off: usize, value: u64) {
+    bytes[off..off + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FlatKernelImage {
+    load_addr: u64,
+    entry_addr: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KernelElfImage {
+    load_addr: u64,
+    entry_addr: u64,
+    load_size: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredCompressedKernelImage {
+    bytes: Vec<u8>,
+    startup_32_offset: u32,
+    startup_64_offset: u32,
+    extract_kernel_offset: u32,
+    ehead_offset: u32,
+    input_data_offset: u32,
+    input_data_end_offset: u32,
+    input_len_word_offset: u32,
+    output_len_word_offset: u32,
+    image_end_offset: u32,
+    init_size: u32,
+    input_data_len: u32,
+    z_input_len: u32,
+    z_output_len: u32,
+    output_len: u32,
+    output_load_addr: u32,
+    extracted_entry_addr: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StoredCompressedPayloadSymbols {
+    head: u32,
+    ehead: u32,
+    text: u32,
+    etext: u32,
+    rodata: u32,
+    erodata: u32,
+    data: u32,
+    edata: u32,
+    bss: u32,
+    ebss: u32,
+    pgtable: u32,
+    epgtable: u32,
+    end: u32,
+    startup_32: u32,
+    startup_64: u32,
+    extract_kernel: u32,
+    input_data: u32,
+    input_data_end: u32,
+    input_len: u32,
+    output_len: u32,
+    entry_addr: u32,
+    z_input_len: u32,
+    z_output_len: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredCompressedPayload {
+    bytes: Vec<u8>,
+    symbols: StoredCompressedPayloadSymbols,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LinuxSetupImage {
+    bytes: Vec<u8>,
+    code32_start: u32,
+    payload_length: u32,
+    init_size: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Elf64ProgramHeader {
+    offset: u64,
+    flags: u32,
+    vaddr: u64,
+    paddr: u64,
+    filesz: u64,
+    memsz: u64,
+    align: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Elf64SectionHeader {
+    section_type: u32,
+    offset: u64,
+    size: u64,
+    link: u32,
+    entsize: u64,
+}
+
+fn read_u16_le(bytes: &[u8], off: usize, what: &str) -> Result<u16> {
+    let value = bytes
+        .get(off..off + 2)
+        .with_context(|| format!("ELF is truncated while reading {what}"))?;
+    Ok(u16::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn read_u32_le(bytes: &[u8], off: usize, what: &str) -> Result<u32> {
+    let value = bytes
+        .get(off..off + 4)
+        .with_context(|| format!("ELF is truncated while reading {what}"))?;
+    Ok(u32::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn read_u64_le(bytes: &[u8], off: usize, what: &str) -> Result<u64> {
+    let value = bytes
+        .get(off..off + 8)
+        .with_context(|| format!("ELF is truncated while reading {what}"))?;
+    Ok(u64::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn checked_elf_slice<'a>(bytes: &'a [u8], off: u64, len: u64, what: &str) -> Result<&'a [u8]> {
+    let off = usize::try_from(off).with_context(|| format!("{what} offset does not fit usize"))?;
+    let len = usize::try_from(len).with_context(|| format!("{what} size does not fit usize"))?;
+    let end = off
+        .checked_add(len)
+        .with_context(|| format!("{what} range overflows usize"))?;
+    bytes
+        .get(off..end)
+        .with_context(|| format!("ELF is truncated while reading {what}"))
+}
+
+fn read_cstr_from_table(table: &[u8], offset: u32, what: &str) -> Result<String> {
+    let start =
+        usize::try_from(offset).with_context(|| format!("{what} offset overflows usize"))?;
+    let rest = table
+        .get(start..)
+        .with_context(|| format!("{what} offset is outside the string table"))?;
+    let end = rest
+        .iter()
+        .position(|b| *b == 0)
+        .with_context(|| format!("{what} is not NUL terminated"))?;
+    core::str::from_utf8(&rest[..end])
+        .with_context(|| format!("{what} is not UTF-8"))
+        .map(|s| s.to_owned())
+}
+
+fn parse_elf64_program_headers(bytes: &[u8]) -> Result<Vec<Elf64ProgramHeader>> {
+    if bytes.len() < ELF64_HEADER_SIZE
+        || bytes.get(0..4) != Some(b"\x7fELF")
+        || bytes.get(4) != Some(&2)
+        || bytes.get(5) != Some(&1)
+    {
+        bail!("kernel image is not a little-endian ELF64 file");
+    }
+    if read_u16_le(bytes, 0x12, "e_machine")? != 0x3e {
+        bail!("kernel ELF is not EM_X86_64");
+    }
+
+    let phoff = read_u64_le(bytes, 0x20, "e_phoff")?;
+    let phentsize = read_u16_le(bytes, 0x36, "e_phentsize")?;
+    let phnum = read_u16_le(bytes, 0x38, "e_phnum")?;
+    if phentsize < ELF64_PROGRAM_HEADER_SIZE {
+        bail!("kernel ELF program header size {phentsize} is smaller than ELF64");
+    }
+
+    let mut headers = Vec::new();
+    for idx in 0..phnum {
+        let off = phoff
+            .checked_add(u64::from(idx) * u64::from(phentsize))
+            .context("ELF program header table offset overflow")?;
+        let ph = checked_elf_slice(bytes, off, u64::from(phentsize), "program header")?;
+        let p_type = read_u32_le(ph, 0, "p_type")?;
+        if p_type != ELF_PT_LOAD {
+            continue;
+        }
+        let p_flags = read_u32_le(ph, 4, "p_flags")?;
+        let p_offset = read_u64_le(ph, 8, "p_offset")?;
+        let p_vaddr = read_u64_le(ph, 16, "p_vaddr")?;
+        let p_paddr = read_u64_le(ph, 24, "p_paddr")?;
+        let p_filesz = read_u64_le(ph, 32, "p_filesz")?;
+        let p_memsz = read_u64_le(ph, 40, "p_memsz")?;
+        let p_align = read_u64_le(ph, 48, "p_align")?;
+        if p_memsz < p_filesz {
+            bail!("PT_LOAD segment has p_memsz smaller than p_filesz");
+        }
+        checked_elf_slice(bytes, p_offset, p_filesz, "PT_LOAD file payload")?;
+        headers.push(Elf64ProgramHeader {
+            offset: p_offset,
+            flags: p_flags,
+            vaddr: p_vaddr,
+            paddr: p_paddr,
+            filesz: p_filesz,
+            memsz: p_memsz,
+            align: p_align,
+        });
+    }
+    if headers.is_empty() {
+        bail!("kernel ELF has no PT_LOAD segments");
+    }
+    Ok(headers)
+}
+
+fn parse_elf64_section_headers(bytes: &[u8]) -> Result<Vec<Elf64SectionHeader>> {
+    let shoff = read_u64_le(bytes, 0x28, "e_shoff")?;
+    let shentsize = read_u16_le(bytes, 0x3a, "e_shentsize")?;
+    let shnum = read_u16_le(bytes, 0x3c, "e_shnum")?;
+    if shoff == 0 || shnum == 0 {
+        bail!("kernel ELF has no section headers; cannot locate {BZIMAGE_EXTRACTED_ENTRY_SYMBOL}");
+    }
+    if shentsize < ELF64_SECTION_HEADER_SIZE {
+        bail!("kernel ELF section header size {shentsize} is smaller than ELF64");
+    }
+
+    let mut headers = Vec::with_capacity(usize::from(shnum));
+    for idx in 0..shnum {
+        let off = shoff
+            .checked_add(u64::from(idx) * u64::from(shentsize))
+            .context("ELF section header table offset overflow")?;
+        let sh = checked_elf_slice(bytes, off, u64::from(shentsize), "section header")?;
+        headers.push(Elf64SectionHeader {
+            section_type: read_u32_le(sh, 4, "sh_type")?,
+            offset: read_u64_le(sh, 24, "sh_offset")?,
+            size: read_u64_le(sh, 32, "sh_size")?,
+            link: read_u32_le(sh, 40, "sh_link")?,
+            entsize: read_u64_le(sh, 56, "sh_entsize")?,
+        });
+    }
+    Ok(headers)
+}
+
+fn find_elf64_symbol_value(bytes: &[u8], symbol_name: &str) -> Result<u64> {
+    let sections = parse_elf64_section_headers(bytes)?;
+    for section in sections
+        .iter()
+        .filter(|section| section.section_type == ELF_SHT_SYMTAB)
+    {
+        let entry_size = if section.entsize == 0 {
+            ELF64_SYMBOL_SIZE
+        } else {
+            section.entsize
+        };
+        if entry_size < ELF64_SYMBOL_SIZE {
+            bail!("ELF symbol table entry size {entry_size} is smaller than ELF64");
+        }
+        let string_section = sections
+            .get(section.link as usize)
+            .with_context(|| "ELF symbol table has invalid linked string table index")?;
+        let string_table = checked_elf_slice(
+            bytes,
+            string_section.offset,
+            string_section.size,
+            "string table",
+        )?;
+        let symtab = checked_elf_slice(bytes, section.offset, section.size, "symbol table")?;
+        let entries = section.size / entry_size;
+        for idx in 0..entries {
+            let off = usize::try_from(idx * entry_size)
+                .context("ELF symbol table entry offset overflows usize")?;
+            let sym = symtab
+                .get(off..off + ELF64_SYMBOL_SIZE as usize)
+                .context("ELF symbol table is truncated")?;
+            let st_name = read_u32_le(sym, 0, "st_name")?;
+            if st_name == 0 {
+                continue;
+            }
+            let name = read_cstr_from_table(string_table, st_name, "symbol name")?;
+            if name == symbol_name {
+                return read_u64_le(sym, 8, "st_value");
+            }
+        }
+    }
+    bail!("kernel ELF does not define symbol {symbol_name}");
+}
+
+fn flat_kernel_image_from_elf(bytes: &[u8], entry_symbol: &str) -> Result<FlatKernelImage> {
+    let load_segments = parse_elf64_program_headers(bytes)?;
+    let load_addr = load_segments
+        .iter()
+        .map(|segment| segment.paddr)
+        .min()
+        .unwrap();
+    let end_addr = load_segments
+        .iter()
+        .map(|segment| segment.paddr.checked_add(segment.memsz))
+        .collect::<Option<Vec<_>>>()
+        .context("PT_LOAD physical range overflow")?
+        .into_iter()
+        .max()
+        .unwrap();
+    if end_addr <= load_addr {
+        bail!("kernel ELF PT_LOAD physical range is empty");
+    }
+    let image_len =
+        usize::try_from(end_addr - load_addr).context("flat kernel image does not fit usize")?;
+    let mut image = vec![0u8; image_len];
+    for segment in load_segments {
+        let src = checked_elf_slice(
+            bytes,
+            segment.offset,
+            segment.filesz,
+            "PT_LOAD file payload",
+        )?;
+        let dst_start = usize::try_from(segment.paddr - load_addr)
+            .context("PT_LOAD destination offset does not fit usize")?;
+        let dst_end = dst_start
+            .checked_add(src.len())
+            .context("PT_LOAD destination range overflow")?;
+        image
+            .get_mut(dst_start..dst_end)
+            .context("PT_LOAD destination range is outside flat image")?
+            .copy_from_slice(src);
+    }
+
+    let entry_addr = find_elf64_symbol_value(bytes, entry_symbol)?;
+    if entry_addr < load_addr || entry_addr >= end_addr {
+        bail!(
+            "kernel ELF symbol {entry_symbol}={entry_addr:#x} is outside PT_LOAD range {load_addr:#x}..{end_addr:#x}"
+        );
+    }
+
+    Ok(FlatKernelImage {
+        load_addr,
+        entry_addr,
+        bytes: image,
+    })
+}
+
+fn align_up_usize(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+
+fn compact_kernel_elf_image(
+    bytes: &[u8],
+    load_segments: &[Elf64ProgramHeader],
+    entry_addr: u64,
+) -> Result<Vec<u8>> {
+    let phnum =
+        u16::try_from(load_segments.len()).context("kernel ELF has too many PT_LOAD segments")?;
+    let phoff = ELF64_HEADER_SIZE as usize;
+    let phdr_bytes = usize::from(phnum) * ELF64_PROGRAM_HEADER_SIZE as usize;
+    let data_start = align_up_usize(phoff + phdr_bytes, 16);
+    let mut image = vec![0u8; data_start];
+
+    image[0..4].copy_from_slice(b"\x7fELF");
+    image[4] = 2;
+    image[5] = 1;
+    image[6] = 1;
+    put_u16_le(&mut image, 0x10, 2);
+    put_u16_le(&mut image, 0x12, 0x3e);
+    put_u32_le(&mut image, 0x14, 1);
+    put_u64_le(&mut image, 0x18, entry_addr);
+    put_u64_le(&mut image, 0x20, phoff as u64);
+    put_u16_le(&mut image, 0x34, ELF64_HEADER_SIZE as u16);
+    put_u16_le(&mut image, 0x36, ELF64_PROGRAM_HEADER_SIZE);
+    put_u16_le(&mut image, 0x38, phnum);
+
+    for (idx, segment) in load_segments.iter().enumerate() {
+        let src = checked_elf_slice(
+            bytes,
+            segment.offset,
+            segment.filesz,
+            "PT_LOAD file payload",
+        )?;
+        let file_offset = align_up_usize(image.len(), 16);
+        image.resize(file_offset, 0);
+        image.extend_from_slice(src);
+
+        let ph = phoff + idx * ELF64_PROGRAM_HEADER_SIZE as usize;
+        put_u32_le(&mut image, ph, ELF_PT_LOAD);
+        put_u32_le(&mut image, ph + 4, segment.flags);
+        put_u64_le(&mut image, ph + 8, file_offset as u64);
+        put_u64_le(&mut image, ph + 16, segment.vaddr);
+        put_u64_le(&mut image, ph + 24, segment.paddr);
+        put_u64_le(&mut image, ph + 32, segment.filesz);
+        put_u64_le(&mut image, ph + 40, segment.memsz);
+        let min_kernel_align = u64::from(BZIMAGE_KERNEL_ALIGNMENT);
+        let segment_align = if segment.align == 0 || segment.align % min_kernel_align == 0 {
+            segment.align
+        } else {
+            min_kernel_align
+        };
+        put_u64_le(&mut image, ph + 48, segment_align);
+    }
+
+    Ok(image)
+}
+
+fn kernel_elf_image_from_elf(bytes: &[u8], entry_symbol: &str) -> Result<KernelElfImage> {
+    let load_segments = parse_elf64_program_headers(bytes)?;
+    let load_addr = load_segments
+        .iter()
+        .map(|segment| segment.paddr)
+        .min()
+        .unwrap();
+    let end_addr = load_segments
+        .iter()
+        .map(|segment| segment.paddr.checked_add(segment.memsz))
+        .collect::<Option<Vec<_>>>()
+        .context("PT_LOAD physical range overflow")?
+        .into_iter()
+        .max()
+        .unwrap();
+    if end_addr <= load_addr {
+        bail!("kernel ELF PT_LOAD physical range is empty");
+    }
+
+    let entry_addr = find_elf64_symbol_value(bytes, entry_symbol)?;
+    if entry_addr < load_addr || entry_addr >= end_addr {
+        bail!(
+            "kernel ELF symbol {entry_symbol}={entry_addr:#x} is outside PT_LOAD range {load_addr:#x}..{end_addr:#x}"
+        );
+    }
+
+    let image = compact_kernel_elf_image(bytes, &load_segments, entry_addr)?;
+
+    Ok(KernelElfImage {
+        load_addr,
+        entry_addr,
+        load_size: align_up_u64(end_addr - load_addr, BZIMAGE_PAGE_SIZE),
+        bytes: image,
+    })
+}
+
+fn assembler_include_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
+fn write_head64_probe_generated_headers(include_root: &Path) -> Result<()> {
+    fs::create_dir_all(include_root.join("generated")).with_context(|| {
+        format!(
+            "failed to create generated include root {}",
+            include_root.display()
+        )
+    })?;
+    fs::create_dir_all(include_root.join("asm")).with_context(|| {
+        format!(
+            "failed to create asm include root {}",
+            include_root.display()
+        )
+    })?;
+
+    let asm_offsets = format!(
+        "#define BP_scratch {:#x}\n#define BP_kernel_alignment {:#x}\n#define BP_init_size {:#x}\n",
+        BZIMAGE_BOOTPARAM_BP_SCRATCH_OFFSET,
+        BZIMAGE_BOOTPARAM_BP_KERNEL_ALIGNMENT_OFFSET,
+        BZIMAGE_BOOTPARAM_BP_INIT_SIZE_OFFSET
+    );
+    fs::write(include_root.join("generated/asm-offsets.h"), asm_offsets).with_context(|| {
+        format!(
+            "failed to write {}",
+            include_root.join("generated/asm-offsets.h").display()
+        )
+    })?;
+    fs::write(
+        include_root.join("asm/rwonce.h"),
+        "#include <asm-generic/rwonce.h>\n",
+    )
+    .with_context(|| {
+        format!(
+            "failed to write {}",
+            include_root.join("asm/rwonce.h").display()
+        )
+    })?;
+    fs::write(
+        include_root.join("asm/types.h"),
+        "#include <asm-generic/types.h>\n",
+    )
+    .with_context(|| {
+        format!(
+            "failed to write {}",
+            include_root.join("asm/types.h").display()
+        )
+    })?;
+
+    let mut cpufeaturemasks =
+        String::from("#ifndef _ASM_X86_CPUFEATUREMASKS_H\n#define _ASM_X86_CPUFEATUREMASKS_H\n");
+    for word in 0..BZIMAGE_HEAD64_NCAPINTS {
+        let mask = match word {
+            0 => BZIMAGE_HEAD64_REQUIRED_MASK0,
+            1 => BZIMAGE_HEAD64_REQUIRED_MASK1,
+            _ => 0,
+        };
+        cpufeaturemasks.push_str(&format!("#define REQUIRED_MASK{word} {mask:#x}\n"));
+    }
+    cpufeaturemasks.push_str("#endif\n");
+    fs::write(include_root.join("asm/cpufeaturemasks.h"), cpufeaturemasks).with_context(|| {
+        format!(
+            "failed to write {}",
+            include_root.join("asm/cpufeaturemasks.h").display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn assemble_linux_compressed_head64_object(
+    include_root: &Path,
+    object: &Path,
+    label: &str,
+) -> Result<()> {
+    let mut command = Command::new("clang");
+    command
+        .arg("--target=x86_64-unknown-linux-gnu")
+        .arg("-x")
+        .arg("assembler-with-cpp")
+        .arg("-c")
+        .arg(BZIMAGE_LINUX_COMPRESSED_HEAD64_SOURCE)
+        .arg("-o")
+        .arg(object)
+        .arg("-I")
+        .arg(include_root)
+        .arg("-I")
+        .arg("vendor/linux/arch/x86/include")
+        .arg("-I")
+        .arg("vendor/linux/arch/x86/include/uapi")
+        .arg("-I")
+        .arg("vendor/linux/include")
+        .arg("-I")
+        .arg("vendor/linux/include/uapi")
+        .arg("-D__KERNEL__")
+        .arg("-DCONFIG_X86_64=1")
+        .arg("-DCONFIG_RELOCATABLE=1")
+        .arg("-DCONFIG_PHYSICAL_START=0x1000000")
+        .arg("-DCONFIG_PHYSICAL_ALIGN=0x200000")
+        .arg("-DCONFIG_PAGE_SHIFT=12")
+        .arg("-D__ASSEMBLY__")
+        .current_dir(repo_root()?);
+    run_command(&mut command, label)
+}
+
+fn write_linux_inflate_generated_headers(include_root: &Path) -> Result<PathBuf> {
+    let linux_dir = include_root.join("linux");
+    fs::create_dir_all(&linux_dir)
+        .with_context(|| format!("failed to create {}", linux_dir.display()))?;
+
+    let string_h = "\
+#ifndef _LINUX_STRING_H\n\
+#define _LINUX_STRING_H\n\
+#include <stddef.h>\n\
+void *memcpy(void *dest, const void *src, size_t n);\n\
+void *memmove(void *dest, const void *src, size_t n);\n\
+void *memset(void *s, int c, size_t n);\n\
+int memcmp(const void *s1, const void *s2, size_t n);\n\
+#endif\n";
+    fs::write(linux_dir.join("string.h"), string_h)
+        .with_context(|| format!("failed to write {}", linux_dir.join("string.h").display()))?;
+
+    let prelude = "\
+#ifndef LUPOS_LINUX_INFLATE_PRELUDE_H\n\
+#define LUPOS_LINUX_INFLATE_PRELUDE_H\n\
+typedef unsigned char u8;\n\
+extern unsigned long free_mem_ptr;\n\
+extern unsigned long free_mem_end_ptr;\n\
+#define IS_ENABLED(option) 0\n\
+#define fallthrough do {} while (0)\n\
+#endif\n";
+    let prelude_path = include_root.join("lupos_linux_inflate_prelude.h");
+    fs::write(&prelude_path, prelude)
+        .with_context(|| format!("failed to write {}", prelude_path.display()))?;
+    Ok(prelude_path)
+}
+
+fn assemble_linux_decompress_inflate_object(
+    include_root: &Path,
+    object: &Path,
+    label: &str,
+) -> Result<()> {
+    let prelude = write_linux_inflate_generated_headers(include_root)?;
+    let mut command = Command::new("clang");
+    command
+        .arg("--target=x86_64-unknown-linux-gnu")
+        .arg("-c")
+        .arg(BZIMAGE_LINUX_DECOMPRESS_INFLATE_SOURCE)
+        .arg("-o")
+        .arg(object)
+        .arg("-include")
+        .arg("vendor/linux/include/linux/hidden.h")
+        .arg("-include")
+        .arg(&prelude)
+        .arg("-I")
+        .arg(include_root)
+        .arg("-I")
+        .arg("vendor/linux/include")
+        .arg("-I")
+        .arg("vendor/linux/include/uapi")
+        .arg("-I")
+        .arg("vendor/linux/arch/x86/include")
+        .arg("-I")
+        .arg("vendor/linux/arch/x86/include/uapi")
+        .arg("-D__KERNEL__")
+        .arg("-DSTATIC=")
+        .arg("-DCONFIG_X86_64=1")
+        .arg("-DCONFIG_KERNEL_GZIP=1")
+        .arg("-fPIE")
+        .arg("-mcmodel=small")
+        .arg("-ffreestanding")
+        .arg("-fno-builtin")
+        .arg("-fno-strict-aliasing")
+        .arg("-fno-stack-protector")
+        .arg("-fshort-wchar")
+        .arg("-fno-asynchronous-unwind-tables")
+        .arg("-fno-unwind-tables")
+        .arg("-mno-mmx")
+        .arg("-mno-red-zone")
+        .arg("-mno-sse")
+        .arg("-Wno-pointer-sign")
+        .arg("-Wa,-mrelax-relocations=no")
+        .current_dir(repo_root()?);
+    run_command(&mut command, label)
+}
+
+fn assemble_linux_compressed_head64_probe(target_dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(target_dir)
+        .with_context(|| format!("failed to create {}", target_dir.display()))?;
+    write_head64_probe_generated_headers(target_dir)?;
+
+    let object = target_dir.join("head_64.o");
+    assemble_linux_compressed_head64_object(
+        target_dir,
+        &object,
+        "assemble real Linux boot/compressed/head_64.S probe",
+    )?;
+
+    Ok(object)
+}
+
+fn read_llvm_nm_defined_symbol_names(object: &Path, label: &str) -> Result<HashSet<String>> {
+    let mut command = Command::new("llvm-nm");
+    command
+        .arg("--defined-only")
+        .arg("--numeric-sort")
+        .arg(object)
+        .current_dir(repo_root()?);
+    let stdout = run_command_stdout(&mut command, label)?;
+
+    Ok(stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn render_stored_piggy_asm(path: &Path, input_data: &[u8], entry_addr: u64) -> Result<String> {
+    let include_path = assembler_include_path(path);
+    let mut asm =
+        boot_compressed_mkpiggy::render_piggy_asm(&include_path, input_data).map_err(|err| {
+            anyhow!("failed to render stored boot/compressed piggy assembly: {err:?}")
+        })?;
+    asm.push_str("\n\t.globl entry_addr\n");
+    asm.push_str("entry_addr:\n");
+    asm.push_str(&format!("\t.quad {entry_addr:#x}\n"));
+    Ok(asm)
+}
+
+fn parse_llvm_nm_value(value: &str, name: &str) -> Result<u32> {
+    let value = u64::from_str_radix(value, 16)
+        .with_context(|| format!("llvm-nm reported invalid value for {name}: {value}"))?;
+    u32::try_from(value).with_context(|| format!("llvm-nm symbol {name} exceeds 32 bits"))
+}
+
+fn required_nm_symbol(symbols: &HashMap<String, u32>, name: &str) -> Result<u32> {
+    symbols
+        .get(name)
+        .copied()
+        .with_context(|| format!("linked stored boot/compressed payload is missing {name}"))
+}
+
+fn read_stored_compressed_payload_symbols(linked: &Path) -> Result<StoredCompressedPayloadSymbols> {
+    let mut command = Command::new("llvm-nm");
+    command
+        .arg("--defined-only")
+        .arg("--numeric-sort")
+        .arg(linked)
+        .current_dir(repo_root()?);
+    let stdout = run_command_stdout(&mut command, "read stored boot/compressed payload symbols")?;
+
+    let mut symbols = HashMap::new();
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(value) = parts.next() else {
+            continue;
+        };
+        let Some(_kind) = parts.next() else {
+            continue;
+        };
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if matches!(
+            name,
+            "_head"
+                | "_ehead"
+                | "_text"
+                | "_etext"
+                | "_rodata"
+                | "_erodata"
+                | "_data"
+                | "_edata"
+                | "_bss"
+                | "_ebss"
+                | "_pgtable"
+                | "_epgtable"
+                | "_end"
+                | "startup_32"
+                | "startup_64"
+                | "extract_kernel"
+                | "input_data"
+                | "input_data_end"
+                | "input_len"
+                | "output_len"
+                | "entry_addr"
+                | "z_input_len"
+                | "z_output_len"
+        ) {
+            symbols.insert(name.to_string(), parse_llvm_nm_value(value, name)?);
+        }
+    }
+
+    Ok(StoredCompressedPayloadSymbols {
+        head: required_nm_symbol(&symbols, "_head")?,
+        ehead: required_nm_symbol(&symbols, "_ehead")?,
+        text: required_nm_symbol(&symbols, "_text")?,
+        etext: required_nm_symbol(&symbols, "_etext")?,
+        rodata: required_nm_symbol(&symbols, "_rodata")?,
+        erodata: required_nm_symbol(&symbols, "_erodata")?,
+        data: required_nm_symbol(&symbols, "_data")?,
+        edata: required_nm_symbol(&symbols, "_edata")?,
+        bss: required_nm_symbol(&symbols, "_bss")?,
+        ebss: required_nm_symbol(&symbols, "_ebss")?,
+        pgtable: required_nm_symbol(&symbols, "_pgtable")?,
+        epgtable: required_nm_symbol(&symbols, "_epgtable")?,
+        end: required_nm_symbol(&symbols, "_end")?,
+        startup_32: required_nm_symbol(&symbols, "startup_32")?,
+        startup_64: required_nm_symbol(&symbols, "startup_64")?,
+        extract_kernel: required_nm_symbol(&symbols, "extract_kernel")?,
+        input_data: required_nm_symbol(&symbols, "input_data")?,
+        input_data_end: required_nm_symbol(&symbols, "input_data_end")?,
+        input_len: required_nm_symbol(&symbols, "input_len")?,
+        output_len: required_nm_symbol(&symbols, "output_len")?,
+        entry_addr: required_nm_symbol(&symbols, "entry_addr")?,
+        z_input_len: required_nm_symbol(&symbols, "z_input_len")?,
+        z_output_len: required_nm_symbol(&symbols, "z_output_len")?,
+    })
+}
+
+struct ScratchFileCleanup {
+    paths: Vec<PathBuf>,
+}
+
+impl ScratchFileCleanup {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        Self { paths }
+    }
+}
+
+impl Drop for ScratchFileCleanup {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+struct ScratchDirCleanup {
+    path: PathBuf,
+}
+
+impl ScratchDirCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for ScratchDirCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn assemble_stored_compressed_payload(
+    input_data: &[u8],
+    entry_addr: u64,
+) -> Result<StoredCompressedPayload> {
+    let target_dir = xtask_target_dir()?.join("boot-compressed");
+    fs::create_dir_all(&target_dir)
+        .with_context(|| format!("failed to create {}", target_dir.display()))?;
+    let run_id = artifact_run_id();
+    let input = target_dir.join(format!(
+        "lupos-stored-input-{}-{run_id}.bin",
+        std::process::id()
+    ));
+    let head_object = target_dir.join(format!(
+        "lupos-linux-head64-{}-{run_id}.o",
+        std::process::id()
+    ));
+    let include_root = target_dir.join(format!(
+        "lupos-linux-head64-include-{}-{run_id}",
+        std::process::id()
+    ));
+    let extractor_object = target_dir.join(format!(
+        "lupos-extract-kernel64-{}-{run_id}.o",
+        std::process::id()
+    ));
+    let inflate_object = target_dir.join(format!(
+        "lupos-linux-decompress-inflate-{}-{run_id}.o",
+        std::process::id()
+    ));
+    let piggy_asm = target_dir.join(format!(
+        "lupos-stored-piggy-{}-{run_id}.S",
+        std::process::id()
+    ));
+    let piggy_object = target_dir.join(format!(
+        "lupos-stored-piggy-{}-{run_id}.o",
+        std::process::id()
+    ));
+    let linked = target_dir.join(format!(
+        "lupos-stored-payload-{}-{run_id}.elf",
+        std::process::id()
+    ));
+    let output = target_dir.join(format!(
+        "lupos-stored-payload-{}-{run_id}.bin",
+        std::process::id()
+    ));
+    let _cleanup = ScratchFileCleanup::new(vec![
+        input.clone(),
+        head_object.clone(),
+        extractor_object.clone(),
+        inflate_object.clone(),
+        piggy_asm.clone(),
+        piggy_object.clone(),
+        linked.clone(),
+        output.clone(),
+    ]);
+    let _include_cleanup = ScratchDirCleanup::new(include_root.clone());
+    fs::write(&input, input_data)
+        .with_context(|| format!("failed to write {}", input.display()))?;
+    let piggy_source = render_stored_piggy_asm(&input, input_data, entry_addr)?;
+    fs::write(&piggy_asm, piggy_source)
+        .with_context(|| format!("failed to write {}", piggy_asm.display()))?;
+
+    write_head64_probe_generated_headers(&include_root)?;
+    assemble_linux_compressed_head64_object(
+        &include_root,
+        &head_object,
+        "assemble real Linux boot/compressed head object",
+    )?;
+
+    let mut command = Command::new("clang");
+    command
+        .arg("--target=x86_64-unknown-linux-gnu")
+        .arg("-c")
+        .arg("-x")
+        .arg("assembler-with-cpp")
+        .arg("-o")
+        .arg(&extractor_object)
+        .arg(BZIMAGE_LUPOS_EXTRACT_KERNEL64_SOURCE)
+        .current_dir(repo_root()?);
+    run_command(
+        &mut command,
+        "assemble stored boot/compressed extract_kernel shim",
+    )?;
+    assemble_linux_decompress_inflate_object(
+        &include_root,
+        &inflate_object,
+        "compile Linux boot/compressed gzip inflater",
+    )?;
+
+    let mut command = Command::new("clang");
+    command
+        .arg("--target=x86_64-unknown-linux-gnu")
+        .arg("-c")
+        .arg("-x")
+        .arg("assembler")
+        .arg("-o")
+        .arg(&piggy_object)
+        .arg(&piggy_asm)
+        .current_dir(repo_root()?);
+    run_command(&mut command, "assemble stored boot/compressed piggy object")?;
+
+    let mut command = Command::new("ld.lld");
+    command
+        .arg("-m")
+        .arg("elf_x86_64")
+        .arg("-T")
+        .arg(BZIMAGE_STORED_COMPRESSED_LINKER_SCRIPT)
+        .arg("-o")
+        .arg(&linked)
+        .arg(&head_object)
+        .arg(&extractor_object)
+        .arg(&inflate_object)
+        .arg(&piggy_object)
+        .current_dir(repo_root()?);
+    run_command(&mut command, "link stored boot/compressed payload")?;
+    let symbols = read_stored_compressed_payload_symbols(&linked)?;
+
+    let mut command = Command::new("llvm-objcopy");
+    command.arg("-O").arg("binary");
+    for section in BZIMAGE_STORED_COMPRESSED_SECTIONS {
+        command.arg(format!("--only-section={section}"));
+    }
+    command.arg(&linked).arg(&output);
+    run_command(&mut command, "objcopy stored boot/compressed payload")?;
+
+    let bytes = fs::read(&output)
+        .with_context(|| format!("failed to read assembled {}", output.display()))?;
+    Ok(StoredCompressedPayload { bytes, symbols })
+}
+
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn build_linux_gzip_stored_payload(uncompressed: &[u8]) -> Result<Vec<u8>> {
+    let output_len = u32::try_from(uncompressed.len())
+        .context("kernel ELF image is too large for gzip ISIZE")?;
+    let block_count = core::cmp::max(
+        1,
+        uncompressed
+            .len()
+            .div_ceil(BZIMAGE_DEFLATE_STORED_BLOCK_MAX),
+    );
+    let mut gz = Vec::with_capacity(
+        BZIMAGE_GZIP_HEADER_SIZE + uncompressed.len() + block_count * 5 + BZIMAGE_GZIP_TRAILER_SIZE,
+    );
+
+    // gzip -n style fixed header: magic, deflate method, no flags, mtime=0,
+    // XFL=0, OS=Unix. Linux's __gunzip verifies the first three bytes and then
+    // skips the ten-byte header before invoking raw deflate.
+    gz.extend_from_slice(&[0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3]);
+
+    let mut offset = 0usize;
+    loop {
+        let remaining = uncompressed.len().saturating_sub(offset);
+        let block_len = remaining.min(BZIMAGE_DEFLATE_STORED_BLOCK_MAX);
+        let final_block = offset + block_len == uncompressed.len();
+        gz.push(if final_block { 1 } else { 0 });
+        let len = block_len as u16;
+        gz.extend_from_slice(&len.to_le_bytes());
+        gz.extend_from_slice(&(!len).to_le_bytes());
+        gz.extend_from_slice(&uncompressed[offset..offset + block_len]);
+        offset += block_len;
+        if final_block {
+            break;
+        }
+    }
+
+    gz.extend_from_slice(&crc32_ieee(uncompressed).to_le_bytes());
+    gz.extend_from_slice(&output_len.to_le_bytes());
+    Ok(gz)
+}
+
+fn build_stored_compressed_kernel_image(
+    kernel_image: &KernelElfImage,
+) -> Result<StoredCompressedKernelImage> {
+    if kernel_image.bytes.is_empty() {
+        bail!("cannot extract an empty protected-mode payload");
+    }
+    let output_len = u32::try_from(kernel_image.bytes.len())
+        .context("kernel ELF image is too large for the 64-bit extractor")?;
+    let kernel_total_size = u32::try_from(kernel_image.load_size)
+        .context("kernel PT_LOAD footprint is too large for the 64-bit extractor")?;
+    let stored_input_data = build_linux_gzip_stored_payload(&kernel_image.bytes)?;
+
+    let input_data_len = u32::try_from(stored_input_data.len())
+        .context("stored compressed input exceeds 32 bits")?;
+    let probe = assemble_stored_compressed_payload(&stored_input_data, kernel_image.entry_addr)?;
+    if probe.symbols.startup_32 != 0 {
+        bail!(
+            "linked stored compressed payload startup_32 is {:#x}, expected 0",
+            probe.symbols.startup_32
+        );
+    }
+    if probe.symbols.startup_64 != 0x200 {
+        bail!(
+            "linked stored compressed payload startup_64 is {:#x}, expected 0x200",
+            probe.symbols.startup_64
+        );
+    }
+    if probe.symbols.head != 0 {
+        bail!(
+            "linked stored compressed payload _head is {:#x}, expected 0",
+            probe.symbols.head
+        );
+    }
+    if probe.symbols.ehead <= probe.symbols.startup_64 {
+        bail!(
+            "linked stored compressed payload _ehead {:#x} does not cover startup_64 {:#x}",
+            probe.symbols.ehead,
+            probe.symbols.startup_64
+        );
+    }
+    if probe.symbols.input_data_end < probe.symbols.input_data {
+        bail!(
+            "linked stored compressed payload input_data_end {:#x} precedes input_data {:#x}",
+            probe.symbols.input_data_end,
+            probe.symbols.input_data
+        );
+    }
+    let linked_input_data_len = probe.symbols.input_data_end - probe.symbols.input_data;
+    if linked_input_data_len != input_data_len {
+        bail!(
+            "linked stored compressed payload input_data length is {}, expected {}",
+            linked_input_data_len,
+            input_data_len
+        );
+    }
+    if probe.symbols.text < probe.symbols.input_data_end {
+        bail!(
+            "linked stored compressed payload _text {:#x} precedes input_data_end {:#x}",
+            probe.symbols.text,
+            probe.symbols.input_data_end
+        );
+    }
+    if probe.symbols.etext < probe.symbols.text {
+        bail!(
+            "linked stored compressed payload _etext {:#x} precedes _text {:#x}",
+            probe.symbols.etext,
+            probe.symbols.text
+        );
+    }
+    if probe.symbols.rodata < probe.symbols.etext {
+        bail!(
+            "linked stored compressed payload _rodata {:#x} precedes _etext {:#x}",
+            probe.symbols.rodata,
+            probe.symbols.etext
+        );
+    }
+    if probe.symbols.input_len < probe.symbols.rodata {
+        bail!(
+            "linked stored compressed payload input_len {:#x} precedes _rodata {:#x}",
+            probe.symbols.input_len,
+            probe.symbols.rodata
+        );
+    }
+    if probe.symbols.output_len < probe.symbols.input_len {
+        bail!(
+            "linked stored compressed payload output_len {:#x} precedes input_len {:#x}",
+            probe.symbols.output_len,
+            probe.symbols.input_len
+        );
+    }
+    let rodata_words_len = probe
+        .symbols
+        .output_len
+        .checked_sub(probe.symbols.input_len)
+        .and_then(|len| len.checked_add(4))
+        .context("linked stored compressed input_len/output_len range overflows")?;
+    if rodata_words_len != BZIMAGE_STORED_PIGGY_RODATA_SIZE as u32 {
+        bail!(
+            "linked stored compressed piggy rodata words are {} bytes; expected {}",
+            rodata_words_len,
+            BZIMAGE_STORED_PIGGY_RODATA_SIZE
+        );
+    }
+    if probe.symbols.erodata < probe.symbols.output_len + 4 {
+        bail!(
+            "linked stored compressed payload _erodata {:#x} truncates output_len",
+            probe.symbols.erodata
+        );
+    }
+    if probe.symbols.entry_addr < probe.symbols.output_len + 4 {
+        bail!(
+            "linked stored compressed payload entry_addr {:#x} precedes output_len end {:#x}",
+            probe.symbols.entry_addr,
+            probe.symbols.output_len + 4
+        );
+    }
+    if probe.symbols.erodata < probe.symbols.entry_addr + 8 {
+        bail!(
+            "linked stored compressed payload _erodata {:#x} truncates entry_addr",
+            probe.symbols.erodata
+        );
+    }
+    if probe.symbols.data < probe.symbols.erodata {
+        bail!(
+            "linked stored compressed payload _data {:#x} precedes _erodata {:#x}",
+            probe.symbols.data,
+            probe.symbols.erodata
+        );
+    }
+    if probe.symbols.edata < probe.symbols.data {
+        bail!(
+            "linked stored compressed payload _edata {:#x} precedes _data {:#x}",
+            probe.symbols.edata,
+            probe.symbols.data
+        );
+    }
+    if probe.symbols.bss < probe.symbols.edata {
+        bail!(
+            "linked stored compressed payload _bss {:#x} precedes _edata {:#x}",
+            probe.symbols.bss,
+            probe.symbols.edata
+        );
+    }
+    if probe.symbols.ebss < probe.symbols.bss {
+        bail!(
+            "linked stored compressed payload _ebss {:#x} precedes _bss {:#x}",
+            probe.symbols.ebss,
+            probe.symbols.bss
+        );
+    }
+    if probe.symbols.pgtable < probe.symbols.ebss {
+        bail!(
+            "linked stored compressed payload _pgtable {:#x} precedes _ebss {:#x}",
+            probe.symbols.pgtable,
+            probe.symbols.ebss
+        );
+    }
+    if probe.symbols.epgtable < probe.symbols.pgtable {
+        bail!(
+            "linked stored compressed payload _epgtable {:#x} precedes _pgtable {:#x}",
+            probe.symbols.epgtable,
+            probe.symbols.pgtable
+        );
+    }
+    if probe.symbols.end < probe.symbols.epgtable {
+        bail!(
+            "linked stored compressed payload _end {:#x} precedes _epgtable {:#x}",
+            probe.symbols.end,
+            probe.symbols.epgtable
+        );
+    }
+    if probe.symbols.end % 0x1000 != 0 {
+        bail!(
+            "linked stored compressed payload _end {:#x} is not page-aligned",
+            probe.symbols.end
+        );
+    }
+    if probe.symbols.z_input_len != input_data_len {
+        bail!(
+            "linked stored compressed payload z_input_len is {}, expected {}",
+            probe.symbols.z_input_len,
+            input_data_len
+        );
+    }
+    if probe.symbols.z_output_len != output_len {
+        bail!(
+            "linked stored compressed payload z_output_len is {}, expected {}",
+            probe.symbols.z_output_len,
+            output_len
+        );
+    }
+    let minimum_payload_len = probe
+        .symbols
+        .output_len
+        .checked_add(4)
+        .context("stored compressed payload length exceeds 32 bits")?;
+    if u32::try_from(probe.bytes.len()).unwrap_or(u32::MAX) < minimum_payload_len {
+        bail!(
+            "linked stored compressed payload is {} bytes, shorter than output_len word end {}",
+            probe.bytes.len(),
+            minimum_payload_len
+        );
+    }
+    if probe.bytes.len() > probe.symbols.end as usize {
+        bail!(
+            "linked stored compressed payload is {} bytes, beyond _end {:#x}",
+            probe.bytes.len(),
+            probe.symbols.end
+        );
+    }
+    let payload_len_usize = probe.bytes.len();
+    let image_end_offset = probe.symbols.end;
+    let _payload_len_u32 = u32::try_from(payload_len_usize)
+        .context("stored compressed payload length exceeds 32 bits")?;
+    let input_data_offset = probe.symbols.input_data;
+    let input_data_end_offset = probe.symbols.input_data_end;
+    let input_len_word_offset = probe.symbols.input_len;
+    let output_len_word_offset = probe.symbols.output_len;
+    let output_load_addr = u32::try_from(kernel_image.load_addr)
+        .context("extracted kernel load address exceeds 32-bit address space")?;
+    if output_load_addr != BZIMAGE_KERNEL_PHYS_BASE {
+        bail!(
+            "Linux head_64 handoff currently requires kernel load address {:#x}, got {:#x}",
+            BZIMAGE_KERNEL_PHYS_BASE,
+            output_load_addr
+        );
+    }
+    let entry_addr = u32::try_from(kernel_image.entry_addr)
+        .context("extracted kernel entry exceeds 32-bit address space")?;
+    let linux_init_size = linux_compressed_init_size(
+        probe.symbols.ehead,
+        probe.symbols.end,
+        input_data_len,
+        output_len,
+        kernel_total_size,
+    )?;
+    let staging_init_size = align_up_u64(
+        u64::from(probe.symbols.end)
+            .checked_add(u64::from(output_len))
+            .context("stored compressed staging init_size overflows")?,
+        BZIMAGE_PAGE_SIZE,
+    );
+    let init_size = u32::try_from(u64::from(linux_init_size).max(staging_init_size))
+        .context("stored compressed staging init_size exceeds 32 bits")?;
+    let payload = assemble_stored_compressed_payload(&stored_input_data, kernel_image.entry_addr)?;
+    if payload.bytes.len() != payload_len_usize {
+        bail!(
+            "assembled stored compressed payload is {} bytes; expected {payload_len_usize}",
+            payload.bytes.len()
+        );
+    }
+    if payload.symbols != probe.symbols {
+        bail!(
+            "linked stored compressed payload symbols changed between probe and final link: {:?} != {:?}",
+            payload.symbols,
+            probe.symbols
+        );
+    }
+    Ok(StoredCompressedKernelImage {
+        bytes: payload.bytes,
+        startup_32_offset: 0,
+        startup_64_offset: probe.symbols.startup_64,
+        extract_kernel_offset: probe.symbols.extract_kernel,
+        ehead_offset: probe.symbols.ehead,
+        input_data_offset,
+        input_data_end_offset,
+        input_len_word_offset,
+        output_len_word_offset,
+        image_end_offset,
+        init_size,
+        input_data_len,
+        z_input_len: input_data_len,
+        z_output_len: output_len,
+        output_len,
+        output_load_addr,
+        extracted_entry_addr: entry_addr,
+    })
+}
+
+fn build_linux_setup_image(compressed: &StoredCompressedKernelImage) -> Result<LinuxSetupImage> {
+    let syssize = u32::try_from(compressed.bytes.len().div_ceil(16))
+        .context("kernel payload is too large for setup_header.syssize")?;
+    let payload_length = u32::try_from(compressed.bytes.len())
+        .context("kernel payload is too large for setup_header.payload_length")?;
+    let code32_start = BZIMAGE_PROTECTED_MODE_LOAD_ADDR;
+    let init_size = compressed.init_size;
+
+    let mut image = vec![0u8; BZIMAGE_SETUP_SIZE];
+    image[0x1f1] = BZIMAGE_SETUP_SECTS;
+    put_u32_le(&mut image, 0x1f4, syssize);
+    put_u16_le(&mut image, 0x1fe, BZIMAGE_BOOT_FLAG);
+    image[0x200] = 0xeb;
+    image[0x201] = 0x66;
+    put_u32_le(&mut image, 0x202, BZIMAGE_HDRS_MAGIC);
+    put_u16_le(&mut image, 0x206, BZIMAGE_PROTOCOL_VERSION);
+    image[0x211] = BZIMAGE_LOADFLAGS_LOADED_HIGH | BZIMAGE_LOADFLAGS_CAN_USE_HEAP;
+    put_u32_le(&mut image, 0x214, code32_start);
+    put_u32_le(&mut image, 0x22c, BZIMAGE_INITRD_ADDR_MAX);
+    put_u32_le(&mut image, 0x230, BZIMAGE_KERNEL_ALIGNMENT);
+    image[0x234] = 0;
+    image[0x235] = 0;
+    put_u16_le(&mut image, 0x236, BZIMAGE_XLOADFLAGS_KERNEL_64);
+    put_u32_le(&mut image, 0x238, BZIMAGE_CMDLINE_SIZE);
+    put_u32_le(&mut image, 0x248, 0);
+    put_u32_le(&mut image, 0x24c, payload_length);
+    put_u64_le(
+        &mut image,
+        0x258,
+        u64::from(BZIMAGE_PROTECTED_MODE_LOAD_ADDR),
+    );
+    put_u32_le(&mut image, 0x260, init_size);
+
+    Ok(LinuxSetupImage {
+        bytes: image,
+        code32_start,
+        payload_length,
+        init_size,
+    })
+}
+
+/// Build a Linux/x86 boot-protocol image wrapper around the kernel payload.
+///
+/// This follows `vendor/linux/Documentation/arch/x86/boot.rst` and
+/// `vendor/linux/arch/x86/include/uapi/asm/bootparam.h`: GRUB and other
+/// Linux-aware bootloaders discover the real-mode setup header at 0x1f1,
+/// validate `boot_flag`/`HdrS`, then load the protected-mode payload from
+/// `(setup_sects + 1) * 512`.
+fn build_linux_bzimage_bytes(kernel_image: &KernelElfImage) -> Result<Vec<u8>> {
+    if kernel_image.bytes.is_empty() {
+        bail!("cannot build bzImage with an empty protected-mode payload");
+    }
+    let compressed = build_stored_compressed_kernel_image(kernel_image)?;
+    let setup = build_linux_setup_image(&compressed)?;
+
+    let mut image = setup.bytes;
+    image.extend_from_slice(&compressed.bytes);
+    Ok(image)
+}
+
+fn build_bzimage_cmd() -> Result<()> {
+    let bzimage = build_bzimage_artifact()?;
+    println!("bzImage built: {}", bzimage.display());
+    Ok(())
+}
+
+fn configured_module_files() -> Result<Vec<InitramfsFile>> {
+    let mut files = match repo_config_text() {
+        Some(text) => {
+            let modules = staged_module_specs_from_config_text(&text);
+            ensure_linux_driver_module_artifacts(&modules)?;
+            staged_module_files_from_config_text(&text)?
+        }
+        None => Vec::new(),
+    };
+    if files.is_empty() {
+        files.push(initramfs_file(
+            &format!("lib/modules/{MODULE_VERSION_DIR}/modules.order"),
+            0o100644,
+            Vec::new(),
+        ));
+        files.push(initramfs_file(
+            &format!("lib/modules/{MODULE_VERSION_DIR}/modules.dep"),
+            0o100644,
+            Vec::new(),
+        ));
+    }
+    Ok(files)
+}
+
+fn build_modules_cmd() -> Result<()> {
+    let target_dir = xtask_target_dir()?.join("modules");
+    fs::create_dir_all(&target_dir)?;
+    let files = configured_module_files()?;
+    let written = write_staged_files(&target_dir, &files)?;
+    println!("modules staged under {}", target_dir.display());
+    for path in written {
+        println!("  {}", path.display());
+    }
+    Ok(())
+}
+
+fn install_modules_cmd() -> Result<()> {
+    let target_dir = match env::var_os("INSTALL_MOD_PATH") {
+        Some(path) => PathBuf::from(path),
+        None => xtask_target_dir()?.join("modules-install"),
+    };
+    fs::create_dir_all(&target_dir)?;
+    let files = configured_module_files()?;
+    let written = write_staged_files(&target_dir, &files)?;
+    println!("modules installed under {}", target_dir.display());
+    for path in written {
+        println!("  {}", path.display());
+    }
+    Ok(())
+}
+
+fn install_cmd() -> Result<()> {
+    let install_root = match env::var_os("INSTALL_PATH") {
+        Some(path) => PathBuf::from(path),
+        None => xtask_target_dir()?.join("install"),
+    };
+    fs::create_dir_all(&install_root)?;
+    let bzimage = build_bzimage_artifact()?;
+    fs::copy(&bzimage, install_root.join("bzImage")).with_context(|| {
+        format!(
+            "failed to install {} into {}",
+            bzimage.display(),
+            install_root.display()
+        )
+    })?;
+    let module_root = install_root.join("modules");
+    let files = configured_module_files()?;
+    write_staged_files(&module_root, &files)?;
+    println!("install tree staged under {}", install_root.display());
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BootProgressStage {
+    name: &'static str,
+    needles: &'static [&'static str],
+}
+
+const BOOT_PROGRESS_STAGES: &[BootProgressStage] = &[
+    BootProgressStage {
+        name: "firmware/grub output seen",
+        needles: &["SeaBIOS", "Booting from", "GNU GRUB", "GRUB"],
+    },
+    BootProgressStage {
+        name: "early kernel entry",
+        needles: &[EARLY_BOOT_MARKER],
+    },
+    BootProgressStage {
+        name: "kernel banner",
+        needles: &["Linux/Lupos version"],
+    },
+    BootProgressStage {
+        name: "cmdline",
+        needles: &["Kernel command line:"],
+    },
+    BootProgressStage {
+        name: "initramfs",
+        needles: &[
+            "Trying to unpack rootfs image as initramfs",
+            "Freeing initrd memory:",
+            "initramfs-rootfs:",
+        ],
+    },
+    BootProgressStage {
+        name: "Run /sbin/init",
+        needles: &["Run /sbin/init as init process"],
+    },
+    BootProgressStage {
+        name: "systemd/Arch banner",
+        needles: &["Welcome to Arch Linux"],
+    },
+    BootProgressStage {
+        name: "login prompt",
+        needles: &["login:", " login:", "lupos login:"],
+    },
+    BootProgressStage {
+        name: "shell prompt",
+        needles: &["root@lupos", "lupos@lupos"],
+    },
+];
+
+fn boot_progress_enabled_from(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return true;
+    };
+    let normalized = value.trim().to_ascii_lowercase();
+    !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+}
+
+fn boot_progress_enabled() -> bool {
+    boot_progress_enabled_from(env::var(BOOT_PROGRESS_ENV).ok().as_deref())
+}
+
+fn boot_progress_detect_stages(log: &str) -> Vec<&'static str> {
+    let stripped = strip_ansi_escapes(log);
+    BOOT_PROGRESS_STAGES
+        .iter()
+        .filter(|stage| {
+            stage
+                .needles
+                .iter()
+                .any(|needle| log.contains(needle) || stripped.contains(needle))
+        })
+        .map(|stage| stage.name)
+        .collect()
+}
+
+fn boot_progress_log_reached_stage(log: &str, stage_name: &str) -> bool {
+    boot_progress_detect_stages(log)
+        .iter()
+        .any(|stage| *stage == stage_name)
+}
+
+fn boot_progress_idle_message(last_stage: &str, serial_log_path: &Path) -> String {
+    format!(
+        "boot-progress: idle for {BOOT_PROGRESS_IDLE_SECS}s; last stage: {last_stage}; serial log: {}",
+        serial_log_path.display()
+    )
+}
+
+struct BootProgressReporter {
+    enabled: bool,
+    serial_log_path: PathBuf,
+    last_len: usize,
+    last_stage: &'static str,
+    seen: HashSet<&'static str>,
+    last_activity: Instant,
+    last_idle_report: Instant,
+}
+
+impl BootProgressReporter {
+    fn new(serial_log_path: &Path) -> Self {
+        let now = Instant::now();
+        let mut reporter = Self {
+            enabled: boot_progress_enabled(),
+            serial_log_path: serial_log_path.to_path_buf(),
+            last_len: 0,
+            last_stage: "qemu spawned",
+            seen: HashSet::new(),
+            last_activity: now,
+            last_idle_report: now,
+        };
+        reporter.note_stage("qemu spawned");
+        reporter
+    }
+
+    fn serial_log_opened(&mut self) {
+        self.note_stage("serial log opened");
+    }
+
+    fn observe_log(&mut self, log: &str) {
+        if !self.enabled {
+            return;
+        }
+
+        if log.len() > self.last_len {
+            self.last_len = log.len();
+            self.last_activity = Instant::now();
+        }
+
+        for stage in boot_progress_detect_stages(log) {
+            self.note_stage(stage);
+        }
+    }
+
+    fn note_expect_match(&mut self, label: &str) {
+        if self.enabled {
+            println!("boot-progress: expect-step match: {label}");
+        }
+    }
+
+    fn tick(&mut self) {
+        if !self.enabled {
+            return;
+        }
+
+        let now = Instant::now();
+        if now.duration_since(self.last_activity) >= Duration::from_secs(BOOT_PROGRESS_IDLE_SECS)
+            && now.duration_since(self.last_idle_report)
+                >= Duration::from_secs(BOOT_PROGRESS_IDLE_SECS)
+        {
+            println!(
+                "{}",
+                boot_progress_idle_message(self.last_stage, &self.serial_log_path)
+            );
+            self.last_idle_report = now;
+        }
+    }
+
+    fn note_stage(&mut self, stage: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        if self.seen.insert(stage) {
+            self.last_stage = stage;
+            if stage == "shell prompt" {
+                println!(
+                    "boot-progress: shell prompt (root Bash is running; click the QEMU window, or use `cargo xtask qemu-iso-terminal` for serial input)"
+                );
+            } else {
+                println!("boot-progress: {stage}");
+            }
+        }
+    }
+}
+
+pub fn run_qemu_iso(
+    iso_path: &Path,
+    serial_log_path: &Path,
+    timeout: Option<Duration>,
+    smp_count: usize,
+) -> Result<ExitStatus> {
+    let mut command = build_qemu_iso_command(iso_path, serial_log_path, smp_count);
+    command.current_dir(repo_root().context("failed to resolve repo root")?);
+    run_command_with_optional_timeout(&mut command, serial_log_path, timeout)
+        .context("failed to launch QEMU with ISO")
+}
+
+pub fn run_qemu_iso_with_serial_script(
+    iso_path: &Path,
+    serial_log_path: &Path,
+    script: &[u8],
+    timeout: Duration,
+) -> Result<ExitStatus> {
+    let serial_log = fs::File::create(serial_log_path)
+        .with_context(|| format!("failed to create {}", serial_log_path.display()))?;
+    let mut command = Command::new(QEMU_BINARY);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(serial_log))
+        .stderr(Stdio::null());
+    add_qemu_iso_base_args(&mut command, iso_path, "none", "stdio");
+    command.current_dir(repo_root().context("failed to resolve repo root")?);
+
+    let qemu_lock = QemuRunLock::acquire()?;
+    let rendered = render_command(&command);
+    let mut guard = spawn_qemu_guard(&mut command, &rendered, &qemu_lock, "scripted")?;
+    let mut progress = BootProgressReporter::new(serial_log_path);
+    progress.serial_log_opened();
+    if let Some(mut stdin) = guard.child.stdin.take() {
+        stdin
+            .write_all(script)
+            .with_context(|| format!("failed to write scripted serial input: {rendered}"))?;
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = guard
+            .try_wait()
+            .with_context(|| format!("failed while waiting on scripted QEMU: {rendered}"))?
+        {
+            return Ok(status);
+        }
+        let log = read_serial_log_if_present(serial_log_path);
+        progress.observe_log(&log);
+        if Instant::now() >= deadline {
+            let _ = guard.kill();
+            let _ = guard.wait();
+            bail!(
+                "scripted QEMU timed out after {}s: {rendered}\npartial serial log:\n{}",
+                timeout.as_secs(),
+                log
+            );
+        }
+        progress.tick();
+        thread::sleep(Duration::from_millis(QEMU_POLL_INTERVAL_MS));
+    }
+}
+
+fn run_qemu_iso_with_serial_expect(
+    iso_path: &Path,
+    serial_log_path: &Path,
+    steps: &[SerialExpectStep],
+    timeout: Duration,
+    display: &str,
+) -> Result<ExitStatus> {
+    let serial_log = fs::File::create(serial_log_path)
+        .with_context(|| format!("failed to create {}", serial_log_path.display()))?;
+    let mut command = Command::new(QEMU_BINARY);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(serial_log))
+        .stderr(Stdio::null());
+    add_qemu_iso_base_args(&mut command, iso_path, display, "stdio");
+    command.current_dir(repo_root().context("failed to resolve repo root")?);
+
+    let qemu_lock = QemuRunLock::acquire()?;
+    let rendered = render_command(&command);
+    let mut guard = spawn_qemu_guard(&mut command, &rendered, &qemu_lock, "expect")?;
+    let mut stdin = guard
+        .child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("scripted QEMU stdin was not piped"))?;
+    let mut progress = BootProgressReporter::new(serial_log_path);
+    progress.serial_log_opened();
+
+    let deadline = Instant::now() + timeout;
+    let mut cursor = 0usize;
+    for step in steps {
+        loop {
+            if let Some(status) = guard
+                .try_wait()
+                .with_context(|| format!("failed while waiting on expect QEMU: {rendered}"))?
+            {
+                bail!(
+                    "QEMU exited before serial step {:?} saw {:?}: status={status}\nserial log:\n{}",
+                    step.label,
+                    step.wait_for,
+                    read_serial_log_if_present(serial_log_path)
+                );
+            }
+            let log = read_serial_log_if_present(serial_log_path);
+            progress.observe_log(&log);
+            let visible = log.get(cursor..).unwrap_or(&log);
+            // The login PS1 paints user@host / \w with ANSI CSI escapes
+            // (`\x1b[01;32m…\x1b[00m`); a plain `visible.contains("root@lupos:~#")`
+            // misses the prompt because the bytes between the visible
+            // characters are color escapes.  Strip them first.
+            let visible_stripped = strip_ansi_escapes(visible);
+            let raw_match_end = visible
+                .find(step.wait_for)
+                .map(|idx| cursor + idx + step.wait_for.len());
+            if raw_match_end.is_some() || visible_stripped.contains(step.wait_for) {
+                progress.note_expect_match(step.label);
+                thread::sleep(Duration::from_millis(50));
+                for byte in step.send {
+                    stdin
+                        .write_all(&[*byte])
+                        .with_context(|| format!("failed to write serial step {}", step.label))?;
+                    stdin
+                        .flush()
+                        .with_context(|| format!("failed to flush serial step {}", step.label))?;
+                    thread::sleep(Duration::from_millis(100));
+                }
+                cursor = if step.send.is_empty() {
+                    raw_match_end.unwrap_or(log.len())
+                } else {
+                    log.len()
+                };
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = guard.kill();
+                let _ = guard.wait();
+                bail!(
+                    "expect QEMU timed out waiting for step {:?} / {:?}: {rendered}\npartial serial log:\n{}",
+                    step.label,
+                    step.wait_for,
+                    log
+                );
+            }
+            progress.tick();
+            thread::sleep(Duration::from_millis(QEMU_POLL_INTERVAL_MS));
+        }
+    }
+
+    drop(stdin);
+    loop {
+        if let Some(status) = guard
+            .try_wait()
+            .with_context(|| format!("failed while waiting on expect QEMU exit: {rendered}"))?
+        {
+            return Ok(status);
+        }
+        let log = read_serial_log_if_present(serial_log_path);
+        progress.observe_log(&log);
+        if Instant::now() >= deadline {
+            let _ = guard.kill();
+            let _ = guard.wait();
+            bail!(
+                "expect QEMU timed out after {}s: {rendered}\npartial serial log:\n{}",
+                timeout.as_secs(),
+                log
+            );
+        }
+        progress.tick();
+        thread::sleep(Duration::from_millis(QEMU_POLL_INTERVAL_MS));
+    }
+}
+
+pub fn read_serial_log(path: &Path) -> Result<String> {
+    fs::read_to_string(path)
+        .with_context(|| format!("failed to read serial log from {}", path.display()))
+}
+
+pub fn serial_log_contains(log: &str, needle: &str) -> bool {
+    let stripped = strip_ansi_escapes(log);
+    let needle_stripped = strip_ansi_escapes(needle);
+    stripped
+        .lines()
+        .any(|line| line.contains(needle_stripped.as_str()))
+        || log.lines().any(|line| line.contains(needle))
+}
+
+/// Strip ANSI escape sequences (CSI `\x1b[…<final>` and OSC
+/// `\x1b]…\x07`) so substring matchers can locate text that the
+/// colorized Bash PS1 — and any kernel-side `[INFO ]` / status
+/// painter — has interleaved with terminal color codes.  Ref:
+/// vendor/bash/bash-5.2.37/parse.y::decode_prompt_string (which
+/// emits these CSI codes when the prompt uses `\[\033[…m\]`).
+pub fn serial_log_has_output_line(log: &str, expected: &str) -> bool {
+    let stripped = strip_ansi_escapes(log);
+    let expected = strip_ansi_escapes(expected);
+    stripped
+        .lines()
+        .map(|line| line.trim_matches(['\r', '\n']))
+        .any(|line| line == expected)
+}
+
+pub fn strip_ansi_escapes(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'[' => {
+                    // CSI: skip params then a final byte in 0x40..=0x7e.
+                    i += 2;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b']' => {
+                    // OSC: skip until BEL (0x07) or ST (`\x1b\\`).
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != 0x07 {
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if i < bytes.len() && bytes[i] == 0x07 {
+                        i += 1;
+                    }
+                    continue;
+                }
+                _ => {
+                    // Two-byte ESC sequence (e.g. `\x1bM`, `\x1b=`).
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+pub fn assert_boot_outcome(
+    run: &BootRun,
+    expected_serial_text: &str,
+    expected_exit_code: i32,
+) -> Result<()> {
+    let actual_code = run
+        .status
+        .code()
+        .ok_or_else(|| anyhow!("QEMU did not return a process exit code"))?;
+
+    if actual_code != expected_exit_code {
+        bail!(
+            "unexpected QEMU exit code: expected {expected_exit_code}, got {actual_code}\nserial log:\n{}",
+            run.serial_output
+        );
+    }
+
+    if !serial_log_contains(&run.serial_output, expected_serial_text) {
+        bail!(
+            "serial log did not contain {:?}\nserial log:\n{}",
+            expected_serial_text,
+            run.serial_output
+        );
+    }
+
+    Ok(())
+}
+
+fn cargo_command() -> Command {
+    let mut command = Command::new("cargo");
+    command.arg("+nightly");
+    command
+}
+
+fn mode_name(mode: BootMode) -> &'static str {
+    match mode {
+        BootMode::Hello => "hello",
+        BootMode::Login => "login",
+        BootMode::LoginDisplay => "login-display",
+        BootMode::GuiShell => "gui-shell",
+        BootMode::Panic => "panic",
+        BootMode::IdtTest => "idt-test",
+        BootMode::SmpTest => "smp-test",
+        BootMode::TimerTest => "timer-test",
+        BootMode::SoftirqTest => "softirq-test",
+        BootMode::TlbShootdownTest => "tlb-shootdown-test",
+        BootMode::BuddyTest => "buddy-test",
+        BootMode::SlabTest => "slab-test",
+        BootMode::VmCoreTest => "vmcore-test",
+        BootMode::VmCoreWalkerTest => "vmcore-walker-test",
+        BootMode::MmTest => "mm-test",
+        BootMode::DemandPagingTest => "demand-paging-test",
+        BootMode::AnonMmapTest => "anon-mmap-test",
+        BootMode::MmSelftests => "mm-selftests",
+        BootMode::CowForkTest => "cow-fork-test",
+        BootMode::PageCacheTest => "page-cache-test",
+        BootMode::ZswapPressureTest => "zswap-pressure",
+        BootMode::CtxSwitchTest => "ctx-switch-test",
+        BootMode::ExecveTest => "execve-test",
+        BootMode::SignalsTest => "signals-test",
+        BootMode::ExitWaitPtraceTest => "exit-wait-ptrace-test",
+        BootMode::CredentialsTest => "credentials-test",
+        BootMode::PtraceSeccompSelftestsTest => "ptrace-seccomp-selftests",
+        BootMode::UefiPlatformCertsTest => "uefi-platform-certs",
+        BootMode::UefiPlatformCertsFirmwareTest => "uefi-platform-certs-firmware",
+        BootMode::NamespacesTest => "namespaces-test",
+        BootMode::CfsTest => "cfs-test",
+        BootMode::RtDeadlineTest => "rt-deadline-test",
+        BootMode::SmpBalanceTest => "smp-balance-test",
+        BootMode::CgroupCpuFutexTest => "cgroup-cpu-futex-test",
+        BootMode::LockingTest => "locking-test",
+        BootMode::RcuTest => "rcu-test",
+        BootMode::PercpuAtomicWqTest => "percpu-atomic-wq-test",
+        BootMode::TimeTest => "time-test",
+        BootMode::SoftlockupWatchdogTest => "lockup-watchdog",
+        BootMode::IrqTest => "irq-test",
+        BootMode::VfsCoreTest => "vfs-core",
+        BootMode::VfsMountTest => "vfs-mount",
+        BootMode::ProcfsTest => "procfs",
+        BootMode::SysfsTest => "sysfs",
+        BootMode::VfsFsSuiteTest => "vfs-fs-suite",
+        BootMode::InitramfsRootfsTest => "initramfs-rootfs",
+        BootMode::DiskRootRemountTest => "disk-root-remount",
+        BootMode::DiskRootFsckTest => "disk-root-fsck",
+        BootMode::BootPartitionTest => "boot-partition",
+        BootMode::MappedSwapTest => "mapped-swap",
+        BootMode::Pid1HandoffTest => "pid1-handoff",
+        BootMode::LoginStackTest => "login-stack",
+        BootMode::UserspaceSmokeTest => "userspace-smoke",
+        BootMode::RuntimeStressTest => "runtime-stress",
+        BootMode::ShippedCommandsTest => "shipped-commands",
+        BootMode::PingSmoke => "ping-smoke",
+        BootMode::BlockCoreTest => "block-core",
+        BootMode::BlockPartitionsTest => "block-partitions",
+        BootMode::Ext4ReadTest => "ext4-read",
+        BootMode::FatIsoSuiteTest => "fat-iso-suite",
+        BootMode::NetworkingTest => "networking",
+        BootMode::DeviceModelTest => "device-model",
+        BootMode::PciAcpiTest => "pci-acpi",
+        BootMode::ModuleLoaderTest => "module-loader",
+        BootMode::VirtioTtyFbTest => "virtio-tty-fb",
+        BootMode::InputHidUsbTest => "input-hid-usb",
+        BootMode::SyscallTableTest => "syscall-table",
+        BootMode::VdsoIoUringTest => "vdso-iouring",
+        BootMode::PrintkKmsgTest => "printk-kmsg",
+        BootMode::FtraceKprobesTest => "ftrace-kprobes",
+        BootMode::BpfPerfTest => "bpf-perf",
+        BootMode::LsmSuiteTest => "lsm-suite",
+        BootMode::KunitTest => "kunit",
+        BootMode::MmKselftests => "mm-kselftests",
+        BootMode::SmpPreemptTest => "smp-preempt",
+        BootMode::SmpMigrationTest => "smp-migration",
+        BootMode::PthreadSmokeTest => "pthread-smoke",
+        BootMode::GraphicsX11 => "graphics-x11",
+        BootMode::GraphicsWayland => "graphics-wayland",
+    }
+}
+
+fn artifact_run_id() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos()
+}
+
+fn default_qemu_timeout() -> Duration {
+    Duration::from_secs(DEFAULT_QEMU_TIMEOUT_SECS)
+}
+
+fn qemu_run_options() -> RunOptions {
+    RunOptions {
+        exit_after_boot: true,
+        qemu_timeout: Some(default_qemu_timeout()),
+        smp_count: 1,
+    }
+}
+
+fn boot_test_run_options() -> RunOptions {
+    RunOptions {
+        exit_after_boot: true,
+        qemu_timeout: Some(default_qemu_timeout()),
+        smp_count: 1,
+    }
+}
+
+fn kunit_tap_run_options() -> RunOptions {
+    RunOptions {
+        exit_after_boot: true,
+        // The no-std KUnit boot gate emits 100 TAP rows and has historically
+        // crossed the generic 30s boot-test budget on cold runs.
+        qemu_timeout: Some(Duration::from_secs(60)),
+        smp_count: 1,
+    }
+}
+
+fn abi_parity_smp_tail_run_options() -> RunOptions {
+    RunOptions {
+        exit_after_boot: true,
+        // The production SMP closure gates boot a larger image under `-smp 4`
+        // and regularly need more than the generic 30s smoke-test budget.
+        qemu_timeout: Some(Duration::from_secs(60)),
+        smp_count: 4,
+    }
+}
+
+fn phase17_smp_runtime_run_options() -> RunOptions {
+    RunOptions {
+        exit_after_boot: true,
+        // Runtime closure reuses the deferred SMP/NOHZ gate under the
+        // same `-smp 4` topology, but the broader kernel image now includes the
+        // heavier runtime feature set and needs the later extended
+        // timeout budget as well.
+        qemu_timeout: Some(Duration::from_secs(300)),
+        smp_count: 4,
+    }
+}
+
+fn phase17_late_boot_run_options() -> RunOptions {
+    RunOptions {
+        exit_after_boot: true,
+        // The later deferred-closure gates pull in broader driver, PCI, BPF,
+        // tracing, and userspace acceptance coverage, so cold ISO boots can
+        // exceed 120s under serial-only QEMU validation.
+        qemu_timeout: Some(Duration::from_secs(300)),
+        smp_count: 1,
+    }
+}
+
+fn feature_list(mode: BootMode, exit_after_boot: bool) -> Vec<&'static str> {
+    let mut features = Vec::new();
+
+    if exit_after_boot {
+        features.push("qemu-test");
+    }
+
+    if mode == BootMode::Panic {
+        features.push("panic-on-boot");
+    }
+
+    if mode == BootMode::Login || mode == BootMode::LoginDisplay || mode == BootMode::GuiShell {
+        features.push("test-login-stack");
+    }
+
+    if mode == BootMode::IdtTest {
+        features.push("test-page-fault");
+    }
+
+    if mode == BootMode::SmpTest {
+        // test-smp implies qemu-test, so no need to push qemu-test separately.
+        // But we pushed it above via exit_after_boot=true; duplicates are fine
+        // since cargo --features deduplicates them.
+        features.push("test-smp");
+    }
+
+    if mode == BootMode::TimerTest {
+        features.push("test-timer");
+    }
+
+    if mode == BootMode::DiskRootFsckTest {
+        features.push("test-login-stack");
+    }
+
+    if mode == BootMode::SoftirqTest {
+        features.push("test-softirq");
+    }
+
+    if mode == BootMode::TlbShootdownTest {
+        features.push("test-tlb-shootdown");
+    }
+
+    if mode == BootMode::BuddyTest {
+        features.push("test-buddy");
+    }
+
+    if mode == BootMode::SlabTest {
+        features.push("test-slab");
+        features.push("slab-alloc");
+    }
+
+    if mode == BootMode::VmCoreTest {
+        features.push("test-vmcore");
+    }
+
+    if mode == BootMode::VmCoreWalkerTest {
+        features.push("test-vmcore-walker");
+    }
+
+    if mode == BootMode::MmTest {
+        features.push("test-mm");
+    }
+
+    if mode == BootMode::DemandPagingTest {
+        features.push("test-demand-paging");
+    }
+
+    if mode == BootMode::AnonMmapTest {
+        features.push("test-anon-mmap");
+    }
+
+    if mode == BootMode::MmSelftests {
+        features.push("test-mm-selftests");
+    }
+
+    if mode == BootMode::CowForkTest {
+        features.push("test-cow-fork");
+    }
+
+    if mode == BootMode::PageCacheTest {
+        features.push("test-page-cache");
+    }
+
+    if mode == BootMode::ZswapPressureTest {
+        features.push("test-zswap-pressure");
+    }
+
+    if mode == BootMode::CtxSwitchTest {
+        features.push("test-ctxswitch");
+    }
+
+    if mode == BootMode::ExecveTest {
+        features.push("test-execve");
+    }
+
+    if mode == BootMode::SignalsTest {
+        features.push("test-signals");
+    }
+
+    if mode == BootMode::ExitWaitPtraceTest {
+        features.push("test-exit-wait-ptrace");
+    }
+
+    if mode == BootMode::CredentialsTest {
+        features.push("test-credentials");
+    }
+    if mode == BootMode::PtraceSeccompSelftestsTest {
+        features.push("test-ptrace-seccomp-selftests");
+    }
+
+    if mode == BootMode::UefiPlatformCertsTest {
+        features.push("test-uefi-platform-certs");
+    }
+    if mode == BootMode::UefiPlatformCertsFirmwareTest {
+        features.push("test-uefi-platform-certs-firmware");
+    }
+
+    if mode == BootMode::NamespacesTest {
+        features.push("test-namespaces");
+    }
+
+    if mode == BootMode::CfsTest {
+        features.push("test-cfs");
+    }
+
+    if mode == BootMode::RtDeadlineTest {
+        features.push("test-rt-deadline");
+    }
+
+    if mode == BootMode::SmpBalanceTest {
+        features.push("test-smp-balance");
+    }
+
+    if mode == BootMode::CgroupCpuFutexTest {
+        features.push("test-cgroup-cpu-futex");
+    }
+
+    if mode == BootMode::LockingTest {
+        features.push("test-locking");
+    }
+
+    if mode == BootMode::RcuTest {
+        features.push("test-rcu");
+    }
+
+    if mode == BootMode::PercpuAtomicWqTest {
+        features.push("test-percpu-atomic-wq");
+    }
+
+    if mode == BootMode::TimeTest {
+        features.push("test-time");
+    }
+
+    if mode == BootMode::SoftlockupWatchdogTest {
+        features.push("test-softlockup-watchdog");
+    }
+
+    if mode == BootMode::IrqTest {
+        features.push("test-irq");
+    }
+
+    if mode == BootMode::VfsCoreTest {
+        features.push("test-vfs-core");
+    }
+    if mode == BootMode::VfsMountTest {
+        features.push("test-vfs-mount");
+    }
+    if mode == BootMode::ProcfsTest {
+        features.push("test-procfs");
+    }
+    if mode == BootMode::SysfsTest {
+        features.push("test-sysfs");
+    }
+    if mode == BootMode::VfsFsSuiteTest {
+        features.push("test-vfs-fs-suite");
+    }
+    if mode == BootMode::InitramfsRootfsTest {
+        features.push("test-initramfs-rootfs");
+    }
+    if mode == BootMode::DiskRootRemountTest {
+        features.push("test-disk-root-remount");
+    }
+    if mode == BootMode::BootPartitionTest {
+        features.push("test-boot-partition");
+    }
+    if mode == BootMode::MappedSwapTest {
+        features.push("test-mapped-swap");
+    }
+    if mode == BootMode::Pid1HandoffTest {
+        features.push("test-pid1-handoff");
+    }
+    if mode == BootMode::PingSmoke {
+        features.push("test-pid1-handoff");
+    }
+    if mode == BootMode::LoginStackTest {
+        features.push("test-login-stack");
+    }
+    if mode == BootMode::UserspaceSmokeTest
+        || mode == BootMode::RuntimeStressTest
+        || mode == BootMode::ShippedCommandsTest
+    {
+        features.push("test-login-stack");
+    }
+    if mode == BootMode::BlockCoreTest {
+        features.push("test-block-core");
+    }
+    if mode == BootMode::BlockPartitionsTest {
+        features.push("test-block-partitions");
+    }
+    if mode == BootMode::Ext4ReadTest {
+        features.push("test-ext4-read");
+    }
+    if mode == BootMode::FatIsoSuiteTest {
+        features.push("test-fat-iso-suite");
+    }
+    if mode == BootMode::NetworkingTest {
+        features.push("test-networking");
+    }
+    if mode == BootMode::DeviceModelTest {
+        features.push("test-device-model");
+    }
+    if mode == BootMode::PciAcpiTest {
+        features.push("test-pci-acpi");
+    }
+    if mode == BootMode::ModuleLoaderTest {
+        features.push("test-module-loader");
+    }
+    if mode == BootMode::VirtioTtyFbTest {
+        features.push("test-virtio-tty-fb");
+    }
+    if mode == BootMode::InputHidUsbTest {
+        features.push("test-input-hid-usb");
+    }
+    if mode == BootMode::SyscallTableTest {
+        features.push("test-syscall-table");
+    }
+    if mode == BootMode::VdsoIoUringTest {
+        features.push("test-vdso-iouring");
+    }
+    if mode == BootMode::PrintkKmsgTest {
+        features.push("test-printk-kmsg");
+    }
+    if mode == BootMode::FtraceKprobesTest {
+        features.push("test-ftrace-kprobes");
+    }
+    if mode == BootMode::BpfPerfTest {
+        features.push("test-bpf-perf");
+    }
+    if mode == BootMode::LsmSuiteTest {
+        features.push("test-lsm-suite");
+    }
+    if mode == BootMode::KunitTest {
+        features.push("test-kunit");
+    }
+    if mode == BootMode::MmKselftests {
+        features.push("test-mm-kselftests");
+    }
+    if mode == BootMode::SmpPreemptTest {
+        features.push("test-smp-preempt");
+    }
+    if mode == BootMode::SmpMigrationTest {
+        features.push("test-smp-migration");
+    }
+    if mode == BootMode::PthreadSmokeTest {
+        features.push("test-pthread-smoke");
+    }
+
+    features
+}
+
+// Path strings for shell scripts come from `shell_path` (native, Linux-only).
+
+fn run_command(command: &mut Command, label: &str) -> Result<()> {
+    let rendered = render_command(command);
+    let status = command
+        .status()
+        .with_context(|| format!("failed to spawn {label}: {rendered}"))?;
+
+    if !status.success() {
+        bail!("{label} failed with status {status}: {rendered}");
+    }
+
+    Ok(())
+}
+
+fn run_command_stdout(command: &mut Command, label: &str) -> Result<String> {
+    let rendered = render_command(command);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to spawn {label}: {rendered}"))?;
+
+    if !output.status.success() {
+        bail!(
+            "{label} failed with status {}: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            rendered,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    String::from_utf8(output.stdout).with_context(|| format!("{label} output is not UTF-8"))
+}
+
+/// RAII guard that ensures a QEMU child process is killed when dropped.
+///
+/// Rust's `std::process::Child` does NOT kill the child on drop — it only
+/// closes the handle, leaving the process running as an orphan.  This wrapper
+/// calls `kill()` + `wait()` in its `Drop` impl so that QEMU never leaks,
+/// even if the caller returns early via `?` or panics.
+struct QemuGuard {
+    child: Child,
+}
+
+impl QemuGuard {
+    fn new(child: Child) -> Self {
+        Self { child }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.child.wait()
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for QemuGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+const QEMU_RUN_LOCK_FILE: &str = "qemu-run.lock";
+
+struct QemuRunLock {
+    path: PathBuf,
+}
+
+impl QemuRunLock {
+    fn acquire() -> Result<Self> {
+        let target = xtask_target_dir()?;
+        acquire_qemu_run_lock_in(&target)
+    }
+
+    fn record_spawn(&self, qemu_pid: u32, rendered: &str) -> Result<()> {
+        let repo = repo_root()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let contents = format!(
+            "xtask_pid={}\nqemu_pid={qemu_pid}\nstarted_unix={started}\nrepo={repo}\ncommand={rendered}\n",
+            std::process::id()
+        );
+        fs::write(&self.path, contents)
+            .with_context(|| format!("failed to update QEMU run lock {}", self.path.display()))
+    }
+}
+
+impl Drop for QemuRunLock {
+    fn drop(&mut self) {
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+}
+
+#[derive(Default)]
+struct QemuRunLockOwner {
+    xtask_pid: Option<u32>,
+    qemu_pid: Option<u32>,
+    repo: Option<String>,
+    command: Option<String>,
+}
+
+fn parse_qemu_run_lock_owner(contents: &str) -> QemuRunLockOwner {
+    let mut owner = QemuRunLockOwner::default();
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "xtask_pid" => owner.xtask_pid = value.parse().ok(),
+            "qemu_pid" => owner.qemu_pid = value.parse().ok(),
+            "repo" => owner.repo = Some(value.to_string()),
+            "command" => owner.command = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    owner
+}
+
+fn qemu_run_lock_owner_is_active(owner: &QemuRunLockOwner) -> bool {
+    owner.xtask_pid.is_some_and(process_is_running_conservative)
+        || owner.qemu_pid.is_some_and(process_is_running_conservative)
+}
+
+fn qemu_run_lock_owner_has_process_ids(owner: &QemuRunLockOwner) -> bool {
+    owner.xtask_pid.is_some() || owner.qemu_pid.is_some()
+}
+
+fn process_is_running_conservative(pid: u32) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg("kill -0 \"$1\" 2>/dev/null")
+        .arg("sh")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
+fn acquire_qemu_run_lock_in(target: &Path) -> Result<QemuRunLock> {
+    fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
+    let path = target.join(QEMU_RUN_LOCK_FILE);
+    let mut file = loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => break file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner =
+                    fs::read_to_string(&path).unwrap_or_else(|_| "<unreadable>".to_string());
+                let parsed = parse_qemu_run_lock_owner(&owner);
+                if !qemu_run_lock_owner_has_process_ids(&parsed)
+                    || qemu_run_lock_owner_is_active(&parsed)
+                {
+                    bail!(
+                        "another QEMU run appears active from this repo (lock: {})\n{}\nIf no QEMU process is running, remove the stale lock file and retry.",
+                        path.display(),
+                        owner.trim_end()
+                    );
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        eprintln!("warning: removed stale QEMU run lock {}", path.display());
+                    }
+                    Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(remove_err) => {
+                        return Err(remove_err).with_context(|| {
+                            format!("failed to remove stale QEMU run lock {}", path.display())
+                        });
+                    }
+                }
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to create QEMU run lock {}", path.display()));
+            }
+        }
+    };
+
+    writeln!(
+        file,
+        "xtask_pid={}\nqemu_pid=<spawning>",
+        std::process::id()
+    )
+    .with_context(|| format!("failed to write QEMU run lock {}", path.display()))?;
+    Ok(QemuRunLock { path })
+}
+
+fn spawn_qemu_guard(
+    command: &mut Command,
+    rendered: &str,
+    lock: &QemuRunLock,
+    label: &str,
+) -> Result<QemuGuard> {
+    let guard = QemuGuard::new(
+        command
+            .spawn()
+            .with_context(|| format!("failed to spawn {label} QEMU process: {rendered}"))?,
+    );
+    lock.record_spawn(guard.id(), rendered)?;
+    Ok(guard)
+}
+
+struct EnvVarGuard {
+    name: &'static str,
+    previous: Option<String>,
+    _env_lock: EnvLockGuard,
+}
+
+struct EnvLockState {
+    owner: Option<thread::ThreadId>,
+    depth: usize,
+}
+
+static ENV_LOCK_STATE: Mutex<EnvLockState> = Mutex::new(EnvLockState {
+    owner: None,
+    depth: 0,
+});
+static ENV_LOCK_CVAR: Condvar = Condvar::new();
+
+struct EnvLockGuard;
+
+impl EnvLockGuard {
+    fn acquire() -> Self {
+        let thread_id = thread::current().id();
+        let mut state = ENV_LOCK_STATE.lock().unwrap();
+        loop {
+            match state.owner {
+                Some(owner) if owner == thread_id => {
+                    state.depth += 1;
+                    return Self;
+                }
+                Some(_) => {
+                    state = ENV_LOCK_CVAR.wait(state).unwrap();
+                }
+                None => {
+                    state.owner = Some(thread_id);
+                    state.depth = 1;
+                    return Self;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for EnvLockGuard {
+    fn drop(&mut self) {
+        let thread_id = thread::current().id();
+        let mut state = ENV_LOCK_STATE.lock().unwrap();
+        assert_eq!(
+            state.owner,
+            Some(thread_id),
+            "EnvLockGuard dropped on a different thread"
+        );
+        state.depth -= 1;
+        if state.depth == 0 {
+            state.owner = None;
+            ENV_LOCK_CVAR.notify_one();
+        }
+    }
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let env_lock = EnvLockGuard::acquire();
+        let previous = env::var(name).ok();
+        unsafe {
+            env::set_var(name, value);
+        }
+        Self {
+            name,
+            previous,
+            _env_lock: env_lock,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(previous) = self.previous.as_ref() {
+                env::set_var(self.name, previous);
+            } else {
+                env::remove_var(self.name);
+            }
+        }
+    }
+}
+
+fn run_command_with_optional_timeout(
+    command: &mut Command,
+    serial_log_path: &Path,
+    timeout: Option<Duration>,
+) -> Result<ExitStatus> {
+    let qemu_lock = QemuRunLock::acquire()?;
+    match timeout {
+        Some(timeout) => run_command_with_timeout(command, serial_log_path, timeout, &qemu_lock),
+        None => {
+            let rendered = render_command(command);
+            let mut guard = spawn_qemu_guard(command, &rendered, &qemu_lock, "standard")?;
+            let mut progress = BootProgressReporter::new(serial_log_path);
+            progress.serial_log_opened();
+            loop {
+                if let Some(status) = guard
+                    .try_wait()
+                    .with_context(|| format!("failed while waiting on QEMU: {rendered}"))?
+                {
+                    return Ok(status);
+                }
+                let serial_output = read_serial_log_if_present(serial_log_path);
+                progress.observe_log(&serial_output);
+                progress.tick();
+                thread::sleep(Duration::from_millis(QEMU_POLL_INTERVAL_MS));
+            }
+        }
+    }
+}
+
+fn run_command_with_timeout(
+    command: &mut Command,
+    serial_log_path: &Path,
+    timeout: Duration,
+    qemu_lock: &QemuRunLock,
+) -> Result<ExitStatus> {
+    let rendered = render_command(command);
+    let mut guard = spawn_qemu_guard(command, &rendered, qemu_lock, "standard")?;
+    let mut progress = BootProgressReporter::new(serial_log_path);
+    progress.serial_log_opened();
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if let Some(status) = guard
+            .try_wait()
+            .with_context(|| format!("failed while waiting on QEMU: {rendered}"))?
+        {
+            return Ok(status);
+        }
+        let serial_output = read_serial_log_if_present(serial_log_path);
+        progress.observe_log(&serial_output);
+
+        if Instant::now() >= deadline {
+            let _ = guard.kill();
+            let _ = guard.wait();
+
+            let timeout_secs = timeout.as_secs();
+            if serial_output.is_empty() {
+                bail!("QEMU timed out after {timeout_secs}s: {rendered}");
+            }
+
+            bail!(
+                "QEMU timed out after {timeout_secs}s: {rendered}\npartial serial log:\n{}",
+                serial_output
+            );
+        }
+
+        progress.tick();
+        thread::sleep(Duration::from_millis(QEMU_POLL_INTERVAL_MS));
+    }
+}
+
+fn read_serial_log_if_present(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+fn render_command(command: &Command) -> String {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if args.is_empty() {
+        program
+    } else {
+        format!("{program} {args}")
+    }
+}
+
+pub(crate) fn xtask_target_dir() -> Result<PathBuf> {
+    let root = repo_root()?;
+    Ok(root.join("target").join("xtask"))
+}
+
+pub(crate) fn repo_root() -> Result<PathBuf> {
+    if let Some(manifest_dir) = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) {
+        if let Some(parent) = manifest_dir.parent() {
+            return Ok(parent.to_path_buf());
+        }
+    }
+
+    for seed in [env::current_exe().ok(), env::current_dir().ok()]
+        .into_iter()
+        .flatten()
+    {
+        for candidate in seed.ancestors() {
+            if candidate.join("Cargo.toml").is_file()
+                && candidate.join("xtask").join("Cargo.toml").is_file()
+            {
+                return Ok(candidate.to_path_buf());
+            }
+        }
+    }
+
+    bail!(
+        "failed to resolve repo root: CARGO_MANIFEST_DIR is not set and no ancestor contains both Cargo.toml and xtask/Cargo.toml"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_repo_file(path: &str) -> String {
+        let root = repo_root().expect("repo root");
+        fs::read_to_string(root.join(path))
+            .unwrap_or_else(|err| panic!("failed to read {path}: {err}"))
+    }
+
+    #[test]
+    fn serial_log_match_is_line_based() {
+        let log = "firmware noise\n[    0.000000] Linux/Lupos version 0.1.0-lupos (lupos@build)\n";
+        assert!(serial_log_contains(log, HELLO_BANNER));
+        assert!(!serial_log_contains(log, "missing"));
+    }
+
+    #[test]
+    fn qemu_run_lock_blocks_concurrent_owner() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let target = xtask_target_dir()
+            .expect("xtask target dir")
+            .join(format!("qemu-run-lock-test-{nonce}"));
+
+        let first = acquire_qemu_run_lock_in(&target).expect("first qemu lock");
+        let err = match acquire_qemu_run_lock_in(&target) {
+            Ok(_) => panic!("second qemu lock should fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            format!("{err:#}").contains("another QEMU run appears active"),
+            "unexpected lock error: {err:#}"
+        );
+
+        drop(first);
+        let second = acquire_qemu_run_lock_in(&target).expect("released qemu lock");
+        drop(second);
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn qemu_run_lock_clears_stale_owner() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let target = xtask_target_dir()
+            .expect("xtask target dir")
+            .join(format!("qemu-run-lock-stale-test-{nonce}"));
+        fs::create_dir_all(&target).expect("test target dir");
+
+        let path = target.join(QEMU_RUN_LOCK_FILE);
+        fs::write(
+            &path,
+            "xtask_pid=4294967295\nqemu_pid=4294967294\nrepo=/missing/lupos\ncommand=qemu-system-x86_64\n",
+        )
+        .expect("stale qemu lock");
+
+        let lock = acquire_qemu_run_lock_in(&target).expect("stale qemu lock should be replaced");
+        let contents = fs::read_to_string(&path).expect("replacement qemu lock");
+        assert!(contents.contains(&format!("xtask_pid={}", std::process::id())));
+        assert!(contents.contains("qemu_pid=<spawning>"));
+
+        drop(lock);
+        assert!(!path.exists(), "qemu lock should be removed on drop");
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn boot_progress_detects_serial_boot_stages() {
+        let log = concat!(
+            "SeaBIOS (version rel-1.16.3)\n",
+            "GNU GRUB  version 2.12\n",
+            "lupos: early 64-bit rust entry\n",
+            "[    0.000000] Linux/Lupos version 6.7.0-lupos\n",
+            "[    0.000000] Kernel command line: quiet\n",
+            "[    0.010000] Trying to unpack rootfs image as initramfs...\n",
+            "[    0.020000] Run /sbin/init as init process\n",
+            "Welcome to Arch Linux!\n",
+            "lupos login: ",
+        );
+
+        assert_eq!(
+            boot_progress_detect_stages(log),
+            vec![
+                "firmware/grub output seen",
+                "early kernel entry",
+                "kernel banner",
+                "cmdline",
+                "initramfs",
+                "Run /sbin/init",
+                "systemd/Arch banner",
+                "login prompt",
+            ]
+        );
+    }
+
+    #[test]
+    fn boot_progress_detects_shell_prompt_after_autologin() {
+        let log = concat!(
+            "login: root (automatic login)\n",
+            "Welcome to Lupos.\n",
+            "\x1b[?2004h\x1b[01;32mroot@lupos\x1b[00m:\x1b[01;34m~\x1b[00m# ",
+        );
+
+        assert_eq!(
+            boot_progress_detect_stages(log),
+            vec!["login prompt", "shell prompt"]
+        );
+        assert!(boot_progress_log_reached_stage(log, "shell prompt"));
+        assert!(!boot_progress_log_reached_stage(log, "kernel banner"));
+    }
+
+    #[test]
+    fn boot_progress_shell_stage_stays_false_before_bash_prompt() {
+        let log = concat!(
+            "[   12.345286] Run /sbin/init as init process\n",
+            "Welcome to Arch Linux!\n",
+            "Starting modprobe@drm.service - Load Kernel Module drm...\n",
+        );
+
+        assert!(!boot_progress_log_reached_stage(log, "shell prompt"));
+    }
+
+    #[test]
+    fn boot_progress_env_zero_suppresses_progress() {
+        assert!(!boot_progress_enabled_from(Some("0")));
+        assert!(!boot_progress_enabled_from(Some("false")));
+        assert!(!boot_progress_enabled_from(Some("OFF")));
+        assert!(boot_progress_enabled_from(None));
+        assert!(boot_progress_enabled_from(Some("1")));
+    }
+
+    #[test]
+    fn boot_progress_idle_message_names_stage_and_serial_path() {
+        let serial = Path::new("target/xtask/serial-login-stack.log");
+        let message = boot_progress_idle_message("kernel banner", serial);
+
+        assert!(message.contains("kernel banner"));
+        assert!(message.contains("serial-login-stack.log"));
+        assert!(message.contains("idle for 15s"));
+    }
+
+    #[test]
+    fn serial_output_marker_does_not_match_echoed_command_text() {
+        let log = "\x1b[01;32mlupos@lupos\x1b[00m:~$ echo login-stack: loginctl session ok\n\
+failed command output\n";
+        assert!(serial_log_contains(log, "login-stack: loginctl session ok"));
+        assert!(!serial_log_has_output_line(
+            log,
+            "login-stack: loginctl session ok"
+        ));
+        assert!(serial_log_has_output_line(
+            "login-stack: loginctl session ok\r\n",
+            "login-stack: loginctl session ok"
+        ));
+    }
+
+    /// `strip_ansi_escapes` must drop CSI (`\x1b[…<final>`) and OSC
+    /// (`\x1b]…\x07` or `\x1b…\x1b\\`) sequences so the serial-expect
+    /// matcher can locate text the colorized Bash PS1 has wrapped in
+    /// `\x1b[01;32m…\x1b[00m`.  Ref: vendor/bash/bash-5.2.37/parse.y
+    /// (decode_prompt_string) and ECMA-48 §5.4 (CSI).
+    #[test]
+    fn strip_ansi_escapes_handles_csi_osc_and_colored_prompt() {
+        // CSI color codes around the visible payload.
+        let ps1 = "\x1b[01;32mroot@lupos\x1b[00m:\x1b[01;34m~\x1b[00m# ";
+        assert_eq!(strip_ansi_escapes(ps1), "root@lupos:~# ");
+
+        // OSC title set: ESC ] 0 ; "title" BEL — must drop the whole thing.
+        let osc = "before\x1b]0;Lupos\x07after";
+        assert_eq!(strip_ansi_escapes(osc), "beforeafter");
+
+        // Two-byte ESC sequence (e.g. ESC `=` — application keypad mode).
+        assert_eq!(strip_ansi_escapes("a\x1b=b"), "ab");
+
+        // serial_log_contains must locate the prompt even when ANSI codes
+        // interleave the substring.
+        assert!(serial_log_contains(
+            "\x1b[01;32mroot@lupos\x1b[00m:\x1b[01;34m~\x1b[00m# echo hi\n",
+            "root@lupos:~#"
+        ));
+    }
+
+    #[test]
+    fn boot_triage_extracts_failed_unit_errno_missing_paths_and_last_syscalls() {
+        let log = concat!(
+            "\x1b[31m[FAILED]\x1b[0m Failed to start systemd-journald.service - Journal Service.\n",
+            "trace-run-openat pid=185 dirfd=-100 flags=0x0 path=/run/systemd/journal ret=-2\n",
+            "trace-svc-sys pid=1 comm=init nr=47 ret=-11 a0=0x4\n",
+            "trace-svc-sys pid=185 comm=systemd-network nr=55 ret=-92 a0=0x3\n",
+            "systemd-resolved.service: Failed with result 'exit-code'.\n",
+            "netlink-audit sendmsg failed errno=107\n",
+        );
+
+        let report = analyze_boot_log(log);
+
+        assert_eq!(
+            report.first_failed_unit.as_deref(),
+            Some("systemd-journald.service")
+        );
+        assert!(report.errno_histogram.contains(&("-2".to_string(), 1)));
+        assert!(report.errno_histogram.contains(&("-11".to_string(), 1)));
+        assert!(report.errno_histogram.contains(&("-92".to_string(), 1)));
+        assert!(report.errno_histogram.contains(&("-107".to_string(), 1)));
+        assert!(
+            report
+                .missing_paths
+                .contains(&"/run/systemd/journal".to_string())
+        );
+        assert!(
+            report
+                .service_failures
+                .iter()
+                .any(|line| line.contains("journald"))
+        );
+        assert!(
+            report
+                .service_failures
+                .iter()
+                .any(|line| line.contains("resolved"))
+        );
+        assert_eq!(report.last_syscalls_by_pid.len(), 2);
+        assert!(
+            report
+                .netlink_or_ioctl_failures
+                .iter()
+                .any(|line| line.contains("netlink-audit"))
+        );
+    }
+
+    #[test]
+    fn boot_triage_render_has_stable_sections() {
+        let report = BootTriageReport {
+            first_failed_unit: Some("systemd-journald.service".to_string()),
+            service_failures: vec!["Failed to start systemd-journald.service".to_string()],
+            errno_histogram: vec![("-2".to_string(), 3)],
+            missing_paths: vec!["/run/systemd/journal".to_string()],
+            netlink_or_ioctl_failures: vec!["netlink ret=-22".to_string()],
+            last_syscalls_by_pid: vec![(185, "trace-svc-sys pid=185 ret=-2".to_string())],
+        };
+
+        let rendered = render_boot_triage_report(&report);
+
+        for needle in [
+            "boot-triage",
+            "first_failed_unit: systemd-journald.service",
+            "service_failures:",
+            "errno_histogram:",
+            "missing_paths:",
+            "netlink_or_ioctl_failures:",
+            "last_syscalls_by_pid:",
+            "pid 185:",
+        ] {
+            assert!(rendered.contains(needle), "missing triage section {needle}");
+        }
+    }
+
+    #[test]
+    fn panic_mode_enables_both_test_features() {
+        let features = feature_list(BootMode::Panic, true);
+        assert!(features.contains(&"qemu-test"));
+        assert!(features.contains(&"panic-on-boot"));
+    }
+
+    #[test]
+    fn deprecated_qemu_aliases_route_through_iso_not_kernel_flag() {
+        let source = read_repo_file("xtask/src/lib.rs");
+
+        assert!(source.contains("Some(\"qemu\") => {"));
+        assert!(source.contains("build_and_run_iso(BootMode::Hello, qemu_run_options())"));
+        assert!(source.contains("Some(\"qemu-display\") => run_single_login_boot(false),"));
+        assert!(
+            !source.contains(".arg(\"-kernel\")"),
+            "xtask must not construct the retired direct Multiboot QEMU path"
+        );
+    }
+
+    #[test]
+    fn grub_bzimage_mode_is_canonical_and_keeps_legacy_aliases() {
+        assert_eq!(
+            normalize_boot_test_mode("test-grub-bzimage"),
+            "grub-bzimage"
+        );
+        assert_eq!(normalize_boot_test_mode("grub-bzimage"), "grub-bzimage");
+        assert_eq!(
+            normalize_boot_test_mode("test-multiboot-grub"),
+            "grub-bzimage"
+        );
+        assert_eq!(normalize_boot_test_mode("multiboot-grub"), "grub-bzimage");
+        assert!(resolve_boot_test_mode("grub-bzimage").is_some());
+        assert!(resolve_boot_test_mode("multiboot-grub").is_some());
+
+        let source = read_repo_file("xtask/src/lib.rs");
+        let production_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("xtask source should contain production code before tests");
+        assert!(production_source.contains("pub fn run_grub_bzimage_tests()"));
+        assert!(!production_source.contains("pub fn run_multiboot_grub_tests()"));
+        assert!(!production_source.contains("Some(run_multiboot_grub_tests)"));
+    }
+
+    #[test]
+    fn qemu_iso_command_uses_cdrom_flag() {
+        let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, "");
+        let _machine = EnvVarGuard::set(LUPOS_QEMU_MACHINE_ENV, "");
+        let iso = Path::new(r"C:\tmp\lupos.iso");
+        let serial_log = Path::new(r"C:\tmp\serial.log");
+        let command = build_qemu_iso_command(iso, serial_log, 1);
+        let rendered = render_command(&command);
+
+        assert!(rendered.contains("-cdrom"));
+        assert!(rendered.contains("lupos.iso"));
+        assert!(rendered.contains("-boot d"));
+        assert!(rendered.contains("-serial file:C:\\tmp\\serial.log"));
+        assert!(rendered.contains("-display none"));
+        assert!(rendered.contains("isa-debug-exit,iobase=0xf4,iosize=0x04"));
+        assert!(rendered.contains("-netdev user,id=luposnet0,hostname=lupos"));
+        assert!(rendered.contains("virtio-net-pci,netdev=luposnet0"));
+        assert!(rendered.contains("qemu-xhci,id=xhci"));
+        assert!(rendered.contains("usb-tablet,bus=xhci.0"));
+        assert!(rendered.contains("-audiodev none,id=luposaudio"));
+        assert!(rendered.contains("intel-hda"));
+        assert!(rendered.contains("hda-duplex,audiodev=luposaudio"));
+        // smp_count=1 should NOT add -smp flag
+        assert!(!rendered.contains("-smp"));
+    }
+
+    #[test]
+    fn qemu_iso_terminal_command_attaches_serial_to_stdio() {
+        let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, "");
+        let _machine = EnvVarGuard::set(LUPOS_QEMU_MACHINE_ENV, "");
+        let iso = Path::new(r"C:\tmp\lupos.iso");
+        let command = build_qemu_iso_login_terminal_command(iso).expect("terminal command");
+        let rendered = render_command(&command);
+
+        assert!(rendered.contains("-cdrom"));
+        assert!(rendered.contains("lupos.iso"));
+        assert!(rendered.contains("-display none"));
+        assert!(rendered.contains("-serial stdio"));
+        assert!(!rendered.contains("file:C:\\tmp\\serial.log"));
+    }
+
+    #[test]
+    fn run_cli_parser_accepts_terminal_gui_and_gdb_modes() {
+        assert_eq!(
+            parse_dev_run_args(vec!["--terminal".into(), "--gdb".into()]).unwrap(),
+            DevRunSelection {
+                target: DevRunTarget::Terminal,
+                gdb: true,
+            }
+        );
+        assert_eq!(
+            parse_dev_run_args(vec!["--gui".into()]).unwrap(),
+            DevRunSelection {
+                target: DevRunTarget::Gui,
+                gdb: false,
+            }
+        );
+        assert_eq!(
+            parse_dev_run_args(vec!["--mode=gui-shell".into()]).unwrap(),
+            DevRunSelection {
+                target: DevRunTarget::Mode("gui-shell".to_string()),
+                gdb: false,
+            }
+        );
+        assert!(parse_dev_run_args(vec!["--terminal".into(), "--gui".into()]).is_err());
+    }
+
+    #[test]
+    fn qemu_iso_command_can_attach_virtio_root_disk() {
+        let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, "/tmp/lupos.qcow2");
+        let _machine = EnvVarGuard::set(LUPOS_QEMU_MACHINE_ENV, "");
+        let iso = Path::new("/tmp/lupos.iso");
+        let serial_log = Path::new("/tmp/serial.log");
+        let command = build_qemu_iso_command(iso, serial_log, 1);
+        let rendered = render_command(&command);
+
+        assert!(
+            rendered.contains("-machine q35,accel="),
+            "root-disk boots need q35 ECAM/MCFG, got: {rendered}"
+        );
+        assert!(rendered.contains("file=/tmp/lupos.qcow2,if=none,id=luposroot0,format=qcow2"));
+        assert!(rendered.contains("virtio-blk-pci,drive=luposroot0,serial=lupos-root"));
+    }
+
+    #[test]
+    fn qemu_iso_command_honors_memory_override_and_gdb_stub() {
+        let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, "");
+        let _machine = EnvVarGuard::set(LUPOS_QEMU_MACHINE_ENV, "");
+        let _memory = EnvVarGuard::set(LUPOS_QEMU_MEMORY_ENV, "4096M");
+        let _gdb = EnvVarGuard::set(LUPOS_QEMU_GDB_ENV, "1");
+        let iso = Path::new("/tmp/lupos.iso");
+        let serial_log = Path::new("/tmp/serial.log");
+        let command = build_qemu_iso_command(iso, serial_log, 1);
+        let rendered = render_command(&command);
+
+        assert!(rendered.contains("-m 4096M"));
+        assert!(rendered.contains("-S -gdb tcp::1234"));
+    }
+
+    #[test]
+    fn initramfs_rootfs_bind_disk_is_raw_and_sized() {
+        let path = ensure_virtio_root_bind_disk().expect("create root bind disk");
+        let metadata = fs::metadata(&path).expect("root bind disk metadata");
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("virtio-root-bind-test.raw")
+        );
+        assert_eq!(qemu_disk_format(&path.to_string_lossy()), "raw");
+        assert_eq!(metadata.len(), VIRTIO_ROOT_BIND_DISK_SIZE);
+    }
+
+    #[test]
+    fn initramfs_rootfs_mode_defaults_to_virtio_root_disk() {
+        let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, "");
+        let _guards = default_qemu_root_disk_guard_for_mode(BootMode::InitramfsRootfsTest)
+            .expect("default root disk guard");
+        let path = env::var(LUPOS_QEMU_ROOT_DISK_ENV).expect("root disk env");
+
+        assert!(
+            !_guards.is_empty(),
+            "initramfs-rootfs should attach a root disk"
+        );
+        assert!(path.ends_with("virtio-root-bind-test.raw"));
+        assert_eq!(qemu_disk_format(&path), "raw");
+        assert!(Path::new(&path).exists(), "root disk must exist: {path}");
+    }
+
+    #[test]
+    fn initramfs_rootfs_mode_preserves_explicit_root_disk() {
+        let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, r"C:\tmp\custom-root.raw");
+        let guards = default_qemu_root_disk_guard_for_mode(BootMode::InitramfsRootfsTest)
+            .expect("default root disk guard");
+
+        assert!(guards.is_empty());
+        assert_eq!(
+            env::var(LUPOS_QEMU_ROOT_DISK_ENV).as_deref(),
+            Ok(r"C:\tmp\custom-root.raw")
+        );
+    }
+
+    #[test]
+    fn cpio_root_disk_manifest_requires_matching_inputs() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let target = xtask_target_dir()
+            .expect("xtask target dir")
+            .join(format!("login-root-manifest-test-{nonce}"));
+        fs::create_dir_all(&target).expect("test target dir");
+        let raw = target.join("disk-root-fsck.raw");
+        let manifest = target.join("disk-root-fsck.rootdisk.manifest");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&raw)
+            .expect("test raw disk");
+        let (_, expected_disk_bytes) = login_root_disk_size(BootMode::DiskRootFsckTest);
+        file.set_len(expected_disk_bytes)
+            .expect("size test raw disk");
+
+        let expected = login_root_disk_manifest(
+            BootMode::DiskRootFsckTest,
+            b"cpio-v1",
+            SYSTEMD_DISK_ROOT_FSTAB,
+            true,
+        );
+        let changed = login_root_disk_manifest(
+            BootMode::DiskRootFsckTest,
+            b"cpio-v2",
+            SYSTEMD_DISK_ROOT_FSTAB,
+            true,
+        );
+
+        assert!(!login_root_disk_manifest_matches(
+            &raw,
+            &manifest,
+            &expected,
+            expected_disk_bytes
+        ));
+        fs::write(&manifest, &changed).expect("write stale manifest");
+        assert!(!login_root_disk_manifest_matches(
+            &raw,
+            &manifest,
+            &expected,
+            expected_disk_bytes
+        ));
+        fs::write(&manifest, &expected).expect("write matching manifest");
+        assert!(login_root_disk_manifest_matches(
+            &raw,
+            &manifest,
+            &expected,
+            expected_disk_bytes
+        ));
+
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn login_root_disk_builder_kinds_keep_direct_stage_and_special_paths() {
+        for mode in [
+            BootMode::Login,
+            BootMode::LoginDisplay,
+            BootMode::LoginStackTest,
+            BootMode::UserspaceSmokeTest,
+            BootMode::RuntimeStressTest,
+            BootMode::ShippedCommandsTest,
+        ] {
+            assert_eq!(
+                login_root_disk_builder_kind(mode),
+                Some(LoginRootDiskBuilderKind::DirectStage),
+                "{mode:?} must build root disks directly from target/userland/stage"
+            );
+            assert!(mode_uses_direct_stage_login_root_disk(mode));
+        }
+        assert_eq!(
+            login_root_disk_builder_kind(BootMode::DiskRootFsckTest),
+            Some(LoginRootDiskBuilderKind::InitramfsCpio)
+        );
+        assert_eq!(
+            login_root_disk_builder_kind(BootMode::GuiShell),
+            Some(LoginRootDiskBuilderKind::GuiShell)
+        );
+        assert!(!mode_uses_direct_stage_login_root_disk(
+            BootMode::DiskRootFsckTest
+        ));
+    }
+
+    #[test]
+    fn direct_stage_root_disk_manifest_changes_for_cache_inputs() {
+        const PACMAN_CONF: &[u8] = b"[options]\nDisableSandbox\n";
+        const PACMAN_MIRRORLIST: &[u8] =
+            b"Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch\n";
+        const PACMAN_REPO_MANIFEST: &str =
+            "var/lib/lupos/pacman-repo/extra/os/x86_64/vim.pkg\t9\tcbf29ce484222325\n";
+
+        let base = direct_stage_root_disk_manifest_from_parts(
+            BootMode::LoginDisplay,
+            LOGIN_ROOT_DISK_SIZE,
+            b"arch:base:2026.06.01\n",
+            b"ALPM_DB_VERSION\n",
+            PACMAN_CONF,
+            PACMAN_MIRRORLIST,
+            PACMAN_REPO_MANIFEST,
+            SYSTEMD_DISK_ROOT_FSTAB,
+            b"overlay-v1",
+            "lib/modules/lupos/modules.dep\t100644\t0\tcbf29ce484222325\n",
+            "etc/systemd/system/default.target\n",
+        );
+
+        for changed in [
+            direct_stage_root_disk_manifest_from_parts(
+                BootMode::Login,
+                LOGIN_ROOT_DISK_SIZE,
+                b"arch:base:2026.06.01\n",
+                b"ALPM_DB_VERSION\n",
+                PACMAN_CONF,
+                PACMAN_MIRRORLIST,
+                PACMAN_REPO_MANIFEST,
+                SYSTEMD_DISK_ROOT_FSTAB,
+                b"overlay-v1",
+                "lib/modules/lupos/modules.dep\t100644\t0\tcbf29ce484222325\n",
+                "etc/systemd/system/default.target\n",
+            ),
+            direct_stage_root_disk_manifest_from_parts(
+                BootMode::LoginDisplay,
+                "769M",
+                b"arch:base:2026.06.01\n",
+                b"ALPM_DB_VERSION\n",
+                PACMAN_CONF,
+                PACMAN_MIRRORLIST,
+                PACMAN_REPO_MANIFEST,
+                SYSTEMD_DISK_ROOT_FSTAB,
+                b"overlay-v1",
+                "lib/modules/lupos/modules.dep\t100644\t0\tcbf29ce484222325\n",
+                "etc/systemd/system/default.target\n",
+            ),
+            direct_stage_root_disk_manifest_from_parts(
+                BootMode::LoginDisplay,
+                LOGIN_ROOT_DISK_SIZE,
+                b"arch:base:refreshed\n",
+                b"ALPM_DB_VERSION\n",
+                PACMAN_CONF,
+                PACMAN_MIRRORLIST,
+                PACMAN_REPO_MANIFEST,
+                SYSTEMD_DISK_ROOT_FSTAB,
+                b"overlay-v1",
+                "lib/modules/lupos/modules.dep\t100644\t0\tcbf29ce484222325\n",
+                "etc/systemd/system/default.target\n",
+            ),
+            direct_stage_root_disk_manifest_from_parts(
+                BootMode::LoginDisplay,
+                LOGIN_ROOT_DISK_SIZE,
+                b"arch:base:2026.06.01\n",
+                b"bash\npacman\nsystemd\n",
+                PACMAN_CONF,
+                PACMAN_MIRRORLIST,
+                PACMAN_REPO_MANIFEST,
+                SYSTEMD_DISK_ROOT_FSTAB,
+                b"overlay-v1",
+                "lib/modules/lupos/modules.dep\t100644\t0\tcbf29ce484222325\n",
+                "etc/systemd/system/default.target\n",
+            ),
+            direct_stage_root_disk_manifest_from_parts(
+                BootMode::LoginDisplay,
+                LOGIN_ROOT_DISK_SIZE,
+                b"arch:base:2026.06.01\n",
+                b"ALPM_DB_VERSION\n",
+                b"[options]\n",
+                PACMAN_MIRRORLIST,
+                PACMAN_REPO_MANIFEST,
+                SYSTEMD_DISK_ROOT_FSTAB,
+                b"overlay-v1",
+                "lib/modules/lupos/modules.dep\t100644\t0\tcbf29ce484222325\n",
+                "etc/systemd/system/default.target\n",
+            ),
+            direct_stage_root_disk_manifest_from_parts(
+                BootMode::LoginDisplay,
+                LOGIN_ROOT_DISK_SIZE,
+                b"arch:base:2026.06.01\n",
+                b"ALPM_DB_VERSION\n",
+                PACMAN_CONF,
+                b"Server = https://mirror.example/$repo/os/$arch\n",
+                PACMAN_REPO_MANIFEST,
+                SYSTEMD_DISK_ROOT_FSTAB,
+                b"overlay-v1",
+                "lib/modules/lupos/modules.dep\t100644\t0\tcbf29ce484222325\n",
+                "etc/systemd/system/default.target\n",
+            ),
+            direct_stage_root_disk_manifest_from_parts(
+                BootMode::LoginDisplay,
+                LOGIN_ROOT_DISK_SIZE,
+                b"arch:base:2026.06.01\n",
+                b"ALPM_DB_VERSION\n",
+                PACMAN_CONF,
+                PACMAN_MIRRORLIST,
+                "var/lib/lupos/pacman-repo/extra/os/x86_64/vim.pkg\t10\tchanged\n",
+                SYSTEMD_DISK_ROOT_FSTAB,
+                b"overlay-v1",
+                "lib/modules/lupos/modules.dep\t100644\t0\tcbf29ce484222325\n",
+                "etc/systemd/system/default.target\n",
+            ),
+            direct_stage_root_disk_manifest_from_parts(
+                BootMode::LoginDisplay,
+                LOGIN_ROOT_DISK_SIZE,
+                b"arch:base:2026.06.01\n",
+                b"ALPM_DB_VERSION\n",
+                PACMAN_CONF,
+                PACMAN_MIRRORLIST,
+                PACMAN_REPO_MANIFEST,
+                "/dev/vdb / ext4 defaults 0 1\n",
+                b"overlay-v1",
+                "lib/modules/lupos/modules.dep\t100644\t0\tcbf29ce484222325\n",
+                "etc/systemd/system/default.target\n",
+            ),
+            direct_stage_root_disk_manifest_from_parts(
+                BootMode::LoginDisplay,
+                LOGIN_ROOT_DISK_SIZE,
+                b"arch:base:2026.06.01\n",
+                b"ALPM_DB_VERSION\n",
+                PACMAN_CONF,
+                PACMAN_MIRRORLIST,
+                PACMAN_REPO_MANIFEST,
+                SYSTEMD_DISK_ROOT_FSTAB,
+                b"overlay-v2",
+                "lib/modules/lupos/modules.dep\t100644\t0\tcbf29ce484222325\n",
+                "etc/systemd/system/default.target\n",
+            ),
+            direct_stage_root_disk_manifest_from_parts(
+                BootMode::LoginDisplay,
+                LOGIN_ROOT_DISK_SIZE,
+                b"arch:base:2026.06.01\n",
+                b"ALPM_DB_VERSION\n",
+                PACMAN_CONF,
+                PACMAN_MIRRORLIST,
+                PACMAN_REPO_MANIFEST,
+                SYSTEMD_DISK_ROOT_FSTAB,
+                b"overlay-v1",
+                "lib/modules/lupos/e1000.ko\t100755\t4\tabcd\n",
+                "etc/systemd/system/default.target\n",
+            ),
+            direct_stage_root_disk_manifest_from_parts(
+                BootMode::LoginDisplay,
+                LOGIN_ROOT_DISK_SIZE,
+                b"arch:base:2026.06.01\n",
+                b"ALPM_DB_VERSION\n",
+                PACMAN_CONF,
+                PACMAN_MIRRORLIST,
+                PACMAN_REPO_MANIFEST,
+                SYSTEMD_DISK_ROOT_FSTAB,
+                b"overlay-v1",
+                "lib/modules/lupos/modules.dep\t100644\t0\tcbf29ce484222325\n",
+                "etc/systemd/system/multi-user.target.wants\n",
+            ),
+        ] {
+            assert_ne!(
+                base, changed,
+                "direct-stage root disk manifest must change when a cache input changes"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_stage_root_disk_overlay_contains_runtime_files_and_modules() {
+        let modules = vec![initramfs_file(
+            "lib/modules/lupos/modules.dep",
+            0o100644,
+            b"dep e1000\n",
+        )];
+        let files = direct_stage_login_root_disk_overlay_files(
+            BootMode::LoginDisplay,
+            SYSTEMD_DISK_ROOT_FSTAB,
+            &modules,
+            Path::new("/nonexistent-login-stage"),
+        );
+
+        assert_eq!(
+            initramfs_file_bytes(&files, "sbin/init"),
+            Some(&b"/usr/lib/systemd/systemd"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/fstab"),
+            Some(SYSTEMD_DISK_ROOT_FSTAB.as_bytes())
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/modules"),
+            Some(etc_modules_from_repo_config().as_slice())
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/pacman.d/mirrorlist"),
+            Some(ARCH_PACMAN_MIRRORLIST.as_bytes())
+        );
+        let pacman_xfer = find_initramfs_entry(&files, ARCH_PACMAN_XFER_HELPER)
+            .expect("direct-stage root disks must include the pacman transfer helper");
+        assert_eq!(pacman_xfer.1 & 0o777, 0o755);
+        assert_eq!(
+            initramfs_file_bytes(&files, ARCH_PACMAN_XFER_HELPER),
+            Some(ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes())
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/pam.d/common-session"),
+            Some(LOGIN_PAM_COMMON_SESSION.as_bytes())
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/pam.d/login"),
+            Some(LOGIN_PAM_LOGIN.as_bytes())
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/profile"),
+            Some(LOGIN_PROFILE.as_bytes())
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/motd"),
+            Some(LOGIN_MOTD.as_bytes())
+        );
+        assert!(
+            find_initramfs_entry(&files, "home/lupos").is_some(),
+            "direct-stage root disks must create the lupos home directory"
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "home/lupos/.bash_profile"),
+            Some(LUPOS_USER_BASH_PROFILE.as_bytes())
+        );
+        assert!(
+            core::str::from_utf8(
+                initramfs_file_bytes(&files, "etc/shadow").expect("shadow overlay")
+            )
+            .expect("shadow utf-8")
+            .contains("root:$6$lupos$"),
+            "direct-stage root disks must overlay the unlocked Lupos root password"
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "lib/modules/lupos/modules.dep"),
+            Some(&b"dep e1000\n"[..])
+        );
+        assert!(
+            find_initramfs_entry(
+                &files,
+                "etc/systemd/system/multi-user.target.wants/systemd-journald.service"
+            )
+            .is_some(),
+            "interactive login disks should keep journald enabled"
+        );
+        let terminal_target = core::str::from_utf8(
+            initramfs_file_bytes(&files, "usr/lib/systemd/system/lupos-terminal.target")
+                .expect("terminal target staged"),
+        )
+        .expect("terminal target utf-8");
+        assert!(
+            terminal_target.contains("systemd-journald-dev-log.socket"),
+            "fast terminal target must start journald's /dev/log socket"
+        );
+        for socket in [
+            "etc/systemd/system/sockets.target.wants/systemd-journald.socket",
+            "etc/systemd/system/sockets.target.wants/systemd-journald-dev-log.socket",
+        ] {
+            assert!(
+                find_initramfs_entry(&files, socket).is_some(),
+                "interactive login disks should enable {socket} so /dev/log captures auth failures"
+            );
+        }
+        let journald_service = core::str::from_utf8(
+            initramfs_file_bytes(&files, "usr/lib/systemd/system/systemd-journald.service")
+                .expect("journald service override staged"),
+        )
+        .expect("journald service utf-8");
+        assert!(journald_service.contains("Environment=RUNTIME_DIRECTORY=/run/systemd/journal"));
+        assert!(journald_service.contains("ExecStart=/usr/lib/systemd/systemd-journald"));
+        assert!(journald_service.contains("Type=simple"));
+        assert!(!journald_service.contains("Type=notify"));
+        assert!(!journald_service.contains("WatchdogSec="));
+        assert!(
+            journald_service.contains("RuntimeDirectory=systemd/journal systemd/journal/streams")
+        );
+        assert!(
+            !journald_service.contains("SystemCallFilter=")
+                && !journald_service.contains("IPAddressDeny="),
+            "direct-stage overlay must replace Arch's sandboxed journald service"
+        );
+    }
+
+    #[test]
+    fn critical_runtime_direct_stage_root_disk_overlay_prunes_journald_and_adds_mode_script() {
+        let modules = Vec::new();
+        let files = direct_stage_login_root_disk_overlay_files(
+            BootMode::UserspaceSmokeTest,
+            SYSTEMD_DISK_ROOT_FSTAB,
+            &modules,
+            Path::new("/nonexistent-login-stage"),
+        );
+        let delete_paths = direct_stage_login_root_disk_delete_paths(BootMode::UserspaceSmokeTest);
+
+        assert_eq!(
+            initramfs_file_bytes(&files, USERSPACE_SMOKE_SCRIPT_PATH),
+            Some(USERSPACE_SMOKE_SCRIPT.as_bytes())
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "root/test.txt"),
+            Some(b"data\n".as_slice())
+        );
+        assert!(
+            find_initramfs_entry(
+                &files,
+                "etc/systemd/system/multi-user.target.wants/systemd-journald.service"
+            )
+            .is_none(),
+            "userspace smoke/stress disks should not enable journald restart churn"
+        );
+        // The disk-root boot mounts / read-only and lupos-terminal.target
+        // skips local-fs.target, so without an explicit want the fstab
+        // tmpfs /tmp never mounts and every /tmp write EROFSes.
+        assert!(
+            find_initramfs_entry(
+                &files,
+                "etc/systemd/system/lupos-terminal.target.wants/tmp.mount"
+            )
+            .is_some(),
+            "terminal-profile disks must mount the tmpfs /tmp for shell writes"
+        );
+        assert!(
+            delete_paths
+                .contains(&"etc/systemd/system/multi-user.target.wants/systemd-journald.service")
+        );
+        assert!(
+            delete_paths.contains(&"var/lib/pacman/db.lck"),
+            "cached direct-stage disks must never preserve a stale pacman lock"
+        );
+    }
+
+    #[test]
+    fn shipped_commands_root_disk_overlay_boots_multi_user_without_desktop_services() {
+        let modules = Vec::new();
+        let files = direct_stage_login_root_disk_overlay_files(
+            BootMode::ShippedCommandsTest,
+            SYSTEMD_DISK_ROOT_FSTAB,
+            &modules,
+            Path::new("/nonexistent-login-stage"),
+        );
+
+        assert_eq!(
+            initramfs_file_bytes(&files, SHIPPED_COMMANDS_SCRIPT_PATH),
+            Some(SHIPPED_COMMANDS_SCRIPT.as_bytes())
+        );
+        // The fast lupos-terminal.target skips sysinit/local-fs, so the
+        // fstab-generated systemd-remount-fs.service never runs and / stays
+        // read-only.  This gate must boot the real multi-user chain.
+        let default_target = find_initramfs_entry(&files, "etc/systemd/system/default.target")
+            .expect("default.target staged");
+        assert_eq!(
+            default_target.2.as_slice(),
+            b"/usr/lib/systemd/system/multi-user.target",
+            "shipped-commands must boot the real multi-user.target chain"
+        );
+        for kept in ["etc/systemd/system/multi-user.target.wants/systemd-journald.service"] {
+            assert!(
+                find_initramfs_entry(&files, kept).is_some(),
+                "{kept} must be enabled for the systemd-tools gates"
+            );
+        }
+        for omitted in [
+            "etc/systemd/system/multi-user.target.wants/systemd-logind.service",
+            "etc/systemd/system/multi-user.target.wants/dbus.service",
+            "etc/systemd/system/sockets.target.wants/dbus.socket",
+        ] {
+            assert!(
+                find_initramfs_entry(&files, omitted).is_none(),
+                "{omitted} must not be required by the Arch base shipped-commands gate"
+            );
+        }
+        let session = find_initramfs_entry(&files, "etc/pam.d/common-session")
+            .expect("common-session staged");
+        assert!(
+            core::str::from_utf8(&session.2)
+                .unwrap()
+                .contains("session required pam_unix.so"),
+            "root login must keep the direct pam_unix session path"
+        );
+        assert!(
+            !core::str::from_utf8(&session.2)
+                .unwrap()
+                .contains("pam_systemd.so"),
+            "Arch base shipped-commands must not wait on logind/dbus session registration"
+        );
+        // A freshly built image must look update-done (what
+        // systemd-update-done.service records), or ConditionNeedsUpdate
+        // units (ldconfig, journal-catalog-update, sysusers) run their
+        // first-boot rebuilds and stall the boot under TCG.
+        for updated in ["etc/.updated", "var/.updated"] {
+            assert!(
+                find_initramfs_entry(&files, updated).is_some(),
+                "{updated} must mark the image update-done"
+            );
+        }
+        // serial-getty@ttyS0 BindsTo dev-ttyS0.device, which only appears
+        // once udevd settles; the udev-independent lupos-serial-getty must
+        // provide the login prompt, and the device-bound template must not
+        // be wanted (two agettys would fight over ttyS0).
+        assert!(
+            find_initramfs_entry(
+                &files,
+                "etc/systemd/system/multi-user.target.wants/lupos-serial-getty.service"
+            )
+            .is_some(),
+            "multi-user must want the udev-independent serial getty"
+        );
+        // Under TCG the whole multi-user burst shares one slow vCPU; if the
+        // getty races it, login(1)'s PAM conversation starves past its 60 s
+        // timeout.  The gate orders login after the heavy services so the
+        // prompt appears on a quiet system.
+        let getty_order = find_initramfs_entry(
+            &files,
+            "etc/systemd/system/lupos-serial-getty.service.d/lupos-shipped-commands.conf",
+        )
+        .expect("shipped-commands getty ordering drop-in staged");
+        let getty_order = core::str::from_utf8(&getty_order.2).unwrap();
+        for unit in [
+            "systemd-user-sessions.service",
+            "systemd-udev-trigger.service",
+            "systemd-vconsole-setup.service",
+            "systemd-journald.service",
+        ] {
+            assert!(
+                getty_order.contains(unit),
+                "gate getty must start after {unit}"
+            );
+        }
+        assert!(
+            find_initramfs_entry(
+                &files,
+                "etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service"
+            )
+            .is_none(),
+            "device-bound serial-getty@ttyS0 must not race lupos-serial-getty"
+        );
+        // The terminal profile's 15s DefaultTimeoutStartSec kills slow
+        // TCG service starts (journald/udevd churn); this gate needs the
+        // services, so give them distro-scale timeouts.
+        let system_conf =
+            find_initramfs_entry(&files, "etc/systemd/system.conf").expect("system.conf staged");
+        assert!(
+            core::str::from_utf8(&system_conf.2)
+                .unwrap()
+                .contains("DefaultTimeoutStartSec=180s"),
+            "shipped-commands needs TCG-tolerant service start timeouts"
+        );
+    }
+
+    #[test]
+    fn login_display_direct_stage_cache_path_avoids_big_cpio_generation() {
+        let source = read_repo_file("xtask/src/lib.rs");
+        let direct_builder = source
+            .split("fn ensure_direct_stage_login_root_disk")
+            .nth(1)
+            .expect("direct-stage builder source")
+            .split("fn ensure_ext4_root_disk_from_initramfs")
+            .next()
+            .expect("direct-stage builder body");
+
+        assert_eq!(
+            login_root_disk_builder_kind(BootMode::LoginDisplay),
+            Some(LoginRootDiskBuilderKind::DirectStage)
+        );
+        assert!(
+            direct_builder
+                .contains("mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -d {stage_sh}"),
+            "direct-stage builds must format ext4 straight from the staged tree"
+        );
+        assert!(direct_builder.contains("debugfs -w -f {overlay_work_sh}/debugfs.commands"));
+        assert!(
+            !direct_builder.contains("cp -a {stage_sh}/. {root_sh}/"),
+            "direct-stage builds must not duplicate the full staged distro tree"
+        );
+        assert!(
+            !direct_builder.contains("build_initramfs_cpio_unconditional"),
+            "direct-stage cache hits must not require the big login CPIO generator"
+        );
+        assert!(
+            !direct_builder.contains("{stem}.cpio"),
+            "direct-stage cache hits must not write the old large login-display.cpio"
+        );
+    }
+
+    #[test]
+    fn real_login_root_disks_use_larger_images() {
+        for mode in [
+            BootMode::Login,
+            BootMode::LoginDisplay,
+            BootMode::LoginStackTest,
+            BootMode::UserspaceSmokeTest,
+            BootMode::RuntimeStressTest,
+        ] {
+            assert_eq!(
+                login_root_disk_size(mode),
+                (LOGIN_ROOT_DISK_SIZE, LOGIN_ROOT_DISK_BYTES),
+                "{mode:?} must have room for the real login rootfs"
+            );
+        }
+        assert_eq!(
+            login_root_disk_size(BootMode::DiskRootFsckTest),
+            (DISK_ROOT_FSCK_DISK_SIZE, DISK_ROOT_FSCK_DISK_BYTES)
+        );
+        assert_eq!(
+            login_root_disk_size(BootMode::ShippedCommandsTest),
+            (
+                SHIPPED_COMMANDS_ROOT_DISK_SIZE,
+                SHIPPED_COMMANDS_ROOT_DISK_BYTES
+            )
+        );
+        assert_eq!(LOGIN_ROOT_DISK_SIZE, "768M");
+        assert_eq!(SHIPPED_COMMANDS_ROOT_DISK_SIZE, "768M");
+        assert!(LOGIN_ROOT_DISK_BYTES > DISK_ROOT_FSCK_DISK_BYTES);
+        assert!(SHIPPED_COMMANDS_ROOT_DISK_BYTES > DISK_ROOT_FSCK_DISK_BYTES);
+    }
+
+    #[test]
+    fn login_root_disk_boot_keeps_small_module_initrd_line() {
+        let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, r"C:\tmp\login.raw");
+        let cfg = grub_cfg_content_with_cmdline(&BootMode::LoginStackTest, "root=/dev/vda");
+
+        assert!(cfg.contains("initrd /boot/initramfs.cpio"));
+        assert!(cfg.contains("linux /boot/bzImage systemd.show_status=yes root=/dev/vda"));
+        assert!(root_disk_boot_uses_module_initrd(&BootMode::LoginStackTest));
+    }
+
+    #[test]
+    fn gui_shell_mode_is_removed_from_public_boot_tests() {
+        assert!(resolve_boot_test_mode("gui-shell").is_none());
+        assert!(resolve_boot_test_mode("test-gui-shell").is_none());
+        assert!(resolve_boot_test_mode("terminal-login").is_some());
+        let source = read_repo_file("xtask/src/lib.rs");
+        assert!(source.contains("pub fn run_gui_shell_tests() -> Result<()>"));
+        assert!(source.contains("Arch base has no desktop gate"));
+        assert!(source.contains("Arch base has no desktop boot"));
+    }
+
+    #[test]
+    fn gui_shell_root_disk_builder_is_not_publicly_reachable() {
+        let source = read_repo_file("xtask/src/lib.rs");
+
+        assert!(source.contains("pub fn run_gui_shell_boot() -> Result<()>"));
+        assert!(source.contains("Arch base has no desktop boot"));
+        assert!(!source.contains("\"test-gui-shell\" | \"gui-shell\" => Some"));
+    }
+
+    #[test]
+    fn initramfs_rootfs_keeps_initrd_even_with_root_bind_disk() {
+        let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, r"C:\tmp\bind.raw");
+        let cfg = grub_cfg_content(&BootMode::InitramfsRootfsTest);
+
+        assert!(cfg.contains("initrd /boot/initramfs.cpio"));
+    }
+
+    #[test]
+    fn qemu_machine_default_tracks_root_disk_request() {
+        assert_eq!(pick_qemu_machine_from_env(None, None), "pc");
+        assert_eq!(pick_qemu_machine_from_env(None, Some("   ")), "pc");
+        assert_eq!(
+            pick_qemu_machine_from_env(None, Some(r"C:\tmp\lupos.qcow2")),
+            "q35"
+        );
+        assert_eq!(
+            pick_qemu_machine_from_env(Some("  pc  "), Some(r"C:\tmp\lupos.qcow2")),
+            "pc"
+        );
+    }
+
+    #[test]
+    fn qemu_machine_override_wins_over_root_disk_default() {
+        let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, r"C:\tmp\lupos.qcow2");
+        let _machine = EnvVarGuard::set(LUPOS_QEMU_MACHINE_ENV, "pc");
+        let iso = Path::new(r"C:\tmp\lupos.iso");
+        let serial_log = Path::new(r"C:\tmp\serial.log");
+        let command = build_qemu_iso_command(iso, serial_log, 1);
+        let rendered = render_command(&command);
+
+        assert!(
+            rendered.contains("-machine pc,accel="),
+            "explicit machine override must win, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn smp_mode_has_test_smp_feature() {
+        let features = feature_list(BootMode::SmpTest, true);
+        assert!(
+            features.contains(&"test-smp"),
+            "SmpTest must include test-smp"
+        );
+        assert!(
+            features.contains(&"qemu-test"),
+            "SmpTest must include qemu-test"
+        );
+    }
+
+    #[test]
+    fn smp_mode_name_is_smp_test() {
+        assert_eq!(mode_name(BootMode::SmpTest), "smp-test");
+    }
+
+    #[test]
+    fn smp_banner_constant_is_correct() {
+        // The banner must match the log_info! call in smp.rs run_ipi_ping_test().
+        assert!(SMP_BANNER.contains("IPI ping test PASSED"));
+    }
+
+    #[test]
+    fn external_suite_boot_modes_and_feature_flags_are_wired() {
+        for mode in [
+            "kunit",
+            "test-kunit",
+            "kselftest",
+            "ltp",
+            "xfstests",
+            "blktests",
+            "packetdrill",
+            "smp-preempt",
+            "smp-migration",
+            "pthread-smoke",
+        ] {
+            assert!(
+                resolve_boot_test_mode(mode).is_some(),
+                "external suite boot mode should resolve: {mode}"
+            );
+        }
+
+        let features = feature_list(BootMode::KunitTest, true);
+        assert!(features.contains(&"test-kunit"));
+        assert!(features.contains(&"qemu-test"));
+        assert_eq!(mode_name(BootMode::KunitTest), "kunit");
+
+        let smp_preempt = feature_list(BootMode::SmpPreemptTest, true);
+        assert!(smp_preempt.contains(&"test-smp-preempt"));
+        assert_eq!(mode_name(BootMode::SmpPreemptTest), "smp-preempt");
+
+        let smp_migration = feature_list(BootMode::SmpMigrationTest, true);
+        assert!(smp_migration.contains(&"test-smp-migration"));
+        assert_eq!(mode_name(BootMode::SmpMigrationTest), "smp-migration");
+
+        let pthread_smoke = feature_list(BootMode::PthreadSmokeTest, true);
+        assert!(pthread_smoke.contains(&"test-pthread-smoke"));
+        assert_eq!(mode_name(BootMode::PthreadSmokeTest), "pthread-smoke");
+    }
+
+    #[test]
+    fn kunit_gate_uses_extended_timeout_budget() {
+        let options = kunit_tap_run_options();
+        assert!(options.exit_after_boot);
+        assert_eq!(options.qemu_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(options.smp_count, 1);
+    }
+
+    #[test]
+    fn smp_tail_gates_use_extended_timeout_budget() {
+        let options = abi_parity_smp_tail_run_options();
+        assert!(options.exit_after_boot);
+        assert_eq!(options.qemu_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(options.smp_count, 4);
+    }
+
+    #[test]
+    fn late_boot_gates_use_extended_timeout_budget() {
+        let options = phase17_late_boot_run_options();
+        assert!(options.exit_after_boot);
+        assert_eq!(options.qemu_timeout, Some(Duration::from_secs(300)));
+        assert_eq!(options.smp_count, 1);
+    }
+
+    #[test]
+    fn smp_runtime_gate_uses_extended_timeout_budget() {
+        let options = phase17_smp_runtime_run_options();
+        assert!(options.exit_after_boot);
+        assert_eq!(options.qemu_timeout, Some(Duration::from_secs(300)));
+        assert_eq!(options.smp_count, 4);
+    }
+
+    #[test]
+    fn ptrace_seccomp_selftests_mode_is_real() {
+        assert!(resolve_boot_test_mode("ptrace-seccomp-selftests").is_some());
+        assert!(resolve_boot_test_mode("test-ptrace-seccomp-selftests").is_some());
+        let features = feature_list(BootMode::PtraceSeccompSelftestsTest, true);
+        assert!(features.contains(&"test-ptrace-seccomp-selftests"));
+        assert!(features.contains(&"qemu-test"));
+        assert_eq!(
+            mode_name(BootMode::PtraceSeccompSelftestsTest),
+            "ptrace-seccomp-selftests"
+        );
+    }
+
+    #[test]
+    fn suite_runner_env_bridge_is_wired() {
+        let script = read_repo_file("src/scripts/abi-parity-suite/run_suite.sh");
+        assert!(script.contains("ABI_PARITY_LINUX_RUNNER"));
+        assert!(script.contains("ABI_PARITY_LUPOS_RUNNER"));
+        assert!(!script.contains("PHASE17_LINUX_RUNNER"));
+        assert!(!script.contains("PHASE17_LUPOS_RUNNER"));
+    }
+
+    #[test]
+    fn external_suite_runners_are_present() {
+        for path in [
+            "src/scripts/abi-parity-suite/runners/common.sh",
+            "src/scripts/abi-parity-suite/runners/ltp-linux.sh",
+            "src/scripts/abi-parity-suite/runners/ltp-lupos.sh",
+            "src/scripts/abi-parity-suite/runners/xfstests-linux.sh",
+            "src/scripts/abi-parity-suite/runners/xfstests-lupos.sh",
+            "src/scripts/abi-parity-suite/runners/blktests-linux.sh",
+            "src/scripts/abi-parity-suite/runners/blktests-lupos.sh",
+            "src/scripts/abi-parity-suite/runners/packetdrill-linux.sh",
+            "src/scripts/abi-parity-suite/runners/packetdrill-lupos.sh",
+            "src/scripts/abi-parity-suite/runners/strace-ab-linux.sh",
+            "src/scripts/abi-parity-suite/runners/strace-ab-lupos.sh",
+            "src/scripts/abi-parity-suite/runners/syzkaller-linux.sh",
+            "src/scripts/abi-parity-suite/runners/syzkaller-lupos.sh",
+            "src/scripts/abi-parity-suite/runners/arch-rootfs-linux.sh",
+            "src/scripts/abi-parity-suite/runners/arch-rootfs-lupos.sh",
+        ] {
+            let contents = read_repo_file(path);
+            assert!(
+                !contents.trim().is_empty(),
+                "external suite runner input {path} must exist and be non-empty"
+            );
+        }
+    }
+
+    #[test]
+    fn strace_runner_uses_mapped_workload_ids() {
+        let runner = read_repo_file("src/scripts/abi-parity-suite/runners/strace-ab-lupos.sh");
+        assert!(runner.contains("strace-true"));
+        assert!(runner.contains("strace-echo"));
+        assert!(runner.contains("strace-uname"));
+        assert!(
+            !runner.contains("login-stack"),
+            "strace workload runner should stay pinned to mapped syscall-trace gates instead of the distro login gate"
+        );
+    }
+
+    #[test]
+    fn syzkaller_linux_runner_builds_to_explicit_artifact() {
+        let runner = read_repo_file("src/scripts/abi-parity-suite/runners/syzkaller-linux.sh");
+        assert!(
+            runner.contains("go build -o"),
+            "syzkaller Linux reference runner should build into a staged artifact path instead of colliding with the source tree"
+        );
+        assert!(runner.contains("syz-manager-linux-reference"));
+    }
+
+    #[test]
+    fn distro_rootfs_lupos_runners_use_guest_command_helper() {
+        for suite in ["arch-rootfs"] {
+            let runner = read_repo_file(&format!(
+                "src/scripts/abi-parity-suite/runners/{suite}-lupos.sh"
+            ));
+            assert!(
+                runner.contains("kselftest-lupos-guest"),
+                "{suite} Lupos runner should reuse the staged login-and-command helper"
+            );
+            assert!(
+                !runner.contains("test-boot --mode login-stack"),
+                "{suite} Lupos runner should avoid the heavier login-stack interactive tail"
+            );
+        }
+    }
+
+    #[test]
+    fn kselftest_lupos_runner_uses_extended_timeout_budget() {
+        let runner = read_repo_file("src/scripts/abi-parity-suite/runners/kselftest-lupos.sh");
+        assert!(
+            runner.contains("ABI_PARITY_KSELFTEST_QEMU_TIMEOUT_SECS:-1800"),
+            "full kselftest guest runs need a long default timeout with an override"
+        );
+        assert!(
+            runner.matches("--timeout-secs").count() >= 1,
+            "the xtask guest path should pass the timeout through"
+        );
+    }
+
+    #[test]
+    fn generated_kselftest_guest_runner_supports_manifest_filter() {
+        let builder = read_repo_file("src/scripts/abi-parity-suite/build_suite.sh");
+        assert!(
+            builder.contains("ABI_PARITY_KSELFTEST_FILTER"),
+            "kselftest guest runner should support focused upstream test reruns"
+        );
+        assert!(
+            builder.contains("kselftest:filter"),
+            "focused reruns should fail closed when a filter matches no manifest row"
+        );
+    }
+
+    #[test]
+    fn abi_parity_serial_parser_handles_terminal_carriage_returns() {
+        let serial = "\x1b[?2004l\rABI_PARITY_RESULT\tprobe\tpass\tok\r\nABI_PARITY_DONE\r\n";
+        let rows = parse_abi_parity_serial_result_lines(serial).expect("parse rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].test_id, "probe");
+        assert_eq!(rows[0].status, "pass");
+        assert_eq!(rows[0].notes, "ok");
+    }
+
+    #[test]
+    fn runner_backed_suites_can_use_script_or_env_overrides() {
+        let arch_linux = abi_parity_runner_script_path("arch-rootfs", AbiParityRunTarget::Linux)
+            .expect("arch linux runner path");
+        let arch_lupos = abi_parity_runner_script_path("arch-rootfs", AbiParityRunTarget::Lupos)
+            .expect("arch lupos runner path");
+        assert!(arch_linux.exists());
+        assert!(arch_lupos.exists());
+
+        let _linux = EnvVarGuard::set("ABI_PARITY_LINUX_RUNNER", "bash -lc true");
+        let _lupos = EnvVarGuard::set("ABI_PARITY_LUPOS_RUNNER", "bash -lc true");
+        assert!(abi_parity_runner_override_configured(
+            AbiParityRunTarget::Linux
+        ));
+        assert!(abi_parity_runner_override_configured(
+            AbiParityRunTarget::Lupos
+        ));
+    }
+
+    #[test]
+    fn suite_script_commands_use_linux_native_scripts() {
+        let root = Path::new(r"C:\repo\lupos");
+        let build = abi_parity_shell_script_command(
+            root,
+            "src/scripts/abi-parity-suite/build_suite.sh",
+            &["--suite", "ltp"],
+        );
+        let vendor = abi_parity_shell_script_command(
+            root,
+            "src/scripts/abi-parity-suite/vendor_sync.sh",
+            &["--suite", "ltp", "--fetch"],
+        );
+        let run = abi_parity_shell_script_command(
+            root,
+            "src/scripts/abi-parity-suite/run_suite.sh",
+            &["--suite", "ltp", "--target", "linux"],
+        );
+
+        assert!(render_command(&build).contains("src/scripts/abi-parity-suite/build_suite.sh"));
+        assert!(render_command(&vendor).contains("src/scripts/abi-parity-suite/vendor_sync.sh"));
+        assert!(render_command(&run).contains("src/scripts/abi-parity-suite/run_suite.sh"));
+    }
+
+    #[test]
+    fn suite_result_summary_parser_accepts_real_contract() {
+        let summary =
+            "test_id\tstatus\tnotes\nmm\tpass\tcollection passed\nsched\tfail\tsee raw.log\n";
+        let rows = parse_abi_parity_result_summary(summary).expect("summary rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].test_id, "mm");
+        assert_eq!(rows[1].status, "fail");
+    }
+
+    #[test]
+    fn kselftest_linux_mm_reference_rejects_failing_rows() {
+        let rows = parse_abi_parity_result_summary(
+            "test_id\tstatus\tnotes\nmm:mmap\tpass\texit=0\nmm:cow\tfail\texit=1\n",
+        )
+        .expect("summary rows");
+        let err = validate_abi_parity_result_summary("kselftest", AbiParityRunTarget::Linux, &rows)
+            .expect_err("linux mm failures should invalidate the reference");
+        assert!(
+            err.to_string().contains("Linux kselftest MM reference"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn kselftest_linux_mm_reference_allows_pass_and_skip() {
+        let rows = parse_abi_parity_result_summary(
+            "test_id\tstatus\tnotes\nmm:mmap\tpass\texit=0\nmm:hmm\tskip\texit=4\n",
+        )
+        .expect("summary rows");
+        validate_abi_parity_result_summary("kselftest", AbiParityRunTarget::Linux, &rows)
+            .expect("pass/skip reference rows should be acceptable");
+    }
+
+    #[test]
+    fn qemu_iso_command_with_smp_adds_flag() {
+        let iso = Path::new(r"C:\tmp\lupos.iso");
+        let serial_log = Path::new(r"C:\tmp\serial.log");
+        let command = build_qemu_iso_command(iso, serial_log, 2);
+        let rendered = render_command(&command);
+        assert!(rendered.contains("-smp 2"), "smp_count=2 must add -smp 2");
+    }
+
+    #[test]
+    fn qemu_iso_command_passes_accel_through_machine() {
+        let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, "");
+        let _machine = EnvVarGuard::set(LUPOS_QEMU_MACHINE_ENV, "");
+        let iso = Path::new(r"C:\tmp\lupos.iso");
+        let serial_log = Path::new(r"C:\tmp\serial.log");
+        let command = build_qemu_iso_command(iso, serial_log, 1);
+        let rendered = render_command(&command);
+        assert!(
+            rendered.contains("-machine pc,accel="),
+            "QEMU must request hardware acceleration via -machine accel=<chain>, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn pick_qemu_accel_honors_env_override() {
+        {
+            let _accel = EnvVarGuard::set(LUPOS_QEMU_ACCEL_ENV, "tcg");
+            assert_eq!(pick_qemu_accel(), "tcg");
+        }
+        {
+            let _accel = EnvVarGuard::set(LUPOS_QEMU_ACCEL_ENV, "  kvm  ");
+            assert_eq!(pick_qemu_accel(), "kvm");
+        }
+    }
+
+    #[test]
+    fn login_iso_boot_defaults_to_release_without_profile_override() {
+        assert_eq!(login_boot_default_release_profile(None, None), Some("1"));
+        assert_eq!(login_boot_default_release_profile(Some("0"), None), None);
+        assert_eq!(
+            login_boot_default_release_profile(None, Some("debug")),
+            None
+        );
+        assert_eq!(
+            login_boot_default_release_profile(None, Some("release")),
+            None
+        );
+    }
+
+    #[test]
+    fn makefile_frontend_has_expected_targets() {
+        let root = repo_root().expect("repo root");
+        let makefile = root.join("Makefile");
+        assert!(
+            makefile.exists(),
+            "top-level Makefile is required for Linux-style builds"
+        );
+        let text = fs::read_to_string(&makefile)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", makefile.display()));
+        for needle in [
+            "config:",
+            "lupos_defconfig:",
+            "syncconfig:",
+            "kernel:",
+            "image:",
+            "all:",
+            "build:",
+            "iso:",
+            "localmodconfig:",
+            "test:",
+            "ping-smoke:",
+        ] {
+            assert!(
+                text.contains(needle),
+                "Makefile missing required target {}",
+                needle.trim_end_matches(':')
+            );
+        }
+        for needle in [
+            ".DEFAULT_GOAL := image",
+            "all: image",
+            "kernel: syncconfig",
+            "$(CARGO) xtask build",
+            "image: syncconfig",
+            "$(CARGO) xtask build --userland --iso",
+            "build: kernel",
+        ] {
+            assert!(
+                text.contains(needle),
+                "Makefile must expose the two-command build surface via {needle}"
+            );
+        }
+        assert!(
+            text.contains("iso: syncconfig"),
+            "make iso must sync Kconfig outputs before delegating to cargo xtask"
+        );
+        assert!(
+            text.contains("$(CARGO) xtask run --ping-smoke"),
+            "make ping-smoke must delegate to the unified xtask run command"
+        );
+        assert!(
+            !text.contains("$(CARGO) xtask qemu-iso"),
+            "Makefile run targets should not use removed qemu-iso xtask commands"
+        );
+    }
+
+    #[test]
+    fn readme_documents_basic_make_and_xtask_flow() {
+        let root = repo_root().expect("repo root");
+        let readme = fs::read_to_string(root.join("README.md")).expect("README.md");
+        let makefile = fs::read_to_string(root.join("Makefile")).expect("Makefile");
+
+        for needle in [
+            "make kernel",
+            "make image",
+            "cargo xtask build",
+            "cargo xtask build --userland --iso",
+            "cargo xtask test",
+            "cargo xtask run",
+            "root` / `lupos",
+        ] {
+            assert!(readme.contains(needle), "README missing {needle}");
+        }
+        for target in [
+            "config:",
+            "kernel:",
+            "image:",
+            "build:",
+            "test:",
+            "run:",
+            "ping-smoke:",
+        ] {
+            assert!(
+                makefile.contains(target),
+                "README documents a Make target that must exist: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_build_default_is_pure_kernel_bzimage_only() {
+        assert_eq!(
+            dev_build_actions(Vec::new()).expect("default build actions"),
+            vec!["bzimage".to_string()],
+            "cargo xtask build must build only the pure kernel image"
+        );
+    }
+
+    #[test]
+    fn dev_build_userland_iso_flags_are_image_path() {
+        assert_eq!(
+            dev_build_actions(vec!["--userland".to_string(), "--iso".to_string()])
+                .expect("image build actions"),
+            vec!["userland".to_string(), "iso".to_string()],
+            "cargo xtask build --userland --iso must stage userland before ISO"
+        );
+    }
+
+    #[test]
+    fn default_lupos_unit_gate_runs_kernel_state_tests_serially() {
+        assert_eq!(
+            LUPOS_LIB_TEST_ARGS,
+            &["test", "-p", "lupos", "--lib", "--", "--test-threads=1"],
+            "the default xtask test gate must serialize lupos kernel-state tests"
+        );
+        assert_eq!(
+            XTASK_LIB_TEST_ARGS,
+            &["test", "-p", "xtask", "--lib", "--", "--test-threads=1"],
+            "the default xtask test gate must serialize xtask env-var tests"
+        );
+    }
+
+    #[test]
+    fn makefile_has_linux_install_targets() {
+        let root = repo_root().expect("repo root");
+        let makefile = root.join("Makefile");
+        let text = fs::read_to_string(&makefile)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", makefile.display()));
+
+        for needle in [
+            "bzImage:",
+            "modules:",
+            "modules_install:",
+            "install:",
+            "$(CARGO) xtask modules-install",
+            "$(CARGO) xtask install",
+        ] {
+            assert!(
+                text.contains(needle),
+                "Makefile missing Linux-style install/build target wiring: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn iso_build_pins_xorriso_dates() {
+        let root = repo_root().expect("repo root");
+        let xtask = root.join("xtask").join("src").join("lib.rs");
+        let text = fs::read_to_string(&xtask)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", xtask.display()));
+
+        for needle in [
+            "SOURCE_DATE_EPOCH",
+            "-iso_nowtime",
+            "\"f\"",
+            "uuid",
+            "-alter_date_r",
+        ] {
+            assert!(
+                text.contains(needle),
+                "ISO build should pin xorriso timestamps for byte-stable baseline: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn makefile_builds_kconfig_tools_out_of_tree() {
+        let root = repo_root().expect("repo root");
+        let makefile_path = root.join("Makefile");
+        let makefile = fs::read_to_string(&makefile_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", makefile_path.display()));
+
+        // The Linux top-level Makefile is off-limits: it would drag in the
+        // full kbuild stack and a kernel tree Lupos does not own.  The
+        // upstream scripts/kconfig/Makefile is also off-limits for mconf and
+        // nconf because it relies on kbuild's hostprogs machinery to inject
+        // include paths and ncurses link flags.  Lupos must compile the
+        // hostprogs directly via scripts/build_kconfig_tools.sh.
+        assert!(
+            !makefile.contains("-C vendor/linux "),
+            "Makefile must not delegate to the Linux top-level Makefile"
+        );
+        assert!(
+            !makefile.contains("-C vendor/linux scripts/kconfig/"),
+            "Makefile must not invoke the Linux top-level Makefile for Kconfig tools"
+        );
+        assert!(
+            !makefile.contains("$(MAKE) -C $(KCONFIG_DIR)"),
+            "Kconfig host tools must not rely on kbuild hostprogs invoked standalone (it falls back to make's implicit %: %.c rule and drops -I and ncurses libs)"
+        );
+
+        let helper_path = root
+            .join("src")
+            .join("scripts")
+            .join("build_kconfig_tools.sh");
+        assert!(
+            helper_path.exists(),
+            "src/scripts/build_kconfig_tools.sh must exist so Kconfig tools build outside kbuild's hostprogs machinery"
+        );
+
+        for needle in [
+            "bash src/scripts/build_kconfig_tools.sh conf",
+            "bash src/scripts/build_kconfig_tools.sh mconf",
+            "bash src/scripts/build_kconfig_tools.sh nconf",
+        ] {
+            assert!(
+                makefile.contains(needle),
+                "Makefile rule should delegate to: {needle}"
+            );
+        }
+
+        let helper = fs::read_to_string(&helper_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", helper_path.display()));
+
+        // Canonical common-objs from vendor/linux/scripts/kconfig/Makefile.
+        // Lexer/parser pre-generated sources are committed in vendor, so we
+        // do not need bison/flex on the host.
+        for needle in [
+            "scripts/include",
+            "confdata.c",
+            "expr.c",
+            "lexer.lex.c",
+            "menu.c",
+            "parser.tab.c",
+            "preprocess.c",
+            "symbol.c",
+            "util.c",
+        ] {
+            assert!(
+                helper.contains(needle),
+                "src/scripts/build_kconfig_tools.sh must reference upstream kbuild common source: {needle}"
+            );
+        }
+
+        // mconf wires lxdialog + mnconf-common + ncurses cfg.
+        for needle in [
+            "mnconf-common.c",
+            "lxdialog/checklist.c",
+            "lxdialog/inputbox.c",
+            "lxdialog/menubox.c",
+            "lxdialog/textbox.c",
+            "lxdialog/util.c",
+            "lxdialog/yesno.c",
+            "mconf-cfg.sh",
+        ] {
+            assert!(
+                helper.contains(needle),
+                "src/scripts/build_kconfig_tools.sh must reference upstream mconf source: {needle}"
+            );
+        }
+
+        // nconf wires nconf.gui + nconf-cfg.
+        for needle in ["nconf.c", "nconf.gui.c", "nconf-cfg.sh"] {
+            assert!(
+                helper.contains(needle),
+                "src/scripts/build_kconfig_tools.sh must reference upstream nconf source: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn kconfig_tree_and_defconfigs_exist() {
+        let root = repo_root().expect("repo root");
+
+        let kconfig = root.join("src").join("kernel").join("Kconfig");
+        assert!(
+            kconfig.exists(),
+            "src/kernel/Kconfig must exist for Linux-style configuration"
+        );
+        let kconfig_text = fs::read_to_string(&kconfig)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", kconfig.display()));
+        assert!(
+            kconfig_text.contains("mainmenu \"Lupos\""),
+            "src/kernel/Kconfig must declare mainmenu \"Lupos\""
+        );
+
+        let defconfig = root.join("configs").join("lupos_defconfig");
+        assert!(defconfig.exists(), "configs/lupos_defconfig must exist");
+
+        let defconfig_text = fs::read_to_string(&defconfig)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", defconfig.display()));
+        for needle in [
+            "CONFIG_MODULES=y",
+            "CONFIG_BLOCK=y",
+            "CONFIG_SERIAL_8250=y",
+            "CONFIG_NET=y",
+            "CONFIG_NETDEVICES=y",
+            "CONFIG_SOUND=y",
+            "CONFIG_SND_HDA_INTEL=y",
+            "CONFIG_VIRTIO_PCI_LIB=m",
+            "CONFIG_VIRTIO_PCI=m",
+            "CONFIG_VIRTIO_BLK=m",
+            "CONFIG_VIRTIO_NET=m",
+            "CONFIG_E1000=m",
+        ] {
+            assert!(
+                defconfig_text.contains(needle),
+                "lupos_defconfig should explicitly set {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_rs_bridges_linux_kconfig_rust_cfgs() {
+        let root = repo_root().expect("repo root");
+        let build_rs = root.join("build.rs");
+        let text = fs::read_to_string(&build_rs)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", build_rs.display()));
+
+        assert!(
+            text.contains("src/include/generated/rustc_cfg"),
+            "build.rs must consume src/include/generated/rustc_cfg (generated by scripts/kconfig --syncconfig)"
+        );
+        assert!(
+            text.contains("cargo:rustc-cfg="),
+            "build.rs must emit cargo:rustc-cfg lines to bridge CONFIG_* into Rust"
+        );
+
+        let kconfig_rs = root.join("src").join("kernel").join("kconfig.rs");
+        let kconfig_text = fs::read_to_string(&kconfig_rs)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", kconfig_rs.display()));
+        for needle in [
+            "pub enum Tristate",
+            "pub const CONFIG_SYMBOLS",
+            "config_value!(CONFIG_X86_64)",
+            "config_value!(CONFIG_SOUND)",
+            "config_value!(CONFIG_SND_HDA_INTEL)",
+            "config_value!(CONFIG_VIRTIO_NET)",
+        ] {
+            assert!(
+                kconfig_text.contains(needle),
+                "kernel Rust config bridge should expose const-table support: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn gitignore_ignores_generated_kconfig_artifacts() {
+        let root = repo_root().expect("repo root");
+        let gitignore = root.join(".gitignore");
+        let text = fs::read_to_string(&gitignore)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", gitignore.display()));
+        for needle in [".config", "src/include/config/", "src/include/generated/"] {
+            assert!(
+                text.contains(needle),
+                ".gitignore should include {needle} to avoid committing generated Kconfig outputs"
+            );
+        }
+    }
+
+    #[test]
+    fn makefile_has_common_config_presets() {
+        let root = repo_root().expect("repo root");
+        let makefile = root.join("Makefile");
+        let text = fs::read_to_string(&makefile)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", makefile.display()));
+
+        for needle in [
+            "allnoconfig:",
+            "allyesconfig:",
+            "allmodconfig:",
+            "alldefconfig:",
+            "tinyconfig:",
+        ] {
+            assert!(
+                text.contains(needle),
+                "Makefile missing config preset target {}",
+                needle.trim_end_matches(':')
+            );
+        }
+        assert!(
+            text.contains("KCONFIG_ALLCONFIG=$(TINY_BASE_CONFIG)"),
+            "tinyconfig should follow Linux's KCONFIG_ALLCONFIG + allnoconfig flow"
+        );
+        assert!(
+            !text.contains("tinyconfig: allnoconfig"),
+            "tinyconfig must be a real preset, not an allnoconfig alias"
+        );
+    }
+
+    #[test]
+    fn makefile_localmodconfig_is_device_aware() {
+        let root = repo_root().expect("repo root");
+        let makefile = root.join("Makefile");
+        let text = fs::read_to_string(&makefile)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", makefile.display()));
+
+        assert!(
+            !text.contains("localmodconfig: stub"),
+            "localmodconfig should not be a stub"
+        );
+
+        let script = root.join("src").join("scripts").join("localmodconfig.sh");
+        assert!(
+            script.exists(),
+            "localmodconfig hardware mapping should live in src/scripts/localmodconfig.sh"
+        );
+        assert!(
+            text.contains("src/scripts/localmodconfig.sh"),
+            "Makefile localmodconfig should delegate the detection matrix to src/scripts/localmodconfig.sh"
+        );
+        let script_text = fs::read_to_string(&script)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", script.display()));
+        assert!(
+            text.contains("lspci") || script_text.contains("lspci"),
+            "localmodconfig should probe PCI via lspci when available"
+        );
+        for needle in [
+            "LUPOS_ACPI_DUMP",
+            "LUPOS_DMI_DUMP",
+            "1af4:",
+            "qemu|bochs|kvm",
+            "CONFIG_PCI=y",
+            "CONFIG_ACPI=y",
+            "CONFIG_FRAMEBUFFER=y",
+            "CONFIG_DRM=y",
+            "CONFIG_USB_XHCI=y",
+            "CONFIG_HID=y",
+            "CONFIG_SOUND=y",
+            "CONFIG_SND_HDA_INTEL=y",
+            "CONFIG_VIRTIO_PCI_LIB=m",
+            "CONFIG_VIRTIO_PCI=m",
+            "CONFIG_VIRTIO_BLK=m",
+            "CONFIG_VIRTIO_NET=m",
+            "CONFIG_E1000=m",
+        ] {
+            assert!(
+                text.contains(needle) || script_text.contains(needle),
+                "localmodconfig should include ACPI/DMI-aware device mapping for {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn kconfig_and_qemu_defconfig_cover_qemu_hardware_classes() {
+        let root = repo_root().expect("repo root");
+        let kconfig = root.join("src").join("kernel").join("Kconfig");
+        let kconfig_text = fs::read_to_string(&kconfig)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", kconfig.display()));
+        for needle in [
+            "config PCI",
+            "config ACPI",
+            "config FRAMEBUFFER",
+            "config DRM",
+            "config USB_XHCI",
+            "config HID",
+            "config INPUT",
+            "config SOUND",
+            "config SND_HDA_INTEL",
+        ] {
+            assert!(
+                kconfig_text.contains(needle),
+                "src/kernel/Kconfig should expose detected hardware class symbol: {needle}"
+            );
+        }
+
+        let lupos_defconfig = root.join("configs").join("lupos_defconfig");
+        let lupos_defconfig_text = fs::read_to_string(&lupos_defconfig)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", lupos_defconfig.display()));
+        for needle in [
+            "CONFIG_PCI=y",
+            "CONFIG_ACPI=y",
+            "CONFIG_FRAMEBUFFER=y",
+            "CONFIG_DRM=y",
+            "CONFIG_USB=y",
+            "CONFIG_USB_XHCI=y",
+            "CONFIG_INPUT=y",
+            "CONFIG_HID=y",
+            "CONFIG_SOUND=y",
+            "CONFIG_SND_HDA_INTEL=y",
+        ] {
+            assert!(
+                lupos_defconfig_text.contains(needle),
+                "lupos_defconfig should enable detected hardware class: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn kconfig_declares_module_capable_driver_symbols() {
+        let root = repo_root().expect("repo root");
+        let kconfig = root.join("src").join("kernel").join("Kconfig");
+        let text = fs::read_to_string(&kconfig)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", kconfig.display()));
+        let text = text.replace("\r\n", "\n");
+
+        for needle in [
+            "modules",
+            "config VIRTIO_PCI_LIB\n\ttristate",
+            "config VIRTIO_PCI\n\ttristate",
+            "config VIRTIO_BLK\n\ttristate",
+            "config VIRTIO_NET\n\ttristate",
+            "config E1000\n\ttristate",
+        ] {
+            assert!(
+                text.contains(needle),
+                "src/kernel/Kconfig must expose module-capable driver symbol: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_sources_are_linux_module_payloads_not_builtins() {
+        let root = repo_root().expect("repo root");
+        let cargo = root.join("Cargo.toml");
+        let cargo_text = fs::read_to_string(&cargo)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", cargo.display()));
+        let retired_fixture_feature = ["legacy", "-rust", "-driver", "-fixtures"].concat();
+        assert!(
+            !cargo_text.contains(&retired_fixture_feature),
+            "driver policy must not expose an opt-in feature for local Rust driver fixtures"
+        );
+
+        let block_mod = root
+            .join("src")
+            .join("linux_driver_abi")
+            .join("block")
+            .join("mod.rs");
+        let block_text = fs::read_to_string(&block_mod)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", block_mod.display()));
+        assert!(
+            block_text.contains("linux-source: vendor/linux/block")
+                && !block_text.contains("linux-source: vendor/linux/drivers/block"),
+            "block ABI glue must map to core vendor/linux/block sources, not a local drivers/block implementation"
+        );
+        assert!(
+            !block_text.contains("pub mod virtio_blk"),
+            "virtio_blk must not be a local Rust module; runtime uses Linux-built virtio_blk.ko"
+        );
+        assert!(
+            !block_text.contains("linux_driver_abi::virtio::"),
+            "generic block-core glue must not call a local Rust virtio path directly"
+        );
+        let block_virtio = root
+            .join("src")
+            .join("linux_driver_abi")
+            .join("block")
+            .join("virtio_blk.rs");
+        assert!(
+            !block_virtio.exists(),
+            "retired local virtio_blk Rust source must be removed; runtime uses Linux-built virtio_blk.ko"
+        );
+
+        let virtio_mod = root
+            .join("src")
+            .join("linux_driver_abi")
+            .join("virtio")
+            .join("mod.rs");
+        let virtio_text = fs::read_to_string(&virtio_mod)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", virtio_mod.display()));
+        let virtio_text_lf = virtio_text.replace("\r\n", "\n");
+        assert!(
+            virtio_text_lf.contains("drivers/virtio/virtio.c")
+                && virtio_text_lf.contains("drivers/virtio/virtio_ring.c")
+                && !virtio_text_lf.contains("drivers/virtio/virtio_pci_modern.c"),
+            "VirtIO ABI glue must mirror virtio.c/virtio_ring.c core only; PCI transport stays in Linux-built virtio_pci*.ko"
+        );
+        assert!(
+            !virtio_text_lf.contains("pub mod pci;"),
+            "virtio-pci must not be a local Rust module; runtime uses Linux-built virtio_pci*.ko"
+        );
+        let virtio_pci = root
+            .join("src")
+            .join("linux_driver_abi")
+            .join("virtio")
+            .join("pci.rs");
+        assert!(
+            !virtio_pci.exists(),
+            "retired local virtio-pci Rust source must be removed; runtime uses Linux-built virtio_pci*.ko"
+        );
+        for rel in [
+            "src/linux_driver_abi/base/linux_sources.rs",
+            "src/linux_driver_abi/gpu/drm/linux_sources.rs",
+            "src/linux_driver_abi/hid/linux_sources.rs",
+            "src/linux_driver_abi/input/linux_sources.rs",
+            "src/linux_driver_abi/pci/linux_sources.rs",
+            "src/linux_driver_abi/tty/linux_sources.rs",
+            "src/linux_driver_abi/usb/linux_sources.rs",
+            "src/linux_driver_abi/virtio/linux_sources.rs",
+            "src/kernel/module/linux_sources.rs",
+        ] {
+            let text = fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|err| panic!("failed to read {rel}: {err}"));
+            assert!(
+                text.contains("source truth") || text.contains("source inventory"),
+                "{rel} should describe vendor/linux as source truth"
+            );
+            assert!(
+                !text.contains("covered by Lupos scaffolding")
+                    && !text.contains("lightweight scaffolding")
+                    && !text.contains("Behaviour is mirrored or stubbed on demand"),
+                "{rel} must not describe local Rust driver scaffolding as coverage"
+            );
+        }
+        for needle in [
+            "pub struct VirtioDevice",
+            "pub struct VirtioDriver",
+            "pub fn register_virtio_driver",
+            "pub fn add_virtio_device",
+            "linux_virtqueue_set_transport_ready",
+            "linux_virtqueue_complete_buffer",
+            "linux_vring_write_used_idx",
+            "linux_vring_write_used_elem",
+            "transport_ready",
+        ] {
+            assert!(
+                !virtio_text_lf.contains(needle),
+                "VirtIO core must not keep local Rust driver fixture path: {needle}"
+            );
+        }
+        let pci_driver = root
+            .join("src")
+            .join("linux_driver_abi")
+            .join("pci")
+            .join("driver.rs");
+        let pci_driver_text = fs::read_to_string(&pci_driver)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", pci_driver.display()));
+        assert!(
+            !pci_driver_text.contains("pub struct PciDriver"),
+            "local Rust PCI driver wrappers must not exist; runtime binding uses Linux struct pci_driver"
+        );
+        assert!(
+            !pci_driver_text.contains("pub fn pci_register_driver"),
+            "local Rust PCI driver registration must not exist; runtime modules call __pci_register_driver"
+        );
+        let pci_enumerate = root
+            .join("src")
+            .join("linux_driver_abi")
+            .join("pci")
+            .join("enumerate.rs");
+        let pci_enumerate_text = fs::read_to_string(&pci_enumerate)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", pci_enumerate.display()));
+        assert!(
+            pci_enumerate_text.contains("linux-parity: partial"),
+            "PCI enumeration must not claim complete Linux parity while bridge recursion and full probe parity remain incomplete"
+        );
+        assert!(
+            !pci_enumerate_text.contains("driver::pci_device_probe")
+                && !pci_enumerate_text.contains("PCI_DRIVERS")
+                && !pci_enumerate_text.contains("drv.matches"),
+            "PCI enumeration must publish real devices only; runtime driver binding belongs to Linux-built .ko modules through __pci_register_driver"
+        );
+        let init_main = root.join("src").join("init").join("main.rs");
+        let init_main_text = fs::read_to_string(&init_main)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", init_main.display()));
+        assert!(
+            !init_main_text.contains("block::virtio_blk")
+                && !init_main_text.contains("register_virtio_blk"),
+            "boot code must not register a Rust virtio-blk device; it should only expose Linux ABI state for Linux-built .ko drivers"
+        );
+        assert!(
+            !init_main_text.contains("record_boot_virtio_blk_probe_plans"),
+            "boot code must not keep a Rust virtio-blk probe-plan hook; PCI discovery should only publish Linux ABI device state"
+        );
+        assert!(
+            !init_main_text.contains("LinuxVirtioDriver")
+                && !init_main_text.contains("__register_virtio_driver("),
+            "boot acceptance must not fabricate a local virtio driver; vendor-built .ko modules call __register_virtio_driver"
+        );
+        let rootfs = root.join("src").join("init").join("rootfs.rs");
+        let rootfs_text = fs::read_to_string(&rootfs)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", rootfs.display()));
+        assert!(
+            !rootfs_text.contains("linux_driver_abi::block::virtio_blk"),
+            "rootfs tests and boot code must not depend on the Rust virtio-blk fixture"
+        );
+        let layout_map = root.join("src").join("docs").join("linux-layout-map.tsv");
+        let layout_text = fs::read_to_string(&layout_map)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", layout_map.display()));
+        assert!(
+            layout_text.contains("src/linux_driver_abi/block/mod.rs\tvendor/linux/block\t")
+                && !layout_text
+                    .contains("src/linux_driver_abi/block/mod.rs\tvendor/linux/drivers/block\t"),
+            "layout map must treat block/mod.rs as block core, not as a local drivers/block implementation"
+        );
+        assert!(
+            !layout_text.contains("src/linux_driver_abi/block/virtio_blk.rs")
+                && !layout_text.contains("src/linux_driver_abi/virtio/pci.rs"),
+            "layout map must not retain retired local virtio driver source anchors"
+        );
+        let xtask_source = root.join("xtask").join("src").join("lib.rs");
+        let xtask_text = fs::read_to_string(&xtask_source)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", xtask_source.display()));
+        let stale_virtio_skeleton = ["virtio", "-blk skeleton"].concat();
+        let stale_virtio_skel = ["virtio", "-blk skel"].concat();
+        for (path, text) in [
+            ("Cargo.toml", cargo_text),
+            ("xtask/src/lib.rs", xtask_text),
+            ("src/init/main.rs", init_main_text),
+        ] {
+            assert!(
+                !text.contains(&stale_virtio_skeleton) && !text.contains(&stale_virtio_skel),
+                "{path} must not describe virtio-blk as a local skeleton"
+            );
+        }
+
+        let net_mod = root.join("src").join("net").join("mod.rs");
+        let net_text = fs::read_to_string(&net_mod)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", net_mod.display()));
+        assert!(
+            net_text.contains("CONFIG_VIRTIO_NET = \"m\""),
+            "virtio_net source visibility should be for module ABI/testing, not built-in driver init"
+        );
+        assert!(
+            !net_text.contains("CONFIG_VIRTIO_NET = \"y\"") && !net_text.contains("module_init()"),
+            "virtio_net must not run a local built-in Rust driver path"
+        );
+    }
+
+    #[test]
+    fn tristate_module_staging_follows_linux_modinst_shape() {
+        let config = "\
+CONFIG_MODULES=y
+CONFIG_VIRTIO_PCI_LIB=m
+CONFIG_VIRTIO_PCI=m
+CONFIG_VIRTIO_BLK=m
+# CONFIG_VIRTIO_NET is not set
+# CONFIG_E1000 is not set
+";
+        match staged_module_files_from_config_text(config) {
+            Ok(files) => {
+                let payload = files
+                    .iter()
+                    .find(|(path, _, _)| path.ends_with("virtio_blk.ko"))
+                    .expect("CONFIG_VIRTIO_BLK=m should stage virtio_blk.ko");
+                assert!(
+                    payload.2.starts_with(b"\x7fELF"),
+                    "staged driver payload must be a Linux-built ELF .ko"
+                );
+            }
+            Err(err) => {
+                assert!(
+                    err.to_string().contains("Linux-built module artifact"),
+                    "staging must refuse descriptor-backed modules: {err}"
+                );
+            }
+        }
+        assert_eq!(
+            etc_modules_from_config_text(config),
+            b"virtio_pci_modern_dev\nvirtio_pci\nvirtio_blk\n"
+        );
+    }
+
+    #[test]
+    fn driver_module_dependency_metadata_tracks_vendor_virtio_pci_split() {
+        let config = "\
+CONFIG_MODULES=y
+CONFIG_VIRTIO_PCI_LIB=m
+CONFIG_VIRTIO_PCI=m
+CONFIG_VIRTIO_BLK=m
+";
+        let specs = staged_module_specs_from_config_text(config);
+
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.module_name)
+                .collect::<Vec<_>>(),
+            vec!["virtio_pci_modern_dev", "virtio_pci", "virtio_blk"]
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.module_name == "virtio_pci")
+                .expect("virtio_pci spec")
+                .module_deps,
+            &["kernel/drivers/virtio/virtio_pci_modern_dev.ko"]
+        );
+    }
+
+    #[test]
+    fn vendor_linux_module_build_script_uses_source_archive_and_installs_elf_payloads() {
+        let root = Path::new(r"C:\repo\lupos");
+        let source = Path::new(r"C:\repo\lupos\target\vendor-linux-src");
+        let build = Path::new(r"C:\repo\lupos\target\vendor-linux-build");
+        let artifacts = Path::new(r"C:\repo\lupos\target\vendor-linux-modules");
+        let module = |name| {
+            DRIVER_MODULES
+                .iter()
+                .find(|spec| spec.module_name == name)
+                .expect("driver module spec")
+        };
+        let script = vendor_linux_module_build_script(
+            root,
+            source,
+            build,
+            artifacts,
+            &[
+                module("virtio_pci_modern_dev"),
+                module("virtio_pci"),
+                module("virtio_blk"),
+            ],
+        );
+
+        assert!(script.contains("git -C"));
+        assert!(script.contains("archive --format=tar HEAD"));
+        assert!(script.contains("KBUILD_MODPOST_WARN=1"));
+        assert!(script.contains("-d VIRTIO_PCI_LEGACY"));
+        assert!(script.contains("'drivers/virtio/virtio_pci_modern_dev.ko'"));
+        assert!(script.contains("'kernel/drivers/virtio/virtio_pci_modern_dev.ko'"));
+        assert!(script.contains("'drivers/virtio/virtio_pci.ko'"));
+        assert!(script.contains("'kernel/drivers/virtio/virtio_pci.ko'"));
+        assert!(script.contains("'drivers/block/virtio_blk.ko'"));
+        assert!(script.contains("'kernel/drivers/block/virtio_blk.ko'"));
+    }
+
+    #[test]
+    fn generic_storage_module_staging_matches_linux_probe_order() {
+        let config = "\
+CONFIG_MODULES=y
+CONFIG_SCSI_COMMON=m
+CONFIG_SCSI=m
+CONFIG_BLK_DEV_SD=m
+CONFIG_ATA=m
+CONFIG_SATA_AHCI=m
+";
+        assert_eq!(
+            etc_modules_from_config_text(config),
+            b"scsi_common\nscsi_mod\nsd_mod\nlibata\nlibahci\nahci\n"
+        );
+        let specs = staged_module_specs_from_config_text(config);
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.module_name == "ahci")
+                .expect("ahci spec")
+                .module_deps,
+            &[
+                "kernel/drivers/ata/libahci.ko",
+                "kernel/drivers/ata/libata.ko",
+                "kernel/drivers/scsi/scsi_mod.ko",
+            ]
+        );
+    }
+
+    #[test]
+    fn initramfs_modules_file_tracks_config_m_only() {
+        let config = "\
+CONFIG_MODULES=y
+CONFIG_VIRTIO_PCI_LIB=m
+CONFIG_VIRTIO_PCI=m
+CONFIG_VIRTIO_BLK=m
+CONFIG_VIRTIO_NET=m
+CONFIG_E1000=m
+";
+        assert_eq!(
+            etc_modules_from_config_text(config),
+            b"virtio_pci_modern_dev\nvirtio_pci\nvirtio_blk\nvirtio_net\ne1000\n"
+        );
+
+        let config = "\
+CONFIG_MODULES=y
+# CONFIG_VIRTIO_PCI_LIB is not set
+# CONFIG_VIRTIO_PCI is not set
+# CONFIG_VIRTIO_BLK is not set
+# CONFIG_VIRTIO_NET is not set
+# CONFIG_E1000 is not set
+";
+        assert_eq!(etc_modules_from_config_text(config), b"");
+    }
+
+    #[test]
+    fn qemu_runner_defaults_to_bounded_auto_exit() {
+        let options = qemu_run_options();
+        assert!(options.exit_after_boot);
+        assert_eq!(options.qemu_timeout, Some(default_qemu_timeout()));
+    }
+
+    #[test]
+    fn boot_smoke_suite_uses_same_timeout_guard() {
+        let options = boot_test_run_options();
+        assert!(options.exit_after_boot);
+        assert_eq!(options.qemu_timeout, Some(default_qemu_timeout()));
+    }
+
+    #[test]
+    fn boot_modes_map_to_stable_artifact_prefixes() {
+        assert_eq!(mode_name(BootMode::Hello), "hello");
+        assert_eq!(mode_name(BootMode::Panic), "panic");
+    }
+
+    // ── Milestone 6 — feature plumbing ────────────────────────────────────
+
+    #[test]
+    fn feature_list_timer_test_contains_test_timer() {
+        let features = feature_list(BootMode::TimerTest, true);
+        assert!(features.contains(&"test-timer"));
+        assert!(features.contains(&"qemu-test"));
+    }
+
+    #[test]
+    fn feature_list_softirq_test_contains_test_softirq() {
+        let features = feature_list(BootMode::SoftirqTest, true);
+        assert!(features.contains(&"test-softirq"));
+        assert!(features.contains(&"qemu-test"));
+    }
+
+    #[test]
+    fn feature_list_tlb_test_contains_test_tlb_shootdown() {
+        let features = feature_list(BootMode::TlbShootdownTest, true);
+        assert!(features.contains(&"test-tlb-shootdown"));
+        assert!(features.contains(&"qemu-test"));
+    }
+
+    #[test]
+    fn mode_name_covers_new_modes() {
+        assert_eq!(mode_name(BootMode::TimerTest), "timer-test");
+        assert_eq!(mode_name(BootMode::SoftirqTest), "softirq-test");
+        assert_eq!(mode_name(BootMode::TlbShootdownTest), "tlb-shootdown-test");
+        assert_eq!(
+            mode_name(BootMode::SoftlockupWatchdogTest),
+            "lockup-watchdog"
+        );
+        assert_eq!(mode_name(BootMode::BuddyTest), "buddy-test");
+        assert_eq!(mode_name(BootMode::VmCoreTest), "vmcore-test");
+        assert_eq!(mode_name(BootMode::ZswapPressureTest), "zswap-pressure");
+        assert_eq!(
+            mode_name(BootMode::UefiPlatformCertsTest),
+            "uefi-platform-certs"
+        );
+        assert_eq!(mode_name(BootMode::SmpPreemptTest), "smp-preempt");
+        assert_eq!(mode_name(BootMode::SmpMigrationTest), "smp-migration");
+        assert_eq!(mode_name(BootMode::PthreadSmokeTest), "pthread-smoke");
+    }
+
+    #[test]
+    fn timer_softirq_tlb_banners_are_correct() {
+        // Banners must be substrings the kernel actually emits.
+        assert!(TIMER_BANNER.starts_with("timer: ticks="));
+        assert!(SOFTIRQ_BANNER.contains("deferred work executed"));
+        assert!(TLB_BANNER.contains("shootdown IPI delivered"));
+        assert!(SOFTLOCKUP_WATCHDOG_BANNER.contains("soft lockup"));
+    }
+
+    #[test]
+    fn lockup_watchdog_mode_resolves_and_enables_feature() {
+        assert!(resolve_boot_test_mode("lockup-watchdog").is_some());
+        assert!(resolve_boot_test_mode("test-softlockup-watchdog").is_some());
+        assert_eq!(
+            normalize_boot_test_mode("softlockup-watchdog"),
+            "lockup-watchdog"
+        );
+        let features = feature_list(BootMode::SoftlockupWatchdogTest, true);
+        assert!(features.contains(&"qemu-test"));
+        assert!(features.contains(&"test-softlockup-watchdog"));
+    }
+
+    #[test]
+    fn feature_list_buddy_test_contains_test_buddy() {
+        let features = feature_list(BootMode::BuddyTest, true);
+        assert!(features.contains(&"test-buddy"));
+        assert!(features.contains(&"qemu-test"));
+    }
+
+    #[test]
+    fn zswap_pressure_mode_resolves_and_enables_feature() {
+        assert!(resolve_boot_test_mode("zswap-pressure").is_some());
+        assert_eq!(
+            normalize_boot_test_mode("test-zswap-pressure"),
+            "zswap-pressure"
+        );
+        let features = feature_list(BootMode::ZswapPressureTest, true);
+        assert!(features.contains(&"test-zswap-pressure"));
+        assert!(features.contains(&"qemu-test"));
+        assert!(ZSWAP_PRESSURE_BANNER.contains("reclaim into zswap ok"));
+    }
+
+    #[test]
+    fn uefi_platform_certs_mode_resolves_and_enables_feature() {
+        assert!(resolve_boot_test_mode("uefi-platform-certs").is_some());
+        assert!(resolve_boot_test_mode("uefi-platform-certs-firmware").is_some());
+        assert_eq!(
+            normalize_boot_test_mode("test-uefi-platform-certs"),
+            "uefi-platform-certs"
+        );
+        assert_eq!(
+            normalize_boot_test_mode("test-uefi-platform-certs-firmware"),
+            "uefi-platform-certs-firmware"
+        );
+        let features = feature_list(BootMode::UefiPlatformCertsTest, true);
+        assert!(features.contains(&"test-uefi-platform-certs"));
+        assert!(features.contains(&"qemu-test"));
+        let firmware_features = feature_list(BootMode::UefiPlatformCertsFirmwareTest, true);
+        assert!(firmware_features.contains(&"test-uefi-platform-certs-firmware"));
+        assert!(firmware_features.contains(&"qemu-test"));
+        assert!(UEFI_PLATFORM_CERTS_BANNER.contains("fixture runtime db import ok"));
+        assert!(UEFI_PLATFORM_CERTS_FIRMWARE_BANNER.contains("firmware runtime db import ok"));
+    }
+
+    #[test]
+    fn uefi_platform_certs_snapshots_boot_params_firmware_variables_before_security_init() {
+        let source = fs::read_to_string(repo_root().expect("repo root").join("src/init/main.rs"))
+            .expect("read kernel init source");
+        let efi_init = source
+            .find("arch::x86::platform::efi::init_from_boot_params")
+            .expect("kernel init should discover EFI runtime services from boot_params");
+        let firmware_vars = source
+            .find("arch::x86::platform::efi::register_secure_boot_variables_from_firmware")
+            .expect("kernel init should snapshot EFI Secure Boot variables from firmware");
+        let security_init = source
+            .find("security::init();")
+            .expect("kernel init should initialise security");
+
+        assert!(
+            !source.contains("lupos_multiboot2_info_ptr")
+                && !source.contains("multiboot2::BootInfo::from_ptr")
+                && !source.contains("init_from_multiboot"),
+            "kernel_main should consume Linux boot_params, not parse Multiboot2 init data"
+        );
+
+        assert!(
+            efi_init < firmware_vars && firmware_vars < security_init,
+            "EFI Secure Boot db/MokListRT must be snapshotted after EFI discovery and before security::platform_certs::init"
+        );
+    }
+
+    #[test]
+    fn kernel_main_schedules_before_timer_softirq_and_irq_enable() {
+        let source = fs::read_to_string(repo_root().expect("repo root").join("src/init/main.rs"))
+            .expect("read kernel init source");
+        let sched = source
+            .find("kernel::sched::sched_init();")
+            .expect("kernel init should initialise scheduler");
+        let timekeeping = source
+            .find("kernel::time::timekeeping::timekeeping_init()")
+            .expect("kernel init should initialise timekeeping");
+        let watchdog = source
+            .find("kernel::watchdog::lockup_detector_init();")
+            .expect("kernel init should initialise watchdog");
+        let apic_timer = source
+            .find("arch::x86::kernel::apic_timer::init();")
+            .expect("kernel init should initialise APIC timer");
+        let softirq = source
+            .find("kernel::softirq::init();")
+            .expect("kernel init should initialise softirq");
+        let irq_enable = source
+            .find("core::arch::asm!(\"sti\",")
+            .expect("kernel init should enable interrupts");
+
+        assert!(
+            sched < timekeeping
+                && timekeeping < watchdog
+                && watchdog < apic_timer
+                && sched < softirq
+                && softirq < irq_enable,
+            "Linux start_kernel initializes sched_init/timekeeping before watchdog and timer work can run, and only enables IRQs after softirq is ready"
+        );
+    }
+
+    #[test]
+    fn kernel_main_preserves_audited_start_kernel_anchor_order() {
+        fn find_after(haystack: &str, needle: &str, base: usize) -> usize {
+            haystack[base..]
+                .find(needle)
+                .map(|offset| base + offset)
+                .unwrap_or_else(|| panic!("missing ordered anchor: {needle}"))
+        }
+
+        let root = repo_root().expect("repo root");
+        let linux = fs::read_to_string(root.join("vendor/linux/init/main.c"))
+            .expect("read vendor Linux start_kernel source");
+        let linux_start = linux
+            .find("void start_kernel(void)")
+            .expect("vendor Linux should define start_kernel");
+        let setup_arch = find_after(&linux, "setup_arch(&command_line);", linux_start);
+        let mm_core = find_after(&linux, "mm_core_init();", setup_arch);
+        let sched = find_after(&linux, "sched_init();", mm_core);
+        let softirq = find_after(&linux, "softirq_init();", sched);
+        let timekeeping = find_after(&linux, "timekeeping_init();", softirq);
+        let security = find_after(&linux, "security_init();", timekeeping);
+        let rest = find_after(&linux, "rest_init();", security);
+        assert!(setup_arch < mm_core && mm_core < sched && sched < softirq);
+        assert!(softirq < timekeeping && timekeeping < security && security < rest);
+
+        let source =
+            fs::read_to_string(root.join("src/init/main.rs")).expect("read kernel init source");
+        let boot_params = source
+            .find("let bp = unsafe { &*boot_params };")
+            .expect("kernel_main should consume Linux boot_params first");
+        let e820 = find_after(
+            &source,
+            "mm::region::MemoryMap::from_boot_params(bp)",
+            boot_params,
+        );
+        let buddy = find_after(&source, "mm::buddy::global_buddy_init", e820);
+        let vmalloc = find_after(&source, "mm::vmalloc::vmalloc_init();", buddy);
+        let traps = find_after(&source, "arch::x86::kernel::idt::init();", vmalloc);
+        let sched = find_after(&source, "kernel::sched::sched_init();", traps);
+        let timekeeping = find_after(
+            &source,
+            "kernel::time::timekeeping::timekeeping_init()",
+            sched,
+        );
+        let softirq = find_after(&source, "kernel::softirq::init();", timekeeping);
+        let efi = find_after(
+            &source,
+            "arch::x86::platform::efi::init_from_boot_params",
+            softirq,
+        );
+        let fork = find_after(&source, "init::start_kernel::fork_init();", efi);
+        let proc_caches = find_after(&source, "init::start_kernel::proc_caches_init();", fork);
+        let security = find_after(&source, "init::start_kernel::security_init(", proc_caches);
+        let net = find_after(&source, "init::start_kernel::net_ns_init(", security);
+        let vfs = find_after(&source, "init::start_kernel::vfs_caches_init(", net);
+        let signals = find_after(&source, "init::start_kernel::signals_init();", vfs);
+        let cgroup = find_after(&source, "init::start_kernel::cgroup_init();", signals);
+        let taskstats_early =
+            find_after(&source, "init::start_kernel::taskstats_init_early(", cgroup);
+        let wx = find_after(&source, "protect_kernel_image_mappings", taskstats_early);
+        let late_initcalls = find_after(&source, "init::initcall::do_late_initcalls();", wx);
+        let initramfs = find_after(&source, "install_from_bytes(initrd_slice)", late_initcalls);
+        let tlb = find_after(&source, "arch::x86::mm::tlb::init();", initramfs);
+        let irq_enable = find_after(&source, "core::arch::asm!(\"sti\",", tlb);
+        let rest = find_after(&source, "halt_loop_with_softirq()", irq_enable);
+
+        assert!(boot_params < e820 && e820 < buddy && buddy < vmalloc);
+        assert!(vmalloc < traps && traps < sched && sched < timekeeping);
+        assert!(timekeeping < softirq && softirq < efi && efi < fork);
+        assert!(fork < proc_caches && proc_caches < security && security < net);
+        assert!(net < vfs && vfs < signals && signals < cgroup);
+        assert!(cgroup < taskstats_early && taskstats_early < wx);
+        assert!(wx < late_initcalls && late_initcalls < initramfs && initramfs < tlb);
+        assert!(tlb < irq_enable && irq_enable < rest);
+    }
+
+    #[test]
+    fn feature_list_vmcore_test_contains_test_vmcore() {
+        let features = feature_list(BootMode::VmCoreTest, true);
+        assert!(features.contains(&"test-vmcore"));
+        assert!(features.contains(&"qemu-test"));
+    }
+
+    #[test]
+    fn early_boot_mode_aliases_are_wired() {
+        for mode in [
+            "buddy",
+            "buddy-test",
+            "test-buddy",
+            "slab",
+            "slab-test",
+            "test-slab",
+            "vmcore",
+            "vmcore-test",
+            "test-vmcore",
+            "vmcore-walker",
+            "vmcore-walker-test",
+            "test-vmcore-walker",
+            "mm",
+            "mm-test",
+            "test-mm",
+            "demand-paging",
+            "demand-paging-test",
+            "test-demand-paging",
+            "anon-mmap",
+            "anon-mmap-test",
+            "test-anon-mmap",
+        ] {
+            assert!(
+                resolve_boot_test_mode(mode).is_some(),
+                "early boot mode should resolve: {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn buddy_banner_is_correct() {
+        assert!(BUDDY_BANNER.contains("alloc/free stress test passed"));
+    }
+
+    #[test]
+    fn vmcore_banner_is_correct() {
+        assert!(VMCORE_BANNER.contains("kmap/kunmap round-trip passed"));
+    }
+
+    #[test]
+    fn mode_name_vmcore_walker() {
+        assert_eq!(mode_name(BootMode::VmCoreWalkerTest), "vmcore-walker-test");
+    }
+
+    #[test]
+    fn feature_list_vmcore_walker_test_contains_test_vmcore_walker() {
+        let features = feature_list(BootMode::VmCoreWalkerTest, true);
+        assert!(features.contains(&"test-vmcore-walker"));
+        assert!(features.contains(&"qemu-test"));
+    }
+
+    #[test]
+    fn vmcore_walker_banner_is_correct() {
+        assert!(VMCORE_WALKER_BANNER.contains("pml4 sweep passed"));
+    }
+
+    #[test]
+    fn mode_name_mm_test() {
+        assert_eq!(mode_name(BootMode::MmTest), "mm-test");
+    }
+
+    #[test]
+    fn feature_list_mm_test_contains_test_mm() {
+        let features = feature_list(BootMode::MmTest, true);
+        assert!(features.contains(&"test-mm"));
+        assert!(features.contains(&"qemu-test"));
+    }
+
+    #[test]
+    fn mm_banner_is_correct() {
+        assert!(MM_BANNER.contains("maple-tree VMA test passed"));
+    }
+
+    #[test]
+    fn mode_name_demand_paging_test() {
+        assert_eq!(mode_name(BootMode::DemandPagingTest), "demand-paging-test");
+    }
+
+    #[test]
+    fn feature_list_demand_paging_test_contains_features() {
+        let features = feature_list(BootMode::DemandPagingTest, true);
+        assert!(features.contains(&"test-demand-paging"));
+        assert!(features.contains(&"qemu-test"));
+    }
+
+    #[test]
+    fn demand_paging_banner_is_correct() {
+        assert!(DEMAND_PAGING_BANNER.contains("anonymous fault OK, RSS=1 pages"));
+    }
+
+    #[test]
+    fn initramfs_rootfs_mode_has_expected_artifact_name() {
+        assert_eq!(mode_name(BootMode::InitramfsRootfsTest), "initramfs-rootfs");
+    }
+
+    #[test]
+    fn initramfs_rootfs_mode_enables_feature_and_initramfs_module() {
+        let features = feature_list(BootMode::InitramfsRootfsTest, true);
+        assert!(features.contains(&"test-initramfs-rootfs"));
+        assert!(features.contains(&"qemu-test"));
+        assert!(
+            grub_cfg_content(&BootMode::InitramfsRootfsTest)
+                .contains("initrd /boot/initramfs.cpio")
+        );
+    }
+
+    #[test]
+    fn disk_root_remount_mode_enables_feature_initramfs_and_root_cmdline() {
+        assert_eq!(
+            mode_name(BootMode::DiskRootRemountTest),
+            "disk-root-remount"
+        );
+        let features = feature_list(BootMode::DiskRootRemountTest, true);
+        assert!(features.contains(&"test-disk-root-remount"));
+        assert!(features.contains(&"qemu-test"));
+        assert!(
+            grub_cfg_content_with_cmdline(
+                &BootMode::DiskRootRemountTest,
+                "root=/dev/vda rootfstype=ext4"
+            )
+            .contains(
+                "linux /boot/bzImage root=/dev/vda rootfstype=ext4\n    initrd /boot/initramfs.cpio"
+            )
+        );
+    }
+
+    #[test]
+    fn disk_root_fsck_mode_uses_login_stack_and_root_fstab() {
+        assert_eq!(mode_name(BootMode::DiskRootFsckTest), "disk-root-fsck");
+        assert_eq!(
+            normalize_boot_test_mode("test-disk-root-fsck"),
+            "disk-root-fsck"
+        );
+        assert!(resolve_boot_test_mode("disk-root-fsck").is_some());
+        let features = feature_list(BootMode::DiskRootFsckTest, true);
+        assert!(features.contains(&"test-login-stack"));
+        assert!(features.contains(&"qemu-test"));
+        assert!(
+            grub_cfg_content_with_cmdline(
+                &BootMode::DiskRootFsckTest,
+                "root=/dev/vda rootfstype=ext4 fsck.mode=force"
+            )
+            .contains(
+                "linux /boot/bzImage systemd.show_status=yes root=/dev/vda rootfstype=ext4 fsck.mode=force\n    initrd /boot/initramfs.cpio"
+            )
+        );
+        assert!(
+            SYSTEMD_DISK_ROOT_FSTAB.starts_with("LABEL=lupos-root / ext4 defaults 0 1\n"),
+            "disk-root fsck fstab must request a root fsck pass"
+        );
+    }
+
+    #[test]
+    fn disk_root_fsck_cmdline_preserves_debug_trace_append() {
+        assert_eq!(
+            disk_root_fsck_cmdline("lupos.trace=syscall,fs,cgroup,netlink"),
+            "root=LABEL=lupos-root rootfstype=ext4 fsck.mode=force fsck.repair=yes lupos.trace=syscall,fs,cgroup,netlink"
+        );
+    }
+
+    #[test]
+    fn login_root_disk_cmdline_defaults_to_writable_root() {
+        assert_eq!(
+            root_disk_cmdline(""),
+            "root=LABEL=lupos-root rootfstype=ext4 rw"
+        );
+        assert_eq!(
+            root_disk_cmdline("lupos.trace=syscall,fs"),
+            "root=LABEL=lupos-root rootfstype=ext4 rw lupos.trace=syscall,fs"
+        );
+        assert_eq!(
+            root_disk_cmdline("root=/dev/vdb rootfstype=ext4"),
+            "root=/dev/vdb rootfstype=ext4 rw"
+        );
+        assert_eq!(
+            root_disk_cmdline("root=/dev/vdb rootfstype=ext4 ro"),
+            "root=/dev/vdb rootfstype=ext4 ro"
+        );
+    }
+
+    #[test]
+    fn boot_partition_mode_enables_feature_without_initramfs_module() {
+        assert_eq!(mode_name(BootMode::BootPartitionTest), "boot-partition");
+        let features = feature_list(BootMode::BootPartitionTest, true);
+        assert!(features.contains(&"test-boot-partition"));
+        assert!(features.contains(&"qemu-test"));
+        assert!(
+            !grub_cfg_content(&BootMode::BootPartitionTest).contains("initrd /boot/initramfs.cpio")
+        );
+    }
+
+    #[test]
+    fn mapped_swap_mode_enables_feature_without_initramfs_module() {
+        assert_eq!(mode_name(BootMode::MappedSwapTest), "mapped-swap");
+        let features = feature_list(BootMode::MappedSwapTest, true);
+        assert!(features.contains(&"test-mapped-swap"));
+        assert!(features.contains(&"qemu-test"));
+        assert!(
+            !grub_cfg_content(&BootMode::MappedSwapTest).contains("initrd /boot/initramfs.cpio")
+        );
+    }
+
+    #[test]
+    fn grub_cfg_can_append_lupos_trace_cmdline() {
+        let cfg = grub_cfg_content_with_cmdline(&BootMode::Login, "lupos.trace=syscall,fs,cgroup");
+
+        // Login modes pre-pend `systemd.show_status=yes` so slow jobs are
+        // visible on the serial console.
+        assert!(cfg.contains(
+            "linux /boot/bzImage systemd.show_status=yes lupos.trace=syscall,fs,cgroup\n    initrd /boot/initramfs.cpio"
+        ));
+    }
+
+    /// Terminal login boots should show systemd status so long-running jobs
+    /// are visible in the serial log instead of looking like a kernel stall.
+    #[test]
+    fn grub_cfg_login_modes_default_to_visible_systemd_status() {
+        for mode in [
+            BootMode::Login,
+            BootMode::LoginDisplay,
+            BootMode::DiskRootFsckTest,
+            BootMode::LoginStackTest,
+        ] {
+            let cfg = grub_cfg_content_with_cmdline(&mode, "");
+            assert!(
+                cfg.contains("/boot/bzImage systemd.show_status=yes"),
+                "{mode:?}: cmdline must default to `systemd.show_status=yes`: {cfg}"
+            );
+            assert!(
+                !cfg.contains("/boot/bzImage quiet systemd.show_status=no"),
+                "{mode:?}: terminal login boot must not hide systemd status: {cfg}"
+            );
+        }
+        // Non-login boot modes (the per-feature gates) keep an empty
+        // cmdline so kernel boot diagnostics stay verbose.
+        let cfg = grub_cfg_content_with_cmdline(&BootMode::Hello, "");
+        assert!(
+            !cfg.contains("quiet"),
+            "non-login boot must not silence kernel prints: {cfg}"
+        );
+    }
+
+    #[test]
+    fn initramfs_rootfs_contains_bootstrap_files() {
+        let cpio = build_initramfs_cpio(&BootMode::InitramfsRootfsTest).expect("cpio");
+        let text = String::from_utf8_lossy(&cpio);
+        assert!(text.contains("bin/busybox"));
+        assert!(text.contains("sbin/init"));
+        assert!(text.contains("etc/inittab"));
+        assert!(text.contains("etc/hostname"));
+    }
+
+    #[test]
+    fn generated_newc_headers_carry_nonzero_mtime() {
+        let cpio = build_cpio_newc(&[("bin/ls", 0o100755, b"x")]);
+        let first_header = core::str::from_utf8(&cpio[..110]).expect("newc header");
+        assert_eq!(&first_header[46..54], "6a0c58f0");
+    }
+
+    #[test]
+    fn pid1_initramfs_contains_sysv_init_and_login_stack() {
+        let cpio = build_initramfs_cpio(&BootMode::Pid1HandoffTest).expect("cpio");
+        let text = String::from_utf8_lossy(&cpio);
+        for needle in [
+            "sbin/init",
+            "sbin/agetty",
+            "bin/login",
+            "bin/bash",
+            "usr/bin/bash",
+            "bin/hostname",
+            "bin/ip",
+            "bin/[",
+            "bin/cat",
+            "bin/ls",
+            "bin/cp",
+            "bin/mv",
+            "bin/rm",
+            "bin/stty",
+            "usr/bin/ls",
+            "usr/bin/cp",
+            "bin/id",
+            "bin/whoami",
+            "bin/sleep",
+            "bin/echo",
+            "sbin/mdev",
+            "sbin/modprobe",
+            "etc/inittab",
+            "etc/rc.d/rcS",
+            "etc/passwd",
+            "etc/shadow",
+            "etc/group",
+            "etc/gshadow",
+            "etc/profile",
+            "etc/motd",
+            "etc/issue",
+            "Ctrl+Alt+Del: shut down",
+            "Ctrl+Shift+Del: restart",
+            "id:3:initdefault",
+            "si::sysinit:/etc/rc.d/rcS",
+            "c1:12345:respawn:/sbin/agetty 115200 tty1 linux",
+            "root:x:0:0:root:/root:/bin/bash",
+            "lupos:x:1000:1000:Lupos User:/home/lupos:/bin/bash",
+            "lupos login:",
+            "root@lupos:~#",
+            PID1_HANDOFF_BANNER,
+        ] {
+            assert!(
+                text.contains(needle),
+                "pid1-handoff initramfs missing SysV/login asset or transcript: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sysv_inittab_parser_tracks_initdefault_sysinit_and_respawn() {
+        let entries = parse_sysv_inittab(LOGIN_SYSV_INITTAB).expect("parse inittab");
+        assert!(entries.iter().any(|entry| {
+            entry.id == "id" && entry.runlevels == "3" && entry.action == "initdefault"
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.id == "si" && entry.action == "sysinit" && entry.process == "/etc/rc.d/rcS"
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.id == "c1"
+                && entry.runlevels == "12345"
+                && entry.action == "respawn"
+                && entry.process == "/sbin/agetty 115200 tty1 linux"
+        }));
+        assert!(!entries.iter().any(|entry| entry.action == "ctrlaltdel"));
+    }
+
+    #[test]
+    fn rcs_and_login_databases_cover_login_contract() {
+        for needle in [
+            "prepared by the kernel before PID 1",
+            "hostname -F /etc/hostname",
+            "modprobe -a",
+        ] {
+            assert!(LOGIN_RCS_SCRIPT.contains(needle), "rcS missing {needle}");
+        }
+        for noisy_command in ["mount -t ", "ip link set lo up", "mdev -s"] {
+            assert!(
+                !LOGIN_RCS_SCRIPT.contains(noisy_command),
+                "rcS should not run unsupported noisy setup command {noisy_command}"
+            );
+        }
+        assert!(LOGIN_PASSWD.contains("root:x:0:0:root:/root:/bin/bash"));
+        assert!(LOGIN_PASSWD.contains("lupos:x:1000:1000:Lupos User:/home/lupos:/bin/bash"));
+        assert!(LOGIN_SHADOW.contains("root:$6$"));
+        assert!(LOGIN_SHADOW.contains("lupos:$6$"));
+        assert!(LOGIN_GROUP.contains("wheel:x:10:root,lupos"));
+        assert!(LOGIN_PROFILE.contains("PATH=/bin:/sbin:/usr/bin:/usr/sbin"));
+        assert!(LOGIN_PROFILE.contains("TERM=${TERM:-linux}"));
+        assert!(!LOGIN_PROFILE.contains("cd \"$HOME\""));
+        assert!(
+            !LOGIN_PROFILE.contains("PS1="),
+            "Arch-backed boots must get PS1 from Arch's /etc/bash.bashrc, not the Lupos fallback profile"
+        );
+        // Login shells do not auto-clear. The framebuffer console now renders
+        // asynchronously, and users can still run `clear` explicitly.
+        assert!(
+            !LOGIN_PROFILE.contains("command -v clear") && !LOGIN_PROFILE.contains(" then clear"),
+            "/etc/profile must not auto-clear during login"
+        );
+    }
+
+    #[test]
+    fn display_getty_override_requires_password_for_interactive_qemu() {
+        let display = String::from_utf8(systemd_getty_override()).expect("display getty override");
+        assert!(display.contains("ExecStart=-/usr/sbin/agetty --noclear --nohostname"));
+        assert!(display.contains("--issue-file /etc/issue tty1 linux"));
+        assert!(!display.contains("--autologin root"));
+    }
+
+    #[test]
+    fn serial_getty_unit_execs_immediately_for_fast_login() {
+        let unit = String::from_utf8(systemd_lupos_serial_getty_unit()).expect("serial getty unit");
+        assert!(unit.contains("Type=simple"));
+        assert!(!unit.contains("Type=idle"));
+        assert!(unit.contains(
+            "After=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service"
+        ));
+        assert!(unit.contains("ExecStart=-/usr/sbin/agetty --noclear --nohostname"));
+    }
+
+    #[test]
+    fn systemd_login_userland_enables_journald_dev_log_for_terminal_login() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+
+        let target = find_initramfs_entry(&files, "usr/lib/systemd/system/lupos-terminal.target")
+            .expect("lupos-terminal.target staged");
+        let target = core::str::from_utf8(&target.2).expect("target utf-8");
+        for wanted in [
+            "systemd-journald.socket",
+            "systemd-journald-dev-log.socket",
+            "systemd-journald.service",
+            "lupos-serial-getty.service",
+        ] {
+            assert!(
+                target.contains(wanted),
+                "terminal target must want {wanted}: {target}"
+            );
+        }
+
+        for (wants_path, target) in [
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-journald.socket",
+                "/usr/lib/systemd/system/systemd-journald.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-journald-dev-log.socket",
+                "/usr/lib/systemd/system/systemd-journald-dev-log.socket",
+            ),
+        ] {
+            let got = find_initramfs_symlink_target(&files, wants_path)
+                .unwrap_or_else(|| panic!("{wants_path} must be staged"));
+            assert_eq!(got, target.as_bytes(), "{wants_path} target changed");
+        }
+
+        let serial_unit =
+            find_initramfs_entry(&files, "usr/lib/systemd/system/lupos-serial-getty.service")
+                .expect("lupos serial getty unit staged");
+        let serial_unit = core::str::from_utf8(&serial_unit.2).expect("serial unit utf-8");
+        assert!(serial_unit.contains(
+            "After=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service"
+        ));
+        assert!(serial_unit.contains("agetty --noclear --nohostname"));
+
+        let journald_service =
+            find_initramfs_entry(&files, "usr/lib/systemd/system/systemd-journald.service")
+                .expect("journald service staged");
+        let journald_service =
+            core::str::from_utf8(&journald_service.2).expect("journald service utf-8");
+        assert!(journald_service.contains("Environment=RUNTIME_DIRECTORY=/run/systemd/journal"));
+        assert!(journald_service.contains("ExecStart=/usr/lib/systemd/systemd-journald"));
+        assert!(journald_service.contains("Type=simple"));
+        assert!(!journald_service.contains("Type=notify"));
+        assert!(!journald_service.contains("WatchdogSec="));
+        assert!(
+            journald_service.contains("RuntimeDirectory=systemd/journal systemd/journal/streams")
+        );
+        for unsupported in [
+            "IPAddressDeny=",
+            "SystemCallFilter=",
+            "RestrictAddressFamilies=",
+            "MemoryDenyWriteExecute=",
+            "LockPersonality=",
+        ] {
+            assert!(
+                !journald_service.contains(unsupported),
+                "journald override must avoid unsupported sandbox directive {unsupported}"
+            );
+        }
+    }
+
+    #[test]
+    fn arch_login_images_preserve_arch_shell_startup_files() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let stage_profile = fs::read(stage.join("etc/profile")).expect("read staged /etc/profile");
+        let stage_bash_bashrc =
+            fs::read(stage.join("etc/bash.bashrc")).expect("read staged /etc/bash.bashrc");
+        let stage_skel_bashrc =
+            fs::read(stage.join("etc/skel/.bashrc")).expect("read staged skel bashrc");
+
+        let initramfs_files = systemd_login_userland_files_with_stage(&stage);
+        assert_eq!(
+            initramfs_file_bytes(&initramfs_files, "etc/profile"),
+            Some(stage_profile.as_slice()),
+            "Arch-backed initramfs login must use Arch's /etc/profile"
+        );
+        assert_eq!(
+            initramfs_file_bytes(&initramfs_files, "etc/bash.bashrc"),
+            Some(stage_bash_bashrc.as_slice()),
+            "Arch-backed initramfs login must stage Arch's /etc/bash.bashrc"
+        );
+        assert_eq!(
+            initramfs_file_bytes(&initramfs_files, "home/lupos/.bashrc"),
+            Some(stage_skel_bashrc.as_slice()),
+            "lupos user startup should come from Arch /etc/skel"
+        );
+        let root_bash_profile = initramfs_file_bytes(&initramfs_files, "root/.bash_profile")
+            .expect("root login profile staged");
+        let root_bash_profile =
+            core::str::from_utf8(root_bash_profile).expect("root bash profile utf-8");
+        assert!(root_bash_profile.contains("/etc/profile"));
+        assert!(root_bash_profile.contains("cd /"));
+        let root_bashrc =
+            initramfs_file_bytes(&initramfs_files, "root/.bashrc").expect("root bashrc staged");
+        assert!(
+            core::str::from_utf8(root_bashrc)
+                .expect("root bashrc utf-8")
+                .contains("/etc/bash.bashrc"),
+            "root bashrc must delegate to Arch's global bashrc"
+        );
+
+        let overlay_files = direct_stage_login_root_disk_overlay_files(
+            BootMode::LoginDisplay,
+            SYSTEMD_DISK_ROOT_FSTAB,
+            &[],
+            &stage,
+        );
+        assert_eq!(
+            initramfs_file_bytes(&overlay_files, "etc/profile"),
+            Some(stage_profile.as_slice()),
+            "direct root-disk overlay must not replace Arch's /etc/profile"
+        );
+        assert_eq!(
+            initramfs_file_bytes(&overlay_files, "etc/bash.bashrc"),
+            Some(stage_bash_bashrc.as_slice()),
+            "direct root-disk overlay must preserve Arch's /etc/bash.bashrc"
+        );
+        assert_eq!(
+            initramfs_file_bytes(&overlay_files, "home/lupos/.bashrc"),
+            Some(stage_skel_bashrc.as_slice()),
+            "direct root-disk overlay should seed lupos from Arch /etc/skel"
+        );
+        let overlay_root_bash_profile = initramfs_file_bytes(&overlay_files, "root/.bash_profile")
+            .expect("direct root login profile staged");
+        let overlay_root_bash_profile =
+            core::str::from_utf8(overlay_root_bash_profile).expect("overlay root profile utf-8");
+        assert!(overlay_root_bash_profile.contains("/etc/profile"));
+        assert!(overlay_root_bash_profile.contains("cd /"));
+    }
+
+    #[test]
+    fn display_sysv_inittab_requires_password_for_interactive_qemu() {
+        let display = sysv_login_inittab();
+        assert_eq!(display, LOGIN_SYSV_INITTAB);
+        assert!(!display.contains("--autologin root"));
+    }
+
+    #[test]
+    fn display_login_mode_keeps_systemd_getty_password_gated() {
+        assert_eq!(mode_name(BootMode::LoginDisplay), "login-display");
+        assert!(feature_list(BootMode::LoginDisplay, false).contains(&"test-login-stack"));
+
+        let stage = repo_root()
+            .expect("repo root")
+            .join("target/xtask-test/login-display-stage");
+        let _ = fs::remove_dir_all(&stage);
+        fs::create_dir_all(stage.join("usr/lib/systemd")).expect("create fake systemd stage");
+        fs::write(
+            stage.join("usr/lib/systemd/systemd"),
+            b"\x7FELFfake-systemd",
+        )
+        .expect("write fake systemd");
+
+        let files = systemd_login_userland_files_with_stage_and_options(
+            &stage,
+            LoginUserlandOptions::default(),
+        );
+        let dropin = initramfs_file_bytes(
+            &files,
+            "etc/systemd/system/getty@tty1.service.d/lupos-login.conf",
+        )
+        .expect("display getty drop-in");
+        let body = core::str::from_utf8(dropin).expect("drop-in utf-8");
+        assert!(body.contains("ExecStart=-/usr/sbin/agetty --noclear --nohostname"));
+        assert!(body.contains("--issue-file /etc/issue tty1 linux"));
+        assert!(!body.contains("--autologin root"));
+
+        let _ = fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn shadow_hashes_are_sha512_crypt_for_test_password() {
+        let expected = "$6$lupos$kfqTeHWlA.9yNwAV7ku8p6jKF5ULWSzdhP3d/4Cq0ObxXStDoiUHezFLQH0Kh5EIXypcHW4AGgV6gn/KgMxou/";
+        assert!(LOGIN_SHADOW.contains(&format!("root:{expected}:")));
+        assert!(LOGIN_SHADOW.contains(&format!("lupos:{expected}:")));
+        assert!(!LOGIN_SHADOW.contains("Placeholder"));
+    }
+
+    #[test]
+    fn auth_config_overrides_locked_arch_accounts_but_keeps_system_users() {
+        let merged_shadow = String::from_utf8(override_colon_records(
+            b"root:*:14871::::::\nsystemd-network:!*:20605:::::1:\n".to_vec(),
+            LOGIN_SHADOW,
+        ))
+        .expect("merged shadow utf-8");
+        assert!(merged_shadow.lines().any(|line| {
+            line == LOGIN_SHADOW
+                .lines()
+                .find(|line| line.starts_with("root:"))
+                .expect("root shadow")
+        }));
+        assert!(merged_shadow.contains("lupos:$6$lupos$"));
+        assert!(merged_shadow.contains("systemd-network:!*:20605:::::1:"));
+        assert!(!merged_shadow.contains("root:*:14871"));
+
+        let merged_passwd = String::from_utf8(override_colon_records(
+            b"root:x:0:0::/root:/usr/bin/bash\nsystemd-network:x:977:977:systemd Network Management:/:/usr/bin/nologin\n".to_vec(),
+            LOGIN_PASSWD,
+        ))
+        .expect("merged passwd utf-8");
+        assert!(merged_passwd.contains("root:x:0:0:root:/root:/bin/bash"));
+        assert!(merged_passwd.contains("lupos:x:1000:1000:Lupos User:/home/lupos:/bin/bash"));
+        assert!(
+            merged_passwd.contains(
+                "systemd-network:x:977:977:systemd Network Management:/:/usr/bin/nologin"
+            )
+        );
+    }
+
+    #[test]
+    fn arch_bootstrap_script_is_tracked() {
+        // The Arch bootstrap script must contain the key structural functions
+        // and the pinned bootstrap archive name so the download is reproducible.
+        let root = repo_root().expect("repo root");
+        let script = fs::read_to_string(root.join(USERLAND_BUILD_SCRIPT)).expect("build script");
+        for needle in [
+            "download_bootstrap",
+            "extract_bootstrap",
+            "apply_lupos_overlay",
+            "BOOTSTRAP_SHA256",
+            "archlinux-bootstrap-",
+            "archive.archlinux.org",
+        ] {
+            assert!(
+                script.contains(needle),
+                "Arch bootstrap script missing {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_stack_mode_alias_resolves_to_real_gate() {
+        assert!(resolve_boot_test_mode("login-stack").is_some());
+        assert_eq!(normalize_boot_test_mode("test-login-stack"), "login-stack");
+    }
+
+    #[test]
+    fn critical_runtime_userland_modes_resolve_and_use_login_stack_feature() {
+        for (mode_name_arg, mode) in [
+            ("userspace-smoke", BootMode::UserspaceSmokeTest),
+            ("runtime-stress", BootMode::RuntimeStressTest),
+        ] {
+            assert!(resolve_boot_test_mode(mode_name_arg).is_some());
+            let features = feature_list(mode, true);
+            assert!(features.contains(&"qemu-test"));
+            assert!(features.contains(&"test-login-stack"));
+            assert!(
+                grub_cfg_content(&mode).contains("initrd /boot/initramfs.cpio"),
+                "{mode_name_arg} must boot with the real login initramfs"
+            );
+        }
+        assert_eq!(mode_name(BootMode::UserspaceSmokeTest), "userspace-smoke");
+        assert_eq!(mode_name(BootMode::RuntimeStressTest), "runtime-stress");
+    }
+
+    #[test]
+    fn userspace_smoke_direct_stage_overlay_includes_pacman_probe_package() {
+        let files = direct_stage_login_root_disk_overlay_files(
+            BootMode::UserspaceSmokeTest,
+            SYSTEMD_DISK_ROOT_FSTAB,
+            &[],
+            Path::new("/nonexistent-login-stage"),
+        );
+        let script = find_initramfs_entry(&files, USERSPACE_SMOKE_SCRIPT_PATH)
+            .expect("userspace-smoke script staged in direct root-disk overlay");
+        let package = find_initramfs_entry(&files, USERSPACE_SMOKE_PACMAN_PACKAGE_PATH)
+            .expect("userspace-smoke pacman package staged in direct root-disk overlay");
+        let hookdir = find_initramfs_entry(&files, USERSPACE_SMOKE_PACMAN_HOOKDIR_PATH)
+            .expect("userspace-smoke pacman hook directory staged in direct root-disk overlay");
+        let package_bytes =
+            initramfs_file_bytes(&files, USERSPACE_SMOKE_PACMAN_PACKAGE_PATH).unwrap();
+        let package_text = String::from_utf8_lossy(package_bytes);
+
+        assert_eq!(initramfs_mode_perms(script.1), 0o755);
+        assert_eq!(initramfs_mode_perms(package.1), 0o644);
+        assert_eq!(hookdir.1, 0o40755);
+        assert!(USERSPACE_SMOKE_SCRIPT.contains(USERSPACE_SMOKE_PACMAN_PACKAGE_PATH));
+        assert!(USERSPACE_SMOKE_SCRIPT.contains(USERSPACE_SMOKE_PACMAN_HOOKDIR_PATH));
+        assert_eq!(package_bytes.len() % 512, 0);
+        assert!(package_text.contains("pkgname = lupos-pacman-smoke"));
+        assert!(package_text.contains("usr/share/lupos-pacman-smoke/probe"));
+        assert!(package_text.contains("installed"));
+    }
+
+    #[test]
+    fn critical_runtime_guest_prunes_service_churn_but_keeps_real_pid1_and_tools() {
+        let root = repo_root().expect("repo root");
+        let stage = root.join("target/xtask-test/critical-runtime-systemd-stage");
+        let _ = fs::remove_dir_all(&stage);
+        for dir in [
+            "bin",
+            "sbin",
+            "lib64",
+            "usr/bin",
+            "usr/sbin",
+            "usr/lib/systemd/system",
+            "usr/lib/pam.d",
+            "usr/lib",
+            "usr/share/terminfo/l",
+        ] {
+            fs::create_dir_all(stage.join(dir)).unwrap_or_else(|err| panic!("stage {dir}: {err}"));
+        }
+        fs::write(stage.join("bin/sh"), b"real-sh").expect("stage sh");
+        fs::write(stage.join("usr/lib/systemd/systemd"), b"real-systemd").expect("stage systemd");
+        fs::write(
+            stage.join("usr/lib/systemd/systemd-user-sessions"),
+            b"real-systemd-user-sessions",
+        )
+        .expect("stage systemd-user-sessions");
+        fs::write(stage.join("usr/bin/clear"), b"real-clear").expect("stage clear");
+        fs::write(stage.join("usr/bin/ping"), b"real-ping").expect("stage ping");
+        fs::write(stage.join("usr/sbin/agetty"), b"real-agetty").expect("stage agetty");
+        fs::write(stage.join("usr/bin/login"), b"real-login").expect("stage login");
+        fs::write(stage.join("usr/bin/bash"), b"real-bash").expect("stage bash");
+        fs::write(stage.join("lib64/ld-linux-x86-64.so.2"), b"real-loader").expect("stage loader");
+        fs::write(stage.join("usr/lib/libc.so.6"), b"real-libc").expect("stage libc");
+        fs::write(stage.join("usr/lib/libidn2.so.0"), b"real-libidn2").expect("stage libidn2");
+        fs::write(
+            stage.join("usr/lib/libunistring.so.5"),
+            b"real-libunistring",
+        )
+        .expect("stage libunistring");
+        fs::write(stage.join("usr/lib/libattr.so.1"), b"real-libattr").expect("stage libattr");
+        fs::write(
+            stage.join("usr/share/terminfo/l/linux"),
+            b"real-linux-terminfo",
+        )
+        .expect("stage linux terminfo");
+        for unit in [
+            "getty@.service",
+            "getty.target",
+            "multi-user.target",
+            "systemd-journald.service",
+            "systemd-user-sessions.service",
+            "systemd-logind.service",
+            "systemd-networkd.service",
+            "systemd-resolved.service",
+        ] {
+            fs::write(
+                stage.join("usr/lib/systemd/system").join(unit),
+                b"real-unit",
+            )
+            .expect("stage systemd unit");
+        }
+
+        let files = critical_runtime_userland_files_with_stage(Some(&stage));
+        let init = find_initramfs_entry(&files, "sbin/init").expect("sbin/init");
+        assert!(
+            initramfs_file_is_symlink(init),
+            "critical runtime guest must boot through the real systemd PID1 path"
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "sbin/init"),
+            Some(&b"/usr/lib/systemd/systemd"[..]),
+            "critical runtime guest must keep systemd as PID1"
+        );
+        assert!(
+            find_initramfs_entry(&files, "usr/lib/systemd/systemd").is_some(),
+            "critical runtime smoke/stress must stage the real systemd binary"
+        );
+        assert!(
+            find_initramfs_entry(
+                &files,
+                "etc/systemd/system/multi-user.target.wants/getty.target"
+            )
+            .is_some(),
+            "critical runtime guest must still start the real getty/login path"
+        );
+        for pruned in [
+            "etc/systemd/system/multi-user.target.wants/systemd-journald.service",
+            "etc/systemd/system/multi-user.target.wants/systemd-logind.service",
+            "etc/systemd/system/multi-user.target.wants/systemd-networkd.service",
+            "etc/systemd/system/multi-user.target.wants/systemd-resolved.service",
+        ] {
+            assert!(
+                find_initramfs_entry(&files, pruned).is_none(),
+                "{pruned} must be pruned from critical runtime smoke/stress to avoid service restart churn"
+            );
+        }
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/bin/clear"),
+            Some(&b"real-clear"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/bin/ping"),
+            Some(&b"real-ping"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, GLIBC_DYNAMIC_LOADER),
+            Some(&b"real-loader"[..])
+        );
+        assert!(
+            find_initramfs_entry(&files, "usr/share/terminfo/l/linux").is_some(),
+            "critical runtime guest must stage terminfo for the real clear command"
+        );
+    }
+
+    #[test]
+    fn shipped_commands_mode_resolves_and_boots_login_initramfs() {
+        assert!(resolve_boot_test_mode("shipped-commands").is_some());
+        assert!(resolve_boot_test_mode("test-shipped-commands").is_some());
+        assert_eq!(mode_name(BootMode::ShippedCommandsTest), "shipped-commands");
+        let features = feature_list(BootMode::ShippedCommandsTest, true);
+        assert!(features.contains(&"qemu-test"));
+        assert!(features.contains(&"test-login-stack"));
+        let grub = grub_cfg_content(&BootMode::ShippedCommandsTest);
+        assert!(
+            grub.contains("initrd /boot/initramfs.cpio"),
+            "shipped-commands must boot with the real login initramfs"
+        );
+        assert!(
+            grub.contains("systemd.show_status=yes"),
+            "shipped-commands must keep slow systemd jobs visible on serial"
+        );
+    }
+
+    #[test]
+    fn shipped_commands_script_exercises_every_required_command() {
+        // Every command group the shipped Arch base image must prove
+        // functional: bash builtins, coreutils, text tools, pacman package
+        // database reads, systemd tools, procps, util-linux, and networking.
+        for needle in [
+            "#!/bin/bash",
+            "set -eu",
+            "trap",
+            "shipped-commands: gate FAILED",
+            // bash builtins
+            "shopt -s expand_aliases",
+            "cd /root",
+            "rm -f test.txt",
+            "printf 'data\\n' >test.txt",
+            "test \"$(ls)\" = test.txt",
+            "test \"$(dir)\" = test.txt",
+            "cd /home",
+            "test \"$(pwd)\" = /home",
+            "test \"$(ls)\" = lupos",
+            "cd /tmp",
+            "alias scmark=",
+            "export LUPOS_SC=",
+            "set -o history",
+            "history -w",
+            // coreutils
+            "mkdir -p /tmp/sc/dir",
+            "cp /tmp/sc/a",
+            "mv /tmp/sc/b",
+            "cat /tmp/sc/dir/c",
+            "chmod 600",
+            "chown root:root",
+            "ls -l /tmp/sc/dir",
+            "rm /tmp/sc/a",
+            // grep find tar sed awk
+            "grep -q '^root:' /etc/passwd",
+            "find /etc -name passwd",
+            "tar -C /tmp -cf",
+            "tar -C /tmp/tardst -xf",
+            "sed 's/alpha/beta/'",
+            "awk '{print $1 + $2}'",
+            // pacman package database checks
+            "pacman --version",
+            "test -d /var/lib/pacman/local",
+            "test -s /var/lib/pacman/local/ALPM_DB_VERSION",
+            "pacman -Q bash coreutils pacman systemd",
+            "pacman -Qq | grep -qx bash",
+            // systemd tools
+            "systemctl is-active systemd-journald.service",
+            "systemctl list-units",
+            "journalctl -b",
+            // procps
+            "ps aux",
+            "top -b -n 1",
+            "free -m",
+            // util-linux
+            "mount -t tmpfs",
+            "umount /tmp/scmnt",
+            "lsblk",
+            "dmesg",
+            // networking
+            "ip addr show lo",
+            "ping -c 1 127.0.0.1",
+            "poweroff -f",
+        ] {
+            assert!(
+                SHIPPED_COMMANDS_SCRIPT.contains(needle),
+                "shipped-commands script missing {needle:?}"
+            );
+        }
+        for marker in SHIPPED_COMMANDS_MARKERS {
+            assert!(
+                SHIPPED_COMMANDS_SCRIPT.contains(marker),
+                "shipped-commands script missing marker {marker:?}"
+            );
+        }
+        assert!(SHIPPED_COMMANDS_SCRIPT.contains(SHIPPED_COMMANDS_BANNER));
+    }
+
+    #[test]
+    fn shipped_commands_initramfs_stages_script_and_keeps_journald() {
+        let root = repo_root().expect("repo root");
+        let stage = root.join("target/xtask-test/shipped-commands-systemd-stage");
+        let _ = fs::remove_dir_all(&stage);
+        for dir in ["bin", "lib64", "usr/lib/systemd/system"] {
+            fs::create_dir_all(stage.join(dir)).unwrap_or_else(|err| panic!("stage {dir}: {err}"));
+        }
+        fs::write(stage.join("bin/sh"), b"real-sh").expect("stage sh");
+        fs::write(stage.join("usr/lib/systemd/systemd"), b"real-systemd").expect("stage systemd");
+        fs::write(stage.join("lib64/ld-linux-x86-64.so.2"), b"real-loader").expect("stage loader");
+        for unit in [
+            "getty@.service",
+            "getty.target",
+            "multi-user.target",
+            "systemd-journald.service",
+            "systemd-user-sessions.service",
+            "systemd-logind.service",
+            "systemd-networkd.service",
+            "systemd-resolved.service",
+        ] {
+            fs::write(
+                stage.join("usr/lib/systemd/system").join(unit),
+                b"real-unit",
+            )
+            .expect("stage systemd unit");
+        }
+
+        let files = shipped_commands_userland_files_with_stage(Some(&stage));
+        let script = find_initramfs_entry(&files, SHIPPED_COMMANDS_SCRIPT_PATH)
+            .expect("shipped-commands script staged in initramfs");
+        assert_eq!(initramfs_mode_perms(script.1), 0o755);
+        assert_eq!(
+            initramfs_file_bytes(&files, SHIPPED_COMMANDS_SCRIPT_PATH),
+            Some(SHIPPED_COMMANDS_SCRIPT.as_bytes()),
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "sbin/init"),
+            Some(&b"/usr/lib/systemd/systemd"[..]),
+            "shipped-commands guest must keep systemd as PID1"
+        );
+        // Unlike the critical-runtime smoke/stress guests, this gate proves
+        // journalctl, so the journald want must not be pruned.
+        for kept in ["etc/systemd/system/multi-user.target.wants/systemd-journald.service"] {
+            assert!(
+                find_initramfs_entry(&files, kept).is_some(),
+                "{kept} must stay enabled so systemctl/journalctl gates can pass"
+            );
+        }
+        for omitted in [
+            "etc/systemd/system/multi-user.target.wants/systemd-logind.service",
+            "etc/systemd/system/multi-user.target.wants/dbus.service",
+            "etc/systemd/system/sockets.target.wants/dbus.socket",
+        ] {
+            assert!(
+                find_initramfs_entry(&files, omitted).is_none(),
+                "{omitted} must not be introduced by shipped-commands"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_commands_direct_stage_overlay_keeps_script_and_journald() {
+        let files = direct_stage_login_root_disk_overlay_files(
+            BootMode::ShippedCommandsTest,
+            SYSTEMD_DISK_ROOT_FSTAB,
+            &[],
+            Path::new("/nonexistent-login-stage"),
+        );
+        let script = find_initramfs_entry(&files, SHIPPED_COMMANDS_SCRIPT_PATH)
+            .expect("shipped-commands script staged in direct root-disk overlay");
+
+        assert_eq!(initramfs_mode_perms(script.1), 0o755);
+        assert_eq!(
+            initramfs_file_bytes(&files, SHIPPED_COMMANDS_SCRIPT_PATH),
+            Some(SHIPPED_COMMANDS_SCRIPT.as_bytes())
+        );
+        for (link, target) in [(
+            "etc/systemd/system/multi-user.target.wants/systemd-journald.service",
+            b"/usr/lib/systemd/system/systemd-journald.service" as &[u8],
+        )] {
+            assert_eq!(
+                initramfs_file_bytes(&files, link),
+                Some(target),
+                "{link} must be enabled in the shipped-commands overlay"
+            );
+        }
+        for omitted in [
+            "etc/systemd/system/multi-user.target.wants/systemd-logind.service",
+            "etc/systemd/system/multi-user.target.wants/dbus.service",
+            "etc/systemd/system/sockets.target.wants/dbus.socket",
+        ] {
+            assert!(
+                find_initramfs_entry(&files, omitted).is_none(),
+                "{omitted} must not be required by the minimal Arch base overlay"
+            );
+        }
+        let pam = core::str::from_utf8(
+            initramfs_file_bytes(&files, "etc/pam.d/common-session")
+                .expect("shipped-commands PAM overlay"),
+        )
+        .expect("PAM overlay utf-8");
+        assert!(pam.contains("session required pam_unix.so"));
+        assert!(!pam.contains("pam_systemd.so"));
+    }
+
+    #[test]
+    fn shipped_commands_runner_asserts_every_group_marker() {
+        let source = fs::read_to_string(repo_root().expect("repo root").join("xtask/src/lib.rs"))
+            .expect("read xtask source");
+        let body = source
+            .split("pub fn run_shipped_commands_tests() -> Result<()>")
+            .nth(1)
+            .expect("run_shipped_commands_tests source")
+            .split("fn assert_no_runtime_smoke_failures")
+            .next()
+            .expect("run_shipped_commands_tests body");
+        assert!(
+            body.contains("SHIPPED_COMMANDS_MARKERS"),
+            "runner must assert every shipped-commands group marker"
+        );
+        assert!(
+            body.contains("SHIPPED_COMMANDS_BANNER"),
+            "runner must assert the final gate banner"
+        );
+        assert!(
+            body.contains("assert_no_runtime_smoke_failures"),
+            "runner must reject kernel/runtime failure markers in the serial log"
+        );
+        assert!(
+            !body.contains("EnvVarGuard::set(LUPOS_QEMU_ACCEL_ENV, \"tcg\")"),
+            "runner must not force TCG; M102 requires the configured accelerator/backend"
+        );
+        for marker in SHIPPED_COMMANDS_MARKERS {
+            assert!(
+                marker.starts_with("shipped-commands: ") && marker.ends_with(" ok"),
+                "marker {marker:?} must follow the shipped-commands: <group> ok shape"
+            );
+        }
+        assert_eq!(
+            SHIPPED_COMMANDS_MARKERS.len(),
+            8,
+            "eight command groups: bash-builtins, coreutils, textutils, packaging, \
+             systemd-tools, procps, util-linux, networking"
+        );
+    }
+
+    #[test]
+    fn userland_build_script_ships_arch_package_manager_surface() {
+        let root = repo_root().expect("repo root");
+        let script = fs::read_to_string(root.join(USERLAND_BUILD_SCRIPT)).expect("build script");
+        for needle in [
+            "archlinux-bootstrap-2026.06.01-x86_64",
+            "tar --warning=no-unknown-keyword --no-same-owner --delay-directory-restore",
+            "usr/bin/pacman",
+            "etc/pacman.conf",
+            "var/lib/pacman/local",
+            "ALPM_DB_VERSION",
+            "pacman_mirrorlist_ready",
+            "pacman_config_ready",
+            "pacman_offline_repo_ready",
+            "stage_arch_pacman_package_cache",
+            "normalize_arch_pacman",
+            "DisableSandbox",
+            "SigLevel = Optional TrustAll",
+            "XferCommand = /usr/lib/lupos/pacman-xfer %u %o",
+            "usr/lib/lupos/pacman-xfer",
+            "ARCH_OFFLINE_REPO_PACKAGE_ALIASES",
+            "stage_arch_pacman_package_aliases",
+            "alias=/p/v",
+            "file:///var/lib/lupos/pacman-repo/$repo/os/$arch",
+            "var/cache/pacman/pkg",
+            "vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst",
+        ] {
+            assert!(
+                script.contains(needle),
+                "userland build script missing {needle}"
+            );
+        }
+        for forbidden in [
+            "command -v sudo",
+            "sudo \"$@\"",
+            "run_root",
+            "chroot \"$",
+            "mount -t",
+            "umount -l",
+            "pacstrap ",
+            "pacman-key",
+            "pacman -Sy",
+            "var/cache/apt/archives/hello.deb",
+            "ssh-keygen",
+            "openssh-server",
+            "nano",
+        ] {
+            assert!(
+                !script.contains(forbidden),
+                "Arch base userland script must not retain removed distro/desktop package surface: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_userland_stage_requires_shipped_command_artifacts() {
+        for required in [
+            "usr/bin/grep",
+            "usr/bin/sed",
+            "usr/bin/tar",
+            "usr/bin/find",
+            "usr/bin/awk",
+            "usr/bin/ps",
+            "usr/bin/top",
+            "usr/bin/free",
+            "usr/bin/lsblk",
+            "usr/bin/dmesg",
+            "usr/bin/pacman",
+            "etc/pacman.conf",
+            "etc/pacman.d/mirrorlist",
+            "var/lib/pacman/local/ALPM_DB_VERSION",
+        ] {
+            assert!(
+                SHIPPED_COMMANDS_STAGE_ARTIFACTS.contains(&required),
+                "shipped-commands stage artifact list missing {required}"
+            );
+        }
+        let source = fs::read_to_string(repo_root().expect("repo root").join("xtask/src/lib.rs"))
+            .expect("read xtask source");
+        let body = source
+            .split("fn validate_userland_stage() -> Result<()>")
+            .nth(1)
+            .expect("validate_userland_stage source")
+            .split("\n}\n")
+            .next()
+            .expect("validate_userland_stage body");
+        assert!(
+            body.contains("SHIPPED_COMMANDS_STAGE_ARTIFACTS"),
+            "validate_userland_stage must gate on the shipped-commands artifacts"
+        );
+    }
+
+    /// Locate the userland stage when present so the Public Boot tests can
+    /// inspect the real systemd initramfs assembly.  Skips with `eprintln!`
+    /// when the stage hasn't been built yet so CI without a staged userland
+    /// remains green.
+    fn systemd_login_stage_or_skip() -> Option<PathBuf> {
+        let stage = target_userland_stage_dir().ok()?;
+        if !stage.join("usr/lib/systemd/systemd").is_file() {
+            eprintln!(
+                "skipping: userland stage missing {} — run `cargo xtask userland-build`",
+                stage.join("usr/lib/systemd/systemd").display()
+            );
+            return None;
+        }
+        Some(stage)
+    }
+
+    fn find_initramfs_entry<'a>(
+        files: &'a [InitramfsFile],
+        path: &str,
+    ) -> Option<&'a InitramfsFile> {
+        files.iter().find(|(entry_path, _, _)| entry_path == path)
+    }
+
+    #[test]
+    fn staged_systemd_units_and_dropins_are_not_executable() {
+        let stage = repo_root()
+            .expect("repo root")
+            .join("target/xtask-test/systemd-mode-stage");
+        let _ = fs::remove_dir_all(&stage);
+        for dir in [
+            "usr/lib/systemd",
+            "usr/lib/systemd/system",
+            "usr/lib/systemd/user",
+            "usr/lib/systemd/user.conf.d",
+        ] {
+            fs::create_dir_all(stage.join(dir)).unwrap_or_else(|err| panic!("stage {dir}: {err}"));
+        }
+        fs::write(stage.join("usr/lib/systemd/systemd-logind"), b"real-logind")
+            .expect("stage executable");
+        fs::write(
+            stage.join("usr/lib/systemd/system/systemd-logind.service"),
+            b"real-unit",
+        )
+        .expect("stage system unit");
+        fs::write(
+            stage.join("usr/lib/systemd/user/default.target"),
+            b"real-user-target",
+        )
+        .expect("stage user target");
+        fs::write(
+            stage.join("usr/lib/systemd/user.conf.d/10-coredump-lupos.conf"),
+            b"real-user-conf",
+        )
+        .expect("stage user manager drop-in");
+
+        let files = staged_tree_files(&stage, &["usr/lib/systemd"]);
+        let exec = find_initramfs_entry(&files, "usr/lib/systemd/systemd-logind")
+            .expect("systemd-logind executable");
+        assert_eq!(initramfs_mode_perms(exec.1), 0o755);
+
+        for rel in [
+            "usr/lib/systemd/system/systemd-logind.service",
+            "usr/lib/systemd/user/default.target",
+            "usr/lib/systemd/user.conf.d/10-coredump-lupos.conf",
+        ] {
+            let entry = find_initramfs_entry(&files, rel).unwrap_or_else(|| panic!("{rel}"));
+            assert_eq!(
+                initramfs_mode_perms(entry.1),
+                0o644,
+                "{rel} must not be executable or systemd warns during boot"
+            );
+        }
+    }
+
+    /// Public Boot acceptance gate: `/sbin/init` must be a symlink to the
+    /// real glibc systemd binary staged under `/usr/lib/systemd/systemd`.
+    /// Ref: vendor/linux/init/main.rs init handoff to the user `init=`.
+    #[test]
+    fn public_boot_real_systemd_is_pid1_via_sbin_init_symlink() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+
+        let sbin_init = find_initramfs_entry(&files, "sbin/init")
+            .expect("systemd userland must stage /sbin/init");
+        assert!(
+            initramfs_file_is_symlink(sbin_init),
+            "/sbin/init must be a symlink (Linux ABI requires init= path to resolve)"
+        );
+        assert_eq!(
+            sbin_init.2.as_slice(),
+            b"/usr/lib/systemd/systemd",
+            "/sbin/init must point at /usr/lib/systemd/systemd"
+        );
+
+        let systemd = find_initramfs_entry(&files, "usr/lib/systemd/systemd")
+            .expect("systemd userland must stage /usr/lib/systemd/systemd");
+        assert!(
+            initramfs_file_is_regular(systemd),
+            "/usr/lib/systemd/systemd must be a regular file in the cpio"
+        );
+        // Real glibc-linked systemd is a PIE ELF that easily exceeds 1MiB on
+        // A real glibc-linked systemd binary is large. The transcript stub is
+        // sub-kilobyte; pick a
+        // threshold that rejects accidental fallbacks without being brittle.
+        assert!(
+            systemd.2.len() > 100 * 1024,
+            "/usr/lib/systemd/systemd is {} bytes — looks like a stub, not real systemd",
+            systemd.2.len()
+        );
+        assert_eq!(
+            &systemd.2[..4],
+            b"\x7FELF",
+            "/usr/lib/systemd/systemd is not an ELF binary"
+        );
+    }
+
+    #[test]
+    fn systemd_login_userland_stages_base_fsck_helper() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+        for rel in [
+            "usr/lib/systemd/systemd-fsck",
+            "usr/lib/systemd/system/systemd-fsck-root.service",
+            "usr/sbin/fsck",
+            "usr/lib/libuuid.so.1",
+        ] {
+            assert!(
+                find_initramfs_entry(&files, rel).is_some(),
+                "{rel} must be staged for systemd-fsck-root.service"
+            );
+        }
+    }
+
+    /// Public Boot acceptance gate: `getty@tty1.service` must run on the
+    /// framebuffer tty via the standard systemd wants chain.  Ref:
+    /// vendor/linux/Documentation/admin-guide/serial-console.rst and the
+    /// systemd `getty@.service` unit at
+    /// vendor/systemd/units/getty@.service.in.
+    #[test]
+    fn public_boot_getty_tty1_runs_on_framebuffer_console() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+
+        // multi-user.target pulls in getty.target.
+        let mu_wants = find_initramfs_entry(
+            &files,
+            "etc/systemd/system/multi-user.target.wants/getty.target",
+        )
+        .expect("multi-user.target must want getty.target");
+        assert!(initramfs_file_is_symlink(mu_wants));
+        assert_eq!(
+            mu_wants.2.as_slice(),
+            b"/usr/lib/systemd/system/getty.target"
+        );
+
+        // getty.target wants the per-tty instance.
+        let getty_wants = find_initramfs_entry(
+            &files,
+            "etc/systemd/system/getty.target.wants/getty@tty1.service",
+        )
+        .expect("getty.target must want getty@tty1.service");
+        assert!(initramfs_file_is_symlink(getty_wants));
+        assert_eq!(
+            getty_wants.2.as_slice(),
+            b"/usr/lib/systemd/system/getty@.service"
+        );
+
+        // Drop-in override forces agetty on tty1 with the linux termcap, the
+        // canonical framebuffer console.  systemd would otherwise vt-allocate
+        // the tty away from the login prompt before agetty got to it.
+        let dropin = find_initramfs_entry(
+            &files,
+            "etc/systemd/system/getty@tty1.service.d/lupos-login.conf",
+        )
+        .expect("getty@tty1 drop-in must be staged");
+        assert!(initramfs_file_is_regular(dropin));
+        let body = core::str::from_utf8(&dropin.2).expect("drop-in is utf-8");
+        assert!(body.contains("TTYVTDisallocate=no"));
+        assert!(body.contains("ExecStart=-/usr/sbin/agetty --noclear --nohostname"));
+        assert!(
+            body.contains("tty1 linux"),
+            "drop-in must spawn agetty on tty1 with the linux termcap"
+        );
+
+        assert!(
+            find_initramfs_entry(&files, "usr/sbin/agetty")
+                .map(|entry| initramfs_file_is_regular(entry) && !entry.2.is_empty())
+                .unwrap_or(false),
+            "/usr/sbin/agetty must be a non-empty real binary"
+        );
+
+        let serial_getty_wants = find_initramfs_entry(
+            &files,
+            "etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service",
+        )
+        .expect("getty.target must want serial-getty@ttyS0.service");
+        assert!(initramfs_file_is_symlink(serial_getty_wants));
+        assert_eq!(
+            serial_getty_wants.2.as_slice(),
+            b"/usr/lib/systemd/system/serial-getty@.service"
+        );
+
+        let serial_dropin = find_initramfs_entry(
+            &files,
+            "etc/systemd/system/serial-getty@ttyS0.service.d/lupos-serial.conf",
+        )
+        .expect("serial-getty@ttyS0 drop-in must be staged");
+        assert!(initramfs_file_is_regular(serial_dropin));
+        let serial_body = core::str::from_utf8(&serial_dropin.2).expect("drop-in is utf-8");
+        assert!(serial_body.contains("ExecStart="));
+        assert!(
+            serial_body.contains(
+                "agetty --noclear --nohostname --issue-file /etc/issue 115200 ttyS0 linux"
+            ),
+            "drop-in must spawn agetty on ttyS0 with a serial baud rate"
+        );
+    }
+
+    #[test]
+    fn systemd_login_userland_uses_arch_usr_lib_runtime_path() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+
+        assert!(
+            find_initramfs_entry(&files, "usr/lib/libc.so.6").is_some(),
+            "Arch runtime libraries must be staged from /usr/lib"
+        );
+        assert!(
+            find_initramfs_entry(&files, "lib/x86_64-linux-gnu").is_none(),
+            "multiarch compatibility symlink must not be staged for Arch"
+        );
+    }
+
+    /// Public Boot acceptance gate: a root login on tty1 reaches bash with a
+    /// Linux-like prompt and working line editing.  Ref:
+    /// vendor/util-linux/login-utils/login.c (securetty + PAM stack) and
+    /// vendor/bash/bash-5.2.37/parse.y (PS1 expansion).
+    #[test]
+    fn public_boot_root_login_reaches_bash_with_linux_prompt() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+
+        for (path, label) in [
+            ("usr/bin/login", "/usr/bin/login"),
+            ("bin/login", "/bin/login"),
+            ("usr/bin/bash", "/usr/bin/bash"),
+            ("bin/bash", "/bin/bash"),
+        ] {
+            let entry = find_initramfs_entry(&files, path)
+                .unwrap_or_else(|| panic!("login chain must stage {label}"));
+            assert!(
+                initramfs_file_is_regular(entry),
+                "{label} must be a regular file"
+            );
+            assert!(!entry.2.is_empty(), "{label} must be a non-empty binary");
+        }
+
+        let securetty = find_initramfs_entry(&files, "etc/securetty")
+            .expect("/etc/securetty must be staged so root may log in on tty1");
+        let securetty_body = core::str::from_utf8(&securetty.2).expect("securetty utf-8");
+        assert!(
+            securetty_body.lines().any(|line| line.trim() == "tty1"),
+            "/etc/securetty must allow root login on tty1"
+        );
+
+        let passwd =
+            find_initramfs_entry(&files, "etc/passwd").expect("/etc/passwd must be staged");
+        let passwd_body = core::str::from_utf8(&passwd.2).expect("passwd utf-8");
+        assert!(
+            passwd_body.contains("root:x:0:0:root:/root:/bin/bash"),
+            "/etc/passwd must point root at /bin/bash with the normal /root home"
+        );
+
+        let shadow =
+            find_initramfs_entry(&files, "etc/shadow").expect("/etc/shadow must be staged");
+        let shadow_body = core::str::from_utf8(&shadow.2).expect("shadow utf-8");
+        for user in ["root", "lupos"] {
+            let expected = LOGIN_SHADOW
+                .lines()
+                .find(|line| line.starts_with(&format!("{user}:")))
+                .unwrap_or_else(|| panic!("expected {user} shadow fixture"));
+            assert!(
+                shadow_body.lines().any(|line| line == expected),
+                "/etc/shadow must stage the Lupos {user} password hash"
+            );
+        }
+        assert!(
+            !shadow_body.lines().any(|line| line.starts_with("root:*:")),
+            "/etc/shadow must not leave Arch's locked root account in place"
+        );
+
+        let pam_login = find_initramfs_entry(&files, "etc/pam.d/login")
+            .expect("/etc/pam.d/login must be staged");
+        let pam_login_body = core::str::from_utf8(&pam_login.2).expect("pam login utf-8");
+        // Some distro /etc/pam.d/login files pull pam_unix through include
+        // chains; accept the inline file, the Debian common-auth path, or
+        // Arch's system-local-login -> system-login -> system-auth path.
+        let auth_via_unix = pam_login_body.contains("pam_unix.so");
+        let auth_via_include = pam_login_body.contains("@include common-auth");
+        let auth_via_arch_include = pam_login_body.contains("system-local-login");
+        assert!(
+            auth_via_unix || auth_via_include || auth_via_arch_include,
+            "PAM login stack must authenticate via pam_unix.so"
+        );
+        if auth_via_include {
+            let common_auth = find_initramfs_entry(&files, "etc/pam.d/common-auth")
+                .expect("/etc/pam.d/common-auth must be staged when login @includes it");
+            let common_auth_body = core::str::from_utf8(&common_auth.2).expect("common-auth utf-8");
+            assert!(
+                common_auth_body.contains("pam_unix.so"),
+                "/etc/pam.d/common-auth must use pam_unix.so for shadow auth"
+            );
+        }
+        if auth_via_arch_include {
+            let system_local_login = find_initramfs_entry(&files, "etc/pam.d/system-local-login")
+                .expect("/etc/pam.d/system-local-login must be staged when login includes it");
+            let system_local_login_body =
+                core::str::from_utf8(&system_local_login.2).expect("system-local-login utf-8");
+            assert!(
+                system_local_login_body.contains("system-login"),
+                "/etc/pam.d/system-local-login must include system-login"
+            );
+
+            let system_login = find_initramfs_entry(&files, "etc/pam.d/system-login")
+                .expect("/etc/pam.d/system-login must be staged for Arch login PAM");
+            let system_login_body =
+                core::str::from_utf8(&system_login.2).expect("system-login utf-8");
+            assert!(
+                system_login_body.contains("system-auth"),
+                "/etc/pam.d/system-login must include system-auth"
+            );
+
+            let system_auth = find_initramfs_entry(&files, "etc/pam.d/system-auth")
+                .expect("/etc/pam.d/system-auth must be staged for Arch login PAM");
+            let system_auth_body = core::str::from_utf8(&system_auth.2).expect("system-auth utf-8");
+            assert!(
+                system_auth_body.contains("pam_unix.so"),
+                "/etc/pam.d/system-auth must use pam_unix.so for shadow auth"
+            );
+        }
+
+        let profile =
+            find_initramfs_entry(&files, "etc/profile").expect("/etc/profile must be staged");
+        let profile_body = core::str::from_utf8(&profile.2).expect("profile utf-8");
+        assert!(
+            profile_body.contains("/etc/bash.bashrc"),
+            "Arch /etc/profile must source /etc/bash.bashrc for interactive Bash"
+        );
+        assert!(
+            !profile_body.contains("PS1="),
+            "/etc/profile must not carry the old Lupos PS1 override"
+        );
+        let bash_bashrc = find_initramfs_entry(&files, "etc/bash.bashrc")
+            .expect("/etc/bash.bashrc must be staged with Arch /etc/profile");
+        let bash_bashrc_body = core::str::from_utf8(&bash_bashrc.2).expect("bash.bashrc utf-8");
+        assert!(
+            bash_bashrc_body.contains("PS1='[\\u@\\h \\W]\\$ '"),
+            "/etc/bash.bashrc must provide Arch's bracketed Bash prompt"
+        );
+        assert!(
+            !bash_bashrc_body.contains("\\033[01;32m"),
+            "/etc/bash.bashrc must not carry the old colored Lupos PS1 override"
+        );
+        assert!(
+            !profile_body.contains("command -v clear") && !profile_body.contains(" then clear"),
+            "/etc/profile must not auto-clear; framebuffer repaint is too slow during login"
+        );
+
+        let issue = find_initramfs_entry(&files, "etc/issue").expect("/etc/issue must be staged");
+        assert!(
+            !issue.2.is_empty(),
+            "/etc/issue body is what agetty prints before the login prompt"
+        );
+    }
+
+    /// Public Boot acceptance gate: `poweroff` / `reboot` from userspace must
+    /// terminate QEMU instead of hanging the CPU.  The kernel-side decoder is
+    /// validated separately in `src/kernel/syscalls.rs::reboot_decoder_*`;
+    /// here we lock in the harness-side contract: every public boot QEMU
+    /// command line wires the `isa-debug-exit` device that the kernel pulses
+    /// from `crate::linux_driver_abi::platform::qemu::exit_success` and `machine_restart`, and the
+    /// userspace `poweroff` / `reboot` / `halt` / `shutdown` entry points
+    /// are present in the initramfs.
+    #[test]
+    fn public_boot_poweroff_and_reboot_terminate_qemu_cleanly() {
+        // Harness contract: every QEMU iso command wires isa-debug-exit at 0xf4.
+        let target_dir = std::env::temp_dir();
+        let iso = target_dir.join("lupos-test.iso");
+        let serial = target_dir.join("lupos-test.serial.log");
+        let command = build_qemu_iso_command(&iso, &serial, 1);
+        let rendered = format!("{command:?}");
+        assert!(
+            rendered.contains("isa-debug-exit,iobase=0xf4,iosize=0x04"),
+            "public boot QEMU command must wire isa-debug-exit so userspace `poweroff` exits QEMU: {rendered}"
+        );
+
+        // Kernel-side: src/linux_driver_abi/platform/qemu.rs must expose both exit and PS/2 restart paths.
+        let root = repo_root().expect("repo root");
+        let qemu_rs = fs::read_to_string(root.join("src/linux_driver_abi/platform/qemu.rs"))
+            .expect("read drivers/platform/qemu.rs");
+        for needle in [
+            "pub fn exit_success() -> !",
+            "pub fn machine_restart() -> !",
+            "KBD_COMMAND_PORT: u16 = 0x64",
+            "KBD_RESET_CMD: u8 = 0xFE",
+        ] {
+            assert!(
+                qemu_rs.contains(needle),
+                "drivers/platform/qemu.rs missing {needle}"
+            );
+        }
+
+        // sys_reboot must dispatch through the new decoder unconditionally,
+        // not gated by the qemu-test cargo feature.
+        let syscalls_rs =
+            fs::read_to_string(root.join("src/kernel/syscalls.rs")).expect("syscalls source");
+        assert!(
+            syscalls_rs.contains("pub fn decode_reboot(magic1: i32, magic2: i32, cmd: u32)"),
+            "sys_reboot must call decode_reboot for the magic/cmd dispatch"
+        );
+        assert!(
+            syscalls_rs.contains("crate::linux_driver_abi::platform::qemu::machine_restart()"),
+            "sys_reboot RESTART/RESTART2 must trigger machine_restart"
+        );
+        assert!(
+            !syscalls_rs
+                .contains("#[cfg(feature = \"qemu-test\")]\n    crate::linux_driver_abi::platform::qemu::exit_success();"),
+            "sys_reboot poweroff path must not be gated behind the qemu-test feature anymore"
+        );
+
+        // Userspace entry points used by Bash / systemctl shutdown.
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+        for entry in ["sbin/poweroff", "usr/sbin/poweroff"] {
+            let f = find_initramfs_entry(&files, entry)
+                .unwrap_or_else(|| panic!("public boot userland must stage {entry}"));
+            assert!(initramfs_file_is_regular(f));
+            assert!(!f.2.is_empty(), "{entry} must be a non-empty binary");
+        }
+    }
+
+    /// Public Boot acceptance gate: `cargo xtask test-boot` (no `--mode`)
+    /// must drive the real systemd login stack, not the synthetic SysV
+    /// transcript.  This keeps the four Public Boot items wired to the
+    /// command users actually run.
+    #[test]
+    fn public_boot_default_test_boot_runs_real_systemd_login_stack() {
+        let source = fs::read_to_string(repo_root().expect("repo root").join("xtask/src/lib.rs"))
+            .expect("read xtask source");
+        // Normalise CRLF -> LF so the assertion is insensitive to checkout settings.
+        let source = source.replace("\r\n", "\n");
+        assert!(
+            source.contains("pub fn run_default_boot_smoke() -> Result<()> {\n    ensure_userland_stage()?;\n    run_login_stack_tests()\n}"),
+            "cargo xtask test-boot must default to run_login_stack_tests so Public Boot items are gated"
+        );
+    }
+
+    #[test]
+    fn login_stack_terminal_gate_is_not_network_bound() {
+        let source = fs::read_to_string(repo_root().expect("repo root").join("xtask/src/lib.rs"))
+            .expect("read xtask source");
+        let finite_ping = ["send: b\"ping -c 1 ", "google.com\\n\""].concat();
+        let foreground_ping = ["send: b\"ping ", "google.com\\n\""].concat();
+        let ping_marker = ["\"login-stack: ping ", "ctrl-c ok\""].concat();
+        assert!(
+            !source.contains(&finite_ping),
+            "terminal-login gate must not wait on external networking before proving Bash"
+        );
+        assert!(
+            !source.contains(&foreground_ping),
+            "terminal-login gate must not start an unbounded foreground ping"
+        );
+        assert!(
+            !source.contains(&ping_marker),
+            "terminal-login markers must not depend on ping recovery"
+        );
+    }
+
+    #[test]
+    fn login_stack_gate_proves_fast_serial_bash_path() {
+        let source = fs::read_to_string(repo_root().expect("repo root").join("xtask/src/lib.rs"))
+            .expect("read xtask source");
+        let source = source
+            .split("pub fn run_login_stack_tests() -> Result<()>")
+            .nth(1)
+            .expect("run_login_stack_tests source")
+            .split("pub fn run_gui_shell_tests() -> Result<()>")
+            .next()
+            .expect("run_login_stack_tests body");
+        let loginctl_probe = ["loginctl ", "list-sessions --no-legend"].concat();
+        assert!(
+            !source.contains(&loginctl_probe),
+            "terminal-login gate should not wait on logind before proving Bash"
+        );
+        assert!(
+            source.contains("\"sched_clock: Marking stable\""),
+            "login-stack gate should prove the scheduler clock stable boot line is emitted"
+        );
+        assert!(
+            source.contains("\"Write protecting the kernel read-only data:\""),
+            "login-stack gate should prove mark_rodata_ro ran"
+        );
+        assert!(
+            source.contains("\"x86/mm: Checked W+X mappings: passed, no W+X pages found.\""),
+            "login-stack gate should prove the W+X audit passed"
+        );
+        assert!(
+            source.contains("\"Freeing unused kernel image (initmem) memory:\""),
+            "login-stack gate should prove free_initmem released boot-only pages"
+        );
+        assert!(
+            source.contains("\"Freeing unused kernel image (text/rodata gap) memory:\""),
+            "login-stack gate should prove text/rodata section gaps are released"
+        );
+        assert!(
+            source.contains("\"Freeing unused kernel image (rodata/data gap) memory:\""),
+            "login-stack gate should prove rodata/data section gaps are released"
+        );
+        let udev_probe = ["systemctl is-active ", "systemd-udevd.service"].concat();
+        assert!(
+            !source.contains(&udev_probe),
+            "terminal-login gate should not wait on udevd before proving Bash"
+        );
+        let udev_marker = ["\"login-stack: ", "udev ok\""].concat();
+        assert!(
+            !source.contains(&udev_marker),
+            "terminal-login gate should not require a udev marker"
+        );
+        let loginctl_marker = ["\"login-stack: ", "loginctl session ok\""].concat();
+        assert!(
+            !source.contains(&loginctl_marker),
+            "terminal-login gate should not require a loginctl marker"
+        );
+        assert!(
+            source.contains("echo $SHELL") && source.contains("/bin/bash"),
+            "terminal-login gate must prove Bash is the login shell"
+        );
+        assert!(
+            source.contains("login-stack: gate ok"),
+            "terminal-login gate should emit the final acceptance marker"
+        );
+    }
+
+    #[test]
+    fn ls_li_parser_requires_linux_stat_fields() {
+        let log = "\
+/home/lupos
+\x1b[32mlupos@lupos\x1b[0m:~$ ls -ldi /home/lupos
+ 15 drwxr-xr-x 2 lupos lupos      0 May 21 17:41 /home/lupos
+";
+
+        let line = ls_li_line(log, "/home/lupos").expect("ls -li metadata row");
+        assert!(line.starts_with(" 15 drwxr-xr-x"));
+        assert!(!line.starts_with("/home/lupos"));
+    }
+
+    #[test]
+    fn pid1_scheduler_loop_drains_console_control_before_maintenance() {
+        let source = fs::read_to_string(repo_root().expect("repo root").join("src/init/main.rs"))
+            .expect("read kernel main source");
+        let source = source.replace("\r\n", "\n");
+        assert!(
+            source.contains(
+                "init::rootfs::drain_console_control_bytes();\n            kernel::console::maintenance_budgeted();"
+            ),
+            "PID1/login scheduler loops must drain tty control bytes before fbcon maintenance"
+        );
+    }
+
+    #[test]
+    fn syscall_entry_drains_console_control_bytes_for_foreground_signals() {
+        let source = fs::read_to_string(
+            repo_root()
+                .expect("repo root")
+                .join("src/arch/x86/entry/syscall.rs"),
+        )
+        .expect("read syscall source");
+        assert!(
+            source.contains("crate::init::rootfs::drain_console_control_bytes();"),
+            "syscall entry should drain tty control bytes so busy foreground tasks can receive Ctrl-C"
+        );
+    }
+
+    /// Read the staged file as `(kind, optional_target)` where `kind` is one
+    /// of `"file"`, `"symlink"`, `"dir"`, `"missing"`.
+    fn classify_stage_path(stage: &Path, rel: &str) -> (&'static str, Option<String>) {
+        let path = stage.join(rel);
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            return ("missing", None);
+        };
+        let ty = meta.file_type();
+        if ty.is_symlink() {
+            let target = fs::read_link(&path)
+                .ok()
+                .map(|t| t.to_string_lossy().into_owned());
+            return ("symlink", target);
+        }
+        if ty.is_dir() {
+            return ("dir", None);
+        }
+        ("file", None)
+    }
+
+    fn assert_stage_symlink_to(stage: &Path, rel: &str, expected: &str) {
+        let (kind, target) = classify_stage_path(stage, rel);
+        assert_eq!(
+            kind, "symlink",
+            "{rel} must be a symlink (merged-/usr / FHS compat), got {kind:?}"
+        );
+        let target = target.unwrap_or_else(|| panic!("{rel} symlink target must be readable"));
+        assert_eq!(
+            target, expected,
+            "{rel} symlink must point at {expected}, got {target}"
+        );
+    }
+
+    /// Resolve up to `MAX_HOPS` of POSIX-style symlinks beneath `stage`.
+    /// Each link is resolved relative to the parent path; the returned path
+    /// is the first non-symlink path reached beneath the stage.
+    fn resolve_stage_symlinks(stage: &Path, rel: &str) -> Option<PathBuf> {
+        const MAX_HOPS: u32 = 8;
+        let mut current = stage.join(rel);
+        for _ in 0..MAX_HOPS {
+            let meta = fs::symlink_metadata(&current).ok()?;
+            if meta.file_type().is_symlink() {
+                let target = fs::read_link(&current).ok()?;
+                let parent = current.parent()?.to_path_buf();
+                current = if target.is_absolute() {
+                    let stripped = target.strip_prefix("/").unwrap_or(&target);
+                    stage.join(stripped)
+                } else {
+                    parent.join(target)
+                };
+                continue;
+            }
+            return Some(current);
+        }
+        None
+    }
+
+    /// Assert that `rel` ultimately resolves to a non-empty ELF blob.
+    /// Symlinks (e.g. `libcrypt.so.1 -> libcrypt.so.1.1.0`) are followed via
+    /// `resolve_stage_symlinks`.
+    fn assert_stage_regular_nonempty_elf(stage: &Path, rel: &str) {
+        let resolved = resolve_stage_symlinks(stage, rel)
+            .unwrap_or_else(|| panic!("stage missing {rel} (unresolved symlink chain)"));
+        let meta = fs::symlink_metadata(&resolved)
+            .unwrap_or_else(|err| panic!("stat {} failed: {err}", resolved.display()));
+        assert!(
+            meta.is_file(),
+            "{rel} must resolve to a regular file in the userland stage"
+        );
+        let bytes = fs::read(&resolved)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", resolved.display()));
+        assert!(!bytes.is_empty(), "{rel} is empty");
+        assert_eq!(
+            &bytes[..4.min(bytes.len())],
+            b"\x7FELF",
+            "{rel} must be an ELF binary"
+        );
+    }
+
+    /// Userland item: the glibc dynamic loader and the canonical shared
+    /// runtime libraries must be staged under merged-/usr.  Ref:
+    /// vendor/linux/Documentation/admin-guide/devices.txt (ABI of /lib64).
+    #[test]
+    fn userland_glibc_loader_and_runtime_libs_are_merged_usr() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+
+        // The dynamic loader path is hard-coded into every PIE in `target/`
+        // — `readelf -l ... | grep INTERP` shows `/lib64/ld-linux-x86-64.so.2`.
+        assert_stage_regular_nonempty_elf(&stage, GLIBC_DYNAMIC_LOADER);
+
+        // Merged-/usr: /lib must resolve to usr/lib.
+        assert_stage_symlink_to(&stage, "lib", "usr/lib");
+
+        for lib in [
+            "usr/lib/libc.so.6",
+            "usr/lib/libpthread.so.0",
+            "usr/lib/libdl.so.2",
+            "usr/lib/librt.so.1",
+            "usr/lib/libm.so.6",
+            "usr/lib/libcrypt.so.2",
+        ] {
+            assert_stage_regular_nonempty_elf(&stage, lib);
+        }
+    }
+
+    /// Userland item: systemd is provided by the Arch base package via the
+    /// bootstrap tarball. The script must NOT build systemd from source, and the
+    /// staged binary (when present) must be a glibc-linked ELF.
+    #[test]
+    fn arch_userland_provides_systemd_from_package() {
+        let root = repo_root().expect("repo root");
+        let script = fs::read_to_string(root.join(USERLAND_BUILD_SCRIPT))
+            .expect("read userland build script");
+
+        // The Arch path must never build systemd from source.
+        for forbidden in [
+            "meson setup",
+            "meson compile",
+            "build_systemd",
+            "LUPOS_SYSTEMD_VERSION",
+        ] {
+            assert!(
+                !script.contains(forbidden),
+                "Arch bootstrap script must not build systemd from source: {forbidden}"
+            );
+        }
+
+        // When the stage is present, the binary must be a glibc-linked ELF.
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let bytes =
+            fs::read(stage.join("usr/lib/systemd/systemd")).expect("read staged systemd binary");
+        assert_eq!(&bytes[..4], b"\x7FELF", "staged systemd must be an ELF");
+        assert!(
+            bytes
+                .windows(b"/lib64/ld-linux-x86-64.so.2".len())
+                .any(|w| w == b"/lib64/ld-linux-x86-64.so.2"),
+            "staged systemd must link against /lib64/ld-linux-x86-64.so.2 (glibc)"
+        );
+    }
+
+    /// Userland item: FHS compatibility paths `/bin`, `/sbin`, `/lib`, and
+    /// `/var/run` are populated so unmodified Linux userspace finds its
+    /// canonical entry points.  Ref: FHS 3.0 §3.4 (/bin), §3.16 (/sbin),
+    /// §3.8 (/lib), §5.13 (/var/run -> /run merge).
+    #[test]
+    fn userland_fhs_compat_paths_bin_sbin_lib_varrun_are_present() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+
+        // /lib -> usr/lib  (merged-/usr).
+        assert_stage_symlink_to(&stage, "lib", "usr/lib");
+        // /var/run -> /run (legacy alias still required by some tooling).
+        let files = systemd_login_userland_files_with_stage(&stage);
+        let var_run = find_initramfs_symlink_target(&files, "var/run")
+            .expect("boot payload must stage /var/run as a symlink");
+        assert_eq!(var_run, b"/run");
+
+        // /bin entries the boot scripts depend on (real binaries or stubs,
+        // never absent).  These are the minimum set the SysV-style getty +
+        // login + bash path needs.
+        for rel in [
+            "bin/sh",
+            "bin/bash",
+            "bin/login",
+            "bin/ls",
+            "bin/mount",
+            "bin/cp",
+            "bin/cat",
+        ] {
+            let (kind, _) = classify_stage_path(&stage, rel);
+            assert!(
+                kind == "file" || kind == "symlink",
+                "{rel} must be present in /bin (kind={kind})"
+            );
+        }
+
+        // /sbin entries the kernel/initramfs handoff depends on.  /sbin/init
+        // is the canonical entry point Linux's `init=` cmdline resolves
+        // (vendor/linux/init/main.c::run_init_process).
+        for rel in ["sbin/init", "sbin/agetty", "sbin/modprobe"] {
+            let (kind, _) = classify_stage_path(&stage, rel);
+            assert!(
+                kind == "file" || kind == "symlink",
+                "{rel} must be present in /sbin (kind={kind})"
+            );
+        }
+
+        // `/lib64` is required by the ABI even on merged-/usr systems
+        // because the ELF PT_INTERP path is hard-coded to /lib64/ld-...
+        let (loader_kind, _) = classify_stage_path(&stage, GLIBC_DYNAMIC_LOADER);
+        assert!(
+            loader_kind == "file" || loader_kind == "symlink",
+            "{GLIBC_DYNAMIC_LOADER} must exist (kind={loader_kind})"
+        );
+    }
+
+    /// Kernel ABI for Systemd item: every subsystem listed in
+    /// `ROADMAP.md` (pidfd, mount API, memfd, eventfd, timerfd, signalfd,
+    /// epoll, inotify, AF_UNIX, AF_NETLINK, capabilities, signals, reboot)
+    /// must (a) expose its syscall entry point and (b) carry at least one
+    /// `#[test]` that references the corresponding `vendor/linux/` source
+    /// it ports from.  This gates the surface so subsequent systemd
+    /// service work doesn't proceed without a Linux-shaped contract test
+    /// in place.
+    #[test]
+    fn kernel_abi_for_systemd_subsystems_have_linux_source_backed_tests() {
+        let root = repo_root().expect("repo root");
+        // (subsystem, source file, syscall fn name, linux source root).
+        // The linux source root is the directory the in-tree
+        // implementation ports from; tests must reference at least one
+        // path under it.
+        let coverage: &[(&str, &str, &str, &str)] = &[
+            (
+                "pidfd",
+                "src/kernel/syscalls.rs",
+                "pub fn sys_pidfd_open",
+                "vendor/linux/kernel/pid.c",
+            ),
+            (
+                "mount API",
+                "src/fs/syscalls.rs",
+                "pub unsafe fn sys_fsopen",
+                "vendor/linux/fs/fsopen.c",
+            ),
+            (
+                "memfd",
+                "src/fs/syscalls.rs",
+                "pub unsafe fn sys_memfd_create",
+                "vendor/linux/mm/memfd.c",
+            ),
+            (
+                "eventfd",
+                "src/fs/eventfd.rs",
+                "pub unsafe fn sys_eventfd2",
+                "vendor/linux/fs/eventfd.c",
+            ),
+            (
+                "timerfd",
+                "src/kernel/time/timerfd.rs",
+                "pub fn sys_timerfd_create",
+                "vendor/linux/fs/timerfd.c",
+            ),
+            (
+                "signalfd",
+                "src/fs/signalfd.rs",
+                "pub unsafe fn sys_signalfd4",
+                "vendor/linux/fs/signalfd.c",
+            ),
+            (
+                "epoll",
+                "src/fs/eventpoll.rs",
+                "pub unsafe fn sys_epoll_create1",
+                "vendor/linux/fs/eventpoll.c",
+            ),
+            (
+                "inotify",
+                "src/fs/inotify.rs",
+                "pub unsafe fn sys_inotify_init1",
+                "vendor/linux/fs/notify/inotify",
+            ),
+            (
+                "AF_UNIX",
+                "src/net/socket.rs",
+                "AF_UNIX: u16 = 1",
+                "vendor/linux/net/unix",
+            ),
+            (
+                "AF_NETLINK",
+                "src/net/socket.rs",
+                "AF_NETLINK: u16 = 16",
+                "vendor/linux/net/netlink",
+            ),
+            (
+                "capabilities",
+                "src/kernel/capability.rs",
+                "pub unsafe fn sys_capset",
+                "vendor/linux/kernel/capability.c",
+            ),
+            (
+                "signals",
+                "src/kernel/signal.rs",
+                "pub unsafe fn sys_rt_sigaction",
+                "vendor/linux/kernel/signal.c",
+            ),
+            (
+                "reboot",
+                "src/kernel/syscalls.rs",
+                "pub fn sys_reboot",
+                "vendor/linux/kernel/reboot.c",
+            ),
+        ];
+
+        for (name, src_rel, sym_needle, linux_root_rel) in coverage {
+            let src_path = root.join(src_rel);
+            let body = fs::read_to_string(&src_path)
+                .unwrap_or_else(|err| panic!("{name}: failed to read {src_rel}: {err}"));
+            assert!(
+                body.contains(sym_needle),
+                "{name}: syscall entry point `{sym_needle}` missing from {src_rel}"
+            );
+            assert!(
+                body.contains("#[test]"),
+                "{name}: {src_rel} must carry unit tests"
+            );
+            // The Linux source root the in-tree code ports from must
+            // exist on disk so future contributors can grep against it.
+            let linux_root = root.join(linux_root_rel);
+            assert!(
+                linux_root.exists(),
+                "{name}: Linux source root {linux_root_rel} must exist for parity tests"
+            );
+            // The source file must reference the Linux source tree in at
+            // least one comment, so the parity contract is documented
+            // alongside the code/tests.
+            assert!(
+                body.contains("vendor/linux/"),
+                "{name}: {src_rel} must reference vendor/linux/ in its docs/tests"
+            );
+        }
+    }
+
+    /// Userland item: PAM modules, NSS modules, `/etc/machine-id`,
+    /// `/etc/os-release`, account databases, and systemd unit presets are
+    /// staged so systemd's first boot can authenticate the root login and
+    /// enable the default service set.  Ref:
+    /// `man 5 machine-id`, `man 5 os-release`, `man 5 nss`,
+    /// `man 5 systemd.preset`, vendor/systemd/systemd-260.1/src/sysusers,
+    /// vendor/systemd/systemd-260.1/src/tmpfiles.
+    #[test]
+    fn userland_pam_nss_machine_id_os_release_accounts_presets_are_staged() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+
+        // machine-id: 32 lowercase hex chars + trailing newline per
+        // `man 5 machine-id` ("The /etc/machine-id file ... contains the
+        // machine ID as a single newline-terminated, hexadecimal, 32-character,
+        // lowercase ID").
+        let files = systemd_login_userland_files_with_stage(&stage);
+        let machine_id_bytes = initramfs_file_bytes(&files, "etc/machine-id")
+            .expect("/etc/machine-id must be staged in the boot payload");
+        let machine_id = core::str::from_utf8(&machine_id_bytes).expect("machine-id must be ASCII");
+        let trimmed = machine_id.trim_end_matches('\n');
+        assert_eq!(
+            trimmed.len(),
+            32,
+            "/etc/machine-id must be 32 hex chars (got {} bytes)",
+            trimmed.len()
+        );
+        assert!(
+            trimmed
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "/etc/machine-id must be lowercase hex per `man 5 machine-id`"
+        );
+
+        // os-release: must define ID= and NAME= per `man 5 os-release`.
+        let os_release = fs::read_to_string(stage.join("etc/os-release"))
+            .expect("/etc/os-release must be staged");
+        assert!(
+            os_release.lines().any(|l| l.starts_with("ID=")),
+            "/etc/os-release missing ID= field"
+        );
+        assert!(
+            os_release.lines().any(|l| l.starts_with("NAME=")),
+            "/etc/os-release missing NAME= field"
+        );
+
+        // The canonical mirror at /usr/lib/os-release is required by
+        // namespaced reads. Either a regular file or a symlink resolved to the
+        // same content is acceptable.
+        let usr_lib_meta = fs::metadata(stage.join("usr/lib/os-release"))
+            .expect("/usr/lib/os-release must resolve");
+        assert!(
+            usr_lib_meta.is_file() && usr_lib_meta.len() > 0,
+            "/usr/lib/os-release must be a non-empty file"
+        );
+
+        // PAM module: pam_unix.so is what login + su authenticate against.
+        let pam_unix_locations = ["usr/lib/security/pam_unix.so", "lib/security/pam_unix.so"];
+        assert!(
+            pam_unix_locations
+                .iter()
+                .any(|rel| stage.join(rel).is_file()),
+            "pam_unix.so must be staged at one of {pam_unix_locations:?}"
+        );
+
+        // NSS: files + dns are the minimum set systemd-resolved + login expect.
+        for rel in ["usr/lib/libnss_files.so.2", "usr/lib/libnss_dns.so.2"] {
+            let meta = fs::symlink_metadata(stage.join(rel))
+                .unwrap_or_else(|err| panic!("{rel} must be staged: {err}"));
+            assert!(meta.is_file() || meta.file_type().is_symlink());
+        }
+
+        // nsswitch.conf must point lookups at `files` (and `dns` for hosts).
+        // Ref: man 5 nsswitch.conf.
+        let nsswitch = fs::read_to_string(stage.join("etc/nsswitch.conf"))
+            .expect("/etc/nsswitch.conf must be staged");
+        for prefix in ["passwd:", "group:", "shadow:", "hosts:"] {
+            assert!(
+                nsswitch.lines().any(|l| l.trim_start().starts_with(prefix)),
+                "/etc/nsswitch.conf missing `{prefix}` lookup"
+            );
+        }
+        assert!(
+            nsswitch.contains("files"),
+            "/etc/nsswitch.conf must use the `files` NSS module"
+        );
+
+        // accountsservice / passwd databases the login chain reads.
+        for rel in ["etc/passwd", "etc/shadow", "etc/group"] {
+            let meta = fs::metadata(stage.join(rel))
+                .unwrap_or_else(|err| panic!("{rel} must be staged: {err}"));
+            assert!(meta.is_file() && meta.len() > 0, "{rel} is empty");
+        }
+
+        // systemd unit presets: the 90-systemd.preset must enable getty@.service
+        // so multi-user.target wants a TTY login.  Ref: man 5 systemd.preset.
+        let preset =
+            fs::read_to_string(stage.join("usr/lib/systemd/system-preset/90-systemd.preset"))
+                .expect("/usr/lib/systemd/system-preset/90-systemd.preset must be staged");
+        assert!(
+            preset.contains("enable getty@.service"),
+            "90-systemd.preset must enable getty@.service for first boot"
+        );
+
+        // sysusers.d and tmpfiles.d: at least the systemd-owned drop-ins
+        // must be present so first boot can populate /var, /run, and the
+        // service users (man 5 sysusers.d, man 5 tmpfiles.d).
+        let sysusers = stage.join("usr/lib/sysusers.d/basic.conf");
+        assert!(
+            sysusers.is_file(),
+            "/usr/lib/sysusers.d/basic.conf must be staged so systemd-sysusers can seed accounts"
+        );
+        let tmpfiles = stage.join("usr/lib/tmpfiles.d/systemd.conf");
+        assert!(
+            tmpfiles.is_file(),
+            "/usr/lib/tmpfiles.d/systemd.conf must be staged so systemd-tmpfiles can prepare /run + /var"
+        );
+    }
+
+    fn find_initramfs_symlink_target<'a>(
+        files: &'a [InitramfsFile],
+        path: &str,
+    ) -> Option<&'a [u8]> {
+        files
+            .iter()
+            .find(|(entry_path, mode, _)| entry_path == path && initramfs_mode_is_symlink(*mode))
+            .map(|(_, _, bytes)| bytes.as_slice())
+    }
+
+    /// Regression for the 2026-05-21 `ping google.com` failure:
+    /// `/usr/bin/ping` (iputils) dlopens `libidn2.so.0` which dlopens
+    /// `libunistring.so.5`.  Without those two libraries in the
+    /// initramfs the dynamic loader prints
+    /// `cannot open shared object file: No such file or directory`
+    /// and ping exits 127 before sending an ICMP packet.  Ref:
+    /// `vendor/iputils/ping/ping.c` (idn2_lookup_ul on the host arg).
+    #[test]
+    fn ping_shared_library_chain_is_staged() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+        for rel in ["usr/lib/libidn2.so.0", "usr/lib/libunistring.so.5"] {
+            assert!(
+                find_initramfs_entry(&files, rel).is_some(),
+                "{rel} must be staged so /usr/bin/ping can dlopen it"
+            );
+        }
+    }
+
+    /// Regression for package-manager runtime omissions: the Arch base profile
+    /// stages `/usr/bin/pacman`; the boot payload must also carry pacman's
+    /// config, local database, and direct shared-library chain.
+    #[test]
+    fn pacman_package_manager_runtime_is_staged() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+
+        for rel in [
+            "usr/bin/pacman",
+            "etc/pacman.conf",
+            "etc/pacman.d/mirrorlist",
+            ARCH_PACMAN_XFER_HELPER,
+            "var/lib/pacman/local/ALPM_DB_VERSION",
+        ] {
+            let entry = find_initramfs_entry(&files, rel)
+                .unwrap_or_else(|| panic!("{rel} must be staged for pacman checks"));
+            assert!(
+                initramfs_file_is_regular(entry),
+                "{rel} must be a regular file in the boot payload"
+            );
+        }
+
+        let mirrorlist = core::str::from_utf8(
+            initramfs_file_bytes(&files, "etc/pacman.d/mirrorlist")
+                .expect("pacman mirrorlist must be staged"),
+        )
+        .expect("pacman mirrorlist must be UTF-8");
+        assert!(
+            mirrorlist.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("Server = ") || line.starts_with("Server=")
+            }),
+            "pacman mirrorlist must include at least one uncommented Server entry"
+        );
+        assert!(
+            mirrorlist.contains("file:///var/lib/lupos/pacman-repo/$repo/os/$arch"),
+            "pacman mirrorlist must use the generated offline repo"
+        );
+        let pacman_conf = core::str::from_utf8(
+            initramfs_file_bytes(&files, "etc/pacman.conf").expect("pacman config must be staged"),
+        )
+        .expect("pacman config must be UTF-8");
+        assert!(
+            pacman_conf
+                .lines()
+                .any(|line| line.trim() == "DisableSandbox"),
+            "pacman config must disable libalpm's Linux sandbox"
+        );
+        assert!(
+            !pacman_conf.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("DownloadUser") && line.contains('=')
+            }),
+            "pacman config must not enable DownloadUser until uid switching works in the guest"
+        );
+        assert!(
+            pacman_conf.contains("SigLevel = Optional TrustAll"),
+            "pacman config must allow the generated offline repos without a guest keyring"
+        );
+        assert!(
+            pacman_conf.contains(ARCH_PACMAN_XFER_COMMAND),
+            "pacman config must use the Lupos transfer helper"
+        );
+        let pacman_xfer = find_initramfs_entry(&files, ARCH_PACMAN_XFER_HELPER)
+            .expect("pacman transfer helper must be staged");
+        assert_eq!(pacman_xfer.1 & 0o777, 0o755);
+        assert_eq!(
+            initramfs_file_bytes(&files, ARCH_PACMAN_XFER_HELPER),
+            Some(ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes())
+        );
+
+        for rel in ARCH_OFFLINE_PACMAN_REPO_ARTIFACTS {
+            let entry = find_initramfs_entry(&files, rel)
+                .unwrap_or_else(|| panic!("{rel} must be staged for offline pacman installs"));
+            assert!(
+                initramfs_file_is_regular(entry),
+                "{rel} must be a regular file in the boot payload"
+            );
+        }
+        for (rel, target) in ARCH_PACMAN_PACKAGE_ALIASES {
+            let actual = find_initramfs_symlink_target(&files, rel)
+                .unwrap_or_else(|| panic!("{rel} package alias must be staged as a symlink"));
+            assert_eq!(
+                core::str::from_utf8(actual).expect("package alias target must be UTF-8"),
+                *target
+            );
+        }
+
+        for rel in [
+            "usr/lib/libarchive.so.13",
+            "usr/lib/libcurl.so.4",
+            "usr/lib/libssl.so.3",
+            "usr/lib/libcrypto.so.3",
+            "usr/lib/libzstd.so.1",
+            "usr/lib/libacl.so.1",
+            "usr/lib/libbz2.so.1.0",
+        ] {
+            let entry = find_initramfs_entry(&files, rel)
+                .unwrap_or_else(|| panic!("{rel} must be staged for pacman"));
+            if initramfs_file_is_symlink(entry) {
+                let target = core::str::from_utf8(&entry.2)
+                    .unwrap_or_else(|err| panic!("{rel} symlink target is not UTF-8: {err}"));
+                let parent = rel.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+                let target_rel = if target.starts_with('/') {
+                    target.trim_start_matches('/').to_owned()
+                } else if parent.is_empty() {
+                    target.to_owned()
+                } else {
+                    format!("{parent}/{target}")
+                };
+                assert!(
+                    find_initramfs_entry(&files, &target_rel).is_some(),
+                    "{rel} symlink target {target_rel} must also be staged"
+                );
+            } else {
+                assert!(
+                    initramfs_file_is_regular(entry),
+                    "{rel} must be a regular file or symlink in the boot payload"
+                );
+            }
+        }
+    }
+
+    /// Regression for the runtime-stress `mv` failure: coreutils links
+    /// `/usr/bin/mv` against libattr for xattr preservation. The stress gate
+    /// must run the real binary, so the initramfs has to carry its loader
+    /// dependency instead of falling back to a shell-side substitute.
+    #[test]
+    fn coreutils_mv_shared_library_chain_is_staged() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+        assert!(
+            find_initramfs_entry(&files, "usr/lib/libattr.so.1").is_some(),
+            "libattr.so.1 must be staged so /usr/bin/mv can load"
+        );
+    }
+
+    /// Keep the core systemd shared-library chain staged under the Arch
+    /// runtime layout.
+    #[test]
+    fn systemd_shared_library_chain_is_staged() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+        for rel in [
+            "usr/lib/libsystemd.so.0",
+            "usr/lib/libexpat.so.1",
+            "usr/lib/libgcrypt.so.20",
+            "usr/lib/libgpg-error.so.0",
+            "usr/lib/liblz4.so.1",
+            "usr/lib/liblzma.so.5",
+        ] {
+            assert!(
+                find_initramfs_entry(&files, rel).is_some(),
+                "{rel} must be staged so systemd tools can load"
+            );
+        }
+    }
+
+    /// systemd tools depend on libsystemd; keep it in the explicit runtime
+    /// list and alias the real versioned file into the initramfs.
+    #[test]
+    fn systemd_libsystemd_runtime_library_is_staged() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+        let libsystemd = find_initramfs_entry(&files, "usr/lib/libsystemd.so.0")
+            .expect("libsystemd.so.0 must be staged so systemd tools can load");
+        assert_eq!(initramfs_mode_perms(libsystemd.1), 0o644);
+    }
+
+    /// Regression for the 2026-05-21 `poweroff` weirdness: when
+    /// `/sbin/poweroff` was a copy of systemctl, invoking it on a
+    /// system without a running D-Bus / logind made systemctl spin on
+    /// the bus connect and never reach `halt_now()` — so QEMU stayed
+    /// up.  We now ship the tiny direct-`reboot(LINUX_REBOOT_CMD_
+    /// POWER_OFF)` stub instead.  This test pins the on-disk shape:
+    /// the staged file is an ELF that contains the canonical magic
+    /// constants the syscall expects.  Ref:
+    /// `vendor/linux/kernel/reboot.c::__do_sys_reboot`.
+    #[test]
+    fn poweroff_stub_issues_linux_reboot_power_off_directly() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+        for rel in ["sbin/poweroff", "usr/sbin/poweroff"] {
+            let entry =
+                find_initramfs_entry(&files, rel).unwrap_or_else(|| panic!("{rel} must be staged"));
+            assert!(
+                initramfs_file_is_regular(entry),
+                "{rel} must be a real file, not a symlink to systemctl"
+            );
+            assert_eq!(&entry.2[..4], b"\x7FELF", "{rel} must be an ELF");
+            // The stub embeds `mov edi, 0xfee1dead` and `mov edx, 0x4321fedc`
+            // as the reboot magic words; the literals appear in the .text
+            // section as little-endian u32s.
+            let bytes = &entry.2;
+            assert!(
+                bytes.windows(4).any(|w| w == 0xfee1dead_u32.to_le_bytes()),
+                "{rel} must embed LINUX_REBOOT_MAGIC1 (0xfee1dead)"
+            );
+            assert!(
+                bytes.windows(4).any(|w| w == 0x4321_fedc_u32.to_le_bytes()),
+                "{rel} must embed LINUX_REBOOT_CMD_POWER_OFF (0x4321fedc)"
+            );
+            // systemctl is much larger than this stub; the stub fits in a few hundred
+            // bytes.  If we ever accidentally ship systemctl again the size
+            // will be enormous.
+            assert!(
+                bytes.len() < 8 * 1024,
+                "{rel} should be the tiny stub, not a copy of systemctl ({} bytes)",
+                bytes.len()
+            );
+        }
+        // systemctl must still be staged at /usr/bin/systemctl so users
+        // who want the full systemd-orchestrated shutdown can call it
+        // directly via `systemctl poweroff`.
+        assert!(
+            find_initramfs_entry(&files, "usr/bin/systemctl").is_some(),
+            "/usr/bin/systemctl must remain staged for `systemctl poweroff`"
+        );
+    }
+
+    /// Regression for the 2026-05-21 `clear` failure with
+    /// "terminals database is inaccessible".  ncurses's `setupterm`
+    /// opens `$TERMINFO_DIRS:/etc/terminfo:/lib/terminfo:/usr/share/
+    /// terminfo/<first-letter>/<TERM>` (see vendor/ncurses/ncurses/
+    /// tinfo/db_iterator.c) and bails if none resolve.  We ship at
+    /// least the `linux` and `dumb` entries so `clear`, `tput`, and
+    /// `readline` find a database.
+    #[test]
+    fn terminfo_database_is_staged_for_clear_and_readline() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+        // `TERM=linux` is what agetty sets on the framebuffer tty.
+        let mut found_linux = false;
+        let mut found_dumb = false;
+        for (path, _, _) in &files {
+            if path.ends_with("terminfo/l/linux") || path.ends_with("terminfo/L/linux") {
+                found_linux = true;
+            }
+            if path.ends_with("terminfo/d/dumb") || path.ends_with("terminfo/D/dumb") {
+                found_dumb = true;
+            }
+        }
+        assert!(
+            found_linux,
+            "/usr/share/terminfo/l/linux must be in the initramfs for clear/tput on tty1"
+        );
+        assert!(
+            found_dumb,
+            "/usr/share/terminfo/d/dumb must be in the initramfs as a fallback TERM"
+        );
+    }
+
+    /// Systemd Services: the multi-user-target boot orchestration must be
+    /// wired end-to-end inside the initramfs we ship to QEMU.  References:
+    ///   - vendor/systemd/systemd-260.1/units/multi-user.target.in
+    ///   - vendor/systemd/systemd-260.1/units/getty.target.in
+    ///   - vendor/systemd/systemd-260.1/units/systemd-journald.service.in
+    ///   - vendor/systemd/systemd-260.1/units/systemd-logind.service.in
+    ///   - vendor/systemd/systemd-260.1/man/systemd.preset.xml
+    #[test]
+    fn systemd_services_multi_user_target_chain_is_wired() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+
+        // (1) multi-user.target is the default through the lightweight
+        // lupos-terminal target.
+        let default_target =
+            find_initramfs_symlink_target(&files, "etc/systemd/system/default.target")
+                .expect("/etc/systemd/system/default.target must be a symlink");
+        assert_eq!(
+            default_target, b"/usr/lib/systemd/system/lupos-terminal.target",
+            "default.target must point at lupos-terminal.target for fast serial login"
+        );
+        let terminal_target =
+            find_initramfs_entry(&files, "usr/lib/systemd/system/lupos-terminal.target")
+                .expect("lupos-terminal.target must be staged");
+        let terminal_target_body = core::str::from_utf8(&terminal_target.2).unwrap();
+        for wanted in [
+            "systemd-journald.socket",
+            "systemd-journald-dev-log.socket",
+            "systemd-journald.service",
+            "lupos-serial-getty.service",
+        ] {
+            assert!(
+                terminal_target_body.contains(wanted),
+                "lupos-terminal.target must want {wanted}: {terminal_target_body}"
+            );
+        }
+        let terminal_wants = find_initramfs_symlink_target(
+            &files,
+            "etc/systemd/system/lupos-terminal.target.wants/lupos-serial-getty.service",
+        )
+        .expect("lupos-terminal.target must want lupos-serial-getty.service");
+        assert_eq!(
+            terminal_wants,
+            b"/usr/lib/systemd/system/lupos-serial-getty.service"
+        );
+        let serial_unit =
+            find_initramfs_entry(&files, "usr/lib/systemd/system/lupos-serial-getty.service")
+                .expect("lupos serial getty unit must be staged");
+        let serial_unit_body = core::str::from_utf8(&serial_unit.2).unwrap();
+        assert!(serial_unit_body.contains("DefaultDependencies=no"));
+        assert!(serial_unit_body.contains("Type=simple"));
+        assert!(!serial_unit_body.contains("Type=idle"));
+        assert!(
+            serial_unit_body.contains(
+                "After=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service"
+            ),
+            "serial getty must wait for journald's /dev/log sink: {serial_unit_body}"
+        );
+        assert!(serial_unit_body.contains("agetty --noclear --nohostname"));
+
+        // (2) systemd-journald.service is enabled via multi-user.target.wants
+        // and the staged binary, /dev/log sockets, and journald.conf are present.
+        let journald_wants = find_initramfs_symlink_target(
+            &files,
+            "etc/systemd/system/multi-user.target.wants/systemd-journald.service",
+        )
+        .expect("systemd-journald.service must be in multi-user.target.wants");
+        assert_eq!(
+            journald_wants,
+            b"/usr/lib/systemd/system/systemd-journald.service"
+        );
+        for (wants_path, target) in [
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-journald.socket",
+                "/usr/lib/systemd/system/systemd-journald.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-journald-dev-log.socket",
+                "/usr/lib/systemd/system/systemd-journald-dev-log.socket",
+            ),
+        ] {
+            let socket_wants = find_initramfs_symlink_target(&files, wants_path)
+                .unwrap_or_else(|| panic!("{wants_path} must be enabled for journald"));
+            assert_eq!(
+                socket_wants,
+                target.as_bytes(),
+                "{wants_path} must point at {target}"
+            );
+        }
+        assert!(
+            find_initramfs_entry(&files, "usr/lib/systemd/systemd-journald").is_some(),
+            "systemd-journald binary must be staged"
+        );
+        let journald_conf = find_initramfs_entry(&files, "etc/systemd/journald.conf")
+            .expect("/etc/systemd/journald.conf must be staged");
+        let conf_body = core::str::from_utf8(&journald_conf.2).unwrap();
+        assert!(
+            conf_body.contains("Storage=volatile"),
+            "journald.conf must declare Storage=volatile so journalctl -b survives without /var/log/journal"
+        );
+        // ForwardToConsole must default to `no` (matches upstream journald.conf.in).
+        // With `=yes`, every late-init service start/stop notification was
+        // pasted into the user's logged-in tty1 session.  Regression for
+        // the 2026-05-22 "systemd late-init banner floods tty1" report.
+        assert!(
+            conf_body.contains("ForwardToConsole=no"),
+            "journald.conf must NOT forward to the console — that floods the user's tty"
+        );
+        assert!(
+            !conf_body.contains("TTYPath="),
+            "journald.conf must not pin a TTYPath when forwarding is off"
+        );
+
+        // (3) systemd-tmpfiles must have at least one drop-in shipped in
+        // the initramfs.  Without /usr/lib/tmpfiles.d/systemd.conf the
+        // tmpfiles-setup.service silently no-ops and /run stays empty.
+        let tmpfiles_systemd_conf = find_initramfs_entry(&files, "usr/lib/tmpfiles.d/systemd.conf")
+            .expect("/usr/lib/tmpfiles.d/systemd.conf must be in the initramfs");
+        let body = core::str::from_utf8(&tmpfiles_systemd_conf.2).unwrap();
+        // The man-5 tmpfiles.d snippets at least declare /run/lock as
+        // tmpfs-managed; the file's existence + non-empty body is enough.
+        assert!(
+            !body.is_empty(),
+            "tmpfiles.d/systemd.conf must not be empty"
+        );
+        let logind_tmpfiles = find_initramfs_entry(&files, "etc/tmpfiles.d/lupos-logind.conf")
+            .expect("lupos-logind tmpfiles drop-in must be in the initramfs");
+        let logind_tmpfiles_body = core::str::from_utf8(&logind_tmpfiles.2).unwrap();
+        assert!(
+            logind_tmpfiles_body.contains("/run/systemd/seats"),
+            "logind tmpfiles drop-in must create /run/systemd/seats for pam_systemd::logind_running"
+        );
+        // sysusers.d/basic.conf also ships so systemd-sysusers seeds the
+        // service accounts journald + networkd run under.
+        assert!(
+            find_initramfs_entry(&files, "usr/lib/sysusers.d/basic.conf").is_some(),
+            "sysusers.d/basic.conf must be in the initramfs"
+        );
+
+        // (4) getty@tty1.service wants chain — locked by the Public Boot
+        // test, but we additionally assert here that getty.target is in
+        // multi-user.target.wants so multi-user pulls the login prompt.
+        // The sysinit wants live in the CPIO explicitly instead of relying
+        // on host symlink metadata; systemd needs the target paths intact.
+        for (wants_path, target) in [
+            (
+                "etc/systemd/system/sysinit.target.wants/systemd-tmpfiles-setup-dev.service",
+                "/usr/lib/systemd/system/systemd-tmpfiles-setup-dev.service",
+            ),
+            (
+                "etc/systemd/system/sysinit.target.wants/systemd-tmpfiles-setup.service",
+                "/usr/lib/systemd/system/systemd-tmpfiles-setup.service",
+            ),
+            (
+                "etc/systemd/system/sysinit.target.wants/systemd-vconsole-setup.service",
+                "/usr/lib/systemd/system/systemd-vconsole-setup.service",
+            ),
+            (
+                "etc/systemd/system/sysinit.target.wants/dev-hugepages.mount",
+                "/usr/lib/systemd/system/dev-hugepages.mount",
+            ),
+            (
+                "etc/systemd/system/sysinit.target.wants/dev-mqueue.mount",
+                "/usr/lib/systemd/system/dev-mqueue.mount",
+            ),
+        ] {
+            let got = find_initramfs_symlink_target(&files, wants_path)
+                .unwrap_or_else(|| panic!("{wants_path} must be a symlink"));
+            assert_eq!(got, target.as_bytes(), "{wants_path} target changed");
+        }
+
+        let vconsole_unit = find_initramfs_entry(
+            &files,
+            "usr/lib/systemd/system/systemd-vconsole-setup.service",
+        )
+        .expect("systemd-vconsole-setup.service must be staged");
+        let vconsole_unit_body = core::str::from_utf8(&vconsole_unit.2).unwrap();
+        assert!(
+            vconsole_unit_body.contains(
+                "Source: vendor/systemd/systemd-260.1/units/systemd-vconsole-setup.service.in"
+            ) && vconsole_unit_body.contains("ConditionPathExists=/dev/tty0")
+                && vconsole_unit_body.contains("ExecStart=/usr/lib/systemd/systemd-vconsole-setup"),
+            "vconsole unit must mirror the systemd source shape"
+        );
+        let vconsole_bin = find_initramfs_entry(&files, "usr/lib/systemd/systemd-vconsole-setup")
+            .expect("systemd-vconsole-setup shim must be staged");
+        assert!(
+            initramfs_file_is_regular(vconsole_bin) && vconsole_bin.1 & 0o111 != 0,
+            "systemd-vconsole-setup must be an executable regular file"
+        );
+        assert!(
+            vconsole_bin.2.starts_with(b"\x7fELF"),
+            "minimal login profile stages an ELF vconsole setup shim"
+        );
+
+        let getty_wants = find_initramfs_symlink_target(
+            &files,
+            "etc/systemd/system/multi-user.target.wants/getty.target",
+        )
+        .expect("getty.target must be wanted by multi-user.target");
+        assert_eq!(getty_wants, b"/usr/lib/systemd/system/getty.target");
+
+        // (5) systemd-user-sessions clears /run/nologin before getty accepts
+        // real users. Without this, pam_nologin rejects the lupos login even
+        // after multi-user.target is reached.
+        let user_sessions_wants = find_initramfs_symlink_target(
+            &files,
+            "etc/systemd/system/multi-user.target.wants/systemd-user-sessions.service",
+        )
+        .expect("systemd-user-sessions.service must be in multi-user.target.wants");
+        assert_eq!(
+            user_sessions_wants,
+            b"/usr/lib/systemd/system/systemd-user-sessions.service"
+        );
+        assert!(
+            find_initramfs_entry(&files, "usr/lib/systemd/systemd-user-sessions").is_some(),
+            "systemd-user-sessions binary must be staged"
+        );
+
+        // (6) logind is staged for manual diagnostics, but terminal-login
+        // must not wait on it before Bash.
+        assert!(
+            find_initramfs_symlink_target(
+                &files,
+                "etc/systemd/system/multi-user.target.wants/systemd-logind.service",
+            )
+            .is_none(),
+            "systemd-logind.service must not be wanted by terminal-login"
+        );
+        assert!(
+            find_initramfs_entry(&files, "usr/lib/systemd/systemd-logind").is_some(),
+            "systemd-logind binary must be staged"
+        );
+        let loginctl_present = ["usr/bin/loginctl", "bin/loginctl"]
+            .iter()
+            .any(|rel| find_initramfs_entry(&files, rel).is_some());
+        assert!(
+            loginctl_present,
+            "/usr/bin/loginctl should remain staged for manual diagnostics"
+        );
+        assert!(
+            find_initramfs_entry(&files, "usr/lib/security/pam_systemd.so").is_some(),
+            "pam_systemd.so should remain staged for systemd-user sessions"
+        );
+        let common_session = find_initramfs_entry(&files, "etc/pam.d/common-session")
+            .expect("/etc/pam.d/common-session must be staged");
+        let common_session_body = core::str::from_utf8(&common_session.2).unwrap();
+        assert!(
+            common_session_body.contains("session required pam_unix.so"),
+            "terminal-login common-session must use the direct pam_unix session path"
+        );
+        assert!(
+            !common_session_body.contains("pam_systemd.so"),
+            "terminal-login common-session must not block login on logind/dbus"
+        );
+        let systemd_user_pam = find_initramfs_entry(&files, "usr/lib/pam.d/systemd-user")
+            .expect("/usr/lib/pam.d/systemd-user must be staged");
+        let systemd_user_pam_body = core::str::from_utf8(&systemd_user_pam.2).unwrap();
+        assert!(
+            systemd_user_pam_body.contains("pam_systemd.so"),
+            "systemd-user PAM stack must invoke pam_systemd so user@.service gets XDG_RUNTIME_DIR"
+        );
+        let user_runtime_env = find_initramfs_entry(
+            &files,
+            "etc/systemd/system/user@.service.d/lupos-runtime-env.conf",
+        )
+        .expect("user@.service runtime env drop-in must be staged");
+        let user_runtime_env_body = core::str::from_utf8(&user_runtime_env.2).unwrap();
+        assert!(
+            user_runtime_env_body.contains("XDG_RUNTIME_DIR=/run/user/%i"),
+            "user@.service must receive XDG_RUNTIME_DIR after user-runtime-dir@.service creates it"
+        );
+
+        // (7) udev — systemd-udevd binary + rules + at least the canonical
+        // 50-udev-default.rules drop-in.
+        let udevd = find_initramfs_entry(&files, "usr/lib/systemd/systemd-udevd")
+            .expect("systemd-udevd ExecStart path must be staged");
+        assert!(
+            initramfs_file_is_regular(udevd),
+            "systemd-udevd ExecStart path must be a regular executable, not a stage symlink"
+        );
+        assert!(
+            find_initramfs_entry(&files, "usr/bin/udevadm").is_some(),
+            "udevadm must remain staged for udevadm trigger/control calls"
+        );
+        assert!(
+            find_initramfs_entry(&files, "usr/lib/udev/rules.d/50-udev-default.rules").is_some(),
+            "udev's canonical 50-udev-default.rules must be in the initramfs"
+        );
+        for wants_path in [
+            "etc/systemd/system/sysinit.target.wants/systemd-udevd.service",
+            "etc/systemd/system/sysinit.target.wants/systemd-udev-trigger.service",
+            "etc/systemd/system/sockets.target.wants/systemd-udevd-control.socket",
+            "etc/systemd/system/sockets.target.wants/systemd-udevd-kernel.socket",
+        ] {
+            assert!(
+                find_initramfs_symlink_target(&files, wants_path).is_none(),
+                "{wants_path} must not be wanted by terminal-login"
+            );
+        }
+
+        // (8) Network daemons are staged but not wanted in terminal-login.
+        // This keeps Bash acceptance independent of DHCP/DNS startup waits.
+        for (wants_path, bin) in [
+            (
+                "etc/systemd/system/multi-user.target.wants/systemd-networkd.service",
+                "usr/lib/systemd/systemd-networkd",
+            ),
+            (
+                "etc/systemd/system/multi-user.target.wants/systemd-resolved.service",
+                "usr/lib/systemd/systemd-resolved",
+            ),
+        ] {
+            assert!(
+                find_initramfs_symlink_target(&files, wants_path).is_none(),
+                "{wants_path} must not be wanted by terminal-login"
+            );
+            assert!(
+                find_initramfs_entry(&files, bin).is_some(),
+                "{bin} binary must be staged"
+            );
+        }
+        let qemu_net = find_initramfs_entry(&files, "etc/systemd/network/10-lupos-qemu.network")
+            .expect("QEMU networkd profile must be staged");
+        let net_body = core::str::from_utf8(&qemu_net.2).unwrap();
+        assert!(
+            net_body.contains("[Match]") && net_body.contains("[Network]"),
+            "10-lupos-qemu.network must be a real systemd network profile"
+        );
+        assert!(
+            net_body.contains("DNS=10.0.2.3"),
+            "10-lupos-qemu.network must point DNS at QEMU user-net's 10.0.2.3"
+        );
+
+        // (9) systemctl status cleanliness: the initramfs must NOT ship
+        // any *.mask file or stub service that would surface "fake" output
+        // when systemctl status enumerates units.  Linux-source-backed
+        // contract: vendor/systemd/systemd-260.1/src/core/unit.c skips
+        // masked units but their presence is a signal that the boot was
+        // shortcut rather than satisfied properly.
+        for (path, _, _) in &files {
+            assert!(
+                !path.ends_with(".mask"),
+                "initramfs ships a masked unit ({path}) — Lupos must boot real services, not stub them"
+            );
+            assert!(
+                !path.contains("/usr/lib/systemd/system/lupos-stub-"),
+                "initramfs ships a stub systemd service ({path}) — must boot real systemd"
+            );
+        }
+        // systemctl binary itself must be staged so the user can run
+        // `systemctl status` after login.
+        let systemctl_present = ["usr/bin/systemctl", "bin/systemctl"]
+            .iter()
+            .any(|rel| find_initramfs_entry(&files, rel).is_some());
+        assert!(
+            systemctl_present,
+            "/usr/bin/systemctl must be staged for the post-login acceptance check"
+        );
+    }
+
+    #[test]
+    fn release_grub_uses_quiet_splash_and_recovery() {
+        let cfg = release_grub_cfg_content();
+        assert!(cfg.contains("set timeout=2"));
+        assert!(cfg.contains(
+            "linux /boot/bzImage quiet splash systemd.show_status=yes root=LABEL=lupos-root rootfstype=ext4 rw"
+        ));
+        assert!(cfg.contains(
+            "linux /boot/bzImage single systemd.show_status=yes root=LABEL=lupos-root rootfstype=ext4 rw"
+        ));
+        assert_eq!(cfg.matches("initrd /boot/initramfs.cpio").count(), 2);
+        assert!(cfg.contains("insmod png"));
+        assert!(cfg.contains("background_image /boot/grub/splashart.png"));
+        assert!(cfg.contains("lupos recovery"));
+        assert!(cfg.contains("os-prober"));
+        assert!(!cfg.contains("multiboot2 /boot/lupos.elf"));
+    }
+
+    #[test]
+    fn release_builder_uses_login_kernel_and_module_initrd() {
+        let source = read_repo_file("xtask/src/lib.rs");
+        let release_start = source
+            .find("fn run_release_cmd()")
+            .expect("release command should exist");
+        let release_end = source[release_start..]
+            .find("fn run_mock_ext4_write_journal_replay()")
+            .expect("release command should end before mock gates");
+        let release_body = &source[release_start..release_start + release_end];
+
+        assert!(release_body.contains("build_kernel(BootMode::Login, false"));
+        assert!(release_body.contains("build_release_iso(&kernel_elf"));
+        assert!(!release_body.contains("BootMode::Hello"));
+
+        let iso_start = source
+            .find("fn build_release_iso(")
+            .expect("release ISO builder should exist");
+        let iso_end = source[iso_start..]
+            .find("fn build_iso_from_parts(")
+            .expect("release ISO builder should delegate to shared ISO writer");
+        let iso_body = &source[iso_start..iso_start + iso_end];
+        assert!(iso_body.contains("release_grub_cfg_content()"));
+        assert!(iso_body.contains("Some(module_stage_initramfs_cpio())"));
+
+        let root_start = source
+            .find("fn write_release_root(")
+            .expect("release root writer should exist");
+        let root_end = source[root_start..]
+            .find("fn release_grub_cfg_content()")
+            .expect("release root writer should end before GRUB config");
+        let root_body = &source[root_start..root_start + root_end];
+        assert!(root_body.contains("\"boot/initramfs.cpio\""));
+        assert!(root_body.contains("module_stage_initramfs_cpio()"));
+    }
+
+    #[test]
+    fn grub_cfg_uses_lupos_splash_art_for_boot_modes() {
+        let cfg = grub_cfg_content_with_cmdline(&BootMode::Login, "");
+        assert!(cfg.contains("set timeout=2"));
+        assert!(cfg.contains("insmod png"));
+        assert!(cfg.contains("background_image /boot/grub/splashart.png"));
+        assert!(cfg.contains("linux /boot/bzImage systemd.show_status=yes"));
+        assert!(cfg.contains("initrd /boot/initramfs.cpio"));
+        assert!(!cfg.contains("multiboot2 /boot/lupos.elf"));
+        assert!(SPLASH_ART_BYTES.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn uefi_grub_cfg_uses_linux_bzimage_loader() {
+        let cfg = uefi_grub_cfg_content(&BootMode::UefiPlatformCertsFirmwareTest);
+
+        assert!(cfg.contains("insmod linux"));
+        assert!(cfg.contains("linux /boot/bzImage"));
+        assert!(cfg.contains("background_image /boot/grub/splashart.png"));
+        assert!(!cfg.contains("initrd /boot/initramfs.cpio"));
+        assert!(!cfg.contains("multiboot2"));
+        assert!(!cfg.contains("LUPOS.ELF"));
+    }
+
+    #[test]
+    fn uefi_grub_disk_builder_stages_bzimage_not_multiboot_elf() {
+        let source = read_repo_file("xtask/src/lib.rs");
+        let start = source
+            .find("fn build_uefi_grub_disk(")
+            .expect("UEFI GRUB disk builder should exist");
+        let end = source[start..]
+            .find("/// Build a QEMU command that boots from a GRUB ISO")
+            .expect("UEFI GRUB disk builder should end before ISO QEMU helper");
+        let body = &source[start..start + end];
+
+        assert!(body.contains("build_bzimage_bytes_from_kernel_elf"));
+        assert!(body.contains("::/boot/bzImage"));
+        assert!(body.contains("linux search"));
+        assert!(!body.contains("multiboot2"));
+        assert!(!body.contains("LUPOS.ELF"));
+    }
+
+    #[test]
+    fn iso_staging_writes_lupos_splash_art_asset() {
+        let root = repo_root()
+            .expect("repo root")
+            .join("target/xtask-test/iso-splash-stage");
+        let _ = fs::remove_dir_all(&root);
+
+        let path = write_grub_splash_art(&root).expect("write splash art");
+        assert_eq!(path, root.join("boot/grub/splashart.png"));
+        let bytes = fs::read(&path).expect("read staged splash art");
+        assert_eq!(bytes, SPLASH_ART_BYTES);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn boot_header_reserves_stack_guard_above_static_page_tables() {
+        fn nasm_define_u64(source: &str, name: &str) -> u64 {
+            let needle = format!("%define {name}");
+            let line = source
+                .lines()
+                .find(|line| line.trim_start().starts_with(&needle))
+                .unwrap_or_else(|| panic!("missing {name} define"));
+            line.split_whitespace()
+                .nth(2)
+                .unwrap_or_else(|| panic!("missing {name} value"))
+                .parse::<u64>()
+                .unwrap_or_else(|err| panic!("invalid {name} value: {err}"))
+        }
+
+        let header = read_repo_file("src/arch/x86/boot/header.S");
+        assert!(header.contains("linux32_start:"));
+        assert!(header.contains("linux64_start:"));
+        assert!(header.contains("mov [rbx], rsi"));
+        assert!(header.contains("mov esp, PHYS(stack_top)"));
+        assert!(header.contains("mov rsp, PHYS(stack_top)"));
+        assert!(header.contains("boot_stack_guard:"));
+        assert!(header.contains("stack_bottom:"));
+        assert!(header.contains("stack_top:"));
+        assert!(
+            header.find("kernel_pd_table:").unwrap() < header.find("boot_params_page:").unwrap()
+        );
+        assert!(
+            header.find("boot_params_page:").unwrap() < header.find("boot_stack_guard:").unwrap()
+        );
+        assert!(header.find("boot_stack_guard:").unwrap() < header.find("stack_bottom:").unwrap());
+        assert!(header.find("stack_bottom:").unwrap() < header.find("stack_top:").unwrap());
+        assert!(nasm_define_u64(&header, "BOOT_STACK_GUARD_SIZE") >= 32 * 1024);
+        assert!(nasm_define_u64(&header, "BOOT_STACK_SIZE") >= 128 * 1024);
+    }
+
+    #[test]
+    fn boot_header_requires_linux_boot_params_handoff() {
+        let header = read_repo_file("src/arch/x86/boot/header.S");
+        assert!(header.contains("linux32_start:"));
+        assert!(header.contains("linux64_start:"));
+        assert!(header.contains("_start:"));
+        assert!(header.contains(".unsupported_elf_entry:"));
+        assert!(header.contains("mov [PHYS(saved_boot_params_ptr)], esi"));
+        assert!(header.contains("mov [rbx], rsi"));
+        assert!(header.contains(".missing_boot_params:"));
+        assert!(!header.contains("efi64_start:"));
+        assert!(!header.contains("section .multiboot_header"));
+        assert!(!header.contains("MULTIBOOT2_HEADER_MAGIC"));
+        assert!(!header.contains("global efi64_start"));
+        assert!(!header.contains("extern build_boot_params"));
+        assert!(!header.contains("call build_boot_params"));
+    }
+
+    #[test]
+    fn bzimage_builder_uses_linux_head64_extract_kernel_handoff() {
+        let source = read_repo_file("xtask/src/lib.rs");
+        let production_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("xtask source should contain production code before tests");
+
+        assert!(
+            production_source
+                .contains("const BZIMAGE_EXTRACTED_ENTRY_SYMBOL: &str = \"linux64_start\";")
+        );
+        assert!(production_source.contains("BZIMAGE_GZIP_HEADER_SIZE"));
+        assert!(production_source.contains("BZIMAGE_GZIP_TRAILER_SIZE"));
+        assert!(production_source.contains("fn build_linux_gzip_stored_payload("));
+        assert!(production_source.contains("crc32_ieee(uncompressed)"));
+        assert!(production_source.contains("BZIMAGE_STORED_PIGGY_RODATA_SIZE"));
+        assert!(production_source.contains("BZIMAGE_LINUX_COMPRESSED_HEAD64_SOURCE"));
+        assert!(production_source.contains("BZIMAGE_LUPOS_EXTRACT_KERNEL64_SOURCE"));
+        assert!(production_source.contains("BZIMAGE_LINUX_DECOMPRESS_INFLATE_SOURCE"));
+        assert!(production_source.contains("BZIMAGE_STORED_COMPRESSED_LINKER_SCRIPT"));
+        assert!(production_source.contains("BZIMAGE_STORED_COMPRESSED_SECTIONS"));
+        assert!(production_source.contains("fn linux_compressed_init_size("));
+        assert!(production_source.contains("struct StoredCompressedKernelImage"));
+        assert!(production_source.contains("struct LinuxSetupImage"));
+        assert!(
+            production_source
+                .contains("#[path = \"../../src/arch/x86/boot/compressed/mkpiggy.rs\"]")
+        );
+        assert!(production_source.contains("mod boot_compressed_mkpiggy;"));
+        assert!(production_source.contains("fn render_stored_piggy_asm("));
+        assert!(production_source.contains("boot_compressed_mkpiggy::render_piggy_asm("));
+        assert!(production_source.contains(".globl entry_addr"));
+        assert!(production_source.contains("fn assemble_stored_compressed_payload("));
+        assert!(production_source.contains("assemble_linux_compressed_head64_object("));
+        assert!(production_source.contains("fn write_linux_inflate_generated_headers("));
+        assert!(production_source.contains("fn assemble_linux_decompress_inflate_object("));
+        assert!(production_source.contains("compile Linux boot/compressed gzip inflater"));
+        assert!(production_source.contains("Command::new(\"clang\")"));
+        assert!(production_source.contains(".arg(\"--target=x86_64-unknown-linux-gnu\")"));
+        assert!(production_source.contains(".arg(\"assembler-with-cpp\")"));
+        assert!(production_source.contains(".arg(\"assembler\")"));
+        assert!(production_source.contains(".arg(\"-include\")"));
+        assert!(production_source.contains("vendor/linux/include/linux/hidden.h"));
+        assert!(production_source.contains(".arg(\"-DSTATIC=\")"));
+        assert!(production_source.contains(".arg(\"-fPIE\")"));
+        assert!(production_source.contains(".arg(\"-mcmodel=small\")"));
+        assert!(production_source.contains(".arg(\"-ffreestanding\")"));
+        assert!(production_source.contains(".arg(\"-fno-strict-aliasing\")"));
+        assert!(production_source.contains(".arg(\"-fshort-wchar\")"));
+        assert!(production_source.contains(".arg(\"-mno-mmx\")"));
+        assert!(production_source.contains(".arg(\"-mno-red-zone\")"));
+        assert!(production_source.contains(".arg(\"-mno-sse\")"));
+        assert!(production_source.contains(".arg(\"-Wa,-mrelax-relocations=no\")"));
+        assert!(production_source.contains("Command::new(\"ld.lld\")"));
+        assert!(production_source.contains(".arg(\"elf_x86_64\")"));
+        assert!(production_source.contains("Command::new(\"llvm-objcopy\")"));
+        assert!(production_source.contains("fn build_stored_compressed_kernel_image("));
+        assert!(production_source.contains("fn build_linux_setup_image("));
+        assert!(production_source.contains("assemble_stored_compressed_payload("));
+        assert!(production_source.contains("&stored_input_data"));
+        assert!(production_source.contains("build_stored_compressed_kernel_image(kernel_image)"));
+        assert!(production_source.contains("build_linux_setup_image(&compressed)"));
+        assert!(!production_source.contains("payload.extend_from_slice(&head)"));
+        assert!(!production_source.contains("fn push_i32_le("));
+        assert!(!production_source.contains("payload.push(0xfa)"));
+        assert!(!production_source.contains("BZIMAGE_LINUX_ENTRY_SYMBOL"));
+        assert!(!production_source.contains("BZIMAGE_DIRECT_ENTRY_SYMBOL"));
+        assert!(!production_source.contains("fn build_bzimage_compressed_startup_payload("));
+        assert!(!production_source.contains("fn build_bzimage_direct_relocator_payload("));
+        assert!(!production_source.contains("fn build_bzimage_relocator_payload("));
+        assert!(!production_source.contains("Command::new(\"nasm\")"));
+        assert!(!production_source.contains(".arg(\"elf32\")"));
+
+        let linux_head = read_repo_file(BZIMAGE_LINUX_COMPRESSED_HEAD64_SOURCE);
+        assert!(linux_head.contains("SYM_FUNC_START(startup_32)"));
+        assert!(linux_head.contains("SYM_CODE_START(startup_64)"));
+        assert!(linux_head.contains("call\textract_kernel"));
+        assert!(linux_head.contains("jmp\t*%rax"));
+
+        let extract_shim = read_repo_file(BZIMAGE_LUPOS_EXTRACT_KERNEL64_SOURCE);
+        assert!(extract_shim.contains(".globl\textract_kernel"));
+        assert!(extract_shim.contains("call\tdecompress_kernel"));
+        assert!(extract_shim.contains("decompress_kernel:"));
+        assert!(extract_shim.contains("LUPOS_BOOT_HEAP_SIZE 0x10000"));
+        assert!(extract_shim.contains("free_mem_ptr(%rip)"));
+        assert!(extract_shim.contains("free_mem_end_ptr(%rip)"));
+        assert!(extract_shim.contains("leaq\tboot_heap(%rip), %rax"));
+        assert!(extract_shim.contains("leaq\tinput_data(%rip), %rdi"));
+        assert!(extract_shim.contains("movl\tinput_len(%rip), %esi"));
+        assert!(extract_shim.contains("movq\t%rbx, %r8"));
+        assert!(extract_shim.contains("movl\toutput_len(%rip), %r9d"));
+        assert!(extract_shim.contains("pushq\t$0"));
+        assert!(extract_shim.contains("call\t__decompress"));
+        assert!(extract_shim.contains("testl\t%eax, %eax"));
+        assert!(extract_shim.contains("js\t.Lbad_payload"));
+        assert!(!extract_shim.contains("cmpb\t$0x00, 3(%r15)"));
+        assert!(!extract_shim.contains(".Lstored_block:"));
+        assert!(!extract_shim.contains("movzwl\t(%rsi), %ecx"));
+        assert!(extract_shim.contains("lupos_decompress_error:"));
+        assert!(extract_shim.contains(".globl\tmemcpy"));
+        assert!(extract_shim.contains("memcpy:"));
+        assert!(extract_shim.contains(".globl\tmemmove"));
+        assert!(extract_shim.contains("memmove:"));
+        assert!(extract_shim.contains(".globl\tfree_mem_ptr"));
+        assert!(extract_shim.contains("boot_heap:"));
+        let linux_inflate = read_repo_file(BZIMAGE_LINUX_DECOMPRESS_INFLATE_SOURCE);
+        assert!(linux_inflate.contains("STATIC int INIT __decompress"));
+        assert!(
+            linux_inflate.contains("__gunzip(buf, len, fill, flush, out_buf, out_len, pos, error)")
+        );
+        assert!(linux_inflate.contains("strm->next_in = zbuf + 10;"));
+        assert!(linux_inflate.contains("if (zbuf[3] & 0x8)"));
+        assert!(linux_inflate.contains("error(\"header error\")"));
+        assert!(linux_inflate.contains("rc = zlib_inflate(strm, 0);"));
+        assert!(extract_shim.contains("movl\toutput_len(%rip), %esi"));
+        assert!(extract_shim.contains("call\tparse_elf"));
+        assert!(extract_shim.contains("movq\tentry_addr(%rip), %r12"));
+        assert!(extract_shim.contains("call\thandle_relocations"));
+        assert!(extract_shim.contains("parse_elf:"));
+        assert!(extract_shim.contains("movq\t24(%r10), %rdi"));
+        assert!(!extract_shim.contains("subq\t$LUPOS_LOAD_PHYSICAL_ADDR, %rdi"));
+        assert!(!extract_shim.contains("addq\t%rbx, %rax"));
+        assert!(extract_shim.contains("cmpl\t$0x464c457f"));
+        assert!(extract_shim.contains("call\tmemmove"));
+        assert!(extract_shim.contains("rep movsb"));
+        assert!(extract_shim.contains("rep stosb"));
+        assert!(extract_shim.contains("addq\t%r9, %r10\n\tdecl\t%r8d"));
+        assert!(!extract_shim.contains("subq\t%r9, %r10\n\tdecl\t%r8d"));
+        assert!(extract_shim.contains("movq\t%r12, %rax"));
+        assert!(!extract_shim.contains("leaq\tinput_data(%rip), %r11"));
+        assert!(extract_shim.contains(".globl\tinitialize_identity_maps"));
+        assert!(!extract_shim.contains("LUPOS_OUTPUT_LOAD_ADDR"));
+        assert!(!extract_shim.contains("LUPOS_ENTRY_ADDR"));
+
+        let linker_script = read_repo_file(BZIMAGE_STORED_COMPRESSED_LINKER_SCRIPT);
+        assert!(linker_script.contains("OUTPUT_FORMAT(elf64-x86-64)"));
+        assert!(linker_script.contains("OUTPUT_ARCH(i386:x86-64)"));
+        assert!(linker_script.contains("ENTRY(startup_64)"));
+        for fragment in [
+            ".head.text",
+            ".rodata..compressed",
+            ".text",
+            ".rodata",
+            ".data",
+            ".bss",
+            ".pgtable",
+            "_head = .;",
+            "_ehead = .;",
+            "_text = .;",
+            "_etext = .;",
+            "_rodata = .;",
+            "_erodata = .;",
+            "_data = .;",
+            "_edata = .;",
+            "_bss = .;",
+            "_ebss = .;",
+            "_pgtable = .;",
+            "_epgtable = .;",
+            "_end = .;",
+            "ASSERT(SIZEOF(.got.plt) == 0 || SIZEOF(.got.plt) == 0x18",
+            "ASSERT(SIZEOF(.got) == 0",
+            "ASSERT(SIZEOF(.plt) == 0",
+            "ASSERT(SIZEOF(.rel.dyn) == 0",
+            "ASSERT(SIZEOF(.rela.dyn) == 0",
+        ] {
+            assert!(linker_script.contains(fragment));
+        }
+        for section in [
+            ".head.text",
+            ".rodata..compressed",
+            ".text",
+            ".rodata",
+            ".data",
+            ".bss",
+            ".pgtable",
+        ] {
+            assert!(production_source.contains(&format!("\"{section}\"")));
+        }
+
+        let translated_mkpiggy = read_repo_file("src/arch/x86/boot/compressed/mkpiggy.rs");
+        let vendor_mkpiggy = read_repo_file("vendor/linux/arch/x86/boot/compressed/mkpiggy.c");
+        for fragment in [
+            ".section \".rodata..compressed\",\"a\",@progbits",
+            ".globl z_input_len",
+            ".globl z_output_len",
+            ".globl input_data, input_data_end",
+            ".incbin",
+            ".section \".rodata\",\"a\",@progbits",
+            ".globl input_len",
+            ".globl output_len",
+        ] {
+            let escaped_fragment = fragment.replace('"', "\\\"");
+            assert!(
+                translated_mkpiggy.contains(fragment)
+                    || translated_mkpiggy.contains(&escaped_fragment)
+            );
+            assert!(
+                vendor_mkpiggy.contains(fragment) || vendor_mkpiggy.contains(&escaped_fragment)
+            );
+        }
+    }
+
+    #[test]
+    fn gzip_stored_payload_uses_linux_mkpiggy_isize_shape() {
+        let gz = build_linux_gzip_stored_payload(b"abc").expect("gzip payload");
+
+        assert_eq!(&gz[..10], &[0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3]);
+        assert_eq!(gz[10], 1);
+        assert_eq!(u16::from_le_bytes(gz[11..13].try_into().unwrap()), 3);
+        assert_eq!(u16::from_le_bytes(gz[13..15].try_into().unwrap()), !3u16);
+        assert_eq!(&gz[15..18], b"abc");
+        assert_eq!(
+            u32::from_le_bytes(gz[18..22].try_into().unwrap()),
+            crc32_ieee(b"abc")
+        );
+        assert_eq!(u32::from_le_bytes(gz[22..26].try_into().unwrap()), 3);
+        assert_eq!(
+            gz.len(),
+            BZIMAGE_GZIP_HEADER_SIZE + 5 + 3 + BZIMAGE_GZIP_TRAILER_SIZE
+        );
+    }
+
+    #[test]
+    fn real_linux_compressed_head64_assembles_with_generated_probe_headers() {
+        let target_dir = xtask_target_dir()
+            .expect("xtask target dir")
+            .join("head64-probe")
+            .join(format!("{}-{}", std::process::id(), artifact_run_id()));
+        let _cleanup = ScratchDirCleanup::new(target_dir.clone());
+
+        let object =
+            assemble_linux_compressed_head64_probe(&target_dir).expect("assemble head_64.S probe");
+        let symbols = read_llvm_nm_defined_symbol_names(&object, "read head_64.S probe symbols")
+            .expect("head_64.S probe symbols");
+
+        for symbol in [
+            "startup_32",
+            "startup_64",
+            "verify_cpu",
+            "pgtable",
+            "top_pgtable",
+        ] {
+            assert!(
+                symbols.contains(symbol),
+                "missing head_64.S symbol {symbol}"
+            );
+        }
+
+        let generated_offsets = read_repo_file("vendor/linux/arch/x86/kernel/asm-offsets.c");
+        assert!(generated_offsets.contains("OFFSET(BP_scratch, boot_params, scratch);"));
+        assert!(
+            generated_offsets
+                .contains("OFFSET(BP_kernel_alignment, boot_params, hdr.kernel_alignment);")
+        );
+        assert!(generated_offsets.contains("OFFSET(BP_init_size, boot_params, hdr.init_size);"));
+
+        let cpucheck = read_repo_file("src/arch/x86/boot/cpucheck.rs");
+        assert!(cpucheck.contains("m[0] = 0x0700_a169;"));
+        assert!(cpucheck.contains("m[1] = 1 << (X86_FEATURE_LM % 32);"));
+        // verify_cpu's REQUIRED_MASK0 must match cpucheck.rs and stay a strict
+        // subset of a TCG qemu64 CPUID.1.EDX (0x078b_fbff) — in particular it
+        // must not require bit 27 (SS), which TCG never sets.
+        assert_eq!(BZIMAGE_HEAD64_REQUIRED_MASK0, 0x0700_a169);
+        assert_eq!(
+            BZIMAGE_HEAD64_REQUIRED_MASK0 & 0x078b_fbff,
+            BZIMAGE_HEAD64_REQUIRED_MASK0
+        );
+        assert_eq!(BZIMAGE_HEAD64_REQUIRED_MASK0 & (1 << 27), 0);
+        assert_eq!(BZIMAGE_HEAD64_REQUIRED_MASK1, 1 << 29);
+    }
+
+    fn test_linux64_kernel_elf() -> Vec<u8> {
+        let mut elf = vec![0u8; 0x200 + 3 * ELF64_SECTION_HEADER_SIZE as usize];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        put_u16_le(&mut elf, 0x10, 2);
+        put_u16_le(&mut elf, 0x12, 0x3e);
+        put_u32_le(&mut elf, 0x14, 1);
+        put_u64_le(&mut elf, 0x18, 0);
+        put_u64_le(&mut elf, 0x20, ELF64_HEADER_SIZE as u64);
+        put_u64_le(&mut elf, 0x28, 0x200);
+        put_u16_le(&mut elf, 0x34, ELF64_HEADER_SIZE as u16);
+        put_u16_le(&mut elf, 0x36, ELF64_PROGRAM_HEADER_SIZE);
+        put_u16_le(&mut elf, 0x38, 2);
+        put_u16_le(&mut elf, 0x3a, ELF64_SECTION_HEADER_SIZE);
+        put_u16_le(&mut elf, 0x3c, 3);
+
+        let ph0 = ELF64_HEADER_SIZE;
+        put_u32_le(&mut elf, ph0, ELF_PT_LOAD);
+        put_u32_le(&mut elf, ph0 + 4, 0x5);
+        put_u64_le(&mut elf, ph0 + 8, 0x100);
+        put_u64_le(&mut elf, ph0 + 16, 0x0020_0000);
+        put_u64_le(&mut elf, ph0 + 24, 0x0020_0000);
+        put_u64_le(&mut elf, ph0 + 32, 4);
+        put_u64_le(&mut elf, ph0 + 40, 8);
+        put_u64_le(&mut elf, ph0 + 48, 0x0020_0000);
+
+        let ph1 = ph0 + ELF64_PROGRAM_HEADER_SIZE as usize;
+        put_u32_le(&mut elf, ph1, ELF_PT_LOAD);
+        put_u32_le(&mut elf, ph1 + 4, 0x5);
+        put_u64_le(&mut elf, ph1 + 8, 0x120);
+        put_u64_le(&mut elf, ph1 + 16, 0x0020_1000);
+        put_u64_le(&mut elf, ph1 + 24, 0x0020_1000);
+        put_u64_le(&mut elf, ph1 + 32, 3);
+        put_u64_le(&mut elf, ph1 + 40, 3);
+        put_u64_le(&mut elf, ph1 + 48, 0x0020_0000);
+
+        elf[0x100..0x104].copy_from_slice(b"BOOT");
+        elf[0x120..0x123].copy_from_slice(b"RUN");
+
+        let strtab = b"\0linux64_start\0";
+        elf[0x140..0x140 + strtab.len()].copy_from_slice(strtab);
+        let sym = 0x160 + ELF64_SYMBOL_SIZE as usize;
+        put_u32_le(&mut elf, sym, 1);
+        elf[sym + 4] = 0x12;
+        put_u16_le(&mut elf, sym + 6, 1);
+        put_u64_le(&mut elf, sym + 8, 0x0020_1001);
+
+        let sh_symtab = 0x200 + ELF64_SECTION_HEADER_SIZE as usize;
+        put_u32_le(&mut elf, sh_symtab + 4, ELF_SHT_SYMTAB);
+        put_u64_le(&mut elf, sh_symtab + 24, 0x160);
+        put_u64_le(&mut elf, sh_symtab + 32, ELF64_SYMBOL_SIZE * 2);
+        put_u32_le(&mut elf, sh_symtab + 40, 2);
+        put_u64_le(&mut elf, sh_symtab + 56, ELF64_SYMBOL_SIZE);
+
+        let sh_strtab = sh_symtab + ELF64_SECTION_HEADER_SIZE as usize;
+        put_u32_le(&mut elf, sh_strtab + 4, 3);
+        put_u64_le(&mut elf, sh_strtab + 24, 0x140);
+        put_u64_le(&mut elf, sh_strtab + 32, strtab.len() as u64);
+
+        elf
+    }
+
+    #[test]
+    fn bzimage_builder_writes_linux_setup_header() {
+        fn le16(bytes: &[u8], off: usize) -> u16 {
+            u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap())
+        }
+        fn le32(bytes: &[u8], off: usize) -> u32 {
+            u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap())
+        }
+        fn le64(bytes: &[u8], off: usize) -> u64 {
+            u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
+        }
+
+        let raw_elf = test_linux64_kernel_elf();
+        let kernel =
+            kernel_elf_image_from_elf(&raw_elf, "linux64_start").expect("kernel ELF image");
+        let payload = kernel.bytes.as_slice();
+        assert_eq!(kernel.load_size % BZIMAGE_PAGE_SIZE, 0);
+        assert!(payload.len() < raw_elf.len());
+        let phoff = le64(payload, 0x20) as usize;
+        let phentsize = le16(payload, 0x36) as usize;
+        let phnum = le16(payload, 0x38) as usize;
+        assert_eq!(phentsize, ELF64_PROGRAM_HEADER_SIZE as usize);
+        for idx in 0..phnum {
+            let ph = phoff + idx * phentsize;
+            assert_eq!(le32(payload, ph), ELF_PT_LOAD);
+            assert_eq!(
+                le64(payload, ph + 48) % u64::from(BZIMAGE_KERNEL_ALIGNMENT),
+                0
+            );
+        }
+        let compressed =
+            build_stored_compressed_kernel_image(&kernel).expect("stored compressed image");
+        let setup = build_linux_setup_image(&compressed).expect("setup image");
+        let image = build_linux_bzimage_bytes(&kernel).expect("bzImage bytes");
+        let expected_input_data =
+            build_linux_gzip_stored_payload(payload).expect("gzip stored payload");
+        let stored_input_len = expected_input_data.len();
+
+        assert_eq!(compressed.startup_32_offset, 0);
+        assert_eq!(compressed.startup_64_offset, 0x200);
+        assert!(compressed.ehead_offset > compressed.startup_64_offset);
+        assert!(compressed.input_data_offset >= compressed.ehead_offset);
+        assert_eq!(compressed.input_data_len, stored_input_len as u32);
+        assert_eq!(
+            compressed.input_data_end_offset,
+            compressed.input_data_offset + compressed.input_data_len
+        );
+        assert!(compressed.extract_kernel_offset >= compressed.input_data_end_offset);
+        assert!(compressed.input_len_word_offset >= compressed.input_data_end_offset);
+        assert_eq!(
+            compressed.output_len_word_offset,
+            compressed.input_len_word_offset + 4
+        );
+        assert!(compressed.image_end_offset >= compressed.output_len_word_offset + 4);
+        assert!(compressed.image_end_offset as usize >= compressed.bytes.len());
+        assert_eq!(compressed.image_end_offset % 0x1000, 0);
+        let linux_init_size = linux_compressed_init_size(
+            compressed.ehead_offset,
+            compressed.image_end_offset,
+            compressed.input_data_len,
+            compressed.output_len,
+            kernel.load_size as u32,
+        )
+        .unwrap();
+        let staging_init_size = align_up_u64(
+            u64::from(compressed.image_end_offset) + u64::from(compressed.output_len),
+            BZIMAGE_PAGE_SIZE,
+        ) as u32;
+        assert_eq!(compressed.init_size, linux_init_size.max(staging_init_size));
+        assert!(compressed.init_size >= compressed.image_end_offset);
+        assert_eq!(compressed.z_input_len, compressed.input_data_len);
+        assert_eq!(compressed.z_output_len, payload.len() as u32);
+        assert_eq!(compressed.output_len, payload.len() as u32);
+        assert_eq!(compressed.output_load_addr, kernel.load_addr as u32);
+        assert_eq!(compressed.extracted_entry_addr, kernel.entry_addr as u32);
+        assert_eq!(le64(payload, 0x18), kernel.entry_addr);
+        let input_data_offset = compressed.input_data_offset as usize;
+        assert_eq!(
+            &compressed.bytes[input_data_offset..input_data_offset + expected_input_data.len()],
+            expected_input_data.as_slice()
+        );
+        assert_eq!(
+            &compressed.bytes[input_data_offset..input_data_offset + 3],
+            &[0x1f, 0x8b, 0x08]
+        );
+        assert_eq!(
+            le32(
+                &compressed.bytes,
+                input_data_offset + expected_input_data.len() - 4
+            ),
+            payload.len() as u32
+        );
+        assert_eq!(
+            le32(&compressed.bytes, compressed.input_len_word_offset as usize),
+            stored_input_len as u32
+        );
+        assert_eq!(
+            le32(
+                &compressed.bytes,
+                compressed.output_len_word_offset as usize
+            ),
+            payload.len() as u32
+        );
+        assert!(compressed.bytes.len() >= compressed.output_len_word_offset as usize + 4);
+
+        assert_eq!(setup.bytes.len(), BZIMAGE_SETUP_SIZE);
+        assert_eq!(setup.code32_start, BZIMAGE_PROTECTED_MODE_LOAD_ADDR);
+        assert_eq!(setup.payload_length as usize, compressed.bytes.len());
+        assert_eq!(setup.init_size, compressed.init_size);
+        assert_eq!(&image[..BZIMAGE_SETUP_SIZE], setup.bytes.as_slice());
+        assert_eq!(&image[BZIMAGE_SETUP_SIZE..], compressed.bytes.as_slice());
+
+        assert_eq!(image[0x1f1], BZIMAGE_SETUP_SECTS);
+        assert_eq!(
+            le32(&image, 0x1f4),
+            compressed.bytes.len().div_ceil(16) as u32
+        );
+        assert_eq!(le16(&image, 0x1fe), BZIMAGE_BOOT_FLAG);
+        assert_eq!(&image[0x200..0x202], &[0xeb, 0x66]);
+        assert_eq!(le32(&image, 0x202), BZIMAGE_HDRS_MAGIC);
+        assert_eq!(le16(&image, 0x206), BZIMAGE_PROTOCOL_VERSION);
+        assert_eq!(
+            image[0x211],
+            BZIMAGE_LOADFLAGS_LOADED_HIGH | BZIMAGE_LOADFLAGS_CAN_USE_HEAP
+        );
+        assert_eq!(le32(&image, 0x214), BZIMAGE_PROTECTED_MODE_LOAD_ADDR);
+        assert_eq!(le32(&image, 0x22c), BZIMAGE_INITRD_ADDR_MAX);
+        assert_eq!(le32(&image, 0x230), BZIMAGE_KERNEL_ALIGNMENT);
+        assert_eq!(image[0x234], 0);
+        assert_eq!(image[0x235], 0);
+        assert_eq!(le16(&image, 0x236), BZIMAGE_XLOADFLAGS_KERNEL_64);
+        assert_eq!(le32(&image, 0x238), BZIMAGE_CMDLINE_SIZE);
+        assert_eq!(le32(&image, 0x248), 0);
+        assert_eq!(le32(&image, 0x24c), compressed.bytes.len() as u32);
+        assert_eq!(le64(&image, 0x258), BZIMAGE_PROTECTED_MODE_LOAD_ADDR as u64);
+        assert_eq!(le32(&image, 0x260), compressed.init_size);
+        let payload_start = BZIMAGE_SETUP_SIZE;
+        assert_eq!(&image[payload_start..payload_start + 2], &[0xfc, 0xfa]);
+        assert_eq!(
+            &image[payload_start + compressed.startup_64_offset as usize
+                ..payload_start + compressed.startup_64_offset as usize + 2],
+            &[0xfc, 0xfa]
+        );
+        assert_eq!(
+            &image[payload_start + input_data_offset
+                ..payload_start + input_data_offset + expected_input_data.len()],
+            expected_input_data.as_slice()
+        );
+        assert_eq!(
+            &image[payload_start + input_data_offset..payload_start + input_data_offset + 3],
+            &[0x1f, 0x8b, 0x08]
+        );
+        assert_eq!(
+            le32(
+                &image,
+                payload_start + input_data_offset + expected_input_data.len() - 4
+            ),
+            payload.len() as u32
+        );
+        assert_eq!(
+            le32(
+                &image,
+                payload_start + compressed.input_len_word_offset as usize
+            ),
+            stored_input_len as u32
+        );
+        assert_eq!(
+            le32(
+                &image,
+                payload_start + compressed.output_len_word_offset as usize
+            ),
+            payload.len() as u32
+        );
+    }
+
+    #[test]
+    fn flat_kernel_image_from_elf_extracts_load_segments_and_linux_entry() {
+        let mut elf = vec![0u8; 0x200 + 3 * ELF64_SECTION_HEADER_SIZE as usize];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        put_u16_le(&mut elf, 0x10, 2);
+        put_u16_le(&mut elf, 0x12, 0x3e);
+        put_u32_le(&mut elf, 0x14, 1);
+        put_u64_le(&mut elf, 0x18, 0x0020_1001);
+        put_u64_le(&mut elf, 0x20, ELF64_HEADER_SIZE as u64);
+        put_u64_le(&mut elf, 0x28, 0x200);
+        put_u16_le(&mut elf, 0x34, ELF64_HEADER_SIZE as u16);
+        put_u16_le(&mut elf, 0x36, ELF64_PROGRAM_HEADER_SIZE);
+        put_u16_le(&mut elf, 0x38, 2);
+        put_u16_le(&mut elf, 0x3a, ELF64_SECTION_HEADER_SIZE);
+        put_u16_le(&mut elf, 0x3c, 3);
+
+        let ph0 = ELF64_HEADER_SIZE;
+        put_u32_le(&mut elf, ph0, ELF_PT_LOAD);
+        put_u32_le(&mut elf, ph0 + 4, 0x5);
+        put_u64_le(&mut elf, ph0 + 8, 0x100);
+        put_u64_le(&mut elf, ph0 + 16, 0x0020_0000);
+        put_u64_le(&mut elf, ph0 + 24, 0x0020_0000);
+        put_u64_le(&mut elf, ph0 + 32, 4);
+        put_u64_le(&mut elf, ph0 + 40, 8);
+        put_u64_le(&mut elf, ph0 + 48, 0x1000);
+
+        let ph1 = ph0 + ELF64_PROGRAM_HEADER_SIZE as usize;
+        put_u32_le(&mut elf, ph1, ELF_PT_LOAD);
+        put_u32_le(&mut elf, ph1 + 4, 0x5);
+        put_u64_le(&mut elf, ph1 + 8, 0x120);
+        put_u64_le(&mut elf, ph1 + 16, 0x0020_1000);
+        put_u64_le(&mut elf, ph1 + 24, 0x0020_1000);
+        put_u64_le(&mut elf, ph1 + 32, 3);
+        put_u64_le(&mut elf, ph1 + 40, 3);
+        put_u64_le(&mut elf, ph1 + 48, 0x1000);
+
+        elf[0x100..0x104].copy_from_slice(b"BOOT");
+        elf[0x120..0x123].copy_from_slice(b"RUN");
+
+        let strtab = b"\0linux64_start\0";
+        elf[0x140..0x140 + strtab.len()].copy_from_slice(strtab);
+        let sym = 0x160 + ELF64_SYMBOL_SIZE as usize;
+        put_u32_le(&mut elf, sym, 1);
+        elf[sym + 4] = 0x12;
+        put_u16_le(&mut elf, sym + 6, 1);
+        put_u64_le(&mut elf, sym + 8, 0x0020_1001);
+
+        let sh_symtab = 0x200 + ELF64_SECTION_HEADER_SIZE as usize;
+        put_u32_le(&mut elf, sh_symtab + 4, ELF_SHT_SYMTAB);
+        put_u64_le(&mut elf, sh_symtab + 24, 0x160);
+        put_u64_le(&mut elf, sh_symtab + 32, ELF64_SYMBOL_SIZE * 2);
+        put_u32_le(&mut elf, sh_symtab + 40, 2);
+        put_u64_le(&mut elf, sh_symtab + 56, ELF64_SYMBOL_SIZE);
+
+        let sh_strtab = sh_symtab + ELF64_SECTION_HEADER_SIZE as usize;
+        put_u32_le(&mut elf, sh_strtab + 4, 3);
+        put_u64_le(&mut elf, sh_strtab + 24, 0x140);
+        put_u64_le(&mut elf, sh_strtab + 32, strtab.len() as u64);
+
+        let flat = flat_kernel_image_from_elf(&elf, "linux64_start").expect("flat kernel image");
+        assert_eq!(flat.load_addr, 0x0020_0000);
+        assert_eq!(flat.entry_addr, 0x0020_1001);
+        assert_eq!(&flat.bytes[0..4], b"BOOT");
+        assert_eq!(&flat.bytes[4..8], &[0, 0, 0, 0]);
+        assert_eq!(&flat.bytes[0x1000..0x1003], b"RUN");
+    }
+
+    #[test]
+    fn login_syscall_surface_is_wired_for_real_userland() {
+        let root = repo_root().expect("repo root");
+        let table = fs::read_to_string(root.join("src/arch/x86/entry/syscall_table.rs"))
+            .expect("read syscall table");
+        let wrappers = fs::read_to_string(root.join("src/arch/x86/entry/syscall_wrappers.rs"))
+            .expect("read syscall wrappers");
+        for (slot, wrapper) in [
+            (0usize, "__x64_sys_read"),
+            (16, "__x64_sys_ioctl"),
+            (109, "__x64_sys_setpgid"),
+            (112, "__x64_sys_setsid"),
+            (165, "__x64_sys_mount"),
+            (170, "__x64_sys_sethostname"),
+            (257, "__x64_sys_openat"),
+        ] {
+            assert!(
+                table.contains(&format!("t[{slot}] = w::{wrapper};")),
+                "login userland requires Linux syscall slot {slot} to dispatch to {wrapper}"
+            );
+            assert!(
+                wrappers.contains(&format!("fn {wrapper}")),
+                "login userland requires syscall wrapper {wrapper}"
+            );
+        }
+    }
+
+    #[test]
+    fn userland_build_script_is_unprivileged_and_cache_first() {
+        let root = repo_root().expect("repo root");
+        let script = fs::read_to_string(root.join(USERLAND_BUILD_SCRIPT)).expect("build script");
+
+        for needle in [
+            "ensure_unprivileged",
+            "refusing to run as root",
+            "refusing to run under sudo",
+            "[ -f \"$BOOTSTRAP_ARCHIVE\" ]",
+            "Using cached bootstrap archive",
+            "cached bootstrap checksum mismatch",
+            "remove $BOOTSTRAP_ARCHIVE to download again",
+            "curl -L --fail --progress-bar \"$BOOTSTRAP_URL\" -o \"$tmp\"",
+            "STAGE_STAMP=\"$STAGE/.lupos-userland-ok\"",
+            "safe_clean_dir",
+            "tar --warning=no-unknown-keyword --no-same-owner --delay-directory-restore",
+            "chmod -R u+rwX \"$ARCH_ROOTFS\"",
+            "cp -a \"$ARCH_ROOTFS/.\" \"$STAGE/\"",
+        ] {
+            assert!(
+                script.contains(needle),
+                "userland build script missing unprivileged/cache guard: {needle}"
+            );
+        }
+
+        for forbidden in [
+            "command -v sudo",
+            "sudo \"$@\"",
+            "run_root",
+            "chroot \"$",
+            "mount -t",
+            "umount -l",
+            "dev/pts",
+            "dev/shm",
+            "bootstrap-root",
+            "pacstrap ",
+            "pacman-key",
+            "pacman -Sy",
+        ] {
+            assert!(
+                !script.contains(forbidden),
+                "userland build script must not require privileged bootstrap operation: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn userland_build_script_defaults_to_arch_base() {
+        let root = repo_root().expect("repo root");
+        let script = fs::read_to_string(root.join(USERLAND_BUILD_SCRIPT)).expect("build script");
+
+        for needle in [
+            "LUPOS_DISTRO=\"${LUPOS_DISTRO:-arch}\"",
+            "LUPOS_ARCH_ROOTFS=\"${LUPOS_ARCH_ROOTFS:-$ROOT/target/userland/arch-rootfs}\"",
+            "LUPOS_ARCH_BOOTSTRAP_ROOTFS=\"${LUPOS_ARCH_BOOTSTRAP_ROOTFS:-}\"",
+            "archlinux-bootstrap-2026.06.01-x86_64",
+            "e68ba918c9f7deede8eccd2cd8ce259df104d84b0791cff3a2bc7579ced34849",
+            "BOOTSTRAP_URL=\"${LUPOS_ARCH_BOOTSTRAP_URL:-https://archive.archlinux.org/iso/2026.06.01/${BOOTSTRAP_NAME}.tar.zst}\"",
+            "tar --warning=no-unknown-keyword --no-same-owner --delay-directory-restore",
+            "usr/bin/pacman",
+            "etc/pacman.conf",
+            "var/lib/pacman/local",
+            "/swapfile none      swap      sw       0 0",
+            "normalize_arch_pam",
+            "pacman_mirrorlist_ready",
+            "pacman_config_ready",
+            "pacman_offline_repo_ready",
+            "stage_arch_pacman_package_cache",
+            "normalize_arch_pacman",
+            "DisableSandbox",
+            "SigLevel = Optional TrustAll",
+            "XferCommand = /usr/lib/lupos/pacman-xfer %u %o",
+            "usr/lib/lupos/pacman-xfer",
+            "ARCH_OFFLINE_REPO_PACKAGE_ALIASES",
+            "stage_arch_pacman_package_aliases",
+            "alias=/p/v",
+            "file:///var/lib/lupos/pacman-repo/$repo/os/$arch",
+            "var/cache/pacman/pkg",
+            "vim-9.2.0573-1-x86_64.pkg.tar.zst",
+            "pam_systemd.so",
+            "etc/systemd/network/10-lupos-qemu.network",
+            "nameserver 10.0.2.3",
+        ] {
+            assert!(
+                script.contains(needle),
+                "Arch userland script missing {needle}"
+            );
+        }
+
+        // Negative guards: the Debian userland surface the Arch rewrite removed
+        // must never creep back into the staging script.
+        for forbidden in ["LUPOS_DEBIAN", "debootstrap", "debian-rootfs"] {
+            assert!(
+                !script.contains(forbidden),
+                "Arch userland script must not retain {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn userland_build_script_omits_desktop_profile() {
+        let root = repo_root().expect("repo root");
+        let script = fs::read_to_string(root.join(USERLAND_BUILD_SCRIPT)).expect("build script");
+
+        // Negative guards: the removed Debian/GNOME desktop profile surface must
+        // not reappear in the Arch `base` staging script.
+        for forbidden in [
+            "debian_gnome_package_list",
+            "gdm3",
+            "gnome-shell",
+            "gnome-session",
+            "gnome-software",
+            "graphical.target",
+            "gdm.service",
+            "display-manager.service",
+            "NetworkManager.service",
+            "/usr/sbin/gdm3",
+            "WaylandEnable=false",
+            "LUPOS_DEBIAN_PROFILE",
+            "polkit.Result.YES",
+            "subject.isInGroup(\"sudo\") || subject.isInGroup(\"wheel\")",
+        ] {
+            assert!(
+                !script.contains(forbidden),
+                "Arch base userland script must not retain removed desktop profile surface: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn userland_build_command_invokes_userland_staging_script() {
+        let root = repo_root().expect("repo root");
+        let command = build_userland_command(&root);
+        let rendered = render_command(&command);
+
+        assert!(rendered.contains("build_userland.sh"));
+        assert!(rendered.contains("bash"));
+    }
+
+    #[test]
+    fn initramfs_prefers_staged_real_userland_binaries() {
+        let root = repo_root().expect("repo root");
+        let stage = root.join("target/xtask-test/userland-stage");
+        let _ = fs::remove_dir_all(&stage);
+        fs::create_dir_all(stage.join("bin")).expect("stage bin");
+        fs::create_dir_all(stage.join("lib")).expect("stage lib");
+        fs::create_dir_all(stage.join("lib/security")).expect("stage pam modules");
+        fs::create_dir_all(stage.join("etc/pacman.d")).expect("stage pacman config");
+        fs::create_dir_all(stage.join("etc/pam.d")).expect("stage pam config");
+        fs::create_dir_all(stage.join("etc/audit")).expect("stage audit config");
+        fs::create_dir_all(stage.join("usr/bin")).expect("stage usr/bin");
+        fs::create_dir_all(stage.join("usr/lib")).expect("stage usr lib");
+        fs::create_dir_all(stage.join("usr/lib/pam.d")).expect("stage systemd-user pam dir");
+        fs::create_dir_all(stage.join("usr/lib/systemd/system")).expect("stage systemd units");
+        fs::create_dir_all(stage.join("usr/libexec/coreutils")).expect("stage coreutils libexec");
+        fs::create_dir_all(stage.join("usr/sbin")).expect("stage usr sbin");
+        fs::create_dir_all(stage.join("usr/share/keyrings")).expect("stage keyrings");
+        fs::create_dir_all(stage.join("sbin")).expect("stage sbin");
+        fs::create_dir_all(stage.join("lib64")).expect("stage lib64");
+        fs::create_dir_all(stage.join("var/cache/pacman/pkg")).expect("stage pacman cache");
+        fs::create_dir_all(stage.join("var/lib/pacman/local/bash-5.2.37-1"))
+            .expect("stage pacman bash database");
+        fs::create_dir_all(stage.join("var/lib/pacman/local/coreutils-9.11-1"))
+            .expect("stage pacman coreutils database");
+        fs::create_dir_all(stage.join("var/log/audit")).expect("stage audit log dir");
+        fs::write(stage.join("bin/bash"), b"real-bash").expect("stage bash");
+        fs::write(stage.join("usr/bin/ls"), b"real-ls").expect("stage ls");
+        fs::write(stage.join("usr/bin/stdbuf"), b"real-stdbuf").expect("stage stdbuf");
+        fs::write(
+            stage.join("usr/libexec/coreutils/libstdbuf.so"),
+            b"real-libstdbuf",
+        )
+        .expect("stage libstdbuf");
+        fs::write(stage.join("lib/ld-musl-x86_64.so.1"), b"real-musl").expect("stage musl");
+        fs::write(
+            stage.join("lib64/ld-linux-x86-64.so.2"),
+            b"real-glibc-loader",
+        )
+        .expect("stage glibc loader");
+        fs::write(stage.join("lib/security/pam_unix.so"), b"real-pam-unix")
+            .expect("stage pam_unix");
+        fs::create_dir_all(stage.join("usr/lib/security")).expect("stage Arch pam module dir");
+        fs::write(
+            stage.join("usr/lib/security/pam_unix.so"),
+            b"real-arch-pam-unix",
+        )
+        .expect("stage Arch pam_unix");
+        fs::write(stage.join("etc/pam.d/login"), b"real-pam-login").expect("stage pam login");
+        fs::write(stage.join("etc/audit/auditd.conf"), b"real-auditd-conf")
+            .expect("stage auditd conf");
+        fs::write(
+            stage.join("usr/lib/pam.d/systemd-user"),
+            b"real-systemd-user-pam pam_systemd.so",
+        )
+        .expect("stage systemd-user pam");
+        let staged_os_release = b"PRETTY_NAME=\"Arch Linux\"\nID=arch\n";
+        fs::write(stage.join("etc/os-release"), staged_os_release).expect("stage os-release");
+        fs::write(stage.join("usr/lib/libpam.so.0"), b"real-libpam").expect("stage libpam");
+        fs::write(stage.join("usr/lib/libpam_misc.so.0"), b"real-libpam-misc")
+            .expect("stage pam misc soname");
+        fs::write(
+            stage.join("usr/lib/libpam_misc.so.0.82.1"),
+            b"real-libpam-misc",
+        )
+        .expect("stage pam misc target");
+        fs::write(stage.join("usr/lib/libcrypt.so.1"), b"real-libcrypt").expect("stage libcrypt");
+        fs::write(stage.join("usr/sbin/unix_chkpwd"), b"real-unix-chkpwd")
+            .expect("stage unix_chkpwd");
+        fs::write(stage.join("usr/bin/kmod"), b"real-kmod").expect("stage kmod");
+        fs::write(stage.join("usr/bin/bash"), b"real-usr-bash").expect("stage usr bash");
+        fs::write(stage.join("bin/login"), b"real-login").expect("stage login");
+        fs::write(stage.join("sbin/agetty"), b"real-agetty").expect("stage agetty");
+        fs::write(stage.join("usr/lib/systemd/systemd"), b"real-systemd").expect("stage systemd");
+        fs::write(
+            stage.join("usr/lib/systemd/systemd-executor"),
+            b"real-systemd-executor",
+        )
+        .expect("stage systemd executor");
+        fs::write(
+            stage.join("usr/lib/systemd/systemd-user-sessions"),
+            b"real-systemd-user-sessions",
+        )
+        .expect("stage systemd-user-sessions");
+        fs::write(
+            stage.join("usr/lib/systemd/libsystemd-core-257.so"),
+            b"real-libsystemd-core",
+        )
+        .expect("stage systemd core");
+        fs::write(
+            stage.join("usr/lib/systemd/libsystemd-shared-257.so"),
+            b"real-libsystemd-shared",
+        )
+        .expect("stage systemd shared");
+        fs::write(stage.join("usr/lib/libapparmor.so.1"), b"real-libapparmor")
+            .expect("stage apparmor");
+        fs::write(stage.join("usr/lib/libcrypto.so.3"), b"real-libcrypto")
+            .expect("stage libcrypto");
+        fs::write(stage.join("usr/lib/libm.so.6"), b"real-libm").expect("stage libm");
+        fs::write(stage.join("usr/lib/libssl.so.3"), b"real-libssl").expect("stage libssl");
+        fs::write(
+            stage.join("usr/lib/libsmartcols.so.1"),
+            b"real-libsmartcols",
+        )
+        .expect("stage libsmartcols");
+        fs::write(stage.join("usr/lib/libnss_dns.so.2"), b"real-libnss-dns")
+            .expect("stage nss dns");
+        fs::write(
+            stage.join("usr/lib/libnss_files.so.2"),
+            b"real-libnss-files",
+        )
+        .expect("stage nss files");
+        fs::write(stage.join("usr/lib/libaudit.so.1"), b"")
+            .expect("stage audit soname placeholder");
+        fs::write(stage.join("usr/lib/libaudit.so.1.0.0"), b"real-libaudit")
+            .expect("stage audit target");
+        fs::write(stage.join("usr/lib/libauparse.so.0"), b"real-libauparse")
+            .expect("stage auparse soname placeholder");
+        let auditd_runtime_libs: &[(&str, &[u8])] = &[
+            ("usr/lib/libgssapi_krb5.so.2", b"real-libgssapi-krb5"),
+            ("usr/lib/libkrb5.so.3", b"real-libkrb5"),
+            ("usr/lib/libk5crypto.so.3", b"real-libk5crypto"),
+            ("usr/lib/libcom_err.so.2", b"real-libcom-err"),
+            ("usr/lib/libkrb5support.so.0", b"real-libkrb5support"),
+            ("usr/lib/libkeyutils.so.1", b"real-libkeyutils"),
+            ("usr/lib/libresolv.so.2", b"real-libresolv"),
+        ];
+        for (rel, bytes) in auditd_runtime_libs {
+            fs::write(stage.join(rel), *bytes).expect("stage auditd runtime lib");
+        }
+        fs::write(stage.join("usr/lib/libsystemd.so.0"), b"")
+            .expect("stage libsystemd soname placeholder");
+        fs::write(
+            stage.join("usr/lib/libsystemd.so.0.40.0"),
+            b"real-libsystemd",
+        )
+        .expect("stage libsystemd target");
+        fs::write(stage.join("usr/lib/libtinfo.so.6"), b"real-libtinfo")
+            .expect("stage libtinfo soname");
+        fs::write(stage.join("usr/lib/libtinfo.so.6.5"), b"real-libtinfo")
+            .expect("stage libtinfo target");
+        for unit in [
+            "getty@.service",
+            "multi-user.target",
+            "systemd-journald.service",
+            "systemd-user-sessions.service",
+            "systemd-logind.service",
+            "systemd-networkd.service",
+            "systemd-resolved.service",
+            "auditd.service",
+        ] {
+            fs::write(
+                stage.join("usr/lib/systemd/system").join(unit),
+                b"real-unit",
+            )
+            .expect("stage systemd unit");
+        }
+        fs::write(stage.join("usr/sbin/auditd"), b"real-auditd").expect("stage auditd");
+        fs::write(stage.join("usr/sbin/auditctl"), b"real-auditctl").expect("stage auditctl");
+        fs::write(stage.join("usr/sbin/augenrules"), b"real-augenrules").expect("stage augenrules");
+        fs::write(stage.join("usr/sbin/swapon"), b"real-swapon").expect("stage swapon");
+        fs::write(stage.join("usr/sbin/swapoff"), b"real-swapoff").expect("stage swapoff");
+        for tool in [
+            "systemctl",
+            "journalctl",
+            "loginctl",
+            "systemd-analyze",
+            "udevadm",
+        ] {
+            fs::write(stage.join("usr/bin").join(tool), b"real-systemd-tool")
+                .expect("stage systemd tool");
+        }
+        let package_manager_stage_files: &[(&str, &[u8])] = &[
+            (
+                "etc/pacman.conf",
+                b"[options]\nArchitecture = auto\nXferCommand = /usr/lib/lupos/pacman-xfer %u %o\n",
+            ),
+            (
+                "etc/pacman.d/mirrorlist",
+                b"Server = https://mirror.example/$repo/os/$arch\n",
+            ),
+            ("usr/bin/pacman", b"real-pacman"),
+            ("var/lib/pacman/local/ALPM_DB_VERSION", b"9\n"),
+            ("var/lib/pacman/local/bash-5.2.37-1/desc", b"%NAME%\nbash\n"),
+            (
+                "var/lib/pacman/local/coreutils-9.11-1/desc",
+                b"%NAME%\ncoreutils\n",
+            ),
+            ("var/cache/pacman/pkg/.keep", b"pacman-cache\n"),
+        ];
+        for (rel, bytes) in package_manager_stage_files {
+            fs::write(stage.join(rel), bytes).unwrap_or_else(|err| panic!("stage {rel}: {err}"));
+        }
+        let package_manager_expected_files: &[(&str, &[u8])] = &[
+            (
+                "etc/pacman.conf",
+                b"[options]\nArchitecture = auto\nXferCommand = /usr/lib/lupos/pacman-xfer %u %o\n",
+            ),
+            ("etc/pacman.d/mirrorlist", ARCH_PACMAN_MIRRORLIST.as_bytes()),
+            ("usr/bin/pacman", b"real-pacman"),
+            ("var/lib/pacman/local/ALPM_DB_VERSION", b"9\n"),
+            ("var/lib/pacman/local/bash-5.2.37-1/desc", b"%NAME%\nbash\n"),
+            (
+                "var/lib/pacman/local/coreutils-9.11-1/desc",
+                b"%NAME%\ncoreutils\n",
+            ),
+            ("var/cache/pacman/pkg/.keep", b"pacman-cache\n"),
+        ];
+        let package_manager_runtime_libs: &[(&str, &[u8])] = &[
+            ("usr/lib/libarchive.so.13", b"real-libarchive"),
+            ("usr/lib/libcurl.so.4", b"real-libcurl"),
+            ("usr/lib/libnghttp2.so.14", b"real-libnghttp2"),
+            ("usr/lib/libpsl.so.5", b"real-libpsl"),
+            ("usr/lib/libzstd.so.1", b"real-libzstd"),
+            ("usr/lib/libacl.so.1", b"real-libacl"),
+            ("usr/lib/libbz2.so.1.0", b"real-libbz2"),
+            ("usr/lib/libgcc_s.so.1", b"real-libgcc-s"),
+        ];
+        for (rel, bytes) in package_manager_runtime_libs {
+            fs::write(stage.join(rel), *bytes).expect("stage package-manager runtime lib");
+        }
+
+        let files = login_userland_files_with_stage(Some(&stage));
+        let fstab = initramfs_file_bytes(&files, "etc/fstab").expect("etc/fstab");
+        assert!(
+            fstab
+                .windows(LUPOS_SWAP_FSTAB_LINE.len())
+                .any(|w| w == LUPOS_SWAP_FSTAB_LINE.as_bytes()),
+            "systemd fstab should activate /swapfile"
+        );
+        let swapfile = files
+            .iter()
+            .find(|(path, _, _)| path == LUPOS_SWAPFILE_PATH)
+            .expect("swapfile");
+        assert_eq!(swapfile.1, 0o100600);
+        assert_eq!(swapfile.2.len(), LUPOS_SWAPFILE_PAGES * 4096);
+        assert_eq!(&swapfile.2[4096 - 10..4096], b"SWAPSPACE2");
+        let init = files
+            .iter()
+            .find(|(path, _, _)| path == "sbin/init")
+            .expect("sbin/init");
+        assert!(initramfs_file_is_symlink(init));
+        assert_eq!(
+            initramfs_file_bytes(&files, "sbin/init"),
+            Some(&b"/usr/lib/systemd/systemd"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/systemd/systemd"),
+            Some(&b"real-systemd"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/systemd/systemd-executor"),
+            Some(&b"real-systemd-executor"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/systemd/libsystemd-core-257.so"),
+            Some(&b"real-libsystemd-core"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/systemd/libsystemd-shared-257.so"),
+            Some(&b"real-libsystemd-shared"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/systemd/systemd-udevd"),
+            Some(&b"real-systemd-tool"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libapparmor.so.1"),
+            Some(&b"real-libapparmor"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libcrypto.so.3"),
+            Some(&b"real-libcrypto"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libm.so.6"),
+            Some(&b"real-libm"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libssl.so.3"),
+            Some(&b"real-libssl"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libsmartcols.so.1"),
+            Some(&b"real-libsmartcols"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libnss_dns.so.2"),
+            Some(&b"real-libnss-dns"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libnss_files.so.2"),
+            Some(&b"real-libnss-files"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libaudit.so.1"),
+            Some(&b"real-libaudit"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libauparse.so.0"),
+            Some(&b"real-libauparse"[..])
+        );
+        for (rel, bytes) in auditd_runtime_libs {
+            assert_eq!(initramfs_file_bytes(&files, rel), Some(*bytes));
+        }
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libpam_misc.so.0"),
+            Some(&b"real-libpam-misc"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libsystemd.so.0"),
+            Some(&b"real-libsystemd"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libtinfo.so.6"),
+            Some(&b"real-libtinfo"[..])
+        );
+        for (rel, bytes) in package_manager_runtime_libs {
+            assert_eq!(initramfs_file_bytes(&files, rel), Some(*bytes));
+        }
+        for (rel, bytes) in package_manager_expected_files {
+            assert_eq!(
+                initramfs_file_bytes(&files, rel),
+                Some(*bytes),
+                "{rel} must be staged for pacman package database checks"
+            );
+        }
+        assert_eq!(
+            initramfs_file_bytes(&files, "bin/bash"),
+            Some(&b"real-usr-bash"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/bin/bash"),
+            Some(&b"real-usr-bash"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "bin/login"),
+            Some(&b"real-login"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/bin/ls"),
+            Some(&b"real-ls"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "bin/ls"),
+            Some(&b"real-ls"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "sbin/agetty"),
+            Some(&b"real-agetty"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, GLIBC_DYNAMIC_LOADER),
+            Some(&b"real-glibc-loader"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/bin/stdbuf"),
+            Some(&b"real-stdbuf"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/libexec/coreutils/libstdbuf.so"),
+            Some(&b"real-libstdbuf"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "lib/security/pam_unix.so"),
+            Some(&b"real-pam-unix"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/security/pam_unix.so"),
+            Some(&b"real-arch-pam-unix"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/pam.d/login"),
+            Some(LOGIN_PAM_LOGIN.as_bytes())
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/audit/auditd.conf"),
+            Some(&b"real-auditd-conf"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/pam.d/systemd-user"),
+            Some(&b"real-systemd-user-pam pam_systemd.so"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/os-release"),
+            Some(&staged_os_release[..])
+        );
+        // Mirrors `man 5 os-release`: /usr/lib/os-release is the canonical
+        // path and must be staged alongside /etc/os-release so systemd's
+        // propagate_etc_os_release succeeds inside its private namespace.
+        // Stage does not provide one, so the initramfs mirrors the staged
+        // /etc/os-release bytes there.
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/os-release"),
+            Some(&staged_os_release[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libpam.so.0"),
+            Some(&b"real-libpam"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/libcrypt.so.1"),
+            Some(&b"real-libcrypt"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/sbin/unix_chkpwd"),
+            Some(&b"real-unix-chkpwd"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/sbin/auditd"),
+            Some(&b"real-auditd"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "sbin/auditctl"),
+            Some(&b"real-auditctl"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "sbin/augenrules"),
+            Some(&b"real-augenrules"[..])
+        );
+        assert!(
+            initramfs_file_bytes(
+                &files,
+                "etc/systemd/system/multi-user.target.wants/auditd.service"
+            )
+            .is_none(),
+            "terminal-login must stage audit tools without waiting on auditd.service"
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "sbin/modprobe"),
+            Some(&b"real-kmod"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/sbin/swapon"),
+            Some(&b"real-swapon"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "sbin/swapon"),
+            Some(&b"real-swapon"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/sbin/swapoff"),
+            Some(&b"real-swapoff"[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "sbin/swapoff"),
+            Some(&b"real-swapoff"[..])
+        );
+        let system_conf = core::str::from_utf8(
+            initramfs_file_bytes(&files, "etc/systemd/system.conf")
+                .expect("system.conf must be staged"),
+        )
+        .unwrap();
+        assert!(
+            system_conf.contains("DefaultTimeoutStartSec=15s\n"),
+            "terminal-login system.conf must cap startup waits under QEMU TCG"
+        );
+        assert!(
+            system_conf.contains("DefaultTimeoutStopSec=15s\n"),
+            "terminal-login system.conf must cap shutdown waits under QEMU TCG"
+        );
+        assert!(initramfs_file_bytes(&files, "etc/machine-id").is_some());
+        assert!(
+            initramfs_file_bytes(
+                &files,
+                "etc/systemd/system/getty@tty1.service.d/lupos-login.conf"
+            )
+            .is_some()
+        );
+        assert!(
+            initramfs_file_bytes(
+                &files,
+                "etc/systemd/system/user@.service.d/lupos-runtime-env.conf"
+            )
+            .is_some()
+        );
+        assert_eq!(
+            initramfs_file_bytes(
+                &files,
+                "etc/systemd/system/multi-user.target.wants/getty.target"
+            ),
+            Some(&b"/usr/lib/systemd/system/getty.target"[..])
+        );
+
+        // Empty libkmod index stubs land under the reported kernel release.
+        // Without these, systemd-modules-load logs
+        // "Failed to initialize kmod context: Operation not supported".
+        let modules_dep = format!("lib/modules/{LUPOS_KERNEL_RELEASE}/modules.dep");
+        let modules_builtin = format!("lib/modules/{LUPOS_KERNEL_RELEASE}/modules.builtin");
+        let modules_builtin_alias =
+            format!("lib/modules/{LUPOS_KERNEL_RELEASE}/modules.builtin.alias.bin");
+        assert_eq!(initramfs_file_bytes(&files, &modules_dep), Some(&b""[..]));
+        assert_eq!(
+            initramfs_file_bytes(&files, &modules_builtin),
+            Some(&b""[..])
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, &modules_builtin_alias),
+            Some(&b""[..])
+        );
+
+        let _ = fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn libkmod_stub_files_cover_libkmod_lookup_set() {
+        let files = libkmod_stub_initramfs_files();
+        // Every entry sits under /lib/modules/<release>/ with mode 0o100644 and
+        // empty contents (a valid "no modules installed" configuration).
+        let expected_prefix = format!("lib/modules/{LUPOS_KERNEL_RELEASE}/");
+        for (path, mode, bytes) in &files {
+            assert!(
+                path.starts_with(&expected_prefix),
+                "stub path {path} must live under {expected_prefix}"
+            );
+            assert_eq!(*mode, 0o100644);
+            assert!(bytes.is_empty(), "stub {path} must be empty");
+        }
+        // The critical lookup files for libkmod's kmod_new().
+        for required in [
+            "modules.dep",
+            "modules.builtin",
+            "modules.builtin.alias.bin",
+        ] {
+            let path = format!("lib/modules/{LUPOS_KERNEL_RELEASE}/{required}");
+            assert!(
+                files.iter().any(|(p, _, _)| p == &path),
+                "missing libkmod stub {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn libkmod_kernel_release_matches_kernel_uts_release_constant() {
+        // Guard rail: if either crate bumps CARGO_PKG_VERSION, both move
+        // together because they share the workspace `[package].version`.
+        // This test exists so that a future divergence (e.g. xtask split into
+        // its own workspace) trips immediately instead of silently producing
+        // /lib/modules/<wrong-release>/ at boot.
+        let repo = repo_root().expect("repo root");
+        let kernel_version =
+            fs::read_to_string(repo.join("src/init/version.rs")).expect("read version.rs");
+        assert!(
+            kernel_version.contains(
+                "pub const UTS_RELEASE: &str = concat!(env!(\"CARGO_PKG_VERSION\"), \"-lupos\");"
+            ),
+            "kernel UTS_RELEASE must use CARGO_PKG_VERSION + \"-lupos\" so xtask \
+             LUPOS_KERNEL_RELEASE stays in lock-step"
+        );
+    }
+
+    #[test]
+    fn large_initramfs_install_uses_linux_boot_params_initrd_in_place() {
+        let root = repo_root().expect("repo root");
+        let main_rs = fs::read_to_string(root.join("src/init/main.rs")).expect("read main.rs");
+        assert!(
+            !main_rs.contains("module_slice.to_vec().into_boxed_slice()"),
+            "large real-userland initramfs must not require one contiguous heap copy"
+        );
+        assert!(
+            main_rs.contains("boot_params_initrd_slice(bp)")
+                && main_rs.contains("install_from_bytes(initrd_slice)")
+                && main_rs.contains("linux boot_params initrd indexed"),
+            "initramfs install should parse Linux boot_params initrd bytes in place"
+        );
+    }
+
+    #[test]
+    fn release_fhs_manifest_covers_required_layout() {
+        let files = login_release_root_files();
+        let manifest = fhs_manifest_content(&files);
+        for needle in [
+            "path\tkind\tmode\torigin",
+            "bin\tdir\t40755\tfhs-skeleton",
+            "boot/grub\tdir\t40755\tfhs-skeleton",
+            "etc/audit/plugins.d\tdir\t40755\tfhs-skeleton",
+            "home/lupos\tdir\t40755\tfhs-skeleton",
+            "root\tdir\t40700\tfhs-skeleton",
+            "tmp\tdir\t41777\tfhs-skeleton",
+            "var/log\tdir\t40755\tfhs-skeleton",
+            "var/log/audit\tdir\t40755\tfhs-skeleton",
+            "bin/bash\tfile\t100755\tlogin-userland",
+            "sbin/init\tfile\t100755\tlogin-userland",
+            "sbin/swapon\tfile\t100755\tlogin-userland",
+            "sbin/swapoff\tfile\t100755\tlogin-userland",
+            "etc/inittab\tfile\t100644\tlogin-etc",
+            "etc/modules\tfile\t100644\tlogin-etc",
+            "swapfile\tfile\t100600\tgenerated",
+            "usr/share/lupos/release.txt\tfile\t100644\tgenerated",
+            "boot/grub/splashart.png\tfile\t100644\trelease-boot",
+        ] {
+            assert!(manifest.contains(needle), "FHS manifest missing {needle}");
+        }
+    }
+
+    #[test]
+    fn release_root_writer_stages_manifest_and_boot_files() {
+        let root = repo_root()
+            .expect("repo root")
+            .join("target/xtask-test/login-release-root");
+        let _ = fs::remove_dir_all(&root);
+        let kernel = root.with_extension("kernel");
+        fs::write(&kernel, b"kernel").expect("kernel fixture");
+
+        let manifest = write_release_root(&root, Some(&kernel)).expect("write release root");
+        let manifest_text = fs::read_to_string(&manifest).expect("manifest");
+
+        assert!(root.join("boot/bzImage").is_file());
+        assert!(root.join("boot/grub/grub.cfg").is_file());
+        assert!(root.join("boot/grub/splashart.png").is_file());
+        assert!(root.join("bin/bash").is_file());
+        assert!(root.join("sbin/init").is_file());
+        assert!(root.join("home/lupos").is_dir());
+        assert!(manifest_text.contains("boot/bzImage\tfile\t100644\trelease-boot"));
+        assert!(manifest_text.contains("boot/grub/grub.cfg\tfile\t100644\trelease-boot"));
+        assert!(manifest_text.contains("boot/grub/splashart.png\tfile\t100644\trelease-boot"));
+        #[cfg(unix)]
+        {
+            assert_eq!(staged_fs_mode(&root.join("etc/shadow")), 0o600);
+            assert_eq!(staged_fs_mode(&root.join("etc/gshadow")), 0o600);
+            assert_eq!(staged_fs_mode(&root.join("root")), 0o700);
+            assert_eq!(staged_fs_mode(&root.join("tmp")), 0o1777);
+        }
+
+        let _ = fs::remove_file(&kernel);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_disk_images_mkfs_uses_kernel_supported_ext4_features() {
+        let script = release_disk_images_build_script(
+            Path::new("/tmp/lupos.ext4"),
+            Path::new("/tmp/lupos.qcow2"),
+            Path::new("/tmp/lupos.vdi"),
+            Path::new("/tmp/rootfs"),
+        );
+
+        assert!(script.contains("mkfs.ext4 -q -F -L lupos-root"));
+        assert!(script.contains("truncate -s 2G"));
+        assert!(script.contains("-O ^metadata_csum,^64bit"));
+        assert!(script.contains("qemu-img convert -f raw -O qcow2"));
+        assert!(script.contains("qemu-img convert -f raw -O vdi"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_staged_files_applies_declared_file_modes() {
+        let root = repo_root()
+            .expect("repo root")
+            .join("target/xtask-test/staged-file-modes");
+        let _ = fs::remove_dir_all(&root);
+        let files = vec![
+            initramfs_file("etc/shadow", 0o100600, b"root:*:1:0:99999:7:::"),
+            initramfs_file("usr/bin/tool", 0o100755, b"tool"),
+        ];
+
+        write_staged_files(&root, &files).expect("write staged files");
+
+        assert_eq!(staged_fs_mode(&root.join("etc/shadow")), 0o600);
+        assert_eq!(staged_fs_mode(&root.join("usr/bin/tool")), 0o755);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_staged_files_preserves_symlinks() {
+        let root = repo_root()
+            .expect("repo root")
+            .join("target/xtask-test/staged-symlinks");
+        let _ = fs::remove_dir_all(&root);
+        let files = vec![initramfs_symlink("sbin/init", "/usr/lib/systemd/systemd")];
+
+        write_staged_files(&root, &files).expect("write staged files");
+
+        let init = root.join("sbin/init");
+        let meta = fs::symlink_metadata(&init)
+            .unwrap_or_else(|err| panic!("failed to lstat {}: {err}", init.display()));
+        assert!(meta.file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(&init).expect("read staged symlink"),
+            Path::new("/usr/lib/systemd/systemd")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    fn staged_fs_mode(path: &Path) -> u32 {
+        fs::metadata(path)
+            .unwrap_or_else(|err| panic!("failed to stat {}: {err}", path.display()))
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[test]
+    fn normalize_boot_test_mode_accepts_device_mode_aliases() {
+        assert_eq!(
+            normalize_boot_test_mode("test-device-mode"),
+            "test-device-model"
+        );
+        assert_eq!(normalize_boot_test_mode("device-mode"), "device-model");
+        assert_eq!(
+            normalize_boot_test_mode("test-device-model"),
+            "test-device-model"
+        );
+    }
+
+    fn abi_parity_command_check_kind(check: &str) -> Option<&'static str> {
+        let mut parts = check.split_whitespace();
+        let command = match parts.next() {
+            Some(command) => command,
+            None => return None,
+        };
+
+        if check == "every ABI parity test names its vendor/linux source" {
+            return Some("readiness-marker");
+        }
+        if check == "ABI parity remains blocked until every ABI parity milestone is checked" {
+            return Some("readiness-marker");
+        }
+
+        match command {
+            "make" => {
+                if let Some(target) = parts.next() {
+                    if matches!(target, "lupos_defconfig" | "iso" | "localmodconfig") {
+                        return Some("make");
+                    }
+                    return Some("make-unknown-target");
+                }
+                Some("make-missing-target")
+            }
+            "cargo" => {
+                let sub = parts.next()?;
+                match sub {
+                    "xtask" => {
+                        if let Some(cmd) = parts.next() {
+                            if matches!(cmd, "release" | "qemu-iso-display") {
+                                return Some("cargo-xtask");
+                            }
+                        }
+                        Some("cargo-xtask-unsupported")
+                    }
+                    "test" => {
+                        let package = parts.next()?;
+                        if let Some(subcmd) = parts.next() {
+                            if package == "-p" && subcmd == "xtask" {
+                                if let Some(filter) = parts.next() {
+                                    if filter == "abi_parity" {
+                                        return Some("cargo-test-abi_parity");
+                                    }
+                                }
+                            }
+                        }
+                        Some("cargo-test-unsupported")
+                    }
+                    _ => Some("cargo-unsupported"),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn abi_parity_manifest_covers_every_pre_phase13_milestone() {
+        assert_eq!(ABI_PARITY_MILESTONES.len(), 14);
+        for milestone in ABI_PARITY_MILESTONES {
+            let id = milestone
+                .id
+                .parse::<usize>()
+                .expect("renumbered milestone ids should be numeric");
+            assert!(
+                (65..=90).contains(&id),
+                "{} must stay in the rearranged ABI parity milestone range",
+                milestone.id
+            );
+            assert!(
+                !milestone.title.is_empty(),
+                "{} must have a title",
+                milestone.id
+            );
+            assert!(
+                milestone.linux_refs.len() >= 4,
+                "{} must be grounded in vendor/linux",
+                milestone.id
+            );
+            assert!(
+                milestone.acceptance_checks.len() >= 3,
+                "{} must name concrete acceptance checks",
+                milestone.id
+            );
+            assert!(
+                !milestone.required_syscalls.is_empty() || !milestone.mocked_syscalls.is_empty(),
+                "{} must list at least one required-or-mocked syscall",
+                milestone.id
+            );
+            for sys in milestone
+                .required_syscalls
+                .iter()
+                .chain(milestone.mocked_syscalls.iter())
+            {
+                assert!(
+                    !sys.is_empty(),
+                    "{} has empty syscall declaration",
+                    milestone.id
+                );
+            }
+            let overlap: HashSet<_> = milestone
+                .required_syscalls
+                .iter()
+                .filter(|s| milestone.mocked_syscalls.contains(s))
+                .collect();
+            assert!(
+                overlap.is_empty(),
+                "{} must not repeat syscall in both required and mocked lists",
+                milestone.id
+            );
+        }
+    }
+
+    #[test]
+    fn abi_parity_vendor_linux_references_exist() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask has repo parent");
+        for milestone in ABI_PARITY_MILESTONES {
+            for rel in milestone.linux_refs {
+                let full = repo_root.join(rel);
+                assert!(
+                    full.exists(),
+                    "{} references missing Linux source path: {}",
+                    milestone.id,
+                    rel
+                );
+                assert!(
+                    path_has_linux_evidence(&full).expect("Linux reference should be inspectable"),
+                    "{} references empty Linux source path: {}",
+                    milestone.id,
+                    rel
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn abi_parity_syscall_requirements_are_linux_backed() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask has repo parent");
+        let linux_syscalls = parse_linux_syscall_names(
+            &repo_root.join("vendor/linux/arch/x86/entry/syscalls/syscall_64.tbl"),
+        );
+        for milestone in ABI_PARITY_MILESTONES {
+            for syscall in milestone
+                .required_syscalls
+                .iter()
+                .chain(milestone.mocked_syscalls.iter())
+            {
+                assert!(
+                    linux_syscalls.contains(*syscall),
+                    "{} references unknown Linux syscall {}",
+                    milestone.id,
+                    syscall
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn abi_parity_required_syscalls_are_implemented_in_dispatch() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask has repo parent");
+        let linux = parse_linux_syscall_numbers(
+            &repo_root.join("vendor/linux/arch/x86/entry/syscalls/syscall_64.tbl"),
+        );
+        let wrappers =
+            parse_syscall_wrappers(&repo_root.join("src/arch/x86/entry/syscall_wrappers.rs"));
+        let wired =
+            parse_syscall_table_slots(&repo_root.join("src/arch/x86/entry/syscall_table.rs"));
+        for milestone in ABI_PARITY_MILESTONES {
+            for syscall in milestone.required_syscalls {
+                let symbol = format!("__x64_sys_{syscall}");
+                assert!(
+                    wrappers.contains(&symbol),
+                    "required syscall {} from {} has no wrapper in syscall_wrappers.rs",
+                    syscall,
+                    milestone.id
+                );
+                let linux_nr = *linux.get(*syscall).unwrap_or_else(|| {
+                    panic!(
+                        "required syscall {} from {} is missing from vendor/linux x86_64 table",
+                        syscall, milestone.id
+                    )
+                });
+                let wired_nr = *wired.get(*syscall).unwrap_or_else(|| {
+                    panic!(
+                        "required syscall {} from {} is not mapped in SYS_CALL_TABLE",
+                        syscall, milestone.id
+                    )
+                });
+                assert!(
+                    wired_nr == linux_nr,
+                    "required syscall {} from {} is wired to x86_64 slot {}, expected {}",
+                    syscall,
+                    milestone.id,
+                    wired_nr,
+                    linux_nr
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn syscall_dispatch_table_is_vendor_linux_x86_64_backed() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask has repo parent");
+        let linux = parse_linux_x86_64_common_syscalls(repo_root).expect("vendor Linux syscalls");
+        let max_nr = linux
+            .iter()
+            .map(|spec| spec.nr)
+            .max()
+            .expect("max syscall nr");
+        let wired = parse_lupos_syscall_table_slots(repo_root).expect("parse dispatch table");
+        let wrappers = parse_lupos_syscall_wrappers(repo_root).expect("parse wrappers");
+        let linux_by_nr = linux
+            .iter()
+            .map(|spec| (spec.nr, spec.name.as_str()))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            parse_lupos_nr_syscalls(repo_root).expect("parse NR_syscalls"),
+            max_nr + 1
+        );
+        assert!(wired.len() > 0);
+        for (name, nr) in wired {
+            assert_eq!(
+                linux_by_nr.get(&nr).copied(),
+                Some(name.as_str()),
+                "wired syscall {name} at slot {nr} must match vendor Linux"
+            );
+            assert!(
+                wrappers.contains(&format!("__x64_sys_{name}")),
+                "wired syscall {name} must have an x86_64 wrapper"
+            );
+        }
+    }
+
+    #[test]
+    fn syscall_evidence_commands_reject_recursive_parity() {
+        validate_syscall_evidence_command("cargo +nightly test -p lupos --lib")
+            .expect("ordinary test command is valid evidence");
+        validate_syscall_evidence_command("cargo xtask syscall-parity --arch x86_64")
+            .expect_err("evidence must not recursively invoke the parity gate");
+        validate_syscall_evidence_command("cargo xtask syscall_parity --arch x86_64")
+            .expect_err("underscore alias must also be rejected");
+    }
+
+    fn parse_linux_syscall_names(path: &Path) -> HashSet<String> {
+        parse_linux_syscall_numbers(path).keys().cloned().collect()
+    }
+
+    fn parse_linux_syscall_numbers(path: &Path) -> HashMap<String, usize> {
+        let text = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!("failed to read {}: {err}", path.display());
+        });
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("0x"))
+            .filter_map(|line| {
+                let mut pieces = line.split_whitespace();
+                let nr = pieces.next()?.parse::<usize>().ok()?;
+                let abi = pieces.next()?;
+                let name = pieces.next()?;
+                match abi {
+                    "common" | "64" => Some((name.to_owned(), nr)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    fn parse_syscall_wrappers(path: &Path) -> HashSet<String> {
+        let text = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!("failed to read {}: {err}", path.display());
+        });
+        let marker = "pub unsafe extern \"C\" fn ";
+        text.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                line.strip_prefix(marker)
+                    .and_then(|rest| rest.find('(').map(|idx| &rest[..idx]))
+                    .map(|name| name.to_owned())
+            })
+            .collect()
+    }
+
+    fn parse_syscall_table_slots(path: &Path) -> HashMap<String, usize> {
+        let text = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!("failed to read {}: {err}", path.display());
+        });
+        let rhs = "w::__x64_sys_";
+        let mut out = HashMap::new();
+        for line in text.lines().map(str::trim) {
+            let Some(rest) = line.strip_prefix("t[") else {
+                continue;
+            };
+            let Some(close) = rest.find(']') else {
+                continue;
+            };
+            let Ok(slot) = rest[..close].trim().parse::<usize>() else {
+                continue;
+            };
+            if let Some(start) = line.find(rhs) {
+                let after = &line[start + rhs.len()..];
+                let end = after
+                    .find(|c| matches!(c, ' ' | ';' | ',' | '\n' | '\r'))
+                    .unwrap_or(after.len());
+                let symbol = after[..end].trim().to_owned();
+                out.insert(symbol, slot);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn abi_parity_boot_mode_acceptance_checks_resolve_to_runners() {
+        for milestone in ABI_PARITY_MILESTONES {
+            for check in milestone.acceptance_checks {
+                if let Some(mode) = boot_mode_from_acceptance_check(check) {
+                    assert!(
+                        resolve_boot_test_mode(mode).is_some(),
+                        "{} has unsupported test-boot mode in acceptance check: {}",
+                        milestone.id,
+                        check
+                    );
+                    continue;
+                }
+
+                if let Some(mock_mode) = abi_parity_mock_fixture_mode_from_acceptance_check(check) {
+                    assert!(
+                        resolve_boot_test_mode(mock_mode).is_some(),
+                        "{} has unsupported mock fixture acceptance check: {}",
+                        milestone.id,
+                        check
+                    );
+                    continue;
+                }
+
+                match abi_parity_command_check_kind(check) {
+                    Some("cargo-xtask")
+                    | Some("make")
+                    | Some("cargo-test-abi_parity")
+                    | Some("readiness-marker") => {}
+                    Some("make-unknown-target")
+                    | Some("cargo-xtask-unsupported")
+                    | Some("cargo-test-unsupported")
+                    | Some("cargo-unsupported") => {
+                        panic!(
+                            "{} has unsupported command-style acceptance check: {}",
+                            milestone.id, check
+                        )
+                    }
+                    None => panic!(
+                        "{} has unsupported acceptance check format: {}",
+                        milestone.id, check
+                    ),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn abi_parity_boot_mode_aliases_are_known() {
+        for mode in [
+            "test-device-mode",
+            "device-mode",
+            "test-pid1-handoff",
+            "test-grub-bzimage",
+            "grub-bzimage",
+            "test-multiboot-grub",
+            "multiboot-grub",
+        ] {
+            assert!(
+                resolve_boot_test_mode(mode).is_some(),
+                "ABI parity expected alias should resolve: {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn abi_parity_mock_acceptance_checks_are_known_to_resolver() {
+        for milestone in ABI_PARITY_MILESTONES {
+            for check in milestone.acceptance_checks {
+                if let Some(mode) = abi_parity_mock_fixture_mode_from_acceptance_check(check) {
+                    assert!(
+                        resolve_boot_test_mode(mode).is_some(),
+                        "{} mock acceptance check has no mock resolver: {}",
+                        milestone.id,
+                        check
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn abi_parity_mock_fixtures_are_coverage_and_source_backed() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask has repo parent");
+        let mut defined_modes = HashSet::new();
+
+        for fixture in abi_parity_mock_fixtures() {
+            assert!(
+                fixture
+                    .mode
+                    .starts_with(ABI_PARITY_MOCK_FIXTURE_MODE_PREFIX)
+                    || fixture
+                        .mode
+                        .starts_with(ABI_PARITY_SOURCE_EVIDENCE_MODE_PREFIX),
+                "ABI parity evidence mode must use a known prefix: {}",
+                fixture.mode
+            );
+            assert!(
+                !fixture.acceptance_check.is_empty(),
+                "ABI parity evidence should have acceptance text"
+            );
+            assert!(
+                fixture.vendor_linux_refs.len() >= 1,
+                "ABI parity evidence {} should include at least one Linux source reference",
+                fixture.acceptance_check
+            );
+
+            for rel in fixture.vendor_linux_refs {
+                let full = repo_root.join(rel);
+                assert!(
+                    full.exists(),
+                    "ABI parity evidence {} references missing Linux source path: {}",
+                    fixture.acceptance_check,
+                    rel
+                );
+                assert!(
+                    path_has_linux_evidence(&full)
+                        .expect("ABI parity evidence ref should be inspectable"),
+                    "ABI parity evidence {} references empty Linux source path: {}",
+                    fixture.acceptance_check,
+                    rel
+                );
+            }
+            validate_abi_parity_mock_fixture(fixture.mode)
+                .expect("ABI parity evidence validation should pass");
+            assert!(
+                abi_parity_mock_fixture_mode_from_acceptance_check(fixture.acceptance_check)
+                    .is_some(),
+                "ABI parity evidence string is not resolvable: {}",
+                fixture.acceptance_check
+            );
+            defined_modes.insert(fixture.mode);
+        }
+
+        for milestone in ABI_PARITY_MILESTONES {
+            for check in milestone.acceptance_checks {
+                if let Some(mode) = abi_parity_mock_fixture_mode_from_acceptance_check(check) {
+                    assert!(
+                        defined_modes.contains(mode),
+                        "{} references undefined ABI parity evidence mode: {}",
+                        milestone.id,
+                        mode
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn abi_parity_acceptance_checks_cover_all_dispatch_types() {
+        for milestone in ABI_PARITY_MILESTONES {
+            let mut has_mode = false;
+            let mut has_mock = false;
+            let mut has_command = false;
+            let mut unrecognized = false;
+
+            for check in milestone.acceptance_checks {
+                if boot_mode_from_acceptance_check(check).is_some() {
+                    has_mode = true;
+                } else if abi_parity_mock_fixture_mode_from_acceptance_check(check).is_some() {
+                    has_mock = true;
+                } else {
+                    match abi_parity_command_check_kind(check) {
+                        Some("cargo-xtask")
+                        | Some("cargo-test-abi_parity")
+                        | Some("make")
+                        | Some("readiness-marker") => {
+                            has_command = true;
+                        }
+                        Some("make-unknown-target")
+                        | Some("cargo-xtask-unsupported")
+                        | Some("cargo-test-unsupported")
+                        | Some("cargo-unsupported")
+                        | None => unrecognized = true,
+                        _ => {}
+                    }
+                }
+            }
+
+            assert!(
+                has_mode || has_mock || has_command,
+                "{} must expose at least one known acceptance runner type",
+                milestone.id
+            );
+            assert!(
+                !unrecognized,
+                "{} has unrecognized acceptance check format",
+                milestone.id
+            );
+        }
+    }
+
+    #[test]
+    fn abi_parity_acceptance_checks_have_public_supported_kind() {
+        for milestone in ABI_PARITY_MILESTONES {
+            for check in milestone.acceptance_checks {
+                assert!(
+                    abi_parity_acceptance_check_kind(check).is_some(),
+                    "{} has unsupported ABI parity acceptance check: {}",
+                    milestone.id,
+                    check
+                );
+            }
+        }
+    }
+}

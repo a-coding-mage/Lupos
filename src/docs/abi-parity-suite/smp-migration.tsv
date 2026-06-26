@@ -1,0 +1,2 @@
+milestone	suite	test_id	source	lupos_command	linux_reference_command	status	expected_failure	root_cause_id	notes
+98	smp-migration	smp-migration	vendor/linux/tools/testing/selftests/sched	cargo xtask suite-run --suite smp-migration --target lupos	cargo xtask suite-run --suite smp-migration --target linux	pass	false	-	SMP migration boot coverage remains tracked by the semantic ABI parity suite matrix.

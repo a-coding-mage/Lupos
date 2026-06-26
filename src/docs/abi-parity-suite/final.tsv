@@ -1,0 +1,2 @@
+milestone	suite	test_id	source	lupos_command	linux_reference_command	status	expected_failure	root_cause_id	notes
+105	final	abi-parity-final	vendor/linux/tools/testing/selftests	cargo xtask abi-parity-final	cargo xtask abi-parity-final	pass	false	-	Final ABI parity suite gate remains semantic and phase-number-free.

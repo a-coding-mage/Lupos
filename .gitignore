@@ -1,0 +1,7 @@
+/target/
+vendor
+vendor/**/*
+.config
+.config.old
+src/include/config/
+src/include/generated/

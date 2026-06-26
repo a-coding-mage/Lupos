@@ -1,0 +1,2 @@
+milestone	suite	test_id	source	lupos_command	linux_reference_command	status	expected_failure	root_cause_id	notes
+101	packetdrill	packetdrill-tcp-curated	vendor/linux/tools/testing/selftests/net	cargo xtask suite-run --suite packetdrill --target lupos	cargo xtask suite-run --suite packetdrill --target linux	pass	false	-	Network packetdrill coverage remains tracked by the semantic ABI parity suite matrix.

@@ -1,0 +1,176 @@
+mainmenu "Lupos"
+
+config LUPOS
+	bool
+	default y
+
+menu "General setup"
+
+menuconfig MODULES
+	bool "Enable loadable module support"
+	modules
+	default y
+
+config SMP
+	bool "Symmetric multi-processing support"
+	default y
+
+config BLOCK
+	bool "Enable the block layer"
+	default y
+
+endmenu
+
+menu "Processor type and features"
+
+config X86_64
+	bool "x86-64 architecture support"
+	default y
+
+endmenu
+
+menu "Bus support"
+
+config PCI
+	bool "PCI support"
+	default y
+
+config ACPI
+	bool "ACPI support"
+	default y
+
+config IOMMU
+	bool "IOMMU support"
+	depends on PCI
+	default n
+
+endmenu
+
+menu "Device Drivers"
+
+config SERIAL_8250
+	bool "8250/16550 serial port support"
+	default y
+
+config FRAMEBUFFER
+	bool "Framebuffer console support"
+	default y
+
+config DRM
+	bool "Direct Rendering Manager support"
+	depends on FRAMEBUFFER
+	default y
+
+config INPUT
+	bool "Input device support"
+	default y
+
+config HID
+	bool "HID bus support"
+	depends on INPUT
+	default y
+
+menu "USB support"
+
+config USB
+	bool "USB support"
+	default y
+
+config USB_XHCI
+	bool "xHCI host controller support"
+	depends on USB && PCI
+	default y
+
+endmenu
+
+menu "Sound support"
+
+config SOUND
+	bool "Sound card support"
+	default y
+
+config SND_HDA_INTEL
+	bool "Intel HD Audio support"
+	depends on SOUND && PCI
+	default y
+
+endmenu
+
+menu "SCSI and ATA storage"
+
+config SCSI_COMMON
+	tristate
+	default m if MODULES
+
+config SCSI
+	tristate "SCSI device support"
+	depends on BLOCK
+	select SCSI_COMMON
+	default m if MODULES
+
+config BLK_DEV_SD
+	tristate "SCSI disk support"
+	depends on SCSI
+	default m if MODULES
+
+config ATA
+	tristate "Serial ATA and Parallel ATA drivers"
+	depends on BLOCK
+	select SCSI
+	default m if MODULES
+
+config SATA_AHCI
+	tristate "AHCI SATA support"
+	depends on ATA && PCI
+	default m if MODULES
+
+endmenu
+
+menu "VirtIO drivers"
+
+config VIRTIO
+	bool "VirtIO support"
+	default y
+
+config VIRTIO_PCI_LIB
+	tristate
+	depends on VIRTIO && PCI
+	default m if MODULES
+
+config VIRTIO_PCI
+	tristate "VirtIO PCI transport support"
+	depends on VIRTIO && PCI
+	select VIRTIO_PCI_LIB
+	default m if MODULES
+
+config VIRTIO_BLK
+	tristate "VirtIO block driver"
+	depends on VIRTIO_PCI
+	default m if MODULES
+
+config VIRTIO_NET
+	tristate "VirtIO network driver"
+	depends on VIRTIO_PCI && NETDEVICES
+	default m if MODULES
+
+endmenu
+
+menu "Network device support"
+
+config NET
+	bool "Networking support"
+	default y
+
+config NETDEVICES
+	bool "Network device support"
+	depends on NET
+	default y
+
+config E1000
+	tristate "Intel PRO/1000 Gigabit Ethernet support"
+	depends on NETDEVICES && PCI
+	default n
+
+endmenu
+
+endmenu

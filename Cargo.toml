@@ -1,0 +1,200 @@
+[workspace]
+members = ["xtask"]
+default-members = ["xtask"]
+resolver = "3"
+
+[package]
+name = "lupos"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "lupos"
+path = "src/init/main.rs"
+
+[features]
+# Enable the slab allocator as the kernel's GlobalAlloc (replaces the legacy
+# linked-list heap).  Default-on from Milestone 8 onwards.
+default = ["slab-alloc"]
+# Enable the legacy bitmap frame allocator (superseded by buddy allocator in M7).
+bitmap-alloc = []
+panic-on-boot = []
+qemu-test = []
+# Triggers a deliberate page fault to verify the IDT exception handler runs.
+# Used by `cargo xtask` BootMode::IdtTest. Implies qemu-test for auto-exit.
+test-page-fault = []
+# Triggers the Milestone 5 "CPU ping" IPI test.
+# Requires QEMU to be launched with -smp 2 (done automatically by xtask).
+# Implies qemu-test so QEMU exits with code 0x21 on pass, 0x01 on panic.
+test-smp = ["qemu-test"]
+# Milestone 6 — TDD: LAPIC periodic timer drives 100 ticks then exits.
+test-timer = ["qemu-test"]
+# Milestone 6 — TDD: register a softirq, raise it, drain it, and verify
+# that the deferred handler executed via a tasklet path.
+test-softirq = ["qemu-test"]
+# Milestone 6 — TDD: BSP sends a TLB shootdown IPI to an AP and waits for
+# acknowledgement.  Requires `-smp 2` (handled automatically by xtask).
+test-tlb-shootdown = ["qemu-test"]
+# Milestone 7 — TDD: buddy allocator alloc/free stress test.
+test-buddy = ["qemu-test"]
+# Milestone 8 — enable the SLUB-style slab allocator as GlobalAlloc.
+slab-alloc = []
+# Milestone 8 — TDD: kmalloc stress test (10 000 allocs, no overlap).
+test-slab = ["qemu-test"]
+# Milestone 9 — TDD: map a physical page via kmap/kunmap and verify data
+# persists in RAM after the temporary mapping is removed.
+test-vmcore = ["qemu-test"]
+# Milestone 10 — TDD: walk kernel PML4 with the generic page-table walker
+# and verify every bootstrap mapping is present.
+test-vmcore-walker = ["qemu-test"]
+# Milestone 11 — TDD: create mm_struct, insert VMAs into a Maple Tree,
+# exercise find_vma / vma_merge / vma_split.
+test-mm = ["qemu-test"]
+test-demand-paging = []
+# Milestone 13 — TDD: mmap/munmap/fault/mprotect/mremap/madvise/brk smoke test.
+test-anon-mmap = ["qemu-test"]
+# Milestone 13 — acceptance: ported Linux mm selftest suite (map_fixed_noreplace,
+# mremap_dontunmap, mprotect-fault, madv_populate, map_hugetlb stub).
+test-mm-selftests = ["qemu-test"]
+# Milestone 14 — acceptance: COW/fork correctness (dup_mm, copy_page_range, wp_page_copy).
+test-cow-fork = ["qemu-test"]
+# Milestone 15 — acceptance: page cache round-trip under concurrent readers/writers.
+test-page-cache = ["qemu-test"]
+# Milestone 17 — acceptance: swap cache round-trip and byte-identical swap-thrash stress.
+test-swap = []
+# Boot tracker #31: release QEMU pressure gate for reclaim into zswap.
+test-zswap-pressure = ["qemu-test"]
+# Boot tracker #32: release QEMU gate for EFI db import into .platform.
+test-uefi-platform-certs = ["qemu-test"]
+# Boot tracker #32: real OVMF pflash db import through EFI runtime GetVariable.
+test-uefi-platform-certs-firmware = ["qemu-test"]
+# Milestone 20 — host-side field offset tests (cargo test --lib, no QEMU needed).
+test-task-struct = []
+# Milestone 21 — two-kthread context switch acceptance test (requires QEMU).
+test-ctxswitch = ["qemu-test"]
+# Milestone 24 — execve + ELF loader acceptance test (requires QEMU).
+test-execve = ["qemu-test"]
+# Milestone 25 — signal delivery, rt_sigaction, sigaltstack acceptance test (requires QEMU).
+test-signals = ["qemu-test"]
+# Milestone 26 — exit / wait4 / waitid / zombies / ptrace acceptance test (requires QEMU).
+test-exit-wait-ptrace = ["qemu-test"]
+# Milestone 27 — credentials + capabilities + seccomp (cBPF) acceptance test.
+test-credentials = ["qemu-test"]
+# Phase 17 / Milestone 93 — Linux-source-backed ptrace/seccomp selftest slice.
+test-ptrace-seccomp-selftests = ["qemu-test"]
+# Milestone 28 — namespaces (uts/pid/ipc/mnt/user/net/cgroup) acceptance test.
+test-namespaces = ["qemu-test"]
+# Milestone 29 — CFS sched_class + nice-weight + leftmost-picking acceptance test.
+test-cfs = ["qemu-test"]
+# Milestone 30 — RT (FIFO/RR) + Deadline + sched_setattr/getattr acceptance test.
+test-rt-deadline = ["qemu-test"]
+# Milestone 31 — SMP load balance + NOHZ idle acceptance test.
+test-smp-balance = ["qemu-test"]
+# Milestone 32 — CPU cgroup controller + futex family acceptance test.
+test-cgroup-cpu-futex = ["qemu-test"]
+# Milestone 33 — Locking primitives (spin/mutex/rwsem/sem/completion) acceptance test.
+test-locking = ["qemu-test"]
+# Milestone 34 — Tree RCU + Tasks RCU acceptance test.
+test-rcu = ["qemu-test"]
+# Milestone 35 — Percpu / atomics / workqueue acceptance test.
+test-percpu-atomic-wq = ["qemu-test"]
+# Milestone 36 — Time subsystem (clocksource/clockevents/hrtimer/posix-timers) test.
+test-time = ["qemu-test"]
+test-softlockup-watchdog = ["qemu-test"]
+# Milestone 37 — Generic IRQ (irq_desc/request_irq/threaded IRQ) acceptance test.
+test-irq = ["qemu-test"]
+# Milestone 38 — VFS core (super_block/inode/dentry/file + ramfs round-trip).
+test-vfs-core = ["qemu-test"]
+# Milestone 39 — mount/fdtable/path-lookup/openat2 RESOLVE_BENEATH.
+test-vfs-mount = ["qemu-test"]
+# Milestone 40 — procfs schema (self/stat, meminfo, uptime).
+test-procfs = ["qemu-test"]
+# Milestone 41 — sysfs / kobject attribute round-trip.
+test-sysfs = ["qemu-test"]
+# Milestone 42 — tmpfs / debugfs / cgroupfs / overlayfs skeleton suite.
+test-vfs-fs-suite = ["qemu-test"]
+test-initramfs-rootfs = ["qemu-test"]
+test-disk-root-remount = ["qemu-test"]
+test-pid1-handoff = ["qemu-test"]
+test-login-stack = ["test-pid1-handoff"]
+# Milestone 43 — block layer (bio/blk-mq/mq-deadline/MemBlockDevice/gendisk).
+test-block-core = ["qemu-test"]
+# Milestone 44 — partitions (MBR/GPT) and loop device.
+test-block-partitions = ["qemu-test"]
+# Boot tracker #26 — partition scan plus `/boot` mount from a FAT partition.
+test-boot-partition = ["qemu-test"]
+test-mapped-swap = ["qemu-test"]
+# Milestone 45 — ext4 read path (mount, lookup, extents, htree, inline_data).
+test-ext4-read = ["qemu-test"]
+# Milestone 46 — FAT32/vfat + ISO9660 read suite.
+test-fat-iso-suite = ["qemu-test"]
+# Networking core (sk_buff, netdev, FIB, IP/UDP/TCP, sockets, netfilter, virtio-net).
+test-networking = ["qemu-test"]
+# Milestone 54 — Device model core (struct device / bus_type / driver / class).
+test-device-model = ["qemu-test"]
+# Milestone 55 — PCI/PCIe enumeration via MCFG, ACPI core, IOMMU, DMA API.
+test-pci-acpi = ["qemu-test"]
+# Milestone 56 — EXPORT_SYMBOL surface + .ko ELF loader.
+test-module-loader = ["qemu-test"]
+# Milestone 57 — VirtIO core, TTY/n_tty/8250 serial, framebuffer console, DRM stub.
+test-virtio-tty-fb = ["qemu-test"]
+# Milestone 58 — Input subsystem, evdev, HID core, USB core + xHCI.
+test-input-hid-usb = ["qemu-test"]
+# Milestone 59 — Syscall dispatcher, full table (451 entries), copy_*_user
+# with __ex_table fault recovery.  Asserts table shape, ENOSYS path, and that
+# a copy_from_user against an unmapped user address recovers via the extable.
+test-syscall-table = ["qemu-test"]
+# Milestone 60 — vDSO, io_uring, epoll, {event,signal,timer,inotify,fanotify}fd.
+# Asserts ABI struct layouts, in-kernel counter/ring semantics, syscall table
+# wiring, and io_uring NOP submit/completion round-trip.
+test-vdso-iouring = ["qemu-test"]
+# Milestone 61 — printk ring buffer, /dev/kmsg, dmesg parity.
+# Asserts printk_info layout, ring buffer reserve/commit/recycle, level
+# parsing, dmesg + dev_kmsg formatters, and prefix round-trip via printk!().
+test-printk-kmsg = ["qemu-test"]
+# Milestone 62 — ftrace, tracepoints, kprobes, uprobes.
+# Asserts tracepoint register/fire round-trip, trace ring push/drain, ftrace
+# function-tracer probe attach + record, and kprobe pre/post handler firing.
+test-ftrace-kprobes = ["qemu-test"]
+# Milestone 63 — perf_event_open, eBPF interpreter, BPF maps.
+# Asserts BPF insn layout, eBPF interpreter arithmetic+jumps, hash/array
+# maps, sys_bpf MAP_CREATE/PROG_LOAD/PROG_TEST_RUN, and sys_perf_event_open
+# sw cpu-clock counter.
+test-bpf-perf = ["qemu-test"]
+# Milestone 64 — LSM framework + capabilities + keyring + Landlock + audit.
+# Asserts LSM dispatch chain default-allow, cap LSM registration, keyring
+# add/request/describe/revoke, audit ring + rule matching, and Landlock
+# path_open allow-inside / deny-outside semantics.
+test-lsm-suite = ["qemu-test"]
+# ABI parity M91 — KUnit-compatible TAP boot runner.
+test-kunit = ["qemu-test"]
+test-mm-kselftests = ["qemu-test"]
+test-entry-kselftests = ["qemu-test"]
+test-futex-kselftests = ["qemu-test"]
+test-rcu-kselftests = ["qemu-test"]
+test-fs-kselftests = ["qemu-test"]
+test-ipc-kselftests = ["qemu-test"]
+test-cgroup-kselftests = ["qemu-test"]
+test-net-kselftests = ["qemu-test"]
+test-drivers-kselftests = ["qemu-test"]
+test-security-kselftests = ["qemu-test"]
+test-block-kselftests = ["qemu-test"]
+test-userspace-kselftests = ["qemu-test"]
+test-smp-preempt = ["qemu-test"]
+test-smp-migration = ["qemu-test"]
+test-pthread-smoke = ["qemu-test"]
+
+[build-dependencies]
+# Used by build.rs to decode branding/splashart.png into raw pixel data for the
+# kernel framebuffer logo, mirroring vendor/linux/drivers/video/logo/pnmtologo.c.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dependencies]
+lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
+spin = "0.9.8"
+bitflags = "1.3"
+log = "0.4"
