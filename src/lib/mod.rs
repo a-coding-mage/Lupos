@@ -1,0 +1,182 @@
+//! linux-parity: partial
+//! linux-source: vendor/linux/lib
+//! Generic Linux library helpers root.
+
+pub mod argv_split;
+pub mod ashldi3;
+pub mod ashrdi3;
+pub mod asn1_decoder;
+pub mod asn1_encoder;
+pub mod atomic64_test;
+pub mod audit;
+pub mod base64;
+pub mod bcd;
+pub mod bitrev;
+pub mod bsearch;
+pub mod bucket_locks;
+pub mod bust_spinlocks;
+pub mod check_signature;
+pub mod checksum;
+pub mod clz_ctz;
+pub mod clz_tab;
+pub mod cmdline;
+pub mod cmpdi2;
+pub mod cmpxchg_emu;
+pub mod compat_audit;
+pub mod crc;
+pub mod crypto;
+pub mod ctype;
+pub mod debug_info;
+pub mod debug_locks;
+pub mod dec_and_lock;
+pub mod decompress;
+pub mod devmem_is_allowed;
+pub mod dhry_run;
+pub mod dim;
+pub mod earlycpio;
+pub mod errname;
+pub mod extable;
+pub mod fault_inject_usercopy;
+pub mod fdt;
+pub mod fdt_addresses;
+pub mod fdt_empty_tree;
+pub mod fdt_ro;
+pub mod fdt_rw;
+pub mod fdt_strerror;
+pub mod fdt_sw;
+pub mod fdt_wip;
+pub mod find_bit;
+pub mod glob;
+pub mod hweight;
+pub mod idr;
+pub mod iomap;
+pub mod iomap_copy;
+pub mod iomem_copy;
+pub mod iommu_helper;
+pub mod irq_regs;
+pub mod is_single_threaded;
+pub mod kasprintf;
+pub mod kobject;
+pub mod kunit;
+pub mod list_debug;
+pub mod llist;
+pub mod lshrdi3;
+pub mod lzo;
+pub mod math;
+pub mod memcat_p;
+pub mod memregion;
+pub mod memweight;
+pub mod min_heap;
+pub mod muldi3;
+pub mod net_utils;
+pub mod netdev_notifier_error_inject;
+pub mod notifier_error_inject;
+pub mod of_reconfig_notifier_error_inject;
+pub mod once;
+pub mod percpu_test;
+pub mod pm_notifier_error_inject;
+pub mod raid;
+pub mod raid6;
+pub mod ratelimit;
+pub mod reed_solomon;
+pub mod scatterlist;
+pub mod smp_processor_id;
+pub mod stmp_device;
+pub mod string;
+pub mod string_helpers;
+pub mod syscall;
+pub mod test_bitops;
+pub mod test_debug_virtual;
+pub mod test_fortify;
+pub mod test_fpu_glue;
+pub mod test_fpu_impl;
+pub mod test_free_pages;
+pub mod test_memcat_p;
+pub mod test_module;
+pub mod test_ref_tracker;
+pub mod test_static_key_base;
+pub mod test_static_keys;
+pub mod tests;
+pub mod timerqueue;
+pub mod trace_readwrite;
+pub mod ucmpdi2;
+pub mod ucs2_string;
+pub mod union_find;
+pub mod usercopy;
+pub mod uuid;
+pub mod vdso;
+pub mod vsprintf;
+pub mod win_minmax;
+pub mod xz;
+pub mod zlib_deflate;
+pub mod zlib_dfltcc;
+pub mod zlib_inflate;
+pub mod zstd;
+pub mod zstd_common_module;
+
+pub fn register_module_exports() {
+    asn1_decoder::register_module_exports();
+    asn1_encoder::register_module_exports();
+    ashldi3::register_module_exports();
+    ashrdi3::register_module_exports();
+    base64::register_module_exports();
+    bitrev::register_module_exports();
+    bsearch::register_module_exports();
+    check_signature::register_module_exports();
+    checksum::register_module_exports();
+    clz_ctz::register_module_exports();
+    cmdline::register_module_exports();
+    cmpxchg_emu::register_module_exports();
+    cmpdi2::register_module_exports();
+    crc::register_module_exports();
+    ctype::register_module_exports();
+    debug_locks::register_module_exports();
+    dec_and_lock::register_module_exports();
+    dim::register_module_exports();
+    errname::register_module_exports();
+    fault_inject_usercopy::register_module_exports();
+    find_bit::register_module_exports();
+    glob::register_module_exports();
+    hweight::register_module_exports();
+    iomap::register_module_exports();
+    iomap_copy::register_module_exports();
+    iomem_copy::register_module_exports();
+    kunit::register_module_exports();
+    list_debug::register_module_exports();
+    llist::register_module_exports();
+    math::register_module_exports();
+    memregion::register_module_exports();
+    min_heap::register_module_exports();
+    muldi3::register_module_exports();
+    net_utils::register_module_exports();
+    lshrdi3::register_module_exports();
+    memcat_p::register_module_exports();
+    memweight::register_module_exports();
+    once::register_module_exports();
+    ratelimit::register_module_exports();
+    smp_processor_id::register_module_exports();
+    stmp_device::register_module_exports();
+    string::register_module_exports();
+    string_helpers::register_module_exports();
+    trace_readwrite::register_module_exports();
+    ucmpdi2::register_module_exports();
+    ucs2_string::register_module_exports();
+    usercopy::register_module_exports();
+    uuid::register_module_exports();
+    vsprintf::register_module_exports();
+    idr::register_module_exports();
+    scatterlist::register_module_exports();
+    crypto::register_module_exports();
+}
+
+#[cfg(test)]
+mod module_export_tests {
+    #[test]
+    fn aggregate_exports_include_ratelimit_for_libata_modules() {
+        crate::lib::register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("___ratelimit"),
+            Some(crate::lib::ratelimit::___ratelimit_raw as usize)
+        );
+    }
+}

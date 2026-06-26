@@ -1,0 +1,2 @@
+milestone	suite	test_id	source	lupos_command	linux_reference_command	status	expected_failure	root_cause_id	notes
+95	kunit	kunit-tap-all	vendor/linux/tools/testing/selftests	cargo xtask test-boot --mode kunit	cargo +nightly test -p lupos --lib kernel::kunit	pass	false	-	KUnit TAP runner executes the registered source-backed in-kernel parity cases.

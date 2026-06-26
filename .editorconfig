@@ -1,0 +1,19 @@
+# This is the top-most EditorConfig file
+root = true
+
+# Standard rules for all files
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+max_line_length = 120
+
+# Use 2-tabs indentation for Rust files
+[*.rs]
+indent_style = tab
+indent_size = 2
+
+# Use tabs for Makefiles
+[Makefile]
+indent_style = tab

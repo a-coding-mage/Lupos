@@ -1,0 +1,2 @@
+milestone	suite	test_id	source	lupos_command	linux_reference_command	status	expected_failure	root_cause_id	notes
+105	xfstests	xfstests-auto-ext4	vendor/linux/tools/testing/selftests/filesystems	cargo xtask suite-run --suite xfstests --target lupos	cargo xtask suite-run --suite xfstests --target linux	pass	false	-	xfstests ext4 coverage remains tracked by the semantic ABI parity suite matrix.

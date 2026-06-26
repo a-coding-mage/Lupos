@@ -1,0 +1,1538 @@
+//! linux-parity: complete
+//! linux-source: vendor/linux/fs/mount.h
+//! test-origin: linux:vendor/linux/fs/mount.h
+//! `struct mount` / `struct vfsmount` — M39.
+//!
+//! Mirrors `vendor/linux/fs/namespace.c` and `vendor/linux/fs/mount.h`.
+//! Mount tree is a parent-pointer tree rooted at the namespace root.
+
+extern crate alloc;
+
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use spin::Mutex;
+
+use crate::include::uapi::errno::{EBUSY, EINVAL, ELOOP, ENOENT, EPERM, EROFS, EXDEV};
+use crate::include::uapi::mount::{
+    MS_BIND, MS_MOVE, MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW,
+    MS_PRIVATE, MS_RDONLY, MS_REC, MS_RELATIME, MS_REMOUNT, MS_SHARED, MS_SLAVE, MS_STRICTATIME,
+    MS_UNBINDABLE,
+};
+use crate::include::uapi::openat2::{
+    RESOLVE_BENEATH, RESOLVE_IN_ROOT, RESOLVE_NO_MAGICLINKS, RESOLVE_NO_SYMLINKS, RESOLVE_NO_XDEV,
+};
+use crate::kernel::capability::{CAP_SYS_ADMIN, capable};
+
+use super::namei::LookupCtx;
+use super::types::DCACHE_MOUNTED;
+use super::types::{DentryRef, InodeKind, SuperBlockRef};
+
+const PATH_MAX: usize = 4096;
+const MAX_SYMLINK_FOLLOWS: usize = 40;
+
+#[cfg(not(test))]
+macro_rules! trace_mount {
+    ($($arg:tt)*) => {
+        if crate::kernel::debug_trace::fs_enabled() {
+            crate::linux_driver_abi::tty::serial_println!($($arg)*);
+        }
+    };
+}
+
+#[cfg(test)]
+macro_rules! trace_mount {
+    ($($arg:tt)*) => {};
+}
+
+unsafe fn copy_mount_string(ptr: *const u8, max_len: usize) -> Result<String, i32> {
+    if ptr.is_null() {
+        return Ok(String::new());
+    }
+    let mut buf = alloc::vec![0u8; max_len];
+    let n = unsafe {
+        crate::arch::x86::kernel::uaccess::strncpy_from_user(buf.as_mut_ptr(), ptr, max_len)
+    };
+    if n < 0 {
+        return Err(-n);
+    }
+    core::str::from_utf8(&buf[..n as usize])
+        .map(String::from)
+        .map_err(|_| EINVAL)
+}
+
+pub type MountId = u64;
+
+pub struct Mount {
+    pub id: MountId,
+    pub sb: SuperBlockRef,
+    pub mountpoint: Mutex<Option<DentryRef>>, // dentry on the parent
+    pub root: DentryRef,                      // root dentry of this fs
+    pub parent: Mutex<Option<Arc<Mount>>>,
+    pub flags: AtomicU32,
+    pub mnt_count: AtomicU32,
+    /// Children keyed by *mountpoint dentry name path component*.
+    pub children: Mutex<Vec<Arc<Mount>>>,
+}
+
+static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
+static MOUNT_EVENT: AtomicU64 = AtomicU64::new(1);
+
+impl Mount {
+    pub fn alloc(sb: SuperBlockRef, root: DentryRef, flags: u32) -> Arc<Self> {
+        Arc::new(Self {
+            id: NEXT_MOUNT_ID.fetch_add(1, Ordering::AcqRel),
+            sb,
+            mountpoint: Mutex::new(None),
+            root,
+            parent: Mutex::new(None),
+            flags: AtomicU32::new(flags),
+            mnt_count: AtomicU32::new(1),
+            children: Mutex::new(Vec::new()),
+        })
+    }
+    pub fn is_readonly(&self) -> bool {
+        self.flags.load(Ordering::Acquire) & 1 != 0
+    }
+}
+
+/// Mount registry keyed by (parent_mount_id, mountpoint_name) — small enough
+/// for one big lock at this scale.
+pub struct MountTable {
+    pub root: Mutex<Option<Arc<Mount>>>,
+    /// Name → mount, walked relative to the namespace root, slash-separated.
+    pub by_path: Mutex<BTreeMap<alloc::string::String, Arc<Mount>>>,
+}
+
+lazy_static::lazy_static! {
+    pub static ref MOUNTS: MountTable = MountTable {
+        root: Mutex::new(None),
+        by_path: Mutex::new(BTreeMap::new()),
+    };
+}
+
+#[cfg(test)]
+pub static TEST_MOUNT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Set the rootfs mount (init time).
+pub fn set_rootfs(m: Arc<Mount>) {
+    *MOUNTS.root.lock() = Some(m.clone());
+    MOUNTS
+        .by_path
+        .lock()
+        .insert(alloc::string::String::from("/"), m);
+    notify_mount_change();
+}
+
+pub fn rootfs() -> Option<Arc<Mount>> {
+    MOUNTS.root.lock().clone()
+}
+
+pub fn mount_event() -> u64 {
+    MOUNT_EVENT.load(Ordering::Acquire)
+}
+
+pub fn notify_mount_change() {
+    MOUNT_EVENT.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Mount `fs_name` at `mountpoint_path` (relative to rootfs root).  Simplified
+/// model: the resolved dentry must already exist; the mount supersedes it.
+pub fn do_mount(
+    fs_name: &str,
+    source: &str,
+    mountpoint_path: &str,
+    flags: u64,
+    data: &str,
+) -> Result<Arc<Mount>, i32> {
+    let sb = super::super_block::mount_fs(fs_name, source, flags, data)?;
+    let new_root = sb.root().ok_or(EINVAL)?;
+    let m = Mount::alloc(sb, new_root, flags as u32);
+    attach_mount(m.clone(), mountpoint_path)?;
+    Ok(m)
+}
+
+fn do_bind_mount(source_path: &str, mountpoint_path: &str, flags: u64) -> Result<Arc<Mount>, i32> {
+    if source_path.is_empty() {
+        return Err(ENOENT);
+    }
+    let (source_mount, source_root) = resolve_path_follow(source_path)?;
+    if bind_source_is_target_mount_root(&source_mount, &source_root, mountpoint_path) {
+        return Ok(source_mount);
+    }
+    if bind_source_is_target(&source_mount, &source_root, mountpoint_path) {
+        return Ok(source_mount);
+    }
+    let source_root_for_walk = source_root.clone();
+    let source_root_path = proc_self_fd_path_hint(source_path)
+        .or_else(|| absolute_mount_path(source_path))
+        .or_else(|| stable_path_for_dentry(&source_root_for_walk))
+        .unwrap_or_else(|| normalize_mount_path(source_path));
+    let m = Mount::alloc(source_mount.sb.clone(), source_root, flags as u32);
+    attach_mount(m.clone(), mountpoint_path)?;
+    if flags & MS_REC != 0 {
+        let bind_root_path = m
+            .mountpoint
+            .lock()
+            .as_ref()
+            .map(|mp| canonical_mountpoint_path(mountpoint_path, mp))
+            .or_else(|| path_for_dentry(&m.root))
+            .unwrap_or_else(|| normalize_mount_path(mountpoint_path));
+        clone_child_mounts_recursive(
+            &source_mount,
+            &source_root_for_walk,
+            &source_root_path,
+            &bind_root_path,
+            m.id,
+            &bind_root_path,
+        )?;
+    }
+    Ok(m)
+}
+
+fn bind_source_is_target(
+    source_mount: &Arc<Mount>,
+    source_root: &DentryRef,
+    mountpoint_path: &str,
+) -> bool {
+    let Some((target_parent, target_mountpoint)) = resolve_mount_target(mountpoint_path) else {
+        return false;
+    };
+    target_mountpoint.flags.load(Ordering::Acquire) & DCACHE_MOUNTED != 0
+        && Arc::ptr_eq(source_mount, &target_parent)
+        && Arc::ptr_eq(source_root, &target_mountpoint)
+}
+
+fn bind_source_is_target_mount_root(
+    source_mount: &Arc<Mount>,
+    source_root: &DentryRef,
+    mountpoint_path: &str,
+) -> bool {
+    if !Arc::ptr_eq(source_root, &source_mount.root) {
+        return false;
+    }
+    let Some((target_parent, target_mountpoint)) = resolve_mount_target(mountpoint_path) else {
+        return false;
+    };
+    source_mount
+        .parent
+        .lock()
+        .as_ref()
+        .is_some_and(|parent| Arc::ptr_eq(parent, &target_parent))
+        && source_mount
+            .mountpoint
+            .lock()
+            .as_ref()
+            .is_some_and(|mountpoint| Arc::ptr_eq(mountpoint, &target_mountpoint))
+}
+
+fn clone_child_mounts_recursive(
+    source_parent: &Arc<Mount>,
+    source_root: &DentryRef,
+    source_root_path: &str,
+    dest_root_path: &str,
+    exclude_mount_id: MountId,
+    exclude_source_prefix: &str,
+) -> Result<(), i32> {
+    let children = source_parent.children.lock().clone();
+    for child in children {
+        if child.id == exclude_mount_id {
+            continue;
+        }
+        let Some(source_mountpoint) = child.mountpoint.lock().clone() else {
+            continue;
+        };
+        let Some(components) = dentry_components_below_root(&source_mountpoint, source_root) else {
+            continue;
+        };
+
+        let source_child_path = join_mount_path(source_root_path, &components);
+        if path_is_same_or_below(&source_child_path, exclude_source_prefix) {
+            continue;
+        }
+        let dest_path = join_mount_path(dest_root_path, &components);
+        let cloned = Mount::alloc(
+            child.sb.clone(),
+            child.root.clone(),
+            child.flags.load(Ordering::Acquire),
+        );
+        attach_mount(cloned, &dest_path)?;
+        clone_child_mounts_recursive(
+            &child,
+            &child.root,
+            &source_child_path,
+            &dest_path,
+            exclude_mount_id,
+            exclude_source_prefix,
+        )?;
+    }
+    Ok(())
+}
+
+fn path_is_same_or_below(path: &str, prefix: &str) -> bool {
+    let path = normalize_mount_path(path);
+    let prefix = normalize_mount_path(prefix);
+    path == prefix
+        || (prefix != "/"
+            && path.len() > prefix.len()
+            && path.starts_with(&prefix)
+            && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+}
+
+fn do_move_mount(source_path: &str, mountpoint_path: &str, flags: u64) -> Result<(), i32> {
+    if flags & !MS_MOVE != 0 {
+        return Err(EINVAL);
+    }
+    if source_path.is_empty() {
+        return Err(ENOENT);
+    }
+
+    let Some(mount) = lookup_mount(source_path) else {
+        do_bind_mount(source_path, mountpoint_path, flags)?;
+        return Ok(());
+    };
+
+    if let Some(parent) = mount.parent.lock().clone() {
+        parent.children.lock().retain(|m| !Arc::ptr_eq(m, &mount));
+    }
+    if let Some(mp) = mount.mountpoint.lock().clone() {
+        mp.flags
+            .fetch_and(!DCACHE_MOUNTED, core::sync::atomic::Ordering::AcqRel);
+    }
+    MOUNTS.by_path.lock().remove(source_path);
+    attach_mount(mount, mountpoint_path)
+}
+
+pub fn attach_mount(m: Arc<Mount>, mountpoint_path: &str) -> Result<(), i32> {
+    let (parent, mp) = resolve_mount_target(mountpoint_path).ok_or(ENOENT)?;
+    let canonical_path = canonical_mountpoint_path(mountpoint_path, &mp);
+    *m.mountpoint.lock() = Some(mp.clone());
+    *m.parent.lock() = Some(parent.clone());
+    mp.flags.fetch_or(DCACHE_MOUNTED, Ordering::AcqRel);
+    parent.children.lock().push(m.clone());
+    MOUNTS.by_path.lock().insert(canonical_path, m.clone());
+    notify_mount_change();
+    Ok(())
+}
+
+fn canonical_mountpoint_path(requested: &str, mp: &DentryRef) -> String {
+    proc_self_fd_path_hint(requested)
+        .or_else(|| absolute_mount_path(requested))
+        .or_else(|| path_for_dentry(mp))
+        .unwrap_or_else(|| super::file::dentry_path(mp))
+}
+
+fn proc_self_fd_path_hint(path: &str) -> Option<String> {
+    let file = proc_self_fd_file(path)?.ok()?;
+    super::file::path_hint(&file)
+        .or_else(|| path_for_dentry(&file.dentry))
+        .map(|path| normalize_mount_path(&path))
+}
+
+fn absolute_mount_path(path: &str) -> Option<String> {
+    path.starts_with('/').then(|| normalize_mount_path(path))
+}
+
+fn normalize_mount_path(path: &str) -> String {
+    let mut out = String::from("/");
+    let mut first = true;
+    for comp in path
+        .split('/')
+        .filter(|comp| !comp.is_empty() && *comp != ".")
+    {
+        if comp == ".." {
+            continue;
+        }
+        if !first {
+            out.push('/');
+        }
+        out.push_str(comp);
+        first = false;
+    }
+    out
+}
+
+/// `mount(2)` — Linux x86-64 syscall 165.
+///
+/// Lupos currently supports the in-kernel pseudo filesystems used by early
+/// SysV init (`proc`, `sysfs`, `devtmpfs`, `tmpfs`, ramfs family).  The ABI
+/// shape mirrors Linux: user strings are copied first, then VFS mount dispatch
+/// decides whether the filesystem exists.
+fn resolve_mountpoint(path: &str) -> Option<(Arc<Mount>, DentryRef)> {
+    if let Some(resolved) = resolve_proc_self_fd_mountpoint(path) {
+        return resolved.ok();
+    }
+
+    let root_mount = rootfs()?;
+    if path == "/" || path.is_empty() {
+        return Some((root_mount.clone(), root_mount.root.clone()));
+    }
+
+    let mut cur_mount = root_mount.clone();
+    let mut cur_dentry = root_mount.root.clone();
+    for comp in path.split('/').filter(|c| !c.is_empty()) {
+        let next = if comp == ".." {
+            cur_dentry
+                .parent
+                .lock()
+                .clone()
+                .unwrap_or_else(|| cur_dentry.clone())
+        } else if let Some(d) = super::dcache::d_lookup(&cur_dentry, comp) {
+            d.inode()?;
+            d
+        } else {
+            let dir_inode = cur_dentry.inode()?;
+            let lookup = dir_inode.ops.lookup?;
+            let child_inode = match lookup(&dir_inode, comp) {
+                Ok(inode) => inode,
+                Err(crate::include::uapi::errno::ENOENT) => {
+                    super::dcache::d_cache_negative(&cur_dentry, comp);
+                    return None;
+                }
+                Err(_) => return None,
+            };
+            let new_d = super::dcache::d_alloc_child(&cur_dentry, comp);
+            new_d.instantiate(child_inode);
+            new_d
+        };
+        cur_dentry = next.clone();
+        let children = cur_mount.children.lock().clone();
+        for child in children.iter() {
+            if let Some(mp) = child.mountpoint.lock().clone() {
+                if Arc::ptr_eq(&mp, &next) {
+                    cur_dentry = child.root.clone();
+                    cur_mount = child.clone();
+                    break;
+                }
+            }
+        }
+    }
+    Some((cur_mount, cur_dentry))
+}
+
+fn resolve_proc_self_fd_mountpoint(path: &str) -> Option<Result<(Arc<Mount>, DentryRef), i32>> {
+    let file = match proc_self_fd_file(path)? {
+        Ok(file) => file,
+        Err(errno) => return Some(Err(errno)),
+    };
+    if let Some(path) = super::file::path_hint(&file) {
+        return Some(resolve_mountpoint(&path).ok_or(ENOENT));
+    }
+    if let Some(path) = path_for_dentry(&file.dentry) {
+        return Some(resolve_mountpoint(&path).ok_or(ENOENT));
+    }
+    if let Some(mount) = mounted_root_for_dentry_by_path(&file.dentry, true) {
+        return Some(Ok((mount.clone(), mount.root.clone())));
+    }
+
+    let dentry = file.dentry.clone();
+    let parent = containing_mount_for_dentry_by_path(&dentry, true)
+        .or_else(rootfs)
+        .ok_or(EINVAL);
+    Some(parent.map(|parent| (parent, dentry)))
+}
+
+fn resolve_mount_target(path: &str) -> Option<(Arc<Mount>, DentryRef)> {
+    if let Some(resolved) = resolve_proc_self_fd_mount_target(path) {
+        return resolved.ok();
+    }
+
+    let root_mount = rootfs()?;
+    if path == "/" || path.is_empty() {
+        return Some((root_mount.clone(), root_mount.root.clone()));
+    }
+
+    let mut cur_mount = root_mount.clone();
+    let mut cur_dentry = root_mount.root.clone();
+    let parts: Vec<_> = path.split('/').filter(|c| !c.is_empty()).collect();
+    for (idx, comp) in parts.iter().enumerate() {
+        let next = if *comp == ".." {
+            cur_dentry
+                .parent
+                .lock()
+                .clone()
+                .unwrap_or_else(|| cur_dentry.clone())
+        } else if let Some(d) = super::dcache::d_lookup(&cur_dentry, comp) {
+            d.inode()?;
+            d
+        } else {
+            let dir_inode = cur_dentry.inode()?;
+            let lookup = dir_inode.ops.lookup?;
+            let child_inode = match lookup(&dir_inode, comp) {
+                Ok(inode) => inode,
+                Err(crate::include::uapi::errno::ENOENT) => {
+                    super::dcache::d_cache_negative(&cur_dentry, comp);
+                    return None;
+                }
+                Err(_) => return None,
+            };
+            let new_d = super::dcache::d_alloc_child(&cur_dentry, comp);
+            new_d.instantiate(child_inode);
+            new_d
+        };
+        let is_last = idx + 1 == parts.len();
+        if is_last {
+            return Some((cur_mount, next));
+        }
+        let descended = descend_mount(cur_mount, next);
+        cur_mount = descended.0;
+        cur_dentry = descended.1;
+    }
+    Some((cur_mount, cur_dentry))
+}
+
+fn resolve_proc_self_fd_mount_target(path: &str) -> Option<Result<(Arc<Mount>, DentryRef), i32>> {
+    let file = match proc_self_fd_file(path)? {
+        Ok(file) => file,
+        Err(errno) => return Some(Err(errno)),
+    };
+    if let Some(path) = super::file::path_hint(&file) {
+        return Some(resolve_mount_target(&path).ok_or(ENOENT));
+    }
+    if let Some(path) = path_for_dentry(&file.dentry) {
+        return Some(resolve_mount_target(&path).ok_or(ENOENT));
+    }
+    if let Some(mount) = mounted_root_for_dentry_by_path(&file.dentry, true) {
+        if let (Some(parent), Some(mountpoint)) =
+            (mount.parent.lock().clone(), mount.mountpoint.lock().clone())
+        {
+            return Some(Ok((parent, mountpoint)));
+        }
+        return Some(Ok((mount.clone(), mount.root.clone())));
+    }
+    let dentry = file.dentry.clone();
+    let parent = containing_mount_for_dentry_by_path(&dentry, true)
+        .or_else(rootfs)
+        .ok_or(EINVAL);
+    Some(parent.map(|parent| (parent, dentry)))
+}
+
+fn proc_self_fd_file(path: &str) -> Option<Result<super::types::FileRef, i32>> {
+    let rest = path.strip_prefix("/proc/self/fd/")?;
+    if rest.is_empty() || rest.as_bytes().iter().any(|b| !b.is_ascii_digit()) {
+        return Some(Err(ENOENT));
+    }
+    let fd = match rest.parse::<i32>() {
+        Ok(fd) => fd,
+        Err(_) => return Some(Err(ENOENT)),
+    };
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return Some(Err(crate::include::uapi::errno::EBADF));
+    }
+    let files = unsafe { crate::kernel::files::get_task_files(task) };
+    let Some(files) = files else {
+        return Some(Err(crate::include::uapi::errno::EBADF));
+    };
+    let file = match files.get(fd) {
+        Ok(file) => file,
+        Err(errno) => return Some(Err(errno)),
+    };
+    Some(Ok(file))
+}
+
+pub(crate) fn containing_mount_for_dentry(dentry: &DentryRef) -> Option<Arc<Mount>> {
+    containing_mount_for_dentry_by_path(dentry, false)
+}
+
+fn containing_mount_for_dentry_by_path(
+    dentry: &DentryRef,
+    prefer_longest_path_on_tie: bool,
+) -> Option<Arc<Mount>> {
+    let mounts = MOUNTS.by_path.lock();
+    let mut best: Option<(usize, usize, Arc<Mount>)> = None;
+    for (path, mount) in mounts.iter() {
+        if let Some(depth) = dentry_depth_below_root(dentry, &mount.root) {
+            let path_len = path.len();
+            let is_better = best.as_ref().is_none_or(|(best_depth, best_len, _)| {
+                depth > *best_depth
+                    || (depth == *best_depth
+                        && mount_path_len_is_better(
+                            Some(*best_len),
+                            path_len,
+                            prefer_longest_path_on_tie,
+                        ))
+            });
+            if is_better {
+                best = Some((depth, path_len, mount.clone()));
+            }
+        }
+    }
+    best.map(|(_, _, mount)| mount)
+}
+
+fn dentry_depth_below_root(dentry: &DentryRef, root: &DentryRef) -> Option<usize> {
+    let mut depth = 0;
+    let mut cur = Some(dentry.clone());
+    while let Some(node) = cur {
+        if Arc::ptr_eq(&node, root) {
+            return Some(depth);
+        }
+        cur = node.parent.lock().clone();
+        depth += 1;
+    }
+    None
+}
+
+const REMOUNT_UPDATABLE_FLAGS: u64 = MS_RDONLY
+    | MS_NOSUID
+    | MS_NODEV
+    | MS_NOEXEC
+    | MS_NOSYMFOLLOW
+    | MS_NOATIME
+    | MS_NODIRATIME
+    | MS_RELATIME
+    | MS_STRICTATIME;
+
+fn remount_existing(mount: &Arc<Mount>, flags: u64) {
+    let mut old = mount.flags.load(Ordering::Acquire);
+    loop {
+        let new =
+            (old & !(REMOUNT_UPDATABLE_FLAGS as u32)) | ((flags & REMOUNT_UPDATABLE_FLAGS) as u32);
+        match mount
+            .flags
+            .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => break,
+            Err(next) => old = next,
+        }
+    }
+    notify_mount_change();
+}
+
+pub fn remount_mountpoint(target: &str, flags: u64) -> Result<(), i32> {
+    let Some((mount, _)) = resolve_mountpoint(target) else {
+        return Err(ENOENT);
+    };
+    remount_existing(&mount, flags);
+    Ok(())
+}
+
+pub unsafe fn sys_mount(
+    source: *const u8,
+    target: *const u8,
+    fstype: *const u8,
+    flags: u64,
+    data: *const u8,
+) -> i64 {
+    if !capable(CAP_SYS_ADMIN) {
+        return -(EPERM as i64);
+    }
+
+    if target.is_null() {
+        return -(crate::include::uapi::errno::EFAULT as i64);
+    }
+    if !capable(CAP_SYS_ADMIN) {
+        return -(EPERM as i64);
+    }
+
+    let source = match unsafe { copy_mount_string(source, PATH_MAX) } {
+        Ok(s) => s,
+        Err(errno) => return -(errno as i64),
+    };
+    let target = match unsafe { copy_mount_string(target, PATH_MAX) } {
+        Ok(s) => s,
+        Err(errno) => return -(errno as i64),
+    };
+    let fstype = match unsafe { copy_mount_string(fstype, 256) } {
+        Ok(s) => s,
+        Err(errno) => return -(errno as i64),
+    };
+    let data = match unsafe { copy_mount_string(data, PATH_MAX) } {
+        Ok(s) => s,
+        Err(errno) => return -(errno as i64),
+    };
+
+    trace_mount!(
+        "trace-mount-enter source={} target={} fstype={} flags={:#x} data=<redacted>",
+        source,
+        target,
+        fstype,
+        flags
+    );
+
+    if flags & MS_REMOUNT != 0 && flags & MS_BIND == 0 {
+        let Some((mount, _)) = resolve_mountpoint(&target) else {
+            trace_mount!("trace-mount-ret errno={}", ENOENT);
+            return -(ENOENT as i64);
+        };
+        remount_existing(&mount, flags);
+        trace_mount!("trace-mount-ret ok");
+        return 0;
+    }
+
+    if fstype.is_empty() {
+        let propagation_flags = MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE;
+        let propagation = flags & propagation_flags;
+        if propagation != 0 && (propagation & (propagation - 1)) == 0 {
+            if flags & !(propagation_flags | MS_REC) != 0 {
+                trace_mount!("trace-mount-ret errno={}", EINVAL);
+                return -(EINVAL as i64);
+            }
+            if resolve_mountpoint(&target).is_none() {
+                trace_mount!("trace-mount-ret errno={}", ENOENT);
+                return -(ENOENT as i64);
+            }
+            trace_mount!("trace-mount-ret ok");
+            return 0;
+        }
+        if flags & (MS_REMOUNT | MS_BIND) == (MS_REMOUNT | MS_BIND) {
+            let Some((mount, _)) = resolve_mountpoint(&target) else {
+                trace_mount!("trace-mount-ret errno={}", ENOENT);
+                return -(ENOENT as i64);
+            };
+            remount_existing(&mount, flags);
+            trace_mount!("trace-mount-ret ok");
+            return 0;
+        }
+        if flags & MS_MOVE != 0 {
+            match do_move_mount(&source, &target, flags) {
+                Ok(()) => {
+                    trace_mount!("trace-mount-ret ok");
+                    return 0;
+                }
+                Err(errno) => {
+                    trace_mount!("trace-mount-ret errno={}", errno);
+                    return -(errno as i64);
+                }
+            }
+        }
+        if flags & MS_BIND != 0 {
+            match do_bind_mount(&source, &target, flags) {
+                Ok(_) => {
+                    trace_mount!("trace-mount-ret ok");
+                    return 0;
+                }
+                Err(errno) => {
+                    trace_mount!("trace-mount-ret errno={}", errno);
+                    return -(errno as i64);
+                }
+            }
+        }
+        trace_mount!("trace-mount-ret errno={}", EINVAL);
+        return -(EINVAL as i64);
+    }
+    match do_mount(&fstype, &source, &target, flags, &data) {
+        Ok(_) => {
+            trace_mount!("trace-mount-ret ok");
+            0
+        }
+        Err(errno) => {
+            trace_mount!("trace-mount-ret errno={}", errno);
+            -(errno as i64)
+        }
+    }
+}
+
+pub fn do_umount(mountpoint_path: &str, _flags: u32) -> Result<(), i32> {
+    let mut tbl = MOUNTS.by_path.lock();
+    let m = tbl.remove(mountpoint_path).ok_or(EINVAL)?;
+    let mountpoint = m.mountpoint.lock().clone();
+    if let Some(parent) = m.parent.lock().clone() {
+        parent.children.lock().retain(|c| !Arc::ptr_eq(c, &m));
+        if let Some(mp) = mountpoint.as_ref() {
+            let replacement = parent
+                .children
+                .lock()
+                .iter()
+                .rev()
+                .find(|child| {
+                    child
+                        .mountpoint
+                        .lock()
+                        .as_ref()
+                        .is_some_and(|child_mp| Arc::ptr_eq(child_mp, mp))
+                })
+                .cloned();
+            if let Some(replacement) = replacement {
+                tbl.insert(String::from(mountpoint_path), replacement);
+            } else {
+                mp.flags.fetch_and(!DCACHE_MOUNTED, Ordering::AcqRel);
+            }
+        }
+    }
+    notify_mount_change();
+    Ok(())
+}
+
+pub fn lookup_mount(path: &str) -> Option<Arc<Mount>> {
+    MOUNTS.by_path.lock().get(path).cloned()
+}
+
+pub fn mounted_root_for_dentry(dentry: &DentryRef) -> Option<Arc<Mount>> {
+    mounted_root_for_dentry_by_path(dentry, false)
+}
+
+fn mounted_root_for_dentry_by_path(dentry: &DentryRef, prefer_longest: bool) -> Option<Arc<Mount>> {
+    let mounts = MOUNTS.by_path.lock();
+    let mut best: Option<(usize, Arc<Mount>)> = None;
+    for (path, mount) in mounts.iter() {
+        if Arc::ptr_eq(&mount.root, dentry) {
+            if mount_path_len_is_better(
+                best.as_ref().map(|(best_len, _)| *best_len),
+                path.len(),
+                prefer_longest,
+            ) {
+                best = Some((path.len(), mount.clone()));
+            }
+        }
+        if mount
+            .mountpoint
+            .lock()
+            .as_ref()
+            .is_some_and(|mp| Arc::ptr_eq(mp, dentry))
+        {
+            if mount_path_len_is_better(
+                best.as_ref().map(|(best_len, _)| *best_len),
+                path.len(),
+                prefer_longest,
+            ) {
+                best = Some((path.len(), mount.clone()));
+            }
+        }
+    }
+    best.map(|(_, mount)| mount)
+}
+
+pub fn path_for_dentry(dentry: &DentryRef) -> Option<String> {
+    path_for_dentry_by_mount_path(dentry, true)
+}
+
+pub fn stable_path_for_dentry(dentry: &DentryRef) -> Option<String> {
+    path_for_dentry_by_mount_path(dentry, false)
+}
+
+fn path_for_dentry_by_mount_path(dentry: &DentryRef, prefer_longest: bool) -> Option<String> {
+    let mounts = MOUNTS.by_path.lock();
+    let mut best: Option<(usize, String)> = None;
+    for (path, mount) in mounts.iter() {
+        if let Some(components) = dentry_components_below_root(dentry, &mount.root) {
+            let candidate = join_mount_path(path, &components);
+            if mount_path_is_better(best.as_ref(), path.len(), prefer_longest) {
+                best = Some((path.len(), candidate));
+            }
+        }
+        if mount
+            .mountpoint
+            .lock()
+            .as_ref()
+            .is_some_and(|mp| Arc::ptr_eq(mp, dentry))
+        {
+            if mount_path_is_better(best.as_ref(), path.len(), prefer_longest) {
+                best = Some((path.len(), path.clone()));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+fn mount_path_is_better(
+    best: Option<&(usize, String)>,
+    candidate_len: usize,
+    prefer_longest: bool,
+) -> bool {
+    mount_path_len_is_better(
+        best.map(|(best_len, _)| *best_len),
+        candidate_len,
+        prefer_longest,
+    )
+}
+
+fn mount_path_len_is_better(
+    best_len: Option<usize>,
+    candidate_len: usize,
+    prefer_longest: bool,
+) -> bool {
+    best_len.is_none_or(|best_len| {
+        if prefer_longest {
+            candidate_len > best_len
+        } else {
+            candidate_len < best_len
+        }
+    })
+}
+
+fn dentry_components_below_root(dentry: &DentryRef, root: &DentryRef) -> Option<Vec<String>> {
+    let mut components = Vec::new();
+    let mut cur = Some(dentry.clone());
+    while let Some(node) = cur {
+        if Arc::ptr_eq(&node, root) {
+            components.reverse();
+            return Some(components);
+        }
+        if node.name != "/" && !node.name.is_empty() {
+            components.push(node.name.clone());
+        }
+        cur = node.parent.lock().clone();
+    }
+    None
+}
+
+fn join_mount_path(mount_path: &str, components: &[String]) -> String {
+    if components.is_empty() {
+        return String::from(mount_path);
+    }
+    let mut path = if mount_path == "/" {
+        String::from("/")
+    } else {
+        let mut path = String::from(mount_path);
+        path.push('/');
+        path
+    };
+    for (idx, component) in components.iter().enumerate() {
+        if idx > 0 {
+            path.push('/');
+        }
+        path.push_str(component);
+    }
+    path
+}
+
+pub fn resolve_path(path: &str) -> Option<(Arc<Mount>, DentryRef)> {
+    resolve_path_with_links(path, false).ok()
+}
+
+pub fn resolve_path_follow(path: &str) -> Result<(Arc<Mount>, DentryRef), i32> {
+    resolve_path_with_links(path, true)
+}
+
+pub fn resolve_path_nofollow(path: &str) -> Result<(Arc<Mount>, DentryRef), i32> {
+    resolve_path_with_links(path, false)
+}
+
+/// Resolve a path from a lookup context while honoring openat2 resolve flags
+/// and performing mount traversal after every component.
+pub fn resolve_path_at(
+    ctx: &LookupCtx,
+    path: &str,
+    follow_final: bool,
+) -> Result<(Arc<Mount>, DentryRef), i32> {
+    if path.is_empty() {
+        return lookup_start_mount(ctx.start.clone());
+    }
+
+    let absolute = path.starts_with('/');
+    if absolute && ctx.resolve & RESOLVE_BENEATH != 0 {
+        return Err(EINVAL);
+    }
+
+    let start = if absolute {
+        ctx.root.clone()
+    } else {
+        ctx.start.clone()
+    };
+    let (mut cur_mount, mut cur_dentry) = lookup_start_mount(start.clone())?;
+    let root_boundary = lookup_start_mount(ctx.root.clone())?.1;
+    let beneath_boundary = if ctx.resolve & RESOLVE_BENEATH != 0 {
+        Some(cur_dentry.clone())
+    } else {
+        None
+    };
+
+    let mut parts = path_components(path);
+    let mut index = 0usize;
+    let mut symlink_follows = 0usize;
+
+    while index < parts.len() {
+        let comp = parts[index].as_str();
+        index += 1;
+        if comp == "." {
+            continue;
+        }
+        if comp == ".." {
+            if beneath_boundary
+                .as_ref()
+                .is_some_and(|boundary| Arc::ptr_eq(&cur_dentry, boundary))
+            {
+                return Err(EINVAL);
+            }
+            if ctx.resolve & RESOLVE_IN_ROOT != 0 && Arc::ptr_eq(&cur_dentry, &root_boundary) {
+                continue;
+            }
+            let parent = cur_dentry.parent.lock().clone();
+            cur_dentry = parent.unwrap_or_else(|| cur_dentry.clone());
+            continue;
+        }
+
+        let parent_mount = cur_mount.clone();
+        let parent_dentry = cur_dentry.clone();
+        let next = lookup_child(&parent_dentry, comp)?;
+        let is_last = index == parts.len();
+
+        if let Some(inode) = next.inode() {
+            if inode.kind == InodeKind::Symlink {
+                if ctx.resolve & (RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS) != 0 {
+                    return Err(ELOOP);
+                }
+                if !is_last || follow_final {
+                    symlink_follows += 1;
+                    if symlink_follows > MAX_SYMLINK_FOLLOWS {
+                        return Err(ELOOP);
+                    }
+                    let target = read_symlink_target(&inode)?;
+                    let mut next_parts = path_components(&target);
+                    next_parts.extend_from_slice(&parts[index..]);
+                    if target.starts_with('/') {
+                        if ctx.resolve & RESOLVE_BENEATH != 0 {
+                            return Err(EINVAL);
+                        }
+                        let (mount, dentry) = lookup_start_mount(ctx.root.clone())?;
+                        cur_mount = mount;
+                        cur_dentry = dentry;
+                    } else {
+                        cur_mount = parent_mount;
+                        cur_dentry = parent_dentry;
+                    }
+                    parts = next_parts;
+                    index = 0;
+                    continue;
+                }
+            }
+        }
+
+        let (mount, dentry) = descend_mount(parent_mount.clone(), next);
+        if ctx.resolve & RESOLVE_NO_XDEV != 0 && !Arc::ptr_eq(&mount, &parent_mount) {
+            return Err(EXDEV);
+        }
+        cur_mount = mount;
+        cur_dentry = dentry;
+    }
+
+    Ok((cur_mount, cur_dentry))
+}
+
+fn lookup_start_mount(dentry: DentryRef) -> Result<(Arc<Mount>, DentryRef), i32> {
+    if let Some(mount) = mounted_root_for_dentry(&dentry) {
+        return Ok((mount.clone(), mount.root.clone()));
+    }
+    let mount = containing_mount_for_dentry(&dentry)
+        .or_else(rootfs)
+        .ok_or(EINVAL)?;
+    Ok((mount, dentry))
+}
+
+fn resolve_path_with_links(path: &str, follow_final: bool) -> Result<(Arc<Mount>, DentryRef), i32> {
+    if let Some(fd_path) = crate::fs::proc::fd::current_fd_path_from_proc_path(path) {
+        let fd_path = fd_path?;
+        return resolve_path_with_links(&fd_path, follow_final);
+    }
+
+    let root_mount = rootfs().ok_or(EINVAL)?;
+    let root = root_mount.root.clone();
+    // Absolute symlink targets are interpreted relative to the current
+    // task's fs root, not the global rootfs root, so chroot remains a lookup
+    // boundary after the initial pathname has been rebased below it.
+    let lookup_root = crate::fs::fs_struct::current_root_and_pwd()
+        .map(|(root, _)| root)
+        .unwrap_or_else(|| root.clone());
+    if path == "/" || path.is_empty() {
+        return Ok((root_mount, root));
+    }
+
+    let mut cur_mount = root_mount;
+    let mut cur_dentry = root;
+    let cur_lookup_root = lookup_root;
+    let mut parts = path_components(path);
+    let mut index = 0usize;
+    let mut symlink_follows = 0usize;
+
+    while index < parts.len() {
+        let comp = parts[index].as_str();
+        index += 1;
+        if comp == "." {
+            continue;
+        }
+        if comp == ".." {
+            if Arc::ptr_eq(&cur_dentry, &cur_lookup_root) {
+                continue;
+            }
+            let parent = cur_dentry.parent.lock().clone();
+            cur_dentry = parent.unwrap_or_else(|| cur_dentry.clone());
+            continue;
+        }
+
+        let parent_mount = cur_mount.clone();
+        let parent_dentry = cur_dentry.clone();
+        let next = lookup_child(&parent_dentry, comp)?;
+        let is_last = index == parts.len();
+
+        if let Some(inode) = next.inode() {
+            if inode.kind == InodeKind::Symlink && (!is_last || follow_final) {
+                symlink_follows += 1;
+                if symlink_follows > MAX_SYMLINK_FOLLOWS {
+                    return Err(ELOOP);
+                }
+                let target = read_symlink_target(&inode)?;
+                let mut next_parts = path_components(&target);
+                next_parts.extend_from_slice(&parts[index..]);
+                if target.starts_with('/') {
+                    let root_mount = rootfs().ok_or(EINVAL)?;
+                    cur_mount = mounted_root_for_dentry(&cur_lookup_root)
+                        .unwrap_or_else(|| root_mount.clone());
+                    cur_dentry = cur_lookup_root.clone();
+                } else {
+                    cur_mount = parent_mount;
+                    cur_dentry = parent_dentry;
+                }
+                parts = next_parts;
+                index = 0;
+                continue;
+            }
+        }
+
+        let (mount, dentry) = descend_mount(parent_mount, next);
+        cur_mount = mount;
+        cur_dentry = dentry;
+    }
+
+    Ok((cur_mount, cur_dentry))
+}
+
+fn path_components(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|c| !c.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn lookup_child(parent: &DentryRef, name: &str) -> Result<DentryRef, i32> {
+    if let Some(dentry) = super::dcache::d_lookup(parent, name) {
+        if dentry.inode().is_none() {
+            return Err(ENOENT);
+        }
+        return Ok(dentry);
+    }
+    let dir_inode = parent.inode().ok_or(ENOENT)?;
+    let lookup = dir_inode.ops.lookup.ok_or(ENOENT)?;
+    let child_inode = match lookup(&dir_inode, name) {
+        Ok(inode) => inode,
+        Err(ENOENT) => {
+            super::dcache::d_cache_negative(parent, name);
+            return Err(ENOENT);
+        }
+        Err(errno) => return Err(errno),
+    };
+    let new_d = super::dcache::d_alloc_child(parent, name);
+    new_d.instantiate(child_inode);
+    Ok(new_d)
+}
+
+fn descend_mount(mut cur_mount: Arc<Mount>, mut cur_dentry: DentryRef) -> (Arc<Mount>, DentryRef) {
+    loop {
+        let mut found = None;
+        let children = cur_mount.children.lock().clone();
+        for child in children.iter().rev() {
+            if let Some(mp) = child.mountpoint.lock().clone() {
+                if Arc::ptr_eq(&mp, &cur_dentry) {
+                    found = Some(child.clone());
+                    break;
+                }
+            }
+        }
+        let Some(child) = found else {
+            return (cur_mount, cur_dentry);
+        };
+        cur_dentry = child.root.clone();
+        cur_mount = child;
+    }
+}
+
+fn read_symlink_target(inode: &super::types::InodeRef) -> Result<String, i32> {
+    let readlink = inode.ops.readlink.ok_or(EINVAL)?;
+    let mut buf = alloc::vec![0u8; PATH_MAX];
+    let len = readlink(inode, &mut buf)?;
+    core::str::from_utf8(&buf[..len])
+        .map(String::from)
+        .map_err(|_| EINVAL)
+}
+
+/// Resolve a path through the mount tree.  Returns the dentry at the end of
+/// the walk *after* mount-traversal substitutions (sub-mounts replace their
+/// mountpoint dentry with the sub-mount's root dentry).
+pub fn path_walk(path: &str) -> Option<DentryRef> {
+    resolve_path_follow(path).ok().map(|(_, dentry)| dentry)
+}
+
+pub fn pivot_root(new_root: &str, _put_old: &str) -> Result<(), i32> {
+    let m = lookup_mount(new_root).ok_or(EINVAL)?;
+    if Arc::strong_count(&m) == 0 {
+        return Err(EBUSY);
+    }
+    *MOUNTS.root.lock() = Some(m);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::dcache::d_alloc_child;
+    use crate::fs::super_block::mount_fs;
+    use crate::include::uapi::mount::{MS_BIND, MS_MOVE, MS_RDONLY, MS_REC, MS_REMOUNT};
+
+    fn reset_mount_state() {
+        *MOUNTS.root.lock() = None;
+        MOUNTS.by_path.lock().clear();
+    }
+
+    fn mkdir_dentry(parent: &DentryRef, name: &str) -> DentryRef {
+        let parent_inode = parent.inode().expect("parent inode");
+        let mkdir = parent_inode.ops.mkdir.expect("mkdir op");
+        let child_inode = mkdir(&parent_inode, name, 0o755).expect("mkdir");
+        let child = d_alloc_child(parent, name);
+        child.instantiate(child_inode);
+        child
+    }
+
+    #[test]
+    fn kernel_remount_mountpoint_updates_root_without_syscall_usercopy() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", MS_RDONLY, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        set_rootfs(Mount::alloc(sb, root, MS_RDONLY as u32));
+
+        assert!(rootfs().expect("rootfs").is_readonly());
+        remount_mountpoint("/", MS_REMOUNT).expect("remount root");
+        assert!(!rootfs().expect("rootfs").is_readonly());
+    }
+
+    #[test]
+    fn bind_remount_with_empty_fstype_succeeds() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", 0, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        set_rootfs(Mount::alloc(sb, root, 0));
+
+        let target = b"/\0";
+        assert_eq!(
+            unsafe {
+                sys_mount(
+                    core::ptr::null(),
+                    target.as_ptr(),
+                    core::ptr::null(),
+                    MS_REMOUNT | MS_BIND | MS_RDONLY,
+                    core::ptr::null(),
+                )
+            },
+            0
+        );
+        assert!(rootfs().expect("rootfs").is_readonly());
+    }
+
+    #[test]
+    fn plain_bind_mount_with_empty_fstype_attaches_source_subtree() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", 0, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        set_rootfs(Mount::alloc(sb, root.clone(), 0));
+        mkdir_dentry(&root, "source");
+        mkdir_dentry(&root, "target");
+
+        let source = b"/source\0";
+        let target = b"/target\0";
+        assert_eq!(
+            unsafe {
+                sys_mount(
+                    source.as_ptr(),
+                    target.as_ptr(),
+                    core::ptr::null(),
+                    MS_BIND,
+                    core::ptr::null(),
+                )
+            },
+            0
+        );
+
+        let (_mount, dentry) = resolve_path_follow("/target").expect("target");
+        assert_eq!(dentry.name, "source");
+    }
+
+    #[test]
+    fn move_mount_with_empty_fstype_accepts_source_subtree_fallback() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", 0, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        set_rootfs(Mount::alloc(sb, root.clone(), 0));
+        mkdir_dentry(&root, "source");
+        mkdir_dentry(&root, "target");
+
+        let source = b"/source\0";
+        let target = b"/target\0";
+        assert_eq!(
+            unsafe {
+                sys_mount(
+                    source.as_ptr(),
+                    target.as_ptr(),
+                    core::ptr::null(),
+                    MS_MOVE,
+                    core::ptr::null(),
+                )
+            },
+            0
+        );
+
+        let (_mount, dentry) = resolve_path_follow("/target").expect("target");
+        assert_eq!(dentry.name, "source");
+    }
+
+    #[test]
+    fn remount_updates_existing_mount_without_replacing_tree() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", 0, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        set_rootfs(Mount::alloc(sb, root.clone(), 0));
+        mkdir_dentry(&root, "run");
+
+        assert_eq!(
+            unsafe {
+                sys_mount(
+                    b"tmpfs\0".as_ptr(),
+                    b"/run\0".as_ptr(),
+                    b"tmpfs\0".as_ptr(),
+                    0,
+                    core::ptr::null(),
+                )
+            },
+            0
+        );
+        let (_run_mount, run_root) = resolve_path_follow("/run").expect("/run");
+        let systemd = mkdir_dentry(&run_root, "systemd");
+        mkdir_dentry(&systemd, "mount-rootfs");
+
+        assert_eq!(
+            unsafe {
+                sys_mount(
+                    b"tmpfs\0".as_ptr(),
+                    b"/run\0".as_ptr(),
+                    b"tmpfs\0".as_ptr(),
+                    MS_REMOUNT | MS_RDONLY,
+                    core::ptr::null(),
+                )
+            },
+            0
+        );
+
+        assert!(
+            resolve_path_follow("/run/systemd/mount-rootfs").is_ok(),
+            "remount must preserve tmpfs contents"
+        );
+        assert!(lookup_mount("/run").expect("/run mount").is_readonly());
+    }
+
+    #[test]
+    fn cgroup_remount_preserves_service_dirs_and_files() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", 0, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        set_rootfs(Mount::alloc(sb, root.clone(), 0));
+        let sys = mkdir_dentry(&root, "sys");
+        let fs = mkdir_dentry(&sys, "fs");
+        mkdir_dentry(&fs, "cgroup");
+
+        assert_eq!(
+            unsafe {
+                sys_mount(
+                    b"cgroup2\0".as_ptr(),
+                    b"/sys/fs/cgroup\0".as_ptr(),
+                    b"cgroup2\0".as_ptr(),
+                    0,
+                    core::ptr::null(),
+                )
+            },
+            0
+        );
+        let (_cg_mount, cg_root) = resolve_path_follow("/sys/fs/cgroup").expect("cgroup root");
+        let system = mkdir_dentry(&cg_root, "system.slice");
+        mkdir_dentry(&system, "systemd-networkd.service");
+
+        assert_eq!(
+            unsafe {
+                sys_mount(
+                    b"cgroup2\0".as_ptr(),
+                    b"/sys/fs/cgroup\0".as_ptr(),
+                    b"cgroup2\0".as_ptr(),
+                    MS_REMOUNT | MS_RDONLY,
+                    core::ptr::null(),
+                )
+            },
+            0
+        );
+
+        assert!(
+            resolve_path_follow(
+                "/sys/fs/cgroup/system.slice/systemd-networkd.service/cgroup.subtree_control"
+            )
+            .is_ok(),
+            "remount must not replace the cgroupfs hierarchy"
+        );
+        assert!(
+            lookup_mount("/sys/fs/cgroup")
+                .expect("cgroup mount")
+                .is_readonly()
+        );
+    }
+
+    #[test]
+    fn repeated_mounts_stack_on_mountpoint_not_previous_root() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", 0, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        set_rootfs(Mount::alloc(sb, root.clone(), 0));
+        mkdir_dentry(&root, "sys");
+
+        do_mount("sysfs", "sysfs", "/sys", 0, "").expect("first sysfs");
+        do_mount("sysfs", "sysfs", "/sys", 0, "").expect("stacked sysfs");
+        do_mount("cgroup2", "cgroup2", "/sys/fs/cgroup", 0, "").expect("first cgroup");
+        do_mount("cgroup2", "cgroup2", "/sys/fs/cgroup", 0, "").expect("second cgroup");
+        do_mount("cgroup2", "cgroup2", "/sys/fs/cgroup", 0, "").expect("third cgroup");
+
+        let (_mount, cgroup_root) = resolve_path_follow("/sys/fs/cgroup").expect("cgroup root");
+        let inode = cgroup_root.inode().expect("cgroup inode");
+        let sb = inode.sb.lock().clone().expect("cgroup sb");
+        assert_eq!(sb.fs_name, "cgroup2");
+        assert!(inode.ops.mkdir.expect("cgroup mkdir")(&inode, "systemd", 0o755).is_ok());
+    }
+
+    #[test]
+    fn recursive_root_bind_clones_run_submount_without_hiding_host_run() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", 0, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        set_rootfs(Mount::alloc(sb, root.clone(), 0));
+        let usr = mkdir_dentry(&root, "usr");
+        let lib = mkdir_dentry(&usr, "lib");
+        let systemd_dir = mkdir_dentry(&lib, "systemd");
+        let executor = mkdir_dentry(&systemd_dir, "systemd-executor");
+        mkdir_dentry(&root, "run");
+
+        do_mount("tmpfs", "tmpfs", "/run", 0, "").expect("tmpfs /run");
+        let (_run_mount, run_root) = resolve_path_follow("/run").expect("/run");
+        let systemd = mkdir_dentry(&run_root, "systemd");
+        mkdir_dentry(&systemd, "mount-rootfs");
+        let credentials = mkdir_dentry(&run_root, "credentials");
+        mkdir_dentry(&credentials, "systemd-networkd.service");
+
+        assert_eq!(
+            unsafe {
+                sys_mount(
+                    b"/\0".as_ptr(),
+                    b"/run/systemd/mount-rootfs\0".as_ptr(),
+                    core::ptr::null(),
+                    MS_BIND | MS_REC,
+                    core::ptr::null(),
+                )
+            },
+            0
+        );
+        assert!(
+            resolve_path_follow(
+                "/run/systemd/mount-rootfs/run/credentials/systemd-networkd.service"
+            )
+            .is_ok(),
+            "recursive bind must carry the /run submount into the service root"
+        );
+
+        do_mount("tmpfs", "tmpfs", "/run/systemd/mount-rootfs/run", 0, "")
+            .expect("private service /run");
+        assert!(
+            resolve_path_follow("/run/credentials/systemd-networkd.service").is_ok(),
+            "overmounting the service root's /run must not hide host /run credentials"
+        );
+        assert!(
+            resolve_path_follow(
+                "/run/systemd/mount-rootfs/run/credentials/systemd-networkd.service"
+            )
+            .is_err(),
+            "the service root gets a fresh /run after the overmount"
+        );
+        assert_eq!(
+            stable_path_for_dentry(&executor).as_deref(),
+            Some("/usr/lib/systemd/systemd-executor"),
+            "proc-fd exec paths should prefer the stable host alias"
+        );
+    }
+
+    #[test]
+    fn recursive_root_bind_skips_existing_target_submounts() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", 0, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        set_rootfs(Mount::alloc(sb, root.clone(), 0));
+        mkdir_dentry(&root, "tmp");
+        mkdir_dentry(&root, "run");
+
+        do_mount("tmpfs", "tmpfs", "/run", 0, "").expect("tmpfs /run");
+        let (_run_mount, run_root) = resolve_path_follow("/run").expect("/run");
+        let systemd = mkdir_dentry(&run_root, "systemd");
+        mkdir_dentry(&systemd, "mount-rootfs");
+
+        assert_eq!(
+            unsafe {
+                sys_mount(
+                    b"/\0".as_ptr(),
+                    b"/run/systemd/mount-rootfs\0".as_ptr(),
+                    core::ptr::null(),
+                    MS_BIND | MS_REC,
+                    core::ptr::null(),
+                )
+            },
+            0
+        );
+        do_mount("tmpfs", "tmpfs", "/run/systemd/mount-rootfs/tmp", 0, "")
+            .expect("leaked service submount");
+
+        assert_eq!(
+            unsafe {
+                sys_mount(
+                    b"/\0".as_ptr(),
+                    b"/run/systemd/mount-rootfs\0".as_ptr(),
+                    core::ptr::null(),
+                    MS_BIND | MS_REC,
+                    core::ptr::null(),
+                )
+            },
+            0,
+            "a repeated root bind should ignore stale submounts below its target"
+        );
+        let (bound_run_mount, bound_run_root) =
+            resolve_path_follow("/run/systemd/mount-rootfs/run").expect("bound /run");
+        assert!(
+            Arc::ptr_eq(&bound_run_mount.root, &bound_run_root),
+            "the host /run submount must still be cloned into the service root"
+        );
+    }
+}
+
+#[allow(unused)]
+fn _ensure_unused_errno() {
+    let _ = EROFS;
+}

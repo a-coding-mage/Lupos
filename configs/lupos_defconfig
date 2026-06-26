@@ -1,0 +1,38 @@
+# Lupos default configuration — the single, generic x86_64 build.
+#
+# Source of truth: vendor/linux/arch/x86/configs/x86_64_defconfig. Core kernel
+# symbols track upstream values. Device drivers that Lupos loads as Linux-built
+# .ko payloads (CLAUDE.md 2a) are forced to =m instead of upstream's built-in =y,
+# because Lupos does not reimplement drivers.
+#
+# Consumed by: make lupos_defconfig
+
+CONFIG_MODULES=y
+CONFIG_SMP=y
+CONFIG_BLOCK=y
+CONFIG_PCI=y
+CONFIG_ACPI=y
+CONFIG_SERIAL_8250=y
+CONFIG_FRAMEBUFFER=y
+CONFIG_DRM=y
+CONFIG_INPUT=y
+CONFIG_HID=y
+CONFIG_USB=y
+CONFIG_USB_XHCI=y
+CONFIG_SOUND=y
+CONFIG_SND_HDA_INTEL=y
+CONFIG_NET=y
+CONFIG_NETDEVICES=y
+CONFIG_VIRTIO=y
+
+# Drivers built as external Linux .ko payloads (=m; CLAUDE.md 2a).
+CONFIG_SCSI_COMMON=m
+CONFIG_SCSI=m
+CONFIG_BLK_DEV_SD=m
+CONFIG_ATA=m
+CONFIG_SATA_AHCI=m
+CONFIG_VIRTIO_PCI_LIB=m
+CONFIG_VIRTIO_PCI=m
+CONFIG_VIRTIO_BLK=m
+CONFIG_VIRTIO_NET=m
+CONFIG_E1000=m

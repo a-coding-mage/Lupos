@@ -1,0 +1,269 @@
+lupos_path	reason
+build.rs	build-glue: Cargo build script bridging Kconfig cfg + assembly inputs; Linux uses Kbuild/Makefile, no .rs counterpart.
+src/lib.rs	crate-index: Cargo crate root with module declarations; Linux has no equivalent crate concept.
+src/usr/init/.cargo/config.toml	cargo-config: Cargo workspace config for staged PID 1 helper crate.
+src/usr/init/.gitignore	vcs-config: Git ignore rules for staged PID 1 helper crate.
+src/usr/init/Cargo.lock	cargo-lock: Cargo lockfile for staged PID 1 helper crate.
+src/usr/init/Cargo.toml	cargo-manifest: Cargo manifest for staged PID 1 helper crate.
+src/usr/init/src/main.rs	userspace-payload: In-tree minimal PID 1 helper; Linux ships no userspace init in-tree (uses external systemd/BusyBox).
+src/arch/x86/configs/i686-lupos.json	build-glue: Rust target spec for the Lupos i686 build; Linux uses Kconfig/arch Makefiles rather than Rust JSON target specs.
+src/arch/x86/configs/x86_64-lupos.json	build-glue: Rust target spec for the Lupos x86_64 build; Linux uses Kconfig/arch Makefiles rather than Rust JSON target specs.
+src/arch/x86/boot/compressed/lupos_extract_kernel_64.S	build-glue: Temporary uncompressed-ELF extract_kernel shim linked behind the real Linux boot/compressed head_64.S until the full decompressor path is linked.
+src/arch/x86/boot/compressed/lupos_stored_vmlinux.lds	build-glue: Temporary linker script for the uncompressed-ELF extract_kernel bridge until the full Linux boot/compressed vmlinux.lds.S path is linked.
+src/scripts/abi-parity-suite/build_suite.sh	build-glue: ABI parity suite staging script; Linux selftests provide test sources, not this Lupos orchestration wrapper.
+src/scripts/abi-parity-suite/run_suite.sh	build-glue: ABI parity suite run wrapper; Linux has no in-tree counterpart for Lupos/Linux result normalization.
+src/scripts/abi-parity-suite/vendor_sync.sh	build-glue: Vendor source synchronization wrapper for local ABI parity runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/blktests-linux.sh	build-glue: ABI parity runner adapter for blktests Linux reference runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/blktests-lupos.sh	build-glue: ABI parity runner adapter for blktests Lupos guest runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/common.sh	build-glue: Shared ABI parity runner helper library; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/arch-rootfs-linux.sh	build-glue: ABI parity runner adapter for Arch rootfs Linux reference runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/arch-rootfs-lupos.sh	build-glue: ABI parity runner adapter for Arch rootfs Lupos guest runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/kselftest-linux.sh	build-glue: ABI parity runner adapter for kselftest Linux reference runs; Linux selftests are the payload, not this wrapper.
+src/scripts/abi-parity-suite/runners/kselftest-lupos.sh	build-glue: ABI parity runner adapter for kselftest Lupos guest runs; Linux selftests are the payload, not this wrapper.
+src/scripts/abi-parity-suite/runners/ltp-linux.sh	build-glue: ABI parity runner adapter for LTP Linux reference runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/ltp-lupos.sh	build-glue: ABI parity runner adapter for LTP Lupos guest runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/packetdrill-linux.sh	build-glue: ABI parity runner adapter for packetdrill Linux reference runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/packetdrill-lupos.sh	build-glue: ABI parity runner adapter for packetdrill Lupos guest runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/pthread-smoke-linux.sh	build-glue: ABI parity runner adapter for pthread smoke Linux reference runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/pthread-smoke-lupos.sh	build-glue: ABI parity runner adapter for pthread smoke Lupos guest runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/smp-migration-linux.sh	build-glue: ABI parity runner adapter for SMP migration Linux reference runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/smp-migration-lupos.sh	build-glue: ABI parity runner adapter for SMP migration Lupos guest runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/smp-preempt-linux.sh	build-glue: ABI parity runner adapter for SMP preemption Linux reference runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/smp-preempt-lupos.sh	build-glue: ABI parity runner adapter for SMP preemption Lupos guest runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/strace-ab-linux.sh	build-glue: ABI parity runner adapter for strace ABI Linux reference runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/strace-ab-lupos.sh	build-glue: ABI parity runner adapter for strace ABI Lupos guest runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/syzkaller-linux.sh	build-glue: ABI parity runner adapter for syzkaller Linux reference runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/syzkaller-lupos.sh	build-glue: ABI parity runner adapter for syzkaller Lupos guest runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/xfstests-linux.sh	build-glue: ABI parity runner adapter for xfstests Linux reference runs; Linux has no in-tree counterpart.
+src/scripts/abi-parity-suite/runners/xfstests-lupos.sh	build-glue: ABI parity runner adapter for xfstests Lupos guest runs; Linux has no in-tree counterpart.
+src/scripts/build_abi_parity_suites.sh	build-glue: Top-level ABI parity suite build shim; Linux has no in-tree counterpart.
+src/scripts/build_kconfig_tools.sh	build-glue: Local Kconfig tool build shim; Linux uses Kbuild rather than this repository wrapper.
+src/scripts/build_userland.sh	build-glue: Local userland staging shim; Linux does not ship this Lupos userland build wrapper.
+src/scripts/localconfig.sh	build-glue: Local Kconfig fragment helper; Linux exposes Kconfig targets rather than this repository wrapper.
+src/scripts/localmodconfig.sh	build-glue: Local module configuration shim; Linux exposes Kconfig targets rather than this repository wrapper.
+src/arch/x86/crypto/aesni_intel_glue.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/crypto/aesni-intel_glue.c.
+src/arch/x86/crypto/camellia_glue.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/crypto/camellia_glue.c.
+src/arch/x86/entry/entry_fred.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/entry/entry_fred.c.
+src/arch/x86/entry/syscall_32.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/entry/syscall_32.c.
+src/arch/x86/kernel/cpu/umc.rs	vendor-drift: Excluded from migrated Linux C map because vendor/linux/arch/x86/kernel/cpu/umc.c is absent in the current vendor tree; re-anchor before claiming mapped parity.
+src/arch/x86/math_emu/mod.rs	vendor-drift: Excluded from migrated Linux C map because vendor/linux/arch/x86/math-emu is absent in the current vendor tree; re-anchor before claiming mapped parity.
+src/arch/x86/math_emu/fpu_tags.rs	vendor-drift: Excluded from migrated Linux C map because vendor/linux/arch/x86/math-emu/fpu_tags.c is absent in the current vendor tree; re-anchor before claiming mapped parity.
+src/arch/x86/math_emu/reg_constant.rs	vendor-drift: Excluded from migrated Linux C map because vendor/linux/arch/x86/math-emu/reg_constant.c is absent in the current vendor tree; re-anchor before claiming mapped parity.
+src/arch/x86/math_emu/reg_convert.rs	vendor-drift: Excluded from migrated Linux C map because vendor/linux/arch/x86/math-emu/reg_convert.c is absent in the current vendor tree; re-anchor before claiming mapped parity.
+src/arch/x86/math_emu/reg_mul.rs	vendor-drift: Excluded from migrated Linux C map because vendor/linux/arch/x86/math-emu/reg_mul.c is absent in the current vendor tree; re-anchor before claiming mapped parity.
+src/arch/x86/xen/debugfs.rs	vendor-drift: Excluded from migrated Linux C map because vendor/linux/arch/x86/xen/debugfs.c is absent in the current vendor tree; re-anchor before claiming mapped parity.
+src/arch/x86/events/amd/core.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/amd/core.c.
+src/arch/x86/events/amd/ibs.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/amd/ibs.c.
+src/arch/x86/events/amd/uncore.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/amd/uncore.c.
+src/arch/x86/events/core.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/core.c.
+src/arch/x86/events/intel/core.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/intel/core.c.
+src/arch/x86/events/intel/ds.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/intel/ds.c.
+src/arch/x86/events/intel/lbr.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/intel/lbr.c.
+src/arch/x86/events/intel/p4.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/intel/p4.c.
+src/arch/x86/events/intel/pt.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/intel/pt.c.
+src/arch/x86/events/intel/uncore.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/intel/uncore.c.
+src/arch/x86/events/intel/uncore_discovery.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/intel/uncore_discovery.c.
+src/arch/x86/events/intel/uncore_nhmex.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/intel/uncore_nhmex.c.
+src/arch/x86/events/intel/uncore_snb.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/intel/uncore_snb.c.
+src/arch/x86/events/intel/uncore_snbep.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/intel/uncore_snbep.c.
+src/arch/x86/events/rapl.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/events/rapl.c.
+src/arch/x86/hyperv/hv_apic.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/hyperv/hv_apic.c.
+src/arch/x86/hyperv/hv_crash.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/hyperv/hv_crash.c.
+src/arch/x86/hyperv/hv_init.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/hyperv/hv_init.c.
+src/arch/x86/hyperv/hv_vtl.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/hyperv/hv_vtl.c.
+src/arch/x86/hyperv/irqdomain.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/hyperv/irqdomain.c.
+src/arch/x86/hyperv/ivm.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/hyperv/ivm.c.
+src/arch/x86/hyperv/mmu.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/hyperv/mmu.c.
+src/arch/x86/kernel/cpu/common.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/common.c.
+src/arch/x86/kernel/cpu/microcode/amd.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/microcode/amd.c.
+src/arch/x86/kernel/cpu/microcode/core.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/microcode/core.c.
+src/arch/x86/kernel/cpu/microcode/intel.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/microcode/intel.c.
+src/arch/x86/kernel/cpu/mtrr/cleanup.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/mtrr/cleanup.c.
+src/arch/x86/kernel/cpu/resctrl/core.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/resctrl/core.c.
+src/arch/x86/kernel/cpu/resctrl/intel_aet.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/resctrl/intel_aet.c.
+src/arch/x86/kernel/cpu/resctrl/monitor.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/resctrl/monitor.c.
+src/arch/x86/kernel/cpu/resctrl/pseudo_lock.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/resctrl/pseudo_lock.c.
+src/arch/x86/kernel/cpu/resctrl/rdtgroup.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/resctrl/rdtgroup.c.
+src/arch/x86/kernel/cpu/sgx/encl.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/sgx/encl.c.
+src/arch/x86/kernel/cpu/sgx/ioctl.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/sgx/ioctl.c.
+src/arch/x86/kernel/cpu/sgx/main.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/sgx/main.c.
+src/arch/x86/kernel/cpu/sgx/virt.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/cpu/sgx/virt.c.
+src/arch/x86/kernel/idt.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/idt.c.
+src/arch/x86/kernel/paravirt.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/paravirt.c.
+src/arch/x86/kernel/shstk.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/shstk.c.
+src/arch/x86/kernel/signal.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/signal.c.
+src/arch/x86/kernel/uprobes.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/uprobes.c.
+src/arch/x86/kernel/vm86_32.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/vm86_32.c.
+src/arch/x86/kernel/x86_init.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/x86_init.c.
+src/arch/x86/kvm/cpuid.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/cpuid.c.
+src/arch/x86/kvm/emulate.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/emulate.c.
+src/arch/x86/kvm/hyperv.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/hyperv.c.
+src/arch/x86/kvm/i8254.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/i8254.c.
+src/arch/x86/kvm/i8259.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/i8259.c.
+src/arch/x86/kvm/ioapic.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/ioapic.c.
+src/arch/x86/kvm/irq.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/irq.c.
+src/arch/x86/kvm/lapic.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/lapic.c.
+src/arch/x86/kvm/mmu/page_track.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/mmu/page_track.c.
+src/arch/x86/kvm/mmu/spte.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/mmu/spte.c.
+src/arch/x86/kvm/mmu/tdp_mmu.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/mmu/tdp_mmu.c.
+src/arch/x86/kvm/pmu.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/pmu.c.
+src/arch/x86/kvm/smm.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/smm.c.
+src/arch/x86/kvm/svm/avic.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/svm/avic.c.
+src/arch/x86/kvm/svm/nested.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/svm/nested.c.
+src/arch/x86/kvm/svm/sev.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/svm/sev.c.
+src/arch/x86/kvm/svm/svm.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/svm/svm.c.
+src/arch/x86/kvm/vmx/hyperv_evmcs.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/vmx/hyperv_evmcs.c.
+src/arch/x86/kvm/vmx/main.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/vmx/main.c.
+src/arch/x86/kvm/vmx/nested.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/vmx/nested.c.
+src/arch/x86/kvm/vmx/pmu_intel.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/vmx/pmu_intel.c.
+src/arch/x86/kvm/vmx/posted_intr.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/vmx/posted_intr.c.
+src/arch/x86/kvm/vmx/sgx.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/vmx/sgx.c.
+src/arch/x86/kvm/vmx/tdx.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/vmx/tdx.c.
+src/arch/x86/kvm/vmx/vmcs12.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/vmx/vmcs12.c.
+src/arch/x86/kvm/vmx/vmx.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/vmx/vmx.c.
+src/arch/x86/kvm/x86.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/x86.c.
+src/arch/x86/kvm/xen.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kvm/xen.c.
+src/arch/x86/mm/mem_encrypt_amd.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/mm/mem_encrypt_amd.c.
+src/arch/x86/platform/efi.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/platform/efi/efi.c.
+src/block/badblocks.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/badblocks.c.
+src/block/bdev.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/bdev.c.
+src/block/bfq_cgroup.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/bfq-cgroup.c.
+src/block/bfq_iosched.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/bfq-iosched.c.
+src/block/bfq_wf2q.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/bfq-wf2q.c.
+src/block/bio_integrity.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/bio-integrity.c.
+src/block/blk_cgroup.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/blk-cgroup.c.
+src/block/blk_mq.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/blk-mq.c.
+src/block/ioctl.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/ioctl.c.
+src/crypto/pcbc.rs	vendor-drift: Excluded from migrated Linux C map because vendor/linux/crypto/pcbc.c is absent in the current vendor tree; re-anchor before claiming mapped parity.
+src/efi/vars.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/drivers/firmware/efi/vars.c.
+src/linux_driver_abi/base/bus.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/drivers/base/bus.c.
+src/linux_driver_abi/base/class.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/drivers/base/class.c.
+src/linux_driver_abi/base/driver.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/drivers/base/driver.c.
+src/linux_driver_abi/pci/access.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/drivers/pci/access.c.
+src/linux_driver_abi/pci/pci.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/drivers/pci/pci.c.
+src/linux_driver_abi/storage_core.rs	pending-migration: Excluded from migrated Linux C map until this multi-source driver-core/block/kernel export glue is split into complete 1:1 translations of its vendor/linux sources.
+src/lib/crc/arm64/crc64_neon_inner.rs	vendor-drift: Excluded from migrated Linux C map because vendor/linux/lib/crc/arm64/crc64-neon-inner.c is absent in the current vendor tree; re-anchor before claiming mapped parity.
+src/lib/raid/xor/arm/xor_neon.rs	vendor-drift: Excluded from migrated Linux C map because vendor/linux/lib/raid/xor/arm/xor-neon.c is absent in the current vendor tree; re-anchor before claiming mapped parity.
+src/net/appletalk/mod.rs	vendor-drift: Excluded from migrated Linux C map because vendor/linux/net/appletalk is absent in the current vendor tree; re-anchor before claiming mapped parity.
+src/net/appletalk/sysctl_net_atalk.rs	vendor-drift: Excluded from migrated Linux C map because vendor/linux/net/appletalk/sysctl_net_atalk.c is absent in the current vendor tree; re-anchor before claiming mapped parity.
+src/fs/debugfs/file.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/debugfs/file.c.
+src/fs/debugfs/inode.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/debugfs/inode.c.
+src/fs/ext4/balloc.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/ext4/balloc.c.
+src/fs/ext4/dir.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/ext4/dir.c.
+src/fs/ext4/extents.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/ext4/extents.c.
+src/fs/ext4/ialloc.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/ext4/ialloc.c.
+src/fs/ext4/indirect.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/ext4/indirect.c.
+src/fs/ext4/inline.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/ext4/inline.c.
+src/fs/ext4/inode.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/ext4/inode.c.
+src/fs/fat/dir.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/fat/dir.c.
+src/fs/fat/fatent.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/fat/fatent.c.
+src/fs/fat/inode.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/fat/inode.c.
+src/fs/fcntl.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/fcntl.c.
+src/fs/hugetlbfs.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/hugetlbfs/inode.c.
+src/fs/inode.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/inode.c.
+src/fs/isofs/inode.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/isofs/inode.c.
+src/fs/kernfs/dir.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/kernfs/dir.c.
+src/fs/kernfs/file.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/kernfs/file.c.
+src/fs/kernfs/inode.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/kernfs/inode.c.
+src/fs/kernfs/mount.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/kernfs/mount.c.
+src/fs/libfs.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/libfs.c.
+src/fs/mqueue.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/ipc/mqueue.c.
+src/fs/namei.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/namei.c.
+src/fs/permission.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/namei.c.
+src/fs/read_write.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/read_write.c.
+src/fs/xattr.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/xattr.c.
+src/fs/sysfs/file.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/sysfs/file.c.
+src/fs/sysfs/group.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/sysfs/group.c.
+src/init/main.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/init/main.c.
+src/init/initcall.rs	pending-migration: Source-backed initcall-level slice of vendor/linux/init/main.c; excluded until init/main.c is a complete 1:1 translation.
+src/init/start_kernel.rs	pending-migration: Source-backed start_kernel tail-order slice of vendor/linux/init/main.c; excluded until init/main.c is a complete 1:1 translation.
+src/io_uring/opdef.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/io_uring/opdef.c.
+src/kernel/bpf/syscall.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/kernel/bpf/syscall.c.
+src/kernel/futex/syscalls.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/kernel/futex/syscalls.c.
+src/kernel/params.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/kernel/params.c.
+src/kernel/softirq.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/kernel/softirq.c.
+src/kernel/taskstats.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/kernel/taskstats.c.
+src/lib/idr.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/lib/idr.c.
+src/lib/iomap.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/lib/iomap.c.
+src/lib/scatterlist.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/lib/scatterlist.c.
+src/lib/string.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/lib/string.c.
+src/lib/string_helpers.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/lib/string_helpers.c.
+src/lib/vsprintf.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/lib/vsprintf.c.
+src/net/virtio_net.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/drivers/net/virtio_net.c.
+src/security/apparmor.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/security/apparmor/lsm.c.
+src/security/apparmorfs.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/security/apparmor/apparmorfs.c.
+src/security/integrity/evm_secfs.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/security/integrity/evm/evm_secfs.c.
+src/security/integrity/evm.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/security/integrity/evm/evm_main.c.
+src/security/integrity/ima_fs.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/security/integrity/ima/ima_fs.c.
+src/security/integrity/ima.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/security/integrity/ima/ima_init.c.
+src/arch/x86/lib/insn_eval.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/lib/insn-eval.c.
+src/arch/x86/lib/insn.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/lib/insn.c.
+src/arch/x86/kernel/kprobes/core.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/kprobes/core.c.
+src/arch/x86/kernel/kprobes/opt.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/kernel/kprobes/opt.c.
+src/linux_driver_abi/video/console/vgacon.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/drivers/video/console/vgacon.c.
+src/linux_driver_abi/video/fbdev/core/writer.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/drivers/video/fbdev/core/fbcon.c.
+src/kernel/cgroup/fs.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/kernel/cgroup/cgroup.c.
+src/fs/jbd2/journal.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/jbd2/journal.c.
+src/fs/jbd2/recovery.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/jbd2/recovery.c.
+src/fs/jbd2/transaction.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/jbd2/transaction.c.
+src/fs/proc/array.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/proc/array.c.
+src/fs/proc/base.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/proc/base.c.
+src/fs/proc/fd.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/proc/fd.c.
+src/fs/proc/generic.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/proc/generic.c.
+src/fs/proc/inode.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/proc/inode.c.
+src/fs/proc/kcore.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/proc/kcore.c.
+src/fs/proc/meminfo.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/proc/meminfo.c.
+src/fs/proc/page.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/proc/page.c.
+src/fs/proc/proc_net.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/proc/proc_net.c.
+src/fs/proc/proc_sysctl.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/proc/proc_sysctl.c.
+src/fs/proc/root.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/proc/root.c.
+src/fs/proc/swaps.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/mm/swapfile.c.
+src/fs/proc/task_mmu.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/proc/task_mmu.c.
+src/fs/proc/vmcore.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/proc/vmcore.c.
+src/security/inode.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/security/inode.c.
+src/kernel/audit.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/kernel/audit.c.
+src/kernel/auditfilter.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/kernel/auditfilter.c.
+src/linux_driver_abi/iommu/iommu.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/drivers/iommu/iommu.c.
+src/lib/kobject.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/lib/kobject.c.
+src/ipc/namespace.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/ipc/namespace.c.
+src/fs/namespace.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/namespace.c.
+src/net/core/net_namespace.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/net/core/net_namespace.c.
+src/fs/nsfs.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/nsfs.c.
+src/kernel/pid_namespace.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/kernel/pid_namespace.c.
+src/kernel/user_namespace.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/kernel/user_namespace.c.
+src/kernel/events/attr.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/kernel/events/core.c.
+src/kernel/workqueue.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/kernel/workqueue.c.
+src/init/do_mounts.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/init/do_mounts.c.
+src/init/initramfs_test.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/init/initramfs_test.c.
+src/certs/blacklist.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/certs/blacklist.c.
+src/certs/system_keyring.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/certs/system_keyring.c.
+src/usr/gen_init_cpio.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/usr/gen_init_cpio.c.
+src/ipc/util.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/ipc/util.c.
+src/ipc/msg.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/ipc/msg.c.
+src/arch/x86/lib/inat.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/arch/x86/lib/inat.c.
+src/lib/crypto/aes.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/lib/crypto/aes.c.
+src/lib/crypto/aesgcm.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/lib/crypto/aesgcm.c.
+src/lib/crypto/chacha20poly1305.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/lib/crypto/chacha20poly1305.c.
+src/crypto/ecdh.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/crypto/ecdh.c.
+src/fs/v9fs/v9fs.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/9p/v9fs.c.
+src/fs/v9fs/vfs_file.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/9p/vfs_file.c.
+src/fs/v9fs/vfs_inode.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/9p/vfs_inode.c.
+src/fs/v9fs/vfs_inode_dotl.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/fs/9p/vfs_inode_dotl.c.
+src/virt/kvm/eventfd.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/virt/kvm/eventfd.c.
+src/virt/kvm/guest_memfd.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/virt/kvm/guest_memfd.c.
+src/virt/kvm/kvm_main.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/virt/kvm/kvm_main.c.
+src/virt/kvm/pfncache.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/virt/kvm/pfncache.c.
+src/ipc/sem.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/ipc/sem.c.
+src/ipc/shm.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/ipc/shm.c.
+src/net/6lowpan/iphc.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/net/6lowpan/iphc.c.
+src/net/802/garp.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/net/802/garp.c.
+src/net/802/mrp.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/net/802/mrp.c.
+src/net/8021q/vlan.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/net/8021q/vlan.c.
+src/net/8021q/vlan_core.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/net/8021q/vlan_core.c.
+src/net/8021q/vlan_dev.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/net/8021q/vlan_dev.c.
+src/net/8021q/vlan_netlink.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/net/8021q/vlan_netlink.c.
+src/mm/debug_vm_pgtable.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/mm/debug_vm_pgtable.c.
+src/mm/dmapool.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/mm/dmapool.c.
+src/mm/execmem.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/mm/execmem.c.
+src/mm/gup_test.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/mm/gup_test.c.
+src/mm/highmem.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/mm/highmem.c.
