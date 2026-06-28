@@ -347,25 +347,6 @@ pub unsafe fn sys_epoll_wait(
                 .saturating_add((timeout as u64).saturating_mul(1_000_000)),
         )
     };
-    // TEMP boot-profiling: trace pid 1's epoll_wait timeouts (throttled) to see
-    // what systemd's event loop is spinning on during the boot stall.
-    #[cfg(not(test))]
-    {
-        let cur = unsafe { crate::kernel::sched::get_current() };
-        let pid = if cur.is_null() { -1 } else { unsafe { (*cur).pid } };
-        if pid == 1 {
-            static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-            let j = crate::kernel::time::jiffies::jiffies();
-            if j.saturating_sub(LAST.load(core::sync::atomic::Ordering::Relaxed)) >= 25 {
-                LAST.store(j, core::sync::atomic::Ordering::Relaxed);
-                crate::linux_driver_abi::tty::serial_println!(
-                    " epw pid=1 timeout={} maxev={}",
-                    timeout,
-                    maxevents
-                );
-            }
-        }
-    }
     #[cfg(not(test))]
     let mut wait_state = EventWaitState::default();
 

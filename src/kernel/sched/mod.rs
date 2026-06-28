@@ -99,7 +99,7 @@ pub fn register_module_exports() {
     swait::register_module_exports();
 }
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -880,9 +880,6 @@ pub unsafe fn schedule() -> bool {
 /// and deadlock on its (non-recursive) poller-list lock.
 static DRIVER_POLL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// TEMP boot-profiling: number of times the idle path halted (read by heartbeat).
-pub static IDLE_HALT_COUNT: AtomicU64 = AtomicU64::new(0);
-
 /// Surface pending Linux-driver hardware completions when the CPU is otherwise
 /// idle, returning whether any event was handled.
 ///
@@ -909,6 +906,22 @@ fn pump_driver_abi_events_on_idle() -> bool {
     handled > 0
 }
 
+/// Reschedule a *runnable* task that is merely yielding for fairness (e.g.
+/// `TIF_NEED_RESCHED` set on syscall return), giving any peer a turn — but never
+/// halting. Unlike [`schedule_with_irqs_enabled`], if no other task is runnable
+/// this returns immediately so the current task keeps running, rather than
+/// halting the CPU for a tick. Halting a still-runnable task wastes ~a tick per
+/// reschedule; with a slow per-syscall transport (VirtualBox's VM-exit-heavy
+/// AHCI/port I/O) and a single busy task (systemd scanning units at boot) that
+/// is half the CPU. The genuine-sleep paths still use `schedule_with_irqs_enabled`
+/// and halt correctly. Only meaningful under the cooperative (single-CPU)
+/// scheduler; the production SMP path has its own idle class.
+pub unsafe fn reschedule_runnable() {
+    crate::kernel::locking::local_irq_enable();
+    let _ = unsafe { schedule() };
+    crate::kernel::locking::local_irq_enable();
+}
+
 pub unsafe fn schedule_with_irqs_enabled() {
     crate::kernel::locking::local_irq_enable();
     let idle = unsafe { schedule() };
@@ -922,8 +935,6 @@ pub unsafe fn schedule_with_irqs_enabled() {
             crate::kernel::locking::local_irq_enable();
             return;
         }
-        #[cfg(not(test))]
-        IDLE_HALT_COUNT.fetch_add(1, Ordering::Relaxed);
         unsafe {
             // sti+hlt as a single sequence -- sti has a one-instruction grace
             // window so a newly-pending interrupt cannot be missed between

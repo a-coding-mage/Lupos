@@ -119,8 +119,7 @@ fn cpu_index() -> usize {
     {
         // Skip the LAPIC MMIO read (a VM-exit on VBox) when only the BSP is
         // online; single-CPU TLB state lives in index 0.
-        if crate::arch::x86::kernel::smp::AP_READY_COUNT
-            .load(core::sync::atomic::Ordering::Acquire)
+        if crate::arch::x86::kernel::smp::AP_READY_COUNT.load(core::sync::atomic::Ordering::Acquire)
             == 0
         {
             return 0;
