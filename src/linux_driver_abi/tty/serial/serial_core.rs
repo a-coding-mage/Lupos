@@ -11,9 +11,7 @@
 ///      https://en.wikibooks.org/wiki/Serial_Programming/8250_UART_Programming
 extern crate alloc;
 
-use alloc::collections::VecDeque;
 use core::fmt;
-use lazy_static::lazy_static;
 use spin::Mutex;
 
 /// COM1 base I/O port address.
@@ -26,6 +24,57 @@ const SERIAL_INPUT_QUEUE_CAP: usize = 4096;
 /// empty, without re-checking LSR between bytes — it trusts the FIFO has room
 /// for that many right after an empty signal. `flush_budget()` mirrors that.
 const TX_FIFO_DEPTH: usize = 16;
+
+struct ByteRing<const CAP: usize> {
+    buf: [u8; CAP],
+    head: usize,
+    len: usize,
+}
+
+impl<const CAP: usize> ByteRing<CAP> {
+    const fn new() -> Self {
+        Self {
+            buf: [0; CAP],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    fn push_drop_oldest(&mut self, byte: u8) {
+        if CAP == 0 {
+            return;
+        }
+        if self.len == CAP {
+            self.buf[self.head] = byte;
+            self.head = (self.head + 1) % CAP;
+            return;
+        }
+
+        let tail = (self.head + self.len) % CAP;
+        self.buf[tail] = byte;
+        self.len += 1;
+    }
+
+    fn pop_front(&mut self) -> Option<u8> {
+        if self.len == 0 {
+            return None;
+        }
+
+        let byte = self.buf[self.head];
+        self.head = (self.head + 1) % CAP;
+        self.len -= 1;
+        Some(byte)
+    }
+}
 
 struct SerialPort {
     base: u16,
@@ -66,8 +115,7 @@ impl SerialPort {
     /// `CONFIG_CONSOLE_POLL` / early-console putchar (`wait_for_xmitr()` in
     /// 8250_port.c), used there only because the caller has no maintenance
     /// loop left to retry from (KDB, panic, pre-scheduler boot prints). Used
-    /// here by the direct/synchronous write paths (`write_bytes`, `_print!`)
-    /// and by `flush_all_blocking()`. Do NOT use this from a budgeted
+    /// here by `flush_all_blocking()`. Do NOT use this from a budgeted
     /// maintenance pass that also needs to keep polling RX — see
     /// `write_byte_unchecked()` / `tx_ready()` below for that path.
     #[cfg(not(test))]
@@ -143,29 +191,22 @@ impl fmt::Write for SerialPort {
     }
 }
 
-lazy_static! {
-    static ref SERIAL1: Mutex<SerialPort> = Mutex::new(SerialPort::new(COM1));
-    static ref SERIAL_QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
-    static ref SERIAL_INPUT_QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
-}
+static SERIAL1: Mutex<SerialPort> = Mutex::new(SerialPort::new(COM1));
+static SERIAL_QUEUE: Mutex<ByteRing<SERIAL_QUEUE_CAP>> = Mutex::new(ByteRing::new());
+static SERIAL_INPUT_QUEUE: Mutex<ByteRing<SERIAL_INPUT_QUEUE_CAP>> = Mutex::new(ByteRing::new());
 
 /// Initialize COM1. Safe to call multiple times.
 pub fn init() {
     SERIAL1.lock().init();
 }
 
-/// Write a raw byte slice to COM1.
+/// Queue a raw byte slice for COM1.
 ///
 /// This is used by early console devices (e.g. `/dev/console`) and must not
-/// allocate or assume UTF-8.
+/// allocate, assume UTF-8, or spin on a disconnected serial sink.
 pub fn write_bytes(bytes: &[u8]) {
-    let mut port = SERIAL1.lock();
-    for &byte in bytes {
-        if byte == b'\n' {
-            port.write_byte(b'\r');
-        }
-        port.write_byte(byte);
-    }
+    enqueue_bytes(bytes);
+    let _ = flush_budget(SERIAL_QUEUE_CAP);
 }
 
 /// Queue raw bytes for later serial transmission.
@@ -182,11 +223,8 @@ pub fn enqueue_bytes(bytes: &[u8]) {
     }
 }
 
-fn enqueue_one(queue: &mut VecDeque<u8>, byte: u8) {
-    if queue.len() >= SERIAL_QUEUE_CAP {
-        let _ = queue.pop_front();
-    }
-    queue.push_back(byte);
+fn enqueue_one<const CAP: usize>(queue: &mut ByteRing<CAP>, byte: u8) {
+    queue.push_drop_oldest(byte);
 }
 
 /// Flush at most `budget` queued bytes to COM1 without blocking.
@@ -245,10 +283,7 @@ pub fn queued_len() -> usize {
 
 fn enqueue_input_byte(byte: u8) {
     let mut queue = SERIAL_INPUT_QUEUE.lock();
-    if queue.len() >= SERIAL_INPUT_QUEUE_CAP {
-        let _ = queue.pop_front();
-    }
-    queue.push_back(byte);
+    queue.push_drop_oldest(byte);
 }
 
 #[cfg(not(test))]
@@ -290,7 +325,18 @@ pub fn try_read_byte() -> Option<u8> {
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments<'_>) {
     use fmt::Write;
-    SERIAL1.lock().write_fmt(args).unwrap();
+
+    struct QueuedSerialWriter;
+
+    impl fmt::Write for QueuedSerialWriter {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            enqueue_bytes(s.as_bytes());
+            Ok(())
+        }
+    }
+
+    let _ = QueuedSerialWriter.write_fmt(args);
+    let _ = flush_budget(SERIAL_QUEUE_CAP);
 }
 
 #[macro_export]

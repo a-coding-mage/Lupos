@@ -918,6 +918,7 @@ unsafe fn exit_group_peers(current: *mut TaskStruct, code: i64) {
         crate::kernel::exit::exit_clear_child_tid(task);
         crate::kernel::exit::exit_mm(task);
         crate::kernel::exit::exit_files(task);
+        crate::kernel::cgroup::mark_pid_exited_from_cgroup((*task).pid);
         (*task).m26.exit_code = code as i32;
         crate::kernel::sched::dequeue_task(task);
         crate::kernel::exit::notify_exit_and_publish_zombie(task);

@@ -161,27 +161,60 @@ fn ext4_symlink(dir: &InodeRef, name: &str, target: &str, mode: u32) -> Result<I
     if name.is_empty() || name.len() > EXT4_NAME_LEN || target.is_empty() {
         return Err(EINVAL);
     }
-    if target.len() >= 60 {
-        return Err(ENOSYS);
-    }
     let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
     let sbi = get_sbi(&sb).ok_or(EINVAL)?;
     let inode = ext4_new_inode(&sbi, &sb, S_IFLNK | (mode & 0o7777), InodeKind::Symlink)?;
     let ext_inode = ext4_inode_of(&inode).ok_or(EINVAL)?;
     let mut raw = { *ext_inode.raw.lock() };
-    raw.i_flags = 0;
     raw.i_size_lo = (target.len() as u32).to_le();
     raw.i_size_hi = 0;
-    raw.i_blocks_lo = 0;
-    let mut i_block = [0u32; 15];
-    i_block_as_bytes_mut(&mut i_block)[..target.len()].copy_from_slice(target.as_bytes());
-    raw.i_block = i_block;
+
+    if target.len() < 60 {
+        raw.i_flags = 0;
+        raw.i_blocks_lo = 0;
+        let mut i_block = [0u32; 15];
+        i_block_as_bytes_mut(&mut i_block)[..target.len()].copy_from_slice(target.as_bytes());
+        raw.i_block = i_block;
+    } else {
+        let block_size = sbi.block_size as usize;
+        let target_blocks = target.len().div_ceil(block_size);
+        if target_blocks == 0 || target_blocks > 0x7fff {
+            return Err(EINVAL);
+        }
+
+        let mut i_block = raw.i_block;
+        let allocation = ext4_alloc_extent_append_blocks(
+            &sbi,
+            &mut raw,
+            &mut i_block,
+            0,
+            target_blocks as u16,
+            target_blocks as u16,
+            None,
+        )?;
+        if allocation.data_blocks < target_blocks as u16 {
+            return Err(EIO);
+        }
+
+        let mut block = alloc::vec![0u8; target_blocks * block_size];
+        block[..target.len()].copy_from_slice(target.as_bytes());
+        write_block(
+            &sbi.bdev,
+            allocation.data_block * sbi.block_size as u64 / 512,
+            &block,
+        )?;
+        raw.i_block = i_block;
+        ext4_add_i_blocks(&mut raw, allocation.allocated_blocks, sbi.block_size as u64)?;
+    }
+
     write_inode_metadata(&sbi, ext_inode.ino, &raw)?;
     *ext_inode.raw.lock() = raw;
     ext_inode
         .i_size
         .store(target.len() as u64, Ordering::Release);
-    ext_inode.i_blocks.store(0, Ordering::Release);
+    ext_inode
+        .i_blocks
+        .store(u32::from_le(raw.i_blocks_lo) as u64, Ordering::Release);
     inode.size.store(target.len() as u64, Ordering::Release);
     if let Err(err) = ext4_add_entry(dir, name, &inode, EXT4_FT_SYMLINK) {
         return Err(err);
@@ -3233,11 +3266,22 @@ mod tests {
         assert_eq!(tmp.kind, InodeKind::Directory);
         let state = ext4_create(&parent, "state", 0o644).expect("create regular file");
         assert_eq!(state.kind, InodeKind::Regular);
+        let long_target = "/devices/platform/serial8250/tty/ttyS0/subsystem/virtual/tty";
+        assert!(long_target.len() >= 60);
+        let long_link = ext4_symlink(&parent, "long-dev-link", long_target, 0o777)
+            .expect("create long symlink");
+        assert_eq!(long_link.kind, InodeKind::Symlink);
+        let long_link_ext = ext4_inode_of(&long_link).unwrap();
+        assert_ne!(long_link_ext.i_blocks.load(Ordering::Acquire), 0);
+        let mut link_buf = [0u8; 128];
+        let link_len = ext4_readlink(&long_link, &mut link_buf).expect("read long symlink");
+        assert_eq!(&link_buf[..link_len], long_target.as_bytes());
 
         let parent_ext = ext4_inode_of(&parent).unwrap();
         let entries = dir_read_all(&sbi, &parent_ext).unwrap();
         assert!(entries.iter().any(|entry| entry.name == "tmp"));
         assert!(entries.iter().any(|entry| entry.name == "state"));
+        assert!(entries.iter().any(|entry| entry.name == "long-dev-link"));
         assert_eq!(parent.nlink.load(Ordering::Acquire), 3);
 
         let child_ext = ext4_inode_of(&tmp).unwrap();
@@ -3299,13 +3343,13 @@ mod tests {
         let inode_bitmap = read_sectors(&bdev, 8, 2).unwrap();
         assert!(!metadata::bitmap_test(&inode_bitmap, 11).unwrap());
         assert!(!metadata::bitmap_test(&inode_bitmap, 12).unwrap());
-        assert!(!metadata::bitmap_test(&inode_bitmap, 13).unwrap());
+        assert!(metadata::bitmap_test(&inode_bitmap, 13).unwrap());
         let block_bitmap = read_sectors(&bdev, 6, 2).unwrap();
         assert!(!metadata::bitmap_test(&block_bitmap, 10).unwrap());
-        assert!(!metadata::bitmap_test(&block_bitmap, 11).unwrap());
+        assert!(metadata::bitmap_test(&block_bitmap, 11).unwrap());
         let gdt = read_sectors(&bdev, 4, 2).unwrap();
-        assert_eq!(u16::from_le_bytes([gdt[12], gdt[13]]), 90);
-        assert_eq!(u16::from_le_bytes([gdt[14], gdt[15]]), 4);
+        assert_eq!(u16::from_le_bytes([gdt[12], gdt[13]]), 89);
+        assert_eq!(u16::from_le_bytes([gdt[14], gdt[15]]), 3);
         assert_eq!(u16::from_le_bytes([gdt[16], gdt[17]]), 1);
         let super_bytes = read_sectors(&bdev, 2, 2).unwrap();
         assert_eq!(
@@ -3315,7 +3359,7 @@ mod tests {
                 super_bytes[14],
                 super_bytes[15]
             ]),
-            90
+            89
         );
         assert_eq!(
             u32::from_le_bytes([
@@ -3324,7 +3368,7 @@ mod tests {
                 super_bytes[18],
                 super_bytes[19]
             ]),
-            2
+            3
         );
     }
 

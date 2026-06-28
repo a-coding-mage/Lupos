@@ -158,6 +158,41 @@ fn trace_unix_sendmsg(fd: i32, path: Option<&str>, bytes: &[u8], result: &Result
 }
 
 #[cfg(not(test))]
+fn trace_notify_sendmsg(
+    fd: i32,
+    path: Option<&str>,
+    bytes: &[u8],
+    fd_count: usize,
+    result: &Result<usize, i32>,
+) {
+    if !crate::kernel::debug_trace::cgroup_enabled() {
+        return;
+    }
+    let Some(path) = path else {
+        return;
+    };
+    if path != "/run/systemd/notify" {
+        return;
+    }
+    let cred = trace_current_ucred();
+    let ret = match result {
+        Ok(n) => *n as i64,
+        Err(errno) => -(*errno as i64),
+    };
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-notify-send fd={} bytes={} fds={} ret={} pid={} uid={} gid={} payload=\"{}\"",
+        fd,
+        bytes.len(),
+        fd_count,
+        ret,
+        cred.pid,
+        cred.uid,
+        cred.gid,
+        trace_payload_prefix(bytes)
+    );
+}
+
+#[cfg(not(test))]
 fn trace_unix_recvmsg(
     fd: i32,
     sock: &SocketRef,
@@ -165,6 +200,7 @@ fn trace_unix_recvmsg(
     packet_cred: &socket::SocketCred,
     passcred: bool,
     passpidfd: bool,
+    fd_count: usize,
     controllen: usize,
     flags: i32,
 ) {
@@ -183,10 +219,11 @@ fn trace_unix_recvmsg(
         return;
     }
     crate::linux_driver_abi::tty::serial_println!(
-        "trace-unix-recvmsg fd={} local={} bytes={} packet_pid={} packet_uid={} packet_gid={} passcred={} passpidfd={} controllen={} flags={:#x} payload=\"{}\"",
+        "trace-unix-recvmsg fd={} local={} bytes={} fds={} packet_pid={} packet_uid={} packet_gid={} passcred={} passpidfd={} controllen={} flags={:#x} payload=\"{}\"",
         fd,
         local.as_deref().unwrap_or("-"),
         bytes.len(),
+        fd_count,
         packet_cred.pid,
         packet_cred.uid,
         packet_cred.gid,
@@ -195,6 +232,48 @@ fn trace_unix_recvmsg(
         controllen,
         flags,
         payload
+    );
+}
+
+#[cfg(not(test))]
+fn trace_notify_recvmsg(
+    fd: i32,
+    sock: &SocketRef,
+    bytes: &[u8],
+    packet_cred: &socket::SocketCred,
+    passcred: bool,
+    passpidfd: bool,
+    fd_count: usize,
+    controllen: usize,
+    flags: i32,
+) {
+    if !crate::kernel::debug_trace::cgroup_enabled() {
+        return;
+    }
+    let local = {
+        let socket = sock.lock();
+        match socket.local.as_ref() {
+            Some(SockAddr::Unix(path)) if path == "/run/systemd/notify" => Some(path.clone()),
+            _ => None,
+        }
+    };
+    let Some(local) = local else {
+        return;
+    };
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-notify-recv fd={} local={} bytes={} fds={} packet_pid={} packet_uid={} packet_gid={} passcred={} passpidfd={} controllen={} flags={:#x} payload=\"{}\"",
+        fd,
+        local,
+        bytes.len(),
+        fd_count,
+        packet_cred.pid,
+        packet_cred.uid,
+        packet_cred.gid,
+        passcred,
+        passpidfd,
+        controllen,
+        flags,
+        trace_payload_prefix(bytes)
     );
 }
 
@@ -1730,17 +1809,7 @@ pub unsafe fn sys_sendmsg(fd: i32, msg: *const LinuxMsghdr, flags: i32) -> i64 {
                 {
                     trace_dest_path = Some(path.clone());
                 }
-                if files.is_empty() {
-                    socket::sendto(&sock, &bytes, peer)
-                } else {
-                    // Connectionless fd-passing isn't used by the
-                    // current systemd executor model (it uses
-                    // socketpair + connected sendmsg) so we drop the
-                    // fds on the floor in the rare sendto-with-cmsg
-                    // case — closer to Linux's silent ignore than a
-                    // hard error.
-                    socket::sendto(&sock, &bytes, peer)
-                }
+                socket::sendto_with_fds(&sock, &bytes, peer, files)
             }
             Err(errno) => Err(errno),
         }
@@ -1749,6 +1818,14 @@ pub unsafe fn sys_sendmsg(fd: i32, msg: *const LinuxMsghdr, flags: i32) -> i64 {
     };
     #[cfg(not(test))]
     trace_unix_sendmsg(fd, trace_dest_path.as_deref(), &bytes, &result);
+    #[cfg(not(test))]
+    trace_notify_sendmsg(
+        fd,
+        trace_dest_path.as_deref(),
+        &bytes,
+        scm_fds.len(),
+        &result,
+    );
     match result {
         Ok(n) => n as i64,
         Err(errno) => -(errno as i64),
@@ -1810,6 +1887,19 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
         &packet_cred,
         passcred,
         passpidfd,
+        files.len(),
+        msgval.controllen,
+        flags,
+    );
+    #[cfg(not(test))]
+    trace_notify_recvmsg(
+        fd,
+        &sock,
+        &tmp[..n],
+        &packet_cred,
+        passcred,
+        passpidfd,
+        files.len(),
         msgval.controllen,
         flags,
     );
@@ -4086,6 +4176,169 @@ mod tests {
             sched::set_current(previous);
             put_pid(current.m26.thread_pid);
             current.m26.thread_pid = core::ptr::null_mut();
+        }
+    }
+
+    #[test]
+    fn unix_passcred_recvmsg_delivers_sendmsg_name_credentials() {
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        *crate::fs::mount::MOUNTS.root.lock() = None;
+        crate::fs::mount::MOUNTS.by_path.lock().clear();
+        let sb = crate::fs::super_block::mount_fs("ramfs", "", 0, "").expect("ramfs mount");
+        let root = sb.root().expect("root dentry");
+        crate::fs::mount::set_rootfs(crate::fs::mount::Mount::alloc(sb, root, 0));
+
+        let previous = unsafe { sched::get_current() };
+        let mut manager = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        manager.pid = 1;
+        manager.tgid = 1;
+        manager.cred = &raw const INIT_CRED;
+        let manager_kpid = alloc_pid(&INIT_PID_NS, Some(manager.pid)).expect("manager pid alloc");
+        manager.m26.thread_pid = Box::into_raw(manager_kpid);
+
+        let mut service = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        service.pid = 465;
+        service.tgid = 465;
+        service.cred = &raw const INIT_CRED;
+        let service_kpid = alloc_pid(&INIT_PID_NS, Some(service.pid)).expect("service pid alloc");
+        service.m26.thread_pid = Box::into_raw(service_kpid);
+
+        unsafe {
+            files::set_task_files(&mut *manager as *mut TaskStruct, FilesStruct::new());
+            files::set_task_files(&mut *service as *mut TaskStruct, FilesStruct::new());
+
+            sched::set_current(&mut *manager as *mut TaskStruct);
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdirat(AT_FDCWD, b"/run\0".as_ptr(), 0o755),
+                0
+            );
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdirat(AT_FDCWD, b"/run/systemd\0".as_ptr(), 0o755),
+                0
+            );
+
+            let server = sys_socket(AF_UNIX as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(server >= 0);
+            let one = 1u32;
+            assert_eq!(
+                sys_setsockopt(
+                    server as i32,
+                    SOL_SOCKET,
+                    socket::SO_PASSCRED as i32,
+                    &one as *const u32 as *const u8,
+                    4,
+                ),
+                0
+            );
+            let (addr, addr_len) = unix_sockaddr("/run/systemd/notify");
+            assert_eq!(sys_bind(server as i32, addr.as_ptr(), addr_len), 0);
+
+            sched::set_current(&mut *service as *mut TaskStruct);
+            let client = sys_socket(AF_UNIX as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(client >= 0);
+            let passed = crate::fs::file::alloc_file(
+                crate::fs::dcache::d_alloc("udevd-inotify"),
+                0,
+                0,
+                &crate::fs::ops::NOOP_FILE_OPS,
+            );
+            let source_fd = current_files()
+                .unwrap()
+                .install(passed.clone(), false)
+                .unwrap();
+            let mut send_control = [0u8; 32];
+            let (send_control_len, truncated) =
+                write_scm_rights(send_control.as_mut_ptr(), send_control.len(), &[source_fd])
+                    .unwrap();
+            assert!(!truncated);
+
+            let payload = b"FDSTORE=1\nFDNAME=inotify\n";
+            let mut send_iov = [LinuxIovec {
+                base: payload.as_ptr() as *mut u8,
+                len: payload.len(),
+            }];
+            let send_hdr = LinuxMsghdr {
+                name: addr.as_ptr() as *mut u8,
+                namelen: addr_len,
+                iov: send_iov.as_mut_ptr(),
+                iovlen: 1,
+                control: send_control.as_mut_ptr(),
+                controllen: send_control_len,
+                flags: 0,
+            };
+            assert_eq!(
+                sys_sendmsg(client as i32, &send_hdr, 0),
+                payload.len() as i64
+            );
+
+            sched::set_current(&mut *manager as *mut TaskStruct);
+            let mut body = [0u8; 64];
+            let mut recv_iov = [LinuxIovec {
+                base: body.as_mut_ptr(),
+                len: body.len(),
+            }];
+            let mut control = [0u8; 64];
+            let mut recv_hdr = LinuxMsghdr {
+                name: core::ptr::null_mut(),
+                namelen: 0,
+                iov: recv_iov.as_mut_ptr(),
+                iovlen: 1,
+                control: control.as_mut_ptr(),
+                controllen: control.len(),
+                flags: 0,
+            };
+            assert_eq!(
+                sys_recvmsg(server as i32, &mut recv_hdr, MSG_CMSG_CLOEXEC),
+                payload.len() as i64
+            );
+            assert_eq!(&body[..payload.len()], payload);
+            assert_eq!(recv_hdr.flags & MSG_CTRUNC, 0);
+            assert_eq!(
+                recv_hdr.controllen,
+                cmsg_align(CMSG_HDR_LEN + core::mem::size_of::<LinuxUcred>())
+                    + cmsg_align(CMSG_HDR_LEN + core::mem::size_of::<i32>())
+            );
+
+            let cmsg_len = core::ptr::read_unaligned(control.as_ptr() as *const usize);
+            let cmsg_level = core::ptr::read_unaligned(control.as_ptr().add(8) as *const i32);
+            let cmsg_type = core::ptr::read_unaligned(control.as_ptr().add(12) as *const i32);
+            let cred =
+                core::ptr::read_unaligned(control.as_ptr().add(CMSG_HDR_LEN) as *const LinuxUcred);
+            assert_eq!(cmsg_len, CMSG_HDR_LEN + core::mem::size_of::<LinuxUcred>());
+            assert_eq!(cmsg_level, SOL_SOCKET);
+            assert_eq!(cmsg_type, SCM_CREDENTIALS);
+            assert_eq!(
+                cred,
+                LinuxUcred {
+                    pid: 465,
+                    uid: 0,
+                    gid: 0
+                }
+            );
+            let rights_off = cmsg_align(CMSG_HDR_LEN + core::mem::size_of::<LinuxUcred>());
+            let rights_cmsg = control.as_ptr().add(rights_off);
+            let rights_len = core::ptr::read_unaligned(rights_cmsg as *const usize);
+            let rights_level = core::ptr::read_unaligned(rights_cmsg.add(8) as *const i32);
+            let rights_type = core::ptr::read_unaligned(rights_cmsg.add(12) as *const i32);
+            let received_fd =
+                core::ptr::read_unaligned(rights_cmsg.add(CMSG_HDR_LEN) as *const i32);
+            assert_eq!(rights_len, CMSG_HDR_LEN + core::mem::size_of::<i32>());
+            assert_eq!(rights_level, SOL_SOCKET);
+            assert_eq!(rights_type, SCM_RIGHTS);
+            let manager_files = current_files().unwrap();
+            assert!(alloc::sync::Arc::ptr_eq(
+                &manager_files.get(received_fd).unwrap(),
+                &passed
+            ));
+
+            files::drop_task_files(&mut *service as *mut TaskStruct);
+            files::drop_task_files(&mut *manager as *mut TaskStruct);
+            sched::set_current(previous);
+            put_pid(service.m26.thread_pid);
+            service.m26.thread_pid = core::ptr::null_mut();
+            put_pid(manager.m26.thread_pid);
+            manager.m26.thread_pid = core::ptr::null_mut();
         }
     }
 

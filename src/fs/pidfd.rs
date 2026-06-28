@@ -23,7 +23,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::fs::anon_inode::alloc_anon_file;
+use crate::fs::anon_inode::alloc_anon_file_with_ino;
 use crate::fs::ops::{FileOps, SuperOps};
 use crate::fs::syscalls::POLLIN;
 use crate::fs::types::{FileRef, SuperBlock};
@@ -139,6 +139,13 @@ static PIDFS_SUPER_OPS: SuperOps = SuperOps {
     alloc_inode: None,
     destroy_inode: None,
 };
+
+fn pidfs_ino_for_kpid(kpid: *mut KPid) -> Result<u64, i32> {
+    if kpid.is_null() {
+        return Err(ESRCH);
+    }
+    Ok(unsafe { (*kpid).pidfs_ino })
+}
 
 fn current_files() -> Result<Arc<crate::fs::fdtable::FilesStruct>, i32> {
     let task = unsafe { sched::get_current() };
@@ -324,7 +331,7 @@ fn install_pidfd_state(
         },
     );
 
-    let file = alloc_anon_file("pidfd", &PIDFD_FILE_OPS, token);
+    let file = alloc_anon_file_with_ino("pidfd", &PIDFD_FILE_OPS, token, pidfs_ino_for_kpid(kpid)?);
     if let Some(inode) = file.inode() {
         *inode.sb.lock() = Some(SuperBlock::alloc("pidfs", PID_FS_MAGIC, &PIDFS_SUPER_OPS));
     }
@@ -548,6 +555,45 @@ mod tests {
             files.close(fd).expect("close pidfd");
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
+            target.m26.thread_pid = core::ptr::null_mut();
+        }
+    }
+
+    #[test]
+    fn pidfd_stat_ino_is_stable_for_same_struct_pid() {
+        let previous = unsafe { sched::get_current() };
+
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 428;
+        current.tgid = 428;
+        current.cred = &raw const INIT_CRED;
+
+        let mut target = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        target.pid = 429;
+        target.tgid = 429;
+        target.cred = &raw const INIT_CRED;
+        let kpid = alloc_pid(&INIT_PID_NS, Some(target.pid)).expect("pid alloc");
+        target.m26.thread_pid = Box::into_raw(kpid);
+
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let first = install_pidfd(&mut *target as *mut TaskStruct, false).expect("pidfd");
+            let second = install_pidfd(&mut *target as *mut TaskStruct, false).expect("pidfd");
+            let mut first_stat = crate::fs::syscalls::LinuxStat::default();
+            let mut second_stat = crate::fs::syscalls::LinuxStat::default();
+
+            assert_eq!(crate::fs::syscalls::sys_fstat(first, &mut first_stat), 0);
+            assert_eq!(crate::fs::syscalls::sys_fstat(second, &mut second_stat), 0);
+            assert_eq!(first_stat.st_ino, second_stat.st_ino);
+
+            let files = files::get_task_files(&mut *current as *mut TaskStruct).expect("files");
+            files.close(first).expect("close first pidfd");
+            files.close(second).expect("close second pidfd");
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+            put_pid(target.m26.thread_pid);
             target.m26.thread_pid = core::ptr::null_mut();
         }
     }

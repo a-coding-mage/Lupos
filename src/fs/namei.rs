@@ -89,7 +89,15 @@ pub fn path_lookupat(ctx: &LookupCtx, path: &str) -> Result<DentryRef, i32> {
 
         let next = if let Some(d) = d_lookup(&cur, comp) {
             if d.inode().is_none() {
-                return Err(ENOENT);
+                if let Some(lookup) = dir.ops.lookup {
+                    match lookup(&dir, comp) {
+                        Ok(inode) => d.instantiate(inode),
+                        Err(ENOENT) => return Err(ENOENT),
+                        Err(errno) => return Err(errno),
+                    }
+                } else {
+                    return Err(ENOENT);
+                }
             }
             d
         } else {

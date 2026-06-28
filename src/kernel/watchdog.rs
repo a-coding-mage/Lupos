@@ -25,31 +25,9 @@ static WATCHDOG_THRESH_SECS: AtomicU64 = AtomicU64::new(WATCHDOG_THRESH_DEFAULT_
 
 struct WatchdogSerial;
 
-impl WatchdogSerial {
-    #[cfg(not(test))]
-    fn write_byte(byte: u8) {
-        const COM1: u16 = 0x3F8;
-        unsafe {
-            use crate::arch::x86::include::asm::io::{inb, outb};
-            while inb(COM1 + 5) & 0x20 == 0 {
-                core::hint::spin_loop();
-            }
-            outb(COM1, byte);
-        }
-    }
-
-    #[cfg(test)]
-    fn write_byte(_byte: u8) {}
-}
-
 impl core::fmt::Write for WatchdogSerial {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for byte in s.bytes() {
-            if byte == b'\n' {
-                Self::write_byte(b'\r');
-            }
-            Self::write_byte(byte);
-        }
+        crate::linux_driver_abi::tty::serial::enqueue_bytes(s.as_bytes());
         Ok(())
     }
 }
@@ -60,6 +38,7 @@ fn watchdog_serial_println(args: core::fmt::Arguments<'_>) {
     let mut serial = WatchdogSerial;
     let _ = serial.write_fmt(args);
     let _ = serial.write_str("\n");
+    let _ = crate::linux_driver_abi::tty::serial::flush_budget(1024);
 }
 
 pub const fn get_softlockup_thresh(watchdog_thresh_secs: u64) -> u64 {
@@ -374,5 +353,18 @@ mod tests {
         assert!(!watchdog_tick_at(0, 13, None, false));
         assert!(watchdog_tick_at(0, 14, None, false));
         assert_eq!(softlockup_report_count(0), 2);
+    }
+
+    #[test]
+    fn watchdog_serial_report_uses_nonblocking_serial_queue() {
+        let _guard = TEST_LOCK.lock();
+        crate::linux_driver_abi::tty::serial::clear_capture_for_tests();
+
+        watchdog_serial_println(format_args!("watchdog queue report"));
+
+        assert_eq!(
+            crate::linux_driver_abi::tty::serial::captured_bytes_for_tests(),
+            b"watchdog queue report\r\n"
+        );
     }
 }

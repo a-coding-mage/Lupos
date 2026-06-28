@@ -148,7 +148,7 @@ pub unsafe fn sys_openat(dirfd: i32, filename: *const u8, flags: i32, mode: u32)
     let how = build_open_how_for_openat(flags, mode);
 
     let opened_path = path_hint_for_open(&ft, dirfd, path);
-    let ret = match do_openat2(root, start, path, &how) {
+    let ret = match do_openat2_with_hint(root, start, path, &how, opened_path.as_deref()) {
         Ok(r) => match ft.install(r.file, r.cloexec) {
             Ok(fd) => {
                 let integrity_path = opened_path.clone();
@@ -243,6 +243,16 @@ pub fn do_openat2(
     path: &str,
     how: &OpenHow,
 ) -> Result<OpenResult, i32> {
+    do_openat2_with_hint(root, dir, path, how, None)
+}
+
+pub(crate) fn do_openat2_with_hint(
+    root: DentryRef,
+    dir: DentryRef,
+    path: &str,
+    how: &OpenHow,
+    hinted_path: Option<&str>,
+) -> Result<OpenResult, i32> {
     validate_open_how(how)?;
     if absent_lsm_sysfs_probe_path(path) {
         return Err(ENOENT);
@@ -253,79 +263,14 @@ pub fn do_openat2(
         return Err(EINVAL);
     }
     if flags & O_CREAT == 0 {
-        if let Some(result) =
-            crate::fs::proc::fd::current_fdinfo_file_from_proc_path(path, flags, mode)
-        {
-            if flags & O_DIRECTORY != 0 {
-                return Err(crate::include::uapi::errno::ENOTDIR);
-            }
-            if flags & O_PATH != 0 {
-                return result.map(|file| OpenResult {
-                    file,
-                    cloexec: flags & O_CLOEXEC != 0,
-                });
-            }
-            if flags & O_ACCMODE != 0 {
-                return Err(EACCES);
-            }
-            return result.map(|file| OpenResult {
-                file,
-                cloexec: flags & O_CLOEXEC != 0,
-            });
+        if let Some(result) = proc_special_open_result(path, flags, mode) {
+            return result;
         }
-        if let Some(result) =
-            crate::fs::proc::base::process_stat_file_from_proc_path(path, flags, mode)
+        if let Some(hinted_path) = hinted_path
+            && hinted_path != path
+            && let Some(result) = proc_special_open_result(hinted_path, flags, mode)
         {
-            if flags & O_DIRECTORY != 0 {
-                return Err(crate::include::uapi::errno::ENOTDIR);
-            }
-            if flags & O_PATH != 0 {
-                return result.map(|file| OpenResult {
-                    file,
-                    cloexec: flags & O_CLOEXEC != 0,
-                });
-            }
-            if flags & O_ACCMODE != 0 {
-                return Err(EACCES);
-            }
-            return result.map(|file| OpenResult {
-                file,
-                cloexec: flags & O_CLOEXEC != 0,
-            });
-        }
-        if let Some(result) =
-            crate::fs::proc::task_mmu::process_task_mmu_file_from_proc_path(path, flags, mode)
-        {
-            if flags & O_DIRECTORY != 0 {
-                return Err(crate::include::uapi::errno::ENOTDIR);
-            }
-            if flags & O_PATH != 0 {
-                return result.map(|file| OpenResult {
-                    file,
-                    cloexec: flags & O_CLOEXEC != 0,
-                });
-            }
-            return result.map(|file| OpenResult {
-                file,
-                cloexec: flags & O_CLOEXEC != 0,
-            });
-        }
-        if let Some(result) =
-            crate::fs::proc::page::kpageflags_file_from_proc_path(path, flags, mode)
-        {
-            if flags & O_DIRECTORY != 0 {
-                return Err(crate::include::uapi::errno::ENOTDIR);
-            }
-            if flags & O_PATH != 0 {
-                return result.map(|file| OpenResult {
-                    file,
-                    cloexec: flags & O_CLOEXEC != 0,
-                });
-            }
-            return result.map(|file| OpenResult {
-                file,
-                cloexec: flags & O_CLOEXEC != 0,
-            });
+            return result;
         }
     }
 
@@ -411,14 +356,35 @@ pub fn do_openat2(
                         return Err(EEXIST);
                     }
                     d
-                } else if flags & O_CREAT != 0 {
-                    let create = parent_inode.ops.create.ok_or(EINVAL)?;
-                    let inode = create(&parent_inode, last, mode)?;
-                    d.instantiate(inode);
-                    super::inotify::notify_create(&parent_dentry, last, false);
-                    d
                 } else {
-                    return Err(ENOENT);
+                    if let Some(lookup) = parent_inode.ops.lookup {
+                        match lookup(&parent_inode, last) {
+                            Ok(inode) => {
+                                if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
+                                    return Err(EEXIST);
+                                }
+                                d.instantiate(inode);
+                                d
+                            }
+                            Err(ENOENT) if flags & O_CREAT != 0 => {
+                                let create = parent_inode.ops.create.ok_or(EINVAL)?;
+                                let inode = create(&parent_inode, last, mode)?;
+                                d.instantiate(inode);
+                                super::inotify::notify_create(&parent_dentry, last, false);
+                                d
+                            }
+                            Err(ENOENT) => return Err(ENOENT),
+                            Err(errno) => return Err(errno),
+                        }
+                    } else if flags & O_CREAT != 0 {
+                        let create = parent_inode.ops.create.ok_or(EINVAL)?;
+                        let inode = create(&parent_inode, last, mode)?;
+                        d.instantiate(inode);
+                        super::inotify::notify_create(&parent_dentry, last, false);
+                        d
+                    } else {
+                        return Err(ENOENT);
+                    }
                 }
             }
             None => {
@@ -497,6 +463,54 @@ pub fn do_openat2(
         file: f,
         cloexec: flags & O_CLOEXEC != 0,
     })
+}
+
+fn read_only_proc_open_result(result: Result<FileRef, i32>, flags: u32) -> Result<OpenResult, i32> {
+    if flags & O_DIRECTORY != 0 {
+        return Err(crate::include::uapi::errno::ENOTDIR);
+    }
+    if flags & O_PATH == 0 && flags & O_ACCMODE != 0 {
+        return Err(EACCES);
+    }
+    result.map(|file| OpenResult {
+        file,
+        cloexec: flags & O_CLOEXEC != 0,
+    })
+}
+
+fn proc_file_open_result(result: Result<FileRef, i32>, flags: u32) -> Result<OpenResult, i32> {
+    if flags & O_DIRECTORY != 0 {
+        return Err(crate::include::uapi::errno::ENOTDIR);
+    }
+    result.map(|file| OpenResult {
+        file,
+        cloexec: flags & O_CLOEXEC != 0,
+    })
+}
+
+fn proc_special_open_result(path: &str, flags: u32, mode: u32) -> Option<Result<OpenResult, i32>> {
+    if let Some(result) = crate::fs::proc::fd::current_fdinfo_file_from_proc_path(path, flags, mode)
+    {
+        return Some(read_only_proc_open_result(result, flags));
+    }
+    if let Some(result) = crate::fs::proc::base::process_stat_file_from_proc_path(path, flags, mode)
+    {
+        return Some(read_only_proc_open_result(result, flags));
+    }
+    if let Some(result) =
+        crate::fs::proc::base::process_cgroup_file_from_proc_path(path, flags, mode)
+    {
+        return Some(read_only_proc_open_result(result, flags));
+    }
+    if let Some(result) =
+        crate::fs::proc::task_mmu::process_task_mmu_file_from_proc_path(path, flags, mode)
+    {
+        return Some(proc_file_open_result(result, flags));
+    }
+    if let Some(result) = crate::fs::proc::page::kpageflags_file_from_proc_path(path, flags, mode) {
+        return Some(proc_file_open_result(result, flags));
+    }
+    None
 }
 
 fn absent_lsm_sysfs_probe_path(path: &str) -> bool {
@@ -1172,6 +1186,48 @@ mod tests {
     }
 
     #[test]
+    fn do_openat2_revalidates_stale_negative_cgroup_events() {
+        let _guard = mount::TEST_MOUNT_LOCK.lock();
+        let _lsm_guard = TEST_LSM_LOCK.lock();
+
+        reset_for_test();
+        OPEN_LOG.lock().unwrap().clear();
+
+        let root = setup_rootfs();
+        let sys = ensure_dir(&root, "/sys");
+        let fs_dir = ensure_dir(&sys, "fs");
+        ensure_dir(&fs_dir, "cgroup");
+        mount::do_mount("cgroup2", "cgroup2", "/sys/fs/cgroup", 0, "").expect("mount cgroup2");
+        let (_, cg_root) = mount::resolve_path_follow("/sys/fs/cgroup").expect("cgroup root");
+        let cg_inode = cg_root.inode().expect("cgroup inode");
+        let mkdir = cg_inode.ops.mkdir.expect("cgroup mkdir");
+        let system = mkdir(&cg_inode, "system.slice", 0o755).expect("system.slice");
+        let system_dentry = d_alloc_child(&cg_root, "system.slice");
+        system_dentry.instantiate(system.clone());
+        let service = mkdir(&system, "systemd-remount-fs.service", 0o755).expect("service");
+        let service_dentry = d_alloc_child(&system_dentry, "systemd-remount-fs.service");
+        service_dentry.instantiate(service);
+        let stale = d_alloc_child(&service_dentry, "cgroup.events");
+        assert!(stale.is_negative());
+
+        let how = OpenHow {
+            flags: crate::include::uapi::fcntl::O_RDONLY as u64,
+            ..OpenHow::default()
+        };
+        let opened = do_openat2(
+            root.clone(),
+            root,
+            "/sys/fs/cgroup/system.slice/systemd-remount-fs.service/cgroup.events",
+            &how,
+        )
+        .expect("stale negative cgroup.events must revalidate");
+
+        assert!(alloc::sync::Arc::ptr_eq(&opened.file.dentry, &stale));
+        assert!(!stale.is_negative());
+        assert_eq!(opened.file.fops.name, "kernfs_file");
+    }
+
+    #[test]
     fn do_openat2_reports_absent_lsm_sysfs_mounts() {
         let _guard = mount::TEST_MOUNT_LOCK.lock();
         let _lsm_guard = TEST_LSM_LOCK.lock();
@@ -1354,5 +1410,34 @@ mod tests {
 
         assert_eq!(file_path(&opened.file), "/run/auditd.pid");
         assert!(mount::resolve_path_follow("/run/auditd.pid").is_ok());
+    }
+
+    #[test]
+    fn do_openat2_with_hint_opens_relative_proc_pid_cgroup() {
+        let _guard = mount::TEST_MOUNT_LOCK.lock();
+
+        reset_for_test();
+        let root = setup_rootfs();
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let cred = Box::new(unprivileged_cred());
+        let previous = install_unprivileged_current(&mut current, &cred);
+
+        let how = OpenHow {
+            flags: crate::include::uapi::fcntl::O_RDONLY as u64,
+            ..OpenHow::default()
+        };
+        let opened = do_openat2_with_hint(
+            root.clone(),
+            root,
+            "cgroup",
+            &how,
+            Some("/proc/4242/cgroup"),
+        )
+        .expect("relative proc cgroup");
+
+        unsafe { sched::set_current(previous) };
+        assert_eq!(opened.file.fops.name, "proc-pid-cgroup");
+        current.cred = &raw const INIT_CRED;
+        current.m27.real_cred = &raw const INIT_CRED;
     }
 }

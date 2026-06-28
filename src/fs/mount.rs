@@ -1101,7 +1101,16 @@ fn path_components(path: &str) -> Vec<String> {
 fn lookup_child(parent: &DentryRef, name: &str) -> Result<DentryRef, i32> {
     if let Some(dentry) = super::dcache::d_lookup(parent, name) {
         if dentry.inode().is_none() {
-            return Err(ENOENT);
+            let dir_inode = parent.inode().ok_or(ENOENT)?;
+            let lookup = dir_inode.ops.lookup.ok_or(ENOENT)?;
+            match lookup(&dir_inode, name) {
+                Ok(inode) => {
+                    dentry.instantiate(inode);
+                    return Ok(dentry);
+                }
+                Err(ENOENT) => return Err(ENOENT),
+                Err(errno) => return Err(errno),
+            }
         }
         return Ok(dentry);
     }
@@ -1168,7 +1177,7 @@ pub fn pivot_root(new_root: &str, _put_old: &str) -> Result<(), i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::dcache::d_alloc_child;
+    use crate::fs::dcache::{d_alloc_child, d_lookup};
     use crate::fs::super_block::mount_fs;
     use crate::include::uapi::mount::{MS_BIND, MS_MOVE, MS_RDONLY, MS_REC, MS_REMOUNT};
 
@@ -1225,6 +1234,30 @@ mod tests {
             0
         );
         assert!(rootfs().expect("rootfs").is_readonly());
+    }
+
+    #[test]
+    fn resolve_path_revalidates_negative_dentry_after_filesystem_create() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", 0, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        set_rootfs(Mount::alloc(sb, root.clone(), 0));
+        let etc = mkdir_dentry(&root, "etc");
+
+        assert_eq!(resolve_path_follow("/etc/ld.so.cache").err(), Some(ENOENT));
+        let stale = d_lookup(&etc, "ld.so.cache").expect("negative dentry");
+        assert!(stale.is_negative());
+
+        let etc_inode = etc.inode().expect("/etc inode");
+        let create = etc_inode.ops.create.expect("create op");
+        create(&etc_inode, "ld.so.cache", 0o644).expect("create behind stale dentry");
+
+        let (_mount, resolved) = resolve_path_follow("/etc/ld.so.cache").expect("revalidated");
+        assert!(alloc::sync::Arc::ptr_eq(&resolved, &stale));
+        assert!(!stale.is_negative());
     }
 
     #[test]

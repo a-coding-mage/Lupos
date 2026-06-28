@@ -4194,7 +4194,7 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             //   pr_info("Run %s as init process\n", execute_command);
             log_info!("", "Run /sbin/init as init process");
             init::boot_trace::record("init", "exec /sbin/init");
-            kernel::console::flush_all_blocking();
+            kernel::console::flush_all_nonblocking();
             // Linux envp_init: vendor/linux/init/main.c
             //   static const char *envp_init[] = { "HOME=/", "TERM=linux", NULL, };
             if kernel::debug_trace::proc_enabled() {

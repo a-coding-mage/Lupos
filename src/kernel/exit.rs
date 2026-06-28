@@ -17,9 +17,9 @@
 //!
 //! Reference: `vendor/linux/kernel/exit.c`.
 
-extern crate alloc;
-
 use core::sync::atomic::Ordering;
+
+extern crate alloc;
 
 use crate::arch::x86::kernel::uaccess;
 use crate::kernel::fork::heap_task_release;
@@ -83,6 +83,7 @@ pub unsafe fn do_exit(code: i64) -> ! {
         exit_mm(tsk);
         exit_files(tsk);
         crate::fs::fs_struct::exit_fs(tsk);
+        crate::kernel::cgroup::mark_pid_exited_from_cgroup((*tsk).pid);
 
         notify_exit_and_publish_zombie(tsk);
     }
@@ -355,6 +356,7 @@ pub unsafe fn release_task(p: *mut TaskStruct) {
 
         // 3. Remove from the run queue so the scheduler stops considering it.
         sched::dequeue_task(p);
+        crate::kernel::cgroup::forget_pid_cgroup((*p).pid);
 
         // 4. Mark EXIT_DEAD just before the final drop, so any concurrent
         //    observer sees the transient state (Linux symmetry).

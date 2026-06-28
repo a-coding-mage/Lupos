@@ -130,6 +130,7 @@ src/block/bdev.rs	pending-migration: Excluded from migrated Linux C map until th
 src/block/bfq_cgroup.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/bfq-cgroup.c.
 src/block/bfq_iosched.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/bfq-iosched.c.
 src/block/bfq_wf2q.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/bfq-wf2q.c.
+src/block/bcache.rs	pending-migration: Source-backed VirtualBox boot cache slice of vendor/linux/fs/buffer.c; excluded until block buffer cache is a complete 1:1 translation.
 src/block/bio_integrity.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/bio-integrity.c.
 src/block/blk_cgroup.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/blk-cgroup.c.
 src/block/blk_mq.rs	pending-migration: Excluded from migrated Linux C map until this is a complete 1:1 translation of vendor/linux/block/blk-mq.c.

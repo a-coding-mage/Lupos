@@ -40,7 +40,7 @@ use crate::kernel::{files, sched};
 
 use super::mount;
 use super::namei::{LookupCtx, path_lookupat};
-use super::openat::{do_openat2, sys_openat};
+use super::openat::{do_openat2, do_openat2_with_hint, sys_openat};
 use super::ops::{NOOP_FILE_OPS, NOOP_INODE_OPS};
 use super::read_write::{vfs_fsync, vfs_lseek, vfs_read, vfs_write};
 use super::select;
@@ -448,6 +448,39 @@ fn trace_run_path(op: &str, dirfd: i32, path: &str, flags: i32, ret: i64) {
 }
 
 #[cfg(not(test))]
+fn trace_run_symlinkat(dirfd: i32, path: &str, target: &str, parent_ops: &str, ret: i64) {
+    if !crate::kernel::debug_trace::fs_enabled() {
+        return;
+    }
+    if !(ret == -(ENOSYS as i64)
+        || path.contains("run")
+        || path.contains("systemd")
+        || path.contains("journal")
+        || path.contains("udev")
+        || path.starts_with("/dev")
+        || path.starts_with("/proc")
+        || path.starts_with("/sys"))
+    {
+        return;
+    }
+    let task = unsafe { sched::get_current() };
+    let pid = if task.is_null() {
+        -1
+    } else {
+        unsafe { (*task).pid }
+    };
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-run-symlinkat pid={} dirfd={} path={} target={} parent_ops={} ret={}",
+        pid,
+        dirfd,
+        path,
+        target,
+        parent_ops,
+        ret
+    );
+}
+
+#[cfg(not(test))]
 fn trace_run_fd(op: &str, fd: i32, name: &str, flags: u32, ret: i64) {
     if !crate::kernel::debug_trace::fs_enabled() {
         return;
@@ -505,6 +538,9 @@ fn trace_xattr_path(op: &str, dirfd: i32, path: &str, ret: i64) {
 
 #[cfg(test)]
 fn trace_run_path(_op: &str, _dirfd: i32, _path: &str, _flags: i32, _ret: i64) {}
+
+#[cfg(test)]
+fn trace_run_symlinkat(_dirfd: i32, _path: &str, _target: &str, _parent_ops: &str, _ret: i64) {}
 
 #[cfg(test)]
 fn trace_run_fd(_op: &str, _fd: i32, _name: &str, _flags: u32, _ret: i64) {}
@@ -598,7 +634,15 @@ pub unsafe fn sys_openat2(
         Ok(how) => how,
         Err(errno) => return -(errno as i64),
     };
-    let opened = match do_openat2(root, start, &path, &how) {
+    let hinted_path = if path.starts_with('/') || dirfd == AT_FDCWD {
+        Some(super::fs_struct::absolute_from_cwd(&path))
+    } else {
+        dirfd_base_hint(dirfd, &start)
+            .ok()
+            .flatten()
+            .map(|base| join_path(&base, &path))
+    };
+    let opened = match do_openat2_with_hint(root, start, &path, &how, hinted_path.as_deref()) {
         Ok(opened) => opened,
         Err(errno) => return -(errno as i64),
     };
@@ -2885,12 +2929,24 @@ pub unsafe fn sys_symlinkat(oldname: *const u8, newdfd: i32, newname: *const u8)
     };
     let parent = match mkdir_parent_dentry(&root, &start, &path, parent_path, base_hint) {
         Ok(parent) => parent,
-        Err(errno) => return -(errno as i64),
+        Err(errno) => {
+            let ret = -(errno as i64);
+            trace_run_symlinkat(newdfd, &path, &target, "<parent-lookup>", ret);
+            return ret;
+        }
     };
     let parent_inode = match parent.inode() {
         Some(inode) if inode.kind == InodeKind::Directory => inode,
-        Some(_) => return -(ENOTDIR as i64),
-        None => return -(ENOENT as i64),
+        Some(_) => {
+            let ret = -(ENOTDIR as i64);
+            trace_run_symlinkat(newdfd, &path, &target, "<not-dir>", ret);
+            return ret;
+        }
+        None => {
+            let ret = -(ENOENT as i64);
+            trace_run_symlinkat(newdfd, &path, &target, "<negative>", ret);
+            return ret;
+        }
     };
     if super::dcache::d_lookup(&parent, last)
         .and_then(|dentry| dentry.inode())
@@ -2900,13 +2956,19 @@ pub unsafe fn sys_symlinkat(oldname: *const u8, newdfd: i32, newname: *const u8)
             .lookup
             .is_some_and(|lookup| lookup(&parent_inode, last).is_ok())
     {
-        return -(EEXIST as i64);
+        let ret = -(EEXIST as i64);
+        trace_run_symlinkat(newdfd, &path, &target, parent_inode.ops.name, ret);
+        return ret;
     }
     let symlink = match parent_inode.ops.symlink {
         Some(symlink) => symlink,
-        None => return -(ENOSYS as i64),
+        None => {
+            let ret = -(ENOSYS as i64);
+            trace_run_symlinkat(newdfd, &path, &target, parent_inode.ops.name, ret);
+            return ret;
+        }
     };
-    match symlink(&parent_inode, last, &target, 0o777) {
+    let ret = match symlink(&parent_inode, last, &target, 0o777) {
         Ok(inode) => {
             let child = super::dcache::d_lookup(&parent, last)
                 .unwrap_or_else(|| super::dcache::d_alloc_child(&parent, last));
@@ -2915,7 +2977,9 @@ pub unsafe fn sys_symlinkat(oldname: *const u8, newdfd: i32, newname: *const u8)
             0
         }
         Err(errno) => -(errno as i64),
-    }
+    };
+    trace_run_symlinkat(newdfd, &path, &target, parent_inode.ops.name, ret);
+    ret
 }
 
 pub unsafe fn sys_symlink(oldname: *const u8, newname: *const u8) -> i64 {

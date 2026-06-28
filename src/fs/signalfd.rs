@@ -93,11 +93,10 @@ fn signalfd_poll(file: &FileRef) -> u32 {
     let Some(mask) = mask_for_file(file) else {
         return 0;
     };
-    if crate::kernel::signal::has_current_pending_signal_mask(mask) {
-        POLLIN as u32
-    } else {
-        0
-    }
+    let pending = crate::kernel::signal::current_pending_signal_bits();
+    let ready = crate::kernel::signal::has_current_pending_signal_mask(mask);
+    trace_signalfd_poll(mask, pending, ready);
+    if ready { POLLIN as u32 } else { 0 }
 }
 
 fn signalfd_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i32> {
@@ -149,6 +148,7 @@ pub unsafe fn sys_signalfd4(fd: i32, mask: *const u8, sizemask: usize, flags: i3
         } else {
             0
         });
+    trace_signalfd_mask(fd, first_word, flags, -1);
     if fd >= 0 {
         let files = match current_files() {
             Ok(files) => files,
@@ -163,13 +163,17 @@ pub unsafe fn sys_signalfd4(fd: i32, mask: *const u8, sizemask: usize, flags: i3
         }
         let token = *file.private.lock();
         SIGNALFDS.lock().insert(token, first_word);
+        trace_signalfd_mask(fd, first_word, flags, fd);
         return fd as i64;
     }
     let token = SIGNALFD_TOKEN.fetch_add(1, Ordering::AcqRel);
     SIGNALFDS.lock().insert(token, first_word);
     let file = alloc_anon_file("signalfd", &SIGNALFD_FILE_OPS, token);
     match current_files().and_then(|ft| ft.install(file, flags & SFD_CLOEXEC != 0)) {
-        Ok(fd) => fd as i64,
+        Ok(fd) => {
+            trace_signalfd_mask(-1, first_word, flags, fd);
+            fd as i64
+        }
         Err(errno) => {
             SIGNALFDS.lock().remove(&token);
             -(errno as i64)
@@ -179,6 +183,49 @@ pub unsafe fn sys_signalfd4(fd: i32, mask: *const u8, sizemask: usize, flags: i3
 
 pub unsafe fn sys_signalfd(fd: i32, mask: *const u8, sizemask: usize) -> i64 {
     unsafe { sys_signalfd4(fd, mask, sizemask, 0) }
+}
+
+fn trace_signalfd_mask(request_fd: i32, mask: u64, flags: i32, ret_fd: i32) {
+    #[cfg(not(test))]
+    if crate::kernel::debug_trace::proc_enabled() {
+        let task = unsafe { sched::get_current() };
+        let pid = if task.is_null() {
+            -1
+        } else {
+            unsafe { (*task).pid }
+        };
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-proc-signalfd pid={} request_fd={} mask={:#x} flags={:#x} ret_fd={}",
+            pid,
+            request_fd,
+            mask,
+            flags,
+            ret_fd
+        );
+    }
+    #[cfg(test)]
+    let _ = (request_fd, mask, flags, ret_fd);
+}
+
+fn trace_signalfd_poll(mask: u64, pending: u64, ready: bool) {
+    #[cfg(not(test))]
+    if crate::kernel::debug_trace::proc_enabled() {
+        let task = unsafe { sched::get_current() };
+        let pid = if task.is_null() {
+            -1
+        } else {
+            unsafe { (*task).pid }
+        };
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-proc-signalfd-poll pid={} mask={:#x} pending={:#x} ready={}",
+            pid,
+            mask,
+            pending,
+            ready
+        );
+    }
+    #[cfg(test)]
+    let _ = (mask, pending, ready);
 }
 
 #[cfg(test)]

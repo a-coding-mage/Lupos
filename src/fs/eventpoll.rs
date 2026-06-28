@@ -51,9 +51,10 @@ pub struct EpollEvent {
 }
 
 /// In-kernel state for one EpollItem (ep_item in Linux).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct EpItem {
     pub fd: i32,
+    pub file: FileRef,
     pub events: u32,
     pub data: u64,
 }
@@ -89,35 +90,39 @@ impl EventPoll {
         }
     }
 
-    pub fn add(&self, fd: i32, ev: EpollEvent) -> Result<(), i32> {
+    pub fn add(&self, fd: i32, file: FileRef, ev: EpollEvent) -> Result<(), i32> {
         let mut items = self.items.lock();
-        if items.iter().any(|e| e.fd == fd) {
+        if items
+            .iter()
+            .any(|e| e.fd == fd && Arc::ptr_eq(&e.file, &file))
+        {
             return Err(EEXIST);
         }
         let evbits = ev.events;
         let evdata = ev.data;
         items.push(EpItem {
             fd,
+            file,
             events: evbits,
             data: evdata,
         });
         Ok(())
     }
 
-    pub fn del(&self, fd: i32) -> Result<(), i32> {
+    pub fn del(&self, fd: i32, file: &FileRef) -> Result<(), i32> {
         let mut items = self.items.lock();
         let len_before = items.len();
-        items.retain(|e| e.fd != fd);
+        items.retain(|e| !(e.fd == fd && Arc::ptr_eq(&e.file, file)));
         if items.len() == len_before {
             return Err(ENOENT);
         }
         Ok(())
     }
 
-    pub fn modify(&self, fd: i32, ev: EpollEvent) -> Result<(), i32> {
+    pub fn modify(&self, fd: i32, file: &FileRef, ev: EpollEvent) -> Result<(), i32> {
         let mut items = self.items.lock();
         for item in items.iter_mut() {
-            if item.fd == fd {
+            if item.fd == fd && Arc::ptr_eq(&item.file, file) {
                 item.events = ev.events;
                 item.data = ev.data;
                 return Ok(());
@@ -126,31 +131,36 @@ impl EventPoll {
         Err(ENOENT)
     }
 
-    fn collect_ready(
-        &self,
-        files: &FilesStruct,
-        out: &mut [EpollEvent],
-        consume: bool,
-    ) -> Result<usize, i32> {
+    pub fn remove_closed_file(&self, fd: i32, file: &FileRef) {
+        self.items
+            .lock()
+            .retain(|e| !(e.fd == fd && Arc::ptr_eq(&e.file, file)));
+    }
+
+    fn collect_ready(&self, out: &mut [EpollEvent], consume: bool) -> Result<usize, i32> {
         let items = self.items.lock();
         let mut n = 0usize;
         for item in items.iter() {
             if n >= out.len() {
                 break;
             }
-            let file = files.get(item.fd);
-            let mask = match &file {
-                Ok(file) => select::poll_mask(file),
-                Err(_) => EPOLLERR,
-            };
+            let mask = select::poll_mask(&item.file);
             let ready = (item.events & mask) | (mask & (EPOLLERR | EPOLLHUP));
             if ready != 0 {
+                trace_epoll_ready(
+                    item.fd,
+                    item.file.fops.name,
+                    item.events,
+                    mask,
+                    ready,
+                    item.data,
+                );
                 out[n] = EpollEvent {
                     events: ready,
                     data: item.data,
                 };
-                if consume && let Ok(file) = &file {
-                    crate::fs::kernfs::consume_poll_event(file);
+                if consume {
+                    crate::fs::kernfs::consume_poll_event(&item.file);
                 }
                 n += 1;
             }
@@ -159,12 +169,12 @@ impl EventPoll {
     }
 
     /// Collect currently ready events by polling the watched files.
-    pub fn wait_ready(&self, files: &FilesStruct, out: &mut [EpollEvent]) -> Result<usize, i32> {
-        self.collect_ready(files, out, true)
+    pub fn wait_ready(&self, _files: &FilesStruct, out: &mut [EpollEvent]) -> Result<usize, i32> {
+        self.collect_ready(out, true)
     }
 
-    fn peek_ready(&self, files: &FilesStruct, out: &mut [EpollEvent]) -> Result<usize, i32> {
-        self.collect_ready(files, out, false)
+    fn peek_ready(&self, _files: &FilesStruct, out: &mut [EpollEvent]) -> Result<usize, i32> {
+        self.collect_ready(out, false)
     }
 }
 
@@ -191,7 +201,6 @@ fn epoll_from_fd(fd: i32) -> Result<Arc<EventPoll>, i32> {
 }
 
 fn epoll_path_reaches(
-    files: &FilesStruct,
     start_token: usize,
     target_token: usize,
     visited: &mut BTreeSet<usize>,
@@ -206,18 +215,29 @@ fn epoll_path_reaches(
     let ep = EPOLLS.lock().get(&start_token).cloned().ok_or(EBADF)?;
     let items = ep.items.lock().clone();
     for item in items {
-        let Ok(file) = files.get(item.fd) else {
-            continue;
-        };
-        if file.fops.name != EPOLL_FILE_OPS.name {
+        if item.file.fops.name != EPOLL_FILE_OPS.name {
             continue;
         }
-        let (next_token, _) = epoll_from_file(&file)?;
-        if epoll_path_reaches(files, next_token, target_token, visited)? {
+        let (next_token, _) = epoll_from_file(&item.file)?;
+        if epoll_path_reaches(next_token, target_token, visited)? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+pub fn notify_fd_closed(files: &FilesStruct, fd: i32, file: &FileRef) {
+    if Arc::strong_count(file) > 2 {
+        return;
+    }
+    let epolls: Vec<_> = files
+        .open_file_refs()
+        .into_iter()
+        .filter_map(|ep_file| epoll_from_file(&ep_file).ok().map(|(_, ep)| ep))
+        .collect();
+    for ep in epolls {
+        ep.remove_closed_file(fd, file);
+    }
 }
 
 fn epoll_release(file: FileRef) {
@@ -296,7 +316,7 @@ pub unsafe fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEven
             Err(errno) => return -(errno as i64),
         };
         let mut visited = BTreeSet::new();
-        match epoll_path_reaches(files.as_ref(), target_token, ep_token, &mut visited) {
+        match epoll_path_reaches(target_token, ep_token, &mut visited) {
             Ok(true) => return -(EINVAL as i64),
             Ok(false) => {}
             Err(errno) => return -(errno as i64),
@@ -309,16 +329,65 @@ pub unsafe fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEven
     } else {
         unsafe { *event }
     };
+    trace_epoll_ctl(epfd, op, fd, target.fops.name, ev.events, ev.data);
     let result = match op {
-        EPOLL_CTL_ADD => ep.add(fd, ev),
-        EPOLL_CTL_DEL => ep.del(fd),
-        EPOLL_CTL_MOD => ep.modify(fd, ev),
+        EPOLL_CTL_ADD => ep.add(fd, target.clone(), ev),
+        EPOLL_CTL_DEL => ep.del(fd, &target),
+        EPOLL_CTL_MOD => ep.modify(fd, &target, ev),
         _ => Err(EINVAL),
     };
     match result {
         Ok(()) => 0,
         Err(errno) => -(errno as i64),
     }
+}
+
+fn trace_epoll_ctl(epfd: i32, op: i32, fd: i32, file_ops: &str, events: u32, data: u64) {
+    #[cfg(not(test))]
+    if crate::kernel::debug_trace::proc_enabled() {
+        let task = unsafe { sched::get_current() };
+        let pid = if task.is_null() {
+            -1
+        } else {
+            unsafe { (*task).pid }
+        };
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-proc-epoll-ctl pid={} epfd={} op={} fd={} file={} events={:#x} data={:#x}",
+            pid,
+            epfd,
+            op,
+            fd,
+            file_ops,
+            events,
+            data
+        );
+    }
+    #[cfg(test)]
+    let _ = (epfd, op, fd, file_ops, events, data);
+}
+
+fn trace_epoll_ready(fd: i32, file_ops: &str, events: u32, mask: u32, ready: u32, data: u64) {
+    #[cfg(not(test))]
+    if crate::kernel::debug_trace::proc_enabled() {
+        let task = unsafe { sched::get_current() };
+        let pid = if task.is_null() {
+            -1
+        } else {
+            unsafe { (*task).pid }
+        };
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-proc-epoll-ready pid={} fd={} file={} events={:#x} mask={:#x} ready={:#x} data={:#x}",
+            pid,
+            fd,
+            file_ops,
+            events,
+            mask,
+            ready,
+            data
+        );
+    }
+    #[cfg(test)]
+    let _ = (fd, file_ops, events, mask, ready, data);
 }
 
 /// `sys_epoll_wait(epfd, events, maxevents, timeout)` — Linux syscall 232.
@@ -511,21 +580,91 @@ mod tests {
     #[test]
     fn add_then_del_round_trip() {
         let ep = EventPoll::new();
+        let file = alloc_file(d_alloc("watched"), 0, 0, &READABLE_OPS);
         let ev = EpollEvent {
             events: EPOLLIN,
             data: 0x12345678,
         };
-        ep.add(3, ev).unwrap();
-        assert_eq!(ep.add(3, ev), Err(EEXIST));
-        ep.del(3).unwrap();
-        assert_eq!(ep.del(3), Err(ENOENT));
+        ep.add(3, file.clone(), ev).unwrap();
+        assert_eq!(ep.add(3, file.clone(), ev), Err(EEXIST));
+        ep.del(3, &file).unwrap();
+        assert_eq!(ep.del(3, &file), Err(ENOENT));
+    }
+
+    #[test]
+    fn add_allows_reused_fd_number_for_new_file_object() {
+        let ep = EventPoll::new();
+        let old_file = alloc_file(d_alloc("old-signalfd"), 0, 0, &READABLE_OPS);
+        let new_file = alloc_file(d_alloc("new-signalfd"), 0, 0, &READABLE_OPS);
+        let ev = EpollEvent {
+            events: EPOLLIN,
+            data: 0x17,
+        };
+
+        ep.add(4, old_file.clone(), ev).unwrap();
+        ep.add(4, new_file.clone(), ev).unwrap();
+        assert_eq!(ep.items.lock().len(), 2);
+
+        ep.remove_closed_file(4, &old_file);
+        let items = ep.items.lock();
+        assert_eq!(items.len(), 1);
+        assert!(Arc::ptr_eq(&items[0].file, &new_file));
+    }
+
+    #[test]
+    fn copied_child_cloexec_close_keeps_parent_interest_until_parent_closes() {
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 263;
+        current.tgid = 263;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let parent = files::get_task_files(&mut *current as *mut TaskStruct).unwrap();
+            let epfd = sys_epoll_create1(0);
+            assert!(epfd >= 0);
+
+            let watched_fd = parent
+                .install(
+                    alloc_file(d_alloc("cloexec-watched"), 0, 0, &READABLE_OPS),
+                    true,
+                )
+                .unwrap();
+            let ev = EpollEvent {
+                events: EPOLLIN,
+                data: 0x263,
+            };
+            assert_eq!(
+                sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, watched_fd, &ev),
+                0
+            );
+
+            let child = crate::fs::fdtable::dup_fd(&parent, false);
+            child.close_on_exec();
+
+            let mut out = [EpollEvent { events: 0, data: 0 }; 1];
+            assert_eq!(sys_epoll_wait(epfd as i32, out.as_mut_ptr(), 1, 0), 1);
+            let data = out[0].data;
+            assert_eq!(data, 0x263);
+
+            parent.close(watched_fd).unwrap();
+            assert_eq!(sys_epoll_wait(epfd as i32, out.as_mut_ptr(), 1, 0), 0);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
     }
 
     #[test]
     fn modify_changes_events() {
         let ep = EventPoll::new();
+        let file = alloc_file(d_alloc("modifiable"), 0, 0, &READABLE_OPS);
         ep.add(
             5,
+            file.clone(),
             EpollEvent {
                 events: EPOLLIN,
                 data: 1,
@@ -534,6 +673,7 @@ mod tests {
         .unwrap();
         ep.modify(
             5,
+            &file,
             EpollEvent {
                 events: EPOLLIN | EPOLLOUT,
                 data: 2,
@@ -548,12 +688,12 @@ mod tests {
     #[test]
     fn wait_returns_ready_items() {
         let files = FilesStruct::new();
-        let fd = files
-            .install(alloc_file(d_alloc("ready"), 0, 0, &READABLE_OPS), false)
-            .unwrap();
+        let file = alloc_file(d_alloc("ready"), 0, 0, &READABLE_OPS);
+        let fd = files.install(file.clone(), false).unwrap();
         let ep = EventPoll::new();
         ep.add(
             fd,
+            file,
             EpollEvent {
                 events: EPOLLIN,
                 data: 0x77,

@@ -28,6 +28,19 @@ static PROC_PID_STAT_FILE_OPS: FileOps = FileOps {
     readdir: None,
 };
 
+static PROC_PID_CGROUP_FILE_OPS: FileOps = FileOps {
+    name: "proc-pid-cgroup",
+    read: Some(proc_pid_cgroup_read),
+    write: None,
+    llseek: None,
+    fsync: None,
+    poll: None,
+    ioctl: None,
+    mmap: None,
+    release: None,
+    readdir: None,
+};
+
 pub fn process_stat_file(pid: i32, flags: u32, mode: u32) -> Result<FileRef, i32> {
     if pid <= 0 || task_by_pid(pid).is_null() {
         return Err(ENOENT);
@@ -36,6 +49,22 @@ pub fn process_stat_file(pid: i32, flags: u32, mode: u32) -> Result<FileRef, i32
     let file = alloc_anon_file_with_kind(
         "stat",
         &PROC_PID_STAT_FILE_OPS,
+        pid as usize,
+        InodeKind::Regular,
+        0o444,
+    );
+    file.flags.store(flags, Ordering::Release);
+    Ok(file)
+}
+
+pub fn process_cgroup_file(pid: i32, flags: u32, mode: u32) -> Result<FileRef, i32> {
+    if pid <= 0 || task_by_pid(pid).is_null() {
+        return Err(ENOENT);
+    }
+    let _ = mode;
+    let file = alloc_anon_file_with_kind(
+        "cgroup",
+        &PROC_PID_CGROUP_FILE_OPS,
         pid as usize,
         InodeKind::Regular,
         0o444,
@@ -60,6 +89,18 @@ pub fn process_stat_file_from_proc_path(
     Some(process_stat_file(pid, flags, mode))
 }
 
+pub fn process_cgroup_file_from_proc_path(
+    path: &str,
+    flags: u32,
+    mode: u32,
+) -> Option<Result<FileRef, i32>> {
+    let (pid, name) = parse_proc_pid_file(path)?;
+    if name != "cgroup" {
+        return None;
+    }
+    Some(process_cgroup_file(pid, flags, mode))
+}
+
 fn proc_pid_stat_read(file: &FileRef, buf: &mut [u8], pos: &mut u64) -> Result<usize, i32> {
     let pid = *file.private.lock() as i32;
     let task = task_by_pid(pid);
@@ -75,12 +116,52 @@ fn proc_pid_stat_read(file: &FileRef, buf: &mut [u8], pos: &mut u64) -> Result<u
     Ok(n)
 }
 
+fn proc_pid_cgroup_read(file: &FileRef, buf: &mut [u8], pos: &mut u64) -> Result<usize, i32> {
+    let pid = *file.private.lock() as i32;
+    if task_by_pid(pid).is_null() {
+        return Err(ENOENT);
+    }
+    let text = crate::kernel::cgroup::proc_cgroup_text_for_pid(pid);
+    read_string_at(&text, buf, pos)
+}
+
+fn read_string_at(text: &str, buf: &mut [u8], pos: &mut u64) -> Result<usize, i32> {
+    let start = (*pos as usize).min(text.len());
+    let end = text.len().min(start + buf.len());
+    let n = end.saturating_sub(start);
+    buf[..n].copy_from_slice(&text.as_bytes()[start..end]);
+    *pos += n as u64;
+    Ok(n)
+}
+
 fn task_by_pid(pid: i32) -> *mut TaskStruct {
     let current = unsafe { crate::kernel::sched::get_current() };
     if !current.is_null() && unsafe { (*current).pid == pid } {
         return current;
     }
-    crate::kernel::fork::find_heap_task_by_pid(pid)
+    let heap = crate::kernel::fork::find_heap_task_by_pid(pid);
+    if !heap.is_null() {
+        return heap;
+    }
+    crate::kernel::sched::find_pool_task_by_pid(pid)
+}
+
+fn parse_proc_pid_file(path: &str) -> Option<(i32, &str)> {
+    if let Some(name) = path.strip_prefix("/proc/self/") {
+        let task = unsafe { crate::kernel::sched::get_current() };
+        let pid = if task.is_null() {
+            1
+        } else {
+            unsafe { (*task).pid }
+        };
+        return Some((pid, name));
+    }
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid_text, name) = rest.split_once('/')?;
+    let Ok(pid) = pid_text.parse::<i32>() else {
+        return None;
+    };
+    Some((pid, name))
 }
 
 unsafe fn task_stat_text(task: *mut TaskStruct) -> alloc::string::String {
