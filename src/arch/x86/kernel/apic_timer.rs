@@ -305,54 +305,9 @@ pub fn on_tick(frame: Option<&ExceptionFrame>) {
     // so a `schedule_timeout`/`msleep` returns promptly (event-driven) instead
     // of the task busy-yielding to its deadline. Only the BSP runs tasks.
     if cpu == 0 {
-        crate::kernel::time::sleep_timeout::sleep_timers_expire(crate::kernel::time::jiffies::jiffies());
-    }
-    // TEMP boot-profiling heartbeat: once/sec, report whether the CPU is busy
-    // (syscall/halt deltas) and which task is current, to localize the stall.
-    #[cfg(not(test))]
-    if cpu == 0 {
-        use core::sync::atomic::AtomicU64;
-        static LAST_HB: AtomicU64 = AtomicU64::new(0);
-        static LAST_SYS: AtomicU64 = AtomicU64::new(0);
-        static LAST_HALT: AtomicU64 = AtomicU64::new(0);
-        let j = crate::kernel::time::jiffies::jiffies();
-        let last = LAST_HB.load(Ordering::Relaxed);
-        if j.saturating_sub(last) >= crate::kernel::time::jiffies::HZ {
-            LAST_HB.store(j, Ordering::Relaxed);
-            let sys = crate::arch::x86::entry::syscall::SYSCALL_COUNT.load(Ordering::Relaxed);
-            let halt = crate::kernel::sched::IDLE_HALT_COUNT.load(Ordering::Relaxed);
-            let dsys = sys.saturating_sub(LAST_SYS.swap(sys, Ordering::Relaxed));
-            let dhalt = halt.saturating_sub(LAST_HALT.swap(halt, Ordering::Relaxed));
-            let cur = unsafe { crate::kernel::sched::get_current() };
-            let pid = if cur.is_null() { -1 } else { unsafe { (*cur).pid } };
-            let (n1, c1, n2, c2) = crate::arch::x86::entry::syscall::pid1_hist_top();
-            let (m1, ms1, m2, ms2) = crate::arch::x86::entry::syscall::pid1_ns_top();
-            static LAST_BIO: AtomicU64 = AtomicU64::new(0);
-            static LAST_BIOSLP: AtomicU64 = AtomicU64::new(0);
-            let bio =
-                crate::linux_driver_abi::block::BLOCK_IO_CALLS.load(Ordering::Relaxed);
-            let bioslp =
-                crate::linux_driver_abi::block::BLOCK_IO_SLEEP_JIFFIES.load(Ordering::Relaxed);
-            let dbio = bio.saturating_sub(LAST_BIO.swap(bio, Ordering::Relaxed));
-            let dbioslp = bioslp.saturating_sub(LAST_BIOSLP.swap(bioslp, Ordering::Relaxed));
-            crate::linux_driver_abi::tty::serial_println!(
-                "hb j={} pid={} dsys={} dhalt={} p1top=[{}:{} {}:{}] p1ms=[{}:{} {}:{}] dbio={} dbioslp={}",
-                j,
-                pid,
-                dsys,
-                dhalt,
-                n1,
-                c1,
-                n2,
-                c2,
-                m1,
-                ms1,
-                m2,
-                ms2,
-                dbio,
-                dbioslp
-            );
-        }
+        crate::kernel::time::sleep_timeout::sleep_timers_expire(
+            crate::kernel::time::jiffies::jiffies(),
+        );
     }
     crate::kernel::watchdog::watchdog_tick(cpu, frame);
     crate::kernel::sched::scheduler_tick();

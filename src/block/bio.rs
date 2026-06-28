@@ -94,11 +94,69 @@ pub fn bio_alloc(bdev: BlockDeviceRef, op: BioOp, sector: u64) -> BioRef {
 /// Submit a Bio.  In M43 this is synchronous: dispatches through the
 /// device's `submit_bio` hook and runs the completion callback inline.
 pub fn submit_bio(bio: BioRef) -> Result<(), i32> {
+    use super::bcache;
+
     let bdev = bio.bdev.clone();
+    let op = bio.op.0;
+    let total = bio.total_size();
+    let sector = bio.sector;
+    let aligned = total != 0 && total % 512 == 0;
+    let nr_sectors = (total / 512) as u64;
+
+    // A read of a contiguous, sector-aligned, single-segment range may be served
+    // straight from the block buffer cache, skipping the device entirely. This
+    // is the hot path for repeated metadata reads at boot.
+    if op == BIO_OP_READ && aligned {
+        let single = {
+            let vecs = bio.vecs.lock();
+            vecs.len() == 1 && vecs[0].off == 0 && vecs[0].len == total
+        };
+        if single {
+            if let Some(cached) = bcache::lookup(&bdev, sector, nr_sectors) {
+                if cached.len() == total {
+                    {
+                        let vecs = bio.vecs.lock();
+                        *vecs[0].data.lock() = cached;
+                    }
+                    bio.status.store(0, Ordering::Release);
+                    bio_endio(bio);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     let result = (bdev.ops.submit_bio)(&bdev, &bio);
     if let Err(e) = result {
         bio.status.store(e as u32, Ordering::Release);
     }
+
+    // Keep the cache coherent with what just hit the device.
+    if result.is_ok() {
+        match op {
+            BIO_OP_WRITE => bcache::invalidate(&bdev, sector, nr_sectors.max(1)),
+            // Discard/flush ranges are not described by the data vecs; drop the
+            // whole device's cache rather than risk a stale read.
+            BIO_OP_DISCARD => bcache::invalidate_device(&bdev),
+            BIO_OP_READ if aligned => {
+                let data = {
+                    let vecs = bio.vecs.lock();
+                    if vecs.len() == 1 && vecs[0].off == 0 && vecs[0].len == total {
+                        Some(vecs[0].data.lock().clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(data) = data {
+                    if data.len() == total {
+                        bcache::store(&bdev, sector, nr_sectors, &data);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     bio_endio(bio);
     result
 }

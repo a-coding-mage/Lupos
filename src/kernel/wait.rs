@@ -237,7 +237,10 @@ fn pid_matches(parent: *mut TaskStruct, target: WaitTarget, child_pid: i32) -> b
 /// Find a reapable zombie child of `parent` matching `target`; returns the
 /// child task pointer on success (enumerated by `real_parent`, so children that
 /// overflowed the `m26.children` cache are still found).
-unsafe fn find_zombie_child(parent: *mut TaskStruct, target: WaitTarget) -> Option<*mut TaskStruct> {
+unsafe fn find_zombie_child(
+    parent: *mut TaskStruct,
+    target: WaitTarget,
+) -> Option<*mut TaskStruct> {
     let mut found: *mut TaskStruct = core::ptr::null_mut();
     unsafe {
         for_each_real_child(parent, target, |c| {

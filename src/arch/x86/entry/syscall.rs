@@ -343,7 +343,10 @@ pub(crate) unsafe extern "C" fn syscall_exit_slowpath(
     let need_resched = unsafe { (*task).thread_info.flags & TIF_NEED_RESCHED != 0 };
     if need_resched && crate::kernel::locking::preempt::preempt_count() == 0 {
         unsafe {
-            sched::schedule_with_irqs_enabled();
+            // The returning task is runnable; yield for fairness but never halt
+            // it (that would waste a tick per syscall under a slow per-syscall
+            // transport — see `reschedule_runnable`).
+            sched::reschedule_runnable();
         }
     }
 }
@@ -445,79 +448,13 @@ pub unsafe extern "C" fn syscall_dispatch_ptregs(
 static SYSCALL_DRAIN_LAST_JIFFY: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
 
-/// TEMP boot-profiling: total syscalls dispatched (read by the timer heartbeat).
-pub static SYSCALL_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// TEMP boot-profiling: per-syscall-nr histogram for pid 1 (systemd).
-pub static PID1_SYS_HIST: [core::sync::atomic::AtomicU32; 512] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; 512];
-
-/// TEMP boot-profiling: per-syscall-nr total wall-ns for pid 1 (systemd).
-pub static PID1_SYS_NS: [core::sync::atomic::AtomicU64; 512] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 512];
-
-/// TEMP: snapshot+report the pid-1 syscall numbers consuming the most wall-ns
-/// since the last call (returns (nr,ms, nr,ms) for the top two).
-#[cfg(not(test))]
-pub fn pid1_ns_top() -> (usize, u64, usize, u64) {
-    use core::sync::atomic::Ordering;
-    static SNAP: [core::sync::atomic::AtomicU64; 512] =
-        [const { core::sync::atomic::AtomicU64::new(0) }; 512];
-    let (mut b1, mut b1n, mut b2, mut b2n) = (0usize, 0u64, 0usize, 0u64);
-    for nr in 0..512 {
-        let cur = PID1_SYS_NS[nr].load(Ordering::Relaxed);
-        let prev = SNAP[nr].swap(cur, Ordering::Relaxed);
-        let d = cur.saturating_sub(prev);
-        if d > b1n {
-            b2 = b1;
-            b2n = b1n;
-            b1 = nr;
-            b1n = d;
-        } else if d > b2n {
-            b2 = nr;
-            b2n = d;
-        }
-    }
-    (b1, b1n / 1_000_000, b2, b2n / 1_000_000)
-}
-
-/// TEMP: snapshot+report the busiest pid-1 syscall numbers since last call.
-#[cfg(not(test))]
-pub fn pid1_hist_top() -> (usize, u32, usize, u32) {
-    use core::sync::atomic::Ordering;
-    static SNAP: [core::sync::atomic::AtomicU32; 512] =
-        [const { core::sync::atomic::AtomicU32::new(0) }; 512];
-    let (mut b1, mut b1n, mut b2, mut b2n) = (0usize, 0u32, 0usize, 0u32);
-    for nr in 0..512 {
-        let cur = PID1_SYS_HIST[nr].load(Ordering::Relaxed);
-        let prev = SNAP[nr].swap(cur, Ordering::Relaxed);
-        let d = cur.saturating_sub(prev);
-        if d > b1n {
-            b2 = b1;
-            b2n = b1n;
-            b1 = nr;
-            b1n = d;
-        } else if d > b2n {
-            b2 = nr;
-            b2n = d;
-        }
-    }
-    (b1, b1n, b2, b2n)
-}
-
 unsafe fn syscall_dispatch_ptregs_inner(
     regs: *mut crate::arch::x86::kernel::ptrace::PtRegs,
 ) -> i64 {
     use super::syscall_table::{NR_syscalls, SYS_CALL_TABLE};
 
     let nr = unsafe { (*regs).orig_rax } as usize;
-    #[cfg(not(test))]
-    SYSCALL_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let task = current_task_for_syscall();
-    #[cfg(not(test))]
-    if nr < 512 && !task.is_null() && unsafe { (*task).pid } == 1 {
-        PID1_SYS_HIST[nr].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    }
     let hook_state = syscall_enter(unsafe { &*regs }, task);
     // Draining the console here delivers terminal signals (Ctrl-C) promptly, but
     // `try_console_input` probes the i8042 status port (`inb 0x64`) when its
@@ -535,8 +472,6 @@ unsafe fn syscall_dispatch_ptregs_inner(
         }
     }
 
-    #[cfg(not(test))]
-    let sys_t0 = crate::kernel::time::jiffies::jiffies();
     let ret = match syscall_seccomp_check(unsafe { &*regs }, task) {
         Ok(()) if nr < NR_syscalls => unsafe { SYS_CALL_TABLE[nr](regs) },
         Ok(()) => {
@@ -559,32 +494,6 @@ unsafe fn syscall_dispatch_ptregs_inner(
         }
         Err(errno) => errno,
     };
-
-    #[cfg(not(test))]
-    if let Some(t0) = pid1_ns_t0 {
-        if nr < 512 {
-            let dt = crate::kernel::time::ktime_get().saturating_sub(t0);
-            PID1_SYS_NS[nr].fetch_add(dt, core::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    #[cfg(not(test))]
-    {
-        let elapsed = crate::kernel::time::jiffies::jiffies().saturating_sub(sys_t0);
-        if elapsed > crate::kernel::time::jiffies::HZ {
-            let pid = if task.is_null() {
-                -1
-            } else {
-                unsafe { (*task).pid }
-            };
-            crate::linux_driver_abi::tty::serial_println!(
-                "slowsys pid={} nr={} took={}ms ret={}",
-                pid,
-                nr,
-                elapsed.saturating_mul(1000) / crate::kernel::time::jiffies::HZ,
-                ret,
-            );
-        }
-    }
 
     #[cfg(not(test))]
     if ret == -ENOSYS {

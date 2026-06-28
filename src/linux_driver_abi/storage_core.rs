@@ -1859,8 +1859,6 @@ unsafe fn ahci_enable_interrupts(mmio: *mut c_void) {
     unsafe { ahci_writel(mmio, 0x04, ghc | 0x2) };
 }
 
-
-
 /// Upper bound for a physical address the AHCI debug dumper is willing to
 /// dereference.  Matches the direct-map coverage tracked by the frame
 /// allocator (`MAX_PHYS_MEMORY` in src/mm/frame.rs).  Command lists for

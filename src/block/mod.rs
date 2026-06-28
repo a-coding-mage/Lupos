@@ -15,6 +15,7 @@
 //! M44 adds: `partitions/{mbr,gpt}`, `loop_dev`, and drivers/block glue.
 
 pub mod badblocks;
+pub mod bcache;
 pub mod bdev;
 pub mod bfq_cgroup;
 pub mod bfq_iosched;

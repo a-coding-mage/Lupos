@@ -1882,12 +1882,7 @@ fn block_facade_acquire() -> BlockFacadeGuard {
     }
     let mut spin = 0usize;
     loop {
-        match BLOCK_FACADE_OWNER.compare_exchange(
-            0,
-            cur_id,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match BLOCK_FACADE_OWNER.compare_exchange(0, cur_id, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return BlockFacadeGuard { held: true },
             // Reentrant: this task already owns the slot.
             Err(owner) if owner == cur_id => return BlockFacadeGuard { held: false },
@@ -1940,11 +1935,12 @@ fn block_facade_acquire() -> BlockFacadeGuard {
 /// the interrupt, where taking a wait-queue mutex could deadlock.
 static BLOCK_IO_WAITER: AtomicUsize = AtomicUsize::new(0);
 
-/// TEMP boot-profiling: count of task-context block I/O waits and the total
-/// number of 1-tick sleeps they performed (≈ jiffies stalled on I/O latency).
-pub static BLOCK_IO_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static BLOCK_IO_SLEEP_JIFFIES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+/// How many times the block-completion waiter polls the driver reaper before
+/// falling back to a true ~1-tick sleep. Sized so the poll-spin spans roughly a
+/// millisecond of emulated-AHCI completion latency on VirtualBox — long enough
+/// to catch the common fast completion, short enough that a genuinely slow I/O
+/// quickly reaches the real (CPU-halting) sleep instead of busy-burning.
+const BLOCK_IO_POLL_SPINS: usize = 256;
 
 /// Wake the block-completion waiter, if any. Lock-free / IRQ-safe; called from
 /// `linux_request_mark_completed` (the AHCI completion path — hard-IRQ when the
@@ -1997,8 +1993,6 @@ fn block_io_wait_for_completion(rq: *mut LinuxRequest) -> LinuxBlkStatus {
     }
 
     BLOCK_IO_WAITER.store(current as usize, Ordering::Release);
-    #[cfg(not(test))]
-    BLOCK_IO_CALLS.fetch_add(1, Ordering::Relaxed);
     let status = loop {
         if let Some(status) = linux_request_completed_status(rq) {
             break status;
@@ -2006,11 +2000,33 @@ fn block_io_wait_for_completion(rq: *mut LinuxRequest) -> LinuxBlkStatus {
         if linux_try_complete_backend_request(rq) {
             continue;
         }
-        // Drive completion (the software reaper finishes the qc when the real
-        // HBA IRQ is not delivered) while still runnable.
-        let _ = crate::linux_driver_abi::poll_driver_abi_events();
-        let _ = linux_poll_request_queue(rq);
-        if let Some(status) = linux_request_completed_status(rq) {
+        // Drive completion via the poll-based reaper. The reaper
+        // (`ahci_handle_port_intr`) completes the qc directly, so a brief bounded
+        // poll-spin catches the completion in microseconds. This matters on
+        // VirtualBox: its emulated AHCI finishes the command shortly after submit
+        // but does not deliver the completion IRQ promptly, so a single
+        // poll-then-sleep pays a full tick (~4ms) per I/O — and systemd reads
+        // thousands of cold metadata blocks at boot, turning that into tens of
+        // seconds. The spin only burns the local CPU that would otherwise halt
+        // idle (every runnable task has yielded by the time we wait), and it
+        // falls through to the true 1-tick sleep if the command is genuinely slow,
+        // so it never busy-burns a long I/O.
+        let mut spun = 0usize;
+        let mut polled = None;
+        loop {
+            let _ = crate::linux_driver_abi::poll_driver_abi_events();
+            let _ = linux_poll_request_queue(rq);
+            if let Some(status) = linux_request_completed_status(rq) {
+                polled = Some(status);
+                break;
+            }
+            spun += 1;
+            if spun >= BLOCK_IO_POLL_SPINS {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if let Some(status) = polled {
             break status;
         }
         if crate::kernel::time::jiffies::jiffies() >= deadline {
@@ -2037,8 +2053,6 @@ fn block_io_wait_for_completion(rq: *mut LinuxRequest) -> LinuxBlkStatus {
             // of ms per I/O. Still a true sleep, so no busy-burn.
             let wake_at = crate::kernel::time::jiffies::jiffies().saturating_add(1);
             crate::kernel::time::sleep_timeout::arm_wakeup(current as usize, wake_at);
-            #[cfg(not(test))]
-            BLOCK_IO_SLEEP_JIFFIES.fetch_add(1, Ordering::Relaxed);
             unsafe {
                 crate::kernel::sched::schedule_with_irqs_enabled();
             }
@@ -2074,8 +2088,7 @@ unsafe fn dump_scsi_busy_state(q: *mut LinuxRequestQueue) {
     if sdev.is_null() {
         return;
     }
-    let starget =
-        unsafe { core::ptr::read_unaligned(sdev.add(0x128) as *const *const u8) };
+    let starget = unsafe { core::ptr::read_unaligned(sdev.add(0x128) as *const *const u8) };
     let (target_busy, target_blocked, can_queue) = if starget.is_null() {
         (0i32, 0i32, 0i32)
     } else {
