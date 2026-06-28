@@ -72,6 +72,15 @@ fn cpu_index() -> usize {
     return 0;
     #[cfg(not(test))]
     {
+        // Reading the LAPIC ID is an MMIO access — a VM-exit under VirtualBox
+        // (and slow emulated MMIO under TCG) — and this runs on every preempt
+        // disable/enable. When no AP is online the only CPU is the BSP (id 0),
+        // so skip the LAPIC entirely; otherwise fall back to the real read.
+        // (Linux reads this from a GS-relative per-CPU field; that's the proper
+        // fix — see the M34 note in kernel::sched.)
+        if crate::arch::x86::kernel::smp::AP_READY_COUNT.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
         let id = unsafe { crate::arch::x86::kernel::apic::id() } as usize;
         id.min(MAX_CPUS - 1)
     }

@@ -377,7 +377,16 @@ pub fn with_rq<R>(cpu: u32, f: impl FnOnce(&mut Rq) -> R) -> Option<R> {
 
 /// Run a closure with mutable access to the runqueue of the current CPU.
 pub fn with_this_rq<R>(f: impl FnOnce(&mut Rq) -> R) -> Option<R> {
-    let cpu = unsafe { crate::arch::x86::kernel::apic::id() } as u32;
+    // Skip the LAPIC MMIO read (a VM-exit on VBox) when only the BSP is online;
+    // the single online runqueue is CPU 0.
+    let cpu = if crate::arch::x86::kernel::smp::AP_READY_COUNT
+        .load(core::sync::atomic::Ordering::Acquire)
+        == 0
+    {
+        0
+    } else {
+        (unsafe { crate::arch::x86::kernel::apic::id() }) as u32
+    };
     with_rq(cpu, f)
 }
 

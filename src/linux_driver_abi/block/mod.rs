@@ -188,6 +188,7 @@ pub const MQ_RQ_COMPLETE: u32 = 2;
 pub const BLK_STS_OK: u8 = 0;
 pub const BLK_STS_RESOURCE: u8 = 9;
 pub const BLK_STS_IOERR: u8 = 10;
+pub const BLK_STS_TIMEOUT: u8 = 11;
 pub const BLK_STS_AGAIN: u8 = 12;
 pub const BLK_STS_DEV_RESOURCE: u8 = 13;
 #[cfg(test)]
@@ -944,6 +945,11 @@ fn linux_request_mark_completed(rq: *mut LinuxRequest, status: LinuxBlkStatus) {
         core::ptr::write_volatile(&mut (*rq).internal_tag, status as i32);
         core::ptr::write_volatile(&mut (*rq).state, MQ_RQ_COMPLETE);
     }
+    // Event-driven wakeup: a request reaching MQ_RQ_COMPLETE is exactly the
+    // signal the submit_bio waiter sleeps for. This runs in the AHCI completion
+    // path (HBA hard-IRQ when delivered, software reaper otherwise), so it must
+    // stay lock-free — see `block_io_wake`.
+    block_io_wake();
 }
 
 fn linux_request_reset_completion(rq: *mut LinuxRequest) {
@@ -1854,34 +1860,195 @@ impl Drop for BlockFacadeGuard {
     }
 }
 
-/// Acquire the single-in-flight slot, yielding to peers while another task is
-/// being serviced. Reentrant for the owning task; a no-op when there is no live
-/// current task (early boot / non-task context), where serialization is neither
-/// possible nor needed.
+/// Acquire the single-in-flight slot. Reentrant for the owning task; a no-op
+/// when there is no live current task (early boot / non-task context), where
+/// serialization is neither possible nor needed.
+///
+/// When the slot is busy the caller *sleeps* (`TASK_INTERRUPTIBLE`) rather than
+/// busy-yielding, arming a ≤1-tick re-poll wakeup before each sleep so it
+/// re-attempts the CAS within a jiffy of the holder releasing. This mirrors the
+/// proven `block_io_wait_for_completion` pattern. It matters because systemd's
+/// generators fire ~20 reads concurrently: a busy-yield leaves all 20 runnable,
+/// so each release is only noticed on the next round-robin pass — invisible on
+/// KVM but ~40ms/handoff under VirtualBox's VM-exit-heavy `schedule()`, i.e.
+/// ~1s of serialized stall. Sleeping waiters keep the runqueue short (so the
+/// holder's own completion poll advances faster) and bound the handoff to one
+/// tick. A non-sleepable (atomic) context falls back to the bounded yield.
 fn block_facade_acquire() -> BlockFacadeGuard {
-    let current = unsafe { crate::kernel::sched::get_current() } as usize;
-    if current == 0 {
+    let current = unsafe { crate::kernel::sched::get_current() };
+    let cur_id = current as usize;
+    if cur_id == 0 {
         return BlockFacadeGuard { held: false };
     }
     let mut spin = 0usize;
     loop {
         match BLOCK_FACADE_OWNER.compare_exchange(
             0,
-            current,
+            cur_id,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
             Ok(_) => return BlockFacadeGuard { held: true },
-            Err(owner) if owner == current => {
-                // Reentrant: this task already owns the slot.
-                return BlockFacadeGuard { held: false };
+            // Reentrant: this task already owns the slot.
+            Err(owner) if owner == cur_id => return BlockFacadeGuard { held: false },
+            Err(_) => {}
+        }
+        if crate::kernel::locking::preempt::preempt_count() != 0 {
+            // Atomic context can't sleep: bounded yield, then retry.
+            linux_request_wait_cpu_relax(spin);
+            spin = spin.wrapping_add(1);
+            continue;
+        }
+        // Sleep until the holder releases. Mark interruptible, re-check the slot
+        // (so a release racing in cannot be lost), arm a ≤1-tick re-poll wakeup,
+        // then yield so the CPU can halt. On wake, retry the CAS.
+        unsafe {
+            (*current).__state.store(
+                crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+                Ordering::Release,
+            );
+        }
+        if BLOCK_FACADE_OWNER.load(Ordering::Acquire) == 0 {
+            unsafe {
+                (*current).__state.store(
+                    crate::kernel::task::task_state::TASK_RUNNING,
+                    Ordering::Release,
+                );
             }
-            Err(_) => {
-                linux_request_wait_cpu_relax(spin);
-                spin = spin.wrapping_add(1);
-            }
+            continue;
+        }
+        let wake_at = crate::kernel::time::jiffies::jiffies().saturating_add(1);
+        crate::kernel::time::sleep_timeout::arm_wakeup(cur_id, wake_at);
+        unsafe {
+            crate::kernel::sched::schedule_with_irqs_enabled();
+        }
+        crate::kernel::time::sleep_timeout::cancel_wakeup(cur_id);
+        unsafe {
+            (*current).__state.store(
+                crate::kernel::task::task_state::TASK_RUNNING,
+                Ordering::Release,
+            );
         }
     }
+}
+
+/// The single submit_bio task sleeping for a block completion (`*mut TaskStruct`
+/// as usize), or 0. The block facade is single-in-flight, so there is at most
+/// one such waiter — which lets the completion path wake it with a lock-free
+/// atomic store. This is what makes the path event-driven and IRQ-safe: the
+/// AHCI completion runs in the HBA hard-IRQ handler on hardware that delivers
+/// the interrupt, where taking a wait-queue mutex could deadlock.
+static BLOCK_IO_WAITER: AtomicUsize = AtomicUsize::new(0);
+
+/// Wake the block-completion waiter, if any. Lock-free / IRQ-safe; called from
+/// `linux_request_mark_completed` (the AHCI completion path — hard-IRQ when the
+/// real HBA interrupt fires, task context from the software reaper otherwise).
+#[inline]
+fn block_io_wake() {
+    let w = BLOCK_IO_WAITER.load(Ordering::Acquire) as *mut crate::kernel::task::TaskStruct;
+    if !w.is_null() {
+        unsafe {
+            (*w).__state.store(
+                crate::kernel::task::task_state::TASK_RUNNING,
+                Ordering::Release,
+            );
+        }
+    }
+}
+
+/// Event-driven wait for a block request to reach `MQ_RQ_COMPLETE`.
+///
+/// Rather than busy-spinning a million iterations, the submitting task arms
+/// itself as the (single) block waiter, goes `TASK_INTERRUPTIBLE`, and sleeps —
+/// so the CPU halts in the scheduler idle path instead of burning cycles. It is
+/// woken the instant the request completes by `block_io_wake()` from the AHCI
+/// completion path: promptly via the real HBA IRQ where it is delivered, or via
+/// the idle/software reaper otherwise. Each pass also drives the poll-based
+/// reaper (`poll_driver_abi_events`) and any block backend (virtio) completion
+/// as a fallback for HBAs/timing where the completion interrupt never arrives.
+/// A jiffies deadline preserves the old spin-cap as a safety net against a lost
+/// completion. Returns the request's completion status.
+fn block_io_wait_for_completion(rq: *mut LinuxRequest) -> LinuxBlkStatus {
+    let current = unsafe { crate::kernel::sched::get_current() };
+    let deadline = crate::kernel::time::jiffies::jiffies()
+        .saturating_add(crate::kernel::time::jiffies::HZ.saturating_mul(60));
+    if current.is_null() {
+        // No task context (early boot): poll until completion.
+        loop {
+            if let Some(status) = linux_request_completed_status(rq) {
+                return status;
+            }
+            if linux_try_complete_backend_request(rq) {
+                continue;
+            }
+            let _ = crate::linux_driver_abi::poll_driver_abi_events();
+            let _ = linux_poll_request_queue(rq);
+            if crate::kernel::time::jiffies::jiffies() >= deadline {
+                return BLK_STS_TIMEOUT;
+            }
+            linux_request_wait_cpu_relax(0);
+        }
+    }
+
+    BLOCK_IO_WAITER.store(current as usize, Ordering::Release);
+    let status = loop {
+        if let Some(status) = linux_request_completed_status(rq) {
+            break status;
+        }
+        if linux_try_complete_backend_request(rq) {
+            continue;
+        }
+        // Drive completion (the software reaper finishes the qc when the real
+        // HBA IRQ is not delivered) while still runnable.
+        let _ = crate::linux_driver_abi::poll_driver_abi_events();
+        let _ = linux_poll_request_queue(rq);
+        if let Some(status) = linux_request_completed_status(rq) {
+            break status;
+        }
+        if crate::kernel::time::jiffies::jiffies() >= deadline {
+            break BLK_STS_TIMEOUT;
+        }
+        // Arm and sleep: mark interruptible, re-check (so a completion racing in
+        // cannot be lost — `block_io_wake` flips us back to RUNNING and the
+        // re-check / schedule observes it), then yield so the CPU can halt until
+        // the completion wakes us.
+        unsafe {
+            (*current).__state.store(
+                crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+                Ordering::Release,
+            );
+        }
+        if linux_request_completed_status(rq).is_none()
+            && crate::kernel::locking::preempt::preempt_count() == 0
+        {
+            // Arm a ≤1-tick re-poll wakeup before sleeping: `block_io_wake`
+            // wakes us the instant the HBA completion is reaped, but if the
+            // completion interrupt is delayed/coalesced (VirtualBox does this)
+            // and no other task drives the idle reaper, this guarantees we wake
+            // within a tick to re-poll `PxIS` ourselves instead of stalling tens
+            // of ms per I/O. Still a true sleep, so no busy-burn.
+            let wake_at = crate::kernel::time::jiffies::jiffies().saturating_add(1);
+            crate::kernel::time::sleep_timeout::arm_wakeup(current as usize, wake_at);
+            unsafe {
+                crate::kernel::sched::schedule_with_irqs_enabled();
+            }
+            crate::kernel::time::sleep_timeout::cancel_wakeup(current as usize);
+        }
+        unsafe {
+            (*current).__state.store(
+                crate::kernel::task::task_state::TASK_RUNNING,
+                Ordering::Release,
+            );
+        }
+    };
+    unsafe {
+        (*current).__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+    }
+    BLOCK_IO_WAITER.store(0, Ordering::Release);
+    status
 }
 
 /// Diagnostic: read the SCSI target/device busy counters behind a request queue
@@ -1983,52 +2150,44 @@ fn linux_queue_submit_bio(q: *mut LinuxRequestQueue, bio: &BioRef) -> Result<(),
         linux_request_wait_cpu_relax(queue_retries);
     }
 
-    for spin in 0..COMPLETION_SPINS {
-        if let Some(status) = linux_request_completed_status(rq) {
-            if status != BLK_STS_OK {
-                crate::log_warn!(
-                    "block",
-                    "linux_queue_submit_bio: completed status={} op={} sector={} bytes={} segments={}",
-                    status,
-                    unsafe { (*rq).cmd_flags },
-                    unsafe { (*rq).sector },
-                    unsafe { (*rq).data_len },
-                    unsafe { (*rq).nr_phys_segments }
-                );
-            }
-            unsafe {
-                blk_mq_free_request(rq);
-            }
-            return linux_blk_status_result(status);
+    // Event-driven completion wait: sleep until the request completes (woken by
+    // the AHCI IRQ / reaper) instead of busy-spinning, so the CPU halts between
+    // events rather than burning cycles (the cause of the slow, soft-locking
+    // boot on real hardware that delivers completions with latency).
+    let status = block_io_wait_for_completion(rq);
+    let _ = (driver_event_polls, mq_polls);
+    if status == BLK_STS_TIMEOUT {
+        crate::log_warn!(
+            "block",
+            "linux_queue_submit_bio: timeout op={} sector={} bytes={} segments={} state={} queue_retries={}",
+            unsafe { (*rq).cmd_flags },
+            unsafe { (*rq).sector },
+            unsafe { (*rq).data_len },
+            unsafe { (*rq).nr_phys_segments },
+            unsafe { (*rq).state },
+            queue_retries
+        );
+        crate::linux_driver_abi::storage_core::debug_dump_ahci_bar5("request timeout");
+        unsafe {
+            blk_mq_free_request(rq);
         }
-        if linux_try_complete_backend_request(rq) {
-            continue;
-        }
-        driver_event_polls =
-            driver_event_polls.saturating_add(crate::linux_driver_abi::poll_driver_abi_events());
-        if linux_poll_request_queue(rq) > 0 {
-            mq_polls = mq_polls.saturating_add(1);
-        }
-        linux_request_wait_cpu_relax(spin);
+        return Err(EIO);
     }
-
-    crate::log_warn!(
-        "block",
-        "linux_queue_submit_bio: timeout op={} sector={} bytes={} segments={} state={} queue_retries={} driver_events={} mq_polls={}",
-        unsafe { (*rq).cmd_flags },
-        unsafe { (*rq).sector },
-        unsafe { (*rq).data_len },
-        unsafe { (*rq).nr_phys_segments },
-        unsafe { (*rq).state },
-        queue_retries,
-        driver_event_polls,
-        mq_polls
-    );
-    crate::linux_driver_abi::storage_core::debug_dump_ahci_bar5("request timeout");
+    if status != BLK_STS_OK {
+        crate::log_warn!(
+            "block",
+            "linux_queue_submit_bio: completed status={} op={} sector={} bytes={} segments={}",
+            status,
+            unsafe { (*rq).cmd_flags },
+            unsafe { (*rq).sector },
+            unsafe { (*rq).data_len },
+            unsafe { (*rq).nr_phys_segments }
+        );
+    }
     unsafe {
         blk_mq_free_request(rq);
     }
-    Err(EIO)
+    linux_blk_status_result(status)
 }
 
 fn linux_gendisk_submit_bio(bdev: &BlockDeviceRef, bio: &BioRef) -> Result<(), i32> {

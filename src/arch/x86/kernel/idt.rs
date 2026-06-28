@@ -657,10 +657,22 @@ fn legacy_irq_line(vector: u8) -> Option<u8> {
     }
 }
 
+/// Count of real device hard-IRQs (non-timer) delivered via the IDT, plus the
+/// last such line. Diagnostic for whether the AHCI completion interrupt is
+/// actually delivered (vs. completion only being found by the software poller).
+pub static DEVICE_HARDIRQ_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static LAST_DEVICE_HARDIRQ_LINE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 fn on_legacy_irq(vector: u8) {
     let Some(irq) = legacy_irq_line(vector) else {
         return;
     };
+    if irq != 0 {
+        DEVICE_HARDIRQ_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        LAST_DEVICE_HARDIRQ_LINE.store(irq as u32, core::sync::atomic::Ordering::Relaxed);
+    }
     let _ = crate::kernel::irq::generic_handle_irq(irq as u32);
     unsafe {
         crate::arch::x86::kernel::pic::send_eoi(irq);

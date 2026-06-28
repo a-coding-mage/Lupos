@@ -441,6 +441,10 @@ pub unsafe extern "C" fn syscall_dispatch_ptregs(
     unsafe { syscall_dispatch_ptregs_inner(regs) }
 }
 
+/// Last jiffy on which the per-syscall console drain ran (throttle state).
+static SYSCALL_DRAIN_LAST_JIFFY: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+
 unsafe fn syscall_dispatch_ptregs_inner(
     regs: *mut crate::arch::x86::kernel::ptrace::PtRegs,
 ) -> i64 {
@@ -449,9 +453,24 @@ unsafe fn syscall_dispatch_ptregs_inner(
     let nr = unsafe { (*regs).orig_rax } as usize;
     let task = current_task_for_syscall();
     let hook_state = syscall_enter(unsafe { &*regs }, task);
+    // Draining the console here delivers terminal signals (Ctrl-C) promptly, but
+    // `try_console_input` probes the i8042 status port (`inb 0x64`) when its
+    // queue is empty — a port-I/O access that is a VM-exit under VirtualBox/KVM
+    // and slow emulation under TCG. Running it on *every* syscall made it the
+    // dominant boot cost (the syscall-heavy systemd generators). Throttle to at
+    // most once per tick: Ctrl-C latency stays ≤1 jiffy, but the per-syscall
+    // port I/O is gone. The console wait loops (console_read, epoll, …) still
+    // drain unthrottled, so interactive input is unaffected.
     #[cfg(not(test))]
-    crate::init::rootfs::drain_console_control_bytes();
+    {
+        let now = crate::kernel::time::jiffies::jiffies();
+        if SYSCALL_DRAIN_LAST_JIFFY.swap(now, core::sync::atomic::Ordering::Relaxed) != now {
+            crate::init::rootfs::drain_console_control_bytes();
+        }
+    }
 
+    #[cfg(not(test))]
+    let sys_t0 = crate::kernel::time::jiffies::jiffies();
     let ret = match syscall_seccomp_check(unsafe { &*regs }, task) {
         Ok(()) if nr < NR_syscalls => unsafe { SYS_CALL_TABLE[nr](regs) },
         Ok(()) => {
@@ -476,6 +495,25 @@ unsafe fn syscall_dispatch_ptregs_inner(
     };
 
     #[cfg(not(test))]
+    {
+        let elapsed = crate::kernel::time::jiffies::jiffies().saturating_sub(sys_t0);
+        if elapsed > crate::kernel::time::jiffies::HZ {
+            let pid = if task.is_null() {
+                -1
+            } else {
+                unsafe { (*task).pid }
+            };
+            crate::linux_driver_abi::tty::serial_println!(
+                "slowsys pid={} nr={} took={}ms ret={}",
+                pid,
+                nr,
+                elapsed.saturating_mul(1000) / crate::kernel::time::jiffies::HZ,
+                ret,
+            );
+        }
+    }
+
+    #[cfg(not(test))]
     if ret == -ENOSYS {
         let pid = if task.is_null() {
             -1
@@ -484,25 +522,6 @@ unsafe fn syscall_dispatch_ptregs_inner(
         };
         if pid != 1 && pid > 0 {
             crate::linux_driver_abi::tty::serial_println!("enosys pid={} nr={}", pid, nr);
-        }
-    }
-
-    #[cfg(not(test))]
-    {
-        // TEMP TRACE: log pid-1 (systemd) syscalls that fail, to diagnose the
-        // multi-CPU "Failed to start up manager" failure.
-        let pid = if task.is_null() {
-            -1
-        } else {
-            unsafe { (*task).pid }
-        };
-        if pid > 0 && pid < 307 && ret < 0 {
-            crate::linux_driver_abi::tty::serial_println!(
-                "initerr pid={} nr={} ret={}",
-                pid,
-                nr,
-                ret
-            );
         }
     }
 
@@ -533,9 +552,19 @@ unsafe fn syscall_dispatch_ptregs_inner(
 /// Helper function to get the current CPU's ID.
 /// Returns 0–63, clamped to MAX_CPUS.
 ///
-/// Called from the syscall entry stub; uses inline assembly to read the APIC ID.
+/// Called from the syscall entry stub on *every* syscall. Reading the LAPIC ID
+/// is an MMIO access — a VM-exit under VirtualBox (no APICv) and slow emulated
+/// MMIO under TCG — so doing it per syscall dominated VBox boot time (systemd's
+/// thousands of fast generator/manager syscalls each paid a VM-exit; the cost is
+/// invisible on KVM where APICv makes the read free). When no AP is online the
+/// only CPU is the BSP (id 0), so skip the LAPIC entirely; otherwise read it.
 #[unsafe(no_mangle)]
 pub extern "C" fn current_cpu_id() -> usize {
+    if crate::arch::x86::kernel::smp::AP_READY_COUNT.load(core::sync::atomic::Ordering::Acquire)
+        == 0
+    {
+        return 0;
+    }
     let cpu_id = unsafe { crate::arch::x86::kernel::apic::id() } as usize;
     cpu_id.min(MAX_CPUS - 1)
 }

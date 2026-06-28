@@ -5855,8 +5855,13 @@ fn write_release_root(root: &Path, kernel_artifact: Option<&Path>) -> Result<Pat
 
 fn release_grub_cfg_content() -> String {
     let extra_cmdline = env::var(LUPOS_KERNEL_CMDLINE_ENV).unwrap_or_default();
+    // No `splash`: it makes userspace put the console in KD_GRAPHICS mode, which
+    // disables the framebuffer text console (`set_fbcon_enabled(false)` in
+    // tty::mod's KDSETMODE handler) and is never restored to KD_TEXT (Lupos has
+    // no splash renderer), leaving the VirtualBox graphical window black. No
+    // `quiet` either, so kernel boot progress is visible on that console.
     let normal_cmdline = format!(
-        "quiet splash systemd.show_status=yes {}",
+        "systemd.show_status=yes {}",
         root_disk_cmdline(&extra_cmdline)
     );
     let recovery_cmdline = format!(
@@ -12607,6 +12612,12 @@ pub fn run_grub_bzimage_tests() -> Result<()> {
 
 fn run_release_cmd() -> Result<()> {
     println!("cargo xtask release: staging login-capable release artifacts");
+    // Ensure the real login userland (systemd + agetty + bash) is staged, like
+    // every test-boot mode does. Without this, a missing stage silently falls
+    // back to the busybox/`build_pid1_transcript_elf64` stub `/sbin/init`, and
+    // the release boots into the scripted PID1 smoke transcript (auto-login +
+    // canned session + self-shutdown) instead of an interactive `login:` getty.
+    ensure_userland_stage()?;
     let target_dir = xtask_target_dir()?;
     fs::create_dir_all(&target_dir)?;
 

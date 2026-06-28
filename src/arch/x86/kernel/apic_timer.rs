@@ -301,6 +301,12 @@ pub fn on_tick(frame: Option<&ExceptionFrame>) {
     record_tick_for_cpu(cpu);
     TIMER_TICKS.fetch_add(1, Ordering::Release);
     crate::kernel::time::clockevents::tick_handle_periodic();
+    // Wake timed sleepers whose deadline has passed before the scheduler runs,
+    // so a `schedule_timeout`/`msleep` returns promptly (event-driven) instead
+    // of the task busy-yielding to its deadline. Only the BSP runs tasks.
+    if cpu == 0 {
+        crate::kernel::time::sleep_timeout::sleep_timers_expire(crate::kernel::time::jiffies::jiffies());
+    }
     crate::kernel::watchdog::watchdog_tick(cpu, frame);
     crate::kernel::sched::scheduler_tick();
     if cpu == 0 {

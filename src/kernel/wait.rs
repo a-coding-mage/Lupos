@@ -234,45 +234,44 @@ fn pid_matches(parent: *mut TaskStruct, target: WaitTarget, child_pid: i32) -> b
     }
 }
 
-/// Find a zombie child of `parent` matching `pid_filter`; returns its index in
-/// the parent's children array on success.
-unsafe fn find_zombie_child(parent: *mut TaskStruct, target: WaitTarget) -> Option<usize> {
+/// Find a reapable zombie child of `parent` matching `target`; returns the
+/// child task pointer on success (enumerated by `real_parent`, so children that
+/// overflowed the `m26.children` cache are still found).
+unsafe fn find_zombie_child(parent: *mut TaskStruct, target: WaitTarget) -> Option<*mut TaskStruct> {
+    let mut found: *mut TaskStruct = core::ptr::null_mut();
     unsafe {
-        let n = (*parent).m26.children_count as usize;
-        for i in 0..n.min(MAX_CHILDREN) {
-            let c = (*parent).m26.children[i];
-            if c.is_null() {
-                continue;
-            }
-            if !pid_matches(parent, target, (*c).pid) {
-                continue;
+        for_each_real_child(parent, target, |c| {
+            if !found.is_null() {
+                return;
             }
             let state = (*c).__state.load(Ordering::Acquire);
             if (*c).m26.exit_state & EXIT_ZOMBIE != 0 && state & EXIT_ZOMBIE != 0 {
-                return Some(i);
+                found = c;
             }
-        }
-        None
+        });
     }
+    (!found.is_null()).then_some(found)
 }
 
-unsafe fn find_stopped_child(parent: *mut TaskStruct, target: WaitTarget) -> Option<usize> {
+unsafe fn find_stopped_child(
+    parent: *mut TaskStruct,
+    target: WaitTarget,
+) -> Option<*mut TaskStruct> {
+    let mut found: *mut TaskStruct = core::ptr::null_mut();
     unsafe {
-        let n = (*parent).m26.children_count as usize;
-        for i in 0..n.min(MAX_CHILDREN) {
-            let c = (*parent).m26.children[i];
-            if c.is_null() || !pid_matches(parent, target, (*c).pid) {
-                continue;
+        for_each_real_child(parent, target, |c| {
+            if !found.is_null() {
+                return;
             }
             let state = (*c).__state.load(Ordering::Acquire);
             if state == crate::kernel::task::task_state::__TASK_TRACED
                 || (*c).m26.ptrace_stop_signal != 0
             {
-                return Some(i);
+                found = c;
             }
-        }
-        None
+        });
     }
+    (!found.is_null()).then_some(found)
 }
 
 fn lookup_task_by_pid(pid: i32) -> *mut TaskStruct {
@@ -329,6 +328,79 @@ unsafe fn for_each_ptrace_wait_match(
     }
 }
 
+/// Visit every child of `parent` matching `target`.
+///
+/// Uses `real_parent` (the authoritative parent link) via the global task
+/// trackers rather than the fixed-size `m26.children` cache array.  The cache
+/// only holds `MAX_CHILDREN` (16) entries and silently drops children that
+/// overflow it (their `real_parent` still points at us — see the note on
+/// `MAX_CHILDREN`).  systemd forks well over 16 generators in parallel on a
+/// multi-CPU boot, so a child-enumeration that only scanned the cache made
+/// `wait4`/`waitid` return `-ECHILD` even though the (untracked) zombie was
+/// still pending — the "Failed to start up manager" multi-CPU boot hang.  This
+/// mirrors the global-tracker fallback `release_task` already relies on.
+unsafe fn child_in_array(parent: *mut TaskStruct, task: *mut TaskStruct) -> bool {
+    unsafe {
+        let n = (*parent).m26.children_count as usize;
+        for i in 0..n.min(MAX_CHILDREN) {
+            if (*parent).m26.children[i] == task {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+unsafe fn for_each_real_child(
+    parent: *mut TaskStruct,
+    target: WaitTarget,
+    mut f: impl FnMut(*mut TaskStruct),
+) {
+    if parent.is_null() {
+        return;
+    }
+    unsafe {
+        // First the fast cache array (also covers unit tests that populate the
+        // array directly without registering in the global task trackers).
+        let n = (*parent).m26.children_count as usize;
+        for i in 0..n.min(MAX_CHILDREN) {
+            let c = (*parent).m26.children[i];
+            if !c.is_null() && pid_matches(parent, target, (*c).pid) {
+                f(c);
+            }
+        }
+    }
+    // Then untracked children that overflowed the cache array: scan the global
+    // task trackers for tasks whose `real_parent` is us and which are not
+    // already in the array.
+    match target {
+        WaitTarget::Pid(pid) => {
+            let task = lookup_task_by_pid(pid);
+            if !task.is_null()
+                && task != parent
+                && unsafe { (*task).m26.real_parent } == parent
+                && !unsafe { child_in_array(parent, task) }
+            {
+                f(task);
+            }
+        }
+        _ => {
+            let mut visit = |task: *mut TaskStruct| unsafe {
+                if !task.is_null()
+                    && task != parent
+                    && (*task).m26.real_parent == parent
+                    && pid_matches(parent, target, (*task).pid)
+                    && !child_in_array(parent, task)
+                {
+                    f(task);
+                }
+            };
+            crate::kernel::fork::for_each_heap_task(&mut visit);
+            sched::for_each_pool_task(&mut visit);
+        }
+    }
+}
+
 unsafe fn find_ptrace_wait_task(
     parent: *mut TaskStruct,
     target: WaitTarget,
@@ -362,8 +434,7 @@ unsafe fn has_reportable_wait_event(
     if unsafe { find_zombie_child(parent, target) }.is_some() {
         return true;
     }
-    if let Some(idx) = unsafe { find_stopped_child(parent, target) } {
-        let child = unsafe { (*parent).m26.children[idx] };
+    if let Some(child) = unsafe { find_stopped_child(parent, target) } {
         if unsafe { should_report_stopped_child(child, options) } {
             return true;
         }
@@ -381,47 +452,41 @@ unsafe fn has_reportable_wait_event(
 /// half-published state because the exiting child may already have snapshotted
 /// its waiter list.
 unsafe fn has_exiting_wait_target(parent: *mut TaskStruct, target: WaitTarget) -> bool {
+    let mut found = false;
     unsafe {
-        let n = (*parent).m26.children_count as usize;
-        for i in 0..n.min(MAX_CHILDREN) {
-            let c = (*parent).m26.children[i];
-            if !c.is_null()
-                && pid_matches(parent, target, (*c).pid)
-                && (*c).m26.exit_state & EXIT_ZOMBIE != 0
-            {
-                return true;
+        for_each_real_child(parent, target, |c| {
+            if (*c).m26.exit_state & EXIT_ZOMBIE != 0 {
+                found = true;
             }
+        });
+        if found {
+            return true;
         }
-        let mut found = false;
         for_each_ptrace_wait_match(parent, target, |task| {
             if (*task).m26.exit_state & EXIT_ZOMBIE != 0 {
                 found = true;
             }
         });
-        found
     }
+    found
 }
 
 /// Returns true iff `parent` has at least one child matching `pid_filter`
 /// (zombie or otherwise).
 unsafe fn has_matching_child(parent: *mut TaskStruct, target: WaitTarget) -> bool {
+    let mut found = false;
     unsafe {
-        let n = (*parent).m26.children_count as usize;
-        for i in 0..n.min(MAX_CHILDREN) {
-            let c = (*parent).m26.children[i];
-            if !c.is_null() && pid_matches(parent, target, (*c).pid) {
-                return true;
-            }
-        }
-        let mut found = false;
-        for_each_ptrace_wait_match(parent, target, |_| {
+        for_each_real_child(parent, target, |_| {
             found = true;
         });
         if found {
             return true;
         }
-        false
+        for_each_ptrace_wait_match(parent, target, |_| {
+            found = true;
+        });
     }
+    found
 }
 
 unsafe fn report_stopped_task(task: *mut TaskStruct, stat_addr: *mut i32, options: i32) -> i64 {
@@ -502,8 +567,7 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
         }
 
         // Fast path: zombie child already available?
-        if let Some(idx) = unsafe { find_zombie_child(parent, target) } {
-            let child = unsafe { (*parent).m26.children[idx] };
+        if let Some(child) = unsafe { find_zombie_child(parent, target) } {
             let child_pid = unsafe { (*child).pid };
             let exit_code = unsafe { (*child).m26.exit_code };
             if let Err(errno) = unsafe { copy_wait_status_to_user(stat_addr, exit_code) } {
@@ -527,8 +591,7 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
             return child_pid as i64;
         }
 
-        if let Some(idx) = unsafe { find_stopped_child(parent, target) } {
-            let child = unsafe { (*parent).m26.children[idx] };
+        if let Some(child) = unsafe { find_stopped_child(parent, target) } {
             if unsafe { should_report_stopped_child(child, options) } {
                 return unsafe { report_stopped_task(child, stat_addr, options) };
             }
@@ -568,13 +631,9 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
         // wait queue, set self interruptible, yield.  When a child exits its
         // `exit_notify` flips us back to TASK_RUNNING.
         unsafe {
-            let n = (*parent).m26.children_count as usize;
-            for i in 0..n.min(MAX_CHILDREN) {
-                let c = (*parent).m26.children[i];
-                if !c.is_null() && pid_matches(parent, target, (*c).pid) {
-                    add_waiter(c, parent);
-                }
-            }
+            for_each_real_child(parent, target, |c| {
+                add_waiter(c, parent);
+            });
             for_each_ptrace_wait_match(parent, target, |task| {
                 add_waiter(task, parent);
             });
@@ -678,8 +737,7 @@ pub unsafe fn sys_waitid(
             exit_if_fatal_signal_pending_current();
         }
 
-        if let Some(idx) = unsafe { find_zombie_child(parent, target) } {
-            let child = unsafe { (*parent).m26.children[idx] };
+        if let Some(child) = unsafe { find_zombie_child(parent, target) } {
             let child_pid = unsafe { (*child).pid };
             let exit_code = unsafe { (*child).m26.exit_code };
             let (si_code, si_status) = waitid_code_status(exit_code);
@@ -716,8 +774,7 @@ pub unsafe fn sys_waitid(
             return 0;
         }
 
-        if let Some(idx) = unsafe { find_stopped_child(parent, target) } {
-            let child = unsafe { (*parent).m26.children[idx] };
+        if let Some(child) = unsafe { find_stopped_child(parent, target) } {
             if unsafe { should_report_stopped_child(child, options) } {
                 let child_pid = unsafe { (*child).pid };
                 let sig = unsafe { (*child).m26.ptrace_stop_signal };
@@ -797,13 +854,9 @@ pub unsafe fn sys_waitid(
         }
 
         unsafe {
-            let n = (*parent).m26.children_count as usize;
-            for i in 0..n.min(MAX_CHILDREN) {
-                let c = (*parent).m26.children[i];
-                if !c.is_null() && pid_matches(parent, target, (*c).pid) {
-                    add_waiter(c, parent);
-                }
-            }
+            for_each_real_child(parent, target, |c| {
+                add_waiter(c, parent);
+            });
             for_each_ptrace_wait_match(parent, target, |task| {
                 add_waiter(task, parent);
             });
@@ -956,9 +1009,9 @@ mod tests {
             Ordering::Release,
         );
 
-        let idx = unsafe { find_stopped_child(&mut *parent as *mut TaskStruct, WaitTarget::Any) };
+        let found = unsafe { find_stopped_child(&mut *parent as *mut TaskStruct, WaitTarget::Any) };
 
-        assert_eq!(idx, Some(0));
+        assert_eq!(found, Some(&mut *child as *mut TaskStruct));
         assert_eq!(w_stopped(5), (5 << 8) | 0x7f);
     }
 
