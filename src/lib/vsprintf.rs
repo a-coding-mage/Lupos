@@ -79,9 +79,16 @@ unsafe fn format_one_arg(buf: *mut c_char, size: usize, fmt: *const c_char, arg0
             b'd' | b'i' | b'u' => unsafe { write_decimal(buf, size, &mut pos, arg0) },
             b's' => {
                 let s = arg0 as *const c_char;
-                let len = unsafe { c_strlen(s, 4096) };
-                let bytes = unsafe { core::slice::from_raw_parts(s.cast::<u8>(), len) };
-                unsafe { write_bytes(buf, size, &mut pos, bytes) };
+                // Mirror Linux vsnprintf: a NULL `%s` argument prints "(null)"
+                // rather than dereferencing it. `slice::from_raw_parts` also
+                // forbids a null base even for a zero length, so guard here.
+                if s.is_null() {
+                    unsafe { write_bytes(buf, size, &mut pos, b"(null)") };
+                } else {
+                    let len = unsafe { c_strlen(s, 4096) };
+                    let bytes = unsafe { core::slice::from_raw_parts(s.cast::<u8>(), len) };
+                    unsafe { write_bytes(buf, size, &mut pos, bytes) };
+                }
             }
             _ => {
                 unsafe { write_byte(buf, size, &mut pos, b'%') };

@@ -381,9 +381,16 @@ pub unsafe fn sys_epoll_wait(
         #[cfg(not(test))]
         {
             wait_state.maintenance();
-            unsafe {
-                crate::kernel::sched::schedule_with_irqs_enabled();
-            }
+            // No fd-ready wakeup chain exists yet, so we must re-poll the set —
+            // but sleep ~1 tick (event-driven via the timer wheel) between polls
+            // instead of busy-yielding while RUNNABLE. Busy-yielding here kept the
+            // task in the round-robin and starved peers (e.g. systemd's epoll
+            // loop stealing CPU from the generators it is waiting on); sleeping
+            // lets the CPU halt / peers run, and the timer wakes us to re-poll.
+            crate::kernel::time::sleep_timeout::schedule_timeout_with_state(
+                1,
+                crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+            );
         }
         #[cfg(test)]
         {

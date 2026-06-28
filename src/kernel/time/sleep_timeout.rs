@@ -5,12 +5,96 @@
 //!
 //! Mirrors `vendor/linux/kernel/time/sleep_timeout.c`.
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
+
+use spin::Mutex;
 
 use super::jiffies::{HZ, jiffies, jiffies_to_msecs, msecs_to_jiffies, time_before};
 use crate::kernel::module::{export_symbol, find_symbol};
+use crate::kernel::task::task_state;
 
 pub const MAX_SCHEDULE_TIMEOUT: u64 = u64::MAX / 2;
+
+// ── Sleep-timer wheel ────────────────────────────────────────────────────────
+//
+// A real timer-backed wakeup for `schedule_timeout`/`msleep`, so a timed sleep
+// truly sleeps (the task goes non-runnable and the CPU halts) and the periodic
+// LAPIC tick wakes it when its jiffies deadline passes — instead of keeping the
+// task RUNNABLE and busy-yielding until the deadline (which burned a CPU for the
+// whole sleep, e.g. throughout systemd's many startup timeouts).
+
+struct SleepTimer {
+    /// `*mut TaskStruct` as usize (the sleeper).
+    task: usize,
+    /// Jiffies value at/after which the sleeper must be woken.
+    expire: u64,
+}
+
+static SLEEP_TIMERS: Mutex<Vec<SleepTimer>> = Mutex::new(Vec::new());
+
+/// Register `task` to be woken at `expire`.  Task context only; interrupts are
+/// disabled across the (brief) critical section so the tick handler — which
+/// takes the same lock from hard-IRQ — can never deadlock against us.
+fn sleep_timer_add(task: usize, expire: u64) {
+    let flags = crate::kernel::locking::irqflags::local_irq_save();
+    {
+        let mut timers = SLEEP_TIMERS.lock();
+        if let Some(existing) = timers.iter_mut().find(|t| t.task == task) {
+            existing.expire = expire;
+        } else {
+            timers.push(SleepTimer { task, expire });
+        }
+    }
+    crate::kernel::locking::irqflags::local_irq_restore(flags);
+}
+
+/// Arm a one-shot wakeup for `task` at jiffy `expire` (for callers that sleep
+/// on their own condition but want a bounded re-check, e.g. the block-I/O wait
+/// re-polling within a tick in case a HBA completion interrupt is delayed).
+pub fn arm_wakeup(task: usize, expire: u64) {
+    sleep_timer_add(task, expire);
+}
+
+/// Cancel a wakeup armed with [`arm_wakeup`].
+pub fn cancel_wakeup(task: usize) {
+    sleep_timer_remove(task);
+}
+
+/// Cancel `task`'s sleep timer (it woke for another reason or its sleep ended).
+fn sleep_timer_remove(task: usize) {
+    let flags = crate::kernel::locking::irqflags::local_irq_save();
+    {
+        let mut timers = SLEEP_TIMERS.lock();
+        if let Some(pos) = timers.iter().position(|t| t.task == task) {
+            timers.swap_remove(pos);
+        }
+    }
+    crate::kernel::locking::irqflags::local_irq_restore(flags);
+}
+
+/// Wake every sleeper whose deadline has passed.  Called from the timer tick
+/// (`apic_timer::on_tick`) in hard-IRQ context — interrupts are already
+/// disabled, so it just takes the lock and marks expired sleepers RUNNING.
+pub fn sleep_timers_expire(now: u64) {
+    let mut timers = SLEEP_TIMERS.lock();
+    timers.retain(|timer| {
+        if time_before(now, timer.expire) {
+            return true;
+        }
+        let task = timer.task as *mut crate::kernel::task::TaskStruct;
+        if !task.is_null() {
+            unsafe {
+                (*task)
+                    .__state
+                    .store(task_state::TASK_RUNNING, Ordering::Release);
+            }
+        }
+        false
+    });
+}
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
@@ -81,23 +165,60 @@ fn schedule_timeout_runtime(timeout_jiffies: u64) -> u64 {
     }
 
     let expire = jiffies().saturating_add(timeout_jiffies);
+    let current = unsafe { crate::kernel::sched::get_current() };
+    let sleep_state = if current.is_null() {
+        task_state::TASK_RUNNING
+    } else {
+        unsafe { (*current).__state.load(Ordering::Acquire) }
+    };
+
+    // Event-driven path: a real task in a sleeping state, not in atomic context,
+    // can be dequeued and woken by the timer wheel at its deadline. The CPU then
+    // halts (or runs other tasks) for the duration instead of busy-yielding.
+    let can_sleep = !current.is_null()
+        && crate::kernel::locking::preempt::preempt_count() == 0
+        && (sleep_state & task_state::NON_RUNNABLE_MASK) != 0;
+
+    if can_sleep {
+        let task_id = current as usize;
+        sleep_timer_add(task_id, expire);
+        while time_before(jiffies(), expire) {
+            // Re-arm the sleep state (a wakeup may have reset it to RUNNING).
+            set_current_task_state(sleep_state);
+            // Re-check after arming so a deadline/wake that raced in is not lost.
+            if !time_before(jiffies(), expire) {
+                break;
+            }
+            // Interruptible sleeps return early on a pending signal.
+            if sleep_state & (task_state::TASK_INTERRUPTIBLE | task_state::TASK_WAKEKILL) != 0
+                && crate::kernel::signal::has_pending_signals(current)
+            {
+                break;
+            }
+            unsafe {
+                crate::kernel::sched::schedule_with_irqs_enabled();
+            }
+        }
+        sleep_timer_remove(task_id);
+        set_current_task_state(task_state::TASK_RUNNING);
+        let now = jiffies();
+        return if time_before(now, expire) {
+            expire.saturating_sub(now)
+        } else {
+            0
+        };
+    }
+
+    // Fallback (no task context / atomic context / caller left us RUNNING): keep
+    // the old bounded busy-yield to the jiffies deadline.
     loop {
-        // There is no timer-wheel wakeup path for module sleeps yet. Keep the
-        // cooperative sleeper runnable while it yields so it can return here
-        // and observe the jiffies deadline itself.
-        set_current_task_state(crate::kernel::task::task_state::TASK_RUNNING);
+        set_current_task_state(task_state::TASK_RUNNING);
         unsafe {
             crate::kernel::sched::schedule_with_irqs_enabled();
         }
-
         let now = jiffies();
-        let remaining = expire.saturating_sub(now);
-        if remaining == 0 {
-            set_current_task_state(crate::kernel::task::task_state::TASK_RUNNING);
-            return remaining;
-        }
         if !time_before(now, expire) {
-            set_current_task_state(crate::kernel::task::task_state::TASK_RUNNING);
+            set_current_task_state(task_state::TASK_RUNNING);
             return 0;
         }
     }

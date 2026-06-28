@@ -328,6 +328,10 @@ fn current_cpu_index() -> usize {
 
 #[cfg(not(test))]
 fn current_cpu_index() -> usize {
+    // Skip the LAPIC MMIO read (a VM-exit on VBox) when only the BSP is online.
+    if crate::arch::x86::kernel::smp::AP_READY_COUNT.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
     let cpu = unsafe { apic::id() } as usize;
     cpu.min(MAX_CPUS - 1)
 }

@@ -265,6 +265,17 @@ pub fn register_module_exports() {
     );
     export_data!("system_wq", ptr::addr_of!(LINUX_SYSTEM_WQ), false);
     export_data!("system_long_wq", ptr::addr_of!(LINUX_SYSTEM_LONG_WQ), false);
+    // `system_dfl_long_wq` is the renamed long-running-work queue introduced in
+    // newer kernels (vendor/linux/kernel/workqueue.c — "similar to system_dfl_wq
+    // but it may host long running works"); libata references it. Back it with
+    // the same workqueue as `system_long_wq`. Without this export, libata.ko
+    // fails to load (unresolved `system_dfl_long_wq`), which cascades into
+    // ahci.ko failing on libata's `ata_pci_shutdown_one` → no root disk → panic.
+    export_data!(
+        "system_dfl_long_wq",
+        ptr::addr_of!(LINUX_SYSTEM_LONG_WQ),
+        false
+    );
     export_data!(
         "system_unbound_wq",
         ptr::addr_of!(LINUX_SYSTEM_UNBOUND_WQ),
