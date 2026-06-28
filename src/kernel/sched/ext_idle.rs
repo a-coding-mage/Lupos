@@ -1,9 +1,9 @@
 //! linux-parity: complete
-//! linux-source: vendor/linux/kernel/sched/ext_idle.c
-//! test-origin: linux:vendor/linux/kernel/sched/ext_idle.c
+//! linux-source: vendor/linux/kernel/sched/ext/idle.c
+//! test-origin: linux:vendor/linux/kernel/sched/ext/idle.c
 //! sched_ext idle hooks.
 //!
-//! Mirrors `vendor/linux/kernel/sched/ext_idle.c`. These helpers are dormant
+//! Mirrors `vendor/linux/kernel/sched/ext/idle.c`. These helpers are dormant
 //! until sched_ext itself is enabled.
 
 use super::entity::CpuMask;

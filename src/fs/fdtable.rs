@@ -122,6 +122,7 @@ impl FilesStruct {
             slot.flags = 0;
             file
         };
+        super::eventpoll::notify_fd_closed(self, fd, &file);
         fput(file);
         Ok(())
     }
@@ -156,6 +157,7 @@ impl FilesStruct {
             }
         };
         if let Some(file) = replaced {
+            super::eventpoll::notify_fd_closed(self, newfd as i32, &file);
             fput(file);
         }
         Ok(newfd as i32)
@@ -174,12 +176,13 @@ impl FilesStruct {
             let hi = last.min(t.len().saturating_sub(1));
             for i in first..=hi {
                 if let Some(file) = t[i].file.take() {
-                    to_put.push(file);
+                    to_put.push((i as i32, file));
                 }
                 t[i] = Slot::empty();
             }
         }
-        for file in to_put {
+        for (fd, file) in to_put {
+            super::eventpoll::notify_fd_closed(self, fd, &file);
             fput(file);
         }
         Ok(())
@@ -195,16 +198,17 @@ impl FilesStruct {
         let mut to_put = Vec::new();
         {
             let mut t = self.table.lock();
-            for slot in t.iter_mut() {
+            for (fd, slot) in t.iter_mut().enumerate() {
                 if slot.flags & FD_CLOEXEC != 0 {
                     if let Some(file) = slot.file.take() {
-                        to_put.push(file);
+                        to_put.push((fd as i32, file));
                     }
                     slot.flags = 0;
                 }
             }
         }
-        for file in to_put {
+        for (fd, file) in to_put {
+            super::eventpoll::notify_fd_closed(self, fd, &file);
             fput(file);
         }
     }
@@ -265,6 +269,14 @@ impl FilesStruct {
             .iter()
             .enumerate()
             .filter_map(|(fd, slot)| slot.file.as_ref().map(|_| fd as i32))
+            .collect()
+    }
+
+    pub fn open_file_refs(&self) -> Vec<FileRef> {
+        self.table
+            .lock()
+            .iter()
+            .filter_map(|slot| slot.file.clone())
             .collect()
     }
 }

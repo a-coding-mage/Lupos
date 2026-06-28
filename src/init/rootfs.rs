@@ -178,6 +178,7 @@ fn dev_kmsg_poll(file: &crate::fs::types::FileRef) -> u32 {
 lazy_static! {
     static ref CONSOLE_CANON_BUFFER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
     static ref CONSOLE_READY_BUFFER: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
+    static ref DISK_ROOT_DEVICE_ALIAS: Mutex<Option<String>> = Mutex::new(None);
 }
 
 pub(crate) fn queue_console_input_response(bytes: &[u8]) {
@@ -629,6 +630,7 @@ pub fn bootstrap_initramfs_rootfs() -> Result<(), i32> {
 }
 
 pub fn bootstrap_initramfs_rootfs_with_options(options: &BootOptions) -> Result<(), i32> {
+    set_disk_root_device_alias(None);
     if let Some(hostname) = options.hostname.as_deref() {
         let _ = version::apply_hostname_param(hostname);
     }
@@ -705,6 +707,7 @@ pub fn mount_disk_root_if_requested(options: &BootOptions) -> Result<Option<Arc<
     };
 
     wait_for_disk_root_device(&mut spec)?;
+    set_disk_root_device_alias(Some(&spec.source));
     fs::init();
     reset_mount_state();
     reset_console_buffers();
@@ -856,6 +859,16 @@ fn resolve_disk_root_block_source(
 
 fn disk_root_block_ready(source: &str, fs_name: &str) -> Option<String> {
     resolve_disk_root_block_source(source, fs_name, false)
+}
+
+fn set_disk_root_device_alias(source: Option<&str>) {
+    *DISK_ROOT_DEVICE_ALIAS.lock() = source
+        .filter(|source| source.starts_with("/dev/"))
+        .map(String::from);
+}
+
+fn disk_root_device_alias() -> Option<String> {
+    DISK_ROOT_DEVICE_ALIAS.lock().clone()
 }
 
 fn settle_disk_root_driver_events() {
@@ -1349,6 +1362,9 @@ fn populate_devtmpfs() -> Result<(), i32> {
     )?;
     populate_common_block_nodes()?;
     populate_registered_block_nodes()?;
+    if let Some(root_device) = disk_root_device_alias() {
+        ensure_symlink("/dev/root", 0o777, &root_device)?;
+    }
 
     // POSIX fd-redirection convention shims.  Ref:
     // `vendor/linux/fs/devpts/inode.c` (devpts), `vendor/linux/init/main.c`
@@ -1940,6 +1956,7 @@ mod tests {
         assert!(!root.is_readonly());
         assert!(path_exists("/dev/console"));
         assert!(path_exists("/dev/vda"));
+        assert!(path_exists("/dev/root"));
         assert!(path_exists("/proc/self/stat"));
         assert!(path_exists("/sys/kernel"));
     }
@@ -1965,6 +1982,7 @@ mod tests {
         assert!(root.is_readonly(), "root= without rw should mount ro");
         assert!(path_exists("/dev/console"));
         assert!(path_exists("/dev/vda"));
+        assert!(path_exists("/dev/root"));
         assert!(path_exists("/proc/self/stat"));
         assert!(path_exists("/sys/kernel"));
         assert!(

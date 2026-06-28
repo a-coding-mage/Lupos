@@ -1,9 +1,9 @@
 //! linux-parity: complete
-//! linux-source: vendor/linux/kernel/sched/ext.c
-//! test-origin: linux:vendor/linux/kernel/sched/ext.c
+//! linux-source: vendor/linux/kernel/sched/ext/ext.c
+//! test-origin: linux:vendor/linux/kernel/sched/ext/ext.c
 //! sched_ext integration surface.
 //!
-//! Mirrors `vendor/linux/kernel/sched/ext.c`. Linux sched_ext delegates policy
+//! Mirrors `vendor/linux/kernel/sched/ext/ext.c`. Linux sched_ext delegates policy
 //! decisions to BPF programs. Lupos does not enable BPF scheduler programs yet,
 //! but keeps explicit disabled-state hooks for ABI and build parity.
 

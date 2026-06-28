@@ -143,7 +143,13 @@ fn read_mm_range(
 }
 
 pub fn self_cgroup_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
-    super::util::copy_into(buf, "0::/\n")
+    let task = unsafe { crate::kernel::sched::get_current() };
+    let pid = if task.is_null() {
+        1
+    } else {
+        unsafe { (*task).pid }
+    };
+    super::util::copy_into(buf, &crate::kernel::cgroup::proc_cgroup_text_for_pid(pid))
 }
 
 pub fn self_oom_score_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {

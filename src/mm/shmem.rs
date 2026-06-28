@@ -760,6 +760,7 @@ pub mod tmpfs_vfs {
     //! shmem integration with swap-out lands when M16 swap finishes plumbing.
 
     use alloc::string::String;
+    use core::sync::atomic::Ordering;
 
     use crate::fs::dcache::d_alloc;
     use crate::fs::libfs::{
@@ -769,7 +770,7 @@ pub mod tmpfs_vfs {
     use crate::fs::ops::{FileOps, InodeOps, SuperOps};
     use crate::fs::super_block::{FileSystemType, register_filesystem};
     use crate::fs::types::{Inode, InodeKind, InodePrivate, InodeRef, SuperBlock, SuperBlockRef};
-    use crate::include::uapi::errno::EINVAL;
+    use crate::include::uapi::errno::{EEXIST, EINVAL};
     use crate::linux_driver_abi::input::evdev_chardev::EVDEV_FILE_OPS;
     use crate::linux_driver_abi::video::fbdev::FBDEV_FILE_OPS;
 
@@ -783,7 +784,7 @@ pub mod tmpfs_vfs {
         unlink: Some(simple_unlink),
         rmdir: Some(simple_rmdir),
         rename: None,
-        symlink: None,
+        symlink: Some(tmpfs_symlink),
         readlink: None,
     };
     pub static TMPFS_FILE_INODE_OPS: InodeOps = InodeOps {
@@ -796,6 +797,17 @@ pub mod tmpfs_vfs {
         rename: None,
         symlink: None,
         readlink: None,
+    };
+    pub static TMPFS_SYMLINK_INODE_OPS: InodeOps = InodeOps {
+        name: "tmpfs_symlink",
+        lookup: None,
+        create: None,
+        mkdir: None,
+        unlink: None,
+        rmdir: None,
+        rename: None,
+        symlink: None,
+        readlink: Some(tmpfs_readlink),
     };
 
     pub static TMPFS_FILE_OPS: FileOps = FileOps {
@@ -821,6 +833,18 @@ pub mod tmpfs_vfs {
         mmap: None,
         release: None,
         readdir: Some(simple_readdir),
+    };
+    pub static TMPFS_SYMLINK_FILE_OPS: FileOps = FileOps {
+        name: "tmpfs_symlink",
+        read: None,
+        write: None,
+        llseek: None,
+        fsync: None,
+        poll: None,
+        ioctl: None,
+        mmap: None,
+        release: None,
+        readdir: None,
     };
 
     pub static TMPFS_SUPER_OPS: SuperOps = SuperOps {
@@ -853,6 +877,22 @@ pub mod tmpfs_vfs {
             &TMPFS_FILE_OPS,
             empty_ram_bytes(),
         );
+        *i.sb.lock() = Some(sb.clone());
+        i
+    }
+    fn make_symlink(sb: &SuperBlockRef, mode: u32, target: &str) -> InodeRef {
+        let i = Inode::new(
+            sb.alloc_ino(),
+            InodeKind::Symlink,
+            mode,
+            &TMPFS_SYMLINK_INODE_OPS,
+            &TMPFS_SYMLINK_FILE_OPS,
+            empty_ram_bytes(),
+        );
+        if let InodePrivate::RamBytes(bytes) = &i.private {
+            bytes.lock().extend_from_slice(target.as_bytes());
+        }
+        i.size.store(target.len() as u64, Ordering::Release);
         *i.sb.lock() = Some(sb.clone());
         i
     }
@@ -899,6 +939,26 @@ pub mod tmpfs_vfs {
             .lock()
             .insert(alloc::string::String::from(name), i.clone());
         Ok(i)
+    }
+    fn tmpfs_symlink(dir: &InodeRef, name: &str, target: &str, mode: u32) -> Result<InodeRef, i32> {
+        let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
+        let i = make_symlink(&sb, mode, target);
+        let mut entries = dir_map(dir)?.lock();
+        if entries.contains_key(name) {
+            return Err(EEXIST);
+        }
+        entries.insert(alloc::string::String::from(name), i.clone());
+        Ok(i)
+    }
+
+    fn tmpfs_readlink(inode: &InodeRef, buf: &mut [u8]) -> Result<usize, i32> {
+        let bytes = match &inode.private {
+            InodePrivate::RamBytes(bytes) => bytes.lock(),
+            _ => return Err(EINVAL),
+        };
+        let n = bytes.len().min(buf.len());
+        buf[..n].copy_from_slice(&bytes[..n]);
+        Ok(n)
     }
 
     fn insert_child(
@@ -1090,6 +1150,35 @@ pub mod tmpfs_vfs {
         fn mounted_devpts_contains_ptmx() {
             let sb = mount_devpts("devpts", 0, "").expect("mount devpts");
             assert_eq!(child_kind(&sb, "ptmx"), InodeKind::Chardev);
+        }
+
+        #[test]
+        fn tmpfs_symlink_round_trips_systemd_invocation_link() {
+            let sb = mount("tmpfs", 0, "").expect("mount tmpfs");
+            let root = sb.root().expect("root");
+            let root_inode = root.inode().expect("root inode");
+            let units = tmpfs_mkdir(&root_inode, "units", 0o755).expect("units dir");
+            let link = tmpfs_symlink(
+                &units,
+                ".#invocation:systemd-vconsole-setup.servicee13514345844c9fe",
+                "ad048641fc1f44bca483d91fc0b0323e",
+                0o777,
+            )
+            .expect("tmpfs symlink");
+
+            assert_eq!(link.kind, InodeKind::Symlink);
+            let mut buf = [0u8; 64];
+            let n = link.ops.readlink.unwrap()(&link, &mut buf).expect("readlink");
+            assert_eq!(&buf[..n], b"ad048641fc1f44bca483d91fc0b0323e");
+            assert!(matches!(
+                tmpfs_symlink(
+                    &units,
+                    ".#invocation:systemd-vconsole-setup.servicee13514345844c9fe",
+                    "duplicate",
+                    0o777,
+                ),
+                Err(EEXIST)
+            ));
         }
     }
 }

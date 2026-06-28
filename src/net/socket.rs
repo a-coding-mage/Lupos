@@ -713,6 +713,15 @@ pub fn sendmsg_with_fds(sock: &SocketRef, bytes: &[u8], fds: Vec<FileRef>) -> Re
 }
 
 pub fn sendto(sock: &SocketRef, bytes: &[u8], dest: SockAddr) -> Result<usize, i32> {
+    sendto_with_fds(sock, bytes, dest, Vec::new())
+}
+
+pub fn sendto_with_fds(
+    sock: &SocketRef,
+    bytes: &[u8],
+    dest: SockAddr,
+    fds: Vec<FileRef>,
+) -> Result<usize, i32> {
     let cred = current_scm_cred();
     if let Some(n) = synthesize_netlink_send(sock, bytes, Some(&dest)) {
         return Ok(n);
@@ -726,10 +735,15 @@ pub fn sendto(sock: &SocketRef, bytes: &[u8], dest: SockAddr) -> Result<usize, i
         .and_then(|sockets| sockets.first().cloned())
         .ok_or(ENOTCONN)?;
     let local = sock.lock().local.clone();
+    let fds = if matches!(dest, SockAddr::Unix(_)) {
+        fds
+    } else {
+        Vec::new()
+    };
     target.lock().recvq.push_back(QueuedPacket {
         bytes: bytes.to_vec(),
         peer: local,
-        fds: Vec::new(),
+        fds,
         cred,
     });
     Ok(bytes.len())

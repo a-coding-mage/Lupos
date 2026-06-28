@@ -23,9 +23,29 @@ pub fn alloc_anon_file_with_kind(
     kind: InodeKind,
     mode: u32,
 ) -> FileRef {
+    alloc_anon_file_with_ino_and_kind(name, fops, token, token as u64, kind, mode)
+}
+
+pub fn alloc_anon_file_with_ino(
+    name: &str,
+    fops: &'static FileOps,
+    token: usize,
+    ino: u64,
+) -> FileRef {
+    alloc_anon_file_with_ino_and_kind(name, fops, token, ino, InodeKind::Socket, 0o600)
+}
+
+pub fn alloc_anon_file_with_ino_and_kind(
+    name: &str,
+    fops: &'static FileOps,
+    token: usize,
+    ino: u64,
+    kind: InodeKind,
+    mode: u32,
+) -> FileRef {
     let dentry = d_alloc(name);
     let inode = Inode::new(
-        token as u64,
+        ino,
         kind,
         mode,
         &NOOP_INODE_OPS,

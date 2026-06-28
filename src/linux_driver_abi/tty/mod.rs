@@ -99,14 +99,18 @@ pub const LFLAG_ECHO: u32 = 0x0000_0008;
 // (`NOFLSH = 0o200`) and vendor/linux/drivers/tty/n_tty.c::isig.
 pub const LFLAG_NOFLSH: u32 = 0x0000_0080;
 
-// `c_cc` array indexes — vendor/linux/include/uapi/asm-generic/termbits.h
-// (`VINTR`, `VQUIT`, `VSUSP`).  These let `process_console_input_byte`
+// `c_cc` array indexes — glibc's x86-64 termios layout keeps these aligned
+// with vendor/linux/include/uapi/asm-generic/termbits.h (`VINTR`, `VQUIT`,
+// `VSUSP`).  These let `process_console_input_byte`
 // honour `stty intr ^A` / `stty quit ^X` / `stty susp ^Y` instead of
 // hard-coding 0x03 / 0x1C / 0x1A.
 pub const VINTR: usize = 0;
 pub const VQUIT: usize = 1;
 pub const VSUSP: usize = 10;
 pub const OFLAG_OPOST: u32 = 0x0000_0001;
+const USER_NCCS: usize = 32;
+const KERNEL_NCCS: usize = 19;
+const DEFAULT_TTY_SPEED: u32 = 115_200;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
@@ -116,7 +120,9 @@ pub struct KernelTermios {
     pub c_cflag: u32,
     pub c_lflag: u32,
     pub c_line: u8,
-    pub c_cc: [u8; 19],
+    pub c_cc: [u8; USER_NCCS],
+    pub c_ispeed: u32,
+    pub c_ospeed: u32,
 }
 
 impl Default for KernelTermios {
@@ -128,8 +134,11 @@ impl Default for KernelTermios {
             c_lflag: 0x8a3b,
             c_line: 0,
             c_cc: [
-                3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0,
+                3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
             ],
+            c_ispeed: DEFAULT_TTY_SPEED,
+            c_ospeed: DEFAULT_TTY_SPEED,
         }
     }
 }
@@ -145,22 +154,24 @@ pub struct KernelTermios2 {
     pub c_cflag: u32,
     pub c_lflag: u32,
     pub c_line: u8,
-    pub c_cc: [u8; 19],
+    pub c_cc: [u8; KERNEL_NCCS],
     pub c_ispeed: u32,
     pub c_ospeed: u32,
 }
 
 impl From<KernelTermios> for KernelTermios2 {
     fn from(t: KernelTermios) -> Self {
+        let mut c_cc = [0u8; KERNEL_NCCS];
+        c_cc.copy_from_slice(&t.c_cc[..KERNEL_NCCS]);
         Self {
             c_iflag: t.c_iflag,
             c_oflag: t.c_oflag,
             c_cflag: t.c_cflag,
             c_lflag: t.c_lflag,
             c_line: t.c_line,
-            c_cc: t.c_cc,
-            c_ispeed: 115200,
-            c_ospeed: 115200,
+            c_cc,
+            c_ispeed: t.c_ispeed,
+            c_ospeed: t.c_ospeed,
         }
     }
 }
@@ -625,13 +636,17 @@ pub fn tty_ioctl_compat(cmd: u32, arg: u64) -> Result<i64, i32> {
                 )
             };
             if not_copied == 0 {
+                let mut c_cc = KernelTermios::default().c_cc;
+                c_cc[..KERNEL_NCCS].copy_from_slice(&termios2.c_cc);
                 let t = KernelTermios {
                     c_iflag: termios2.c_iflag,
                     c_oflag: termios2.c_oflag,
                     c_cflag: termios2.c_cflag,
                     c_lflag: termios2.c_lflag,
                     c_line: termios2.c_line,
-                    c_cc: termios2.c_cc,
+                    c_cc,
+                    c_ispeed: termios2.c_ispeed,
+                    c_ospeed: termios2.c_ospeed,
                 };
                 set_compat_termios(t);
                 Ok(0)
@@ -897,6 +912,19 @@ mod tests {
         );
         assert_eq!(got.ws_row, 37);
         assert_eq!(got.ws_col, 100);
+    }
+
+    #[test]
+    fn tcgets_layout_matches_x86_64_glibc_termios() {
+        let termios = KernelTermios::default();
+        let base = &termios as *const KernelTermios as usize;
+        let ispeed = &termios.c_ispeed as *const u32 as usize - base;
+        let ospeed = &termios.c_ospeed as *const u32 as usize - base;
+
+        assert_eq!(core::mem::size_of::<KernelTermios>(), 60);
+        assert_eq!(ispeed, 52);
+        assert_eq!(ospeed, 56);
+        assert_eq!(core::mem::size_of::<KernelTermios2>(), 44);
     }
 
     #[test]

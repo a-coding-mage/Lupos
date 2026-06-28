@@ -14,4 +14,8 @@ pub mod fs;
 pub mod namespace;
 
 pub use cpu::{BANDWIDTH_PERIOD_NS_DEFAULT, CpuStat, MAX_BW_BURST, TaskGroup};
-pub use fs::{mount, new_cgroup_dir, register};
+pub use fs::{
+    assign_pid_to_cgroup_fd, assign_pid_to_cgroup_path, forget_pid_cgroup,
+    mark_pid_exited_from_cgroup, mount, new_cgroup_dir, path_for_pid, proc_cgroup_text_for_pid,
+    register,
+};

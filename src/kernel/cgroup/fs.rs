@@ -10,6 +10,8 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,7 +23,7 @@ use crate::fs::kernfs::{KernfsNode, add_child, inode_for_node, lookup};
 use crate::fs::ops::SuperOps;
 use crate::fs::super_block::{FileSystemType, register_filesystem};
 use crate::fs::types::{SuperBlock, SuperBlockRef};
-use crate::include::uapi::errno::{EINVAL, ENODEV};
+use crate::include::uapi::errno::{EBADF, EINVAL, ENODEV};
 use crate::kernel::cgroup::cpu::{TaskGroup, format_cpu_stat, parse_cpu_max};
 
 const CGROUP2_MAGIC: u64 = 0x63677270;
@@ -38,6 +40,14 @@ pub static CGROUP_SUPER_OPS: SuperOps = SuperOps {
 lazy_static! {
     /// Single root cgroup state.  Concrete hierarchy lands in M64+.
     pub static ref ROOT_CG: Mutex<TaskGroup> = Mutex::new(TaskGroup::new_root());
+    static ref PID_CGROUPS: Mutex<BTreeMap<i32, PidCgroupMembership>> =
+        Mutex::new(BTreeMap::new());
+}
+
+#[derive(Clone)]
+struct PidCgroupMembership {
+    path: String,
+    live: bool,
 }
 
 // ── cpu.* show/store callbacks ────────────────────────────────────────────
@@ -150,22 +160,147 @@ fn write_const(buf: &mut [u8], text: &'static str) -> Result<usize, i32> {
 fn cgroup_type_show(_n: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
     write_const(buf, "domain\n")
 }
-fn cgroup_procs_show(_n: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
-    write_const(buf, "")
+
+fn cgroup_path_for_node(node: &Arc<KernfsNode>) -> String {
+    let dir = node.parent.lock().upgrade().unwrap_or_else(|| node.clone());
+    let components = crate::fs::kernfs::symlink::kernfs_node_path_from_root(&dir);
+    if components.is_empty() {
+        return String::from("/");
+    }
+
+    let mut path = String::new();
+    for component in components {
+        path.push('/');
+        path.push_str(&component);
+    }
+    path
+}
+
+fn current_pid() -> Option<i32> {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        None
+    } else {
+        Some(unsafe { (*task).pid })
+    }
+}
+
+pub fn assign_pid_to_cgroup_path(pid: i32, path: &str) {
+    PID_CGROUPS.lock().insert(
+        pid,
+        PidCgroupMembership {
+            path: String::from(path),
+            live: true,
+        },
+    );
+}
+
+pub fn mark_pid_exited_from_cgroup(pid: i32) {
+    if let Some(membership) = PID_CGROUPS.lock().get_mut(&pid) {
+        membership.live = false;
+    }
+}
+
+pub fn forget_pid_cgroup(pid: i32) {
+    PID_CGROUPS.lock().remove(&pid);
+}
+
+fn cgroup_procs_store(node: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize, i32> {
+    let text = core::str::from_utf8(buf).map_err(|_| EINVAL)?;
+    let path = cgroup_path_for_node(node);
+    for token in text.split_ascii_whitespace() {
+        let mut pid = token.parse::<i32>().map_err(|_| EINVAL)?;
+        if pid == 0 {
+            pid = current_pid().ok_or(EINVAL)?;
+        }
+        if pid < 0 {
+            return Err(EINVAL);
+        }
+        assign_pid_to_cgroup_path(pid, &path);
+    }
+    Ok(buf.len())
+}
+
+pub fn cgroup_path_from_fd(fd: i32) -> Result<String, i32> {
+    if fd < 0 {
+        return Err(EBADF);
+    }
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return Err(EBADF);
+    }
+    let files = unsafe { crate::kernel::files::get_task_files(task) }.ok_or(EBADF)?;
+    let file = files.get(fd)?;
+    let path = crate::fs::file::path_hint(&file)
+        .or_else(|| crate::fs::mount::path_for_dentry(&file.dentry))
+        .unwrap_or_else(|| crate::fs::file::file_path(&file));
+
+    const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+    let resolved = if path == CGROUP_ROOT {
+        Ok(String::from("/"))
+    } else {
+        let suffix = path.strip_prefix("/sys/fs/cgroup/").ok_or(EINVAL)?;
+        Ok(alloc::format!("/{suffix}"))
+    };
+    resolved
+}
+
+pub fn assign_pid_to_cgroup_fd(pid: i32, fd: i32) -> Result<(), i32> {
+    let path = cgroup_path_from_fd(fd)?;
+    assign_pid_to_cgroup_path(pid, &path);
+    Ok(())
+}
+
+fn cgroup_procs_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    let path = cgroup_path_for_node(node);
+    let mut text = String::new();
+    for (pid, membership) in PID_CGROUPS.lock().iter() {
+        if membership.live && membership.path == path {
+            text.push_str(&alloc::format!("{pid}\n"));
+        }
+    }
+    let n = text.len().min(buf.len());
+    buf[..n].copy_from_slice(&text.as_bytes()[..n]);
+    Ok(n)
+}
+
+pub fn path_for_pid(pid: i32) -> String {
+    PID_CGROUPS
+        .lock()
+        .get(&pid)
+        .map(|membership| membership.path.clone())
+        .unwrap_or_else(|| String::from("/"))
+}
+
+pub fn proc_cgroup_text_for_pid(pid: i32) -> String {
+    alloc::format!("0::{}\n", path_for_pid(pid))
+}
+
+#[cfg(test)]
+fn clear_pid_cgroups_for_test() {
+    PID_CGROUPS.lock().clear();
 }
 fn cgroup_events_show(n: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
-    let populated = if file_lives_in_root_cgroup(n) { 1 } else { 0 };
+    let path = cgroup_path_for_node(n);
+    let populated = if cgroup_path_is_populated(&path) {
+        1
+    } else {
+        0
+    };
     let s = alloc::format!("populated {}\nfrozen 0\n", populated);
     let n = s.len().min(buf.len());
     buf[..n].copy_from_slice(&s.as_bytes()[..n]);
     Ok(n)
 }
 
-fn file_lives_in_root_cgroup(n: &Arc<KernfsNode>) -> bool {
-    n.parent
-        .lock()
-        .upgrade()
-        .is_some_and(|dir| dir.parent.lock().upgrade().is_none())
+fn cgroup_path_is_populated(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    let prefix = alloc::format!("{path}/");
+    PID_CGROUPS.lock().values().any(|membership| {
+        membership.live && (membership.path == path || membership.path.starts_with(&prefix))
+    })
 }
 fn cgroup_max_show(_n: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
     write_const(buf, "max\n")
@@ -315,7 +450,7 @@ fn populate_cgroup_dir_internal(root: &Arc<KernfsNode>, is_root: bool) {
             "cgroup.procs",
             0o644,
             Some(cgroup_procs_show),
-            Some(accept_store),
+            Some(cgroup_procs_store),
         ),
     );
     add_child(
@@ -324,7 +459,7 @@ fn populate_cgroup_dir_internal(root: &Arc<KernfsNode>, is_root: bool) {
             "cgroup.threads",
             0o644,
             Some(cgroup_procs_show),
-            Some(accept_store),
+            Some(cgroup_procs_store),
         ),
     );
     add_child(
@@ -486,6 +621,8 @@ pub fn register() {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
     #[test]
     fn systemd_root_cgroup_files_have_linux_shaped_defaults() {
         let node = KernfsNode::new_dir("/", 0o755);
@@ -522,6 +659,8 @@ mod tests {
 
     #[test]
     fn cgroup_events_reports_service_cgroups_unpopulated() {
+        let _guard = TEST_LOCK.lock();
+        clear_pid_cgroups_for_test();
         let root = KernfsNode::new_dir("/", 0o755);
         let service = new_cgroup_dir("systemd-journald.service", 0o755);
         add_child(&root, service.clone());
@@ -530,6 +669,30 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = cgroup_events_show(&events, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"populated 0\nfrozen 0\n");
+    }
+
+    #[test]
+    fn cgroup_events_reports_descendant_pid_populated() {
+        let _guard = TEST_LOCK.lock();
+        clear_pid_cgroups_for_test();
+        let root = KernfsNode::new_dir("/", 0o755);
+        let system = new_cgroup_dir("system.slice", 0o755);
+        let service = new_cgroup_dir("systemd-udevd.service", 0o755);
+        let udev = new_cgroup_dir("udev", 0o755);
+        add_child(&root, system.clone());
+        add_child(&system, service.clone());
+        add_child(&service, udev.clone());
+
+        assign_pid_to_cgroup_path(342, "/system.slice/systemd-udevd.service/udev");
+
+        let events = lookup(&service, "cgroup.events").unwrap();
+        let mut buf = [0u8; 64];
+        let n = cgroup_events_show(&events, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"populated 1\nfrozen 0\n");
+
+        let events = lookup(&udev, "cgroup.events").unwrap();
+        let n = cgroup_events_show(&events, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"populated 1\nfrozen 0\n");
     }
 
     #[test]
@@ -685,5 +848,54 @@ mod tests {
         );
         let pids_max = lookup(&service, "pids.max").unwrap();
         assert_eq!(unsupported_controller_store(&pids_max, b"2\n"), Err(ENODEV));
+    }
+
+    #[test]
+    fn cgroup_procs_write_updates_proc_pid_cgroup_path() {
+        let _guard = TEST_LOCK.lock();
+        clear_pid_cgroups_for_test();
+        let root = KernfsNode::new_dir("/", 0o755);
+        populate_cgroup_dir(&root);
+        let system = new_cgroup_dir("system.slice", 0o755);
+        let service = new_cgroup_dir("systemd-udevd.service", 0o755);
+        add_child(&root, system.clone());
+        add_child(&system, service.clone());
+
+        let procs = lookup(&service, "cgroup.procs").unwrap();
+        assert_eq!(cgroup_procs_store(&procs, b"341\n"), Ok(4));
+        assert_eq!(path_for_pid(341), "/system.slice/systemd-udevd.service");
+        assert_eq!(
+            proc_cgroup_text_for_pid(341),
+            "0::/system.slice/systemd-udevd.service\n"
+        );
+
+        let mut buf = [0u8; 32];
+        let n = cgroup_procs_show(&procs, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"341\n");
+    }
+
+    #[test]
+    fn cgroup_exit_drops_procs_but_keeps_proc_cgroup_until_reap() {
+        let _guard = TEST_LOCK.lock();
+        clear_pid_cgroups_for_test();
+        let root = KernfsNode::new_dir("/", 0o755);
+        let service = new_cgroup_dir("systemd-udevd.service", 0o755);
+        add_child(&root, service.clone());
+
+        assign_pid_to_cgroup_path(342, "/systemd-udevd.service");
+        mark_pid_exited_from_cgroup(342);
+        assert_eq!(path_for_pid(342), "/systemd-udevd.service");
+
+        let procs = lookup(&service, "cgroup.procs").unwrap();
+        let mut buf = [0u8; 64];
+        let n = cgroup_procs_show(&procs, &mut buf).unwrap();
+        assert_eq!(n, 0);
+
+        let events = lookup(&service, "cgroup.events").unwrap();
+        let n = cgroup_events_show(&events, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"populated 0\nfrozen 0\n");
+
+        forget_pid_cgroup(342);
+        assert_eq!(path_for_pid(342), "/");
     }
 }

@@ -755,8 +755,8 @@ src/kernel/sched/cputime.rs	vendor/linux/kernel/sched/cputime.c	layout-oracle
 src/kernel/sched/deadline.rs	vendor/linux/kernel/sched/deadline.c	layout-oracle
 src/kernel/sched/debug.rs	vendor/linux/kernel/sched/debug.c	layout-oracle
 src/kernel/sched/entity.rs	vendor/linux/kernel/sched	layout-oracle
-src/kernel/sched/ext.rs	vendor/linux/kernel/sched/ext.c	layout-oracle
-src/kernel/sched/ext_idle.rs	vendor/linux/kernel/sched/ext_idle.c	layout-oracle
+src/kernel/sched/ext.rs	vendor/linux/kernel/sched/ext/ext.c	layout-oracle
+src/kernel/sched/ext_idle.rs	vendor/linux/kernel/sched/ext/idle.c	layout-oracle
 src/kernel/sched/fair.rs	vendor/linux/kernel/sched/fair.c	layout-oracle
 src/kernel/sched/idle.rs	vendor/linux/kernel/sched/idle.c	layout-oracle
 src/kernel/sched/isolation.rs	vendor/linux/kernel/sched/isolation.c	layout-oracle

@@ -440,7 +440,7 @@ pub unsafe fn sys_rt_sigprocmask(
         set.remove(SIGSTOP);
     }
 
-    let old = {
+    let (old, blocked) = {
         let mut table = SIGNAL_TABLE.lock();
         let state = match table.get_or_create_current() {
             Ok(s) => s,
@@ -456,8 +456,25 @@ pub unsafe fn sys_rt_sigprocmask(
                 _ => return -22,
             }
         }
-        old
+        (old, state.blocked)
     };
+    #[cfg(not(test))]
+    if crate::kernel::debug_trace::proc_enabled() {
+        let task = unsafe { sched::get_current() };
+        let pid = if task.is_null() {
+            -1
+        } else {
+            unsafe { (*task).pid }
+        };
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-proc-sigmask pid={} how={} set={} old={:#x} new={:#x}",
+            pid,
+            how,
+            next.map(|set| set.bits).unwrap_or(0),
+            old.bits,
+            blocked.bits
+        );
+    }
 
     if !oldset.is_null() {
         if let Err(e) = unsafe { write_user_value(oldset, &old) } {
@@ -723,14 +740,35 @@ pub unsafe fn send_signal_to_task(target: *mut crate::kernel::task::TaskStruct, 
             sig_bit(SIGSTOP) | sig_bit(SIGTSTP) | sig_bit(SIGTTIN) | sig_bit(SIGTTOU),
         );
     }
-    if !stop_now {
+    let (pending_bits, blocked_bits) = if !stop_now {
         state.shared_pending.add(sig);
         state.pending.add(sig);
         if sig >= 32 {
             state.rt_queue.push_back(SigInfo::new(sig, 0));
         }
-    }
+        (
+            state.pending.bits | state.shared_pending.bits,
+            state.blocked.bits,
+        )
+    } else {
+        (
+            state.pending.bits | state.shared_pending.bits,
+            state.blocked.bits,
+        )
+    };
     drop(table);
+
+    #[cfg(not(test))]
+    if crate::kernel::debug_trace::proc_enabled() {
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-proc-signal-send target={} sig={} pending={:#x} blocked={:#x} stop_now={}",
+            target_pid,
+            sig,
+            pending_bits,
+            blocked_bits,
+            stop_now
+        );
+    }
 
     if sig == SIGCONT {
         unsafe {
@@ -970,6 +1008,21 @@ pub fn has_current_pending_signal_mask(mask: u64) -> bool {
         })
 }
 
+pub fn current_pending_signal_bits() -> u64 {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return 0;
+    }
+    let pid = unsafe { (*task).pid };
+    let table = SIGNAL_TABLE.lock();
+    table
+        .states
+        .iter()
+        .find(|state| state.pid == pid)
+        .map(|state| state.pending.bits | state.shared_pending.bits)
+        .unwrap_or(0)
+}
+
 pub fn dequeue_current_pending_signal_mask(mask: u64) -> Option<SigInfo> {
     let task = unsafe { crate::kernel::sched::get_current() };
     if task.is_null() {
@@ -1082,6 +1135,15 @@ pub unsafe fn do_signal_stop_only() -> bool {
         },
         SIGSTOP | SIGTSTP => unsafe { stop_current_for_signal(task, info.signo) },
         _ => {
+            #[cfg(not(test))]
+            if crate::kernel::debug_trace::proc_enabled() {
+                let pid = unsafe { (*task).pid };
+                crate::linux_driver_abi::tty::serial_println!(
+                    "trace-proc-signal-drain pid={} sig={}",
+                    pid,
+                    info.signo
+                );
+            }
             let still_pending = {
                 let mut table = SIGNAL_TABLE.lock();
                 table

@@ -596,7 +596,7 @@ const SYSTEMD_FSTAB: &str = concat!(
     "/swapfile none swap sw 0 0\n",
 );
 const SYSTEMD_DISK_ROOT_FSTAB: &str = concat!(
-    "LABEL=lupos-root / ext4 defaults 0 1\n",
+    "/dev/root / ext4 defaults 0 1\n",
     "proc /proc proc defaults 0 0\n",
     "sysfs /sys sysfs defaults 0 0\n",
     "devtmpfs /dev devtmpfs defaults 0 0\n",
@@ -605,11 +605,14 @@ const SYSTEMD_DISK_ROOT_FSTAB: &str = concat!(
     "cgroup2 /sys/fs/cgroup cgroup2 defaults 0 0\n",
     "/swapfile none swap sw 0 0\n",
 );
+// The login image stages the Arch/systemd static account databases. Keep auth
+// lookups file-only so early boot services do not block on DynamicUser userdb
+// traffic before the login stack is fully up.
 const SYSTEMD_NSSWITCH: &str = concat!(
-    "passwd: files systemd\n",
-    "group: files [SUCCESS=merge] systemd\n",
-    "shadow: files systemd\n",
-    "gshadow: files systemd\n",
+    "passwd: files\n",
+    "group: files\n",
+    "shadow: files\n",
+    "gshadow: files\n",
     "hosts: mymachines resolve [!UNAVAIL=return] files myhostname dns\n",
 );
 const SYSTEMD_SYSTEM_CONF: &str = concat!(
@@ -2838,6 +2841,9 @@ fn systemd_getty_override() -> Vec<u8> {
 
 fn systemd_serial_getty_override() -> Vec<u8> {
     concat!(
+        "[Unit]\n",
+        "ConditionKernelCommandLine=lupos.serial_getty=1\n",
+        "\n",
         "[Service]\n",
         "ExecStart=\n",
         "ExecStart=-/usr/sbin/agetty --noclear --nohostname --issue-file /etc/issue 115200 ttyS0 linux\n",
@@ -2847,12 +2853,16 @@ fn systemd_serial_getty_override() -> Vec<u8> {
 }
 
 fn systemd_lupos_terminal_target_unit() -> Vec<u8> {
+    // VirtualBox users see the Linux virtual console, not a connected serial
+    // pipe.  Keep tty1 in the fast terminal target: vendor/linux/Documentation/
+    // admin-guide/devices.rst defines /dev/tty1 as the first virtual console
+    // and /dev/tty0 as the current system video console.
     concat!(
         "[Unit]\n",
         "Description=Lupos Terminal Login\n",
         "Documentation=man:systemd.target(5)\n",
         "DefaultDependencies=no\n",
-        "Wants=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service lupos-serial-getty.service\n",
+        "Wants=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service getty@tty1.service lupos-serial-getty.service\n",
         "AllowIsolate=yes\n",
     )
     .as_bytes()
@@ -2865,6 +2875,7 @@ fn systemd_lupos_serial_getty_unit() -> Vec<u8> {
         "Description=Lupos Serial Getty on ttyS0\n",
         "Documentation=man:agetty(8) man:login(1)\n",
         "DefaultDependencies=no\n",
+        "ConditionKernelCommandLine=lupos.serial_getty=1\n",
         "After=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service\n",
         "\n",
         "[Service]\n",
@@ -4797,6 +4808,8 @@ fn systemd_login_userland_files_with_stage_and_options(
         ),
         initramfs_file("etc/hostname", 0o100644, staged_config("etc/hostname", b"lupos\n")),
         initramfs_file("etc/machine-id", 0o100444, SYSTEMD_MACHINE_ID.as_bytes()),
+        initramfs_file("etc/.updated", 0o100644, Vec::new()),
+        initramfs_file("var/.updated", 0o100644, Vec::new()),
         initramfs_file("etc/passwd", 0o100644, staged_auth_config(stage, "etc/passwd", LOGIN_PASSWD)),
         initramfs_file("etc/shadow", 0o100600, staged_auth_config(stage, "etc/shadow", LOGIN_SHADOW)),
         initramfs_file("etc/group", 0o100644, staged_auth_config(stage, "etc/group", LOGIN_GROUP)),
@@ -4828,7 +4841,7 @@ fn systemd_login_userland_files_with_stage_and_options(
             0o100600,
             lupos_swapfile_bytes(),
         ),
-        initramfs_file("etc/nsswitch.conf", 0o100644, staged_config("etc/nsswitch.conf", SYSTEMD_NSSWITCH.as_bytes())),
+        initramfs_file("etc/nsswitch.conf", 0o100644, SYSTEMD_NSSWITCH.as_bytes()),
         initramfs_file("etc/profile", 0o100644, staged_config("etc/profile", LOGIN_PROFILE.as_bytes())),
         initramfs_file("etc/bash.bashrc", 0o100644, staged_config("etc/bash.bashrc", LOGIN_BASH_BASHRC.as_bytes())),
         // Root keeps Arch's normal HOME=/root, but its first interactive login
@@ -4897,6 +4910,10 @@ fn systemd_login_userland_files_with_stage_and_options(
         initramfs_symlink(
             "etc/systemd/system/lupos-terminal.target.wants/lupos-serial-getty.service",
             "/usr/lib/systemd/system/lupos-serial-getty.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/getty@tty1.service",
+            "/usr/lib/systemd/system/getty@.service",
         ),
         initramfs_symlink(
             "etc/systemd/system/getty.target.wants/getty@tty1.service",
@@ -5334,7 +5351,7 @@ fn staged_auth_runtime_files(stage: Option<&Path>) -> Vec<InitramfsFile> {
         ("usr/lib/libpam_misc.so", 0o100755),
         ("usr/lib/libpam_misc.so.0", 0o100755),
         ("usr/lib/libpam_misc.so.0.82.1", 0o100755),
-        ("usr/sbin/unix_chkpwd", 0o100755),
+        ("usr/sbin/unix_chkpwd", 0o104755),
         ("lib/security/pam_deny.so", 0o100755),
         ("lib/security/pam_env.so", 0o100755),
         ("lib/security/pam_permit.so", 0o100755),
@@ -5855,36 +5872,53 @@ fn write_release_root(root: &Path, kernel_artifact: Option<&Path>) -> Result<Pat
 
 fn release_grub_cfg_content() -> String {
     let extra_cmdline = env::var(LUPOS_KERNEL_CMDLINE_ENV).unwrap_or_default();
+    let normal_cmdline = root_disk_cmdline(&extra_cmdline);
+    let recovery_cmdline = format!(
+        "single systemd.show_status=yes {}",
+        root_disk_cmdline(&extra_cmdline)
+    );
+
+    // The release ISO is the VirtualBox path. Keep its default entry on the
+    // same Linux boot-protocol path as the public QEMU login boot: GRUB's
+    // `linux` command fills the boot_params command line/initrd fields from
+    // vendor/linux/arch/x86/include/uapi/asm/bootparam.h, and Linux root mount
+    // handling consumes root=, rootfstype=, and rw in vendor/linux/init/do_mounts.c.
+    //
+    // Do not include GRUB's serial terminal here. QEMU test boots always attach
+    // a serial sink, but a normal VirtualBox VM may have a host-pipe UART with
+    // no client connected. In that case GRUB can stall before it ever loads the
+    // kernel. The Linux boot path remains the same; only the bootloader terminal
+    // devices differ so the graphical VM window is authoritative for release.
+    //
     // No `splash`: it makes userspace put the console in KD_GRAPHICS mode, which
     // disables the framebuffer text console (`set_fbcon_enabled(false)` in
     // tty::mod's KDSETMODE handler) and is never restored to KD_TEXT (Lupos has
     // no splash renderer), leaving the VirtualBox graphical window black. No
     // `quiet` either, so kernel boot progress is visible on that console.
-    let normal_cmdline = format!(
-        "systemd.show_status=yes {}",
-        root_disk_cmdline(&extra_cmdline)
-    );
-    let recovery_cmdline = format!(
-        "single systemd.show_status=yes {}",
-        root_disk_cmdline(&extra_cmdline)
-    );
-    format!(
+    let mut cfg = format!(
         r#"set timeout={GRUB_INTERACTIVE_SPLASH_TIMEOUT_SECS}
 set default=0
+
+# Use GRUB's stock graphical terminal with the Lupos splash art as background.
 insmod all_video
 insmod linux
 set gfxmode=auto
 insmod png
 insmod gfxterm
+terminal_input console
 terminal_output gfxterm
 background_image /boot/grub/splashart.png
 
 menuentry "lupos" {{
-    linux /boot/bzImage {normal_cmdline}
+    # linux: GRUB command to load a Linux boot-protocol bzImage.
+    linux /boot/bzImage systemd.show_status=yes {normal_cmdline}
     initrd /boot/initramfs.cpio
     boot
 }}
-
+"#
+    );
+    cfg.push_str(&format!(
+        r#"
 menuentry "lupos recovery" {{
     linux /boot/bzImage {recovery_cmdline}
     initrd /boot/initramfs.cpio
@@ -5893,7 +5927,8 @@ menuentry "lupos recovery" {{
 
 # os-prober entries are appended by the release installer when another OS is detected.
 "#
-    )
+    ));
+    cfg
 }
 
 fn write_grub_splash_art(root: &Path) -> Result<PathBuf> {
@@ -6136,7 +6171,7 @@ fn grub_cfg_content_with_cmdline(mode: &BootMode, extra_cmdline: &str) -> String
         | BootMode::LoginStackTest
         | BootMode::UserspaceSmokeTest
         | BootMode::RuntimeStressTest
-        | BootMode::ShippedCommandsTest => "systemd.show_status=yes",
+        | BootMode::ShippedCommandsTest => "systemd.show_status=yes lupos.serial_getty=1",
         BootMode::GraphicsX11 | BootMode::GraphicsWayland => "quiet systemd.show_status=no",
         _ => "",
     };
@@ -9563,6 +9598,10 @@ fn direct_stage_login_root_disk_overlay_files(
         BootMode::UserspaceSmokeTest | BootMode::RuntimeStressTest
     );
     let shipped_commands = mode == BootMode::ShippedCommandsTest;
+    let mark_update_done = matches!(
+        mode,
+        BootMode::LoginStackTest | BootMode::ShippedCommandsTest
+    );
     let staged_config = |rel: &str, fallback: &[u8]| {
         staged_userland_bytes(Some(stage), &[rel]).unwrap_or_else(|| fallback.to_vec())
     };
@@ -9604,6 +9643,7 @@ fn direct_stage_login_root_disk_overlay_files(
             staged_auth_config(stage, "etc/gshadow", LOGIN_GSHADOW),
         ),
         initramfs_file("etc/fstab", 0o100644, fstab_contents.as_bytes().to_vec()),
+        initramfs_file("etc/nsswitch.conf", 0o100644, SYSTEMD_NSSWITCH.as_bytes()),
         initramfs_file("etc/modules", 0o100644, etc_modules_from_repo_config()),
         initramfs_file(
             "etc/pacman.d/mirrorlist",
@@ -9820,6 +9860,16 @@ fn direct_stage_login_root_disk_overlay_files(
         _ => {}
     }
 
+    if mark_update_done {
+        // Mark freshly built direct-stage systemd images update-done, exactly
+        // as systemd-update-done.service would after a completed update cycle
+        // (vendor/systemd src/update-done/update-done.c). Without these,
+        // ConditionNeedsUpdate units can run first-boot rebuild work or fail
+        // on roots that are still transitioning to read-write.
+        files.push(initramfs_file("etc/.updated", 0o100644, Vec::new()));
+        files.push(initramfs_file("var/.updated", 0o100644, Vec::new()));
+    }
+
     if shipped_commands {
         files.push(initramfs_file(
             SHIPPED_COMMANDS_SCRIPT_PATH,
@@ -9839,14 +9889,6 @@ fn direct_stage_login_root_disk_overlay_files(
             "etc/systemd/system/default.target",
             "/usr/lib/systemd/system/multi-user.target",
         ));
-        // Mark the freshly built image update-done, exactly as
-        // systemd-update-done.service would after a completed update cycle
-        // (vendor/systemd src/update-done/update-done.c).  Without these,
-        // ConditionNeedsUpdate units (ldconfig.service,
-        // systemd-journal-catalog-update.service, systemd-sysusers.service)
-        // run whole-tree first-boot rebuilds that stall the boot under TCG.
-        files.push(initramfs_file("etc/.updated", 0o100644, Vec::new()));
-        files.push(initramfs_file("var/.updated", 0o100644, Vec::new()));
         // serial-getty@ttyS0 BindsTo dev-ttyS0.device, which only shows up
         // after udevd settles; until the udev device-unit path is proven on
         // Lupos, the login prompt must come from the udev-independent
@@ -17716,6 +17758,35 @@ failed command output\n";
     }
 
     #[test]
+    fn login_stack_root_disk_overlay_marks_update_done_without_multi_user_gate() {
+        let modules = Vec::new();
+        let files = direct_stage_login_root_disk_overlay_files(
+            BootMode::LoginStackTest,
+            SYSTEMD_DISK_ROOT_FSTAB,
+            &modules,
+            Path::new("/nonexistent-login-stage"),
+        );
+
+        for updated in ["etc/.updated", "var/.updated"] {
+            assert!(
+                find_initramfs_entry(&files, updated).is_some(),
+                "{updated} must mark the login-stack image update-done"
+            );
+        }
+        let default_target = find_initramfs_entry(&files, "etc/systemd/system/default.target")
+            .expect("default.target staged");
+        assert_eq!(
+            default_target.2.as_slice(),
+            b"/usr/lib/systemd/system/lupos-terminal.target",
+            "login-stack must keep the fast terminal target"
+        );
+        assert!(
+            find_initramfs_entry(&files, SHIPPED_COMMANDS_SCRIPT_PATH).is_none(),
+            "login-stack must not include the shipped-commands gate"
+        );
+    }
+
+    #[test]
     fn shipped_commands_root_disk_overlay_boots_multi_user_without_desktop_services() {
         let modules = Vec::new();
         let files = direct_stage_login_root_disk_overlay_files(
@@ -17906,7 +17977,9 @@ failed command output\n";
         let cfg = grub_cfg_content_with_cmdline(&BootMode::LoginStackTest, "root=/dev/vda");
 
         assert!(cfg.contains("initrd /boot/initramfs.cpio"));
-        assert!(cfg.contains("linux /boot/bzImage systemd.show_status=yes root=/dev/vda"));
+        assert!(cfg.contains(
+            "linux /boot/bzImage systemd.show_status=yes lupos.serial_getty=1 root=/dev/vda"
+        ));
         assert!(root_disk_boot_uses_module_initrd(&BootMode::LoginStackTest));
     }
 
@@ -19590,12 +19663,12 @@ CONFIG_MODULES=y
                 "root=/dev/vda rootfstype=ext4 fsck.mode=force"
             )
             .contains(
-                "linux /boot/bzImage systemd.show_status=yes root=/dev/vda rootfstype=ext4 fsck.mode=force\n    initrd /boot/initramfs.cpio"
+                "linux /boot/bzImage systemd.show_status=yes lupos.serial_getty=1 root=/dev/vda rootfstype=ext4 fsck.mode=force\n    initrd /boot/initramfs.cpio"
             )
         );
         assert!(
-            SYSTEMD_DISK_ROOT_FSTAB.starts_with("LABEL=lupos-root / ext4 defaults 0 1\n"),
-            "disk-root fsck fstab must request a root fsck pass"
+            SYSTEMD_DISK_ROOT_FSTAB.starts_with("/dev/root / ext4 defaults 0 1\n"),
+            "disk-root fsck fstab must request a root fsck pass through the resolved root device"
         );
     }
 
@@ -19656,7 +19729,7 @@ CONFIG_MODULES=y
         // Login modes pre-pend `systemd.show_status=yes` so slow jobs are
         // visible on the serial console.
         assert!(cfg.contains(
-            "linux /boot/bzImage systemd.show_status=yes lupos.trace=syscall,fs,cgroup\n    initrd /boot/initramfs.cpio"
+            "linux /boot/bzImage systemd.show_status=yes lupos.serial_getty=1 lupos.trace=syscall,fs,cgroup\n    initrd /boot/initramfs.cpio"
         ));
     }
 
@@ -19672,8 +19745,8 @@ CONFIG_MODULES=y
         ] {
             let cfg = grub_cfg_content_with_cmdline(&mode, "");
             assert!(
-                cfg.contains("/boot/bzImage systemd.show_status=yes"),
-                "{mode:?}: cmdline must default to `systemd.show_status=yes`: {cfg}"
+                cfg.contains("/boot/bzImage systemd.show_status=yes lupos.serial_getty=1"),
+                "{mode:?}: cmdline must default to visible status and serial getty opt-in: {cfg}"
             );
             assert!(
                 !cfg.contains("/boot/bzImage quiet systemd.show_status=no"),
@@ -19824,12 +19897,17 @@ CONFIG_MODULES=y
     #[test]
     fn serial_getty_unit_execs_immediately_for_fast_login() {
         let unit = String::from_utf8(systemd_lupos_serial_getty_unit()).expect("serial getty unit");
+        assert!(unit.contains("ConditionKernelCommandLine=lupos.serial_getty=1"));
         assert!(unit.contains("Type=simple"));
         assert!(!unit.contains("Type=idle"));
         assert!(unit.contains(
             "After=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service"
         ));
         assert!(unit.contains("ExecStart=-/usr/sbin/agetty --noclear --nohostname"));
+
+        let drop_in =
+            String::from_utf8(systemd_serial_getty_override()).expect("serial getty drop-in");
+        assert!(drop_in.contains("ConditionKernelCommandLine=lupos.serial_getty=1"));
     }
 
     #[test]
@@ -19901,6 +19979,21 @@ CONFIG_MODULES=y
             assert!(
                 !journald_service.contains(unsupported),
                 "journald override must avoid unsupported sandbox directive {unsupported}"
+            );
+        }
+    }
+
+    #[test]
+    fn systemd_login_userland_marks_fresh_image_update_done() {
+        let Some(stage) = systemd_login_stage_or_skip() else {
+            return;
+        };
+        let files = systemd_login_userland_files_with_stage(&stage);
+
+        for updated in ["etc/.updated", "var/.updated"] {
+            assert!(
+                find_initramfs_entry(&files, updated).is_some(),
+                "{updated} must mark release login images update-done"
             );
         }
     }
@@ -20753,6 +20846,17 @@ CONFIG_MODULES=y
             b"/usr/lib/systemd/system/getty@.service"
         );
 
+        let terminal_getty_wants = find_initramfs_entry(
+            &files,
+            "etc/systemd/system/lupos-terminal.target.wants/getty@tty1.service",
+        )
+        .expect("fast terminal target must directly want getty@tty1.service");
+        assert!(initramfs_file_is_symlink(terminal_getty_wants));
+        assert_eq!(
+            terminal_getty_wants.2.as_slice(),
+            b"/usr/lib/systemd/system/getty@.service"
+        );
+
         // Drop-in override forces agetty on tty1 with the linux termcap, the
         // canonical framebuffer console.  systemd would otherwise vt-allocate
         // the tty away from the login prompt before agetty got to it.
@@ -21158,6 +21262,26 @@ CONFIG_MODULES=y
                 "init::rootfs::drain_console_control_bytes();\n            kernel::console::maintenance_budgeted();"
             ),
             "PID1/login scheduler loops must drain tty control bytes before fbcon maintenance"
+        );
+    }
+
+    #[test]
+    fn pid1_handoff_uses_nonblocking_console_flush() {
+        let source = fs::read_to_string(repo_root().expect("repo root").join("src/init/main.rs"))
+            .expect("read kernel main source");
+        let source = source.replace("\r\n", "\n");
+        let handoff = source
+            .find("Run /sbin/init as init process")
+            .expect("PID1 handoff log line must exist");
+        let end = (handoff + 512).min(source.len());
+        let window = &source[handoff..end];
+        assert!(
+            window.contains("kernel::console::flush_all_nonblocking();"),
+            "PID1 handoff must repaint the framebuffer without blocking on serial"
+        );
+        assert!(
+            !window.contains("kernel::console::flush_all_blocking();"),
+            "PID1 handoff must not spin forever on an unwritable serial sink"
         );
     }
 
@@ -21576,12 +21700,20 @@ CONFIG_MODULES=y
 
         // nsswitch.conf must point lookups at `files` (and `dns` for hosts).
         // Ref: man 5 nsswitch.conf.
-        let nsswitch = fs::read_to_string(stage.join("etc/nsswitch.conf"))
-            .expect("/etc/nsswitch.conf must be staged");
-        for prefix in ["passwd:", "group:", "shadow:", "hosts:"] {
+        let nsswitch_bytes = initramfs_file_bytes(&files, "etc/nsswitch.conf")
+            .expect("/etc/nsswitch.conf must be staged in the boot payload");
+        let nsswitch = core::str::from_utf8(&nsswitch_bytes).expect("nsswitch.conf must be ASCII");
+        for prefix in ["passwd:", "group:", "shadow:", "gshadow:", "hosts:"] {
             assert!(
                 nsswitch.lines().any(|l| l.trim_start().starts_with(prefix)),
                 "/etc/nsswitch.conf missing `{prefix}` lookup"
+            );
+        }
+        for database in ["passwd", "group", "shadow", "gshadow"] {
+            let expected = format!("{database}: files");
+            assert!(
+                nsswitch.lines().any(|l| l.trim() == expected),
+                "/etc/nsswitch.conf must keep `{database}` lookups file-only"
             );
         }
         assert!(
@@ -21948,6 +22080,7 @@ CONFIG_MODULES=y
             "systemd-journald.socket",
             "systemd-journald-dev-log.socket",
             "systemd-journald.service",
+            "getty@tty1.service",
             "lupos-serial-getty.service",
         ] {
             assert!(
@@ -21955,6 +22088,15 @@ CONFIG_MODULES=y
                 "lupos-terminal.target must want {wanted}: {terminal_target_body}"
             );
         }
+        let display_getty_wants = find_initramfs_symlink_target(
+            &files,
+            "etc/systemd/system/lupos-terminal.target.wants/getty@tty1.service",
+        )
+        .expect("lupos-terminal.target must directly want getty@tty1.service");
+        assert_eq!(
+            display_getty_wants,
+            b"/usr/lib/systemd/system/getty@.service"
+        );
         let terminal_wants = find_initramfs_symlink_target(
             &files,
             "etc/systemd/system/lupos-terminal.target.wants/lupos-serial-getty.service",
@@ -22281,11 +22423,21 @@ CONFIG_MODULES=y
     }
 
     #[test]
-    fn release_grub_uses_quiet_splash_and_recovery() {
+    fn release_grub_uses_linux_boot_process_without_serial_terminal() {
+        let _cmdline = EnvVarGuard::set(LUPOS_KERNEL_CMDLINE_ENV, "");
         let cfg = release_grub_cfg_content();
         assert!(cfg.contains("set timeout=2"));
+        assert!(cfg.contains("terminal_input console"));
+        assert!(cfg.contains("terminal_output gfxterm"));
+        assert!(
+            !cfg.contains("serial --unit="),
+            "VirtualBox release GRUB must not block on an unconnected host-pipe serial terminal"
+        );
+        assert!(!cfg.contains("terminal_input console serial"));
+        assert!(!cfg.contains("terminal_output gfxterm serial"));
+        assert!(!cfg.contains("lupos.serial_getty=1"));
         assert!(cfg.contains(
-            "linux /boot/bzImage quiet splash systemd.show_status=yes root=LABEL=lupos-root rootfstype=ext4 rw"
+            "linux /boot/bzImage systemd.show_status=yes root=LABEL=lupos-root rootfstype=ext4 rw"
         ));
         assert!(cfg.contains(
             "linux /boot/bzImage single systemd.show_status=yes root=LABEL=lupos-root rootfstype=ext4 rw"
@@ -22295,6 +22447,13 @@ CONFIG_MODULES=y
         assert!(cfg.contains("background_image /boot/grub/splashart.png"));
         assert!(cfg.contains("lupos recovery"));
         assert!(cfg.contains("os-prober"));
+        assert!(!cfg.contains("quiet splash"));
+        assert!(
+            !cfg.lines()
+                .filter_map(|line| line.trim_start().strip_prefix("linux /boot/bzImage "))
+                .flat_map(str::split_ascii_whitespace)
+                .any(|arg| arg == "quiet" || arg == "splash")
+        );
         assert!(!cfg.contains("multiboot2 /boot/lupos.elf"));
     }
 
@@ -23601,6 +23760,9 @@ CONFIG_MODULES=y
             initramfs_file_bytes(&files, "usr/sbin/unix_chkpwd"),
             Some(&b"real-unix-chkpwd"[..])
         );
+        let unix_chkpwd = find_initramfs_entry(&files, "usr/sbin/unix_chkpwd")
+            .expect("unix_chkpwd must be staged for pam_unix");
+        assert_eq!(unix_chkpwd.1, 0o104755);
         assert_eq!(
             initramfs_file_bytes(&files, "usr/sbin/auditd"),
             Some(&b"real-auditd"[..])
@@ -23775,10 +23937,8 @@ CONFIG_MODULES=y
             "var/log\tdir\t40755\tfhs-skeleton",
             "var/log/audit\tdir\t40755\tfhs-skeleton",
             "bin/bash\tfile\t100755\tlogin-userland",
-            "sbin/init\tfile\t100755\tlogin-userland",
             "sbin/swapon\tfile\t100755\tlogin-userland",
             "sbin/swapoff\tfile\t100755\tlogin-userland",
-            "etc/inittab\tfile\t100644\tlogin-etc",
             "etc/modules\tfile\t100644\tlogin-etc",
             "swapfile\tfile\t100600\tgenerated",
             "usr/share/lupos/release.txt\tfile\t100644\tgenerated",
@@ -23786,6 +23946,28 @@ CONFIG_MODULES=y
         ] {
             assert!(manifest.contains(needle), "FHS manifest missing {needle}");
         }
+        assert!(
+            manifest.contains("sbin/init\tfile\t100755\tlogin-userland")
+                || manifest.contains("sbin/init\tsymlink\t120777\tlogin-userland"),
+            "FHS manifest missing valid sbin/init entry"
+        );
+        assert!(
+            manifest.contains(
+                "etc/systemd/system/lupos-terminal.target.wants/getty@tty1.service\tsymlink\t120777\tlogin-etc"
+            ),
+            "FHS manifest missing terminal target tty1 getty want"
+        );
+        assert!(
+            manifest.contains("etc/inittab\tfile\t100644\tlogin-etc")
+                || (manifest.contains("usr/lib/systemd/systemd\tfile\t100755\tlogin-userland")
+                    && manifest.contains(
+                        "usr/lib/systemd/system/lupos-terminal.target\tfile\t100644\tlogin-userland",
+                    )
+                    && manifest.contains(
+                        "etc/systemd/system/default.target\tsymlink\t120777\tlogin-etc",
+                    )),
+            "FHS manifest missing SysV inittab or systemd login target"
+        );
     }
 
     #[test]

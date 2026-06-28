@@ -47,8 +47,8 @@ use crate::arch::x86::entry::syscall::load_current_user_tls_base;
 use crate::arch::x86::kernel::ptrace::PtRegs;
 use crate::arch::x86::kernel::uaccess;
 use crate::kernel::clone::{
-    CLONE_EMPTY_MNTNS, CLONE_FILES, CLONE_NEWNS, CLONE_NEWUSER, CLONE_NNP, CLONE_PIDFD,
-    CLONE_SETTLS, CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM,
+    CLONE_EMPTY_MNTNS, CLONE_FILES, CLONE_INTO_CGROUP, CLONE_NEWNS, CLONE_NEWUSER, CLONE_NNP,
+    CLONE_PIDFD, CLONE_SETTLS, CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM,
 };
 use crate::kernel::pid::{INIT_PID_NS, alloc_pid};
 use crate::kernel::sched::{
@@ -64,8 +64,8 @@ use crate::mm::mm_types::MmStruct;
 ///
 /// Mirrors Linux `struct kernel_clone_args` from
 /// `include/linux/sched/task.h`.  Fields not yet meaningful in M23
-/// (cgroup, io_thread, user_worker, no_files) are present for ABI
-/// completeness but not inspected.
+/// (io_thread, user_worker, no_files) are present for ABI completeness
+/// but not inspected.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct KernelCloneArgs {
@@ -89,6 +89,8 @@ pub struct KernelCloneArgs {
     pub tls: u64,
     /// Desired PID at namespace level 0 (from clone3 `set_tid[0]`).
     pub set_tid: Option<i32>,
+    /// Cgroup directory fd for clone3 `CLONE_INTO_CGROUP`.
+    pub cgroup: i32,
     /// Thread function for the kthread path (set by `kthread_create_on_node`).
     pub fn_ptr: Option<unsafe extern "C" fn(*mut core::ffi::c_void) -> i32>,
     /// Argument for `fn_ptr`.
@@ -115,6 +117,7 @@ impl Default for KernelCloneArgs {
             stack_size: 0,
             tls: 0,
             set_tid: None,
+            cgroup: -1,
             fn_ptr: None,
             fn_arg: core::ptr::null_mut(),
             user_regs: None,
@@ -796,6 +799,26 @@ pub unsafe fn kernel_clone(args: &KernelCloneArgs) -> i64 {
         }
     }
 
+    if effective_args.flags & CLONE_INTO_CGROUP != 0 {
+        if let Err(errno) =
+            crate::kernel::cgroup::assign_pid_to_cgroup_fd(child_pid as i32, effective_args.cgroup)
+        {
+            #[cfg(not(test))]
+            if crate::kernel::debug_trace::cgroup_enabled() {
+                crate::linux_driver_abi::tty::serial_println!(
+                    "trace-cgroup-clone-into-error child={} fd={} errno={}",
+                    child_pid,
+                    effective_args.cgroup,
+                    errno
+                );
+            }
+            unsafe {
+                cleanup_failed_child(parent, child, core::ptr::null_mut(), true);
+            }
+            return -(errno as i64);
+        }
+    }
+
     if effective_args.flags & CLONE_PIDFD != 0 {
         if effective_args.pidfd.is_null() {
             unsafe {
@@ -1256,6 +1279,7 @@ mod tests {
         assert!(args.child_tid.is_null());
         assert_eq!(args.exit_signal, 0);
         assert_eq!(args.kthread, 0);
+        assert_eq!(args.cgroup, -1);
         assert!(args.fn_ptr.is_none());
     }
 

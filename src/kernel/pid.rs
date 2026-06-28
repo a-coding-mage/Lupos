@@ -101,6 +101,8 @@ unsafe impl Sync for Upid {}
 pub struct KPid {
     /// Structural reference count.
     pub count: AtomicU32,
+    /// Stable pidfs inode number for pidfds referencing this struct pid.
+    pub pidfs_ino: u64,
     /// Namespace nesting level (always 0 in M22).
     pub level: u32,
     /// Per-namespace PID number.  Only `numbers[0]` is populated in M22.
@@ -166,6 +168,8 @@ impl PidNamespace {
 /// until namespace support (M28) is added.
 pub static INIT_PID_NS: PidNamespace = PidNamespace::new();
 
+static PIDFS_INO_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 // ── alloc_pid ────────────────────────────────────────────────────────────────
 
 /// Allocate a new PID from `ns`.
@@ -204,6 +208,7 @@ pub fn alloc_pid(ns: &PidNamespace, set_tid: Option<i32>) -> Result<Box<KPid>, i
 
     Ok(Box::new(KPid {
         count: AtomicU32::new(1),
+        pidfs_ino: PIDFS_INO_COUNTER.fetch_add(1, Ordering::Relaxed),
         level: 0,
         numbers: [Upid {
             nr,

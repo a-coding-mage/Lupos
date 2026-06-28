@@ -712,6 +712,19 @@ pub fn flush_all_blocking() {
     }
 }
 
+pub fn flush_all_nonblocking() {
+    flush_serial_budgeted();
+    if !FBCON_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    loop {
+        let Some(batch) = take_dirty_batch(usize::MAX) else {
+            break;
+        };
+        crate::linux_driver_abi::video::fbdev::core::render_batch(&batch);
+    }
+}
+
 pub fn set_fbcon_enabled(enabled: bool) {
     let was_enabled = FBCON_ENABLED.swap(enabled, Ordering::AcqRel);
     if enabled && !was_enabled {

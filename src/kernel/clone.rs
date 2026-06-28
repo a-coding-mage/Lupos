@@ -502,6 +502,7 @@ pub unsafe fn sys_clone3_with_regs(
         stack_size: args.stack_size,
         tls: args.tls,
         set_tid,
+        cgroup: args.cgroup as i32,
         fn_ptr: None,
         fn_arg: core::ptr::null_mut(),
         user_regs,
@@ -623,6 +624,7 @@ mod tests {
         assert_eq!(CLONE_CHILD_SETTID, 0x0100_0000u64);
         assert_eq!(CLONE_NEWPID, 0x2000_0000u64);
         assert_eq!(CLONE_CLEAR_SIGHAND, 1u64 << 32);
+        assert_eq!(CLONE_INTO_CGROUP, 1u64 << 33);
         assert_eq!(CLONE_NNP, 1u64 << 35);
         assert_eq!(CLONE_PIDFD_AUTOKILL, 1u64 << 36);
         assert_eq!(CLONE_EMPTY_MNTNS, 1u64 << 37);
