@@ -1940,6 +1940,12 @@ fn block_facade_acquire() -> BlockFacadeGuard {
 /// the interrupt, where taking a wait-queue mutex could deadlock.
 static BLOCK_IO_WAITER: AtomicUsize = AtomicUsize::new(0);
 
+/// TEMP boot-profiling: count of task-context block I/O waits and the total
+/// number of 1-tick sleeps they performed (≈ jiffies stalled on I/O latency).
+pub static BLOCK_IO_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static BLOCK_IO_SLEEP_JIFFIES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Wake the block-completion waiter, if any. Lock-free / IRQ-safe; called from
 /// `linux_request_mark_completed` (the AHCI completion path — hard-IRQ when the
 /// real HBA interrupt fires, task context from the software reaper otherwise).
@@ -1991,6 +1997,8 @@ fn block_io_wait_for_completion(rq: *mut LinuxRequest) -> LinuxBlkStatus {
     }
 
     BLOCK_IO_WAITER.store(current as usize, Ordering::Release);
+    #[cfg(not(test))]
+    BLOCK_IO_CALLS.fetch_add(1, Ordering::Relaxed);
     let status = loop {
         if let Some(status) = linux_request_completed_status(rq) {
             break status;
@@ -2029,6 +2037,8 @@ fn block_io_wait_for_completion(rq: *mut LinuxRequest) -> LinuxBlkStatus {
             // of ms per I/O. Still a true sleep, so no busy-burn.
             let wake_at = crate::kernel::time::jiffies::jiffies().saturating_add(1);
             crate::kernel::time::sleep_timeout::arm_wakeup(current as usize, wake_at);
+            #[cfg(not(test))]
+            BLOCK_IO_SLEEP_JIFFIES.fetch_add(1, Ordering::Relaxed);
             unsafe {
                 crate::kernel::sched::schedule_with_irqs_enabled();
             }

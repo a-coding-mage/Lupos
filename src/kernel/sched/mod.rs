@@ -99,7 +99,7 @@ pub fn register_module_exports() {
     swait::register_module_exports();
 }
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -880,6 +880,9 @@ pub unsafe fn schedule() -> bool {
 /// and deadlock on its (non-recursive) poller-list lock.
 static DRIVER_POLL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// TEMP boot-profiling: number of times the idle path halted (read by heartbeat).
+pub static IDLE_HALT_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Surface pending Linux-driver hardware completions when the CPU is otherwise
 /// idle, returning whether any event was handled.
 ///
@@ -919,6 +922,8 @@ pub unsafe fn schedule_with_irqs_enabled() {
             crate::kernel::locking::local_irq_enable();
             return;
         }
+        #[cfg(not(test))]
+        IDLE_HALT_COUNT.fetch_add(1, Ordering::Relaxed);
         unsafe {
             // sti+hlt as a single sequence -- sti has a one-instruction grace
             // window so a newly-pending interrupt cannot be missed between
