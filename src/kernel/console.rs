@@ -1013,6 +1013,27 @@ mod tests {
     }
 
     #[test]
+    fn bash_prompt_sgr_sequences_color_cells_without_artifacts() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(20, 3);
+        write_visible_bytes(b"\x1b[01;32m[root@lupos\x1b[00m \x1b[01;34m/\x1b[00m]# ");
+
+        let batch = dirty_batch_for_tests(1).expect("dirty row");
+        let cells = &batch.dirty_rows[0].cells;
+        let rendered = cells
+            .iter()
+            .take(16)
+            .map(|cell| cell.ch)
+            .collect::<Vec<_>>();
+        assert_eq!(rendered.as_slice(), b"[root@lupos /]# ");
+        assert_eq!(cells[0].fg, 0x0055_ff55);
+        assert_eq!(cells[10].fg, 0x0055_ff55);
+        assert_eq!(cells[11].fg, DEFAULT_FG);
+        assert_eq!(cells[12].fg, 0x0055_55ff);
+        assert_eq!(cells[13].fg, DEFAULT_FG);
+    }
+
+    #[test]
     fn systemd_terminal_reset_controls_do_not_render_artifacts() {
         let _guard = TEST_CONSOLE_LOCK.lock();
         reset_for_tests(12, 3);
