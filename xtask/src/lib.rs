@@ -154,6 +154,14 @@ const GRUB_TEST_BOOT_TIMEOUT_SECS: u8 = 3;
 const LUPOS_QEMU_ACCEL_ENV: &str = "LUPOS_QEMU_ACCEL";
 const LUPOS_QEMU_ROOT_DISK_ENV: &str = "LUPOS_QEMU_ROOT_DISK";
 const LUPOS_QEMU_MACHINE_ENV: &str = "LUPOS_QEMU_MACHINE";
+/// Selects the QEMU `-audiodev` backend that the Intel HDA codec and the
+/// PC speaker (`pcspk-audiodev`) feed into. Defaults to `none` (a null sink,
+/// safe for headless/CI). Set e.g. `LUPOS_QEMU_AUDIODEV=pa` (PulseAudio),
+/// `pipewire`, or `alsa` to actually hear the console bell on the host.
+const LUPOS_QEMU_AUDIODEV_ENV: &str = "LUPOS_QEMU_AUDIODEV";
+/// Stable QEMU id shared by the audio backend, the HDA codec, and the PC
+/// speaker routing.
+const QEMU_AUDIODEV_ID: &str = "luposaudio";
 const LUPOS_QEMU_MEMORY_ENV: &str = "LUPOS_QEMU_MEMORY";
 const LUPOS_QEMU_GDB_ENV: &str = "LUPOS_QEMU_GDB";
 const LUPOS_OVMF_CODE_ENV: &str = "LUPOS_OVMF_CODE";
@@ -14036,7 +14044,15 @@ mcopy -o -i {disk} {splash} ::/boot/grub/splashart.png
 ///
 /// Ref: https://www.qemu.org/docs/master/system/invocation.html
 fn add_qemu_iso_base_args(command: &mut Command, iso_path: &Path, display: &str, serial: &str) {
-    let machine = format!("{},accel={}", pick_qemu_machine(), pick_qemu_accel());
+    // Route the emulated PC speaker (PIT channel 2) to the shared audiodev so
+    // the kernel's console bell is audible. Without `pcspk-audiodev` QEMU
+    // discards the speaker output regardless of the audio backend.
+    let machine = format!(
+        "{},accel={},pcspk-audiodev={}",
+        pick_qemu_machine(),
+        pick_qemu_accel(),
+        QEMU_AUDIODEV_ID,
+    );
     let memory = qemu_memory_arg(DEFAULT_QEMU_MEMORY);
     command
         // Boot from the CD-ROM image that contains GRUB + the Linux bzImage.
@@ -14199,11 +14215,24 @@ fn add_qemu_default_devices(command: &mut Command) {
         .arg("-device")
         .arg("usb-tablet,bus=xhci.0")
         .arg("-audiodev")
-        .arg("none,id=luposaudio")
+        .arg(qemu_audiodev_spec())
         .arg("-device")
         .arg("intel-hda")
         .arg("-device")
-        .arg("hda-duplex,audiodev=luposaudio");
+        .arg(format!("hda-duplex,audiodev={QEMU_AUDIODEV_ID}"));
+}
+
+/// Build the `-audiodev` value. Defaults to the null backend (`none`), which
+/// keeps headless and CI runs silent and dependency-free; override the driver
+/// with `LUPOS_QEMU_AUDIODEV` (e.g. `pa`, `pipewire`, `alsa`) to hear the
+/// console bell on the host.
+fn qemu_audiodev_spec() -> String {
+    let driver = env::var(LUPOS_QEMU_AUDIODEV_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "none".to_string());
+    format!("{driver},id={QEMU_AUDIODEV_ID}")
 }
 
 fn add_qemu_root_disk_if_requested(command: &mut Command) {
@@ -17602,6 +17631,7 @@ failed command output\n";
     fn qemu_iso_command_uses_cdrom_flag() {
         let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, "");
         let _machine = EnvVarGuard::set(LUPOS_QEMU_MACHINE_ENV, "");
+        let _audiodev = EnvVarGuard::set(LUPOS_QEMU_AUDIODEV_ENV, "");
         let iso = Path::new(r"C:\tmp\lupos.iso");
         let serial_log = Path::new(r"C:\tmp\serial.log");
         let command = build_qemu_iso_command(iso, serial_log, 1);
@@ -17621,8 +17651,20 @@ failed command output\n";
         assert!(rendered.contains("-audiodev none,id=luposaudio"));
         assert!(rendered.contains("intel-hda"));
         assert!(rendered.contains("hda-duplex,audiodev=luposaudio"));
+        // The PC speaker must be routed to the audiodev so the console bell
+        // is emitted, not discarded.
+        assert!(rendered.contains("pcspk-audiodev=luposaudio"));
         // smp_count=1 should NOT add -smp flag
         assert!(!rendered.contains("-smp"));
+    }
+
+    #[test]
+    fn qemu_audiodev_spec_defaults_to_null_and_honors_override() {
+        let _audiodev = EnvVarGuard::set(LUPOS_QEMU_AUDIODEV_ENV, "");
+        assert_eq!(qemu_audiodev_spec(), "none,id=luposaudio");
+
+        let _override = EnvVarGuard::set(LUPOS_QEMU_AUDIODEV_ENV, "  pa  ");
+        assert_eq!(qemu_audiodev_spec(), "pa,id=luposaudio");
     }
 
     #[test]

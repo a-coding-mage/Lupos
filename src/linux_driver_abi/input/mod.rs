@@ -26,6 +26,7 @@ extern crate alloc;
 pub mod evdev_chardev;
 pub mod i8042;
 pub mod linux_sources;
+pub mod misc;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
