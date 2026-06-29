@@ -2885,23 +2885,80 @@ fn renameat2_path(
 }
 
 pub unsafe fn sys_linkat(
-    _olddfd: i32,
+    olddfd: i32,
     oldname: *const u8,
-    _newdfd: i32,
+    newdfd: i32,
     newname: *const u8,
     flags: i32,
 ) -> i64 {
-    if flags & !((AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) as i32) != 0 {
+    if flags & !((AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) as i32) != 0 {
         return -(EINVAL as i64);
     }
-    match unsafe { user_path(oldname).and_then(|_| user_path(newname)) } {
-        Ok(_) => -(ENOSYS as i64),
+    match unsafe { user_path(oldname).and_then(|old| user_path(newname).map(|new| (old, new))) } {
+        Ok((old_path, new_path)) => linkat_path(olddfd, &old_path, newdfd, &new_path, flags)
+            .map(|_| 0)
+            .unwrap_or_else(|errno| -(errno as i64)),
         Err(errno) => -(errno as i64),
     }
 }
 
 pub unsafe fn sys_link(oldname: *const u8, newname: *const u8) -> i64 {
     unsafe { sys_linkat(AT_FDCWD, oldname, AT_FDCWD, newname, 0) }
+}
+
+fn linkat_path(
+    olddfd: i32,
+    old_path: &str,
+    newdfd: i32,
+    new_path: &str,
+    flags: i32,
+) -> Result<(), i32> {
+    let old_target = if old_path.is_empty() {
+        if flags & AT_EMPTY_PATH as i32 == 0 {
+            return Err(ENOENT);
+        }
+        lookup_empty_stat_target(olddfd)?
+    } else {
+        lookup_path_str_with_follow(olddfd, old_path, flags & AT_SYMLINK_FOLLOW as i32 != 0)?
+    };
+    let old_inode = old_target.dentry.inode().ok_or(ENOENT)?;
+    if old_inode.kind == InodeKind::Directory {
+        return Err(EPERM);
+    }
+
+    if new_path.is_empty() {
+        return Err(ENOENT);
+    }
+    let (new_parent, new_dir, new_name) = rename_parent(newdfd, new_path)?;
+    if !same_superblock(&old_inode, &new_dir)? {
+        return Err(EXDEV);
+    }
+    if lookup_child_optional(&new_parent, &new_dir, &new_name)?.is_some() {
+        return Err(EEXIST);
+    }
+
+    match &new_dir.private {
+        InodePrivate::RamDir(children) => {
+            let mut children = children.lock();
+            if ramdir_key(&children, &new_name).is_some() {
+                return Err(EEXIST);
+            }
+            children.insert(new_name.clone(), old_inode.clone());
+            old_inode.nlink.fetch_add(1, Ordering::AcqRel);
+            super::types::touch_inode_now(&new_dir);
+            super::types::touch_inode_now(&old_inode);
+        }
+        _ if new_dir.ops.name == "ext4_dir" => {
+            crate::fs::ext4::ops::ext4_link(&new_dir, &new_name, &old_inode)?;
+        }
+        _ => return Err(ENOSYS),
+    }
+
+    super::dcache::d_drop(&new_parent, &new_name);
+    let linked = super::dcache::d_alloc_child(&new_parent, &new_name);
+    linked.instantiate(old_inode);
+    super::inotify::notify_create(&new_parent, &new_name, false);
+    Ok(())
 }
 
 pub unsafe fn sys_symlinkat(oldname: *const u8, newdfd: i32, newname: *const u8) -> i64 {
@@ -6548,9 +6605,17 @@ mod tests {
                 -(EEXIST as i64)
             );
             assert_eq!(sys_rename(renamed.as_ptr(), file.as_ptr()), 0);
+            let hard = b"/m77-dir/hard\0";
+            assert_eq!(sys_link(file.as_ptr(), hard.as_ptr()), 0);
+            let mut hard_st = LinuxStat::default();
+            assert_eq!(sys_stat(file.as_ptr(), &mut stat_buf), 0);
+            assert_eq!(sys_stat(hard.as_ptr(), &mut hard_st), 0);
+            assert_eq!(hard_st.st_ino, stat_buf.st_ino);
+            assert_eq!(stat_buf.st_nlink, 2);
+            assert_eq!(sys_link(file.as_ptr(), hard.as_ptr()), -(EEXIST as i64));
             assert_eq!(
-                sys_link(file.as_ptr(), b"/m77-dir/hard\0".as_ptr()),
-                -(ENOSYS as i64)
+                sys_link(dir.as_ptr(), b"/m77-dir/dir-hard\0".as_ptr()),
+                -(EPERM as i64)
             );
             assert_eq!(
                 sys_symlink(b"/target\0".as_ptr(), b"/m77-dir/sym\0".as_ptr()),
@@ -6663,6 +6728,7 @@ mod tests {
                 assert_eq!(st.st_mode & crate::include::uapi::stat::S_IFMT, expected);
             }
             assert_eq!(sys_unlink(file.as_ptr()), 0);
+            assert_eq!(sys_unlink(hard.as_ptr()), 0);
             assert_eq!(
                 sys_unlinkat(AT_FDCWD, b"/m77-dir/missing\0".as_ptr(), 0),
                 -(ENOENT as i64)

@@ -282,6 +282,8 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     mm::vmalloc::vmalloc_init();
     init::boot_trace::record("kernel", "allocator and vmalloc ready");
 
+    let early_cmdline = boot_params_command_line(bp);
+
     // Framebuffer console setup from screen_info (if present).
     if let Some(fb) = bp.framebuffer_info() {
         let fb_ready =
@@ -290,6 +292,19 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             // Display Lupos brand logo on the framebuffer immediately after init.
             // Gated by the Linux logo.c nologo/logos_freed state model.
             linux_driver_abi::video::logo::fb_show_logo();
+        }
+    }
+    if fbdev_core::fb_info().is_none()
+        && let Some(mode) =
+            early_cmdline.and_then(fbdev_core::synthetic_framebuffer_mode_from_cmdline)
+    {
+        if fbdev_core::init_synthetic(mode) {
+            linux_driver_abi::video::logo::fb_show_logo();
+        } else {
+            log_warn!(
+                "fbcon",
+                "synthetic framebuffer requested but initialization failed"
+            );
         }
     }
     linux_driver_abi::input::i8042::init();
@@ -633,7 +648,7 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     }
 
     let mut parsed_boot_options = init::boot::BootOptions::default();
-    if let Some(cmdline) = boot_params_command_line(bp) {
+    if let Some(cmdline) = early_cmdline {
         kernel::debug_trace::init_from_cmdline(cmdline);
         fs::proc::cmdline::set_saved_command_line(cmdline);
         parsed_boot_options = init::boot::BootOptions::parse(cmdline);

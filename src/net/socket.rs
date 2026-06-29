@@ -198,6 +198,27 @@ pub fn release_bound_socket(sock: &SocketRef) {
     });
 }
 
+pub fn rollback_bound_socket_addr(sock: &SocketRef, addr: &SockAddr) {
+    {
+        let mut bound = BOUND.lock();
+        let remove = if let Some(entries) = bound.get_mut(addr) {
+            entries.retain(|entry| !Arc::ptr_eq(entry, sock));
+            entries.is_empty()
+        } else {
+            false
+        };
+        if remove {
+            bound.remove(addr);
+        }
+    }
+
+    let mut socket = sock.lock();
+    if socket.local.as_ref() == Some(addr) {
+        socket.local = None;
+        socket.state = SocketState::Created;
+    }
+}
+
 pub fn socket(family: u16, sock_type: u16, protocol: u16) -> Result<SocketRef, i32> {
     match family {
         AF_INET | AF_INET6 => validate_inet_socket(sock_type, protocol)?,

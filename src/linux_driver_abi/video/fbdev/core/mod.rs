@@ -47,7 +47,62 @@ pub struct FramebufferInfo {
     pub bpp: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyntheticFramebufferMode {
+    pub width: u32,
+    pub height: u32,
+    pub bpp: u8,
+}
+
+impl SyntheticFramebufferMode {
+    pub const DEFAULT: Self = Self {
+        width: 800,
+        height: 600,
+        bpp: 32,
+    };
+
+    pub fn pitch(self) -> Option<u32> {
+        let bytes_per_pixel = match self.bpp {
+            24 => 3,
+            32 => 4,
+            _ => return None,
+        };
+        self.width.checked_mul(bytes_per_pixel)
+    }
+}
+
 static mut FB_INFO: Option<FramebufferInfo> = None;
+
+fn parse_synthetic_framebuffer_mode(value: &str) -> Option<SyntheticFramebufferMode> {
+    if value == "1" || value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("on") {
+        return Some(SyntheticFramebufferMode::DEFAULT);
+    }
+
+    let mut parts = value.split('x');
+    let width = parts.next()?.parse::<u32>().ok()?;
+    let height = parts.next()?.parse::<u32>().ok()?;
+    let bpp = parts.next()?.parse::<u8>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let mode = SyntheticFramebufferMode { width, height, bpp };
+    let pitch = mode.pitch()?;
+    checked_framebuffer_size(1, pitch, width, height, bpp)?;
+    Some(mode)
+}
+
+pub fn synthetic_framebuffer_mode_from_cmdline(cmdline: &str) -> Option<SyntheticFramebufferMode> {
+    for token in cmdline.split_whitespace() {
+        if token == "lupos.synthetic_fb" {
+            return Some(SyntheticFramebufferMode::DEFAULT);
+        }
+        if let Some(value) = token.strip_prefix("lupos.synthetic_fb=") {
+            return parse_synthetic_framebuffer_mode(value);
+        }
+    }
+    None
+}
 
 /// Validate framebuffer geometry before any MMIO writes are attempted.
 ///
@@ -112,14 +167,35 @@ pub unsafe fn init(addr: u64, pitch: u32, width: u32, height: u32, bpp: u8) -> b
             })
             .unwrap_or(addr)
     };
+    unsafe { init_from_kernel_mapping(addr, kernel_addr, pitch, width, height, bpp) }
+}
+
+/// Initialize fbcon/fbdev from an already kernel-visible framebuffer mapping.
+///
+/// # Safety
+/// `kernel_addr` must point to writable memory covering `pitch * height` bytes.
+pub unsafe fn init_from_kernel_mapping(
+    phys_addr: u64,
+    kernel_addr: u64,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    bpp: u8,
+) -> bool {
+    if kernel_addr == 0 || checked_framebuffer_size(phys_addr, pitch, width, height, bpp).is_none()
+    {
+        crate::init::boot_trace::record("fbcon", "invalid framebuffer geometry ignored");
+        return false;
+    }
+
     let writer =
         unsafe { FramebufferWriter::new(kernel_addr as *mut u8, pitch, width, height, bpp) };
     let mut fb = FB_WRITER.lock();
     *fb = Some(writer);
     unsafe {
         FB_INFO = Some(FramebufferInfo {
-            addr,
-            phys_addr: addr,
+            addr: phys_addr,
+            phys_addr,
             kernel_addr,
             pitch,
             width,
@@ -132,6 +208,56 @@ pub unsafe fn init(addr: u64, pitch: u32, width: u32, height: u32, bpp: u8) -> b
     // Avoid a full-screen clear during boot: QEMU's framebuffer aperture can
     // be slow to touch, and the boot smoke only needs the console to be live.
     true
+}
+
+pub fn init_synthetic(mode: SyntheticFramebufferMode) -> bool {
+    let Some(pitch) = mode.pitch() else {
+        crate::init::boot_trace::record("fbcon", "invalid synthetic framebuffer mode ignored");
+        return false;
+    };
+    let Some(size) = checked_framebuffer_size(1, pitch, mode.width, mode.height, mode.bpp) else {
+        crate::init::boot_trace::record("fbcon", "invalid synthetic framebuffer mode ignored");
+        return false;
+    };
+    let Ok(size) = usize::try_from(size) else {
+        crate::init::boot_trace::record("fbcon", "synthetic framebuffer too large");
+        return false;
+    };
+
+    let ptr = crate::mm::page_alloc::alloc_pages_exact_noprof(
+        size,
+        crate::mm::page_flags::GFP_KERNEL | crate::mm::page_flags::__GFP_ZERO,
+    );
+    if ptr.is_null() {
+        crate::init::boot_trace::record("fbcon", "synthetic framebuffer allocation failed");
+        return false;
+    }
+
+    let Some(phys_addr) = crate::arch::x86::mm::paging::virt_to_phys(ptr as u64) else {
+        crate::mm::page_alloc::free_pages_exact(ptr, size);
+        crate::init::boot_trace::record(
+            "fbcon",
+            "synthetic framebuffer address translation failed",
+        );
+        return false;
+    };
+
+    let ok = unsafe {
+        init_from_kernel_mapping(
+            phys_addr,
+            ptr as u64,
+            pitch,
+            mode.width,
+            mode.height,
+            mode.bpp,
+        )
+    };
+    if ok {
+        crate::init::boot_trace::record("fbcon", "synthetic framebuffer ready");
+    } else {
+        crate::mm::page_alloc::free_pages_exact(ptr, size);
+    }
+    ok
 }
 
 /// Print formatted text to the framebuffer (if available).
@@ -228,5 +354,25 @@ mod tests {
         assert_eq!(checked_framebuffer_size(0x1000, 3199, 800, 600, 32), None);
         assert_eq!(checked_framebuffer_size(0x1000, 800, 800, 600, 8), None);
         assert_eq!(checked_framebuffer_size(u64::MAX - 7, 8, 1, 2, 32), None);
+    }
+
+    #[test]
+    fn parses_synthetic_framebuffer_cmdline_option() {
+        assert_eq!(
+            synthetic_framebuffer_mode_from_cmdline("quiet lupos.synthetic_fb=800x600x32"),
+            Some(SyntheticFramebufferMode {
+                width: 800,
+                height: 600,
+                bpp: 32,
+            })
+        );
+        assert_eq!(
+            synthetic_framebuffer_mode_from_cmdline("lupos.synthetic_fb=1"),
+            Some(SyntheticFramebufferMode::DEFAULT)
+        );
+        assert_eq!(
+            synthetic_framebuffer_mode_from_cmdline("lupos.synthetic_fb=800x600x16"),
+            None
+        );
     }
 }
