@@ -5,6 +5,9 @@ AArch64 planned later. The success condition is binary-level Linux ABI parity:
 binaries built for Linux should observe Linux-compatible syscalls, filesystems,
 device interfaces, and process behavior.
 
+<span style="font-style: italic;">Working on virtualbox</span>
+<img src="./branding/virtualbox_bash.png" />
+
 The public build surface is intentionally small:
 
 - `make kernel` / `cargo xtask build`: build the pure Lupos kernel, ELF and
