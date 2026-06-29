@@ -870,31 +870,6 @@ fn read_sockaddr(ptr: *const u8, len: u32) -> Result<SockAddr, i32> {
     }
 }
 
-#[cfg(not(test))]
-fn trace_x11_unix_bind(path: &str, result: &Result<(), i32>) {
-    if !path.contains("X11") && !path.contains(".X") {
-        return;
-    }
-    let mut printable = String::new();
-    for ch in path.chars().take(160) {
-        if ch == '\0' {
-            printable.push('@');
-        } else if ch.is_ascii_graphic() || ch == ' ' {
-            printable.push(ch);
-        } else {
-            printable.push('?');
-        }
-    }
-    let ret = result
-        .as_ref()
-        .map(|_| 0)
-        .unwrap_or_else(|errno| -(*errno as i32));
-    crate::linux_driver_abi::tty::serial_println!("trace-unix-bind path={} ret={}", printable, ret);
-}
-
-#[cfg(test)]
-fn trace_x11_unix_bind(_path: &str, _result: &Result<(), i32>) {}
-
 fn split_last_path(path: &str) -> (&str, &str) {
     let trimmed = path.trim_end_matches('/');
     if let Some(idx) = trimmed.rfind('/') {
@@ -1188,9 +1163,6 @@ pub unsafe fn sys_bind(fd: i32, addr: *const u8, addrlen: u32) -> i64 {
                 }
                 Ok::<(), i32>(())
             })();
-            if let SockAddr::Unix(path) = sa {
-                trace_x11_unix_bind(path, &result);
-            }
             result.map(|_| 0).unwrap_or_else(|errno| -(errno as i64))
         }
         Err(errno) => -(*errno as i64),

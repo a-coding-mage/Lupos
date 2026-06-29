@@ -52,6 +52,7 @@ const OFF_SCREEN_EXT_LFB_BASE: usize = 0x3a;
 // Video type constants (uapi/linux/screen_info.h)
 const VIDEO_TYPE_VGAC: u8 = 0x22;
 const VIDEO_TYPE_VLFB: u8 = 0x23;
+const VIDEO_TYPE_EFI: u8 = 0x70;
 const VIDEO_CAPABILITY_64BIT_BASE: u32 = 1 << 1;
 
 /// A single E820 entry (20 bytes)
@@ -347,7 +348,7 @@ impl BootParams {
 
     pub fn framebuffer_info(&self) -> Option<FramebufferInfo> {
         let video = self.data[OFF_SCREEN_ORIG_VIDEO_ISVGA];
-        if video != VIDEO_TYPE_VLFB {
+        if video != VIDEO_TYPE_VLFB && video != VIDEO_TYPE_EFI {
             return None;
         }
         let width = read_u16(&self.data, OFF_SCREEN_LFB_WIDTH) as u32;
@@ -355,7 +356,12 @@ impl BootParams {
         let depth = read_u16(&self.data, OFF_SCREEN_LFB_DEPTH) as u32;
         let pitch = read_u16(&self.data, OFF_SCREEN_LFB_LINELENGTH) as u32;
         let base_low = read_u32(&self.data, OFF_SCREEN_LFB_BASE) as u64;
-        let base_high = read_u32(&self.data, OFF_SCREEN_EXT_LFB_BASE) as u64;
+        let capabilities = read_u32(&self.data, OFF_SCREEN_CAPABILITIES);
+        let base_high = if capabilities & VIDEO_CAPABILITY_64BIT_BASE != 0 {
+            read_u32(&self.data, OFF_SCREEN_EXT_LFB_BASE) as u64
+        } else {
+            0
+        };
         let addr = base_low | (base_high << 32);
         Some(FramebufferInfo {
             addr,
@@ -447,6 +453,42 @@ mod tests {
         assert_eq!(fb.height, 600);
         assert_eq!(fb.depth, 32);
         assert_eq!(fb.pitch, 3200);
+    }
+
+    #[test]
+    fn screen_info_framebuffer_accepts_efi_video_type() {
+        let mut bp = BootParams::new();
+        bp.data[OFF_SCREEN_ORIG_VIDEO_ISVGA] = VIDEO_TYPE_EFI;
+        write_u16(&mut bp.data, OFF_SCREEN_LFB_WIDTH, 1024);
+        write_u16(&mut bp.data, OFF_SCREEN_LFB_HEIGHT, 768);
+        write_u16(&mut bp.data, OFF_SCREEN_LFB_DEPTH, 32);
+        write_u16(&mut bp.data, OFF_SCREEN_LFB_LINELENGTH, 4096);
+        write_u32(&mut bp.data, OFF_SCREEN_LFB_BASE, 0xe000_0000);
+
+        let fb = bp.framebuffer_info().unwrap();
+        assert_eq!(fb.addr, 0xe000_0000);
+        assert_eq!(fb.width, 1024);
+        assert_eq!(fb.height, 768);
+        assert_eq!(fb.depth, 32);
+        assert_eq!(fb.pitch, 4096);
+    }
+
+    #[test]
+    fn screen_info_framebuffer_uses_ext_base_only_with_capability() {
+        let mut bp = BootParams::new();
+        bp.set_screen_info_framebuffer(800, 600, 32, 3200, 0x0000_0000_e000_0000);
+        write_u32(&mut bp.data, OFF_SCREEN_EXT_LFB_BASE, 0x1234_5678);
+
+        let fb = bp.framebuffer_info().unwrap();
+        assert_eq!(fb.addr, 0xe000_0000);
+
+        write_u32(
+            &mut bp.data,
+            OFF_SCREEN_CAPABILITIES,
+            VIDEO_CAPABILITY_64BIT_BASE,
+        );
+        let fb = bp.framebuffer_info().unwrap();
+        assert_eq!(fb.addr, 0x1234_5678_e000_0000);
     }
 
     #[test]

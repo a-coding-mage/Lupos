@@ -433,6 +433,22 @@ const USERSPACE_SMOKE_SCRIPT: &str = concat!(
     "rm -f /var/lib/pacman/db.lck\n",
     "test ! -e /usr/share/lupos-pacman-smoke/probe\n",
     "echo userspace-smoke: pacman-install ok\n",
+    // Sync-install a real package (nano) from the staged offline repo. This
+    // exercises libalpm's sync path: reading the preseeded sync database,
+    // resolving nano's deps (ncurses/file/glibc, already installed), fetching
+    // the package through the Lupos XferCommand helper (file:// -> /p alias),
+    // and extracting it. Then remove it so the rootfs is left unchanged.
+    "rm -f /var/lib/pacman/db.lck\n",
+    "if pacman -Q nano >/dev/null 2>&1; then pacman -Rns --noconfirm --hookdir /usr/share/lupos/empty-hooks nano; fi\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "pacman -S --noconfirm --hookdir /usr/share/lupos/empty-hooks nano\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "pacman -Q nano >/dev/null\n",
+    "test -x /usr/bin/nano\n",
+    "pacman -Rns --noconfirm --hookdir /usr/share/lupos/empty-hooks nano\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "test ! -e /usr/bin/nano\n",
+    "echo userspace-smoke: pacman-sync-install ok\n",
     "sleep 0.01\n",
     "echo userspace-smoke: sleep ok\n",
     "clear\n",
@@ -2346,6 +2362,7 @@ const ARCH_PACMAN_XFER_HELPER_SCRIPT: &str = concat!(
     "alias=\n",
     "case \"$base\" in\n",
     "    gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst) alias=/p/g ;;\n",
+    "    nano-9.0-1-x86_64.pkg.tar.zst) alias=/p/n ;;\n",
     "    vim-9.2.0573-1-x86_64.pkg.tar.zst) alias=/p/v ;;\n",
     "    vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst) alias=/p/r ;;\n",
     "esac\n",
@@ -2360,6 +2377,7 @@ const ARCH_PACMAN_XFER_HELPER_SCRIPT: &str = concat!(
 const ARCH_OFFLINE_PACMAN_REPO_ARTIFACTS: &[&str] = &[
     "var/lib/lupos/pacman-repo/core/os/x86_64/core.db",
     "var/lib/lupos/pacman-repo/core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst",
     "var/lib/lupos/pacman-repo/extra/os/x86_64/extra.db",
     "var/lib/lupos/pacman-repo/extra/os/x86_64/vim-9.2.0573-1-x86_64.pkg.tar.zst",
     "var/lib/lupos/pacman-repo/extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst",
@@ -2378,6 +2396,10 @@ const ARCH_PACMAN_PACKAGE_ALIASES: &[(&str, &str)] = &[
     (
         "p/g",
         "/var/lib/lupos/pacman-repo/core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/n",
+        "/var/lib/lupos/pacman-repo/core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst",
     ),
     (
         "p/v",
@@ -2850,7 +2872,12 @@ fn systemd_getty_override() -> Vec<u8> {
     let exec_start =
         "ExecStart=-/usr/sbin/agetty --noclear --nohostname --issue-file /etc/issue tty1 linux\n";
     format!(
-        "[Service]\n\
+        "[Unit]\n\
+         DefaultDependencies=no\n\
+         ConditionKernelCommandLine=lupos.display_getty=1\n\
+         After=tmp.mount systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service\n\
+         \n\
+         [Service]\n\
          TTYVTDisallocate=no\n\
          ExecStart=\n\
          {exec_start}"
@@ -6126,11 +6153,17 @@ fn release_grub_cfg_content() -> String {
     // kernel. The Linux boot path remains the same; only the bootloader terminal
     // devices differ so the graphical VM window is authoritative for release.
     //
-    // No `splash`: it makes userspace put the console in KD_GRAPHICS mode, which
-    // disables the framebuffer text console (`set_fbcon_enabled(false)` in
+    // Keep the GRUB menu graphical so the splash art is visible before boot,
+    // but hand the kernel a VGA text payload. Some BIOS GRUB/QEMU paths do not
+    // populate a usable boot_params.screen_info framebuffer for Lupos yet; if
+    // we keep GRUB graphics mode, tty1 writes fall back to vgacon while the VM
+    // still displays the old splash. Text payload makes the tty login visible.
+    //
+    // No `splash`: it makes userspace put the console in KD_GRAPHICS mode,
+    // disabling the framebuffer text console (`set_fbcon_enabled(false)` in
     // tty::mod's KDSETMODE handler) and is never restored to KD_TEXT (Lupos has
-    // no splash renderer), leaving the VirtualBox graphical window black. No
-    // `quiet` either, so kernel boot progress is visible on that console.
+    // no splash renderer). No `quiet` either, so kernel boot progress is
+    // visible on that console.
     let mut cfg = format!(
         r#"set timeout={GRUB_INTERACTIVE_SPLASH_TIMEOUT_SECS}
 set default=0
@@ -6139,7 +6172,7 @@ set default=0
 insmod all_video
 insmod linux
 set gfxmode=auto
-set gfxpayload=keep
+set gfxpayload=text
 insmod png
 insmod gfxterm
 terminal_input console
@@ -6187,7 +6220,7 @@ fn release_disk_images_build_script(raw: &Path, qcow2: &Path, vdi: &Path, rootfs
     let vdi_sh = shell_single_quote(&shell_path(vdi));
     let rootfs_sh = shell_single_quote(&shell_path(rootfs));
     format!(
-        "truncate -s 2G {raw_sh} && mkfs.ext4 -q -F -L lupos-root -O {RELEASE_EXT4_FEATURE_OPTS} -d {rootfs_sh} {raw_sh} && qemu-img convert -f raw -O qcow2 {raw_sh} {qcow2_sh} && qemu-img convert -f raw -O vdi {raw_sh} {vdi_sh}"
+        "truncate -s 2G {raw_sh} && mkfs.ext4 -q -F -L lupos-root -O {RELEASE_EXT4_FEATURE_OPTS} -E no_copy_xattrs -d {rootfs_sh} {raw_sh} && qemu-img convert -f raw -O qcow2 {raw_sh} {qcow2_sh} && qemu-img convert -f raw -O vdi {raw_sh} {vdi_sh}"
     )
 }
 
@@ -6404,8 +6437,8 @@ fn grub_cfg_content_with_cmdline(mode: &BootMode, extra_cmdline: &str) -> String
     // visible on the serial console.
     let mode_default_cmdline = match mode {
         BootMode::GuiShell => "quiet splash systemd.show_status=no",
-        BootMode::Login
-        | BootMode::LoginDisplay
+        BootMode::Login => "systemd.show_status=yes lupos.display_getty=1",
+        BootMode::LoginDisplay
         | BootMode::DiskRootFsckTest
         | BootMode::LoginStackTest
         | BootMode::UserspaceSmokeTest
@@ -6436,7 +6469,7 @@ serial --unit=0 --speed=115200
 insmod all_video
 insmod linux
 set gfxmode=auto
-set gfxpayload=keep
+set gfxpayload=text
 insmod png
 insmod gfxterm
 terminal_input console serial
@@ -9480,7 +9513,7 @@ const LOGIN_ROOT_DISK_BYTES: u64 = 768 * 1024 * 1024;
 const SHIPPED_COMMANDS_ROOT_DISK_SIZE: &str = "768M";
 const SHIPPED_COMMANDS_ROOT_DISK_BYTES: u64 = 768 * 1024 * 1024;
 const LOGIN_ROOT_DISK_MANIFEST_VERSION: &str = "1";
-const DIRECT_STAGE_ROOT_DISK_MANIFEST_VERSION: &str = "12";
+const DIRECT_STAGE_ROOT_DISK_MANIFEST_VERSION: &str = "14";
 
 fn ensure_disk_root_remount_disk() -> Result<PathBuf> {
     let target = xtask_target_dir()?;
@@ -9508,7 +9541,7 @@ fn ensure_disk_root_remount_disk() -> Result<PathBuf> {
     let root_sh = shell_single_quote(&shell_path(&root));
     let raw_sh = shell_single_quote(&shell_path(&raw));
     let script = format!(
-        "rm -f {raw_sh} && truncate -s {DISK_ROOT_REMOUNT_DISK_SIZE} {raw_sh} && mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -d {root_sh} {raw_sh}"
+        "rm -f {raw_sh} && truncate -s {DISK_ROOT_REMOUNT_DISK_SIZE} {raw_sh} && mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -E no_copy_xattrs -d {root_sh} {raw_sh}"
     );
     let mut command = Command::new("bash");
     command.arg("-lc").arg(script);
@@ -9672,6 +9705,28 @@ fn login_root_disk_manifest_matches(
         && fs::read_to_string(manifest)
             .map(|actual| actual == expected)
             .unwrap_or(false)
+}
+
+fn login_root_disk_image_is_clean(raw: &Path) -> bool {
+    Command::new("e2fsck")
+        .arg("-fn")
+        .arg(raw)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn login_root_disk_cache_is_valid(
+    raw: &Path,
+    manifest: &Path,
+    expected: &str,
+    expected_disk_bytes: u64,
+) -> bool {
+    login_root_disk_manifest_matches(raw, manifest, expected, expected_disk_bytes)
+        && login_root_disk_image_is_clean(raw)
 }
 
 fn root_disk_files_manifest(files: &[InitramfsFile]) -> String {
@@ -10288,7 +10343,7 @@ fn ensure_gui_shell_root_disk() -> Result<PathBuf> {
         r#"set -euo pipefail
 rm -f {raw_sh}
 truncate -s {GUI_SHELL_ROOT_DISK_SIZE} {raw_sh}
-mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -d {stage_sh} {raw_sh}
+mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -E no_copy_xattrs -d {stage_sh} {raw_sh}
 "#
     );
     let mut command = Command::new("bash");
@@ -10329,13 +10384,19 @@ fn ensure_direct_stage_login_root_disk(
     );
     let (disk_size, disk_bytes) = login_root_disk_size(mode);
 
-    if login_root_disk_manifest_matches(&raw, &manifest, &expected_manifest, disk_bytes) {
+    if login_root_disk_cache_is_valid(&raw, &manifest, &expected_manifest, disk_bytes) {
         println!(
             "Reusing {} ext4 root disk: {}",
             mode_name(mode),
             raw.display()
         );
         return Ok(raw);
+    } else if login_root_disk_manifest_matches(&raw, &manifest, &expected_manifest, disk_bytes) {
+        println!(
+            "Cached {} ext4 root disk failed e2fsck -fn; rebuilding: {}",
+            mode_name(mode),
+            raw.display()
+        );
     }
 
     fs::write(&overlay, &overlay_cpio)
@@ -10538,7 +10599,7 @@ with open(os.path.join(work, "debugfs.commands"), "w", encoding="utf-8") as out:
 PY
 echo "Creating ext4 image from staged userland..."
 truncate -s {disk_size} "$raw_build"
-mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -d {stage_sh} "$raw_build"
+mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -E no_copy_xattrs -d {stage_sh} "$raw_build"
 echo "Applying generated root-disk overlay..."
 debugfs -w -f {overlay_work_sh}/debugfs.commands "$raw_build" >/dev/null
 echo "Publishing root disk..."
@@ -10585,8 +10646,7 @@ fn ensure_ext4_root_disk_from_initramfs(
     let expected_manifest = login_root_disk_manifest(mode, &cpio_bytes, fstab_contents, force_fsck);
     let (disk_size, disk_bytes) = login_root_disk_size(mode);
 
-    if cacheable
-        && login_root_disk_manifest_matches(&raw, &manifest, &expected_manifest, disk_bytes)
+    if cacheable && login_root_disk_cache_is_valid(&raw, &manifest, &expected_manifest, disk_bytes)
     {
         println!(
             "Reusing {} ext4 root disk: {}",
@@ -10594,6 +10654,14 @@ fn ensure_ext4_root_disk_from_initramfs(
             raw.display()
         );
         return Ok(raw);
+    } else if cacheable
+        && login_root_disk_manifest_matches(&raw, &manifest, &expected_manifest, disk_bytes)
+    {
+        println!(
+            "Cached {} ext4 root disk failed e2fsck -fn; rebuilding: {}",
+            mode_name(mode),
+            raw.display()
+        );
     }
 
     let root_sh = shell_single_quote(&shell_path(&root));
@@ -10703,7 +10771,7 @@ chmod 1777 {root_sh}/tmp
 printf %s {fstab} > {root_sh}/etc/fstab
 rm -f {raw_sh}
 truncate -s {disk_size} {raw_sh}
-mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -d {root_sh} {raw_sh}
+mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -E no_copy_xattrs -d {root_sh} {raw_sh}
 {fsck_tail}
 "#
     );
@@ -11266,6 +11334,7 @@ pub fn run_userspace_smoke_tests() -> Result<()> {
         "userspace-smoke: transcript ok",
         "userspace-smoke: ls ok",
         "userspace-smoke: pacman-install ok",
+        "userspace-smoke: pacman-sync-install ok",
         "userspace-smoke: sleep ok",
         "userspace-smoke: clear ok",
     ] {
@@ -14431,7 +14500,12 @@ pub fn run_single_login_boot(_autologin_root: bool) -> Result<()> {
             }
             bail!("QEMU exited with unexpected status code {code}\nserial log:\n{serial_output}");
         }
-        None => Ok(()),
+        None => {
+            if serial_output.is_empty() {
+                bail!("QEMU terminated before a clean exit");
+            }
+            bail!("QEMU terminated before a clean exit\nserial log:\n{serial_output}");
+        }
     }
 }
 
@@ -14477,7 +14551,7 @@ pub fn run_single_login_boot_terminal() -> Result<()> {
     match status.code() {
         Some(0) | Some(QEMU_SUCCESS_EXIT_CODE) => Ok(()),
         Some(code) => bail!("QEMU exited with unexpected status code {code}"),
-        None => Ok(()),
+        None => bail!("QEMU terminated before a clean exit"),
     }
 }
 
@@ -17783,6 +17857,19 @@ failed command output\n";
     }
 
     #[test]
+    fn qemu_login_root_disk_guard_defaults_cmdline_to_label() {
+        let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, "/tmp/lupos-login.raw");
+        let _cmdline = EnvVarGuard::set(LUPOS_KERNEL_CMDLINE_ENV, "");
+        let _guards =
+            default_qemu_root_disk_guard_for_mode(BootMode::Login).expect("login root guard");
+
+        assert_eq!(
+            env::var(LUPOS_KERNEL_CMDLINE_ENV).as_deref(),
+            Ok("root=LABEL=lupos-root rootfstype=ext4 rw")
+        );
+    }
+
+    #[test]
     fn cpio_root_disk_manifest_requires_matching_inputs() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -18489,11 +18576,20 @@ failed command output\n";
             Some(LoginRootDiskBuilderKind::DirectStage)
         );
         assert!(
-            direct_builder
-                .contains("mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -d {stage_sh}"),
-            "direct-stage builds must format ext4 straight from the staged tree"
+            direct_builder.contains(
+                "mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -E no_copy_xattrs -d {stage_sh}"
+            ),
+            "direct-stage builds must format ext4 straight from the staged tree without copying host xattrs"
         );
         assert!(direct_builder.contains("debugfs -w -f {overlay_work_sh}/debugfs.commands"));
+        assert!(
+            direct_builder.contains("login_root_disk_cache_is_valid"),
+            "direct-stage cache hits must validate the ext4 image, not just the manifest"
+        );
+        assert!(
+            source.contains("e2fsck") && source.contains(".arg(\"-fn\")"),
+            "root-disk cache validation must run e2fsck -fn before reusing writable images"
+        );
         assert!(
             !direct_builder.contains("cp -a {stage_sh}/. {root_sh}/"),
             "direct-stage builds must not duplicate the full staged distro tree"
@@ -20279,6 +20375,7 @@ CONFIG_MODULES=y
     }
 
     #[test]
+    #[test]
     fn boot_partition_mode_enables_feature_without_initramfs_module() {
         assert_eq!(mode_name(BootMode::BootPartitionTest), "boot-partition");
         let features = feature_list(BootMode::BootPartitionTest, true);
@@ -20304,10 +20401,11 @@ CONFIG_MODULES=y
     fn grub_cfg_can_append_lupos_trace_cmdline() {
         let cfg = grub_cfg_content_with_cmdline(&BootMode::Login, "lupos.trace=syscall,fs,cgroup");
 
-        // Login modes pre-pend `systemd.show_status=yes` so slow jobs are
-        // visible on the serial console.
+        // Login display boots pre-pend `systemd.show_status=yes` so slow jobs
+        // remain visible in the serial diagnostics log, but only tty1 gets an
+        // interactive getty.
         assert!(cfg.contains(
-            "linux /boot/bzImage systemd.show_status=yes lupos.serial_getty=1 lupos.trace=syscall,fs,cgroup\n    initrd /boot/initramfs.cpio"
+            "linux /boot/bzImage systemd.show_status=yes lupos.display_getty=1 lupos.trace=syscall,fs,cgroup\n    initrd /boot/initramfs.cpio"
         ));
     }
 
@@ -20315,8 +20413,20 @@ CONFIG_MODULES=y
     /// are visible in the serial log instead of looking like a kernel stall.
     #[test]
     fn grub_cfg_login_modes_default_to_visible_systemd_status() {
+        let display_cfg = grub_cfg_content_with_cmdline(&BootMode::Login, "");
+        assert!(
+            display_cfg.contains("/boot/bzImage systemd.show_status=yes lupos.display_getty=1"),
+            "display login boot must default to visible status and tty1 getty opt-in: {display_cfg}"
+        );
+        assert!(
+            !display_cfg.contains("lupos.serial_getty=1"),
+            "display login boot must not spawn a second serial getty: {display_cfg}"
+        );
+        assert!(
+            !display_cfg.contains("/boot/bzImage quiet systemd.show_status=no"),
+            "display login boot must not hide systemd status: {display_cfg}"
+        );
         for mode in [
-            BootMode::Login,
             BootMode::LoginDisplay,
             BootMode::DiskRootFsckTest,
             BootMode::LoginStackTest,
@@ -20329,6 +20439,17 @@ CONFIG_MODULES=y
             assert!(
                 !cfg.contains("/boot/bzImage quiet systemd.show_status=no"),
                 "{mode:?}: terminal login boot must not hide systemd status: {cfg}"
+            );
+        }
+        for mode in [
+            BootMode::LoginDisplay,
+            BootMode::DiskRootFsckTest,
+            BootMode::LoginStackTest,
+        ] {
+            let cfg = grub_cfg_content_with_cmdline(&mode, "");
+            assert!(
+                !cfg.contains("lupos.display_getty=1"),
+                "{mode:?}: serial-driven boot must not start tty1 getty: {cfg}"
             );
         }
         // Non-login boot modes (the per-feature gates) keep an empty
@@ -20467,6 +20588,9 @@ CONFIG_MODULES=y
     #[test]
     fn display_getty_override_requires_password_for_interactive_qemu() {
         let display = String::from_utf8(systemd_getty_override()).expect("display getty override");
+        assert!(display.contains("DefaultDependencies=no"));
+        assert!(display.contains("ConditionKernelCommandLine=lupos.display_getty=1"));
+        assert!(display.contains("After=tmp.mount"));
         assert!(display.contains("ExecStart=-/usr/sbin/agetty --noclear --nohostname"));
         assert!(display.contains("--issue-file /etc/issue tty1 linux"));
         assert!(!display.contains("--autologin root"));
@@ -21219,7 +21343,6 @@ CONFIG_MODULES=y
             "var/cache/apt/archives/hello.deb",
             "ssh-keygen",
             "openssh-server",
-            "nano",
         ] {
             assert!(
                 !script.contains(forbidden),
@@ -21460,6 +21583,9 @@ CONFIG_MODULES=y
         .expect("getty@tty1 drop-in must be staged");
         assert!(initramfs_file_is_regular(dropin));
         let body = core::str::from_utf8(&dropin.2).expect("drop-in is utf-8");
+        assert!(body.contains("DefaultDependencies=no"));
+        assert!(body.contains("ConditionKernelCommandLine=lupos.display_getty=1"));
+        assert!(body.contains("After=tmp.mount"));
         assert!(body.contains("TTYVTDisallocate=no"));
         assert!(body.contains("ExecStart=-/usr/sbin/agetty --noclear --nohostname"));
         assert!(
@@ -23024,7 +23150,7 @@ CONFIG_MODULES=y
         assert!(cfg.contains("set timeout=2"));
         assert!(cfg.contains("terminal_input console"));
         assert!(cfg.contains("terminal_output gfxterm"));
-        assert!(cfg.contains("set gfxpayload=keep"));
+        assert!(cfg.contains("set gfxpayload=text"));
         assert!(
             !cfg.contains("serial --unit="),
             "VirtualBox release GRUB must not block on an unconnected host-pipe serial terminal"
@@ -23094,7 +23220,7 @@ CONFIG_MODULES=y
         let cfg = grub_cfg_content_with_cmdline(&BootMode::Login, "");
         assert!(cfg.contains("set timeout=2"));
         assert!(cfg.contains("insmod png"));
-        assert!(cfg.contains("set gfxpayload=keep"));
+        assert!(cfg.contains("set gfxpayload=text"));
         assert!(cfg.contains("background_image /boot/grub/splashart.png"));
         assert!(cfg.contains("linux /boot/bzImage systemd.show_status=yes"));
         assert!(cfg.contains("initrd /boot/initramfs.cpio"));
@@ -23108,7 +23234,7 @@ CONFIG_MODULES=y
 
         assert!(cfg.contains("insmod linux"));
         assert!(cfg.contains("linux /boot/bzImage"));
-        assert!(cfg.contains("set gfxpayload=keep"));
+        assert!(cfg.contains("set gfxpayload=text"));
         assert!(cfg.contains("background_image /boot/grub/splashart.png"));
         assert!(!cfg.contains("initrd /boot/initramfs.cpio"));
         assert!(!cfg.contains("multiboot2"));
@@ -24661,6 +24787,7 @@ CONFIG_MODULES=y
         assert!(script.contains("mkfs.ext4 -q -F -L lupos-root"));
         assert!(script.contains("truncate -s 2G"));
         assert!(script.contains("-O ^metadata_csum,^64bit"));
+        assert!(script.contains("-E no_copy_xattrs"));
         assert!(script.contains("qemu-img convert -f raw -O qcow2"));
         assert!(script.contains("qemu-img convert -f raw -O vdi"));
     }
