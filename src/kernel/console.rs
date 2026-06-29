@@ -35,6 +35,17 @@ static CURSOR_BLINK_ON: AtomicBool = AtomicBool::new(true);
 static CURSOR_LAST_TSC: AtomicU64 = AtomicU64::new(0);
 const CURSOR_BLINK_CYCLES: u64 = 250_000_000;
 
+/// TSC deadline at which the in-progress console bell is silenced, or `0`
+/// when the speaker is idle. Driven from the console write path and cleared
+/// by [`bell_tick`] on the maintenance pump.
+static BELL_DEADLINE_TSC: AtomicU64 = AtomicU64::new(0);
+/// Linux `DEFAULT_BELL_PITCH` (drivers/tty/vt/vt.c) — 750 Hz.
+const BELL_PITCH_HZ: u32 = 750;
+/// Bell ring length in TSC cycles. Linux uses `DEFAULT_BELL_DURATION = HZ/8`
+/// (~125 ms); scaled here to a quarter of the cursor-blink interval to match
+/// the same TSC assumption used for [`CURSOR_BLINK_CYCLES`].
+const BELL_DURATION_CYCLES: u64 = CURSOR_BLINK_CYCLES / 4;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirtyRow {
     pub row: usize,
@@ -149,6 +160,7 @@ impl VirtualConsole {
     fn write_ground(&mut self, byte: u8) {
         match byte {
             0x1b => self.esc_state = EscapeState::Escape,
+            0x07 => ring_bell(),
             b'\n' => self.new_line(),
             b'\r' => self.set_col(0),
             b'\t' => self.tab(),
@@ -682,6 +694,7 @@ pub fn write_visible_bytes(bytes: &[u8]) {
 
 pub fn maintenance_budgeted() {
     flush_serial_budgeted();
+    bell_tick();
     render_dirty_to_display(FBCON_ROW_BUDGET);
 }
 
@@ -753,6 +766,43 @@ pub fn refresh_cursor_blink() {
     with_console_mut(|console| console.set_cursor_blink_on(on));
 }
 
+/// Handle a ground-state BEL (`0x07`) like Linux's `bell()` in the VT layer:
+/// start the PC speaker at the default bell pitch and arm the silence
+/// deadline. The maintenance pump ([`bell_tick`]) turns the speaker back off
+/// once [`BELL_DURATION_CYCLES`] have elapsed, mirroring `kd_mksound`'s
+/// duration timer.
+fn ring_bell() {
+    #[cfg(not(test))]
+    {
+        crate::linux_driver_abi::input::misc::pcspkr::kd_mksound(BELL_PITCH_HZ);
+        let deadline = read_tsc().saturating_add(BELL_DURATION_CYCLES).max(1);
+        BELL_DEADLINE_TSC.store(deadline, Ordering::Release);
+    }
+    #[cfg(test)]
+    BELL_DEADLINE_TSC.store(1, Ordering::Release);
+}
+
+/// Silence the console bell once its duration has elapsed. Called from the
+/// maintenance pump, which also drives the cursor blink, so the speaker is
+/// gated off shortly after the ring even on an otherwise idle shell.
+pub fn bell_tick() {
+    let deadline = BELL_DEADLINE_TSC.load(Ordering::Acquire);
+    if deadline == 0 {
+        return;
+    }
+    if read_tsc() < deadline {
+        return;
+    }
+    if BELL_DEADLINE_TSC
+        .compare_exchange(deadline, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    #[cfg(not(test))]
+    crate::linux_driver_abi::input::misc::pcspkr::kd_mksound(0);
+}
+
 fn take_dirty_batch(budget: usize) -> Option<RenderBatch> {
     let mut guard = CONSOLE.lock();
     guard.as_mut()?.take_dirty_rows(budget)
@@ -813,6 +863,7 @@ pub fn reset_for_tests(cols: usize, rows: usize) {
     FBCON_ENABLED.store(true, Ordering::Release);
     CURSOR_BLINK_ON.store(true, Ordering::Release);
     CURSOR_LAST_TSC.store(0, Ordering::Release);
+    BELL_DEADLINE_TSC.store(0, Ordering::Release);
     crate::init::rootfs::clear_console_input_for_tests();
 }
 
@@ -829,6 +880,11 @@ pub fn cell_char_for_tests(row: usize, col: usize) -> u8 {
 #[cfg(test)]
 pub fn cursor_for_tests() -> Option<(usize, usize)> {
     with_console_mut(|console| console.cursor())
+}
+
+#[cfg(test)]
+pub fn bell_armed_for_tests() -> bool {
+    BELL_DEADLINE_TSC.load(Ordering::Acquire) != 0
 }
 
 #[cfg(test)]
@@ -1081,6 +1137,44 @@ mod tests {
             assert_eq!(cell_char_for_tests(0, col), b' ');
         }
         assert_eq!(cursor_for_tests(), Some((7, 0)));
+    }
+
+    #[test]
+    fn ground_bel_arms_speaker_without_rendering_a_glyph() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(10, 3);
+        assert!(!bell_armed_for_tests());
+
+        write_visible_bytes(b"a\x07b");
+
+        // BEL must not advance the cursor or paint a cell.
+        assert_eq!(cell_char_for_tests(0, 0), b'a');
+        assert_eq!(cell_char_for_tests(0, 1), b'b');
+        assert_eq!(cursor_for_tests(), Some((2, 0)));
+        assert!(bell_armed_for_tests());
+    }
+
+    #[test]
+    fn bell_tick_silences_speaker_after_duration() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(10, 3);
+        write_visible_bytes(b"\x07");
+        assert!(bell_armed_for_tests());
+
+        // The test `read_tsc` always reports a time past the deadline.
+        bell_tick();
+        assert!(!bell_armed_for_tests());
+    }
+
+    #[test]
+    fn osc_terminator_bel_does_not_ring_the_bell() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(12, 3);
+        // BEL here is the OSC string terminator, not a ground-state bell.
+        write_visible_bytes(b"\x1b]0;title\x07hi");
+        assert!(!bell_armed_for_tests());
+        assert_eq!(cell_char_for_tests(0, 0), b'h');
+        assert_eq!(cell_char_for_tests(0, 1), b'i');
     }
 
     #[test]
