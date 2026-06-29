@@ -459,6 +459,8 @@ src/linux_driver_abi/hid/mod.rs	vendor/linux/drivers/hid	layout-oracle
 src/linux_driver_abi/input/evdev_chardev.rs	vendor/linux/drivers/input	layout-oracle
 src/linux_driver_abi/input/i8042.rs	vendor/linux/drivers/input	layout-oracle
 src/linux_driver_abi/input/linux_sources.rs	vendor/linux/drivers/input	layout-oracle
+src/linux_driver_abi/input/misc/mod.rs	vendor/linux/drivers/input/misc	layout-oracle
+src/linux_driver_abi/input/misc/pcspkr.rs	vendor/linux/drivers/input/misc/pcspkr.c	layout-oracle
 src/linux_driver_abi/input/mod.rs	vendor/linux/drivers/input	layout-oracle
 src/linux_driver_abi/mod.rs	vendor/linux/drivers	layout-oracle
 src/linux_driver_abi/pci/device.rs	vendor/linux/drivers/pci	layout-oracle

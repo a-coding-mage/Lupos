@@ -87,6 +87,35 @@ cargo xtask run
 
 Log in as `root` / `lupos`.
 
+## Why don't I hear the terminal bell (`printf '\a'`)?
+
+The kernel does emit the bell: a ground-state BEL (`0x07`) drives the emulated
+PC speaker (PIT channel 2 gated through port `0x61`), exactly like Linux's VT
+`bell()` / `pcspkr` path. Whether you *hear* it depends on the VM routing that
+speaker to host audio.
+
+- **QEMU** (`cargo xtask run`): the PC speaker is wired to the shared audiodev
+  with `-machine ...,pcspk-audiodev=luposaudio`, but the default audio backend
+  is the null sink (`none`) so headless/CI runs stay silent. To actually hear
+  it, pick a host backend:
+
+  ```bash
+  LUPOS_QEMU_AUDIODEV=pa cargo xtask run        # PulseAudio
+  LUPOS_QEMU_AUDIODEV=pipewire cargo xtask run  # PipeWire
+  ```
+
+- **VirtualBox** (`luposbox`): enable PC-speaker passthrough once, then
+  power-cycle the VM:
+
+  ```bash
+  scripts/lupos-vbox-beep.sh            # mode 1: host PC speaker
+  scripts/lupos-vbox-beep.sh luposbox 2 # mode 2: route via host audio device
+  ```
+
+Inside the guest, test with `printf '\a'` (note: `prinf` in the screenshotted
+session was a typo, and `printf '\a'` with an unterminated quote waits for more
+input — close the quote).
+
 ## How do I contribute?
 
 1. Pick an unfinished milestone in `ROADMAP.md` or open a pull request based on

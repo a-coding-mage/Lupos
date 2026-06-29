@@ -186,9 +186,26 @@ pub(crate) fn queue_console_input_response(bytes: &[u8]) {
 }
 
 #[cfg(test)]
+lazy_static! {
+    /// Simulated hardware input queue for tests. Bytes are handed back one
+    /// per `try_console_input()` call, mirroring the real i8042/serial path
+    /// where a multi-byte key sequence is queued together but popped a byte
+    /// at a time. Lets tests exercise `console_read`'s drain-to-exhaustion
+    /// behavior, which `push_console_input_for_tests` (which writes straight
+    /// to the ready buffer) bypasses.
+    static ref TEST_HW_INPUT_QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
+}
+
+#[cfg(test)]
+pub(crate) fn push_hardware_input_for_tests(bytes: &[u8]) {
+    TEST_HW_INPUT_QUEUE.lock().extend(bytes.iter().copied());
+}
+
+#[cfg(test)]
 pub(crate) fn clear_console_input_for_tests() {
     CONSOLE_CANON_BUFFER.lock().clear();
     CONSOLE_READY_BUFFER.lock().clear();
+    TEST_HW_INPUT_QUEUE.lock().clear();
 }
 
 #[cfg(test)]
@@ -286,7 +303,10 @@ fn try_console_input() -> Option<ConsoleInput> {
 
 #[cfg(test)]
 fn try_console_input() -> Option<ConsoleInput> {
-    None
+    TEST_HW_INPUT_QUEUE
+        .lock()
+        .pop_front()
+        .map(ConsoleInput::Byte)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -555,8 +575,19 @@ fn console_read(
             return Ok(n);
         }
 
-        if let Some(input) = try_console_input() {
+        // Drain every input byte that is already available before returning.
+        // Multi-byte key sequences (arrow/Home/End/Delete keys decode to
+        // `ESC [ ...`) arrive in the input queue together, but the source
+        // hands them back one byte per call. Returning a lone `ESC` makes a
+        // raw-mode reader (bash readline) hit its ESC keyseq timeout and
+        // mis-parse the rest as literal input, corrupting in-line editing.
+        // Draining to exhaustion keeps the whole sequence in a single read().
+        let mut drained = false;
+        while let Some(input) = try_console_input() {
             process_console_input(input);
+            drained = true;
+        }
+        if drained {
             if let Some(n) = console_read_ready_or_signal(buf, pos)? {
                 return Ok(n);
             }
@@ -2471,6 +2502,21 @@ mod tests {
         let mut raw = [0u8; 8];
         let n = vfs_read(&file, &mut raw).expect("raw console read");
         assert_eq!(&raw[..n], b"\x1b[D");
+
+        // Regression: an arrow key reaches the input source as a multi-byte
+        // ESC sequence that is handed back one byte per `try_console_input()`
+        // call (the real i8042/serial path). `console_read` must drain the
+        // whole sequence into a single read; otherwise a raw-mode reader
+        // (bash readline) sees a lone ESC, times out, and mis-parses the rest
+        // as literal input — corrupting in-line editing.
+        push_hardware_input_for_tests(b"\x1b[D");
+        let mut arrow = [0u8; 8];
+        let n = vfs_read(&file, &mut arrow).expect("hardware arrow read");
+        assert_eq!(
+            &arrow[..n],
+            b"\x1b[D",
+            "multi-byte key sequence must arrive in one read, not split"
+        );
 
         crate::kernel::console::reset_for_tests(12, 3);
         crate::kernel::console::write_visible_bytes(b"\x1b[18t\x1b[2;3H\x1b[6n");
