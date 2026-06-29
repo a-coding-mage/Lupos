@@ -739,8 +739,12 @@ mod tests {
     use std::vec::Vec;
 
     fn make_test_writer() -> (Vec<u8>, FramebufferWriter) {
-        let width = 80u32;
-        let height = 48u32;
+        make_test_writer_with_cells(10, 3)
+    }
+
+    fn make_test_writer_with_cells(cols: usize, rows: usize) -> (Vec<u8>, FramebufferWriter) {
+        let width = (cols * font::GLYPH_WIDTH) as u32;
+        let height = (rows * font::GLYPH_HEIGHT) as u32;
         let bpp = 32u8;
         let pitch = width * (bpp as u32 / 8);
         let buf_size = (pitch * height) as usize;
@@ -965,6 +969,26 @@ mod tests {
         assert_eq!(normal_green, 0x0000_aa00);
         assert_eq!(writer.cell_char(0, 0), b'L');
         assert_eq!(writer.cell_char(0, 1), b'x');
+    }
+
+    #[test]
+    fn bash_prompt_sgr_sequences_color_cells_without_artifacts() {
+        let (_buf, mut writer) = make_test_writer_with_cells(20, 3);
+        use core::fmt::Write;
+        write!(
+            writer,
+            "\x1b[01;32m[root@lupos\x1b[00m \x1b[01;34m/\x1b[00m]# "
+        )
+        .unwrap();
+
+        for (col, byte) in b"[root@lupos /]# ".iter().enumerate() {
+            assert_eq!(writer.cell_char(0, col), *byte);
+        }
+        assert_eq!(writer.cells[writer.cell_index(0, 0)].fg, 0x0055_ff55);
+        assert_eq!(writer.cells[writer.cell_index(10, 0)].fg, 0x0055_ff55);
+        assert_eq!(writer.cells[writer.cell_index(11, 0)].fg, DEFAULT_FG);
+        assert_eq!(writer.cells[writer.cell_index(12, 0)].fg, 0x0055_55ff);
+        assert_eq!(writer.cells[writer.cell_index(13, 0)].fg, DEFAULT_FG);
     }
 
     #[test]

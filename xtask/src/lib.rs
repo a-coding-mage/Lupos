@@ -331,20 +331,22 @@ const LOGIN_PROFILE: &str = concat!(
     // framebuffer is slow to repaint, and an interactive user can still run
     // `clear` explicitly when they want a fresh screen.
 );
+const COLOR_BASH_PS1_ASSIGNMENT: &str =
+    "PS1='\\[\\033[01;32m\\][\\u@\\h\\[\\033[00m\\] \\[\\033[01;34m\\]\\W\\[\\033[00m\\]]\\$ '";
 const LOGIN_BASH_BASHRC: &str = concat!(
     "[[ $- != *i* ]] && return\n",
-    "[[ \"$PS1\" = '\\s-\\v\\$ ' ]] && PS1='[\\u@\\h \\W]\\$ '\n",
+    "[[ \"$PS1\" = '\\s-\\v\\$ ' ]] && PS1='\\[\\033[01;32m\\][\\u@\\h\\[\\033[00m\\] \\[\\033[01;34m\\]\\W\\[\\033[00m\\]]\\$ '\n",
 );
 const ROOT_LOGIN_BASHRC: &str = concat!(
     ". /etc/bash.bashrc 2>/dev/null || true\n",
     "if [ \"$PWD\" = \"$HOME\" ]; then cd /; fi\n",
-    "PS1='[\\u@\\h \\W]\\$ '\n",
+    "PS1='\\[\\033[01;32m\\][\\u@\\h\\[\\033[00m\\] \\[\\033[01;34m\\]\\W\\[\\033[00m\\]]\\$ '\n",
 );
 const ROOT_LOGIN_BASH_PROFILE: &str = concat!(
     ". /etc/profile 2>/dev/null || true\n",
     ". ~/.bashrc 2>/dev/null || true\n",
     "if [ \"$PWD\" = \"$HOME\" ]; then cd /; fi\n",
-    "PS1='[\\u@\\h \\W]\\$ '\n",
+    "PS1='\\[\\033[01;32m\\][\\u@\\h\\[\\033[00m\\] \\[\\033[01;34m\\]\\W\\[\\033[00m\\]]\\$ '\n",
 );
 // Home directory skeleton files.
 // Reference: common bash /etc/skel contents installed by pam_mkhomedir / adduser(8).
@@ -356,6 +358,9 @@ const LUPOS_USER_BASHRC: &str = concat!(
     "HISTSIZE=1000\n",
     "HISTFILESIZE=2000\n",
     "shopt -s checkwinsize\n",
+    "alias ls='ls --color=auto'\n",
+    "alias grep='grep --color=auto'\n",
+    "PS1='\\[\\033[01;32m\\][\\u@\\h\\[\\033[00m\\] \\[\\033[01;34m\\]\\W\\[\\033[00m\\]]\\$ '\n",
 );
 const LUPOS_USER_BASH_PROFILE: &str = "# ~/.bash_profile\n[ -f ~/.bashrc ] && . ~/.bashrc\n";
 
@@ -367,6 +372,9 @@ const SKEL_BASHRC: &str = concat!(
     "HISTSIZE=1000\n",
     "HISTFILESIZE=2000\n",
     "shopt -s checkwinsize\n",
+    "alias ls='ls --color=auto'\n",
+    "alias grep='grep --color=auto'\n",
+    "PS1='\\[\\033[01;32m\\][\\u@\\h\\[\\033[00m\\] \\[\\033[01;34m\\]\\W\\[\\033[00m\\]]\\$ '\n",
 );
 const SKEL_BASH_PROFILE: &str = "# ~/.bash_profile\n[ -f ~/.bashrc ] && . ~/.bashrc\n";
 const SKEL_BASH_LOGOUT: &str = "# ~/.bash_logout\nclear\n";
@@ -4275,6 +4283,22 @@ fn staged_userland_bytes(stage: Option<&Path>, candidates: &[&str]) -> Option<Ve
     None
 }
 
+fn colorized_bash_prompt_config(bytes: Vec<u8>) -> Vec<u8> {
+    String::from_utf8_lossy(&bytes)
+        .replace("PS1='[\\u@\\h \\W]\\$ '", COLOR_BASH_PS1_ASSIGNMENT)
+        .into_bytes()
+}
+
+fn staged_bash_startup_config(
+    stage: Option<&Path>,
+    candidates: &[&str],
+    fallback: &[u8],
+) -> Vec<u8> {
+    colorized_bash_prompt_config(
+        staged_userland_bytes(stage, candidates).unwrap_or_else(|| fallback.to_vec()),
+    )
+}
+
 fn colon_record_key(line: &str) -> Option<&str> {
     let (key, _) = line.split_once(':')?;
     (!key.is_empty()).then_some(key)
@@ -4600,8 +4624,7 @@ fn sysv_login_userland_files_with_stage_and_options(
         initramfs_file(
             "etc/bash.bashrc",
             0o100644,
-            staged_userland_bytes(stage, &["etc/bash.bashrc"])
-                .unwrap_or_else(|| LOGIN_BASH_BASHRC.as_bytes().to_vec()),
+            staged_bash_startup_config(stage, &["etc/bash.bashrc"], LOGIN_BASH_BASHRC.as_bytes()),
         ),
         initramfs_file("root/.bashrc", 0o100644, ROOT_LOGIN_BASHRC.as_bytes()),
         initramfs_file(
@@ -4611,9 +4634,9 @@ fn sysv_login_userland_files_with_stage_and_options(
         ),
         // Home directory skeleton files mirroring common /etc/skel bash defaults.
         // adduser(8)/pam_mkhomedir(8) copies these to new home directories on real systems.
-        initramfs_file("home/lupos/.bashrc",       0o100644, staged_userland_bytes(stage, &["home/lupos/.bashrc", "etc/skel/.bashrc"]).unwrap_or_else(|| LUPOS_USER_BASHRC.as_bytes().to_vec())),
+        initramfs_file("home/lupos/.bashrc",       0o100644, staged_bash_startup_config(stage, &["home/lupos/.bashrc", "etc/skel/.bashrc"], LUPOS_USER_BASHRC.as_bytes())),
         initramfs_file("home/lupos/.bash_profile", 0o100644, staged_userland_bytes(stage, &["home/lupos/.bash_profile", "etc/skel/.bash_profile"]).unwrap_or_else(|| LUPOS_USER_BASH_PROFILE.as_bytes().to_vec())),
-        initramfs_file("etc/skel/.bashrc",         0o100644, staged_userland_bytes(stage, &["etc/skel/.bashrc"]).unwrap_or_else(|| SKEL_BASHRC.as_bytes().to_vec())),
+        initramfs_file("etc/skel/.bashrc",         0o100644, staged_bash_startup_config(stage, &["etc/skel/.bashrc"], SKEL_BASHRC.as_bytes())),
         initramfs_file("etc/skel/.bash_profile",   0o100644, staged_userland_bytes(stage, &["etc/skel/.bash_profile"]).unwrap_or_else(|| SKEL_BASH_PROFILE.as_bytes().to_vec())),
         initramfs_file("etc/skel/.bash_logout",    0o100644, staged_userland_bytes(stage, &["etc/skel/.bash_logout"]).unwrap_or_else(|| SKEL_BASH_LOGOUT.as_bytes().to_vec())),
         initramfs_file("etc/motd", 0o100644, LOGIN_MOTD.as_bytes()),
@@ -4843,15 +4866,19 @@ fn systemd_login_userland_files_with_stage_and_options(
         ),
         initramfs_file("etc/nsswitch.conf", 0o100644, SYSTEMD_NSSWITCH.as_bytes()),
         initramfs_file("etc/profile", 0o100644, staged_config("etc/profile", LOGIN_PROFILE.as_bytes())),
-        initramfs_file("etc/bash.bashrc", 0o100644, staged_config("etc/bash.bashrc", LOGIN_BASH_BASHRC.as_bytes())),
+        initramfs_file(
+            "etc/bash.bashrc",
+            0o100644,
+            colorized_bash_prompt_config(staged_config("etc/bash.bashrc", LOGIN_BASH_BASHRC.as_bytes())),
+        ),
         // Root keeps Arch's normal HOME=/root, but its first interactive login
         // starts at / so plain `ls` shows the real root filesystem.
         initramfs_file("root/.bashrc", 0o100644, ROOT_LOGIN_BASHRC.as_bytes()),
         initramfs_file("root/.bash_profile", 0o100644, ROOT_LOGIN_BASH_PROFILE.as_bytes()),
         // Mirror Arch's user startup files when a real stage exists.
-        initramfs_file("home/lupos/.bashrc",       0o100644, staged_userland_bytes(Some(stage), &["home/lupos/.bashrc", "etc/skel/.bashrc"]).unwrap_or_else(|| LUPOS_USER_BASHRC.as_bytes().to_vec())),
+        initramfs_file("home/lupos/.bashrc",       0o100644, staged_bash_startup_config(Some(stage), &["home/lupos/.bashrc", "etc/skel/.bashrc"], LUPOS_USER_BASHRC.as_bytes())),
         initramfs_file("home/lupos/.bash_profile", 0o100644, staged_userland_bytes(Some(stage), &["home/lupos/.bash_profile", "etc/skel/.bash_profile"]).unwrap_or_else(|| LUPOS_USER_BASH_PROFILE.as_bytes().to_vec())),
-        initramfs_file("etc/skel/.bashrc",         0o100644, staged_config("etc/skel/.bashrc", SKEL_BASHRC.as_bytes())),
+        initramfs_file("etc/skel/.bashrc",         0o100644, colorized_bash_prompt_config(staged_config("etc/skel/.bashrc", SKEL_BASHRC.as_bytes()))),
         initramfs_file("etc/skel/.bash_profile",   0o100644, staged_config("etc/skel/.bash_profile", SKEL_BASH_PROFILE.as_bytes())),
         initramfs_file("etc/skel/.bash_logout",    0o100644, staged_config("etc/skel/.bash_logout", SKEL_BASH_LOGOUT.as_bytes())),
         initramfs_file("etc/motd", 0o100644, staged_config("etc/motd", LOGIN_MOTD.as_bytes())),
@@ -9672,7 +9699,11 @@ fn direct_stage_login_root_disk_overlay_files(
             LOGIN_PAM_SU.as_bytes().to_vec(),
         ),
         initramfs_file("etc/profile", 0o100644, staged_config("etc/profile", LOGIN_PROFILE.as_bytes())),
-        initramfs_file("etc/bash.bashrc", 0o100644, staged_config("etc/bash.bashrc", LOGIN_BASH_BASHRC.as_bytes())),
+        initramfs_file(
+            "etc/bash.bashrc",
+            0o100644,
+            colorized_bash_prompt_config(staged_config("etc/bash.bashrc", LOGIN_BASH_BASHRC.as_bytes())),
+        ),
         initramfs_file("root", 0o40700, Vec::new()),
         initramfs_file("root/.bashrc", 0o100644, ROOT_LOGIN_BASHRC.as_bytes()),
         initramfs_file("root/.bash_profile", 0o100644, ROOT_LOGIN_BASH_PROFILE.as_bytes()),
@@ -9682,14 +9713,14 @@ fn direct_stage_login_root_disk_overlay_files(
         initramfs_file(
             "home/lupos/.bashrc",
             0o100644,
-            staged_config_any(&["home/lupos/.bashrc", "etc/skel/.bashrc"], LUPOS_USER_BASHRC.as_bytes()),
+            colorized_bash_prompt_config(staged_config_any(&["home/lupos/.bashrc", "etc/skel/.bashrc"], LUPOS_USER_BASHRC.as_bytes())),
         ),
         initramfs_file(
             "home/lupos/.bash_profile",
             0o100644,
             staged_config_any(&["home/lupos/.bash_profile", "etc/skel/.bash_profile"], LUPOS_USER_BASH_PROFILE.as_bytes()),
         ),
-        initramfs_file("etc/skel/.bashrc", 0o100644, staged_config("etc/skel/.bashrc", SKEL_BASHRC.as_bytes())),
+        initramfs_file("etc/skel/.bashrc", 0o100644, colorized_bash_prompt_config(staged_config("etc/skel/.bashrc", SKEL_BASHRC.as_bytes()))),
         initramfs_file(
             "etc/skel/.bash_profile",
             0o100644,
@@ -20008,6 +20039,8 @@ CONFIG_MODULES=y
             fs::read(stage.join("etc/bash.bashrc")).expect("read staged /etc/bash.bashrc");
         let stage_skel_bashrc =
             fs::read(stage.join("etc/skel/.bashrc")).expect("read staged skel bashrc");
+        let expected_bash_bashrc = colorized_bash_prompt_config(stage_bash_bashrc);
+        let expected_skel_bashrc = colorized_bash_prompt_config(stage_skel_bashrc);
 
         let initramfs_files = systemd_login_userland_files_with_stage(&stage);
         assert_eq!(
@@ -20017,13 +20050,13 @@ CONFIG_MODULES=y
         );
         assert_eq!(
             initramfs_file_bytes(&initramfs_files, "etc/bash.bashrc"),
-            Some(stage_bash_bashrc.as_slice()),
-            "Arch-backed initramfs login must stage Arch's /etc/bash.bashrc"
+            Some(expected_bash_bashrc.as_slice()),
+            "Arch-backed initramfs login must stage Arch's /etc/bash.bashrc with a colored Bash prompt"
         );
         assert_eq!(
             initramfs_file_bytes(&initramfs_files, "home/lupos/.bashrc"),
-            Some(stage_skel_bashrc.as_slice()),
-            "lupos user startup should come from Arch /etc/skel"
+            Some(expected_skel_bashrc.as_slice()),
+            "lupos user startup should come from Arch /etc/skel with a colored Bash prompt"
         );
         let root_bash_profile = initramfs_file_bytes(&initramfs_files, "root/.bash_profile")
             .expect("root login profile staged");
@@ -20053,13 +20086,13 @@ CONFIG_MODULES=y
         );
         assert_eq!(
             initramfs_file_bytes(&overlay_files, "etc/bash.bashrc"),
-            Some(stage_bash_bashrc.as_slice()),
-            "direct root-disk overlay must preserve Arch's /etc/bash.bashrc"
+            Some(expected_bash_bashrc.as_slice()),
+            "direct root-disk overlay must preserve Arch's /etc/bash.bashrc with a colored Bash prompt"
         );
         assert_eq!(
             initramfs_file_bytes(&overlay_files, "home/lupos/.bashrc"),
-            Some(stage_skel_bashrc.as_slice()),
-            "direct root-disk overlay should seed lupos from Arch /etc/skel"
+            Some(expected_skel_bashrc.as_slice()),
+            "direct root-disk overlay should seed lupos from Arch /etc/skel with a colored Bash prompt"
         );
         let overlay_root_bash_profile = initramfs_file_bytes(&overlay_files, "root/.bash_profile")
             .expect("direct root login profile staged");
@@ -21050,12 +21083,14 @@ CONFIG_MODULES=y
             .expect("/etc/bash.bashrc must be staged with Arch /etc/profile");
         let bash_bashrc_body = core::str::from_utf8(&bash_bashrc.2).expect("bash.bashrc utf-8");
         assert!(
-            bash_bashrc_body.contains("PS1='[\\u@\\h \\W]\\$ '"),
-            "/etc/bash.bashrc must provide Arch's bracketed Bash prompt"
+            bash_bashrc_body.contains(COLOR_BASH_PS1_ASSIGNMENT),
+            "/etc/bash.bashrc must provide an Arch-style bracketed Bash prompt with ANSI colors"
         );
         assert!(
-            !bash_bashrc_body.contains("\\033[01;32m"),
-            "/etc/bash.bashrc must not carry the old colored Lupos PS1 override"
+            bash_bashrc_body.contains("\\033[01;32m")
+                && bash_bashrc_body.contains("\\033[01;34m")
+                && bash_bashrc_body.contains("\\033[00m"),
+            "/etc/bash.bashrc must emit ANSI SGR color sequences for Bash prompts"
         );
         assert!(
             !profile_body.contains("command -v clear") && !profile_body.contains(" then clear"),
