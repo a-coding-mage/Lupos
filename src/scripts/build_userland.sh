@@ -25,19 +25,22 @@ ARCH_PACMAN_SERVER='Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch'
 ARCH_PACMAN_XFER_HELPER="usr/lib/lupos/pacman-xfer"
 ARCH_PACMAN_XFER_COMMAND="XferCommand = /usr/lib/lupos/pacman-xfer %u %o"
 ARCH_OFFLINE_REPO_ARTIFACTS=(
-    "core/os/x86_64/core.db:a7e2c5c084e9bf7db0a5c9231942a4bd12cf170b85ae8d048e10d75acbe74e4d"
+    "core/os/x86_64/core.db:798ab7b65aea244fb3cbfeab13fcf6a9642dfbcbc3dcfcda6c8071aeeb2e19ee"
     "core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst:95b97f61aacc075e85465a7d5e1c99d1b249b4eba63081a170482cdc8791f799"
+    "core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst:2b52fdaafc70e63511f3b85d98c34f26151b0498fa6f0e61fcb4be4b0d754edf"
     "extra/os/x86_64/extra.db:2b5a0cb4a6e5503a060c6011fb6cacb58c3b990a44829c3b70646641117b94c4"
     "extra/os/x86_64/vim-9.2.0573-1-x86_64.pkg.tar.zst:f375bc1779e4b595d0e3cdd7ba3a20eebaed9c7f16cb3e751589a27fdda174b1"
     "extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst:96518629c05db726744469eef47498bc15992e0ed499a0123c9f8917ff404cd6"
 )
 ARCH_OFFLINE_REPO_PACKAGES=(
     "core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst:95b97f61aacc075e85465a7d5e1c99d1b249b4eba63081a170482cdc8791f799"
+    "core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst:2b52fdaafc70e63511f3b85d98c34f26151b0498fa6f0e61fcb4be4b0d754edf"
     "extra/os/x86_64/vim-9.2.0573-1-x86_64.pkg.tar.zst:f375bc1779e4b595d0e3cdd7ba3a20eebaed9c7f16cb3e751589a27fdda174b1"
     "extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst:96518629c05db726744469eef47498bc15992e0ed499a0123c9f8917ff404cd6"
 )
 ARCH_OFFLINE_REPO_PACKAGE_ALIASES=(
     "p/g:/var/lib/lupos/pacman-repo/core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst"
+    "p/n:/var/lib/lupos/pacman-repo/core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst"
     "p/v:/var/lib/lupos/pacman-repo/extra/os/x86_64/vim-9.2.0573-1-x86_64.pkg.tar.zst"
     "p/r:/var/lib/lupos/pacman-repo/extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst"
 )
@@ -372,6 +375,9 @@ stage_arch_offline_pacman_repo() {
         "core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst" \
         "95b97f61aacc075e85465a7d5e1c99d1b249b4eba63081a170482cdc8791f799"
     download_arch_offline_repo_artifact \
+        "core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst" \
+        "2b52fdaafc70e63511f3b85d98c34f26151b0498fa6f0e61fcb4be4b0d754edf"
+    download_arch_offline_repo_artifact \
         "extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst" \
         "96518629c05db726744469eef47498bc15992e0ed499a0123c9f8917ff404cd6"
     download_arch_offline_repo_artifact \
@@ -380,8 +386,9 @@ stage_arch_offline_pacman_repo() {
     stage_arch_minimal_repo_db \
         "core/os/x86_64/core.db" \
         "45037c1a6abb70a08cd225f1f2e98f6f1a0140117eba54a24843b581bf884a56" \
-        "a7e2c5c084e9bf7db0a5c9231942a4bd12cf170b85ae8d048e10d75acbe74e4d" \
-        "gpm-1.20.7.r38.ge82d1a6-6"
+        "798ab7b65aea244fb3cbfeab13fcf6a9642dfbcbc3dcfcda6c8071aeeb2e19ee" \
+        "gpm-1.20.7.r38.ge82d1a6-6" \
+        "nano-9.0-1"
     stage_arch_minimal_repo_db \
         "extra/os/x86_64/extra.db" \
         "2c4b923190d67f414ee981a020ca00a9f46c0e4ac44efa33fc067e2369e0387d" \
@@ -588,6 +595,7 @@ base=${src##*/}
 alias=
 case "$base" in
     gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst) alias=/p/g ;;
+    nano-9.0-1-x86_64.pkg.tar.zst) alias=/p/n ;;
     vim-9.2.0573-1-x86_64.pkg.tar.zst) alias=/p/v ;;
     vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst) alias=/p/r ;;
 esac

@@ -1901,7 +1901,6 @@ fn block_facade_acquire() -> Result<BlockFacadeGuard, i32> {
         return Ok(BlockFacadeGuard { held: false });
     }
     let mut spin = 0usize;
-    let mut last_reported_owner = 0usize;
     loop {
         match BLOCK_FACADE_OWNER.compare_exchange(0, cur_id, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return Ok(BlockFacadeGuard { held: true }),
@@ -1917,16 +1916,6 @@ fn block_facade_acquire() -> Result<BlockFacadeGuard, i32> {
                         spin
                     );
                     return Err(EIO);
-                }
-                if owner != last_reported_owner || spin == 1024 {
-                    crate::log_warn!(
-                        "block",
-                        "block_facade_acquire: waiting owner={:#x} current={:#x} spins={}",
-                        owner,
-                        cur_id,
-                        spin
-                    );
-                    last_reported_owner = owner;
                 }
             }
         }
