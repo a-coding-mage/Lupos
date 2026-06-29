@@ -870,6 +870,31 @@ fn read_sockaddr(ptr: *const u8, len: u32) -> Result<SockAddr, i32> {
     }
 }
 
+#[cfg(not(test))]
+fn trace_x11_unix_bind(path: &str, result: &Result<(), i32>) {
+    if !path.contains("X11") && !path.contains(".X") {
+        return;
+    }
+    let mut printable = String::new();
+    for ch in path.chars().take(160) {
+        if ch == '\0' {
+            printable.push('@');
+        } else if ch.is_ascii_graphic() || ch == ' ' {
+            printable.push(ch);
+        } else {
+            printable.push('?');
+        }
+    }
+    let ret = result
+        .as_ref()
+        .map(|_| 0)
+        .unwrap_or_else(|errno| -(*errno as i32));
+    crate::linux_driver_abi::tty::serial_println!("trace-unix-bind path={} ret={}", printable, ret);
+}
+
+#[cfg(test)]
+fn trace_x11_unix_bind(_path: &str, _result: &Result<(), i32>) {}
+
 fn split_last_path(path: &str) -> (&str, &str) {
     let trimmed = path.trim_end_matches('/');
     if let Some(idx) = trimmed.rfind('/') {
@@ -897,13 +922,15 @@ fn ensure_unix_socket_node(path: &str) -> Result<(), i32> {
     if parent_inode.kind != InodeKind::Directory {
         return Err(ENOTDIR);
     }
-    if let Some(existing) = crate::fs::dcache::d_lookup(&parent, name) {
-        return match existing.inode() {
-            Some(inode) if inode.kind == InodeKind::Socket => Ok(()),
-            Some(_) => Err(EADDRINUSE),
-            None => Err(ENOENT),
-        };
-    }
+    let negative_dentry = if let Some(existing) = crate::fs::dcache::d_lookup(&parent, name) {
+        match existing.inode() {
+            Some(inode) if inode.kind == InodeKind::Socket => return Ok(()),
+            Some(_) => return Err(EADDRINUSE),
+            None => Some(existing),
+        }
+    } else {
+        None
+    };
     if let Some(lookup) = parent_inode.ops.lookup
         && let Ok(inode) = lookup(&parent_inode, name)
     {
@@ -933,7 +960,7 @@ fn ensure_unix_socket_node(path: &str) -> Result<(), i32> {
         }
         _ => return Err(ENOSYS),
     }
-    let dentry = crate::fs::dcache::d_alloc_child(&parent, name);
+    let dentry = negative_dentry.unwrap_or_else(|| crate::fs::dcache::d_alloc_child(&parent, name));
     dentry.instantiate(inode);
     crate::fs::inotify::notify_create(&parent, name, false);
     Ok(())
@@ -1150,16 +1177,22 @@ pub unsafe fn sys_bind(fd: i32, addr: *const u8, addrlen: u32) -> i64 {
     };
     let parsed = read_sockaddr(addr, addrlen);
     match parsed.as_ref() {
-        Ok(sa) => match (|| {
-            socket::bind(&sock, sa.clone())?;
+        Ok(sa) => {
+            let result = (|| {
+                socket::bind(&sock, sa.clone())?;
+                if let SockAddr::Unix(path) = sa {
+                    if let Err(errno) = ensure_unix_socket_node(path) {
+                        socket::rollback_bound_socket_addr(&sock, sa);
+                        return Err(errno);
+                    }
+                }
+                Ok::<(), i32>(())
+            })();
             if let SockAddr::Unix(path) = sa {
-                ensure_unix_socket_node(path)?;
+                trace_x11_unix_bind(path, &result);
             }
-            Ok::<(), i32>(())
-        })() {
-            Ok(()) => 0,
-            Err(errno) => -(errno as i64),
-        },
+            result.map(|_| 0).unwrap_or_else(|errno| -(errno as i64))
+        }
         Err(errno) => -(*errno as i64),
     }
 }
@@ -2163,7 +2196,7 @@ pub unsafe fn sys_recvmmsg(
 
 #[cfg(test)]
 mod tests {
-    use alloc::{boxed::Box, format};
+    use alloc::{boxed::Box, format, string::String};
 
     use super::*;
     use crate::include::uapi::fcntl::{
@@ -4452,6 +4485,117 @@ mod tests {
                 0
             );
             assert_eq!(sys_bind(second as i32, addr.as_ptr(), addrlen), 0);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn unix_path_bind_instantiates_negative_socket_dentry() {
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        *crate::fs::mount::MOUNTS.root.lock() = None;
+        crate::fs::mount::MOUNTS.by_path.lock().clear();
+        let sb = crate::fs::super_block::mount_fs("ramfs", "", 0, "").expect("ramfs mount");
+        let root = sb.root().expect("root dentry");
+        crate::fs::mount::set_rootfs(crate::fs::mount::Mount::alloc(sb, root, 0));
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 284;
+        current.tgid = 284;
+        current.cred = &raw const INIT_CRED;
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdirat(AT_FDCWD, b"/run\0".as_ptr(), 0o755),
+                0
+            );
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdirat(AT_FDCWD, b"/run/systemd\0".as_ptr(), 0o755),
+                0
+            );
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdirat(
+                    AT_FDCWD,
+                    b"/run/systemd/journal\0".as_ptr(),
+                    0o755
+                ),
+                0
+            );
+
+            let (_, parent) = crate::fs::mount::resolve_path_follow("/run/systemd/journal")
+                .expect("socket parent");
+            let negative = crate::fs::dcache::d_cache_negative(&parent, "X0");
+            assert!(negative.inode().is_none());
+
+            let fd = sys_socket(AF_UNIX as i32, socket::SOCK_STREAM as i32, 0);
+            assert!(fd >= 0);
+            let (addr, addrlen) = unix_sockaddr("/run/systemd/journal/X0");
+            assert_eq!(sys_bind(fd as i32, addr.as_ptr(), addrlen), 0);
+            assert_eq!(
+                negative.inode().expect("socket inode").kind,
+                InodeKind::Socket
+            );
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn unix_path_bind_rolls_back_when_socket_node_create_fails() {
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        *crate::fs::mount::MOUNTS.root.lock() = None;
+        crate::fs::mount::MOUNTS.by_path.lock().clear();
+        let sb = crate::fs::super_block::mount_fs("ramfs", "", 0, "").expect("ramfs mount");
+        let root = sb.root().expect("root dentry");
+        crate::fs::mount::set_rootfs(crate::fs::mount::Mount::alloc(sb.clone(), root.clone(), 0));
+
+        let root_inode = root.inode().expect("root inode");
+        let bad_dir = crate::fs::types::Inode::new(
+            sb.alloc_ino(),
+            InodeKind::Directory,
+            0o755,
+            &crate::fs::ops::NOOP_INODE_OPS,
+            &crate::fs::ops::NOOP_FILE_OPS,
+            InodePrivate::None,
+        );
+        *bad_dir.sb.lock() = Some(sb);
+        let InodePrivate::RamDir(children) = &root_inode.private else {
+            panic!("ramfs root must have RamDir children");
+        };
+        children.lock().insert(String::from("bad"), bad_dir);
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 283;
+        current.tgid = 283;
+        current.cred = &raw const INIT_CRED;
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let path = "/bad/X0";
+            let (addr, addrlen) = unix_sockaddr(path);
+            let first = sys_socket(AF_UNIX as i32, socket::SOCK_STREAM as i32, 0);
+            assert!(first >= 0);
+            assert_eq!(
+                sys_bind(first as i32, addr.as_ptr(), addrlen),
+                -(ENOSYS as i64)
+            );
+
+            let second = sys_socket(AF_UNIX as i32, socket::SOCK_STREAM as i32, 0);
+            assert!(second >= 0);
+            assert_eq!(
+                sys_bind(second as i32, addr.as_ptr(), addrlen),
+                -(ENOSYS as i64),
+                "failed filesystem node creation must not leave the address internally busy"
+            );
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);

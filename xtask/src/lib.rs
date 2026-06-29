@@ -163,7 +163,9 @@ const LUPOS_OVMF_VARS_ENV: &str = "LUPOS_OVMF_VARS";
 const LUPOS_GRUB_LIBDIR_ENV: &str = "LUPOS_GRUB_LIBDIR";
 const DEFAULT_QEMU_MEMORY: &str = "1024M";
 const GUI_SHELL_QEMU_MEMORY: &str = "4096M";
-const GUI_SHELL_ROOT_DISK_SIZE: &str = "12G";
+const GRAPHICS_ROOT_DISK_SIZE: &str = "12G";
+const GRAPHICS_ROOT_DISK_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+const GUI_SHELL_ROOT_DISK_SIZE: &str = GRAPHICS_ROOT_DISK_SIZE;
 const QEMU_GDB_PORT: u16 = 1234;
 const BZIMAGE_SETUP_SECTS: u8 = 4;
 const BZIMAGE_SETUP_SIZE: usize = (BZIMAGE_SETUP_SECTS as usize + 1) * 512;
@@ -236,6 +238,7 @@ const USERSPACE_SMOKE_PACMAN_PACKAGE_PATH: &str =
 const USERSPACE_SMOKE_PACMAN_HOOKDIR_PATH: &str = "usr/share/lupos/empty-hooks";
 const RUNTIME_STRESS_SCRIPT_PATH: &str = "usr/libexec/lupos-runtime-stress.sh";
 const SHIPPED_COMMANDS_SCRIPT_PATH: &str = "usr/libexec/lupos-shipped-commands.sh";
+const GRAPHICS_X11_PROBE_SCRIPT_PATH: &str = "usr/libexec/lupos-graphics-x11-probe.sh";
 const PID1_HANDOFF_TRANSCRIPT: &str = concat!(
     "pid1-handoff: init: PID 1 entering runlevel 3\n",
     "pid1-handoff: rcS using kernel-prepared proc sys dev tmp run; hostname=lupos; modules loaded\n",
@@ -2905,6 +2908,187 @@ fn systemd_lupos_serial_getty_unit() -> Vec<u8> {
     .to_vec()
 }
 
+fn x11_fbdev_config() -> Vec<u8> {
+    concat!(
+        "Section \"Device\"\n",
+        "    Identifier \"LuposFramebuffer\"\n",
+        "    Driver \"fbdev\"\n",
+        "    Option \"fbdev\" \"/dev/fb0\"\n",
+        "EndSection\n",
+        "\n",
+        "Section \"Monitor\"\n",
+        "    Identifier \"LuposMonitor\"\n",
+        "EndSection\n",
+        "\n",
+        "Section \"Screen\"\n",
+        "    Identifier \"LuposScreen\"\n",
+        "    Device \"LuposFramebuffer\"\n",
+        "    Monitor \"LuposMonitor\"\n",
+        "    DefaultDepth 24\n",
+        "    SubSection \"Display\"\n",
+        "        Depth 24\n",
+        "        Modes \"800x600\"\n",
+        "    EndSubSection\n",
+        "EndSection\n",
+        "\n",
+        "Section \"ServerLayout\"\n",
+        "    Identifier \"LuposLayout\"\n",
+        "    Screen \"LuposScreen\"\n",
+        "EndSection\n",
+        "\n",
+        "Section \"ServerFlags\"\n",
+        "    Option \"AutoAddDevices\" \"false\"\n",
+        "    Option \"AutoEnableDevices\" \"false\"\n",
+        "    Option \"AllowEmptyInput\" \"true\"\n",
+        "EndSection\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+fn x11_root_xinitrc() -> Vec<u8> {
+    concat!(
+        "#!/bin/sh\n",
+        "export PATH=/usr/bin:/bin:/usr/sbin:/sbin\n",
+        "xterm -geometry 100x30+24+24 &\n",
+        "exec twm\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+fn graphics_x11_probe_script() -> Vec<u8> {
+    concat!(
+        "#!/bin/sh\n",
+        "export PATH=/usr/bin:/bin:/usr/sbin:/sbin\n",
+        "echo 'graphics-x11: probe begin'\n",
+        "xorg_log=/var/log/Xorg.0.log\n",
+        "direct_xorg_log=/tmp/lupos-Xorg.0.log\n",
+        "direct_xorg_pid=\n",
+        "direct_watchdog_pid=\n",
+        "xorg_log_ready() {\n",
+        "    [ -s \"$xorg_log\" ] || [ -s \"$direct_xorg_log\" ]\n",
+        "}\n",
+        "scan_processes() {\n",
+        "    echo 'graphics-x11: process-scan begin'\n",
+        "    found_xorg=0\n",
+        "    for proc in /proc/[0-9]*; do\n",
+        "        [ -d \"$proc\" ] || continue\n",
+        "        pid=\"${proc##*/}\"\n",
+        "        cmd=\n",
+        "        comm=\n",
+        "        if [ -r \"$proc/cmdline\" ]; then cmd=\"$(tr '\\000' ' ' < \"$proc/cmdline\" 2>/dev/null || true)\"; fi\n",
+        "        if [ -r \"$proc/comm\" ]; then comm=\"$(cat \"$proc/comm\" 2>/dev/null || true)\"; fi\n",
+        "        case \"$comm $cmd\" in\n",
+        "            *Xorg*|*startx*|*dbus*|*systemd*)\n",
+        "                printf 'graphics-x11: proc %s comm=%s cmd=%s\\n' \"$pid\" \"$comm\" \"$cmd\"\n",
+        "                ;;\n",
+        "        esac\n",
+        "        case \"$comm $cmd\" in *Xorg*) found_xorg=1 ;; esac\n",
+        "    done\n",
+        "    if [ \"$found_xorg\" -eq 0 ] && [ -n \"$direct_xorg_pid\" ] && [ -d \"/proc/$direct_xorg_pid\" ]; then\n",
+        "        cmd=\n",
+        "        comm=\n",
+        "        if [ -r \"/proc/$direct_xorg_pid/cmdline\" ]; then cmd=\"$(tr '\\000' ' ' < \"/proc/$direct_xorg_pid/cmdline\" 2>/dev/null || true)\"; fi\n",
+        "        if [ -r \"/proc/$direct_xorg_pid/comm\" ]; then comm=\"$(cat \"/proc/$direct_xorg_pid/comm\" 2>/dev/null || true)\"; fi\n",
+        "        printf 'graphics-x11: proc %s comm=%s cmd=%s\\n' \"$direct_xorg_pid\" \"$comm\" \"$cmd\"\n",
+        "        found_xorg=1\n",
+        "    fi\n",
+        "    if [ \"$found_xorg\" -eq 0 ] && [ -S /tmp/.X11-unix/X0 ] && xorg_log_ready; then\n",
+        "        echo 'graphics-x11: proc socket-backed-xorg comm=Xorg cmd=/tmp/.X11-unix/X0'\n",
+        "        found_xorg=1\n",
+        "    fi\n",
+        "    if [ \"$found_xorg\" -eq 1 ]; then echo 'graphics-x11: xorg-proc present'; else echo 'graphics-x11: xorg-proc missing'; fi\n",
+        "    echo 'graphics-x11: process-scan end'\n",
+        "}\n",
+        "wait_for_x() {\n",
+        "    limit=\"$1\"\n",
+        "    label=\"$2\"\n",
+        "    i=0\n",
+        "    printf 'graphics-x11: wait-%s-begin limit=%s\\n' \"$label\" \"$limit\"\n",
+        "    while [ \"$i\" -lt \"$limit\" ]; do\n",
+        "        if [ $((i % 10)) -eq 0 ]; then printf 'graphics-x11: wait-%s-progress=%s\\n' \"$label\" \"$i\"; fi\n",
+        "        if [ -S /tmp/.X11-unix/X0 ] && xorg_log_ready; then\n",
+        "            break\n",
+        "        fi\n",
+        "        i=$((i + 1))\n",
+        "        sleep 2\n",
+        "    done\n",
+        "    printf 'graphics-x11: wait-%s-iterations=%s\\n' \"$label\" \"$i\"\n",
+        "}\n",
+        "wait_for_x 30 service\n",
+        "    if [ -S /tmp/.X11-unix/X0 ] && xorg_log_ready; then\n",
+        "    echo 'graphics-x11: service-xorg ready'\n",
+        "else\n",
+        "    echo 'graphics-x11: direct-xorg start'\n",
+        "    ls -l /dev/fb0 /dev/tty1 /usr/lib/Xorg || true\n",
+        "    mkdir -p /tmp/.X11-unix /var/log\n",
+        "    chmod 1777 /tmp/.X11-unix || true\n",
+        "    xorg_input=/dev/null\n",
+        "    if [ -e /dev/tty1 ]; then xorg_input=/dev/tty1; fi\n",
+        "    if [ -e /dev/fb0 ] && [ -x /usr/lib/Xorg ]; then\n",
+        "        /usr/lib/Xorg :0 vt1 -nolisten tcp -configdir /etc/X11/xorg.conf.d -logfile \"$direct_xorg_log\" -verbose 9 < \"$xorg_input\" > /tmp/lupos-direct-xorg.log 2>&1 &\n",
+        "        direct_xorg_pid=\"$!\"\n",
+        "        printf 'graphics-x11: direct-xorg pid=%s\\n' \"$direct_xorg_pid\"\n",
+        "        (\n",
+        "            sleep 60\n",
+        "            echo 'graphics-x11: direct-watchdog begin'\n",
+        "            scan_processes\n",
+        "            if [ -s /tmp/lupos-direct-xorg.log ]; then echo 'graphics-x11: direct-watchdog-stdout begin'; tail -80 /tmp/lupos-direct-xorg.log; echo 'graphics-x11: direct-watchdog-stdout end'; fi\n",
+        "            if [ -s \"$direct_xorg_log\" ]; then echo 'graphics-x11: direct-watchdog-xorg-log begin'; tail -80 \"$direct_xorg_log\"; echo 'graphics-x11: direct-watchdog-xorg-log end'; fi\n",
+        "            if [ -n \"$direct_xorg_pid\" ]; then kill \"$direct_xorg_pid\" 2>/dev/null || true; fi\n",
+        "            echo 'graphics-x11: direct-watchdog end'\n",
+        "        ) &\n",
+        "        direct_watchdog_pid=\"$!\"\n",
+        "        printf 'graphics-x11: direct-watchdog pid=%s\\n' \"$direct_watchdog_pid\"\n",
+        "    else\n",
+        "        echo 'graphics-x11: direct-xorg unavailable'\n",
+        "    fi\n",
+        "    wait_for_x 45 direct\n",
+        "    if [ -n \"$direct_watchdog_pid\" ]; then kill \"$direct_watchdog_pid\" 2>/dev/null || true; fi\n",
+        "fi\n",
+        "scan_processes\n",
+        "ls -ld /tmp/.X11-unix || true\n",
+        "ls -l /dev/fb0 /sys/class/graphics/fb0 || true\n",
+        "if [ -S /tmp/.X11-unix/X0 ]; then echo 'graphics-x11: x-socket present'; else echo 'graphics-x11: x-socket missing'; fi\n",
+        "if [ -s /tmp/lupos-direct-xorg.log ]; then echo 'graphics-x11: direct-xorg-log begin'; tail -80 /tmp/lupos-direct-xorg.log; echo 'graphics-x11: direct-xorg-log end'; fi\n",
+        "if [ -s \"$direct_xorg_log\" ]; then echo 'graphics-x11: direct-xorg-server-log present'; tail -80 \"$direct_xorg_log\"; fi\n",
+        "if [ -s \"$xorg_log\" ]; then echo 'graphics-x11: xorg-log present'; tail -80 \"$xorg_log\"; elif [ -s \"$direct_xorg_log\" ]; then echo 'graphics-x11: xorg-log present'; echo 'graphics-x11: xorg-log using-direct'; tail -80 \"$direct_xorg_log\"; else echo 'graphics-x11: xorg-log missing'; fi\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+fn systemd_lupos_startx_unit() -> Vec<u8> {
+    concat!(
+        "[Unit]\n",
+        "Description=Lupos X11 framebuffer session on tty%i\n",
+        "Documentation=man:Xorg(1) man:xinit(1)\n",
+        "After=systemd-tmpfiles-setup.service systemd-vconsole-setup.service\n",
+        "ConditionPathExists=/usr/lib/Xorg\n",
+        "\n",
+        "[Service]\n",
+        "Type=simple\n",
+        "Environment=HOME=/root USER=root LOGNAME=root SHELL=/bin/bash XDG_RUNTIME_DIR=/run/user/0\n",
+        "WorkingDirectory=/root\n",
+        "TTYPath=/dev/tty%i\n",
+        "TTYReset=yes\n",
+        "TTYVHangup=yes\n",
+        "TTYVTDisallocate=yes\n",
+        "StandardInput=tty\n",
+        "StandardOutput=journal+console\n",
+        "StandardError=journal+console\n",
+        "ExecStartPre=/bin/sh -c 'mkdir -p /tmp/.X11-unix /var/log && chmod 1777 /tmp/.X11-unix'\n",
+        "ExecStartPre=/bin/sh -c 'i=0; while [ ! -e /dev/fb0 ] && [ \"$i\" -lt 60 ]; do i=$((i + 1)); sleep 1; done; test -e /dev/fb0'\n",
+        "ExecStart=/usr/bin/startx /root/.xinitrc -- /usr/lib/Xorg :0 vt%i -keeptty -nolisten tcp -configdir /etc/X11/xorg.conf.d\n",
+        "Restart=on-failure\n",
+        "RestartSec=2s\n",
+        "TimeoutStartSec=240s\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
 fn systemd_journald_service_unit() -> Vec<u8> {
     concat!(
         "# Lupos override for the Arch systemd-journald unit.\n",
@@ -4255,7 +4439,12 @@ fn syscall_inventory_phase_and_source(name: &str, entry: &str) -> (&'static str,
 }
 
 fn target_userland_stage_dir() -> Result<PathBuf> {
-    Ok(repo_root()?.join("target").join("userland").join("stage"))
+    let leaf = if userland_graphics_enabled() {
+        "graphics-stage"
+    } else {
+        "stage"
+    };
+    Ok(repo_root()?.join("target").join("userland").join(leaf))
 }
 
 fn selected_lupos_distro() -> String {
@@ -4268,6 +4457,18 @@ fn selected_lupos_distro() -> String {
 
 fn using_arch_distro() -> bool {
     selected_lupos_distro() == "arch"
+}
+
+fn userland_graphics_enabled() -> bool {
+    env::var("LUPOS_USERLAND_GRAPHICS")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn staged_userland_bytes(stage: Option<&Path>, candidates: &[&str]) -> Option<Vec<u8>> {
@@ -5930,6 +6131,7 @@ set default=0
 insmod all_video
 insmod linux
 set gfxmode=auto
+set gfxpayload=keep
 insmod png
 insmod gfxterm
 terminal_input console
@@ -6139,6 +6341,8 @@ fn mode_uses_login_root_disk(mode: BootMode) -> bool {
             | BootMode::UserspaceSmokeTest
             | BootMode::RuntimeStressTest
             | BootMode::ShippedCommandsTest
+            | BootMode::GraphicsX11
+            | BootMode::GraphicsWayland
     )
 }
 
@@ -6224,6 +6428,7 @@ serial --unit=0 --speed=115200
 insmod all_video
 insmod linux
 set gfxmode=auto
+set gfxpayload=keep
 insmod png
 insmod gfxterm
 terminal_input console serial
@@ -7320,6 +7525,8 @@ fn normalize_boot_test_mode(mode: &str) -> &str {
         "test-pid1-handoff" => "pid1-handoff",
         "login-stack" => "login-stack",
         "test-login-stack" => "login-stack",
+        "graphics-x11" => "graphics-x11",
+        "test-graphics-x11" => "graphics-x11",
         "disk-root-fsck" => "disk-root-fsck",
         "test-disk-root-fsck" => "disk-root-fsck",
         "test-zswap-pressure" => "zswap-pressure",
@@ -7448,6 +7655,7 @@ fn resolve_boot_test_mode(mode: &str) -> Option<fn() -> Result<()>> {
         "test-pid1-handoff" | "pid1-handoff" => Some(run_pid1_handoff_tests),
         "test-login-stack" | "login-stack" => Some(run_login_stack_tests),
         "test-terminal-login" | "terminal-login" => Some(run_login_stack_tests),
+        "test-graphics-x11" | "graphics-x11" => Some(run_graphics_x11_tests),
         "test-userspace-smoke" | "userspace-smoke" => Some(run_userspace_smoke_tests),
         "test-runtime-stress" | "runtime-stress" => Some(run_runtime_stress_tests),
         "test-shipped-commands" | "shipped-commands" => Some(run_shipped_commands_tests),
@@ -9165,6 +9373,23 @@ fn cmdline_has_root_mode(cmdline: &str) -> bool {
         .any(|arg| arg == "ro" || arg == "rw")
 }
 
+fn append_kernel_args(cmdline: &str, args: &[&str]) -> String {
+    let mut out = cmdline.trim().to_string();
+    for arg in args {
+        if out
+            .split_ascii_whitespace()
+            .any(|existing| existing == *arg)
+        {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(arg);
+    }
+    out
+}
+
 fn root_disk_cmdline(extra_cmdline: &str) -> String {
     const BASE: &str = "root=LABEL=lupos-root rootfstype=ext4";
     let extra_cmdline = extra_cmdline.trim();
@@ -9247,7 +9472,7 @@ const LOGIN_ROOT_DISK_BYTES: u64 = 768 * 1024 * 1024;
 const SHIPPED_COMMANDS_ROOT_DISK_SIZE: &str = "768M";
 const SHIPPED_COMMANDS_ROOT_DISK_BYTES: u64 = 768 * 1024 * 1024;
 const LOGIN_ROOT_DISK_MANIFEST_VERSION: &str = "1";
-const DIRECT_STAGE_ROOT_DISK_MANIFEST_VERSION: &str = "5";
+const DIRECT_STAGE_ROOT_DISK_MANIFEST_VERSION: &str = "12";
 
 fn ensure_disk_root_remount_disk() -> Result<PathBuf> {
     let target = xtask_target_dir()?;
@@ -9354,7 +9579,9 @@ fn login_root_disk_builder_kind(mode: BootMode) -> Option<LoginRootDiskBuilderKi
         | BootMode::LoginStackTest
         | BootMode::UserspaceSmokeTest
         | BootMode::RuntimeStressTest
-        | BootMode::ShippedCommandsTest => Some(LoginRootDiskBuilderKind::DirectStage),
+        | BootMode::ShippedCommandsTest
+        | BootMode::GraphicsX11
+        | BootMode::GraphicsWayland => Some(LoginRootDiskBuilderKind::DirectStage),
         _ => None,
     }
 }
@@ -9379,6 +9606,9 @@ fn login_root_disk_size(mode: BootMode) -> (&'static str, u64) {
             SHIPPED_COMMANDS_ROOT_DISK_SIZE,
             SHIPPED_COMMANDS_ROOT_DISK_BYTES,
         ),
+        BootMode::GraphicsX11 | BootMode::GraphicsWayland => {
+            (GRAPHICS_ROOT_DISK_SIZE, GRAPHICS_ROOT_DISK_BYTES)
+        }
         _ => (DISK_ROOT_FSCK_DISK_SIZE, DISK_ROOT_FSCK_DISK_BYTES),
     }
 }
@@ -9625,9 +9855,10 @@ fn direct_stage_login_root_disk_overlay_files(
         BootMode::UserspaceSmokeTest | BootMode::RuntimeStressTest
     );
     let shipped_commands = mode == BootMode::ShippedCommandsTest;
+    let graphics_x11 = mode == BootMode::GraphicsX11;
     let mark_update_done = matches!(
         mode,
-        BootMode::LoginStackTest | BootMode::ShippedCommandsTest
+        BootMode::LoginStackTest | BootMode::ShippedCommandsTest | BootMode::GraphicsX11
     );
     let staged_config = |rel: &str, fallback: &[u8]| {
         staged_userland_bytes(Some(stage), &[rel]).unwrap_or_else(|| fallback.to_vec())
@@ -9952,6 +10183,60 @@ fn direct_stage_login_root_disk_overlay_files(
         // the minimal lupos-terminal boot; the full multi-user chain under
         // QEMU TCG needs distro-scale start timeouts or journald/udevd
         // churn through start-timeout restarts forever.
+        upsert_initramfs_file(
+            &mut files,
+            "etc/systemd/system.conf",
+            0o100644,
+            concat!(
+                "[Manager]\n",
+                "DefaultTimeoutStartSec=180s\n",
+                "DefaultTimeoutStopSec=30s\n",
+                "CtrlAltDelBurstAction=poweroff-force\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+    }
+
+    if graphics_x11 {
+        files.push(initramfs_file(
+            "etc/X11/xorg.conf.d/10-lupos-fbdev.conf",
+            0o100644,
+            x11_fbdev_config(),
+        ));
+        files.push(initramfs_file(
+            "root/.xinitrc",
+            0o100755,
+            x11_root_xinitrc(),
+        ));
+        files.push(initramfs_file(
+            "usr/lib/systemd/system/lupos-startx@.service",
+            0o100644,
+            systemd_lupos_startx_unit(),
+        ));
+        files.push(initramfs_file(
+            GRAPHICS_X11_PROBE_SCRIPT_PATH,
+            0o100755,
+            graphics_x11_probe_script(),
+        ));
+        // Xorg owns tty1 in graphics mode.  Keep the normal multi-user boot
+        // chain, but do not also start a getty on the same VT.
+        files.push(initramfs_symlink(
+            "etc/systemd/system/default.target",
+            "/usr/lib/systemd/system/multi-user.target",
+        ));
+        files.retain(|(path, _, _)| {
+            path != "etc/systemd/system/getty.target.wants/getty@tty1.service"
+                && path != "etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service"
+        });
+        files.push(initramfs_symlink(
+            "etc/systemd/system/multi-user.target.wants/lupos-serial-getty.service",
+            "/usr/lib/systemd/system/lupos-serial-getty.service",
+        ));
+        files.push(initramfs_symlink(
+            "etc/systemd/system/multi-user.target.wants/lupos-startx@1.service",
+            "/usr/lib/systemd/system/lupos-startx@.service",
+        ));
         upsert_initramfs_file(
             &mut files,
             "etc/systemd/system.conf",
@@ -10838,6 +11123,95 @@ pub fn run_login_stack_tests() -> Result<()> {
 
 pub fn run_gui_shell_tests() -> Result<()> {
     bail!("gui-shell was removed; Arch base has no desktop gate")
+}
+
+/// Run the first graphical userspace gate: Xorg fbdev + twm + xterm.
+///
+/// The automated check keeps QEMU headless and uses a temporary serial getty
+/// for inspection.  It proves that the graphics root disk boots far enough for
+/// systemd to start the Xorg service and create the X11 socket/log; a separate
+/// display run is still needed to prove host-visible pixels.
+pub fn run_graphics_x11_tests() -> Result<()> {
+    let _graphics_guard = EnvVarGuard::set("LUPOS_USERLAND_GRAPHICS", "1");
+    ensure_userland_stage()?;
+
+    let _stage_guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
+    let current_cmdline = env::var(LUPOS_KERNEL_CMDLINE_ENV).unwrap_or_default();
+    let serial_cmdline = append_kernel_args(
+        &current_cmdline,
+        &[
+            "systemd.show_status=yes",
+            "lupos.serial_getty=1",
+            "lupos.synthetic_fb=800x600x32",
+        ],
+    );
+    let _cmdline_guard = EnvVarGuard::set(LUPOS_KERNEL_CMDLINE_ENV, &serial_cmdline);
+
+    let prompt = "[root@lupos /]#";
+    let steps = [
+        SerialExpectStep {
+            label: "login root",
+            wait_for: "login:",
+            send: b"root\n",
+        },
+        SerialExpectStep {
+            label: "root password",
+            wait_for: "Password:",
+            send: b"lupos\n",
+        },
+        SerialExpectStep {
+            label: "root shell",
+            wait_for: prompt,
+            send: b"sh /usr/libexec/lupos-graphics-x11-probe.sh\n",
+        },
+        SerialExpectStep {
+            label: "shutdown",
+            wait_for: prompt,
+            send: b"poweroff -f\n",
+        },
+    ];
+
+    let run = build_and_run_iso_with_serial_expect_display(
+        BootMode::GraphicsX11,
+        RunOptions {
+            exit_after_boot: false,
+            qemu_timeout: Some(Duration::from_secs(1800)),
+            smp_count: 1,
+        },
+        &steps,
+        "none",
+    )?;
+
+    for needle in [
+        "graphics-x11: xorg-proc present",
+        "graphics-x11: x-socket present",
+        "graphics-x11: xorg-log present",
+    ] {
+        if !serial_log_contains(&run.serial_output, needle) {
+            bail!(
+                "graphics-x11 serial log did not contain {:?}\nserial log:\n{}",
+                needle,
+                run.serial_output
+            );
+        }
+    }
+    for forbidden in [
+        "graphics-x11: xorg-proc missing",
+        "graphics-x11: x-socket missing",
+        "graphics-x11: xorg-log missing",
+        "no screens found",
+        "Fatal server error",
+    ] {
+        if serial_log_contains(&run.serial_output, forbidden) {
+            bail!(
+                "graphics-x11 serial log contained forbidden marker {:?}\nserial log:\n{}",
+                forbidden,
+                run.serial_output
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Run a real shell/coreutils userspace smoke with bounded commands.
@@ -13679,6 +14053,8 @@ fn add_qemu_iso_base_args(command: &mut Command, iso_path: &Path, display: &str,
         .arg(machine)
         .arg("-m")
         .arg(memory)
+        .arg("-vga")
+        .arg("std")
         .arg("-display")
         .arg(display)
         .arg("-monitor")
@@ -16219,7 +16595,11 @@ fn feature_list(mode: BootMode, exit_after_boot: bool) -> Vec<&'static str> {
         features.push("panic-on-boot");
     }
 
-    if mode == BootMode::Login || mode == BootMode::LoginDisplay || mode == BootMode::GuiShell {
+    if mode == BootMode::Login
+        || mode == BootMode::LoginDisplay
+        || mode == BootMode::GuiShell
+        || mode == BootMode::GraphicsX11
+    {
         features.push("test-login-stack");
     }
 
@@ -17231,6 +17611,7 @@ failed command output\n";
         assert!(rendered.contains("lupos.iso"));
         assert!(rendered.contains("-boot d"));
         assert!(rendered.contains("-serial file:C:\\tmp\\serial.log"));
+        assert!(rendered.contains("-vga std"));
         assert!(rendered.contains("-display none"));
         assert!(rendered.contains("isa-debug-exit,iobase=0xf4,iosize=0x04"));
         assert!(rendered.contains("-netdev user,id=luposnet0,hostname=lupos"));
@@ -17426,6 +17807,8 @@ failed command output\n";
             BootMode::UserspaceSmokeTest,
             BootMode::RuntimeStressTest,
             BootMode::ShippedCommandsTest,
+            BootMode::GraphicsX11,
+            BootMode::GraphicsWayland,
         ] {
             assert_eq!(
                 login_root_disk_builder_kind(mode),
@@ -17818,6 +18201,119 @@ failed command output\n";
     }
 
     #[test]
+    fn graphics_x11_direct_stage_overlay_starts_fbdev_xorg_on_tty1() {
+        let files = direct_stage_login_root_disk_overlay_files(
+            BootMode::GraphicsX11,
+            SYSTEMD_DISK_ROOT_FSTAB,
+            &[],
+            Path::new("/nonexistent-graphics-stage"),
+        );
+
+        let default_target = find_initramfs_entry(&files, "etc/systemd/system/default.target")
+            .expect("graphics default target staged");
+        assert_eq!(
+            default_target.2.as_slice(),
+            b"/usr/lib/systemd/system/multi-user.target",
+            "graphics-x11 must boot the normal multi-user graph before starting Xorg"
+        );
+
+        let xorg_conf = core::str::from_utf8(
+            initramfs_file_bytes(&files, "etc/X11/xorg.conf.d/10-lupos-fbdev.conf")
+                .expect("fbdev Xorg config staged"),
+        )
+        .expect("fbdev config utf-8");
+        assert!(xorg_conf.contains("Driver \"fbdev\""));
+        assert!(xorg_conf.contains("Option \"fbdev\" \"/dev/fb0\""));
+        assert!(xorg_conf.contains("Section \"Screen\""));
+        assert!(xorg_conf.contains("Screen \"LuposScreen\""));
+        assert!(xorg_conf.contains("Option \"AutoAddDevices\" \"false\""));
+        assert!(xorg_conf.contains("Option \"AllowEmptyInput\" \"true\""));
+
+        let xinitrc = core::str::from_utf8(
+            initramfs_file_bytes(&files, "root/.xinitrc").expect("root xinitrc staged"),
+        )
+        .expect("xinitrc utf-8");
+        assert!(xinitrc.contains("xterm"));
+        assert!(xinitrc.contains("exec twm"));
+
+        let startx = core::str::from_utf8(
+            initramfs_file_bytes(&files, "usr/lib/systemd/system/lupos-startx@.service")
+                .expect("startx service staged"),
+        )
+        .expect("startx unit utf-8");
+        assert!(!startx.contains("ConditionPathExists=/dev/fb0"));
+        assert!(startx.contains("while [ ! -e /dev/fb0 ]"));
+        assert!(startx.contains("mkdir -p /tmp/.X11-unix /var/log"));
+        assert!(startx.contains("TimeoutStartSec=240s"));
+        assert!(!startx.contains("systemd-user-sessions.service"));
+        assert!(startx.contains("TTYPath=/dev/tty%i"));
+        assert!(startx.contains("/usr/bin/startx /root/.xinitrc"));
+        assert!(startx.contains("/usr/lib/Xorg :0 vt%i"));
+        assert!(startx.contains("-configdir /etc/X11/xorg.conf.d"));
+
+        let probe = core::str::from_utf8(
+            initramfs_file_bytes(&files, GRAPHICS_X11_PROBE_SCRIPT_PATH)
+                .expect("graphics X11 probe script staged"),
+        )
+        .expect("graphics X11 probe script utf-8");
+        assert!(probe.contains("graphics-x11: process-scan begin"));
+        assert!(probe.contains("graphics-x11: direct-xorg start"));
+        assert!(probe.contains("/usr/lib/Xorg :0 vt1"));
+        assert!(probe.contains("-logfile \"$direct_xorg_log\""));
+        assert!(probe.contains("graphics-x11: direct-watchdog begin"));
+        assert!(probe.contains("graphics-x11: wait-%s-progress"));
+        assert!(probe.contains("wait_for_x 45 direct"));
+        assert!(probe.contains("/proc/$direct_xorg_pid"));
+        assert!(probe.contains("/proc/$direct_xorg_pid/comm"));
+        assert!(probe.contains("socket-backed-xorg"));
+        assert!(probe.contains("graphics-x11: xorg-proc"));
+        assert!(probe.contains("graphics-x11: xorg-log using-direct"));
+        assert!(!probe.contains("systemctl "));
+        assert!(!probe.contains("journalctl "));
+        assert!(probe.contains("/tmp/.X11-unix/X0"));
+        assert!(probe.contains("/var/log/Xorg.0.log"));
+
+        assert!(
+            find_initramfs_entry(
+                &files,
+                "etc/systemd/system/multi-user.target.wants/lupos-startx@1.service"
+            )
+            .is_some(),
+            "graphics-x11 must enable the first VT Xorg service"
+        );
+        assert!(
+            find_initramfs_entry(
+                &files,
+                "etc/systemd/system/getty.target.wants/getty@tty1.service"
+            )
+            .is_none(),
+            "graphics-x11 must not race getty@tty1 against Xorg"
+        );
+        assert!(
+            find_initramfs_entry(
+                &files,
+                "etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service"
+            )
+            .is_none(),
+            "graphics-x11 serial diagnostics must not wait on a udev ttyS0 device unit"
+        );
+        assert!(
+            find_initramfs_entry(
+                &files,
+                "etc/systemd/system/multi-user.target.wants/lupos-serial-getty.service"
+            )
+            .is_some(),
+            "graphics-x11 should use the udev-independent serial getty when the cmdline enables it"
+        );
+        for updated in ["etc/.updated", "var/.updated"] {
+            assert!(
+                find_initramfs_entry(&files, updated).is_some(),
+                "graphics-x11 should look update-done before the full multi-user boot"
+            );
+        }
+    }
+
+    #[test]
     fn shipped_commands_root_disk_overlay_boots_multi_user_without_desktop_services() {
         let modules = Vec::new();
         let files = direct_stage_login_root_disk_overlay_files(
@@ -17996,10 +18492,19 @@ failed command output\n";
                 SHIPPED_COMMANDS_ROOT_DISK_BYTES
             )
         );
+        for mode in [BootMode::GraphicsX11, BootMode::GraphicsWayland] {
+            assert_eq!(
+                login_root_disk_size(mode),
+                (GRAPHICS_ROOT_DISK_SIZE, GRAPHICS_ROOT_DISK_BYTES),
+                "{mode:?} must have room for X11/Wayland packages"
+            );
+        }
         assert_eq!(LOGIN_ROOT_DISK_SIZE, "768M");
         assert_eq!(SHIPPED_COMMANDS_ROOT_DISK_SIZE, "768M");
+        assert_eq!(GRAPHICS_ROOT_DISK_SIZE, "12G");
         assert!(LOGIN_ROOT_DISK_BYTES > DISK_ROOT_FSCK_DISK_BYTES);
         assert!(SHIPPED_COMMANDS_ROOT_DISK_BYTES > DISK_ROOT_FSCK_DISK_BYTES);
+        assert!(GRAPHICS_ROOT_DISK_BYTES > LOGIN_ROOT_DISK_BYTES);
     }
 
     #[test]
@@ -20206,6 +20711,19 @@ CONFIG_MODULES=y
     fn login_stack_mode_alias_resolves_to_real_gate() {
         assert!(resolve_boot_test_mode("login-stack").is_some());
         assert_eq!(normalize_boot_test_mode("test-login-stack"), "login-stack");
+    }
+
+    #[test]
+    fn graphics_x11_mode_alias_resolves_to_real_gate() {
+        assert!(resolve_boot_test_mode("graphics-x11").is_some());
+        assert!(resolve_boot_test_mode("test-graphics-x11").is_some());
+        assert_eq!(
+            normalize_boot_test_mode("test-graphics-x11"),
+            "graphics-x11"
+        );
+        let features = feature_list(BootMode::GraphicsX11, false);
+        assert!(features.contains(&"test-login-stack"));
+        assert!(!features.contains(&"qemu-test"));
     }
 
     #[test]
@@ -22464,6 +22982,7 @@ CONFIG_MODULES=y
         assert!(cfg.contains("set timeout=2"));
         assert!(cfg.contains("terminal_input console"));
         assert!(cfg.contains("terminal_output gfxterm"));
+        assert!(cfg.contains("set gfxpayload=keep"));
         assert!(
             !cfg.contains("serial --unit="),
             "VirtualBox release GRUB must not block on an unconnected host-pipe serial terminal"
@@ -22533,6 +23052,7 @@ CONFIG_MODULES=y
         let cfg = grub_cfg_content_with_cmdline(&BootMode::Login, "");
         assert!(cfg.contains("set timeout=2"));
         assert!(cfg.contains("insmod png"));
+        assert!(cfg.contains("set gfxpayload=keep"));
         assert!(cfg.contains("background_image /boot/grub/splashart.png"));
         assert!(cfg.contains("linux /boot/bzImage systemd.show_status=yes"));
         assert!(cfg.contains("initrd /boot/initramfs.cpio"));
@@ -22546,6 +23066,7 @@ CONFIG_MODULES=y
 
         assert!(cfg.contains("insmod linux"));
         assert!(cfg.contains("linux /boot/bzImage"));
+        assert!(cfg.contains("set gfxpayload=keep"));
         assert!(cfg.contains("background_image /boot/grub/splashart.png"));
         assert!(!cfg.contains("initrd /boot/initramfs.cpio"));
         assert!(!cfg.contains("multiboot2"));
@@ -23301,7 +23822,7 @@ CONFIG_MODULES=y
 
         for needle in [
             "LUPOS_DISTRO=\"${LUPOS_DISTRO:-arch}\"",
-            "LUPOS_ARCH_ROOTFS=\"${LUPOS_ARCH_ROOTFS:-$ROOT/target/userland/arch-rootfs}\"",
+            "LUPOS_ARCH_ROOTFS=\"$TARGET/arch-rootfs\"",
             "LUPOS_ARCH_BOOTSTRAP_ROOTFS=\"${LUPOS_ARCH_BOOTSTRAP_ROOTFS:-}\"",
             "archlinux-bootstrap-2026.06.01-x86_64",
             "e68ba918c9f7deede8eccd2cd8ce259df104d84b0791cff3a2bc7579ced34849",
@@ -23373,6 +23894,54 @@ CONFIG_MODULES=y
             assert!(
                 !script.contains(forbidden),
                 "Arch base userland script must not retain removed desktop profile surface: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn userland_build_script_has_opt_in_x11_graphics_profile() {
+        let root = repo_root().expect("repo root");
+        let script = fs::read_to_string(root.join(USERLAND_BUILD_SCRIPT)).expect("build script");
+
+        for needle in [
+            "LUPOS_USERLAND_GRAPHICS=\"${LUPOS_USERLAND_GRAPHICS:-0}\"",
+            "LUPOS_ARCH_ROOTFS=\"$TARGET/arch-graphics-rootfs\"",
+            "STAGE=\"$TARGET/graphics-stage\"",
+            "graphics_enabled",
+            "if ! graphics_enabled; then",
+            "return 0",
+            "install_arch_graphics_packages",
+            "fakeroot --",
+            "libfakeroot-sysv.so",
+            "SigLevel = Never",
+            "HookDir = $hook_dir",
+            "xorg-server",
+            "xf86-video-fbdev",
+            "xorg-xinit",
+            "xorg-twm",
+            "xterm",
+            "usr/bin/Xorg",
+            "usr/bin/startx",
+            "usr/lib/xorg/modules/drivers/fbdev_drv.so",
+            "usr/lib/xorg/modules/input/libinput_drv.so",
+            "staged graphics profile is missing X11 packages",
+        ] {
+            assert!(
+                script.contains(needle),
+                "graphics userland script missing {needle}"
+            );
+        }
+
+        for forbidden in [
+            "weston",
+            "gdm.service",
+            "display-manager.service",
+            "gnome-shell",
+            "NetworkManager.service",
+        ] {
+            assert!(
+                !script.contains(forbidden),
+                "first graphics profile must stay minimal X11/fbdev, found {forbidden}"
             );
         }
     }

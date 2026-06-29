@@ -88,6 +88,16 @@ const ENOSYS: i64 = 38;
 const EPERM: i64 = 1;
 const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 
+fn enosys_log_suppressed(nr: usize) -> bool {
+    matches!(
+        nr,
+        40   // sendfile: userland falls back to read/write
+            | 275 // splice: userland falls back to buffered I/O
+            | 326 // copy_file_range: coreutils/systemd fall back to userspace copy
+            | 334 // rseq: glibc probes and disables rseq on ENOSYS
+    )
+}
+
 // ── MSR addresses ────────────────────────────────────────────────────────────
 //
 // These are "Model-Specific Registers" — not I/O ports.  They are read and
@@ -502,7 +512,7 @@ unsafe fn syscall_dispatch_ptregs_inner(
         } else {
             unsafe { (*task).pid }
         };
-        if pid != 1 && pid > 0 {
+        if pid != 1 && pid > 0 && !enosys_log_suppressed(nr) {
             crate::linux_driver_abi::tty::serial_println!("enosys pid={} nr={}", pid, nr);
         }
     }

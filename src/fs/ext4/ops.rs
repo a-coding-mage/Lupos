@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
@@ -20,7 +21,7 @@ use crate::fs::types::{
     FileRef, Inode, InodeKind, InodePrivate, InodeRef, SuperBlockRef, touch_inode_now,
 };
 use crate::include::uapi::errno::{
-    EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EROFS,
+    EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EPERM, EROFS, EXDEV,
 };
 use crate::include::uapi::stat::{S_IFDIR, S_IFLNK, S_IFREG};
 
@@ -35,6 +36,10 @@ use super::super_block::get_sbi;
 
 const EXT4_FT_REG_FILE: u8 = 1;
 const EXT4_FT_DIR: u8 = 2;
+const EXT4_FT_CHRDEV: u8 = 3;
+const EXT4_FT_BLKDEV: u8 = 4;
+const EXT4_FT_FIFO: u8 = 5;
+const EXT4_FT_SOCK: u8 = 6;
 const EXT4_FT_SYMLINK: u8 = 7;
 const EXT4_NAME_LEN: usize = 255;
 const EXT4_DIR_PAD: usize = 4;
@@ -220,6 +225,30 @@ fn ext4_symlink(dir: &InodeRef, name: &str, target: &str, mode: u32) -> Result<I
         return Err(err);
     }
     Ok(inode)
+}
+
+pub fn ext4_link(dir: &InodeRef, name: &str, inode: &InodeRef) -> Result<(), i32> {
+    if name.is_empty() || name.len() > EXT4_NAME_LEN {
+        return Err(EINVAL);
+    }
+    let dir_sb = dir.sb.lock().clone().ok_or(EINVAL)?;
+    let inode_sb = inode.sb.lock().clone().ok_or(EINVAL)?;
+    if !Arc::ptr_eq(&dir_sb, &inode_sb) {
+        return Err(EXDEV);
+    }
+    let file_type = match inode.kind {
+        InodeKind::Regular => EXT4_FT_REG_FILE,
+        InodeKind::Symlink => EXT4_FT_SYMLINK,
+        InodeKind::Chardev => EXT4_FT_CHRDEV,
+        InodeKind::Blockdev => EXT4_FT_BLKDEV,
+        InodeKind::Fifo => EXT4_FT_FIFO,
+        InodeKind::Socket => EXT4_FT_SOCK,
+        InodeKind::Directory => return Err(EPERM),
+    };
+    ext4_add_entry(dir, name, inode, file_type)?;
+    ext4_inc_links(inode, 1)?;
+    touch_inode_now(inode);
+    Ok(())
 }
 
 fn ext4_unlink(dir: &InodeRef, name: &str) -> Result<(), i32> {

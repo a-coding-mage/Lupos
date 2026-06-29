@@ -14,6 +14,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 LUPOS_DISTRO="${LUPOS_DISTRO:-arch}"
+LUPOS_USERLAND_GRAPHICS="${LUPOS_USERLAND_GRAPHICS:-0}"
 BOOTSTRAP_NAME="${LUPOS_ARCH_BOOTSTRAP_NAME:-archlinux-bootstrap-2026.06.01-x86_64}"
 BOOTSTRAP_SHA256="${LUPOS_ARCH_BOOTSTRAP_SHA256:-e68ba918c9f7deede8eccd2cd8ce259df104d84b0791cff3a2bc7579ced34849}"
 BOOTSTRAP_URL="${LUPOS_ARCH_BOOTSTRAP_URL:-https://archive.archlinux.org/iso/2026.06.01/${BOOTSTRAP_NAME}.tar.zst}"
@@ -40,14 +41,31 @@ ARCH_OFFLINE_REPO_PACKAGE_ALIASES=(
     "p/v:/var/lib/lupos/pacman-repo/extra/os/x86_64/vim-9.2.0573-1-x86_64.pkg.tar.zst"
     "p/r:/var/lib/lupos/pacman-repo/extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst"
 )
+ARCH_GRAPHICS_PACKAGES=(
+    xorg-server
+    xf86-video-fbdev
+    xorg-xinit
+    xorg-twm
+    xterm
+)
 
 TARGET="$ROOT/target/userland"
 CACHE="$TARGET/cache"
 BOOTSTRAP_ARCHIVE="$CACHE/${BOOTSTRAP_NAME}.tar.zst"
-LUPOS_ARCH_ROOTFS="${LUPOS_ARCH_ROOTFS:-$ROOT/target/userland/arch-rootfs}"
+if [ -z "${LUPOS_ARCH_ROOTFS:-}" ]; then
+    case "${LUPOS_USERLAND_GRAPHICS,,}" in
+        1|true|yes|on) LUPOS_ARCH_ROOTFS="$TARGET/arch-graphics-rootfs" ;;
+        *) LUPOS_ARCH_ROOTFS="$TARGET/arch-rootfs" ;;
+    esac
+fi
 LUPOS_ARCH_BOOTSTRAP_ROOTFS="${LUPOS_ARCH_BOOTSTRAP_ROOTFS:-}"
 ARCH_ROOTFS="${LUPOS_ARCH_BOOTSTRAP_ROOTFS:-$LUPOS_ARCH_ROOTFS}"
-STAGE="${STAGE:-$TARGET/stage}"
+if [ -z "${STAGE:-}" ]; then
+    case "${LUPOS_USERLAND_GRAPHICS,,}" in
+        1|true|yes|on) STAGE="$TARGET/graphics-stage" ;;
+        *) STAGE="$TARGET/stage" ;;
+    esac
+fi
 STAGE_STAMP="$STAGE/.lupos-userland-ok"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -63,6 +81,13 @@ sha256_of() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "$1 required"
+}
+
+graphics_enabled() {
+    case "${LUPOS_USERLAND_GRAPHICS,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 ensure_unprivileged() {
@@ -170,6 +195,23 @@ pacman_offline_repo_ready() {
     done
 }
 
+graphics_stage_ready() {
+    if ! graphics_enabled; then
+        return 0
+    fi
+    [ -x "$1/usr/bin/Xorg" ] \
+        && [ -x "$1/usr/bin/startx" ] \
+        && [ -x "$1/usr/bin/twm" ] \
+        && [ -x "$1/usr/bin/xterm" ] \
+        && [ -e "$1/usr/lib/xorg/modules/drivers/fbdev_drv.so" ] \
+        && [ -e "$1/usr/lib/xorg/modules/input/libinput_drv.so" ] \
+        && [ -d "$1/var/lib/pacman/local/xorg-server-21.1.22-2" ] \
+        && [ -d "$1/var/lib/pacman/local/xf86-video-fbdev-0.5.1-1" ] \
+        && [ -d "$1/var/lib/pacman/local/xorg-xinit-1.4.4-1" ] \
+        && [ -d "$1/var/lib/pacman/local/xorg-twm-1.0.13.1-1" ] \
+        && [ -d "$1/var/lib/pacman/local/xterm-410-1" ]
+}
+
 stage_ready() {
     [ -e "$STAGE_STAMP" ] \
         && [ -e "$STAGE/.lupos-profile" ] \
@@ -180,7 +222,8 @@ stage_ready() {
         && pacman_mirrorlist_ready "$STAGE" \
         && pacman_config_ready "$STAGE" \
         && pacman_offline_repo_ready "$STAGE" \
-        && pam_systemd_ready "$STAGE"
+        && pam_systemd_ready "$STAGE" \
+        && graphics_stage_ready "$STAGE"
 }
 
 download_bootstrap() {
@@ -358,6 +401,88 @@ stage_arch_pacman_sync_dbs() {
         "$ARCH_ROOTFS/var/lib/pacman/sync/extra.db"
 }
 
+find_fakeroot_lib_dir() {
+    local dir
+    for dir in \
+        /usr/lib/x86_64-linux-gnu/libfakeroot \
+        /usr/lib64/libfakeroot \
+        /usr/lib/libfakeroot
+    do
+        [ -e "$dir/libfakeroot-sysv.so" ] || continue
+        printf '%s\n' "$dir"
+        return 0
+    done
+    return 1
+}
+
+write_arch_archive_pacman_conf() {
+    local conf="$1"
+    local hook_dir="$2"
+    write_file "$conf" <<EOF
+[options]
+Architecture = x86_64
+SigLevel = Never
+DisableSandbox
+HookDir = $hook_dir
+
+[core]
+SigLevel = Never
+Server = $ARCH_REPO_BASE_URL/core/os/x86_64
+
+[extra]
+SigLevel = Never
+Server = $ARCH_REPO_BASE_URL/extra/os/x86_64
+EOF
+}
+
+install_arch_graphics_packages() {
+    if ! graphics_enabled; then
+        return 0
+    fi
+    if graphics_stage_ready "$ARCH_ROOTFS"; then
+        log "Graphics packages already present in $ARCH_ROOTFS"
+        return
+    fi
+
+    require_command fakeroot
+    local fakeroot_lib_dir
+    fakeroot_lib_dir="$(find_fakeroot_lib_dir)" || die "fakeroot library directory not found"
+
+    local full_core_db="$CACHE/arch-repo/$ARCH_REPO_SNAPSHOT/core/os/x86_64/core.db"
+    local full_extra_db="$CACHE/arch-repo/$ARCH_REPO_SNAPSHOT/extra/os/x86_64/extra.db"
+    [ -s "$full_core_db" ] || die "missing full Arch core db: $full_core_db"
+    [ -s "$full_extra_db" ] || die "missing full Arch extra db: $full_extra_db"
+
+    local work="$TARGET/.graphics-pacman-$$"
+    safe_clean_dir "$work"
+    mkdir -p "$work/hooks" "$work/gpg" "$CACHE/pacman-graphics"
+    write_arch_archive_pacman_conf "$work/pacman.conf" "$work/hooks"
+
+    cp "$full_core_db" "$ARCH_ROOTFS/var/lib/pacman/sync/core.db"
+    cp "$full_extra_db" "$ARCH_ROOTFS/var/lib/pacman/sync/extra.db"
+
+    log "Installing X11 graphics packages into Arch rootfs"
+    fakeroot -- \
+        "$ARCH_ROOTFS/usr/lib/ld-linux-x86-64.so.2" \
+        --library-path "$fakeroot_lib_dir:$ARCH_ROOTFS/usr/lib" \
+        "$ARCH_ROOTFS/usr/bin/pacman" \
+        -S \
+        --config "$work/pacman.conf" \
+        --root "$ARCH_ROOTFS" \
+        --dbpath "$ARCH_ROOTFS/var/lib/pacman" \
+        --cachedir "$CACHE/pacman-graphics" \
+        --gpgdir "$work/gpg" \
+        --hookdir "$work/hooks" \
+        --noconfirm \
+        --needed \
+        --noscriptlet \
+        --disable-sandbox \
+        "${ARCH_GRAPHICS_PACKAGES[@]}"
+
+    stage_arch_pacman_sync_dbs
+    safe_clean_dir "$work"
+}
+
 extract_bootstrap() {
     if [ "${LUPOS_ARCH_REFRESH:-0}" != "1" ] && rootfs_ready; then
         log "Arch rootfs already present at $ARCH_ROOTFS"
@@ -476,6 +601,7 @@ fi
 EOF
     chmod 755 "$S/$ARCH_PACMAN_XFER_HELPER"
     stage_arch_offline_pacman_repo
+    install_arch_graphics_packages
 
     write_file "$S/etc/fstab" <<'EOF'
 proc      /proc     proc      defaults 0 0
@@ -559,6 +685,7 @@ validate_stage() {
     pacman_config_ready "$STAGE" || die "staged pacman config must disable sandboxing, define direct offline repo servers, use the Lupos transfer helper, and avoid DownloadUser"
     pacman_offline_repo_ready "$STAGE" || die "staged offline pacman repo is missing pinned database/package files or preseeded sync databases"
     pam_systemd_ready "$STAGE" || die "staged PAM systemd session hook is missing"
+    graphics_stage_ready "$STAGE" || die "staged graphics profile is missing X11 packages"
     : > "$STAGE_STAMP"
 }
 
