@@ -93,6 +93,7 @@ struct VirtualConsole {
     pending_clear: Option<ClearOp>,
     cursor_enabled: bool,
     cursor_blink_on: bool,
+    insert_mode: bool,
     esc_state: EscapeState,
     csi_params: [usize; 4],
     csi_count: usize,
@@ -120,6 +121,7 @@ impl VirtualConsole {
             pending_clear: None,
             cursor_enabled: true,
             cursor_blink_on: true,
+            insert_mode: false,
             esc_state: EscapeState::Ground,
             csi_params: [0; 4],
             csi_count: 0,
@@ -284,9 +286,16 @@ impl VirtualConsole {
             b'H' | b'f' => self.set_cursor_1based(self.csi_param(0, 1), self.csi_param(1, 1)),
             b'J' => self.clear_display(self.csi_param(0, 0)),
             b'K' => self.clear_line(self.csi_param(0, 0)),
+            b'@' => self.insert_chars(self.csi_param(0, 1)),
             b'P' => self.delete_chars(self.csi_param(0, 1)),
             b'n' if !self.csi_private && self.csi_param(0, 0) == 6 => self.report_cursor_position(),
             b't' if !self.csi_private && self.csi_param(0, 0) == 18 => self.report_text_area_size(),
+            b'h' if !self.csi_private && self.csi_param(0, 0) == 4 => {
+                self.insert_mode = true;
+            }
+            b'l' if !self.csi_private && self.csi_param(0, 0) == 4 => {
+                self.insert_mode = false;
+            }
             b'h' if self.csi_private && self.csi_param(0, 0) == 25 => {
                 self.cursor_enabled = true;
                 self.mark_cursor_dirty();
@@ -318,6 +327,7 @@ impl VirtualConsole {
         self.bg_color = DEFAULT_BG;
         self.bold = false;
         self.cursor_enabled = true;
+        self.insert_mode = false;
         self.col = 0;
         self.row = 0;
         self.mark_cursor_dirty();
@@ -355,6 +365,9 @@ impl VirtualConsole {
         if self.col >= self.cols {
             self.new_line();
         }
+        if self.insert_mode {
+            self.insert_chars(1);
+        }
         self.mark_cursor_dirty();
         let idx = self.cell_index(self.col, self.row);
         self.cells[idx] = TextCell {
@@ -369,6 +382,30 @@ impl VirtualConsole {
         } else {
             self.mark_cursor_dirty();
         }
+    }
+
+    fn insert_chars(&mut self, count: usize) {
+        let count = count.min(self.cols.saturating_sub(self.col));
+        if count == 0 {
+            return;
+        }
+        self.mark_cursor_dirty();
+        for col in (self.col + count..self.cols).rev() {
+            let src = self.cell_index(col - count, self.row);
+            let dst = self.cell_index(col, self.row);
+            self.cells[dst] = self.cells[src];
+        }
+        let blank = TextCell {
+            ch: b' ',
+            fg: self.fg_color,
+            bg: self.bg_color,
+        };
+        for col in self.col..self.col + count {
+            let idx = self.cell_index(col, self.row);
+            self.cells[idx] = blank;
+        }
+        self.mark_dirty(self.row);
+        self.mark_cursor_dirty();
     }
 
     fn tab(&mut self) {
@@ -1059,6 +1096,37 @@ mod tests {
     }
 
     #[test]
+    fn linux_csi_at_inserts_cells_on_current_line() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(6, 2);
+        write_visible_bytes(b"abcde\x1b[1;3H\x1b[@X");
+
+        for (col, byte) in b"abXcde".iter().enumerate() {
+            assert_eq!(cell_char_for_tests(0, col), *byte);
+        }
+        assert_eq!(cursor_for_tests(), Some((3, 0)));
+    }
+
+    #[test]
+    fn bash_readline_insert_mode_shifts_existing_text() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(6, 2);
+        write_visible_bytes(b"abde\x1b[1;3H\x1b[4hc\x1b[4l");
+
+        for (col, byte) in b"abcde ".iter().enumerate() {
+            assert_eq!(cell_char_for_tests(0, col), *byte);
+        }
+        assert_eq!(cursor_for_tests(), Some((3, 0)));
+
+        write_visible_bytes(b"Z");
+
+        for (col, byte) in b"abcZe ".iter().enumerate() {
+            assert_eq!(cell_char_for_tests(0, col), *byte);
+        }
+        assert_eq!(cursor_for_tests(), Some((4, 0)));
+    }
+
+    #[test]
     fn sgr_colors_are_kept_in_cells() {
         let _guard = TEST_CONSOLE_LOCK.lock();
         reset_for_tests(10, 3);
@@ -1196,6 +1264,7 @@ mod tests {
         let _guard = TEST_CONSOLE_LOCK.lock();
         crate::linux_driver_abi::tty::serial::clear_capture_for_tests();
         reset_for_tests(10, 3);
+        set_fbcon_enabled(false);
 
         write_bytes(b"systemctl status\n");
 

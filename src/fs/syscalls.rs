@@ -5474,11 +5474,46 @@ mod tests {
                 0
             );
             assert_eq!(
+                crate::kernel::syscalls::sys_futimesat(fd as i32, core::ptr::null(), tv.as_ptr()),
+                0
+            );
+            assert_eq!(
+                crate::kernel::syscalls::sys_futimesat(AT_FDCWD, core::ptr::null(), tv.as_ptr()),
+                -(EFAULT as i64)
+            );
+            assert_eq!(
                 crate::kernel::syscalls::sys_utimensat(
                     AT_FDCWD,
                     path.as_ptr(),
                     core::ptr::null(),
                     0
+                ),
+                0
+            );
+            assert_eq!(
+                crate::kernel::syscalls::sys_utimensat(
+                    fd as i32,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0
+                ),
+                0
+            );
+            assert_eq!(
+                crate::kernel::syscalls::sys_utimensat(
+                    fd as i32,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    AT_EMPTY_PATH as i32
+                ),
+                -(EINVAL as i64)
+            );
+            assert_eq!(
+                crate::kernel::syscalls::sys_utimensat(
+                    fd as i32,
+                    empty.as_ptr(),
+                    core::ptr::null(),
+                    AT_EMPTY_PATH as i32
                 ),
                 0
             );

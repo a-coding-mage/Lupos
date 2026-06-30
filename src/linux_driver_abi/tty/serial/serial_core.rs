@@ -12,10 +12,14 @@
 extern crate alloc;
 
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 /// COM1 base I/O port address.
 const COM1: u16 = 0x3F8;
+const UART_LSR: u16 = 5;
+const UART_LSR_DR: u8 = 0x01;
+const UART_LSR_THRE: u8 = 0x20;
 const SERIAL_QUEUE_CAP: usize = 128 * 1024;
 const SERIAL_INPUT_QUEUE_CAP: usize = 4096;
 /// 16550A transmit FIFO depth enabled by `init()`'s FCR write (0xC7).  Linux's
@@ -102,7 +106,15 @@ impl SerialPort {
             outb(self.base + 3, 0x03); // 8 bits, no parity, one stop bit (8N1)
             outb(self.base + 2, 0xC7); // Enable FIFO, clear, 14-byte threshold
 
-            let _ = inb(self.base + 5); // Read LSR to clear any pending state
+            let lsr = inb(self.base + UART_LSR); // Read LSR to clear any pending state
+            // Linux serial8250_do_startup() bails out when LSR is still 0xff:
+            // all-ones on an I/O port means there is likely no UART decoded
+            // there. VirtualBox returns this when COM1 is disabled.
+            if lsr == 0xff {
+                mark_serial_absent();
+            } else {
+                SERIAL_PRESENT.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -120,11 +132,23 @@ impl SerialPort {
     /// `write_byte_unchecked()` / `tx_ready()` below for that path.
     #[cfg(not(test))]
     fn write_byte(&self, byte: u8) {
+        if !serial_present() {
+            return;
+        }
         unsafe {
             use crate::arch::x86::include::asm::io::{inb, outb};
 
             // Spin until bit 5 (THR empty) of Line Status Register is set.
-            while inb(self.base + 5) & 0x20 == 0 {}
+            loop {
+                let lsr = inb(self.base + UART_LSR);
+                if lsr == 0xff {
+                    mark_serial_absent();
+                    return;
+                }
+                if lsr & UART_LSR_THRE != 0 {
+                    break;
+                }
+            }
             outb(self.base, byte);
         }
     }
@@ -138,9 +162,17 @@ impl SerialPort {
     /// drained and is ready to accept a fresh burst. Never spins.
     #[cfg(not(test))]
     fn tx_ready(&self) -> bool {
+        if !serial_present() {
+            return false;
+        }
         unsafe {
             use crate::arch::x86::include::asm::io::inb;
-            inb(self.base + 5) & 0x20 != 0
+            let lsr = inb(self.base + UART_LSR);
+            if lsr == 0xff {
+                mark_serial_absent();
+                return false;
+            }
+            lsr & UART_LSR_THRE != 0
         }
     }
 
@@ -168,10 +200,18 @@ impl SerialPort {
 
     /// Read one byte if the UART receiver FIFO has data.
     fn try_read_byte(&self) -> Option<u8> {
+        if !serial_present() {
+            return None;
+        }
         unsafe {
             use crate::arch::x86::include::asm::io::inb;
 
-            if inb(self.base + 5) & 0x01 == 0 {
+            let lsr = inb(self.base + UART_LSR);
+            if lsr == 0xff {
+                mark_serial_absent();
+                return None;
+            }
+            if lsr & UART_LSR_DR == 0 {
                 return None;
             }
             Some(inb(self.base))
@@ -194,6 +234,15 @@ impl fmt::Write for SerialPort {
 static SERIAL1: Mutex<SerialPort> = Mutex::new(SerialPort::new(COM1));
 static SERIAL_QUEUE: Mutex<ByteRing<SERIAL_QUEUE_CAP>> = Mutex::new(ByteRing::new());
 static SERIAL_INPUT_QUEUE: Mutex<ByteRing<SERIAL_INPUT_QUEUE_CAP>> = Mutex::new(ByteRing::new());
+static SERIAL_PRESENT: AtomicBool = AtomicBool::new(true);
+
+fn serial_present() -> bool {
+    SERIAL_PRESENT.load(Ordering::Acquire)
+}
+
+fn mark_serial_absent() {
+    SERIAL_PRESENT.store(false, Ordering::Release);
+}
 
 /// Initialize COM1. Safe to call multiple times.
 pub fn init() {
@@ -205,6 +254,9 @@ pub fn init() {
 /// This is used by early console devices (e.g. `/dev/console`) and must not
 /// allocate, assume UTF-8, or spin on a disconnected serial sink.
 pub fn write_bytes(bytes: &[u8]) {
+    if !serial_present() {
+        return;
+    }
     enqueue_bytes(bytes);
     let _ = flush_budget(SERIAL_QUEUE_CAP);
 }
@@ -214,6 +266,9 @@ pub fn write_bytes(bytes: &[u8]) {
 /// The queue stores the CRLF-expanded stream so budgeted flushing can write a
 /// simple byte at a time without remembering terminal translation state.
 pub fn enqueue_bytes(bytes: &[u8]) {
+    if !serial_present() {
+        return;
+    }
     let mut queue = SERIAL_QUEUE.lock();
     for &byte in bytes {
         if byte == b'\n' {
@@ -241,6 +296,9 @@ fn enqueue_one<const CAP: usize>(queue: &mut ByteRing<CAP>, byte: u8) {
 /// then miss incoming bytes during that window — the root cause of dropped
 /// leading characters on scripted/pasted input.
 pub fn flush_budget(budget: usize) -> usize {
+    if !serial_present() {
+        return 0;
+    }
     let mut drained = 0usize;
     while drained < budget {
         if !SERIAL1.lock().tx_ready() {
@@ -269,6 +327,9 @@ pub fn flush_budget(budget: usize) -> usize {
 /// so spinning here is correct — unlike the budgeted path above, which must
 /// stay non-blocking to keep RX polling responsive.
 pub fn flush_all_blocking() {
+    if !serial_present() {
+        return;
+    }
     loop {
         let Some(byte) = SERIAL_QUEUE.lock().pop_front() else {
             break;
@@ -288,6 +349,9 @@ fn enqueue_input_byte(byte: u8) {
 
 #[cfg(not(test))]
 pub fn poll_input_budget(budget: usize) -> usize {
+    if !serial_present() {
+        return 0;
+    }
     let mut drained = 0usize;
     while drained < budget {
         let Some(byte) = SERIAL1.lock().try_read_byte() else {
@@ -310,6 +374,9 @@ pub fn poll_input_budget(_budget: usize) -> usize {
 /// serial input rather than by an in-kernel transcript.
 #[cfg(not(test))]
 pub fn try_read_byte() -> Option<u8> {
+    if !serial_present() {
+        return None;
+    }
     if let Some(byte) = SERIAL_INPUT_QUEUE.lock().pop_front() {
         return Some(byte);
     }
@@ -325,6 +392,10 @@ pub fn try_read_byte() -> Option<u8> {
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments<'_>) {
     use fmt::Write;
+
+    if !serial_present() {
+        return;
+    }
 
     struct QueuedSerialWriter;
 
@@ -380,6 +451,7 @@ mod test_capture {
 pub fn clear_capture_for_tests() {
     SERIAL_QUEUE.lock().clear();
     SERIAL_INPUT_QUEUE.lock().clear();
+    SERIAL_PRESENT.store(true, Ordering::Release);
     test_capture::clear();
 }
 

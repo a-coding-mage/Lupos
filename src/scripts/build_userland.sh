@@ -24,25 +24,98 @@ ARCH_OFFLINE_REPO_REL="var/lib/lupos/pacman-repo"
 ARCH_PACMAN_SERVER='Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch'
 ARCH_PACMAN_XFER_HELPER="usr/lib/lupos/pacman-xfer"
 ARCH_PACMAN_XFER_COMMAND="XferCommand = /usr/lib/lupos/pacman-xfer %u %o"
+ARCH_SYSTEMD_HOOK_SCRIPT="usr/share/libalpm/scripts/systemd-hook"
 ARCH_OFFLINE_REPO_ARTIFACTS=(
     "core/os/x86_64/core.db:798ab7b65aea244fb3cbfeab13fcf6a9642dfbcbc3dcfcda6c8071aeeb2e19ee"
     "core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst:95b97f61aacc075e85465a7d5e1c99d1b249b4eba63081a170482cdc8791f799"
     "core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst:2b52fdaafc70e63511f3b85d98c34f26151b0498fa6f0e61fcb4be4b0d754edf"
-    "extra/os/x86_64/extra.db:2b5a0cb4a6e5503a060c6011fb6cacb58c3b990a44829c3b70646641117b94c4"
+    "extra/os/x86_64/extra.db:1298f235b84b0ad6f48dceb29908a3862d31d22b31fb5ffec0ddaef0f08cbcb3"
+    "extra/os/x86_64/fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst:64dcc7ccaa5460b93ce1c76a9e104bcbb373d3d15fb5abc01a1192f4607e9d2e"
+    "extra/os/x86_64/freetype2-2.14.3-1-x86_64.pkg.tar.zst:fcaa410420dea42779d02aa76f1cc95d8430bdc52071ac6219d33306899b8655"
+    "extra/os/x86_64/libice-1.1.2-1-x86_64.pkg.tar.zst:bb613be39e5bc1707a39f895c178674bbda52f022da51612e7a10a386608e107"
+    "extra/os/x86_64/libpng-1.6.58-1-x86_64.pkg.tar.zst:8d80045f15f6339b2284db5df06a4287225cc2389c24dbb2fbc23458f6887ee5"
+    "extra/os/x86_64/libsm-1.2.6-1-x86_64.pkg.tar.zst:ce334b07a9701ba6ef4d610257500f7b035dc1cdc0a658e056d293547cde0976"
+    "extra/os/x86_64/libutempter-1.2.3-1-x86_64.pkg.tar.zst:e1dd15aed4cd76b42729d5dc58d4db3dd49d6c5fe08b33abee0df3bcfc98fd13"
+    "extra/os/x86_64/libx11-1.8.13-1-x86_64.pkg.tar.zst:251f58e0a9bc2cd69b8e708f239914e48e3a91cd1822220806d273be873d026f"
+    "extra/os/x86_64/libxau-1.0.12-1-x86_64.pkg.tar.zst:605c8b059c36792f4e0cc235acadf39d0762df6c7878825a1be01a00ae7ea21e"
+    "extra/os/x86_64/libxaw-1.0.16-2-x86_64.pkg.tar.zst:79966ba7df3cf46bbcac4292384247b0070bfd036f3a55dbcd9121cb4ccf8a38"
+    "extra/os/x86_64/libxcb-1.17.0-1-x86_64.pkg.tar.zst:2b2e7ac64b1d56c08a227c10bcab179605f2773f31db0a8c89f49f4e5b2f1292"
+    "extra/os/x86_64/libxdmcp-1.1.5-2-x86_64.pkg.tar.zst:623c957c2fd4b427a0f5a531da44931f9f66521391ee0bd0e635479947036b65"
+    "extra/os/x86_64/libxext-1.3.7-1-x86_64.pkg.tar.zst:ac56905dc51bb652eca5f706fd7e7bb7ea81d4e057a236139fc769ce5ea10cf1"
+    "extra/os/x86_64/libxft-2.3.9-1-x86_64.pkg.tar.zst:a7841ed8e67dc3f94eca4672c8961329dfdd6b67836f8ac720a246d3aab02ecb"
+    "extra/os/x86_64/libxmu-1.3.1-1-x86_64.pkg.tar.zst:31870eb5ad1911880cd7b2f3a59292b644d84b873ed62a1a7c36b9ac26bc08a5"
+    "extra/os/x86_64/libxpm-3.5.19-1-x86_64.pkg.tar.zst:cb4df58d300485410132dcd0deeb209c0ef9a6e8d5280ec0f4cb532aba2c208e"
+    "extra/os/x86_64/libxrender-0.9.12-1-x86_64.pkg.tar.zst:fed0389073d5b107074eaab48cefcc2716e607865142cde5b579c8ceeefea142"
+    "extra/os/x86_64/libxt-1.3.1-1-x86_64.pkg.tar.zst:5d4ee1f73c946cdd9b908b127157d6d826d198be982c91e199daf6bdd7f6b9ec"
     "extra/os/x86_64/vim-9.2.0573-1-x86_64.pkg.tar.zst:f375bc1779e4b595d0e3cdd7ba3a20eebaed9c7f16cb3e751589a27fdda174b1"
     "extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst:96518629c05db726744469eef47498bc15992e0ed499a0123c9f8917ff404cd6"
+    "extra/os/x86_64/xcb-proto-1.17.0-4-any.pkg.tar.zst:98f661ef7c7e05eb7a687e859cf123a92806ceed8f55c0d70ddbac799988239a"
+    "extra/os/x86_64/xorg-xauth-1.1.5-1-x86_64.pkg.tar.zst:df9e0d1f29ae0135a49b17157841a4cc7c97869f9f27fd7480fff64f9afb94b7"
+    "extra/os/x86_64/xorg-xinit-1.4.4-1-x86_64.pkg.tar.zst:edf4f98e4c787074b3d182daf9eadfacee3ce14785397ccd63fe11f9ffb1c903"
+    "extra/os/x86_64/xorg-xmodmap-1.0.11-2-x86_64.pkg.tar.zst:b80ea53e86c02b3c7697c8353ccc41df80278b57f0134f6a608be126a0724bb3"
+    "extra/os/x86_64/xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst:e916cb35a6a3031ddd6c6d49d795bcd702dcc532debb911dc97cec715a235c30"
+    "extra/os/x86_64/xorgproto-2025.1-1-any.pkg.tar.zst:f7bf3eed570618511fb53cc1bd32c2f1ee82e02662075436a59e6e50436f30de"
+    "extra/os/x86_64/xterm-410-1-x86_64.pkg.tar.zst:85b31fbadc47676215007d2fb08115a237e30c385e382d98f7cf6c59a77d9fa9"
 )
 ARCH_OFFLINE_REPO_PACKAGES=(
     "core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst:95b97f61aacc075e85465a7d5e1c99d1b249b4eba63081a170482cdc8791f799"
     "core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst:2b52fdaafc70e63511f3b85d98c34f26151b0498fa6f0e61fcb4be4b0d754edf"
+    "extra/os/x86_64/fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst:64dcc7ccaa5460b93ce1c76a9e104bcbb373d3d15fb5abc01a1192f4607e9d2e"
+    "extra/os/x86_64/freetype2-2.14.3-1-x86_64.pkg.tar.zst:fcaa410420dea42779d02aa76f1cc95d8430bdc52071ac6219d33306899b8655"
+    "extra/os/x86_64/libice-1.1.2-1-x86_64.pkg.tar.zst:bb613be39e5bc1707a39f895c178674bbda52f022da51612e7a10a386608e107"
+    "extra/os/x86_64/libpng-1.6.58-1-x86_64.pkg.tar.zst:8d80045f15f6339b2284db5df06a4287225cc2389c24dbb2fbc23458f6887ee5"
+    "extra/os/x86_64/libsm-1.2.6-1-x86_64.pkg.tar.zst:ce334b07a9701ba6ef4d610257500f7b035dc1cdc0a658e056d293547cde0976"
+    "extra/os/x86_64/libutempter-1.2.3-1-x86_64.pkg.tar.zst:e1dd15aed4cd76b42729d5dc58d4db3dd49d6c5fe08b33abee0df3bcfc98fd13"
+    "extra/os/x86_64/libx11-1.8.13-1-x86_64.pkg.tar.zst:251f58e0a9bc2cd69b8e708f239914e48e3a91cd1822220806d273be873d026f"
+    "extra/os/x86_64/libxau-1.0.12-1-x86_64.pkg.tar.zst:605c8b059c36792f4e0cc235acadf39d0762df6c7878825a1be01a00ae7ea21e"
+    "extra/os/x86_64/libxaw-1.0.16-2-x86_64.pkg.tar.zst:79966ba7df3cf46bbcac4292384247b0070bfd036f3a55dbcd9121cb4ccf8a38"
+    "extra/os/x86_64/libxcb-1.17.0-1-x86_64.pkg.tar.zst:2b2e7ac64b1d56c08a227c10bcab179605f2773f31db0a8c89f49f4e5b2f1292"
+    "extra/os/x86_64/libxdmcp-1.1.5-2-x86_64.pkg.tar.zst:623c957c2fd4b427a0f5a531da44931f9f66521391ee0bd0e635479947036b65"
+    "extra/os/x86_64/libxext-1.3.7-1-x86_64.pkg.tar.zst:ac56905dc51bb652eca5f706fd7e7bb7ea81d4e057a236139fc769ce5ea10cf1"
+    "extra/os/x86_64/libxft-2.3.9-1-x86_64.pkg.tar.zst:a7841ed8e67dc3f94eca4672c8961329dfdd6b67836f8ac720a246d3aab02ecb"
+    "extra/os/x86_64/libxmu-1.3.1-1-x86_64.pkg.tar.zst:31870eb5ad1911880cd7b2f3a59292b644d84b873ed62a1a7c36b9ac26bc08a5"
+    "extra/os/x86_64/libxpm-3.5.19-1-x86_64.pkg.tar.zst:cb4df58d300485410132dcd0deeb209c0ef9a6e8d5280ec0f4cb532aba2c208e"
+    "extra/os/x86_64/libxrender-0.9.12-1-x86_64.pkg.tar.zst:fed0389073d5b107074eaab48cefcc2716e607865142cde5b579c8ceeefea142"
+    "extra/os/x86_64/libxt-1.3.1-1-x86_64.pkg.tar.zst:5d4ee1f73c946cdd9b908b127157d6d826d198be982c91e199daf6bdd7f6b9ec"
     "extra/os/x86_64/vim-9.2.0573-1-x86_64.pkg.tar.zst:f375bc1779e4b595d0e3cdd7ba3a20eebaed9c7f16cb3e751589a27fdda174b1"
     "extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst:96518629c05db726744469eef47498bc15992e0ed499a0123c9f8917ff404cd6"
+    "extra/os/x86_64/xcb-proto-1.17.0-4-any.pkg.tar.zst:98f661ef7c7e05eb7a687e859cf123a92806ceed8f55c0d70ddbac799988239a"
+    "extra/os/x86_64/xorg-xauth-1.1.5-1-x86_64.pkg.tar.zst:df9e0d1f29ae0135a49b17157841a4cc7c97869f9f27fd7480fff64f9afb94b7"
+    "extra/os/x86_64/xorg-xinit-1.4.4-1-x86_64.pkg.tar.zst:edf4f98e4c787074b3d182daf9eadfacee3ce14785397ccd63fe11f9ffb1c903"
+    "extra/os/x86_64/xorg-xmodmap-1.0.11-2-x86_64.pkg.tar.zst:b80ea53e86c02b3c7697c8353ccc41df80278b57f0134f6a608be126a0724bb3"
+    "extra/os/x86_64/xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst:e916cb35a6a3031ddd6c6d49d795bcd702dcc532debb911dc97cec715a235c30"
+    "extra/os/x86_64/xorgproto-2025.1-1-any.pkg.tar.zst:f7bf3eed570618511fb53cc1bd32c2f1ee82e02662075436a59e6e50436f30de"
+    "extra/os/x86_64/xterm-410-1-x86_64.pkg.tar.zst:85b31fbadc47676215007d2fb08115a237e30c385e382d98f7cf6c59a77d9fa9"
 )
 ARCH_OFFLINE_REPO_PACKAGE_ALIASES=(
+    "p/fontconfig:/var/lib/lupos/pacman-repo/extra/os/x86_64/fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst"
+    "p/freetype2:/var/lib/lupos/pacman-repo/extra/os/x86_64/freetype2-2.14.3-1-x86_64.pkg.tar.zst"
     "p/g:/var/lib/lupos/pacman-repo/core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst"
+    "p/libice:/var/lib/lupos/pacman-repo/extra/os/x86_64/libice-1.1.2-1-x86_64.pkg.tar.zst"
+    "p/libpng:/var/lib/lupos/pacman-repo/extra/os/x86_64/libpng-1.6.58-1-x86_64.pkg.tar.zst"
+    "p/libsm:/var/lib/lupos/pacman-repo/extra/os/x86_64/libsm-1.2.6-1-x86_64.pkg.tar.zst"
+    "p/libutempter:/var/lib/lupos/pacman-repo/extra/os/x86_64/libutempter-1.2.3-1-x86_64.pkg.tar.zst"
+    "p/libx11:/var/lib/lupos/pacman-repo/extra/os/x86_64/libx11-1.8.13-1-x86_64.pkg.tar.zst"
+    "p/libxau:/var/lib/lupos/pacman-repo/extra/os/x86_64/libxau-1.0.12-1-x86_64.pkg.tar.zst"
+    "p/libxaw:/var/lib/lupos/pacman-repo/extra/os/x86_64/libxaw-1.0.16-2-x86_64.pkg.tar.zst"
+    "p/libxcb:/var/lib/lupos/pacman-repo/extra/os/x86_64/libxcb-1.17.0-1-x86_64.pkg.tar.zst"
+    "p/libxdmcp:/var/lib/lupos/pacman-repo/extra/os/x86_64/libxdmcp-1.1.5-2-x86_64.pkg.tar.zst"
+    "p/libxext:/var/lib/lupos/pacman-repo/extra/os/x86_64/libxext-1.3.7-1-x86_64.pkg.tar.zst"
+    "p/libxft:/var/lib/lupos/pacman-repo/extra/os/x86_64/libxft-2.3.9-1-x86_64.pkg.tar.zst"
+    "p/libxmu:/var/lib/lupos/pacman-repo/extra/os/x86_64/libxmu-1.3.1-1-x86_64.pkg.tar.zst"
+    "p/libxpm:/var/lib/lupos/pacman-repo/extra/os/x86_64/libxpm-3.5.19-1-x86_64.pkg.tar.zst"
+    "p/libxrender:/var/lib/lupos/pacman-repo/extra/os/x86_64/libxrender-0.9.12-1-x86_64.pkg.tar.zst"
+    "p/libxt:/var/lib/lupos/pacman-repo/extra/os/x86_64/libxt-1.3.1-1-x86_64.pkg.tar.zst"
     "p/n:/var/lib/lupos/pacman-repo/core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst"
     "p/v:/var/lib/lupos/pacman-repo/extra/os/x86_64/vim-9.2.0573-1-x86_64.pkg.tar.zst"
     "p/r:/var/lib/lupos/pacman-repo/extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst"
+    "p/xcb-proto:/var/lib/lupos/pacman-repo/extra/os/x86_64/xcb-proto-1.17.0-4-any.pkg.tar.zst"
+    "p/xorg-xauth:/var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xauth-1.1.5-1-x86_64.pkg.tar.zst"
+    "p/xorg-xinit:/var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xinit-1.4.4-1-x86_64.pkg.tar.zst"
+    "p/xorg-xmodmap:/var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xmodmap-1.0.11-2-x86_64.pkg.tar.zst"
+    "p/xorg-xrdb:/var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst"
+    "p/xorgproto:/var/lib/lupos/pacman-repo/extra/os/x86_64/xorgproto-2025.1-1-any.pkg.tar.zst"
+    "p/xterm:/var/lib/lupos/pacman-repo/extra/os/x86_64/xterm-410-1-x86_64.pkg.tar.zst"
 )
 ARCH_GRAPHICS_PACKAGES=(
     xorg-server
@@ -129,6 +202,14 @@ pam_systemd_ready() {
         && grep -q 'pam_systemd\.so' "$r/usr/lib/pam.d/systemd-user"
 }
 
+systemd_hook_ready() {
+    local r="$1"
+    local hook="$r/$ARCH_SYSTEMD_HOOK_SCRIPT"
+    [ -x "$hook" ] \
+        && grep -Fq 'skip_live_service_hook()' "$hook" \
+        && grep -Fq 'live systemd service-manager package hook is disabled on Lupos' "$hook"
+}
+
 pacman_mirrorlist_ready() {
     local r="$1"
     grep -Fxq "$ARCH_PACMAN_SERVER" "$r/etc/pacman.d/mirrorlist"
@@ -172,7 +253,7 @@ pacman_offline_repo_ready() {
     local r="$1"
     local entry rel sha path actual target repo_db sync_db
     for entry in "${ARCH_OFFLINE_REPO_ARTIFACTS[@]}"; do
-        rel="${entry%%:*}"
+        rel="${entry%:*}"
         sha="${entry##*:}"
         path="$r/$ARCH_OFFLINE_REPO_REL/$rel"
         [ -s "$path" ] || return 1
@@ -180,7 +261,7 @@ pacman_offline_repo_ready() {
         [ "$actual" = "$sha" ] || return 1
     done
     for entry in "${ARCH_OFFLINE_REPO_PACKAGES[@]}"; do
-        rel="${entry%%:*}"
+        rel="${entry%:*}"
         path="$r/var/cache/pacman/pkg/$(basename "$rel")"
         [ ! -e "$path" ] || return 1
     done
@@ -226,6 +307,7 @@ stage_ready() {
         && pacman_config_ready "$STAGE" \
         && pacman_offline_repo_ready "$STAGE" \
         && pam_systemd_ready "$STAGE" \
+        && systemd_hook_ready "$STAGE" \
         && graphics_stage_ready "$STAGE"
 }
 
@@ -287,6 +369,15 @@ download_arch_offline_repo_artifact() {
     local rel="$1"
     local expected="$2"
     local dst="$ARCH_ROOTFS/$ARCH_OFFLINE_REPO_REL/$rel"
+    local cached_pkg="$CACHE/pacman-graphics/$(basename "$rel")"
+    if [[ "$rel" == *.pkg.tar.zst ]] && [ -f "$cached_pkg" ]; then
+        local cached_actual
+        cached_actual="$(sha256_of "$cached_pkg")"
+        [ "$cached_actual" = "$expected" ] || die "SHA-256 mismatch for cached $cached_pkg: expected $expected, got $cached_actual"
+        mkdir -p "$(dirname "$dst")"
+        cp "$cached_pkg" "$dst"
+        return
+    fi
     download_arch_repo_file "$rel" "$expected" "$dst"
 }
 
@@ -354,7 +445,7 @@ stage_arch_pacman_package_cache() {
     mkdir -p "$cache_dir"
     local entry rel base
     for entry in "${ARCH_OFFLINE_REPO_PACKAGES[@]}"; do
-        rel="${entry%%:*}"
+        rel="${entry%:*}"
         base="$(basename "$rel")"
         rm -f "$cache_dir/$base" "$cache_dir/$base.part" "$cache_dir/$base.sig"
     done
@@ -383,6 +474,78 @@ stage_arch_offline_pacman_repo() {
     download_arch_offline_repo_artifact \
         "extra/os/x86_64/vim-9.2.0573-1-x86_64.pkg.tar.zst" \
         "f375bc1779e4b595d0e3cdd7ba3a20eebaed9c7f16cb3e751589a27fdda174b1"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst" \
+        "64dcc7ccaa5460b93ce1c76a9e104bcbb373d3d15fb5abc01a1192f4607e9d2e"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/freetype2-2.14.3-1-x86_64.pkg.tar.zst" \
+        "fcaa410420dea42779d02aa76f1cc95d8430bdc52071ac6219d33306899b8655"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libice-1.1.2-1-x86_64.pkg.tar.zst" \
+        "bb613be39e5bc1707a39f895c178674bbda52f022da51612e7a10a386608e107"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libpng-1.6.58-1-x86_64.pkg.tar.zst" \
+        "8d80045f15f6339b2284db5df06a4287225cc2389c24dbb2fbc23458f6887ee5"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libsm-1.2.6-1-x86_64.pkg.tar.zst" \
+        "ce334b07a9701ba6ef4d610257500f7b035dc1cdc0a658e056d293547cde0976"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libutempter-1.2.3-1-x86_64.pkg.tar.zst" \
+        "e1dd15aed4cd76b42729d5dc58d4db3dd49d6c5fe08b33abee0df3bcfc98fd13"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libx11-1.8.13-1-x86_64.pkg.tar.zst" \
+        "251f58e0a9bc2cd69b8e708f239914e48e3a91cd1822220806d273be873d026f"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libxau-1.0.12-1-x86_64.pkg.tar.zst" \
+        "605c8b059c36792f4e0cc235acadf39d0762df6c7878825a1be01a00ae7ea21e"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libxaw-1.0.16-2-x86_64.pkg.tar.zst" \
+        "79966ba7df3cf46bbcac4292384247b0070bfd036f3a55dbcd9121cb4ccf8a38"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libxcb-1.17.0-1-x86_64.pkg.tar.zst" \
+        "2b2e7ac64b1d56c08a227c10bcab179605f2773f31db0a8c89f49f4e5b2f1292"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libxdmcp-1.1.5-2-x86_64.pkg.tar.zst" \
+        "623c957c2fd4b427a0f5a531da44931f9f66521391ee0bd0e635479947036b65"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libxext-1.3.7-1-x86_64.pkg.tar.zst" \
+        "ac56905dc51bb652eca5f706fd7e7bb7ea81d4e057a236139fc769ce5ea10cf1"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libxft-2.3.9-1-x86_64.pkg.tar.zst" \
+        "a7841ed8e67dc3f94eca4672c8961329dfdd6b67836f8ac720a246d3aab02ecb"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libxmu-1.3.1-1-x86_64.pkg.tar.zst" \
+        "31870eb5ad1911880cd7b2f3a59292b644d84b873ed62a1a7c36b9ac26bc08a5"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libxpm-3.5.19-1-x86_64.pkg.tar.zst" \
+        "cb4df58d300485410132dcd0deeb209c0ef9a6e8d5280ec0f4cb532aba2c208e"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libxrender-0.9.12-1-x86_64.pkg.tar.zst" \
+        "fed0389073d5b107074eaab48cefcc2716e607865142cde5b579c8ceeefea142"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/libxt-1.3.1-1-x86_64.pkg.tar.zst" \
+        "5d4ee1f73c946cdd9b908b127157d6d826d198be982c91e199daf6bdd7f6b9ec"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/xcb-proto-1.17.0-4-any.pkg.tar.zst" \
+        "98f661ef7c7e05eb7a687e859cf123a92806ceed8f55c0d70ddbac799988239a"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/xorg-xauth-1.1.5-1-x86_64.pkg.tar.zst" \
+        "df9e0d1f29ae0135a49b17157841a4cc7c97869f9f27fd7480fff64f9afb94b7"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/xorg-xinit-1.4.4-1-x86_64.pkg.tar.zst" \
+        "edf4f98e4c787074b3d182daf9eadfacee3ce14785397ccd63fe11f9ffb1c903"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/xorg-xmodmap-1.0.11-2-x86_64.pkg.tar.zst" \
+        "b80ea53e86c02b3c7697c8353ccc41df80278b57f0134f6a608be126a0724bb3"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst" \
+        "e916cb35a6a3031ddd6c6d49d795bcd702dcc532debb911dc97cec715a235c30"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/xorgproto-2025.1-1-any.pkg.tar.zst" \
+        "f7bf3eed570618511fb53cc1bd32c2f1ee82e02662075436a59e6e50436f30de"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/xterm-410-1-x86_64.pkg.tar.zst" \
+        "85b31fbadc47676215007d2fb08115a237e30c385e382d98f7cf6c59a77d9fa9"
     stage_arch_minimal_repo_db \
         "core/os/x86_64/core.db" \
         "45037c1a6abb70a08cd225f1f2e98f6f1a0140117eba54a24843b581bf884a56" \
@@ -392,9 +555,33 @@ stage_arch_offline_pacman_repo() {
     stage_arch_minimal_repo_db \
         "extra/os/x86_64/extra.db" \
         "2c4b923190d67f414ee981a020ca00a9f46c0e4ac44efa33fc067e2369e0387d" \
-        "2b5a0cb4a6e5503a060c6011fb6cacb58c3b990a44829c3b70646641117b94c4" \
+        "1298f235b84b0ad6f48dceb29908a3862d31d22b31fb5ffec0ddaef0f08cbcb3" \
+        "fontconfig-2:2.17.1-1" \
+        "freetype2-2.14.3-1" \
+        "libice-1.1.2-1" \
+        "libpng-1.6.58-1" \
+        "libsm-1.2.6-1" \
+        "libutempter-1.2.3-1" \
+        "libx11-1.8.13-1" \
+        "libxau-1.0.12-1" \
+        "libxaw-1.0.16-2" \
+        "libxcb-1.17.0-1" \
+        "libxdmcp-1.1.5-2" \
+        "libxext-1.3.7-1" \
+        "libxft-2.3.9-1" \
+        "libxmu-1.3.1-1" \
+        "libxpm-3.5.19-1" \
+        "libxrender-0.9.12-1" \
+        "libxt-1.3.1-1" \
         "vim-9.2.0573-1" \
-        "vim-runtime-9.2.0573-1"
+        "vim-runtime-9.2.0573-1" \
+        "xcb-proto-1.17.0-4" \
+        "xorg-xauth-1.1.5-1" \
+        "xorg-xinit-1.4.4-1" \
+        "xorg-xmodmap-1.0.11-2" \
+        "xorg-xrdb-1.2.2-2" \
+        "xorgproto-2025.1-1" \
+        "xterm-410-1"
     stage_arch_pacman_sync_dbs
     stage_arch_pacman_package_cache
     stage_arch_pacman_package_aliases
@@ -592,12 +779,44 @@ case "$src" in
 esac
 
 base=${src##*/}
+if [ ! -e "$src" ]; then
+    case "$src" in
+        *.sig) exit 1 ;;
+    esac
+    echo "missing pacman transfer source: $src" >&2
+    exit 1
+fi
+
 alias=
 case "$base" in
+    fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst) alias=/p/fontconfig ;;
+    freetype2-2.14.3-1-x86_64.pkg.tar.zst) alias=/p/freetype2 ;;
     gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst) alias=/p/g ;;
+    libice-1.1.2-1-x86_64.pkg.tar.zst) alias=/p/libice ;;
+    libpng-1.6.58-1-x86_64.pkg.tar.zst) alias=/p/libpng ;;
+    libsm-1.2.6-1-x86_64.pkg.tar.zst) alias=/p/libsm ;;
+    libutempter-1.2.3-1-x86_64.pkg.tar.zst) alias=/p/libutempter ;;
+    libx11-1.8.13-1-x86_64.pkg.tar.zst) alias=/p/libx11 ;;
+    libxau-1.0.12-1-x86_64.pkg.tar.zst) alias=/p/libxau ;;
+    libxaw-1.0.16-2-x86_64.pkg.tar.zst) alias=/p/libxaw ;;
+    libxcb-1.17.0-1-x86_64.pkg.tar.zst) alias=/p/libxcb ;;
+    libxdmcp-1.1.5-2-x86_64.pkg.tar.zst) alias=/p/libxdmcp ;;
+    libxext-1.3.7-1-x86_64.pkg.tar.zst) alias=/p/libxext ;;
+    libxft-2.3.9-1-x86_64.pkg.tar.zst) alias=/p/libxft ;;
+    libxmu-1.3.1-1-x86_64.pkg.tar.zst) alias=/p/libxmu ;;
+    libxpm-3.5.19-1-x86_64.pkg.tar.zst) alias=/p/libxpm ;;
+    libxrender-0.9.12-1-x86_64.pkg.tar.zst) alias=/p/libxrender ;;
+    libxt-1.3.1-1-x86_64.pkg.tar.zst) alias=/p/libxt ;;
     nano-9.0-1-x86_64.pkg.tar.zst) alias=/p/n ;;
     vim-9.2.0573-1-x86_64.pkg.tar.zst) alias=/p/v ;;
     vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst) alias=/p/r ;;
+    xcb-proto-1.17.0-4-any.pkg.tar.zst) alias=/p/xcb-proto ;;
+    xorg-xauth-1.1.5-1-x86_64.pkg.tar.zst) alias=/p/xorg-xauth ;;
+    xorg-xinit-1.4.4-1-x86_64.pkg.tar.zst) alias=/p/xorg-xinit ;;
+    xorg-xmodmap-1.0.11-2-x86_64.pkg.tar.zst) alias=/p/xorg-xmodmap ;;
+    xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst) alias=/p/xorg-xrdb ;;
+    xorgproto-2025.1-1-any.pkg.tar.zst) alias=/p/xorgproto ;;
+    xterm-410-1-x86_64.pkg.tar.zst) alias=/p/xterm ;;
 esac
 
 if [ -n "$alias" ]; then
@@ -608,6 +827,93 @@ else
 fi
 EOF
     chmod 755 "$S/$ARCH_PACMAN_XFER_HELPER"
+
+    write_file "$S/$ARCH_SYSTEMD_HOOK_SCRIPT" <<'EOF'
+#!/bin/sh -e
+
+skip_chrooted() {
+  if systemd-detect-virt --chroot >/dev/null 2>/dev/null; then
+    echo >&2 "  Skipped: Running in chroot."
+    exit 0
+  fi
+}
+
+systemd_live() {
+  skip_chrooted
+
+  if ! systemd-notify --booted; then
+    echo >&2 "  Skipped: Current root is not booted."
+    exit 0
+  fi
+}
+
+skip_live_service_hook() {
+  skip_chrooted
+  echo >&2 "  Skipped: live systemd service-manager package hook is disabled on Lupos."
+}
+
+udevd_live() {
+  systemd_live
+
+  if [ ! -S /run/udev/control ]; then
+    echo >&2 "  Skipped: Device manager is not running."
+    exit 0
+  fi
+}
+
+op="$1"; shift
+
+case "$op" in
+  binfmt)
+    systemd_live
+    /usr/lib/systemd/systemd-binfmt
+    ;;
+  catalog)
+    /usr/bin/journalctl --update-catalog
+    ;;
+  daemon-reload-system)
+    skip_live_service_hook
+    ;;
+  daemon-reload-user)
+    skip_live_service_hook
+    ;;
+  hwdb)
+    /usr/bin/systemd-hwdb --usr update
+    ;;
+  sysctl)
+    systemd_live
+    /usr/lib/systemd/systemd-sysctl
+    ;;
+  sysusers)
+    /usr/bin/systemd-sysusers
+    ;;
+  tmpfiles)
+    /usr/bin/systemd-tmpfiles --create
+    ;;
+  update)
+    touch -c /usr
+    ;;
+  udev-reload)
+    skip_live_service_hook
+    ;;
+  enqueue-marked)
+    skip_live_service_hook
+    ;;
+  reload)
+    skip_live_service_hook
+    ;;
+  restart)
+    skip_live_service_hook
+    ;;
+  *)
+    echo >&2 "  Invalid operation '$op'"
+    exit 1
+    ;;
+esac
+
+exit 0
+EOF
+    chmod 755 "$S/$ARCH_SYSTEMD_HOOK_SCRIPT"
     stage_arch_offline_pacman_repo
     install_arch_graphics_packages
 
@@ -648,6 +954,9 @@ EOF
 
     write_file "$S/etc/systemd/system/getty@tty1.service.d/lupos.conf" <<'EOF'
 [Service]
+Type=simple
+Restart=always
+RestartSec=0
 ExecStart=
 ExecStart=-/sbin/agetty --noclear --nohostname tty1 linux
 EOF
@@ -693,6 +1002,7 @@ validate_stage() {
     pacman_config_ready "$STAGE" || die "staged pacman config must disable sandboxing, define direct offline repo servers, use the Lupos transfer helper, and avoid DownloadUser"
     pacman_offline_repo_ready "$STAGE" || die "staged offline pacman repo is missing pinned database/package files or preseeded sync databases"
     pam_systemd_ready "$STAGE" || die "staged PAM systemd session hook is missing"
+    systemd_hook_ready "$STAGE" || die "staged systemd package hook wrapper is stale"
     graphics_stage_ready "$STAGE" || die "staged graphics profile is missing X11 packages"
     : > "$STAGE_STAMP"
 }

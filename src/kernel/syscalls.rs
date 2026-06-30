@@ -16,6 +16,7 @@ use crate::arch::x86::kernel::uaccess;
 use crate::include::uapi::errno::{
     E2BIG, EBADF, EFAULT, EINTR, EINVAL, ENODEV, ENOENT, ENOMEM, ENOSYS, ENOTSUP, EPERM, ESRCH,
 };
+use crate::include::uapi::fcntl::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use crate::kernel::{capability, cred, sched, session};
 
 use super::task::TaskStruct;
@@ -1133,22 +1134,32 @@ pub unsafe fn sys_utimes(filename: *const u8, times: *const TimeVal) -> i64 {
     unsafe { sys_utime(filename, times) }
 }
 
-pub unsafe fn sys_futimesat(_dfd: i32, filename: *const u8, times: *const TimeVal) -> i64 {
+pub unsafe fn sys_futimesat(dfd: i32, filename: *const u8, times: *const TimeVal) -> i64 {
+    if filename.is_null() {
+        return if dfd == AT_FDCWD { -(EFAULT as i64) } else { 0 };
+    }
     unsafe { sys_utime(filename, times) }
 }
 
 pub unsafe fn sys_utimensat(
-    _dfd: i32,
+    dfd: i32,
     filename: *const u8,
     _times: *const crate::kernel::time::Timespec64,
     flags: i32,
 ) -> i64 {
-    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
-    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+    let allowed = (AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) as i32;
+    if flags & !allowed != 0 {
         return -(EINVAL as i64);
     }
     if filename.is_null() {
-        return -(EFAULT as i64);
+        if dfd != AT_FDCWD && flags == 0 {
+            return 0;
+        }
+        return if dfd != AT_FDCWD {
+            -(EINVAL as i64)
+        } else {
+            -(EFAULT as i64)
+        };
     }
     0
 }
