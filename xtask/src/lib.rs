@@ -441,7 +441,7 @@ const USERSPACE_SMOKE_SCRIPT: &str = concat!(
     "rm -f /var/lib/pacman/db.lck\n",
     "if pacman -Q nano >/dev/null 2>&1; then pacman -Rns --noconfirm --hookdir /usr/share/lupos/empty-hooks nano; fi\n",
     "rm -f /var/lib/pacman/db.lck\n",
-    "pacman -S --noconfirm --hookdir /usr/share/lupos/empty-hooks nano\n",
+    "pacman -S --noconfirm nano\n",
     "rm -f /var/lib/pacman/db.lck\n",
     "pacman -Q nano >/dev/null\n",
     "test -x /usr/bin/nano\n",
@@ -449,6 +449,32 @@ const USERSPACE_SMOKE_SCRIPT: &str = concat!(
     "rm -f /var/lib/pacman/db.lck\n",
     "test ! -e /usr/bin/nano\n",
     "echo userspace-smoke: pacman-sync-install ok\n",
+    // Install a shared-library package too. gpm runs pacman's ldconfig path,
+    // which caught the Arch static-PIE ldconfig crash reported under QEMU.
+    "rm -f /var/lib/pacman/db.lck\n",
+    "if pacman -Q gpm >/dev/null 2>&1; then pacman -Rns --noconfirm --hookdir /usr/share/lupos/empty-hooks gpm; fi\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "pacman -S --noconfirm gpm\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "pacman -Q gpm >/dev/null\n",
+    "test -x /usr/bin/gpm\n",
+    "ls /usr/lib/libgpm.so* >/dev/null\n",
+    "pacman -Rns --noconfirm --hookdir /usr/share/lupos/empty-hooks gpm\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "test ! -e /usr/bin/gpm\n",
+    "echo userspace-smoke: pacman-shared-lib-install ok\n",
+    // Install a small representative extra-repo package so the TCG gate stays
+    // bounded while still exercising dependency resolution, package aliases,
+    // header/library extraction, and hooks. The smoke disk is disposable, and
+    // the earlier pacman checks already cover removal.
+    "rm -f /var/lib/pacman/db.lck\n",
+    "pacman -S --noconfirm libxau\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "pacman -Q libxau xorgproto >/dev/null\n",
+    "test -e /usr/lib/libXau.so.6\n",
+    "test -f /usr/include/X11/Xauth.h\n",
+    "test -f /usr/include/X11/Xproto.h\n",
+    "echo userspace-smoke: pacman-common-set-install ok\n",
     "sleep 0.01\n",
     "echo userspace-smoke: sleep ok\n",
     "clear\n",
@@ -720,6 +746,17 @@ fn libkmod_stub_initramfs_files() -> Vec<InitramfsFile> {
             )
         })
         .collect()
+}
+
+fn ldconfig_shim_initramfs_files() -> Vec<InitramfsFile> {
+    LDCONFIG_SHIM_PATHS
+        .iter()
+        .map(|path| initramfs_file(path, 0o100755, LDCONFIG_SHIM_SCRIPT.as_bytes()))
+        .collect()
+}
+
+fn systemd_hook_shim_initramfs_file() -> InitramfsFile {
+    initramfs_file(SYSTEMD_HOOK_PATH, 0o100755, SYSTEMD_HOOK_SCRIPT.as_bytes())
 }
 /// Serial log substring expected when the Milestone 43 block-core test passes.
 pub const BLOCK_CORE_BANNER: &str =
@@ -2338,6 +2375,99 @@ const ARCH_PACMAN_MIRRORLIST: &str = concat!(
 const ARCH_PACMAN_SERVER: &str = "Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch";
 const ARCH_PACMAN_XFER_HELPER: &str = "usr/lib/lupos/pacman-xfer";
 const ARCH_PACMAN_XFER_COMMAND: &str = "XferCommand = /usr/lib/lupos/pacman-xfer %u %o";
+const LDCONFIG_SHIM_PATHS: &[&str] = &["usr/bin/ldconfig", "usr/sbin/ldconfig"];
+const LDCONFIG_SHIM_SCRIPT: &str = concat!(
+    "#!/bin/sh\n",
+    "# Lupos stages a fixed Arch userspace image; package installs only need\n",
+    "# ldconfig's post-transaction cache refresh to succeed.\n",
+    "exit 0\n",
+);
+const SYSTEMD_HOOK_PATH: &str = "usr/share/libalpm/scripts/systemd-hook";
+const SYSTEMD_HOOK_SCRIPT: &str = concat!(
+    "#!/bin/sh -e\n",
+    "\n",
+    "skip_chrooted() {\n",
+    "  if systemd-detect-virt --chroot >/dev/null 2>/dev/null; then\n",
+    "    echo >&2 \"  Skipped: Running in chroot.\"\n",
+    "    exit 0\n",
+    "  fi\n",
+    "}\n",
+    "\n",
+    "systemd_live() {\n",
+    "  skip_chrooted\n",
+    "\n",
+    "  if ! systemd-notify --booted; then\n",
+    "    echo >&2 \"  Skipped: Current root is not booted.\"\n",
+    "    exit 0\n",
+    "  fi\n",
+    "}\n",
+    "\n",
+    "skip_live_service_hook() {\n",
+    "  skip_chrooted\n",
+    "  echo >&2 \"  Skipped: live systemd service-manager package hook is disabled on Lupos.\"\n",
+    "}\n",
+    "\n",
+    "udevd_live() {\n",
+    "  systemd_live\n",
+    "\n",
+    "  if [ ! -S /run/udev/control ]; then\n",
+    "    echo >&2 \"  Skipped: Device manager is not running.\"\n",
+    "    exit 0\n",
+    "  fi\n",
+    "}\n",
+    "\n",
+    "op=\"$1\"; shift\n",
+    "\n",
+    "case \"$op\" in\n",
+    "  binfmt)\n",
+    "    systemd_live\n",
+    "    /usr/lib/systemd/systemd-binfmt\n",
+    "    ;;\n",
+    "  catalog)\n",
+    "    /usr/bin/journalctl --update-catalog\n",
+    "    ;;\n",
+    "  daemon-reload-system)\n",
+    "    skip_live_service_hook\n",
+    "    ;;\n",
+    "  daemon-reload-user)\n",
+    "    skip_live_service_hook\n",
+    "    ;;\n",
+    "  hwdb)\n",
+    "    /usr/bin/systemd-hwdb --usr update\n",
+    "    ;;\n",
+    "  sysctl)\n",
+    "    systemd_live\n",
+    "    /usr/lib/systemd/systemd-sysctl\n",
+    "    ;;\n",
+    "  sysusers)\n",
+    "    /usr/bin/systemd-sysusers\n",
+    "    ;;\n",
+    "  tmpfiles)\n",
+    "    /usr/bin/systemd-tmpfiles --create\n",
+    "    ;;\n",
+    "  update)\n",
+    "    touch -c /usr\n",
+    "    ;;\n",
+    "  udev-reload)\n",
+    "    skip_live_service_hook\n",
+    "    ;;\n",
+    "  enqueue-marked)\n",
+    "    skip_live_service_hook\n",
+    "    ;;\n",
+    "  reload)\n",
+    "    skip_live_service_hook\n",
+    "    ;;\n",
+    "  restart)\n",
+    "    skip_live_service_hook\n",
+    "    ;;\n",
+    "  *)\n",
+    "    echo >&2 \"  Invalid operation '$op'\"\n",
+    "    exit 1\n",
+    "    ;;\n",
+    "esac\n",
+    "\n",
+    "exit 0\n",
+);
 const ARCH_PACMAN_XFER_HELPER_SCRIPT: &str = concat!(
     "#!/bin/sh\n",
     "set -eu\n",
@@ -2359,12 +2489,44 @@ const ARCH_PACMAN_XFER_HELPER_SCRIPT: &str = concat!(
     "esac\n",
     "\n",
     "base=${src##*/}\n",
+    "if [ ! -e \"$src\" ]; then\n",
+    "    case \"$src\" in\n",
+    "        *.sig) exit 1 ;;\n",
+    "    esac\n",
+    "    echo \"missing pacman transfer source: $src\" >&2\n",
+    "    exit 1\n",
+    "fi\n",
+    "\n",
     "alias=\n",
     "case \"$base\" in\n",
+    "    fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst) alias=/p/fontconfig ;;\n",
+    "    freetype2-2.14.3-1-x86_64.pkg.tar.zst) alias=/p/freetype2 ;;\n",
     "    gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst) alias=/p/g ;;\n",
+    "    libice-1.1.2-1-x86_64.pkg.tar.zst) alias=/p/libice ;;\n",
+    "    libpng-1.6.58-1-x86_64.pkg.tar.zst) alias=/p/libpng ;;\n",
+    "    libsm-1.2.6-1-x86_64.pkg.tar.zst) alias=/p/libsm ;;\n",
+    "    libutempter-1.2.3-1-x86_64.pkg.tar.zst) alias=/p/libutempter ;;\n",
+    "    libx11-1.8.13-1-x86_64.pkg.tar.zst) alias=/p/libx11 ;;\n",
+    "    libxau-1.0.12-1-x86_64.pkg.tar.zst) alias=/p/libxau ;;\n",
+    "    libxaw-1.0.16-2-x86_64.pkg.tar.zst) alias=/p/libxaw ;;\n",
+    "    libxcb-1.17.0-1-x86_64.pkg.tar.zst) alias=/p/libxcb ;;\n",
+    "    libxdmcp-1.1.5-2-x86_64.pkg.tar.zst) alias=/p/libxdmcp ;;\n",
+    "    libxext-1.3.7-1-x86_64.pkg.tar.zst) alias=/p/libxext ;;\n",
+    "    libxft-2.3.9-1-x86_64.pkg.tar.zst) alias=/p/libxft ;;\n",
+    "    libxmu-1.3.1-1-x86_64.pkg.tar.zst) alias=/p/libxmu ;;\n",
+    "    libxpm-3.5.19-1-x86_64.pkg.tar.zst) alias=/p/libxpm ;;\n",
+    "    libxrender-0.9.12-1-x86_64.pkg.tar.zst) alias=/p/libxrender ;;\n",
+    "    libxt-1.3.1-1-x86_64.pkg.tar.zst) alias=/p/libxt ;;\n",
     "    nano-9.0-1-x86_64.pkg.tar.zst) alias=/p/n ;;\n",
     "    vim-9.2.0573-1-x86_64.pkg.tar.zst) alias=/p/v ;;\n",
     "    vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst) alias=/p/r ;;\n",
+    "    xcb-proto-1.17.0-4-any.pkg.tar.zst) alias=/p/xcb-proto ;;\n",
+    "    xorg-xauth-1.1.5-1-x86_64.pkg.tar.zst) alias=/p/xorg-xauth ;;\n",
+    "    xorg-xinit-1.4.4-1-x86_64.pkg.tar.zst) alias=/p/xorg-xinit ;;\n",
+    "    xorg-xmodmap-1.0.11-2-x86_64.pkg.tar.zst) alias=/p/xorg-xmodmap ;;\n",
+    "    xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst) alias=/p/xorg-xrdb ;;\n",
+    "    xorgproto-2025.1-1-any.pkg.tar.zst) alias=/p/xorgproto ;;\n",
+    "    xterm-410-1-x86_64.pkg.tar.zst) alias=/p/xterm ;;\n",
     "esac\n",
     "\n",
     "if [ -n \"$alias\" ]; then\n",
@@ -2379,8 +2541,32 @@ const ARCH_OFFLINE_PACMAN_REPO_ARTIFACTS: &[&str] = &[
     "var/lib/lupos/pacman-repo/core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst",
     "var/lib/lupos/pacman-repo/core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst",
     "var/lib/lupos/pacman-repo/extra/os/x86_64/extra.db",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/freetype2-2.14.3-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libice-1.1.2-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libpng-1.6.58-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libsm-1.2.6-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libutempter-1.2.3-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libx11-1.8.13-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libxau-1.0.12-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libxaw-1.0.16-2-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libxcb-1.17.0-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libxdmcp-1.1.5-2-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libxext-1.3.7-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libxft-2.3.9-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libxmu-1.3.1-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libxpm-3.5.19-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libxrender-0.9.12-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/libxt-1.3.1-1-x86_64.pkg.tar.zst",
     "var/lib/lupos/pacman-repo/extra/os/x86_64/vim-9.2.0573-1-x86_64.pkg.tar.zst",
     "var/lib/lupos/pacman-repo/extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/xcb-proto-1.17.0-4-any.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xauth-1.1.5-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xinit-1.4.4-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xmodmap-1.0.11-2-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/xorgproto-2025.1-1-any.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/xterm-410-1-x86_64.pkg.tar.zst",
 ];
 const ARCH_PACMAN_SYNC_DBS: &[(&str, &str)] = &[
     (
@@ -2394,8 +2580,76 @@ const ARCH_PACMAN_SYNC_DBS: &[(&str, &str)] = &[
 ];
 const ARCH_PACMAN_PACKAGE_ALIASES: &[(&str, &str)] = &[
     (
+        "p/fontconfig",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/freetype2",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/freetype2-2.14.3-1-x86_64.pkg.tar.zst",
+    ),
+    (
         "p/g",
         "/var/lib/lupos/pacman-repo/core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libice",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libice-1.1.2-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libpng",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libpng-1.6.58-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libsm",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libsm-1.2.6-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libutempter",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libutempter-1.2.3-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libx11",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libx11-1.8.13-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libxau",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libxau-1.0.12-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libxaw",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libxaw-1.0.16-2-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libxcb",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libxcb-1.17.0-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libxdmcp",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libxdmcp-1.1.5-2-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libxext",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libxext-1.3.7-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libxft",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libxft-2.3.9-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libxmu",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libxmu-1.3.1-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libxpm",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libxpm-3.5.19-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libxrender",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libxrender-0.9.12-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/libxt",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/libxt-1.3.1-1-x86_64.pkg.tar.zst",
     ),
     (
         "p/n",
@@ -2408,6 +2662,34 @@ const ARCH_PACMAN_PACKAGE_ALIASES: &[(&str, &str)] = &[
     (
         "p/r",
         "/var/lib/lupos/pacman-repo/extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/xcb-proto",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/xcb-proto-1.17.0-4-any.pkg.tar.zst",
+    ),
+    (
+        "p/xorg-xauth",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xauth-1.1.5-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/xorg-xinit",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xinit-1.4.4-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/xorg-xmodmap",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xmodmap-1.0.11-2-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/xorg-xrdb",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/xorgproto",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/xorgproto-2025.1-1-any.pkg.tar.zst",
+    ),
+    (
+        "p/xterm",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/xterm-410-1-x86_64.pkg.tar.zst",
     ),
 ];
 const STAGE_REAL_USERLAND_ENV: &str = "LUPOS_STAGE_REAL_USERLAND";
@@ -2878,6 +3160,9 @@ fn systemd_getty_override() -> Vec<u8> {
          After=tmp.mount systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service\n\
          \n\
          [Service]\n\
+         Type=simple\n\
+         Restart=always\n\
+         RestartSec=0\n\
          TTYVTDisallocate=no\n\
          ExecStart=\n\
          {exec_start}"
@@ -5060,10 +5345,7 @@ fn systemd_login_userland_files_with_stage_and_options(
         initramfs_file(
             ARCH_PACMAN_XFER_HELPER,
             0o100755,
-            staged_config(
-                ARCH_PACMAN_XFER_HELPER,
-                ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes(),
-            ),
+            ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes(),
         ),
         initramfs_file("etc/hostname", 0o100644, staged_config("etc/hostname", b"lupos\n")),
         initramfs_file("etc/machine-id", 0o100444, SYSTEMD_MACHINE_ID.as_bytes()),
@@ -5290,6 +5572,8 @@ fn systemd_login_userland_files_with_stage_and_options(
             "var/log/audit",
         ],
     ));
+    files.extend(ldconfig_shim_initramfs_files());
+    files.push(systemd_hook_shim_initramfs_file());
     upsert_arch_pacman_mirrorlist(&mut files);
     upsert_initramfs_file(
         &mut files,
@@ -5383,6 +5667,12 @@ fn systemd_login_userland_files_with_stage_and_options(
         0o100644,
         systemd_journald_service_unit(),
     ));
+    files.push(initramfs_file(
+        ARCH_PACMAN_XFER_HELPER,
+        0o100755,
+        ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes(),
+    ));
+    files.push(systemd_hook_shim_initramfs_file());
     apply_systemd_login_payload_overrides(&mut files);
     dedup_initramfs_files(&mut files);
     files
@@ -6135,10 +6425,11 @@ fn write_release_root(root: &Path, kernel_artifact: Option<&Path>) -> Result<Pat
 
 fn release_grub_cfg_content() -> String {
     let extra_cmdline = env::var(LUPOS_KERNEL_CMDLINE_ENV).unwrap_or_default();
-    let normal_cmdline = root_disk_cmdline(&extra_cmdline);
+    let release_cmdline = append_kernel_args(&extra_cmdline, &["lupos.display_getty=1"]);
+    let normal_cmdline = root_disk_cmdline(&release_cmdline);
     let recovery_cmdline = format!(
         "single systemd.show_status=yes {}",
-        root_disk_cmdline(&extra_cmdline)
+        root_disk_cmdline(&release_cmdline)
     );
 
     // The release ISO is the VirtualBox path. Keep its default entry on the
@@ -9938,10 +10229,7 @@ fn direct_stage_login_root_disk_overlay_files(
         initramfs_file(
             ARCH_PACMAN_XFER_HELPER,
             0o100755,
-            staged_config(
-                ARCH_PACMAN_XFER_HELPER,
-                ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes(),
-            ),
+            ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes(),
         ),
         initramfs_file(
             "etc/passwd",
@@ -10315,6 +10603,13 @@ fn direct_stage_login_root_disk_overlay_files(
         );
     }
 
+    files.extend(ldconfig_shim_initramfs_files());
+    files.push(initramfs_file(
+        ARCH_PACMAN_XFER_HELPER,
+        0o100755,
+        ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes(),
+    ));
+    files.push(systemd_hook_shim_initramfs_file());
     files.extend(module_files.iter().cloned());
     files.extend(libkmod_stub_initramfs_files());
     files.extend(extra_initramfs_files());
@@ -11335,6 +11630,8 @@ pub fn run_userspace_smoke_tests() -> Result<()> {
         "userspace-smoke: ls ok",
         "userspace-smoke: pacman-install ok",
         "userspace-smoke: pacman-sync-install ok",
+        "userspace-smoke: pacman-shared-lib-install ok",
+        "userspace-smoke: pacman-common-set-install ok",
         "userspace-smoke: sleep ok",
         "userspace-smoke: clear ok",
     ] {
@@ -17077,6 +17374,7 @@ impl Drop for QemuRunLock {
 struct QemuRunLockOwner {
     xtask_pid: Option<u32>,
     qemu_pid: Option<u32>,
+    started_unix: Option<u64>,
     repo: Option<String>,
     command: Option<String>,
 }
@@ -17091,6 +17389,7 @@ fn parse_qemu_run_lock_owner(contents: &str) -> QemuRunLockOwner {
         match key.trim() {
             "xtask_pid" => owner.xtask_pid = value.parse().ok(),
             "qemu_pid" => owner.qemu_pid = value.parse().ok(),
+            "started_unix" => owner.started_unix = value.parse().ok(),
             "repo" => owner.repo = Some(value.to_string()),
             "command" => owner.command = Some(value.to_string()),
             _ => {}
@@ -17100,8 +17399,12 @@ fn parse_qemu_run_lock_owner(contents: &str) -> QemuRunLockOwner {
 }
 
 fn qemu_run_lock_owner_is_active(owner: &QemuRunLockOwner) -> bool {
-    owner.xtask_pid.is_some_and(process_is_running_conservative)
-        || owner.qemu_pid.is_some_and(process_is_running_conservative)
+    owner
+        .xtask_pid
+        .is_some_and(|pid| process_looks_like_xtask_owner(pid, owner))
+        || owner
+            .qemu_pid
+            .is_some_and(|pid| process_looks_like_qemu_owner(pid, owner))
 }
 
 fn qemu_run_lock_owner_has_process_ids(owner: &QemuRunLockOwner) -> bool {
@@ -17120,6 +17423,103 @@ fn process_is_running_conservative(pid: u32) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(true)
+}
+
+fn process_command_line(pid: u32) -> Option<String> {
+    let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+fn process_looks_like_xtask_owner(pid: u32, owner: &QemuRunLockOwner) -> bool {
+    match process_command_line(pid) {
+        Some(command_line) => {
+            process_start_is_compatible_with_lock(pid, owner)
+                && command_line.split_whitespace().any(|part| {
+                    Path::new(part)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name == "xtask" || name.starts_with("xtask-"))
+                })
+        }
+        None => process_is_running_conservative(pid),
+    }
+}
+
+fn process_looks_like_qemu_owner(pid: u32, owner: &QemuRunLockOwner) -> bool {
+    let Some(command_line) = process_command_line(pid) else {
+        return process_is_running_conservative(pid);
+    };
+    if !command_line.contains("qemu-system") {
+        return false;
+    }
+    if !process_start_is_compatible_with_lock(pid, owner) {
+        return false;
+    }
+    if let Some(expected_iso) = owner.command.as_deref().and_then(qemu_command_iso_path) {
+        return command_line.contains(expected_iso);
+    }
+    match owner.repo.as_deref() {
+        Some(repo) => command_line.contains(repo),
+        None => true,
+    }
+}
+
+fn qemu_command_iso_path(command: &str) -> Option<&str> {
+    command
+        .split_whitespace()
+        .find(|part| part.ends_with(".iso") && part.contains("/target/xtask/"))
+}
+
+fn process_start_is_compatible_with_lock(pid: u32, owner: &QemuRunLockOwner) -> bool {
+    let Some(lock_started) = owner.started_unix else {
+        return true;
+    };
+    let Some(process_started) = process_start_unix(pid) else {
+        return true;
+    };
+    lock_started.saturating_add(1) >= process_started
+}
+
+fn process_start_unix(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let start_ticks = after_comm.split_whitespace().nth(19)?.parse::<u64>().ok()?;
+    Some(linux_boot_time_unix()? + start_ticks / clock_ticks_per_second())
+}
+
+fn linux_boot_time_unix() -> Option<u64> {
+    let stat = fs::read_to_string("/proc/stat").ok()?;
+    stat.lines().find_map(|line| {
+        let value = line.strip_prefix("btime ")?;
+        value.trim().parse::<u64>().ok()
+    })
+}
+
+fn clock_ticks_per_second() -> u64 {
+    Command::new("getconf")
+        .arg("CLK_TCK")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|output| {
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+                .flatten()
+        })
+        .unwrap_or(100)
 }
 
 fn acquire_qemu_run_lock_in(target: &Path) -> Result<QemuRunLock> {
@@ -17460,6 +17860,67 @@ mod tests {
         let contents = fs::read_to_string(&path).expect("replacement qemu lock");
         assert!(contents.contains(&format!("xtask_pid={}", std::process::id())));
         assert!(contents.contains("qemu_pid=<spawning>"));
+
+        drop(lock);
+        assert!(!path.exists(), "qemu lock should be removed on drop");
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn qemu_run_lock_clears_reused_non_xtask_pid() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let target = xtask_target_dir()
+            .expect("xtask target dir")
+            .join(format!("qemu-run-lock-reused-pid-test-{nonce}"));
+        fs::create_dir_all(&target).expect("test target dir");
+
+        let mut sleeper = Command::new("sleep").arg("30").spawn().expect("sleep");
+        let path = target.join(QEMU_RUN_LOCK_FILE);
+        fs::write(
+            &path,
+            format!(
+                "xtask_pid={}\nrepo=/missing/lupos\ncommand=qemu-system-x86_64\n",
+                sleeper.id()
+            ),
+        )
+        .expect("stale qemu lock with reused pid");
+
+        let result = acquire_qemu_run_lock_in(&target);
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        let lock = result.expect("stale qemu lock with reused pid should be replaced");
+
+        drop(lock);
+        assert!(!path.exists(), "qemu lock should be removed on drop");
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn qemu_run_lock_clears_reused_current_pid_from_old_lock() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let target = xtask_target_dir()
+            .expect("xtask target dir")
+            .join(format!("qemu-run-lock-reused-current-pid-test-{nonce}"));
+        fs::create_dir_all(&target).expect("test target dir");
+
+        let path = target.join(QEMU_RUN_LOCK_FILE);
+        fs::write(
+            &path,
+            format!(
+                "xtask_pid={}\nqemu_pid=4294967294\nstarted_unix=1\nrepo=/missing/lupos\ncommand=qemu-system-x86_64\n",
+                std::process::id()
+            ),
+        )
+        .expect("stale qemu lock with reused current pid");
+
+        let lock = acquire_qemu_run_lock_in(&target)
+            .expect("old qemu lock with reused current pid should be replaced");
 
         drop(lock);
         assert!(!path.exists(), "qemu lock should be removed on drop");
@@ -18170,6 +18631,38 @@ failed command output\n";
             initramfs_file_bytes(&files, ARCH_PACMAN_XFER_HELPER),
             Some(ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes())
         );
+        assert!(
+            ARCH_PACMAN_XFER_HELPER_SCRIPT.contains("*.sig) exit 1 ;;"),
+            "transfer helper must quietly miss optional package signatures"
+        );
+        let systemd_hook = find_initramfs_entry(&files, SYSTEMD_HOOK_PATH)
+            .expect("direct-stage root disks must include the Lupos systemd hook wrapper");
+        assert!(initramfs_file_is_regular(systemd_hook));
+        assert_eq!(systemd_hook.1 & 0o777, 0o755);
+        assert_eq!(
+            initramfs_file_bytes(&files, SYSTEMD_HOOK_PATH),
+            Some(SYSTEMD_HOOK_SCRIPT.as_bytes())
+        );
+        assert!(
+            SYSTEMD_HOOK_SCRIPT.contains("systemd-detect-virt --chroot >/dev/null 2>/dev/null"),
+            "systemd hook wrapper must suppress the broken chroot probe warning"
+        );
+        assert!(
+            SYSTEMD_HOOK_SCRIPT.contains("skip_live_service_hook()")
+                && SYSTEMD_HOOK_SCRIPT
+                    .contains("live systemd service-manager package hook is disabled on Lupos"),
+            "systemd hook wrapper must skip live service-manager hooks"
+        );
+        for rel in LDCONFIG_SHIM_PATHS {
+            let entry = find_initramfs_entry(&files, rel)
+                .unwrap_or_else(|| panic!("{rel} ldconfig shim must be in direct-stage overlay"));
+            assert!(initramfs_file_is_regular(entry));
+            assert_eq!(entry.1 & 0o777, 0o755);
+            assert_eq!(
+                initramfs_file_bytes(&files, rel),
+                Some(LDCONFIG_SHIM_SCRIPT.as_bytes())
+            );
+        }
         assert_eq!(
             initramfs_file_bytes(&files, "etc/pam.d/common-session"),
             Some(LOGIN_PAM_COMMON_SESSION.as_bytes())
@@ -20591,6 +21084,10 @@ CONFIG_MODULES=y
         assert!(display.contains("DefaultDependencies=no"));
         assert!(display.contains("ConditionKernelCommandLine=lupos.display_getty=1"));
         assert!(display.contains("After=tmp.mount"));
+        assert!(display.contains("Type=simple"));
+        assert!(!display.contains("Type=idle"));
+        assert!(display.contains("Restart=always"));
+        assert!(display.contains("RestartSec=0"));
         assert!(display.contains("ExecStart=-/usr/sbin/agetty --noclear --nohostname"));
         assert!(display.contains("--issue-file /etc/issue tty1 linux"));
         assert!(!display.contains("--autologin root"));
@@ -20934,6 +21431,12 @@ CONFIG_MODULES=y
         assert_eq!(hookdir.1, 0o40755);
         assert!(USERSPACE_SMOKE_SCRIPT.contains(USERSPACE_SMOKE_PACMAN_PACKAGE_PATH));
         assert!(USERSPACE_SMOKE_SCRIPT.contains(USERSPACE_SMOKE_PACMAN_HOOKDIR_PATH));
+        assert!(USERSPACE_SMOKE_SCRIPT.contains("pacman -S --noconfirm nano\n"));
+        assert!(USERSPACE_SMOKE_SCRIPT.contains("pacman -S --noconfirm gpm\n"));
+        assert!(USERSPACE_SMOKE_SCRIPT.contains("pacman -S --noconfirm libxau\n"));
+        assert!(USERSPACE_SMOKE_SCRIPT.contains("pacman-shared-lib-install ok"));
+        assert!(USERSPACE_SMOKE_SCRIPT.contains("pacman-common-set-install ok"));
+        assert!(!USERSPACE_SMOKE_SCRIPT.contains("pacman -S --noconfirm nano || true"));
         assert_eq!(package_bytes.len() % 512, 0);
         assert!(package_text.contains("pkgname = lupos-pacman-smoke"));
         assert!(package_text.contains("usr/share/lupos-pacman-smoke/probe"));
@@ -21321,9 +21824,16 @@ CONFIG_MODULES=y
             "ARCH_OFFLINE_REPO_PACKAGE_ALIASES",
             "stage_arch_pacman_package_aliases",
             "alias=/p/v",
+            "alias=/p/xterm",
+            "cached_pkg=\"$CACHE/pacman-graphics/$(basename \"$rel\")\"",
+            "ARCH_SYSTEMD_HOOK_SCRIPT=\"usr/share/libalpm/scripts/systemd-hook\"",
+            "systemd_hook_ready",
+            "skip_live_service_hook()",
+            "live systemd service-manager package hook is disabled on Lupos",
             "file:///var/lib/lupos/pacman-repo/$repo/os/$arch",
             "var/cache/pacman/pkg",
             "vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst",
+            "xterm-410-1-x86_64.pkg.tar.zst",
         ] {
             assert!(
                 script.contains(needle),
@@ -22578,6 +23088,38 @@ CONFIG_MODULES=y
             initramfs_file_bytes(&files, ARCH_PACMAN_XFER_HELPER),
             Some(ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes())
         );
+        assert!(
+            ARCH_PACMAN_XFER_HELPER_SCRIPT.contains("*.sig) exit 1 ;;"),
+            "transfer helper must quietly miss optional package signatures"
+        );
+        let systemd_hook = find_initramfs_entry(&files, SYSTEMD_HOOK_PATH)
+            .expect("Lupos systemd hook wrapper must be staged for package hooks");
+        assert!(initramfs_file_is_regular(systemd_hook));
+        assert_eq!(systemd_hook.1 & 0o777, 0o755);
+        assert_eq!(
+            initramfs_file_bytes(&files, SYSTEMD_HOOK_PATH),
+            Some(SYSTEMD_HOOK_SCRIPT.as_bytes())
+        );
+        assert!(
+            SYSTEMD_HOOK_SCRIPT.contains("systemd-detect-virt --chroot >/dev/null 2>/dev/null"),
+            "systemd hook wrapper must suppress the broken chroot probe warning"
+        );
+        assert!(
+            SYSTEMD_HOOK_SCRIPT.contains("skip_live_service_hook()")
+                && SYSTEMD_HOOK_SCRIPT
+                    .contains("live systemd service-manager package hook is disabled on Lupos"),
+            "systemd hook wrapper must skip live service-manager hooks"
+        );
+        for rel in LDCONFIG_SHIM_PATHS {
+            let entry = find_initramfs_entry(&files, rel)
+                .unwrap_or_else(|| panic!("{rel} ldconfig shim must be staged for pacman"));
+            assert!(initramfs_file_is_regular(entry));
+            assert_eq!(entry.1 & 0o777, 0o755);
+            assert_eq!(
+                initramfs_file_bytes(&files, rel),
+                Some(LDCONFIG_SHIM_SCRIPT.as_bytes())
+            );
+        }
 
         for rel in ARCH_OFFLINE_PACMAN_REPO_ARTIFACTS {
             let entry = find_initramfs_entry(&files, rel)
@@ -23158,12 +23700,13 @@ CONFIG_MODULES=y
         assert!(!cfg.contains("terminal_input console serial"));
         assert!(!cfg.contains("terminal_output gfxterm serial"));
         assert!(!cfg.contains("lupos.serial_getty=1"));
-        assert!(cfg.contains(
-            "linux /boot/bzImage systemd.show_status=yes root=LABEL=lupos-root rootfstype=ext4 rw"
-        ));
-        assert!(cfg.contains(
-            "linux /boot/bzImage single systemd.show_status=yes root=LABEL=lupos-root rootfstype=ext4 rw"
-        ));
+        assert!(cfg.contains("linux /boot/bzImage "));
+        assert!(cfg.contains("linux /boot/bzImage single "));
+        assert_eq!(cfg.matches("lupos.display_getty=1").count(), 2);
+        assert_eq!(cfg.matches("systemd.show_status=yes").count(), 2);
+        assert_eq!(cfg.matches("root=LABEL=lupos-root").count(), 2);
+        assert_eq!(cfg.matches("rootfstype=ext4").count(), 2);
+        assert_eq!(cfg.matches(" rw").count(), 2);
         assert_eq!(cfg.matches("initrd /boot/initramfs.cpio").count(), 2);
         assert!(cfg.contains("insmod png"));
         assert!(cfg.contains("background_image /boot/grub/splashart.png"));
@@ -24013,9 +24556,17 @@ CONFIG_MODULES=y
             "ARCH_OFFLINE_REPO_PACKAGE_ALIASES",
             "stage_arch_pacman_package_aliases",
             "alias=/p/v",
+            "alias=/p/xterm",
+            "ARCH_SYSTEMD_HOOK_SCRIPT=\"usr/share/libalpm/scripts/systemd-hook\"",
+            "systemd_hook_ready",
+            "skip_live_service_hook()",
+            "live systemd service-manager package hook is disabled on Lupos",
             "file:///var/lib/lupos/pacman-repo/$repo/os/$arch",
             "var/cache/pacman/pkg",
             "vim-9.2.0573-1-x86_64.pkg.tar.zst",
+            "fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst",
+            "xorg-xinit-1.4.4-1-x86_64.pkg.tar.zst",
+            "xterm-410-1-x86_64.pkg.tar.zst",
             "pam_systemd.so",
             "etc/systemd/network/10-lupos-qemu.network",
             "nameserver 10.0.2.3",

@@ -329,13 +329,30 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
                     crate::arch::x86::kernel::msr::read(crate::arch::x86::kernel::msr::MSR_FS_BASE)
                 };
                 let task_fs = unsafe { (*task).thread.fsbase };
+                let comm = unsafe { (*task).comm };
+                let comm_str = {
+                    let end = comm.iter().position(|&c| c == 0).unwrap_or(comm.len());
+                    core::str::from_utf8(&comm[..end]).unwrap_or("<?>")
+                };
+                // Dump the faulting instruction bytes — but only for data faults,
+                // where rip is guaranteed present (it was fetched).  On an
+                // instruction-fetch fault rip itself may be unmapped, so reading
+                // it from the kernel would double-fault.
+                let mut insn = [0u8; 16];
+                if ec & X86_PF_INSTR == 0 {
+                    for (i, b) in insn.iter_mut().enumerate() {
+                        *b = unsafe { core::ptr::read_volatile((frame.rip as *const u8).add(i)) };
+                    }
+                }
                 crate::linux_driver_abi::tty::serial_println!(
-                    "trace-user-pf pid={} fs_msr={:#x} task_fs={:#x} cr2={:#x} rip={:#x}",
+                    "trace-user-pf pid={} comm={} fs_msr={:#x} task_fs={:#x} cr2={:#x} rip={:#x} insn={:02x?}",
                     pid,
+                    comm_str,
                     fs_msr,
                     task_fs,
                     addr,
-                    frame.rip
+                    frame.rip,
+                    insn
                 );
             }
             if pid == 1 {
