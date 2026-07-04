@@ -1,2 +1,0 @@
-test_id	command	notes
-arch-rootfs-smoke	pacman -Q bash coreutils pacman systemd	Arch base package database smoke check.

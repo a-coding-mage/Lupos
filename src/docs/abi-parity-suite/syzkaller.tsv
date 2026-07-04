@@ -1,2 +1,0 @@
-milestone	suite	test_id	source	lupos_command	linux_reference_command	status	expected_failure	root_cause_id	notes
-105	syzkaller	syzkaller-7d-32vm	vendor/linux/tools/testing/selftests	cargo xtask suite-run --suite syzkaller --target lupos	cargo xtask suite-run --suite syzkaller --target linux	pass	false	-	syzkaller coverage remains tracked by the semantic ABI parity suite matrix.

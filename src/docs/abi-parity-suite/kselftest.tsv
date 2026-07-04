@@ -1,2 +1,0 @@
-milestone	suite	test_id	source	lupos_command	linux_reference_command	status	expected_failure	root_cause_id	notes
-105	kselftest	userspace-kselftest-manifest	vendor/linux/tools/testing/selftests	cargo xtask suite-run --suite kselftest --target lupos	cargo xtask suite-run --suite kselftest --target linux	pass	false	-	Userspace ABI parity runner builds the declared upstream kselftest manifest and compares Lupos against the Linux reference.

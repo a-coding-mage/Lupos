@@ -1,2 +1,0 @@
-milestone	suite	test_id	source	lupos_command	linux_reference_command	status	expected_failure	root_cause_id	notes
-104	blktests	blktests-virtio-blk	vendor/linux/tools/testing/selftests	cargo xtask suite-run --suite blktests --target lupos	cargo xtask suite-run --suite blktests --target linux	pass	false	-	Block parity coverage remains tracked by the semantic ABI parity suite matrix.
