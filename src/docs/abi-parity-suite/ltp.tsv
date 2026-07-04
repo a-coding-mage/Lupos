@@ -1,2 +1,0 @@
-milestone	suite	test_id	source	lupos_command	linux_reference_command	status	expected_failure	root_cause_id	notes
-105	ltp	ltp-family-manifest	vendor/linux/tools/testing/selftests	cargo xtask suite-run --suite ltp --target lupos	cargo xtask suite-run --suite ltp --target linux	pass	false	-	LTP integration remains tracked by the semantic ABI parity suite matrix.

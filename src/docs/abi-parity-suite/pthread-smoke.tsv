@@ -1,2 +1,0 @@
-milestone	suite	test_id	source	lupos_command	linux_reference_command	status	expected_failure	root_cause_id	notes
-98	pthread-smoke	pthread-smoke	vendor/linux/tools/testing/selftests/futex	cargo xtask suite-run --suite pthread-smoke --target lupos	cargo xtask suite-run --suite pthread-smoke --target linux	pass	false	-	Pthread and futex smoke coverage remains tracked by the semantic ABI parity suite matrix.

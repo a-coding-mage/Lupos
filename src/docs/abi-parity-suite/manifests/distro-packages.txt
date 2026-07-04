@@ -1,3 +1,0 @@
-rootfs-package-surface
-pacman-local-database
-systemd-login

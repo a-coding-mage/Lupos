@@ -1,3 +1,0 @@
-suite	version	source_url	archive_or_commit	sha256	status	setup_script	notes
-linux	in-tree	vendor/linux	workspace	workspace	present	vendor/setup_linux.sh	Linux vendor tree is tracked in the workspace.
-arch-rootfs	2026.06.01	https://archive.archlinux.org/iso/2026.06.01/archlinux-bootstrap-2026.06.01-x86_64.tar.zst	archlinux-bootstrap-2026.06.01-x86_64.tar.zst	e68ba918c9f7deede8eccd2cd8ce259df104d84b0791cff3a2bc7579ced34849	pinned	src/scripts/abi-parity-suite/vendor_sync.sh	Arch bootstrap rootfs pin for the arch-rootfs ABI suite.
