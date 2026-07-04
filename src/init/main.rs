@@ -121,12 +121,12 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
 
     // Linux banner — vendor/linux/init/main.c:1038 prints this via
     //   pr_notice("%s", linux_banner);
-    // Inlined (rather than calling init::version::linux_banner() which returns
-    // a heap String) so the banner is emitted before slab_init() turns the
-    // allocator on. log_info! writes into a fixed stack buffer.
+    // Inlined from init::version_timestamp::linux_banner() so the banner is
+    // emitted before slab_init() turns the allocator on. log_info! writes into
+    // a fixed stack buffer.
     log_info!(
         "",
-        "Linux/Lupos version {} ({}@{}) ({}) {}",
+        "Linux version {} ({}@{}) ({}) {}",
         init::version::UTS_RELEASE,
         init::version::LINUX_COMPILE_BY,
         init::version::LINUX_COMPILE_HOST,
@@ -580,6 +580,11 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     init::start_kernel::cgroup_init();
     init::start_kernel::taskstats_init_early(kernel::taskstats::init_early);
     init::start_kernel::delayacct_init();
+    // Lupos has no ACPI/KCSAN init hook yet, but keep the Linux
+    // start_kernel state anchors in their source order.
+    init::start_kernel::acpi_subsystem_init();
+    init::start_kernel::arch_post_acpi_subsys_init();
+    init::start_kernel::kcsan_init();
 
     {
         const LOW_IDENTITY_DIRECT_MAP_END: u64 = 64 * 1024 * 1024 * 1024;
@@ -652,6 +657,15 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         kernel::debug_trace::init_from_cmdline(cmdline);
         fs::proc::cmdline::set_saved_command_line(cmdline);
         parsed_boot_options = init::boot::BootOptions::parse(cmdline);
+        if let Some((kind, param)) = parsed_boot_options.boot_var_overflow() {
+            panic!("Too many boot {} vars at `{}'", kind, param);
+        }
+        if let Some(level) = parsed_boot_options.console_loglevel {
+            // The printk emit path does not yet consult this level, but the
+            // boot parser preserves Linux's early-param side effect.
+            kernel::printk::sysctl::CONSOLE_LOGLEVEL
+                .store(level, core::sync::atomic::Ordering::Release);
+        }
         log_info!("", "Kernel command line: {}", cmdline);
     }
 
@@ -661,7 +675,8 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     // path is available. Lupos still runs the kernel body in one thread, but
     // route translated late hooks through the same level model instead of
     // calling each old one-shot init directly.
-    let late_initcalls = init::initcall::do_late_initcalls();
+    let late_initcalls =
+        init::initcall::do_late_initcalls_filtered(&parsed_boot_options.initcall_blacklist);
     if let Some(err) = late_initcalls.first_error {
         log_warn!(
             "initcall",
@@ -702,8 +717,9 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         if !boot_options.noinitrd {
             if let Some((_initrd_phys, initrd_slice)) = boot_params_initrd_slice(bp) {
                 log_info!("", "Trying to unpack rootfs image as initramfs...");
-                match init::initramfs::install_from_bytes(initrd_slice) {
-                    Ok(()) => {
+                match init::initramfs::InitramfsImage::parse(initrd_slice) {
+                    Ok(image) => {
+                        init::initramfs::install(image);
                         init::boot_trace::record("initramfs", "linux boot_params initrd indexed");
                         log_info!(
                             "",
@@ -711,11 +727,27 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
                             initrd_slice.len().div_ceil(1024)
                         );
                     }
-                    Err(e) => {
-                        log_error!("", "initramfs: parse error {}", e);
+                    Err(err) => {
+                        if let Some(name) =
+                            lupos::lib::decompress::decompress_method_name(initrd_slice)
+                        {
+                            log_error!(
+                                "",
+                                "initramfs: compressed image detected ({}); decompression not supported, extraction skipped",
+                                name
+                            );
+                        } else {
+                            log_error!("", "initramfs: {}", err.as_str());
+                        }
                     }
                 }
             }
+        } else {
+            log_warn!(
+                "",
+                "{}",
+                init::do_mounts_initrd::NOINITRD_DEPRECATION_WARNING
+            );
         }
         boot_options
     };
@@ -4171,23 +4203,46 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     // and either stay interactive or exit cleanly back to the kernel harness.
     #[cfg(feature = "test-pid1-handoff")]
     {
+        use alloc::boxed::Box;
+        use alloc::format;
+        use alloc::vec::Vec;
         use core::ffi::c_void;
         use core::sync::atomic::Ordering;
 
         use fs::fdtable::FilesStruct;
         use fs::file::alloc_file;
         use fs::mount::path_walk;
+        use include::uapi::errno::ENOENT;
         use include::uapi::fcntl::O_RDWR;
         use kernel::fork::{KernelCloneArgs, find_heap_task_by_pid, kernel_clone};
         use kernel::task::task_state::EXIT_ZOMBIE;
 
         init::rootfs::bootstrap_initramfs_rootfs_with_options(&initramfs_boot_options)
             .expect("initramfs rootfs bootstrap");
-        init::rootfs::switch_to_disk_root_if_requested(&initramfs_boot_options)
-            .expect("pid1-handoff: disk root switch");
+        let rdinit_path = initramfs_boot_options.ramdisk_execute_command.clone();
+        let rdinit_accessible = rdinit_path
+            .as_deref()
+            .is_some_and(init::rootfs::path_exists);
+        let needs_prepare_namespace =
+            initramfs_boot_options.needs_prepare_namespace(init::rootfs::path_exists);
+        if needs_prepare_namespace {
+            init::rootfs::switch_to_disk_root_if_requested(&initramfs_boot_options)
+                .expect("pid1-handoff: disk root switch");
+        }
+        let final_init_plan = initramfs_boot_options.init_plan(|path| {
+            if rdinit_path.as_deref() == Some(path) {
+                rdinit_accessible
+            } else {
+                init::rootfs::path_exists(path)
+            }
+        });
+        if let Some(warn) = final_init_plan.rdinit_warn.as_deref() {
+            log_warn!("", "{}", warn);
+        }
         mm::page_alloc::free_initmem();
 
-        unsafe extern "C" fn pid1_handoff_thread(_: *mut c_void) -> i32 {
+        unsafe extern "C" fn pid1_handoff_thread(arg: *mut c_void) -> i32 {
+            let plan = unsafe { &*(arg as *const init::boot::InitPlan) };
             let task = unsafe { kernel::sched::get_current() };
             assert!(!task.is_null(), "pid1-handoff: no current task");
 
@@ -4204,25 +4259,70 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             ft.dup2(fd0, 1).expect("dup2 stdout");
             ft.dup2(fd0, 2).expect("dup2 stderr");
 
-            // execve("/sbin/init") then jump to userspace with SYSRET.
-            // Linux: vendor/linux/init/main.c:1507
-            //   pr_info("Run %s as init process\n", execute_command);
-            log_info!("", "Run /sbin/init as init process");
-            init::boot_trace::record("init", "exec /sbin/init");
-            kernel::console::flush_all_nonblocking();
-            // Linux envp_init: vendor/linux/init/main.c
-            //   static const char *envp_init[] = { "HOME=/", "TERM=linux", NULL, };
-            if kernel::debug_trace::proc_enabled() {
-                crate::linux_driver_abi::tty::serial_println!(
-                    "trace-pid1-handoff exec-enter path=/sbin/init"
-                );
+            // execve(init candidate) then jump to userspace with SYSRET.
+            // Linux: vendor/linux/init/main.c:1462
+            //   pr_info("Run %s as init process\n", init_filename);
+            let mut ctx = None;
+            for candidate in &plan.candidates {
+                let path = candidate.path.as_str();
+                log_info!("", "Run {} as init process", path);
+                let trace = Box::leak(format!("exec {}", path).into_boxed_str());
+                init::boot_trace::record("init", trace);
+                kernel::console::flush_all_nonblocking();
+
+                let mut argv: Vec<&str> = Vec::new();
+                argv.push(path);
+                for arg in plan.argv.iter().skip(1) {
+                    argv.push(arg.as_str());
+                }
+
+                let mut envp: Vec<&str> = plan.envp.iter().map(|env| env.as_str()).collect();
+                if !envp.iter().any(|env| env.starts_with("PATH=")) {
+                    // Deliberate Lupos deviation: the shipped login stack
+                    // expects a standard search path, while Linux's static
+                    // envp_init only seeds HOME and TERM.
+                    envp.push("PATH=/sbin:/bin:/usr/sbin:/usr/bin");
+                }
+
+                if kernel::debug_trace::proc_enabled() {
+                    crate::linux_driver_abi::tty::serial_println!(
+                        "trace-pid1-handoff exec-enter path={}",
+                        path
+                    );
+                }
+                match kernel::exec::execve_from_kernel(path, &argv, &envp) {
+                    Ok(next_ctx) => {
+                        ctx = Some(next_ctx);
+                        break;
+                    }
+                    Err(err) => match candidate.kind {
+                        init::boot::InitCandidateKind::Ramdisk => {
+                            log_error!("", "Failed to execute {} (error {})", path, err);
+                        }
+                        init::boot::InitCandidateKind::Explicit => {
+                            panic!("Requested init {} failed (error {}).", path, err);
+                        }
+                        init::boot::InitCandidateKind::ConfigDefault => {
+                            log_error!("", "Default init {} failed (error {})", path, err);
+                        }
+                        init::boot::InitCandidateKind::Fallback => {
+                            if err != -ENOENT {
+                                log_error!(
+                                    "",
+                                    "Starting init: {} exists but couldn't execute it (error {})",
+                                    path,
+                                    err
+                                );
+                            }
+                        }
+                    },
+                }
             }
-            let ctx = kernel::exec::execve_from_kernel(
-                "/sbin/init",
-                &["/sbin/init"],
-                &["HOME=/", "TERM=linux", "PATH=/sbin:/bin:/usr/sbin:/usr/bin"],
-            )
-            .expect("pid1-handoff: exec /sbin/init");
+            let ctx = ctx.unwrap_or_else(|| {
+                panic!(
+                    "No working init found.  Try passing init= option to kernel. See Linux Documentation/admin-guide/init.rst for guidance."
+                )
+            });
             if kernel::debug_trace::proc_enabled() {
                 crate::linux_driver_abi::tty::serial_println!(
                     "trace-pid1-handoff exec-ok ip={:#x} sp={:#x} flags={:#x}",
@@ -4276,6 +4376,7 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             }
         }
 
+        let init_plan_arg = Box::into_raw(Box::new(final_init_plan)) as *mut c_void;
         let args = KernelCloneArgs {
             flags: 0,
             exit_signal: kernel::clone::SIGCHLD,
@@ -4284,7 +4385,7 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             // command-line parsing and manager mode based on the PID1 contract.
             set_tid: Some(1),
             fn_ptr: Some(pid1_handoff_thread),
-            fn_arg: core::ptr::null_mut(),
+            fn_arg: init_plan_arg,
             ..KernelCloneArgs::default()
         };
 

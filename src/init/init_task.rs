@@ -1,12 +1,16 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/init/init_task.c
 //! test-origin: linux:vendor/linux/init/init_task.c
 //! Initial task template.
 //!
-//! Mirrors the fields from `vendor/linux/init/init_task.c` that Lupos
+//! Models the fields from `vendor/linux/init/init_task.c` that Lupos
 //! represents today: the boot task is a kernel thread, starts runnable,
 //! owns root credentials, uses normal scheduling at nice 0, and begins with
 //! a single-thread signal group.
+//! Linux also defines init_signals, init_sighand, init_cred, init_groups,
+//! init_task_exec_state, pid links, namespace/audit hooks, and optional
+//! shadow-call-stack storage; those globals remain owned by their subsystem
+//! modules or deferred.
 
 use crate::kernel::sched::entity::CpuMask;
 use crate::kernel::sched::prio::{DEFAULT_PRIO, MAX_PRIO, SCHED_NORMAL};

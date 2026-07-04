@@ -9,6 +9,8 @@
 //! provides the same level model with explicit tables for translated one-shot
 //! hooks that are currently wired by hand.
 
+extern crate alloc;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum InitcallLevel {
@@ -73,10 +75,24 @@ pub const LUPOS_LATE_INITCALLS: &[Initcall] = &[
 ];
 
 pub fn do_initcall_level(level: InitcallLevel, initcalls: &[Initcall]) -> InitcallReport {
+    do_initcall_level_filtered(level, initcalls, &[])
+}
+
+pub fn do_initcall_level_filtered(
+    level: InitcallLevel,
+    initcalls: &[Initcall],
+    blacklist: &[alloc::string::String],
+) -> InitcallReport {
     let mut first_error = None;
+    let mut ran = 0usize;
 
     for initcall in initcalls {
+        if initcall_blacklisted(initcall.name, blacklist) {
+            crate::log_info!("initcall", "initcall {} blacklisted", initcall.name);
+            continue;
+        }
         let ret = (initcall.func)();
+        ran += 1;
         if ret != 0 && first_error.is_none() {
             first_error = Some(ret);
         }
@@ -84,13 +100,21 @@ pub fn do_initcall_level(level: InitcallLevel, initcalls: &[Initcall]) -> Initca
 
     InitcallReport {
         level,
-        ran: initcalls.len(),
+        ran,
         first_error,
     }
 }
 
 pub fn do_late_initcalls() -> InitcallReport {
     do_initcall_level(InitcallLevel::Late, LUPOS_LATE_INITCALLS)
+}
+
+pub fn do_late_initcalls_filtered(blacklist: &[alloc::string::String]) -> InitcallReport {
+    do_initcall_level_filtered(InitcallLevel::Late, LUPOS_LATE_INITCALLS, blacklist)
+}
+
+pub fn initcall_blacklisted(name: &str, blacklist: &[alloc::string::String]) -> bool {
+    blacklist.iter().any(|entry| entry == name)
 }
 
 #[cfg(test)]
@@ -143,6 +167,33 @@ mod tests {
                 level: InitcallLevel::Late,
                 ran: 3,
                 first_error: Some(-22),
+            }
+        );
+    }
+
+    #[test]
+    fn initcall_blacklist_skips_exact_names() {
+        let calls = [
+            Initcall {
+                name: "ok0",
+                func: ok,
+            },
+            Initcall {
+                name: "fail",
+                func: fail,
+            },
+        ];
+        let blacklist = [alloc::string::String::from("fail")];
+        let report = do_initcall_level_filtered(InitcallLevel::Late, &calls, &blacklist);
+
+        assert!(initcall_blacklisted("fail", &blacklist));
+        assert!(!initcall_blacklisted("fail_extra", &blacklist));
+        assert_eq!(
+            report,
+            InitcallReport {
+                level: InitcallLevel::Late,
+                ran: 1,
+                first_error: None,
             }
         );
     }

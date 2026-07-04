@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/init
 //! test-origin: linux:vendor/linux/init
 //! Initramfs root bootstrap: unpack initramfs into a ramfs root, create a
@@ -11,10 +11,15 @@
 //!   - `vendor/linux/init/do_mounts_initrd.c` - deprecated initrd switches
 //!   - `vendor/linux/init/do_mounts_rd.c` - legacy ramdisk image probing
 //!   - `drivers/base/devtmpfs.c` - populate `/dev`
+//!
+//! Covered: rootfs/devtmpfs bootstrap, newc materialization, hardlinks, basic
+//! special nodes, and disk-root switching. Deferred: decompression, streaming
+//! unpack FSM, `/initrd.image` writeback, NFS/CIFS root matrices, and rdev
+//! persistence in `Inode`/stat output.
 
 extern crate alloc;
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -46,8 +51,8 @@ const DEFAULT_DIR_MODE: u32 = 0o755;
 const DEFAULT_FILE_MODE: u32 = 0o644;
 const INITRAMFS_CONTIG_FILE_LIMIT: usize =
     (1usize << crate::mm::zone::MAX_PAGE_ORDER) * crate::mm::frame::PAGE_SIZE;
-pub const LINUX_INITRD_BLOCK_SIZE: usize = 1024;
-const CRAMFS_MAGIC_LE: [u8; 4] = [0x45, 0x3d, 0xcd, 0x28];
+pub const LINUX_INITRD_BLOCK_SIZE: usize = crate::init::do_mounts_rd::BLOCK_SIZE;
+const CRAMFS_MAGIC_LE: [u8; 4] = crate::init::do_mounts_rd::CRAMFS_MAGIC_LE;
 const DEFAULT_DISK_ROOT_FS: &str = "ext4";
 #[cfg(not(test))]
 const DISK_ROOT_WAIT_POLLS: usize = 200_000;
@@ -628,6 +633,7 @@ pub(crate) static CONSOLE_FILE_OPS: FileOps = FileOps {
 
 fn console_poll(_file: &crate::fs::types::FileRef) -> u32 {
     drain_console_control_bytes();
+    #[cfg(not(test))]
     crate::kernel::console::maintenance_budgeted();
     let mut mask = crate::fs::select::POLLOUT as u32;
     if !CONSOLE_READY_BUFFER.lock().is_empty() {
@@ -961,19 +967,24 @@ fn wait_for_disk_root_device(spec: &mut DiskRootMountSpec) -> Result<(), i32> {
         requested,
         crate::linux_driver_abi::block::registered_linux_disk_names()
     );
+    #[cfg(not(test))]
     crate::linux_driver_abi::storage_core::debug_dump_ahci_bar5("root device wait expired");
     Err(ENODEV)
 }
 
 fn poll_disk_root_driver_events() {
-    let _ = crate::linux_driver_abi::poll_driver_abi_events();
-    crate::kernel::console::maintenance_budgeted();
-    #[cfg(not(test))]
-    unsafe {
-        crate::kernel::sched::schedule_with_irqs_enabled();
-    }
     #[cfg(test)]
-    core::hint::spin_loop();
+    {
+        core::hint::spin_loop();
+    }
+    #[cfg(not(test))]
+    {
+        let _ = crate::linux_driver_abi::poll_driver_abi_events();
+        crate::kernel::console::maintenance_budgeted();
+        unsafe {
+            crate::kernel::sched::schedule_with_irqs_enabled();
+        }
+    }
 }
 
 fn disk_root_wait_expired(polls: usize, wait_deadline: u64) -> bool {
@@ -997,40 +1008,19 @@ pub fn remount_root_read_write() -> Result<(), i32> {
 }
 
 pub fn identify_legacy_ramdisk_image(bytes: &[u8], start_block: u32) -> LegacyRamdiskImage {
-    let offset = (start_block as usize).saturating_mul(LINUX_INITRD_BLOCK_SIZE);
-    if offset >= bytes.len() {
-        return LegacyRamdiskImage::Unknown;
-    }
-    let image = &bytes[offset..];
-
-    if image.starts_with(b"\x1f\x8b") {
-        LegacyRamdiskImage::Gzip
-    } else if image.starts_with(b"BZh") {
-        LegacyRamdiskImage::Bzip2
-    } else if image.starts_with(b"\x5d\x00\x00") {
-        LegacyRamdiskImage::Lzma
-    } else if image.starts_with(b"\xfd7zXZ\x00") {
-        LegacyRamdiskImage::Xz
-    } else if image.starts_with(b"\x89LZO") {
-        LegacyRamdiskImage::Lzo
-    } else if image.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
-        LegacyRamdiskImage::Lz4
-    } else if image.starts_with(b"-rom1fs-") {
-        LegacyRamdiskImage::Romfs
-    } else if image.starts_with(&CRAMFS_MAGIC_LE)
-        || image
-            .get(0x200..)
-            .is_some_and(|tail| tail.starts_with(&CRAMFS_MAGIC_LE))
-    {
-        LegacyRamdiskImage::Cramfs
-    } else if image.starts_with(b"hsqs") {
-        LegacyRamdiskImage::Squashfs
-    } else if has_ext2_magic(image) {
-        LegacyRamdiskImage::Ext2
-    } else if has_minix_magic(image) {
-        LegacyRamdiskImage::Minix
-    } else {
-        LegacyRamdiskImage::Unknown
+    match crate::init::do_mounts_rd::identify_ramdisk_image(bytes, start_block).kind {
+        crate::init::do_mounts_rd::RamdiskImageKind::Gzip => LegacyRamdiskImage::Gzip,
+        crate::init::do_mounts_rd::RamdiskImageKind::Bzip2 => LegacyRamdiskImage::Bzip2,
+        crate::init::do_mounts_rd::RamdiskImageKind::Lzma => LegacyRamdiskImage::Lzma,
+        crate::init::do_mounts_rd::RamdiskImageKind::Xz => LegacyRamdiskImage::Xz,
+        crate::init::do_mounts_rd::RamdiskImageKind::Lzo => LegacyRamdiskImage::Lzo,
+        crate::init::do_mounts_rd::RamdiskImageKind::Lz4 => LegacyRamdiskImage::Lz4,
+        crate::init::do_mounts_rd::RamdiskImageKind::Romfs => LegacyRamdiskImage::Romfs,
+        crate::init::do_mounts_rd::RamdiskImageKind::Cramfs => LegacyRamdiskImage::Cramfs,
+        crate::init::do_mounts_rd::RamdiskImageKind::Squashfs => LegacyRamdiskImage::Squashfs,
+        crate::init::do_mounts_rd::RamdiskImageKind::Minix => LegacyRamdiskImage::Minix,
+        crate::init::do_mounts_rd::RamdiskImageKind::Ext2 => LegacyRamdiskImage::Ext2,
+        crate::init::do_mounts_rd::RamdiskImageKind::Unknown => LegacyRamdiskImage::Unknown,
     }
 }
 
@@ -1263,15 +1253,39 @@ fn bootstrap_rootfs() -> Result<Arc<Mount>, i32> {
 }
 
 fn materialize_initramfs() -> Result<(), i32> {
+    let mut dir_mtimes = Vec::new();
+    let mut links: BTreeMap<(u32, u32, u32), Arc<Inode>> = BTreeMap::new();
+
     for entry in initramfs::installed_entries()? {
+        if entry.is_dir() {
+            ensure_dir(&entry.path, entry.mode & 0o7777)?;
+            set_path_metadata_with_mtime(
+                &entry.path,
+                entry.mode & 0o7777,
+                entry.uid(),
+                entry.gid(),
+                entry.mtime() as u64,
+            )?;
+            dir_mtimes.push((entry.path.clone(), entry.mtime() as u64));
+            continue;
+        }
+
+        let hardlink_key = (entry.nlink() >= 2).then_some(entry.link_key());
+        if let Some(key) = hardlink_key
+            && let Some(existing) = links.get(&key)
+        {
+            link_existing_inode(&entry.path, existing)?;
+            continue;
+        }
+
         if entry.is_regular_file() {
             let contents = initramfs::read_file_slice(&entry.path)?;
             ensure_static_file(
                 &entry.path,
-                entry.mode & 0o777,
+                entry.mode & 0o7777,
                 entry.uid(),
                 entry.gid(),
-                entry.nlink(),
+                if entry.nlink() >= 2 { 1 } else { entry.nlink() },
                 entry.mtime() as u64,
                 contents,
             )?;
@@ -1279,15 +1293,71 @@ fn materialize_initramfs() -> Result<(), i32> {
             let target = initramfs::read_link(&entry.path)?;
             ensure_symlink_with_metadata(
                 &entry.path,
-                entry.mode & 0o777,
+                entry.mode & 0o7777,
                 &target,
                 entry.uid(),
                 entry.gid(),
-                entry.nlink(),
+                if entry.nlink() >= 2 { 1 } else { entry.nlink() },
                 entry.mtime() as u64,
             )?;
+        } else if entry.is_chardev() || entry.is_blockdev() || entry.is_fifo() || entry.is_socket()
+        {
+            if is_kernel_owned_dev_path(&entry.path) {
+                continue;
+            }
+            let kind = crate::fs::syscalls::mknod_kind(entry.mode)?;
+            let fops = if kind == InodeKind::Blockdev {
+                &crate::block::block_device::BLOCK_DEVICE_FILE_OPS
+            } else {
+                &RAMFS_FILE_OPS
+            };
+            create_special_node_with_metadata(
+                &entry.path,
+                kind,
+                entry.mode & 0o7777,
+                entry.uid(),
+                entry.gid(),
+                if entry.nlink() >= 2 { 1 } else { entry.nlink() },
+                entry.mtime() as u64,
+                fops,
+            )?;
+        }
+
+        if let Some(key) = hardlink_key
+            && let Some(inode) = path_walk(&entry.path).and_then(|dentry| dentry.inode())
+        {
+            links.entry(key).or_insert(inode);
         }
     }
+
+    for (path, mtime) in dir_mtimes {
+        set_path_mtime(&path, mtime)?;
+    }
+    Ok(())
+}
+
+fn link_existing_inode(path: &str, inode: &Arc<Inode>) -> Result<(), i32> {
+    let (parent_path, leaf) = split_parent(path)?;
+    let parent = ensure_dir(parent_path, DEFAULT_DIR_MODE)?;
+    if d_lookup(&parent, leaf)
+        .and_then(|dentry| dentry.inode())
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let parent_inode = parent.inode().ok_or(EINVAL)?;
+    match &parent_inode.private {
+        InodePrivate::RamDir(children) => {
+            children.lock().insert(String::from(leaf), inode.clone());
+        }
+        _ => return Err(EINVAL),
+    }
+    inode.nlink.fetch_add(1, Ordering::AcqRel);
+    crate::fs::ramfs::dir_account_insert(&parent_inode);
+    let child = d_alloc_child(&parent, leaf);
+    child.instantiate(inode.clone());
+    touch_inode_now(&parent_inode);
     Ok(())
 }
 
@@ -1440,6 +1510,8 @@ fn populate_registered_block_nodes() -> Result<(), i32> {
 }
 
 pub fn ensure_block_device_node(path: &str, mode: u32) -> Result<(), i32> {
+    // Linux `init/do_mounts.h::create_dev` creates block-device nodes for
+    // early root mounting; Lupos keeps the operation here with devtmpfs setup.
     create_special_node(
         path,
         InodeKind::Blockdev,
@@ -1501,10 +1573,7 @@ fn has_minix_magic(image: &[u8]) -> bool {
     let Some(magic) = image.get(1024 + 16..1024 + 18) else {
         return false;
     };
-    matches!(
-        u16::from_le_bytes([magic[0], magic[1]]),
-        0x137f | 0x138f | 0x2468 | 0x2478
-    )
+    matches!(u16::from_le_bytes([magic[0], magic[1]]), 0x137f | 0x138f)
 }
 
 fn mount_pseudo_filesystems() -> Result<(), i32> {
@@ -1717,6 +1786,19 @@ fn create_special_node(
     mode: u32,
     fops: &'static FileOps,
 ) -> Result<(), i32> {
+    create_special_node_with_metadata(path, kind, mode, 0, 0, 1, 0, fops)
+}
+
+fn create_special_node_with_metadata(
+    path: &str,
+    kind: InodeKind,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u32,
+    mtime: u64,
+    fops: &'static FileOps,
+) -> Result<(), i32> {
     let (parent_path, leaf) = split_parent(path)?;
     let parent = ensure_dir(parent_path, DEFAULT_DIR_MODE)?;
     if d_lookup(&parent, leaf)
@@ -1736,7 +1818,7 @@ fn create_special_node(
         fops,
         empty_ram_bytes(),
     );
-    init_inode_metadata(&inode, 0, 0, 1, 0);
+    init_inode_metadata(&inode, uid, gid, nlink, mtime);
     *inode.sb.lock() = Some(sb);
 
     match &parent_inode.private {
@@ -1758,6 +1840,16 @@ fn create_special_node(
 }
 
 fn set_path_metadata(path: &str, mode: u32, uid: u32, gid: u32) -> Result<(), i32> {
+    set_path_metadata_with_mtime(path, mode, uid, gid, 0)
+}
+
+fn set_path_metadata_with_mtime(
+    path: &str,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: u64,
+) -> Result<(), i32> {
     let dentry = path_walk(path).ok_or(ENOENT)?;
     let inode = dentry.inode().ok_or(EINVAL)?;
     inode
@@ -1765,7 +1857,61 @@ fn set_path_metadata(path: &str, mode: u32, uid: u32, gid: u32) -> Result<(), i3
         .store(mode | inode.kind.s_ifmt(), Ordering::Release);
     inode.uid.store(uid, Ordering::Release);
     inode.gid.store(gid, Ordering::Release);
+    if mtime != 0 {
+        inode.atime.store(mtime, Ordering::Release);
+        inode.mtime.store(mtime, Ordering::Release);
+        inode.ctime.store(mtime, Ordering::Release);
+    }
     Ok(())
+}
+
+fn set_path_mtime(path: &str, mtime: u64) -> Result<(), i32> {
+    if mtime == 0 {
+        return Ok(());
+    }
+    let dentry = path_walk(path).ok_or(ENOENT)?;
+    let inode = dentry.inode().ok_or(EINVAL)?;
+    inode.atime.store(mtime, Ordering::Release);
+    inode.mtime.store(mtime, Ordering::Release);
+    inode.ctime.store(mtime, Ordering::Release);
+    Ok(())
+}
+
+fn is_kernel_owned_dev_path(path: &str) -> bool {
+    if !path.starts_with("/dev/") {
+        return false;
+    }
+    if matches!(
+        path,
+        "/dev/console"
+            | "/dev/tty"
+            | "/dev/kmsg"
+            | "/dev/null"
+            | "/dev/zero"
+            | "/dev/random"
+            | "/dev/urandom"
+            | "/dev/full"
+            | "/dev/ptmx"
+            | "/dev/mapper/control"
+            | "/dev/vda"
+            | "/dev/vda1"
+            | "/dev/vdb"
+            | "/dev/vdb1"
+            | "/dev/sda"
+            | "/dev/sda1"
+            | "/dev/sdb"
+            | "/dev/sdb1"
+            | "/dev/nvme0n1"
+            | "/dev/nvme0n1p1"
+    ) {
+        return true;
+    }
+    path.starts_with("/dev/tty")
+        || path.starts_with("/dev/fb")
+        || path.starts_with("/dev/input/")
+        || path.starts_with("/dev/vd")
+        || path.starts_with("/dev/sd")
+        || path.starts_with("/dev/nvme")
 }
 
 fn split_parent(path: &str) -> Result<(&str, &str), i32> {
@@ -1785,36 +1931,74 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use crate::include::uapi::stat::{S_IFDIR, S_IFIFO, S_IFREG};
     use alloc::boxed::Box;
+    use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
 
+    #[derive(Clone, Copy)]
+    struct HeaderSpec<'a> {
+        name: &'a str,
+        mode: u32,
+        ino: u32,
+        uid: u32,
+        gid: u32,
+        nlink: u32,
+        mtime: u32,
+        dev_major: u32,
+        dev_minor: u32,
+        rdev_major: u32,
+        rdev_minor: u32,
+        payload: &'a [u8],
+    }
+
     fn append_header(out: &mut Vec<u8>, name: &str, mode: u32, payload: &[u8]) {
+        append_header_full(
+            out,
+            HeaderSpec {
+                name,
+                mode,
+                ino: 0,
+                uid: 0,
+                gid: 0,
+                nlink: 1,
+                mtime: 0,
+                dev_major: 0,
+                dev_minor: 0,
+                rdev_major: 0,
+                rdev_minor: 0,
+                payload,
+            },
+        )
+    }
+
+    fn append_header_full(out: &mut Vec<u8>, spec: HeaderSpec<'_>) {
         fn write_hex(out: &mut Vec<u8>, value: u32) {
             let text = std::format!("{value:08x}");
             out.extend_from_slice(text.as_bytes());
         }
 
         out.extend_from_slice(b"070701");
+        write_hex(out, spec.ino);
+        write_hex(out, spec.mode);
+        write_hex(out, spec.uid);
+        write_hex(out, spec.gid);
+        write_hex(out, spec.nlink);
+        write_hex(out, spec.mtime);
+        write_hex(out, spec.payload.len() as u32);
+        write_hex(out, spec.dev_major);
+        write_hex(out, spec.dev_minor);
+        write_hex(out, spec.rdev_major);
+        write_hex(out, spec.rdev_minor);
+        write_hex(out, (spec.name.len() + 1) as u32);
         write_hex(out, 0);
-        write_hex(out, mode);
-        write_hex(out, 0);
-        write_hex(out, 0);
-        write_hex(out, 1);
-        write_hex(out, 0);
-        write_hex(out, payload.len() as u32);
-        write_hex(out, 0);
-        write_hex(out, 0);
-        write_hex(out, 0);
-        write_hex(out, 0);
-        write_hex(out, (name.len() + 1) as u32);
-        write_hex(out, 0);
-        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(spec.name.as_bytes());
         out.push(0);
         while out.len() % 4 != 0 {
             out.push(0);
         }
-        out.extend_from_slice(payload);
+        out.extend_from_slice(spec.payload);
         while out.len() % 4 != 0 {
             out.push(0);
         }
@@ -1883,6 +2067,81 @@ mod tests {
         Box::leak(archive.into_boxed_slice())
     }
 
+    fn metadata_initramfs() -> &'static [u8] {
+        let mut archive = Vec::new();
+        append_header_full(
+            &mut archive,
+            HeaderSpec {
+                name: "opt",
+                mode: S_IFDIR | 0o1770,
+                ino: 10,
+                uid: 100,
+                gid: 200,
+                nlink: 2,
+                mtime: 123,
+                dev_major: 0,
+                dev_minor: 1,
+                rdev_major: 0,
+                rdev_minor: 0,
+                payload: &[],
+            },
+        );
+        append_header_full(
+            &mut archive,
+            HeaderSpec {
+                name: "opt/a",
+                mode: S_IFREG | 0o4755,
+                ino: 11,
+                uid: 0,
+                gid: 0,
+                nlink: 2,
+                mtime: 124,
+                dev_major: 0,
+                dev_minor: 1,
+                rdev_major: 0,
+                rdev_minor: 0,
+                payload: &[],
+            },
+        );
+        append_header_full(
+            &mut archive,
+            HeaderSpec {
+                name: "opt/b",
+                mode: S_IFREG | 0o4755,
+                ino: 11,
+                uid: 0,
+                gid: 0,
+                nlink: 2,
+                mtime: 124,
+                dev_major: 0,
+                dev_minor: 1,
+                rdev_major: 0,
+                rdev_minor: 0,
+                payload: b"hardlink payload",
+            },
+        );
+        append_header_full(
+            &mut archive,
+            HeaderSpec {
+                name: "run/initramfs-fifo",
+                mode: S_IFIFO | 0o600,
+                ino: 12,
+                uid: 0,
+                gid: 0,
+                nlink: 1,
+                mtime: 125,
+                dev_major: 0,
+                dev_minor: 1,
+                rdev_major: 0,
+                rdev_minor: 0,
+                payload: &[],
+            },
+        );
+        append_header(&mut archive, "dev/console", S_IFIFO | 0o777, &[]);
+        append_header(&mut archive, "TRAILER!!!", 0, &[]);
+        Box::leak(archive.into_boxed_slice())
+    }
+
     #[test]
     fn disk_root_spec_defaults_to_ext4_readonly() {
         let options = BootOptions::parse("quiet root=/dev/vda");
@@ -1920,6 +2179,7 @@ mod tests {
 
     #[test]
     fn disk_root_label_resolves_registered_ext4_device() {
+        unregister_test_root_fixtures();
         register_ext4_root_fixture("sda");
         let mut spec = DiskRootMountSpec {
             source: String::from("LABEL=lupos-root"),
@@ -2382,9 +2642,28 @@ mod tests {
         }
     }
 
+    fn unregister_test_root_fixtures() {
+        use crate::block::block_device::unregister_block_device;
+        use crate::block::gendisk::unregister_gendisk;
+
+        for name in [
+            "vda",
+            "vda1",
+            "sda",
+            "sda1",
+            "nvme0n1",
+            "nvme0n1p1",
+            "bootfatunit",
+        ] {
+            let _ = unregister_block_device(name);
+            let _ = unregister_gendisk(name);
+        }
+    }
+
     #[test]
     fn initramfs_rootfs_bootstrap_populates_expected_tree() {
         let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        unregister_test_root_fixtures();
         initramfs::reset_for_tests();
         initramfs::install_from_bytes(fixture_initramfs()).expect("install initramfs");
         bootstrap_initramfs_rootfs().expect("initramfs rootfs bootstrap");
@@ -2652,6 +2931,42 @@ mod tests {
     }
 
     #[test]
+    fn initramfs_materializer_preserves_metadata_specials_and_hardlinks() {
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        initramfs::reset_for_tests();
+        initramfs::install_from_bytes(metadata_initramfs()).expect("install initramfs");
+
+        bootstrap_initramfs_rootfs().expect("initramfs rootfs bootstrap");
+
+        let opt = path_walk("/opt").and_then(|d| d.inode()).expect("/opt");
+        assert_eq!(opt.kind, InodeKind::Directory);
+        assert_eq!(opt.mode.load(Ordering::Acquire) & 0o7777, 0o1770);
+        assert_eq!(opt.uid.load(Ordering::Acquire), 100);
+        assert_eq!(opt.gid.load(Ordering::Acquire), 200);
+        assert_eq!(opt.mtime.load(Ordering::Acquire), 123);
+
+        assert_eq!(read_rootfs_file("/opt/a").unwrap(), b"hardlink payload");
+        assert_eq!(read_rootfs_file("/opt/b").unwrap(), b"hardlink payload");
+        let a = path_walk("/opt/a").and_then(|d| d.inode()).expect("/opt/a");
+        let b = path_walk("/opt/b").and_then(|d| d.inode()).expect("/opt/b");
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(a.nlink.load(Ordering::Acquire), 2);
+        assert_eq!(a.mode.load(Ordering::Acquire) & 0o7777, 0o4755);
+
+        let fifo = path_walk("/run/initramfs-fifo")
+            .and_then(|d| d.inode())
+            .expect("fifo");
+        assert_eq!(fifo.kind, InodeKind::Fifo);
+        assert_eq!(fifo.mode.load(Ordering::Acquire) & 0o7777, 0o600);
+
+        let console = path_walk("/dev/console")
+            .and_then(|d| d.inode())
+            .expect("devtmpfs console");
+        assert_eq!(console.kind, InodeKind::Chardev);
+        assert_eq!(console.mode.load(Ordering::Acquire) & 0o7777, 0o600);
+    }
+
+    #[test]
     fn initramfs_rootfs_bootstrap_completes_without_panicking() {
         let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
         initramfs::reset_for_tests();
@@ -2669,13 +2984,13 @@ mod tests {
     }
 
     #[test]
-    fn failed_module_load_returns_errno_without_panicking() {
+    fn failed_module_load_logs_and_continues_without_panicking() {
         let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
         initramfs::reset_for_tests();
         initramfs::install_from_bytes(missing_module_initramfs()).expect("install initramfs");
 
-        let err = bootstrap_initramfs_rootfs().expect_err("missing module should fail");
-        assert_eq!(err, ENOENT);
+        bootstrap_initramfs_rootfs().expect("missing configured module should not abort boot");
+        assert!(crate::kernel::module::find_module("missing_net").is_none());
     }
 
     #[test]
@@ -2684,8 +2999,7 @@ mod tests {
         initramfs::reset_for_tests();
         initramfs::install_from_bytes(missing_module_initramfs()).expect("install initramfs");
 
-        let err = bootstrap_initramfs_rootfs().expect_err("missing module should fail");
-        assert_eq!(err, ENOENT);
+        bootstrap_initramfs_rootfs().expect("missing configured module should not abort boot");
         assert!(crate::kernel::module::find_symbol("device_initialize").is_some());
         assert!(crate::kernel::module::find_symbol("device_add").is_some());
         assert!(crate::kernel::module::find_symbol("device_register").is_some());
@@ -3358,6 +3672,15 @@ mod tests {
         assert_eq!(
             identify_legacy_ramdisk_image(&ext2, 0),
             LegacyRamdiskImage::Ext2
+        );
+
+        let mut minix_and_ext2 = vec![0u8; 2048];
+        minix_and_ext2[1024 + 16..1024 + 18].copy_from_slice(&0x137fu16.to_le_bytes());
+        minix_and_ext2[1024 + 56] = 0x53;
+        minix_and_ext2[1024 + 57] = 0xef;
+        assert_eq!(
+            identify_legacy_ramdisk_image(&minix_and_ext2, 0),
+            LegacyRamdiskImage::Minix
         );
 
         let mut shifted = vec![0u8; LINUX_INITRD_BLOCK_SIZE + 8];

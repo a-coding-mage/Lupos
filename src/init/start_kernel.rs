@@ -37,6 +37,9 @@ pub const MEM_CGROUP_INIT: u32 = 1 << 20;
 pub const CGROUP_INIT: u32 = 1 << 21;
 pub const TASKSTATS_INIT_EARLY: u32 = 1 << 22;
 pub const DELAYACCT_INIT: u32 = 1 << 23;
+pub const ACPI_SUBSYSTEM_INIT: u32 = 1 << 24;
+pub const ARCH_POST_ACPI_SUBSYS_INIT: u32 = 1 << 25;
+pub const KCSAN_INIT: u32 = 1 << 26;
 
 static START_KERNEL_TAIL_STATE: AtomicU32 = AtomicU32::new(0);
 
@@ -165,6 +168,18 @@ pub fn delayacct_init() {
     mark(DELAYACCT_INIT);
 }
 
+pub fn acpi_subsystem_init() {
+    mark(ACPI_SUBSYSTEM_INIT);
+}
+
+pub fn arch_post_acpi_subsys_init() {
+    mark(ARCH_POST_ACPI_SUBSYS_INIT);
+}
+
+pub fn kcsan_init() {
+    mark(KCSAN_INIT);
+}
+
 #[cfg(test)]
 fn reset_for_test() {
     START_KERNEL_TAIL_STATE.store(0, Ordering::Release);
@@ -192,6 +207,9 @@ mod tests {
         assert!(find("signals_init();") < find("cgroup_init();"));
         assert!(find("cgroup_init();") < find("taskstats_init_early();"));
         assert!(find("taskstats_init_early();") < find("delayacct_init();"));
+        assert!(find("delayacct_init();") < find("acpi_subsystem_init();"));
+        assert!(find("acpi_subsystem_init();") < find("arch_post_acpi_subsys_init();"));
+        assert!(find("arch_post_acpi_subsys_init();") < find("kcsan_init();"));
     }
 
     #[test]
@@ -223,6 +241,9 @@ mod tests {
         cgroup_init();
         taskstats_init_early(|| callbacks.push("taskstats"));
         delayacct_init();
+        acpi_subsystem_init();
+        arch_post_acpi_subsys_init();
+        kcsan_init();
 
         assert_eq!(callbacks, ["security", "net", "vfs", "taskstats"]);
         let state = state();
@@ -235,5 +256,8 @@ mod tests {
         assert!(state.contains(CGROUP_INIT));
         assert!(state.contains(TASKSTATS_INIT_EARLY));
         assert!(state.contains(DELAYACCT_INIT));
+        assert!(state.contains(ACPI_SUBSYSTEM_INIT));
+        assert!(state.contains(ARCH_POST_ACPI_SUBSYS_INIT));
+        assert!(state.contains(KCSAN_INIT));
     }
 }

@@ -2,6 +2,9 @@
 //! linux-source: vendor/linux/init/do_mounts_rd.c
 //! test-origin: linux:vendor/linux/init/do_mounts_rd.c
 //! Legacy initial ramdisk image probing.
+//!
+//! This module is a pure decision model of `do_mounts_rd.c`: it preserves the
+//! parser/probe/load branch contracts without doing kernel file I/O.
 
 use crate::include::uapi::errno::{EINVAL, ENOEXEC, ENOMEM, EOPNOTSUPP};
 
@@ -376,14 +379,28 @@ const fn blocks_for_size(kind: RamdiskImageKind, size: u64) -> RamdiskIdentifica
 }
 
 fn parse_int(arg: &str) -> Option<i32> {
-    let (radix, digits) = if let Some(hex) = arg.strip_prefix("0x") {
-        (16, hex)
-    } else if let Some(hex) = arg.strip_prefix("0X") {
-        (16, hex)
+    let (negative, body) = if let Some(rest) = arg.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = arg.strip_prefix('+') {
+        (false, rest)
     } else {
-        (10, arg)
+        (false, arg)
     };
-    i32::from_str_radix(digits, radix).ok()
+    let (radix, digits) = if let Some(hex) = body.strip_prefix("0x") {
+        (16, hex)
+    } else if let Some(hex) = body.strip_prefix("0X") {
+        (16, hex)
+    } else if let Some(octal) = body.strip_prefix('0') {
+        (8, if octal.is_empty() { "0" } else { octal })
+    } else {
+        (10, body)
+    };
+    let value = i32::from_str_radix(digits, radix).ok()?;
+    if negative {
+        value.checked_neg()
+    } else {
+        Some(value)
+    }
 }
 
 fn read_le_u16(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -655,6 +672,13 @@ mod tests {
         assert!(copied.fput_input);
         assert!(copied.fput_output);
         assert!(copied.unlink_dev_ram);
+    }
+
+    #[test]
+    fn ramdisk_start_setup_accepts_base_zero_numbers() {
+        assert_eq!(ramdisk_start_setup("010"), Ok(8));
+        assert_eq!(ramdisk_start_setup("0x10"), Ok(16));
+        assert_eq!(ramdisk_start_setup("10"), Ok(10));
     }
 
     #[test]
