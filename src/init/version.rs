@@ -15,6 +15,8 @@ use alloc::string::String;
 
 use crate::kernel::utsname::NEW_UTS_LEN_PLUS_NUL;
 
+pub use crate::init::version_timestamp::linux_banner;
+
 pub const UTS_SYSNAME: &str = "Lupos";
 pub const UTS_NODENAME: &str = "(none)";
 pub const UTS_RELEASE: &str = concat!(env!("CARGO_PKG_VERSION"), "-lupos");
@@ -29,13 +31,6 @@ pub const LINUX_COMPILER: &str = "rustc";
 pub struct HostnameParam {
     pub nodename: [u8; NEW_UTS_LEN_PLUS_NUL],
     pub truncated: bool,
-}
-
-pub fn linux_banner() -> String {
-    format!(
-        "Linux/Lupos version {} ({}@{}) ({}) {}\n",
-        UTS_RELEASE, LINUX_COMPILE_BY, LINUX_COMPILE_HOST, LINUX_COMPILER, UTS_VERSION
-    )
 }
 
 pub fn linux_proc_banner(sysname: &str, release: &str, version: &str) -> String {
@@ -59,6 +54,13 @@ pub fn hostname_from_param(arg: &str) -> HostnameParam {
 
 pub fn apply_hostname_param(arg: &str) -> HostnameParam {
     let param = hostname_from_param(arg);
+    if param.truncated {
+        crate::log_warn!(
+            "",
+            "hostname parameter exceeds {} characters and will be truncated",
+            NEW_UTS_LEN_PLUS_NUL - 1
+        );
+    }
     crate::kernel::utsname::set_current_nodename_packed(param.nodename);
     param
 }
@@ -70,7 +72,7 @@ mod tests {
     #[test]
     fn linux_banner_matches_version_timestamp_shape() {
         let banner = linux_banner();
-        assert!(banner.starts_with("Linux/Lupos version "));
+        assert!(banner.starts_with("Linux version "));
         assert!(banner.contains(UTS_RELEASE));
         assert!(banner.contains("lupos@build"));
         assert!(banner.ends_with('\n'));

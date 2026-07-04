@@ -10,9 +10,12 @@ use alloc::vec::Vec;
 
 pub const CPIO_NEWC_MAGIC: &str = "070701";
 pub const CPIO_CRC_MAGIC: &str = "070702";
+pub const CPIO_HDR_OX_INJECT: &str =
+    "%s%08x%08x0x%06x0X%06x%08x%08x%08x%08x%08x%08x%08x0x%06x%08x%s";
 pub const CPIO_HDRLEN: usize = 110;
 pub const PATH_MAX: usize = 4096;
 pub const INITRAMFS_TEST_MANY_LIMIT: usize = 1000;
+pub const INITRAMFS_TEST_MANY_PATH_MAX: usize = 26;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InitramfsTestCpio<'a> {
@@ -57,28 +60,49 @@ impl<'a> InitramfsTestCpio<'a> {
     }
 }
 
-pub fn fill_cpio(entries: &[InitramfsTestCpio<'_>]) -> Vec<u8> {
+pub fn fill_cpio(entries: &[InitramfsTestCpio<'_>], inject_ox: bool) -> Vec<u8> {
     let mut out = Vec::new();
     for entry in entries {
         let start = out.len();
-        let header = format!(
-            "{}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{}",
-            entry.magic,
-            entry.ino,
-            entry.mode,
-            entry.uid,
-            entry.gid,
-            entry.nlink,
-            entry.mtime,
-            entry.filesize,
-            entry.devmajor,
-            entry.devminor,
-            entry.rdevmajor,
-            entry.rdevminor,
-            entry.namesize,
-            entry.csum,
-            entry.fname
-        );
+        let header = if inject_ox {
+            format!(
+                "{}{:08x}{:08x}0x{:06x}0X{:06x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}0x{:06x}{:08x}{}",
+                entry.magic,
+                entry.ino,
+                entry.mode,
+                entry.uid,
+                entry.gid,
+                entry.nlink,
+                entry.mtime,
+                entry.filesize,
+                entry.devmajor,
+                entry.devminor,
+                entry.rdevmajor,
+                entry.rdevminor,
+                entry.namesize,
+                entry.csum,
+                entry.fname
+            )
+        } else {
+            format!(
+                "{}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{}",
+                entry.magic,
+                entry.ino,
+                entry.mode,
+                entry.uid,
+                entry.gid,
+                entry.nlink,
+                entry.mtime,
+                entry.filesize,
+                entry.devmajor,
+                entry.devminor,
+                entry.rdevmajor,
+                entry.rdevminor,
+                entry.namesize,
+                entry.csum,
+                entry.fname
+            )
+        };
         out.extend_from_slice(header.as_bytes());
         out.push(0);
 
@@ -125,7 +149,8 @@ mod tests {
         ));
         assert!(source.contains("struct initramfs_test_cpio"));
         assert!(source.contains("static size_t fill_cpio(struct initramfs_test_cpio *cs"));
-        assert!(source.contains("thislen = sprintf(pos, \"%s\""));
+        assert!(source.contains("#define CPIO_HDR_OX_INJECT"));
+        assert!(source.contains("inject_ox ? CPIO_HDR_OX_INJECT : CPIO_HDR_FMT"));
         assert!(source.contains("off += CPIO_HDRLEN + c->namesize;"));
         assert!(source.contains("while (off & 3)"));
         assert!(source.contains("memcpy(&out[off], c->data, c->filesize);"));
@@ -137,6 +162,7 @@ mod tests {
         assert!(source.contains("KUNIT_CASE(initramfs_test_many)"));
         assert!(source.contains("KUNIT_CASE(initramfs_test_fname_pad)"));
         assert!(source.contains("KUNIT_CASE(initramfs_test_fname_path_max)"));
+        assert!(source.contains("KUNIT_CASE(initramfs_test_hdr_hex)"));
         assert!(source.contains("MODULE_DESCRIPTION(\"Initramfs KUnit test suite\")"));
     }
 
@@ -161,7 +187,7 @@ mod tests {
             fname: "TRAILER!!!",
             data: &[],
         };
-        let image = fill_cpio(&[file, trailer]);
+        let image = fill_cpio(&[file, trailer], false);
         assert_eq!(&image[..6], b"070701");
         assert_eq!(image.len() & 3, 0);
 
@@ -175,7 +201,7 @@ mod tests {
         let mut file = InitramfsTestCpio::regular("initramfs_test_csum", b"ASDF");
         file.magic = CPIO_CRC_MAGIC;
         file.csum = cpio_payload_csum(file.data);
-        let image = fill_cpio(&[file]);
+        let image = fill_cpio(&[file], false);
         assert_eq!(&image[..6], b"070702");
         assert!(image.windows(8).any(|window| window == b"0000011e"));
         assert_eq!(
@@ -196,7 +222,7 @@ mod tests {
             filesize: b"this file data is aligned at 4K in the archive".len() as u32,
             ..InitramfsTestCpio::regular(fname, b"")
         };
-        let image = fill_cpio(&[file]);
+        let image = fill_cpio(&[file], false);
         assert_eq!(CPIO_HDRLEN + file.namesize as usize, 4096);
         assert_eq!(
             &image[4096..4096 + file.filesize as usize],
@@ -207,7 +233,19 @@ mod tests {
     #[test]
     fn many_limit_path_budget_matches_source_formula() {
         assert_eq!(INITRAMFS_TEST_MANY_LIMIT, 1000);
+        assert_eq!(INITRAMFS_TEST_MANY_PATH_MAX, 26);
         assert_eq!(many_path_len(999), "initramfs_test_many-999".len() + 1);
         assert!(many_path_len(INITRAMFS_TEST_MANY_LIMIT) <= PATH_MAX);
+    }
+
+    #[test]
+    fn hdr_hex_fixture_rejects_ox_prefixed_header_fields() {
+        let file = InitramfsTestCpio::regular("initramfs_test_hdr_hex", b"ASDF");
+        let image = fill_cpio(&[file], true);
+        let leaked = alloc::boxed::Box::leak(image.into_boxed_slice());
+        assert!(matches!(
+            InitramfsImage::parse(leaked),
+            Err(crate::init::initramfs::InitramfsParseError::DamagedHeader)
+        ));
     }
 }

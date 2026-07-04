@@ -26,8 +26,8 @@ mod boot_compressed_mkpiggy;
 /// Serial-log substring expected on every successful boot. Matches the
 /// Linux banner printed by `linux_banner()` from `src/init/version.rs`.
 /// The leading `] ` anchors the match to the printk timestamp prefix
-/// (`[    0.000000] Linux/Lupos version ...`) so unrelated fixtures don't trip it.
-pub const HELLO_BANNER: &str = "] Linux/Lupos version ";
+/// (`[    0.000000] Linux version ...`) so unrelated fixtures don't trip it.
+pub const HELLO_BANNER: &str = "] Linux version ";
 pub const PANIC_PREFIX: &str = "KERNEL PANIC";
 /// Serial log substring expected when the IDT page-fault test passes.
 /// Must match the exact format string in `idt.rs` `on_page_fault()`.
@@ -16389,7 +16389,7 @@ const BOOT_PROGRESS_STAGES: &[BootProgressStage] = &[
     },
     BootProgressStage {
         name: "kernel banner",
-        needles: &["Linux/Lupos version"],
+        needles: &["Linux version"],
     },
     BootProgressStage {
         name: "cmdline",
@@ -17806,7 +17806,7 @@ mod tests {
 
     #[test]
     fn serial_log_match_is_line_based() {
-        let log = "firmware noise\n[    0.000000] Linux/Lupos version 0.1.0-lupos (lupos@build)\n";
+        let log = "firmware noise\n[    0.000000] Linux version 0.1.0-lupos (lupos@build)\n";
         assert!(serial_log_contains(log, HELLO_BANNER));
         assert!(!serial_log_contains(log, "missing"));
     }
@@ -17933,7 +17933,7 @@ mod tests {
             "SeaBIOS (version rel-1.16.3)\n",
             "GNU GRUB  version 2.12\n",
             "lupos: early 64-bit rust entry\n",
-            "[    0.000000] Linux/Lupos version 6.7.0-lupos\n",
+            "[    0.000000] Linux version 6.7.0-lupos\n",
             "[    0.000000] Kernel command line: quiet\n",
             "[    0.010000] Trying to unpack rootfs image as initramfs...\n",
             "[    0.020000] Run /sbin/init as init process\n",
@@ -20660,9 +20660,29 @@ CONFIG_MODULES=y
         let cgroup = find_after(&source, "init::start_kernel::cgroup_init();", signals);
         let taskstats_early =
             find_after(&source, "init::start_kernel::taskstats_init_early(", cgroup);
-        let wx = find_after(&source, "protect_kernel_image_mappings", taskstats_early);
-        let late_initcalls = find_after(&source, "init::initcall::do_late_initcalls();", wx);
-        let initramfs = find_after(&source, "install_from_bytes(initrd_slice)", late_initcalls);
+        let delayacct = find_after(
+            &source,
+            "init::start_kernel::delayacct_init();",
+            taskstats_early,
+        );
+        let acpi = find_after(
+            &source,
+            "init::start_kernel::acpi_subsystem_init();",
+            delayacct,
+        );
+        let arch_post_acpi = find_after(
+            &source,
+            "init::start_kernel::arch_post_acpi_subsys_init();",
+            acpi,
+        );
+        let kcsan = find_after(&source, "init::start_kernel::kcsan_init();", arch_post_acpi);
+        let wx = find_after(&source, "protect_kernel_image_mappings", kcsan);
+        let late_initcalls = find_after(&source, "init::initcall::do_late_initcalls_filtered", wx);
+        let initramfs = find_after(
+            &source,
+            "InitramfsImage::parse(initrd_slice)",
+            late_initcalls,
+        );
         let tlb = find_after(&source, "arch::x86::mm::tlb::init();", initramfs);
         let irq_enable = find_after(&source, "core::arch::asm!(\"sti\",", tlb);
         let rest = find_after(&source, "halt_loop_with_softirq()", irq_enable);
@@ -20672,7 +20692,9 @@ CONFIG_MODULES=y
         assert!(timekeeping < softirq && softirq < efi && efi < fork);
         assert!(fork < proc_caches && proc_caches < security && security < net);
         assert!(net < vfs && vfs < signals && signals < cgroup);
-        assert!(cgroup < taskstats_early && taskstats_early < wx);
+        assert!(cgroup < taskstats_early && taskstats_early < delayacct);
+        assert!(delayacct < acpi && acpi < arch_post_acpi && arch_post_acpi < kcsan);
+        assert!(kcsan < wx);
         assert!(wx < late_initcalls && late_initcalls < initramfs && initramfs < tlb);
         assert!(tlb < irq_enable && irq_enable < rest);
     }
@@ -22502,7 +22524,7 @@ CONFIG_MODULES=y
             .expect("read kernel main source");
         let source = source.replace("\r\n", "\n");
         let handoff = source
-            .find("Run /sbin/init as init process")
+            .find("Run {} as init process")
             .expect("PID1 handoff log line must exist");
         let end = (handoff + 512).min(source.len());
         let window = &source[handoff..end];
@@ -25239,7 +25261,8 @@ CONFIG_MODULES=y
         );
         assert!(
             main_rs.contains("boot_params_initrd_slice(bp)")
-                && main_rs.contains("install_from_bytes(initrd_slice)")
+                && main_rs.contains("InitramfsImage::parse(initrd_slice)")
+                && main_rs.contains("init::initramfs::install(image)")
                 && main_rs.contains("linux boot_params initrd indexed"),
             "initramfs install should parse Linux boot_params initrd bytes in place"
         );

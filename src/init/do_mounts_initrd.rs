@@ -6,6 +6,9 @@
 use crate::include::uapi::errno::EINVAL;
 
 pub const ROOT_RAM0: u32 = (1 << 20) | 0;
+pub const NOINITRD_DEPRECATION_WARNING: &str =
+    "noinitrd option is deprecated and will be removed soon";
+pub const INITRD_DEPRECATION_WARNING: &str = "using deprecated initrd support, will be removed in January 2027; use initramfs instead or (as a last resort) /sys/firmware/initrd";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InitrdState {
@@ -49,6 +52,10 @@ impl InitrdState {
         Ok(())
     }
 
+    pub fn early_initrd(&mut self, arg: &str) -> Result<(), i32> {
+        self.early_initrdmem(arg)
+    }
+
     pub fn initrd_load(&self, rd_load_image_ok: bool) -> InitrdLoadPlan {
         InitrdLoadPlan {
             create_ram_device: self.mount_initrd,
@@ -58,6 +65,11 @@ impl InitrdState {
                 None
             },
             deprecated_initrd_used: self.mount_initrd && rd_load_image_ok,
+            deprecation_warning: if self.mount_initrd && rd_load_image_ok {
+                Some(INITRD_DEPRECATION_WARNING)
+            } else {
+                None
+            },
             unlink_initrd_image: true,
         }
     }
@@ -68,6 +80,7 @@ pub struct InitrdLoadPlan {
     pub create_ram_device: bool,
     pub root_device: Option<u32>,
     pub deprecated_initrd_used: bool,
+    pub deprecation_warning: Option<&'static str>,
     pub unlink_initrd_image: bool,
 }
 
@@ -127,22 +140,29 @@ mod tests {
         assert!(source.contains("unsigned long initrd_start, initrd_end;"));
         assert!(source.contains("static int __initdata mount_initrd = 1;"));
         assert!(source.contains("__setup(\"noinitrd\", no_initrd);"));
+        assert!(source.contains("noinitrd option is deprecated"));
         assert!(source.contains("early_param(\"initrdmem\", early_initrdmem);"));
         assert!(source.contains("early_param(\"initrd\", early_initrd);"));
+        assert!(source.contains("static int __init early_initrd(char *p)"));
         assert!(source.contains("create_dev(\"/dev/ram\", Root_RAM0);"));
         assert!(source.contains("rd_load_image()"));
+        assert!(source.contains("using deprecated initrd support"));
         assert!(source.contains("init_unlink(\"/initrd.image\");"));
 
         let mut state = InitrdState::new();
         assert_eq!(state.early_initrdmem("0x1000,4M"), Ok(()));
         assert_eq!(state.phys_initrd_start, 0x1000);
         assert_eq!(state.phys_initrd_size, 4 << 20);
+        assert_eq!(state.early_initrd("0x2000,8K"), Ok(()));
+        assert_eq!(state.phys_initrd_start, 0x2000);
+        assert_eq!(state.phys_initrd_size, 8 << 10);
         assert_eq!(
             state.initrd_load(true),
             InitrdLoadPlan {
                 create_ram_device: true,
                 root_device: Some(ROOT_RAM0),
                 deprecated_initrd_used: true,
+                deprecation_warning: Some(INITRD_DEPRECATION_WARNING),
                 unlink_initrd_image: true,
             }
         );

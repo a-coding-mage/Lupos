@@ -1,7 +1,12 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/init/do_mounts.c
+//! linux-source: vendor/linux/init/do_mounts.h
 //! test-origin: linux:vendor/linux/init/do_mounts.c
 //! Initial root mount command-line state and root-device selection.
+//!
+//! `do_mounts.h` is folded into Rust helpers: `create_dev` is represented by
+//! `rootfs::ensure_block_device_node`, while `rd_load_image`/`initrd_load`
+//! are modeled by `do_mounts_rd` and `do_mounts_initrd`.
 
 extern crate alloc;
 

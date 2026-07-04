@@ -3146,7 +3146,7 @@ pub unsafe fn sys_readlink(pathname: *const u8, buf: *mut u8, bufsiz: usize) -> 
     unsafe { sys_readlinkat(AT_FDCWD, pathname, buf, bufsiz) }
 }
 
-fn mknod_kind(mode: u32) -> Result<InodeKind, i32> {
+pub(crate) fn mknod_kind(mode: u32) -> Result<InodeKind, i32> {
     match mode & S_IFMT {
         0 | S_IFREG => Ok(InodeKind::Regular),
         S_IFIFO => Ok(InodeKind::Fifo),

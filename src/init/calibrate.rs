@@ -1,12 +1,14 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/init/calibrate.c
 //! test-origin: linux:vendor/linux/init/calibrate.c
 //! Delay-loop calibration.
 //!
 //! Mirrors `vendor/linux/init/calibrate.c`: the boot CPU chooses
 //! `loops_per_jiffy` from an already-known CPU value, the `lpj=` preset,
-//! a timer-derived fine value, an arch-known value, a direct timer
-//! calibration, or finally the convergence fallback.
+//! a timer-derived fine value before the first printk, an arch-known value, a
+//! direct timer calibration, or finally the convergence fallback. The direct
+//! and convergence calibration internals are modeled as inputs here rather
+//! than reimplemented cycle-by-cycle.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -31,6 +33,7 @@ pub enum DelayCalibrationSource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DelayCalibrationInputs {
+    pub printed: bool,
     pub per_cpu_lpj: u64,
     pub preset_lpj: u64,
     pub lpj_fine: u64,
@@ -51,6 +54,7 @@ pub struct DelayCalibrationResult {
 impl Default for DelayCalibrationInputs {
     fn default() -> Self {
         Self {
+            printed: PRINTED.load(Ordering::Acquire),
             per_cpu_lpj: 0,
             preset_lpj: preset_lpj(),
             lpj_fine: lpj_fine(),
@@ -86,12 +90,25 @@ pub fn setup_lpj(value: &str) -> bool {
 }
 
 pub fn parse_lpj(value: &str) -> Option<u64> {
+    parse_u64_auto(value)
+}
+
+fn parse_u64_auto(value: &str) -> Option<u64> {
     let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
     if let Some(hex) = trimmed
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
     {
         u64::from_str_radix(hex, 16).ok()
+    } else if let Some(octal) = trimmed.strip_prefix('0') {
+        if octal.is_empty() {
+            Some(0)
+        } else {
+            u64::from_str_radix(octal, 8).ok()
+        }
     } else {
         trimmed.parse::<u64>().ok()
     }
@@ -106,6 +123,7 @@ pub fn calibrate_delay_with(inputs: DelayCalibrationInputs) -> DelayCalibrationR
     LOOPS_PER_JIFFY.store(lpj, Ordering::Release);
     let (bogo_mips_int, bogo_mips_frac) = bogomips_parts(lpj, HZ);
     let first_print = !PRINTED.swap(true, Ordering::AcqRel);
+    calibration_delay_done();
 
     DelayCalibrationResult {
         loops_per_jiffy: lpj,
@@ -124,7 +142,7 @@ pub fn select_lpj(inputs: DelayCalibrationInputs) -> (u64, DelayCalibrationSourc
         )
     } else if inputs.preset_lpj != 0 {
         (inputs.preset_lpj, DelayCalibrationSource::Preset)
-    } else if inputs.lpj_fine != 0 {
+    } else if !inputs.printed && inputs.lpj_fine != 0 {
         (inputs.lpj_fine, DelayCalibrationSource::Fine)
     } else if inputs.known_lpj != 0 {
         (inputs.known_lpj, DelayCalibrationSource::Known)
@@ -134,6 +152,8 @@ pub fn select_lpj(inputs: DelayCalibrationInputs) -> (u64, DelayCalibrationSourc
         (inputs.converged_lpj, DelayCalibrationSource::Converged)
     }
 }
+
+pub fn calibration_delay_done() {}
 
 pub fn bogomips_parts(lpj: u64, hz: u64) -> (u64, u64) {
     let whole_div = 500_000 / hz;
@@ -160,12 +180,27 @@ mod tests {
         assert_eq!(preset_lpj(), 8192);
         assert!(setup_lpj("0x4000"));
         assert_eq!(preset_lpj(), 0x4000);
+        assert!(setup_lpj("010"));
+        assert_eq!(preset_lpj(), 8);
         assert!(!setup_lpj("nope"));
+    }
+
+    #[test]
+    fn calibrate_source_contract_matches_linux() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/init/calibrate.c"
+        ));
+        assert!(source.contains("return kstrtoul(str, 0, &preset_lpj) == 0;"));
+        assert!(source.contains("} else if ((!printed) && lpj_fine) {"));
+        assert!(source.contains("void __attribute__((weak)) calibration_delay_done(void)"));
+        assert!(source.contains("calibration_delay_done();"));
     }
 
     #[test]
     fn calibration_precedence_matches_linux() {
         let inputs = DelayCalibrationInputs {
+            printed: false,
             per_cpu_lpj: 1,
             preset_lpj: 2,
             lpj_fine: 3,
@@ -189,12 +224,19 @@ mod tests {
             ..inputs
         };
         assert_eq!(select_lpj(inputs), (3, DelayCalibrationSource::Fine));
+
+        let inputs = DelayCalibrationInputs {
+            printed: true,
+            ..inputs
+        };
+        assert_eq!(select_lpj(inputs), (4, DelayCalibrationSource::Known));
     }
 
     #[test]
     fn calibrate_delay_stores_global_lpj_and_formats_bogomips() {
         reset_for_tests();
         let result = calibrate_delay_with(DelayCalibrationInputs {
+            printed: false,
             per_cpu_lpj: 0,
             preset_lpj: 500_000,
             lpj_fine: 0,
