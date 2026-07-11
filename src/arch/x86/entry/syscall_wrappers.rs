@@ -1837,7 +1837,7 @@ pub unsafe extern "C" fn __x64_sys_rt_sigtimedwait(regs: *mut PtRegs) -> i64 {
 
 pub unsafe extern "C" fn __x64_sys_rt_sigsuspend(regs: *mut PtRegs) -> i64 {
     let r = unsafe { &*regs };
-    crate::kernel::syscalls::sys_rt_sigsuspend(r.arg1() as usize)
+    unsafe { signal::sys_rt_sigsuspend(r.arg0() as *const signal::SigSet, r.arg1() as usize) }
 }
 
 pub unsafe extern "C" fn __x64_sys_rt_sigqueueinfo(regs: *mut PtRegs) -> i64 {
@@ -2338,7 +2338,7 @@ pub unsafe extern "C" fn __x64_sys_clock_gettime(regs: *mut PtRegs) -> i64 {
     let r = unsafe { &*regs };
     let out = r.arg1() as *mut crate::kernel::time::Timespec64;
     if out.is_null() {
-        return -(crate::kernel::time::posix_clock::EINVAL as i64);
+        return -(crate::include::uapi::errno::EFAULT as i64);
     }
     errno_result(
         crate::kernel::time::sys_clock_gettime(r.arg0() as i32),
@@ -3690,6 +3690,7 @@ mod tests {
         current.pid = 83;
         current.tgid = 83;
         current.cred = &raw const INIT_CRED;
+        current.m29.se.sum_exec_runtime = 123_456;
 
         unsafe {
             files::set_task_files(
@@ -3731,6 +3732,29 @@ mod tests {
                 0,
             ]);
             assert_eq!(__x64_sys_clock_gettime(&mut r), 0);
+            let mut cpu_time = crate::kernel::time::Timespec64::default();
+            let mut r = regs([
+                crate::kernel::time::CLOCK_PROCESS_CPUTIME_ID as u64,
+                &mut cpu_time as *mut _ as u64,
+                0,
+                0,
+                0,
+                0,
+            ]);
+            assert_eq!(__x64_sys_clock_gettime(&mut r), 0);
+            assert_eq!(cpu_time.to_ns(), 123_456);
+            let mut r = regs([
+                crate::kernel::time::CLOCK_PROCESS_CPUTIME_ID as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]);
+            assert_eq!(
+                __x64_sys_clock_gettime(&mut r),
+                -(crate::include::uapi::errno::EFAULT as i64)
+            );
             let mut res = crate::kernel::time::Timespec64::default();
             let mut r = regs([
                 crate::kernel::time::CLOCK_MONOTONIC as u64,

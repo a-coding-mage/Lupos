@@ -184,9 +184,12 @@ fn evdev_poll(file: &FileRef) -> u32 {
 }
 
 fn evdev_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
-    // Strip the size + direction fields from the cmd so the "len"-encoded
-    // ioctls (EVIOCGNAME, EVIOCGBIT, EVIOCGABS, …) match on a base value.
-    let base = (cmd >> IOC_TYPESHIFT) & 0xffff;
+    // The length-encoded evdev ioctls (EVIOCGNAME, EVIOCGBIT, EVIOCGABS, …)
+    // vary their size field per call and encode the event/axis index in the
+    // low nibble of `nr`, so they cannot be matched against a fixed `cmd`.
+    // Dispatch on the `type`+`nr` fields, ignoring `dir` and `size`.
+    let nr = cmd & IOC_NRMASK;
+    let ty = (cmd >> IOC_TYPESHIFT) & IOC_TYPEMASK;
     let size = ((cmd >> IOC_SIZESHIFT) & IOC_SIZEMASK) as usize;
 
     match cmd {
@@ -217,32 +220,24 @@ fn evdev_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
             // succeeds, and event timestamps already use a monotonic source.
             Ok(0)
         }
-        _ => match base {
-            EVIOCGNAME_BASE => evdev_get_name(file, arg, size),
-            EVIOCGPHYS_BASE => evdev_get_string(arg, size, b""),
-            EVIOCGUNIQ_BASE => evdev_get_string(arg, size, b""),
-            EVIOCGBIT_BASE => {
-                // The low byte of nr is the event type (0 = all event types).
-                let ev_type = ((cmd >> IOC_NRSHIFT) & IOC_NRMASK) as u16 & 0xff;
-                evdev_get_bit(arg, size, ev_type)
-            }
-            EVIOCGABS_BASE => {
-                // We don't expose an absolute axis device yet — return zeroed.
-                let abs = InputAbsinfo::default();
-                if size < size_of::<InputAbsinfo>() {
-                    return Err(EINVAL);
-                }
-                let not_copied = unsafe {
-                    crate::arch::x86::kernel::uaccess::copy_to_user(
-                        arg as *mut u8,
-                        &abs as *const InputAbsinfo as *const u8,
-                        size_of::<InputAbsinfo>(),
-                    )
-                };
-                if not_copied == 0 { Ok(0) } else { Err(EFAULT) }
-            }
+        _ if ty == EVDEV_IOC_TYPE => match nr {
+            // EVIOCGNAME(len) — device name.
+            0x06 => evdev_get_name(file, arg, size),
+            // EVIOCGPHYS(len) / EVIOCGUNIQ(len) — physical/unique id (empty).
+            0x07 | 0x08 => evdev_get_string(arg, size, b""),
+            // EVIOCGPROP(len) — input properties bitmap. We expose none.
+            0x09 => evdev_get_zeroed(arg, size),
+            // EVIOCGKEY / EVIOCGLED / EVIOCGSW — current key/LED/switch state.
+            // All released; report an all-zero bitmap.
+            0x18 | 0x19 | 0x1b => evdev_get_zeroed(arg, size),
+            // EVIOCGBIT(ev, len) — capability bitmap for event type `ev`
+            // (nr == 0x20 + ev; 0x20 == the supported-event-types bitmap).
+            0x20..=0x3f => evdev_get_bit(file, arg, size, (nr - 0x20) as u16),
+            // EVIOCGABS(abs, len) — per-axis absinfo. No absolute axes.
+            0x40..=0x7f => evdev_get_abs(arg, size),
             _ => Err(ENOTTY),
         },
+        _ => Err(ENOTTY),
     }
 }
 
@@ -277,16 +272,17 @@ fn evdev_copy_string(arg: u64, size: usize, src: &[u8]) -> Result<i64, i32> {
     Ok((n + 1) as i64)
 }
 
-fn evdev_get_bit(arg: u64, size: usize, ev_type: u16) -> Result<i64, i32> {
+fn evdev_get_bit(file: &FileRef, arg: u64, size: usize, ev_type: u16) -> Result<i64, i32> {
     if arg == 0 || size == 0 {
         return Err(EFAULT);
     }
-    // Build a bitmap describing which event codes are supported. We expose a
-    // minimal capability set:
-    //   - EV_SYN | EV_KEY for every keyboard,
-    //   - EV_REL for the pointer (mouse) device,
-    // Per-code bitmaps just return all-ones up to the byte limit — userspace
-    // probes specific codes via EVIOCGKEY/EVIOCGABS separately.
+    // Capabilities are per device: `/dev/input/event0` (minor 0) is the AT
+    // keyboard (EV_SYN | EV_KEY only — advertising EV_REL/EV_ABS would make
+    // X.Org's evdev driver misclassify it as a pointer); other minors are the
+    // PS/2 mouse (EV_SYN | EV_KEY | EV_REL — only the BTN_* buttons and the
+    // X/Y/wheel relative axes).
+    let minor = slot_for_path(&file.dentry.name).unwrap_or(0);
+    let is_keyboard = minor == 0;
     let mut buf = [0u8; 128];
     let n = core::cmp::min(size, buf.len());
     match ev_type {
@@ -294,14 +290,35 @@ fn evdev_get_bit(arg: u64, size: usize, ev_type: u16) -> Result<i64, i32> {
             // Bitmap of supported event types. Bit 0 = EV_SYN, 1 = EV_KEY, …
             buf[0] |= 1 << EV_SYN;
             buf[0] |= 1 << EV_KEY;
-            buf[0] |= 1 << EV_REL;
-            buf[0] |= 1 << EV_ABS;
+            if !is_keyboard {
+                buf[0] |= 1 << EV_REL;
+            }
         }
-        _ => {
-            // Per-type code bitmap — populate all bytes within `n`.
-            for byte in &mut buf[..n] {
+        EV_KEY if is_keyboard => {
+            // Report support for the keyboard key range (codes 0x00..0xff).
+            // Leaving the BTN_* range (0x100+) clear keeps the keyboard from
+            // also looking like it has pointer buttons.
+            let keys = core::cmp::min(n, 32);
+            for byte in &mut buf[..keys] {
                 *byte = 0xff;
             }
+        }
+        EV_KEY => {
+            // Pointer: advertise only the three mouse buttons so X.Org's evdev
+            // driver classifies it as a pointer (which requires BTN_LEFT), not
+            // a keyboard.  BTN_LEFT=0x110, BTN_RIGHT=0x111, BTN_MIDDLE=0x112.
+            set_code_bit(&mut buf, n, 0x110);
+            set_code_bit(&mut buf, n, 0x111);
+            set_code_bit(&mut buf, n, 0x112);
+        }
+        EV_REL if !is_keyboard => {
+            // REL_X=0, REL_Y=1, REL_WHEEL=8.
+            set_code_bit(&mut buf, n, 0x00);
+            set_code_bit(&mut buf, n, 0x01);
+            set_code_bit(&mut buf, n, 0x08);
+        }
+        _ => {
+            // Unsupported event type for this device — all-zero bitmap.
         }
     }
     let not_copied =
@@ -311,6 +328,53 @@ fn evdev_get_bit(arg: u64, size: usize, ev_type: u16) -> Result<i64, i32> {
     } else {
         Err(EFAULT)
     }
+}
+
+/// Set the bit for evdev event `code` in a little-endian capability bitmap,
+/// if the byte holding it fits within the caller-supplied length `n`.
+fn set_code_bit(buf: &mut [u8], n: usize, code: u16) {
+    let byte = (code / 8) as usize;
+    if byte < n && byte < buf.len() {
+        buf[byte] |= 1 << (code % 8);
+    }
+}
+
+/// Copy an all-zero bitmap of `size` bytes to userspace. Used by the state
+/// ioctls (EVIOCGKEY/EVIOCGLED/EVIOCGSW) and EVIOCGPROP, which report "nothing
+/// currently set / no properties".
+fn evdev_get_zeroed(arg: u64, size: usize) -> Result<i64, i32> {
+    if arg == 0 || size == 0 {
+        return Err(EFAULT);
+    }
+    let buf = [0u8; 128];
+    let n = core::cmp::min(size, buf.len());
+    let not_copied =
+        unsafe { crate::arch::x86::kernel::uaccess::copy_to_user(arg as *mut u8, buf.as_ptr(), n) };
+    if not_copied == 0 {
+        Ok(n as i64)
+    } else {
+        Err(EFAULT)
+    }
+}
+
+/// EVIOCGABS(abs) — per-axis absinfo. We expose no absolute axes, so return a
+/// zeroed `input_absinfo`.
+fn evdev_get_abs(arg: u64, size: usize) -> Result<i64, i32> {
+    if arg == 0 {
+        return Err(EFAULT);
+    }
+    if size < size_of::<InputAbsinfo>() {
+        return Err(EINVAL);
+    }
+    let abs = InputAbsinfo::default();
+    let not_copied = unsafe {
+        crate::arch::x86::kernel::uaccess::copy_to_user(
+            arg as *mut u8,
+            &abs as *const InputAbsinfo as *const u8,
+            size_of::<InputAbsinfo>(),
+        )
+    };
+    if not_copied == 0 { Ok(0) } else { Err(EFAULT) }
 }
 
 /// `file_operations` for the evdev character device.

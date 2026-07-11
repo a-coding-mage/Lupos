@@ -71,11 +71,22 @@ pub struct RenderBatch {
 enum EscapeState {
     Ground,
     Escape,
+    CharsetDesignation,
     Csi,
     Osc,
     OscEscape,
     Dcs,
     DcsEscape,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SavedCursor {
+    col: usize,
+    row: usize,
+    fg_color: u32,
+    bg_color: u32,
+    bold: bool,
+    reverse: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -88,12 +99,17 @@ struct VirtualConsole {
     fg_color: u32,
     bg_color: u32,
     bold: bool,
+    reverse: bool,
     cells: Vec<TextCell>,
     dirty_rows: Vec<bool>,
     pending_clear: Option<ClearOp>,
     cursor_enabled: bool,
     cursor_blink_on: bool,
     insert_mode: bool,
+    need_wrap: bool,
+    scroll_top: usize,
+    scroll_bottom: usize,
+    saved_cursor: SavedCursor,
     esc_state: EscapeState,
     csi_params: [usize; 4],
     csi_count: usize,
@@ -116,12 +132,24 @@ impl VirtualConsole {
             fg_color: DEFAULT_FG,
             bg_color: DEFAULT_BG,
             bold: false,
+            reverse: false,
             cells: vec![TextCell::default(); cols * rows],
             dirty_rows: vec![true; rows],
             pending_clear: None,
             cursor_enabled: true,
             cursor_blink_on: true,
             insert_mode: false,
+            need_wrap: false,
+            scroll_top: 0,
+            scroll_bottom: rows,
+            saved_cursor: SavedCursor {
+                col: 0,
+                row: 0,
+                fg_color: DEFAULT_FG,
+                bg_color: DEFAULT_BG,
+                bold: false,
+                reverse: false,
+            },
             esc_state: EscapeState::Ground,
             csi_params: [0; 4],
             csi_count: 0,
@@ -151,6 +179,9 @@ impl VirtualConsole {
         match self.esc_state {
             EscapeState::Ground => self.write_ground(byte),
             EscapeState::Escape => self.write_escape(byte),
+            EscapeState::CharsetDesignation => {
+                self.esc_state = EscapeState::Ground;
+            }
             EscapeState::Csi => self.write_csi(byte),
             EscapeState::Osc => self.write_osc(byte),
             EscapeState::OscEscape => self.write_osc_escape(byte),
@@ -180,6 +211,27 @@ impl VirtualConsole {
             }
             b']' => self.esc_state = EscapeState::Osc,
             b'P' => self.esc_state = EscapeState::Dcs,
+            b'(' | b')' => self.esc_state = EscapeState::CharsetDesignation,
+            b'D' => {
+                self.line_feed();
+                self.esc_state = EscapeState::Ground;
+            }
+            b'E' => {
+                self.new_line();
+                self.esc_state = EscapeState::Ground;
+            }
+            b'M' => {
+                self.reverse_index();
+                self.esc_state = EscapeState::Ground;
+            }
+            b'7' => {
+                self.save_cursor();
+                self.esc_state = EscapeState::Ground;
+            }
+            b'8' => {
+                self.restore_cursor();
+                self.esc_state = EscapeState::Ground;
+            }
             b'c' => {
                 self.clear();
                 self.esc_state = EscapeState::Ground;
@@ -283,13 +335,22 @@ impl VirtualConsole {
             b'C' => self.move_right(self.csi_param(0, 1)),
             b'D' => self.move_left(self.csi_param(0, 1)),
             b'G' => self.set_col_1based(self.csi_param(0, 1)),
+            b'd' => self.set_row_1based(self.csi_param(0, 1)),
             b'H' | b'f' => self.set_cursor_1based(self.csi_param(0, 1), self.csi_param(1, 1)),
             b'J' => self.clear_display(self.csi_param(0, 0)),
             b'K' => self.clear_line(self.csi_param(0, 0)),
+            b'L' => self.insert_lines(self.csi_param(0, 1)),
+            b'M' => self.delete_lines(self.csi_param(0, 1)),
             b'@' => self.insert_chars(self.csi_param(0, 1)),
             b'P' => self.delete_chars(self.csi_param(0, 1)),
+            b'X' => self.erase_chars(self.csi_param(0, 1)),
             b'n' if !self.csi_private && self.csi_param(0, 0) == 6 => self.report_cursor_position(),
             b't' if !self.csi_private && self.csi_param(0, 0) == 18 => self.report_text_area_size(),
+            b'r' if !self.csi_private => {
+                self.set_scroll_region(self.csi_param(0, 1), self.csi_param(1, self.rows));
+            }
+            b's' if !self.csi_private => self.save_cursor(),
+            b'u' if !self.csi_private => self.restore_cursor(),
             b'h' if !self.csi_private && self.csi_param(0, 0) == 4 => {
                 self.insert_mode = true;
             }
@@ -326,10 +387,22 @@ impl VirtualConsole {
         self.fg_color = DEFAULT_FG;
         self.bg_color = DEFAULT_BG;
         self.bold = false;
+        self.reverse = false;
         self.cursor_enabled = true;
         self.insert_mode = false;
+        self.need_wrap = false;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows;
         self.col = 0;
         self.row = 0;
+        self.saved_cursor = SavedCursor {
+            col: 0,
+            row: 0,
+            fg_color: DEFAULT_FG,
+            bg_color: DEFAULT_BG,
+            bold: false,
+            reverse: false,
+        };
         self.mark_cursor_dirty();
     }
 
@@ -338,6 +411,7 @@ impl VirtualConsole {
             self.fg_color = DEFAULT_FG;
             self.bg_color = DEFAULT_BG;
             self.bold = false;
+            self.reverse = false;
             return;
         }
         for idx in 0..self.csi_count {
@@ -347,9 +421,12 @@ impl VirtualConsole {
                     self.fg_color = DEFAULT_FG;
                     self.bg_color = DEFAULT_BG;
                     self.bold = false;
+                    self.reverse = false;
                 }
                 1 => self.bold = true,
+                7 => self.reverse = true,
                 22 => self.bold = false,
+                27 => self.reverse = false,
                 30..=37 => self.fg_color = ansi_color(code - 30, self.bold),
                 40..=47 => self.bg_color = ansi_color(code - 40, false),
                 90..=97 => self.fg_color = ansi_color(code - 90, true),
@@ -361,8 +438,21 @@ impl VirtualConsole {
         }
     }
 
+    fn current_cell(&self, ch: u8) -> TextCell {
+        let (fg, bg) = if self.reverse {
+            (self.bg_color, self.fg_color)
+        } else {
+            (self.fg_color, self.bg_color)
+        };
+        TextCell { ch, fg, bg }
+    }
+
+    fn blank_cell(&self) -> TextCell {
+        self.current_cell(b' ')
+    }
+
     fn put_printable(&mut self, ch: u8) {
-        if self.col >= self.cols {
+        if self.need_wrap {
             self.new_line();
         }
         if self.insert_mode {
@@ -370,21 +460,19 @@ impl VirtualConsole {
         }
         self.mark_cursor_dirty();
         let idx = self.cell_index(self.col, self.row);
-        self.cells[idx] = TextCell {
-            ch,
-            fg: self.fg_color,
-            bg: self.bg_color,
-        };
+        let cell = self.current_cell(ch);
+        self.cells[idx] = cell;
         self.mark_dirty(self.row);
-        self.col += 1;
-        if self.col >= self.cols {
-            self.new_line();
+        if self.col == self.cols - 1 {
+            self.need_wrap = true;
         } else {
-            self.mark_cursor_dirty();
+            self.col += 1;
         }
+        self.mark_cursor_dirty();
     }
 
     fn insert_chars(&mut self, count: usize) {
+        self.need_wrap = false;
         let count = count.min(self.cols.saturating_sub(self.col));
         if count == 0 {
             return;
@@ -395,11 +483,7 @@ impl VirtualConsole {
             let dst = self.cell_index(col, self.row);
             self.cells[dst] = self.cells[src];
         }
-        let blank = TextCell {
-            ch: b' ',
-            fg: self.fg_color,
-            bg: self.bg_color,
-        };
+        let blank = self.blank_cell();
         for col in self.col..self.col + count {
             let idx = self.cell_index(col, self.row);
             self.cells[idx] = blank;
@@ -409,16 +493,15 @@ impl VirtualConsole {
     }
 
     fn tab(&mut self) {
+        self.mark_cursor_dirty();
         let target = ((self.col / 8) + 1) * 8;
-        while self.col < target.min(self.cols) {
-            self.put_printable(b' ');
-        }
-        if self.col >= self.cols {
-            self.new_line();
-        }
+        self.col = target.min(self.cols - 1);
+        self.need_wrap = false;
+        self.mark_cursor_dirty();
     }
 
     fn backspace(&mut self) {
+        self.need_wrap = false;
         if self.col > 0 {
             self.mark_cursor_dirty();
             self.col -= 1;
@@ -429,50 +512,137 @@ impl VirtualConsole {
     fn new_line(&mut self) {
         self.mark_cursor_dirty();
         self.col = 0;
-        self.row += 1;
-        if self.row >= self.rows {
-            self.scroll_up();
-            self.row = self.rows - 1;
+        self.need_wrap = false;
+        self.advance_line();
+        self.mark_cursor_dirty();
+    }
+
+    fn line_feed(&mut self) {
+        self.mark_cursor_dirty();
+        self.need_wrap = false;
+        self.advance_line();
+        self.mark_cursor_dirty();
+    }
+
+    fn advance_line(&mut self) {
+        if self.row + 1 == self.scroll_bottom {
+            self.scroll_region_up(self.scroll_top, self.scroll_bottom, 1);
+            self.row = self.scroll_bottom - 1;
+        } else if self.row < self.rows - 1 {
+            self.row += 1;
+        }
+    }
+
+    fn reverse_index(&mut self) {
+        self.mark_cursor_dirty();
+        self.need_wrap = false;
+        if self.row == self.scroll_top {
+            self.scroll_region_down(self.scroll_top, self.scroll_bottom, 1);
+        } else if self.row > 0 {
+            self.row -= 1;
         }
         self.mark_cursor_dirty();
     }
 
-    fn scroll_up(&mut self) {
-        if self.rows <= 1 {
-            self.clear_line(2);
+    fn scroll_region_up(&mut self, top: usize, bottom: usize, count: usize) {
+        if top >= bottom || bottom > self.rows {
             return;
         }
-        self.row_head = (self.row_head + 1) % self.rows;
-        let bottom = self.rows - 1;
-        let blank = TextCell {
-            ch: b' ',
-            fg: self.fg_color,
-            bg: self.bg_color,
-        };
-        for col in 0..self.cols {
-            let idx = self.cell_index(col, bottom);
-            self.cells[idx] = blank;
+        let count = count.min(bottom - top);
+        if count == 0 {
+            return;
         }
-        self.mark_all_dirty();
+
+        if top == 0 && bottom == self.rows {
+            self.row_head = (self.row_head + count) % self.rows;
+        } else {
+            for row in top..bottom - count {
+                for col in 0..self.cols {
+                    let src = self.cell_index(col, row + count);
+                    let dst = self.cell_index(col, row);
+                    let cell = self.cells[src];
+                    self.cells[dst] = cell;
+                }
+            }
+        }
+
+        let blank = self.blank_cell();
+        for row in bottom - count..bottom {
+            for col in 0..self.cols {
+                let idx = self.cell_index(col, row);
+                self.cells[idx] = blank;
+            }
+        }
+        for row in top..bottom {
+            self.mark_dirty(row);
+        }
+    }
+
+    fn scroll_region_down(&mut self, top: usize, bottom: usize, count: usize) {
+        if top >= bottom || bottom > self.rows {
+            return;
+        }
+        let count = count.min(bottom - top);
+        if count == 0 {
+            return;
+        }
+
+        if top == 0 && bottom == self.rows {
+            self.row_head = (self.row_head + self.rows - count) % self.rows;
+        } else {
+            for row in (top + count..bottom).rev() {
+                for col in 0..self.cols {
+                    let src = self.cell_index(col, row - count);
+                    let dst = self.cell_index(col, row);
+                    let cell = self.cells[src];
+                    self.cells[dst] = cell;
+                }
+            }
+        }
+
+        let blank = self.blank_cell();
+        for row in top..top + count {
+            for col in 0..self.cols {
+                let idx = self.cell_index(col, row);
+                self.cells[idx] = blank;
+            }
+        }
+        for row in top..bottom {
+            self.mark_dirty(row);
+        }
     }
 
     fn clear(&mut self) {
-        let blank = TextCell {
-            ch: b' ',
-            fg: self.fg_color,
-            bg: self.bg_color,
-        };
+        self.fg_color = DEFAULT_FG;
+        self.bg_color = DEFAULT_BG;
+        self.bold = false;
+        self.reverse = false;
+        self.cursor_enabled = true;
+        self.insert_mode = false;
+        self.need_wrap = false;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows;
+        let blank = self.blank_cell();
         for cell in &mut self.cells {
             *cell = blank;
         }
         self.col = 0;
         self.row = 0;
         self.row_head = 0;
+        self.saved_cursor = SavedCursor {
+            col: 0,
+            row: 0,
+            fg_color: DEFAULT_FG,
+            bg_color: DEFAULT_BG,
+            bold: false,
+            reverse: false,
+        };
         self.esc_state = EscapeState::Ground;
         self.queue_full_clear(blank, false);
     }
 
     fn clear_display(&mut self, mode: usize) {
+        self.need_wrap = false;
         match mode {
             0 if self.row == 0 && self.col == 0 => self.clear_visible_display(),
             0 => {
@@ -506,11 +676,7 @@ impl VirtualConsole {
     }
 
     fn clear_visible_display_with_scrollback(&mut self, flush_scrollback: bool) {
-        let blank = TextCell {
-            ch: b' ',
-            fg: self.fg_color,
-            bg: self.bg_color,
-        };
+        let blank = self.blank_cell();
         for cell in &mut self.cells {
             *cell = blank;
         }
@@ -518,6 +684,7 @@ impl VirtualConsole {
     }
 
     fn clear_line(&mut self, mode: usize) {
+        self.need_wrap = false;
         match mode {
             0 => self.clear_row_range(self.row, self.col, self.cols),
             1 => self.clear_row_range(self.row, 0, self.col.saturating_add(1)),
@@ -528,11 +695,7 @@ impl VirtualConsole {
 
     fn clear_row_range(&mut self, row: usize, start: usize, end: usize) {
         let end = end.min(self.cols);
-        let blank = TextCell {
-            ch: b' ',
-            fg: self.fg_color,
-            bg: self.bg_color,
-        };
+        let blank = self.blank_cell();
         for col in start.min(end)..end {
             let idx = self.cell_index(col, row);
             self.cells[idx] = blank;
@@ -541,6 +704,7 @@ impl VirtualConsole {
     }
 
     fn delete_chars(&mut self, count: usize) {
+        self.need_wrap = false;
         let count = count.min(self.cols.saturating_sub(self.col));
         if count == 0 {
             return;
@@ -551,16 +715,84 @@ impl VirtualConsole {
             let dst = self.cell_index(col, self.row);
             self.cells[dst] = self.cells[src];
         }
-        let blank = TextCell {
-            ch: b' ',
-            fg: self.fg_color,
-            bg: self.bg_color,
-        };
+        let blank = self.blank_cell();
         for col in self.cols - count..self.cols {
             let idx = self.cell_index(col, self.row);
             self.cells[idx] = blank;
         }
         self.mark_dirty(self.row);
+        self.mark_cursor_dirty();
+    }
+
+    fn erase_chars(&mut self, count: usize) {
+        self.need_wrap = false;
+        let count = count.min(self.cols.saturating_sub(self.col));
+        if count == 0 {
+            return;
+        }
+        let blank = self.blank_cell();
+        for col in self.col..self.col + count {
+            let idx = self.cell_index(col, self.row);
+            self.cells[idx] = blank;
+        }
+        self.mark_dirty(self.row);
+    }
+
+    fn insert_lines(&mut self, count: usize) {
+        self.need_wrap = false;
+        if !(self.scroll_top..self.scroll_bottom).contains(&self.row) {
+            return;
+        }
+        self.mark_cursor_dirty();
+        self.scroll_region_down(self.row, self.scroll_bottom, count);
+        self.mark_cursor_dirty();
+    }
+
+    fn delete_lines(&mut self, count: usize) {
+        self.need_wrap = false;
+        if !(self.scroll_top..self.scroll_bottom).contains(&self.row) {
+            return;
+        }
+        self.mark_cursor_dirty();
+        self.scroll_region_up(self.row, self.scroll_bottom, count);
+        self.mark_cursor_dirty();
+    }
+
+    fn set_scroll_region(&mut self, top_1based: usize, bottom_1based: usize) {
+        if top_1based >= bottom_1based || bottom_1based > self.rows {
+            return;
+        }
+        let top = top_1based.saturating_sub(1);
+        let bottom = bottom_1based;
+        self.mark_cursor_dirty();
+        self.scroll_top = top;
+        self.scroll_bottom = bottom;
+        self.col = 0;
+        self.row = 0;
+        self.need_wrap = false;
+        self.mark_cursor_dirty();
+    }
+
+    fn save_cursor(&mut self) {
+        self.saved_cursor = SavedCursor {
+            col: self.col,
+            row: self.row,
+            fg_color: self.fg_color,
+            bg_color: self.bg_color,
+            bold: self.bold,
+            reverse: self.reverse,
+        };
+    }
+
+    fn restore_cursor(&mut self) {
+        self.mark_cursor_dirty();
+        self.col = self.saved_cursor.col.min(self.cols - 1);
+        self.row = self.saved_cursor.row.min(self.rows - 1);
+        self.fg_color = self.saved_cursor.fg_color;
+        self.bg_color = self.saved_cursor.bg_color;
+        self.bold = self.saved_cursor.bold;
+        self.reverse = self.saved_cursor.reverse;
+        self.need_wrap = false;
         self.mark_cursor_dirty();
     }
 
@@ -584,22 +816,29 @@ impl VirtualConsole {
         self.set_col(col.saturating_sub(1).min(self.cols - 1));
     }
 
+    fn set_row_1based(&mut self, row: usize) {
+        self.set_row(row.saturating_sub(1).min(self.rows - 1));
+    }
+
     fn set_cursor_1based(&mut self, row: usize, col: usize) {
         self.mark_cursor_dirty();
         self.row = row.saturating_sub(1).min(self.rows - 1);
         self.col = col.saturating_sub(1).min(self.cols - 1);
+        self.need_wrap = false;
         self.mark_cursor_dirty();
     }
 
     fn set_col(&mut self, col: usize) {
         self.mark_cursor_dirty();
         self.col = col.min(self.cols - 1);
+        self.need_wrap = false;
         self.mark_cursor_dirty();
     }
 
     fn set_row(&mut self, row: usize) {
         self.mark_cursor_dirty();
         self.row = row.min(self.rows - 1);
+        self.need_wrap = false;
         self.mark_cursor_dirty();
     }
 
@@ -1093,6 +1332,140 @@ mod tests {
         let batch = dirty_batch_for_tests(usize::MAX).expect("line clear batch");
         assert!(batch.clear.is_none());
         assert!(batch.dirty_rows.iter().any(|row| row.row == 0));
+    }
+
+    #[test]
+    fn nano_replay_places_title_edit_row_and_shortcuts_on_distinct_rows() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(80, 25);
+        write_visible_bytes(
+            b"\x1b[H\x1b[J\x1b)0\x1b[1;25r\
+              \x1b[0;10;7mGNU nano\x1b[m\r\
+              \x1b[24d^G Help\r\
+              \x1b[25d^X Exit\r\
+              \x1b[2dedit",
+        );
+
+        for (col, byte) in b"GNU nano".iter().enumerate() {
+            assert_eq!(cell_char_for_tests(0, col), *byte);
+        }
+        for (col, byte) in b"edit".iter().enumerate() {
+            assert_eq!(cell_char_for_tests(1, col), *byte);
+        }
+        for (col, byte) in b"^G Help".iter().enumerate() {
+            assert_eq!(cell_char_for_tests(23, col), *byte);
+        }
+        for (col, byte) in b"^X Exit".iter().enumerate() {
+            assert_eq!(cell_char_for_tests(24, col), *byte);
+        }
+        assert_eq!(cursor_for_tests(), Some((4, 1)));
+    }
+
+    #[test]
+    fn reverse_sgr_swaps_rendered_cell_colors_until_reset() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(6, 2);
+        write_visible_bytes(b"\x1b[31;47mA\x1b[7mB\x1b[27mC");
+
+        let cells = with_console_mut(|console| {
+            [
+                console.cells[console.cell_index(0, 0)],
+                console.cells[console.cell_index(1, 0)],
+                console.cells[console.cell_index(2, 0)],
+            ]
+        });
+        assert_eq!((cells[0].fg, cells[0].bg), (0x00aa_0000, 0x00aa_aaaa));
+        assert_eq!((cells[1].fg, cells[1].bg), (0x00aa_aaaa, 0x00aa_0000));
+        assert_eq!((cells[2].fg, cells[2].bg), (0x00aa_0000, 0x00aa_aaaa));
+    }
+
+    #[test]
+    fn pending_wrap_is_cancelled_by_carriage_return() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(3, 2);
+        write_visible_bytes(b"abc\rX");
+
+        for (col, byte) in b"Xbc".iter().enumerate() {
+            assert_eq!(cell_char_for_tests(0, col), *byte);
+        }
+        assert_eq!(cell_char_for_tests(1, 0), b' ');
+        assert_eq!(cursor_for_tests(), Some((1, 0)));
+    }
+
+    #[test]
+    fn printable_after_right_margin_performs_deferred_wrap() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(3, 2);
+        write_visible_bytes(b"abcD");
+
+        for (col, byte) in b"abc".iter().enumerate() {
+            assert_eq!(cell_char_for_tests(0, col), *byte);
+        }
+        assert_eq!(cell_char_for_tests(1, 0), b'D');
+        assert_eq!(cursor_for_tests(), Some((1, 1)));
+    }
+
+    #[test]
+    fn tab_at_final_tab_stop_clamps_without_wrapping_or_filling() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(10, 2);
+        write_visible_bytes(b"12345678\tX");
+
+        assert_eq!(cell_char_for_tests(0, 8), b' ');
+        assert_eq!(cell_char_for_tests(0, 9), b'X');
+        assert_eq!(cursor_for_tests(), Some((9, 0)));
+    }
+
+    #[test]
+    fn scroll_region_line_feed_and_reverse_index_preserve_outside_rows() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(5, 5);
+        write_visible_bytes(
+            b"\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[4;1HD\x1b[5;1HE\
+              \x1b[2;4r\x1b[4;1H\x1bD\x1b[2;1H\x1bM",
+        );
+
+        assert_eq!(cell_char_for_tests(0, 0), b'A');
+        assert_eq!(cell_char_for_tests(1, 0), b' ');
+        assert_eq!(cell_char_for_tests(2, 0), b'C');
+        assert_eq!(cell_char_for_tests(3, 0), b'D');
+        assert_eq!(cell_char_for_tests(4, 0), b'E');
+        assert_eq!(cursor_for_tests(), Some((0, 1)));
+    }
+
+    #[test]
+    fn insert_delete_lines_and_erase_chars_follow_active_region() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(5, 5);
+        write_visible_bytes(
+            b"\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[4;1HD\x1b[5;1HE\
+              \x1b[2;5r\x1b[3;1H\x1b[L\x1b[M",
+        );
+
+        for (row, byte) in b"ABCD ".iter().enumerate() {
+            assert_eq!(cell_char_for_tests(row, 0), *byte);
+        }
+
+        write_visible_bytes(b"\x1b[1;1Habcde\x1b[1;2H\x1b[2X");
+        assert_eq!(cell_char_for_tests(0, 0), b'a');
+        assert_eq!(cell_char_for_tests(0, 1), b' ');
+        assert_eq!(cell_char_for_tests(0, 2), b' ');
+        assert_eq!(cell_char_for_tests(0, 3), b'd');
+        assert_eq!(cell_char_for_tests(0, 4), b'e');
+    }
+
+    #[test]
+    fn esc_and_csi_save_restore_cursor_positions() {
+        let _guard = TEST_CONSOLE_LOCK.lock();
+        reset_for_tests(8, 4);
+        write_visible_bytes(b"A\x1b7\x1b[3;4HB\x1b8C\x1b[s\x1b[4;5HD\x1b[uE");
+
+        assert_eq!(cell_char_for_tests(0, 0), b'A');
+        assert_eq!(cell_char_for_tests(0, 1), b'C');
+        assert_eq!(cell_char_for_tests(0, 2), b'E');
+        assert_eq!(cell_char_for_tests(2, 3), b'B');
+        assert_eq!(cell_char_for_tests(3, 4), b'D');
+        assert_eq!(cursor_for_tests(), Some((3, 0)));
     }
 
     #[test]

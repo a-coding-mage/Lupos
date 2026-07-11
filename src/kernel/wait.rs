@@ -25,7 +25,9 @@ use core::sync::atomic::Ordering;
 use crate::arch::x86::kernel::uaccess::copy_to_user;
 use crate::kernel::exit::release_task;
 use crate::kernel::sched;
-use crate::kernel::signal::{SIGCHLD, exit_if_fatal_signal_pending_current};
+use crate::kernel::signal::{
+    SIGCHLD, exit_if_fatal_signal_pending_current, has_unblocked_pending_signals,
+};
 use crate::kernel::task::task_state::{
     __TASK_STOPPED, EXIT_ZOMBIE, TASK_INTERRUPTIBLE, TASK_RUNNING,
 };
@@ -64,6 +66,8 @@ const ECHILD: i64 = -10;
 const EFAULT: i64 = -14;
 const EINVAL: i64 = -22;
 const ESRCH: i64 = -3;
+// Kernel-internal restart pseudo-errno from vendor/linux/include/linux/errno.h.
+const ERESTARTSYS: i64 = -512;
 
 #[inline]
 unsafe fn copy_wait_status_to_user(stat_addr: *mut i32, status: i32) -> Result<(), i64> {
@@ -474,6 +478,40 @@ unsafe fn has_exiting_wait_target(parent: *mut TaskStruct, target: WaitTarget) -
     found
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitBlockAction {
+    Recheck,
+    Sleep,
+    Yield,
+}
+
+/// Choose how a blocking child wait should give up the CPU after registering
+/// itself as a waiter.
+///
+/// A half-published zombie has already snapshotted its waiters, so the parent
+/// cannot safely sleep: it might never receive the wakeup. It must still yield,
+/// though, because the cooperative scheduler may need to run that child before
+/// `__state = EXIT_ZOMBIE` can become visible. Keeping the parent runnable while
+/// yielding closes both the lost-wakeup window and the child-starvation loop.
+fn wait_block_action(reportable: bool, exiting: bool, matching: bool) -> WaitBlockAction {
+    if reportable || !matching {
+        WaitBlockAction::Recheck
+    } else if exiting {
+        WaitBlockAction::Yield
+    } else {
+        WaitBlockAction::Sleep
+    }
+}
+
+/// Linux's `do_wait()` returns `-ERESTARTSYS` when an interruptible wait has no
+/// reportable event and a signal is pending.  Lupos has a short split-publish
+/// window where `m26.exit_state` advertises exit in progress before `__state`
+/// becomes `EXIT_ZOMBIE`; don't let SIGCHLD escape as EINTR in that window or
+/// a parent can miss the child that is about to become reapable.
+unsafe fn wait_interrupted_by_signal(parent: *mut TaskStruct, target: WaitTarget) -> bool {
+    has_unblocked_pending_signals(parent) && !unsafe { has_exiting_wait_target(parent, target) }
+}
+
 /// Returns true iff `parent` has at least one child matching `pid_filter`
 /// (zombie or otherwise).
 unsafe fn has_matching_child(parent: *mut TaskStruct, target: WaitTarget) -> bool {
@@ -630,6 +668,13 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
             return 0;
         }
 
+        // Linux `do_wait()` breaks out with -ERESTARTSYS once an interruptible
+        // child wait observes a pending signal. The arch signal-exit path then
+        // turns it into EINTR or rewinds the syscall for SA_RESTART handlers.
+        if unsafe { wait_interrupted_by_signal(parent, target) } {
+            return ERESTARTSYS;
+        }
+
         // Cooperative-scheduler block: register on every matching child's
         // wait queue, set self interruptible, yield.  When a child exits its
         // `exit_notify` flips us back to TASK_RUNNING.
@@ -643,19 +688,28 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
             (*parent)
                 .__state
                 .store(TASK_INTERRUPTIBLE, Ordering::Release);
-            if !has_reportable_wait_event(parent, target, options)
-                && !has_exiting_wait_target(parent, target)
-                && has_matching_child(parent, target)
-            {
-                #[cfg(not(test))]
-                if crate::kernel::debug_trace::proc_enabled() {
-                    crate::linux_driver_abi::tty::serial_println!(
-                        "trace-proc-wait4-block pid={} wait_pid={}",
-                        (*parent).pid,
-                        target.trace_value()
-                    );
+            let action = wait_block_action(
+                has_reportable_wait_event(parent, target, options),
+                has_exiting_wait_target(parent, target),
+                has_matching_child(parent, target),
+            );
+            match action {
+                WaitBlockAction::Recheck => {}
+                WaitBlockAction::Sleep => {
+                    #[cfg(not(test))]
+                    if crate::kernel::debug_trace::proc_enabled() {
+                        crate::linux_driver_abi::tty::serial_println!(
+                            "trace-proc-wait4-block pid={} wait_pid={}",
+                            (*parent).pid,
+                            target.trace_value()
+                        );
+                    }
+                    sched::schedule_with_irqs_enabled();
                 }
-                sched::schedule_with_irqs_enabled();
+                WaitBlockAction::Yield => {
+                    (*parent).__state.store(TASK_RUNNING, Ordering::Release);
+                    sched::reschedule_runnable();
+                }
             }
             // After waking, reset state and re-check the children.
             (*parent).__state.store(TASK_RUNNING, Ordering::Release);
@@ -856,6 +910,12 @@ pub unsafe fn sys_waitid(
             return 0;
         }
 
+        // See `sys_wait4`: Linux's child wait is interruptible by any
+        // unblocked pending signal after immediate child events are exhausted.
+        if unsafe { wait_interrupted_by_signal(parent, target) } {
+            return ERESTARTSYS;
+        }
+
         unsafe {
             for_each_real_child(parent, target, |c| {
                 add_waiter(c, parent);
@@ -866,19 +926,28 @@ pub unsafe fn sys_waitid(
             (*parent)
                 .__state
                 .store(TASK_INTERRUPTIBLE, Ordering::Release);
-            if !has_reportable_wait_event(parent, target, options)
-                && !has_exiting_wait_target(parent, target)
-                && has_matching_child(parent, target)
-            {
-                #[cfg(not(test))]
-                if crate::kernel::debug_trace::proc_enabled() {
-                    crate::linux_driver_abi::tty::serial_println!(
-                        "trace-proc-waitid-block pid={} pid_filter={}",
-                        (*parent).pid,
-                        target.trace_value()
-                    );
+            let action = wait_block_action(
+                has_reportable_wait_event(parent, target, options),
+                has_exiting_wait_target(parent, target),
+                has_matching_child(parent, target),
+            );
+            match action {
+                WaitBlockAction::Recheck => {}
+                WaitBlockAction::Sleep => {
+                    #[cfg(not(test))]
+                    if crate::kernel::debug_trace::proc_enabled() {
+                        crate::linux_driver_abi::tty::serial_println!(
+                            "trace-proc-waitid-block pid={} pid_filter={}",
+                            (*parent).pid,
+                            target.trace_value()
+                        );
+                    }
+                    sched::schedule_with_irqs_enabled();
                 }
-                sched::schedule_with_irqs_enabled();
+                WaitBlockAction::Yield => {
+                    (*parent).__state.store(TASK_RUNNING, Ordering::Release);
+                    sched::reschedule_runnable();
+                }
             }
             (*parent).__state.store(TASK_RUNNING, Ordering::Release);
         }
@@ -972,6 +1041,24 @@ mod tests {
         t
     }
 
+    unsafe fn install_test_signal_handler(sig: i32) {
+        let action = crate::kernel::signal::RtSigAction {
+            sa_handler: 0x1234,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe {
+                crate::kernel::signal::sys_rt_sigaction(
+                    sig,
+                    &action,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<crate::kernel::signal::SigSet>(),
+                )
+            },
+            0
+        );
+    }
+
     #[test]
     fn w_exitcode_normal_exit() {
         // exit(42) → low 7 bits termsig=0, bits 8..15 = 42.
@@ -1034,7 +1121,81 @@ mod tests {
     }
 
     #[test]
-    fn half_published_zombie_prevents_wait_sleep() {
+    fn wait4_returns_erestartsys_for_unblocked_pending_signal() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+
+        let mut parent = task(110);
+        let mut child = task(111);
+        parent.m26.children[0] = &mut *child as *mut TaskStruct;
+        parent.m26.children_count = 1;
+
+        unsafe {
+            sched::set_current(&mut *parent as *mut TaskStruct);
+            install_test_signal_handler(crate::kernel::signal::SIGALRM);
+            assert_eq!(
+                crate::kernel::signal::send_signal_to_task(
+                    &mut *parent as *mut TaskStruct,
+                    crate::kernel::signal::SIGALRM,
+                ),
+                0
+            );
+
+            assert_eq!(
+                sys_wait4(-1, core::ptr::null_mut(), 0, core::ptr::null_mut()),
+                ERESTARTSYS
+            );
+            assert_eq!(parent.m26.children_count, 1);
+            assert_eq!(child.m26.wait_count, 0);
+
+            sched::set_current(previous);
+        }
+        crate::kernel::signal::reset_for_tests();
+    }
+
+    #[test]
+    fn waitid_returns_erestartsys_for_unblocked_pending_signal() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+
+        let mut parent = task(112);
+        let mut child = task(113);
+        parent.m26.children[0] = &mut *child as *mut TaskStruct;
+        parent.m26.children_count = 1;
+
+        unsafe {
+            sched::set_current(&mut *parent as *mut TaskStruct);
+            install_test_signal_handler(crate::kernel::signal::SIGALRM);
+            assert_eq!(
+                crate::kernel::signal::send_signal_to_task(
+                    &mut *parent as *mut TaskStruct,
+                    crate::kernel::signal::SIGALRM,
+                ),
+                0
+            );
+
+            assert_eq!(
+                sys_waitid(
+                    P_ALL,
+                    0,
+                    core::ptr::null_mut(),
+                    WEXITED,
+                    core::ptr::null_mut(),
+                ),
+                ERESTARTSYS
+            );
+            assert_eq!(parent.m26.children_count, 1);
+            assert_eq!(child.m26.wait_count, 0);
+
+            sched::set_current(previous);
+        }
+        crate::kernel::signal::reset_for_tests();
+    }
+
+    #[test]
+    fn half_published_zombie_yields_without_sleeping() {
         let mut parent = task(1200);
         let mut child = task(1201);
         parent.m26.children[0] = &mut *child as *mut TaskStruct;
@@ -1061,13 +1222,69 @@ mod tests {
                 &mut *parent as *mut TaskStruct,
                 WaitTarget::Any
             ));
-            assert!(
-                !(!has_reportable_wait_event(&mut *parent as *mut TaskStruct, WaitTarget::Any, 0)
-                    && !has_exiting_wait_target(&mut *parent as *mut TaskStruct, WaitTarget::Any)
-                    && has_matching_child(&mut *parent as *mut TaskStruct, WaitTarget::Any)),
-                "wait must not schedule while a matching child is between the exit snapshot and zombie publication"
+            assert_eq!(
+                wait_block_action(
+                    has_reportable_wait_event(&mut *parent as *mut TaskStruct, WaitTarget::Any, 0),
+                    has_exiting_wait_target(&mut *parent as *mut TaskStruct, WaitTarget::Any),
+                    has_matching_child(&mut *parent as *mut TaskStruct, WaitTarget::Any),
+                ),
+                WaitBlockAction::Yield,
+                "the parent must remain runnable and yield while zombie publication finishes"
             );
         }
+    }
+
+    #[test]
+    fn ordinary_child_wait_sleeps_and_immediate_events_recheck() {
+        assert_eq!(
+            wait_block_action(false, false, true),
+            WaitBlockAction::Sleep
+        );
+        assert_eq!(
+            wait_block_action(true, false, true),
+            WaitBlockAction::Recheck
+        );
+        assert_eq!(
+            wait_block_action(false, false, false),
+            WaitBlockAction::Recheck
+        );
+    }
+
+    #[test]
+    fn pending_signal_does_not_interrupt_half_published_zombie() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+
+        let mut parent = task(1300);
+        let mut child = task(1301);
+        parent.m26.children[0] = &mut *child as *mut TaskStruct;
+        parent.m26.children_count = 1;
+        child.m26.exit_state = EXIT_ZOMBIE;
+
+        unsafe {
+            sched::set_current(&mut *parent as *mut TaskStruct);
+            install_test_signal_handler(crate::kernel::signal::SIGALRM);
+            assert_eq!(
+                crate::kernel::signal::send_signal_to_task(
+                    &mut *parent as *mut TaskStruct,
+                    crate::kernel::signal::SIGALRM,
+                ),
+                0
+            );
+
+            assert!(has_exiting_wait_target(
+                &mut *parent as *mut TaskStruct,
+                WaitTarget::Any,
+            ));
+            assert!(!wait_interrupted_by_signal(
+                &mut *parent as *mut TaskStruct,
+                WaitTarget::Any,
+            ));
+
+            sched::set_current(previous);
+        }
+        crate::kernel::signal::reset_for_tests();
     }
 
     #[test]

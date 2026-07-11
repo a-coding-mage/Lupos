@@ -16,6 +16,8 @@ pub const POLLOUT: i16 = 0x0004;
 pub const POLLERR: i16 = 0x0008;
 // vendor/linux/include/uapi/asm-generic/poll.h
 pub const POLLHUP: i16 = 0x0010;
+pub const POLLRDNORM: i16 = 0x0040;
+pub const POLLWRNORM: i16 = 0x0100;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]

@@ -398,8 +398,6 @@ fn syscall_frame_allows_sysret(regs: &crate::arch::x86::kernel::ptrace::PtRegs) 
         && regs.cs == sel::USER_CS as u64
         && regs.ss == sel::USER_DS as u64
         && regs.rip < crate::arch::x86::kernel::uaccess::TASK_SIZE_MAX
-        && regs.rsp < crate::arch::x86::kernel::uaccess::TASK_SIZE_MAX
-        && regs.eflags & RFLAGS_FIXED != 0
         && regs.eflags
             & (crate::arch::x86::kernel::ptrace::X86_EFLAGS_RF
                 | crate::arch::x86::kernel::ptrace::X86_EFLAGS_TF)
@@ -895,7 +893,6 @@ fn syscall_enter(
     unsafe {
         ptrace::syscall_trace_enter(task, regs);
     }
-    trace_pid1_syscall_enter(regs, task);
     trace_ping_syscall_enter(regs, task);
     trace_executor_syscall_enter(regs, task);
     trace_syscall(TRACE_SYSCALL_ENTER, regs, 0, pid);
@@ -975,48 +972,6 @@ fn trace_ping_syscall_enter(
 
 #[cfg(test)]
 fn trace_ping_syscall_enter(
-    _regs: &crate::arch::x86::kernel::ptrace::PtRegs,
-    _task: *mut crate::kernel::task::TaskStruct,
-) {
-}
-
-#[cfg(not(test))]
-static TRACE_PID1_SYSCALL_ENTER_COUNT: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-
-#[cfg(not(test))]
-fn trace_pid1_syscall_enter(
-    regs: &crate::arch::x86::kernel::ptrace::PtRegs,
-    task: *mut crate::kernel::task::TaskStruct,
-) {
-    if task.is_null() || !crate::kernel::debug_trace::syscall_enabled() {
-        return;
-    }
-    let pid = unsafe { (*task).pid };
-    if pid != 1 {
-        return;
-    }
-    let count = TRACE_PID1_SYSCALL_ENTER_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    if count >= 400 {
-        return;
-    }
-    let comm = unsafe { &(*task).comm };
-    crate::linux_driver_abi::tty::serial_println!(
-        "trace-pid1-sys-enter pid={} comm={} nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
-        pid,
-        comm_for_trace(comm),
-        regs.orig_rax,
-        regs.arg0(),
-        regs.arg1(),
-        regs.arg2(),
-        regs.arg3(),
-        regs.arg4(),
-        regs.arg5()
-    );
-}
-
-#[cfg(test)]
-fn trace_pid1_syscall_enter(
     _regs: &crate::arch::x86::kernel::ptrace::PtRegs,
     _task: *mut crate::kernel::task::TaskStruct,
 ) {
@@ -1350,10 +1305,6 @@ mod tests {
         regs.r11 = regs.eflags;
         regs.rip = crate::arch::x86::kernel::uaccess::TASK_SIZE_MAX;
         regs.rcx = regs.rip;
-        assert!(!syscall_frame_allows_sysret(&regs));
-        regs.rip = 0x401000;
-        regs.rcx = regs.rip;
-        regs.rsp = crate::arch::x86::kernel::uaccess::TASK_SIZE_MAX;
         assert!(!syscall_frame_allows_sysret(&regs));
     }
 

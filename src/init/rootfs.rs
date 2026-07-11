@@ -1419,8 +1419,10 @@ fn populate_noinitramfs_rootfs() -> Result<(), i32> {
 fn populate_devtmpfs() -> Result<(), i32> {
     ensure_dir("/dev", DEFAULT_DIR_MODE)?;
     create_special_node("/dev/console", InodeKind::Chardev, 0o600, &CONSOLE_FILE_OPS)?;
+    set_node_rdev("/dev/console", 5, 1);
     create_special_node("/dev/tty", InodeKind::Chardev, 0o666, &CONSOLE_FILE_OPS)?;
-    for tty in [
+    set_node_rdev("/dev/tty", 5, 0);
+    for (minor, tty) in [
         "/dev/tty0",
         "/dev/tty1",
         "/dev/tty2",
@@ -1428,10 +1430,18 @@ fn populate_devtmpfs() -> Result<(), i32> {
         "/dev/tty4",
         "/dev/tty5",
         "/dev/tty6",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         create_special_node(tty, InodeKind::Chardev, 0o620, &CONSOLE_FILE_OPS)?;
+        // Virtual consoles live on TTY_MAJOR (4): tty0 is the current-VT alias,
+        // tty1..tty6 the individual consoles.
+        set_node_rdev(tty, 4, minor as u32);
     }
     create_special_node("/dev/ttyS0", InodeKind::Chardev, 0o620, &CONSOLE_FILE_OPS)?;
+    // Serial console: TTY_MAJOR (4), minor 64 == ttyS0.
+    set_node_rdev("/dev/ttyS0", 4, 64);
     ensure_dir("/dev/mapper", DEFAULT_DIR_MODE)?;
     create_special_node(
         "/dev/mapper/control",
@@ -1444,9 +1454,23 @@ fn populate_devtmpfs() -> Result<(), i32> {
         create_special_node(node, InodeKind::Chardev, 0o666, &RAMFS_FILE_OPS)?;
     }
     create_special_node("/dev/full", InodeKind::Chardev, 0o666, &DEV_FULL_FILE_OPS)?;
-    create_special_node("/dev/ptmx", InodeKind::Chardev, 0o666, &RAMFS_FILE_OPS)?;
+    // UNIX98 pty master multiplexor.  `/dev/ptmx` is char major 5 minor 2;
+    // opening it allocates a pty pair and its `/dev/pts/N` slave node.
+    replace_special_node(
+        "/dev/ptmx",
+        InodeKind::Chardev,
+        0o666,
+        &crate::linux_driver_abi::tty::pty::PTMX_FILE_OPS,
+    )?;
+    set_node_rdev("/dev/ptmx", 5, 2);
     ensure_dir("/dev/pts", DEFAULT_DIR_MODE)?;
-    create_special_node("/dev/pts/ptmx", InodeKind::Chardev, 0o666, &RAMFS_FILE_OPS)?;
+    replace_special_node(
+        "/dev/pts/ptmx",
+        InodeKind::Chardev,
+        0o666,
+        &crate::linux_driver_abi::tty::pty::PTMX_FILE_OPS,
+    )?;
+    set_node_rdev("/dev/pts/ptmx", 5, 2);
     ensure_dir("/dev/hugepages", DEFAULT_DIR_MODE)?;
     ensure_dir("/dev/mqueue", DEFAULT_DIR_MODE)?;
     create_special_node(
@@ -1556,8 +1580,13 @@ fn populate_graphics_nodes() -> Result<(), i32> {
     announce_class_device("input", "event0", "input", "input/event0");
     announce_class_device("input", "event1", "input", "input/event1");
 
+    // evdev input nodes live on major 13 (INPUT_MAJOR): event0/event1 are
+    // minors 64/65.
+    set_node_rdev("/dev/input/event0", 13, 64);
+    set_node_rdev("/dev/input/event1", 13, 65);
     if fbdev_init() {
         create_special_node("/dev/fb0", InodeKind::Chardev, 0o660, &FBDEV_FILE_OPS)?;
+        set_node_rdev("/dev/fb0", 29, 0);
         announce_class_device("graphics", "fb0", "graphics", "fb0");
     }
     Ok(())
@@ -1837,6 +1866,87 @@ fn create_special_node_with_metadata(
     child.instantiate(inode);
     touch_inode_now(&parent_inode);
     Ok(())
+}
+
+/// Remove a special node previously created under a ramfs `/dev` directory.
+/// A no-op if the path (or its parent) does not resolve.  Mirrors the child
+/// teardown `ramfs_unlink` performs: drop the RamDir entry, adjust the parent
+/// directory accounting, and evict the dentry.
+fn remove_special_node(path: &str) -> Result<(), i32> {
+    let Ok((parent_path, leaf)) = split_parent(path) else {
+        return Ok(());
+    };
+    let Some(parent) = path_walk(parent_path) else {
+        return Ok(());
+    };
+    let Some(parent_inode) = parent.inode() else {
+        return Ok(());
+    };
+    let removed = match &parent_inode.private {
+        InodePrivate::RamDir(children) => children.lock().remove(leaf).is_some(),
+        _ => false,
+    };
+    if removed {
+        crate::fs::ramfs::dir_account_remove(&parent_inode);
+        crate::fs::dcache::d_drop(&parent, leaf);
+        touch_inode_now(&parent_inode);
+    }
+    Ok(())
+}
+
+/// Create a special node, replacing any existing entry of the same name so the
+/// new `fops` take effect even if an earlier populator (e.g. an initramfs cpio)
+/// already created a placeholder with different operations.
+fn replace_special_node(
+    path: &str,
+    kind: InodeKind,
+    mode: u32,
+    fops: &'static FileOps,
+) -> Result<(), i32> {
+    remove_special_node(path)?;
+    create_special_node(path, kind, mode, fops)
+}
+
+/// devpts: materialise `/dev/pts/<index>` for a freshly allocated pty slave.
+/// Called from the pty master allocation path.  Linux's devpts creates this
+/// node (char major 136) when `/dev/ptmx` hands out a new master.
+pub(crate) fn devpts_create_slave(index: u32) -> Result<(), i32> {
+    let path = alloc::format!("/dev/pts/{}", index);
+    create_special_node(
+        &path,
+        InodeKind::Chardev,
+        0o620,
+        &crate::linux_driver_abi::tty::pty::PTS_SLAVE_FILE_OPS,
+    )?;
+    set_node_rdev(
+        &path,
+        crate::linux_driver_abi::tty::pty::UNIX98_PTY_SLAVE_MAJOR,
+        index,
+    );
+    Ok(())
+}
+
+/// devpts: tear down `/dev/pts/<index>` when its pty pair is freed.
+pub(crate) fn devpts_remove_slave(index: u32) {
+    let path = alloc::format!("/dev/pts/{}", index);
+    let _ = remove_special_node(&path);
+}
+
+/// Assign a device number (`st_rdev`) to an already-created special node.
+///
+/// Stored in Linux `new_encode_dev()` form so `stat(2)` reports the real
+/// `major`/`minor`.  Userspace keys real behaviour off this: e.g. Xorg's
+/// `xf86HasTTYs()` only enables VT/console management (opening the VT and
+/// switching it to `KD_GRAPHICS`) when `major(stat("/dev/tty0").st_rdev)`
+/// equals `TTY_MAJOR` (4).  A no-op if the path does not resolve.
+fn set_node_rdev(path: &str, major: u32, minor: u32) {
+    use crate::init::noinitramfs::{mkdev, new_encode_dev};
+    if let Some(inode) = path_walk(path).and_then(|dentry| dentry.inode()) {
+        inode.rdev.store(
+            new_encode_dev(mkdev(major, minor)) as u64,
+            Ordering::Release,
+        );
+    }
 }
 
 fn set_path_metadata(path: &str, mode: u32, uid: u32, gid: u32) -> Result<(), i32> {

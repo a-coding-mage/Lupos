@@ -164,6 +164,12 @@ const LUPOS_QEMU_AUDIODEV_ENV: &str = "LUPOS_QEMU_AUDIODEV";
 const QEMU_AUDIODEV_ID: &str = "luposaudio";
 const LUPOS_QEMU_MEMORY_ENV: &str = "LUPOS_QEMU_MEMORY";
 const LUPOS_QEMU_GDB_ENV: &str = "LUPOS_QEMU_GDB";
+/// When set to `0`, omit the absolute `usb-tablet` pointer so QEMU stays in
+/// relative-pointer mode and forwards host motion to the guest's **PS/2 mouse**
+/// (i8042 aux) instead — which is the pointer Lupos can actually drive. The
+/// graphics/GUI runners set this so the desktop cursor works; other boots keep
+/// the tablet (e.g. the input-hid-usb xHCI probe).
+const LUPOS_QEMU_USB_TABLET_ENV: &str = "LUPOS_QEMU_USB_TABLET";
 const LUPOS_OVMF_CODE_ENV: &str = "LUPOS_OVMF_CODE";
 const LUPOS_OVMF_VARS_ENV: &str = "LUPOS_OVMF_VARS";
 /// Override the GRUB module directory passed to `grub-mkrescue -d`, so hosts
@@ -299,6 +305,11 @@ const LOGIN_SHADOW: &str = concat!(
 );
 const LOGIN_GROUP: &str = concat!("root:x:0:\n", "lupos:x:1000:\n", "wheel:x:10:root,lupos\n",);
 const LOGIN_GSHADOW: &str = concat!("root:*::\n", "lupos:*::\n", "wheel:*::root,lupos\n",);
+const LIGHTDM_PASSWD: &str =
+    "lightdm:x:969:969:Light Display Manager:/var/lib/lightdm:/usr/bin/nologin\n";
+const LIGHTDM_SHADOW: &str = "lightdm:!*:19793::::::\n";
+const LIGHTDM_GROUP: &str = "lightdm:x:969:\n";
+const LIGHTDM_GSHADOW: &str = "lightdm:!::\n";
 const LOGIN_PAM_LOGIN: &str = concat!(
     "auth     required pam_unix.so\n",
     "account  required pam_unix.so\n",
@@ -3234,6 +3245,13 @@ fn x11_fbdev_config() -> Vec<u8> {
         "    Identifier \"LuposFramebuffer\"\n",
         "    Driver \"fbdev\"\n",
         "    Option \"fbdev\" \"/dev/fb0\"\n",
+        // Draw straight into the mmap'd scanout aperture instead of a shadow
+        // copy.  The fbdev driver's shadow path relies on a wakeup/block handler
+        // to blit dirty regions to the real framebuffer; on Lupos that blit does
+        // not run, so client output never reaches the display.  Direct rendering
+        // faults each framebuffer page into the process (LUPOS_DEVICE_PFN_VM_OPS)
+        // and lands pixels in VRAM immediately.
+        "    Option \"ShadowFB\" \"false\"\n",
         "EndSection\n",
         "\n",
         "Section \"Monitor\"\n",
@@ -3251,27 +3269,340 @@ fn x11_fbdev_config() -> Vec<u8> {
         "    EndSubSection\n",
         "EndSection\n",
         "\n",
+        // Bind the keyboard explicitly to the kernel evdev node.  Lupos has no
+        // udev/logind seat, so Xorg's udev hotplug (AutoAddDevices) finds
+        // nothing; the classic `evdev` driver opens the device path directly,
+        // which is what makes the graphical greeter and XFCE session typable.
+        "Section \"InputDevice\"\n",
+        "    Identifier \"LuposKeyboard\"\n",
+        "    Driver \"evdev\"\n",
+        "    Option \"Device\" \"/dev/input/event0\"\n",
+        "    Option \"XkbLayout\" \"us\"\n",
+        "EndSection\n",
+        "\n",
+        // Bind the pointer explicitly to the kernel evdev node for the i8042
+        // PS/2 mouse.  Same rationale as the keyboard: no udev/logind seat, so
+        // the classic evdev driver opens the device path directly.  Relative
+        // pointer (QEMU is launched without the absolute usb-tablet), so the
+        // cursor tracks motion deltas once the window grabs the host pointer.
+        "Section \"InputDevice\"\n",
+        "    Identifier \"LuposMouse\"\n",
+        "    Driver \"evdev\"\n",
+        "    Option \"Device\" \"/dev/input/event1\"\n",
+        "EndSection\n",
+        "\n",
         "Section \"ServerLayout\"\n",
         "    Identifier \"LuposLayout\"\n",
         "    Screen \"LuposScreen\"\n",
+        "    InputDevice \"LuposKeyboard\" \"CoreKeyboard\"\n",
+        "    InputDevice \"LuposMouse\" \"CorePointer\"\n",
         "EndSection\n",
         "\n",
         "Section \"ServerFlags\"\n",
         "    Option \"AutoAddDevices\" \"false\"\n",
         "    Option \"AutoEnableDevices\" \"false\"\n",
-        "    Option \"AllowEmptyInput\" \"true\"\n",
         "EndSection\n",
     )
     .as_bytes()
     .to_vec()
 }
 
+/// Shared X session body: launch the XFCE desktop (under a per-session D-Bus
+/// bus), falling back to the minimal xterm + twm session when the XFCE packages
+/// are not staged. Reused by both `startx`'s `~/.xinitrc` and LightDM's session
+/// wrapper so the two entry points never drift.
+const X11_SESSION_BODY: &str = concat!(
+    "export PATH=/usr/bin:/bin:/usr/sbin:/sbin\n",
+    "export XDG_CONFIG_DIRS=/etc/xdg\n",
+    "export XDG_DATA_DIRS=/usr/local/share:/usr/share\n",
+    "export XDG_CACHE_HOME=\"$HOME/.cache\"\n",
+    "export XDG_CONFIG_HOME=\"$HOME/.config\"\n",
+    "runtime_uid=\"$(id -u)\" || exit 1\n",
+    "if [ -z \"${XDG_RUNTIME_DIR:-}\" ]; then\n",
+    "    XDG_RUNTIME_DIR=\"$(mktemp -d \"/tmp/lupos-runtime-${runtime_uid}.XXXXXX\")\" || exit 1\n",
+    "else\n",
+    "    mkdir -p \"$XDG_RUNTIME_DIR\" || exit 1\n",
+    "fi\n",
+    "chmod 700 \"$XDG_RUNTIME_DIR\" || exit 1\n",
+    "[ \"$(stat -c %u \"$XDG_RUNTIME_DIR\")\" = \"$runtime_uid\" ] || exit 1\n",
+    "export XDG_RUNTIME_DIR\n",
+    "mkdir -p \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\" || exit 1\n",
+    // Disable the GTK/at-spi accessibility bridge.  Loading it makes every GTK
+    // app trigger `org.a11y.Bus` D-Bus activation, which spawns a second
+    // dbus-daemon (at-spi-bus-launcher) and is a common source of session-bus
+    // activation deadlocks; a desktop with no assistive tech does not need it.
+    "export NO_AT_BRIDGE=1 GTK_A11Y=none\n",
+    // XFCE components talk over a per-session D-Bus bus.  dbus-daemon itself
+    // works under Lupos, but `dbus-launch --autolaunch` (which xfconf/xfce4-panel
+    // fall back to) relies on the X11 autolaunch property dance and fails here.
+    // `dbus-run-session` starts a private session bus and execs the command with
+    // DBUS_SESSION_BUS_ADDRESS already set, so nothing has to autolaunch.
+    "if command -v startxfce4 >/dev/null 2>&1; then\n",
+    "    if command -v dbus-run-session >/dev/null 2>&1; then\n",
+    "        exec dbus-run-session -- startxfce4\n",
+    "    fi\n",
+    "    exec startxfce4\n",
+    "fi\n",
+    // Fallback: the minimal twm + xterm session, used if the XFCE packages are
+    // not staged (e.g. a non-graphics build profile).
+    "xterm -geometry 100x30+24+24 &\n",
+    "exec twm\n",
+);
+
 fn x11_root_xinitrc() -> Vec<u8> {
+    format!("#!/bin/sh\n{X11_SESSION_BODY}").into_bytes()
+}
+
+/// LightDM's per-login session wrapper. The selected desktop is deliberately
+/// pinned to the same XFCE-first session that `startx` uses: Lupos currently
+/// offers one desktop, and avoiding distro shell-hook fan-out keeps login
+/// deterministic on the single-vCPU guest.
+fn lightdm_session_wrapper() -> Vec<u8> {
+    format!("#!/bin/sh\n{X11_SESSION_BODY}").into_bytes()
+}
+
+/// System GTK3 defaults.  Modern Arch `librsvg` (2.62) no longer ships the
+/// gdk-pixbuf SVG loader, and `gdk-pixbuf2` builds its loaders in, so GTK3 apps
+/// cannot rasterise the SVG `Adwaita` icon theme — a missing icon then fatally
+/// aborts (`Gtk:ERROR ensure_surface_for_gicon ... Bail out!`).  Point the icon
+/// theme at the **PNG** `AdwaitaLegacy` theme (from `adwaita-icon-theme-legacy`)
+/// so no icon load ever needs an SVG loader.  The Adwaita *GTK* theme itself is
+/// built into libgtk-3 as a GResource, so it needs no external loader.
+fn gtk3_settings_ini() -> Vec<u8> {
+    concat!(
+        "[Settings]\n",
+        "gtk-icon-theme-name=AdwaitaLegacy\n",
+        "gtk-fallback-icon-theme=hicolor\n",
+        "gtk-theme-name=Adwaita\n",
+        "gtk-font-name=Sans 10\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+/// XFCE `xsettings` channel defaults.  Once `xfsettingsd` starts it owns the
+/// XSETTINGS manager selection and overrides `gtk-3.0/settings.ini`, so pin the
+/// same PNG icon theme here to keep GTK apps off the SVG path for the whole
+/// session.
+fn xfce_xsettings_xml() -> Vec<u8> {
+    concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+        "<channel name=\"xsettings\" version=\"1.0\">\n",
+        "  <property name=\"Net\" type=\"empty\">\n",
+        "    <property name=\"ThemeName\" type=\"string\" value=\"Adwaita\"/>\n",
+        "    <property name=\"IconThemeName\" type=\"string\" value=\"AdwaitaLegacy\"/>\n",
+        "  </property>\n",
+        "  <property name=\"Gtk\" type=\"empty\">\n",
+        "    <property name=\"FontName\" type=\"string\" value=\"Sans 10\"/>\n",
+        "    <property name=\"CursorThemeName\" type=\"string\" value=\"Adwaita\"/>\n",
+        "  </property>\n",
+        "</channel>\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+/// Path to the retry wrapper LightDM launches instead of Xorg directly.
+const X11_XSERVER_WRAPPER_PATH: &str = "usr/lib/xorg/lupos-xserver";
+
+/// LightDM daemon configuration for the single local framebuffer seat.
+fn lightdm_config() -> Vec<u8> {
+    concat!(
+        "[LightDM]\n",
+        "start-default-seat=true\n",
+        // The graphics root-disk overlay materializes this package sysuser
+        // explicitly because package scriptlets are disabled while staging.
+        "greeter-user=lightdm\n",
+        "minimum-display-number=0\n",
+        "minimum-vt=1\n",
+        "lock-memory=false\n",
+        "logind-check-graphical=false\n",
+        "log-directory=/var/log/lightdm\n",
+        "run-directory=/run/lightdm\n",
+        "cache-directory=/var/cache/lightdm\n",
+        "backup-logs=false\n",
+        "dbus-service=false\n",
+        // Pre-stage the authority file with the greeter's ownership because
+        // the guest ext4 chown path cannot yet repair a root-created file.
+        "user-authority-in-system-dir=false\n",
+        "\n",
+        "[Seat:*]\n",
+        "type=local\n",
+        "pam-service=lightdm\n",
+        "pam-greeter-service=lightdm-greeter\n",
+        // The fbdev node is briefly present-but-not-ready during boot, so keep
+        // the proven retry wrapper. LightDM distributes the X server cookie to
+        // the greeter and authenticated session; do not disable access control.
+        "xserver-command=/usr/lib/xorg/lupos-xserver -retro -configdir /etc/X11/xorg.conf.d\n",
+        "xserver-allow-tcp=false\n",
+        "xserver-share=true\n",
+        "greeter-session=lightdm-gtk-greeter\n",
+        "greeter-hide-users=true\n",
+        "greeter-allow-guest=false\n",
+        "greeter-show-manual-login=true\n",
+        "greeter-show-remote-login=false\n",
+        "user-session=xfce\n",
+        "allow-user-switching=false\n",
+        "allow-guest=false\n",
+        "session-wrapper=/usr/libexec/lupos-lightdm-session\n",
+        "exit-on-failure=true\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+/// LightDM GTK greeter settings. The existing boot artwork provides a real
+/// branded background while the centered, dark Adwaita login surface follows
+/// the compact user/password flow familiar from GNOME.
+fn lightdm_gtk_greeter_config() -> Vec<u8> {
+    concat!(
+        "[greeter]\n",
+        "background=/usr/share/backgrounds/lupos-login.png\n",
+        "user-background=false\n",
+        "theme-name=LuposLogin\n",
+        "icon-theme-name=AdwaitaLegacy\n",
+        "cursor-theme-name=Adwaita\n",
+        "font-name=Sans 11\n",
+        "xft-antialias=true\n",
+        "xft-dpi=96\n",
+        "xft-hintstyle=hintslight\n",
+        "active-monitor=0\n",
+        "position=50%,center 50%,center\n",
+        "default-user-image=#avatar-default\n",
+        "hide-user-image=false\n",
+        "round-user-image=true\n",
+        "indicators=~host;~spacer;~clock;~power\n",
+        "clock-format=%a %H:%M\n",
+        "at-spi-enabled=false\n",
+        "screensaver-timeout=0\n",
+        "default-session=xfce\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+fn lightdm_gtk_theme_css() -> Vec<u8> {
+    concat!(
+        "@import url(\"resource:///org/gtk/libgtk/theme/Adwaita/gtk-contained-dark.css\");\n",
+        "\n",
+        ".lightdm-gtk-greeter {\n",
+        "  color: #f4f7fb;\n",
+        "}\n",
+        "\n",
+        "#panel_window {\n",
+        "  background-color: rgba(8, 12, 18, 0.82);\n",
+        "  color: #f4f7fb;\n",
+        "  border-bottom: 1px solid rgba(255, 255, 255, 0.14);\n",
+        "}\n",
+        "\n",
+        "#panel_window menubar,\n",
+        "#panel_window menuitem {\n",
+        "  background-color: transparent;\n",
+        "  color: #f4f7fb;\n",
+        "}\n",
+        "\n",
+        "#login_window,\n",
+        "#shutdown_dialog,\n",
+        "#restart_dialog {\n",
+        "  background-color: rgba(20, 26, 36, 0.94);\n",
+        "  color: #f4f7fb;\n",
+        "  border: 1px solid rgba(255, 255, 255, 0.18);\n",
+        "  border-radius: 8px;\n",
+        "  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.48);\n",
+        "}\n",
+        "\n",
+        "#login_window entry {\n",
+        "  min-height: 38px;\n",
+        "  border-radius: 6px;\n",
+        "}\n",
+        "\n",
+        "#login_window button {\n",
+        "  min-height: 36px;\n",
+        "  border-radius: 6px;\n",
+        "}\n",
+        "\n",
+        "#user_image {\n",
+        "  border-radius: 999px;\n",
+        "  padding: 4px;\n",
+        "  background-color: rgba(255, 255, 255, 0.10);\n",
+        "}\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+/// Preflight wrapper that the display manager runs as its X server.
+///
+/// `exec` is essential here: LightDM associates Xorg's ready SIGUSR1 with the
+/// exact child PID it spawned. Keeping a shell parent or relaying readiness
+/// from a background helper gives the signal a different sender PID. The
+/// service restart policy handles an early framebuffer startup failure.
+fn x11_xserver_wrapper() -> Vec<u8> {
     concat!(
         "#!/bin/sh\n",
-        "export PATH=/usr/bin:/bin:/usr/sbin:/sbin\n",
-        "xterm -geometry 100x30+24+24 &\n",
-        "exec twm\n",
+        "i=0\n",
+        "while [ ! -e /dev/fb0 ] && [ \"$i\" -lt 60 ]; do\n",
+        "    i=$((i + 1))\n",
+        "    sleep 1\n",
+        "done\n",
+        "[ -e /dev/fb0 ] || exit 1\n",
+        // Give the synthetic framebuffer's mode setup a short settle window.
+        "sleep 2\n",
+        "rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 2>/dev/null\n",
+        "exec /usr/lib/Xorg \"$@\"\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+/// PAM stack for authenticated LightDM sessions. Mirrors the working console
+/// login stack instead of Arch's `system-login` include, which pulls session
+/// helpers that are not yet reliable on Lupos.
+fn lightdm_login_pam() -> Vec<u8> {
+    format!("#%PAM-1.0\n{LOGIN_PAM_LOGIN}").into_bytes()
+}
+
+fn lightdm_greeter_pam() -> Vec<u8> {
+    concat!(
+        "#%PAM-1.0\n",
+        "auth required pam_permit.so\n",
+        "account required pam_permit.so\n",
+        "password required pam_deny.so\n",
+        "session required pam_permit.so\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+fn systemd_lupos_lightdm_unit() -> Vec<u8> {
+    // Keep the display manager independent from the full default dependency
+    // chain, but do not race Xorg against the system bus.  Xorg's logind path
+    // connects to /run/dbus/system_bus_socket before entering the client
+    // dispatch loop, so starting it before dbus/logind can leave GTK clients
+    // connected to an X socket that never replies.
+    concat!(
+        "[Unit]\n",
+        "Description=Lupos LightDM graphical login on the framebuffer\n",
+        "Documentation=man:lightdm(1) man:Xorg(1)\n",
+        "DefaultDependencies=no\n",
+        "Wants=dbus.socket dbus.service systemd-logind.service\n",
+        "After=systemd-journald.socket systemd-journald.service dbus.socket dbus.service systemd-logind.service\n",
+        "Conflicts=shutdown.target\n",
+        "Before=shutdown.target\n",
+        "ConditionPathExists=/usr/bin/lightdm\n",
+        "ConditionPathExists=/usr/bin/lightdm-gtk-greeter\n",
+        "\n",
+        "[Service]\n",
+        "Type=simple\n",
+        "Environment=NO_AT_BRIDGE=1 GTK_A11Y=none\n",
+        "ExecStartPre=/bin/sh -c 'mkdir -p /tmp/.X11-unix /run/lightdm /var/cache/lightdm /var/lib/lightdm /var/lib/lightdm-data /var/log/lightdm; chown 969:969 /run/lightdm /var/lib/lightdm /var/lib/lightdm-data 2>/dev/null || true; chown 0:969 /var/cache/lightdm /var/log/lightdm 2>/dev/null || true; chmod 1777 /tmp/.X11-unix 2>/dev/null || true; chmod 0711 /run/lightdm /var/cache/lightdm /var/log/lightdm 2>/dev/null || true; chmod 1770 /var/lib/lightdm /var/lib/lightdm-data 2>/dev/null || true; exit 0'\n",
+        "ExecStartPre=/bin/sh -c 'i=0; while [ ! -e /dev/fb0 ] && [ \"$i\" -lt 60 ]; do i=$((i + 1)); sleep 1; done; test -e /dev/fb0'\n",
+        "ExecStart=/usr/bin/lightdm --debug\n",
+        "Restart=on-failure\n",
+        "RestartSec=2s\n",
+        "TimeoutStartSec=240s\n",
+        "StandardOutput=journal+console\n",
+        "StandardError=journal+console\n",
     )
     .as_bytes()
     .to_vec()
@@ -3281,6 +3612,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
     concat!(
         "#!/bin/sh\n",
         "export PATH=/usr/bin:/bin:/usr/sbin:/sbin\n",
+        "[ ! -r /run/lightdm/root/:0 ] || export XAUTHORITY=/run/lightdm/root/:0\n",
         "echo 'graphics-x11: probe begin'\n",
         "xorg_log=/var/log/Xorg.0.log\n",
         "direct_xorg_log=/tmp/lupos-Xorg.0.log\n",
@@ -3289,18 +3621,54 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "xorg_log_ready() {\n",
         "    [ -s \"$xorg_log\" ] || [ -s \"$direct_xorg_log\" ]\n",
         "}\n",
+        "process_cmdline_contains() {\n",
+        "    needle=\"$1\"\n",
+        "    for proc in /proc/[0-9]*; do\n",
+        "        [ \"${proc##*/}\" != 0 ] || continue\n",
+        "        [ -r \"$proc/cmdline\" ] || continue\n",
+        "        cmd=\"$(tr '\\000' ' ' < \"$proc/cmdline\" 2>/dev/null || true)\"\n",
+        "        case \"$cmd\" in *\"$needle\"*) return 0 ;; esac\n",
+        "    done\n",
+        "    return 1\n",
+        "}\n",
+        "process_named() {\n",
+        "    wanted=\"$1\"\n",
+        "    for proc in /proc/[0-9]*; do\n",
+        "        [ \"${proc##*/}\" != 0 ] || continue\n",
+        "        [ -r \"$proc/comm\" ] || continue\n",
+        "        comm=\n",
+        "        IFS= read -r comm < \"$proc/comm\" 2>/dev/null || true\n",
+        "        [ \"$comm\" = \"$wanted\" ] && return 0\n",
+        "    done\n",
+        "    return 1\n",
+        "}\n",
+        "xfce_desktop_ready() {\n",
+        "    for wanted in xfce4-session xfwm4 xfsettingsd xfce4-panel xfdesktop; do\n",
+        "        process_named \"$wanted\" || return 1\n",
+        "    done\n",
+        "    return 0\n",
+        "}\n",
+        "wait_for_process() {\n",
+        "    needle=\"$1\"; limit=\"$2\"; i=0\n",
+        "    while [ \"$i\" -lt \"$limit\" ]; do\n",
+        "        process_cmdline_contains \"$needle\" && return 0\n",
+        "        i=$((i + 1)); sleep 1\n",
+        "    done\n",
+        "    return 1\n",
+        "}\n",
         "scan_processes() {\n",
         "    echo 'graphics-x11: process-scan begin'\n",
         "    found_xorg=0\n",
         "    for proc in /proc/[0-9]*; do\n",
         "        [ -d \"$proc\" ] || continue\n",
         "        pid=\"${proc##*/}\"\n",
+        "        [ \"$pid\" != 0 ] || continue\n",
         "        cmd=\n",
         "        comm=\n",
         "        if [ -r \"$proc/cmdline\" ]; then cmd=\"$(tr '\\000' ' ' < \"$proc/cmdline\" 2>/dev/null || true)\"; fi\n",
         "        if [ -r \"$proc/comm\" ]; then comm=\"$(cat \"$proc/comm\" 2>/dev/null || true)\"; fi\n",
         "        case \"$comm $cmd\" in\n",
-        "            *Xorg*|*startx*|*dbus*|*systemd*)\n",
+        "            *Xorg*|*startx*|*lightdm*|*xfce*|*dbus*|*systemd*)\n",
         "                printf 'graphics-x11: proc %s comm=%s cmd=%s\\n' \"$pid\" \"$comm\" \"$cmd\"\n",
         "                ;;\n",
         "        esac\n",
@@ -3336,7 +3704,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    done\n",
         "    printf 'graphics-x11: wait-%s-iterations=%s\\n' \"$label\" \"$i\"\n",
         "}\n",
-        "wait_for_x 30 service\n",
+        "wait_for_x 60 service\n",
         "    if [ -S /tmp/.X11-unix/X0 ] && xorg_log_ready; then\n",
         "    echo 'graphics-x11: service-xorg ready'\n",
         "else\n",
@@ -3374,36 +3742,181 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "if [ -s /tmp/lupos-direct-xorg.log ]; then echo 'graphics-x11: direct-xorg-log begin'; tail -80 /tmp/lupos-direct-xorg.log; echo 'graphics-x11: direct-xorg-log end'; fi\n",
         "if [ -s \"$direct_xorg_log\" ]; then echo 'graphics-x11: direct-xorg-server-log present'; tail -80 \"$direct_xorg_log\"; fi\n",
         "if [ -s \"$xorg_log\" ]; then echo 'graphics-x11: xorg-log present'; tail -80 \"$xorg_log\"; elif [ -s \"$direct_xorg_log\" ]; then echo 'graphics-x11: xorg-log present'; echo 'graphics-x11: xorg-log using-direct'; tail -80 \"$direct_xorg_log\"; else echo 'graphics-x11: xorg-log missing'; fi\n",
-    )
-    .as_bytes()
-    .to_vec()
-}
-
-fn systemd_lupos_startx_unit() -> Vec<u8> {
-    concat!(
-        "[Unit]\n",
-        "Description=Lupos X11 framebuffer session on tty%i\n",
-        "Documentation=man:Xorg(1) man:xinit(1)\n",
-        "After=systemd-tmpfiles-setup.service systemd-vconsole-setup.service\n",
-        "ConditionPathExists=/usr/lib/Xorg\n",
-        "\n",
-        "[Service]\n",
-        "Type=simple\n",
-        "Environment=HOME=/root USER=root LOGNAME=root SHELL=/bin/bash XDG_RUNTIME_DIR=/run/user/0\n",
-        "WorkingDirectory=/root\n",
-        "TTYPath=/dev/tty%i\n",
-        "TTYReset=yes\n",
-        "TTYVHangup=yes\n",
-        "TTYVTDisallocate=yes\n",
-        "StandardInput=tty\n",
-        "StandardOutput=journal+console\n",
-        "StandardError=journal+console\n",
-        "ExecStartPre=/bin/sh -c 'mkdir -p /tmp/.X11-unix /var/log && chmod 1777 /tmp/.X11-unix'\n",
-        "ExecStartPre=/bin/sh -c 'i=0; while [ ! -e /dev/fb0 ] && [ \"$i\" -lt 60 ]; do i=$((i + 1)); sleep 1; done; test -e /dev/fb0'\n",
-        "ExecStart=/usr/bin/startx /root/.xinitrc -- /usr/lib/Xorg :0 vt%i -keeptty -nolisten tcp -configdir /etc/X11/xorg.conf.d\n",
-        "Restart=on-failure\n",
-        "RestartSec=2s\n",
-        "TimeoutStartSec=240s\n",
+        "if process_named lightdm; then echo 'graphics-x11: lightdm ok'; else echo 'graphics-x11: lightdm missing'; for f in /var/log/lightdm/*.log; do [ -s \"$f\" ] && printf 'graphics-x11: lightdm-log %s begin\\n' \"$f\" && tail -80 \"$f\" && printf 'graphics-x11: lightdm-log %s end\\n' \"$f\"; done; fi\n",
+        // Lupos currently exposes TASK_COMM_LEN-sized cmdlines through procfs,
+        // so match the observable 15-byte prefix of lightdm-gtk-greeter.
+        "if wait_for_process 'lightdm-gtk-gre' 30; then echo 'graphics-x11: greeter ok'; else echo 'graphics-x11: greeter missing'; for f in /var/log/lightdm/*.log; do [ -s \"$f\" ] && printf 'graphics-x11: greeter-log %s begin\\n' \"$f\" && tail -80 \"$f\" && printf 'graphics-x11: greeter-log %s end\\n' \"$f\"; done; fi\n",
+        "echo 'graphics-x11: timeout-sanity begin'\n",
+        "if timeout 3 sh -c 'sleep 30' >/tmp/lupos-timeout-sanity.log 2>&1; then\n",
+        "    echo 'graphics-x11: timeout-sanity unexpected-ok'\n",
+        "else\n",
+        "    rc=\"$?\"\n",
+        "    if [ \"$rc\" -eq 124 ]; then echo 'graphics-x11: timeout-sanity ok'; else printf 'graphics-x11: timeout-sanity failed rc=%s\\n' \"$rc\"; fi\n",
+        "fi\n",
+        "echo 'graphics-x11: xclient-probe begin'\n",
+        "if [ -x /usr/bin/xmodmap ]; then\n",
+        "    if DISPLAY=:0 timeout 20 /usr/bin/xmodmap -query > /tmp/lupos-xclient.log 2>&1; then\n",
+        "        echo 'graphics-x11: xclient-roundtrip ok'\n",
+        "    else\n",
+        "        rc=\"$?\"\n",
+        "        printf 'graphics-x11: xclient-roundtrip failed rc=%s\\n' \"$rc\"\n",
+        "    fi\n",
+        "    if [ -s /tmp/lupos-xclient.log ]; then echo 'graphics-x11: xclient-log begin'; tail -40 /tmp/lupos-xclient.log; echo 'graphics-x11: xclient-log end'; fi\n",
+        "else\n",
+        "    echo 'graphics-x11: xclient-roundtrip missing-xmodmap'\n",
+        "fi\n",
+        // Pointer check: confirm Xorg's evdev driver picked up the PS/2 mouse
+        // node (/dev/input/event1) and configured it as a pointer at startup.
+        // Actual motion needs a host moving the pointer (QMP input injection);
+        // detection is the headless-observable evidence the device is usable.
+        "echo 'graphics-x11: pointer-probe begin'\n",
+        "ptr_log=\"$xorg_log\"; [ -s \"$ptr_log\" ] || ptr_log=\"$direct_xorg_log\"\n",
+        "if [ -s \"$ptr_log\" ] && grep -q 'LuposMouse' \"$ptr_log\" && grep -Eq 'Configuring as (pointer|mouse)|Found relative axes|type: (MOUSE|RELATIVE)' \"$ptr_log\"; then\n",
+        "    echo 'graphics-x11: pointer ok'\n",
+        "else\n",
+        "    echo 'graphics-x11: pointer not-detected'\n",
+        "fi\n",
+        "if [ -s \"$ptr_log\" ]; then echo 'graphics-x11: pointer-log begin'; grep -iE 'LuposMouse|event1|pointer|relative axes' \"$ptr_log\" | tail -25; echo 'graphics-x11: pointer-log end'; fi\n",
+        // UNIX98 pty end-to-end check: util-linux `script` calls openpty()
+        // (open /dev/ptmx -> grantpt -> unlockpt -> ptsname -> open /dev/pts/N),
+        // forks a child on the slave, and reads the child's output back through
+        // the master.  A round-tripped marker proves the whole pty data path —
+        // the same path xterm's get_pty() needs to run a shell.
+        "echo 'graphics-x11: pty-probe begin'\n",
+        "if [ ! -e /dev/ptmx ]; then\n",
+        "    echo 'graphics-x11: pty-roundtrip no-ptmx'\n",
+        "elif [ ! -x /usr/bin/script ]; then\n",
+        "    echo 'graphics-x11: pty-roundtrip no-script'\n",
+        "else\n",
+        // Round-tripping the marker through the pty (master reads what the
+        // child wrote to the slave) exercises the entire path xterm needs:
+        // openpt -> unlockpt -> ptsname -> open slave -> fork/exec on the slave
+        // -> bidirectional IO -> slave-close EOF back to the master.  That is
+        // the pass criterion; util-linux `script`'s own exit status also covers
+        // typescript bookkeeping/teardown beyond the pty itself.\n",
+        // `timeout` guards against util-linux `script`'s teardown occasionally
+        // wedging after a successful round-trip; the marker in .out already
+        // proves the pty path, so a killed teardown must not stall the probe.
+        "    timeout -k 5 20 script -qec 'echo PTY_ROUNDTRIP_OK' /tmp/lupos-pty.log >/tmp/lupos-pty.out 2>/tmp/lupos-pty.err; sc=$?\n",
+        "    if grep -q PTY_ROUNDTRIP_OK /tmp/lupos-pty.out /tmp/lupos-pty.log 2>/dev/null; then\n",
+        "        printf 'graphics-x11: pty-roundtrip ok (script-rc=%s)\\n' \"$sc\"\n",
+        "    else\n",
+        "        printf 'graphics-x11: pty-roundtrip failed rc=%s\\n' \"$sc\"\n",
+        "    fi\n",
+        "    if [ -e /dev/pts/0 ]; then echo 'graphics-x11: devpts-slave present'; fi\n",
+        "    for f in /tmp/lupos-pty.log /tmp/lupos-pty.out /tmp/lupos-pty.err; do\n",
+        "        if [ -s \"$f\" ]; then printf 'graphics-x11: pty-diag %s begin\\n' \"$f\"; tail -30 \"$f\"; printf '\\ngraphics-x11: pty-diag %s end\\n' \"$f\"; fi\n",
+        "    done\n",
+        "fi\n",
+        // Decode one PNG through gdk-pixbuf. Rebuilding the entire hicolor icon
+        // cache here created hundreds of avoidable file reads and occasionally
+        // exhausted the old cooperative scheduler before XFCE even launched.
+        "echo 'graphics-x11: pixbuf-probe begin'\n",
+        "pixbuf_source=/usr/share/icons/AdwaitaLegacy/48x48/status/avatar-default.png\n",
+        "if [ -x /usr/bin/gdk-pixbuf-thumbnailer ] && [ -f \"$pixbuf_source\" ]; then\n",
+        "    timeout 15 /usr/bin/gdk-pixbuf-thumbnailer -s 32 \"$pixbuf_source\" /tmp/lupos-pixbuf.png >/tmp/pixbuf.log 2>&1\n",
+        "    prc=$?\n",
+        "    printf 'graphics-x11: pixbuf rc=%s\\n' \"$prc\"\n",
+        "    if [ \"$prc\" = 0 ] && [ -s /tmp/lupos-pixbuf.png ]; then echo 'graphics-x11: pixbuf ok'; else echo 'graphics-x11: pixbuf failed'; fi\n",
+        "    if [ -s /tmp/pixbuf.log ]; then echo 'graphics-x11: pixbuf-log begin'; tail -20 /tmp/pixbuf.log; echo 'graphics-x11: pixbuf-log end'; fi\n",
+        "else\n",
+        "    echo 'graphics-x11: pixbuf no-tool'\n",
+        "fi\n",
+        // D-Bus session-bus probe: xfconf/xfce4-panel/xfsettingsd need a working
+        // per-session bus.  dbus-launch was failing ("Connection refused"), so
+        // start dbus-daemon directly and prove a client can round-trip a call.
+        // Capture the daemon's own stderr so its startup failure surfaces.
+        "echo 'graphics-x11: dbus-probe begin'\n",
+        "if [ -x /usr/bin/dbus-daemon ]; then\n",
+        "    export XDG_RUNTIME_DIR=/tmp/lupos-dbus-runtime; mkdir -p \"$XDG_RUNTIME_DIR\"; chmod 700 \"$XDG_RUNTIME_DIR\" 2>/dev/null || true\n",
+        "    rm -f /tmp/dbus-addr.txt /tmp/dbus-daemon.log\n",
+        "    ( /usr/bin/dbus-daemon --session --nofork --print-address=1 >/tmp/dbus-addr.txt 2>/tmp/dbus-daemon.log ) &\n",
+        "    dbpid=$!\n",
+        "    i=0; while [ \"$i\" -lt 10 ] && [ ! -s /tmp/dbus-addr.txt ]; do i=$((i+1)); sleep 1; done\n",
+        "    DA=\"$(cat /tmp/dbus-addr.txt 2>/dev/null)\"\n",
+        "    printf 'graphics-x11: dbus-addr %s\\n' \"$DA\"\n",
+        "    if [ -n \"$DA\" ]; then\n",
+        "        export DBUS_SESSION_BUS_ADDRESS=\"$DA\"\n",
+        "        timeout 8 /usr/bin/dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/tmp/dbus-send.log 2>&1\n",
+        "        printf 'graphics-x11: dbus-send rc=%s\\n' \"$?\"\n",
+        "        if grep -q 'org.freedesktop.DBus' /tmp/dbus-send.log 2>/dev/null; then echo 'graphics-x11: dbus ok'; else echo 'graphics-x11: dbus failed'; fi\n",
+        "    else\n",
+        "        echo 'graphics-x11: dbus no-address'\n",
+        "    fi\n",
+        "    if [ -s /tmp/dbus-daemon.log ]; then echo 'graphics-x11: dbus-daemon-log begin'; tail -30 /tmp/dbus-daemon.log; echo 'graphics-x11: dbus-daemon-log end'; fi\n",
+        "    if [ -s /tmp/dbus-send.log ]; then echo 'graphics-x11: dbus-send-log begin'; tail -10 /tmp/dbus-send.log; echo 'graphics-x11: dbus-send-log end'; fi\n",
+        "    kill \"$dbpid\" 2>/dev/null || true\n",
+        "else\n",
+        "    echo 'graphics-x11: dbus no-daemon'\n",
+        "fi\n",
+        // XFCE desktop check: launch the same session LightDM dispatches against
+        // its already-running X server, then require the session manager,
+        // window manager, settings daemon, panel, and desktop surface together.
+        "echo 'graphics-x11: xfce-probe begin'\n",
+        "if [ ! -x /usr/bin/startxfce4 ]; then\n",
+        "    echo 'graphics-x11: xfce no-startxfce4'\n",
+        "elif [ ! -S /tmp/.X11-unix/X0 ]; then\n",
+        "    echo 'graphics-x11: xfce no-xserver'\n",
+        "else\n",
+        "    export DISPLAY=:0 HOME=/root\n",
+        "    export XDG_CONFIG_DIRS=/etc/xdg XDG_DATA_DIRS=/usr/share\n",
+        "    export XDG_CACHE_HOME=/root/.cache XDG_CONFIG_HOME=/root/.config XDG_RUNTIME_DIR=/tmp/lupos-xfce-runtime\n",
+        "    export NO_AT_BRIDGE=1 GTK_A11Y=none\n",
+        "    mkdir -p /root/.cache /root/.config \"$XDG_RUNTIME_DIR\"\n",
+        "    chmod 700 \"$XDG_RUNTIME_DIR\" 2>/dev/null || true\n",
+        // Detach the session into its own process group/session with setsid and
+        // a null stdin so it can never contend for the probe shell's controlling
+        // terminal or job control while we poll for the window manager.
+        "    setsid sh -c 'dbus-run-session -- startxfce4' </dev/null >/tmp/lupos-xfce.log 2>&1 &\n",
+        // Poll the complete desktop set without spawning a pgrep process for
+        // every component on every iteration. This keeps the gate's own process
+        // pressure small and makes "xfce ok" mean a usable desktop, not just a WM.
+        "    i=0\n",
+        "    while [ \"$i\" -lt 120 ]; do\n",
+        "        if xfce_desktop_ready; then break; fi\n",
+        "        if [ $((i % 15)) -eq 0 ]; then\n",
+        "            printf 'graphics-x11: xfce-wait t=%s procs=[' \"$i\"\n",
+        "            for p in xfce4-session xfwm4 xfsettingsd xfconfd xfce4-panel xfdesktop; do\n",
+        "                process_named \"$p\" && printf '%s ' \"$p\"\n",
+        "            done\n",
+        "            printf ']\\n'\n",
+        "        fi\n",
+        "        i=$((i + 1)); sleep 1\n",
+        "    done\n",
+        "    sleep 5\n",
+        "    xfce_ready=0\n",
+        "    if xfce_desktop_ready; then\n",
+        "        xfce_ready=1\n",
+        "        echo 'graphics-x11: xfce ok'\n",
+        "        for p in xfce4-session xfwm4 xfsettingsd xfce4-panel xfdesktop; do\n",
+        "            printf 'graphics-x11: xfce-proc %s\\n' \"$p\"\n",
+        "        done\n",
+        "    else\n",
+        "        echo 'graphics-x11: xfce failed'\n",
+        "        printf 'graphics-x11: xfce-final procs=['\n",
+        "        for p in xfce4-session xfwm4 xfsettingsd xfconfd xfce4-panel xfdesktop; do\n",
+        "            process_named \"$p\" && printf '%s ' \"$p\"\n",
+        "        done\n",
+        "        printf ']\\n'\n",
+        "    fi\n",
+        "    if [ -s /tmp/lupos-xfce.log ]; then echo 'graphics-x11: xfce-log begin'; tail -80 /tmp/lupos-xfce.log; echo 'graphics-x11: xfce-log end'; fi\n",
+        // Diagnostic: if the WM/panel did not come up under the session, try to
+        // launch them directly so their startup errors surface on the serial log.
+        "    if [ \"$xfce_ready\" -eq 0 ]; then\n",
+        "        if ! process_named xfwm4; then\n",
+        "            DISPLAY=:0 xfwm4 >/tmp/lupos-xfwm4.log 2>&1 &\n",
+        "            sleep 3\n",
+        "            if process_named xfwm4; then echo 'graphics-x11: xfwm4-direct ok'; else echo 'graphics-x11: xfwm4-direct failed'; fi\n",
+        "            echo 'graphics-x11: xfwm4-log begin'; tail -40 /tmp/lupos-xfwm4.log 2>/dev/null; echo 'graphics-x11: xfwm4-log end'\n",
+        "        fi\n",
+        "        if ! process_named xfce4-panel; then\n",
+        "            DISPLAY=:0 xfce4-panel >/tmp/lupos-panel.log 2>&1 &\n",
+        "            sleep 3\n",
+        "            if process_named xfce4-panel; then echo 'graphics-x11: panel-direct ok'; else echo 'graphics-x11: panel-direct failed'; fi\n",
+        "            echo 'graphics-x11: panel-log begin'; tail -40 /tmp/lupos-panel.log 2>/dev/null; echo 'graphics-x11: panel-log end'\n",
+        "        fi\n",
+        "    fi\n",
+        "fi\n",
     )
     .as_bytes()
     .to_vec()
@@ -6751,6 +7264,15 @@ fn grub_cfg_content_with_cmdline(mode: &BootMode, extra_cmdline: &str) -> String
         format!(" {combined}")
     };
 
+    // Graphics boots need GRUB to hand the kernel a real VBE linear framebuffer
+    // (screen_info VLFB) instead of the text console, so `/dev/fb0` is the
+    // actually-displayed framebuffer and Xorg's fbdev pixels reach the screen.
+    // Text/login boots keep `text` so the kernel/systemd console stays usable.
+    let gfxpayload = match mode {
+        BootMode::GraphicsX11 | BootMode::GraphicsWayland => "800x600x32",
+        _ => "text",
+    };
+
     format!(
         r#"set timeout={timeout}
 set default=0
@@ -6759,8 +7281,8 @@ set default=0
 serial --unit=0 --speed=115200
 insmod all_video
 insmod linux
-set gfxmode=auto
-set gfxpayload=text
+set gfxmode=800x600x32,auto
+set gfxpayload={gfxpayload}
 insmod png
 insmod gfxterm
 terminal_input console serial
@@ -7064,9 +7586,10 @@ pub enum BootMode {
     /// clear_child_tid behavior needed by pthread runtimes.
     PthreadSmokeTest,
     /// Boot the full glibc + systemd userland with the X11 stack on top.
-    /// `lupos-startx@1.service` starts Xorg with `xf86-video-fbdev` on `/dev/fb0`,
-    /// twm as the window manager, and an xterm.  Requires the userland to be
-    /// rebuilt with `LUPOS_USERLAND_GRAPHICS=1`.
+    /// `lupos-lightdm.service` presents a GTK graphical login on `/dev/fb0`
+    /// (Xorg + `xf86-video-fbdev`); a successful login starts XFCE. Requires
+    /// the userland to be rebuilt with
+    /// `LUPOS_USERLAND_GRAPHICS=1`.
     GraphicsX11,
     /// Boot the full glibc + systemd userland with the Wayland stack on top.
     /// `lupos-weston@2.service` starts Weston with the fbdev backend + pixman
@@ -9803,8 +10326,13 @@ const LOGIN_ROOT_DISK_SIZE: &str = "768M";
 const LOGIN_ROOT_DISK_BYTES: u64 = 768 * 1024 * 1024;
 const SHIPPED_COMMANDS_ROOT_DISK_SIZE: &str = "768M";
 const SHIPPED_COMMANDS_ROOT_DISK_BYTES: u64 = 768 * 1024 * 1024;
-const LOGIN_ROOT_DISK_MANIFEST_VERSION: &str = "1";
-const DIRECT_STAGE_ROOT_DISK_MANIFEST_VERSION: &str = "14";
+// Bump when a change alters the staged rootfs in a way the per-part manifest
+// hashes below do not capture (e.g. swapping a shared library in-place without
+// touching the pacman package DB), so cached disks rebuild from the new stage.
+// v2: keep the legacy builder cache distinct after graphics staging changes.
+const LOGIN_ROOT_DISK_MANIFEST_VERSION: &str = "2";
+// v15: replace glycin-based gdk-pixbuf 2.44 with the pre-glycin 2.42.12 build.
+const DIRECT_STAGE_ROOT_DISK_MANIFEST_VERSION: &str = "15";
 
 fn ensure_disk_root_remount_disk() -> Result<PathBuf> {
     let target = xtask_target_dir()?;
@@ -10550,20 +11078,129 @@ fn direct_stage_login_root_disk_overlay_files(
     }
 
     if graphics_x11 {
+        // Pacman runs with --noscriptlet, so systemd-sysusers never creates the
+        // dedicated greeter identity from usr/lib/sysusers.d/lightdm.conf.
+        // Keep it graphics-only: using root as the greeter makes a root login
+        // look like an already-running greeter session and LightDM refuses to
+        // launch the selected desktop.
+        upsert_initramfs_file(
+            &mut files,
+            "etc/passwd",
+            0o100644,
+            override_colon_records(
+                staged_auth_config(stage, "etc/passwd", LOGIN_PASSWD),
+                LIGHTDM_PASSWD,
+            ),
+        );
+        upsert_initramfs_file(
+            &mut files,
+            "etc/shadow",
+            0o100600,
+            override_colon_records(
+                staged_auth_config(stage, "etc/shadow", LOGIN_SHADOW),
+                LIGHTDM_SHADOW,
+            ),
+        );
+        upsert_initramfs_file(
+            &mut files,
+            "etc/group",
+            0o100644,
+            override_colon_records(
+                staged_auth_config(stage, "etc/group", LOGIN_GROUP),
+                LIGHTDM_GROUP,
+            ),
+        );
+        upsert_initramfs_file(
+            &mut files,
+            "etc/gshadow",
+            0o100600,
+            override_colon_records(
+                staged_auth_config(stage, "etc/gshadow", LOGIN_GSHADOW),
+                LIGHTDM_GSHADOW,
+            ),
+        );
+        for (path, mode) in [
+            ("var/cache/lightdm", 0o40711),
+            ("var/lib/lightdm", 0o41770),
+            ("var/lib/lightdm-data", 0o41770),
+            ("var/log/lightdm", 0o40711),
+        ] {
+            upsert_initramfs_file(&mut files, path, mode, Vec::new());
+        }
+        upsert_initramfs_file(
+            &mut files,
+            "var/lib/lightdm/.Xauthority",
+            0o100600,
+            Vec::new(),
+        );
         files.push(initramfs_file(
             "etc/X11/xorg.conf.d/10-lupos-fbdev.conf",
             0o100644,
             x11_fbdev_config(),
+        ));
+        // GTK3 + XFCE defaults: force the PNG AdwaitaLegacy icon theme so GTK
+        // never needs the (absent) SVG pixbuf loader and cannot fatally abort.
+        files.push(initramfs_file(
+            "etc/gtk-3.0/settings.ini",
+            0o100644,
+            gtk3_settings_ini(),
+        ));
+        files.push(initramfs_file(
+            "etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml",
+            0o100644,
+            xfce_xsettings_xml(),
         ));
         files.push(initramfs_file(
             "root/.xinitrc",
             0o100755,
             x11_root_xinitrc(),
         ));
+        // Graphical login: LightDM's GTK greeter presents a branded login on the
+        // framebuffer and dispatches every authenticated user to XFCE.
         files.push(initramfs_file(
-            "usr/lib/systemd/system/lupos-startx@.service",
+            "usr/lib/systemd/system/lupos-lightdm.service",
             0o100644,
-            systemd_lupos_startx_unit(),
+            systemd_lupos_lightdm_unit(),
+        ));
+        files.push(initramfs_file(
+            "etc/lightdm/lightdm.conf",
+            0o100644,
+            lightdm_config(),
+        ));
+        files.push(initramfs_file(
+            "etc/lightdm/lightdm-gtk-greeter.conf",
+            0o100644,
+            lightdm_gtk_greeter_config(),
+        ));
+        files.push(initramfs_file(
+            "usr/share/themes/LuposLogin/gtk-3.0/gtk.css",
+            0o100644,
+            lightdm_gtk_theme_css(),
+        ));
+        files.push(initramfs_file(
+            "usr/share/backgrounds/lupos-login.png",
+            0o100644,
+            SPLASH_ART_BYTES.to_vec(),
+        ));
+        files.push(initramfs_file(
+            X11_XSERVER_WRAPPER_PATH,
+            0o100755,
+            x11_xserver_wrapper(),
+        ));
+        files.push(initramfs_file(
+            "usr/libexec/lupos-lightdm-session",
+            0o100755,
+            lightdm_session_wrapper(),
+        ));
+        files.push(initramfs_file(
+            "etc/pam.d/lightdm",
+            0o100644,
+            lightdm_login_pam(),
+        ));
+        files.push(initramfs_file(
+            "etc/pam.d/lightdm-greeter",
+            0o100644,
+            lightdm_greeter_pam(),
         ));
         files.push(initramfs_file(
             GRAPHICS_X11_PROBE_SCRIPT_PATH,
@@ -10585,8 +11222,8 @@ fn direct_stage_login_root_disk_overlay_files(
             "/usr/lib/systemd/system/lupos-serial-getty.service",
         ));
         files.push(initramfs_symlink(
-            "etc/systemd/system/multi-user.target.wants/lupos-startx@1.service",
-            "/usr/lib/systemd/system/lupos-startx@.service",
+            "etc/systemd/system/multi-user.target.wants/lupos-lightdm.service",
+            "/usr/lib/systemd/system/lupos-lightdm.service",
         ));
         upsert_initramfs_file(
             &mut files,
@@ -10831,11 +11468,18 @@ def emit_recursive_delete(rel):
     else:
         emit_remove(rel, host)
 
-def emit_lupos_owner(rel):
+def emit_overlay_owner(rel):
     rel = clean_rel(rel)
     if rel == "home/lupos" or rel.startswith("home/lupos/"):
         commands.append("sif %s uid 1000" % image_path(rel))
         commands.append("sif %s gid 1000" % image_path(rel))
+    elif (rel == "var/lib/lightdm" or rel.startswith("var/lib/lightdm/") or
+          rel == "var/lib/lightdm-data" or rel.startswith("var/lib/lightdm-data/")):
+        commands.append("sif %s uid 969" % image_path(rel))
+        commands.append("sif %s gid 969" % image_path(rel))
+    elif rel in ("var/cache/lightdm", "var/log/lightdm"):
+        commands.append("sif %s uid 0" % image_path(rel))
+        commands.append("sif %s gid 969" % image_path(rel))
 
 with open(delete_list, "r", encoding="utf-8") as f:
     for line in f:
@@ -10870,7 +11514,7 @@ while True:
         if not exists_after_deletes(rel):
             commands.append("mkdir %s" % image_path(rel))
         commands.append("sif %s mode 0%o" % (image_path(rel), mode))
-        emit_lupos_owner(rel)
+        emit_overlay_owner(rel)
     elif kind == stat.S_IFLNK:
         emit_parent_dirs(rel)
         if exists_after_deletes(rel):
@@ -10886,7 +11530,7 @@ while True:
             out.write(payload)
         commands.append("write %s %s" % (host, image_path(rel)))
         commands.append("sif %s mode 0%o" % (image_path(rel), mode))
-        emit_lupos_owner(rel)
+        emit_overlay_owner(rel)
 
 with open(os.path.join(work, "debugfs.commands"), "w", encoding="utf-8") as out:
     out.write("\n".join(commands))
@@ -11496,25 +12140,27 @@ pub fn run_gui_shell_tests() -> Result<()> {
     bail!("gui-shell was removed; Arch base has no desktop gate")
 }
 
-/// Run the first graphical userspace gate: Xorg fbdev + twm + xterm.
+/// Run the graphical userspace gate: LightDM, Xorg fbdev, and XFCE.
 ///
 /// The automated check keeps QEMU headless and uses a temporary serial getty
 /// for inspection.  It proves that the graphics root disk boots far enough for
-/// systemd to start the Xorg service and create the X11 socket/log; a separate
-/// display run is still needed to prove host-visible pixels.
+/// systemd to start the greeter and create the X11 socket/log, then launches a
+/// full XFCE session and requires its core desktop components.
 pub fn run_graphics_x11_tests() -> Result<()> {
     let _graphics_guard = EnvVarGuard::set("LUPOS_USERLAND_GRAPHICS", "1");
+    // Use a relative PS/2 mouse (the pointer Lupos drives) rather than the
+    // absolute usb-tablet, so the X pointer actually moves.
+    let _tablet_guard = EnvVarGuard::set(LUPOS_QEMU_USB_TABLET_ENV, "0");
     ensure_userland_stage()?;
 
     let _stage_guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
     let current_cmdline = env::var(LUPOS_KERNEL_CMDLINE_ENV).unwrap_or_default();
+    // No `lupos.synthetic_fb`: the GraphicsX11 GRUB config sets a real VBE
+    // linear framebuffer (`gfxpayload=800x600x32`) so `/dev/fb0` is the
+    // displayed framebuffer — the same path the interactive `--gui` boot uses.
     let serial_cmdline = append_kernel_args(
         &current_cmdline,
-        &[
-            "systemd.show_status=yes",
-            "lupos.serial_getty=1",
-            "lupos.synthetic_fb=800x600x32",
-        ],
+        &["systemd.show_status=yes", "lupos.serial_getty=1"],
     );
     let _cmdline_guard = EnvVarGuard::set(LUPOS_KERNEL_CMDLINE_ENV, &serial_cmdline);
 
@@ -11557,6 +12203,23 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: xorg-proc present",
         "graphics-x11: x-socket present",
         "graphics-x11: xorg-log present",
+        "graphics-x11: lightdm ok",
+        "graphics-x11: greeter ok",
+        "graphics-x11: timeout-sanity ok",
+        "graphics-x11: xclient-roundtrip ok",
+        "graphics-x11: pointer ok",
+        "graphics-x11: pty-roundtrip ok",
+        // The pre-glycin gdk-pixbuf loads PNG icons in-process (no glycin
+        // subprocess), a private D-Bus session bus round-trips, and the XFCE
+        // complete desktop process set actually comes up.
+        "graphics-x11: pixbuf ok",
+        "graphics-x11: dbus ok",
+        "graphics-x11: xfce ok",
+        "graphics-x11: xfce-proc xfce4-session",
+        "graphics-x11: xfce-proc xfwm4",
+        "graphics-x11: xfce-proc xfsettingsd",
+        "graphics-x11: xfce-proc xfce4-panel",
+        "graphics-x11: xfce-proc xfdesktop",
     ] {
         if !serial_log_contains(&run.serial_output, needle) {
             bail!(
@@ -11570,6 +12233,20 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: xorg-proc missing",
         "graphics-x11: x-socket missing",
         "graphics-x11: xorg-log missing",
+        "graphics-x11: lightdm missing",
+        "graphics-x11: greeter missing",
+        "graphics-x11: timeout-sanity unexpected-ok",
+        "graphics-x11: timeout-sanity failed",
+        "graphics-x11: xclient-roundtrip failed",
+        "graphics-x11: xclient-roundtrip missing-xmodmap",
+        "graphics-x11: pty-roundtrip failed",
+        "graphics-x11: pty-roundtrip no-ptmx",
+        "graphics-x11: pty-roundtrip no-script",
+        "graphics-x11: pointer not-detected",
+        "graphics-x11: pixbuf failed",
+        "graphics-x11: dbus failed",
+        "graphics-x11: xfce failed",
+        "Unrecognized image file format",
         "no screens found",
         "Fatal server error",
     ] {
@@ -12267,6 +12944,25 @@ fn validate_userland_stage() -> Result<()> {
     };
     for required in required {
         validate_stage_artifact(&stage, required, allow_symlinks)?;
+    }
+    // When building the graphics profile, the desktop binaries must be staged
+    // too — otherwise a stale base-only stage passes validation and the XFCE /
+    // Xorg packages are never (re)installed after the package list changes.
+    if userland_graphics_enabled() {
+        for required in [
+            "usr/bin/Xorg",
+            "usr/bin/lightdm",
+            "usr/bin/lightdm-gtk-greeter",
+            "usr/bin/startxfce4",
+            "usr/bin/xfwm4",
+            "usr/bin/xfce4-panel",
+            "usr/bin/xfdesktop",
+            "usr/bin/xfsettingsd",
+            "usr/bin/xfce4-terminal",
+            "usr/bin/dbus-launch",
+        ] {
+            validate_stage_artifact(&stage, required, allow_symlinks)?;
+        }
     }
     if allow_symlinks {
         validate_arch_pam_systemd_session(&stage)?;
@@ -14577,9 +15273,15 @@ fn add_qemu_default_devices(command: &mut Command) {
         .arg("-device")
         .arg("virtio-net-pci,netdev=luposnet0")
         .arg("-device")
-        .arg("qemu-xhci,id=xhci")
-        .arg("-device")
-        .arg("usb-tablet,bus=xhci.0")
+        .arg("qemu-xhci,id=xhci");
+    // The absolute usb-tablet puts QEMU in absolute-pointer mode, which starves
+    // the guest's PS/2 mouse (the only pointer Lupos drives).  Graphics runners
+    // set LUPOS_QEMU_USB_TABLET=0 to drop it so relative motion reaches the PS/2
+    // mouse; everything else keeps the tablet (e.g. the xHCI probe test).
+    if env::var(LUPOS_QEMU_USB_TABLET_ENV).as_deref() != Ok("0") {
+        command.arg("-device").arg("usb-tablet,bus=xhci.0");
+    }
+    command
         .arg("-audiodev")
         .arg(qemu_audiodev_spec())
         .arg("-device")
@@ -14873,8 +15575,65 @@ fn run_qemu_iso_login_terminal(iso_path: &Path) -> Result<ExitStatus> {
         .with_context(|| format!("failed while waiting on serial-console QEMU: {rendered}"))
 }
 
+/// Public boot path: build the X11 graphics image and open QEMU's VGA window on
+/// the LightDM GTK graphical login.
+///
+/// This is the interactive counterpart to the headless `graphics-x11` gate
+/// (`run_graphics_x11_tests`): same `BootMode::GraphicsX11` image (Xorg on the
+/// fbdev backend, driven by LightDM), but launched with the visible GTK display
+/// so the greeter's pixels reach the host. Log in as `root` / `lupos` to land in
+/// the XFCE desktop.
 pub fn run_gui_shell_boot() -> Result<()> {
-    bail!("gui-shell was removed; Arch base has no desktop boot")
+    // Select the graphics userland (target/userland/graphics-stage) and stage it
+    // before the root-disk guard builds an ext4 image from it.
+    let _graphics_guard = EnvVarGuard::set("LUPOS_USERLAND_GRAPHICS", "1");
+    ensure_userland_stage()?;
+    let _stage_guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
+    let _release_guard = default_login_boot_release_guard();
+    let _memory_guard = default_gui_shell_memory_guard();
+    // Drop the absolute usb-tablet so QEMU forwards host pointer motion to the
+    // guest's PS/2 mouse (the pointer Lupos drives) and the desktop cursor moves.
+    let _tablet_guard = EnvVarGuard::set(LUPOS_QEMU_USB_TABLET_ENV, "0");
+
+    // The fbdev Xorg driver needs a framebuffer that is actually displayed.
+    // The GraphicsX11 GRUB config sets `gfxpayload=800x600x32`, so the kernel
+    // receives a real VBE linear framebuffer (screen_info VLFB) backing
+    // `/dev/fb0` — the same memory QEMU's `-vga std` shows in the window.  We
+    // deliberately do NOT pass `lupos.synthetic_fb`, which would replace it with
+    // an off-screen RAM buffer that never reaches the display.
+    let _root_disk_guards = default_qemu_root_disk_guard_for_mode(BootMode::GraphicsX11)?;
+
+    let artifacts = build_iso_artifacts(BootMode::GraphicsX11, false)?;
+    let iso = artifacts
+        .iso
+        .as_ref()
+        .expect("iso path must be present in ISO artifacts");
+
+    println!("Launching Lupos GUI (LightDM + XFCE) boot...");
+    println!("Serial log: {}", artifacts.serial_log.display());
+    println!(
+        "Log in at the LightDM greeter as root with password `lupos`; \
+         run `poweroff` from a shell (or close the window) to exit QEMU."
+    );
+    print_qemu_gdb_hint(&artifacts.kernel_elf);
+
+    let status = run_qemu_iso_login_display(iso, &artifacts.serial_log)?;
+    let serial_output = read_serial_log_if_present(&artifacts.serial_log);
+    match status.code() {
+        Some(0) | Some(QEMU_SUCCESS_EXIT_CODE) => Ok(()),
+        Some(code) => {
+            if serial_output.is_empty() {
+                bail!("QEMU exited with unexpected status code {code}");
+            }
+            bail!("QEMU exited with unexpected status code {code}\nserial log:\n{serial_output}");
+        }
+        None => {
+            if serial_output.is_empty() {
+                bail!("QEMU terminated before a clean exit");
+            }
+            bail!("QEMU terminated before a clean exit\nserial log:\n{serial_output}");
+        }
+    }
 }
 
 /// Compatibility alias for the single login boot.
@@ -18849,29 +19608,117 @@ failed command output\n";
         assert!(xorg_conf.contains("Section \"Screen\""));
         assert!(xorg_conf.contains("Screen \"LuposScreen\""));
         assert!(xorg_conf.contains("Option \"AutoAddDevices\" \"false\""));
-        assert!(xorg_conf.contains("Option \"AllowEmptyInput\" \"true\""));
+        // Lupos has no udev seat, so the keyboard is bound explicitly to the
+        // kernel evdev node via the classic evdev driver.
+        assert!(!xorg_conf.contains("Option \"AllowEmptyInput\""));
+        assert!(xorg_conf.contains("Section \"InputDevice\""));
+        assert!(xorg_conf.contains("Driver \"evdev\""));
+        assert!(xorg_conf.contains("Option \"Device\" \"/dev/input/event0\""));
+        assert!(xorg_conf.contains("InputDevice \"LuposKeyboard\" \"CoreKeyboard\""));
 
         let xinitrc = core::str::from_utf8(
             initramfs_file_bytes(&files, "root/.xinitrc").expect("root xinitrc staged"),
         )
         .expect("xinitrc utf-8");
+        // Primary path launches XFCE; twm+xterm remains as the fallback.
+        assert!(xinitrc.contains("startxfce4"));
         assert!(xinitrc.contains("xterm"));
         assert!(xinitrc.contains("exec twm"));
 
-        let startx = core::str::from_utf8(
-            initramfs_file_bytes(&files, "usr/lib/systemd/system/lupos-startx@.service")
-                .expect("startx service staged"),
+        // Graphical login runs through LightDM instead of an auto-started startx.
+        let lightdm = core::str::from_utf8(
+            initramfs_file_bytes(&files, "usr/lib/systemd/system/lupos-lightdm.service")
+                .expect("LightDM service staged"),
         )
-        .expect("startx unit utf-8");
-        assert!(!startx.contains("ConditionPathExists=/dev/fb0"));
-        assert!(startx.contains("while [ ! -e /dev/fb0 ]"));
-        assert!(startx.contains("mkdir -p /tmp/.X11-unix /var/log"));
-        assert!(startx.contains("TimeoutStartSec=240s"));
-        assert!(!startx.contains("systemd-user-sessions.service"));
-        assert!(startx.contains("TTYPath=/dev/tty%i"));
-        assert!(startx.contains("/usr/bin/startx /root/.xinitrc"));
-        assert!(startx.contains("/usr/lib/Xorg :0 vt%i"));
-        assert!(startx.contains("-configdir /etc/X11/xorg.conf.d"));
+        .expect("LightDM unit utf-8");
+        assert!(lightdm.contains("while [ ! -e /dev/fb0 ]"));
+        assert!(lightdm.contains("mkdir -p /tmp/.X11-unix /run/lightdm"));
+        assert!(lightdm.contains("TimeoutStartSec=240s"));
+        assert!(lightdm.contains("ExecStart=/usr/bin/lightdm --debug"));
+        assert!(lightdm.contains("chown 969:969 /run/lightdm"));
+        // LightDM stays outside the full default dependency chain, but Xorg must
+        // not race the system bus/logind path it enters before serving clients.
+        assert!(lightdm.contains("DefaultDependencies=no"));
+        assert!(lightdm.contains("Wants=dbus.socket dbus.service systemd-logind.service"));
+        assert!(lightdm.contains(
+            "After=systemd-journald.socket systemd-journald.service dbus.socket dbus.service systemd-logind.service"
+        ));
+        assert!(!lightdm.contains("systemd-user-sessions.service"));
+
+        let lightdm_config = core::str::from_utf8(
+            initramfs_file_bytes(&files, "etc/lightdm/lightdm.conf")
+                .expect("LightDM config staged"),
+        )
+        .expect("LightDM config utf-8");
+        assert!(lightdm_config.contains("greeter-session=lightdm-gtk-greeter"));
+        assert!(lightdm_config.contains("greeter-user=lightdm"));
+        assert!(!lightdm_config.contains("greeter-user=root"));
+        assert!(lightdm_config.contains("user-authority-in-system-dir=false"));
+        assert!(lightdm_config.contains("user-session=xfce"));
+        assert!(lightdm_config.contains("/usr/lib/xorg/lupos-xserver"));
+        assert!(lightdm_config.contains("-configdir /etc/X11/xorg.conf.d"));
+        assert!(!lightdm_config.contains(" -ac"));
+        assert!(lightdm_config.contains("greeter-show-manual-login=true"));
+
+        for (path, expected) in [
+            ("etc/passwd", "lightdm:x:969:969:Light Display Manager:"),
+            ("etc/shadow", "lightdm:!*:"),
+            ("etc/group", "lightdm:x:969:"),
+            ("etc/gshadow", "lightdm:!::"),
+        ] {
+            let contents = core::str::from_utf8(
+                initramfs_file_bytes(&files, path).expect("LightDM account database staged"),
+            )
+            .expect("LightDM account database utf-8");
+            assert!(contents.contains(expected), "{path} missing {expected}");
+        }
+        for (path, mode) in [
+            ("var/cache/lightdm", 0o40711),
+            ("var/lib/lightdm", 0o41770),
+            ("var/lib/lightdm-data", 0o41770),
+            ("var/log/lightdm", 0o40711),
+            ("var/lib/lightdm/.Xauthority", 0o100600),
+        ] {
+            assert_eq!(
+                find_initramfs_entry(&files, path).map(|entry| entry.1),
+                Some(mode),
+                "{path} must carry LightDM's package directory mode"
+            );
+        }
+
+        let greeter_config = core::str::from_utf8(
+            initramfs_file_bytes(&files, "etc/lightdm/lightdm-gtk-greeter.conf")
+                .expect("GTK greeter config staged"),
+        )
+        .expect("GTK greeter config utf-8");
+        assert!(greeter_config.contains("background=/usr/share/backgrounds/lupos-login.png"));
+        assert!(greeter_config.contains("theme-name=LuposLogin"));
+        assert!(greeter_config.contains("default-session=xfce"));
+        assert!(
+            initramfs_file_bytes(&files, "usr/share/backgrounds/lupos-login.png")
+                .is_some_and(|background| !background.is_empty())
+        );
+
+        let xserver = core::str::from_utf8(
+            initramfs_file_bytes(&files, "usr/lib/xorg/lupos-xserver")
+                .expect("xserver wrapper staged"),
+        )
+        .expect("xserver wrapper utf-8");
+        assert!(xserver.contains("exec /usr/lib/Xorg \"$@\""));
+        assert!(xserver.contains("sleep 2"));
+        assert!(!xserver.contains("notify_ready"));
+
+        let lightdm_session = core::str::from_utf8(
+            initramfs_file_bytes(&files, "usr/libexec/lupos-lightdm-session")
+                .expect("LightDM session wrapper staged"),
+        )
+        .expect("LightDM session wrapper utf-8");
+        assert!(lightdm_session.contains("dbus-run-session -- startxfce4"));
+        assert!(lightdm_session.contains("mktemp -d"));
+        assert!(lightdm_session.contains("chmod 700 \"$XDG_RUNTIME_DIR\""));
+        assert!(lightdm_session.contains("stat -c %u"));
+        assert!(lightdm_session.contains("xterm"));
+        assert!(lightdm_session.contains("exec twm"));
 
         let probe = core::str::from_utf8(
             initramfs_file_bytes(&files, GRAPHICS_X11_PROBE_SCRIPT_PATH)
@@ -18884,12 +19731,17 @@ failed command output\n";
         assert!(probe.contains("-logfile \"$direct_xorg_log\""));
         assert!(probe.contains("graphics-x11: direct-watchdog begin"));
         assert!(probe.contains("graphics-x11: wait-%s-progress"));
+        assert!(probe.contains("wait_for_x 60 service"));
         assert!(probe.contains("wait_for_x 45 direct"));
         assert!(probe.contains("/proc/$direct_xorg_pid"));
         assert!(probe.contains("/proc/$direct_xorg_pid/comm"));
         assert!(probe.contains("socket-backed-xorg"));
         assert!(probe.contains("graphics-x11: xorg-proc"));
         assert!(probe.contains("graphics-x11: xorg-log using-direct"));
+        assert!(probe.contains("graphics-x11: lightdm ok"));
+        assert!(probe.contains("graphics-x11: greeter ok"));
+        assert!(probe.contains("xfce_desktop_ready"));
+        assert!(probe.contains("xfce4-panel xfdesktop"));
         assert!(!probe.contains("systemctl "));
         assert!(!probe.contains("journalctl "));
         assert!(probe.contains("/tmp/.X11-unix/X0"));
@@ -18898,10 +19750,10 @@ failed command output\n";
         assert!(
             find_initramfs_entry(
                 &files,
-                "etc/systemd/system/multi-user.target.wants/lupos-startx@1.service"
+                "etc/systemd/system/multi-user.target.wants/lupos-lightdm.service"
             )
             .is_some(),
-            "graphics-x11 must enable the first VT Xorg service"
+            "graphics-x11 must enable the LightDM display manager"
         );
         assert!(
             find_initramfs_entry(
@@ -19152,21 +20004,27 @@ failed command output\n";
 
     #[test]
     fn gui_shell_mode_is_removed_from_public_boot_tests() {
+        // The legacy "gui-shell" boot-test mode stays unresolvable; the
+        // automated graphical gate is the "graphics-x11" mode instead.
         assert!(resolve_boot_test_mode("gui-shell").is_none());
         assert!(resolve_boot_test_mode("test-gui-shell").is_none());
         assert!(resolve_boot_test_mode("terminal-login").is_some());
+        assert!(resolve_boot_test_mode("graphics-x11").is_some());
         let source = read_repo_file("xtask/src/lib.rs");
         assert!(source.contains("pub fn run_gui_shell_tests() -> Result<()>"));
         assert!(source.contains("Arch base has no desktop gate"));
-        assert!(source.contains("Arch base has no desktop boot"));
     }
 
     #[test]
-    fn gui_shell_root_disk_builder_is_not_publicly_reachable() {
+    fn gui_run_boots_the_interactive_graphics_x11_image() {
         let source = read_repo_file("xtask/src/lib.rs");
 
+        // `cargo xtask run --gui` boots the interactive LightDM/XFCE graphics
+        // image with a visible display, not the removed gui-shell root disk.
         assert!(source.contains("pub fn run_gui_shell_boot() -> Result<()>"));
-        assert!(source.contains("Arch base has no desktop boot"));
+        assert!(source.contains("build_iso_artifacts(BootMode::GraphicsX11, false)?"));
+        assert!(source.contains("run_qemu_iso_login_display(iso, &artifacts.serial_log)"));
+        // The legacy gui-shell boot-test mode remains unreachable.
         assert!(!source.contains("\"test-gui-shell\" | \"gui-shell\" => Some"));
     }
 
@@ -24658,13 +25516,28 @@ CONFIG_MODULES=y
             "HookDir = $hook_dir",
             "xorg-server",
             "xf86-video-fbdev",
+            "xf86-input-evdev",
             "xorg-xinit",
             "xorg-twm",
             "xterm",
+            "lightdm",
+            "lightdm-gtk-greeter",
+            "xfce4-session",
+            "xfwm4",
+            "xfce4-panel",
+            "xfdesktop",
+            "xfce4-settings",
+            "xfce4-terminal",
             "usr/bin/Xorg",
             "usr/bin/startx",
+            "usr/bin/lightdm",
+            "usr/bin/lightdm-gtk-greeter",
+            "usr/bin/startxfce4",
+            "usr/bin/xfce4-panel",
+            "usr/bin/xfdesktop",
             "usr/lib/xorg/modules/drivers/fbdev_drv.so",
             "usr/lib/xorg/modules/input/libinput_drv.so",
+            "usr/lib/xorg/modules/input/evdev_drv.so",
             "staged graphics profile is missing X11 packages",
         ] {
             assert!(
@@ -24682,7 +25555,7 @@ CONFIG_MODULES=y
         ] {
             assert!(
                 !script.contains(forbidden),
-                "first graphics profile must stay minimal X11/fbdev, found {forbidden}"
+                "graphics profile must stay on the lean X11/fbdev stack, found {forbidden}"
             );
         }
     }

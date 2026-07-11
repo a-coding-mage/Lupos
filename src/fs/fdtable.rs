@@ -17,7 +17,7 @@ use spin::Mutex;
 use crate::include::uapi::errno::{EBADF, EINVAL, EMFILE};
 use crate::include::uapi::fcntl::FD_CLOEXEC;
 
-use super::file::fput;
+use super::file::{fget, fput};
 use super::types::FileRef;
 
 pub const NR_OPEN_DEFAULT: usize = 64;
@@ -103,6 +103,38 @@ impl FilesStruct {
         Ok(fd as i32)
     }
 
+    pub fn dup_at_or_above(&self, oldfd: i32, min_fd: usize, cloexec: bool) -> Result<i32, i32> {
+        if oldfd < 0 {
+            return Err(EBADF);
+        }
+        if min_fd >= NR_OPEN_MAX {
+            return Err(EMFILE);
+        }
+
+        let mut t = self.table.lock();
+        let src = t
+            .get(oldfd as usize)
+            .and_then(|s| s.file.as_ref())
+            .ok_or(EBADF)?;
+        let new_file = fget(src);
+        for (i, slot) in t.iter_mut().enumerate().skip(min_fd) {
+            if slot.file.is_none() {
+                slot.file = Some(new_file);
+                slot.flags = if cloexec { FD_CLOEXEC } else { 0 };
+                return Ok(i as i32);
+            }
+        }
+
+        let fd = t.len().max(min_fd);
+        if let Err(errno) = self.ensure_len_locked(&mut t, fd + 1) {
+            fput(new_file);
+            return Err(errno);
+        }
+        t[fd].file = Some(new_file);
+        t[fd].flags = if cloexec { FD_CLOEXEC } else { 0 };
+        Ok(fd as i32)
+    }
+
     pub fn get(&self, fd: i32) -> Result<FileRef, i32> {
         if fd < 0 {
             return Err(EBADF);
@@ -143,9 +175,10 @@ impl FilesStruct {
             }
             let src = t
                 .get(oldfd as usize)
-                .and_then(|s| s.file.clone())
+                .and_then(|s| s.file.as_ref())
                 .ok_or(EBADF)?;
             if oldfd as usize != newfd {
+                let src = fget(src);
                 let replaced = t[newfd].file.take();
                 t[newfd] = Slot {
                     file: Some(src),
@@ -339,7 +372,7 @@ pub fn dup_fd(parent: &Arc<FilesStruct>, share: bool) -> Arc<FilesStruct> {
     for (i, s) in src.iter().enumerate() {
         if let Some(f) = &s.file {
             dst[i] = Slot {
-                file: Some(f.clone()),
+                file: Some(fget(f)),
                 flags: s.flags,
             };
         }
@@ -396,6 +429,36 @@ mod tests {
         let fd0 = ft.install(f, false).unwrap();
         ft.dup2(fd0, 5).unwrap();
         assert!(ft.get(5).is_ok());
+    }
+
+    #[test]
+    fn dup2_takes_counted_file_reference() {
+        let ft = FilesStruct::new();
+        let file = alloc_file(d_alloc("dup-count"), 0, 0, &NOOP_FILE_OPS);
+        let fd0 = ft.install(file.clone(), false).unwrap();
+
+        ft.dup2(fd0, 5).unwrap();
+        assert_eq!(file.f_count.load(Ordering::Acquire), 2);
+
+        ft.close(fd0).unwrap();
+        assert_eq!(file.f_count.load(Ordering::Acquire), 1);
+        ft.close(5).unwrap();
+        assert_eq!(file.f_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn dup_fd_takes_counted_file_references_for_child_table() {
+        let parent = FilesStruct::new();
+        let file = alloc_file(d_alloc("fork-count"), 0, 0, &NOOP_FILE_OPS);
+        let fd = parent.install(file.clone(), false).unwrap();
+
+        let child = dup_fd(&parent, false);
+        assert_eq!(file.f_count.load(Ordering::Acquire), 2);
+
+        child.close(fd).unwrap();
+        assert_eq!(file.f_count.load(Ordering::Acquire), 1);
+        parent.close(fd).unwrap();
+        assert_eq!(file.f_count.load(Ordering::Acquire), 0);
     }
 
     #[test]

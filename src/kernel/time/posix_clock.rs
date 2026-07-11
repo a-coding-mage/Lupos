@@ -13,6 +13,7 @@ use super::hrtimer::{
 use super::jiffies::NSEC_PER_TICK;
 use super::timekeeping::{TK, ktime_get, ktime_get_boottime, ktime_get_real, tk_set_wall_seconds};
 use crate::kernel::capability::{CAP_SYS_TIME, capable};
+use crate::kernel::task::TaskStruct;
 
 // ── UAPI: CLOCK_* ids ────────────────────────────────────────────────────────
 
@@ -73,11 +74,61 @@ pub const EPERM: i32 = 1;
 
 // ── sys_clock_gettime ────────────────────────────────────────────────────────
 
+fn task_sched_runtime_ns(task: *mut TaskStruct) -> u64 {
+    if task.is_null() {
+        return 0;
+    }
+    let base = unsafe { (*task).m29.se.sum_exec_runtime };
+    let current = unsafe { crate::kernel::sched::get_current() };
+    if task != current {
+        return base;
+    }
+    let exec_start = unsafe { (*task).m29.se.exec_start };
+    if exec_start == 0 {
+        return base;
+    }
+    base.saturating_add(crate::kernel::sched::sched_clock_ns().saturating_sub(exec_start))
+}
+
+fn current_process_sched_runtime_ns() -> Result<u64, i32> {
+    let current = unsafe { crate::kernel::sched::get_current() };
+    if current.is_null() {
+        return Err(EINVAL);
+    }
+    let tgid = unsafe { (*current).tgid };
+    let mut total = 0u64;
+    let mut found = false;
+    let mut visit = |task: *mut TaskStruct| {
+        if task.is_null() || unsafe { (*task).tgid } != tgid {
+            return;
+        }
+        found = true;
+        total = total.saturating_add(task_sched_runtime_ns(task));
+    };
+    crate::kernel::fork::for_each_heap_task(&mut visit);
+    crate::kernel::sched::for_each_pool_task(&mut visit);
+    if found {
+        Ok(total)
+    } else {
+        Ok(task_sched_runtime_ns(current))
+    }
+}
+
+fn current_thread_sched_runtime_ns() -> Result<u64, i32> {
+    let current = unsafe { crate::kernel::sched::get_current() };
+    if current.is_null() {
+        return Err(EINVAL);
+    }
+    Ok(task_sched_runtime_ns(current))
+}
+
 pub fn sys_clock_gettime(clock: ClockId) -> Result<Timespec64, i32> {
     let ns = match clock {
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE => ktime_get_real(),
         CLOCK_MONOTONIC | CLOCK_MONOTONIC_COARSE | CLOCK_MONOTONIC_RAW => ktime_get(),
         CLOCK_BOOTTIME => ktime_get_boottime(),
+        CLOCK_PROCESS_CPUTIME_ID => current_process_sched_runtime_ns()?,
+        CLOCK_THREAD_CPUTIME_ID => current_thread_sched_runtime_ns()?,
         CLOCK_TAI => {
             ktime_get_real()
                 + TK.tai_offset.load(core::sync::atomic::Ordering::Acquire) * 1_000_000_000
@@ -100,6 +151,7 @@ pub fn sys_clock_settime(clock: ClockId, tp: Timespec64) -> Result<(), i32> {
             Ok(())
         }
         CLOCK_MONOTONIC | CLOCK_BOOTTIME => Err(EINVAL), // monotonic clocks are read-only
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => Err(EPERM),
         _ => Err(EINVAL),
     }
 }
@@ -113,6 +165,7 @@ pub fn sys_clock_getres(clock: ClockId) -> Result<Timespec64, i32> {
         | CLOCK_REALTIME_COARSE
         | CLOCK_MONOTONIC_COARSE
         | CLOCK_MONOTONIC_RAW => Ok(Timespec64::from_ns(NSEC_PER_TICK)),
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => Ok(Timespec64::from_ns(1)),
         _ => Err(EINVAL),
     }
 }
@@ -317,6 +370,40 @@ mod tests {
     #[test]
     fn clock_gettime_invalid_id_returns_einval() {
         assert_eq!(sys_clock_gettime(42), Err(EINVAL));
+    }
+
+    #[test]
+    fn cpu_clock_gettime_uses_current_sched_runtime() {
+        use alloc::boxed::Box;
+
+        use crate::kernel::{sched, task::TaskStruct};
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 91;
+        current.tgid = 91;
+        current.m29.se.sum_exec_runtime = 123_456;
+
+        unsafe { sched::set_current(&mut *current as *mut TaskStruct) };
+
+        assert_eq!(
+            sys_clock_gettime(CLOCK_PROCESS_CPUTIME_ID).unwrap().to_ns(),
+            123_456
+        );
+        assert_eq!(
+            sys_clock_gettime(CLOCK_THREAD_CPUTIME_ID).unwrap().to_ns(),
+            123_456
+        );
+        assert_eq!(
+            sys_clock_getres(CLOCK_PROCESS_CPUTIME_ID).unwrap().to_ns(),
+            1
+        );
+        assert_eq!(
+            sys_clock_getres(CLOCK_THREAD_CPUTIME_ID).unwrap().to_ns(),
+            1
+        );
+
+        unsafe { sched::set_current(previous) };
     }
 
     #[test]

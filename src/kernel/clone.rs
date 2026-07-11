@@ -21,7 +21,8 @@
 //!   For now the syscall handlers assume they are called from kernel context
 //!   with kernel-space `CloneArgs` pointers (testing only).
 //! - Namespace flags (`CLONE_NEWPID`, `CLONE_NEWNS`, …): wired in M28.
-//! - `CLONE_VFORK` completion semantics: M23 enqueues the child without blocking.
+//! - `CLONE_VFORK` completion waits in `fork::kernel_clone` until the child
+//!   exits or replaces its mm, matching Linux's `wait_for_vfork_done()`.
 //!
 //! References:
 //!   Linux `kernel/fork.c`

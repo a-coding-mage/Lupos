@@ -72,6 +72,7 @@ help:
 	@echo ""
 	@echo "Run:"
 	@echo "  make run                  - boot the default distro with a VGA window"
+	@echo "  make run-gui              - boot into LightDM and the XFCE desktop (X11)"
 	@echo "  make run-headless         - boot the default distro through the automated gate"
 	@echo ""
 	@echo "Tests:"
@@ -198,6 +199,10 @@ install: syncconfig
 .PHONY: run
 run: syncconfig
 	@$(CARGO) xtask run
+
+.PHONY: run-gui
+run-gui: syncconfig
+	@$(CARGO) xtask run --gui
 
 .PHONY: run-headless
 run-headless: syncconfig

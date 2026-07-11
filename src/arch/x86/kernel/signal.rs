@@ -129,6 +129,7 @@ pub unsafe fn setup_rt_frame(
     signum: i32,
     action: *const crate::kernel::signal::RtSigAction,
     info: *const SigInfo,
+    mask: SigSet,
 ) -> Result<(), i32> {
     // Linux `get_sigframe()` honors the x86-64 red zone, allocates the frame,
     // then leaves `%rsp % 16 == 8` for function-entry ABI alignment.
@@ -192,36 +193,14 @@ pub unsafe fn setup_rt_frame(
 
     // 4. Copy signal info (siginfo_t).
     frame.info = unsafe { *info };
+    frame.uc.uc_sigmask = mask;
+    frame.uc.uc_mcontext.oldmask = mask.bits;
 
     // 5. Write the frame to user stack.
     let frame_ptr = user_sp as *mut RtSigFrame;
     unsafe {
         // TODO: Replace with user_copy_to() once per-task memory safety is in place.
         core::ptr::copy_nonoverlapping(&frame as *const RtSigFrame, frame_ptr, 1);
-    }
-
-    #[cfg(not(test))]
-    {
-        if crate::kernel::debug_trace::proc_enabled() {
-            let pid = unsafe {
-                let task = crate::kernel::sched::get_current();
-                if task.is_null() { -1 } else { (*task).pid }
-            };
-            crate::linux_driver_abi::tty::serial_println!(
-                "trace-sigsetup pid={} sig={} frame={:#x} saved_rip={:#x} saved_rsp={:#x} saved_r12={:#x} saved_r13={:#x} saved_rbp={:#x} saved_rbx={:#x} handler={:#x} restorer={:#x}",
-                pid,
-                signum,
-                user_sp,
-                frame.uc.uc_mcontext.rip,
-                frame.uc.uc_mcontext.rsp,
-                frame.uc.uc_mcontext.r12,
-                frame.uc.uc_mcontext.r13,
-                frame.uc.uc_mcontext.rbp,
-                frame.uc.uc_mcontext.rbx,
-                unsafe { (*action).sa_handler as u64 },
-                unsafe { (*action).sa_restorer as u64 }
-            );
-        }
     }
 
     // 6. Modify PtRegs to transfer control to the signal handler.
@@ -318,6 +297,7 @@ mod tests {
                 10,
                 &action,
                 &info,
+                action.sa_mask,
             )
             .unwrap();
         }
@@ -338,6 +318,8 @@ mod tests {
         let frame = unsafe { &*(regs.sp as *const RtSigFrame) };
         assert_eq!(frame.pretcode, action.sa_restorer as u64);
         assert_eq!(frame.uc.uc_mcontext.rip, 0x401000);
+        assert_eq!(frame.uc.uc_mcontext.oldmask, action.sa_mask.bits);
+        assert_eq!(frame.uc.uc_sigmask, action.sa_mask);
         assert_eq!(frame.uc.uc_flags, UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS);
         assert_eq!(frame.info.signo, 10);
     }

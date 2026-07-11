@@ -369,6 +369,7 @@ pub unsafe fn release_task(p: *mut TaskStruct) {
         // 6. Drop task-owned shared state that is not released during do_exit.
         crate::kernel::syscalls::release_process_rlimits(p);
         crate::kernel::syscalls::release_task_rseq_registration(p);
+        crate::kernel::syscalls::release_task_real_itimer((*p).pid);
         crate::kernel::fork::cleanup_task_shared_state(p);
 
         // 7. Drop the heap allocations (TaskStruct + kernel stack).  After
@@ -526,6 +527,22 @@ mod tests {
         let mut parent = make_task(7777, 7777);
         let mut child = make_task(7778, 7778);
         unsafe {
+            let previous = sched::get_current();
+            sched::set_current(&mut *parent as *mut TaskStruct);
+            let blocked = signal::SigSet {
+                bits: 1u64 << (SIGCHLD - 1),
+            };
+            assert_eq!(
+                signal::sys_rt_sigprocmask(
+                    signal::SIG_BLOCK,
+                    &blocked,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<signal::SigSet>(),
+                ),
+                0
+            );
+            sched::set_current(previous);
+
             child.m26.real_parent = &mut *parent as *mut TaskStruct;
             child.m26.exit_signal = SIGCHLD;
 
@@ -546,6 +563,22 @@ mod tests {
         let mut parent = make_task(8110, 8110);
         let mut child = make_task(8111, 8111);
         unsafe {
+            let previous = sched::get_current();
+            sched::set_current(&mut *parent as *mut TaskStruct);
+            let blocked = signal::SigSet {
+                bits: 1u64 << (SIGCHLD - 1),
+            };
+            assert_eq!(
+                signal::sys_rt_sigprocmask(
+                    signal::SIG_BLOCK,
+                    &blocked,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<signal::SigSet>(),
+                ),
+                0
+            );
+            sched::set_current(previous);
+
             parent.__state.store(TASK_INTERRUPTIBLE, Ordering::Release);
             child.m26.real_parent = &mut *parent as *mut TaskStruct;
             child.m26.exit_signal = SIGCHLD;

@@ -168,7 +168,8 @@ pub unsafe fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
         }
 
         kbuf.truncate(copied);
-        match vfs_write(&file, &kbuf) {
+        let result = vfs_write(&file, &kbuf);
+        match result {
             Ok(n) => {
                 written += n;
                 if n < copied {
