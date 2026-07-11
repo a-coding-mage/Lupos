@@ -86,6 +86,11 @@ pub struct Inode {
     pub atime: AtomicU64,
     pub mtime: AtomicU64,
     pub ctime: AtomicU64,
+    /// Device number for special (char/block) inodes, in Linux
+    /// `new_encode_dev()` form (`major<<8 | minor` for small numbers). Zero for
+    /// non-device inodes. `stat(2)` reports this as `st_rdev`; userspace (e.g.
+    /// Xorg's `xf86HasTTYs()`) keys VT/console behaviour off `major(st_rdev)`.
+    pub rdev: AtomicU64,
     /// VFS reference count (Arc strong count is the source of truth; this is
     /// kept for diagnostics + Linux-style `i_count` callers).
     pub i_count: AtomicUsize,
@@ -120,6 +125,7 @@ impl Inode {
             atime: AtomicU64::new(0),
             mtime: AtomicU64::new(0),
             ctime: AtomicU64::new(0),
+            rdev: AtomicU64::new(0),
             i_count: AtomicUsize::new(1),
             ops,
             fops,

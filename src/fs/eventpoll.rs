@@ -19,6 +19,7 @@ use spin::Mutex;
 
 use crate::fs::anon_inode::alloc_anon_file;
 use crate::fs::fdtable::FilesStruct;
+use crate::fs::file::{fget, fput};
 use crate::fs::ops::FileOps;
 use crate::fs::select;
 use crate::fs::types::FileRef;
@@ -36,6 +37,8 @@ pub const EPOLLPRI: u32 = 0x0002;
 pub const EPOLLOUT: u32 = 0x0004;
 pub const EPOLLERR: u32 = 0x0008;
 pub const EPOLLHUP: u32 = 0x0010;
+pub const EPOLLRDNORM: u32 = 0x0040;
+pub const EPOLLWRNORM: u32 = 0x0100;
 pub const EPOLLET: u32 = 1 << 31;
 pub const EPOLLONESHOT: u32 = 1 << 30;
 
@@ -57,6 +60,7 @@ pub struct EpItem {
     pub file: FileRef,
     pub events: u32,
     pub data: u64,
+    pub last_ready: u32,
 }
 
 /// In-kernel state for one EventPoll instance.
@@ -98,22 +102,44 @@ impl EventPoll {
         {
             return Err(EEXIST);
         }
-        let evbits = ev.events;
+        let evbits = ev.events | EPOLLERR | EPOLLHUP;
         let evdata = ev.data;
         items.push(EpItem {
             fd,
-            file,
+            file: fget(&file),
             events: evbits,
             data: evdata,
+            last_ready: 0,
         });
         Ok(())
     }
 
+    fn remove_matching(&self, mut matches: impl FnMut(&EpItem) -> bool) -> usize {
+        let removed = {
+            let mut items = self.items.lock();
+            let mut removed = Vec::new();
+            let mut idx = 0;
+            while idx < items.len() {
+                if matches(&items[idx]) {
+                    removed.push(items.remove(idx).file);
+                } else {
+                    idx += 1;
+                }
+            }
+            removed
+        };
+        let count = removed.len();
+        for file in removed {
+            // epoll owns a real file reference. Dropping the Arc directly would
+            // bypass the watched file's release hook; Linux drops epitems via
+            // fput in vendor/linux/fs/eventpoll.c.
+            fput(file);
+        }
+        count
+    }
+
     pub fn del(&self, fd: i32, file: &FileRef) -> Result<(), i32> {
-        let mut items = self.items.lock();
-        let len_before = items.len();
-        items.retain(|e| !(e.fd == fd && Arc::ptr_eq(&e.file, file)));
-        if items.len() == len_before {
+        if self.remove_matching(|e| e.fd == fd && Arc::ptr_eq(&e.file, file)) == 0 {
             return Err(ENOENT);
         }
         Ok(())
@@ -123,8 +149,9 @@ impl EventPoll {
         let mut items = self.items.lock();
         for item in items.iter_mut() {
             if item.fd == fd && Arc::ptr_eq(&item.file, file) {
-                item.events = ev.events;
+                item.events = ev.events | EPOLLERR | EPOLLHUP;
                 item.data = ev.data;
+                item.last_ready = 0;
                 return Ok(());
             }
         }
@@ -132,21 +159,31 @@ impl EventPoll {
     }
 
     pub fn remove_closed_file(&self, fd: i32, file: &FileRef) {
-        self.items
-            .lock()
-            .retain(|e| !(e.fd == fd && Arc::ptr_eq(&e.file, file)));
+        self.remove_matching(|e| e.fd == fd && Arc::ptr_eq(&e.file, file));
+    }
+
+    pub fn clear(&self) {
+        self.remove_matching(|_| true);
     }
 
     fn collect_ready(&self, out: &mut [EpollEvent], consume: bool) -> Result<usize, i32> {
-        let items = self.items.lock();
+        let mut items = self.items.lock();
         let mut n = 0usize;
-        for item in items.iter() {
+        for item in items.iter_mut() {
             if n >= out.len() {
                 break;
             }
             let mask = select::poll_mask(&item.file);
-            let ready = (item.events & mask) | (mask & (EPOLLERR | EPOLLHUP));
-            if ready != 0 {
+            let ready = item.events & mask;
+            let deliver_ready = if ready == 0 {
+                0
+            } else if item.events & EPOLLET != 0 {
+                ready & !item.last_ready
+            } else {
+                ready
+            };
+            item.last_ready = ready;
+            if deliver_ready != 0 {
                 trace_epoll_ready(
                     item.fd,
                     item.file.fops.name,
@@ -159,6 +196,9 @@ impl EventPoll {
                     events: ready,
                     data: item.data,
                 };
+                if item.events & EPOLLONESHOT != 0 {
+                    item.events &= EPOLLONESHOT | EPOLLET;
+                }
                 if consume {
                     crate::fs::kernfs::consume_poll_event(&item.file);
                 }
@@ -174,7 +214,23 @@ impl EventPoll {
     }
 
     fn peek_ready(&self, _files: &FilesStruct, out: &mut [EpollEvent]) -> Result<usize, i32> {
-        self.collect_ready(out, false)
+        let items = self.items.lock();
+        let mut n = 0usize;
+        for item in items.iter() {
+            if n >= out.len() {
+                break;
+            }
+            let mask = select::poll_mask(&item.file);
+            let ready = item.events & mask;
+            if ready != 0 {
+                out[n] = EpollEvent {
+                    events: ready,
+                    data: item.data,
+                };
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -242,7 +298,9 @@ pub fn notify_fd_closed(files: &FilesStruct, fd: i32, file: &FileRef) {
 
 fn epoll_release(file: FileRef) {
     let token = *file.private.lock();
-    EPOLLS.lock().remove(&token);
+    if let Some(ep) = EPOLLS.lock().remove(&token) {
+        ep.clear();
+    }
 }
 
 fn epoll_poll(file: &FileRef) -> u32 {
@@ -363,7 +421,7 @@ fn trace_epoll_ctl(epfd: i32, op: i32, fd: i32, file_ops: &str, events: u32, dat
         );
     }
     #[cfg(test)]
-    let _ = (epfd, op, fd, file_ops, events, data);
+    let _ = (&epfd, &op, &fd, &file_ops, &events, &data);
 }
 
 fn trace_epoll_ready(fd: i32, file_ops: &str, events: u32, mask: u32, ready: u32, data: u64) {
@@ -387,7 +445,7 @@ fn trace_epoll_ready(fd: i32, file_ops: &str, events: u32, mask: u32, ready: u32
         );
     }
     #[cfg(test)]
-    let _ = (fd, file_ops, events, mask, ready, data);
+    let _ = (&fd, &file_ops, &events, &mask, &ready, &data);
 }
 
 /// `sys_epoll_wait(epfd, events, maxevents, timeout)` — Linux syscall 232.
@@ -426,7 +484,7 @@ pub unsafe fn sys_epoll_wait(
         #[cfg(not(test))]
         {
             crate::init::rootfs::drain_console_control_bytes();
-            if crate::kernel::signal::current_has_pending_signals() {
+            if crate::kernel::signal::current_has_unblocked_pending_signals() {
                 return -(EINTR as i64);
             }
         }
@@ -554,10 +612,11 @@ impl EventWaitState {
 mod tests {
     use super::*;
     use crate::fs::dcache::d_alloc;
-    use crate::fs::file::alloc_file;
+    use crate::fs::file::{alloc_file, fput};
     use crate::fs::ops::FileOps;
     use crate::kernel::{cred::INIT_CRED, files, sched, task::TaskStruct};
     use alloc::boxed::Box;
+    use core::sync::atomic::AtomicUsize;
 
     static READABLE_OPS: FileOps = FileOps {
         name: "epoll-readable",
@@ -566,6 +625,42 @@ mod tests {
         llseek: None,
         fsync: None,
         poll: Some(|_| EPOLLIN),
+        ioctl: None,
+        mmap: None,
+        release: None,
+        readdir: None,
+    };
+
+    static RELEASED_WATCHED_FILES: AtomicUsize = AtomicUsize::new(0);
+
+    fn release_watched_file(_file: FileRef) {
+        RELEASED_WATCHED_FILES.fetch_add(1, Ordering::AcqRel);
+    }
+
+    static RELEASE_COUNT_OPS: FileOps = FileOps {
+        name: "epoll-release-count",
+        read: None,
+        write: None,
+        llseek: None,
+        fsync: None,
+        poll: Some(|_| EPOLLIN),
+        ioctl: None,
+        mmap: None,
+        release: Some(release_watched_file),
+        readdir: None,
+    };
+
+    fn test_poll_mask(file: &FileRef) -> u32 {
+        *file.private.lock() as u32
+    }
+
+    static MASK_OPS: FileOps = FileOps {
+        name: "epoll-mask",
+        read: None,
+        write: None,
+        llseek: None,
+        fsync: None,
+        poll: Some(test_poll_mask),
         ioctl: None,
         mmap: None,
         release: None,
@@ -589,6 +684,43 @@ mod tests {
         assert_eq!(ep.add(3, file.clone(), ev), Err(EEXIST));
         ep.del(3, &file).unwrap();
         assert_eq!(ep.del(3, &file), Err(ENOENT));
+    }
+
+    #[test]
+    fn del_fputs_watched_file_reference() {
+        RELEASED_WATCHED_FILES.store(0, Ordering::Release);
+        let ep = EventPoll::new();
+        let file = alloc_file(d_alloc("watched-release"), 0, 0, &RELEASE_COUNT_OPS);
+        let ev = EpollEvent {
+            events: EPOLLIN,
+            data: 0x99,
+        };
+
+        ep.add(3, file.clone(), ev).unwrap();
+        ep.del(3, &file).unwrap();
+        assert_eq!(RELEASED_WATCHED_FILES.load(Ordering::Acquire), 0);
+
+        fput(file);
+        assert_eq!(RELEASED_WATCHED_FILES.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn clear_fputs_last_watched_reference_after_fd_put() {
+        RELEASED_WATCHED_FILES.store(0, Ordering::Release);
+        let ep = EventPoll::new();
+        let file = alloc_file(d_alloc("watched-clear-release"), 0, 0, &RELEASE_COUNT_OPS);
+        let file_for_add = file.clone();
+        let ev = EpollEvent {
+            events: EPOLLIN,
+            data: 0x100,
+        };
+
+        ep.add(4, file_for_add, ev).unwrap();
+        fput(file);
+        assert_eq!(RELEASED_WATCHED_FILES.load(Ordering::Acquire), 0);
+
+        ep.clear();
+        assert_eq!(RELEASED_WATCHED_FILES.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -681,8 +813,70 @@ mod tests {
         )
         .unwrap();
         let items = ep.items.lock();
-        assert_eq!(items[0].events, EPOLLIN | EPOLLOUT);
+        assert_eq!(items[0].events, EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP);
         assert_eq!(items[0].data, 2);
+    }
+
+    #[test]
+    fn oneshot_interest_is_disabled_until_modified() {
+        let files = FilesStruct::new();
+        let file = alloc_file(d_alloc("oneshot"), 0, 0, &MASK_OPS);
+        *file.private.lock() = EPOLLIN as usize;
+        let fd = files.install(file.clone(), false).unwrap();
+        let ep = EventPoll::new();
+        ep.add(
+            fd,
+            file.clone(),
+            EpollEvent {
+                events: EPOLLIN | EPOLLONESHOT,
+                data: 0x10,
+            },
+        )
+        .unwrap();
+
+        let mut buf = [EpollEvent { events: 0, data: 0 }; 1];
+        assert_eq!(ep.wait_ready(&files, &mut buf).unwrap(), 1);
+        assert_eq!(ep.wait_ready(&files, &mut buf).unwrap(), 0);
+
+        ep.modify(
+            fd,
+            &file,
+            EpollEvent {
+                events: EPOLLIN | EPOLLONESHOT,
+                data: 0x11,
+            },
+        )
+        .unwrap();
+        assert_eq!(ep.wait_ready(&files, &mut buf).unwrap(), 1);
+        let data = buf[0].data;
+        assert_eq!(data, 0x11);
+    }
+
+    #[test]
+    fn edge_triggered_interest_waits_for_new_ready_edge() {
+        let files = FilesStruct::new();
+        let file = alloc_file(d_alloc("edge"), 0, 0, &MASK_OPS);
+        *file.private.lock() = EPOLLIN as usize;
+        let fd = files.install(file.clone(), false).unwrap();
+        let ep = EventPoll::new();
+        ep.add(
+            fd,
+            file.clone(),
+            EpollEvent {
+                events: EPOLLIN | EPOLLET,
+                data: 0x20,
+            },
+        )
+        .unwrap();
+
+        let mut buf = [EpollEvent { events: 0, data: 0 }; 1];
+        assert_eq!(ep.wait_ready(&files, &mut buf).unwrap(), 1);
+        assert_eq!(ep.wait_ready(&files, &mut buf).unwrap(), 0);
+
+        *file.private.lock() = 0;
+        assert_eq!(ep.wait_ready(&files, &mut buf).unwrap(), 0);
+        *file.private.lock() = EPOLLIN as usize;
+        assert_eq!(ep.wait_ready(&files, &mut buf).unwrap(), 1);
     }
 
     #[test]

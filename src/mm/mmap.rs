@@ -335,6 +335,13 @@ pub unsafe fn do_mmap(
     if unsafe { file_is_hugetlbfs(file) } {
         vm_flags |= VM_HUGETLB;
     }
+    // Device files that expose a `->mmap` (e.g. `/dev/fb0`) are mapped straight
+    // onto their physical aperture: mark the VMA `VM_PFNMAP | VM_IO` so faults
+    // route to the pfn-mapping handler and teardown skips struct-page bookkeeping.
+    let is_pfn_device = unsafe { file_wants_pfn_mmap(file) };
+    if is_pfn_device {
+        vm_flags |= crate::mm::vm_flags::VM_PFNMAP | crate::mm::vm_flags::VM_IO;
+    }
     let locked_pages = if vm_flags & VM_LOCKED != 0 {
         len >> crate::arch::x86::mm::paging::PAGE_SHIFT
     } else {
@@ -386,9 +393,13 @@ pub unsafe fn do_mmap(
             (*raw).vm_pgoff = pgoff;
             (*raw).vm_file = file;
             if file != 0 {
-                (*raw).vm_ops = &crate::mm::fault::LUPOS_FILE_VM_OPS
-                    as *const crate::mm::fault::VmOperationsStruct
-                    as usize;
+                (*raw).vm_ops = if is_pfn_device {
+                    &crate::mm::fault::LUPOS_DEVICE_PFN_VM_OPS
+                        as *const crate::mm::fault::VmOperationsStruct as usize
+                } else {
+                    &crate::mm::fault::LUPOS_FILE_VM_OPS
+                        as *const crate::mm::fault::VmOperationsStruct as usize
+                };
             }
             if hugetlb_private != 0 {
                 (*raw).vm_private_data = hugetlb_private;
@@ -424,6 +435,18 @@ unsafe fn file_is_secretmem(file: usize) -> bool {
     }
     let file = unsafe { &*(file as *const crate::fs::types::File) };
     file.fops.name == crate::fs::syscalls::SECRETMEM_FILE_OPS.name
+}
+
+/// True if the backing device implements a `->mmap` that returns a physical
+/// address for a byte offset — i.e. it should be mapped `VM_PFNMAP` straight
+/// onto its aperture rather than through the page cache.  Today only the
+/// framebuffer character device (`/dev/fb0`) qualifies.
+unsafe fn file_wants_pfn_mmap(file: usize) -> bool {
+    if file == 0 {
+        return false;
+    }
+    let file = unsafe { &*(file as *const crate::fs::types::File) };
+    file.fops.mmap.is_some()
 }
 
 unsafe fn file_is_hugetlbfs(file: usize) -> bool {

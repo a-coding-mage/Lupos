@@ -57,7 +57,7 @@ pub fn vfs_getattr(inode: &InodeRef) -> KStat {
         mode: inode.mode.load(Ordering::Acquire),
         uid: inode.uid.load(Ordering::Acquire),
         gid: inode.gid.load(Ordering::Acquire),
-        rdev: 0,
+        rdev: inode.rdev.load(Ordering::Acquire),
         size,
         blksize: 4096,
         blocks: (size.saturating_add(511) / 512).max(0),

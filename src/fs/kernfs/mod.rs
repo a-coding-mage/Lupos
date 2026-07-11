@@ -273,7 +273,7 @@ pub fn inode_for_node(sb: &SuperBlockRef, node: Arc<KernfsNode>) -> InodeRef {
     inode
 }
 
-fn node_from_inode(inode: &InodeRef) -> Arc<KernfsNode> {
+pub(crate) fn node_from_inode(inode: &InodeRef) -> Arc<KernfsNode> {
     let raw = match &inode.private {
         InodePrivate::Opaque(p) => *p as *const KernfsNode,
         _ => panic!("kernfs: inode missing kernfs-node payload"),
@@ -365,12 +365,14 @@ pub static KERNFS_SYMLINK_FILE_OPS: FileOps = FileOps {
 
 fn kernfs_lookup(dir: &InodeRef, name: &str) -> Result<InodeRef, i32> {
     let node = node_from_inode(dir);
+    if let Some(child) = lookup(&node, name) {
+        let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
+        return Ok(inode_for_node(&sb, child));
+    }
     if let Some(lookup) = node.dynamic_lookup {
         return lookup(dir, name);
     }
-    let child = lookup(&node, name).ok_or(ENOENT)?;
-    let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
-    Ok(inode_for_node(&sb, child))
+    Err(ENOENT)
 }
 
 fn kernfs_mkdir(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> {

@@ -206,6 +206,11 @@ pub unsafe fn sys_sched_rr_get_interval(p: *mut TaskStruct) -> u64 {
 
 /// Linux `sched_yield()` — request voluntary CPU release.
 pub unsafe fn sys_sched_yield() -> i32 {
+    #[cfg(test)]
+    {
+        return 0;
+    }
+    #[cfg(not(test))]
     unsafe {
         super::schedule_with_irqs_enabled();
     }

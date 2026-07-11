@@ -769,7 +769,9 @@ pub mod tmpfs_vfs {
     };
     use crate::fs::ops::{FileOps, InodeOps, SuperOps};
     use crate::fs::super_block::{FileSystemType, register_filesystem};
-    use crate::fs::types::{Inode, InodeKind, InodePrivate, InodeRef, SuperBlock, SuperBlockRef};
+    use crate::fs::types::{
+        Inode, InodeKind, InodePrivate, InodeRef, SuperBlock, SuperBlockRef, touch_inode_now,
+    };
     use crate::include::uapi::errno::{EEXIST, EINVAL};
     use crate::linux_driver_abi::input::evdev_chardev::EVDEV_FILE_OPS;
     use crate::linux_driver_abi::video::fbdev::FBDEV_FILE_OPS;
@@ -927,28 +929,29 @@ pub mod tmpfs_vfs {
     fn tmpfs_create(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> {
         let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
         let i = make_reg(&sb, mode);
-        dir_map(dir)?
-            .lock()
-            .insert(alloc::string::String::from(name), i.clone());
-        Ok(i)
+        insert_tmpfs_inode(dir, name, i)
     }
     fn tmpfs_mkdir(dir: &InodeRef, name: &str, _mode: u32) -> Result<InodeRef, i32> {
         let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
         let i = make_dir(&sb);
-        dir_map(dir)?
-            .lock()
-            .insert(alloc::string::String::from(name), i.clone());
-        Ok(i)
+        insert_tmpfs_inode(dir, name, i)
     }
     fn tmpfs_symlink(dir: &InodeRef, name: &str, target: &str, mode: u32) -> Result<InodeRef, i32> {
         let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
         let i = make_symlink(&sb, mode, target);
+        insert_tmpfs_inode(dir, name, i)
+    }
+
+    fn insert_tmpfs_inode(dir: &InodeRef, name: &str, inode: InodeRef) -> Result<InodeRef, i32> {
         let mut entries = dir_map(dir)?.lock();
         if entries.contains_key(name) {
             return Err(EEXIST);
         }
-        entries.insert(alloc::string::String::from(name), i.clone());
-        Ok(i)
+        entries.insert(alloc::string::String::from(name), inode.clone());
+        drop(entries);
+        touch_inode_now(dir);
+        touch_inode_now(&inode);
+        Ok(inode)
     }
 
     fn tmpfs_readlink(inode: &InodeRef, buf: &mut [u8]) -> Result<usize, i32> {
@@ -967,9 +970,7 @@ pub mod tmpfs_vfs {
         inode: InodeRef,
     ) -> Result<crate::fs::types::DentryRef, i32> {
         let parent_inode = parent.inode().ok_or(EINVAL)?;
-        dir_map(&parent_inode)?
-            .lock()
-            .insert(String::from(name), inode.clone());
+        insert_tmpfs_inode(&parent_inode, name, inode.clone())?;
         let child = crate::fs::dcache::d_alloc_child(parent, name);
         child.instantiate(inode);
         Ok(child)
@@ -978,23 +979,29 @@ pub mod tmpfs_vfs {
     fn populate_devtmpfs(sb: &SuperBlockRef) -> Result<(), i32> {
         let root = sb.root().ok_or(EINVAL)?;
         let console = &crate::init::rootfs::CONSOLE_FILE_OPS;
-        for (name, mode) in [
-            ("console", 0o600),
-            ("tty", 0o666),
-            ("tty0", 0o620),
-            ("tty1", 0o620),
-            ("tty2", 0o620),
-            ("tty3", 0o620),
-            ("tty4", 0o620),
-            ("tty5", 0o620),
-            ("tty6", 0o620),
-            ("ttyS0", 0o620),
+        // `st_rdev` in Linux `new_encode_dev()` form. Userspace relies on real
+        // device numbers: Xorg's `xf86HasTTYs()` only enables VT/console
+        // management (VT switch + `KDSETMODE(KD_GRAPHICS)`) when
+        // `major(stat("/dev/tty0").st_rdev) == TTY_MAJOR` (4).
+        let dev = |major: u32, minor: u32| {
+            use crate::init::noinitramfs::{mkdev, new_encode_dev};
+            new_encode_dev(mkdev(major, minor)) as u64
+        };
+        for (name, mode, rdev) in [
+            ("console", 0o600, dev(5, 1)),
+            ("tty", 0o666, dev(5, 0)),
+            ("tty0", 0o620, dev(4, 0)),
+            ("tty1", 0o620, dev(4, 1)),
+            ("tty2", 0o620, dev(4, 2)),
+            ("tty3", 0o620, dev(4, 3)),
+            ("tty4", 0o620, dev(4, 4)),
+            ("tty5", 0o620, dev(4, 5)),
+            ("tty6", 0o620, dev(4, 6)),
+            ("ttyS0", 0o620, dev(4, 64)),
         ] {
-            insert_child(
-                &root,
-                name,
-                make_special(sb, InodeKind::Chardev, mode, console),
-            )?;
+            let node = make_special(sb, InodeKind::Chardev, mode, console);
+            node.rdev.store(rdev, Ordering::Release);
+            insert_child(&root, name, node)?;
         }
         insert_child(
             &root,
@@ -1032,18 +1039,14 @@ pub mod tmpfs_vfs {
             make_special(sb, InodeKind::Chardev, 0o666, &TMPFS_FILE_OPS),
         )?;
         let input = insert_child(&root, "input", make_dir(sb))?;
-        for name in ["event0", "event1"] {
-            insert_child(
-                &input,
-                name,
-                make_special(sb, InodeKind::Chardev, 0o660, &EVDEV_FILE_OPS),
-            )?;
+        for (idx, name) in ["event0", "event1"].into_iter().enumerate() {
+            let node = make_special(sb, InodeKind::Chardev, 0o660, &EVDEV_FILE_OPS);
+            node.rdev.store(dev(13, 64 + idx as u32), Ordering::Release);
+            insert_child(&input, name, node)?;
         }
-        insert_child(
-            &root,
-            "fb0",
-            make_special(sb, InodeKind::Chardev, 0o660, &FBDEV_FILE_OPS),
-        )?;
+        let fb0 = make_special(sb, InodeKind::Chardev, 0o660, &FBDEV_FILE_OPS);
+        fb0.rdev.store(dev(29, 0), Ordering::Release);
+        insert_child(&root, "fb0", fb0)?;
         Ok(())
     }
 
@@ -1097,6 +1100,8 @@ pub mod tmpfs_vfs {
 
     #[cfg(test)]
     mod tests {
+        use alloc::sync::Arc;
+
         use super::*;
         use crate::fs::dcache::d_lookup;
 
@@ -1150,6 +1155,31 @@ pub mod tmpfs_vfs {
         fn mounted_devpts_contains_ptmx() {
             let sb = mount_devpts("devpts", 0, "").expect("mount devpts");
             assert_eq!(child_kind(&sb, "ptmx"), InodeKind::Chardev);
+        }
+
+        #[test]
+        fn tmpfs_create_and_mkdir_reject_duplicates_without_replacing_inodes() {
+            let sb = mount("tmpfs", 0, "").expect("mount tmpfs");
+            let root = sb.root().expect("root");
+            let root_inode = root.inode().expect("root inode");
+
+            let created = tmpfs_create(&root_inode, "state", 0o644).expect("create");
+            assert!(matches!(
+                tmpfs_create(&root_inode, "state", 0o600),
+                Err(EEXIST)
+            ));
+            let looked_up = root_inode.ops.lookup.unwrap()(&root_inode, "state").expect("lookup");
+            assert!(Arc::ptr_eq(&created, &looked_up));
+            assert_eq!(looked_up.kind, InodeKind::Regular);
+
+            let dir = tmpfs_mkdir(&root_inode, "units", 0o755).expect("mkdir");
+            assert!(matches!(
+                tmpfs_mkdir(&root_inode, "units", 0o700),
+                Err(EEXIST)
+            ));
+            let looked_up = root_inode.ops.lookup.unwrap()(&root_inode, "units").expect("lookup");
+            assert!(Arc::ptr_eq(&dir, &looked_up));
+            assert_eq!(looked_up.kind, InodeKind::Directory);
         }
 
         #[test]

@@ -23,6 +23,7 @@ extern crate alloc;
 
 pub mod ldisc;
 pub mod linux_sources;
+pub mod pty;
 pub mod serial;
 #[cfg(any(test, CONFIG_SERIAL_8250 = "y"))]
 pub mod serial8250;
@@ -146,7 +147,7 @@ impl Default for KernelTermios {
 /// `struct termios2` — extended termios with explicit baud rates.
 /// vendor/linux/include/uapi/asm-generic/termbits.h::`struct termios2`.
 /// Identical to termios but adds c_ispeed and c_ospeed (speed_t = u32).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 #[repr(C)]
 pub struct KernelTermios2 {
     pub c_iflag: u32,

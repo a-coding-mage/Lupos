@@ -26,12 +26,15 @@ use alloc::{collections::VecDeque, vec::Vec};
 use core::ffi::c_void;
 
 use crate::arch::x86::kernel::uaccess;
+use crate::include::uapi::errno::EINTR;
 use crate::kernel::sched;
 
 pub const NSIG: usize = 64;
 /// Signal number range — RT signals start at SIGRTMIN.
 pub const SIGRTMIN: i32 = 32;
 pub const SIGRTMAX: i32 = NSIG as i32;
+pub const SI_USER: i32 = 0;
+pub const SI_TKILL: i32 = -6;
 
 pub const SIGHUP: i32 = 1;
 pub const SIGINT: i32 = 2;
@@ -80,6 +83,17 @@ pub const SA_ONSTACK: u64 = 0x0800_0000;
 pub const SA_RESTART: u64 = 0x1000_0000;
 pub const SA_NODEFER: u64 = 0x4000_0000;
 pub const SA_RESETHAND: u64 = 0x8000_0000;
+
+// Kernel-internal restart pseudo-errors from vendor/linux/include/linux/errno.h.
+const ERESTARTSYS: i32 = 512;
+const ERESTARTNOINTR: i32 = 513;
+const ERESTARTNOHAND: i32 = 514;
+const ERESTART_RESTARTBLOCK: i32 = 516;
+
+// x86-64 Linux values used by arch_do_signal_or_restart().
+const X86_64_NR_RESTART_SYSCALL: u64 = 219;
+const X86_64_SYSCALL_INSN_LEN: u64 = 2;
+const NO_SYSCALL: u64 = u64::MAX;
 
 const SS_ONSTACK: u32 = 1;
 const SS_DISABLE: u32 = 2;
@@ -152,6 +166,13 @@ impl SigInfo {
         info
     }
 
+    pub fn with_sender(signo: i32, code: i32, pid: i32, uid: u32) -> Self {
+        let mut info = Self::new(signo, code);
+        info._sifields[0..4].copy_from_slice(&pid.to_ne_bytes());
+        info._sifields[4..8].copy_from_slice(&uid.to_ne_bytes());
+        info
+    }
+
     pub fn with_sigfault(signo: i32, code: i32, addr: u64, addr_lsb: i16) -> Self {
         let mut info = Self::new(signo, code);
         info._sifields[0..8].copy_from_slice(&addr.to_ne_bytes());
@@ -178,9 +199,16 @@ pub struct SigAltStack {
 struct SignalState {
     actions: [RtSigAction; NSIG + 1],
     blocked: SigSet,
+    sigsuspend_saved: Option<SigSet>,
     pending: SigSet,
     shared_pending: SigSet,
+    /// Siginfo records for task-directed signals. Standard signals keep one
+    /// record; realtime signals keep every queued instance.
     rt_queue: VecDeque<SigInfo>,
+    /// Siginfo records for process-directed signals. Keeping this separate
+    /// prevents task/shared instances of the same signal from exchanging
+    /// sender metadata during dequeue.
+    shared_queue: VecDeque<SigInfo>,
     altstack: SigAltStack,
     pid: i32,
     tgid: i32,
@@ -193,9 +221,11 @@ impl SignalState {
         Self {
             actions,
             blocked: SigSet::default(),
+            sigsuspend_saved: None,
             pending: SigSet::default(),
             shared_pending: SigSet::default(),
             rt_queue: VecDeque::new(),
+            shared_queue: VecDeque::new(),
             altstack: SigAltStack::default(),
             pid,
             tgid,
@@ -203,38 +233,27 @@ impl SignalState {
     }
 
     fn dequeue_unblocked_signal(&mut self) -> Option<SigInfo> {
-        if let Some(idx) = self
-            .rt_queue
-            .iter()
-            .position(|info| !self.blocked.contains(info.signo))
-        {
-            let info = self.rt_queue.remove(idx)?;
-            self.pending.remove(info.signo);
-            self.shared_pending.remove(info.signo);
-            return Some(info);
-        }
-
         let mut merged = self.pending.bits | self.shared_pending.bits;
         merged &= !self.blocked.bits;
         if merged == 0 {
             return None;
         }
         let sig = merged.trailing_zeros() as i32 + 1;
-        self.pending.remove(sig);
-        self.shared_pending.remove(sig);
-        Some(SigInfo::new(sig, 0))
+        if self.pending.contains(sig) {
+            Some(take_task_signal_info(self, sig))
+        } else {
+            Some(take_shared_signal_info(self, sig))
+        }
     }
 
     fn dequeue_specific_signal(&mut self, sig: i32) -> Option<SigInfo> {
         if !self.pending.contains(sig) && !self.shared_pending.contains(sig) {
             return None;
         }
-        self.pending.remove(sig);
-        self.shared_pending.remove(sig);
-        if let Some(idx) = self.rt_queue.iter().position(|info| info.signo == sig) {
-            return self.rt_queue.remove(idx);
+        if self.pending.contains(sig) {
+            return Some(take_task_signal_info(self, sig));
         }
-        Some(SigInfo::new(sig, 0))
+        Some(take_shared_signal_info(self, sig))
     }
 
     fn dequeue_masked_signal(&mut self, mask: u64) -> Option<SigInfo> {
@@ -243,38 +262,87 @@ impl SignalState {
             return None;
         }
 
-        if let Some(idx) = self
-            .rt_queue
-            .iter()
-            .position(|info| sig_bit(info.signo) & mask != 0)
-        {
-            let info = self.rt_queue.remove(idx)?;
-            self.pending.remove(info.signo);
-            self.shared_pending.remove(info.signo);
-            return Some(info);
-        }
-
         let merged = (self.pending.bits | self.shared_pending.bits) & mask;
         if merged == 0 {
             return None;
         }
         let sig = merged.trailing_zeros() as i32 + 1;
-        self.pending.remove(sig);
-        self.shared_pending.remove(sig);
-        Some(SigInfo::new(sig, 0))
+        if self.pending.contains(sig) {
+            Some(take_task_signal_info(self, sig))
+        } else {
+            Some(take_shared_signal_info(self, sig))
+        }
     }
 
     fn remove_signal(&mut self, sig: i32) {
         self.pending.remove(sig);
         self.shared_pending.remove(sig);
         self.rt_queue.retain(|info| info.signo != sig);
+        self.shared_queue.retain(|info| info.signo != sig);
     }
 
     fn remove_signal_mask(&mut self, mask: u64) {
         self.pending.bits &= !mask;
         self.shared_pending.bits &= !mask;
         self.rt_queue.retain(|info| sig_bit(info.signo) & mask == 0);
+        self.shared_queue
+            .retain(|info| sig_bit(info.signo) & mask == 0);
     }
+}
+
+fn take_task_signal_info(state: &mut SignalState, sig: i32) -> SigInfo {
+    let info = state
+        .rt_queue
+        .iter()
+        .position(|info| info.signo == sig)
+        .and_then(|idx| state.rt_queue.remove(idx))
+        .unwrap_or_else(|| SigInfo::new(sig, 0));
+    if !state.rt_queue.iter().any(|queued| queued.signo == sig) {
+        state.pending.remove(sig);
+    }
+    info
+}
+
+fn take_shared_signal_info(state: &mut SignalState, sig: i32) -> SigInfo {
+    let info = state
+        .shared_queue
+        .iter()
+        .position(|info| info.signo == sig)
+        .and_then(|idx| state.shared_queue.remove(idx))
+        .unwrap_or_else(|| SigInfo::new(sig, 0));
+    if !state.shared_queue.iter().any(|queued| queued.signo == sig) {
+        state.shared_pending.remove(sig);
+    }
+    info
+}
+
+/// Queue one signal while retaining the siginfo record Linux exposes to
+/// SA_SIGINFO handlers. Realtime signals queue every instance; standard
+/// signals coalesce and retain the first sender's record until delivery.
+fn queue_signal_info(state: &mut SignalState, sig: i32, info: SigInfo, shared: bool) {
+    let already_pending = if shared {
+        state.shared_pending.contains(sig)
+    } else {
+        state.pending.contains(sig)
+    };
+    if sig >= SIGRTMIN || !already_pending {
+        if shared {
+            state.shared_queue.push_back(info);
+        } else {
+            state.rt_queue.push_back(info);
+        }
+    }
+    if shared {
+        state.shared_pending.add(sig);
+    } else {
+        state.pending.add(sig);
+    }
+}
+
+fn sanitize_blocked_mask(mask: &mut SigSet) {
+    // Linux never blocks SIGKILL/SIGSTOP.
+    mask.remove(SIGKILL);
+    mask.remove(SIGSTOP);
 }
 
 /// Shared by thread-group tasks. Attached to `task_struct.signal`.
@@ -290,38 +358,219 @@ struct SignalTable {
 }
 
 impl SignalTable {
-    fn get_or_create_current(&mut self) -> Result<&mut SignalState, i32> {
+    fn state_for_new_task(&self, pid: i32, tgid: i32) -> SignalState {
+        let mut state = SignalState::new(pid, tgid);
+        if let Some(source) = self
+            .states
+            .iter()
+            .find(|state| state.pid == tgid && state.tgid == tgid)
+            .or_else(|| self.states.iter().find(|state| state.tgid == tgid))
+        {
+            state.actions = source.actions;
+        }
+        state
+    }
+
+    fn get_or_create_current_index(&mut self) -> Result<usize, i32> {
         let task = unsafe { sched::get_current() };
         if task.is_null() {
             return Err(-3); // ESRCH
         }
         let (pid, tgid) = unsafe { ((*task).pid, (*task).tgid) };
         if let Some(pos) = self.states.iter().position(|s| s.pid == pid) {
-            return Ok(self.states.get_mut(pos).expect("index exists"));
+            return Ok(pos);
         }
-        self.states.push(SignalState::new(pid, tgid));
-        Ok(self.states.last_mut().expect("just pushed"))
+        let state = self.state_for_new_task(pid, tgid);
+        self.states.push(state);
+        Ok(self.states.len() - 1)
+    }
+
+    fn get_or_create_current(&mut self) -> Result<&mut SignalState, i32> {
+        let idx = self.get_or_create_current_index()?;
+        Ok(self.states.get_mut(idx).expect("index exists"))
     }
 
     fn get_by_pid_mut(&mut self, pid: i32) -> Option<&mut SignalState> {
         let pos = self.states.iter().position(|s| s.pid == pid)?;
         self.states.get_mut(pos)
     }
+
+    fn get_or_create_task_index(&mut self, pid: i32, tgid: i32) -> usize {
+        if let Some(pos) = self.states.iter().position(|s| s.pid == pid) {
+            return pos;
+        }
+        let state = self.state_for_new_task(pid, tgid);
+        self.states.push(state);
+        self.states.len() - 1
+    }
+
+    fn inherit_for_clone(&mut self, parent_pid: i32, child_pid: i32, child_tgid: i32) {
+        let inherited = self
+            .states
+            .iter()
+            .find(|state| state.pid == parent_pid)
+            .cloned()
+            .unwrap_or_else(|| self.state_for_new_task(parent_pid, child_tgid));
+
+        let mut child = SignalState::new(child_pid, child_tgid);
+        child.actions = inherited.actions;
+        child.blocked = inherited.blocked;
+        child.altstack = inherited.altstack;
+
+        if let Some(existing) = self.states.iter_mut().find(|state| state.pid == child_pid) {
+            *existing = child;
+        } else {
+            self.states.push(child);
+        }
+    }
 }
 
 static SIGNAL_TABLE: spin::Mutex<SignalTable> =
     spin::Mutex::new(SignalTable { states: Vec::new() });
+#[cfg(test)]
+pub(crate) static SIGNAL_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 fn valid_signal(sig: i32) -> bool {
     (1..=NSIG as i32).contains(&sig)
 }
 
+fn current_signal_sender() -> (i32, u32) {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    let pid = if task.is_null() {
+        0
+    } else {
+        unsafe {
+            if (*task).tgid > 0 {
+                (*task).tgid
+            } else {
+                (*task).pid.max(0)
+            }
+        }
+    };
+    let cred = crate::kernel::cred::current_cred();
+    let uid = if cred.is_null() {
+        0
+    } else {
+        unsafe { (*cred).uid.0 }
+    };
+    (pid, uid)
+}
+
+fn kill_siginfo(sig: i32, code: i32) -> SigInfo {
+    let (pid, uid) = current_signal_sender();
+    SigInfo::with_sender(sig, code, pid, uid)
+}
+
 fn task_for_pid(pid: i32) -> *mut crate::kernel::task::TaskStruct {
+    let current = unsafe { crate::kernel::sched::get_current() };
+    if !current.is_null() && unsafe { (*current).pid == pid } {
+        return current;
+    }
     let heap = crate::kernel::fork::find_heap_task_by_pid(pid);
     if !heap.is_null() {
         return heap;
     }
     crate::kernel::sched::find_pool_task_by_pid(pid)
+}
+
+fn task_is_exiting(task: *mut crate::kernel::task::TaskStruct) -> bool {
+    if task.is_null() {
+        return true;
+    }
+    let exit_bits =
+        crate::kernel::task::task_state::EXIT_ZOMBIE | crate::kernel::task::task_state::EXIT_DEAD;
+    unsafe { (*task).m26.exit_state & exit_bits != 0 }
+}
+
+fn task_is_stopped_or_traced(task: *mut crate::kernel::task::TaskStruct) -> bool {
+    if task.is_null() {
+        return false;
+    }
+    let state = unsafe { (*task).__state.load(core::sync::atomic::Ordering::Acquire) };
+    state == crate::kernel::task::task_state::__TASK_STOPPED
+        || state == crate::kernel::task::task_state::TASK_STOPPED
+        || state == crate::kernel::task::task_state::__TASK_TRACED
+}
+
+fn task_wants_signal(
+    table: &SignalTable,
+    task: *mut crate::kernel::task::TaskStruct,
+    sig: i32,
+) -> bool {
+    if task.is_null() {
+        return false;
+    }
+    let pid = unsafe { (*task).pid };
+    let Some(state) = table.states.iter().find(|state| state.pid == pid) else {
+        return false;
+    };
+    if state.blocked.contains(sig) || task_is_exiting(task) {
+        return false;
+    }
+    if sig == SIGKILL {
+        return true;
+    }
+    !task_is_stopped_or_traced(task)
+}
+
+fn select_signal_wake_target(
+    table: &SignalTable,
+    tasks: &[*mut crate::kernel::task::TaskStruct],
+    suggested: *mut crate::kernel::task::TaskStruct,
+    sig: i32,
+) -> *mut crate::kernel::task::TaskStruct {
+    if task_wants_signal(table, suggested, sig) {
+        return suggested;
+    }
+    tasks
+        .iter()
+        .copied()
+        .find(|&task| task_wants_signal(table, task, sig))
+        .unwrap_or(core::ptr::null_mut())
+}
+
+fn push_unique_task(
+    tasks: &mut Vec<*mut crate::kernel::task::TaskStruct>,
+    task: *mut crate::kernel::task::TaskStruct,
+) {
+    if task.is_null() || tasks.iter().any(|&existing| existing == task) {
+        return;
+    }
+    tasks.push(task);
+}
+
+fn tasks_for_tgid(tgid: i32) -> Vec<*mut crate::kernel::task::TaskStruct> {
+    let mut tasks = Vec::new();
+    if tgid <= 0 {
+        return tasks;
+    }
+
+    crate::kernel::fork::for_each_heap_task(|task| unsafe {
+        if !task.is_null() && (*task).tgid == tgid {
+            push_unique_task(&mut tasks, task);
+        }
+    });
+    crate::kernel::sched::for_each_pool_task(|task| unsafe {
+        if !task.is_null() && (*task).tgid == tgid {
+            push_unique_task(&mut tasks, task);
+        }
+    });
+
+    let current = unsafe { crate::kernel::sched::get_current() };
+    if !current.is_null() && unsafe { (*current).tgid == tgid } {
+        push_unique_task(&mut tasks, current);
+    }
+    tasks
+}
+
+fn ensure_task_in_group(
+    tasks: &mut Vec<*mut crate::kernel::task::TaskStruct>,
+    task: *mut crate::kernel::task::TaskStruct,
+    tgid: i32,
+) {
+    if !task.is_null() && unsafe { (*task).tgid == tgid } {
+        push_unique_task(tasks, task);
+    }
 }
 
 fn is_stop_signal(sig: i32) -> bool {
@@ -393,7 +642,6 @@ pub unsafe fn sys_rt_sigaction(
             Err(e) => return e,
         }
     };
-
     let old = {
         let mut table = SIGNAL_TABLE.lock();
         let state = match table.get_or_create_current() {
@@ -403,11 +651,13 @@ pub unsafe fn sys_rt_sigaction(
 
         let old = state.actions[sig as usize];
         if let Some(action) = next {
-            state.actions[sig as usize] = action;
+            let tgid = state.tgid;
+            for state in table.states.iter_mut().filter(|state| state.tgid == tgid) {
+                state.actions[sig as usize] = action;
+            }
         }
         old
     };
-
     if !oldact.is_null() {
         if let Err(e) = unsafe { write_user_value(oldact, &old) } {
             return e;
@@ -435,11 +685,10 @@ pub unsafe fn sys_rt_sigprocmask(
         }
     };
     if let Some(set) = next.as_mut() {
-        // Linux never blocks SIGKILL/SIGSTOP.
-        set.remove(SIGKILL);
-        set.remove(SIGSTOP);
+        sanitize_blocked_mask(set);
     }
 
+    let task = unsafe { sched::get_current() };
     let (old, blocked) = {
         let mut table = SIGNAL_TABLE.lock();
         let state = match table.get_or_create_current() {
@@ -458,9 +707,9 @@ pub unsafe fn sys_rt_sigprocmask(
         }
         (old, state.blocked)
     };
+    recalc_tif_sigpending(task);
     #[cfg(not(test))]
     if crate::kernel::debug_trace::proc_enabled() {
-        let task = unsafe { sched::get_current() };
         let pid = if task.is_null() {
             -1
         } else {
@@ -484,6 +733,69 @@ pub unsafe fn sys_rt_sigprocmask(
     0
 }
 
+pub unsafe fn sys_rt_sigsuspend(set: *const SigSet, sigsetsize: usize) -> i64 {
+    if sigsetsize != core::mem::size_of::<SigSet>() {
+        return -22;
+    }
+    let mut next = match unsafe { read_user_value(set) } {
+        Ok(set) => set,
+        Err(e) => return e,
+    };
+    sanitize_blocked_mask(&mut next);
+
+    let task = unsafe { sched::get_current() };
+    let mut pending = {
+        let mut table = SIGNAL_TABLE.lock();
+        let idx = match table.get_or_create_current_index() {
+            Ok(idx) => idx,
+            Err(e) => return e as i64,
+        };
+        table.states[idx].sigsuspend_saved = Some(table.states[idx].blocked);
+        table.states[idx].blocked = next;
+        state_has_unblocked_pending_signal(&table, idx)
+    };
+    recalc_tif_sigpending(task);
+
+    #[cfg(not(test))]
+    if crate::kernel::debug_trace::proc_enabled() {
+        let pid = if task.is_null() {
+            -1
+        } else {
+            unsafe { (*task).pid }
+        };
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-proc-sigsuspend pid={} mask={:#x} pending={}",
+            pid,
+            next.bits,
+            pending
+        );
+    }
+
+    #[cfg(not(test))]
+    while !pending {
+        if !task.is_null() {
+            unsafe {
+                (*task).__state.store(
+                    crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+                    core::sync::atomic::Ordering::Release,
+                );
+                crate::kernel::sched::schedule_with_irqs_enabled();
+                (*task).__state.store(
+                    crate::kernel::task::task_state::TASK_RUNNING,
+                    core::sync::atomic::Ordering::Release,
+                );
+            }
+        } else {
+            unsafe {
+                crate::kernel::sched::schedule_with_irqs_enabled();
+            }
+        }
+        pending = current_has_unblocked_pending_signals();
+    }
+
+    -4
+}
+
 pub unsafe fn sys_rt_sigpending(set: *mut SigSet, sigsetsize: usize) -> i64 {
     if sigsetsize != core::mem::size_of::<SigSet>() {
         return -22;
@@ -493,12 +805,12 @@ pub unsafe fn sys_rt_sigpending(set: *mut SigSet, sigsetsize: usize) -> i64 {
     }
     let pending = {
         let mut table = SIGNAL_TABLE.lock();
-        let state = match table.get_or_create_current() {
-            Ok(s) => s,
+        let idx = match table.get_or_create_current_index() {
+            Ok(idx) => idx,
             Err(e) => return e as i64,
         };
         SigSet {
-            bits: state.pending.bits | state.shared_pending.bits,
+            bits: pending_bits_for_state(&table, &table.states[idx]),
         }
     };
     if let Err(e) = unsafe { write_user_value(set, &pending) } {
@@ -516,27 +828,49 @@ pub unsafe fn sys_rt_sigqueueinfo(pid: i32, sig: i32, uinfo: *const SigInfo) -> 
         };
         info.signo = sig;
     }
-    enqueue_for_pid(pid, sig, info)
-}
-
-pub unsafe fn sys_tkill(pid: i32, sig: i32) -> i64 {
-    enqueue_for_pid(pid, sig, SigInfo::new(sig, 0))
-}
-
-pub unsafe fn sys_tgkill(tgid: i32, pid: i32, sig: i32) -> i64 {
     if !valid_signal(sig) {
         return -22;
     }
+    let target = task_for_pid(pid);
+    if target.is_null() {
+        return -3;
+    }
+    send_signal_info_to_process_for_target(target, sig, info) as i64
+}
+
+pub unsafe fn sys_tkill(pid: i32, sig: i32) -> i64 {
+    if pid <= 0 {
+        return -22;
+    }
+    if sig == 0 {
+        let table = SIGNAL_TABLE.lock();
+        if table.states.iter().any(|state| state.pid == pid) {
+            return 0;
+        }
+        drop(table);
+        return if task_for_pid(pid).is_null() { -3 } else { 0 };
+    }
+    enqueue_for_pid(pid, sig, kill_siginfo(sig, SI_TKILL))
+}
+
+pub unsafe fn sys_tgkill(tgid: i32, pid: i32, sig: i32) -> i64 {
+    if pid <= 0 || tgid <= 0 {
+        return -22;
+    }
+    if sig != 0 && !valid_signal(sig) {
+        return -22;
+    }
+    let info = kill_siginfo(sig, SI_TKILL);
     {
         let mut table = SIGNAL_TABLE.lock();
         if let Some(state) = table.get_by_pid_mut(pid) {
             if state.tgid != tgid {
                 return -3;
             }
-            state.pending.add(sig);
-            if sig >= 32 {
-                state.rt_queue.push_back(SigInfo::new(sig, 0));
+            if sig == 0 {
+                return 0;
             }
+            queue_signal_info(state, sig, info, false);
             drop(table);
             wake_signal_task_if_live(pid, sig);
             return 0;
@@ -547,7 +881,10 @@ pub unsafe fn sys_tgkill(tgid: i32, pid: i32, sig: i32) -> i64 {
     if task.is_null() || unsafe { (*task).tgid } != tgid {
         return -3;
     }
-    queue_signal_for_live_task(task, sig, SigInfo::new(sig, 0));
+    if sig == 0 {
+        return 0;
+    }
+    queue_signal_for_live_task(task, sig, info);
     wake_signal_task_if_live(pid, sig);
     0
 }
@@ -559,16 +896,9 @@ fn queue_signal_for_live_task(task: *mut crate::kernel::task::TaskStruct, sig: i
     let target_pid = unsafe { (*task).pid };
     let target_tgid = unsafe { (*task).tgid };
     let mut table = SIGNAL_TABLE.lock();
-    let state = if let Some(pos) = table.states.iter().position(|s| s.pid == target_pid) {
-        table.states.get_mut(pos).expect("position valid")
-    } else {
-        table.states.push(SignalState::new(target_pid, target_tgid));
-        table.states.last_mut().expect("just pushed")
-    };
-    state.pending.add(sig);
-    if sig >= 32 {
-        state.rt_queue.push_back(info);
-    }
+    let state_idx = table.get_or_create_task_index(target_pid, target_tgid);
+    let state = table.states.get_mut(state_idx).expect("index valid");
+    queue_signal_info(state, sig, info, false);
 }
 
 fn wake_signal_task_if_live(pid: i32, sig: i32) {
@@ -605,10 +935,7 @@ fn enqueue_for_pid(pid: i32, sig: i32, info: SigInfo) -> i64 {
     {
         let mut table = SIGNAL_TABLE.lock();
         if let Some(state) = table.get_by_pid_mut(pid) {
-            state.pending.add(sig);
-            if sig >= 32 {
-                state.rt_queue.push_back(info);
-            }
+            queue_signal_info(state, sig, info, false);
             drop(table);
             wake_signal_task_if_live(pid, sig);
             return 0;
@@ -640,25 +967,20 @@ pub unsafe fn sys_rt_sigtimedwait(
         Ok(set) => set,
         Err(e) => return e,
     };
+    let task = unsafe { sched::get_current() };
     let candidate = {
         let mut table = SIGNAL_TABLE.lock();
-        let state = match table.get_or_create_current() {
-            Ok(s) => s,
+        let idx = match table.get_or_create_current_index() {
+            Ok(idx) => idx,
             Err(e) => return e as i64,
         };
-        let Some(candidate) = state.dequeue_unblocked_signal() else {
+        let Some(candidate) = dequeue_masked_signal_for_state_index(&mut table, idx, wait.bits)
+        else {
             return -11; // EAGAIN
         };
-        if !wait.contains(candidate.signo) {
-            // Put it back if caller wasn't waiting for this signal.
-            state.pending.add(candidate.signo);
-            if candidate.signo >= 32 {
-                state.rt_queue.push_front(candidate);
-            }
-            return -11;
-        }
         candidate
     };
+    recalc_tif_sigpending(task);
     if !info.is_null() {
         if let Err(e) = unsafe { write_user_value(info, &candidate) } {
             return e;
@@ -702,6 +1024,177 @@ pub unsafe fn sys_sigaltstack(new_ss: *const SigAltStack, old_ss: *mut SigAltSta
     0
 }
 
+#[derive(Clone, Copy)]
+enum SignalQueueScope {
+    Task,
+    Shared,
+}
+
+fn task_for_tgid(tgid: i32) -> *mut crate::kernel::task::TaskStruct {
+    if tgid <= 0 {
+        return core::ptr::null_mut();
+    }
+    let tasks = tasks_for_tgid(tgid);
+    if let Some(leader) = tasks
+        .iter()
+        .copied()
+        .find(|&task| unsafe { (*task).pid == tgid })
+    {
+        return leader;
+    }
+    tasks
+        .first()
+        .copied()
+        .unwrap_or_else(|| crate::kernel::sched::find_pool_task_by_tgid(tgid))
+}
+
+fn send_signal_info_to_process_for_target(
+    target: *mut crate::kernel::task::TaskStruct,
+    sig: i32,
+    info: SigInfo,
+) -> i32 {
+    if target.is_null() {
+        return -3; // ESRCH
+    }
+    if !valid_signal(sig) {
+        return -22; // EINVAL
+    }
+
+    let target_pid = unsafe { (*target).pid };
+    let target_tgid = unsafe { (*target).tgid };
+    let current = unsafe { crate::kernel::sched::get_current() };
+    let stop_now = is_stop_signal(sig) && target != current;
+    let mut tasks = tasks_for_tgid(target_tgid);
+    ensure_task_in_group(&mut tasks, target, target_tgid);
+
+    let (pending_bits, blocked_bits, ignored, wake_target) = {
+        let mut table = SIGNAL_TABLE.lock();
+        for &task in tasks.iter() {
+            let pid = unsafe { (*task).pid };
+            let tgid = unsafe { (*task).tgid };
+            table.get_or_create_task_index(pid, tgid);
+        }
+        let target_idx = table.get_or_create_task_index(target_pid, target_tgid);
+        let owner_idx = table
+            .states
+            .iter()
+            .position(|state| state.tgid == target_tgid && state.pid == target_tgid)
+            .unwrap_or(target_idx);
+
+        {
+            let owner = table.states.get_mut(owner_idx).expect("owner index valid");
+            if is_stop_signal(sig) {
+                owner.remove_signal(SIGCONT);
+            } else if sig == SIGCONT {
+                owner.remove_signal_mask(
+                    sig_bit(SIGSTOP) | sig_bit(SIGTSTP) | sig_bit(SIGTTIN) | sig_bit(SIGTTOU),
+                );
+            }
+        }
+
+        let ignored = {
+            let owner = table.states.get(owner_idx).expect("owner index valid");
+            !stop_now && signal_ignored_for_state(owner, sig)
+        };
+        if !stop_now && !ignored {
+            let owner = table.states.get_mut(owner_idx).expect("owner index valid");
+            queue_signal_info(owner, sig, info, true);
+        }
+        let pending_bits = pending_bits_for_state(&table, &table.states[owner_idx]);
+        let blocked_bits = table.states[owner_idx].blocked.bits;
+        let wake_target = if ignored {
+            core::ptr::null_mut()
+        } else {
+            select_signal_wake_target(&table, &tasks, target, sig)
+        };
+        (pending_bits, blocked_bits, ignored, wake_target)
+    };
+
+    #[cfg(not(test))]
+    if crate::kernel::debug_trace::proc_enabled() {
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-proc-signal-send target={} sig={} pending={:#x} blocked={:#x} stop_now={}",
+            target_pid,
+            sig,
+            pending_bits,
+            blocked_bits,
+            stop_now
+        );
+    }
+    if ignored {
+        return 0;
+    }
+
+    if sig == SIGCONT {
+        unsafe {
+            let state = (*target)
+                .__state
+                .load(core::sync::atomic::Ordering::Acquire);
+            if state == crate::kernel::task::task_state::__TASK_STOPPED
+                || state == crate::kernel::task::task_state::TASK_STOPPED
+            {
+                (*target).m26.ptrace_stop_signal = 0;
+                (*target).__state.store(
+                    crate::kernel::task::task_state::TASK_RUNNING,
+                    core::sync::atomic::Ordering::Release,
+                );
+            }
+        }
+    }
+
+    if stop_now {
+        unsafe {
+            (*target).m26.ptrace_stop_signal = sig;
+            (*target).__state.store(
+                crate::kernel::task::task_state::__TASK_STOPPED,
+                core::sync::atomic::Ordering::Release,
+            );
+            let parent = (*target).m26.real_parent;
+            if !parent.is_null() {
+                let _ = send_signal_to_task(parent, SIGCHLD);
+            }
+            wake_waiters(target);
+        }
+        return 0;
+    }
+
+    if !wake_target.is_null() {
+        unsafe { wake_signal_task(wake_target, sig) };
+    }
+    0
+}
+
+/// Queue a process-directed signal to a thread group.
+///
+/// Linux enqueues `ITIMER_REAL` SIGALRM on `signal_struct::shared_pending`
+/// via `kill_pid_info(..., PIDTYPE_TGID)`. Lupos stores that bit on the group
+/// leader's signal state and makes every thread in the tgid consult it, matching
+/// Linux's shared-pending visibility without a separate `signal_struct` table.
+pub fn send_signal_to_process(tgid: i32, sig: i32) -> i32 {
+    if !valid_signal(sig) {
+        return -22; // EINVAL
+    }
+    let target = task_for_tgid(tgid);
+    if target.is_null() {
+        return -3; // ESRCH
+    }
+    send_signal_info_to_process_for_target(target, sig, SigInfo::new(sig, 0))
+}
+
+/// Queue a process-directed signal generated by the calling userspace task.
+/// Unlike kernel-originated process signals, kill(2) must expose SI_USER and
+/// the caller's PID/UID through siginfo_t.
+pub fn send_user_signal_to_process(tgid: i32, sig: i32) -> i32 {
+    if !valid_signal(sig) {
+        return -22; // EINVAL
+    }
+    let target = task_for_tgid(tgid);
+    if target.is_null() {
+        return -3; // ESRCH
+    }
+    send_signal_info_to_process_for_target(target, sig, kill_siginfo(sig, SI_USER))
+}
+
 /// Queue `sig` for delivery to `target` and raise `TIF_SIGPENDING`.
 ///
 /// M26 helper used by `exit_notify` (SIGCHLD to parent) and
@@ -711,11 +1204,22 @@ pub unsafe fn sys_sigaltstack(new_ss: *const SigAltStack, old_ss: *mut SigAltSta
 /// # Safety
 /// `target` must be a valid `*mut TaskStruct`.
 pub unsafe fn send_signal_to_task(target: *mut crate::kernel::task::TaskStruct, sig: i32) -> i32 {
+    unsafe { send_signal_to_task_scoped(target, sig, SignalQueueScope::Task) }
+}
+
+unsafe fn send_signal_to_task_scoped(
+    target: *mut crate::kernel::task::TaskStruct,
+    sig: i32,
+    scope: SignalQueueScope,
+) -> i32 {
     if target.is_null() {
         return -3; // ESRCH
     }
     if !valid_signal(sig) {
         return -22; // EINVAL
+    }
+    if matches!(scope, SignalQueueScope::Shared) {
+        return send_signal_info_to_process_for_target(target, sig, SigInfo::new(sig, 0));
     }
     let target_pid = unsafe { (*target).pid };
     let target_tgid = unsafe { (*target).tgid };
@@ -725,12 +1229,8 @@ pub unsafe fn send_signal_to_task(target: *mut crate::kernel::task::TaskStruct, 
     // Ensure a SignalState exists for the target — create one on demand,
     // mirroring the lazy registration in `get_or_create_current`.
     let mut table = SIGNAL_TABLE.lock();
-    let state = if let Some(pos) = table.states.iter().position(|s| s.pid == target_pid) {
-        table.states.get_mut(pos).expect("position valid")
-    } else {
-        table.states.push(SignalState::new(target_pid, target_tgid));
-        table.states.last_mut().expect("just pushed")
-    };
+    let state_idx = table.get_or_create_task_index(target_pid, target_tgid);
+    let state = table.states.get_mut(state_idx).expect("index valid");
     // Linux `prepare_signal()` applies these job-control side effects at
     // signal generation time, regardless of blocking or default disposition.
     if is_stop_signal(sig) {
@@ -740,12 +1240,9 @@ pub unsafe fn send_signal_to_task(target: *mut crate::kernel::task::TaskStruct, 
             sig_bit(SIGSTOP) | sig_bit(SIGTSTP) | sig_bit(SIGTTIN) | sig_bit(SIGTTOU),
         );
     }
-    let (pending_bits, blocked_bits) = if !stop_now {
-        state.shared_pending.add(sig);
-        state.pending.add(sig);
-        if sig >= 32 {
-            state.rt_queue.push_back(SigInfo::new(sig, 0));
-        }
+    let ignored = !stop_now && signal_ignored_for_state(state, sig);
+    let (pending_bits, blocked_bits) = if !stop_now && !ignored {
+        queue_signal_info(state, sig, SigInfo::new(sig, 0), false);
         (
             state.pending.bits | state.shared_pending.bits,
             state.blocked.bits,
@@ -768,6 +1265,9 @@ pub unsafe fn send_signal_to_task(target: *mut crate::kernel::task::TaskStruct, 
             blocked_bits,
             stop_now
         );
+    }
+    if ignored {
+        return 0;
     }
 
     if sig == SIGCONT {
@@ -831,15 +1331,9 @@ pub unsafe fn send_signal_info_to_task(
     let target_pid = unsafe { (*target).pid };
     let target_tgid = unsafe { (*target).tgid };
     let mut table = SIGNAL_TABLE.lock();
-    let state = if let Some(pos) = table.states.iter().position(|s| s.pid == target_pid) {
-        table.states.get_mut(pos).expect("position valid")
-    } else {
-        table.states.push(SignalState::new(target_pid, target_tgid));
-        table.states.last_mut().expect("just pushed")
-    };
-    state.shared_pending.add(info.signo);
-    state.pending.add(info.signo);
-    state.rt_queue.push_back(info);
+    let state_idx = table.get_or_create_task_index(target_pid, target_tgid);
+    let state = table.states.get_mut(state_idx).expect("index valid");
+    queue_signal_info(state, info.signo, info, false);
     drop(table);
     set_tif_sigpending(target);
     0
@@ -876,6 +1370,48 @@ pub fn send_signal_to_process_group(pgrp: i32, sig: i32) -> i32 {
         let pid = unsafe { (*current).pid };
         if crate::kernel::session::process_group(pid).unwrap_or(pid) == pgrp
             && (sig == 0 || unsafe { send_signal_to_task(current, sig) } == 0)
+        {
+            sent += 1;
+        }
+    }
+    if sent == 0 { -3 } else { 0 }
+}
+
+/// User-generated process-group signal used by kill(2). Unlike tty/job-control
+/// generation, every target must observe SI_USER and the caller's credentials.
+pub fn send_user_signal_to_process_group(pgrp: i32, sig: i32) -> i32 {
+    if pgrp <= 0 {
+        return -3;
+    }
+    if sig != 0 && !valid_signal(sig) {
+        return -22;
+    }
+    let current = unsafe { crate::kernel::sched::get_current() };
+    let mut sent_tgids = Vec::new();
+    let mut targets = Vec::new();
+    let mut collect = |task: *mut crate::kernel::task::TaskStruct| {
+        if task.is_null() {
+            return;
+        }
+        let pid = unsafe { (*task).pid };
+        let tgid = unsafe { if (*task).tgid > 0 { (*task).tgid } else { pid } };
+        if crate::kernel::session::process_group(pid).unwrap_or(pid) != pgrp
+            || sent_tgids.contains(&tgid)
+        {
+            return;
+        }
+        sent_tgids.push(tgid);
+        targets.push(task);
+    };
+    // for_each_heap_task holds HEAP_TASKS across its callback. Collect raw
+    // targets first, then deliver after that lock is released because process
+    // delivery scans the tracker again to find thread-group siblings.
+    crate::kernel::fork::for_each_heap_task(&mut collect);
+    collect(current);
+    let mut sent = 0i32;
+    for task in targets {
+        if sig == 0
+            || send_signal_info_to_process_for_target(task, sig, kill_siginfo(sig, SI_USER)) == 0
         {
             sent += 1;
         }
@@ -928,8 +1464,8 @@ unsafe fn stop_current_for_signal(task: *mut crate::kernel::task::TaskStruct, si
 /// `process_mrelease(2)` to mirror Linux's "fatal signal pending" gate.
 pub fn has_pending_signal_for_pid(pid: i32, sig: i32) -> bool {
     let table = SIGNAL_TABLE.lock();
-    if let Some(state) = table.states.iter().find(|s| s.pid == pid) {
-        return state.shared_pending.contains(sig) || state.pending.contains(sig);
+    if let Some(idx) = table.states.iter().position(|s| s.pid == pid) {
+        return pending_bits_for_state(&table, &table.states[idx]) & sig_bit(sig) != 0;
     }
     false
 }
@@ -987,6 +1523,196 @@ pub fn has_pending_signals(task: *const crate::kernel::task::TaskStruct) -> bool
     }
 }
 
+fn group_shared_pending_bits(table: &SignalTable, tgid: i32) -> u64 {
+    table
+        .states
+        .iter()
+        .filter(|state| state.tgid == tgid)
+        .fold(0, |bits, state| bits | state.shared_pending.bits)
+}
+
+fn pending_bits_for_state(table: &SignalTable, state: &SignalState) -> u64 {
+    state.pending.bits | group_shared_pending_bits(table, state.tgid)
+}
+
+fn first_matching_signal(
+    state: &SignalState,
+    bits: u64,
+    mut pred: impl FnMut(&SignalState, i32) -> bool,
+) -> Option<i32> {
+    for sig in 1..=NSIG as i32 {
+        if bits & sig_bit(sig) != 0 && pred(state, sig) {
+            return Some(sig);
+        }
+    }
+    None
+}
+
+fn select_pending_signal(
+    state: &SignalState,
+    task_bits: u64,
+    shared_bits: u64,
+    mut pred: impl FnMut(&SignalState, i32) -> bool,
+) -> Option<(i32, SignalQueueScope)> {
+    for sig in 1..=NSIG as i32 {
+        if !pred(state, sig) {
+            continue;
+        }
+        if task_bits & sig_bit(sig) != 0 {
+            return Some((sig, SignalQueueScope::Task));
+        }
+        if shared_bits & sig_bit(sig) != 0 {
+            return Some((sig, SignalQueueScope::Shared));
+        }
+    }
+    None
+}
+
+fn take_group_shared_signal_info(table: &mut SignalTable, tgid: i32, sig: i32) -> SigInfo {
+    let mut info = None;
+    for state in table.states.iter_mut().filter(|state| state.tgid == tgid) {
+        if !state.shared_pending.contains(sig) {
+            continue;
+        }
+        if let Some(idx) = state
+            .shared_queue
+            .iter()
+            .position(|queued| queued.signo == sig)
+        {
+            info = state.shared_queue.remove(idx);
+            break;
+        }
+    }
+    let remains = table
+        .states
+        .iter()
+        .filter(|state| state.tgid == tgid)
+        .any(|state| state.shared_queue.iter().any(|queued| queued.signo == sig));
+    if !remains {
+        for state in table.states.iter_mut().filter(|state| state.tgid == tgid) {
+            state.shared_pending.remove(sig);
+        }
+    }
+    info.unwrap_or_else(|| SigInfo::new(sig, 0))
+}
+
+fn state_has_unblocked_pending_signal(table: &SignalTable, idx: usize) -> bool {
+    let Some(state) = table.states.get(idx) else {
+        return false;
+    };
+    select_pending_signal(
+        state,
+        state.pending.bits,
+        group_shared_pending_bits(table, state.tgid),
+        signal_unblocked_for_state,
+    )
+    .is_some()
+}
+
+fn dequeue_unblocked_signal_for_state_index(
+    table: &mut SignalTable,
+    idx: usize,
+) -> Option<SigInfo> {
+    let tgid = table.states.get(idx)?.tgid;
+    let shared_bits = group_shared_pending_bits(table, tgid);
+    let (sig, scope) = {
+        let state = table.states.get(idx)?;
+        select_pending_signal(
+            state,
+            state.pending.bits,
+            shared_bits,
+            signal_unblocked_for_state,
+        )
+    }?;
+    match scope {
+        SignalQueueScope::Task => Some(take_task_signal_info(table.states.get_mut(idx)?, sig)),
+        SignalQueueScope::Shared => Some(take_group_shared_signal_info(table, tgid, sig)),
+    }
+}
+
+fn dequeue_masked_signal_for_state_index(
+    table: &mut SignalTable,
+    idx: usize,
+    mask: u64,
+) -> Option<SigInfo> {
+    let mask = user_dequeue_signal_mask(mask);
+    if mask == 0 {
+        return None;
+    }
+    let tgid = table.states.get(idx)?.tgid;
+
+    let shared_bits = group_shared_pending_bits(table, tgid) & mask;
+    let (sig, scope) = {
+        let state = table.states.get(idx)?;
+        select_pending_signal(state, state.pending.bits & mask, shared_bits, |_, _| true)
+    }?;
+    match scope {
+        SignalQueueScope::Task => Some(take_task_signal_info(table.states.get_mut(idx)?, sig)),
+        SignalQueueScope::Shared => Some(take_group_shared_signal_info(table, tgid, sig)),
+    }
+}
+
+fn dequeue_default_fatal_signal_for_state_index(
+    table: &mut SignalTable,
+    idx: usize,
+) -> Option<SigInfo> {
+    let tgid = table.states.get(idx)?.tgid;
+    let shared_bits = group_shared_pending_bits(table, tgid);
+    let (sig, scope) = {
+        let state = table.states.get(idx)?;
+        select_pending_signal(
+            state,
+            state.pending.bits,
+            shared_bits,
+            signal_is_default_fatal,
+        )
+    }?;
+    match scope {
+        SignalQueueScope::Task => Some(take_task_signal_info(table.states.get_mut(idx)?, sig)),
+        SignalQueueScope::Shared => Some(take_group_shared_signal_info(table, tgid, sig)),
+    }
+}
+
+pub fn has_unblocked_pending_signals(task: *const crate::kernel::task::TaskStruct) -> bool {
+    if task.is_null() || !has_pending_signals(task) {
+        return false;
+    }
+    task_has_unblocked_pending_signal_state(task)
+}
+
+fn task_has_unblocked_pending_signal_state(task: *const crate::kernel::task::TaskStruct) -> bool {
+    if task.is_null() {
+        return false;
+    }
+    let pid = unsafe { (*task).pid };
+    let table = SIGNAL_TABLE.lock();
+    table
+        .states
+        .iter()
+        .position(|state| state.pid == pid)
+        .is_some_and(|idx| state_has_unblocked_pending_signal(&table, idx))
+}
+
+fn recalc_tif_sigpending(task: *mut crate::kernel::task::TaskStruct) -> bool {
+    if task.is_null() {
+        return false;
+    }
+    let pending = task_has_unblocked_pending_signal_state(task);
+    unsafe {
+        if pending {
+            (*task).thread_info.flags |= crate::kernel::task::TIF_SIGPENDING;
+        } else {
+            (*task).thread_info.flags &= !crate::kernel::task::TIF_SIGPENDING;
+        }
+    }
+    pending
+}
+
+pub fn current_has_unblocked_pending_signals() -> bool {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    has_unblocked_pending_signals(task)
+}
+
 pub fn current_has_pending_signals() -> bool {
     let task = unsafe { crate::kernel::sched::get_current() };
     has_pending_signals(task)
@@ -1002,9 +1728,10 @@ pub fn has_current_pending_signal_mask(mask: u64) -> bool {
     table
         .states
         .iter()
-        .find(|state| state.pid == pid)
+        .position(|state| state.pid == pid)
         .is_some_and(|state| {
-            ((state.pending.bits | state.shared_pending.bits) & user_dequeue_signal_mask(mask)) != 0
+            (pending_bits_for_state(&table, &table.states[state]) & user_dequeue_signal_mask(mask))
+                != 0
         })
 }
 
@@ -1018,8 +1745,8 @@ pub fn current_pending_signal_bits() -> u64 {
     table
         .states
         .iter()
-        .find(|state| state.pid == pid)
-        .map(|state| state.pending.bits | state.shared_pending.bits)
+        .position(|state| state.pid == pid)
+        .map(|idx| pending_bits_for_state(&table, &table.states[idx]))
         .unwrap_or(0)
 }
 
@@ -1029,17 +1756,13 @@ pub fn dequeue_current_pending_signal_mask(mask: u64) -> Option<SigInfo> {
         return None;
     }
 
-    let (info, still_pending) = {
+    let info = {
         let mut table = SIGNAL_TABLE.lock();
-        let state = table.get_or_create_current().ok()?;
-        let info = state.dequeue_masked_signal(mask)?;
-        let still_pending = has_unblocked_pending_signal(state);
-        (info, still_pending)
+        let idx = table.get_or_create_current_index().ok()?;
+        dequeue_masked_signal_for_state_index(&mut table, idx, mask)?
     };
 
-    if !still_pending {
-        clear_tif_sigpending(task);
-    }
+    recalc_tif_sigpending(task);
     Some(info)
 }
 
@@ -1054,20 +1777,58 @@ pub fn clear_tif_sigpending(task: *mut crate::kernel::task::TaskStruct) {
     }
 }
 
-fn has_unblocked_pending_signal(state: &SignalState) -> bool {
-    if state
-        .rt_queue
-        .iter()
-        .any(|info| !state.blocked.contains(info.signo))
-    {
-        return true;
+fn restore_current_blocked_mask(mut mask: SigSet) {
+    sanitize_blocked_mask(&mut mask);
+    let task = unsafe { crate::kernel::sched::get_current() };
+    let mut table = SIGNAL_TABLE.lock();
+    if let Ok(state) = table.get_or_create_current() {
+        state.blocked = mask;
     }
-    ((state.pending.bits | state.shared_pending.bits) & !state.blocked.bits) != 0
+    drop(table);
+    recalc_tif_sigpending(task);
 }
 
-/// Consume a pending fatal signal for the current task without delivering a
-/// user signal frame. Blocking syscall loops use this before sleeping again so
-/// service timeout SIGKILLs take effect promptly.
+fn signal_is_default_fatal(state: &SignalState, sig: i32) -> bool {
+    if sig == SIGKILL {
+        return true;
+    }
+    if !valid_signal(sig) || state.blocked.contains(sig) {
+        return false;
+    }
+    matches!(
+        handler_kind(&state.actions[sig as usize]),
+        HandlerKind::Default
+    ) && matches!(
+        default_action(sig),
+        DefaultAction::Term | DefaultAction::Core
+    )
+}
+
+fn signal_ignored_for_state(state: &SignalState, sig: i32) -> bool {
+    if !valid_signal(sig) || state.blocked.contains(sig) {
+        return false;
+    }
+    match handler_kind(&state.actions[sig as usize]) {
+        HandlerKind::Ignore => true,
+        HandlerKind::Default => matches!(default_action(sig), DefaultAction::Ign),
+        HandlerKind::User(_) => false,
+    }
+}
+
+fn signal_unblocked_for_state(state: &SignalState, sig: i32) -> bool {
+    valid_signal(sig) && !state.blocked.contains(sig)
+}
+
+fn signal_deliverable_for_state(state: &SignalState, sig: i32) -> bool {
+    signal_unblocked_for_state(state, sig) && !signal_ignored_for_state(state, sig)
+}
+
+/// Consume a pending terminating signal for the current task without
+/// delivering a user signal frame. Blocking syscall loops use this before
+/// sleeping again so service timeout kills take effect promptly. Linux's
+/// `complete_signal()` turns unblocked default-fatal signals into group-exit
+/// wakeups; until Lupos grows that group-exit state, consume the same class of
+/// signals here while preserving user handlers and ignored/stopped defaults.
 pub fn take_current_fatal_signal() -> Option<i32> {
     let task = unsafe { crate::kernel::sched::get_current() };
     if task.is_null() || !has_pending_signals(task) {
@@ -1076,14 +1837,15 @@ pub fn take_current_fatal_signal() -> Option<i32> {
 
     let (signal, still_pending) = {
         let mut table = SIGNAL_TABLE.lock();
-        let state = match table.get_or_create_current() {
-            Ok(state) => state,
+        let idx = match table.get_or_create_current_index() {
+            Ok(idx) => idx,
             Err(_) => return None,
         };
-        let signal = state
-            .dequeue_specific_signal(SIGKILL)
-            .map(|info| info.signo);
-        let still_pending = has_unblocked_pending_signal(state);
+        let signal = dequeue_default_fatal_signal_for_state_index(&mut table, idx).map(|info| {
+            sigqueue_release(info.signo);
+            info.signo
+        });
+        let still_pending = state_has_unblocked_pending_signal(&table, idx);
         (signal, still_pending)
     };
 
@@ -1115,12 +1877,16 @@ pub unsafe fn do_signal_stop_only() -> bool {
         return false;
     }
 
-    let signal_info = {
+    let (signal_info, saved_mask) = {
         let mut table = SIGNAL_TABLE.lock();
-        if let Ok(state) = table.get_or_create_current() {
-            state.dequeue_unblocked_signal()
+        if let Ok(idx) = table.get_or_create_current_index() {
+            let saved_mask = table.states[idx].sigsuspend_saved.take();
+            (
+                dequeue_unblocked_signal_for_state_index(&mut table, idx),
+                saved_mask,
+            )
         } else {
-            None
+            (None, None)
         }
     };
 
@@ -1128,6 +1894,9 @@ pub unsafe fn do_signal_stop_only() -> bool {
         clear_tif_sigpending(task);
         return false;
     };
+    if let Some(mask) = saved_mask {
+        restore_current_blocked_mask(mask);
+    }
 
     match info.signo {
         SIGKILL | SIGINT => unsafe {
@@ -1144,16 +1913,7 @@ pub unsafe fn do_signal_stop_only() -> bool {
                     info.signo
                 );
             }
-            let still_pending = {
-                let mut table = SIGNAL_TABLE.lock();
-                table
-                    .get_or_create_current()
-                    .map(|state| has_unblocked_pending_signal(state))
-                    .unwrap_or(false)
-            };
-            if !still_pending {
-                clear_tif_sigpending(task);
-            }
+            recalc_tif_sigpending(task);
             true
         }
     }
@@ -1226,6 +1986,60 @@ fn handler_kind(action: &RtSigAction) -> HandlerKind {
     }
 }
 
+#[inline]
+fn neg_errno(errno: i32) -> u64 {
+    (-(errno as i64)) as u64
+}
+
+fn syscall_restart_error(regs: &crate::kernel::task::PtRegs) -> Option<i32> {
+    if regs.orig_ax == NO_SYSCALL {
+        return None;
+    }
+
+    match regs.ax {
+        value if value == neg_errno(ERESTARTSYS) => Some(ERESTARTSYS),
+        value if value == neg_errno(ERESTARTNOINTR) => Some(ERESTARTNOINTR),
+        value if value == neg_errno(ERESTARTNOHAND) => Some(ERESTARTNOHAND),
+        value if value == neg_errno(ERESTART_RESTARTBLOCK) => Some(ERESTART_RESTARTBLOCK),
+        _ => None,
+    }
+}
+
+fn rewind_syscall(regs: &mut crate::kernel::task::PtRegs) {
+    regs.ip = regs.ip.wrapping_sub(X86_64_SYSCALL_INSN_LEN);
+}
+
+fn restart_original_syscall(regs: &mut crate::kernel::task::PtRegs) {
+    regs.ax = regs.orig_ax;
+    rewind_syscall(regs);
+}
+
+fn apply_syscall_restart_for_handler(regs: &mut crate::kernel::task::PtRegs, action: &RtSigAction) {
+    match syscall_restart_error(regs) {
+        Some(ERESTART_RESTARTBLOCK) | Some(ERESTARTNOHAND) => {
+            regs.ax = neg_errno(EINTR);
+        }
+        Some(ERESTARTSYS) if action.sa_flags & SA_RESTART == 0 => {
+            regs.ax = neg_errno(EINTR);
+        }
+        Some(ERESTARTSYS) | Some(ERESTARTNOINTR) => restart_original_syscall(regs),
+        _ => {}
+    }
+}
+
+fn apply_syscall_restart_without_handler(regs: &mut crate::kernel::task::PtRegs) {
+    match syscall_restart_error(regs) {
+        Some(ERESTARTNOHAND) | Some(ERESTARTSYS) | Some(ERESTARTNOINTR) => {
+            restart_original_syscall(regs);
+        }
+        Some(ERESTART_RESTARTBLOCK) => {
+            regs.ax = X86_64_NR_RESTART_SYSCALL;
+            rewind_syscall(regs);
+        }
+        _ => {}
+    }
+}
+
 /// Deliver pending signals to the current task.
 ///
 /// Called from the syscall exit path when TIF_SIGPENDING is set.
@@ -1246,19 +2060,44 @@ pub unsafe fn do_signal(regs: *mut crate::kernel::task::PtRegs) -> bool {
     }
 
     loop {
-        let signal_info = {
+        let (signal_info, saved_mask, mask_to_save) = {
             let mut table = SIGNAL_TABLE.lock();
-            if let Ok(state) = table.get_or_create_current() {
-                state.dequeue_unblocked_signal()
+            if let Ok(idx) = table.get_or_create_current_index() {
+                let saved_mask = table.states[idx].sigsuspend_saved.take();
+                let mask_to_save = saved_mask.unwrap_or(table.states[idx].blocked);
+                (
+                    dequeue_unblocked_signal_for_state_index(&mut table, idx),
+                    saved_mask,
+                    mask_to_save,
+                )
             } else {
-                None
+                (None, None, SigSet::default())
             }
         };
 
         let Some(info) = signal_info else {
+            if let Some(mask) = saved_mask {
+                restore_current_blocked_mask(mask);
+            }
             clear_tif_sigpending(task);
+            if let Some(regs_mut) = unsafe { regs.as_mut() } {
+                apply_syscall_restart_without_handler(regs_mut);
+            }
             return false;
         };
+        if info.signo == SIGALRM {
+            let key = unsafe {
+                if (*task).tgid > 0 {
+                    (*task).tgid
+                } else {
+                    (*task).pid
+                }
+            };
+            crate::kernel::syscalls::rearm_real_itimer_after_sigalrm(key);
+        }
+        if let Some(mask) = saved_mask {
+            restore_current_blocked_mask(mask);
+        }
 
         // Release the rlimit charge held by the queue entry, if any.
         sigqueue_release(info.signo);
@@ -1279,14 +2118,17 @@ pub unsafe fn do_signal(regs: *mut crate::kernel::task::PtRegs) -> bool {
         } else {
             handler_kind(&action)
         };
-
         match kind {
             HandlerKind::Ignore => {
                 // Loop to drain the next unblocked signal.
+                recalc_tif_sigpending(task);
                 continue;
             }
             HandlerKind::Default => match default_action(info.signo) {
-                DefaultAction::Ign => continue,
+                DefaultAction::Ign => {
+                    recalc_tif_sigpending(task);
+                    continue;
+                }
                 DefaultAction::Term => unsafe {
                     crate::kernel::exit::do_exit(
                         crate::kernel::wait::w_exitcode(0, info.signo) as i64
@@ -1301,6 +2143,7 @@ pub unsafe fn do_signal(regs: *mut crate::kernel::task::PtRegs) -> bool {
                     ) as i64);
                 },
                 DefaultAction::Stop => {
+                    recalc_tif_sigpending(task);
                     return unsafe { stop_current_for_signal(task, info.signo) };
                 }
                 DefaultAction::Cont => {
@@ -1310,13 +2153,21 @@ pub unsafe fn do_signal(regs: *mut crate::kernel::task::PtRegs) -> bool {
                             core::sync::atomic::Ordering::Release,
                         );
                     }
+                    recalc_tif_sigpending(task);
                     return true;
                 }
             },
             HandlerKind::User(_) => {
+                if let Some(regs_mut) = unsafe { regs.as_mut() } {
+                    apply_syscall_restart_for_handler(regs_mut, &action);
+                }
                 if unsafe {
                     crate::arch::x86::kernel::signal::setup_rt_frame(
-                        regs, info.signo, &action, &info,
+                        regs,
+                        info.signo,
+                        &action,
+                        &info,
+                        mask_to_save,
                     )
                 }
                 .is_err()
@@ -1345,6 +2196,7 @@ pub unsafe fn do_signal(regs: *mut crate::kernel::task::PtRegs) -> bool {
                         }
                     }
                 }
+                recalc_tif_sigpending(task);
                 return true;
             }
         }
@@ -1386,38 +2238,11 @@ pub unsafe fn sys_rt_sigreturn_impl(regs: *mut crate::kernel::task::PtRegs) -> i
     // calling rt_sigreturn.  We tolerate both layouts by re-reading from
     // the documented offset.
     let sp = unsafe { (*regs).sp };
-    let Some((frame_addr, frame)) = (unsafe { rt_sigframe_from_sp(sp) }) else {
+    let Some((_frame_addr, frame)) = (unsafe { rt_sigframe_from_sp(sp) }) else {
         return unsafe { bad_rt_sigreturn() };
     };
     let sc: &SigContext = &frame.uc.uc_mcontext;
     let mask = frame.uc.uc_sigmask;
-
-    #[cfg(not(test))]
-    {
-        if crate::kernel::debug_trace::proc_enabled() {
-            let pid = unsafe {
-                let task = crate::kernel::sched::get_current();
-                if task.is_null() { -1 } else { (*task).pid }
-            };
-            crate::linux_driver_abi::tty::serial_println!(
-                "trace-sigreturn pid={} sp={:#x} frame={:#x} sig={} rip={:#x} rsp={:#x} r12={:#x} r13={:#x} rbp={:#x} rbx={:#x} rax={:#x} flags={:#x} cs={:#x} ss={:#x}",
-                pid,
-                sp,
-                frame_addr,
-                frame.info.signo,
-                sc.rip,
-                sc.rsp,
-                sc.r12,
-                sc.r13,
-                sc.rbp,
-                sc.rbx,
-                sc.rax,
-                sc.eflags,
-                sc.cs,
-                sc.ss
-            );
-        }
-    }
 
     let regs_mut = unsafe { &mut *regs };
     const FIX_EFLAGS: u64 = 0x50dd5;
@@ -1453,6 +2278,8 @@ pub unsafe fn sys_rt_sigreturn_impl(regs: *mut crate::kernel::task::PtRegs) -> i
             state.blocked = next;
         }
     }
+    let task = unsafe { crate::kernel::sched::get_current() };
+    recalc_tif_sigpending(task);
 
     // Linux: rt_sigreturn returns the restored rax verbatim so the resumed
     // program sees the syscall return value untouched.
@@ -1636,7 +2463,36 @@ pub fn reset_for_tests() {
 pub fn register_test_task(pid: i32, tgid: i32) {
     let mut table = SIGNAL_TABLE.lock();
     if table.states.iter().all(|s| s.pid != pid) {
-        table.states.push(SignalState::new(pid, tgid));
+        let state = table.state_for_new_task(pid, tgid);
+        table.states.push(state);
+    }
+}
+
+pub(crate) fn inherit_signal_state_for_clone(parent_pid: i32, child_pid: i32, child_tgid: i32) {
+    SIGNAL_TABLE
+        .lock()
+        .inherit_for_clone(parent_pid, child_pid, child_tgid);
+}
+
+pub(crate) fn flush_signal_handlers_for_exec(force_default: bool) {
+    let task = unsafe { sched::get_current() };
+    if task.is_null() {
+        return;
+    }
+
+    let mut table = SIGNAL_TABLE.lock();
+    let Ok(state) = table.get_or_create_current() else {
+        return;
+    };
+
+    for action in state.actions.iter_mut().skip(1) {
+        let keep_ignored = !force_default && handler_kind(action) == HandlerKind::Ignore;
+        *action = RtSigAction {
+            sa_handler: if keep_ignored { 1 } else { 0 },
+            sa_flags: 0,
+            sa_restorer: 0,
+            sa_mask: SigSet::default(),
+        };
     }
 }
 
@@ -1647,7 +2503,33 @@ mod tests {
     use super::*;
     use crate::kernel::{cred::INIT_CRED, sched, task::TaskStruct};
 
-    static TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+    use super::SIGNAL_TEST_LOCK as TEST_LOCK;
+
+    fn syscall_restart_regs(errno: i32) -> crate::kernel::task::PtRegs {
+        crate::kernel::task::PtRegs {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            bp: 0,
+            bx: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            ax: neg_errno(errno),
+            cx: 0,
+            dx: 0,
+            si: 0,
+            di: 0,
+            orig_ax: 202,
+            ip: 0x400102,
+            cs: crate::arch::x86::kernel::gdt::sel::USER_CS as u64,
+            flags: 0x202,
+            sp: 0x700000,
+            ss: crate::arch::x86::kernel::gdt::sel::USER_DS as u64,
+        }
+    }
 
     #[test]
     fn sigset_add_remove_contains() {
@@ -1663,8 +2545,341 @@ mod tests {
         let _guard = TEST_LOCK.lock();
         reset_for_tests();
         register_test_task(101, 1);
+        assert_eq!(unsafe { sys_tgkill(1, 101, 0) }, 0);
         assert_eq!(unsafe { sys_tgkill(2, 101, 10) }, -3);
         assert_eq!(unsafe { sys_tgkill(1, 101, 10) }, 0);
+        assert_eq!(unsafe { sys_tgkill(1, 0, 10) }, -22);
+        assert_eq!(unsafe { sys_tkill(0, 10) }, -22);
+        assert_eq!(unsafe { sys_tkill(101, 0) }, 0);
+    }
+
+    #[test]
+    fn clone_signal_state_inherits_handlers_but_not_pending_signals() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        register_test_task(100, 100);
+
+        {
+            let mut table = SIGNAL_TABLE.lock();
+            let parent = table.get_by_pid_mut(100).expect("parent signal state");
+            parent.actions[(SIGRTMIN + 1) as usize] = RtSigAction {
+                sa_handler: 0xfeed_cafe,
+                sa_flags: SA_RESTART,
+                sa_restorer: 0x1234,
+                sa_mask: SigSet { bits: sig_bit(12) },
+            };
+            parent.blocked.add(SIGUSR1);
+            parent.pending.add(SIGTERM);
+            parent.shared_pending.add(SIGALRM);
+            parent.rt_queue.push_back(SigInfo::new(SIGRTMIN + 1, 0));
+        }
+
+        inherit_signal_state_for_clone(100, 101, 100);
+
+        let table = SIGNAL_TABLE.lock();
+        let child = table
+            .states
+            .iter()
+            .find(|state| state.pid == 101)
+            .expect("child signal state");
+        assert_eq!(
+            child.actions[(SIGRTMIN + 1) as usize].sa_handler,
+            0xfeed_cafe
+        );
+        assert!(child.blocked.contains(SIGUSR1));
+        assert_eq!(child.pending.bits, 0);
+        assert_eq!(child.shared_pending.bits, 0);
+        assert!(child.rt_queue.is_empty());
+        assert!(child.shared_queue.is_empty());
+        assert!(
+            !signal_is_default_fatal(child, SIGRTMIN + 1),
+            "inherited NPTL realtime handler must prevent default termination"
+        );
+    }
+
+    #[test]
+    fn rt_sigaction_updates_existing_thread_group_signal_states() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        register_test_task(100, 100);
+        register_test_task(101, 100);
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 100;
+        current.tgid = 100;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            let action = RtSigAction {
+                sa_handler: 0x5555_aaaa,
+                sa_flags: SA_RESTART,
+                sa_restorer: 0x1111,
+                sa_mask: SigSet::default(),
+            };
+            assert_eq!(
+                sys_rt_sigaction(
+                    SIGRTMIN + 1,
+                    &action,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<SigSet>()
+                ),
+                0
+            );
+            sched::set_current(previous);
+        }
+
+        let table = SIGNAL_TABLE.lock();
+        for pid in [100, 101] {
+            let state = table
+                .states
+                .iter()
+                .find(|state| state.pid == pid)
+                .expect("thread signal state");
+            assert_eq!(
+                state.actions[(SIGRTMIN + 1) as usize].sa_handler,
+                0x5555_aaaa
+            );
+        }
+    }
+
+    #[test]
+    fn late_thread_signal_state_inherits_thread_group_actions() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        register_test_task(100, 100);
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 100;
+        current.tgid = 100;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            let action = RtSigAction {
+                sa_handler: 0x7777_aaaa,
+                sa_flags: SA_RESTART,
+                sa_restorer: 0x2222,
+                sa_mask: SigSet {
+                    bits: sig_bit(SIGUSR1),
+                },
+            };
+            assert_eq!(
+                sys_rt_sigaction(
+                    SIGRTMIN + 1,
+                    &action,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<SigSet>()
+                ),
+                0
+            );
+
+            register_test_task(101, 100);
+            assert_eq!(sys_tgkill(100, 101, SIGRTMIN + 1), 0);
+            sched::set_current(previous);
+        }
+
+        let table = SIGNAL_TABLE.lock();
+        let thread = table
+            .states
+            .iter()
+            .find(|state| state.pid == 101)
+            .expect("late thread signal state");
+        assert_eq!(
+            thread.actions[(SIGRTMIN + 1) as usize].sa_handler,
+            0x7777_aaaa
+        );
+        assert!(thread.pending.contains(SIGRTMIN + 1));
+        let queued = thread.rt_queue.front().expect("queued realtime siginfo");
+        assert_eq!(queued.code, SI_TKILL);
+        assert_eq!(
+            i32::from_ne_bytes(queued._sifields[0..4].try_into().unwrap()),
+            100
+        );
+        assert!(
+            !signal_is_default_fatal(thread, SIGRTMIN + 1),
+            "late-created thread must not treat NPTL realtime signal as default fatal"
+        );
+    }
+
+    #[test]
+    fn standard_user_process_signal_preserves_sender_siginfo() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 140;
+        current.tgid = 140;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            register_test_task(140, 140);
+            assert_eq!(send_user_signal_to_process(140, SIGUSR1), 0);
+            let info = dequeue_current_pending_signal_mask(sig_bit(SIGUSR1))
+                .expect("queued standard user signal");
+            assert_eq!(info.signo, SIGUSR1);
+            assert_eq!(info.code, SI_USER);
+            assert_eq!(
+                i32::from_ne_bytes(info._sifields[0..4].try_into().unwrap()),
+                140
+            );
+            assert_eq!(
+                u32::from_ne_bytes(info._sifields[4..8].try_into().unwrap()),
+                0
+            );
+            sched::set_current(previous);
+        }
+        reset_for_tests();
+    }
+
+    #[test]
+    fn standard_signal_coalescing_retains_first_sender() {
+        let _guard = TEST_LOCK.lock();
+        let mut state = SignalState::new(150, 150);
+        queue_signal_info(
+            &mut state,
+            SIGUSR1,
+            SigInfo::with_sender(SIGUSR1, SI_USER, 151, 1),
+            false,
+        );
+        queue_signal_info(
+            &mut state,
+            SIGUSR1,
+            SigInfo::with_sender(SIGUSR1, SI_USER, 152, 2),
+            false,
+        );
+
+        assert_eq!(state.rt_queue.len(), 1);
+        let info = state
+            .dequeue_specific_signal(SIGUSR1)
+            .expect("coalesced standard signal");
+        assert_eq!(
+            i32::from_ne_bytes(info._sifields[0..4].try_into().unwrap()),
+            151
+        );
+        assert_eq!(
+            u32::from_ne_bytes(info._sifields[4..8].try_into().unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn standard_signals_dequeue_in_signal_number_order() {
+        let _guard = TEST_LOCK.lock();
+        let mut state = SignalState::new(153, 153);
+        queue_signal_info(
+            &mut state,
+            SIGUSR2,
+            SigInfo::with_sender(SIGUSR2, SI_USER, 154, 1),
+            false,
+        );
+        queue_signal_info(
+            &mut state,
+            SIGUSR1,
+            SigInfo::with_sender(SIGUSR1, SI_USER, 155, 2),
+            false,
+        );
+
+        let first = state.dequeue_unblocked_signal().expect("first signal");
+        let second = state.dequeue_unblocked_signal().expect("second signal");
+        assert_eq!(first.signo, SIGUSR1);
+        assert_eq!(second.signo, SIGUSR2);
+        assert_eq!(
+            i32::from_ne_bytes(first._sifields[0..4].try_into().unwrap()),
+            155
+        );
+        assert_eq!(
+            i32::from_ne_bytes(second._sifields[0..4].try_into().unwrap()),
+            154
+        );
+    }
+
+    #[test]
+    fn task_and_shared_standard_siginfo_do_not_cross_scopes() {
+        let _guard = TEST_LOCK.lock();
+        let mut state = SignalState::new(156, 156);
+        queue_signal_info(
+            &mut state,
+            SIGUSR1,
+            SigInfo::with_sender(SIGUSR1, SI_TKILL, 157, 3),
+            false,
+        );
+        queue_signal_info(
+            &mut state,
+            SIGUSR1,
+            SigInfo::with_sender(SIGUSR1, SI_USER, 158, 4),
+            true,
+        );
+
+        let task = state.dequeue_unblocked_signal().expect("task signal");
+        assert_eq!(task.code, SI_TKILL);
+        assert!(state.shared_pending.contains(SIGUSR1));
+        let shared = state.dequeue_unblocked_signal().expect("shared signal");
+        assert_eq!(shared.code, SI_USER);
+        assert_eq!(
+            i32::from_ne_bytes(task._sifields[0..4].try_into().unwrap()),
+            157
+        );
+        assert_eq!(
+            i32::from_ne_bytes(shared._sifields[0..4].try_into().unwrap()),
+            158
+        );
+    }
+
+    #[test]
+    fn exec_flush_resets_caught_handlers_but_keeps_ignored_handlers() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 110;
+        current.tgid = 110;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            register_test_task(110, 110);
+            {
+                let mut table = SIGNAL_TABLE.lock();
+                let state = table.get_by_pid_mut(110).expect("registered");
+                state.actions[SIGTERM as usize] = RtSigAction {
+                    sa_handler: 0x1234,
+                    sa_flags: SA_RESTART,
+                    sa_restorer: 0x5678,
+                    sa_mask: SigSet {
+                        bits: sig_bit(SIGUSR1),
+                    },
+                };
+                state.actions[SIGPIPE as usize] = RtSigAction {
+                    sa_handler: 1,
+                    sa_flags: SA_RESTART,
+                    sa_restorer: 0x5678,
+                    sa_mask: SigSet {
+                        bits: sig_bit(SIGUSR1),
+                    },
+                };
+            }
+
+            flush_signal_handlers_for_exec(false);
+
+            let table = SIGNAL_TABLE.lock();
+            let state = table
+                .states
+                .iter()
+                .find(|state| state.pid == 110)
+                .expect("state after exec flush");
+            assert_eq!(state.actions[SIGTERM as usize].sa_handler, 0);
+            assert_eq!(state.actions[SIGTERM as usize].sa_flags, 0);
+            assert_eq!(state.actions[SIGTERM as usize].sa_restorer, 0);
+            assert_eq!(state.actions[SIGTERM as usize].sa_mask.bits, 0);
+            assert_eq!(state.actions[SIGPIPE as usize].sa_handler, 1);
+            assert_eq!(state.actions[SIGPIPE as usize].sa_flags, 0);
+            assert_eq!(state.actions[SIGPIPE as usize].sa_restorer, 0);
+            assert_eq!(state.actions[SIGPIPE as usize].sa_mask.bits, 0);
+            drop(table);
+
+            sched::set_current(previous);
+        }
     }
 
     #[test]
@@ -1774,6 +2989,384 @@ mod tests {
         info = got;
         assert_eq!(info.signo, 12);
         let _ = wait;
+    }
+
+    #[test]
+    fn rt_sigsuspend_uses_temporary_mask_until_signal_delivery() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 77;
+        current.tgid = 77;
+        current.cred = &raw const INIT_CRED;
+
+        let mut stack = [0u8; 4096];
+        let stack_top = unsafe { stack.as_mut_ptr().add(stack.len()) as u64 };
+        let mut regs = crate::kernel::task::PtRegs {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            bp: 0,
+            bx: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            ax: 0,
+            cx: 0,
+            dx: 0,
+            si: 0,
+            di: 0,
+            orig_ax: 0,
+            ip: 0x7000,
+            cs: crate::arch::x86::kernel::gdt::sel::USER_CS as u64,
+            flags: 0x202,
+            sp: stack_top,
+            ss: crate::arch::x86::kernel::gdt::sel::USER_DS as u64,
+        };
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            let action = RtSigAction {
+                sa_handler: 0x4444,
+                sa_restorer: 0x5555,
+                ..Default::default()
+            };
+            assert_eq!(
+                sys_rt_sigaction(
+                    SIGALRM,
+                    &action,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<SigSet>(),
+                ),
+                0
+            );
+            let old_blocked = SigSet {
+                bits: sig_bit(SIGUSR1),
+            };
+            assert_eq!(
+                sys_rt_sigprocmask(
+                    SIG_SETMASK,
+                    &old_blocked,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<SigSet>(),
+                ),
+                0
+            );
+            assert_eq!(
+                send_signal_to_task(&mut *current as *mut TaskStruct, SIGALRM),
+                0
+            );
+
+            let temporary = SigSet::default();
+            assert_eq!(
+                sys_rt_sigsuspend(&temporary, core::mem::size_of::<SigSet>()),
+                -4
+            );
+            {
+                let table = SIGNAL_TABLE.lock();
+                let state = table.states.iter().find(|state| state.pid == 77).unwrap();
+                assert_eq!(state.blocked.bits, 0);
+                assert_eq!(state.sigsuspend_saved, Some(old_blocked));
+            }
+
+            assert!(do_signal(&mut regs));
+            assert_eq!(regs.ip, action.sa_handler as u64);
+            let frame = &*(regs.sp as *const crate::arch::x86::kernel::signal::RtSigFrame);
+            assert_eq!(frame.uc.uc_sigmask, old_blocked);
+            {
+                let table = SIGNAL_TABLE.lock();
+                let state = table.states.iter().find(|state| state.pid == 77).unwrap();
+                assert!(state.blocked.contains(SIGUSR1));
+                assert!(state.blocked.contains(SIGALRM));
+                assert_eq!(state.sigsuspend_saved, None);
+            }
+
+            sched::set_current(previous);
+        }
+        reset_for_tests();
+    }
+
+    #[test]
+    fn process_scoped_signal_queues_shared_pending_only() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 78;
+        current.tgid = 78;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            assert_eq!(
+                send_signal_to_task_scoped(
+                    &mut *current as *mut TaskStruct,
+                    SIGALRM,
+                    SignalQueueScope::Shared,
+                ),
+                0
+            );
+            sched::set_current(previous);
+        }
+
+        let table = SIGNAL_TABLE.lock();
+        let state = table.states.iter().find(|state| state.pid == 78).unwrap();
+        assert!(!state.pending.contains(SIGALRM));
+        assert!(state.shared_pending.contains(SIGALRM));
+        drop(table);
+        reset_for_tests();
+    }
+
+    #[test]
+    fn process_scoped_signal_wakes_unblocked_sibling() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut leader = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        leader.pid = 120;
+        leader.tgid = 120;
+        leader.cred = &raw const INIT_CRED;
+        let mut sibling = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        sibling.pid = 121;
+        sibling.tgid = 120;
+        sibling.cred = &raw const INIT_CRED;
+
+        unsafe {
+            sched::set_current(&mut *sibling as *mut TaskStruct);
+            register_test_task(120, 120);
+            register_test_task(121, 120);
+            {
+                let mut table = SIGNAL_TABLE.lock();
+                table
+                    .get_by_pid_mut(120)
+                    .expect("leader")
+                    .blocked
+                    .add(SIGALRM);
+            }
+
+            assert_eq!(
+                send_signal_to_task_scoped(
+                    &mut *leader as *mut TaskStruct,
+                    SIGALRM,
+                    SignalQueueScope::Shared,
+                ),
+                0
+            );
+
+            assert_eq!(
+                leader.thread_info.flags & crate::kernel::task::TIF_SIGPENDING,
+                0
+            );
+            assert!(sibling.thread_info.flags & crate::kernel::task::TIF_SIGPENDING != 0);
+            assert!(has_unblocked_pending_signals(
+                &mut *sibling as *mut TaskStruct
+            ));
+            assert!(!has_unblocked_pending_signals(
+                &mut *leader as *mut TaskStruct
+            ));
+
+            sched::set_current(previous);
+        }
+        reset_for_tests();
+    }
+
+    #[test]
+    fn sibling_dequeue_clears_process_shared_pending_once() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut leader = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        leader.pid = 122;
+        leader.tgid = 122;
+        leader.cred = &raw const INIT_CRED;
+        let mut sibling = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        sibling.pid = 123;
+        sibling.tgid = 122;
+        sibling.cred = &raw const INIT_CRED;
+
+        unsafe {
+            sched::set_current(&mut *sibling as *mut TaskStruct);
+            register_test_task(122, 122);
+            register_test_task(123, 122);
+            {
+                let mut table = SIGNAL_TABLE.lock();
+                table
+                    .get_by_pid_mut(122)
+                    .expect("leader")
+                    .blocked
+                    .add(SIGUSR1);
+            }
+
+            assert_eq!(
+                send_signal_to_task_scoped(
+                    &mut *leader as *mut TaskStruct,
+                    SIGUSR1,
+                    SignalQueueScope::Shared,
+                ),
+                0
+            );
+            assert!(has_pending_signal_for_pid(122, SIGUSR1));
+            assert!(has_pending_signal_for_pid(123, SIGUSR1));
+
+            let info =
+                dequeue_current_pending_signal_mask(sig_bit(SIGUSR1)).expect("shared signal");
+            assert_eq!(info.signo, SIGUSR1);
+            assert!(!has_pending_signal_for_pid(122, SIGUSR1));
+            assert!(!has_pending_signal_for_pid(123, SIGUSR1));
+            assert!(dequeue_current_pending_signal_mask(sig_bit(SIGUSR1)).is_none());
+
+            sched::set_current(previous);
+        }
+        reset_for_tests();
+    }
+
+    #[test]
+    fn task_scoped_signal_queues_task_pending_only() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 79;
+        current.tgid = 79;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            assert_eq!(
+                send_signal_to_task_scoped(
+                    &mut *current as *mut TaskStruct,
+                    SIGTERM,
+                    SignalQueueScope::Task,
+                ),
+                0
+            );
+            sched::set_current(previous);
+        }
+
+        let table = SIGNAL_TABLE.lock();
+        let state = table.states.iter().find(|state| state.pid == 79).unwrap();
+        assert!(state.pending.contains(SIGTERM));
+        assert!(!state.shared_pending.contains(SIGTERM));
+        drop(table);
+        reset_for_tests();
+    }
+
+    #[test]
+    fn delivered_user_signal_recalculates_pending_flag() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 82;
+        current.tgid = 82;
+        current.cred = &raw const INIT_CRED;
+
+        let mut stack = [0u8; 4096];
+        let stack_top = unsafe { stack.as_mut_ptr().add(stack.len()) as u64 };
+        let mut regs = crate::kernel::task::PtRegs {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            bp: 0,
+            bx: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            ax: 0,
+            cx: 0,
+            dx: 0,
+            si: 0,
+            di: 0,
+            orig_ax: NO_SYSCALL,
+            ip: 0x7000,
+            cs: crate::arch::x86::kernel::gdt::sel::USER_CS as u64,
+            flags: 0x202,
+            sp: stack_top,
+            ss: crate::arch::x86::kernel::gdt::sel::USER_DS as u64,
+        };
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            let action = RtSigAction {
+                sa_handler: 0x4444,
+                sa_restorer: 0x5555,
+                ..Default::default()
+            };
+            assert_eq!(
+                sys_rt_sigaction(
+                    SIGUSR1,
+                    &action,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<SigSet>(),
+                ),
+                0
+            );
+            assert_eq!(
+                send_signal_to_task(&mut *current as *mut TaskStruct, SIGUSR1),
+                0
+            );
+            assert!(current.thread_info.flags & crate::kernel::task::TIF_SIGPENDING != 0);
+
+            assert!(do_signal(&mut regs));
+            assert_eq!(regs.ip, action.sa_handler as u64);
+            assert_eq!(
+                current.thread_info.flags & crate::kernel::task::TIF_SIGPENDING,
+                0
+            );
+
+            sched::set_current(previous);
+        }
+        reset_for_tests();
+    }
+
+    #[test]
+    fn syscall_restart_handler_with_sa_restart_rewinds_original_syscall() {
+        let mut regs = syscall_restart_regs(ERESTARTSYS);
+        let action = RtSigAction {
+            sa_flags: SA_RESTART,
+            ..Default::default()
+        };
+
+        apply_syscall_restart_for_handler(&mut regs, &action);
+
+        assert_eq!(regs.ax, regs.orig_ax);
+        assert_eq!(regs.ip, 0x400100);
+    }
+
+    #[test]
+    fn syscall_restart_handler_without_sa_restart_returns_eintr() {
+        let mut regs = syscall_restart_regs(ERESTARTSYS);
+        let action = RtSigAction::default();
+
+        apply_syscall_restart_for_handler(&mut regs, &action);
+
+        assert_eq!(regs.ax, neg_errno(EINTR));
+        assert_eq!(regs.ip, 0x400102);
+    }
+
+    #[test]
+    fn syscall_restart_no_handler_rewinds_original_syscall() {
+        let mut regs = syscall_restart_regs(ERESTARTNOHAND);
+
+        apply_syscall_restart_without_handler(&mut regs);
+
+        assert_eq!(regs.ax, regs.orig_ax);
+        assert_eq!(regs.ip, 0x400100);
+    }
+
+    #[test]
+    fn syscall_restartblock_no_handler_uses_restart_syscall() {
+        let mut regs = syscall_restart_regs(ERESTART_RESTARTBLOCK);
+
+        apply_syscall_restart_without_handler(&mut regs);
+
+        assert_eq!(regs.ax, X86_64_NR_RESTART_SYSCALL);
+        assert_eq!(regs.ip, 0x400100);
     }
 
     #[test]
@@ -2028,6 +3621,39 @@ mod tests {
     }
 
     #[test]
+    fn late_sigkill_does_not_resurrect_zombie_task() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut sender = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        sender.pid = 190;
+        sender.tgid = 190;
+        sender.cred = &raw const INIT_CRED;
+        let mut zombie = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        zombie.pid = 191;
+        zombie.tgid = 191;
+        zombie.m26.exit_state = crate::kernel::task::task_state::EXIT_ZOMBIE;
+        zombie.__state.store(
+            crate::kernel::task::task_state::EXIT_ZOMBIE,
+            core::sync::atomic::Ordering::Release,
+        );
+
+        unsafe {
+            sched::set_current(&mut *sender as *mut TaskStruct);
+            assert_eq!(
+                send_signal_to_task(&mut *zombie as *mut TaskStruct, SIGKILL),
+                0
+            );
+            assert_eq!(
+                zombie.__state.load(core::sync::atomic::Ordering::Acquire),
+                crate::kernel::task::task_state::EXIT_ZOMBIE
+            );
+            sched::set_current(previous);
+        }
+        reset_for_tests();
+    }
+
+    #[test]
     fn sigterm_wakes_interruptible_task_for_syscall_exit_delivery() {
         let _guard = TEST_LOCK.lock();
         reset_for_tests();
@@ -2053,6 +3679,122 @@ mod tests {
                 crate::kernel::task::task_state::TASK_RUNNING
             );
             assert!(has_pending_signal_for_pid(92, SIGTERM));
+
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn default_sigterm_can_be_taken_by_blocking_wait() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 94;
+        current.tgid = 94;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            assert_eq!(
+                send_signal_to_task(&mut *current as *mut TaskStruct, SIGTERM),
+                0
+            );
+            assert_eq!(take_current_fatal_signal(), Some(SIGTERM));
+            assert!(!has_pending_signal_for_pid(94, SIGTERM));
+
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn handled_sigterm_is_preserved_for_signal_delivery() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 95;
+        current.tgid = 95;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            register_test_task(95, 95);
+            {
+                let mut table = SIGNAL_TABLE.lock();
+                let state = table.get_by_pid_mut(95).expect("registered");
+                state.actions[SIGTERM as usize].sa_handler = 0x1234;
+            }
+
+            assert_eq!(
+                send_signal_to_task(&mut *current as *mut TaskStruct, SIGTERM),
+                0
+            );
+            assert_eq!(take_current_fatal_signal(), None);
+            assert!(has_pending_signal_for_pid(95, SIGTERM));
+            assert!(has_unblocked_pending_signals(
+                &mut *current as *mut TaskStruct
+            ));
+
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn blocked_sigterm_is_not_taken_by_blocking_wait() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 96;
+        current.tgid = 96;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            register_test_task(96, 96);
+            {
+                let mut table = SIGNAL_TABLE.lock();
+                let state = table.get_by_pid_mut(96).expect("registered");
+                state.blocked.add(SIGTERM);
+            }
+
+            assert_eq!(
+                send_signal_to_task(&mut *current as *mut TaskStruct, SIGTERM),
+                0
+            );
+            assert_eq!(take_current_fatal_signal(), None);
+            assert!(has_pending_signal_for_pid(96, SIGTERM));
+            assert!(!has_unblocked_pending_signals(
+                &mut *current as *mut TaskStruct
+            ));
+
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn default_ignored_sigchld_does_not_interrupt_blocking_waits() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 97;
+        current.tgid = 97;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            assert_eq!(
+                send_signal_to_task(&mut *current as *mut TaskStruct, SIGCHLD),
+                0
+            );
+            assert!(!has_pending_signal_for_pid(97, SIGCHLD));
+            assert!(!has_unblocked_pending_signals(
+                &mut *current as *mut TaskStruct
+            ));
 
             sched::set_current(previous);
         }
@@ -2093,7 +3835,7 @@ mod tests {
             assert_eq!(child.m26.ptrace_stop_signal, SIGTSTP);
             assert!(!has_pending_signal_for_pid(102, SIGTSTP));
             assert!(!has_pending_signal_for_pid(102, SIGCONT));
-            assert!(has_pending_signal_for_pid(101, SIGCHLD));
+            assert!(!has_pending_signal_for_pid(101, SIGCHLD));
 
             assert_eq!(
                 send_signal_to_task(&mut *child as *mut TaskStruct, SIGCONT),

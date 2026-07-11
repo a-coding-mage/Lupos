@@ -966,6 +966,97 @@ unsafe extern "C" fn lupos_file_fault(vmf: *mut VmFault) -> VmFaultFlags {
     }
 }
 
+// ---------------------------------------------------------------------------
+// lupos_device_pfn_fault — direct MMIO/PFN device mappings (fbdev, …)
+// ---------------------------------------------------------------------------
+
+/// vm_ops for `VM_PFNMAP` device mappings such as `/dev/fb0`.
+///
+/// Unlike a page-cache mapping, a fault here does **not** allocate a fresh
+/// page: it maps the device's own physical aperture straight into the calling
+/// process, so userspace writes reach the hardware (a framebuffer's scanout
+/// memory, in the fbdev case) instead of a throwaway private copy.
+///
+/// Ref: Linux `remap_pfn_range()` plus a driver `->mmap` that sets `VM_PFNMAP`.
+pub static LUPOS_DEVICE_PFN_VM_OPS: VmOperationsStruct = VmOperationsStruct {
+    open: None,
+    close: None,
+    fault: Some(lupos_device_pfn_fault),
+    map_pages: None,
+    pfn_mkwrite: None,
+    access: None,
+};
+
+unsafe extern "C" fn lupos_device_pfn_fault(vmf: *mut VmFault) -> VmFaultFlags {
+    use crate::arch::x86::mm::paging::{_PAGE_DIRTY, _PAGE_PWT, _PAGE_RW};
+    use alloc::sync::Arc;
+
+    if vmf.is_null() {
+        return VM_FAULT_SIGBUS;
+    }
+
+    unsafe {
+        let vma = (*vmf).vma;
+        if vma.is_null() || (*vma).vm_file == 0 {
+            return VM_FAULT_SIGBUS;
+        }
+
+        // Ask the backing device which physical address maps this page offset.
+        // The driver's `->mmap` returns the physical base for the given byte
+        // offset (see `fbdev_mmap`); a device without one cannot be PFN-mapped.
+        let file_ptr = (*vma).vm_file as *const crate::fs::types::File;
+        let Some(mmap_fn) = (*file_ptr).fops.mmap else {
+            return VM_FAULT_SIGBUS;
+        };
+        Arc::increment_strong_count(file_ptr);
+        let file = Arc::from_raw(file_ptr);
+        let byte_off = (*vmf).pgoff << PAGE_SHIFT;
+        let phys = mmap_fn(&file, (*vmf).address, PAGE_SIZE as usize, 0, 0, byte_off);
+        drop(file);
+        let phys = match phys {
+            Ok(p) => p,
+            Err(_) => return VM_FAULT_SIGBUS,
+        };
+
+        let ptep = match pte_alloc((*vmf).pmd, (*vmf).address, _PAGE_TABLE) {
+            Some(p) => p,
+            None => return VM_FAULT_OOM,
+        };
+
+        // Install a fully permissive, write-combining PTE.  The MMIO frame has
+        // no `struct page`, so a later write-protect fault could never be
+        // resolved (`pfn_valid` is false for it) — map it present + writable +
+        // dirty up front so the CPU never faults on this page again.
+        let prot = pgprot_t(
+            _PAGE_PRESENT
+                | _PAGE_USER
+                | _PAGE_ACCESSED
+                | _PAGE_RW
+                | _PAGE_DIRTY
+                | _PAGE_PWT
+                | _PAGE_NX,
+        );
+        let pfn = phys >> PAGE_SHIFT;
+        let entry = pte_mkyoung(pfn_pte(pfn, prot));
+        set_pte_at((*vma).vm_mm as *mut (), (*vmf).address, ptep, entry);
+        (*vmf).pte = ptep;
+        // A true MMIO aperture (e.g. a VESA LFB) has no `struct page`, so
+        // `pfn_valid` is false and teardown's `put_page_from_pte` no-ops on it —
+        // leave `vmf.page` null and skip rss/refcount bookkeeping.  A RAM-backed
+        // framebuffer (the synthetic-fb test mode) *does* have a `struct page`;
+        // there we must take the reference that `put_page_from_pte` will later
+        // drop, or the driver's frame would be freed out from under it.
+        if pfn_valid(pfn as usize) {
+            let page = pfn_to_page(pfn as usize);
+            if !page.is_null() {
+                (*page)._refcount.fetch_add(1, Ordering::Relaxed);
+                (*page)._mapcount.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        VM_FAULT_NOPAGE
+    }
+}
+
 pub unsafe extern "C" fn filemap_fault(vmf: *mut VmFault) -> VmFaultFlags {
     use crate::mm::address_space::{page_uptodate, unlock_page, wait_on_page_locked};
     use crate::mm::filemap::{filemap_grab_folio, find_lock_page};

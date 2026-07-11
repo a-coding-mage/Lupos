@@ -111,16 +111,14 @@ pub fn sys_fcntl(files: &Arc<FilesStruct>, fd: i32, cmd: i32, arg: u64) -> Resul
             if arg >= NR_OPEN_MAX as u64 {
                 return Err(EINVAL);
             }
-            let f = files.get(fd)?;
-            let new = files.install_at_or_above(f, arg as usize, false)?;
+            let new = files.dup_at_or_above(fd, arg as usize, false)?;
             Ok(new as i64)
         }
         F_DUPFD_CLOEXEC => {
             if arg >= NR_OPEN_MAX as u64 {
                 return Err(EINVAL);
             }
-            let f = files.get(fd)?;
-            let new = files.install_at_or_above(f, arg as usize, true)?;
+            let new = files.dup_at_or_above(fd, arg as usize, true)?;
             Ok(new as i64)
         }
         F_GETLK | F_GETLK64 | F_OFD_GETLK => {

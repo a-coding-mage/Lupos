@@ -267,6 +267,23 @@ static RUN_QUEUE: Mutex<RunQueue> = Mutex::new(RunQueue {
     current_idx: 0,
 });
 
+/// Run a legacy runqueue critical section with local interrupts disabled.
+///
+/// The periodic LAPIC interrupt expires hrtimers, and an hrtimer callback may
+/// wake a task through `legacy_place_after_current()`. If the interrupt lands
+/// while task context owns `RUN_QUEUE`, the callback would otherwise spin on a
+/// lock held by the interrupted frame. This is the legacy equivalent of
+/// `rq::with_rq()`'s `rq_lock_irqsave()` discipline.
+fn with_legacy_run_queue<R>(f: impl FnOnce(&mut RunQueue) -> R) -> R {
+    let flags = crate::kernel::locking::irqflags::local_irq_save();
+    let result = {
+        let mut rq = RUN_QUEUE.lock();
+        f(&mut rq)
+    };
+    crate::kernel::locking::irqflags::local_irq_restore(flags);
+    result
+}
+
 #[cfg(test)]
 fn clear_legacy_run_queue_for_tests() {
     let mut rq = RUN_QUEUE.lock();
@@ -280,45 +297,46 @@ fn legacy_place_after_current(task: *mut TaskStruct) {
         return;
     }
     let current = unsafe { get_current() };
-    let mut rq = RUN_QUEUE.lock();
-    rq.normalize_legacy();
-    if rq.len == 0 {
-        rq.tasks[0] = task;
-        rq.len = 1;
-        rq.current_idx = 0;
-        return;
-    }
-    if task == current {
-        return;
-    }
-
-    if let Some(pos) = rq.active_tasks().iter().position(|&t| t == task) {
-        for i in pos..rq.len - 1 {
-            rq.tasks[i] = rq.tasks[i + 1];
+    with_legacy_run_queue(|rq| {
+        rq.normalize_legacy();
+        if rq.len == 0 {
+            rq.tasks[0] = task;
+            rq.len = 1;
+            rq.current_idx = 0;
+            return;
         }
-        rq.len -= 1;
-        let len = rq.len;
-        rq.tasks[len] = core::ptr::null_mut();
-    } else if rq.len >= MAX_RUN_QUEUE {
-        return;
-    }
+        if task == current {
+            return;
+        }
 
-    let current_pos = rq
-        .active_tasks()
-        .iter()
-        .position(|&t| !current.is_null() && t == current)
-        .unwrap_or_else(|| rq.current_idx.min(rq.len.saturating_sub(1)));
-    let idx = (current_pos + 1).min(rq.len);
-    for i in (idx..rq.len).rev() {
-        rq.tasks[i + 1] = rq.tasks[i];
-    }
-    rq.tasks[idx] = task;
-    rq.len += 1;
-    rq.current_idx = rq
-        .active_tasks()
-        .iter()
-        .position(|&t| !current.is_null() && t == current)
-        .unwrap_or(0);
+        if let Some(pos) = rq.active_tasks().iter().position(|&t| t == task) {
+            for i in pos..rq.len - 1 {
+                rq.tasks[i] = rq.tasks[i + 1];
+            }
+            rq.len -= 1;
+            let len = rq.len;
+            rq.tasks[len] = core::ptr::null_mut();
+        } else if rq.len >= MAX_RUN_QUEUE {
+            return;
+        }
+
+        let current_pos = rq
+            .active_tasks()
+            .iter()
+            .position(|&t| !current.is_null() && t == current)
+            .unwrap_or_else(|| rq.current_idx.min(rq.len.saturating_sub(1)));
+        let idx = (current_pos + 1).min(rq.len);
+        for i in (idx..rq.len).rev() {
+            rq.tasks[i + 1] = rq.tasks[i];
+        }
+        rq.tasks[idx] = task;
+        rq.len += 1;
+        rq.current_idx = rq
+            .active_tasks()
+            .iter()
+            .position(|&t| !current.is_null() && t == current)
+            .unwrap_or(0);
+    });
 }
 
 #[cfg(test)]
@@ -652,24 +670,25 @@ pub unsafe fn dequeue_task(task: *mut TaskStruct) {
         let _ = unsafe { dequeue_from_rq(cpu, task, class::DEQUEUE_SLEEP) };
         return;
     }
-    let mut rq = RUN_QUEUE.lock();
-    rq.normalize_legacy();
-    let pos = rq.active_tasks().iter().position(|&t| t == task);
-    if let Some(pos) = pos {
-        // Compact the array by shifting entries down.
-        for i in pos..rq.len - 1 {
-            rq.tasks[i] = rq.tasks[i + 1];
+    with_legacy_run_queue(|rq| {
+        rq.normalize_legacy();
+        let pos = rq.active_tasks().iter().position(|&t| t == task);
+        if let Some(pos) = pos {
+            // Compact the array by shifting entries down.
+            for i in pos..rq.len - 1 {
+                rq.tasks[i] = rq.tasks[i + 1];
+            }
+            rq.len -= 1;
+            let new_len = rq.len;
+            rq.tasks[new_len] = core::ptr::null_mut();
+            // Adjust current_idx if needed.
+            if rq.current_idx > pos && rq.current_idx > 0 {
+                rq.current_idx -= 1;
+            } else if rq.current_idx >= rq.len && rq.len > 0 {
+                rq.current_idx = 0;
+            }
         }
-        rq.len -= 1;
-        let new_len = rq.len;
-        rq.tasks[new_len] = core::ptr::null_mut();
-        // Adjust current_idx if needed.
-        if rq.current_idx > pos && rq.current_idx > 0 {
-            rq.current_idx -= 1;
-        } else if rq.current_idx >= rq.len && rq.len > 0 {
-            rq.current_idx = 0;
-        }
-    }
+    });
 }
 
 /// Cooperative legacy scheduler used by early uniprocessor milestones.
@@ -686,14 +705,19 @@ pub unsafe fn legacy_schedule() -> bool {
         return false;
     }
 
-    let (prev, next) = {
-        let mut rq = RUN_QUEUE.lock();
+    enum Pick {
+        Idle,
+        CurrentNotQueued,
+        Switch(*mut TaskStruct, *mut TaskStruct),
+    }
+
+    let pick = with_legacy_run_queue(|rq| {
         rq.normalize_legacy();
         if rq.len <= 1 {
             unsafe {
                 clear_need_resched(current);
             }
-            return true; // nothing to switch to
+            return Pick::Idle;
         }
 
         // Find the current task's position.
@@ -701,7 +725,7 @@ pub unsafe fn legacy_schedule() -> bool {
             unsafe {
                 clear_need_resched(current);
             }
-            return false;
+            return Pick::CurrentNotQueued;
         };
 
         // Advance to the next runnable task in round-robin order.
@@ -725,10 +749,15 @@ pub unsafe fn legacy_schedule() -> bool {
                     clear_need_resched(current);
                 }
             }
-            return true; // no other runnable task; system is idle
+            return Pick::Idle;
         }
         rq.current_idx = next_pos;
-        (rq.tasks[pos], rq.tasks[next_pos])
+        Pick::Switch(rq.tasks[pos], rq.tasks[next_pos])
+    });
+    let (prev, next) = match pick {
+        Pick::Idle => return true,
+        Pick::CurrentNotQueued => return false,
+        Pick::Switch(prev, next) => (prev, next),
     };
 
     if prev == next {
@@ -923,27 +952,33 @@ pub unsafe fn reschedule_runnable() {
 }
 
 pub unsafe fn schedule_with_irqs_enabled() {
-    crate::kernel::locking::local_irq_enable();
-    let idle = unsafe { schedule() };
-    if idle {
-        // Idle == every runnable task yielded. Drain pending Linux-driver
-        // hardware completions that have no native IRQ wakeup yet before
-        // halting; if we handled one, return so the next schedule picks up the
-        // now-runnable waiter instead of halting.
-        #[cfg(not(test))]
-        if pump_driver_abi_events_on_idle() {
-            crate::kernel::locking::local_irq_enable();
-            return;
-        }
-        unsafe {
-            // sti+hlt as a single sequence -- sti has a one-instruction grace
-            // window so a newly-pending interrupt cannot be missed between
-            // enabling IRQs and halting. Same idiom as
-            // halt_loop_with_softirq() (src/init/main.rs).
-            core::arch::asm!("sti; hlt", options(nomem, nostack, preserves_flags));
-        }
+    #[cfg(test)]
+    {
+        return;
     }
-    crate::kernel::locking::local_irq_enable();
+    #[cfg(not(test))]
+    {
+        crate::kernel::locking::local_irq_enable();
+        let idle = unsafe { schedule() };
+        if idle {
+            // Idle == every runnable task yielded. Drain pending Linux-driver
+            // hardware completions that have no native IRQ wakeup yet before
+            // halting; if we handled one, return so the next schedule picks up the
+            // now-runnable waiter instead of halting.
+            if pump_driver_abi_events_on_idle() {
+                crate::kernel::locking::local_irq_enable();
+                return;
+            }
+            unsafe {
+                // sti+hlt as a single sequence -- sti has a one-instruction grace
+                // window so a newly-pending interrupt cannot be missed between
+                // enabling IRQs and halting. Same idiom as
+                // halt_loop_with_softirq() (src/init/main.rs).
+                core::arch::asm!("sti; hlt", options(nomem, nostack, preserves_flags));
+            }
+        }
+        crate::kernel::locking::local_irq_enable();
+    }
 }
 
 // ── Kernel thread creation ───────────────────────────────────────────────────
@@ -1366,7 +1401,19 @@ pub unsafe fn try_to_wake_up(p: *mut TaskStruct, wake_flags: u32) -> bool {
     if p.is_null() {
         return false;
     }
+    let exit_mask =
+        crate::kernel::task::task_state::EXIT_ZOMBIE | crate::kernel::task::task_state::EXIT_DEAD;
     unsafe {
+        // Linux never makes an exiting task runnable again. In particular, a
+        // late SIGKILL may still resolve a zombie PID; blindly storing
+        // TASK_RUNNING here would resurrect that zombie and leave its parent
+        // spinning forever between exit_state and __state publication.
+        let state = (*p).__state.load(Ordering::Acquire);
+        if (*p).m26.exit_state & exit_mask != 0
+            || state & (exit_mask | crate::kernel::task::task_state::TASK_DEAD) != 0
+        {
+            return false;
+        }
         (*p).__state.store(
             crate::kernel::task::task_state::TASK_RUNNING,
             Ordering::Release,
@@ -1525,6 +1572,57 @@ mod tests {
     }
 
     #[test]
+    fn legacy_run_queue_lock_is_held_with_interrupts_disabled() {
+        let source = include_str!("mod.rs");
+        let helper = source
+            .split("fn with_legacy_run_queue")
+            .nth(1)
+            .expect("legacy runqueue irq-save helper must exist")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("legacy runqueue helper body end");
+        let save = helper
+            .find("local_irq_save()")
+            .expect("legacy runqueue helper must save and disable IRQs");
+        let lock = helper
+            .find("RUN_QUEUE.lock()")
+            .expect("legacy runqueue helper must acquire RUN_QUEUE");
+        let restore = helper
+            .find("local_irq_restore(flags)")
+            .expect("legacy runqueue helper must restore IRQs");
+        assert!(save < lock);
+        assert!(lock < restore);
+
+        for (start, end) in [
+            (
+                "fn legacy_place_after_current",
+                "#[cfg(test)]\nfn current_cpu_index",
+            ),
+            (
+                "pub unsafe fn dequeue_task",
+                "/// Cooperative legacy scheduler",
+            ),
+            ("pub unsafe fn legacy_schedule", "unsafe fn pick_next_task"),
+        ] {
+            let body = source
+                .split(start)
+                .nth(1)
+                .unwrap_or_else(|| panic!("missing legacy runqueue caller {start}"))
+                .split(end)
+                .next()
+                .unwrap_or_else(|| panic!("missing end marker for {start}"));
+            assert!(
+                body.contains("with_legacy_run_queue"),
+                "{start} must use the IRQ-safe legacy runqueue helper"
+            );
+            assert!(
+                !body.contains("RUN_QUEUE.lock()"),
+                "{start} must not acquire RUN_QUEUE directly"
+            );
+        }
+    }
+
+    #[test]
     fn legacy_scheduler_tick_only_requests_resched() {
         let _guard = legacy_sched_test_guard();
         let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
@@ -1625,6 +1723,35 @@ mod tests {
             "legacy wakeup must request a syscall-exit reschedule"
         );
         drop(rq);
+    }
+
+    #[test]
+    fn wake_rejects_exiting_tasks_without_resurrecting_them() {
+        let _guard = legacy_sched_test_guard();
+        for (exit_state, task_state) in [
+            (
+                crate::kernel::task::task_state::EXIT_ZOMBIE,
+                crate::kernel::task::task_state::TASK_RUNNING,
+            ),
+            (
+                crate::kernel::task::task_state::EXIT_ZOMBIE,
+                crate::kernel::task::task_state::EXIT_ZOMBIE,
+            ),
+            (
+                crate::kernel::task::task_state::EXIT_DEAD,
+                crate::kernel::task::task_state::EXIT_DEAD,
+            ),
+            (0, crate::kernel::task::task_state::TASK_DEAD),
+        ] {
+            let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+            let task_ptr = &mut *task as *mut TaskStruct;
+            task.m26.exit_state = exit_state;
+            task.__state.store(task_state, Ordering::Release);
+
+            assert!(!unsafe { wake_task(task_ptr) });
+            assert_eq!(task.__state.load(Ordering::Acquire), task_state);
+        }
+        assert_eq!(RUN_QUEUE.lock().len, 0);
     }
 
     #[test]
@@ -1745,27 +1872,29 @@ mod tests {
     fn task_switch_frame_must_stay_inside_kernel_stack() {
         let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         let task_ptr = &mut *task as *mut TaskStruct;
+        let stack_top = (KTHREAD_STACK_SIZE * 2) as u64;
+        let stack_bottom = stack_top - KTHREAD_STACK_SIZE as u64;
         task.__state.store(
             crate::kernel::task::task_state::TASK_RUNNING,
             Ordering::Release,
         );
-        task.stack = 0x8000usize as *mut core::ffi::c_void;
+        task.stack = stack_top as *mut core::ffi::c_void;
 
-        task.thread.sp = 0x8000 - SWITCH_FRAME_BYTES as u64;
+        task.thread.sp = stack_top - SWITCH_FRAME_BYTES as u64;
         assert!(unsafe { task_can_switch_to(task_ptr) });
 
-        task.thread.sp = 0x4000 - 8;
+        task.thread.sp = stack_bottom - 8;
         assert!(!unsafe { task_can_switch_to(task_ptr) });
 
-        task.thread.sp = 0x8000 - (SWITCH_FRAME_BYTES as u64 - 8);
+        task.thread.sp = stack_top - (SWITCH_FRAME_BYTES as u64 - 8);
         assert!(!unsafe { task_can_switch_to(task_ptr) });
 
-        task.thread.sp = 0x8000 - SWITCH_FRAME_BYTES as u64 + 1;
+        task.thread.sp = stack_top - SWITCH_FRAME_BYTES as u64 + 1;
         assert!(!unsafe { task_can_switch_to(task_ptr) });
 
         task.pid = 371;
         task.stack = core::ptr::null_mut();
-        task.thread.sp = 0x8000 - SWITCH_FRAME_BYTES as u64;
+        task.thread.sp = stack_top - SWITCH_FRAME_BYTES as u64;
         assert!(!unsafe { task_can_switch_to(task_ptr) });
 
         task.pid = 0;

@@ -322,11 +322,42 @@ fn fbdev_ioctl(_file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
             if not_copied == 0 { Ok(0) } else { Err(EFAULT) }
         }
         FBIOPUT_VSCREENINFO => {
-            // Refuse any mode change — we only support the bootloader-provided
-            // geometry.  Linux returns -EINVAL from fbcon under the same
-            // conditions, which X and Weston tolerate by falling back to
-            // FBIOGET_VSCREENINFO's reported mode.
-            Err(EINVAL)
+            // We support exactly one mode: the bootloader-provided geometry.
+            // Accept a request that matches it (a no-op, incl. the driver's
+            // FB_ACTIVATE_TEST probe) and reject anything else with -EINVAL,
+            // mirroring a real fixed-mode fbdev `fb_set_var`/`check_var`.
+            //
+            // Unconditionally returning -EINVAL breaks `xf86-video-fbdev`, whose
+            // `fbdevHWModeInit` treats a failed `FBIOPUT_VSCREENINFO` for the
+            // native mode as fatal ("mode initialization failed" →
+            // "AddScreen/ScreenInit failed").
+            if arg == 0 {
+                return Err(EFAULT);
+            }
+            let mut req = FbVarScreeninfo::default();
+            let not_copied = unsafe {
+                crate::arch::x86::kernel::uaccess::copy_from_user(
+                    &mut req as *mut FbVarScreeninfo as *mut u8,
+                    arg as *const u8,
+                    size_of::<FbVarScreeninfo>(),
+                )
+            };
+            if not_copied != 0 {
+                return Err(EFAULT);
+            }
+            // The visible resolution and pixel depth must match; virtual size
+            // may be equal or larger (the X server rounds the pitch up), and we
+            // ignore timing/margin fields we don't model.
+            if req.xres == info.width
+                && req.yres == info.height
+                && req.bits_per_pixel == info.bpp as u32
+                && req.xres_virtual >= info.width
+                && req.yres_virtual >= info.height
+            {
+                Ok(0)
+            } else {
+                Err(EINVAL)
+            }
         }
         FBIOGET_FSCREENINFO => {
             if arg == 0 {
@@ -365,16 +396,28 @@ fn fbdev_mmap(
     if off >= total || len == 0 {
         return Err(EINVAL);
     }
-    if off.saturating_add(len as u64) > total {
-        return Err(EINVAL);
-    }
-    // Identity-mapping: the kernel virtual address of the framebuffer is the
-    // same as its physical address (the linear aperture is direct-mapped in
-    // `kernel/memory/`), so userspace can use it directly.  A real
-    // `mmap` would set up a per-process VMA mapping; until the kernel
-    // exposes that to drivers, returning the kernel-visible address is the
-    // honest interim answer that lets the X server proceed.
-    Ok(info.kernel_addr.saturating_add(off))
+    // Note: `off + len` may exceed `total` on the final page — the framebuffer
+    // length is rarely page-aligned (e.g. 800x600x32 = 1_920_000 B = 468.75
+    // pages).  Linux `fb_mmap` maps `PAGE_ALIGN(len + offset)`, i.e. the whole
+    // last page, and so do we: the fault handler maps one full physical page per
+    // fault, and any bytes past `total` fall inside the (larger, page-aligned)
+    // hardware aperture.  Only reject offsets that start beyond the framebuffer.
+    //
+    // A userspace client (the X server) is taking ownership of the scanout
+    // aperture. Linux relies on the client issuing `KDSETMODE(KD_GRAPHICS)` on
+    // its VT to stop fbcon from repainting the text console over the graphics
+    // output; Xorg under Lupos never reaches that path (its logind/VT handling
+    // is unavailable), so fbcon would otherwise clobber every frame the client
+    // draws. Silence fbcon here, when the framebuffer is mmap'd for direct
+    // pixel output, mirroring the effect of the graphics-mode switch.
+    crate::kernel::console::set_fbcon_enabled(false);
+    // Return the *physical* framebuffer address for this byte offset.  The mm
+    // layer marks the VMA `VM_PFNMAP` (see `file_wants_pfn_mmap` /
+    // `LUPOS_DEVICE_PFN_VM_OPS`) and, on fault, maps this physical frame's pfn
+    // straight into the calling process — so userspace writes (X server pixel
+    // output) land in the real scanout aperture instead of a private page-cache
+    // copy.
+    Ok(info.phys_addr.saturating_add(off))
 }
 
 pub const FBDEV_FILE_OPS: FileOps = FileOps {

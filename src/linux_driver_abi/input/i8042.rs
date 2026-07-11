@@ -18,21 +18,76 @@ const STATUS_PORT: u16 = 0x64;
 const COMMAND_PORT: u16 = 0x64;
 const STATUS_OUTPUT_FULL: u8 = 0x01;
 const STATUS_INPUT_FULL: u8 = 0x02;
+/// Status bit 5 (`0x20`): the byte in the output buffer came from the **aux**
+/// (PS/2 mouse) channel rather than the keyboard.  Linux `i8042.c` calls this
+/// `I8042_STR_AUXDATA`.
+const STATUS_AUX_DATA: u8 = 0x20;
 const COMMAND_READ_CONFIG: u8 = 0x20;
 const COMMAND_WRITE_CONFIG: u8 = 0x60;
 const COMMAND_ENABLE_KEYBOARD: u8 = 0xAE;
+/// `0xA8` — enable the aux (mouse) port / clock.
+const COMMAND_ENABLE_AUX: u8 = 0xA8;
+/// `0xD4` — the next byte written to the data port is routed to the mouse.
+const COMMAND_WRITE_AUX: u8 = 0xD4;
 const CONFIG_IRQ1: u8 = 0x01;
+/// Controller-config bit 1: raise IRQ12 when aux data arrives.
+const CONFIG_IRQ12: u8 = 0x02;
 const CONFIG_DISABLE_KEYBOARD: u8 = 0x10;
+/// Controller-config bit 5: aux (mouse) clock disabled.  Cleared to let mouse
+/// packets flow.
+const CONFIG_DISABLE_MOUSE: u8 = 0x20;
 const CONFIG_TRANSLATION: u8 = 0x40;
 const KEYBOARD_ENABLE_SCANNING: u8 = 0xF4;
+/// PS/2 mouse commands (`drivers/input/mouse/psmouse-base.c`).
+const MOUSE_SET_DEFAULTS: u8 = 0xF6;
+const MOUSE_ENABLE_REPORTING: u8 = 0xF4;
+/// Standard PS/2 device acknowledge byte.
+const MOUSE_ACK: u8 = 0xFA;
+
+/// evdev id of `/dev/input/event1` (the PS/2 mouse) — see
+/// `input::register_default_evdev_devices`.
+const EVDEV_MOUSE_ID: u32 = 0xE002;
 
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 static ALT_DOWN: AtomicBool = AtomicBool::new(false);
 static EXTENDED: AtomicBool = AtomicBool::new(false);
 
+/// Separate extended-prefix latch for the evdev bridge.  The console decoder
+/// consumes its own [`EXTENDED`] latch inside `decode_scancode_input`, so the
+/// raw-scancode → evdev path tracks the `0xE0` prefix independently.
+static EVDEV_EXTENDED: AtomicBool = AtomicBool::new(false);
+
+/// evdev id of `/dev/input/event0` (the AT keyboard) — see
+/// `input::register_default_evdev_devices`.
+const EVDEV_KEYBOARD_ID: u32 = 0xE001;
+
 lazy_static! {
     static ref BYTE_QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
+    static ref MOUSE_STATE: Mutex<MousePacket> = Mutex::new(MousePacket::new());
+}
+
+/// Whether the aux (mouse) channel initialised and enabled stream reporting.
+static MOUSE_PRESENT: AtomicBool = AtomicBool::new(false);
+
+/// Accumulates the 3-byte PS/2 mouse movement packet
+/// (`drivers/input/mouse/psmouse-base.c`).
+struct MousePacket {
+    bytes: [u8; 3],
+    index: usize,
+    /// Previous button bitmap (bit0 left, bit1 right, bit2 middle) so we only
+    /// emit `EV_KEY` transitions.
+    buttons: u8,
+}
+
+impl MousePacket {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 3],
+            index: 0,
+            buttons: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,17 +112,63 @@ pub enum ConsoleInput {
 
 pub fn init() {
     BYTE_QUEUE.lock().clear();
+    *MOUSE_STATE.lock() = MousePacket::new();
+    MOUSE_PRESENT.store(false, Ordering::Release);
     drain_pending();
 
+    // Enable the aux (mouse) port before touching the config byte so the
+    // controller accepts the mouse-directed writes below.
+    let _ = write_command(COMMAND_ENABLE_AUX);
+
     if let Some(mut config) = read_config() {
-        config &= !CONFIG_DISABLE_KEYBOARD;
-        config |= CONFIG_IRQ1 | CONFIG_TRANSLATION;
+        config &= !(CONFIG_DISABLE_KEYBOARD | CONFIG_DISABLE_MOUSE);
+        config |= CONFIG_IRQ1 | CONFIG_IRQ12 | CONFIG_TRANSLATION;
         write_config(config);
     }
 
     let _ = write_command(COMMAND_ENABLE_KEYBOARD);
     let _ = write_data(KEYBOARD_ENABLE_SCANNING);
+
+    init_mouse();
     drain_pending();
+}
+
+/// Initialise the PS/2 mouse: restore defaults, then enable stream-mode data
+/// reporting.  Each command is answered with `0xFA` (ACK).  Sets
+/// [`MOUSE_PRESENT`] when reporting is successfully enabled.
+fn init_mouse() {
+    // Set-defaults settles sample rate / resolution / scaling.
+    let _ = mouse_command(MOUSE_SET_DEFAULTS);
+    // Enable data reporting — the mouse now streams 3-byte movement packets.
+    if mouse_command(MOUSE_ENABLE_REPORTING) {
+        MOUSE_PRESENT.store(true, Ordering::Release);
+    }
+}
+
+/// Send one byte to the mouse (via the `0xD4` prefix) and consume its ACK.
+/// Returns true when the mouse acknowledged (`0xFA`).
+fn mouse_command(command: u8) -> bool {
+    if !write_command(COMMAND_WRITE_AUX) {
+        return false;
+    }
+    if !write_data(command) {
+        return false;
+    }
+    // The ACK is delivered on the aux channel; a set-defaults/reset can also
+    // emit a self-test byte first, so scan a few responses for the ACK.
+    for _ in 0..4 {
+        match read_data_timeout() {
+            Some(MOUSE_ACK) => return true,
+            Some(_) => continue,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Whether the PS/2 mouse initialised and is streaming movement packets.
+pub fn mouse_present() -> bool {
+    MOUSE_PRESENT.load(Ordering::Acquire)
 }
 
 fn wait_input_clear() -> bool {
@@ -151,11 +252,171 @@ pub fn try_read_input() -> Option<ConsoleInput> {
     if let Some(byte) = BYTE_QUEUE.lock().pop_front() {
         return Some(ConsoleInput::Byte(byte));
     }
-    if !controller_has_data() {
-        return None;
+    // Port 0x60 is shared by the keyboard and the aux (mouse) channel; the
+    // status byte's AUX bit says which produced the pending byte.  This polled
+    // path is the single reader (pumped from the idle loop), so drain until we
+    // either surface a console byte or the buffer empties — mouse bytes and
+    // bare modifiers must not stop the drain, or a keystroke queued behind a
+    // mouse packet would stall.
+    loop {
+        let status = unsafe { crate::arch::x86::include::asm::io::inb(STATUS_PORT) };
+        if status & STATUS_OUTPUT_FULL == 0 {
+            return None;
+        }
+        let byte = unsafe { crate::arch::x86::include::asm::io::inb(DATA_PORT) };
+        if status & STATUS_AUX_DATA != 0 {
+            feed_mouse_byte(byte);
+            continue;
+        }
+        // Mirror every raw scancode into the evdev `/dev/input/event0` device
+        // so X.Org's evdev driver receives keystrokes, while the cooked ASCII
+        // path keeps feeding the console/tty.
+        feed_evdev_scancode(byte);
+        if let Some(input) = enqueue_decoded(byte) {
+            return Some(input);
+        }
     }
-    let scancode = unsafe { crate::arch::x86::include::asm::io::inb(DATA_PORT) };
-    enqueue_decoded(scancode)
+}
+
+/// Feed one aux-channel byte into the PS/2 mouse packet decoder and, on a
+/// complete 3-byte packet, emit the corresponding evdev events on
+/// `/dev/input/event1` (`EV_REL` motion + `EV_KEY` button transitions).
+///
+/// PS/2 packet layout (`drivers/input/mouse/psmouse-base.c`):
+///   byte0: YO XO YS XS 1 M R L   (overflow, sign, always-1, buttons)
+///   byte1: X movement (9-bit two's complement with XS)
+///   byte2: Y movement (9-bit two's complement with YS)
+fn feed_mouse_byte(byte: u8) {
+    use super::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EV_KEY, EV_REL, EV_SYN, REL_X, REL_Y};
+
+    let (dx, dy, buttons, prev) = {
+        let mut pkt = MOUSE_STATE.lock();
+        // Resync: the first packet byte always has bit3 set.  If it is clear we
+        // are mid-stream out of alignment, so drop the byte.
+        if pkt.index == 0 && (byte & 0x08) == 0 {
+            return;
+        }
+        let idx = pkt.index;
+        pkt.bytes[idx] = byte;
+        pkt.index += 1;
+        if pkt.index < 3 {
+            return;
+        }
+        pkt.index = 0;
+
+        let flags = pkt.bytes[0];
+        let mut dx = pkt.bytes[1] as i32;
+        let mut dy = pkt.bytes[2] as i32;
+        // Sign-extend the 9-bit deltas.
+        if flags & 0x10 != 0 {
+            dx -= 0x100;
+        }
+        if flags & 0x20 != 0 {
+            dy -= 0x100;
+        }
+        // Overflow bits mean the deltas are unreliable — drop the motion but
+        // still honour the button state.
+        if flags & 0xC0 != 0 {
+            dx = 0;
+            dy = 0;
+        }
+        let buttons = flags & 0x07;
+        let prev = pkt.buttons;
+        pkt.buttons = buttons;
+        (dx, dy, buttons, prev)
+    };
+
+    let Some(dev) = super::find_input_dev(EVDEV_MOUSE_ID) else {
+        return;
+    };
+
+    let mut emitted = false;
+    for (mask, code) in [(0x01u8, BTN_LEFT), (0x02, BTN_RIGHT), (0x04, BTN_MIDDLE)] {
+        if (buttons & mask) != (prev & mask) {
+            dev.input_event(EV_KEY, code, if buttons & mask != 0 { 1 } else { 0 });
+            emitted = true;
+        }
+    }
+    if dx != 0 {
+        dev.input_event(EV_REL, REL_X, dx);
+        emitted = true;
+    }
+    if dy != 0 {
+        // PS/2 reports +Y as "up"; evdev/screen coordinates grow downward.
+        dev.input_event(EV_REL, REL_Y, -dy);
+        emitted = true;
+    }
+    if emitted {
+        dev.input_event(EV_SYN, 0, 0);
+    }
+}
+
+/// Bridge a raw AT set-1 scancode into an evdev `EV_KEY` event on
+/// `/dev/input/event0`.  For the set-1 base range (`0x01..=0x58`) the Linux
+/// keycode equals the scancode value — Linux's keycode table is aligned to AT
+/// set-1 — and the high bit is the key-release flag.  Extended (`0xE0`-prefixed)
+/// codes use a small side table.  A `SYN_REPORT` follows each key event, as
+/// evdev readers expect.
+fn feed_evdev_scancode(scancode: u8) {
+    // Multi-byte prefixes: latch 0xE0, ignore the 0xE1 (Pause) lead-in.
+    if scancode == 0xE0 {
+        EVDEV_EXTENDED.store(true, Ordering::Release);
+        return;
+    }
+    if scancode == 0xE1 {
+        return;
+    }
+    let extended = EVDEV_EXTENDED.swap(false, Ordering::AcqRel);
+    let Some((keycode, value)) = evdev_key_event(scancode, extended) else {
+        return;
+    };
+    let Some(dev) = super::find_input_dev(EVDEV_KEYBOARD_ID) else {
+        return;
+    };
+    dev.input_event(super::EV_KEY, keycode, value);
+    // SYN_REPORT (code 0) closes the event frame.
+    dev.input_event(super::EV_SYN, 0, 0);
+}
+
+/// Pure scancode → `(keycode, value)` translation for the evdev bridge.
+/// `value` is 1 for press, 0 for release.  Returns `None` for scancodes with
+/// no evdev mapping (unknown extended codes, out-of-range base codes).
+fn evdev_key_event(scancode: u8, extended: bool) -> Option<(u16, i32)> {
+    let released = (scancode & 0x80) != 0;
+    let base = scancode & 0x7F;
+    let keycode = if extended {
+        evdev_extended_keycode(base)?
+    } else if (0x01..=0x58).contains(&base) {
+        base as u16
+    } else {
+        return None;
+    };
+    Some((keycode, if released { 0 } else { 1 }))
+}
+
+/// Map the common `0xE0`-prefixed set-1 scancodes to their Linux keycodes
+/// (`include/uapi/linux/input-event-codes.h`).  Only the keys a login session
+/// realistically needs are covered; anything else is dropped.
+fn evdev_extended_keycode(base: u8) -> Option<u16> {
+    Some(match base {
+        0x1C => 96,  // KEY_KPENTER
+        0x1D => 97,  // KEY_RIGHTCTRL
+        0x35 => 98,  // KEY_KPSLASH
+        0x38 => 100, // KEY_RIGHTALT
+        0x47 => 102, // KEY_HOME
+        0x48 => 103, // KEY_UP
+        0x49 => 104, // KEY_PAGEUP
+        0x4B => 105, // KEY_LEFT
+        0x4D => 106, // KEY_RIGHT
+        0x4F => 107, // KEY_END
+        0x50 => 108, // KEY_DOWN
+        0x51 => 109, // KEY_PAGEDOWN
+        0x52 => 110, // KEY_INSERT
+        0x53 => 111, // KEY_DELETE
+        0x5B => 125, // KEY_LEFTMETA
+        0x5C => 126, // KEY_RIGHTMETA
+        _ => return None,
+    })
 }
 
 fn enqueue_decoded(scancode: u8) -> Option<ConsoleInput> {
@@ -555,6 +816,77 @@ mod tests {
             decode_scancode_input(0x53),
             Some(DecodedInput::Action(ConsoleAction::Restart))
         );
+    }
+
+    #[test]
+    fn evdev_maps_base_scancodes_to_matching_keycodes() {
+        // AT set-1 base range: keycode == scancode, high bit = release.
+        assert_eq!(evdev_key_event(0x1E, false), Some((30, 1))); // KEY_A press
+        assert_eq!(evdev_key_event(0x9E, false), Some((30, 0))); // KEY_A release
+        assert_eq!(evdev_key_event(0x1C, false), Some((28, 1))); // KEY_ENTER
+        assert_eq!(evdev_key_event(0x2A, false), Some((42, 1))); // KEY_LEFTSHIFT
+        assert_eq!(evdev_key_event(0x39, false), Some((57, 1))); // KEY_SPACE
+    }
+
+    #[test]
+    fn evdev_maps_extended_scancodes_and_drops_unknowns() {
+        assert_eq!(evdev_key_event(0x48, true), Some((103, 1))); // KEY_UP press
+        assert_eq!(evdev_key_event(0xC8, true), Some((103, 0))); // KEY_UP release
+        assert_eq!(evdev_key_event(0x1D, true), Some((97, 1))); // KEY_RIGHTCTRL
+        assert_eq!(evdev_key_event(0x2A, true), None); // fake-shift filler, dropped
+        assert_eq!(evdev_key_event(0x00, false), None); // out of range
+    }
+
+    #[test]
+    fn ps2_mouse_packet_decodes_to_evdev_rel_and_buttons() {
+        use super::super::{
+            BTN_LEFT, EV_KEY, EV_REL, EV_SYN, InputDev, REL_X, REL_Y, find_input_dev,
+            input_register_device,
+        };
+        // Register the event1 pointer device (idempotent across parallel tests
+        // would race on the shared 0xE002 id, so use it directly here — this is
+        // the canonical mouse id the decoder targets).
+        if find_input_dev(EVDEV_MOUSE_ID).is_none() {
+            let _ = input_register_device(InputDev::new("test-mouse", EVDEV_MOUSE_ID));
+        }
+        let dev = find_input_dev(EVDEV_MOUSE_ID).unwrap();
+        let _ = dev.drain_events();
+        *MOUSE_STATE.lock() = MousePacket::new();
+
+        // Left button held, move +5 in X and +3 in Y (PS/2 up-positive).
+        // byte0: bit3 set (0x08) + left button (0x01) = 0x09.
+        feed_mouse_byte(0x09);
+        feed_mouse_byte(5);
+        feed_mouse_byte(3);
+
+        let events = dev.drain_events();
+        // Expect: BTN_LEFT press, REL_X +5, REL_Y -3 (inverted), SYN.
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == EV_KEY && e.code == BTN_LEFT && e.value == 1)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == EV_REL && e.code == REL_X && e.value == 5)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == EV_REL && e.code == REL_Y && e.value == -3)
+        );
+        assert!(events.iter().any(|e| e.event_type == EV_SYN));
+    }
+
+    #[test]
+    fn ps2_mouse_resyncs_on_missing_sync_bit() {
+        // A first packet byte without bit3 set is dropped (out-of-sync).
+        *MOUSE_STATE.lock() = MousePacket::new();
+        feed_mouse_byte(0x00); // no sync bit → ignored
+        assert_eq!(MOUSE_STATE.lock().index, 0);
+        feed_mouse_byte(0x08); // valid first byte
+        assert_eq!(MOUSE_STATE.lock().index, 1);
     }
 
     #[test]

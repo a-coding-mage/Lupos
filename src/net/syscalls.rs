@@ -24,7 +24,7 @@ use crate::fs::ops::{FileOps, NOOP_FILE_OPS, NOOP_INODE_OPS};
 use crate::fs::types::{FileRef, Inode, InodeKind, InodePrivate};
 use crate::include::uapi::errno::{
     EADDRINUSE, EAGAIN, EBADF, EFAULT, EINTR, EINVAL, ENOENT, ENOPROTOOPT, ENOSYS, ENOTCONN,
-    ENOTDIR, EPERM,
+    ENOTDIR, EPERM, ERANGE,
 };
 use crate::include::uapi::fcntl::{O_NONBLOCK, O_RDWR};
 use crate::kernel::capability::{CAP_NET_RAW, capable};
@@ -545,7 +545,7 @@ fn socket_release(file: FileRef) {
     let token = *file.private.lock();
     if token != 0 {
         if let Some(sock) = SOCKETS.lock().remove(&token) {
-            socket::release_bound_socket(&sock);
+            socket::release_socket(&sock);
         }
     }
 }
@@ -565,7 +565,11 @@ fn socket_file_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<us
     loop {
         match socket::recvmsg(&sock, buf) {
             Ok(n) => return Ok(n),
-            Err(EAGAIN) if !nonblocking => wait_for_socket_recv(&sock, recv_timeout_ns)?,
+            Err(EAGAIN) if !nonblocking => {
+                if let Err(errno) = wait_for_socket_recv(&sock, recv_timeout_ns) {
+                    return Err(errno);
+                }
+            }
             Err(errno) => return Err(errno),
         }
     }
@@ -580,30 +584,37 @@ fn socket_file_poll(file: &FileRef) -> u32 {
     let Ok(sock) = socket_from_file(file) else {
         return crate::fs::select::POLLERR as u32;
     };
-    let socket = sock.lock();
-    let mut mask = 0u32;
-    let readable = if socket.state == SocketState::Listening {
-        !socket.backlog.is_empty()
-    } else {
-        // A hung-up stream is readable: the pending read drains to EOF
-        // (Linux tcp_poll() reports EPOLLIN once the peer closes).
-        // TODO(parity): Linux also raises EPOLLHUP here; systemd's PID1
-        // event loop currently fails manager startup when it sees it —
-        // re-add once the sd-event interaction is understood.
-        !socket.recvq.is_empty() || socket::stream_hangup_locked(&socket)
+    let mask = {
+        let socket = sock.lock();
+        let mut mask = 0u32;
+        let readable = if socket.state == SocketState::Listening {
+            !socket.backlog.is_empty()
+        } else {
+            // A hung-up stream is readable: the pending read drains to EOF
+            // (Linux tcp_poll() reports EPOLLIN once the peer closes).
+            // TODO(parity): Linux also raises EPOLLHUP here; systemd's PID1
+            // event loop currently fails manager startup when it sees it —
+            // re-add once the sd-event interaction is understood.
+            !socket.recvq.is_empty() || socket::stream_hangup_locked(&socket)
+        };
+        if readable {
+            // Linux AF_UNIX poll reports normal readable data as both EPOLLIN and
+            // EPOLLRDNORM (vendor/linux/net/unix/af_unix.c::unix_poll).
+            mask |= (crate::fs::select::POLLIN | crate::fs::select::POLLRDNORM) as u32;
+        }
+        let datagram_writable = matches!(socket.sock_type, socket::SOCK_DGRAM | socket::SOCK_RAW)
+            && socket.state != SocketState::Closed
+            && socket.state != SocketState::Listening;
+        if socket.state == SocketState::Connected || datagram_writable {
+            // unix_poll() likewise reports writable streams with EPOLLOUT and
+            // EPOLLWRNORM.
+            mask |= (crate::fs::select::POLLOUT | crate::fs::select::POLLWRNORM) as u32;
+        }
+        if socket.state == SocketState::Closed {
+            mask |= crate::fs::select::POLLERR as u32;
+        }
+        mask
     };
-    if readable {
-        mask |= crate::fs::select::POLLIN as u32;
-    }
-    let datagram_writable = matches!(socket.sock_type, socket::SOCK_DGRAM | socket::SOCK_RAW)
-        && socket.state != SocketState::Closed
-        && socket.state != SocketState::Listening;
-    if socket.state == SocketState::Connected || datagram_writable {
-        mask |= crate::fs::select::POLLOUT as u32;
-    }
-    if socket.state == SocketState::Closed {
-        mask |= crate::fs::select::POLLERR as u32;
-    }
     mask
 }
 
@@ -689,6 +700,12 @@ fn socket_file_is_nonblocking(file: &FileRef) -> bool {
     file.flags.load(Ordering::Acquire) & O_NONBLOCK != 0
 }
 
+fn drop_file_refs(fds: alloc::vec::Vec<FileRef>) {
+    for file in fds {
+        crate::fs::file::fput(file);
+    }
+}
+
 fn recvmsg_is_nonblocking(file: &FileRef, flags: i32) -> bool {
     flags & MSG_DONTWAIT != 0 || socket_file_is_nonblocking(file)
 }
@@ -757,7 +774,7 @@ fn wait_for_socket_recv(sock: &SocketRef, timeout_ns: u64) -> Result<(), i32> {
             crate::kernel::signal::exit_if_fatal_signal_pending_current();
         }
         crate::init::rootfs::drain_console_control_bytes();
-        if crate::kernel::signal::current_has_pending_signals() {
+        if crate::kernel::signal::current_has_unblocked_pending_signals() {
             return Err(EINTR);
         }
         if let Some(deadline_ns) = deadline_ns {
@@ -774,7 +791,11 @@ fn wait_for_socket_recv(sock: &SocketRef, timeout_ns: u64) -> Result<(), i32> {
 }
 
 #[cfg(test)]
+static TEST_SOCKET_RECV_WAIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
 fn wait_for_socket_recv(_sock: &SocketRef, _timeout_ns: u64) -> Result<(), i32> {
+    TEST_SOCKET_RECV_WAIT_CALLS.fetch_add(1, Ordering::AcqRel);
     Err(EAGAIN)
 }
 
@@ -1182,10 +1203,11 @@ pub unsafe fn sys_connect(fd: i32, addr: *const u8, addrlen: u32) -> i64 {
         Err(errno) => return -(errno as i64),
     };
     let parsed = read_sockaddr(addr, addrlen);
-    match parsed.clone().and_then(|sa| socket::connect(&sock, sa)) {
+    let ret = match parsed.clone().and_then(|sa| socket::connect(&sock, sa)) {
         Ok(()) => 0,
         Err(errno) => -(errno as i64),
-    }
+    };
+    ret
 }
 
 pub unsafe fn sys_accept4(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: i32) -> i64 {
@@ -1206,7 +1228,9 @@ pub unsafe fn sys_accept4(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: i32)
                     return -(errno as i64);
                 }
             }
-            Err(errno) => return -(errno as i64),
+            Err(errno) => {
+                return -(errno as i64);
+            }
         }
     };
     if !addr.is_null() || !addrlen.is_null() {
@@ -1272,7 +1296,20 @@ pub unsafe fn sys_getsockname(fd: i32, addr: *mut u8, addrlen: *mut u32) -> i64 
         Ok(sock) => sock,
         Err(errno) => return -(errno as i64),
     };
-    let local = sock.lock().local.clone();
+    let (family, local) = {
+        let socket = sock.lock();
+        (socket.family, socket.local.clone())
+    };
+    let local = local.or_else(|| {
+        if family == AF_UNIX {
+            // vendor/linux/net/unix/af_unix.c::unix_getname(): unnamed
+            // AF_UNIX sockets report sa_family=AF_UNIX and length
+            // offsetof(struct sockaddr_un, sun_path), not EINVAL.
+            Some(SockAddr::Unix(String::new()))
+        } else {
+            None
+        }
+    });
     match local {
         Some(local) => match write_sockaddr(&local, addr, addrlen) {
             Ok(()) => 0,
@@ -1478,6 +1515,21 @@ pub unsafe fn sys_getsockopt(fd: i32, level: i32, opt: i32, val: *mut u8, len: *
             Err(errno) => -(errno as i64),
         };
     }
+    if level == SOL_SOCKET && opt as u32 == socket::SO_PEERSEC {
+        return match socket_from_fd(fd) {
+            // Lupos has no peer security label model yet. Linux reaches
+            // security_socket_getpeersec_stream() here and returns
+            // -ENOPROTOOPT when the active LSM has no stream peer label.
+            Ok(_) => -(ENOPROTOOPT as i64),
+            Err(errno) => -(errno as i64),
+        };
+    }
+    if level == SOL_SOCKET && opt as u32 == socket::SO_PEERGROUPS {
+        return match socket_from_fd(fd).and_then(|sock| copy_unix_peergroups(&sock, val, len)) {
+            Ok(()) => 0,
+            Err(errno) => -(errno as i64),
+        };
+    }
     if val.is_null() {
         return -(EFAULT as i64);
     }
@@ -1601,6 +1653,44 @@ fn netlink_membership_len(sock: &SocketRef) -> usize {
     ((groups + 7) / 8 + 3) & !3
 }
 
+fn current_socket_cred_fallback() -> socket::SocketCred {
+    let task = unsafe { sched::get_current() };
+    if task.is_null() {
+        return socket::SocketCred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+            groups: Default::default(),
+            pid_ref: None,
+        };
+    }
+    let cred = unsafe { (*task).cred };
+    if cred.is_null() {
+        socket::SocketCred {
+            pid: unsafe { (*task).pid },
+            uid: 0,
+            gid: 0,
+            groups: Default::default(),
+            pid_ref: None,
+        }
+    } else {
+        socket::SocketCred {
+            pid: unsafe { (*task).pid },
+            uid: unsafe { (*cred).euid.0 },
+            gid: unsafe { (*cred).egid.0 },
+            groups: unsafe { (*cred).group_info },
+            pid_ref: None,
+        }
+    }
+}
+
+fn unix_peer_cred(sock: &SocketRef) -> socket::SocketCred {
+    sock.lock()
+        .peer_cred
+        .clone()
+        .unwrap_or_else(current_socket_cred_fallback)
+}
+
 fn copy_unix_peercred(sock: &SocketRef, val: *mut u8, len: *mut u32) -> Result<(), i32> {
     if sock.lock().family != AF_UNIX {
         return Err(EINVAL);
@@ -1614,33 +1704,7 @@ fn copy_unix_peercred(sock: &SocketRef, val: *mut u8, len: *mut u32) -> Result<(
         return Err(EINVAL);
     }
 
-    let peer = sock.lock().peer_cred.clone().unwrap_or_else(|| {
-        let task = unsafe { sched::get_current() };
-        if task.is_null() {
-            return socket::SocketCred {
-                pid: 0,
-                uid: 0,
-                gid: 0,
-                pid_ref: None,
-            };
-        }
-        let cred = unsafe { (*task).cred };
-        if cred.is_null() {
-            socket::SocketCred {
-                pid: unsafe { (*task).pid },
-                uid: 0,
-                gid: 0,
-                pid_ref: None,
-            }
-        } else {
-            socket::SocketCred {
-                pid: unsafe { (*task).pid },
-                uid: unsafe { (*cred).euid.0 },
-                gid: unsafe { (*cred).egid.0 },
-                pid_ref: None,
-            }
-        }
-    });
+    let peer = unix_peer_cred(sock);
     let cred = LinuxUcred {
         pid: peer.pid,
         uid: peer.uid,
@@ -1648,6 +1712,31 @@ fn copy_unix_peercred(sock: &SocketRef, val: *mut u8, len: *mut u32) -> Result<(
     };
     unsafe {
         core::ptr::write_unaligned(val as *mut LinuxUcred, cred);
+    }
+    Ok(())
+}
+
+fn copy_unix_peergroups(sock: &SocketRef, val: *mut u8, len: *mut u32) -> Result<(), i32> {
+    if sock.lock().family != AF_UNIX {
+        return Err(EINVAL);
+    }
+    let peer = unix_peer_cred(sock);
+    let group_count = (peer.groups.ngroups as usize).min(crate::kernel::cred::NGROUPS_MAX_INLINE);
+    let need = (group_count * core::mem::size_of::<u32>()) as u32;
+    let have = unsafe { core::ptr::read_unaligned(len) };
+    unsafe {
+        core::ptr::write_unaligned(len, need);
+    }
+    if have < need {
+        return Err(ERANGE);
+    }
+    if need != 0 && val.is_null() {
+        return Err(EFAULT);
+    }
+    for idx in 0..group_count {
+        unsafe {
+            core::ptr::write_unaligned((val as *mut u32).add(idx), peer.groups.gid[idx].0);
+        }
     }
     Ok(())
 }
@@ -1716,10 +1805,12 @@ pub unsafe fn sys_recvfrom(
     if buf.is_null() && len != 0 {
         return -(EFAULT as i64);
     }
-    let sock = match socket_from_fd(fd) {
-        Ok(sock) => sock,
+    let (file, sock) = match socket_file_from_fd(fd) {
+        Ok(pair) => pair,
         Err(errno) => return -(errno as i64),
     };
+    let nonblocking = recvmsg_is_nonblocking(&file, flags);
+    let recv_timeout_ns = sock.lock().recv_timeout_ns;
     let mut empty = [];
     let out = if len == 0 {
         &mut empty[..]
@@ -1728,22 +1819,30 @@ pub unsafe fn sys_recvfrom(
     };
     // Honour MSG_PEEK / MSG_TRUNC for parity with sock_recvmsg.
     // Ref: vendor/linux/net/socket.c::__sys_recvfrom.
-    match socket::recvmsg_full(&sock, out, flags) {
-        Ok((n, peer, _, _, real_len)) => {
-            if (!src.is_null() || !src_len.is_null())
-                && let Some(peer) = peer
-            {
-                if let Err(errno) = write_sockaddr(&peer, src, src_len) {
+    loop {
+        match socket::recvmsg_full(&sock, out, flags) {
+            Ok((n, peer, _, _, real_len)) => {
+                if (!src.is_null() || !src_len.is_null())
+                    && let Some(peer) = peer
+                {
+                    if let Err(errno) = write_sockaddr(&peer, src, src_len) {
+                        return -(errno as i64);
+                    }
+                }
+                let ret = if flags & MSG_TRUNC != 0 {
+                    real_len as i64
+                } else {
+                    n as i64
+                };
+                return ret;
+            }
+            Err(EAGAIN) if !nonblocking => {
+                if let Err(errno) = wait_for_socket_recv(&sock, recv_timeout_ns) {
                     return -(errno as i64);
                 }
             }
-            if flags & MSG_TRUNC != 0 {
-                real_len as i64
-            } else {
-                n as i64
-            }
+            Err(errno) => return -(errno as i64),
         }
-        Err(errno) => -(errno as i64),
     }
 }
 
@@ -1770,12 +1869,18 @@ pub unsafe fn sys_sendmsg(fd: i32, msg: *const LinuxMsghdr, flags: i32) -> i64 {
     if !scm_fds.is_empty() {
         let ft = match current_files() {
             Ok(ft) => ft,
-            Err(errno) => return -(errno as i64),
+            Err(errno) => {
+                drop_file_refs(files);
+                return -(errno as i64);
+            }
         };
         for fd in &scm_fds {
             match ft.get(*fd) {
-                Ok(file) => files.push(file),
-                Err(errno) => return -(errno as i64),
+                Ok(file) => files.push(crate::fs::file::fget(&file)),
+                Err(errno) => {
+                    drop_file_refs(files);
+                    return -(errno as i64);
+                }
             }
         }
     }
@@ -1792,10 +1897,12 @@ pub unsafe fn sys_sendmsg(fd: i32, msg: *const LinuxMsghdr, flags: i32) -> i64 {
             cred.gid
         );
     }
-
     let sock = match socket_from_fd(fd) {
         Ok(sock) => sock,
-        Err(errno) => return -(errno as i64),
+        Err(errno) => {
+            drop_file_refs(files);
+            return -(errno as i64);
+        }
     };
 
     // If the caller specified an explicit destination address, use the
@@ -1816,7 +1923,10 @@ pub unsafe fn sys_sendmsg(fd: i32, msg: *const LinuxMsghdr, flags: i32) -> i64 {
                 }
                 socket::sendto_with_fds(&sock, &bytes, peer, files)
             }
-            Err(errno) => Err(errno),
+            Err(errno) => {
+                drop_file_refs(files);
+                Err(errno)
+            }
         }
     } else {
         socket::sendmsg_with_fds(&sock, &bytes, files)
@@ -2243,6 +2353,15 @@ mod tests {
         })
     }
 
+    fn cred_with_groups(gids: &[u32]) -> Box<Cred> {
+        let mut cred = unprivileged_cred();
+        cred.group_info.ngroups = gids.len() as u32;
+        for (idx, gid) in gids.iter().copied().enumerate() {
+            cred.group_info.gid[idx] = KGid(gid);
+        }
+        cred
+    }
+
     fn deny_socket_create(_family: i32, _kind: i32, _proto: i32) -> i32 {
         -crate::include::uapi::errno::EACCES
     }
@@ -2265,6 +2384,63 @@ mod tests {
         );
 
         reset_for_test();
+    }
+
+    #[test]
+    fn unix_getsockopt_peergroups_returns_peer_supplementary_groups() {
+        let previous = unsafe { sched::get_current() };
+        let cred = cred_with_groups(&[10, 42]);
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 5521;
+        current.tgid = 5521;
+        current.cred = &*cred as *const Cred;
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let mut sv = [-1i32; 2];
+            assert_eq!(
+                sys_socketpair(
+                    AF_UNIX as i32,
+                    socket::SOCK_STREAM as i32,
+                    0,
+                    sv.as_mut_ptr()
+                ),
+                0
+            );
+
+            let mut one_gid = [0u32; 1];
+            let mut one_gid_len = core::mem::size_of_val(&one_gid) as u32;
+            assert_eq!(
+                sys_getsockopt(
+                    sv[0],
+                    SOL_SOCKET,
+                    socket::SO_PEERGROUPS as i32,
+                    one_gid.as_mut_ptr() as *mut u8,
+                    &mut one_gid_len,
+                ),
+                -(ERANGE as i64)
+            );
+            assert_eq!(one_gid_len, (2 * core::mem::size_of::<u32>()) as u32);
+
+            let mut groups = [0u32; 2];
+            let mut groups_len = core::mem::size_of_val(&groups) as u32;
+            assert_eq!(
+                sys_getsockopt(
+                    sv[0],
+                    SOL_SOCKET,
+                    socket::SO_PEERGROUPS as i32,
+                    groups.as_mut_ptr() as *mut u8,
+                    &mut groups_len,
+                ),
+                0
+            );
+            assert_eq!(groups_len, (2 * core::mem::size_of::<u32>()) as u32);
+            assert_eq!(groups, [10, 42]);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
     }
 
     #[test]
@@ -2507,6 +2683,48 @@ mod tests {
 
         file.flags.store(O_RDWR | O_NONBLOCK, Ordering::Release);
         assert!(recvmsg_is_nonblocking(&file, 0));
+    }
+
+    #[test]
+    fn recvfrom_empty_blocking_socket_waits_before_eagain() {
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 283;
+        current.tgid = 283;
+        current.cred = &raw const INIT_CRED;
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let mut sv = [0i32; 2];
+            assert_eq!(
+                sys_socketpair(
+                    AF_UNIX as i32,
+                    socket::SOCK_STREAM as i32,
+                    0,
+                    sv.as_mut_ptr()
+                ),
+                0
+            );
+
+            let mut out = [0u8; 1];
+            TEST_SOCKET_RECV_WAIT_CALLS.store(0, Ordering::Release);
+            assert_eq!(
+                sys_recvfrom(
+                    sv[0],
+                    out.as_mut_ptr(),
+                    out.len(),
+                    0,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                ),
+                -(EAGAIN as i64)
+            );
+            assert_eq!(TEST_SOCKET_RECV_WAIT_CALLS.load(Ordering::Acquire), 1);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
     }
 
     #[test]
@@ -3225,9 +3443,17 @@ mod tests {
                 ),
                 -(EINVAL as i64)
             );
+            let mut unnamed_unix = [0u8; 2];
+            let mut unnamed_unix_len = unnamed_unix.len() as u32;
+            assert_eq!(
+                sys_getsockname(fd as i32, unnamed_unix.as_mut_ptr(), &mut unnamed_unix_len,),
+                0
+            );
+            assert_eq!(unnamed_unix_len, 2);
+            assert_eq!(unnamed_unix, AF_UNIX.to_ne_bytes());
             assert_eq!(
                 sys_getsockname(fd as i32, core::ptr::null_mut(), core::ptr::null_mut()),
-                -(EINVAL as i64)
+                -(EFAULT as i64)
             );
             assert_eq!(
                 sys_getpeername(fd as i32, core::ptr::null_mut(), core::ptr::null_mut()),
@@ -3874,10 +4100,23 @@ mod tests {
             let (addr, addr_len) = unix_sockaddr("/run/systemd/journal/stdout");
             assert_eq!(sys_bind(listener as i32, addr.as_ptr(), addr_len), 0);
             assert_eq!(sys_listen(listener as i32, 4096), 0);
+            let ft = current_files().unwrap();
 
             let client = sys_socket(AF_UNIX as i32, socket::SOCK_STREAM as i32, 0);
             assert!(client >= 0);
             assert_eq!(sys_connect(client as i32, addr.as_ptr(), addr_len), 0);
+            let listener_file = ft.get(listener as i32).unwrap();
+            let listener_mask = crate::fs::select::poll_mask(&listener_file);
+            assert_ne!(
+                listener_mask & crate::fs::select::POLLIN as u32,
+                0,
+                "listener should report accept readiness with POLLIN"
+            );
+            assert_ne!(
+                listener_mask & crate::fs::select::POLLRDNORM as u32,
+                0,
+                "Linux AF_UNIX poll also reports listener readiness as POLLRDNORM"
+            );
 
             let accepted = sys_accept4(
                 listener as i32,
@@ -3886,14 +4125,12 @@ mod tests {
                 (socket::SOCK_CLOEXEC | socket::SOCK_NONBLOCK) as i32,
             );
             assert!(accepted >= 0);
-            let ft = current_files().unwrap();
             let file = ft.get(accepted as i32).unwrap();
             assert_eq!(file.flags.load(Ordering::Acquire) & O_NONBLOCK, O_NONBLOCK);
             assert_eq!(
                 ft.get_fd_flags(accepted as i32).unwrap() & FD_CLOEXEC,
                 FD_CLOEXEC
             );
-            let listener_file = ft.get(listener as i32).unwrap();
             assert_eq!(
                 crate::fs::select::poll_mask(&listener_file) & crate::fs::select::POLLIN as u32,
                 0,
@@ -3916,10 +4153,16 @@ mod tests {
                 0,
                 "stream payload data belongs to the accepted socket, not the listener"
             );
+            let accepted_mask = crate::fs::select::poll_mask(&file);
             assert_ne!(
-                crate::fs::select::poll_mask(&file) & crate::fs::select::POLLIN as u32,
+                accepted_mask & crate::fs::select::POLLIN as u32,
                 0,
                 "accepted stream socket should become readable after peer writes"
+            );
+            assert_ne!(
+                accepted_mask & crate::fs::select::POLLRDNORM as u32,
+                0,
+                "Linux AF_UNIX poll also reports stream payload readiness as POLLRDNORM"
             );
             listener_file
                 .flags
@@ -4403,6 +4646,48 @@ mod tests {
     }
 
     #[test]
+    fn unix_getsockopt_peersec_reports_unsupported_security_label() {
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 426;
+        current.tgid = 426;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let mut sv = [-1i32; 2];
+            assert_eq!(
+                sys_socketpair(
+                    AF_UNIX as i32,
+                    socket::SOCK_STREAM as i32,
+                    0,
+                    sv.as_mut_ptr(),
+                ),
+                0
+            );
+
+            let mut label = [0u8; 1];
+            let mut len = label.len() as u32;
+            assert_eq!(
+                sys_getsockopt(
+                    sv[0],
+                    SOL_SOCKET,
+                    socket::SO_PEERSEC as i32,
+                    label.as_mut_ptr(),
+                    &mut len,
+                ),
+                -(ENOPROTOOPT as i64)
+            );
+            assert_eq!(len, 1);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
     fn unix_path_socket_unlink_allows_journald_rebind() {
         let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
         crate::fs::init();
@@ -4457,6 +4742,81 @@ mod tests {
                 0
             );
             assert_eq!(sys_bind(second as i32, addr.as_ptr(), addrlen), 0);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn unix_listener_bound_path_released_when_epoll_holds_file_reference() {
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        *crate::fs::mount::MOUNTS.root.lock() = None;
+        crate::fs::mount::MOUNTS.by_path.lock().clear();
+        let sb = crate::fs::super_block::mount_fs("ramfs", "", 0, "").expect("ramfs mount");
+        let root = sb.root().expect("root dentry");
+        crate::fs::mount::set_rootfs(crate::fs::mount::Mount::alloc(sb, root, 0));
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 285;
+        current.tgid = 285;
+        current.cred = &raw const INIT_CRED;
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdirat(AT_FDCWD, b"/run\0".as_ptr(), 0o755),
+                0
+            );
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdirat(AT_FDCWD, b"/run/systemd\0".as_ptr(), 0o755),
+                0
+            );
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdirat(
+                    AT_FDCWD,
+                    b"/run/systemd/journal\0".as_ptr(),
+                    0o755
+                ),
+                0
+            );
+
+            let first = sys_socket(AF_UNIX as i32, socket::SOCK_STREAM as i32, 0);
+            assert!(first >= 0);
+            let path = "/run/systemd/journal/epoll-release-rebind";
+            let (addr, addrlen) = unix_sockaddr(path);
+            assert_eq!(sys_bind(first as i32, addr.as_ptr(), addrlen), 0);
+            assert_eq!(sys_listen(first as i32, 4096), 0);
+
+            let epfd = crate::fs::eventpoll::sys_epoll_create1(0);
+            assert!(epfd >= 0);
+            let ev = crate::fs::eventpoll::EpollEvent {
+                events: crate::fs::eventpoll::EPOLLIN,
+                data: 0x285,
+            };
+            assert_eq!(
+                crate::fs::eventpoll::sys_epoll_ctl(
+                    epfd as i32,
+                    crate::fs::eventpoll::EPOLL_CTL_ADD,
+                    first as i32,
+                    &ev,
+                ),
+                0
+            );
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+
+            let second = sys_socket(AF_UNIX as i32, socket::SOCK_STREAM as i32, 0);
+            assert!(second >= 0);
+            assert_eq!(
+                sys_bind(second as i32, addr.as_ptr(), addrlen),
+                0,
+                "epoll's watched file reference must fput the listener and clear BOUND"
+            );
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);

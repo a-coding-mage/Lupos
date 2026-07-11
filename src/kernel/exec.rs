@@ -1144,6 +1144,7 @@ unsafe fn commit_exec_for_current(
         files.close_on_exec();
     }
     crate::kernel::syscalls::clear_current_rseq_registration_for_exec();
+    crate::kernel::signal::flush_signal_handlers_for_exec(false);
 
     let old_mm = unsafe { (*task).mm };
 

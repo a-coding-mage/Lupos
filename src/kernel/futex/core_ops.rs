@@ -24,6 +24,9 @@ use super::{
     FUTEX_WAITERS, FUTEX2_MPOL, FUTEX2_NUMA, FUTEX2_SIZE_MASK, FUTEX2_VALID_MASK, FutexWaitv,
 };
 
+// Kernel-internal restart pseudo-errno from vendor/linux/include/linux/errno.h.
+const ERESTARTSYS: i32 = 512;
+
 // ── Hash bucket (vendor/linux/kernel/futex/core.c::futex_hash) ───────────────
 
 /// Number of buckets — must be a power of two for fast hashing.  Linux uses
@@ -614,8 +617,23 @@ unsafe fn futex_wait_impl(
             }
             return -ETIMEDOUT as i64;
         }
-        unsafe {
-            crate::kernel::sched::schedule_with_irqs_enabled();
+        if crate::kernel::signal::has_unblocked_pending_signals(cur) {
+            if requeue_pi {
+                remove_waiter_any_bucket(pid, uaddr);
+            } else {
+                remove_waiter(bucket_idx, pid, uaddr);
+            }
+            if !cur.is_null() {
+                unsafe {
+                    (*cur).__state.store(
+                        crate::kernel::task::task_state::TASK_RUNNING,
+                        Ordering::Release,
+                    );
+                }
+            }
+            // Linux's futex wait paths return -ERESTARTSYS here; the arch
+            // signal-exit path turns it into EINTR or restarts the syscall.
+            return -ERESTARTSYS as i64;
         }
         #[cfg(test)]
         if timeout_ns == 0 {
@@ -642,6 +660,9 @@ unsafe fn futex_wait_impl(
                 );
             }
             return -ETIMEDOUT as i64;
+        }
+        unsafe {
+            crate::kernel::sched::schedule_with_irqs_enabled();
         }
     }
 }
@@ -1234,8 +1255,15 @@ pub unsafe fn futex_waitv(waiters: &[FutexWaitv], timeout_ns: u64) -> i64 {
             }
             return -ETIMEDOUT as i64;
         }
-        unsafe {
-            crate::kernel::sched::schedule_with_irqs_enabled();
+        if crate::kernel::signal::has_unblocked_pending_signals(cur) {
+            remove_waitv_waiters(waitv_id);
+            unsafe {
+                (*cur).__state.store(
+                    crate::kernel::task::task_state::TASK_RUNNING,
+                    Ordering::Release,
+                );
+            }
+            return -ERESTARTSYS as i64;
         }
         #[cfg(test)]
         if timeout_ns == 0 {
@@ -1247,6 +1275,9 @@ pub unsafe fn futex_waitv(waiters: &[FutexWaitv], timeout_ns: u64) -> i64 {
                 );
             }
             return -ETIMEDOUT as i64;
+        }
+        unsafe {
+            crate::kernel::sched::schedule_with_irqs_enabled();
         }
     }
 }
@@ -1270,7 +1301,27 @@ pub fn _with_test_lock<R>(f: impl FnOnce() -> R) -> R {
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
+
     use super::*;
+    use crate::kernel::{cred::INIT_CRED, sched, task::TaskStruct};
+
+    fn with_test_current<R>(pid: i32, f: impl FnOnce(*mut TaskStruct) -> R) -> R {
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = pid;
+        current.tgid = pid;
+        current.cred = &raw const INIT_CRED;
+        let task = &mut *current as *mut TaskStruct;
+        unsafe {
+            sched::set_current(task);
+        }
+        let ret = f(task);
+        unsafe {
+            sched::set_current(previous);
+        }
+        ret
+    }
 
     #[test]
     fn hash_key_is_pow2_bucket() {
@@ -1314,6 +1365,150 @@ mod tests {
     fn wait_invalid_bitset_returns_einval() {
         let r = unsafe { futex_wait(0x1000, 0, 0, 0, true) };
         assert_eq!(r, -EINVAL as i64);
+    }
+
+    #[test]
+    fn futex_wait_returns_erestartsys_for_unblocked_pending_signal() {
+        _with_test_lock(|| {
+            let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+            crate::kernel::signal::reset_for_tests();
+            _flush_for_tests();
+            with_test_current(31_001, |task| {
+                let futex_word = AtomicU32::new(0);
+                let action = crate::kernel::signal::RtSigAction {
+                    sa_handler: 0x1234,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    unsafe {
+                        crate::kernel::signal::sys_rt_sigaction(
+                            crate::kernel::signal::SIGTERM,
+                            &action,
+                            core::ptr::null_mut(),
+                            core::mem::size_of::<crate::kernel::signal::SigSet>(),
+                        )
+                    },
+                    0
+                );
+                assert_eq!(
+                    unsafe {
+                        crate::kernel::signal::send_signal_to_task(
+                            task,
+                            crate::kernel::signal::SIGTERM,
+                        )
+                    },
+                    0
+                );
+
+                let ret = unsafe {
+                    futex_wait(
+                        &futex_word as *const AtomicU32 as u64,
+                        0,
+                        super::super::FUTEX_BITSET_MATCH_ANY,
+                        0,
+                        true,
+                    )
+                };
+
+                assert_eq!(ret, -ERESTARTSYS as i64);
+            });
+            _flush_for_tests();
+        });
+    }
+
+    #[test]
+    fn futex_wait_ignores_blocked_pending_signal() {
+        _with_test_lock(|| {
+            let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+            crate::kernel::signal::reset_for_tests();
+            _flush_for_tests();
+            with_test_current(31_002, |task| {
+                let mut blocked = crate::kernel::signal::SigSet {
+                    bits: 1u64 << (crate::kernel::signal::SIGUSR1 - 1),
+                };
+                assert_eq!(
+                    unsafe {
+                        crate::kernel::signal::sys_rt_sigprocmask(
+                            crate::kernel::signal::SIG_BLOCK,
+                            &mut blocked,
+                            core::ptr::null_mut(),
+                            core::mem::size_of::<crate::kernel::signal::SigSet>(),
+                        )
+                    },
+                    0
+                );
+                assert_eq!(
+                    unsafe {
+                        crate::kernel::signal::send_signal_to_task(
+                            task,
+                            crate::kernel::signal::SIGUSR1,
+                        )
+                    },
+                    0
+                );
+
+                let futex_word = AtomicU32::new(0);
+                let ret = unsafe {
+                    futex_wait(
+                        &futex_word as *const AtomicU32 as u64,
+                        0,
+                        super::super::FUTEX_BITSET_MATCH_ANY,
+                        0,
+                        true,
+                    )
+                };
+
+                assert_eq!(ret, -ETIMEDOUT as i64);
+            });
+            _flush_for_tests();
+        });
+    }
+
+    #[test]
+    fn futex_waitv_returns_erestartsys_for_unblocked_pending_signal() {
+        _with_test_lock(|| {
+            let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+            crate::kernel::signal::reset_for_tests();
+            _flush_for_tests();
+            with_test_current(31_003, |task| {
+                let futex_word = AtomicU32::new(0);
+                let action = crate::kernel::signal::RtSigAction {
+                    sa_handler: 0x1234,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    unsafe {
+                        crate::kernel::signal::sys_rt_sigaction(
+                            crate::kernel::signal::SIGTERM,
+                            &action,
+                            core::ptr::null_mut(),
+                            core::mem::size_of::<crate::kernel::signal::SigSet>(),
+                        )
+                    },
+                    0
+                );
+                assert_eq!(
+                    unsafe {
+                        crate::kernel::signal::send_signal_to_task(
+                            task,
+                            crate::kernel::signal::SIGTERM,
+                        )
+                    },
+                    0
+                );
+                let waiters = [FutexWaitv {
+                    val: 0,
+                    uaddr: &futex_word as *const AtomicU32 as u64,
+                    flags: FUTEX_32,
+                    _reserved: 0,
+                }];
+
+                let ret = unsafe { futex_waitv(&waiters, 0) };
+
+                assert_eq!(ret, -ERESTARTSYS as i64);
+            });
+            _flush_for_tests();
+        });
     }
 
     #[test]

@@ -848,6 +848,11 @@ pub unsafe fn sys_statx(
             },
             stx_dev_major: ((st.st_dev >> 8) & 0xfff) as u32,
             stx_dev_minor: (st.st_dev & 0xff) as u32,
+            // Device number of a char/block special file (`new_encode_dev` form).
+            // Zero for other inode kinds. Userspace (e.g. Xorg `xf86HasTTYs()`)
+            // keys behaviour off `major(st_rdev)`.
+            stx_rdev_major: ((st.st_rdev >> 8) & 0xfff) as u32,
+            stx_rdev_minor: (st.st_rdev & 0xff) as u32,
             stx_mnt_id: statx_mount_id(target.mount.id, mask),
             ..LinuxStatx::default()
         };
@@ -1485,11 +1490,7 @@ pub unsafe fn sys_dup(oldfd: i32) -> i64 {
         Ok(files) => files,
         Err(errno) => return -(errno as i64),
     };
-    let file = match files.get(oldfd) {
-        Ok(file) => file,
-        Err(errno) => return -(errno as i64),
-    };
-    match files.install(file, false) {
+    match files.dup_at_or_above(oldfd, 0, false) {
         Ok(fd) => fd as i64,
         Err(errno) => -(errno as i64),
     }
@@ -1582,7 +1583,7 @@ unsafe fn poll_impl(fds: *mut PollFd, nfds: usize, timeout_ns: Option<u64>) -> i
             return ready;
         }
         #[cfg(not(test))]
-        if crate::kernel::signal::current_has_pending_signals() {
+        if crate::kernel::signal::current_has_unblocked_pending_signals() {
             return -(EINTR as i64);
         }
         if let Some(deadline_ns) = deadline_ns {
@@ -1594,9 +1595,10 @@ unsafe fn poll_impl(fds: *mut PollFd, nfds: usize, timeout_ns: Option<u64>) -> i
         #[cfg(not(test))]
         {
             wait_state.maintenance();
-            unsafe {
-                crate::kernel::sched::schedule_with_irqs_enabled();
-            }
+            crate::kernel::time::sleep_timeout::schedule_timeout_with_state(
+                1,
+                crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+            );
         }
         #[cfg(test)]
         {
@@ -1691,7 +1693,7 @@ unsafe fn select_impl(
             return ready;
         }
         #[cfg(not(test))]
-        if crate::kernel::signal::current_has_pending_signals() {
+        if crate::kernel::signal::current_has_unblocked_pending_signals() {
             return -(EINTR as i64);
         }
 
@@ -1704,9 +1706,10 @@ unsafe fn select_impl(
         #[cfg(not(test))]
         {
             wait_state.maintenance();
-            unsafe {
-                crate::kernel::sched::schedule_with_irqs_enabled();
-            }
+            crate::kernel::time::sleep_timeout::schedule_timeout_with_state(
+                1,
+                crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+            );
         }
         #[cfg(test)]
         {
@@ -2064,10 +2067,8 @@ pub unsafe fn sys_mkdirat(dirfd: i32, pathname: *const u8, mode: u32) -> i64 {
             Some(inode) => inode,
             None => return -(ENOENT as i64),
         };
-        if let Some(existing) = super::dcache::d_lookup(&parent, last) {
-            if existing.inode().is_some() {
-                return -(EEXIST as i64);
-            }
+        if cached_positive_child(&parent, &dir, last).is_some() {
+            return -(EEXIST as i64);
         }
         if let Some(lookup) = dir.ops.lookup {
             match lookup(&dir, last) {
@@ -2737,10 +2738,8 @@ fn lookup_child(
     dir: &InodeRef,
     name: &str,
 ) -> Result<(DentryRef, InodeRef), i32> {
-    if let Some(dentry) = super::dcache::d_lookup(parent, name)
-        && let Some(inode) = dentry.inode()
-    {
-        return Ok((dentry, inode));
+    if let Some(child) = cached_positive_child(parent, dir, name) {
+        return Ok(child);
     }
     let lookup = dir.ops.lookup.ok_or(ENOENT)?;
     let inode = match lookup(dir, name) {
@@ -2754,6 +2753,25 @@ fn lookup_child(
     let dentry = super::dcache::d_alloc_child(parent, name);
     dentry.instantiate(inode.clone());
     Ok((dentry, inode))
+}
+
+fn cached_positive_child(
+    parent: &DentryRef,
+    dir: &InodeRef,
+    name: &str,
+) -> Option<(DentryRef, InodeRef)> {
+    let dentry = super::dcache::d_lookup(parent, name)?;
+    let inode = dentry.inode()?;
+    if let Some(mapped) = ramdir_child_inode(dir, name) {
+        match mapped {
+            Some(mapped_inode) if Arc::ptr_eq(&mapped_inode, &inode) => {}
+            Some(_) | None => {
+                super::dcache::d_drop(parent, name);
+                return None;
+            }
+        }
+    }
+    Some((dentry, inode))
 }
 
 fn lookup_child_optional(
@@ -2770,6 +2788,15 @@ fn lookup_child_optional(
 
 fn ramdir_key(map: &BTreeMap<String, InodeRef>, name: &str) -> Option<String> {
     map.keys().find(|key| key.as_str() == name).cloned()
+}
+
+fn ramdir_child_inode(dir: &InodeRef, name: &str) -> Option<Option<InodeRef>> {
+    let InodePrivate::RamDir(children) = &dir.private else {
+        return None;
+    };
+    let children = children.lock();
+    let child = ramdir_key(&children, name).and_then(|key| children.get(&key).cloned());
+    Some(child)
 }
 
 fn ensure_empty_directory(inode: &InodeRef) -> Result<(), i32> {
@@ -5236,6 +5263,48 @@ mod tests {
                 fd >= 0,
                 "open after mkdir inside the tmpfs mount must succeed, got {fd}"
             );
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn linkat_ignores_stale_positive_dentry_missing_from_tmpfs_map() {
+        let _guard = mount::TEST_MOUNT_LOCK.lock();
+        let (mut current, previous) = setup_current_with_rootfs(860);
+        unsafe {
+            assert_eq!(sys_mkdirat(AT_FDCWD, b"/tmp\0".as_ptr(), 0o777), 0);
+            mount::do_mount("tmpfs", "tmpfs", "/tmp", 0, "").expect("tmp tmpfs");
+
+            let src = sys_openat(
+                AT_FDCWD,
+                b"/tmp/src\0".as_ptr(),
+                (O_RDWR | O_CREAT) as i32,
+                0o644,
+            );
+            assert!(src >= 0);
+            assert_eq!(crate::fs::fdtable::sys_close(src as i32), 0);
+
+            let tmp = lookup_path_str(AT_FDCWD, "/tmp").expect("/tmp").dentry;
+            let src_dentry = lookup_path_str(AT_FDCWD, "/tmp/src")
+                .expect("/tmp/src")
+                .dentry;
+            let stale = crate::fs::dcache::d_alloc_child(&tmp, "ghost");
+            stale.instantiate(src_dentry.inode().expect("src inode"));
+
+            assert_eq!(
+                sys_link(b"/tmp/src\0".as_ptr(), b"/tmp/ghost\0".as_ptr()),
+                0
+            );
+
+            let fd = open_dir(b"/tmp\0");
+            assert!(fd >= 0);
+            let mut dirents = [0u8; 256];
+            let len = sys_getdents64(fd as i32, dirents.as_mut_ptr(), dirents.len());
+            assert!(len > 0);
+            assert!(dirents_contain(&dirents, len as usize, b"ghost"));
+            assert_eq!(crate::fs::fdtable::sys_close(fd as i32), 0);
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);

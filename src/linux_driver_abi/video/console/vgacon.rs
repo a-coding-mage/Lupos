@@ -72,6 +72,7 @@ pub mod buffer {
         pub row: usize,
         pub color: u8,
         cursor_pos: usize,
+        cursor_visible: bool,
         /// Pointer to a `[[VgaChar; 80]; 25]` buffer.
         buffer: *mut VgaChar,
     }
@@ -93,6 +94,7 @@ pub mod buffer {
                 row: 0,
                 color: color_code(fg, bg),
                 cursor_pos: 0,
+                cursor_visible: true,
                 buffer,
             }
         }
@@ -113,6 +115,7 @@ pub mod buffer {
             }
             self.col = 0;
             self.row = 0;
+            self.set_cursor_visible(true);
             self.sync_cursor();
         }
 
@@ -209,10 +212,14 @@ pub mod buffer {
                     );
                 }
             }
-            if let Some((col, row)) = batch.cursor {
-                self.col = col.min(BUFFER_WIDTH - 1);
-                self.row = row.min(BUFFER_HEIGHT - 1);
-                self.sync_cursor();
+            match batch.cursor {
+                Some((col, row)) => {
+                    self.col = col.min(BUFFER_WIDTH - 1);
+                    self.row = row.min(BUFFER_HEIGHT - 1);
+                    self.set_cursor_visible(true);
+                    self.sync_cursor();
+                }
+                None => self.set_cursor_visible(false),
             }
         }
 
@@ -229,6 +236,17 @@ pub mod buffer {
             #[cfg(not(test))]
             unsafe {
                 write_hardware_cursor(pos as u16);
+            }
+        }
+
+        fn set_cursor_visible(&mut self, visible: bool) {
+            if self.cursor_visible == visible {
+                return;
+            }
+            self.cursor_visible = visible;
+            #[cfg(not(test))]
+            unsafe {
+                write_hardware_cursor_visibility(visible);
             }
         }
 
@@ -303,6 +321,28 @@ pub mod buffer {
             crate::arch::x86::include::asm::io::outb(VGA_CRTC_DATA, (pos >> 8) as u8);
             crate::arch::x86::include::asm::io::outb(VGA_CRTC_INDEX, VGA_CRTC_CURSOR_LO);
             crate::arch::x86::include::asm::io::outb(VGA_CRTC_DATA, pos as u8);
+        }
+    }
+
+    #[cfg(not(test))]
+    unsafe fn write_hardware_cursor_visibility(visible: bool) {
+        const VGA_CRTC_INDEX: u16 = 0x3d4;
+        const VGA_CRTC_DATA: u16 = 0x3d5;
+        const VGA_CRTC_CURSOR_START: u8 = 0x0a;
+        const VGA_CRTC_CURSOR_DISABLE: u8 = 1 << 5;
+
+        unsafe {
+            crate::arch::x86::include::asm::io::outb(VGA_CRTC_INDEX, VGA_CRTC_CURSOR_START);
+            let start = crate::arch::x86::include::asm::io::inb(VGA_CRTC_DATA);
+            crate::arch::x86::include::asm::io::outb(VGA_CRTC_INDEX, VGA_CRTC_CURSOR_START);
+            crate::arch::x86::include::asm::io::outb(
+                VGA_CRTC_DATA,
+                if visible {
+                    start & !VGA_CRTC_CURSOR_DISABLE
+                } else {
+                    start | VGA_CRTC_CURSOR_DISABLE
+                },
+            );
         }
     }
 
@@ -481,6 +521,27 @@ pub mod buffer {
 
             assert!(buf.iter().all(|cell| cell.ascii == b' '));
             assert_eq!(w.cursor_pos, 0);
+        }
+
+        #[test]
+        fn render_batch_hides_and_restores_hardware_cursor_state() {
+            let mut buf = blank_buffer();
+            let mut w = test_writer(&mut buf);
+            let mut batch = crate::kernel::console::RenderBatch {
+                cols: BUFFER_WIDTH,
+                rows: BUFFER_HEIGHT,
+                clear: None,
+                dirty_rows: alloc::vec![],
+                cursor: None,
+            };
+
+            w.render_console_batch(&batch);
+            assert!(!w.cursor_visible);
+
+            batch.cursor = Some((7, 3));
+            w.render_console_batch(&batch);
+            assert!(w.cursor_visible);
+            assert_eq!(w.cursor_pos, 3 * BUFFER_WIDTH + 7);
         }
 
         #[test]

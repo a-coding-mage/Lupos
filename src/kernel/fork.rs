@@ -28,7 +28,7 @@
 //!
 //! # Deferred
 //! - `do_exit` / `release_task` (M26): heap tasks are tracked but not freed.
-//! - `CLONE_VFORK` completion (M26): the parent is not put to sleep.
+//! - `CLONE_VFORK` completion (M26): the parent waits until the child exits or execs.
 //! - Namespace flag handling (M28).
 //! - User-mode thread-info restoration (M24 / M59).
 //!
@@ -40,6 +40,7 @@ extern crate alloc;
 
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use spin::Mutex;
 
@@ -154,6 +155,7 @@ static HEAP_TASKS: Mutex<HeapTaskTracker> = Mutex::new(HeapTaskTracker {
     entries: [const { None }; MAX_HEAP_TASKS],
     len: 0,
 });
+static CHILD_SETTID_REGISTRATIONS: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
 
 fn track_heap_task(task: *mut TaskStruct, stack: *mut u8) {
     let mut tracker = HEAP_TASKS.lock();
@@ -186,6 +188,39 @@ fn untrack_heap_task(task: *mut TaskStruct) -> Option<*mut u8> {
         }
     }
     None
+}
+
+fn register_child_set_tid(pid: i32, ptr: *mut i32) {
+    if pid <= 0 || ptr.is_null() {
+        return;
+    }
+    let mut regs = CHILD_SETTID_REGISTRATIONS.lock();
+    if let Some(entry) = regs.iter_mut().find(|(entry_pid, _)| *entry_pid == pid) {
+        entry.1 = ptr as u64;
+    } else {
+        regs.push((pid, ptr as u64));
+    }
+}
+
+fn take_child_set_tid(pid: i32) -> *mut i32 {
+    let mut regs = CHILD_SETTID_REGISTRATIONS.lock();
+    regs.iter()
+        .position(|(entry_pid, _)| *entry_pid == pid)
+        .map(|idx| regs.remove(idx).1 as *mut i32)
+        .unwrap_or(core::ptr::null_mut())
+}
+
+pub(crate) fn clear_child_set_tid_registration(pid: i32) {
+    let _ = take_child_set_tid(pid);
+}
+
+#[cfg(test)]
+fn child_set_tid_for_tests(pid: i32) -> *mut i32 {
+    let regs = CHILD_SETTID_REGISTRATIONS.lock();
+    regs.iter()
+        .find(|(entry_pid, _)| *entry_pid == pid)
+        .map(|(_, ptr)| *ptr as *mut i32)
+        .unwrap_or(core::ptr::null_mut())
 }
 
 /// Locate a heap-allocated task by PID.
@@ -265,6 +300,27 @@ unsafe fn write_user_tid(ptr: *mut i32, tid: i32) -> Result<(), i32> {
     unsafe { uaccess::put_user_u32(ptr as *mut u32, tid as u32) }
 }
 
+/// Linux stores `set_child_tid` during `copy_process()` and writes it only on
+/// the child return path, after the child mm is active.  A fork-style clone
+/// must not modify the parent's private TLS/TID slot.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn user_fork_child_set_tid() {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return;
+    }
+    let pid = unsafe { (*task).pid };
+    let set_child_tid = take_child_set_tid(pid);
+    if set_child_tid.is_null() {
+        return;
+    }
+    let _ = unsafe { write_user_tid(set_child_tid, pid) };
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe extern "C" fn user_fork_child_set_tid() {}
+
 /// Entry point for all tasks created by `copy_process`.
 ///
 /// After `__switch_to_asm` pops six callee-saved registers and
@@ -308,6 +364,7 @@ pub fn kernel_fork_child_entry_addr() -> u64 {
 pub unsafe extern "C" fn user_fork_child_return() -> ! {
     core::arch::naked_asm!(
         "sub rsp, 8",
+        "call {set_child_tid}",
         "call {load_tls}",
         "add rsp, 8",
         // Close the interrupt window before switching RSP to the user stack.
@@ -331,6 +388,7 @@ pub unsafe extern "C" fn user_fork_child_return() -> ! {
         "mov rsp, [rsp + 152]",
         "swapgs",
         "sysretq",
+        set_child_tid = sym user_fork_child_set_tid,
         load_tls = sym load_current_user_tls_base,
     );
 }
@@ -470,15 +528,8 @@ pub unsafe fn copy_process(
         if args.flags & crate::kernel::clone::CLONE_CHILD_CLEARTID != 0 {
             (*child).m26.clear_child_tid = args.child_tid;
         }
-
         if args.flags & crate::kernel::clone::CLONE_PARENT_SETTID != 0 {
             if let Err(e) = unsafe { write_user_tid(args.parent_tid, nr) } {
-                cleanup_failed_child(parent, child, stack_ptr, task_allocated);
-                return Err(e);
-            }
-        }
-        if args.flags & crate::kernel::clone::CLONE_CHILD_SETTID != 0 {
-            if let Err(e) = unsafe { write_user_tid(args.child_tid, nr) } {
                 cleanup_failed_child(parent, child, stack_ptr, task_allocated);
                 return Err(e);
             }
@@ -646,6 +697,10 @@ pub unsafe fn copy_process(
             (*parent).m26.children[parent_count] = child;
             (*parent).m26.children_count = (parent_count + 1) as u32;
         }
+        if args.flags & crate::kernel::clone::CLONE_CHILD_SETTID != 0 {
+            register_child_set_tid(nr, args.child_tid);
+        }
+        crate::kernel::signal::inherit_signal_state_for_clone((*parent).pid, nr, (*child).tgid);
     }
 
     Ok(child)
@@ -665,6 +720,7 @@ pub(crate) unsafe fn cleanup_task_shared_state(task: *mut TaskStruct) {
     }
 
     unsafe {
+        clear_child_set_tid_registration((*task).pid);
         crate::fs::fs_struct::exit_fs(task);
 
         let seccomp_filter = (*task)
@@ -748,6 +804,20 @@ unsafe fn cleanup_failed_child(
         let stack_to_free = tracked_stack.unwrap_or(stack_ptr);
         drop(Box::from_raw(child));
         free_kernel_stack(stack_to_free);
+    }
+}
+
+fn vfork_child_done(parent: *mut TaskStruct, child: *mut TaskStruct) -> bool {
+    if parent.is_null() || child.is_null() {
+        return true;
+    }
+    unsafe {
+        let child_state = (*child).__state.load(Ordering::Acquire);
+        child_state
+            & (crate::kernel::task::task_state::EXIT_ZOMBIE
+                | crate::kernel::task::task_state::EXIT_DEAD)
+            != 0
+            || (*child).mm != (*parent).mm
     }
 }
 
@@ -859,16 +929,7 @@ pub unsafe fn kernel_clone(args: &KernelCloneArgs) -> i64 {
     unsafe { enqueue_task(child) };
 
     if effective_args.flags & CLONE_VFORK != 0 {
-        for _ in 0..1024 {
-            let child_done = unsafe {
-                (*child).__state.load(Ordering::Acquire)
-                    & crate::kernel::task::task_state::EXIT_ZOMBIE
-                    != 0
-                    || (*child).mm != (*parent).mm
-            };
-            if child_done {
-                break;
-            }
+        while !vfork_child_done(parent, child) {
             unsafe { schedule_with_irqs_enabled() };
         }
     }
@@ -1161,6 +1222,72 @@ mod tests {
     }
 
     #[test]
+    fn vfork_child_done_stays_false_while_child_shares_parent_mm() {
+        let mut parent = make_parent();
+        let mut child = make_parent();
+        child.pid = 1001;
+        child.tgid = 1001;
+        let shared_mm = Box::into_raw(Box::new(MmStruct::new(0)));
+        parent.mm = shared_mm;
+        child.mm = shared_mm;
+
+        assert!(
+            !vfork_child_done(&mut *parent, &mut *child),
+            "CLONE_VFORK parent must keep waiting while child still shares its mm"
+        );
+
+        unsafe {
+            let _ = Box::from_raw(shared_mm);
+        }
+    }
+
+    #[test]
+    fn vfork_child_done_when_child_exits() {
+        let mut parent = make_parent();
+        let mut child = make_parent();
+        child.pid = 1001;
+        child.tgid = 1001;
+        let shared_mm = Box::into_raw(Box::new(MmStruct::new(0)));
+        parent.mm = shared_mm;
+        child.mm = shared_mm;
+        child.__state.store(
+            crate::kernel::task::task_state::EXIT_ZOMBIE,
+            Ordering::Release,
+        );
+
+        assert!(
+            vfork_child_done(&mut *parent, &mut *child),
+            "Linux completes vfork when the child exits through mm_release()"
+        );
+
+        unsafe {
+            let _ = Box::from_raw(shared_mm);
+        }
+    }
+
+    #[test]
+    fn vfork_child_done_when_child_execs() {
+        let mut parent = make_parent();
+        let mut child = make_parent();
+        child.pid = 1001;
+        child.tgid = 1001;
+        let shared_mm = Box::into_raw(Box::new(MmStruct::new(0)));
+        let exec_mm = Box::into_raw(Box::new(MmStruct::new(0)));
+        parent.mm = shared_mm;
+        child.mm = exec_mm;
+
+        assert!(
+            vfork_child_done(&mut *parent, &mut *child),
+            "Linux completes vfork when exec replaces the child's mm"
+        );
+
+        unsafe {
+            let _ = Box::from_raw(shared_mm);
+            let _ = Box::from_raw(exec_mm);
+        }
+    }
+
+    #[test]
     fn copy_process_kthread_has_null_mm() {
         clean_lsm_hooks!();
         let mut parent = make_parent();
@@ -1242,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_process_clone_tid_flags_write_expected_slots() {
+    fn copy_process_clone_tid_flags_defer_child_settid_to_child_return() {
         clean_lsm_hooks!();
         let mut parent = make_parent();
         let mut parent_tid = -1i32;
@@ -1260,7 +1387,15 @@ mod tests {
             .expect("copy_process should write clone tid pointers");
         let pid = unsafe { (*child).pid };
         assert_eq!(parent_tid, pid, "CLONE_PARENT_SETTID must write child pid");
-        assert_eq!(child_tid, pid, "CLONE_CHILD_SETTID must write child pid");
+        assert_eq!(
+            child_tid, -1,
+            "CLONE_CHILD_SETTID must not write into the parent's address space during fork"
+        );
+        assert_eq!(
+            child_set_tid_for_tests(pid),
+            &mut child_tid as *mut i32,
+            "CLONE_CHILD_SETTID must store the child-side set-tid pointer"
+        );
         assert_eq!(
             unsafe { (*child).m26.clear_child_tid },
             &mut child_tid as *mut i32,

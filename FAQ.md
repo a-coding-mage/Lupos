@@ -87,6 +87,10 @@ cargo xtask run
 
 Log in as `root` / `lupos`.
 
+For a graphical login instead of the text console, run `cargo xtask run --gui`
+(or `make run-gui`). It boots into a LightDM GTK greeter on the framebuffer;
+logging in as `root` / `lupos` starts the XFCE desktop.
+
 ## Why don't I hear the terminal bell (`printf '\a'`)?
 
 The kernel does emit the bell: a ground-state BEL (`0x07`) drives the emulated

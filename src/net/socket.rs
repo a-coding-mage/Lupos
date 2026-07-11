@@ -7,19 +7,21 @@ extern crate alloc;
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use lazy_static::lazy_static;
 use spin::Mutex;
 
+use crate::fs::file::fput;
 use crate::fs::types::FileRef;
 use crate::include::uapi::errno::{
-    EADDRINUSE, EAFNOSUPPORT, EAGAIN, ECONNREFUSED, EINVAL, ENOTCONN, EOPNOTSUPP, EPERM,
-    EPROTONOSUPPORT,
+    EADDRINUSE, EAFNOSUPPORT, EAGAIN, ECONNREFUSED, EINVAL, ENOPROTOOPT, ENOTCONN, EOPNOTSUPP,
+    EPERM, EPIPE, EPROTONOSUPPORT,
 };
 use crate::kernel::capability::{CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE, capable};
+use crate::kernel::cred::GroupInfo;
 use crate::kernel::pid::{KPid, get_pid, put_pid};
 use crate::kernel::sched;
 use crate::kernel::task::TaskStruct;
@@ -57,6 +59,7 @@ pub const SO_RCVTIMEO_OLD: u32 = 20;
 pub const SO_SNDTIMEO_OLD: u32 = 21;
 pub const SO_TIMESTAMP_OLD: u32 = 29;
 pub const SO_ACCEPTCONN: u32 = 30;
+pub const SO_PEERSEC: u32 = 31;
 pub const SO_SNDBUFFORCE: u32 = 32;
 pub const SO_RCVBUFFORCE: u32 = 33;
 pub const SO_PASSSEC: u32 = 34;
@@ -68,10 +71,10 @@ pub const SO_SNDTIMEO_NEW: u32 = 67;
 pub const SO_PASSPIDFD: u32 = 76;
 pub const SO_PEERPIDFD: u32 = 77;
 pub const SO_PASSRIGHTS: u32 = 83;
+pub const SO_PEERGROUPS: u32 = 59;
 pub const IP_RECVTTL: u32 = 12;
 
 pub type SocketRef = Arc<Mutex<KernelSocket>>;
-pub type WeakSocketRef = Weak<Mutex<KernelSocket>>;
 
 #[derive(Debug)]
 pub struct SocketPidRef {
@@ -113,6 +116,7 @@ pub struct SocketCred {
     pub pid: i32,
     pub uid: u32,
     pub gid: u32,
+    pub groups: GroupInfo,
     pub pid_ref: Option<SocketPidRef>,
 }
 
@@ -151,7 +155,7 @@ pub struct KernelSocket {
     pub peer: Option<SockAddr>,
     pub recvq: VecDeque<QueuedPacket>,
     pub backlog: VecDeque<SocketRef>,
-    pub peer_socket: Option<WeakSocketRef>,
+    pub peer_socket: Option<SocketRef>,
     pub cred: SocketCred,
     pub peer_cred: Option<SocketCred>,
     pub reuseaddr: bool,
@@ -196,6 +200,38 @@ pub fn release_bound_socket(sock: &SocketRef) {
         bound.retain(|entry| !Arc::ptr_eq(entry, sock));
         !bound.is_empty()
     });
+}
+
+pub fn release_socket(sock: &SocketRef) {
+    release_bound_socket(sock);
+
+    let (peer, backlog) = {
+        let mut socket = sock.lock();
+        // Linux unix_release_sock() removes the endpoint from lookup, marks it
+        // closed/shutdown, clears the held peer pointer, and releases unaccepted
+        // children queued on a listening socket. unix_stream_connect() takes
+        // peer sock references with sock_hold(); Lupos mirrors that with Arc
+        // links and breaks the opposite link here to avoid an Arc cycle.
+        socket.state = SocketState::Closed;
+        let peer = socket.peer_socket.take();
+        socket.recvq.clear();
+        (peer, socket.backlog.drain(..).collect::<Vec<_>>())
+    };
+
+    if let Some(peer) = peer {
+        let mut peer_locked = peer.lock();
+        if peer_locked
+            .peer_socket
+            .as_ref()
+            .is_some_and(|linked| Arc::ptr_eq(linked, sock))
+        {
+            peer_locked.peer_socket = None;
+        }
+    }
+
+    for queued in backlog {
+        release_socket(&queued);
+    }
 }
 
 pub fn rollback_bound_socket_addr(sock: &SocketRef, addr: &SockAddr) {
@@ -326,6 +362,7 @@ fn current_peer_cred() -> SocketCred {
             pid,
             uid: 0,
             gid: 0,
+            groups: GroupInfo::default(),
             pid_ref: current_pid_ref(pid),
         };
     }
@@ -333,6 +370,7 @@ fn current_peer_cred() -> SocketCred {
         pid,
         uid: unsafe { (*cred).euid.0 },
         gid: unsafe { (*cred).egid.0 },
+        groups: unsafe { (*cred).group_info },
         pid_ref: current_pid_ref(pid),
     }
 }
@@ -345,6 +383,7 @@ fn current_scm_cred() -> SocketCred {
             pid,
             uid: 0,
             gid: 0,
+            groups: GroupInfo::default(),
             pid_ref: current_pid_ref(pid),
         };
     }
@@ -352,6 +391,7 @@ fn current_scm_cred() -> SocketCred {
         pid,
         uid: unsafe { (*cred).uid.0 },
         gid: unsafe { (*cred).gid.0 },
+        groups: unsafe { (*cred).group_info },
         pid_ref: current_pid_ref(pid),
     }
 }
@@ -576,7 +616,7 @@ pub fn connect(sock: &SocketRef, peer: SockAddr) -> Result<(), i32> {
             let client_cred = current_peer_cred();
             socket.peer = Some(peer);
             socket.state = SocketState::Connected;
-            socket.peer_socket = Some(Arc::downgrade(&accepted));
+            socket.peer_socket = Some(accepted.clone());
             socket.peer_cred = Some(listener_cred.clone());
             (socket.local.clone(), client_cred)
         };
@@ -587,7 +627,7 @@ pub fn connect(sock: &SocketRef, peer: SockAddr) -> Result<(), i32> {
             socket.state = SocketState::Connected;
             socket.local = accepted_local;
             socket.peer = client_local;
-            socket.peer_socket = Some(Arc::downgrade(sock));
+            socket.peer_socket = Some(sock.clone());
             socket.peer_cred = Some(client_cred.clone());
             socket.passcred = listener_passcred;
             socket.passpidfd = listener_passpidfd;
@@ -664,13 +704,13 @@ pub fn socketpair(
     {
         let mut locked = left.lock();
         locked.state = SocketState::Connected;
-        locked.peer_socket = Some(Arc::downgrade(&right));
+        locked.peer_socket = Some(right.clone());
         locked.peer_cred = Some(right_cred);
     }
     {
         let mut locked = right.lock();
         locked.state = SocketState::Connected;
-        locked.peer_socket = Some(Arc::downgrade(&left));
+        locked.peer_socket = Some(left.clone());
         locked.peer_cred = Some(left_cred);
     }
     Ok((left, right))
@@ -680,25 +720,52 @@ pub fn sendmsg(sock: &SocketRef, bytes: &[u8]) -> Result<usize, i32> {
     sendmsg_with_fds(sock, bytes, Vec::new())
 }
 
+fn drop_file_refs(fds: Vec<FileRef>) {
+    for file in fds {
+        fput(file);
+    }
+}
+
 /// Send `bytes` plus an optional SCM_RIGHTS attachment of `fds` to whatever
 /// the socket is connected to.  Mirrors Linux's `unix_dgram_sendmsg` +
 /// `unix_attach_fds` shape: the file references travel with the packet and
 /// are installed into the receiver on `recvmsg`.
-pub fn sendmsg_with_fds(sock: &SocketRef, bytes: &[u8], fds: Vec<FileRef>) -> Result<usize, i32> {
+pub fn sendmsg_with_fds(
+    sock: &SocketRef,
+    bytes: &[u8],
+    mut fds: Vec<FileRef>,
+) -> Result<usize, i32> {
     let cred = current_scm_cred();
-    let (peer_socket, peer_addr, local_addr) = {
+    let (peer_socket, peer_addr, local_addr, family, sock_type, state) = {
         let socket = sock.lock();
         (
             socket.peer_socket.clone(),
             socket.peer.clone(),
             socket.local.clone(),
+            socket.family,
+            socket.sock_type,
+            socket.state,
         )
     };
+    if family != AF_UNIX && !fds.is_empty() {
+        drop_file_refs(core::mem::take(&mut fds));
+    }
+    let disconnected = if matches!(sock_type, SOCK_STREAM | SOCK_SEQPACKET) {
+        EPIPE
+    } else {
+        ENOTCONN
+    };
+    if state == SocketState::Closed {
+        drop_file_refs(fds);
+        return Err(disconnected);
+    }
     if let Some(peer_socket) = peer_socket {
-        let Some(target) = peer_socket.upgrade() else {
-            return Err(ENOTCONN);
-        };
-        target.lock().recvq.push_back(QueuedPacket {
+        let mut target = peer_socket.lock();
+        if target.state == SocketState::Closed {
+            drop_file_refs(fds);
+            return Err(disconnected);
+        }
+        target.recvq.push_back(QueuedPacket {
             bytes: bytes.to_vec(),
             peer: local_addr,
             fds,
@@ -706,25 +773,47 @@ pub fn sendmsg_with_fds(sock: &SocketRef, bytes: &[u8], fds: Vec<FileRef>) -> Re
         });
         return Ok(bytes.len());
     }
+    if matches!(sock_type, SOCK_STREAM | SOCK_SEQPACKET) {
+        drop_file_refs(fds);
+        return Err(disconnected);
+    }
 
     let Some(peer) = peer_addr else {
         if let Some(n) = synthesize_netlink_send(sock, bytes, None) {
+            drop_file_refs(fds);
             return Ok(n);
         }
+        drop_file_refs(fds);
         return Err(ENOTCONN);
     };
     if let Some(n) = synthesize_netlink_send(sock, bytes, Some(&peer)) {
+        drop_file_refs(fds);
         return Ok(n);
     }
     if let Some(n) = synthesize_external_inet_response(sock, bytes, &peer) {
+        drop_file_refs(fds);
         return Ok(n);
     }
-    let target = BOUND
+    if !matches!(peer, SockAddr::Unix(_)) && !fds.is_empty() {
+        drop_file_refs(core::mem::take(&mut fds));
+    }
+    let target = match BOUND
         .lock()
         .get(&peer)
         .and_then(|sockets| sockets.first().cloned())
-        .ok_or(ENOTCONN)?;
-    target.lock().recvq.push_back(QueuedPacket {
+    {
+        Some(target) => target,
+        None => {
+            drop_file_refs(fds);
+            return Err(ENOTCONN);
+        }
+    };
+    let mut target = target.lock();
+    if target.state == SocketState::Closed {
+        drop_file_refs(fds);
+        return Err(ENOTCONN);
+    }
+    target.recvq.push_back(QueuedPacket {
         bytes: bytes.to_vec(),
         peer: local_addr,
         fds,
@@ -741,27 +830,51 @@ pub fn sendto_with_fds(
     sock: &SocketRef,
     bytes: &[u8],
     dest: SockAddr,
-    fds: Vec<FileRef>,
+    mut fds: Vec<FileRef>,
 ) -> Result<usize, i32> {
     let cred = current_scm_cred();
+    if sock.lock().family != AF_UNIX && !fds.is_empty() {
+        drop_file_refs(core::mem::take(&mut fds));
+    }
     if let Some(n) = synthesize_netlink_send(sock, bytes, Some(&dest)) {
+        drop_file_refs(fds);
         return Ok(n);
     }
     if let Some(n) = synthesize_external_inet_response(sock, bytes, &dest) {
+        drop_file_refs(fds);
         return Ok(n);
     }
-    let target = BOUND
+    let target = match BOUND
         .lock()
         .get(&dest)
         .and_then(|sockets| sockets.first().cloned())
-        .ok_or(ENOTCONN)?;
-    let local = sock.lock().local.clone();
+    {
+        Some(target) => target,
+        None => {
+            drop_file_refs(fds);
+            return Err(ENOTCONN);
+        }
+    };
+    let local = {
+        let socket = sock.lock();
+        if socket.state == SocketState::Closed {
+            drop_file_refs(fds);
+            return Err(ENOTCONN);
+        }
+        socket.local.clone()
+    };
     let fds = if matches!(dest, SockAddr::Unix(_)) {
         fds
     } else {
+        drop_file_refs(fds);
         Vec::new()
     };
-    target.lock().recvq.push_back(QueuedPacket {
+    let mut target = target.lock();
+    if target.state == SocketState::Closed {
+        drop_file_refs(fds);
+        return Err(ENOTCONN);
+    }
+    target.recvq.push_back(QueuedPacket {
         bytes: bytes.to_vec(),
         peer: local,
         fds,
@@ -964,6 +1077,7 @@ fn queue_netlink_error(sock: &SocketRef, bytes: &[u8], error: i32) {
             pid: 0,
             uid: 0,
             gid: 0,
+            groups: GroupInfo::default(),
             pid_ref: None,
         },
     });
@@ -1269,6 +1383,7 @@ fn enqueue_netlink_packet(sock: &SocketRef, bytes: Vec<u8>) {
             pid: 0,
             uid: 0,
             gid: 0,
+            groups: GroupInfo::default(),
             pid_ref: None,
         },
     });
@@ -1452,6 +1567,7 @@ fn synthesize_external_inet_response(
                     pid: 0,
                     uid: 0,
                     gid: 0,
+                    groups: GroupInfo::default(),
                     pid_ref: None,
                 },
             });
@@ -1473,6 +1589,7 @@ fn synthesize_external_inet_response(
                 pid: 0,
                 uid: 0,
                 gid: 0,
+                groups: GroupInfo::default(),
                 pid_ref: None,
             },
         });
@@ -1605,15 +1722,11 @@ pub fn stream_hangup_locked(socket: &KernelSocket) -> bool {
         return false;
     }
     match &socket.peer_socket {
-        Some(peer) => match peer.upgrade() {
-            Some(peer) => peer
-                .try_lock()
-                .map(|peer| peer.state == SocketState::Closed)
-                .unwrap_or(false),
-            // Peer socket object is gone entirely: the other end closed.
-            None => true,
-        },
-        None => false,
+        Some(peer) => peer
+            .try_lock()
+            .map(|peer| peer.state == SocketState::Closed)
+            .unwrap_or(false),
+        None => true,
     }
 }
 
@@ -1744,6 +1857,7 @@ pub fn getsockopt(sock: &SocketRef, opt: u32) -> Result<u32, i32> {
         SO_TIMESTAMP_OLD => Ok(socket.timestamp_old as u32),
         SO_TIMESTAMP_NEW => Ok(socket.timestamp_new as u32),
         SO_ACCEPTCONN => Ok((socket.state == SocketState::Listening) as u32),
+        SO_PEERSEC => Err(ENOPROTOOPT),
         SO_PROTOCOL => Ok(socket.protocol as u32),
         SO_DOMAIN => Ok(socket.family as u32),
         _ => Err(EINVAL),
@@ -2546,15 +2660,17 @@ mod tests {
     }
 
     #[test]
-    fn unix_socketpair_peer_links_do_not_keep_endpoints_alive() {
+    fn unix_socketpair_release_breaks_held_peer_links() {
         let (left, right) = socketpair(AF_UNIX, SOCK_STREAM, 0).unwrap();
         let left_weak = Arc::downgrade(&left);
         let right_weak = Arc::downgrade(&right);
 
-        assert_eq!(Arc::strong_count(&left), 1);
-        assert_eq!(Arc::strong_count(&right), 1);
+        assert_eq!(Arc::strong_count(&left), 2);
+        assert_eq!(Arc::strong_count(&right), 2);
 
         assert_eq!(sendmsg(&left, b"queued").unwrap(), 6);
+        release_socket(&left);
+        release_socket(&right);
         drop(left);
         drop(right);
 
@@ -2582,7 +2698,7 @@ mod tests {
     #[test]
     fn unix_socketpair_carries_scm_rights_fileref_through_sendmsg_with_fds() {
         use crate::fs::dcache::d_alloc;
-        use crate::fs::file::alloc_file;
+        use crate::fs::file::{alloc_file, fget, fput};
         use crate::fs::ops::NOOP_FILE_OPS;
 
         let (left, right) = socketpair(AF_UNIX, SOCK_DGRAM, 0).unwrap();
@@ -2591,7 +2707,7 @@ mod tests {
 
         // Sender bundles a file reference into the cmsg payload.
         assert_eq!(
-            sendmsg_with_fds(&left, b"fd!", alloc::vec![attached.clone()]).unwrap(),
+            sendmsg_with_fds(&left, b"fd!", alloc::vec![fget(&attached)]).unwrap(),
             3
         );
 
@@ -2605,6 +2721,9 @@ mod tests {
             Arc::ptr_eq(&fds[0], &attached),
             "receiver gets the same Arc<File>, not a clone of the bytes"
         );
+        for file in fds {
+            fput(file);
+        }
     }
 
     #[test]
@@ -2644,6 +2763,44 @@ mod tests {
         let mut out = [0u8; 8];
         assert_eq!(recvmsg(&accepted, &mut out).unwrap(), 3);
         assert_eq!(&out[..3], b"log");
+    }
+
+    #[test]
+    fn unix_release_socket_closes_backlog_and_unbinds_listener() {
+        let addr = SockAddr::Unix(String::from("/sock-release-backlog"));
+        let listener = socket(AF_UNIX, SOCK_STREAM, 0).unwrap();
+        let client = socket(AF_UNIX, SOCK_STREAM, 0).unwrap();
+        bind(&listener, addr.clone()).unwrap();
+        listen(&listener).unwrap();
+        connect(&client, addr.clone()).unwrap();
+        assert_eq!(listener.lock().backlog.len(), 1);
+
+        release_socket(&listener);
+        assert_eq!(listener.lock().state, SocketState::Closed);
+        assert!(listener.lock().backlog.is_empty());
+
+        let replacement = socket(AF_UNIX, SOCK_STREAM, 0).unwrap();
+        assert_eq!(bind(&replacement, addr), Ok(()));
+
+        let mut out = [0u8; 1];
+        assert_eq!(recvmsg(&client, &mut out), Ok(0));
+        assert_eq!(
+            sendmsg(&client, b"x"),
+            Err(crate::include::uapi::errno::EPIPE)
+        );
+    }
+
+    #[test]
+    fn unix_stream_send_after_peer_release_returns_epipe() {
+        let (left, right) = socketpair(AF_UNIX, SOCK_STREAM, 0).unwrap();
+        release_socket(&right);
+
+        assert_eq!(
+            sendmsg(&left, b"x"),
+            Err(crate::include::uapi::errno::EPIPE)
+        );
+        let mut out = [0u8; 1];
+        assert_eq!(recvmsg(&left, &mut out), Ok(0));
     }
 
     #[test]

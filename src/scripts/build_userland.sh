@@ -20,6 +20,19 @@ BOOTSTRAP_SHA256="${LUPOS_ARCH_BOOTSTRAP_SHA256:-e68ba918c9f7deede8eccd2cd8ce259
 BOOTSTRAP_URL="${LUPOS_ARCH_BOOTSTRAP_URL:-https://archive.archlinux.org/iso/2026.06.01/${BOOTSTRAP_NAME}.tar.zst}"
 ARCH_REPO_SNAPSHOT="2026/06/01"
 ARCH_REPO_BASE_URL="${LUPOS_ARCH_REPO_BASE_URL:-https://archive.archlinux.org/repos/$ARCH_REPO_SNAPSHOT}"
+# gdk-pixbuf 2.44 delegates all image decoding to `glycin`, which spawns a
+# sandboxed out-of-process `glycin-image-rs` loader and talks to it over peer
+# D-Bus + memfd.  That subprocess model does not work under the Lupos kernel
+# (the loader fails to decode — GTK aborts with "Unrecognized image file
+# format" — and orphaned loaders busy-loop the cooperative scheduler).  Pin the
+# last pre-glycin release (2.42.12), which compiles PNG/JPEG/TIFF loaders
+# directly into libgdk_pixbuf-2.0.so (no subprocess), and overlay it over the
+# staged 2.44 build so every GTK icon load works in-process.  See
+# `downgrade_gdk_pixbuf_no_glycin`.
+GDK_PIXBUF_NOGLYCIN_PKG="gdk-pixbuf2-2.42.12-1-x86_64.pkg.tar.zst"
+GDK_PIXBUF_NOGLYCIN_URL="${LUPOS_GDK_PIXBUF_NOGLYCIN_URL:-https://archive.archlinux.org/packages/g/gdk-pixbuf2/${GDK_PIXBUF_NOGLYCIN_PKG}}"
+GDK_PIXBUF_NOGLYCIN_SHA256="1b1c6495a2439222760f535ddd2da9b56e0c70fa43c90e93cb1b640f86debb47"
+GDK_PIXBUF_NOGLYCIN_SOFILE="libgdk_pixbuf-2.0.so.0.4200.12"
 ARCH_OFFLINE_REPO_REL="var/lib/lupos/pacman-repo"
 ARCH_PACMAN_SERVER='Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch'
 ARCH_PACMAN_XFER_HELPER="usr/lib/lupos/pacman-xfer"
@@ -120,9 +133,31 @@ ARCH_OFFLINE_REPO_PACKAGE_ALIASES=(
 ARCH_GRAPHICS_PACKAGES=(
     xorg-server
     xf86-video-fbdev
+    xf86-input-evdev
     xorg-xinit
     xorg-twm
     xterm
+    xorg-fonts-misc
+    # Modern graphical login.  The GTK greeter reuses the GTK3/theme stack
+    # already required by XFCE and avoids the classic Xaw xdm login widget.
+    lightdm
+    lightdm-gtk-greeter
+    # XFCE desktop session (task: land in a real desktop, not twm).  pacman
+    # resolves the full GTK3/xfconf/garcon dependency closure from the Arch
+    # snapshot mirror automatically.
+    xfce4-session
+    xfwm4
+    xfce4-panel
+    xfdesktop
+    xfce4-settings
+    thunar
+    xfce4-terminal
+    # D-Bus for the per-session bus xfce4-session needs, plus a base icon theme
+    # and scalable fonts so the panel/desktop render.
+    dbus
+    adwaita-icon-theme
+    hicolor-icon-theme
+    ttf-dejavu
 )
 
 TARGET="$ROOT/target/userland"
@@ -287,13 +322,40 @@ graphics_stage_ready() {
         && [ -x "$1/usr/bin/startx" ] \
         && [ -x "$1/usr/bin/twm" ] \
         && [ -x "$1/usr/bin/xterm" ] \
+        && [ -x "$1/usr/bin/lightdm" ] \
+        && [ -x "$1/usr/bin/lightdm-gtk-greeter" ] \
+        && [ -x "$1/usr/bin/startxfce4" ] \
+        && [ -x "$1/usr/bin/xfwm4" ] \
+        && [ -x "$1/usr/bin/xfce4-panel" ] \
+        && [ -x "$1/usr/bin/xfdesktop" ] \
+        && [ -x "$1/usr/bin/xfsettingsd" ] \
+        && [ -x "$1/usr/bin/xfce4-terminal" ] \
+        && [ -x "$1/usr/bin/dbus-launch" ] \
         && [ -e "$1/usr/lib/xorg/modules/drivers/fbdev_drv.so" ] \
         && [ -e "$1/usr/lib/xorg/modules/input/libinput_drv.so" ] \
+        && [ -e "$1/usr/lib/xorg/modules/input/evdev_drv.so" ] \
         && [ -d "$1/var/lib/pacman/local/xorg-server-21.1.22-2" ] \
         && [ -d "$1/var/lib/pacman/local/xf86-video-fbdev-0.5.1-1" ] \
+        && [ -d "$1/var/lib/pacman/local/xf86-input-evdev-2.11.0-1" ] \
         && [ -d "$1/var/lib/pacman/local/xorg-xinit-1.4.4-1" ] \
         && [ -d "$1/var/lib/pacman/local/xorg-twm-1.0.13.1-1" ] \
-        && [ -d "$1/var/lib/pacman/local/xterm-410-1" ]
+        && [ -d "$1/var/lib/pacman/local/xterm-410-1" ] \
+        && [ -e "$1/usr/share/fonts/misc/6x13-ISO8859-1.pcf.gz" ] \
+        && [ -d "$1/var/lib/pacman/local/xorg-fonts-misc-1.0.4-2" ]
+}
+
+graphics_runtime_cache_ready() {
+    if ! graphics_enabled; then
+        return 0
+    fi
+    [ -x "$1/usr/bin/gdk-pixbuf-thumbnailer" ] \
+        && [ -s "$1/usr/lib/$GDK_PIXBUF_NOGLYCIN_SOFILE" ] \
+        && [ "$(readlink "$1/usr/lib/libgdk_pixbuf-2.0.so.0" 2>/dev/null || true)" = "$GDK_PIXBUF_NOGLYCIN_SOFILE" ] \
+        && [ -s "$1/usr/share/glib-2.0/schemas/gschemas.compiled" ] \
+        && [ -s "$1/usr/share/icons/hicolor/icon-theme.cache" ] \
+        && [ -s "$1/usr/share/icons/AdwaitaLegacy/icon-theme.cache" ] \
+        && [ -s "$1/usr/share/fonts/misc/fonts.dir" ] \
+        && [ -s "$1/usr/share/mime/mime.cache" ]
 }
 
 stage_ready() {
@@ -308,7 +370,8 @@ stage_ready() {
         && pacman_offline_repo_ready "$STAGE" \
         && pam_systemd_ready "$STAGE" \
         && systemd_hook_ready "$STAGE" \
-        && graphics_stage_ready "$STAGE"
+        && graphics_stage_ready "$STAGE" \
+        && graphics_runtime_cache_ready "$STAGE"
 }
 
 download_bootstrap() {
@@ -677,6 +740,39 @@ install_arch_graphics_packages() {
     safe_clean_dir "$work"
 }
 
+# Rebuild the core-X `fonts.dir` index for every bitmap font directory under the
+# given root.  pacman runs with `--noscriptlet`, so the packaged
+# mkfontdir/mkfontscale hook never fires and the fonts.alias/*.pcf.gz files ship
+# without the index the X server and xterm need to resolve core fonts. Generate
+# it here with the host mkfontdir.
+# Called on the final stage (not gated by the graphics-install early-return), so
+# it always runs when the graphics profile is enabled.
+generate_arch_font_indexes() {
+    if ! graphics_enabled; then
+        return 0
+    fi
+    local root="$1"
+    local base="$root/usr/share/fonts"
+    [ -d "$base" ] || return 0
+    require_command mkfontdir
+    local dir f has_bitmap
+    while IFS= read -r -d '' dir; do
+        # Non-matching globs stay literal, so probe each candidate with -e
+        # instead of letting `ls` fail the whole directory.
+        has_bitmap=0
+        for f in "$dir"/*.pcf.gz "$dir"/*.pcf "$dir"/*.bdf; do
+            if [ -e "$f" ]; then
+                has_bitmap=1
+                break
+            fi
+        done
+        if [ "$has_bitmap" = 1 ]; then
+            log "Generating fonts.dir in ${dir#"$root"/}"
+            ( cd "$dir" && mkfontdir . )
+        fi
+    done < <(find "$base" -type d -print0)
+}
+
 extract_bootstrap() {
     if [ "${LUPOS_ARCH_REFRESH:-0}" != "1" ] && rootfs_ready; then
         log "Arch rootfs already present at $ARCH_ROOTFS"
@@ -977,6 +1073,129 @@ copy_to_stage() {
     safe_clean_dir "$STAGE"
     mkdir -p "$STAGE"
     cp -a "$ARCH_ROOTFS/." "$STAGE/"
+    downgrade_gdk_pixbuf_no_glycin "$STAGE"
+    generate_arch_font_indexes "$STAGE"
+    generate_arch_gtk_caches "$STAGE"
+}
+
+# Replace the staged glycin-based gdk-pixbuf (2.44) with the last pre-glycin
+# release (2.42.12), whose PNG/JPEG/TIFF loaders are compiled directly into
+# libgdk_pixbuf-2.0.so.  The soname (.so.0) is unchanged, and gtk3 depends on
+# `gdk-pixbuf2` with no version bound, so swapping the library file is ABI-safe
+# and makes GTK icon loading work fully in-process.  Idempotent.
+downgrade_gdk_pixbuf_no_glycin() {
+    if ! graphics_enabled; then
+        return 0
+    fi
+    local root="$1"
+    local libdir="$root/usr/lib"
+    # Nothing to do if the pre-glycin library is already in place.
+    if [ -f "$libdir/$GDK_PIXBUF_NOGLYCIN_SOFILE" ] \
+        && [ -x "$root/usr/bin/gdk-pixbuf-thumbnailer" ]; then
+        return 0
+    fi
+    # Only act when a glycin-linked gdk-pixbuf is actually staged.
+    [ -e "$libdir/libgdk_pixbuf-2.0.so.0" ] || return 0
+
+    local pkg="$CACHE/pacman-graphics/$GDK_PIXBUF_NOGLYCIN_PKG"
+    if [ ! -f "$pkg" ]; then
+        require_command curl
+        mkdir -p "$CACHE/pacman-graphics"
+        log "Downloading pre-glycin gdk-pixbuf ($GDK_PIXBUF_NOGLYCIN_PKG)"
+        curl -L --fail --progress-bar "$GDK_PIXBUF_NOGLYCIN_URL" -o "$pkg.tmp.$$"
+        mv "$pkg.tmp.$$" "$pkg"
+    fi
+    local actual
+    actual="$(sha256_of "$pkg")"
+    [ "$actual" = "$GDK_PIXBUF_NOGLYCIN_SHA256" ] || \
+        die "SHA-256 mismatch for $pkg: expected $GDK_PIXBUF_NOGLYCIN_SHA256, got $actual"
+
+    log "Overlaying pre-glycin gdk-pixbuf 2.42.12 over $root (drops glycin subprocess loaders)"
+    # Extract the library and its matching query/thumbnail tools over the stage.
+    tar --zstd -xf "$pkg" -C "$root" \
+        usr/lib/"$GDK_PIXBUF_NOGLYCIN_SOFILE" \
+        usr/bin/gdk-pixbuf-query-loaders \
+        usr/bin/gdk-pixbuf-thumbnailer 2>/dev/null \
+        || die "failed to extract $pkg"
+    # Drop every other libgdk_pixbuf-2.0.so.0.* (the 2.44 glycin build) so only
+    # the pre-glycin library remains, then repoint the sonames at it.
+    local f
+    for f in "$libdir"/libgdk_pixbuf-2.0.so.0.*; do
+        [ -e "$f" ] || continue
+        case "$(basename "$f")" in
+            "$GDK_PIXBUF_NOGLYCIN_SOFILE") ;;
+            *) rm -f "$f" ;;
+        esac
+    done
+    ln -sfn "$GDK_PIXBUF_NOGLYCIN_SOFILE" "$libdir/libgdk_pixbuf-2.0.so.0"
+    ln -sfn "libgdk_pixbuf-2.0.so.0" "$libdir/libgdk_pixbuf-2.0.so"
+}
+
+# pacman runs with `--noscriptlet`, so the GTK/GLib post-install hooks never
+# fire.  XFCE (GTK3) refuses to start, or renders unthemed/iconless, without
+# the compiled GSettings schemas, the gdk-pixbuf loader cache (needed to load
+# PNG/SVG icons), and the per-theme icon caches.  Generate them host-side with
+# the tools shipped inside the staged rootfs — mirrors what
+# `generate_arch_font_indexes` does for the core-X fonts.dir.
+generate_arch_gtk_caches() {
+    if ! graphics_enabled; then
+        return 0
+    fi
+    local root="$1"
+    local ld="$root/usr/lib/ld-linux-x86-64.so.2"
+    [ -x "$ld" ] || return 0
+    # Run a staged ELF binary against the staged libraries (the host may not
+    # have the same glib), like install_arch_graphics_packages does for pacman.
+    run_staged() {
+        local bin="$root/$1"
+        shift
+        [ -x "$bin" ] || return 0
+        "$ld" --library-path "$root/usr/lib" "$bin" "$@" 2>/dev/null
+    }
+
+    # shared-mime-info's package hook is disabled with every other pacman
+    # scriptlet. GdkPixbuf consults mime.cache before selecting even its built-in
+    # PNG loader, so without this database valid PNG icons report "unknown type".
+    if [ -x "$root/usr/bin/update-mime-database" ] \
+        && [ -d "$root/usr/share/mime/packages" ]; then
+        log "Updating shared MIME database"
+        run_staged usr/bin/update-mime-database "$root/usr/share/mime" \
+            || die "failed to update staged MIME database"
+    fi
+
+    if [ -d "$root/usr/share/glib-2.0/schemas" ]; then
+        log "Compiling GSettings schemas"
+        run_staged usr/bin/glib-compile-schemas "$root/usr/share/glib-2.0/schemas" \
+            || die "failed to compile staged GSettings schemas"
+    fi
+
+    # gdk-pixbuf loader cache — written to the versioned loaders dir the
+    # library looks up at runtime.
+    local loaders_conf
+    loaders_conf="$(find "$root/usr/lib/gdk-pixbuf-2.0" -name loaders.cache 2>/dev/null | head -1 || true)"
+    if [ -x "$root/usr/bin/gdk-pixbuf-query-loaders" ]; then
+        local loaders_dir
+        loaders_dir="$(find "$root/usr/lib/gdk-pixbuf-2.0" -type d -name loaders 2>/dev/null | head -1 || true)"
+        if [ -n "$loaders_dir" ]; then
+            log "Building gdk-pixbuf loaders cache"
+            GDK_PIXBUF_MODULEDIR="$loaders_dir" \
+                "$ld" --library-path "$root/usr/lib" \
+                "$root/usr/bin/gdk-pixbuf-query-loaders" \
+                > "${loaders_conf:-$(dirname "$loaders_dir")/loaders.cache}" 2>/dev/null \
+                || die "failed to build staged gdk-pixbuf loader cache"
+        fi
+    fi
+
+    # Per-theme icon caches so GTK finds icons quickly and correctly.
+    if [ -x "$root/usr/bin/gtk-update-icon-cache" ]; then
+        local theme
+        for theme in "$root"/usr/share/icons/*/; do
+            [ -f "$theme/index.theme" ] || continue
+            log "Updating icon cache for ${theme#"$root"/}"
+            run_staged usr/bin/gtk-update-icon-cache -q -f "$theme" \
+                || die "failed to update staged icon cache for ${theme#"$root"/}"
+        done
+    fi
 }
 
 validate_stage() {
@@ -1004,6 +1223,7 @@ validate_stage() {
     pam_systemd_ready "$STAGE" || die "staged PAM systemd session hook is missing"
     systemd_hook_ready "$STAGE" || die "staged systemd package hook wrapper is stale"
     graphics_stage_ready "$STAGE" || die "staged graphics profile is missing X11 packages"
+    graphics_runtime_cache_ready "$STAGE" || die "staged graphics profile is missing generated runtime caches"
     : > "$STAGE_STAMP"
 }
 

@@ -303,6 +303,48 @@ fn add_mm_sysfs(kernel: &Arc<KernfsNode>) {
     add_child(kernel, mm);
 }
 
+fn fb0_name_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    copy_text(buf, "lupos-fb\n")
+}
+
+fn fb0_dev_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    // Framebuffer devices use major 29; the bootloader framebuffer is fb0.
+    copy_text(buf, "29:0\n")
+}
+
+/// Populate `/sys/class/graphics`, exposing `fb0` when a framebuffer is
+/// registered.  `xf86-video-fbdev`'s probe `readlink`s
+/// `/sys/class/graphics/fb0/device/subsystem` to confirm the framebuffer is not
+/// a PCI device before it claims `/dev/fb0`; without this node the probe reports
+/// "No devices detected" and Xorg dies with "no screens found".
+///
+/// Ref: `xf86-video-fbdev` `FBDevProbe`/`fbdevHWProbe`; Linux registers the
+/// class in `drivers/video/fbdev/core/fbsysfs.c`.
+fn add_graphics_class(class: &Arc<KernfsNode>) {
+    let graphics = KernfsNode::new_dir("graphics", 0o555);
+    if crate::linux_driver_abi::video::fbdev::core::fb_info().is_some() {
+        let fb0 = KernfsNode::new_dir("fb0", 0o555);
+        add_child(
+            &fb0,
+            KernfsNode::new_file("name", 0o444, Some(fb0_name_show), None),
+        );
+        add_child(
+            &fb0,
+            KernfsNode::new_file("dev", 0o444, Some(fb0_dev_show), None),
+        );
+        let device = KernfsNode::new_dir("device", 0o555);
+        // The link target's basename must not contain "pci", so the driver
+        // treats fb0 as a platform (non-PCI) framebuffer and claims it directly.
+        add_child(
+            &device,
+            KernfsNode::new_symlink("subsystem", "../../../../bus/platform"),
+        );
+        add_child(&fb0, device);
+        add_child(&graphics, fb0);
+    }
+    add_child(class, graphics);
+}
+
 fn add_tty_class(class: &Arc<KernfsNode>) {
     let tty = KernfsNode::new_dir("tty", 0o555);
     let tty0 = KernfsNode::new_dir("tty0", 0o555);
@@ -374,6 +416,7 @@ pub fn build_root() -> (Arc<KernfsNode>, Arc<KernfsNode>) {
 
     let class = KernfsNode::new_dir("class", 0o555);
     add_tty_class(&class);
+    add_graphics_class(&class);
 
     for child in [
         kernel.clone(),

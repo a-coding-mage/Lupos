@@ -40,9 +40,14 @@ system package manager:
 build-essential nasm grub-pc-bin xorriso mtools curl ca-certificates qemu-system-x86
 ```
 
-The ISO build uses GRUB and `xorriso`. `grub-pc-bin` is required — without it
+The ISO build uses GRUB and `xorriso`. `grub-pc-bin` is required; without it
 `grub-mkrescue` builds an EFI-only ISO that QEMU's BIOS cannot boot. QEMU is
 required for run and smoke targets.
+
+The X11 graphics profile (`cargo xtask run --gui`, `LUPOS_USERLAND_GRAPHICS=1`)
+additionally needs `mkfontdir` on the host, from `xorg-mkfontscale` (Arch) or
+`xfonts-utils` (Debian/Ubuntu), to build the core-X `fonts.dir` index that the
+pinned Arch font package ships without.
 
 Populate `vendor/linux` once so the Makefile can build Linux's Kconfig tools:
 
@@ -96,17 +101,28 @@ Boot in dev mode with a visible QEMU display:
 cargo xtask run
 ```
 
-Log in as `root` with password `lupos`. QEMU exposes the same baseline devices
-for automated and display boots: framebuffer/DRM video, 8250 serial,
-virtio-net user networking, xHCI USB with a USB tablet for pointer input, and
-Intel HDA audio. The generic config enables the matching Kconfig symbols.
+Log in as `root` with password `lupos`. QEMU exposes framebuffer/DRM video,
+8250 serial, virtio-net user networking, xHCI USB, and Intel HDA audio. The GUI
+boot uses the emulated PS/2 mouse so XFCE receives relative pointer input; other
+run modes retain the USB tablet. The generic config enables the matching
+Kconfig symbols.
 
 Use the explicit public boot modes when you want a terminal or graphical shell:
 
 ```bash
 cargo xtask run --terminal
-cargo xtask run --gui
+cargo xtask run --gui        # or: make run-gui
 ```
+
+`--gui` boots the X11 graphics image and opens a QEMU window on a branded
+**LightDM GTK** graphical login (Xorg on the framebuffer via
+`xf86-video-fbdev`). Log in as `root` / `lupos` at the greeter to enter the XFCE
+desktop, including its window manager, settings daemon, panel, desktop, file
+manager, and terminal. The first run stages the graphics userland automatically
+(`LUPOS_USERLAND_GRAPHICS=1`: `xorg-server`, `xf86-video-fbdev`,
+`xf86-input-evdev`, `lightdm`, `lightdm-gtk-greeter`, and the XFCE components),
+so it takes longer than the text login. A serial console stays available for
+debugging; the run prints its log path.
 
 For QEMU/GDB debugging:
 
