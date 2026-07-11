@@ -29,9 +29,20 @@ pub const IORING_OFF_PBUF_SHIFT: u64 = 16;
 /// integration uses 4 KiB pages on x86_64.
 pub const PAGE_SIZE: usize = 4096;
 
-/// One backing region.  `pages` holds the physical-page-equivalent buffers.
+/// One page-aligned backing page.
+///
+/// Linux's io_uring mmap path exposes page allocations, not arbitrary heap
+/// byte slices. Keeping the Rust element page-aligned lets the kernel global
+/// allocator satisfy the vector from a page-aligned contiguous buddy block,
+/// so its direct-map address can be translated to the PFN range installed in
+/// the userspace VMA.
+#[repr(C, align(4096))]
+pub struct RingPage(pub [u8; PAGE_SIZE]);
+
+/// One backing region. `pages` is page-aligned and physically contiguous in
+/// the bare-metal kernel allocator for every supported io_uring size.
 pub struct RingRegion {
-    pub pages: Vec<[u8; PAGE_SIZE]>,
+    pub pages: Vec<RingPage>,
     /// Byte length the region exposes (may be less than `pages.len() * PAGE_SIZE`).
     pub len: usize,
 }
@@ -42,7 +53,7 @@ impl RingRegion {
         let n_pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
         let mut pages = Vec::with_capacity(n_pages);
         for _ in 0..n_pages {
-            pages.push([0u8; PAGE_SIZE]);
+            pages.push(RingPage([0u8; PAGE_SIZE]));
         }
         Self { pages, len: bytes }
     }
@@ -52,7 +63,7 @@ impl RingRegion {
         if off >= self.len {
             return None;
         }
-        Some(self.pages[off / PAGE_SIZE][off % PAGE_SIZE])
+        Some(self.pages[off / PAGE_SIZE].0[off % PAGE_SIZE])
     }
 
     /// Mutate the byte at offset `off`.  Used by the kernel-side ring writer
@@ -61,7 +72,7 @@ impl RingRegion {
         if off >= self.len {
             return Err(());
         }
-        self.pages[off / PAGE_SIZE][off % PAGE_SIZE] = val;
+        self.pages[off / PAGE_SIZE].0[off % PAGE_SIZE] = val;
         Ok(())
     }
 }

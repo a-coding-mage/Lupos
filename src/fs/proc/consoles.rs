@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/fs/proc/consoles.c
 //! test-origin: linux:vendor/linux/fs/proc/consoles.c
 //! `/proc/consoles`.

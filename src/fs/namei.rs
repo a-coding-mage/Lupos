@@ -14,6 +14,7 @@ use crate::include::uapi::openat2::{
 };
 
 use super::dcache::{d_alloc_child, d_cache_negative, d_lookup};
+use super::mount::VfsPath;
 use super::types::{DentryRef, InodeKind};
 
 const MAX_LINK_RECURSION: u32 = 40;
@@ -21,6 +22,10 @@ const MAX_LINK_RECURSION: u32 = 40;
 pub struct LookupCtx {
     pub root: DentryRef,
     pub start: DentryRef,
+    /// Exact Linux `struct path` identities when the caller has them.  The
+    /// dentry fields above remain for the legacy dentry-only ref-walk.
+    pub root_path: Option<VfsPath>,
+    pub start_path: Option<VfsPath>,
     pub resolve: u64,
     pub _depth: u32,
 }
@@ -30,6 +35,19 @@ impl LookupCtx {
         Self {
             root,
             start,
+            root_path: None,
+            start_path: None,
+            resolve,
+            _depth: 0,
+        }
+    }
+
+    pub fn from_paths(root: VfsPath, start: VfsPath, resolve: u64) -> Self {
+        Self {
+            root: root.dentry.clone(),
+            start: start.dentry.clone(),
+            root_path: Some(root),
+            start_path: Some(start),
             resolve,
             _depth: 0,
         }
@@ -50,6 +68,9 @@ pub fn validate_open_how(how: &OpenHow) -> Result<(), i32> {
 
 /// Resolve `path` honoring `ctx.resolve` flags.  Returns the terminal dentry.
 pub fn path_lookupat(ctx: &LookupCtx, path: &str) -> Result<DentryRef, i32> {
+    if ctx.root_path.is_some() && ctx.start_path.is_some() {
+        return super::mount::resolve_path_at(ctx, path, true).map(|(_, dentry)| dentry);
+    }
     if path.is_empty() {
         return Ok(ctx.start.clone());
     }

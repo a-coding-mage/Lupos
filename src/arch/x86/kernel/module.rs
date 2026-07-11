@@ -1,10 +1,16 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/kernel/module.c
 //! test-origin: linux:vendor/linux/arch/x86/kernel/module.c
-//! x86 module relocation/finalization wrapper.
+//! x86 module relocation and finalization audit helpers.
 //!
 //! Ports / mirrors:
 //! - vendor/linux/arch/x86/kernel/module.c
+//!
+//! The relocation writer delegates to the runtime loader's bounded x86_64
+//! implementation.  `module_finalize()` below only inventories metadata; it
+//! does not run the vendor ITS/FineIBT, return thunk, call thunk, alternatives,
+//! IBT sealing, SMP-lock, or ORC registration sequence.  The runtime loader
+//! therefore rejects those sections before allocation.
 
 #![allow(dead_code)]
 
@@ -18,6 +24,9 @@ use crate::kernel::module::relocate::{Rela, RelocType, apply_rela};
 pub struct X86ModuleMetadata {
     pub has_jump_entries: bool,
     pub has_orc_unwind: bool,
+    pub has_alternatives: bool,
+    /// True only after `.altinstructions` has actually been patched.  Merely
+    /// finding the section is not equivalent to Linux `apply_alternatives()`.
     pub alternatives_applied: bool,
 }
 
@@ -33,12 +42,15 @@ pub fn apply_relocate_add(
     relocs: &[ResolvedRela],
 ) -> Result<(), i32> {
     for r in relocs {
+        let patch_addr = section_addr
+            .checked_add(r.rela.offset)
+            .ok_or(crate::include::uapi::errno::ENOEXEC)?;
         apply_rela(
             mem,
             r.rela.offset as usize,
             r.rela.rel_type,
             r.sym_addr,
-            section_addr + r.rela.offset,
+            patch_addr,
             r.rela.addend,
         )?;
     }
@@ -63,7 +75,8 @@ pub fn module_finalize(sections: &[&str]) -> X86ModuleMetadata {
     X86ModuleMetadata {
         has_jump_entries: sections.iter().any(|s| *s == "__jump_table"),
         has_orc_unwind: sections.iter().any(|s| *s == ".orc_unwind"),
-        alternatives_applied: sections.iter().any(|s| *s == ".altinstructions"),
+        has_alternatives: sections.iter().any(|s| *s == ".altinstructions"),
+        alternatives_applied: false,
     }
 }
 

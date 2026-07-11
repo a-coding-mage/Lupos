@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/include/uapi/asm/bootparam.h
 //! test-origin: linux:vendor/linux/arch/x86/include/uapi/asm/bootparam.h
 //! Minimal Linux `boot_params` (zeropage) helper for Milestone 3.5.
@@ -8,7 +8,8 @@
 //! populate:
 //!   - sentinel (0x1ef)
 //!   - e820_entries (0x1e8) and e820_table (0x2d0, 128 entries)
-//!   - screen_info (subset) at offset 0x00
+//!   - screen_info (subset) at offset 0x00, including linear-framebuffer
+//!     geometry and color masks
 //! This keeps layout compatibility without re-declaring the full header.
 
 use crate::arch::x86::boot::compressed::efi::EfiInfo;
@@ -46,6 +47,14 @@ const OFF_SCREEN_LFB_DEPTH: usize = 0x16;
 const OFF_SCREEN_LFB_BASE: usize = 0x18;
 const OFF_SCREEN_LFB_SIZE: usize = 0x1c;
 const OFF_SCREEN_LFB_LINELENGTH: usize = 0x24;
+const OFF_SCREEN_RED_SIZE: usize = 0x26;
+const OFF_SCREEN_RED_POS: usize = 0x27;
+const OFF_SCREEN_GREEN_SIZE: usize = 0x28;
+const OFF_SCREEN_GREEN_POS: usize = 0x29;
+const OFF_SCREEN_BLUE_SIZE: usize = 0x2a;
+const OFF_SCREEN_BLUE_POS: usize = 0x2b;
+const OFF_SCREEN_RSVD_SIZE: usize = 0x2c;
+const OFF_SCREEN_RSVD_POS: usize = 0x2d;
 const OFF_SCREEN_CAPABILITIES: usize = 0x36;
 const OFF_SCREEN_EXT_LFB_BASE: usize = 0x3a;
 
@@ -337,13 +346,26 @@ impl BootParams {
         write_u32(&mut self.data, OFF_SCREEN_LFB_SIZE, 0); // optional
         write_u16(&mut self.data, OFF_SCREEN_LFB_LINELENGTH, pitch as u16);
 
+        // The local setup helper describes the packed RGB modes it creates.
+        // Firmware-provided zeropages bypass this helper and retain their own
+        // channel positions below when `framebuffer_info()` parses them.
+        let direct_color = bpp == 24 || bpp == 32;
+        self.data[OFF_SCREEN_RED_SIZE] = if direct_color { 8 } else { 0 };
+        self.data[OFF_SCREEN_RED_POS] = if direct_color { 16 } else { 0 };
+        self.data[OFF_SCREEN_GREEN_SIZE] = if direct_color { 8 } else { 0 };
+        self.data[OFF_SCREEN_GREEN_POS] = if direct_color { 8 } else { 0 };
+        self.data[OFF_SCREEN_BLUE_SIZE] = if direct_color { 8 } else { 0 };
+        self.data[OFF_SCREEN_BLUE_POS] = 0;
+        self.data[OFF_SCREEN_RSVD_SIZE] = if bpp == 32 { 8 } else { 0 };
+        self.data[OFF_SCREEN_RSVD_POS] = if bpp == 32 { 24 } else { 0 };
+
+        let mut capabilities = read_u32(&self.data, OFF_SCREEN_CAPABILITIES);
         if fb_addr >> 32 != 0 {
-            write_u32(
-                &mut self.data,
-                OFF_SCREEN_CAPABILITIES,
-                VIDEO_CAPABILITY_64BIT_BASE,
-            );
+            capabilities |= VIDEO_CAPABILITY_64BIT_BASE;
+        } else {
+            capabilities &= !VIDEO_CAPABILITY_64BIT_BASE;
         }
+        write_u32(&mut self.data, OFF_SCREEN_CAPABILITIES, capabilities);
     }
 
     pub fn framebuffer_info(&self) -> Option<FramebufferInfo> {
@@ -355,6 +377,7 @@ impl BootParams {
         let height = read_u16(&self.data, OFF_SCREEN_LFB_HEIGHT) as u32;
         let depth = read_u16(&self.data, OFF_SCREEN_LFB_DEPTH) as u32;
         let pitch = read_u16(&self.data, OFF_SCREEN_LFB_LINELENGTH) as u32;
+        let encoded_lfb_size = read_u32(&self.data, OFF_SCREEN_LFB_SIZE) as u64;
         let base_low = read_u32(&self.data, OFF_SCREEN_LFB_BASE) as u64;
         let capabilities = read_u32(&self.data, OFF_SCREEN_CAPABILITIES);
         let base_high = if capabilities & VIDEO_CAPABILITY_64BIT_BASE != 0 {
@@ -363,22 +386,115 @@ impl BootParams {
             0
         };
         let addr = base_low | (base_high << 32);
+        let red_size = self.data[OFF_SCREEN_RED_SIZE];
+        let red_pos = self.data[OFF_SCREEN_RED_POS];
+        let green_size = self.data[OFF_SCREEN_GREEN_SIZE];
+        let green_pos = self.data[OFF_SCREEN_GREEN_POS];
+        let blue_size = self.data[OFF_SCREEN_BLUE_SIZE];
+        let blue_pos = self.data[OFF_SCREEN_BLUE_POS];
+        let rsvd_size = self.data[OFF_SCREEN_RSVD_SIZE];
+        let rsvd_pos = self.data[OFF_SCREEN_RSVD_POS];
+        let bits_per_pixel = screen_info_lfb_bits_per_pixel(
+            depth, red_size, red_pos, green_size, green_pos, blue_size, blue_pos, rsvd_size,
+            rsvd_pos,
+        );
+        // Linux screen_info.h::__screen_info_lfb_size(): VBE records the
+        // aperture in 64-KiB units while EFI records bytes.
+        let resource_size = if video == VIDEO_TYPE_VLFB {
+            encoded_lfb_size << 16
+        } else {
+            encoded_lfb_size
+        };
         Some(FramebufferInfo {
+            video_type: video,
             addr,
+            resource_size,
             width,
             height,
             depth,
+            bits_per_pixel,
             pitch,
+            red_size,
+            red_pos,
+            green_size,
+            green_pos,
+            blue_size,
+            blue_pos,
+            rsvd_size,
+            rsvd_pos,
         })
     }
 }
 
+/// Linear-framebuffer data decoded from Linux `struct screen_info`.
+///
+/// `depth` is the firmware value. `bits_per_pixel` follows Linux
+/// `__screen_info_lfb_bits_per_pixel()` and also accounts for color or
+/// reserved fields extending beyond that value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FramebufferInfo {
+    pub video_type: u8,
     pub addr: u64,
+    /// Exact byte size returned by Linux `__screen_info_lfb_size()`.
+    pub resource_size: u64,
     pub width: u32,
     pub height: u32,
     pub depth: u32,
+    pub bits_per_pixel: u32,
     pub pitch: u32,
+    pub red_size: u8,
+    pub red_pos: u8,
+    pub green_size: u8,
+    pub green_pos: u8,
+    pub blue_size: u8,
+    pub blue_pos: u8,
+    pub rsvd_size: u8,
+    pub rsvd_pos: u8,
+}
+
+/// Exact port of Linux `__screen_info_lfb_bits_per_pixel()` from
+/// `drivers/video/screen_info_generic.c`.
+#[allow(clippy::too_many_arguments)]
+const fn screen_info_lfb_bits_per_pixel(
+    depth: u32,
+    red_size: u8,
+    red_pos: u8,
+    green_size: u8,
+    green_pos: u8,
+    blue_size: u8,
+    blue_pos: u8,
+    rsvd_size: u8,
+    rsvd_pos: u8,
+) -> u32 {
+    if depth <= 8 {
+        return depth;
+    }
+
+    let red_end = red_size as u32 + red_pos as u32;
+    let green_end = green_size as u32 + green_pos as u32;
+    let blue_end = blue_size as u32 + blue_pos as u32;
+    let rsvd_end = rsvd_size as u32 + rsvd_pos as u32;
+    let color_end = if red_end > green_end {
+        if red_end > blue_end {
+            red_end
+        } else {
+            blue_end
+        }
+    } else if green_end > blue_end {
+        green_end
+    } else {
+        blue_end
+    };
+    let format_end = if color_end > rsvd_end {
+        color_end
+    } else {
+        rsvd_end
+    };
+    if depth > format_end {
+        depth
+    } else {
+        format_end
+    }
 }
 
 fn write_u16(buf: &mut [u8], offset: usize, val: u16) {
@@ -452,7 +568,12 @@ mod tests {
         assert_eq!(fb.width, 800);
         assert_eq!(fb.height, 600);
         assert_eq!(fb.depth, 32);
+        assert_eq!(fb.bits_per_pixel, 32);
         assert_eq!(fb.pitch, 3200);
+        assert_eq!((fb.red_size, fb.red_pos), (8, 16));
+        assert_eq!((fb.green_size, fb.green_pos), (8, 8));
+        assert_eq!((fb.blue_size, fb.blue_pos), (8, 0));
+        assert_eq!((fb.rsvd_size, fb.rsvd_pos), (8, 24));
     }
 
     #[test]
@@ -470,7 +591,55 @@ mod tests {
         assert_eq!(fb.width, 1024);
         assert_eq!(fb.height, 768);
         assert_eq!(fb.depth, 32);
+        assert_eq!(fb.bits_per_pixel, 32);
         assert_eq!(fb.pitch, 4096);
+    }
+
+    #[test]
+    fn screen_info_framebuffer_preserves_linux_color_masks_and_storage_width() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/drivers/video/screen_info_generic.c"
+        ));
+        assert!(source.contains("u32 __screen_info_lfb_bits_per_pixel"));
+        assert!(source.contains("si->rsvd_size + si->rsvd_pos"));
+
+        let mut bp = BootParams::new();
+        bp.data[OFF_SCREEN_ORIG_VIDEO_ISVGA] = VIDEO_TYPE_VLFB;
+        write_u16(&mut bp.data, OFF_SCREEN_LFB_WIDTH, 640);
+        write_u16(&mut bp.data, OFF_SCREEN_LFB_HEIGHT, 480);
+        write_u16(&mut bp.data, OFF_SCREEN_LFB_DEPTH, 15);
+        write_u16(&mut bp.data, OFF_SCREEN_LFB_LINELENGTH, 1280);
+        write_u32(&mut bp.data, OFF_SCREEN_LFB_BASE, 0xe000_0000);
+        bp.data[OFF_SCREEN_RED_SIZE] = 5;
+        bp.data[OFF_SCREEN_RED_POS] = 10;
+        bp.data[OFF_SCREEN_GREEN_SIZE] = 5;
+        bp.data[OFF_SCREEN_GREEN_POS] = 5;
+        bp.data[OFF_SCREEN_BLUE_SIZE] = 5;
+        bp.data[OFF_SCREEN_BLUE_POS] = 0;
+        bp.data[OFF_SCREEN_RSVD_SIZE] = 1;
+        bp.data[OFF_SCREEN_RSVD_POS] = 15;
+
+        let fb = bp.framebuffer_info().unwrap();
+        assert_eq!(fb.depth, 15);
+        assert_eq!(fb.bits_per_pixel, 16);
+        assert_eq!((fb.red_size, fb.red_pos), (5, 10));
+        assert_eq!((fb.green_size, fb.green_pos), (5, 5));
+        assert_eq!((fb.blue_size, fb.blue_pos), (5, 0));
+        assert_eq!((fb.rsvd_size, fb.rsvd_pos), (1, 15));
+    }
+
+    #[test]
+    fn screen_info_storage_width_includes_reserved_field_beyond_depth() {
+        assert_eq!(
+            screen_info_lfb_bits_per_pixel(24, 8, 16, 8, 8, 8, 0, 8, 24),
+            32
+        );
+        assert_eq!(
+            screen_info_lfb_bits_per_pixel(8, 8, 16, 8, 8, 8, 0, 8, 24),
+            8,
+            "Linux leaves indexed modes at their reported depth"
+        );
     }
 
     #[test]

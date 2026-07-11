@@ -25,7 +25,6 @@ use crate::arch::x86::mm::paging::{
     p4d_offset, pgd_none, pgd_offset_pgd, pgd_t, pmd_huge, pmd_none, pmd_offset, pte_offset_kernel,
     pte_phys, pte_present, pte_t, pte_write, pud_huge, pud_none, pud_offset,
 };
-use crate::init::initramfs;
 use crate::kernel::{sched, task::TaskStruct};
 use crate::mm::{
     buddy::{is_buddy_ready, page_to_pfn, with_global_buddy},
@@ -335,9 +334,6 @@ fn read_shebang_spec(path: &str) -> Result<Option<ShebangSpec>, i32> {
 }
 
 fn read_exec_file(path: &str) -> Result<Vec<u8>, i32> {
-    if let Ok(bytes) = initramfs::read_file(path) {
-        return Ok(bytes);
-    }
     let (_, dentry) =
         crate::fs::mount::resolve_path_follow(path).map_err(|errno| -(errno as i32))?;
     let inode = dentry.inode().ok_or(-2)?;

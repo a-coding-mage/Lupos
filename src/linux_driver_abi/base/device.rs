@@ -177,6 +177,104 @@ pub fn register_module_exports() {
     export_symbol_once("device_unregister", linux_device_unregister as usize, true);
     export_symbol_once("get_device", get_device as usize, true);
     export_symbol_once("put_device", put_device as usize, true);
+    export_symbol_once("_dev_err", linux_dev_err as usize, false);
+    export_symbol_once("_dev_warn", linux_dev_warn as usize, false);
+    export_symbol_once("_dev_notice", linux_dev_notice as usize, false);
+    export_symbol_once("_dev_info", linux_dev_info as usize, false);
+}
+
+macro_rules! define_linux_dev_printk_level {
+    ($function:ident, $symbol:literal, $level:expr) => {
+        /// x86-64 C-variadic trampoline for the corresponding Linux
+        /// `define_dev_printk_level()` entry point.
+        #[unsafe(naked)]
+        #[unsafe(export_name = $symbol)]
+        pub unsafe extern "C" fn $function() {
+            core::arch::naked_asm!(
+                "sub rsp, 40",
+                "mov qword ptr [rsp], rdx",
+                "mov qword ptr [rsp + 8], rcx",
+                "mov qword ptr [rsp + 16], r8",
+                "mov qword ptr [rsp + 24], r9",
+                "lea rcx, [rsp]",
+                "lea r8, [rsp + 48]",
+                "mov edx, {level}",
+                "call {helper}",
+                "add rsp, 40",
+                "ret",
+                level = const $level,
+                helper = sym linux_dev_printk_helper,
+            );
+        }
+    };
+}
+
+define_linux_dev_printk_level!(linux_dev_err, "_dev_err", 3);
+define_linux_dev_printk_level!(linux_dev_warn, "_dev_warn", 4);
+define_linux_dev_printk_level!(linux_dev_notice, "_dev_notice", 5);
+define_linux_dev_printk_level!(linux_dev_info, "_dev_info", 6);
+
+unsafe fn linux_device_c_str<'a>(ptr: *const c_char) -> &'a str {
+    if ptr.is_null() {
+        return "";
+    }
+    let len = unsafe { crate::lib::string::c_strlen(ptr, 512) };
+    let bytes = unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+    core::str::from_utf8(bytes).unwrap_or("")
+}
+
+#[inline(never)]
+unsafe extern "C" fn linux_dev_printk_helper(
+    dev: *const LinuxDevice,
+    fmt: *const c_char,
+    level: u32,
+    register_args: *const usize,
+    stack_args: *const usize,
+) {
+    let mut message_buf = [0u8; crate::kernel::printk::log::MSG_CAP];
+    let message_len = unsafe {
+        super::printf::vscnprintf(
+            message_buf.as_mut_ptr(),
+            message_buf.len(),
+            fmt,
+            register_args,
+            stack_args,
+        )
+    };
+    let message = core::str::from_utf8(&message_buf[..message_len]).unwrap_or("");
+    // Lupos's console renderer appends the record newline. Linux stores the
+    // terminator as LOG_NEWLINE rather than as message text, so remove exactly
+    // one terminal newline before handing the record to that renderer.
+    let message = message.strip_suffix('\n').unwrap_or(message);
+    let log_level = match level {
+        0..=3 => crate::kernel::printk::log::Level::Error,
+        4 => crate::kernel::printk::log::Level::Warn,
+        _ => crate::kernel::printk::log::Level::Info,
+    };
+
+    if dev.is_null() {
+        crate::kernel::printk::log::_log(log_level, "", format_args!("(NULL device *): {message}"));
+        return;
+    }
+
+    let device_name = unsafe { linux_device_c_str(linux_dev_name(&*dev)) };
+    let driver = unsafe { (*dev).driver };
+    let driver_name = if !driver.is_null() {
+        unsafe { linux_device_c_str((*driver).name) }
+    } else {
+        let bus = unsafe { (*dev).bus };
+        if bus.is_null() {
+            ""
+        } else {
+            unsafe { linux_device_c_str((*bus).name) }
+        }
+    };
+
+    crate::kernel::printk::log::_log(
+        log_level,
+        driver_name,
+        format_args!("{device_name}: {message}"),
+    );
 }
 
 pub fn registered_linux_device_count() -> usize {

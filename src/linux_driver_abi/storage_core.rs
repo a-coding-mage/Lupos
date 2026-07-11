@@ -502,8 +502,11 @@ pub fn register_module_exports() {
         linux_disk_check_media_change,
         true
     );
-    export_fn!("bsg_register_queue", linux_bsg_register_queue, true);
-    export_fn!("bsg_unregister_queue", linux_bsg_unregister_queue, true);
+    // `bsg_register_queue()` returns `struct bsg_device *` and owns the
+    // cdev/device/sysfs lifecycle in vendor Linux. The previous local no-op
+    // used an incompatible integer return ABI. These symbols are supplied by
+    // the staged vendor `block/bsg.ko`; do not mask a missing dependency with
+    // a fabricated built-in provider.
     export_fn!("kblockd_schedule_work", linux_kblockd_schedule_work, true);
 
     export_fn!("pcim_enable_device", linux_pcim_enable_device, false);
@@ -1756,16 +1759,6 @@ unsafe extern "C" fn linux_disk_set_independent_access_ranges(
 unsafe extern "C" fn linux_disk_check_media_change(_disk: *mut LinuxGendisk) -> bool {
     false
 }
-unsafe extern "C" fn linux_bsg_register_queue(
-    _q: *mut LinuxRequestQueue,
-    _dev: *mut LinuxDevice,
-    _name: *const c_char,
-    _job_fn: *mut c_void,
-    _timeout: u32,
-) -> i32 {
-    0
-}
-unsafe extern "C" fn linux_bsg_unregister_queue(_q: *mut LinuxRequestQueue) {}
 unsafe extern "C" fn linux_kblockd_schedule_work(work: *mut WorkStruct) -> bool {
     unsafe {
         linux_queue_work_on(

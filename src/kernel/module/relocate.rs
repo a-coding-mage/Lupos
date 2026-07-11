@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/module
 //! test-origin: linux:vendor/linux/kernel/module
 //! ELF relocation engine for x86_64 `.ko` files.
@@ -29,7 +29,7 @@ pub enum RelocType {
     Pc32 = 2,
     /// PLT-relative 32-bit: Linux treats this like `R_X86_64_PC32`.
     Plt32 = 4,
-    /// GOT-relative 32-bit: `G + A`.  We treat as PC-relative for now.
+    /// GOT-relative 32-bit. x86 Linux modules reject this relocation.
     GotPcRel = 9,
     /// 32-bit zero-extended absolute: `S + A`.
     _32 = 10,
@@ -107,68 +107,49 @@ pub fn apply_rela(
     patch_vaddr: u64,
     addend: i64,
 ) -> Result<(), i32> {
-    let s = sym_addr as i64;
-    let a = addend;
-    let p = patch_vaddr as i64;
-
-    match rel_type {
-        RelocType::None => {}
-
-        RelocType::Abs64 => {
-            let val = (s + a) as u64;
-            if offset + 8 > mem.len() {
-                return Err(ENOEXEC);
-            }
-            mem[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
-        }
-
-        RelocType::Pc32 | RelocType::Plt32 | RelocType::GotPcRel => {
-            // PC-relative 32-bit: value = S + A - P, must fit in i32.
-            let val = s + a - p;
-            let val32 = val as i32;
-            if val as i64 != val32 as i64 {
-                return Err(ENOEXEC);
-            } // overflow
-            if offset + 4 > mem.len() {
-                return Err(ENOEXEC);
-            }
-            mem[offset..offset + 4].copy_from_slice(&val32.to_le_bytes());
-        }
-
-        RelocType::_32 => {
-            let full = (s + a) as u64;
-            let val = full as u32;
-            if full != val as u64 {
-                return Err(ENOEXEC);
-            }
-            if offset + 4 > mem.len() {
-                return Err(ENOEXEC);
-            }
-            mem[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
-        }
-
-        RelocType::_32S => {
-            let full = s + a;
-            let val = full as i32;
-            if full != val as i64 {
-                return Err(ENOEXEC);
-            }
-            if offset + 4 > mem.len() {
-                return Err(ENOEXEC);
-            }
-            mem[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
-        }
-
-        RelocType::Pc64 => {
-            let val = (s + a - p) as u64;
-            if offset + 8 > mem.len() {
-                return Err(ENOEXEC);
-            }
-            mem[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
-        }
-
-        RelocType::Unknown => return Err(ENOEXEC),
+    if rel_type == RelocType::None {
+        return Ok(());
     }
+
+    let mut value = sym_addr.wrapping_add(addend as u64);
+    let size = match rel_type {
+        RelocType::Abs64 => 8,
+        RelocType::_32 => {
+            if value != value as u32 as u64 {
+                return Err(ENOEXEC);
+            }
+            4
+        }
+        RelocType::_32S => {
+            if value as i64 != value as u32 as i32 as i64 {
+                return Err(ENOEXEC);
+            }
+            4
+        }
+        RelocType::Pc32 | RelocType::Plt32 => {
+            // Vendor Linux deliberately writes the low 32 bits here; module
+            // placement, not the relocation helper, guarantees reachability.
+            value = value.wrapping_sub(patch_vaddr);
+            4
+        }
+        RelocType::Pc64 => {
+            value = value.wrapping_sub(patch_vaddr);
+            8
+        }
+        RelocType::GotPcRel | RelocType::Unknown | RelocType::None => {
+            return Err(ENOEXEC);
+        }
+    };
+
+    let end = offset.checked_add(size).ok_or(ENOEXEC)?;
+    let target = mem.get_mut(offset..end).ok_or(ENOEXEC)?;
+    // `arch/x86/kernel/module.c:__write_relocate_add()` refuses RELA
+    // targets containing any pre-existing value. Accepting one would apply an
+    // addend twice or overwrite executable data from a malformed module.
+    if target.iter().any(|byte| *byte != 0) {
+        return Err(ENOEXEC);
+    }
+    target.copy_from_slice(&value.to_le_bytes()[..size]);
     Ok(())
 }
 

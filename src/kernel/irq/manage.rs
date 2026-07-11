@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/irq/manage.c
 //! test-origin: linux:vendor/linux/kernel/irq/manage.c
 //! IRQ management — `request_irq` / `free_irq` / `enable_irq` / `disable_irq`
@@ -10,6 +10,7 @@ use core::ffi::{c_char, c_void};
 use core::sync::atomic::Ordering;
 
 use super::irqdesc::{IRQ_DISABLED, IrqAction, IrqHandler, ThreadedHandler, desc_for};
+use crate::arch::x86::kernel::cpu::common::LinuxCpuMask;
 use crate::kernel::module::{export_symbol, find_symbol};
 
 // ── Linux `IRQF_*` flags ────────────────────────────────────────────────────
@@ -41,6 +42,11 @@ pub fn register_module_exports() {
     );
     export_symbol_once("free_irq", linux_free_irq as usize, false);
     export_symbol_once("synchronize_irq", linux_synchronize_irq as usize, false);
+    export_symbol_once(
+        "__irq_apply_affinity_hint",
+        linux_irq_apply_affinity_hint as usize,
+        true,
+    );
 }
 
 /// `request_irq(irq, handler, flags, name, dev_id)`.
@@ -150,8 +156,39 @@ pub fn disable_irq(irq: u32) {
 /// `irq_set_affinity(irq, mask)`.
 pub fn irq_set_affinity(irq: u32, mask: u32) -> Result<(), i32> {
     let desc = desc_for(irq).ok_or(ENXIO)?;
+    if u64::from(mask) & super::cpuhotplug::irq_online_cpu_mask() == 0 {
+        return Err(EINVAL);
+    }
     desc.affinity.store(mask, Ordering::Release);
     Ok(())
+}
+
+/// `__irq_apply_affinity_hint` - `vendor/linux/kernel/irq/manage.c:504`.
+///
+/// Linux retains the caller-owned mask pointer in `irq_desc::affinity_hint`.
+/// When requested it then attempts to apply the same mask, but deliberately
+/// does not replace the successful hint-update return value with an affinity
+/// programming error.
+#[unsafe(export_name = "__irq_apply_affinity_hint")]
+pub unsafe extern "C" fn linux_irq_apply_affinity_hint(
+    irq: u32,
+    mask: *const LinuxCpuMask,
+    set_affinity: bool,
+) -> i32 {
+    let Some(desc) = desc_for(irq) else {
+        return -EINVAL;
+    };
+
+    desc.affinity_hint.store(mask as usize, Ordering::Release);
+    if !mask.is_null() && set_affinity {
+        // The staged x86_64 vendor configuration has NR_CPUS=64, hence a
+        // Linux cpumask occupies exactly one machine word.  Lupos's IRQ
+        // descriptor currently tracks its supported CPU slots in its u32
+        // affinity field; CPUs outside that field cannot be online.
+        let requested = unsafe { (*mask).bits[0] } as u32;
+        let _ = irq_set_affinity(irq, requested);
+    }
+    0
 }
 
 fn startup_irq(irq: u32) {

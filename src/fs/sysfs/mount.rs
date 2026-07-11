@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/fs/sysfs/mount.c
 //! test-origin: linux:vendor/linux/fs/sysfs/mount.c
 //! sysfs mount tree builder.

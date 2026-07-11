@@ -1,7 +1,8 @@
-//! linux-parity: complete
+//! linux-parity: stub
 //! linux-source: vendor/linux/rust/helpers/drm.c
 //! test-origin: linux:vendor/linux/rust/helpers/drm.c
-//! Rust helper shims for DRM GEM and GEM shmem operations.
+//! Source-contract metadata for Linux's DRM Rust helper shims; this file does
+//! not provide the C ABI functions themselves.
 
 use super::RustHelperSource;
 

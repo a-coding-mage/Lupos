@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/kernel/early-quirks.c
 //! test-origin: linux:vendor/linux/arch/x86/kernel/early-quirks.c
 //! Early x86 PCI quirk matching.
@@ -106,33 +106,20 @@ pub const fn gen6_stolen_size(gms: u16) -> u64 {
 }
 
 pub const fn chv_stolen_size(gms: u16) -> u64 {
-    match gms {
-        0 => 0,
-        1 => 32 * MB,
-        2 => 64 * MB,
-        3 => 96 * MB,
-        4 => 128 * MB,
-        5 => 160 * MB,
-        6 => 192 * MB,
-        7 => 224 * MB,
-        8 => 256 * MB,
-        9 => 288 * MB,
-        10 => 320 * MB,
-        11 => 352 * MB,
-        12 => 384 * MB,
-        13 => 416 * MB,
-        14 => 448 * MB,
-        15 => 480 * MB,
-        _ => 512 * MB,
+    if gms < 0x11 {
+        (gms as u64) * 32 * MB
+    } else if gms < 0x17 {
+        ((gms as u64) - 0x11) * 4 * MB + 8 * MB
+    } else {
+        ((gms as u64) - 0x17) * 4 * MB + 36 * MB
     }
 }
 
 pub const fn gen9_stolen_size(gms: u16) -> u64 {
-    match gms {
-        0 => 0,
-        1..=0xef => (gms as u64) * 32 * MB,
-        0xf0..=0xfe => 4 * 1024 * MB + ((gms as u64 - 0xf0) * 4 * MB),
-        _ => 0,
+    if gms < 0xf0 {
+        (gms as u64) * 32 * MB
+    } else {
+        ((gms as u64) - 0xf0) * 4 * MB + 4 * MB
     }
 }
 
@@ -204,8 +191,6 @@ mod tests {
     #[test]
     fn intel_stolen_memory_size_helpers_match_linux_units() {
         assert_eq!(gen6_stolen_size(2), 64 * MB);
-        assert_eq!(chv_stolen_size(5), 160 * MB);
-        assert_eq!(gen9_stolen_size(0xf1), 4 * 1024 * MB + 4 * MB);
         assert_eq!(
             intel_graphics_stolen(0x1000_0000, 64 * MB),
             Some(Resource {
@@ -213,5 +198,24 @@ mod tests {
                 end: 0x13ff_ffff
             })
         );
+    }
+
+    #[test]
+    fn chv_stolen_memory_size_matches_linux_encoding_boundaries() {
+        assert_eq!(chv_stolen_size(0x00), 0);
+        assert_eq!(chv_stolen_size(0x10), 512 * MB);
+        assert_eq!(chv_stolen_size(0x11), 8 * MB);
+        assert_eq!(chv_stolen_size(0x16), 28 * MB);
+        assert_eq!(chv_stolen_size(0x17), 36 * MB);
+        assert_eq!(chv_stolen_size(0x1d), 60 * MB);
+    }
+
+    #[test]
+    fn gen9_stolen_memory_size_matches_linux_encoding_boundaries() {
+        assert_eq!(gen9_stolen_size(0x00), 0);
+        assert_eq!(gen9_stolen_size(0xef), 0xef * 32 * MB);
+        assert_eq!(gen9_stolen_size(0xf0), 4 * MB);
+        assert_eq!(gen9_stolen_size(0xfe), 60 * MB);
+        assert_eq!(gen9_stolen_size(0xff), 64 * MB);
     }
 }

@@ -56,10 +56,63 @@ config FRAMEBUFFER
 	bool "Framebuffer console support"
 	default y
 
+config AGP
+	tristate "/dev/agpgart (AGP support)"
+	depends on PCI
+	default m if MODULES
+	default n
+
+config AGP_AMD64
+	tristate "AMD Opteron/Athlon64 on-CPU GART support"
+	depends on AGP && PCI
+	default m if MODULES
+	default n
+
+config AGP_INTEL
+	tristate "Intel AGP chipset support"
+	depends on AGP && PCI
+	default m if MODULES
+	default n
+
 config DRM
 	bool "Direct Rendering Manager support"
 	depends on FRAMEBUFFER
 	default y
+
+config DRM_KMS_HELPER
+	tristate
+	depends on DRM
+	default m if MODULES
+
+config DRM_GEM_SHMEM_HELPER
+	tristate
+	depends on DRM
+	default m if MODULES
+
+config DRM_PANEL_ORIENTATION_QUIRKS
+	tristate
+	depends on DRM
+	default m if MODULES
+
+config DRM_BOCHS
+	tristate "DRM Support for bochs dispi vga interface (qemu stdvga)"
+	depends on DRM && PCI
+	select DRM_KMS_HELPER
+	select DRM_GEM_SHMEM_HELPER
+	select DRM_PANEL_ORIENTATION_QUIRKS
+	default m if MODULES
+
+config DRM_I915
+	tristate "Intel 915-family graphics support"
+	depends on DRM && PCI
+	default m if MODULES
+	default n
+
+config DRM_VIRTIO_GPU
+	tristate "VirtIO GPU support"
+	depends on DRM && VIRTIO && PCI
+	default m if MODULES
+	default n
 
 config INPUT
 	bool "Input device support"

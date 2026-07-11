@@ -683,6 +683,14 @@ pub fn pte_modify(pte: pte_t, prot: pgprot_t) -> pte_t {
     pte_t((pte.0 & _PAGE_CHG_MASK) | (prot.0 & !_PAGE_CHG_MASK))
 }
 
+/// Replace a VMA's protection bits while preserving PAT/cache-mode and
+/// encryption/PFN-field bits. This is the x86 `pgprot_modify()` used by
+/// mprotect before updating `vma->vm_page_prot`.
+#[inline]
+pub fn pgprot_modify(oldprot: pgprot_t, newprot: pgprot_t) -> pgprot_t {
+    pgprot_t((oldprot.0 & _PAGE_CHG_MASK) | (newprot.0 & !_PAGE_CHG_MASK))
+}
+
 // ---------------------------------------------------------------------------
 // PMD-level set/clear — needed by `pmd_huge`/anonymous-THP code paths.
 // Mirrors `pmd_mk*` in pgtable.h.

@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/mm/init.c
 //! test-origin: linux:vendor/linux/arch/x86/mm/init.c
 //! x86 memory initialization policy.
@@ -9,6 +9,13 @@
 //! safe to test outside early boot.
 
 #[cfg(not(test))]
+extern crate alloc;
+
+#[cfg(not(test))]
+use alloc::vec::Vec;
+#[cfg(not(test))]
+use lazy_static::lazy_static;
+#[cfg(not(test))]
 use spin::Mutex;
 
 use crate::arch::x86::mm::paging::{
@@ -16,7 +23,7 @@ use crate::arch::x86::mm::paging::{
 };
 #[cfg(not(test))]
 use crate::arch::x86::mm::paging::{
-    _PAGE_ACCESSED, _PAGE_DIRTY, _PAGE_GLOBAL, _PAGE_PRESENT, _PAGE_RW, map_kernel_page,
+    _PAGE_ACCESSED, _PAGE_DIRTY, _PAGE_GLOBAL, _PAGE_NX, _PAGE_PRESENT, _PAGE_RW, map_kernel_page,
     unmap_kernel_page, virt_to_phys,
 };
 use crate::arch::x86::mm::pat::{PageCacheMode, pgprot_with_cachemode};
@@ -52,9 +59,6 @@ pub const MODULES_END: u64 = 0xffff_ffff_ff00_0000;
 pub const MODULE_ALIGN: u64 = PAGE_SIZE;
 
 #[cfg(not(test))]
-const EXECMEM_ALLOCS: usize = 128;
-
-#[cfg(not(test))]
 #[derive(Clone, Copy)]
 struct ExecmemRange {
     start: u64,
@@ -64,34 +68,40 @@ struct ExecmemRange {
 #[cfg(not(test))]
 struct ExecmemState {
     ready: bool,
-    free: [Option<ExecmemRange>; EXECMEM_ALLOCS],
-    live: [Option<ExecmemRange>; EXECMEM_ALLOCS],
+    free: Vec<ExecmemRange>,
+    live: Vec<ExecmemRange>,
 }
 
 #[cfg(not(test))]
 impl ExecmemState {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             ready: false,
-            free: [None; EXECMEM_ALLOCS],
-            live: [None; EXECMEM_ALLOCS],
+            free: Vec::new(),
+            live: Vec::new(),
         }
     }
 
-    fn ensure_ready(&mut self) {
+    fn ensure_ready(&mut self) -> bool {
         if self.ready {
-            return;
+            return true;
         }
-        self.free[0] = Some(ExecmemRange {
+        if self.free.try_reserve(1).is_err() {
+            return false;
+        }
+        self.free.push(ExecmemRange {
             start: MODULES_VADDR,
             size: (MODULES_END - MODULES_VADDR) as usize,
         });
         self.ready = true;
+        true
     }
 }
 
 #[cfg(not(test))]
-static EXECMEM_STATE: Mutex<ExecmemState> = Mutex::new(ExecmemState::new());
+lazy_static! {
+    static ref EXECMEM_STATE: Mutex<ExecmemState> = Mutex::new(ExecmemState::new());
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirectMapRange {
@@ -170,23 +180,21 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
 #[cfg(not(test))]
 fn reserve_execmem_va(state: &mut ExecmemState, size: usize) -> Option<u64> {
     let mut best_idx = None;
-    for (idx, slot) in state.free.iter().enumerate() {
-        if let Some(range) = slot {
-            if range.size < size {
-                continue;
-            }
-            match best_idx {
-                None => best_idx = Some(idx),
-                Some(best) if range.size < state.free[best].unwrap().size => best_idx = Some(idx),
-                _ => {}
-            }
+    for (idx, range) in state.free.iter().enumerate() {
+        if range.size < size {
+            continue;
+        }
+        match best_idx {
+            None => best_idx = Some(idx),
+            Some(best) if range.size < state.free[best].size => best_idx = Some(idx),
+            _ => {}
         }
     }
 
     let idx = best_idx?;
-    let range = state.free[idx].take().unwrap();
+    let range = state.free.swap_remove(idx);
     if range.size > size {
-        state.free[idx] = Some(ExecmemRange {
+        state.free.push(ExecmemRange {
             start: range.start + size as u64,
             size: range.size - size,
         });
@@ -197,42 +205,41 @@ fn reserve_execmem_va(state: &mut ExecmemState, size: usize) -> Option<u64> {
 #[cfg(not(test))]
 fn free_execmem_va(state: &mut ExecmemState, start: u64, size: usize) {
     let mut merged = ExecmemRange { start, size };
-    for slot in state.free.iter_mut() {
-        let Some(range) = *slot else {
-            continue;
-        };
+    let mut index = 0;
+    while index < state.free.len() {
+        let range = state.free[index];
         if range.start + range.size as u64 == merged.start {
             merged.start = range.start;
             merged.size += range.size;
-            *slot = None;
+            state.free.swap_remove(index);
+            index = 0;
         } else if merged.start + merged.size as u64 == range.start {
             merged.size += range.size;
-            *slot = None;
+            state.free.swap_remove(index);
+            index = 0;
+        } else {
+            index += 1;
         }
     }
-    if let Some(slot) = state.free.iter_mut().find(|slot| slot.is_none()) {
-        *slot = Some(merged);
+    if state.free.try_reserve(1).is_ok() {
+        state.free.push(merged);
     }
 }
 
 #[cfg(not(test))]
 fn remember_execmem_live(state: &mut ExecmemState, start: u64, size: usize) -> bool {
-    if let Some(slot) = state.live.iter_mut().find(|slot| slot.is_none()) {
-        *slot = Some(ExecmemRange { start, size });
-        true
-    } else {
+    if state.live.try_reserve(1).is_err() {
         false
+    } else {
+        state.live.push(ExecmemRange { start, size });
+        true
     }
 }
 
 #[cfg(not(test))]
 fn take_execmem_live(state: &mut ExecmemState, start: u64) -> Option<ExecmemRange> {
-    for slot in state.live.iter_mut() {
-        if slot.map(|range| range.start == start).unwrap_or(false) {
-            return slot.take();
-        }
-    }
-    None
+    let index = state.live.iter().position(|range| range.start == start)?;
+    Some(state.live.swap_remove(index))
 }
 
 #[cfg(not(test))]
@@ -240,14 +247,16 @@ fn unmap_execmem_pages(start: u64, size: usize) {
     for off in (0..size).step_by(PAGE_SIZE as usize) {
         let va = start + off as u64;
         if let Some(phys) = virt_to_phys(va) {
+            unsafe { unmap_kernel_page(va) };
             let page = pfn_to_page((phys >> 12) as usize);
             with_global_buddy(|buddy| buddy.free_pages(page, 0));
+        } else {
+            unsafe { unmap_kernel_page(va) };
         }
-        unsafe { unmap_kernel_page(va) };
     }
 }
 
-/// Allocate writable executable memory in Linux's x86 module range.
+/// Allocate writable, non-executable memory in Linux's x86 module range.
 ///
 /// Linux routes module text/data through `execmem_alloc_rw()` with range
 /// parameters from `execmem_arch_setup()` in this file's vendor counterpart.
@@ -264,7 +273,9 @@ pub fn execmem_alloc_rw(size: usize) -> *mut u8 {
 
     let start = {
         let mut state = EXECMEM_STATE.lock();
-        state.ensure_ready();
+        if !state.ensure_ready() {
+            return core::ptr::null_mut();
+        }
         let Some(start) = reserve_execmem_va(&mut state, size) else {
             return core::ptr::null_mut();
         };
@@ -275,11 +286,13 @@ pub fn execmem_alloc_rw(size: usize) -> *mut u8 {
         start
     };
 
-    // Writable and executable while the module loader copies sections and
-    // applies relocations. Linux later restores ROX where configured; that is
-    // a protection upgrade, not part of the driver ABI handoff itself.
+    // `execmem_alloc_rw()` first makes module memory non-executable, then
+    // writable.  Text becomes ROX only after relocation and architecture
+    // finalization; data remains NX.  Lupos does not yet implement that final
+    // per-memory-type transition, so the module loader gates real modules
+    // before allocation.
     let execmem_rw =
-        __pgprot(_PAGE_PRESENT | _PAGE_RW | _PAGE_ACCESSED | _PAGE_DIRTY | _PAGE_GLOBAL);
+        __pgprot(_PAGE_PRESENT | _PAGE_RW | _PAGE_NX | _PAGE_ACCESSED | _PAGE_DIRTY | _PAGE_GLOBAL);
 
     let mut mapped = 0usize;
     for off in (0..size).step_by(PAGE_SIZE as usize) {
@@ -301,6 +314,70 @@ pub fn execmem_alloc_rw(size: usize) -> *mut u8 {
 
     unsafe { core::ptr::write_bytes(start as *mut u8, 0, size) };
     start as *mut u8
+}
+
+/// Apply the final Linux module permission for one page-aligned execmem
+/// allocation after relocation and architecture finalization.
+///
+/// `module_enable_rodata_ro()`, `module_enable_data_nx()`, and
+/// `module_enable_text_rox()` in `vendor/linux/kernel/module/strict_rwx.c`
+/// produce exactly three useful states: ROX text, RO+NX rodata, and RW+NX
+/// data.  Lupos currently allocates each SHF_ALLOC section separately, so the
+/// same transition is applied to the retained section allocation rather than
+/// to Linux's grouped memory class.
+#[cfg(not(test))]
+pub fn execmem_set_final_permissions(
+    ptr: *mut u8,
+    size: usize,
+    writable: bool,
+    executable: bool,
+) -> Result<(), i32> {
+    if ptr.is_null() || size == 0 || (writable && executable) {
+        return Err(EINVAL);
+    }
+    let start = ptr as u64;
+    let allocation = {
+        let state = EXECMEM_STATE.lock();
+        state
+            .live
+            .iter()
+            .find(|range| range.start == start)
+            .copied()
+    }
+    .ok_or(EINVAL)?;
+    if size > allocation.size {
+        return Err(EINVAL);
+    }
+
+    let mut flags = _PAGE_PRESENT | _PAGE_ACCESSED | _PAGE_DIRTY | _PAGE_GLOBAL;
+    if writable {
+        flags |= _PAGE_RW;
+    }
+    if !executable {
+        flags |= _PAGE_NX;
+    }
+    let prot = __pgprot(flags);
+
+    for off in (0..allocation.size).step_by(PAGE_SIZE as usize) {
+        let virt = allocation.start + off as u64;
+        let phys = virt_to_phys(virt).ok_or(EINVAL)?;
+        unsafe { map_kernel_page(virt, phys, prot) };
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub fn execmem_set_final_permissions(
+    ptr: *mut u8,
+    size: usize,
+    writable: bool,
+    executable: bool,
+) -> Result<(), i32> {
+    if ptr.is_null() || size == 0 || (writable && executable) {
+        Err(EINVAL)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(not(test))]

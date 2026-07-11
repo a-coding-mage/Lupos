@@ -59,12 +59,12 @@ help:
 	@echo ""
 	@echo "Public build:"
 	@echo "  make kernel              - build a pure Lupos kernel (ELF + bzImage); = cargo xtask build"
-	@echo "  make image / make        - build the Arch userland + bootable kernel ISO; = cargo xtask build --userland --iso"
+	@echo "  make image / make        - build the Arch userland + paired boot ISO/ext4 root; = cargo xtask build --userland --iso"
 	@echo "  make build               - alias of 'make kernel' (pure kernel)"
 	@echo ""
 	@echo "Backend build targets:"
 	@echo "  make userland             - stage the minimal Arch userland"
-	@echo "  make iso                  - build kernel ELF + GRUB ISO"
+	@echo "  make iso                  - build kernel ELF + GRUB ISO + ext4 root pair"
 	@echo "  make bzImage              - build a Linux-style kernel image artifact"
 	@echo "  make modules              - stage CONFIG_*=m driver modules"
 	@echo "  make modules_install      - install staged modules under INSTALL_MOD_PATH"
@@ -118,6 +118,7 @@ syncconfig: $(KCONFIG_CONF) $(KCONFIG)
 		echo "*** No .config found; using '$(DEFCONFIG)'"; \
 		$(KCONFIG_CONF) --defconfig=$(DEFCONFIG) $(KCONFIG); \
 	fi
+	@$(KCONFIG_CONF) --olddefconfig $(KCONFIG)
 	@$(KCONFIG_CONF) --syncconfig $(KCONFIG)
 
 .PHONY: config
@@ -130,12 +131,12 @@ config: $(KCONFIG_CONF) $(KCONFIG)
 	@$(KCONFIG_CONF) --syncconfig $(KCONFIG)
 
 .PHONY: menuconfig
-menuconfig: $(KCONFIG_MCONF) $(KCONFIG)
+menuconfig: $(KCONFIG_MCONF) $(KCONFIG_CONF) $(KCONFIG)
 	@$(KCONFIG_MCONF) $(KCONFIG)
 	@$(KCONFIG_CONF) --syncconfig $(KCONFIG)
 
 .PHONY: nconfig
-nconfig: $(KCONFIG_NCONF) $(KCONFIG)
+nconfig: $(KCONFIG_NCONF) $(KCONFIG_CONF) $(KCONFIG)
 	@$(KCONFIG_NCONF) $(KCONFIG)
 	@$(KCONFIG_CONF) --syncconfig $(KCONFIG)
 

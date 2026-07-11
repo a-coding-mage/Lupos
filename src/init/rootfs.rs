@@ -681,6 +681,10 @@ pub fn bootstrap_initramfs_rootfs_with_options(options: &BootOptions) -> Result<
             mount_boot_partition_if_available()?;
             mount_pseudo_filesystems()?;
             let _ = options.console_on_rootfs_ready(path_exists);
+            // Acceptance-only legacy gates inspect module state before PID1.
+            // Production disk-root images carry /init and load modules from
+            // early userspace, matching vendor Linux.
+            #[cfg(any(feature = "test-initramfs-rootfs", feature = "test-disk-root-remount"))]
             load_configured_modules()?;
             return Ok(());
         }
@@ -702,6 +706,7 @@ pub fn bootstrap_initramfs_rootfs_with_options(options: &BootOptions) -> Result<
     mount_boot_partition_if_available()?;
     mount_pseudo_filesystems()?;
     let _ = options.console_on_rootfs_ready(path_exists);
+    #[cfg(any(feature = "test-initramfs-rootfs", feature = "test-disk-root-remount"))]
     load_configured_modules()?;
     Ok(())
 }
@@ -1147,13 +1152,24 @@ pub fn modprobe(module_name: &str) -> Result<(), i32> {
             );
             Err(ENOEXEC)
         }
-        Err(LoadModuleError::InitFailed(errno)) => Err(errno),
+        Err(LoadModuleError::UnsupportedSection(section)) => {
+            crate::log_warn!(
+                "",
+                "modprobe: {} requires unsupported Linux module finalization for {}",
+                module_name,
+                section
+            );
+            Err(ENOEXEC)
+        }
+        Err(LoadModuleError::InitFailed(errno)) => Err(errno.saturating_abs()),
+        Err(LoadModuleError::OutOfMemory) => Err(crate::include::uapi::errno::ENOMEM),
         Err(LoadModuleError::Invalid) => Err(EINVAL),
     }
 }
 
 fn resolve_module_path(module_name: &str) -> Result<String, i32> {
-    let dep = read_rootfs_file("/lib/modules/lupos/modules.dep")?;
+    let module_root = alloc::format!("/lib/modules/{}", crate::init::version::UTS_RELEASE);
+    let dep = read_rootfs_file(&alloc::format!("{module_root}/modules.dep"))?;
     let text = core::str::from_utf8(&dep).map_err(|_| EINVAL)?;
     let normalized = normalize_module_name(module_name);
 
@@ -1162,7 +1178,7 @@ fn resolve_module_path(module_name: &str) -> Result<String, i32> {
             continue;
         };
         if module_path_matches_name(path, &normalized) {
-            return Ok(alloc::format!("/lib/modules/lupos/{path}"));
+            return Ok(alloc::format!("{module_root}/{path}"));
         }
     }
 
@@ -2126,11 +2142,24 @@ mod tests {
         append_header(&mut archive, "etc/modules", 0o100644, b"");
         append_header(
             &mut archive,
-            "lib/modules/lupos/modules.order",
+            concat!(
+                "lib/modules/",
+                env!("CARGO_PKG_VERSION"),
+                "-lupos/modules.order"
+            ),
             0o100644,
             b"",
         );
-        append_header(&mut archive, "lib/modules/lupos/modules.dep", 0o100644, b"");
+        append_header(
+            &mut archive,
+            concat!(
+                "lib/modules/",
+                env!("CARGO_PKG_VERSION"),
+                "-lupos/modules.dep"
+            ),
+            0o100644,
+            b"",
+        );
         append_header(&mut archive, "bin/busybox", 0o100755, b"ELF...");
         append_header(
             &mut archive,
@@ -2153,7 +2182,11 @@ mod tests {
         append_header(&mut archive, "etc/modules", 0o100644, b"missing_net\n");
         append_header(
             &mut archive,
-            "lib/modules/lupos/modules.dep",
+            concat!(
+                "lib/modules/",
+                env!("CARGO_PKG_VERSION"),
+                "-lupos/modules.dep"
+            ),
             0o100644,
             b"kernel/drivers/net/virtio_net.ko:\n",
         );
@@ -2797,8 +2830,16 @@ mod tests {
         assert!(path_exists("/sbin/init"));
         assert!(path_exists("/usr/lib/systemd/systemd"));
         assert!(path_exists("/bin/busybox"));
-        assert!(path_exists("/lib/modules/lupos/modules.order"));
-        assert!(path_exists("/lib/modules/lupos/modules.dep"));
+        assert!(path_exists(concat!(
+            "/lib/modules/",
+            env!("CARGO_PKG_VERSION"),
+            "-lupos/modules.order"
+        )));
+        assert!(path_exists(concat!(
+            "/lib/modules/",
+            env!("CARGO_PKG_VERSION"),
+            "-lupos/modules.dep"
+        )));
         assert_eq!(read_rootfs_file("/bin/busybox").unwrap(), b"ELF...");
 
         // `ls -li` on a directory unpacked from the initramfs must show
@@ -2846,7 +2887,12 @@ mod tests {
         assert_eq!(read_rootfs_file("/etc/hostname").unwrap(), b"lupos\n");
         assert_eq!(read_rootfs_file("/etc/modules").unwrap(), b"");
         assert_eq!(
-            read_rootfs_file("/lib/modules/lupos/modules.order").unwrap(),
+            read_rootfs_file(concat!(
+                "/lib/modules/",
+                env!("CARGO_PKG_VERSION"),
+                "-lupos/modules.order"
+            ))
+            .unwrap(),
             b""
         );
         let console = path_walk("/dev/console").expect("console");
@@ -3110,6 +3156,7 @@ mod tests {
         initramfs::install_from_bytes(missing_module_initramfs()).expect("install initramfs");
 
         bootstrap_initramfs_rootfs().expect("missing configured module should not abort boot");
+        assert_eq!(modprobe("missing_net"), Err(ENOENT));
         assert!(crate::kernel::module::find_symbol("device_initialize").is_some());
         assert!(crate::kernel::module::find_symbol("device_add").is_some());
         assert!(crate::kernel::module::find_symbol("device_register").is_some());

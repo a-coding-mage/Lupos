@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/printk
 //! test-origin: linux:vendor/linux/kernel/printk
 //! Structured kernel logging with static storage only.

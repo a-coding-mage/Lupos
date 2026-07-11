@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/realmode/rm
 //! Real-mode build wrappers for setup-code sources reused by Linux.
 //!

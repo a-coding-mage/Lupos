@@ -401,6 +401,7 @@ pub(crate) enum ParityScope {
     CriticalTask,
     CriticalFdVfs,
     CriticalRuntime,
+    Video,
 }
 
 impl ParityScope {
@@ -412,6 +413,7 @@ impl ParityScope {
             "critical-task" => Ok(Self::CriticalTask),
             "critical-fd-vfs" => Ok(Self::CriticalFdVfs),
             "critical-runtime" => Ok(Self::CriticalRuntime),
+            "video" => Ok(Self::Video),
             other => bail!(
                 "unknown --scope value `{other}`; expected {}",
                 Self::usage()
@@ -420,7 +422,7 @@ impl ParityScope {
     }
 
     pub(crate) fn usage() -> &'static str {
-        "all|critical-futex|critical-time|critical-task|critical-fd-vfs|critical-runtime"
+        "all|critical-futex|critical-time|critical-task|critical-fd-vfs|critical-runtime|video"
     }
 
     fn as_arg(self) -> &'static str {
@@ -431,6 +433,7 @@ impl ParityScope {
             Self::CriticalTask => "critical-task",
             Self::CriticalFdVfs => "critical-fd-vfs",
             Self::CriticalRuntime => "critical-runtime",
+            Self::Video => "video",
         }
     }
 
@@ -463,8 +466,57 @@ impl ParityScope {
                     || Self::CriticalFdVfs.includes_path(path)
                     || is_critical_network_path(path)
             }
+            Self::Video => is_video_output_path(path),
         }
     }
+}
+
+fn is_video_output_path(path: &str) -> bool {
+    path.starts_with("src/linux_driver_abi/video/")
+        || path.starts_with("src/linux_driver_abi/gpu/")
+        || path == "src/linux_driver_abi/mod.rs"
+        || path == "src/linux_driver_abi/pci/device.rs"
+        || path == "src/linux_driver_abi/pci/enumerate.rs"
+        || path == "src/linux_driver_abi/virtio/mod.rs"
+        || path.starts_with("src/arch/x86/video/")
+        || path == "src/arch/x86/boot/compressed/misc.rs"
+        || path == "src/arch/x86/boot/legacy.rs"
+        || path == "src/arch/x86/boot/main.rs"
+        || path == "src/arch/x86/boot/mod.rs"
+        || path.starts_with("src/arch/x86/boot/video")
+        || path == "src/arch/x86/boot/vesa.rs"
+        || path == "src/arch/x86/entry/thunk.rs"
+        || path == "src/arch/x86/kernel/alternative.rs"
+        || path == "src/arch/x86/kernel/early_quirks.rs"
+        || path == "src/arch/x86/kernel/probe_roms.rs"
+        || path == "src/arch/x86/mm/init.rs"
+        || path == "src/arch/x86/realmode/mod.rs"
+        || path == "src/arch/x86/realmode/rm/mod.rs"
+        || path == "src/arch/x86/realmode/rm/wakemain.rs"
+        || path.starts_with("src/arch/x86/realmode/rm/video")
+        || path == "src/arch/x86/xen/mod.rs"
+        || path == "src/arch/x86/xen/vga.rs"
+        || path == "src/arch/x86/include/uapi/asm/bootparam.rs"
+        || path == "src/init/main.rs"
+        || path == "src/init/rootfs.rs"
+        || path == "src/kernel/console.rs"
+        || path == "src/kernel/dma/mod.rs"
+        || path == "src/kernel/printk/log.rs"
+        || path == "src/kernel/module/loader.rs"
+        || path == "src/kernel/module/relocate.rs"
+        || path == "src/kernel/module/symbols.rs"
+        || path == "src/fs/ops.rs"
+        || path == "src/fs/proc/consoles.rs"
+        || path == "src/fs/sysfs/mount.rs"
+        || path == "src/io_uring/mod.rs"
+        || path == "src/rust/helpers/drm.rs"
+        || path == "src/rust/helpers/gpu.rs"
+        || path == "src/mm/fault.rs"
+        || path == "src/mm/mmap.rs"
+        || path == "src/mm/mm_init.rs"
+        || path == "src/mm/pgprot.rs"
+        || path == "src/mm/shmem.rs"
+        || path == "src/mm/vma.rs"
 }
 
 fn is_critical_time_path(path: &str) -> bool {
@@ -2646,8 +2698,9 @@ pub(crate) fn parity_table_cmd() -> Result<()> {
 //
 // `configs/lupos_defconfig` is the projection of upstream
 // `vendor/linux/arch/x86/configs/x86_64_defconfig` onto the symbols Lupos's
-// Kconfig defines today.  This audit diffs the two for their *overlapping*
-// symbol set so the Lupos config cannot silently drift from Linux.
+// Kconfig defines today.  This audit diffs the overlapping symbol set and also
+// requires the upstream generic x86_64 video selections.  The latter must not
+// disappear merely because a local Kconfig symbol was accidentally omitted.
 //
 // The one sanctioned divergence is the driver-as-module policy (CLAUDE.md 2a):
 // device drivers Lupos loads as Linux-built `.ko` payloads are forced to `=m`
@@ -2655,9 +2708,34 @@ pub(crate) fn parity_table_cmd() -> Result<()> {
 // as `module-override` and do not fail the gate; every other mismatch does.
 
 pub(crate) const LUPOS_DEFCONFIG_PATH: &str = "configs/lupos_defconfig";
+pub(crate) const LUPOS_KCONFIG_PATH: &str = "src/kernel/Kconfig";
 pub(crate) const LINUX_X86_64_DEFCONFIG_PATH: &str =
     "vendor/linux/arch/x86/configs/x86_64_defconfig";
 pub(crate) const AUDIT_CONFIG_REPORT_PATH: &str = "target/xtask/config-parity.tsv";
+
+pub(crate) const REQUIRED_X86_64_GENERIC_VIDEO_SYMBOLS: &[&str] = &[
+    "CONFIG_AGP",
+    "CONFIG_AGP_AMD64",
+    "CONFIG_AGP_INTEL",
+    "CONFIG_DRM",
+    "CONFIG_DRM_I915",
+    "CONFIG_DRM_VIRTIO_GPU",
+];
+
+const LINUX_DRIVER_MODULE_OVERRIDE_SYMBOLS: &[&str] = &[
+    "CONFIG_AGP",
+    "CONFIG_AGP_AMD64",
+    "CONFIG_AGP_INTEL",
+    "CONFIG_ATA",
+    "CONFIG_BLK_DEV_SD",
+    "CONFIG_DRM_I915",
+    "CONFIG_DRM_VIRTIO_GPU",
+    "CONFIG_E1000",
+    "CONFIG_SATA_AHCI",
+    "CONFIG_VIRTIO_BLK",
+    "CONFIG_VIRTIO_NET",
+    "CONFIG_VIRTIO_PCI",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ConfigParityKind {
@@ -2756,13 +2834,75 @@ pub(crate) fn parse_defconfig(text: &str) -> BTreeMap<String, String> {
 pub(crate) fn run_config_parity_audit(repo: &Path) -> Result<ConfigParityReport> {
     let lupos_text = fs::read_to_string(repo.join(LUPOS_DEFCONFIG_PATH))
         .with_context(|| format!("failed to read {LUPOS_DEFCONFIG_PATH}"))?;
+    let kconfig_text = fs::read_to_string(repo.join(LUPOS_KCONFIG_PATH))
+        .with_context(|| format!("failed to read {LUPOS_KCONFIG_PATH}"))?;
     let linux_path = repo.join(LINUX_X86_64_DEFCONFIG_PATH);
     let linux_text = fs::read_to_string(&linux_path).with_context(|| {
         format!(
             "failed to read {LINUX_X86_64_DEFCONFIG_PATH} (is vendor/linux/ populated? run vendor/setup_linux.sh)"
         )
     })?;
-    Ok(audit_config_parity(&lupos_text, &linux_text))
+    let mut report = audit_config_parity(&lupos_text, &linux_text);
+    audit_required_video_kconfig_symbols(&mut report, &kconfig_text, &linux_text);
+    Ok(report)
+}
+
+fn parse_kconfig_symbols(text: &str) -> BTreeSet<String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("config ")
+                .or_else(|| line.strip_prefix("menuconfig "))
+                .map(|name| format!("CONFIG_{}", name.trim()))
+        })
+        .collect()
+}
+
+fn audit_required_video_kconfig_symbols(
+    report: &mut ConfigParityReport,
+    kconfig_text: &str,
+    linux_text: &str,
+) {
+    let declared = parse_kconfig_symbols(kconfig_text);
+    let linux = parse_defconfig(linux_text);
+
+    for &symbol in REQUIRED_X86_64_GENERIC_VIDEO_SYMBOLS {
+        let Some(linux_value) = linux.get(symbol) else {
+            continue;
+        };
+        if declared.contains(symbol) {
+            continue;
+        }
+
+        if let Some(entry) = report
+            .entries
+            .iter_mut()
+            .find(|entry| entry.symbol == symbol)
+        {
+            if entry.kind == ConfigParityKind::Divergence {
+                continue;
+            }
+            match entry.kind {
+                ConfigParityKind::Match => report.matched -= 1,
+                ConfigParityKind::ModuleOverride => report.module_overrides -= 1,
+                ConfigParityKind::Divergence => unreachable!(),
+            }
+            entry.kind = ConfigParityKind::Divergence;
+            entry.lupos_value = "<missing-kconfig>".to_owned();
+            report.divergences += 1;
+        } else {
+            report.entries.push(ConfigParityEntry {
+                symbol: symbol.to_owned(),
+                lupos_value: "<missing-kconfig>".to_owned(),
+                linux_value: linux_value.clone(),
+                kind: ConfigParityKind::Divergence,
+            });
+            report.divergences += 1;
+        }
+    }
+    report
+        .entries
+        .sort_by(|a, b| (a.kind, &a.symbol).cmp(&(b.kind, &b.symbol)));
 }
 
 pub(crate) fn audit_config_parity(lupos_text: &str, linux_text: &str) -> ConfigParityReport {
@@ -2770,16 +2910,39 @@ pub(crate) fn audit_config_parity(lupos_text: &str, linux_text: &str) -> ConfigP
     let linux = parse_defconfig(linux_text);
 
     let mut report = ConfigParityReport::default();
-    // Only the overlapping symbol set is in scope: symbols Lupos's defconfig
-    // pins that upstream's defconfig also pins.
-    for (symbol, lupos_value) in &lupos {
-        let Some(linux_value) = linux.get(symbol) else {
+    let mut compared_symbols = lupos
+        .keys()
+        .filter(|symbol| linux.contains_key(*symbol))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    compared_symbols.extend(
+        REQUIRED_X86_64_GENERIC_VIDEO_SYMBOLS
+            .iter()
+            .filter(|symbol| linux.contains_key(**symbol))
+            .map(|symbol| (*symbol).to_owned()),
+    );
+
+    for symbol in compared_symbols {
+        let linux_value = linux
+            .get(&symbol)
+            .expect("compared symbols must be present in Linux defconfig");
+        let Some(lupos_value) = lupos.get(&symbol) else {
+            report.divergences += 1;
+            report.entries.push(ConfigParityEntry {
+                symbol,
+                lupos_value: "<missing>".to_owned(),
+                linux_value: linux_value.clone(),
+                kind: ConfigParityKind::Divergence,
+            });
             continue;
         };
         let kind = if lupos_value == linux_value {
             report.matched += 1;
             ConfigParityKind::Match
-        } else if lupos_value == "m" && linux_value == "y" {
+        } else if lupos_value == "m"
+            && linux_value == "y"
+            && LINUX_DRIVER_MODULE_OVERRIDE_SYMBOLS.contains(&symbol.as_str())
+        {
             report.module_overrides += 1;
             ConfigParityKind::ModuleOverride
         } else {
@@ -2787,7 +2950,7 @@ pub(crate) fn audit_config_parity(lupos_text: &str, linux_text: &str) -> ConfigP
             ConfigParityKind::Divergence
         };
         report.entries.push(ConfigParityEntry {
-            symbol: symbol.clone(),
+            symbol,
             lupos_value: lupos_value.clone(),
             linux_value: linux_value.clone(),
             kind,
@@ -2813,7 +2976,7 @@ pub(crate) fn config_parity_cmd() -> Result<()> {
     write_config_parity_report(&report)?;
 
     println!(
-        "config-parity: overlapping={} match={} module_override={} divergence={}",
+        "config-parity: compared={} match={} module_override={} divergence={}",
         report.entries.len(),
         report.matched,
         report.module_overrides,
@@ -3238,6 +3401,7 @@ mod tests {
             "critical-task",
             "critical-fd-vfs",
             "critical-runtime",
+            "video",
         ] {
             let scope = ParityScope::parse(arg).unwrap();
             assert_eq!(scope.as_arg(), arg);
@@ -3254,6 +3418,50 @@ mod tests {
         assert!(ParityScope::CriticalRuntime.includes_path("src/kernel/futex/core_ops.rs"));
         assert!(!ParityScope::CriticalRuntime.includes_path("src/kernel/bpf/syscall.rs"));
         assert!(!ParityScope::CriticalRuntime.includes_path("src/net/linux_sources.rs"));
+    }
+
+    #[test]
+    fn video_scope_covers_boot_console_framebuffer_and_drm_paths() {
+        for path in [
+            "src/arch/x86/boot/video_vesa.rs",
+            "src/arch/x86/boot/compressed/misc.rs",
+            "src/arch/x86/boot/legacy.rs",
+            "src/arch/x86/boot/main.rs",
+            "src/arch/x86/entry/thunk.rs",
+            "src/arch/x86/kernel/alternative.rs",
+            "src/arch/x86/kernel/early_quirks.rs",
+            "src/arch/x86/kernel/probe_roms.rs",
+            "src/arch/x86/mm/init.rs",
+            "src/arch/x86/realmode/rm/video_vga.rs",
+            "src/arch/x86/realmode/rm/wakemain.rs",
+            "src/arch/x86/video/mod.rs",
+            "src/arch/x86/xen/mod.rs",
+            "src/arch/x86/xen/vga.rs",
+            "src/linux_driver_abi/video/fbdev/mod.rs",
+            "src/linux_driver_abi/gpu/drm/mod.rs",
+            "src/linux_driver_abi/pci/enumerate.rs",
+            "src/linux_driver_abi/virtio/mod.rs",
+            "src/init/main.rs",
+            "src/init/rootfs.rs",
+            "src/kernel/console.rs",
+            "src/kernel/dma/mod.rs",
+            "src/kernel/printk/log.rs",
+            "src/kernel/module/loader.rs",
+            "src/kernel/module/relocate.rs",
+            "src/fs/ops.rs",
+            "src/fs/sysfs/mount.rs",
+            "src/io_uring/mod.rs",
+            "src/mm/fault.rs",
+            "src/mm/mmap.rs",
+            "src/mm/mm_init.rs",
+            "src/mm/pgprot.rs",
+            "src/mm/shmem.rs",
+            "src/mm/vma.rs",
+            "src/rust/helpers/drm.rs",
+        ] {
+            assert!(ParityScope::Video.includes_path(path), "{path}");
+        }
+        assert!(!ParityScope::Video.includes_path("src/net/ipv4/tcp.rs"));
     }
 
     #[test]
@@ -3725,6 +3933,93 @@ mod tests {
             .collect();
         assert!(drift.contains(&"CONFIG_NET"));
         assert!(drift.contains(&"CONFIG_HZ"));
+    }
+
+    #[test]
+    fn config_parity_requires_upstream_generic_video_symbols_locally() {
+        let lupos = "CONFIG_DRM=y\n";
+        let linux = "CONFIG_DRM=y\n\
+                     CONFIG_DRM_I915=y\n\
+                     CONFIG_DRM_VIRTIO_GPU=y\n";
+        let report = audit_config_parity(lupos, linux);
+
+        assert!(!report.is_clean());
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.divergences, 2);
+        for symbol in ["CONFIG_DRM_I915", "CONFIG_DRM_VIRTIO_GPU"] {
+            let entry = report
+                .divergent_entries()
+                .find(|entry| entry.symbol == symbol)
+                .unwrap_or_else(|| panic!("missing required-video finding for {symbol}"));
+            assert_eq!(entry.lupos_value, "<missing>");
+            assert_eq!(entry.linux_value, "y");
+        }
+    }
+
+    #[test]
+    fn config_parity_accepts_declared_video_driver_module_overrides() {
+        let lupos = "CONFIG_DRM=y\n\
+                     CONFIG_DRM_I915=m\n\
+                     CONFIG_DRM_VIRTIO_GPU=m\n";
+        let linux = "CONFIG_DRM=y\n\
+                     CONFIG_DRM_I915=y\n\
+                     CONFIG_DRM_VIRTIO_GPU=y\n";
+        let report = audit_config_parity(lupos, linux);
+
+        assert!(report.is_clean());
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.module_overrides, 2);
+        assert_eq!(report.divergences, 0);
+    }
+
+    #[test]
+    fn config_parity_requires_generic_video_kconfig_declarations() {
+        let lupos = "CONFIG_DRM=y\n\
+                     CONFIG_DRM_I915=m\n\
+                     CONFIG_DRM_VIRTIO_GPU=m\n";
+        let linux = "CONFIG_DRM=y\n\
+                     CONFIG_DRM_I915=y\n\
+                     CONFIG_DRM_VIRTIO_GPU=y\n";
+        let kconfig = "config DRM\n\
+                       bool \"Direct Rendering Manager support\"\n";
+        let mut report = audit_config_parity(lupos, linux);
+        audit_required_video_kconfig_symbols(&mut report, kconfig, linux);
+
+        assert!(!report.is_clean());
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.module_overrides, 0);
+        assert_eq!(report.divergences, 2);
+        for symbol in ["CONFIG_DRM_I915", "CONFIG_DRM_VIRTIO_GPU"] {
+            let entry = report
+                .divergent_entries()
+                .find(|entry| entry.symbol == symbol)
+                .unwrap_or_else(|| panic!("missing Kconfig-declaration finding for {symbol}"));
+            assert_eq!(entry.lupos_value, "<missing-kconfig>");
+        }
+    }
+
+    #[test]
+    fn config_parity_rejects_undeclared_y_to_m_demotions() {
+        let lupos = "CONFIG_DRM=y\n\
+                     CONFIG_DRM_I915=m\n\
+                     CONFIG_DRM_VIRTIO_GPU=m\n\
+                     CONFIG_UNDECLARED_DRIVER=m\n";
+        let linux = "CONFIG_DRM=y\n\
+                     CONFIG_DRM_I915=y\n\
+                     CONFIG_DRM_VIRTIO_GPU=y\n\
+                     CONFIG_UNDECLARED_DRIVER=y\n";
+        let report = audit_config_parity(lupos, linux);
+
+        assert!(!report.is_clean());
+        assert_eq!(report.module_overrides, 2);
+        assert_eq!(report.divergences, 1);
+        assert_eq!(
+            report
+                .divergent_entries()
+                .next()
+                .map(|entry| entry.symbol.as_str()),
+            Some("CONFIG_UNDECLARED_DRIVER")
+        );
     }
 
     #[test]

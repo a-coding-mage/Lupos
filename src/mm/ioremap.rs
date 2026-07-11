@@ -1,7 +1,9 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/mm/ioremap.c
 //! test-origin: linux:vendor/linux/mm/ioremap.c
-//! Generic IO-memory remap alignment and validation.
+//! Generic IO-memory remap alignment and validation. The registered module ABI
+//! currently exposes only `ioremap()`/`iounmap()` and inherits the x86
+//! backend's incomplete memtype and VA-lifetime handling.
 
 extern crate alloc;
 

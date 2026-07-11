@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/realmode
 //! test-origin: linux:vendor/linux/arch/x86/realmode
 //! Real-mode trampoline reservation and BIOS-video handoff model.

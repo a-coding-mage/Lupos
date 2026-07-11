@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/mm/mmap.c
 //! test-origin: linux:vendor/linux/mm/mmap.c
 /// Anonymous memory mapping — `mmap`, `munmap`, and `brk`.
@@ -31,7 +31,7 @@ use alloc::vec::Vec;
 use crate::arch::x86::mm::paging::{
     PAGE_MASK, PAGE_SHIFT, PAGE_SIZE, flush_tlb_range, p4d_offset, pfn_to_virt, pgd_none,
     pgd_offset_pgd, pgd_t, pmd_huge, pmd_none, pmd_offset, pte_offset_kernel, pte_pfn, pte_present,
-    pte_t, ptep_get, ptep_get_and_clear, pud_huge, pud_none, pud_offset,
+    pte_special, pte_t, ptep_get, ptep_get_and_clear, pud_huge, pud_none, pud_offset,
 };
 use crate::include::uapi::fcntl::{O_ACCMODE, O_RDWR, O_WRONLY};
 use crate::mm::address_space::{AS_SHARED_ANON, AddressSpace};
@@ -335,13 +335,6 @@ pub unsafe fn do_mmap(
     if unsafe { file_is_hugetlbfs(file) } {
         vm_flags |= VM_HUGETLB;
     }
-    // Device files that expose a `->mmap` (e.g. `/dev/fb0`) are mapped straight
-    // onto their physical aperture: mark the VMA `VM_PFNMAP | VM_IO` so faults
-    // route to the pfn-mapping handler and teardown skips struct-page bookkeeping.
-    let is_pfn_device = unsafe { file_wants_pfn_mmap(file) };
-    if is_pfn_device {
-        vm_flags |= crate::mm::vm_flags::VM_PFNMAP | crate::mm::vm_flags::VM_IO;
-    }
     let locked_pages = if vm_flags & VM_LOCKED != 0 {
         len >> crate::arch::x86::mm::paging::PAGE_SHIFT
     } else {
@@ -390,16 +383,13 @@ pub unsafe fn do_mmap(
             // Initialize the anon_vma_chain list-head now that the VMA is
             // at a stable heap address.
             ListHead::init(&mut (*raw).anon_vma_chain);
+            (*raw).vm_mm = mm as *mut MmStruct;
             (*raw).vm_pgoff = pgoff;
             (*raw).vm_file = file;
             if file != 0 {
-                (*raw).vm_ops = if is_pfn_device {
-                    &crate::mm::fault::LUPOS_DEVICE_PFN_VM_OPS
-                        as *const crate::mm::fault::VmOperationsStruct as usize
-                } else {
-                    &crate::mm::fault::LUPOS_FILE_VM_OPS
-                        as *const crate::mm::fault::VmOperationsStruct as usize
-                };
+                (*raw).vm_ops = &crate::mm::fault::LUPOS_FILE_VM_OPS
+                    as *const crate::mm::fault::VmOperationsStruct
+                    as usize;
             }
             if hugetlb_private != 0 {
                 (*raw).vm_private_data = hugetlb_private;
@@ -408,6 +398,18 @@ pub unsafe fn do_mmap(
         }
         raw
     };
+    if let Err(err) = unsafe { call_file_mmap(file, vma_ptr) } {
+        unsafe {
+            // The syscall wrapper still owns the raw Arc on failure.
+            (*vma_ptr).vm_file = 0;
+            (*vma_ptr).vm_ops = 0;
+            vm_area_free(vma_ptr);
+        }
+        if hugetlb_private != 0 {
+            let _ = crate::mm::huge::free_hugetlb_page(hugetlb_private as u64);
+        }
+        return Err(err);
+    }
     if let Err(err) = unsafe { insert_vma(mm, vma_ptr) } {
         unsafe {
             (*vma_ptr).vm_file = 0;
@@ -437,16 +439,26 @@ unsafe fn file_is_secretmem(file: usize) -> bool {
     file.fops.name == crate::fs::syscalls::SECRETMEM_FILE_OPS.name
 }
 
-/// True if the backing device implements a `->mmap` that returns a physical
-/// address for a byte offset — i.e. it should be mapped `VM_PFNMAP` straight
-/// onto its aperture rather than through the page cache.  Today only the
-/// framebuffer character device (`/dev/fb0`) qualifies.
-unsafe fn file_wants_pfn_mmap(file: usize) -> bool {
+/// Invoke `file_operations::mmap` once on the initialized VMA, matching
+/// Linux `__mmap_new_file_vma()` in `mm/vma.c`.
+unsafe fn call_file_mmap(file: usize, vma: *mut VmAreaStruct) -> Result<(), i32> {
+    use alloc::sync::Arc;
+
     if file == 0 {
-        return false;
+        return Ok(());
     }
-    let file = unsafe { &*(file as *const crate::fs::types::File) };
-    file.fops.mmap.is_some()
+    let file_ptr = file as *const crate::fs::types::File;
+    let Some(mmap_fn) = (unsafe { (*file_ptr).fops.mmap }) else {
+        return Ok(());
+    };
+
+    unsafe {
+        Arc::increment_strong_count(file_ptr);
+    }
+    let file_ref = unsafe { Arc::from_raw(file_ptr) };
+    let result = mmap_fn(&file_ref, unsafe { &mut *vma });
+    drop(file_ref);
+    result
 }
 
 unsafe fn file_is_hugetlbfs(file: usize) -> bool {
@@ -784,6 +796,11 @@ unsafe fn put_page_from_pte(pte: pte_t, release_shared_anon: bool) {
     use crate::arch::x86::mm::paging::pte_pfn;
     use crate::mm::buddy::{pfn_to_page, pfn_valid};
 
+    // `remap_pfn_range()` PTEs are raw PFNs even when the PFN happens to lie
+    // in managed RAM. They do not own a `struct page` reference.
+    if pte_special(pte) {
+        return;
+    }
     let pfn = crate::arch::x86::mm::paging::pte_pfn(pte);
     if pfn == 0 {
         return;

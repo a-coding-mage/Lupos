@@ -307,12 +307,10 @@ fn lookup_path_str_with_follow(
     follow_final: bool,
 ) -> Result<StatTarget, i32> {
     if path.starts_with('/') || dirfd == AT_FDCWD {
-        let effective_path = super::fs_struct::absolute_from_cwd(path);
-        let lookup = effective_path.as_str();
         let (mount, dentry) = if follow_final {
-            mount::resolve_path_follow(lookup)?
+            mount::resolve_path_follow(path)?
         } else {
-            mount::resolve_path_nofollow(lookup)?
+            mount::resolve_path_nofollow(path)?
         };
         return Ok(StatTarget { dentry, mount });
     }
@@ -2649,9 +2647,15 @@ pub unsafe fn sys_chdir(pathname: *const u8) -> i64 {
         {
             let fs = super::fs_struct::current_fs();
             if !fs.is_null() {
-                super::fs_struct::set_fs_pwd(unsafe { &*fs }, target.dentry.clone());
+                super::fs_struct::set_fs_pwd_path(
+                    unsafe { &*fs },
+                    mount::VfsPath::new(target.mount.clone(), target.dentry.clone()),
+                );
             }
-            let visible = super::fs_struct::visible_path_for_current_root(&target.dentry);
+            let visible = super::fs_struct::visible_path_for_current_root(&mount::VfsPath::new(
+                target.mount,
+                target.dentry,
+            ));
             super::fs_struct::set_current_cwd_path(&visible);
             0
         }
@@ -2674,9 +2678,14 @@ pub unsafe fn sys_fchdir(fd: i32) -> i64 {
     }
     let fs = super::fs_struct::current_fs();
     if !fs.is_null() {
-        super::fs_struct::set_fs_pwd(unsafe { &*fs }, file.dentry.clone());
+        let path = mount::VfsPath::for_dentry(file.dentry.clone());
+        if let Some(path) = path {
+            super::fs_struct::set_fs_pwd_path(unsafe { &*fs }, path);
+        }
     }
-    let visible = super::fs_struct::visible_path_for_current_root(&file.dentry);
+    let visible = mount::VfsPath::for_dentry(file.dentry.clone())
+        .map(|path| super::fs_struct::visible_path_for_current_root(&path))
+        .unwrap_or_else(|| super::file::dentry_path(&file.dentry));
     super::fs_struct::set_current_cwd_path(&visible);
     0
 }
@@ -3310,13 +3319,10 @@ pub unsafe fn sys_chroot(pathname: *const u8) -> i64 {
         return -(EPERM as i64);
     }
     let fs_ref = unsafe { &*fs };
-    let old_root = fs_ref
-        .root
-        .lock()
-        .clone()
-        .unwrap_or_else(|| target.dentry.clone());
-    super::fs_struct::set_fs_root(fs_ref, target.dentry.clone());
-    super::fs_struct::chroot_fs_refs(&old_root, &target.dentry);
+    // Linux chroot(2) changes only current->fs.  chroot_fs_refs() is the
+    // all-task helper used by namespace root transitions (for example
+    // pivot_root), not by fs/open.c::chroot.
+    super::fs_struct::set_fs_root_path(fs_ref, mount::VfsPath::new(target.mount, target.dentry));
     let pwd = fs_ref.pwd.lock().clone();
     let cwd = pwd
         .map(|pwd| super::fs_struct::visible_path_for_current_root(&pwd))
@@ -6896,16 +6902,16 @@ mod tests {
         let (mut current, previous) = setup_current_with_rootfs(185);
         unsafe {
             assert_eq!(sys_mkdir(b"/jail\0".as_ptr(), 0o755), 0);
-            assert_eq!(sys_chdir(b"/\0".as_ptr()), 0);
-            assert_eq!(sys_chroot(b"/jail\0".as_ptr()), 0);
+            assert_eq!(sys_chdir(b"/jail\0".as_ptr()), 0);
+            assert_eq!(sys_chroot(b".\0".as_ptr()), 0);
 
             let mut cwd = [0u8; 8];
             assert_eq!(sys_getcwd(cwd.as_mut_ptr(), cwd.len()), 2);
             assert_eq!(&cwd[..2], b"/\0");
 
             assert_eq!(sys_mkdir(b"/inside\0".as_ptr(), 0o755), 0);
-            assert!(mount::resolve_path_follow("/jail/inside").is_ok());
-            assert!(mount::resolve_path_follow("/inside").is_err());
+            assert!(mount::resolve_path_follow("/inside").is_ok());
+            assert!(mount::resolve_path_follow("/jail/inside").is_err());
 
             crate::fs::fs_struct::exit_fs(&mut *current as *mut TaskStruct);
             crate::fs::fs_struct::set_current_cwd_path("/");

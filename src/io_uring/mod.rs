@@ -267,23 +267,19 @@ fn io_ring_release(file: FileRef) {
     IO_RINGS.lock().remove(&token);
 }
 
-/// `io_uring_mmap` — return the kernel virtual address of the first page of
-/// the SQ_RING / CQ_RING / SQES (or per-bgid PBUF_RING) region.
+/// `io_uring_mmap` — prepare the SQ_RING / CQ_RING / SQES mapping.
 ///
-/// Linux maps the kernel-allocated pages into the user mm at `addr`; lupos's
-/// kernel-only port returns the kernel pointer.  The `addr` hint, `prot` and
-/// `flags` arguments are accepted but not honoured — userspace passes them
-/// for compatibility.
+/// Linux maps the kernel-allocated pages into the initialized VMA and marks it
+/// `VM_DONTEXPAND`. Lupos retains the selected region base in the VMA for its
+/// lazy PTE materialization path.
 ///
 /// Ref: vendor/linux/io_uring/memmap.c::io_uring_mmap
-fn io_ring_mmap(
-    file: &FileRef,
-    _addr: u64,
-    len: usize,
-    _prot: u32,
-    _flags: u32,
-    off: u64,
-) -> Result<u64, i32> {
+fn io_ring_mmap(file: &FileRef, vma: &mut crate::mm::mm_types::VmAreaStruct) -> Result<(), i32> {
+    let len = usize::try_from(vma.vm_end.checked_sub(vma.vm_start).ok_or(-22)?).map_err(|_| -22)?;
+    let off = vma
+        .vm_pgoff
+        .checked_mul(memmap::PAGE_SIZE as u64)
+        .ok_or(-22)?;
     let token = *file.private.lock();
     let ctx = IO_RINGS.lock().get(&token).cloned().ok_or(-9 /* EBADF */)?;
 
@@ -303,10 +299,16 @@ fn io_ring_mmap(
     if len > guard.pages.len() * memmap::PAGE_SIZE {
         return Err(-22);
     }
-    // SAFETY: the page array is heap-pinned for the ctx's lifetime; we
-    // expose the address of the first page as the mapping base.
-    let base = guard.pages.as_ptr() as u64;
-    Ok(base)
+    // RingPage's 4 KiB alignment makes this a page-aligned direct-map range.
+    // Translate the kernel address before installing userspace PFNs; treating
+    // a Rust pointer as a physical address would map unrelated memory.
+    let base = guard.pages.as_ptr().cast::<u8>() as u64;
+    #[cfg(not(test))]
+    let phys = crate::arch::x86::mm::paging::virt_to_phys(base).ok_or(-22)?;
+    #[cfg(test)]
+    let phys = base;
+    crate::mm::fault::prepare_lupos_device_pfn_mapping(vma, phys);
+    Ok(())
 }
 
 /// `sys_io_uring_setup(entries, params)` — Linux syscall 425.
@@ -454,10 +456,17 @@ mod tests {
             assert!(fd >= 0);
             let file = current_files().unwrap().get(fd as i32).unwrap();
 
-            // Mmap'ing each well-known offset returns a non-zero base.
-            let sq_base = io_ring_mmap(&file, 0, 4096, 0, 0, IORING_OFF_SQ_RING).unwrap();
-            let cq_base = io_ring_mmap(&file, 0, 4096, 0, 0, IORING_OFF_CQ_RING).unwrap();
-            let sqes_base = io_ring_mmap(&file, 0, 4096, 0, 0, IORING_OFF_SQES).unwrap();
+            let map_region = |off: u64| {
+                let mut vma = crate::mm::mm_types::VmAreaStruct::new(0x1000, 0x2000, 0);
+                vma.vm_pgoff = off >> 12;
+                io_ring_mmap(&file, &mut vma)?;
+                Ok::<u64, i32>((vma.vm_private_data as u64).wrapping_add(off))
+            };
+
+            // Mmap'ing each well-known offset records a non-zero base.
+            let sq_base = map_region(IORING_OFF_SQ_RING).unwrap();
+            let cq_base = map_region(IORING_OFF_CQ_RING).unwrap();
+            let sqes_base = map_region(IORING_OFF_SQES).unwrap();
             assert!(sq_base != 0);
             assert!(cq_base != 0);
             assert!(sqes_base != 0);
@@ -467,10 +476,7 @@ mod tests {
             assert_ne!(cq_base, sqes_base);
 
             // Unknown offset is rejected with -EINVAL.
-            assert_eq!(
-                io_ring_mmap(&file, 0, 4096, 0, 0, 0x1234_5678).unwrap_err(),
-                -22
-            );
+            assert_eq!(map_region(0x1234_5000).unwrap_err(), -22);
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);

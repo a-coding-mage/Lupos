@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/realmode/rm/wakemain.c
 //! test-origin: linux:vendor/linux/arch/x86/realmode/rm/wakemain.c
 //! Real-mode wakeup speaker and video handoff.

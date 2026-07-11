@@ -1,7 +1,8 @@
-//! linux-parity: complete
+//! linux-parity: stub
 //! linux-source: vendor/linux/rust/helpers/gpu.c
 //! test-origin: linux:vendor/linux/rust/helpers/gpu.c
-//! Rust helper shims for GPU buddy blocks.
+//! Source-contract metadata for Linux's GPU-buddy Rust helper shims; this file
+//! does not provide the C ABI functions themselves.
 
 use super::RustHelperSource;
 

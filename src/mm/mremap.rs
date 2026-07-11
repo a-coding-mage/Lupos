@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/mm/mremap.c
 //! test-origin: linux:vendor/linux/mm/mremap.c
 /// Memory remapping — `mremap`.
@@ -30,8 +30,7 @@ use crate::mm::mmap::{
     MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_READ, PROT_WRITE, SYSCTL_MAX_MAP_COUNT, TASK_SIZE,
     do_mmap, do_munmap, get_unmapped_area, sync_shared_file_range,
 };
-use crate::mm::pgprot::vm_get_page_prot;
-use crate::mm::vm_flags::{VmFlags, vm_flags_equal};
+use crate::mm::vm_flags::{VM_DONTEXPAND, VM_PFNMAP, VmFlags, vm_flags_equal};
 use crate::mm::vma::{
     find_vma, insert_vma, remove_vma, vm_area_dup, vm_area_free, vma_file_get, vma_file_put_raw,
 };
@@ -250,14 +249,12 @@ unsafe fn reserve_mremap_destination_segment(
     let src = unsafe { &*segment.vma };
     let len = segment.end - segment.start;
     let pgoff = src.vm_pgoff + ((segment.start - src.vm_start) >> PAGE_SHIFT);
-    let vm_flags = src.vm_flags;
 
     let dst_vma = unsafe { vm_area_dup(segment.vma) };
     unsafe {
         (*dst_vma).vm_start = dest;
         (*dst_vma).vm_end = dest + len;
         (*dst_vma).vm_pgoff = pgoff;
-        (*dst_vma).vm_page_prot = vm_get_page_prot(vm_flags);
         match insert_vma(mm, dst_vma) {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -457,6 +454,13 @@ pub unsafe fn do_mremap(
     }
     let old_end = addr.checked_add(old_len).ok_or(ENOMEM)?;
     let old_range_single_vma = vend >= old_end;
+    let source_flags = unsafe { (*vma_ptr).vm_flags };
+
+    // Linux rejects MREMAP_DONTUNMAP for remap/PFN VMAs: duplicating the VMA
+    // would leave two independently managed raw-PFN mappings.
+    if (flags & MREMAP_DONTUNMAP) != 0 && source_flags & (VM_DONTEXPAND | VM_PFNMAP) != 0 {
+        return Err(EINVAL);
+    }
 
     // ── Case 1: same size ────────────────────────────────────────────────────
     if new_len == old_len {
@@ -495,6 +499,9 @@ pub unsafe fn do_mremap(
     // ── Case 3: expand ───────────────────────────────────────────────────────
     let expand = new_len - old_len;
     if !old_range_single_vma {
+        return Err(EFAULT);
+    }
+    if source_flags & (VM_DONTEXPAND | VM_PFNMAP) != 0 {
         return Err(EFAULT);
     }
 

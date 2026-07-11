@@ -31,15 +31,20 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::arch::x86::mm::paging::pfn_to_virt;
 use crate::block::bio::{BIO_OP_READ, BIO_OP_WRITE, BioRef};
-use crate::include::uapi::errno::{E2BIG, EINVAL, EIO, ENODEV, ENOSPC, EOPNOTSUPP};
+use crate::include::uapi::errno::{E2BIG, EINVAL, EIO, ENODEV, ENOMEM, ENOSPC, EOPNOTSUPP};
 use crate::kernel::dma::{
-    DmaAddr, DmaDirection, dma_alloc_coherent, dma_free_coherent, dma_map_single,
+    DMA_MAPPING_ERROR, DmaAddr, DmaDirection, dma_alloc_attrs, dma_alloc_coherent, dma_free_attrs,
+    dma_free_coherent, dma_map_page_attrs, dma_map_single, dma_map_single_for_device,
+};
+use crate::kernel::locking::qspinlock::QSpinLock;
+use crate::kernel::locking::{
+    IrqFlags, local_irq_disable, local_irq_enable, local_irq_restore, local_irq_save,
+    preempt_disable, preempt_enable,
 };
 use crate::kernel::module::{export_symbol, find_symbol};
 use crate::linux_driver_abi::base::{
@@ -51,7 +56,6 @@ use crate::linux_driver_abi::block::{
     LINUX_REQUEST_PDU_OFFSET, LinuxBlockBackendHooks, LinuxRequest, LinuxRequestQueue,
     blk_mq_complete_request, linux_disk_name, register_linux_block_backend_hooks,
 };
-use crate::mm::buddy::page_to_pfn;
 use crate::mm::page::Page;
 
 // ── VirtIO device IDs (subset) ────────────────────────────────────────────────
@@ -119,6 +123,7 @@ pub fn virtio_device_id_from_pci_ids(
 // ── VirtIO feature bits ───────────────────────────────────────────────────────
 // From `include/uapi/linux/virtio_config.h`.
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+pub const VIRTIO_F_ACCESS_PLATFORM: u32 = 33;
 pub const VIRTIO_F_RING_PACKED: u64 = 1 << 34;
 pub const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 pub const VIRTIO_NET_F_MAC: u64 = 1 << 5;
@@ -197,7 +202,7 @@ pub struct LinuxVirtqueue {
     pub index: u32,
     pub num_free: u32,
     pub num_max: u32,
-    pub reset: bool,
+    pub reset: AtomicBool,
     pub priv_: *mut c_void,
 }
 
@@ -239,6 +244,8 @@ struct LinuxVirtqueueToken {
 struct LinuxVirtqueueBackend {
     vq: usize,
     notify: LinuxVirtqueueNotify,
+    dma_dev: usize,
+    use_map_api: bool,
     ring_cpu: usize,
     ring_dma: u64,
     ring_len: usize,
@@ -296,6 +303,8 @@ pub struct LinuxVirtioDevicePrefix {
     pub config_core_enabled: bool,
     pub config_driver_disabled: bool,
     pub config_change_pending: bool,
+    pub config_lock: QSpinLock,
+    pub vqs_list_lock: QSpinLock,
 }
 
 /// Prefix of `struct virtio_device` through `priv`.
@@ -315,12 +324,67 @@ pub struct LinuxVirtioDevice {
     pub vqs: LinuxListHead,
     pub features: [u64; VIRTIO_FEATURES_U64S],
     pub priv_: *mut c_void,
+    pub vmap: usize,
 }
 
-pub const LINUX_VIRTIO_DEVICE_DEV_OFFSET: usize = 0x8;
-pub const LINUX_VIRTIO_DEVICE_ID_OFFSET: usize = 0x1b8;
-pub const LINUX_VIRTIO_DEVICE_CONFIG_OFFSET: usize = 0x1c0;
-pub const LINUX_VIRTIO_DEVICE_PRIV_OFFSET: usize = 0x1f8;
+pub const LINUX_VIRTIO_DEVICE_DEV_OFFSET: usize = 0x10;
+pub const LINUX_VIRTIO_DEVICE_ID_OFFSET: usize = 0x308;
+pub const LINUX_VIRTIO_DEVICE_CONFIG_OFFSET: usize = 0x310;
+pub const LINUX_VIRTIO_DEVICE_PRIV_OFFSET: usize = 0x348;
+pub const LINUX_VIRTIO_DEVICE_SIZE: usize = 0x358;
+
+struct LinuxVirtioSpinGuard<'a> {
+    lock: &'a QSpinLock,
+    irq_state: LinuxVirtioSpinIrqState,
+}
+
+#[derive(Clone, Copy)]
+enum LinuxVirtioSpinIrqState {
+    None,
+    Enable,
+    Restore(IrqFlags),
+}
+
+impl Drop for LinuxVirtioSpinGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.unlock();
+        match self.irq_state {
+            LinuxVirtioSpinIrqState::None => {}
+            LinuxVirtioSpinIrqState::Enable => local_irq_enable(),
+            LinuxVirtioSpinIrqState::Restore(flags) => local_irq_restore(flags),
+        }
+        preempt_enable();
+    }
+}
+
+fn linux_virtio_spin_lock(lock: &QSpinLock) -> LinuxVirtioSpinGuard<'_> {
+    preempt_disable();
+    lock.lock();
+    LinuxVirtioSpinGuard {
+        lock,
+        irq_state: LinuxVirtioSpinIrqState::None,
+    }
+}
+
+fn linux_virtio_spin_lock_irq(lock: &QSpinLock) -> LinuxVirtioSpinGuard<'_> {
+    local_irq_disable();
+    preempt_disable();
+    lock.lock();
+    LinuxVirtioSpinGuard {
+        lock,
+        irq_state: LinuxVirtioSpinIrqState::Enable,
+    }
+}
+
+fn linux_virtio_spin_lock_irqsave(lock: &QSpinLock) -> LinuxVirtioSpinGuard<'_> {
+    let flags = local_irq_save();
+    preempt_disable();
+    lock.lock();
+    LinuxVirtioSpinGuard {
+        lock,
+        irq_state: LinuxVirtioSpinIrqState::Restore(flags),
+    }
+}
 
 // ── Virtqueue ─────────────────────────────────────────────────────────────────
 
@@ -416,6 +480,20 @@ fn linux_virtio_features_set(features: &mut [u64; VIRTIO_FEATURES_U64S], fbit: u
     if let Some((word, bit)) = linux_virtio_feature_word(fbit) {
         features[word] |= bit;
     }
+}
+
+fn linux_vring_use_map_api(vdev: *const LinuxVirtioDevice) -> Option<bool> {
+    if vdev.is_null() {
+        return None;
+    }
+    // `vring_use_map_api()` uses the DMA API when ACCESS_PLATFORM removes
+    // the legacy DMA quirk.  The other vendor branch is Xen-specific; Lupos's
+    // modeled runtime target is native x86_64 and does not expose a live
+    // `xen_domain()` state to this ABI layer.
+    Some(linux_virtio_features_has(
+        unsafe { &(*vdev).features },
+        VIRTIO_F_ACCESS_PLATFORM,
+    ))
 }
 
 fn linux_align_up(value: usize, align: usize) -> Option<usize> {
@@ -531,6 +609,8 @@ unsafe fn linux_vring_used_elem(
 fn linux_virtqueue_register_backend(
     vq: *mut LinuxVirtqueue,
     notify: LinuxVirtqueueNotify,
+    dma_dev: *mut LinuxDevice,
+    use_map_api: bool,
     ring_cpu: *mut u8,
     ring_dma: u64,
     ring_len: usize,
@@ -549,6 +629,8 @@ fn linux_virtqueue_register_backend(
     backends.push(LinuxVirtqueueBackend {
         vq: vq as usize,
         notify,
+        dma_dev: dma_dev as usize,
+        use_map_api,
         ring_cpu: ring_cpu as usize,
         ring_dma,
         ring_len,
@@ -571,7 +653,17 @@ fn linux_virtqueue_remove_backend(vq: *mut LinuxVirtqueue) {
     {
         let backend = backends.remove(pos);
         unsafe {
-            dma_free_coherent(backend.ring_cpu as *mut u8, backend.ring_len);
+            if backend.use_map_api {
+                dma_free_attrs(
+                    backend.dma_dev as *mut c_void,
+                    backend.ring_len,
+                    backend.ring_cpu as *mut c_void,
+                    backend.ring_dma,
+                    0,
+                );
+            } else {
+                dma_free_coherent(backend.ring_cpu as *mut u8, backend.ring_len);
+            }
         }
     }
 }
@@ -600,7 +692,7 @@ fn poll_virtqueues() -> usize {
                     return None;
                 }
                 let vq = backend.vq as *mut LinuxVirtqueue;
-                if vq.is_null() || unsafe { (*vq).reset } {
+                if vq.is_null() || unsafe { (*vq).reset.load(Ordering::Acquire) } {
                     return None;
                 }
                 let used_idx = unsafe { linux_vring_used_idx(backend) } as u32;
@@ -627,7 +719,7 @@ pub(crate) fn take_used_buffer_for_token(data: *mut c_void) -> bool {
             continue;
         }
         let vq = backend.vq as *mut LinuxVirtqueue;
-        if vq.is_null() || unsafe { (*vq).reset } {
+        if vq.is_null() || unsafe { (*vq).reset.load(Ordering::Acquire) } {
             continue;
         }
         let used_idx = unsafe { linux_vring_used_idx(backend) };
@@ -643,7 +735,7 @@ pub(crate) fn take_used_buffer_for_token(data: *mut c_void) -> bool {
             .position(|token| token.head as u32 == elem.id)
         else {
             unsafe {
-                (*vq).reset = true;
+                (*vq).reset.store(true, Ordering::Release);
             }
             return false;
         };
@@ -776,6 +868,7 @@ fn linux_sg_entry() -> crate::lib::scatterlist::LinuxScatterList {
         length: 0,
         dma_address: 0,
         dma_length: 0,
+        dma_flags: 0,
     }
 }
 
@@ -1020,6 +1113,29 @@ unsafe fn linux_virtio_config_changed_inner(dev: *mut c_void) {
     }
 }
 
+/// `virtio_config_core_disable` —
+/// `vendor/linux/drivers/virtio/virtio.c:180`.
+unsafe fn linux_virtio_config_core_disable(dev: *mut c_void) {
+    let prefix = dev.cast::<LinuxVirtioDevicePrefix>();
+    unsafe {
+        let _guard = linux_virtio_spin_lock_irq(&(*prefix).config_lock);
+        (*prefix).config_core_enabled = false;
+    }
+}
+
+/// `virtio_config_core_enable` —
+/// `vendor/linux/drivers/virtio/virtio.c:187`.
+unsafe fn linux_virtio_config_core_enable(dev: *mut c_void) {
+    let prefix = dev.cast::<LinuxVirtioDevicePrefix>();
+    unsafe {
+        let _guard = linux_virtio_spin_lock_irq(&(*prefix).config_lock);
+        (*prefix).config_core_enabled = true;
+        if (*prefix).config_change_pending {
+            linux_virtio_config_changed_inner(dev);
+        }
+    }
+}
+
 /// `virtio_dev_match` — `vendor/linux/drivers/virtio/virtio.c:85`.
 unsafe extern "C" fn linux_virtio_dev_match(dev: *mut c_void, driver: *const c_void) -> i32 {
     if dev.is_null() || driver.is_null() {
@@ -1184,15 +1300,7 @@ unsafe extern "C" fn linux_virtio_dev_probe(dev: *mut c_void) -> i32 {
     }
 
     unsafe {
-        (*vdev.cast::<LinuxVirtioDevice>())
-            .prefix
-            .config_core_enabled = true;
-        if (*vdev.cast::<LinuxVirtioDevice>())
-            .prefix
-            .config_change_pending
-        {
-            linux_virtio_config_changed_inner(vdev);
-        }
+        linux_virtio_config_core_enable(vdev);
     }
 
     0
@@ -1275,6 +1383,12 @@ pub fn register_module_exports() {
     );
     export_symbol_once("virtio_add_status", virtio_add_status as usize, true);
     export_symbol_once("virtio_reset_device", virtio_reset_device as usize, true);
+    export_symbol_once("virtio_device_freeze", virtio_device_freeze as usize, true);
+    export_symbol_once(
+        "virtio_device_restore",
+        virtio_device_restore as usize,
+        true,
+    );
     export_symbol_once(
         "virtio_device_reset_prepare",
         virtio_device_reset_prepare as usize,
@@ -1502,7 +1616,12 @@ pub unsafe extern "C" fn virtio_check_driver_offered_feature(dev: *const c_void,
 /// `virtio_config_changed` — `vendor/linux/drivers/virtio/virtio.c:138`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn virtio_config_changed(dev: *mut c_void) {
+    if dev.is_null() {
+        return;
+    }
     unsafe {
+        let prefix = dev.cast::<LinuxVirtioDevicePrefix>();
+        let _guard = linux_virtio_spin_lock_irqsave(&(*prefix).config_lock);
         linux_virtio_config_changed_inner(dev);
     }
 }
@@ -1514,7 +1633,9 @@ pub unsafe extern "C" fn virtio_config_driver_disable(dev: *mut c_void) {
         return;
     }
     unsafe {
-        (*dev.cast::<LinuxVirtioDevicePrefix>()).config_driver_disabled = true;
+        let prefix = dev.cast::<LinuxVirtioDevicePrefix>();
+        let _guard = linux_virtio_spin_lock_irq(&(*prefix).config_lock);
+        (*prefix).config_driver_disabled = true;
     }
 }
 
@@ -1524,13 +1645,11 @@ pub unsafe extern "C" fn virtio_config_driver_enable(dev: *mut c_void) {
     if dev.is_null() {
         return;
     }
-    let prefix = dev.cast::<LinuxVirtioDevicePrefix>();
-    let pending = unsafe {
+    unsafe {
+        let prefix = dev.cast::<LinuxVirtioDevicePrefix>();
+        let _guard = linux_virtio_spin_lock_irq(&(*prefix).config_lock);
         (*prefix).config_driver_disabled = false;
-        (*prefix).config_change_pending
-    };
-    if pending {
-        unsafe {
+        if (*prefix).config_change_pending {
             linux_virtio_config_changed_inner(dev);
         }
     }
@@ -1563,6 +1682,138 @@ pub unsafe extern "C" fn virtio_reset_device(dev: *mut c_void) {
         };
         reset(dev);
     }
+}
+
+unsafe fn linux_virtio_device_restore_priv(dev: *mut c_void, restore: bool) -> i32 {
+    if dev.is_null() {
+        return -EINVAL;
+    }
+    let Some(config_ptr) = linux_virtio_config_ops(dev) else {
+        return -EINVAL;
+    };
+    let config = unsafe { &*config_ptr };
+    let (Some(reset), Some(get_status), Some(set_status), Some(finalize_features)) = (
+        config.reset,
+        config.get_status,
+        config.set_status,
+        config.finalize_features,
+    ) else {
+        return -EINVAL;
+    };
+
+    // `virtio_device_restore_priv()` always starts from a transport reset,
+    // then rebuilds exactly the ACKNOWLEDGE/DRIVER/DRIVER_OK state machine.
+    unsafe {
+        reset(dev);
+        set_status(dev, get_status(dev) | VIRTIO_CONFIG_S_ACKNOWLEDGE);
+        if (*dev.cast::<LinuxVirtioDevicePrefix>()).failed {
+            set_status(dev, get_status(dev) | VIRTIO_CONFIG_S_FAILED);
+        }
+    }
+
+    let Some(driver) = (unsafe { linux_virtio_driver_for_device(dev) }) else {
+        return 0;
+    };
+
+    unsafe {
+        set_status(dev, get_status(dev) | VIRTIO_CONFIG_S_DRIVER);
+    }
+    let mut ret = unsafe { finalize_features(dev) };
+    if ret != 0 {
+        unsafe {
+            set_status(dev, get_status(dev) | VIRTIO_CONFIG_S_FAILED);
+        }
+        return ret;
+    }
+
+    ret = unsafe { linux_virtio_features_ok(dev, config) };
+    if ret != 0 {
+        unsafe {
+            set_status(dev, get_status(dev) | VIRTIO_CONFIG_S_FAILED);
+        }
+        return ret;
+    }
+
+    if restore {
+        if let Some(restore_callback) = unsafe { (*driver).restore } {
+            ret = unsafe { restore_callback(dev) };
+            if ret != 0 {
+                unsafe {
+                    set_status(dev, get_status(dev) | VIRTIO_CONFIG_S_FAILED);
+                }
+                return ret;
+            }
+        }
+    } else {
+        let Some(reset_done) = (unsafe { (*driver).reset_done }) else {
+            unsafe {
+                set_status(dev, get_status(dev) | VIRTIO_CONFIG_S_FAILED);
+            }
+            return -EOPNOTSUPP;
+        };
+        ret = unsafe { reset_done(dev) };
+        if ret != 0 {
+            unsafe {
+                set_status(dev, get_status(dev) | VIRTIO_CONFIG_S_FAILED);
+            }
+            return ret;
+        }
+    }
+
+    unsafe {
+        if get_status(dev) & VIRTIO_CONFIG_S_DRIVER_OK == 0 {
+            set_status(dev, get_status(dev) | VIRTIO_CONFIG_S_DRIVER_OK);
+        }
+        linux_virtio_config_core_enable(dev);
+    }
+    0
+}
+
+/// `virtio_device_freeze` — `vendor/linux/drivers/virtio/virtio.c:657`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn virtio_device_freeze(dev: *mut c_void) -> i32 {
+    if dev.is_null() {
+        return -EINVAL;
+    }
+    unsafe {
+        linux_virtio_config_core_disable(dev);
+    }
+
+    let Some(config_ptr) = linux_virtio_config_ops(dev) else {
+        unsafe {
+            linux_virtio_config_core_enable(dev);
+        }
+        return -EINVAL;
+    };
+    let Some(get_status) = (unsafe { (*config_ptr).get_status }) else {
+        unsafe {
+            linux_virtio_config_core_enable(dev);
+        }
+        return -EINVAL;
+    };
+    unsafe {
+        (*dev.cast::<LinuxVirtioDevicePrefix>()).failed =
+            get_status(dev) & VIRTIO_CONFIG_S_FAILED != 0;
+    }
+
+    if let Some(driver) = unsafe { linux_virtio_driver_for_device(dev) } {
+        if let Some(freeze) = unsafe { (*driver).freeze } {
+            let ret = unsafe { freeze(dev) };
+            if ret != 0 {
+                unsafe {
+                    linux_virtio_config_core_enable(dev);
+                }
+                return ret;
+            }
+        }
+    }
+    0
+}
+
+/// `virtio_device_restore` — `vendor/linux/drivers/virtio/virtio.c:678`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn virtio_device_restore(dev: *mut c_void) -> i32 {
+    unsafe { linux_virtio_device_restore_priv(dev, true) }
 }
 
 /// `virtio_device_reset_prepare` - `vendor/linux/drivers/virtio/virtio.c:676`.
@@ -1653,7 +1904,24 @@ pub unsafe extern "C" fn virtio_device_ready(dev: *mut c_void) {
 
 /// `virtio_max_dma_size` — `vendor/linux/drivers/virtio/virtio_ring.c:359`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn virtio_max_dma_size(_dev: *const c_void) -> usize {
+pub unsafe extern "C" fn virtio_max_dma_size(dev: *const c_void) -> usize {
+    let vdev = dev.cast::<LinuxVirtioDevice>();
+    let Some(use_map_api) = linux_vring_use_map_api(vdev) else {
+        return 0;
+    };
+    if !use_map_api {
+        return usize::MAX;
+    }
+    unsafe {
+        // A transport-specific `virtio_map_ops::max_mapping_size` callback is
+        // not modeled by this ABI layer.  Do not claim a usable mapping size
+        // for that path.
+        if !(*vdev).map.is_null() || (*vdev).dev.parent.is_null() {
+            return 0;
+        }
+    }
+    // `dma_direct_max_mapping_size()` returns SIZE_MAX when SWIOTLB is not
+    // active.  Lupos models this direct, no-bounce branch only.
     usize::MAX
 }
 
@@ -1694,21 +1962,9 @@ pub unsafe extern "C" fn vring_create_virtqueue(
         );
         return core::ptr::null_mut();
     };
-    let Some((ring_cpu, ring_dma)) = dma_alloc_coherent(layout.total_size) else {
-        crate::log_warn!(
-            "virtio",
-            "vring_create_virtqueue dma alloc failed index={} bytes={}",
-            index,
-            layout.total_size
-        );
-        return core::ptr::null_mut();
-    };
     let num_u16 = match u16::try_from(num) {
         Ok(num) => num,
         Err(_) => {
-            unsafe {
-                dma_free_coherent(ring_cpu, layout.total_size);
-            }
             crate::log_warn!(
                 "virtio",
                 "vring_create_virtqueue queue too large index={} num={}",
@@ -1717,6 +1973,43 @@ pub unsafe extern "C" fn vring_create_virtqueue(
             );
             return core::ptr::null_mut();
         }
+    };
+    let use_map_api = linux_vring_use_map_api(vdev).unwrap_or(false);
+    let dma_dev = unsafe { (*vdev).dev.parent };
+    if use_map_api && (dma_dev.is_null() || unsafe { !(*vdev).map.is_null() }) {
+        crate::log_warn!(
+            "virtio",
+            "vring_create_virtqueue unsupported DMA map index={} dma_dev={:p} custom_map={}",
+            index,
+            dma_dev,
+            unsafe { !(*vdev).map.is_null() }
+        );
+        return core::ptr::null_mut();
+    }
+    let allocation = if use_map_api {
+        let mut ring_dma = DMA_MAPPING_ERROR;
+        let ring_cpu = unsafe {
+            dma_alloc_attrs(
+                dma_dev.cast::<c_void>(),
+                layout.total_size,
+                core::ptr::addr_of_mut!(ring_dma),
+                0,
+                0,
+            )
+        }
+        .cast::<u8>();
+        (!ring_cpu.is_null()).then_some((ring_cpu, ring_dma))
+    } else {
+        dma_alloc_coherent(layout.total_size)
+    };
+    let Some((ring_cpu, ring_dma)) = allocation else {
+        crate::log_warn!(
+            "virtio",
+            "vring_create_virtqueue dma alloc failed index={} bytes={}",
+            index,
+            layout.total_size
+        );
+        return core::ptr::null_mut();
     };
 
     let vq = Box::new(LinuxVirtqueue {
@@ -1730,17 +2023,27 @@ pub unsafe extern "C" fn vring_create_virtqueue(
         index,
         num_free: num_u16 as u32,
         num_max: num_u16 as u32,
-        reset: false,
+        reset: AtomicBool::new(false),
         priv_: core::ptr::null_mut(),
     });
     let vq = Box::into_raw(vq);
     unsafe {
+        let _guard = linux_virtio_spin_lock(&(*vdev).prefix.vqs_list_lock);
         linux_list_add_tail(
             core::ptr::addr_of_mut!((*vq).list),
             core::ptr::addr_of_mut!((*vdev).vqs),
         );
     }
-    linux_virtqueue_register_backend(vq, notify, ring_cpu, ring_dma, layout.total_size, layout);
+    linux_virtqueue_register_backend(
+        vq,
+        notify,
+        dma_dev,
+        use_map_api,
+        ring_cpu,
+        ring_dma,
+        layout.total_size,
+        layout,
+    );
     vq
 }
 
@@ -1749,7 +2052,13 @@ pub unsafe extern "C" fn vring_create_virtqueue(
 pub unsafe extern "C" fn vring_del_virtqueue(vq: *mut LinuxVirtqueue) {
     if !vq.is_null() {
         unsafe {
-            linux_list_del_init(core::ptr::addr_of_mut!((*vq).list));
+            let vdev = (*vq).vdev;
+            if vdev.is_null() {
+                linux_list_del_init(core::ptr::addr_of_mut!((*vq).list));
+            } else {
+                let _guard = linux_virtio_spin_lock(&(*vdev).prefix.vqs_list_lock);
+                linux_list_del_init(core::ptr::addr_of_mut!((*vq).list));
+            }
             linux_virtqueue_remove_backend(vq);
             drop(Box::from_raw(vq));
         }
@@ -1810,7 +2119,7 @@ pub unsafe extern "C" fn virtqueue_add_sgs(
         );
         return -EINVAL;
     }
-    if unsafe { (*vq).reset } {
+    if unsafe { (*vq).reset.load(Ordering::Acquire) } {
         crate::log_warn!(
             "virtio",
             "virtqueue_add_sgs rejected broken queue index={}",
@@ -1862,21 +2171,20 @@ pub unsafe extern "C" fn virtqueue_add_sgs(
                 );
                 return -EINVAL;
             }
-            let dma = dma_map_single(
-                cpu_addr,
-                len as usize,
-                if writable {
-                    DmaDirection::FromDevice
-                } else {
-                    DmaDirection::ToDevice
-                },
-            );
-            let dma = if dma == 0 {
-                unsafe { (*sg).dma_address as u64 }
-            } else {
-                dma
+            let dma = unsafe {
+                virtqueue_map_single_attrs(
+                    vq,
+                    cpu_addr.cast_mut().cast(),
+                    len as usize,
+                    if writable {
+                        DmaDirection::FromDevice
+                    } else {
+                        DmaDirection::ToDevice
+                    },
+                    0,
+                )
             };
-            if dma == 0 {
+            if unsafe { virtqueue_map_mapping_error(vq, dma) } != 0 {
                 crate::log_warn!(
                     "virtio",
                     "virtqueue_add_sgs dma map failed list={} len={} cpu={:p}",
@@ -1884,7 +2192,7 @@ pub unsafe extern "C" fn virtqueue_add_sgs(
                     len,
                     cpu_addr
                 );
-                return -EINVAL;
+                return -ENOMEM;
             }
             entries.push((dma, len, writable));
 
@@ -2066,18 +2374,31 @@ pub unsafe extern "C" fn virtqueue_add_outbuf_premapped(
 /// `virtqueue_map_page_attrs` — `vendor/linux/drivers/virtio/virtio_ring.c:3776`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn virtqueue_map_page_attrs(
-    _vq: *const LinuxVirtqueue,
+    vq: *const LinuxVirtqueue,
     page: *mut Page,
     offset: usize,
     size: usize,
     dir: DmaDirection,
-    _attrs: usize,
+    attrs: usize,
 ) -> DmaAddr {
-    if page.is_null() || size == 0 {
-        return 0;
+    if vq.is_null() || page.is_null() || size == 0 {
+        return DMA_MAPPING_ERROR;
     }
-    let cpu = unsafe { pfn_to_virt(page_to_pfn(page)).add(offset) };
-    dma_map_single(cpu, size, dir)
+    linux_virtqueue_with_backend_mut(vq.cast_mut(), |backend| unsafe {
+        let vdev = (*vq).vdev;
+        if vdev.is_null() || !(*vdev).map.is_null() {
+            return DMA_MAPPING_ERROR;
+        }
+        dma_map_page_attrs(
+            backend.dma_dev as *mut c_void,
+            page,
+            offset,
+            size,
+            dir,
+            attrs,
+        )
+    })
+    .unwrap_or(DMA_MAPPING_ERROR)
 }
 
 /// `virtqueue_unmap_page_attrs` — `vendor/linux/drivers/virtio/virtio_ring.c:3794`.
@@ -2094,13 +2415,26 @@ pub unsafe extern "C" fn virtqueue_unmap_page_attrs(
 /// `virtqueue_map_single_attrs` — `vendor/linux/drivers/virtio/virtio_ring.c:3819`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn virtqueue_map_single_attrs(
-    _vq: *const LinuxVirtqueue,
+    vq: *const LinuxVirtqueue,
     ptr: *mut c_void,
     size: usize,
     dir: DmaDirection,
     _attrs: usize,
 ) -> DmaAddr {
-    dma_map_single(ptr.cast::<u8>(), size, dir)
+    if vq.is_null() || ptr.is_null() || size == 0 {
+        return DMA_MAPPING_ERROR;
+    }
+    linux_virtqueue_with_backend_mut(vq.cast_mut(), |backend| unsafe {
+        if !backend.use_map_api {
+            return dma_map_single(ptr.cast::<u8>(), size, dir);
+        }
+        let vdev = (*vq).vdev;
+        if vdev.is_null() || !(*vdev).map.is_null() {
+            return DMA_MAPPING_ERROR;
+        }
+        dma_map_single_for_device(backend.dma_dev as *mut c_void, ptr.cast::<u8>(), size, dir)
+    })
+    .unwrap_or(DMA_MAPPING_ERROR)
 }
 
 /// `virtqueue_unmap_single_attrs` — `vendor/linux/drivers/virtio/virtio_ring.c:3854`.
@@ -2117,10 +2451,23 @@ pub unsafe extern "C" fn virtqueue_unmap_single_attrs(
 /// `virtqueue_map_mapping_error` — `vendor/linux/drivers/virtio/virtio_ring.c:3882`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn virtqueue_map_mapping_error(
-    _vq: *const LinuxVirtqueue,
+    vq: *const LinuxVirtqueue,
     addr: DmaAddr,
 ) -> i32 {
-    i32::from(addr == 0)
+    if vq.is_null() {
+        return 1;
+    }
+    linux_virtqueue_with_backend_mut(vq.cast_mut(), |backend| unsafe {
+        if !backend.use_map_api {
+            return 0;
+        }
+        let vdev = (*vq).vdev;
+        if vdev.is_null() || !(*vdev).map.is_null() {
+            return 1;
+        }
+        i32::from(addr == DMA_MAPPING_ERROR)
+    })
+    .unwrap_or(1)
 }
 
 /// `virtqueue_map_need_sync` — `vendor/linux/drivers/virtio/virtio_ring.c:3896`.
@@ -2172,7 +2519,7 @@ pub unsafe extern "C" fn virtqueue_kick_prepare(vq: *mut LinuxVirtqueue) -> bool
 /// `virtqueue_notify` — `vendor/linux/drivers/virtio/virtio_ring.c:3028`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn virtqueue_notify(vq: *mut LinuxVirtqueue) -> bool {
-    if vq.is_null() || unsafe { (*vq).reset } {
+    if vq.is_null() || unsafe { (*vq).reset.load(Ordering::Acquire) } {
         return false;
     }
     let notify = linux_virtqueue_with_backend_mut(vq, |backend| {
@@ -2189,7 +2536,7 @@ pub unsafe extern "C" fn virtqueue_notify(vq: *mut LinuxVirtqueue) -> bool {
     let ok = unsafe { notify(vq) };
     if !ok {
         unsafe {
-            (*vq).reset = true;
+            (*vq).reset.store(true, Ordering::Release);
         }
     }
     ok
@@ -2202,7 +2549,7 @@ pub unsafe extern "C" fn virtqueue_kick(vq: *mut LinuxVirtqueue) -> bool {
         unsafe { virtqueue_notify(vq) }
     } else {
         linux_virtqueue_with_backend_mut(vq, |backend| backend.ring_ready).unwrap_or(false)
-            && !unsafe { (*vq).reset }
+            && !unsafe { (*vq).reset.load(Ordering::Acquire) }
     }
 }
 
@@ -2230,7 +2577,7 @@ pub unsafe extern "C" fn virtqueue_get_buf_ctx(
             .position(|token| token.head as u32 == elem.id)
         else {
             unsafe {
-                (*vq).reset = true;
+                (*vq).reset.store(true, Ordering::Release);
             }
             return None;
         };
@@ -2405,7 +2752,7 @@ pub unsafe extern "C" fn virtqueue_reset(
             linux_vring_write_avail_idx(backend, 0);
             linux_vring_set_used_idx(backend, 0);
             (*vq).num_free = (*vq).num_max;
-            (*vq).reset = false;
+            (*vq).reset.store(false, Ordering::Release);
         }
         backend.avail_idx_shadow = 0;
         backend.last_used_idx = 0;
@@ -2448,13 +2795,24 @@ pub unsafe extern "C" fn virtqueue_get_vring_size(vq: *const LinuxVirtqueue) -> 
 /// `virtqueue_is_broken` — `vendor/linux/drivers/virtio/virtio_ring.c:3576`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn virtqueue_is_broken(vq: *const LinuxVirtqueue) -> bool {
-    !vq.is_null() && unsafe { (*vq).reset }
+    !vq.is_null() && unsafe { (*vq).reset.load(Ordering::Acquire) }
 }
 
 /// `virtqueue_dma_dev` — `vendor/linux/drivers/virtio/virtio_ring.c:2990`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn virtqueue_dma_dev(_vq: *mut LinuxVirtqueue) -> *mut LinuxDevice {
-    core::ptr::null_mut()
+    if _vq.is_null() {
+        return core::ptr::null_mut();
+    }
+    linux_virtqueue_with_backend_mut(_vq, |backend| unsafe {
+        let vdev = (*_vq).vdev;
+        if backend.use_map_api && !vdev.is_null() && (*vdev).map.is_null() {
+            backend.dma_dev as *mut LinuxDevice
+        } else {
+            core::ptr::null_mut()
+        }
+    })
+    .unwrap_or(core::ptr::null_mut())
 }
 
 /// `__virtqueue_break` — `vendor/linux/drivers/virtio/virtio_ring.c:3555`.
@@ -2497,19 +2855,46 @@ pub unsafe extern "C" fn virtqueue_get_used_addr(vq: *const LinuxVirtqueue) -> u
     .unwrap_or(0)
 }
 
+unsafe fn linux_virtio_set_device_broken(dev: *mut c_void, broken: bool) {
+    if dev.is_null() {
+        return;
+    }
+    unsafe {
+        let vdev = dev.cast::<LinuxVirtioDevice>();
+        let _guard = linux_virtio_spin_lock(&(*vdev).prefix.vqs_list_lock);
+        let head = core::ptr::addr_of_mut!((*vdev).vqs);
+        let mut node = (*head).next.cast::<LinuxListHead>();
+        while node != head {
+            let next = (*node).next.cast::<LinuxListHead>();
+            (*node.cast::<LinuxVirtqueue>())
+                .reset
+                .store(broken, Ordering::Release);
+            node = next;
+        }
+    }
+}
+
 /// `virtio_break_device` - `vendor/linux/drivers/virtio/virtio_ring.c:3588`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn virtio_break_device(_dev: *mut c_void) {}
+pub unsafe extern "C" fn virtio_break_device(dev: *mut c_void) {
+    unsafe {
+        linux_virtio_set_device_broken(dev, true);
+    }
+}
 
 /// `__virtio_unbreak_device` - `vendor/linux/drivers/virtio/virtio_ring.c:3610`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __virtio_unbreak_device(_dev: *mut c_void) {}
+pub unsafe extern "C" fn __virtio_unbreak_device(dev: *mut c_void) {
+    unsafe {
+        linux_virtio_set_device_broken(dev, false);
+    }
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __virtqueue_break(vq: *mut LinuxVirtqueue) {
     if !vq.is_null() {
         unsafe {
-            (*vq).reset = true;
+            (*vq).reset.store(true, Ordering::Release);
         }
     }
 }
@@ -2519,7 +2904,7 @@ pub unsafe extern "C" fn __virtqueue_break(vq: *mut LinuxVirtqueue) {
 pub unsafe extern "C" fn __virtqueue_unbreak(vq: *mut LinuxVirtqueue) {
     if !vq.is_null() {
         unsafe {
-            (*vq).reset = false;
+            (*vq).reset.store(false, Ordering::Release);
         }
     }
 }
@@ -2548,6 +2933,14 @@ pub unsafe extern "C" fn register_virtio_device(dev: *mut c_void) -> i32 {
     let index = NEXT_LINUX_VIRTIO_INDEX.fetch_add(1, Ordering::AcqRel);
 
     unsafe {
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*prefix).config_lock),
+            QSpinLock::new(),
+        );
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*prefix).vqs_list_lock),
+            QSpinLock::new(),
+        );
         (*prefix).index = index;
         (*prefix).failed = false;
         (*prefix).config_core_enabled = false;
@@ -2810,8 +3203,11 @@ mod tests {
             offset_of!(LinuxVirtioDevicePrefix, config_change_pending),
             7
         );
-        assert_eq!(size_of::<LinuxVirtioDevicePrefix>(), 8);
-        assert_eq!(LINUX_VIRTIO_DEVICE_DEV_OFFSET, 8);
+        assert_eq!(offset_of!(LinuxVirtioDevicePrefix, config_lock), 8);
+        assert_eq!(offset_of!(LinuxVirtioDevicePrefix, vqs_list_lock), 12);
+        assert_eq!(size_of::<QSpinLock>(), 4);
+        assert_eq!(size_of::<LinuxVirtioDevicePrefix>(), 16);
+        assert_eq!(LINUX_VIRTIO_DEVICE_DEV_OFFSET, 16);
 
         assert_eq!(offset_of!(LinuxVirtioDevice, prefix), 0);
         assert_eq!(
@@ -2826,15 +3222,16 @@ mod tests {
             offset_of!(LinuxVirtioDevice, config),
             LINUX_VIRTIO_DEVICE_CONFIG_OFFSET
         );
-        assert_eq!(offset_of!(LinuxVirtioDevice, vringh_config), 0x1c8);
-        assert_eq!(offset_of!(LinuxVirtioDevice, map), 0x1d0);
-        assert_eq!(offset_of!(LinuxVirtioDevice, vqs), 0x1d8);
-        assert_eq!(offset_of!(LinuxVirtioDevice, features), 0x1e8);
+        assert_eq!(offset_of!(LinuxVirtioDevice, vringh_config), 0x318);
+        assert_eq!(offset_of!(LinuxVirtioDevice, map), 0x320);
+        assert_eq!(offset_of!(LinuxVirtioDevice, vqs), 0x328);
+        assert_eq!(offset_of!(LinuxVirtioDevice, features), 0x338);
         assert_eq!(
             offset_of!(LinuxVirtioDevice, priv_),
             LINUX_VIRTIO_DEVICE_PRIV_OFFSET
         );
-        assert_eq!(size_of::<LinuxVirtioDevice>(), 0x200);
+        assert_eq!(offset_of!(LinuxVirtioDevice, vmap), 0x350);
+        assert_eq!(size_of::<LinuxVirtioDevice>(), LINUX_VIRTIO_DEVICE_SIZE);
 
         assert_eq!(offset_of!(LinuxDeviceDriver, name), 0);
         assert_eq!(offset_of!(LinuxDeviceDriver, bus), 8);
@@ -2941,6 +3338,12 @@ mod tests {
                 device: VIRTIO_ID_BLOCK,
                 vendor: VIRTIO_DEV_ANY_ID,
             };
+            core::ptr::addr_of_mut!(device.prefix.config_lock)
+                .cast::<u32>()
+                .write(u32::MAX);
+            core::ptr::addr_of_mut!(device.prefix.vqs_list_lock)
+                .cast::<u32>()
+                .write(u32::MAX);
 
             assert_eq!(register_virtio_device(vdev), 0);
             assert!(device.prefix.index >= 0);
@@ -2948,6 +3351,8 @@ mod tests {
             assert!(!device.prefix.config_core_enabled);
             assert!(!device.prefix.config_driver_disabled);
             assert!(!device.prefix.config_change_pending);
+            assert_eq!(device.prefix.config_lock.raw(), 0);
+            assert_eq!(device.prefix.vqs_list_lock.raw(), 0);
             assert_eq!(device.dev.bus, linux_virtio_bus_ptr());
             assert!(!device.dev.p.is_null());
             assert!(is_virtio_device(
@@ -3253,7 +3658,7 @@ mod tests {
                     index: 99,
                     num_free: 8,
                     num_max: 8,
-                    reset: false,
+                    reset: AtomicBool::new(false),
                     priv_: core::ptr::null_mut(),
                 }));
                 (*queue).callback = (*info).callback;
@@ -3393,6 +3798,10 @@ mod tests {
             assert_eq!(avail % VRING_AVAIL_ALIGN_SIZE as u64, 0);
             assert!(used > avail);
             assert_eq!(used % VRING_USED_ALIGN_SIZE as u64, 0);
+            virtio_break_device((&mut device as *mut LinuxVirtioDevice).cast());
+            assert!(virtqueue_is_broken(vq));
+            __virtio_unbreak_device((&mut device as *mut LinuxVirtioDevice).cast());
+            assert!(!virtqueue_is_broken(vq));
             vring_del_virtqueue(vq);
             assert_eq!(device.vqs.next, head);
             assert_eq!(device.vqs.prev, head);
@@ -3436,6 +3845,7 @@ mod tests {
             assert!(!device.prefix.config_driver_disabled);
             assert!(!device.prefix.config_change_pending);
             assert_eq!(CHANGE_COUNT.load(Ordering::Acquire), 2);
+            assert_eq!(device.prefix.config_lock.raw(), 0);
         }
     }
 

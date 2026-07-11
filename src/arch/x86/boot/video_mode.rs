@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/boot/video-mode.c
 //! test-origin: linux:vendor/linux/arch/x86/boot/video-mode.c
 //! Set the video mode (shared with the ACPI wakeup code).
@@ -154,8 +154,34 @@ pub fn vga_recalc_vertical<I: VgaRecalcIo>(io: &mut I, force_y: i32) {
 pub fn set_mode<C: CardInfo, I: VgaRecalcIo>(
     cards: &mut [C],
     st: &mut VideoState,
-    recalc_io: Option<&mut I>,
+    recalc_io: &mut I,
+    mode: u16,
+) -> i32 {
+    set_mode_for_build(cards, st, recalc_io, mode, true)
+}
+
+/// `_WAKEUP` build of `set_mode()`.
+///
+/// `arch/x86/realmode/rm/video-mode.c` includes this C file with `_WAKEUP`
+/// defined.  The register programming is identical, but the
+/// `boot_params.hdr.vid_mode = real_mode` store is compiled out.  Keeping a
+/// distinct entry point prevents the real-mode wrapper from accidentally
+/// mutating the normal-boot `VideoState::video_mode` mirror.
+pub(crate) fn set_mode_wakeup<C: CardInfo, I: VgaRecalcIo>(
+    cards: &mut [C],
+    st: &mut VideoState,
+    recalc_io: &mut I,
+    mode: u16,
+) -> i32 {
+    set_mode_for_build(cards, st, recalc_io, mode, false)
+}
+
+fn set_mode_for_build<C: CardInfo, I: VgaRecalcIo>(
+    cards: &mut [C],
+    st: &mut VideoState,
+    recalc_io: &mut I,
     mut mode: u16,
+    store_canonical_mode: bool,
 ) -> i32 {
     // Very special mode numbers...
     if mode == VIDEO_CURRENT_MODE {
@@ -173,14 +199,18 @@ pub fn set_mode<C: CardInfo, I: VgaRecalcIo>(
     }
 
     if mode & VIDEO_RECALC != 0 {
-        if let Some(io) = recalc_io {
-            vga_recalc_vertical(io, st.force_y);
-        }
+        // Linux cannot silently omit this operation: a VIDEO_RECALC request
+        // always executes vga_recalc_vertical().  Requiring the I/O seam also
+        // makes that invariant true in the Rust translation.
+        vga_recalc_vertical(recalc_io, st.force_y);
     }
 
     // Save the canonical mode number for the kernel, not an alias, size
     // specification or menu position. (boot_params.hdr.vid_mode = real_mode)
-    st.video_mode = real_mode;
+    // The store is excluded from Linux's `_WAKEUP` build.
+    if store_canonical_mode {
+        st.video_mode = real_mode;
+    }
     rv
 }
 
@@ -276,6 +306,17 @@ mod tests {
         }
         fn out_idx(&mut self, value: u8, port: u16, index: u8) {
             self.writes.push((port, index, value));
+        }
+    }
+
+    fn unused_recalc_io() -> TestVga {
+        TestVga {
+            font_size: 0,
+            text_rows: 0,
+            crtc: 0x3d4,
+            cr11: 0,
+            cr07: 0,
+            writes: Vec::new(),
         }
     }
 
@@ -441,8 +482,9 @@ mod tests {
     fn set_mode_current_mode_is_noop() {
         let mut cards = [TestCard::new(Vec::new())];
         let mut st = VideoState::default();
+        let mut vga = unused_recalc_io();
         assert_eq!(
-            set_mode::<_, TestVga>(&mut cards, &mut st, None, VIDEO_CURRENT_MODE),
+            set_mode(&mut cards, &mut st, &mut vga, VIDEO_CURRENT_MODE),
             0
         );
         assert!(cards[0].set_modes.borrow().is_empty());
@@ -457,10 +499,8 @@ mod tests {
             depth: 0,
         }])];
         let mut st = VideoState::default();
-        assert_eq!(
-            set_mode::<_, TestVga>(&mut cards, &mut st, None, NORMAL_VGA),
-            0
-        );
+        let mut vga = unused_recalc_io();
+        assert_eq!(set_mode(&mut cards, &mut st, &mut vga, NORMAL_VGA), 0);
         // Canonical mode stored, not the NORMAL_VGA alias.
         assert_eq!(st.video_mode, VIDEO_80X25);
         assert_eq!(cards[0].set_modes.borrow()[0].mode, VIDEO_80X25);
@@ -487,12 +527,7 @@ mod tests {
             writes: Vec::new(),
         };
         assert_eq!(
-            set_mode(
-                &mut cards,
-                &mut st,
-                Some(&mut vga),
-                VIDEO_8POINT | VIDEO_RECALC
-            ),
+            set_mode(&mut cards, &mut st, &mut vga, VIDEO_8POINT | VIDEO_RECALC),
             0
         );
         assert_eq!(st.video_mode, VIDEO_8POINT);
@@ -504,9 +539,7 @@ mod tests {
     fn set_mode_propagates_raw_set_mode_failure() {
         let mut cards = [TestCard::new(Vec::new())];
         let mut st = VideoState::default();
-        assert_eq!(
-            set_mode::<_, TestVga>(&mut cards, &mut st, None, 0xBEEF),
-            -1
-        );
+        let mut vga = unused_recalc_io();
+        assert_eq!(set_mode(&mut cards, &mut st, &mut vga, 0xBEEF), -1);
     }
 }
