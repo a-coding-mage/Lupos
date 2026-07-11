@@ -13,7 +13,9 @@ The public build surface is intentionally small:
 - `make kernel` / `cargo xtask build`: build the pure Lupos kernel, ELF and
   bzImage, from the shared generic x86_64 config.
 - `make image` / `cargo xtask build --userland --iso`: build the same kernel,
-  stage a minimal Arch `base` userland, and emit a bootable ISO.
+  stage a minimal Arch `base` userland, and emit a paired GRUB ISO plus ext4
+  root disk. The ISO carries the Linux-style early initramfs; the real
+  userland and complete module tree live on `target/xtask/login.raw`.
 
 Both commands use `configs/lupos_defconfig`, which tracks the overlapping
 symbols from Linux's `vendor/linux/arch/x86/configs/x86_64_defconfig`.
@@ -37,7 +39,7 @@ Use a native Linux shell. Install the equivalent of these packages with your
 system package manager:
 
 ```text
-build-essential nasm grub-pc-bin xorriso mtools curl ca-certificates qemu-system-x86
+build-essential fakeroot nasm grub-pc-bin xorriso mtools curl ca-certificates qemu-system-x86
 ```
 
 The ISO build uses GRUB and `xorriso`. `grub-pc-bin` is required; without it
@@ -78,6 +80,10 @@ Equivalent xtask commands:
 cargo xtask build
 cargo xtask build --userland --iso
 ```
+
+The image command prints both required paths. When launching QEMU manually,
+boot the ISO and attach the printed raw root disk as a virtio block device;
+`cargo xtask run` performs that pairing automatically.
 
 Backend build products remain available for focused work:
 

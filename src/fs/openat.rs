@@ -1,7 +1,7 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/fs
 //! test-origin: linux:vendor/linux/fs
-//! `openat`/`openat2` (M39) â€” kernel-side path open.
+//! `openat`/`openat2` (M39) — kernel-side path open.
 //!
 //! Mirrors `vendor/linux/fs/open.c::do_filp_open` and the `openat2(2)`
 //! syscall path.
@@ -21,7 +21,7 @@ use crate::security;
 
 use super::dcache::d_alloc_child;
 use super::file::{alloc_file, note_file_access_for_integrity, path_hint, set_path_hint};
-use super::namei::{LookupCtx, path_lookupat, validate_open_how};
+use super::namei::{LookupCtx, validate_open_how};
 use super::ops::PATH_FILE_OPS;
 use super::permission::check_file_write_permission;
 use super::types::{DentryRef, FileRef, InodeKind};
@@ -85,9 +85,8 @@ pub struct OpenResult {
 
 /// `openat(2)` syscall entry point.
 ///
-/// During early rootfs bring-up we only support `dirfd == AT_FDCWD` and treat the
-/// rootfs mount's root dentry as both the root and current working directory.
-/// The full `fs_struct`-based root/pwd semantics land later in M39 closure.
+/// `AT_FDCWD` starts from current->fs->pwd and absolute paths start from
+/// current->fs->root, retaining both halves of Linux `struct path`.
 ///
 /// Source of truth: `vendor/linux/fs/open.c`, `vendor/linux/fs/namei.c`,
 /// `vendor/linux/arch/x86/entry/syscalls/syscall_64.tbl` (nr 257).
@@ -115,14 +114,6 @@ pub unsafe fn sys_openat(dirfd: i32, filename: *const u8, flags: i32, mode: u32)
         Err(_) => return -(EINVAL as i64),
     };
 
-    let effective_path;
-    let path = if path.starts_with('/') || dirfd == AT_FDCWD {
-        effective_path = super::fs_struct::absolute_from_cwd(path);
-        effective_path.as_str()
-    } else {
-        path
-    };
-
     let task = unsafe { sched::get_current() };
     if task.is_null() {
         return -(EBADF as i64);
@@ -131,24 +122,27 @@ pub unsafe fn sys_openat(dirfd: i32, filename: *const u8, flags: i32, mode: u32)
         return -(EBADF as i64);
     };
 
-    let Some(root_mnt) = mount::rootfs() else {
+    let Some(namespace_root) = mount::namespace_root_path() else {
         return -(EINVAL as i64);
     };
-    let root = root_mnt.root.clone();
-    let start = if dirfd == AT_FDCWD {
-        root.clone()
+    let (root, start) = if dirfd == AT_FDCWD {
+        super::fs_struct::current_root_and_pwd_paths()
+            .unwrap_or_else(|| (namespace_root.clone(), namespace_root.clone()))
     } else {
-        match ft.get(dirfd) {
-            Ok(file) => mount::mounted_root_for_dentry(&file.dentry)
-                .map(|mnt| mnt.root.clone())
-                .unwrap_or_else(|| file.dentry.clone()),
+        let root = super::fs_struct::current_root_and_pwd_paths()
+            .map(|(root, _)| root)
+            .unwrap_or_else(|| namespace_root.clone());
+        let start = match ft.get(dirfd) {
+            Ok(file) => mount::VfsPath::for_dentry(file.dentry.clone())
+                .unwrap_or_else(|| namespace_root.clone()),
             Err(errno) => return -(errno as i64),
-        }
+        };
+        (root, start)
     };
     let how = build_open_how_for_openat(flags, mode);
 
     let opened_path = path_hint_for_open(&ft, dirfd, path);
-    let ret = match do_openat2_with_hint(root, start, path, &how, opened_path.as_deref()) {
+    let ret = match do_openat2_with_path_hint(root, start, path, &how, opened_path.as_deref()) {
         Ok(r) => match ft.install(r.file, r.cloexec) {
             Ok(fd) => {
                 let integrity_path = opened_path.clone();
@@ -224,7 +218,7 @@ fn path_hint_for_open(
         return Some(String::from(path));
     }
     if dirfd == AT_FDCWD {
-        return Some(join_path("/", path));
+        return Some(super::fs_struct::absolute_from_cwd(path));
     }
     if dirfd < 0 {
         return None;
@@ -253,6 +247,18 @@ pub(crate) fn do_openat2_with_hint(
     how: &OpenHow,
     hinted_path: Option<&str>,
 ) -> Result<OpenResult, i32> {
+    let root_path = super::mount::VfsPath::for_dentry(root).ok_or(EINVAL)?;
+    let dir_path = super::mount::VfsPath::for_dentry(dir).ok_or(EINVAL)?;
+    do_openat2_with_path_hint(root_path, dir_path, path, how, hinted_path)
+}
+
+fn do_openat2_with_path_hint(
+    root: super::mount::VfsPath,
+    dir: super::mount::VfsPath,
+    path: &str,
+    how: &OpenHow,
+    hinted_path: Option<&str>,
+) -> Result<OpenResult, i32> {
     validate_open_how(how)?;
     if absent_lsm_sysfs_probe_path(path) {
         return Err(ENOENT);
@@ -274,7 +280,7 @@ pub(crate) fn do_openat2_with_hint(
         }
     }
 
-    let ctx = LookupCtx::new(root, dir.clone(), how.resolve);
+    let ctx = LookupCtx::from_paths(root, dir.clone(), how.resolve);
 
     if let Some(dentry) = resolve_existing_open_path(&ctx, path, flags & O_NOFOLLOW == 0)? {
         if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
@@ -326,7 +332,7 @@ pub(crate) fn do_openat2_with_hint(
     // Split into parent path + final component for O_CREAT handling.
     let (parent_path, last) = split_last(path);
 
-    let parent_dentry = resolve_open_parent(&ctx.root, &dir, path, parent_path)?;
+    let parent_dentry = resolve_open_parent(&ctx, parent_path)?;
     let parent_inode = parent_dentry.inode().ok_or(ENOENT)?;
     if parent_inode.kind != InodeKind::Directory {
         return Err(crate::include::uapi::errno::ENOTDIR);
@@ -548,68 +554,15 @@ fn resolve_existing_open_path(
     path: &str,
     follow_final: bool,
 ) -> Result<Option<DentryRef>, i32> {
-    if ctx.resolve != 0 {
-        return match super::mount::resolve_path_at(ctx, path, follow_final) {
-            Ok((_, dentry)) => Ok(Some(dentry)),
-            Err(ENOENT) => Ok(None),
-            Err(errno) => Err(errno),
-        };
-    }
-
-    if !path.starts_with('/') {
-        if let Some(base) = super::mount::path_for_dentry(&ctx.start) {
-            let full_path = join_path(&base, path);
-            return match if follow_final {
-                super::mount::resolve_path_follow(&full_path)
-            } else {
-                super::mount::resolve_path_nofollow(&full_path)
-            } {
-                Ok((_, dentry)) => Ok(Some(dentry)),
-                Err(ENOENT) => Ok(None),
-                Err(errno) => Err(errno),
-            };
-        }
-
-        return match path_lookupat(ctx, path) {
-            Ok(dentry) => Ok(Some(dentry)),
-            Err(ENOENT) => Ok(None),
-            Err(errno) => Err(errno),
-        };
-    }
-
-    match if follow_final {
-        super::mount::resolve_path_follow(path)
-    } else {
-        super::mount::resolve_path_nofollow(path)
-    } {
+    match super::mount::resolve_path_at(ctx, path, follow_final) {
         Ok((_, dentry)) => Ok(Some(dentry)),
         Err(ENOENT) => Ok(None),
         Err(errno) => Err(errno),
     }
 }
 
-fn resolve_open_parent(
-    root: &DentryRef,
-    dir: &DentryRef,
-    path: &str,
-    parent_path: &str,
-) -> Result<DentryRef, i32> {
-    if path.starts_with('/') {
-        return super::mount::resolve_path_follow(parent_path).map_or_else(
-            |_| path_lookupat(&LookupCtx::new(root.clone(), dir.clone(), 0), parent_path),
-            |(_, dentry)| Ok(dentry),
-        );
-    }
-
-    if let Some(base) = super::mount::path_for_dentry(dir) {
-        let full_parent = join_path(&base, parent_path);
-        return super::mount::resolve_path_follow(&full_parent).map_or_else(
-            |_| path_lookupat(&LookupCtx::new(root.clone(), dir.clone(), 0), parent_path),
-            |(_, dentry)| Ok(dentry),
-        );
-    }
-
-    path_lookupat(&LookupCtx::new(root.clone(), dir.clone(), 0), parent_path)
+fn resolve_open_parent(ctx: &LookupCtx, parent_path: &str) -> Result<DentryRef, i32> {
+    super::mount::resolve_path_at(ctx, parent_path, true).map(|(_, dentry)| dentry)
 }
 
 fn join_path(base: &str, child: &str) -> String {

@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/module
 //! test-origin: linux:vendor/linux/kernel/module
 //! EXPORT_SYMBOL registry — `include/linux/export.h:89`.

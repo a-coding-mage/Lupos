@@ -28,6 +28,7 @@ pub mod device;
 pub mod driver;
 pub mod linux_sources;
 pub mod platform;
+pub(crate) mod printf;
 
 pub use bus::{
     BusType, LinuxBusType, bus_register, bus_unregister, linux_bus_type_registered,

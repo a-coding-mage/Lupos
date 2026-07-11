@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/drivers/video/logo/logo.c
 //! test-origin: linux:vendor/linux/drivers/video/logo/logo.c
 //! Linux boot-logo selection.
@@ -106,6 +106,9 @@ fn reset_logo_state_for_tests() {
     LOGOS_FREED.store(false, Ordering::SeqCst);
 }
 
+#[cfg(test)]
+static LOGO_STATE_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 // In the kernel binary, use the pre-generated pixel data.
 #[cfg(not(test))]
 static LOGO_DATA: &[u8] = include_bytes!(env!("LUPOS_SPLASH_BIN"));
@@ -115,7 +118,68 @@ static LOGO_DATA: &[u8] = include_bytes!(env!("LUPOS_SPLASH_BIN"));
 #[cfg(test)]
 static LOGO_DATA: &[u8] = &[];
 
-/// Display the Lupos brand logo on the linear framebuffer, centered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SplashLayout {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+/// Fit the source image inside the framebuffer without changing its aspect
+/// ratio.  The remaining pixels are the black letterbox rendered by
+/// `fb_show_logo`.
+fn splash_layout(
+    source_width: usize,
+    source_height: usize,
+    framebuffer_width: usize,
+    framebuffer_height: usize,
+) -> Option<SplashLayout> {
+    if source_width == 0 || source_height == 0 || framebuffer_width == 0 || framebuffer_height == 0
+    {
+        return None;
+    }
+
+    let source_width_u64 = source_width as u64;
+    let source_height_u64 = source_height as u64;
+    let framebuffer_width_u64 = framebuffer_width as u64;
+    let framebuffer_height_u64 = framebuffer_height as u64;
+
+    let (width, height) =
+        if framebuffer_width_u64 * source_height_u64 <= framebuffer_height_u64 * source_width_u64 {
+            (
+                framebuffer_width,
+                ((source_height_u64 * framebuffer_width_u64) / source_width_u64).max(1) as usize,
+            )
+        } else {
+            (
+                ((source_width_u64 * framebuffer_height_u64) / source_height_u64).max(1) as usize,
+                framebuffer_height,
+            )
+        };
+
+    Some(SplashLayout {
+        x: (framebuffer_width - width) / 2,
+        y: (framebuffer_height - height) / 2,
+        width,
+        height,
+    })
+}
+
+/// Store one already-packed 32-bit framebuffer pixel in little-endian byte
+/// order. Writing all four bytes matters for valid `screen_info` layouts that
+/// place a color channel, rather than filler, in bits 24..31.
+unsafe fn write_packed_pixel_32(ptr: *mut u8, offset: usize, color: u32) {
+    unsafe {
+        core::ptr::write_volatile(ptr.add(offset), color as u8);
+        core::ptr::write_volatile(ptr.add(offset + 1), (color >> 8) as u8);
+        core::ptr::write_volatile(ptr.add(offset + 2), (color >> 16) as u8);
+        core::ptr::write_volatile(ptr.add(offset + 3), (color >> 24) as u8);
+    }
+}
+
+/// Display the Lupos splash on the linear framebuffer at the framebuffer's
+/// actual resolution.
 ///
 /// Silently returns if the framebuffer is unavailable (headless boot) or
 /// if the pixel data is malformed.
@@ -133,29 +197,45 @@ pub fn fb_show_logo() {
 
     let logo_w = u32::from_le_bytes(LOGO_DATA[0..4].try_into().unwrap()) as usize;
     let logo_h = u32::from_le_bytes(LOGO_DATA[4..8].try_into().unwrap()) as usize;
-    let expected_len = 8 + logo_w * logo_h * 4;
+    let Some(expected_len) = logo_w
+        .checked_mul(logo_h)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| bytes.checked_add(8))
+    else {
+        return;
+    };
     if LOGO_DATA.len() < expected_len || logo_w == 0 || logo_h == 0 {
         return;
     }
 
     let fb_w = fb.width as usize;
     let fb_h = fb.height as usize;
-    let x0 = fb_w.saturating_sub(logo_w) / 2;
-    let y0 = fb_h.saturating_sub(logo_h) / 2;
-    let draw_w = logo_w.min(fb_w);
-    let draw_h = logo_h.min(fb_h);
+    let Some(layout) = splash_layout(logo_w, logo_h, fb_w, fb_h) else {
+        return;
+    };
 
-    for row in 0..draw_h {
-        for col in 0..draw_w {
-            let px_off = 8 + (row * logo_w + col) * 4;
-            let color = u32::from_le_bytes(LOGO_DATA[px_off..px_off + 4].try_into().unwrap());
-            let offset = (y0 + row) * fb.pitch as usize + (x0 + col) * 4;
+    // Paint every visible framebuffer pixel in one pass.  Besides scaling the
+    // splash, this replaces the previous GRUB/menu contents and fbcon's initial
+    // top-left cursor cell with a deterministic black letterbox.
+    for row in 0..fb_h {
+        for col in 0..fb_w {
+            let color = if row >= layout.y
+                && row < layout.y + layout.height
+                && col >= layout.x
+                && col < layout.x + layout.width
+            {
+                let source_row = (row - layout.y) * logo_h / layout.height;
+                let source_col = (col - layout.x) * logo_w / layout.width;
+                let px_off = 8 + (source_row * logo_w + source_col) * 4;
+                u32::from_le_bytes(LOGO_DATA[px_off..px_off + 4].try_into().unwrap())
+            } else {
+                0
+            };
+            let color = fb.pixel_format.encode_rgb888(color);
+            let offset = row * fb.pitch as usize + col * 4;
             unsafe {
                 let ptr = fb.kernel_addr as *mut u8;
-                core::ptr::write_volatile(ptr.add(offset), color as u8);
-                core::ptr::write_volatile(ptr.add(offset + 1), (color >> 8) as u8);
-                core::ptr::write_volatile(ptr.add(offset + 2), (color >> 16) as u8);
-                core::ptr::write_volatile(ptr.add(offset + 3), 0u8);
+                write_packed_pixel_32(ptr, offset, color);
             }
         }
     }
@@ -199,6 +279,7 @@ mod tests {
 
     #[test]
     fn fb_find_logo_selects_highest_configured_logo_for_depth() {
+        let _guard = LOGO_STATE_TEST_LOCK.lock();
         reset_logo_state_for_tests();
 
         assert_eq!(fb_find_logo(0), None);
@@ -212,6 +293,7 @@ mod tests {
 
     #[test]
     fn fb_find_logo_honors_config_guards_and_late_free_state() {
+        let _guard = LOGO_STATE_TEST_LOCK.lock();
         reset_logo_state_for_tests();
 
         assert_eq!(
@@ -256,5 +338,53 @@ mod tests {
         assert_eq!(LinuxLogoKind::Mono.linux_type(), LINUX_LOGO_MONO);
         assert_eq!(LinuxLogoKind::Vga16.linux_type(), LINUX_LOGO_VGA16);
         assert_eq!(LinuxLogoKind::Clut224.linux_type(), LINUX_LOGO_CLUT224);
+    }
+
+    #[test]
+    fn splash_fills_800x600_width_with_aspect_correct_letterbox() {
+        assert_eq!(
+            splash_layout(800, 450, 800, 600),
+            Some(SplashLayout {
+                x: 0,
+                y: 75,
+                width: 800,
+                height: 450,
+            })
+        );
+    }
+
+    #[test]
+    fn splash_layout_scales_up_and_down_with_the_framebuffer() {
+        assert_eq!(
+            splash_layout(800, 450, 1920, 1080),
+            Some(SplashLayout {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            })
+        );
+        assert_eq!(
+            splash_layout(800, 450, 640, 480),
+            Some(SplashLayout {
+                x: 0,
+                y: 60,
+                width: 640,
+                height: 360,
+            })
+        );
+    }
+
+    #[test]
+    fn splash_layout_rejects_empty_geometry() {
+        assert_eq!(splash_layout(0, 450, 800, 600), None);
+        assert_eq!(splash_layout(800, 450, 0, 600), None);
+    }
+
+    #[test]
+    fn packed_pixel_writer_preserves_high_color_channel_byte() {
+        let mut pixel = [0u8; 4];
+        unsafe { write_packed_pixel_32(pixel.as_mut_ptr(), 0, 0xab12_3456) };
+        assert_eq!(pixel, [0x56, 0x34, 0x12, 0xab]);
     }
 }

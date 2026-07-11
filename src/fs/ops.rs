@@ -8,11 +8,16 @@
 //! never has to NULL-check before calling.
 
 use super::types::{Dentry, DentryRef, File, FileRef, Inode, InodeRef, SuperBlock, SuperBlockRef};
+use crate::mm::mm_types::VmAreaStruct;
 
 pub type PollFn = fn(&FileRef) -> u32;
 pub type IoctlFn = fn(&FileRef, cmd: u32, arg: u64) -> Result<i64, i32>;
-pub type MmapFn =
-    fn(&FileRef, addr: u64, len: usize, prot: u32, flags: u32, off: u64) -> Result<u64, i32>;
+/// Rust-native equivalent of Linux `file_operations::mmap`.
+///
+/// The MM core initializes the VMA before invoking the callback. As in Linux,
+/// the callback runs once while the mapping is created and may update VMA
+/// flags, page protection, operations, and private data.
+pub type MmapFn = fn(&FileRef, &mut VmAreaStruct) -> Result<(), i32>;
 pub type RenameFn =
     fn(old_dir: &InodeRef, old_name: &str, new_dir: &InodeRef, new_name: &str) -> Result<(), i32>;
 pub type SymlinkFn =

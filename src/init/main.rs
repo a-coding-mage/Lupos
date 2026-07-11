@@ -286,8 +286,27 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
 
     // Framebuffer console setup from screen_info (if present).
     if let Some(fb) = bp.framebuffer_info() {
-        let fb_ready =
-            unsafe { fbdev_core::init(fb.addr, fb.pitch, fb.width, fb.height, fb.depth as u8) };
+        arch::x86::video::set_primary_display_resource(fb.addr, fb.resource_size);
+        let pixel_format = fbdev_core::PixelFormat::from_screen_info(
+            fb.red_size,
+            fb.red_pos,
+            fb.green_size,
+            fb.green_pos,
+            fb.blue_size,
+            fb.blue_pos,
+            fb.rsvd_size,
+            fb.rsvd_pos,
+        );
+        let fb_ready = u8::try_from(fb.bits_per_pixel).is_ok_and(|bits_per_pixel| unsafe {
+            fbdev_core::init_with_pixel_format(
+                fb.addr,
+                fb.pitch,
+                fb.width,
+                fb.height,
+                bits_per_pixel,
+                pixel_format,
+            )
+        });
         if fb_ready {
             // Display Lupos brand logo on the framebuffer immediately after init.
             // Gated by the Linux logo.c nologo/logos_freed state model.
@@ -656,6 +675,7 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     if let Some(cmdline) = early_cmdline {
         kernel::debug_trace::init_from_cmdline(cmdline);
         fs::proc::cmdline::set_saved_command_line(cmdline);
+        linux_driver_abi::video::configure_from_cmdline(cmdline);
         parsed_boot_options = init::boot::BootOptions::parse(cmdline);
         if let Some((kind, param)) = parsed_boot_options.boot_var_overflow() {
             panic!("Too many boot {} vars at `{}'", kind, param);
@@ -670,6 +690,13 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     }
 
     discover_boot_pci_devices();
+
+    // Linux's exported kernel symbol table exists before any module-loading
+    // entry point becomes reachable.  Install the foreign-driver ABI once the
+    // allocator and PCI inventory are ready, rather than relying solely on the
+    // initramfs `modprobe()` wrapper; user-space init_module/finit_module must
+    // see the same exports on their first call.
+    linux_driver_abi::register_module_exports();
 
     // Linux runs late initcalls from kernel_init_freeable() after the rootfs
     // path is available. Lupos still runs the kernel body in one thread, but

@@ -55,6 +55,10 @@ pub fn register() {
     });
 }
 
+pub fn register_module_exports() {
+    file::register_module_exports();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,6 +3,7 @@
 //! test-origin: linux:vendor/linux/drivers/video/fbdev/core/fbcon.c
 extern crate alloc;
 
+use super::PixelFormat;
 use super::font;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -50,6 +51,7 @@ pub struct FramebufferWriter {
     width: u32,
     height: u32,
     bpp: u8,
+    pixel_format: PixelFormat,
     col: usize,
     row: usize,
     fg_color: u32,
@@ -77,6 +79,21 @@ impl FramebufferWriter {
     /// `fb_addr` must point to a valid, writable framebuffer region of at
     /// least `pitch * height` bytes. The framebuffer must be identity-mapped.
     pub unsafe fn new(fb_addr: *mut u8, pitch: u32, width: u32, height: u32, bpp: u8) -> Self {
+        let pixel_format = PixelFormat::packed_rgb_for_bpp(bpp).unwrap_or(PixelFormat::XRGB8888);
+        unsafe { Self::new_with_pixel_format(fb_addr, pitch, width, height, bpp, pixel_format) }
+    }
+
+    /// # Safety
+    /// The mapping requirements are the same as [`Self::new`]. `pixel_format`
+    /// must have been validated for `bpp` by the framebuffer initializer.
+    pub unsafe fn new_with_pixel_format(
+        fb_addr: *mut u8,
+        pitch: u32,
+        width: u32,
+        height: u32,
+        bpp: u8,
+        pixel_format: PixelFormat,
+    ) -> Self {
         let cols = (width as usize / font::GLYPH_WIDTH).max(1);
         let rows = (height as usize / font::GLYPH_HEIGHT).max(1);
         Self {
@@ -85,6 +102,7 @@ impl FramebufferWriter {
             width,
             height,
             bpp,
+            pixel_format,
             col: 0,
             row: 0,
             fg_color: DEFAULT_FG,
@@ -466,6 +484,11 @@ impl FramebufferWriter {
         for col in 0..cols {
             self.render_cell(col, rows - 1, false);
         }
+        // A framebuffer height need not be an exact multiple of the fixed
+        // glyph height (800x600 leaves eight pixels below 37 text rows). The
+        // scanline move above does not write that bottom remainder, so clear
+        // it explicitly instead of leaving pixels from the pre-scroll frame.
+        self.fill_pixel_rows(rows * glyph_h, self.height as usize, self.bg_color);
     }
 
     fn clear_display(&mut self, mode: usize) {
@@ -617,54 +640,46 @@ impl FramebufferWriter {
         let glyph_data = font::glyph(ch);
         let px_x = col * font::GLYPH_WIDTH;
         let px_y = row * font::GLYPH_HEIGHT;
-
-        if self.bpp == 32 {
-            for (scanline, &glyph_byte) in glyph_data.iter().enumerate() {
-                let row_offset = (px_y + scanline) * self.pitch as usize + px_x * 4;
-                unsafe {
-                    let row = self.fb_addr.add(row_offset) as *mut u32;
-                    for bit in 0..font::GLYPH_WIDTH {
-                        let is_fg = (glyph_byte >> (7 - bit)) & 1 == 1;
-                        row.add(bit).write(if is_fg { fg } else { bg });
-                    }
-                }
-            }
-            return;
-        }
+        let fg = self.pixel_format.encode_rgb888(fg);
+        let bg = self.pixel_format.encode_rgb888(bg);
 
         for (scanline, &glyph_byte) in glyph_data.iter().enumerate() {
             for bit in 0..font::GLYPH_WIDTH {
                 let is_fg = (glyph_byte >> (7 - bit)) & 1 == 1;
                 let color = if is_fg { fg } else { bg };
-                self.put_pixel(px_x + bit, px_y + scanline, color, bytes_per_pixel);
+                self.put_packed_pixel(px_x + bit, px_y + scanline, color, bytes_per_pixel);
             }
         }
     }
 
     fn fill_pixels(&self, color: u32) {
+        self.fill_pixel_rows(0, self.height as usize, color);
+    }
+
+    fn fill_pixel_rows(&self, start_y: usize, end_y: usize, color: u32) {
         let Some(bytes_per_pixel) = self.bytes_per_pixel() else {
             return;
         };
-        if self.bpp == 32 {
-            for y in 0..self.height as usize {
-                let row_offset = y * self.pitch as usize;
-                unsafe {
-                    let row = self.fb_addr.add(row_offset) as *mut u32;
-                    for x in 0..self.width as usize {
-                        row.add(x).write(color);
-                    }
-                }
-            }
-            return;
-        }
-        for y in 0..self.height as usize {
+        let start_y = start_y.min(self.height as usize);
+        let end_y = end_y.min(self.height as usize);
+        let color = self.pixel_format.encode_rgb888(color);
+        for y in start_y..end_y {
             for x in 0..self.width as usize {
-                self.put_pixel(x, y, color, bytes_per_pixel);
+                self.put_packed_pixel(x, y, color, bytes_per_pixel);
             }
         }
     }
 
     fn put_pixel(&self, x: usize, y: usize, color: u32, bytes_per_pixel: usize) {
+        self.put_packed_pixel(
+            x,
+            y,
+            self.pixel_format.encode_rgb888(color),
+            bytes_per_pixel,
+        );
+    }
+
+    fn put_packed_pixel(&self, x: usize, y: usize, packed: u32, bytes_per_pixel: usize) {
         if !(3..=4).contains(&bytes_per_pixel) {
             return;
         }
@@ -679,11 +694,11 @@ impl FramebufferWriter {
         };
         unsafe {
             let pixel_ptr = self.fb_addr.add(offset);
-            core::ptr::write_volatile(pixel_ptr, color as u8);
-            core::ptr::write_volatile(pixel_ptr.add(1), (color >> 8) as u8);
-            core::ptr::write_volatile(pixel_ptr.add(2), (color >> 16) as u8);
+            core::ptr::write_volatile(pixel_ptr, packed as u8);
+            core::ptr::write_volatile(pixel_ptr.add(1), (packed >> 8) as u8);
+            core::ptr::write_volatile(pixel_ptr.add(2), (packed >> 16) as u8);
             if bytes_per_pixel == 4 {
-                core::ptr::write_volatile(pixel_ptr.add(3), 0);
+                core::ptr::write_volatile(pixel_ptr.add(3), (packed >> 24) as u8);
             }
         }
     }
@@ -798,6 +813,25 @@ mod tests {
     }
 
     #[test]
+    fn scroll_clears_pixel_rows_below_last_complete_glyph() {
+        let width = (2 * font::GLYPH_WIDTH) as u32;
+        let height = (2 * font::GLYPH_HEIGHT + 8) as u32;
+        let pitch = width * 4;
+        let mut buf = vec![0x5au8; (pitch * height) as usize];
+        let mut writer =
+            unsafe { FramebufferWriter::new(buf.as_mut_ptr(), pitch, width, height, 32) };
+
+        writer.write_char(b'\n');
+        writer.write_char(b'\n');
+
+        let remainder_start = 2 * font::GLYPH_HEIGHT * pitch as usize;
+        assert!(
+            buf[remainder_start..].iter().all(|byte| *byte == 0),
+            "bottom partial-glyph scanlines must not retain stale pixels"
+        );
+    }
+
+    #[test]
     fn fmt_write_trait_works() {
         let (_buf, mut writer) = make_test_writer();
         use core::fmt::Write;
@@ -813,6 +847,19 @@ mod tests {
         writer.fill_pixels(0x00ff_ffff);
 
         assert_eq!(buf, vec![0u8; 4]);
+    }
+
+    #[test]
+    fn pixel_writes_follow_firmware_channel_positions() {
+        let xbgr = PixelFormat::from_screen_info(8, 0, 8, 8, 8, 16, 8, 24);
+        let mut buf = vec![0u8; 4];
+        let writer = unsafe {
+            FramebufferWriter::new_with_pixel_format(buf.as_mut_ptr(), 4, 1, 1, 32, xbgr)
+        };
+
+        writer.put_pixel(0, 0, 0x0012_3456, 4);
+
+        assert_eq!(buf, vec![0x12, 0x34, 0x56, 0x00]);
     }
 
     #[test]

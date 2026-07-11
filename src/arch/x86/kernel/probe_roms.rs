@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/kernel/probe_roms.c
 //! test-origin: linux:vendor/linux/arch/x86/kernel/probe_roms.c
 //! Legacy option-ROM probing.

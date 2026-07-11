@@ -41,7 +41,12 @@ pub const CONFIG_ACPI: Tristate = config_value!(CONFIG_ACPI);
 pub const CONFIG_IOMMU: Tristate = config_value!(CONFIG_IOMMU);
 pub const CONFIG_SERIAL_8250: Tristate = config_value!(CONFIG_SERIAL_8250);
 pub const CONFIG_FRAMEBUFFER: Tristate = config_value!(CONFIG_FRAMEBUFFER);
+pub const CONFIG_AGP: Tristate = config_value!(CONFIG_AGP);
+pub const CONFIG_AGP_AMD64: Tristate = config_value!(CONFIG_AGP_AMD64);
+pub const CONFIG_AGP_INTEL: Tristate = config_value!(CONFIG_AGP_INTEL);
 pub const CONFIG_DRM: Tristate = config_value!(CONFIG_DRM);
+pub const CONFIG_DRM_I915: Tristate = config_value!(CONFIG_DRM_I915);
+pub const CONFIG_DRM_VIRTIO_GPU: Tristate = config_value!(CONFIG_DRM_VIRTIO_GPU);
 pub const CONFIG_INPUT: Tristate = config_value!(CONFIG_INPUT);
 pub const CONFIG_HID: Tristate = config_value!(CONFIG_HID);
 pub const CONFIG_USB: Tristate = config_value!(CONFIG_USB);
@@ -94,8 +99,28 @@ pub const CONFIG_SYMBOLS: &[ConfigSymbol] = &[
         value: CONFIG_FRAMEBUFFER,
     },
     ConfigSymbol {
+        name: "CONFIG_AGP",
+        value: CONFIG_AGP,
+    },
+    ConfigSymbol {
+        name: "CONFIG_AGP_AMD64",
+        value: CONFIG_AGP_AMD64,
+    },
+    ConfigSymbol {
+        name: "CONFIG_AGP_INTEL",
+        value: CONFIG_AGP_INTEL,
+    },
+    ConfigSymbol {
         name: "CONFIG_DRM",
         value: CONFIG_DRM,
+    },
+    ConfigSymbol {
+        name: "CONFIG_DRM_I915",
+        value: CONFIG_DRM_I915,
+    },
+    ConfigSymbol {
+        name: "CONFIG_DRM_VIRTIO_GPU",
+        value: CONFIG_DRM_VIRTIO_GPU,
     },
     ConfigSymbol {
         name: "CONFIG_INPUT",
@@ -165,6 +190,11 @@ mod tests {
     #[test]
     fn config_symbol_table_is_queryable() {
         assert_eq!(lookup("CONFIG_MODULES"), Some(CONFIG_MODULES));
+        assert_eq!(lookup("CONFIG_AGP"), Some(CONFIG_AGP));
+        assert_eq!(lookup("CONFIG_AGP_AMD64"), Some(CONFIG_AGP_AMD64));
+        assert_eq!(lookup("CONFIG_AGP_INTEL"), Some(CONFIG_AGP_INTEL));
+        assert_eq!(lookup("CONFIG_DRM_I915"), Some(CONFIG_DRM_I915));
+        assert_eq!(lookup("CONFIG_DRM_VIRTIO_GPU"), Some(CONFIG_DRM_VIRTIO_GPU));
         assert_eq!(lookup("CONFIG_E1000"), Some(CONFIG_E1000));
         assert_eq!(lookup("CONFIG_DOES_NOT_EXIST"), None);
     }

@@ -15,8 +15,82 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use super::irqflags::{IrqFlags, local_irq_restore, local_irq_save};
+use super::irqflags::{
+    IrqFlags, local_irq_disable, local_irq_enable, local_irq_restore, local_irq_save,
+};
 use super::preempt::{preempt_disable, preempt_enable};
+use super::qspinlock::QSpinLock;
+use crate::kernel::module::{export_symbol, find_symbol};
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "_raw_spin_lock_irqsave",
+        linux_raw_spin_lock_irqsave as usize,
+        false,
+    );
+    export_symbol_once(
+        "_raw_spin_unlock_irqrestore",
+        linux_raw_spin_unlock_irqrestore as usize,
+        false,
+    );
+    export_symbol_once(
+        "_raw_spin_lock_irq",
+        linux_raw_spin_lock_irq as usize,
+        false,
+    );
+    export_symbol_once(
+        "_raw_spin_unlock_irq",
+        linux_raw_spin_unlock_irq as usize,
+        false,
+    );
+}
+
+/// `_raw_spin_lock_irqsave` —
+/// `vendor/linux/kernel/locking/spinlock.c:164` and
+/// `vendor/linux/include/linux/spinlock_api_smp.h:125`.
+///
+/// Vendor x86-64 `raw_spinlock_t` contains a four-byte `arch_spinlock_t`
+/// qspinlock, so the module-facing ABI deliberately takes `QSpinLock` rather
+/// than Lupos's separate Rust-owned ticket-lock wrapper below.
+#[unsafe(export_name = "_raw_spin_lock_irqsave")]
+pub unsafe extern "C" fn linux_raw_spin_lock_irqsave(lock: *mut QSpinLock) -> IrqFlags {
+    let flags = local_irq_save();
+    preempt_disable();
+    unsafe { &*lock }.lock();
+    flags
+}
+
+/// `_raw_spin_unlock_irqrestore` —
+/// `vendor/linux/include/linux/spinlock_api_smp.h:172`.
+#[unsafe(export_name = "_raw_spin_unlock_irqrestore")]
+pub unsafe extern "C" fn linux_raw_spin_unlock_irqrestore(lock: *mut QSpinLock, flags: IrqFlags) {
+    unsafe { &*lock }.unlock();
+    local_irq_restore(flags);
+    preempt_enable();
+}
+
+/// `_raw_spin_lock_irq` — `vendor/linux/include/linux/spinlock_api_smp.h:137`.
+#[unsafe(export_name = "_raw_spin_lock_irq")]
+pub unsafe extern "C" fn linux_raw_spin_lock_irq(lock: *mut QSpinLock) {
+    local_irq_disable();
+    preempt_disable();
+    unsafe { &*lock }.lock();
+}
+
+/// `_raw_spin_unlock_irq` —
+/// `vendor/linux/include/linux/spinlock_api_smp.h:182`.
+#[unsafe(export_name = "_raw_spin_unlock_irq")]
+pub unsafe extern "C" fn linux_raw_spin_unlock_irq(lock: *mut QSpinLock) {
+    unsafe { &*lock }.unlock();
+    local_irq_enable();
+    preempt_enable();
+}
 
 /// Ticket spinlock state — `next` and `owner` packed into a single 32-bit word
 /// so the cmpxchg increment is a single instruction.

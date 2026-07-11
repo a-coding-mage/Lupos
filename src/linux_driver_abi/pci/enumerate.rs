@@ -20,7 +20,9 @@ use crate::arch::x86::include::asm::io::{inb, inl, inw, outl, outw};
 use crate::arch::x86::pci::early::{PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_PORT};
 use crate::linux_driver_abi::pci::PCI_BUSES;
 use crate::linux_driver_abi::pci::device::{
-    PCI_CONFIG_SPACE_SIZE, PciBar, PciBus, PciDev, register_linux_pci_device,
+    IORESOURCE_MEM, IORESOURCE_PREFETCH, IORESOURCE_READONLY, IORESOURCE_ROM_ENABLE,
+    IORESOURCE_SIZEALIGN, LINUX_PCI_CONFIG_IO_LOCK, LinuxPciBarResource, PCI_CONFIG_SPACE_EXP_SIZE,
+    PCI_CONFIG_SPACE_SIZE, PciBar, PciBus, PciConfigBackend, PciDev, register_linux_pci_device,
 };
 use crate::linux_driver_abi::pci::ecam::McfgEntry;
 
@@ -40,13 +42,20 @@ const PCI_BASE_ADDRESS_MEM_MASK: u64 = 0xffff_fff0;
 const PCI_BASE_ADDRESS_IO_MASK: u64 = 0xffff_fffc;
 const PCI_SUBSYSTEM_VID: u16 = 0x2C;
 const PCI_SUBSYSTEM_ID: u16 = 0x2E;
-
-static LEGACY_CF8_CONFIG_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+const PCI_ROM_ADDRESS: u16 = 0x30;
+const PCI_ROM_ADDRESS1: u16 = 0x38;
+const PCI_ROM_ADDRESS_ENABLE: u32 = 0x01;
+const PCI_ROM_ADDRESS_MASK: u32 = !0x7ff;
+const PCI_CAP_ID_SSVID: u8 = 0x0d;
+const PCI_SSVID_VENDOR_ID: u16 = 4;
+const PCI_SSVID_DEVICE_ID: u16 = 6;
 
 trait PciConfigAccess {
     fn segment(&self) -> u16;
     fn bus_start(&self) -> u8;
     fn bus_end(&self) -> u8;
+    fn backend(&self) -> PciConfigBackend;
+    fn max_config_size(&self) -> usize;
 
     unsafe fn read8(&self, bus: u8, dev: u8, func: u8, offset: u16) -> u8;
     unsafe fn read16(&self, bus: u8, dev: u8, func: u8, offset: u16) -> u16;
@@ -66,6 +75,14 @@ impl PciConfigAccess for McfgEntry {
 
     fn bus_end(&self) -> u8 {
         self.bus_end
+    }
+
+    fn backend(&self) -> PciConfigBackend {
+        PciConfigBackend::Ecam(*self)
+    }
+
+    fn max_config_size(&self) -> usize {
+        PCI_CONFIG_SPACE_EXP_SIZE
     }
 
     unsafe fn read8(&self, bus: u8, dev: u8, func: u8, offset: u16) -> u8 {
@@ -119,8 +136,16 @@ impl PciConfigAccess for LegacyCf8ConfigAccess {
         self.bus_end
     }
 
+    fn backend(&self) -> PciConfigBackend {
+        PciConfigBackend::LegacyCf8
+    }
+
+    fn max_config_size(&self) -> usize {
+        PCI_CONFIG_SPACE_SIZE
+    }
+
     unsafe fn read8(&self, bus: u8, dev: u8, func: u8, offset: u16) -> u8 {
-        let _guard = LEGACY_CF8_CONFIG_LOCK.lock();
+        let _guard = LINUX_PCI_CONFIG_IO_LOCK.lock();
         unsafe {
             outl(
                 PCI_CONFIG_ADDRESS_PORT,
@@ -131,7 +156,7 @@ impl PciConfigAccess for LegacyCf8ConfigAccess {
     }
 
     unsafe fn read16(&self, bus: u8, dev: u8, func: u8, offset: u16) -> u16 {
-        let _guard = LEGACY_CF8_CONFIG_LOCK.lock();
+        let _guard = LINUX_PCI_CONFIG_IO_LOCK.lock();
         unsafe {
             outl(
                 PCI_CONFIG_ADDRESS_PORT,
@@ -142,7 +167,7 @@ impl PciConfigAccess for LegacyCf8ConfigAccess {
     }
 
     unsafe fn read32(&self, bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
-        let _guard = LEGACY_CF8_CONFIG_LOCK.lock();
+        let _guard = LINUX_PCI_CONFIG_IO_LOCK.lock();
         unsafe {
             outl(
                 PCI_CONFIG_ADDRESS_PORT,
@@ -153,7 +178,7 @@ impl PciConfigAccess for LegacyCf8ConfigAccess {
     }
 
     unsafe fn write16(&self, bus: u8, dev: u8, func: u8, offset: u16, value: u16) {
-        let _guard = LEGACY_CF8_CONFIG_LOCK.lock();
+        let _guard = LINUX_PCI_CONFIG_IO_LOCK.lock();
         unsafe {
             outl(
                 PCI_CONFIG_ADDRESS_PORT,
@@ -164,7 +189,7 @@ impl PciConfigAccess for LegacyCf8ConfigAccess {
     }
 
     unsafe fn write32(&self, bus: u8, dev: u8, func: u8, offset: u16, value: u32) {
-        let _guard = LEGACY_CF8_CONFIG_LOCK.lock();
+        let _guard = LINUX_PCI_CONFIG_IO_LOCK.lock();
         unsafe {
             outl(
                 PCI_CONFIG_ADDRESS_PORT,
@@ -245,13 +270,24 @@ fn enumerate_config_access<A: PciConfigAccess + ?Sized>(access: &A) {
                 let subclass = (class_w & 0xFF) as u8;
                 let prog_if = config_space[PCI_CLASS_PROG as usize];
                 let rev = config_space[PCI_REVISION_ID as usize];
+                let header_type = config_space[PCI_HEADER_TYPE as usize] & 0x7f;
 
-                let subsystem_vendor = read_config_u16(&config_space, PCI_SUBSYSTEM_VID as usize);
-                let subsystem_device = read_config_u16(&config_space, PCI_SUBSYSTEM_ID as usize);
+                let (subsystem_vendor, subsystem_device) =
+                    read_subsystem_ids(access, bus_n, dev_n, func_n, header_type, &config_space);
 
-                let bars = read_assigned_bars(access, bus_n, dev_n, func_n);
+                let (bars, expansion_rom) =
+                    read_assigned_resources(access, bus_n, dev_n, func_n, header_type);
 
-                let pdev = PciDev::new_with_subsystem_bars_and_config(
+                let cfg_size = pci_cfg_space_size(
+                    access,
+                    bus_n,
+                    dev_n,
+                    func_n,
+                    class,
+                    subclass,
+                    &config_space,
+                );
+                let pdev = PciDev::new_with_subsystem_bars_config_and_backend(
                     access.segment(),
                     bus_n,
                     dev_n,
@@ -265,7 +301,10 @@ fn enumerate_config_access<A: PciConfigAccess + ?Sized>(access: &A) {
                     subsystem_vendor,
                     subsystem_device,
                     bars,
+                    expansion_rom,
                     config_space,
+                    access.backend(),
+                    cfg_size,
                 );
 
                 crate::linux_driver_abi::pci::driver::register_module_exports();
@@ -323,13 +362,155 @@ fn read_config_u16(config: &[u8; PCI_CONFIG_SPACE_SIZE], offset: usize) -> u16 {
     u16::from_le_bytes([config[offset], config[offset + 1]])
 }
 
-fn read_assigned_bars<A: PciConfigAccess + ?Sized>(
+fn read_config_u32(config: &[u8; PCI_CONFIG_SPACE_SIZE], offset: usize) -> u32 {
+    u32::from_le_bytes(config[offset..offset + 4].try_into().unwrap())
+}
+
+/// `pci_cfg_space_size()` / `pci_cfg_space_size_ext()` from
+/// `vendor/linux/drivers/pci/probe.c` for the x86 generic configuration.
+fn pci_cfg_space_size<A: PciConfigAccess + ?Sized>(
     access: &A,
     bus: u8,
     dev: u8,
     func: u8,
-) -> [Option<PciBar>; 6] {
+    class: u8,
+    subclass: u8,
+    config: &[u8; PCI_CONFIG_SPACE_SIZE],
+) -> usize {
+    if access.max_config_size() < PCI_CONFIG_SPACE_EXP_SIZE {
+        return PCI_CONFIG_SPACE_SIZE;
+    }
+
+    if class == 0x06 && subclass == 0x00 {
+        return pci_cfg_space_size_ext(access, bus, dev, func);
+    }
+    if pci_find_capability(config, 0x10).is_some() {
+        return pci_cfg_space_size_ext(access, bus, dev, func);
+    }
+    let Some(pos) = pci_find_capability(config, 0x07) else {
+        return PCI_CONFIG_SPACE_SIZE;
+    };
+    if pos + 8 > PCI_CONFIG_SPACE_SIZE {
+        return PCI_CONFIG_SPACE_SIZE;
+    }
+    let status = read_config_u32(config, pos + 4);
+    if status & (0x4000_0000 | 0x8000_0000) != 0 {
+        pci_cfg_space_size_ext(access, bus, dev, func)
+    } else {
+        PCI_CONFIG_SPACE_SIZE
+    }
+}
+
+fn pci_cfg_space_size_ext<A: PciConfigAccess + ?Sized>(
+    access: &A,
+    bus: u8,
+    dev: u8,
+    func: u8,
+) -> usize {
+    let status = unsafe { access.read32(bus, dev, func, PCI_CONFIG_SPACE_SIZE as u16) };
+    if status == u32::MAX || pci_ext_cfg_is_aliased(access, bus, dev, func) {
+        PCI_CONFIG_SPACE_SIZE
+    } else {
+        PCI_CONFIG_SPACE_EXP_SIZE
+    }
+}
+
+/// The target vendor configuration has `CONFIG_PCI_QUIRKS=y`, so retain the
+/// reachability/aliasing guard from `probe.c:pci_ext_cfg_is_aliased()`.
+fn pci_ext_cfg_is_aliased<A: PciConfigAccess + ?Sized>(
+    access: &A,
+    bus: u8,
+    dev: u8,
+    func: u8,
+) -> bool {
+    let header = unsafe { access.read32(bus, dev, func, PCI_VENDOR_ID) };
+    for pos in (PCI_CONFIG_SPACE_SIZE..PCI_CONFIG_SPACE_EXP_SIZE).step_by(PCI_CONFIG_SPACE_SIZE) {
+        let value = unsafe { access.read32(bus, dev, func, pos as u16) };
+        if value != header {
+            return false;
+        }
+    }
+    true
+}
+
+/// Standard capability-list walk matching `PCI_FIND_NEXT_CAP` in
+/// `vendor/linux/drivers/pci/pci.h`.
+fn pci_find_capability(config: &[u8; PCI_CONFIG_SPACE_SIZE], cap: u8) -> Option<usize> {
+    if read_config_u16(config, 0x06) & 0x10 == 0 {
+        return None;
+    }
+
+    let pointer = match config[PCI_HEADER_TYPE as usize] & 0x7f {
+        0 | 1 => 0x34,
+        2 => 0x14,
+        _ => return None,
+    };
+    let mut pos = config[pointer] as usize;
+    for _ in 0..48 {
+        if pos < 0x40 {
+            break;
+        }
+        pos &= !3;
+        if pos + 1 >= PCI_CONFIG_SPACE_SIZE {
+            break;
+        }
+        let entry = read_config_u16(config, pos);
+        let id = entry as u8;
+        if id == u8::MAX {
+            break;
+        }
+        if id == cap {
+            return Some(pos);
+        }
+        pos = ((entry >> 8) as usize) & !3;
+    }
+    None
+}
+
+/// Type-0/type-1 subsystem ID discovery from `probe.c:pci_setup_device()`.
+fn read_subsystem_ids<A: PciConfigAccess + ?Sized>(
+    access: &A,
+    bus: u8,
+    dev: u8,
+    func: u8,
+    header_type: u8,
+    config: &[u8; PCI_CONFIG_SPACE_SIZE],
+) -> (u16, u16) {
+    match header_type {
+        0 => {
+            return (
+                read_config_u16(config, PCI_SUBSYSTEM_VID as usize),
+                read_config_u16(config, PCI_SUBSYSTEM_ID as usize),
+            );
+        }
+        1 => {}
+        _ => return (0, 0),
+    }
+
+    let Some(pos) = pci_find_capability(config, PCI_CAP_ID_SSVID) else {
+        return (0, 0);
+    };
+    if pos + PCI_SSVID_DEVICE_ID as usize + 2 > PCI_CONFIG_SPACE_SIZE {
+        return (0, 0);
+    }
+
+    unsafe {
+        (
+            access.read16(bus, dev, func, pos as u16 + PCI_SSVID_VENDOR_ID),
+            access.read16(bus, dev, func, pos as u16 + PCI_SSVID_DEVICE_ID),
+        )
+    }
+}
+
+fn read_assigned_resources<A: PciConfigAccess + ?Sized>(
+    access: &A,
+    bus: u8,
+    dev: u8,
+    func: u8,
+    header_type: u8,
+) -> ([Option<PciBar>; 6], Option<LinuxPciBarResource>) {
     let mut bars = [None; 6];
+    let bar_count = pci_header_bar_count(header_type);
     let mut index = 0usize;
     let orig_cmd = unsafe { access.read16(bus, dev, func, PCI_COMMAND) };
     let decode_enabled = orig_cmd & PCI_COMMAND_DECODE_ENABLE != 0;
@@ -345,16 +526,20 @@ fn read_assigned_bars<A: PciConfigAccess + ?Sized>(
         }
     }
 
-    while index < bars.len() {
+    while index < bar_count {
         let offset = PCI_BASE_ADDRESS_0 + (index as u16 * 4);
         let raw = unsafe { access.read32(bus, dev, func, offset) };
-        let next_raw = if index + 1 < bars.len() {
+        let next_raw = if index + 1 < bar_count {
             unsafe { access.read32(bus, dev, func, offset + 4) }
         } else {
             0
         };
 
         if let Some((mut bar, consumes_next)) = PciBar::decode_config(raw, next_raw) {
+            if consumes_next && index + 1 >= bar_count {
+                index += 1;
+                continue;
+            }
             bar.size = read_bar_size(access, bus, dev, func, offset, raw, next_raw, &bar);
             bars[index] = Some(bar);
             index += if consumes_next { 2 } else { 1 };
@@ -363,13 +548,82 @@ fn read_assigned_bars<A: PciConfigAccess + ?Sized>(
         }
     }
 
+    let expansion_rom = read_expansion_rom(access, bus, dev, func, header_type);
+
     if decode_enabled {
         unsafe {
             access.write16(bus, dev, func, PCI_COMMAND, orig_cmd);
         }
     }
 
-    bars
+    (bars, expansion_rom)
+}
+
+/// Expansion-ROM half of `probe.c:pci_read_bases()`. The all-ones sizing
+/// value keeps the ROM-enable bit clear, and the original register is restored
+/// before the resource is published.
+fn read_expansion_rom<A: PciConfigAccess + ?Sized>(
+    access: &A,
+    bus: u8,
+    dev: u8,
+    func: u8,
+    header_type: u8,
+) -> Option<LinuxPciBarResource> {
+    let offset = match header_type {
+        0 => PCI_ROM_ADDRESS,
+        1 => PCI_ROM_ADDRESS1,
+        _ => return None,
+    };
+
+    let original = unsafe { access.read32(bus, dev, func, offset) };
+    unsafe {
+        access.write32(bus, dev, func, offset, PCI_ROM_ADDRESS_MASK);
+    }
+    let mut size_mask = unsafe { access.read32(bus, dev, func, offset) };
+    unsafe {
+        access.write32(bus, dev, func, offset, original);
+    }
+    let mut raw = unsafe { access.read32(bus, dev, func, offset) };
+
+    if raw == u32::MAX {
+        raw = 0;
+    }
+    if size_mask == u32::MAX {
+        size_mask = 0;
+    }
+    let base = (raw & PCI_ROM_ADDRESS_MASK) as u64;
+    let size = pci_size(
+        base,
+        (size_mask & PCI_ROM_ADDRESS_MASK) as u64,
+        PCI_ROM_ADDRESS_MASK as u64,
+    );
+    if size == 0 || base == 0 {
+        // Linux can retain an unassigned ROM resource and allocate/claim it
+        // later. Lupos has no equivalent resource allocator yet, so exposing
+        // address zero to a driver would be unsafe; fail closed after the
+        // non-destructive sizing probe.
+        return None;
+    }
+
+    let mut flags =
+        IORESOURCE_MEM | IORESOURCE_PREFETCH | IORESOURCE_READONLY | IORESOURCE_SIZEALIGN;
+    if raw & PCI_ROM_ADDRESS_ENABLE != 0 {
+        flags |= IORESOURCE_ROM_ENABLE;
+    }
+    Some(LinuxPciBarResource {
+        start: base,
+        len: size,
+        flags,
+    })
+}
+
+const fn pci_header_bar_count(header_type: u8) -> usize {
+    match header_type & 0x7f {
+        0 => 6,
+        1 => 2,
+        2 => 1,
+        _ => 0,
+    }
 }
 
 fn read_bar_size<A: PciConfigAccess + ?Sized>(
@@ -484,6 +738,16 @@ mod tests {
             0x100
         );
         assert_eq!(pci_size(0, 0, PCI_BASE_ADDRESS_MEM_MASK), 0);
+    }
+
+    #[test]
+    fn bar_probe_count_respects_pci_header_type() {
+        assert_eq!(pci_header_bar_count(0x00), 6);
+        assert_eq!(pci_header_bar_count(0x80), 6);
+        assert_eq!(pci_header_bar_count(0x01), 2);
+        assert_eq!(pci_header_bar_count(0x81), 2);
+        assert_eq!(pci_header_bar_count(0x02), 1);
+        assert_eq!(pci_header_bar_count(0x7f), 0);
     }
 
     #[test]

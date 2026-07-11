@@ -3,13 +3,22 @@
 //! test-origin: linux:vendor/linux/drivers/pci/pci.c
 //! Generic PCI helper exports used by Linux-built PCI drivers.
 
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
 
-use crate::include::uapi::errno::EINVAL;
+use lazy_static::lazy_static;
+use spin::Mutex;
+
+use crate::include::uapi::errno::{EBUSY, EINVAL};
 use crate::kernel::module::{export_symbol, find_symbol};
+use crate::linux_driver_abi::base::LinuxListHead;
 use crate::linux_driver_abi::pci::device::{
-    IORESOURCE_IO, IORESOURCE_MEM, PCI_STD_NUM_BARS, linux_pci_bar_resource, linux_pci_config_read,
-    linux_pci_config_write, linux_pci_device_state,
+    IORESOURCE_IO, IORESOURCE_MEM, LinuxPciBus, LinuxPciDev, LinuxResource,
+    PCI_DEVICE_RESOURCE_COUNT, PCI_STD_NUM_BARS, linux_pci_bar_resource, linux_pci_config_read,
+    linux_pci_config_write, linux_pci_device_state, linux_pci_slot_for_raw,
 };
 
 const PCI_COMMAND: usize = 0x04;
@@ -23,6 +32,61 @@ const PCI_CAP_LIST_NEXT: usize = 1;
 const PCI_CAP_MIN: u8 = 0x40;
 const PCI_FIND_CAP_TTL: usize = 48;
 const PCI_CFG_SPACE_SIZE: u16 = 256;
+const IORESOURCE_BUSY: usize = 0x8000_0000;
+static PCI_IO_RESOURCE_NAME: [u8; 7] = *b"PCI IO\0";
+static PCI_MEM_RESOURCE_NAME: [u8; 8] = *b"PCI mem\0";
+
+static mut LINUX_IOPORT_RESOURCE: LinuxResource = LinuxResource {
+    start: 0,
+    end: 0xffff,
+    name: PCI_IO_RESOURCE_NAME.as_ptr().cast::<c_char>(),
+    flags: IORESOURCE_IO,
+    desc: 0,
+    parent: core::ptr::null_mut(),
+    sibling: core::ptr::null_mut(),
+    child: core::ptr::null_mut(),
+};
+
+static mut LINUX_IOMEM_RESOURCE: LinuxResource = LinuxResource {
+    start: 0,
+    end: u64::MAX,
+    name: PCI_MEM_RESOURCE_NAME.as_ptr().cast::<c_char>(),
+    flags: IORESOURCE_MEM,
+    desc: 0,
+    parent: core::ptr::null_mut(),
+    sibling: core::ptr::null_mut(),
+    child: core::ptr::null_mut(),
+};
+
+#[repr(C)]
+struct LinuxPciBusResource {
+    list: LinuxListHead,
+    res: *mut LinuxResource,
+}
+
+#[derive(Clone, Copy)]
+struct PciResourceSpec {
+    start: u64,
+    end: u64,
+    flags: usize,
+    raw: *mut LinuxResource,
+}
+
+struct PciRegionReservation {
+    start: u64,
+    end: u64,
+    resource_type: usize,
+    raw: usize,
+    parent: usize,
+}
+
+lazy_static! {
+    /// Linux serializes `request_region()` / `release_region()` with
+    /// `resource_lock`.  This table is the corresponding busy-resource state
+    /// for driver reservations; PCI BAR descriptors themselves remain the
+    /// non-busy parents published by enumeration.
+    static ref PCI_REGION_RESERVATIONS: Mutex<Vec<PciRegionReservation>> = Mutex::new(Vec::new());
+}
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
@@ -31,6 +95,18 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 }
 
 pub fn register_module_exports() {
+    unsafe {
+        export_symbol_once(
+            "ioport_resource",
+            core::ptr::addr_of_mut!(LINUX_IOPORT_RESOURCE) as usize,
+            false,
+        );
+        export_symbol_once(
+            "iomem_resource",
+            core::ptr::addr_of_mut!(LINUX_IOMEM_RESOURCE) as usize,
+            false,
+        );
+    }
     export_symbol_once("pci_find_capability", pci_find_capability as usize, false);
     export_symbol_once(
         "pci_find_next_capability",
@@ -60,6 +136,7 @@ pub fn register_module_exports() {
     export_symbol_once("pcix_get_mmrbc", pcix_get_mmrbc as usize, false);
     export_symbol_once("pcix_set_mmrbc", pcix_set_mmrbc as usize, false);
     export_symbol_once("pci_select_bars", pci_select_bars as usize, false);
+    export_symbol_once("pci_bus_resource_n", pci_bus_resource_n as usize, true);
     export_symbol_once("pci_save_state", pci_save_state as usize, false);
     export_symbol_once("pci_set_power_state", pci_set_power_state as usize, false);
     export_symbol_once("pci_enable_wake", pci_enable_wake as usize, false);
@@ -79,6 +156,37 @@ pub fn register_module_exports() {
         pci_release_selected_regions as usize,
         false,
     );
+    export_symbol_once("pci_request_region", pci_request_region as usize, false);
+    export_symbol_once("pci_release_region", pci_release_region as usize, false);
+}
+
+/// `pci_bus_resource_n` - `vendor/linux/drivers/pci/bus.c:78`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pci_bus_resource_n(bus: *const LinuxPciBus, n: i32) -> *mut LinuxResource {
+    if bus.is_null() || n < 0 {
+        return core::ptr::null_mut();
+    }
+    let mut n = n as usize;
+    if n < 4 {
+        return unsafe { (*bus).resource[n] };
+    }
+    n -= 4;
+
+    unsafe {
+        let head = core::ptr::addr_of!((*bus).resources).cast_mut();
+        let mut node = (*head).next.cast::<LinuxListHead>();
+        let mut remaining = 4096usize;
+        while node != head && !node.is_null() && remaining != 0 {
+            let bus_resource = node.cast::<LinuxPciBusResource>();
+            if n == 0 {
+                return (*bus_resource).res;
+            }
+            n -= 1;
+            node = (*node).next.cast::<LinuxListHead>();
+            remaining -= 1;
+        }
+    }
+    core::ptr::null_mut()
 }
 
 fn find_next_capability_in_config(config: &[u8], mut pos: u8, cap: i32) -> u8 {
@@ -269,23 +377,207 @@ pub unsafe extern "C" fn pci_device_is_present(dev: *mut c_void) -> bool {
     linux_pci_device_state(dev.cast_const()).is_some()
 }
 
+fn pci_resource_spec(dev: *mut c_void, bar: i32) -> Result<PciResourceSpec, i32> {
+    let Ok(bar) = usize::try_from(bar) else {
+        return Err(EINVAL);
+    };
+    if bar >= PCI_DEVICE_RESOURCE_COUNT || linux_pci_device_state(dev.cast_const()).is_none() {
+        return Err(EINVAL);
+    }
+
+    if linux_pci_slot_for_raw(dev.cast_const()).is_some() {
+        let raw = unsafe { core::ptr::addr_of_mut!((*dev.cast::<LinuxPciDev>()).resource[bar]) };
+        return Ok(PciResourceSpec {
+            start: unsafe { (*raw).start },
+            end: unsafe { (*raw).end },
+            flags: unsafe { (*raw).flags },
+            raw,
+        });
+    }
+
+    // Synthetic PCI state used by the existing vendor-derived host tests has
+    // no complete `struct pci_dev` allocation.  Its standard BAR snapshot is
+    // nevertheless sufficient for the same reservation semantics.
+    let resource = (bar < PCI_STD_NUM_BARS)
+        .then(|| linux_pci_bar_resource(dev.cast_const(), bar))
+        .flatten();
+    Ok(match resource {
+        Some(resource) => PciResourceSpec {
+            start: resource.start,
+            end: resource.end(),
+            flags: resource.flags,
+            raw: core::ptr::null_mut(),
+        },
+        None => PciResourceSpec {
+            start: 0,
+            end: 0,
+            flags: 0,
+            raw: core::ptr::null_mut(),
+        },
+    })
+}
+
+fn resource_len(resource: PciResourceSpec) -> u64 {
+    if resource.end == 0 || resource.end < resource.start {
+        0
+    } else {
+        resource.end - resource.start + 1
+    }
+}
+
+unsafe fn link_busy_resource(parent: *mut LinuxResource, child: *mut LinuxResource) {
+    if parent.is_null() {
+        return;
+    }
+    unsafe {
+        (*child).parent = parent;
+        (*child).sibling = (*parent).child;
+        (*parent).child = child;
+    }
+}
+
+unsafe fn unlink_busy_resource(parent: *mut LinuxResource, child: *mut LinuxResource) {
+    if parent.is_null() || child.is_null() {
+        return;
+    }
+    unsafe {
+        let mut link = core::ptr::addr_of_mut!((*parent).child);
+        while !(*link).is_null() {
+            if *link == child {
+                *link = (*child).sibling;
+                (*child).parent = core::ptr::null_mut();
+                (*child).sibling = core::ptr::null_mut();
+                return;
+            }
+            link = core::ptr::addr_of_mut!((**link).sibling);
+        }
+    }
+}
+
+unsafe fn request_pci_resource(dev: *mut c_void, bar: i32, name: *const c_char) -> Result<(), i32> {
+    let resource = pci_resource_spec(dev, bar)?;
+    if resource_len(resource) == 0 {
+        return Ok(());
+    }
+    let resource_type = resource.flags & (IORESOURCE_IO | IORESOURCE_MEM);
+    if resource_type == 0 {
+        return Ok(());
+    }
+
+    let mut reservations = PCI_REGION_RESERVATIONS.lock();
+    if reservations.iter().any(|busy| {
+        busy.resource_type == resource_type
+            && busy.start <= resource.end
+            && resource.start <= busy.end
+    }) {
+        return Err(EBUSY);
+    }
+
+    let busy = Box::new(LinuxResource {
+        start: resource.start,
+        end: resource.end,
+        name,
+        flags: resource_type | IORESOURCE_BUSY,
+        desc: if resource.raw.is_null() {
+            0
+        } else {
+            unsafe { (*resource.raw).desc }
+        },
+        parent: core::ptr::null_mut(),
+        sibling: core::ptr::null_mut(),
+        child: core::ptr::null_mut(),
+    });
+    let busy = Box::into_raw(busy);
+    unsafe { link_busy_resource(resource.raw, busy) };
+    reservations.push(PciRegionReservation {
+        start: resource.start,
+        end: resource.end,
+        resource_type,
+        raw: busy as usize,
+        parent: resource.raw as usize,
+    });
+    Ok(())
+}
+
+unsafe fn release_pci_resource(dev: *mut c_void, bar: i32) {
+    let Ok(resource) = pci_resource_spec(dev, bar) else {
+        return;
+    };
+    if resource_len(resource) == 0 {
+        return;
+    }
+    let resource_type = resource.flags & (IORESOURCE_IO | IORESOURCE_MEM);
+    if resource_type == 0 {
+        return;
+    }
+
+    let mut reservations = PCI_REGION_RESERVATIONS.lock();
+    let Some(index) = reservations.iter().position(|busy| {
+        busy.resource_type == resource_type
+            && busy.start == resource.start
+            && busy.end == resource.end
+    }) else {
+        return;
+    };
+    let busy = reservations.swap_remove(index);
+    let raw = busy.raw as *mut LinuxResource;
+    unsafe { unlink_busy_resource(busy.parent as *mut LinuxResource, raw) };
+    unsafe {
+        drop(Box::from_raw(raw));
+    }
+}
+
+/// `pci_request_region` - `vendor/linux/drivers/pci/pci.c:3864`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pci_request_region(
+    dev: *mut c_void,
+    bar: i32,
+    name: *const c_char,
+) -> i32 {
+    match unsafe { request_pci_resource(dev, bar, name) } {
+        Ok(()) => 0,
+        Err(errno) => -errno,
+    }
+}
+
+/// `pci_release_region` - `vendor/linux/drivers/pci/pci.c:3785`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pci_release_region(dev: *mut c_void, bar: i32) {
+    unsafe { release_pci_resource(dev, bar) };
+}
+
 /// `pci_request_selected_regions` - `vendor/linux/drivers/pci/pci.c:3884`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pci_request_selected_regions(
     dev: *mut c_void,
-    _bars: i32,
-    _name: *const c_char,
+    bars: i32,
+    name: *const c_char,
 ) -> i32 {
-    if linux_pci_device_state(dev.cast_const()).is_some() {
-        0
-    } else {
-        -EINVAL
+    for bar in 0..PCI_STD_NUM_BARS as i32 {
+        if bars & (1 << bar) == 0 {
+            continue;
+        }
+        if unsafe { pci_request_region(dev, bar, name) } != 0 {
+            for rollback in (0..bar).rev() {
+                if bars & (1 << rollback) != 0 {
+                    unsafe { pci_release_region(dev, rollback) };
+                }
+            }
+            return -EBUSY;
+        }
     }
+    0
 }
 
 /// `pci_release_selected_regions` - `vendor/linux/drivers/pci/pci.c:3846`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pci_release_selected_regions(_dev: *mut c_void, _bars: i32) {}
+pub unsafe extern "C" fn pci_release_selected_regions(dev: *mut c_void, bars: i32) {
+    for bar in 0..PCI_STD_NUM_BARS as i32 {
+        if bars & (1 << bar) != 0 {
+            unsafe { pci_release_region(dev, bar) };
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

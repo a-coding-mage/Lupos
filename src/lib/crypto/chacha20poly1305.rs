@@ -702,6 +702,7 @@ mod tests {
             length: buf.len() as u32,
             dma_address: buf.as_mut_ptr() as usize,
             dma_length: buf.len() as u32,
+            dma_flags: 0,
         }
     }
 

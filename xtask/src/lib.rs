@@ -147,9 +147,8 @@ pub const SHIPPED_COMMANDS_MARKERS: &[&str] = &[
     "shipped-commands: util-linux ok",
     "shipped-commands: networking ok",
 ];
-const SPLASH_ART_BOOT_PATH: &str = "boot/grub/splashart.png";
 const SPLASH_ART_BYTES: &[u8] = include_bytes!("../../branding/splashart.png");
-const GRUB_INTERACTIVE_SPLASH_TIMEOUT_SECS: u8 = 2;
+const GRUB_INTERACTIVE_TIMEOUT_SECS: u8 = 2;
 const GRUB_TEST_BOOT_TIMEOUT_SECS: u8 = 3;
 const LUPOS_QEMU_ACCEL_ENV: &str = "LUPOS_QEMU_ACCEL";
 const LUPOS_QEMU_ROOT_DISK_ENV: &str = "LUPOS_QEMU_ROOT_DISK";
@@ -722,10 +721,13 @@ const LUPOS_OS_RELEASE: &str = concat!(
 /// `src/init/version.rs::UTS_RELEASE` so libkmod's
 /// `/lib/modules/$(uname -r)/` lookups land on the staged stubs.
 const LUPOS_KERNEL_RELEASE: &str = concat!(env!("CARGO_PKG_VERSION"), "-lupos");
+const LUPOS_MODULE_VERMAGIC: &str =
+    concat!(env!("CARGO_PKG_VERSION"), "-lupos SMP preempt mod_unload ");
 
 /// Module index filenames libkmod opens from `/lib/modules/<release>/`.
-/// Staged as empty files so `kmod_new()` succeeds with a "no modules"
-/// configuration instead of failing with EOPNOTSUPP.  Ref:
+/// Login payloads seed these as empty files so `kmod_new()` succeeds with a
+/// "no modules" configuration instead of failing with EOPNOTSUPP. Configured
+/// module payloads replace them with the exact depmod-generated indexes. Ref:
 /// `vendor/linux/Documentation/kbuild/modules.rst` and libkmod's
 /// `kmod_search_moddep()` lookup order.
 const LIBKMOD_INDEX_FILES: &[&str] = &[
@@ -736,11 +738,13 @@ const LIBKMOD_INDEX_FILES: &[&str] = &[
     "modules.symbols",
     "modules.symbols.bin",
     "modules.builtin",
+    "modules.builtin.bin",
     "modules.builtin.alias.bin",
     "modules.builtin.modinfo",
     "modules.devname",
     "modules.order",
     "modules.softdep",
+    "modules.weakdep",
 ];
 
 /// Build the empty `/lib/modules/<release>/<name>` initramfs stubs that
@@ -2123,8 +2127,12 @@ fn build_cpio_newc(files: &[(&str, u32, &[u8])]) -> Vec<u8> {
     let mut archive = Vec::new();
 
     for (filename, mode, data) in files {
-        let namesize = filename.len() + 1; // include NUL terminator
-        let filesize = data.len();
+        let namesize = u32::try_from(filename.len() + 1)
+            .expect("initramfs newc filename exceeds its 32-bit field");
+        // vendor/linux/usr/gen_init_cpio.c rejects inputs above 0xffffffff;
+        // never truncate a host usize into the on-disk newc field.
+        let filesize =
+            u32::try_from(data.len()).expect("initramfs newc file exceeds its 32-bit size field");
 
         // Build the 110-byte header (all fields are 8-char hex strings)
         // CPIO newc header: 070701 followed by 13 fields of 8 hex chars each = 110 bytes total
@@ -2136,12 +2144,12 @@ fn build_cpio_newc(files: &[(&str, u32, &[u8])]) -> Vec<u8> {
             0u32,                    // gid
             1u32,                    // nlink
             INITRAMFS_DEFAULT_MTIME, // mtime
-            filesize as u32,         // filesize
+            filesize,                // filesize
             0u32,                    // devmajor
             0u32,                    // devminor
             0u32,                    // rdevmajor
             0u32,                    // rdevminor
-            namesize as u32,         // namesize (including NUL)
+            namesize,                // namesize (including NUL)
             0u32                     // check
         );
         archive.extend_from_slice(header.as_bytes());
@@ -2294,8 +2302,22 @@ const INITRAMFS_S_IFREG: u32 = 0o100000;
 const INITRAMFS_S_IFLNK: u32 = 0o120000;
 const INITRAMFS_DEFAULT_MTIME: u32 = 1_779_194_096;
 
-const MODULE_VERSION_DIR: &str = "lupos";
+const MODULE_VERSION_DIR: &str = LUPOS_KERNEL_RELEASE;
 static LINUX_DRIVER_MODULE_BUILD_LOCK: Mutex<()> = Mutex::new(());
+static DEPMOD_INDEX_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+const LINUX_DRIVER_MODULE_MANIFEST: &str = ".lupos-build-manifest";
+const LINUX_DRIVER_MODULE_EFFECTIVE_CONFIG: &str = ".lupos-effective-config";
+const LINUX_DRIVER_MODULE_BUILD_POLICY: &str = concat!(
+    "linux-x86_64-lupos-runtime-v3;modules-forced-per-staged-artifact;",
+    "vga-arb=y;aperture-helpers=y;video=y;screen-info=y;sysfb=n;",
+    "virtio-pci-legacy=vendor-default-y;drm-fbdev=vendor-default-n;",
+    "retpoline=n;stackprotector=n;ftrace=n;ibt=n;kprobes=n;jump-label=n;orc=n;frame-pointer=y;",
+    "lupos-abi-layout-guard=v2;combined-selected-modpost=v1;vermagic-release=",
+    env!("CARGO_PKG_VERSION"),
+    "-lupos"
+);
+const INTENTIONAL_LUPOS_BUILTIN_MODULE_SUBSTITUTES: &[&str] =
+    &["bitrev", "crc32", "virtio", "virtio_ring"];
 const BASH_VERSION: &str = "5.2.37";
 const UTIL_LINUX_VERSION: &str = "2.42";
 const COREUTILS_VERSION: &str = "9.11";
@@ -2734,7 +2756,10 @@ const RELEASE_FHS_DIRS: &[(&str, u32)] = &[
     ("home/lupos", 0o40755),
     ("lib", 0o40755),
     ("lib/modules", 0o40755),
-    ("lib/modules/lupos", 0o40755),
+    (
+        concat!("lib/modules/", env!("CARGO_PKG_VERSION"), "-lupos"),
+        0o40755,
+    ),
     ("lib/security", 0o40755),
     ("proc", 0o40555),
     ("root", 0o40700),
@@ -2929,6 +2954,15 @@ const USERLAND_AUTH_VENDOR_SOURCES: &[UserlandAuthVendorSource] = &[
 
 const DRIVER_MODULES: &[DriverModuleSpec] = &[
     DriverModuleSpec {
+        symbol: "CONFIG_BLK_DEV_BSG_COMMON",
+        module_name: "bsg",
+        module_path: "kernel/block/bsg.ko",
+        vendor_linux_ref: "vendor/linux/block/bsg.c",
+        linux_make_dir: "block",
+        linux_make_target: "bsg.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
         symbol: "CONFIG_SCSI_COMMON",
         module_name: "scsi_common",
         module_path: "kernel/drivers/scsi/scsi_common.ko",
@@ -2944,7 +2978,7 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         vendor_linux_ref: "vendor/linux/drivers/scsi/scsi.c",
         linux_make_dir: "drivers/scsi",
         linux_make_target: "scsi_mod.ko",
-        module_deps: &["kernel/drivers/scsi/scsi_common.ko"],
+        module_deps: &["kernel/block/bsg.ko", "kernel/drivers/scsi/scsi_common.ko"],
     },
     DriverModuleSpec {
         symbol: "CONFIG_BLK_DEV_SD",
@@ -2953,7 +2987,11 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         vendor_linux_ref: "vendor/linux/drivers/scsi/sd.c",
         linux_make_dir: "drivers/scsi",
         linux_make_target: "sd_mod.ko",
-        module_deps: &["kernel/drivers/scsi/scsi_mod.ko"],
+        module_deps: &[
+            "kernel/drivers/scsi/scsi_mod.ko",
+            "kernel/block/bsg.ko",
+            "kernel/drivers/scsi/scsi_common.ko",
+        ],
     },
     DriverModuleSpec {
         symbol: "CONFIG_ATA",
@@ -2962,7 +3000,11 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         vendor_linux_ref: "vendor/linux/drivers/ata/libata-core.c",
         linux_make_dir: "drivers/ata",
         linux_make_target: "libata.ko",
-        module_deps: &["kernel/drivers/scsi/scsi_mod.ko"],
+        module_deps: &[
+            "kernel/drivers/scsi/scsi_mod.ko",
+            "kernel/block/bsg.ko",
+            "kernel/drivers/scsi/scsi_common.ko",
+        ],
     },
     DriverModuleSpec {
         symbol: "CONFIG_SATA_AHCI",
@@ -2971,7 +3013,12 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         vendor_linux_ref: "vendor/linux/drivers/ata/libahci.c",
         linux_make_dir: "drivers/ata",
         linux_make_target: "libahci.ko",
-        module_deps: &["kernel/drivers/ata/libata.ko"],
+        module_deps: &[
+            "kernel/drivers/ata/libata.ko",
+            "kernel/drivers/scsi/scsi_mod.ko",
+            "kernel/block/bsg.ko",
+            "kernel/drivers/scsi/scsi_common.ko",
+        ],
     },
     DriverModuleSpec {
         symbol: "CONFIG_SATA_AHCI",
@@ -2984,6 +3031,8 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
             "kernel/drivers/ata/libahci.ko",
             "kernel/drivers/ata/libata.ko",
             "kernel/drivers/scsi/scsi_mod.ko",
+            "kernel/block/bsg.ko",
+            "kernel/drivers/scsi/scsi_common.ko",
         ],
     },
     DriverModuleSpec {
@@ -2996,13 +3045,25 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         module_deps: &[],
     },
     DriverModuleSpec {
+        symbol: "CONFIG_VIRTIO_PCI_LIB_LEGACY",
+        module_name: "virtio_pci_legacy_dev",
+        module_path: "kernel/drivers/virtio/virtio_pci_legacy_dev.ko",
+        vendor_linux_ref: "vendor/linux/drivers/virtio/virtio_pci_legacy_dev.c",
+        linux_make_dir: "drivers/virtio",
+        linux_make_target: "virtio_pci_legacy_dev.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
         symbol: "CONFIG_VIRTIO_PCI",
         module_name: "virtio_pci",
         module_path: "kernel/drivers/virtio/virtio_pci.ko",
         vendor_linux_ref: "vendor/linux/drivers/virtio/virtio_pci_common.c",
         linux_make_dir: "drivers/virtio",
         linux_make_target: "virtio_pci.ko",
-        module_deps: &["kernel/drivers/virtio/virtio_pci_modern_dev.ko"],
+        module_deps: &[
+            "kernel/drivers/virtio/virtio_pci_legacy_dev.ko",
+            "kernel/drivers/virtio/virtio_pci_modern_dev.ko",
+        ],
     },
     DriverModuleSpec {
         symbol: "CONFIG_VIRTIO_BLK",
@@ -3025,11 +3086,242 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
     DriverModuleSpec {
         symbol: "CONFIG_E1000",
         module_name: "e1000",
-        module_path: "kernel/drivers/net/e1000.ko",
+        module_path: "kernel/drivers/net/ethernet/intel/e1000/e1000.ko",
         vendor_linux_ref: "vendor/linux/drivers/net/ethernet/intel/e1000/e1000_main.c",
         linux_make_dir: "drivers/net/ethernet/intel/e1000",
         linux_make_target: "e1000.ko",
         module_deps: &[],
+    },
+    // Vendor-built graphics modules. This is a topological superset: the
+    // activation policy below derives support modules from the selected DRM
+    // driver instead of requiring every hidden vendor Kconfig symbol to be
+    // copied into a Lupos configuration.
+    DriverModuleSpec {
+        symbol: "CONFIG_ZLIB_DEFLATE",
+        module_name: "zlib_deflate",
+        module_path: "kernel/lib/zlib_deflate/zlib_deflate.ko",
+        vendor_linux_ref: "vendor/linux/lib/zlib_deflate/deflate_syms.c",
+        linux_make_dir: "lib/zlib_deflate",
+        linux_make_target: "zlib_deflate.ko",
+        // bitrev is supplied by the built-in Rust Linux ABI layer.
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_I2C",
+        module_name: "i2c_core",
+        module_path: "kernel/drivers/i2c/i2c-core.ko",
+        vendor_linux_ref: "vendor/linux/drivers/i2c/i2c-core-base.c",
+        linux_make_dir: "drivers/i2c",
+        linux_make_target: "i2c-core.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_I2C_ALGOBIT",
+        module_name: "i2c_algo_bit",
+        module_path: "kernel/drivers/i2c/algos/i2c-algo-bit.ko",
+        vendor_linux_ref: "vendor/linux/drivers/i2c/algos/i2c-algo-bit.c",
+        linux_make_dir: "drivers/i2c/algos",
+        linux_make_target: "i2c-algo-bit.ko",
+        module_deps: &["kernel/drivers/i2c/i2c-core.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_AGP",
+        module_name: "agpgart",
+        module_path: "kernel/drivers/char/agp/agpgart.ko",
+        vendor_linux_ref: "vendor/linux/drivers/char/agp/backend.c",
+        linux_make_dir: "drivers/char/agp",
+        linux_make_target: "agpgart.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_AGP_AMD64",
+        module_name: "amd64_agp",
+        module_path: "kernel/drivers/char/agp/amd64-agp.ko",
+        vendor_linux_ref: "vendor/linux/drivers/char/agp/amd64-agp.c",
+        linux_make_dir: "drivers/char/agp",
+        linux_make_target: "amd64-agp.ko",
+        module_deps: &["kernel/drivers/char/agp/agpgart.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_INTEL_GTT",
+        module_name: "intel_gtt",
+        module_path: "kernel/drivers/char/agp/intel-gtt.ko",
+        vendor_linux_ref: "vendor/linux/drivers/char/agp/intel-gtt.c",
+        linux_make_dir: "drivers/char/agp",
+        linux_make_target: "intel-gtt.ko",
+        module_deps: &["kernel/drivers/char/agp/agpgart.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_AGP_INTEL",
+        module_name: "intel_agp",
+        module_path: "kernel/drivers/char/agp/intel-agp.ko",
+        vendor_linux_ref: "vendor/linux/drivers/char/agp/intel-agp.c",
+        linux_make_dir: "drivers/char/agp",
+        linux_make_target: "intel-agp.ko",
+        module_deps: &[
+            "kernel/drivers/char/agp/intel-gtt.ko",
+            "kernel/drivers/char/agp/agpgart.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_IOSF_MBI",
+        module_name: "iosf_mbi",
+        module_path: "kernel/arch/x86/platform/intel/iosf_mbi.ko",
+        vendor_linux_ref: "vendor/linux/arch/x86/platform/intel/iosf_mbi.c",
+        linux_make_dir: "arch/x86/platform/intel",
+        linux_make_target: "iosf_mbi.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_DRM_PANEL_ORIENTATION_QUIRKS",
+        module_name: "drm_panel_orientation_quirks",
+        module_path: "kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko",
+        vendor_linux_ref: "vendor/linux/drivers/gpu/drm/drm_panel_orientation_quirks.c",
+        linux_make_dir: "drivers/gpu/drm",
+        linux_make_target: "drm_panel_orientation_quirks.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_DRM",
+        module_name: "drm",
+        module_path: "kernel/drivers/gpu/drm/drm.ko",
+        vendor_linux_ref: "vendor/linux/drivers/gpu/drm/drm_drv.c",
+        linux_make_dir: "drivers/gpu/drm",
+        linux_make_target: "drm.ko",
+        module_deps: &[
+            "kernel/drivers/i2c/i2c-core.ko",
+            "kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_DRM_BUDDY",
+        module_name: "drm_buddy",
+        module_path: "kernel/drivers/gpu/drm/drm_buddy.ko",
+        vendor_linux_ref: "vendor/linux/drivers/gpu/drm/drm_buddy.c",
+        linux_make_dir: "drivers/gpu/drm",
+        linux_make_target: "drm_buddy.ko",
+        module_deps: &[
+            "kernel/drivers/gpu/drm/drm.ko",
+            "kernel/drivers/i2c/i2c-core.ko",
+            "kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_DRM_TTM",
+        module_name: "ttm",
+        module_path: "kernel/drivers/gpu/drm/ttm/ttm.ko",
+        vendor_linux_ref: "vendor/linux/drivers/gpu/drm/ttm/ttm_module.c",
+        linux_make_dir: "drivers/gpu/drm/ttm",
+        linux_make_target: "ttm.ko",
+        module_deps: &[
+            "kernel/drivers/gpu/drm/drm.ko",
+            "kernel/drivers/i2c/i2c-core.ko",
+            "kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko",
+            "kernel/drivers/char/agp/agpgart.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_DRM_KMS_HELPER",
+        module_name: "drm_kms_helper",
+        module_path: "kernel/drivers/gpu/drm/drm_kms_helper.ko",
+        vendor_linux_ref: "vendor/linux/drivers/gpu/drm/drm_kms_helper_common.c",
+        linux_make_dir: "drivers/gpu/drm",
+        linux_make_target: "drm_kms_helper.ko",
+        module_deps: &[
+            "kernel/drivers/gpu/drm/drm.ko",
+            "kernel/drivers/i2c/i2c-core.ko",
+            "kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_DRM_DISPLAY_HELPER",
+        module_name: "drm_display_helper",
+        module_path: "kernel/drivers/gpu/drm/display/drm_display_helper.ko",
+        vendor_linux_ref: "vendor/linux/drivers/gpu/drm/display/drm_display_helper_mod.c",
+        linux_make_dir: "drivers/gpu/drm/display",
+        linux_make_target: "drm_display_helper.ko",
+        module_deps: &[
+            "kernel/drivers/gpu/drm/drm_kms_helper.ko",
+            "kernel/drivers/gpu/drm/drm.ko",
+            "kernel/drivers/i2c/i2c-core.ko",
+            "kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_DRM_GEM_SHMEM_HELPER",
+        module_name: "drm_shmem_helper",
+        module_path: "kernel/drivers/gpu/drm/drm_shmem_helper.ko",
+        vendor_linux_ref: "vendor/linux/drivers/gpu/drm/drm_gem_shmem_helper.c",
+        linux_make_dir: "drivers/gpu/drm",
+        linux_make_target: "drm_shmem_helper.ko",
+        module_deps: &[
+            "kernel/drivers/gpu/drm/drm.ko",
+            "kernel/drivers/i2c/i2c-core.ko",
+            "kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_VIRTIO_DMA_SHARED_BUFFER",
+        module_name: "virtio_dma_buf",
+        module_path: "kernel/drivers/virtio/virtio_dma_buf.ko",
+        vendor_linux_ref: "vendor/linux/drivers/virtio/virtio_dma_buf.c",
+        linux_make_dir: "drivers/virtio",
+        linux_make_target: "virtio_dma_buf.ko",
+        // virtio and virtio_ring are supplied by the built-in Rust ABI layer.
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_DRM_BOCHS",
+        module_name: "bochs",
+        module_path: "kernel/drivers/gpu/drm/tiny/bochs.ko",
+        vendor_linux_ref: "vendor/linux/drivers/gpu/drm/tiny/bochs.c",
+        linux_make_dir: "drivers/gpu/drm/tiny",
+        linux_make_target: "bochs.ko",
+        module_deps: &[
+            "kernel/drivers/gpu/drm/drm_shmem_helper.ko",
+            "kernel/drivers/gpu/drm/drm_kms_helper.ko",
+            "kernel/drivers/gpu/drm/drm.ko",
+            "kernel/drivers/i2c/i2c-core.ko",
+            "kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_DRM_I915",
+        module_name: "i915",
+        module_path: "kernel/drivers/gpu/drm/i915/i915.ko",
+        vendor_linux_ref: "vendor/linux/drivers/gpu/drm/i915/i915_module.c",
+        linux_make_dir: "drivers/gpu/drm/i915",
+        linux_make_target: "i915.ko",
+        module_deps: &[
+            "kernel/drivers/i2c/algos/i2c-algo-bit.ko",
+            "kernel/lib/zlib_deflate/zlib_deflate.ko",
+            "kernel/arch/x86/platform/intel/iosf_mbi.ko",
+            "kernel/drivers/gpu/drm/drm_buddy.ko",
+            "kernel/drivers/gpu/drm/display/drm_display_helper.ko",
+            "kernel/drivers/gpu/drm/ttm/ttm.ko",
+            "kernel/drivers/gpu/drm/drm_kms_helper.ko",
+            "kernel/drivers/gpu/drm/drm.ko",
+            "kernel/drivers/i2c/i2c-core.ko",
+            "kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko",
+            "kernel/drivers/char/agp/intel-gtt.ko",
+            "kernel/drivers/char/agp/agpgart.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_DRM_VIRTIO_GPU",
+        module_name: "virtio_gpu",
+        module_path: "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko",
+        vendor_linux_ref: "vendor/linux/drivers/gpu/drm/virtio/virtgpu_drv.c",
+        linux_make_dir: "drivers/gpu/drm/virtio",
+        linux_make_target: "virtio-gpu.ko",
+        module_deps: &[
+            "kernel/drivers/virtio/virtio_dma_buf.ko",
+            "kernel/drivers/gpu/drm/drm_shmem_helper.ko",
+            "kernel/drivers/gpu/drm/drm_kms_helper.ko",
+            "kernel/drivers/gpu/drm/drm.ko",
+            "kernel/drivers/i2c/i2c-core.ko",
+            "kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko",
+        ],
     },
 ];
 
@@ -3263,9 +3555,12 @@ fn x11_fbdev_config() -> Vec<u8> {
         "    Device \"LuposFramebuffer\"\n",
         "    Monitor \"LuposMonitor\"\n",
         "    DefaultDepth 24\n",
+        // No fixed `Modes` list: the fbdev driver defaults to the current
+        // framebuffer geometry, so Xorg follows whatever mode the kernel's
+        // native display driver (or GRUB's `gfxpayload=keep` handoff)
+        // programmed instead of assuming 800x600.
         "    SubSection \"Display\"\n",
         "        Depth 24\n",
-        "        Modes \"800x600\"\n",
         "    EndSubSection\n",
         "EndSection\n",
         "\n",
@@ -6524,11 +6819,64 @@ fn parse_kconfig_values(text: &str) -> HashMap<String, KconfigValue> {
     values
 }
 
+const DRM_DRIVER_SYMBOLS: &[&str] = &[
+    "CONFIG_DRM_BOCHS",
+    "CONFIG_DRM_I915",
+    "CONFIG_DRM_VIRTIO_GPU",
+];
+const I915_DRIVER_SYMBOLS: &[&str] = &["CONFIG_DRM_I915"];
+const SHMEM_DRM_DRIVER_SYMBOLS: &[&str] = &["CONFIG_DRM_BOCHS", "CONFIG_DRM_VIRTIO_GPU"];
+const VIRTIO_GPU_DRIVER_SYMBOLS: &[&str] = &["CONFIG_DRM_VIRTIO_GPU"];
+const VIRTIO_PCI_DRIVER_SYMBOLS: &[&str] = &["CONFIG_VIRTIO_PCI"];
+const SCSI_DRIVER_SYMBOLS: &[&str] = &["CONFIG_SCSI"];
+
+/// Hidden/support symbols are derived from the selected graphics driver. This
+/// keeps a tuned config such as virtio-gpu-only from inheriting the generic
+/// config's i915/AGP closure merely because a support tristate defaults to `m`.
+fn derived_driver_activation_symbols(spec: &DriverModuleSpec) -> Option<&'static [&'static str]> {
+    match spec.module_name {
+        "bsg" => Some(SCSI_DRIVER_SYMBOLS),
+        "zlib_deflate" | "i2c_algo_bit" | "agpgart" | "amd64_agp" | "intel_gtt" | "intel_agp"
+        | "iosf_mbi" | "drm_buddy" | "ttm" | "drm_display_helper" => Some(I915_DRIVER_SYMBOLS),
+        "i2c_core" | "drm_panel_orientation_quirks" | "drm" | "drm_kms_helper" => {
+            Some(DRM_DRIVER_SYMBOLS)
+        }
+        "drm_shmem_helper" => Some(SHMEM_DRM_DRIVER_SYMBOLS),
+        "virtio_dma_buf" => Some(VIRTIO_GPU_DRIVER_SYMBOLS),
+        "virtio_pci_legacy_dev" => Some(VIRTIO_PCI_DRIVER_SYMBOLS),
+        _ => None,
+    }
+}
+
+fn driver_module_is_selected(
+    spec: &DriverModuleSpec,
+    values: &HashMap<String, KconfigValue>,
+) -> bool {
+    derived_driver_activation_symbols(spec).map_or_else(
+        || values.get(spec.symbol) == Some(&KconfigValue::Module),
+        |symbols| {
+            symbols
+                .iter()
+                .any(|symbol| values.get(*symbol) == Some(&KconfigValue::Module))
+        },
+    )
+}
+
+fn driver_module_activation_description(spec: &DriverModuleSpec) -> String {
+    match derived_driver_activation_symbols(spec) {
+        Some(symbols) => symbols.join("=m or "),
+        None => spec.symbol.to_owned(),
+    }
+}
+
 fn staged_module_specs_from_config_text(text: &str) -> Vec<&'static DriverModuleSpec> {
     let values = parse_kconfig_values(text);
+    let mut paths = HashSet::new();
+    let mut names = HashSet::new();
     DRIVER_MODULES
         .iter()
-        .filter(|module| values.get(module.symbol) == Some(&KconfigValue::Module))
+        .filter(|module| driver_module_is_selected(module, &values))
+        .filter(|module| paths.insert(module.module_path) && names.insert(module.module_name))
         .collect()
 }
 
@@ -6545,6 +6893,574 @@ fn linux_driver_module_artifact_is_elf(spec: &DriverModuleSpec) -> bool {
         .is_some_and(|bytes| bytes.starts_with(b"\x7fELF"))
 }
 
+fn vendor_linux_source_head() -> Result<String> {
+    let vendor_linux = repo_root()?.join("vendor/linux");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&vendor_linux)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to query source revision in {}",
+                vendor_linux.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "git rev-parse failed for {}: {}",
+            vendor_linux.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(output.stdout)
+        .context("vendor/linux revision is not UTF-8")?
+        .trim()
+        .to_owned())
+}
+
+fn sha256_bytes(label: &str, bytes: &[u8]) -> Result<String> {
+    let mut child = Command::new("sha256sum")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start sha256sum for {label}"))?;
+    child
+        .stdin
+        .take()
+        .context("sha256sum stdin was not piped")?
+        .write_all(bytes)
+        .with_context(|| format!("failed to hash {label}"))?;
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to wait for sha256sum while hashing {label}"))?;
+    if !output.status.success() {
+        bail!(
+            "sha256sum failed while hashing {label}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout)
+        .context("sha256sum output is not UTF-8")?
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+        .with_context(|| format!("sha256sum produced no digest for {label}"))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    sha256_bytes(&path.display().to_string(), &bytes)
+}
+
+fn resolve_tool_path(command: &str) -> Result<PathBuf> {
+    let command_path = Path::new(command);
+    let resolved = if command_path.components().count() > 1 {
+        command_path.to_owned()
+    } else {
+        env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+            .map(|dir| dir.join(command))
+            .find(|candidate| candidate.is_file())
+            .with_context(|| format!("could not resolve Kbuild tool {command:?} through PATH"))?
+    };
+    fs::canonicalize(&resolved)
+        .with_context(|| format!("failed to resolve Kbuild tool {}", resolved.display()))
+}
+
+fn explicit_kbuild_tool_command(env_key: &str) -> Option<String> {
+    env::var(env_key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn kbuild_tool_commands() -> Result<Vec<(&'static str, String)>> {
+    let llvm = env::var("LLVM").unwrap_or_default();
+    let cross_compile = env::var("CROSS_COMPILE").unwrap_or_default();
+    let llvm_ias = env::var("LLVM_IAS").unwrap_or_default();
+    let mut tools = vec![("make", "make".to_owned())];
+
+    if llvm.is_empty() {
+        for (role, name) in [
+            ("cc", "gcc"),
+            ("ld", "ld"),
+            ("ar", "ar"),
+            ("nm", "nm"),
+            ("objcopy", "objcopy"),
+            ("objdump", "objdump"),
+            ("readelf", "readelf"),
+            ("strip", "strip"),
+            ("assembler", "as"),
+        ] {
+            tools.push((role, format!("{cross_compile}{name}")));
+        }
+        tools.push(("hostcc", "gcc".to_owned()));
+        tools.push(("hostcxx", "g++".to_owned()));
+        tools.push(("hostld", "ld".to_owned()));
+    } else {
+        let (prefix, suffix) = if llvm == "1" {
+            ("", "")
+        } else if llvm.ends_with('/') {
+            (llvm.as_str(), "")
+        } else if llvm.starts_with('-') {
+            ("", llvm.as_str())
+        } else {
+            bail!(
+                "invalid LLVM={llvm:?}; vendor Linux Kbuild accepts 1, a path ending in /, or a version suffix beginning with -"
+            );
+        };
+        for (role, name) in [
+            ("cc", "clang"),
+            ("ld", "ld.lld"),
+            ("ar", "llvm-ar"),
+            ("nm", "llvm-nm"),
+            ("objcopy", "llvm-objcopy"),
+            ("objdump", "llvm-objdump"),
+            ("readelf", "llvm-readelf"),
+            ("strip", "llvm-strip"),
+            ("hostcc", "clang"),
+            ("hostcxx", "clang++"),
+            ("hostld", "ld.lld"),
+        ] {
+            tools.push((role, format!("{prefix}{name}{suffix}")));
+        }
+        if llvm_ias == "0" {
+            tools.push(("assembler", format!("{cross_compile}as")));
+        }
+    }
+
+    // Ordinary environment variables are overridden by Linux's makefile
+    // assignments (and ambient MAKEFLAGS=-e is cleared below), so the tools
+    // above are the actual Kbuild defaults. Still fingerprint every explicit
+    // tool command conservatively: wrappers or future Kbuild changes must not
+    // let a replacement binary reuse artifacts produced by another toolchain.
+    for (role, env_key) in [
+        ("cc-env", "CC"),
+        ("hostcc-env", "HOSTCC"),
+        ("hostcxx-env", "HOSTCXX"),
+        ("hostld-env", "HOSTLD"),
+        ("ld-env", "LD"),
+        ("assembler-env", "AS"),
+        ("ar-env", "AR"),
+        ("nm-env", "NM"),
+        ("objcopy-env", "OBJCOPY"),
+        ("objdump-env", "OBJDUMP"),
+        ("readelf-env", "READELF"),
+        ("strip-env", "STRIP"),
+    ] {
+        if let Some(command) = explicit_kbuild_tool_command(env_key) {
+            tools.push((role, command));
+        }
+    }
+    Ok(tools)
+}
+
+fn linux_driver_module_toolchain_sha256() -> Result<String> {
+    // These variables can alter compiler selection, generated Kconfig values,
+    // or the bytes emitted into a module even when vendor HEAD is unchanged.
+    // Staging-only metadata such as modules.dep/modules.order is deliberately
+    // absent: changing load metadata must not force a C rebuild.
+    const RELEVANT_ENV: &[&str] = &[
+        "LLVM",
+        "LLVM_IAS",
+        "CROSS_COMPILE",
+        "CC",
+        "HOSTCC",
+        "HOSTCXX",
+        "HOSTLD",
+        "LD",
+        "AS",
+        "AR",
+        "NM",
+        "OBJCOPY",
+        "OBJDUMP",
+        "READELF",
+        "STRIP",
+        "KCFLAGS",
+        "KCPPFLAGS",
+        "KAFLAGS",
+        "CFLAGS_MODULE",
+        "LDFLAGS_MODULE",
+        "HOSTCFLAGS",
+        "HOSTCXXFLAGS",
+        "HOSTLDFLAGS",
+        "HOSTLDLIBS",
+        "USERCFLAGS",
+        "USERLDFLAGS",
+        "KCONFIG_CONFIG",
+        "KCONFIG_ALLCONFIG",
+        "LOCALVERSION",
+        "LOCALVERSION_AUTO",
+        "KBUILD_BUILD_TIMESTAMP",
+        "KBUILD_BUILD_USER",
+        "KBUILD_BUILD_HOST",
+        "KBUILD_BUILD_VERSION",
+        "SOURCE_DATE_EPOCH",
+    ];
+
+    let mut identity = String::from("lupos-vendor-linux-kbuild-toolchain-v1\n");
+    for key in RELEVANT_ENV {
+        let value = env::var_os(key)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        identity.push_str(&format!("env:{key}:{}:{value}\n", value.len()));
+    }
+
+    let mut executable_identities = HashMap::<PathBuf, (String, String)>::new();
+    for (role, command) in kbuild_tool_commands()? {
+        identity.push_str(&format!("tool:{role}:command={command:?}\n"));
+        let mut resolved_any = false;
+        for word in command.split_whitespace() {
+            let word = word.trim_matches(['\'', '"']);
+            if word.is_empty() || word.starts_with('-') || word.contains('=') {
+                continue;
+            }
+            let Ok(path) = resolve_tool_path(word) else {
+                continue;
+            };
+            resolved_any = true;
+            let (executable_sha256, version) =
+                if let Some(identity) = executable_identities.get(&path) {
+                    identity.clone()
+                } else {
+                    let executable_sha256 = sha256_file(&path)?;
+                    let output = Command::new(&path)
+                        .arg("--version")
+                        .env("LC_ALL", "C")
+                        .output()
+                        .with_context(|| format!("failed to query {} --version", path.display()))?;
+                    let version = format!(
+                        "status={:?};stdout={:?};stderr={:?}",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    executable_identities
+                        .insert(path.clone(), (executable_sha256.clone(), version.clone()));
+                    (executable_sha256, version)
+                };
+            identity.push_str(&format!(
+                "tool-executable:path={:?};sha256={executable_sha256};version={version}\n",
+                path
+            ));
+        }
+        if !resolved_any {
+            bail!("could not resolve an executable from Kbuild {role} command {command:?}");
+        }
+    }
+    sha256_bytes(
+        "vendor Linux Kbuild toolchain identity",
+        identity.as_bytes(),
+    )
+}
+
+#[derive(Clone, Debug)]
+struct LinuxDriverModuleBuildIdentity {
+    source_head: String,
+    abi_probe_makefile_sha256: String,
+    abi_probe_source_sha256: String,
+    toolchain_sha256: String,
+}
+
+fn linux_driver_module_build_identity(
+    abi_probe_dir: &Path,
+) -> Result<LinuxDriverModuleBuildIdentity> {
+    Ok(LinuxDriverModuleBuildIdentity {
+        source_head: vendor_linux_source_head()?,
+        abi_probe_makefile_sha256: sha256_file(&abi_probe_dir.join("Makefile"))?,
+        abi_probe_source_sha256: sha256_file(&abi_probe_dir.join("lupos_abi_layout_probe.c"))?,
+        toolchain_sha256: linux_driver_module_toolchain_sha256()?,
+    })
+}
+
+fn linux_driver_module_manifest_text(
+    identity: &LinuxDriverModuleBuildIdentity,
+    effective_config_sha256: &str,
+    modules: &[&DriverModuleSpec],
+) -> String {
+    let mut manifest = format!(
+        "format=2\nsource_head={}\npolicy={LINUX_DRIVER_MODULE_BUILD_POLICY}\n\
+         abi_probe_makefile_sha256={}\nabi_probe_source_sha256={}\n\
+         effective_config_sha256={effective_config_sha256}\ntoolchain_sha256={}\n",
+        identity.source_head,
+        identity.abi_probe_makefile_sha256,
+        identity.abi_probe_source_sha256,
+        identity.toolchain_sha256,
+    );
+    for spec in modules {
+        manifest.push_str("module=");
+        manifest.push_str(spec.module_name);
+        manifest.push('|');
+        manifest.push_str(spec.symbol);
+        manifest.push('|');
+        manifest.push_str(spec.module_path);
+        manifest.push('|');
+        manifest.push_str(spec.linux_make_dir);
+        manifest.push('/');
+        manifest.push_str(spec.linux_make_target);
+        manifest.push('\n');
+    }
+    manifest
+}
+
+fn linux_driver_module_manifest_path() -> Result<PathBuf> {
+    Ok(xtask_target_dir()?
+        .join("vendor-linux-modules")
+        .join(LINUX_DRIVER_MODULE_MANIFEST))
+}
+
+fn linux_driver_module_effective_config_path() -> Result<PathBuf> {
+    Ok(xtask_target_dir()?
+        .join("vendor-linux-modules")
+        .join(LINUX_DRIVER_MODULE_EFFECTIVE_CONFIG))
+}
+
+fn expected_linux_driver_module_manifest(modules: &[&DriverModuleSpec]) -> Result<Option<String>> {
+    let config_path = linux_driver_module_effective_config_path()?;
+    if !config_path.is_file() {
+        return Ok(None);
+    }
+    let root = repo_root()?;
+    let identity = linux_driver_module_build_identity(&root.join("xtask/vendor_abi_probe"))?;
+    let effective_config_sha256 = sha256_file(&config_path)?;
+    Ok(Some(linux_driver_module_manifest_text(
+        &identity,
+        &effective_config_sha256,
+        modules,
+    )))
+}
+
+/// Serialize the shared vendor source/build/artifact trees across xtask
+/// processes.  The in-process mutex below is not sufficient when two build
+/// frontends (for example an ISO build and `cargo xtask modules`) start at the
+/// same time: each build deliberately recreates those trees, so a concurrent
+/// cleanup can remove a C source file while Kbuild is compiling it.
+fn lock_linux_driver_module_build_tree() -> Result<fs::File> {
+    let path = xtask_target_dir()?.join("vendor-linux-modules.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("failed to lock {}", path.display()))?;
+    Ok(file)
+}
+
+fn linux_driver_module_manifest_matches(expected: &str) -> bool {
+    linux_driver_module_manifest_path()
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .is_some_and(|actual| actual == expected)
+}
+
+fn collect_linux_module_artifacts(dir: &Path, modules: &mut Vec<PathBuf>) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("failed to enumerate {}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if file_type.is_dir() {
+            collect_linux_module_artifacts(&path, modules)?;
+        } else if file_type.is_file() && path.extension().is_some_and(|extension| extension == "ko")
+        {
+            modules.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn prune_linux_driver_module_artifacts_under(
+    artifact_root: &Path,
+    modules: &[&DriverModuleSpec],
+) -> Result<()> {
+    let expected = modules
+        .iter()
+        .map(|spec| artifact_root.join(spec.module_path))
+        .collect::<HashSet<_>>();
+    let mut actual = Vec::new();
+    collect_linux_module_artifacts(artifact_root, &mut actual)?;
+    for stale in actual
+        .into_iter()
+        .filter(|artifact| !expected.contains(artifact))
+    {
+        fs::remove_file(&stale).with_context(|| {
+            format!("failed to remove stale module artifact {}", stale.display())
+        })?;
+    }
+    Ok(())
+}
+
+fn audit_linux_driver_module_artifact_set_under(
+    artifact_root: &Path,
+    modules: &[&DriverModuleSpec],
+) -> Result<()> {
+    let expected = modules
+        .iter()
+        .map(|spec| artifact_root.join(spec.module_path))
+        .collect::<HashSet<_>>();
+    let mut actual = Vec::new();
+    collect_linux_module_artifacts(artifact_root, &mut actual)?;
+    let actual = actual.into_iter().collect::<HashSet<_>>();
+    if actual != expected {
+        let mut missing = expected.difference(&actual).collect::<Vec<_>>();
+        let mut extra = actual.difference(&expected).collect::<Vec<_>>();
+        missing.sort();
+        extra.sort();
+        bail!(
+            "vendor Linux module artifact set does not match manifest: missing [{}], extra [{}]",
+            missing
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            extra
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn prune_and_audit_linux_driver_module_artifact_set(modules: &[&DriverModuleSpec]) -> Result<()> {
+    let artifact_root = xtask_target_dir()?.join("vendor-linux-modules");
+    prune_linux_driver_module_artifacts_under(&artifact_root, modules)?;
+    audit_linux_driver_module_artifact_set_under(&artifact_root, modules)
+}
+
+fn nm_output(path: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("nm")
+        .args(args)
+        .arg(path)
+        .output()
+        .with_context(|| format!("failed to inspect module symbols in {}", path.display()))?;
+    if !output.status.success() {
+        bail!(
+            "nm failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout)
+        .with_context(|| format!("nm output for {} is not UTF-8", path.display()))
+}
+
+fn module_exported_symbols(spec: &DriverModuleSpec) -> Result<HashSet<String>> {
+    let path = linux_driver_module_artifact(spec)?;
+    Ok(nm_output(&path, &["-a"])?
+        .lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .filter_map(|name| name.strip_prefix("__ksymtab_"))
+        .map(str::to_owned)
+        .collect())
+}
+
+fn module_strong_undefined_symbols(spec: &DriverModuleSpec) -> Result<HashSet<String>> {
+    let path = linux_driver_module_artifact(spec)?;
+    Ok(nm_output(&path, &["-u"])?
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            (fields.len() >= 2 && fields[fields.len() - 2] == "U")
+                .then(|| fields[fields.len() - 1].to_owned())
+        })
+        .collect())
+}
+
+/// Cross-check hand-authored modules.dep metadata against the actual ELF
+/// import/export graph. Undefined kernel symbols with no selected module
+/// provider remain a separate Lupos ABI obligation and are reported by the
+/// runtime-loadability warning; this audit rejects missing/interverted staged
+/// module providers.
+fn audit_linux_driver_module_dependencies(modules: &[&DriverModuleSpec]) -> Result<()> {
+    let positions = modules
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| (spec.module_path, index))
+        .collect::<HashMap<_, _>>();
+    for (index, spec) in modules.iter().enumerate() {
+        for dependency in spec.module_deps {
+            let Some(dependency_index) = positions.get(dependency) else {
+                bail!(
+                    "{} declares unstaged module dependency {}",
+                    spec.module_name,
+                    dependency
+                );
+            };
+            if *dependency_index >= index {
+                bail!(
+                    "{} must follow module dependency {} in /etc/modules",
+                    spec.module_name,
+                    dependency
+                );
+            }
+        }
+    }
+
+    let mut providers = HashMap::<String, Vec<&DriverModuleSpec>>::new();
+    for spec in modules {
+        for symbol in module_exported_symbols(spec)? {
+            providers.entry(symbol).or_default().push(spec);
+        }
+    }
+
+    let mut metadata_errors = Vec::new();
+    for consumer in modules {
+        let declared = consumer.module_deps.iter().copied().collect::<HashSet<_>>();
+        let mut missing = Vec::new();
+        for symbol in module_strong_undefined_symbols(consumer)? {
+            let Some(symbol_providers) = providers.get(&symbol) else {
+                continue;
+            };
+            let external_providers = symbol_providers
+                .iter()
+                .copied()
+                .filter(|provider| provider.module_path != consumer.module_path)
+                .collect::<Vec<_>>();
+            if !external_providers.is_empty()
+                && !external_providers
+                    .iter()
+                    .any(|provider| declared.contains(provider.module_path))
+            {
+                missing.push(format!(
+                    "{symbol} from {}",
+                    external_providers
+                        .iter()
+                        .map(|provider| provider.module_path)
+                        .collect::<Vec<_>>()
+                        .join(" or ")
+                ));
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        if !missing.is_empty() {
+            metadata_errors.push(format!(
+                "{} omits {}",
+                consumer.module_name,
+                missing.join(", ")
+            ));
+        }
+    }
+    if !metadata_errors.is_empty() {
+        bail!(
+            "modules.dep metadata omits actual ELF provider(s): {}",
+            metadata_errors.join("; ")
+        );
+    }
+    Ok(())
+}
+
 fn shell_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -6556,38 +7472,83 @@ fn vendor_linux_module_build_script_from_shell_paths(
     artifacts: &str,
     modules: &[&DriverModuleSpec],
 ) -> String {
+    let abi_probe_source = shell_single_quote(&format!("{repo}/xtask/vendor_abi_probe"));
+    let abi_probe_build = shell_single_quote(&format!("{build}/lupos-abi-probe"));
     let repo = shell_single_quote(repo);
+    let source_archive = shell_single_quote(&format!("{src}.tar"));
     let src = shell_single_quote(src);
     let build = shell_single_quote(build);
     let artifacts = shell_single_quote(artifacts);
+    let kernel_release = shell_single_quote(LUPOS_KERNEL_RELEASE);
 
     let mut symbol_args = String::new();
+    let mut configured_symbols = HashSet::new();
     for spec in modules {
         let symbol = spec.symbol.trim_start_matches("CONFIG_");
-        symbol_args.push_str(" -m ");
-        symbol_args.push_str(symbol);
+        if configured_symbols.insert(symbol) {
+            symbol_args.push_str(" -m ");
+            symbol_args.push_str(symbol);
+        }
     }
-
     let mut script = format!(
         "set -euo pipefail\n\
-         rm -rf {src} {build}\n\
+         rm -rf {src} {build} {artifacts}\n\
+         rm -f {source_archive}\n\
          mkdir -p {src} {build} {artifacts}\n\
-         git -C {repo}/vendor/linux archive --format=tar HEAD | tar -xf - -C {src}\n\
-         make -C {src} O={build} ARCH=x86_64 tinyconfig >/tmp/lupos-linux-modules-tinyconfig.log\n\
-         {src}/scripts/config --file {build}/.config -e MODULES -e BLOCK -e PCI -e NET -e NETDEVICES -e ETHERNET -e NET_VENDOR_INTEL -e VIRTIO_MENU -m VIRTIO -m VIRTIO_PCI -d VIRTIO_PCI_LEGACY -d VIRTIO_PCI_ADMIN_LEGACY -m SCSI -m BLK_DEV_SD -m ATA -m SATA_AHCI{symbol_args}\n\
-         make -C {src} O={build} ARCH=x86_64 olddefconfig >/tmp/lupos-linux-modules-olddefconfig.log\n\
-         make -C {src} O={build} ARCH=x86_64 prepare modules_prepare V=0 >/tmp/lupos-linux-modules-prepare.log\n"
+         git -C {repo}/vendor/linux archive --format=tar --output={source_archive} HEAD\n\
+         tar -xf {source_archive} -C {src}\n\
+         rm -f {source_archive}\n\
+         test -r {src}/scripts/kconfig/symbol.c\n\
+         test -r {src}/drivers/gpu/drm/i915/display/intel_ddi.c\n\
+         test -r {abi_probe_source}/lupos_abi_layout_probe.c\n\
+         make -C {src} O={build} ARCH=x86_64 KERNELRELEASE={kernel_release} x86_64_defconfig >/tmp/lupos-linux-modules-x86_64-defconfig.log\n\
+         {src}/scripts/config --file {build}/.config -e MODULES -e SMP -e PREEMPT -d PREEMPT_LAZY -d PREEMPT_DYNAMIC -d CPU_MITIGATIONS -d X86_KERNEL_IBT -d STACKPROTECTOR -d FTRACE -d KPROBES -d JUMP_LABEL -d UNWINDER_ORC -e UNWINDER_FRAME_POINTER{symbol_args}\n\
+         make -C {src} O={build} ARCH=x86_64 KERNELRELEASE={kernel_release} olddefconfig >/tmp/lupos-linux-modules-olddefconfig.log\n\
+         grep -qx 'CONFIG_VGA_ARB=y' {build}/.config\n\
+         grep -qx 'CONFIG_APERTURE_HELPERS=y' {build}/.config\n\
+         grep -qx 'CONFIG_VIDEO=y' {build}/.config\n\
+         grep -qx 'CONFIG_SCREEN_INFO=y' {build}/.config\n\
+         grep -qx '# CONFIG_SYSFB_SIMPLEFB is not set' {build}/.config\n\
+         ! grep -qx 'CONFIG_SYSFB=y' {build}/.config\n\
+         grep -qx '# CONFIG_DRM_FBDEV_EMULATION is not set' {build}/.config\n\
+         grep -qx 'CONFIG_VIRTIO_PCI_LEGACY=y' {build}/.config\n\
+         grep -qx 'CONFIG_VIRTIO_PCI_LIB_LEGACY=m' {build}/.config\n\
+         grep -qx 'CONFIG_SMP=y' {build}/.config\n\
+         grep -qx 'CONFIG_PREEMPT=y' {build}/.config\n\
+         grep -qx '# CONFIG_PREEMPT_DYNAMIC is not set' {build}/.config\n\
+         grep -qx '# CONFIG_CPU_MITIGATIONS is not set' {build}/.config\n\
+         grep -qx '# CONFIG_STACKPROTECTOR is not set' {build}/.config\n\
+         grep -qx '# CONFIG_FTRACE is not set' {build}/.config\n\
+         grep -qx '# CONFIG_KPROBES is not set' {build}/.config\n\
+         grep -qx '# CONFIG_JUMP_LABEL is not set' {build}/.config\n\
+         grep -qx '# CONFIG_X86_KERNEL_IBT is not set' {build}/.config\n\
+         grep -qx '# CONFIG_UNWINDER_ORC is not set' {build}/.config\n\
+         grep -qx 'CONFIG_UNWINDER_FRAME_POINTER=y' {build}/.config\n\
+         make -C {src} O={build} ARCH=x86_64 KERNELRELEASE={kernel_release} prepare modules_prepare V=0 >/tmp/lupos-linux-modules-prepare.log\n\
+         install -D {abi_probe_source}/Makefile {abi_probe_build}/Makefile\n\
+         install -D {abi_probe_source}/lupos_abi_layout_probe.c {abi_probe_build}/lupos_abi_layout_probe.c\n\
+         make -C {src} O={build} ARCH=x86_64 KERNELRELEASE={kernel_release} M={abi_probe_build} lupos_abi_layout_probe.o V=0\n"
     );
+
+    let make_targets = modules
+        .iter()
+        .map(|spec| {
+            shell_single_quote(&format!(
+                "{}/{}",
+                spec.linux_make_dir, spec.linux_make_target
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    script.push_str(&format!(
+        "make -C {src} O={build} ARCH=x86_64 KERNELRELEASE={kernel_release} {make_targets} KBUILD_MODPOST_WARN=1 V=0\n"
+    ));
 
     for spec in modules {
         let built = format!("{}/{}", spec.linux_make_dir, spec.linux_make_target);
-        let make_target = shell_single_quote(&built);
         let built = shell_single_quote(&built);
         let dest = shell_single_quote(spec.module_path);
-        script.push_str(&format!(
-            "make -C {src} O={build} ARCH=x86_64 {make_target} KBUILD_MODPOST_WARN=1 V=0\n\
-             install -D {build}/{built} {artifacts}/{dest}\n"
-        ));
+        script.push_str(&format!("install -D {build}/{built} {artifacts}/{dest}\n"));
     }
 
     script
@@ -6651,8 +7612,41 @@ fn build_linux_driver_module_artifacts(modules: &[&DriverModuleSpec]) -> Result<
     );
 
     let mut command = Command::new("bash");
-    command.arg("-lc").arg(script);
+    // A login shell may rewrite PATH or compiler variables after the cache
+    // identity above has resolved them.  This build script needs no login
+    // startup state, so execute it in the current, fingerprinted environment.
+    command
+        .arg("-c")
+        .arg(script)
+        // Parent make jobserver flags can also carry variable assignments
+        // that silently replace the fingerprinted Kbuild tools.  The module
+        // builder is a closed build and establishes its own recursive make
+        // flags, so do not inherit those ambient channels.
+        .env_remove("MAKEFLAGS")
+        .env_remove("MFLAGS")
+        .env_remove("GNUMAKEFLAGS")
+        .env_remove("MAKELEVEL");
     run_command(&mut command, "vendor Linux module build")?;
+
+    // Persist the exact post-olddefconfig input that produced these objects.
+    // The snapshot lives with the artifacts so the build directory remains
+    // disposable while cache validation can still bind every .ko to its
+    // effective Kconfig state.
+    let generated_config = build_dir.join(".config");
+    let effective_config = artifact_root.join(LINUX_DRIVER_MODULE_EFFECTIVE_CONFIG);
+    let config_bytes = fs::read(&generated_config)
+        .with_context(|| format!("failed to read {}", generated_config.display()))?;
+    fs::write(&effective_config, &config_bytes)
+        .with_context(|| format!("failed to write {}", effective_config.display()))?;
+
+    // Hash the installed probe copies, not merely the current working-tree
+    // files: these are the inputs Kbuild actually compiled in this build.
+    let identity = linux_driver_module_build_identity(&build_dir.join("lupos-abi-probe"))?;
+    let effective_config_sha256 = sha256_bytes("effective vendor Linux .config", &config_bytes)?;
+    let manifest = linux_driver_module_manifest_text(&identity, &effective_config_sha256, modules);
+    let manifest_path = artifact_root.join(LINUX_DRIVER_MODULE_MANIFEST);
+    fs::write(&manifest_path, manifest)
+        .with_context(|| format!("failed to write {}", manifest_path.display()))?;
     Ok(())
 }
 
@@ -6660,33 +7654,87 @@ fn ensure_linux_driver_module_artifacts(modules: &[&DriverModuleSpec]) -> Result
     let _guard = LINUX_DRIVER_MODULE_BUILD_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _tree_lock = lock_linux_driver_module_build_tree()?;
+    let expected_manifest = expected_linux_driver_module_manifest(modules)?;
     let missing = modules
         .iter()
         .copied()
         .filter(|spec| !linux_driver_module_artifact_is_elf(spec))
         .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        build_linux_driver_module_artifacts(&missing)?;
+    if !missing.is_empty()
+        || !expected_manifest
+            .as_deref()
+            .is_some_and(linux_driver_module_manifest_matches)
+    {
+        // Rebuild the complete selected set under one effective vendor config.
+        // Mixing old tinyconfig artifacts with x86_64-defconfig artifacts can
+        // silently change inline driver behavior (notably aperture removal).
+        build_linux_driver_module_artifacts(modules)?;
     }
 
     for spec in modules {
         if !linux_driver_module_artifact_is_elf(spec) {
             bail!(
-                "{}=m requires Linux-built module artifact {}; build it from {}",
+                "{}=m activates {} and requires Linux-built module artifact {}; build it from {}",
+                driver_module_activation_description(spec),
                 spec.symbol,
                 linux_driver_module_artifact(spec)?.display(),
                 spec.vendor_linux_ref
             );
         }
     }
+    prune_and_audit_linux_driver_module_artifact_set(modules)?;
+    let expected_manifest = expected_linux_driver_module_manifest(modules)?;
+    if !expected_manifest
+        .as_deref()
+        .is_some_and(linux_driver_module_manifest_matches)
+    {
+        bail!(
+            "Linux driver module artifact manifest is absent or stale after rebuild: {}",
+            linux_driver_module_manifest_path()?.display()
+        );
+    }
+    for spec in modules {
+        let path = linux_driver_module_artifact(spec)?;
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read module metadata from {}", path.display()))?;
+        let vermagic = module_modinfo_value(&bytes, b"vermagic=")
+            .and_then(|value| str::from_utf8(value).ok())
+            .with_context(|| format!("{} has no valid vermagic field", path.display()))?;
+        if vermagic != LUPOS_MODULE_VERMAGIC {
+            bail!(
+                "{} vermagic {:?} does not match Lupos kernel vermagic {:?}",
+                path.display(),
+                vermagic,
+                LUPOS_MODULE_VERMAGIC
+            );
+        }
+    }
+    audit_linux_driver_module_dependencies(modules)?;
+    if let Some(warning) = video_module_runtime_loadability_warning(modules) {
+        eprintln!("warning: {warning}");
+    }
     Ok(())
+}
+
+fn module_modinfo_value<'a>(module: &'a [u8], field: &[u8]) -> Option<&'a [u8]> {
+    let field_offset = module
+        .windows(field.len())
+        .position(|candidate| candidate == field)?;
+    let value_start = field_offset.checked_add(field.len())?;
+    let value_len = module
+        .get(value_start..)?
+        .iter()
+        .position(|byte| *byte == 0)?;
+    module.get(value_start..value_start.checked_add(value_len)?)
 }
 
 fn module_payload(spec: &DriverModuleSpec) -> Result<Vec<u8>> {
     let path = linux_driver_module_artifact(spec)?;
     let bytes = fs::read(&path).with_context(|| {
         format!(
-            "{}=m requires Linux-built module artifact {}; run `cargo xtask modules` to build it from {}",
+            "{}=m activates {} and requires Linux-built module artifact {}; run `cargo xtask modules` to build it from {}",
+            driver_module_activation_description(spec),
             spec.symbol,
             path.display(),
             spec.vendor_linux_ref
@@ -6710,29 +7758,215 @@ fn module_list_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
     list.into_bytes()
 }
 
+/// Alias-resolution order emitted by the vendor Kbuild tree for the effective
+/// x86_64 configuration, filtered to artifacts staged by Lupos. This is not a
+/// dependency/load order; `/etc/modules` retains the explicit topological order
+/// above. Both `modules.order` and depmod's `modules.dep` line order follow this
+/// vendor Kbuild order.
+const VENDOR_KBUILD_MODULE_ORDER: &[&str] = &[
+    "iosf_mbi",
+    "bsg",
+    "zlib_deflate",
+    "virtio_pci_modern_dev",
+    "virtio_pci_legacy_dev",
+    "virtio_pci",
+    "virtio_dma_buf",
+    "agpgart",
+    "amd64_agp",
+    "intel_agp",
+    "intel_gtt",
+    "drm_display_helper",
+    "bochs",
+    "drm",
+    "drm_panel_orientation_quirks",
+    "drm_buddy",
+    "drm_shmem_helper",
+    "drm_kms_helper",
+    "ttm",
+    "i915",
+    "virtio_gpu",
+    "virtio_blk",
+    "scsi_mod",
+    "scsi_common",
+    "sd_mod",
+    "e1000",
+    "virtio_net",
+    "i2c_algo_bit",
+    "i2c_core",
+    "libata",
+    "ahci",
+    "libahci",
+];
+
+fn modules_order_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
+    let by_name = modules
+        .iter()
+        .map(|spec| (spec.module_name, *spec))
+        .collect::<HashMap<_, _>>();
+    let mut order = String::new();
+    let mut emitted = HashSet::new();
+    for name in VENDOR_KBUILD_MODULE_ORDER {
+        if let Some(spec) = by_name.get(name) {
+            order.push_str(spec.module_path);
+            order.push('\n');
+            emitted.insert(*name);
+        }
+    }
+    assert_eq!(
+        emitted.len(),
+        modules.len(),
+        "selected module lacks an audited vendor Kbuild modules.order position"
+    );
+    order.into_bytes()
+}
+
+fn modules_dep_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
+    let by_name = modules
+        .iter()
+        .map(|spec| (spec.module_name, *spec))
+        .collect::<HashMap<_, _>>();
+    let mut deps = String::new();
+    let mut emitted = HashSet::new();
+    for name in VENDOR_KBUILD_MODULE_ORDER {
+        if let Some(spec) = by_name.get(name) {
+            deps.push_str(spec.module_path);
+            deps.push(':');
+            for dep in spec.module_deps {
+                deps.push(' ');
+                deps.push_str(dep);
+            }
+            deps.push('\n');
+            emitted.insert(*name);
+        }
+    }
+    assert_eq!(
+        emitted.len(),
+        modules.len(),
+        "selected module lacks an audited depmod modules.dep position"
+    );
+    deps.into_bytes()
+}
+
+const VIDEO_MODULE_RUNTIME_LOADABILITY_WARNING: &str = "vendor-built video .ko artifacts are configured from Linux x86_64_defconfig with the explicit Lupos runtime contract and staged. \
+The minimized storage-module path has a real struct-module lifecycle and final W^X permissions, \
+but each generic video module remains fail-closed when it needs an unimplemented Linux finalizer \
+or ABI export. The audited remaining closure includes alternatives/SMP locks/static calls and \
+DRM/KMS, I2C, AGP/TTM/GTT, dma-buf/shmem, aperture helpers/VGA arbitration, \
+VIDEO/SCREEN_INFO framebuffer handoff, GPU buddy, and bochs/i915/virtio-gpu support; artifact \
+staging alone is not runtime success";
+
+fn video_module_runtime_loadability_warning(modules: &[&DriverModuleSpec]) -> Option<&'static str> {
+    modules
+        .iter()
+        .any(|spec| matches!(spec.module_name, "bochs" | "i915" | "virtio_gpu"))
+        .then_some(VIDEO_MODULE_RUNTIME_LOADABILITY_WARNING)
+}
+
 fn etc_modules_from_config_text(text: &str) -> Vec<u8> {
     module_list_from_specs(&staged_module_specs_from_config_text(text))
 }
 
+fn depmod_executable() -> Result<PathBuf> {
+    if let Some(configured) = env::var_os("DEPMOD") {
+        let configured = PathBuf::from(configured);
+        if configured.components().count() > 1 && configured.is_file() {
+            return Ok(configured);
+        }
+        if let Some(command) = configured.to_str()
+            && let Ok(path) = resolve_tool_path(command)
+        {
+            return Ok(path);
+        }
+    }
+    for candidate in ["/usr/sbin/depmod", "/sbin/depmod"] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    resolve_tool_path("depmod").context(
+        "depmod is required to emit modules.dep.bin/modules.alias.bin for staged Linux modules",
+    )
+}
+
+fn depmod_index_files(
+    staged: &[InitramfsFile],
+    expected_modules_dep: &[u8],
+) -> Result<Vec<InitramfsFile>> {
+    let sequence = DEPMOD_INDEX_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_root =
+        xtask_target_dir()?.join(format!("depmod-index-{}-{sequence}", std::process::id()));
+    let result = (|| {
+        fs::create_dir_all(&temp_root)
+            .with_context(|| format!("failed to create {}", temp_root.display()))?;
+        write_staged_files(&temp_root, staged)?;
+        let module_dir = temp_root.join("lib/modules").join(MODULE_VERSION_DIR);
+        for name in ["modules.builtin", "modules.builtin.modinfo"] {
+            fs::write(module_dir.join(name), [])
+                .with_context(|| format!("failed to seed depmod {name}"))?;
+        }
+
+        let output = Command::new(depmod_executable()?)
+            .arg("-b")
+            .arg(&temp_root)
+            .arg("-C")
+            .arg("/dev/null")
+            .arg(MODULE_VERSION_DIR)
+            .env("LC_ALL", "C")
+            .output()
+            .context("failed to run depmod for staged Linux modules")?;
+        if !output.status.success() {
+            bail!(
+                "depmod failed for staged Linux modules: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let generated_dep =
+            fs::read(module_dir.join("modules.dep")).context("depmod did not emit modules.dep")?;
+        if generated_dep != expected_modules_dep {
+            bail!(
+                "audited modules.dep differs from depmod output for the exact staged artifacts\nexpected:\n{}generated:\n{}",
+                String::from_utf8_lossy(expected_modules_dep),
+                String::from_utf8_lossy(&generated_dep)
+            );
+        }
+
+        LIBKMOD_INDEX_FILES
+            .iter()
+            .filter(|name| !matches!(**name, "modules.dep" | "modules.order"))
+            .map(|name| {
+                let path = module_dir.join(name);
+                let bytes = fs::read(&path)
+                    .with_context(|| format!("depmod did not emit {}", path.display()))?;
+                Ok(initramfs_file(
+                    &format!("lib/modules/{MODULE_VERSION_DIR}/{name}"),
+                    0o100644,
+                    bytes,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()
+    })();
+    let _ = fs::remove_dir_all(&temp_root);
+    result
+}
+
 fn staged_module_files_from_config_text(text: &str) -> Result<Vec<InitramfsFile>> {
     let modules = staged_module_specs_from_config_text(text);
+    staged_module_files_from_specs(&modules)
+}
+
+fn staged_module_files_from_specs(
+    modules: &[&'static DriverModuleSpec],
+) -> Result<Vec<InitramfsFile>> {
     if modules.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut files = Vec::new();
-    let mut modules_order = String::new();
-    let mut modules_dep = String::new();
+    let modules_order = modules_order_from_specs(modules);
+    let modules_dep = modules_dep_from_specs(modules);
     for spec in modules {
-        modules_order.push_str(spec.module_path);
-        modules_order.push('\n');
-        modules_dep.push_str(spec.module_path);
-        modules_dep.push(':');
-        for dep in spec.module_deps {
-            modules_dep.push(' ');
-            modules_dep.push_str(dep);
-        }
-        modules_dep.push('\n');
         files.push(initramfs_file(
             &format!("lib/modules/{MODULE_VERSION_DIR}/{}", spec.module_path),
             0o100644,
@@ -6742,13 +7976,14 @@ fn staged_module_files_from_config_text(text: &str) -> Result<Vec<InitramfsFile>
     files.push(initramfs_file(
         &format!("lib/modules/{MODULE_VERSION_DIR}/modules.order"),
         0o100644,
-        modules_order.into_bytes(),
+        modules_order,
     ));
     files.push(initramfs_file(
         &format!("lib/modules/{MODULE_VERSION_DIR}/modules.dep"),
         0o100644,
-        modules_dep.into_bytes(),
+        modules_dep.clone(),
     ));
+    files.extend(depmod_index_files(&files, &modules_dep)?);
     Ok(files)
 }
 
@@ -6831,26 +8066,23 @@ fn write_staged_files(root: &Path, files: &[InitramfsFile]) -> Result<Vec<PathBu
 
 fn login_release_root_files() -> Vec<InitramfsFile> {
     let stage = target_userland_stage_dir().ok();
+    // Synchronize before reading `/etc/modules`, not only before copying the
+    // module payloads below, so both views come from the same `.config`.
+    let configured_modules =
+        configured_module_files().expect("configured Linux driver module artifacts must be staged");
     let mut files = login_userland_files_with_stage(stage.as_deref());
     files.push(initramfs_file(
         "etc/modules",
         0o100644,
         etc_modules_from_repo_config(),
     ));
-    files.extend(
-        configured_module_files().expect("configured Linux driver module artifacts must be staged"),
-    );
+    files.extend(configured_modules);
     files.push(initramfs_file(
         "usr/share/lupos/release.txt",
         0o100644,
         format!(
             "name=Lupos\nversion={RELEASE_VERSION}\nrootfs=login-fhs\nlinux_refs=vendor/linux/usr/gen_init_cpio.c,vendor/linux/Documentation/filesystems\n"
         ),
-    ));
-    files.push(initramfs_file(
-        SPLASH_ART_BOOT_PATH,
-        0o100644,
-        SPLASH_ART_BYTES.to_vec(),
     ));
     files
 }
@@ -6923,7 +8155,7 @@ fn write_release_root(root: &Path, kernel_artifact: Option<&Path>) -> Result<Pat
     files.push(initramfs_file(
         "boot/initramfs.cpio",
         0o100644,
-        module_stage_initramfs_cpio(),
+        linux_root_initramfs_cpio(),
     ));
 
     let manifest = fhs_manifest_content(&files);
@@ -6957,31 +8189,36 @@ fn release_grub_cfg_content() -> String {
     // kernel. The Linux boot path remains the same; only the bootloader terminal
     // devices differ so the graphical VM window is authoritative for release.
     //
-    // Keep the GRUB menu graphical so the splash art is visible before boot,
-    // but hand the kernel a VGA text payload. Some BIOS GRUB/QEMU paths do not
+    // Keep the GRUB menu graphical, but leave it on GRUB's stock background and
+    // hand the kernel a VGA text payload. Some BIOS GRUB/QEMU paths do not
     // populate a usable boot_params.screen_info framebuffer for Lupos yet; if
     // we keep GRUB graphics mode, tty1 writes fall back to vgacon while the VM
-    // still displays the old splash. Text payload makes the tty login visible.
+    // still displays the old graphical menu. Text payload makes tty login visible.
     //
     // No `splash`: it makes userspace put the console in KD_GRAPHICS mode,
     // disabling the framebuffer text console (`set_fbcon_enabled(false)` in
-    // tty::mod's KDSETMODE handler) and is never restored to KD_TEXT (Lupos has
-    // no splash renderer). No `quiet` either, so kernel boot progress is
-    // visible on that console.
+    // tty::mod's KDSETMODE handler). Lupos has no userspace splash daemon to
+    // restore KD_TEXT; the earlier in-kernel boot art is independent of this
+    // userspace flag. No `quiet` either, so kernel progress remains visible.
     let mut cfg = format!(
-        r#"set timeout={GRUB_INTERACTIVE_SPLASH_TIMEOUT_SECS}
+        r#"set timeout={GRUB_INTERACTIVE_TIMEOUT_SECS}
 set default=0
 
-# Use GRUB's stock graphical terminal with the Lupos splash art as background.
-insmod all_video
+# GRUB's gfxterm needs a loaded PF2 font for deterministic Unicode glyph
+# coverage.  Follow grub-mkconfig's 00_header ordering and fall back to the
+# firmware console if the explicitly staged font cannot be read.
 insmod linux
-set gfxmode=auto
 set gfxpayload=text
-insmod png
-insmod gfxterm
 terminal_input console
-terminal_output gfxterm
-background_image /boot/grub/splashart.png
+insmod font
+if loadfont $prefix/fonts/unicode.pf2; then
+    insmod all_video
+    set gfxmode=auto
+    insmod gfxterm
+    terminal_output gfxterm
+else
+    terminal_output console
+fi
 
 menuentry "lupos" {{
     # linux: GRUB command to load a Linux boot-protocol bzImage.
@@ -7003,17 +8240,6 @@ menuentry "lupos recovery" {{
 "#
     ));
     cfg
-}
-
-fn write_grub_splash_art(root: &Path) -> Result<PathBuf> {
-    let dst = root.join(SPLASH_ART_BOOT_PATH);
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(&dst, SPLASH_ART_BYTES)
-        .with_context(|| format!("failed to write splash art to {}", dst.display()))?;
-    Ok(dst)
 }
 
 const RELEASE_EXT4_FEATURE_OPTS: &str = "^metadata_csum,^64bit";
@@ -7067,8 +8293,135 @@ fn module_stage_initramfs_cpio() -> Vec<u8> {
     build_cpio_newc(&borrowed)
 }
 
+/// Root-storage modules needed before a disk-backed `/sbin/init` is visible.
+///
+/// This is the dependency-first union for the two canonical x86_64 emulator
+/// transports: virtio-blk under QEMU and AHCI/SCSI under VirtualBox.  The
+/// freestanding `/init` stops after the first transport publishes a root
+/// gendisk, matching Linux initramfs hardware-triggered modprobe behavior.
+/// Graphics and network modules stay on the real root and are loaded by normal
+/// userspace after switch_root.
+const EARLY_ROOT_MODULE_NAMES: &[&str] = &[
+    "virtio_pci_modern_dev",
+    "virtio_pci_legacy_dev",
+    "virtio_pci",
+    "virtio_blk",
+    "bsg",
+    "scsi_common",
+    "scsi_mod",
+    "sd_mod",
+    "libata",
+    "libahci",
+    "ahci",
+];
+
+fn early_root_module_specs_from_repo_config() -> Vec<&'static DriverModuleSpec> {
+    let Some(text) = repo_config_text() else {
+        return Vec::new();
+    };
+    let selected = staged_module_specs_from_config_text(&text);
+    // Artifact cache identity is the complete selected Kbuild invocation. Do
+    // not validate/build only the initramfs subset or it would alternate the
+    // shared cache between early-root and full-root manifests.
+    ensure_linux_driver_module_artifacts(&selected)
+        .expect("configured Linux driver module artifacts must be built");
+    EARLY_ROOT_MODULE_NAMES
+        .iter()
+        .filter_map(|name| {
+            selected
+                .iter()
+                .copied()
+                .find(|spec| spec.module_name == *name)
+        })
+        .collect()
+}
+
+fn early_root_module_paths(modules: &[&DriverModuleSpec]) -> Vec<u8> {
+    let mut paths = String::new();
+    for spec in modules {
+        paths.push_str("/lib/modules/");
+        paths.push_str(MODULE_VERSION_DIR);
+        paths.push('/');
+        paths.push_str(spec.module_path);
+        paths.push('\n');
+    }
+    paths.into_bytes()
+}
+
+fn build_initramfs_init_binary() -> Vec<u8> {
+    let root = repo_root().expect("repository root for initramfs /init");
+    let source = root.join("src/usr/initramfs_init.c");
+    let target = xtask_target_dir().expect("xtask target for initramfs /init");
+    fs::create_dir_all(&target).expect("create xtask target for initramfs /init");
+    let output = target.join("initramfs-init");
+    let compiler = env::var_os("HOSTCC")
+        .or_else(|| env::var_os("CC"))
+        .unwrap_or_else(|| "cc".into());
+    let mut command = Command::new(compiler);
+    command
+        .args([
+            "-std=c11",
+            "-Os",
+            "-ffreestanding",
+            "-fno-builtin",
+            "-fno-stack-protector",
+            "-fPIE",
+            "-fno-asynchronous-unwind-tables",
+            "-fno-unwind-tables",
+            "-nostdlib",
+            "-static-pie",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wl,--build-id=none",
+            "-Wl,-z,noexecstack",
+            "-Wl,-e,_start",
+            "-s",
+            "-o",
+        ])
+        .arg(&output)
+        .arg(&source);
+    run_command(&mut command, "freestanding Linux initramfs /init build")
+        .expect("freestanding Linux initramfs /init must build");
+    fs::read(&output).expect("read freestanding Linux initramfs /init")
+}
+
+fn linux_root_initramfs_files() -> Vec<InitramfsFile> {
+    let modules = early_root_module_specs_from_repo_config();
+    let mut files = vec![
+        initramfs_file("dev", 0o40755, Vec::new()),
+        initramfs_file("proc", 0o40555, Vec::new()),
+        initramfs_file("sys", 0o40555, Vec::new()),
+        initramfs_file("run", 0o40755, Vec::new()),
+        initramfs_file("new_root", 0o40755, Vec::new()),
+        initramfs_file("etc", 0o40755, Vec::new()),
+        initramfs_file("init", 0o100755, build_initramfs_init_binary()),
+        initramfs_file("etc/hostname", 0o100644, b"lupos\n".to_vec()),
+        initramfs_file("etc/modules", 0o100644, module_list_from_specs(&modules)),
+        initramfs_file(
+            "etc/initramfs.modules",
+            0o100644,
+            early_root_module_paths(&modules),
+        ),
+    ];
+    files.extend(
+        staged_module_files_from_specs(&modules)
+            .expect("early root Linux driver modules must be staged"),
+    );
+    files
+}
+
+fn linux_root_initramfs_cpio() -> Vec<u8> {
+    let files = linux_root_initramfs_files();
+    let borrowed = files
+        .iter()
+        .map(|(path, mode, bytes)| (path.as_str(), *mode, bytes.as_slice()))
+        .collect::<Vec<_>>();
+    build_cpio_newc(&borrowed)
+}
+
 fn initramfs_files(mode: &BootMode) -> Option<Vec<InitramfsFile>> {
-    match mode {
+    let mut files = match mode {
         BootMode::ExecveTest => Some(vec![initramfs_file(
             "init",
             0o100755,
@@ -7151,7 +8504,14 @@ fn initramfs_files(mode: &BootMode) -> Option<Vec<InitramfsFile>> {
             Some(files)
         }
         _ => None,
+    };
+    if let Some(files) = files.as_mut() {
+        // Login payloads seed empty libkmod index files.  Configured module
+        // metadata is appended later and must be the sole, authoritative
+        // entry at each path under /lib/modules/$(uname -r).
+        dedup_initramfs_files(files);
     }
+    files
 }
 
 fn build_initramfs_cpio_unconditional(mode: &BootMode) -> Option<Vec<u8>> {
@@ -7165,7 +8525,7 @@ fn build_initramfs_cpio_unconditional(mode: &BootMode) -> Option<Vec<u8>> {
 
 fn build_initramfs_cpio(mode: &BootMode) -> Option<Vec<u8>> {
     if root_disk_boot_uses_module_initrd(mode) {
-        return Some(module_stage_initramfs_cpio());
+        return Some(linux_root_initramfs_cpio());
     }
     build_initramfs_cpio_unconditional(mode)
 }
@@ -7225,7 +8585,7 @@ fn grub_cfg_content_with_cmdline(mode: &BootMode, extra_cmdline: &str) -> String
             | BootMode::GraphicsX11
             | BootMode::GraphicsWayland
     ) {
-        GRUB_INTERACTIVE_SPLASH_TIMEOUT_SECS
+        GRUB_INTERACTIVE_TIMEOUT_SECS
     } else {
         GRUB_TEST_BOOT_TIMEOUT_SECS
     };
@@ -7267,27 +8627,38 @@ fn grub_cfg_content_with_cmdline(mode: &BootMode, extra_cmdline: &str) -> String
     // Graphics boots need GRUB to hand the kernel a real VBE linear framebuffer
     // (screen_info VLFB) instead of the text console, so `/dev/fb0` is the
     // actually-displayed framebuffer and Xorg's fbdev pixels reach the screen.
+    // `gfxmode` is an ordered preference list: QEMU's EDID advertises 1280x800
+    // as the preferred mode, so ask for that first and fall back through
+    // common modes to `auto`.  `gfxpayload=keep` hands the kernel whichever
+    // mode GRUB managed to set (`gfxmode=auto` alone picks 800x600).
     // Text/login boots keep `text` so the kernel/systemd console stays usable.
-    let gfxpayload = match mode {
-        BootMode::GraphicsX11 | BootMode::GraphicsWayland => "800x600x32",
-        _ => "text",
+    let (gfxmode, gfxpayload) = match mode {
+        BootMode::GraphicsX11 | BootMode::GraphicsWayland => {
+            ("1280x800x32,1024x768x32,800x600x32,auto", "keep")
+        }
+        _ => ("800x600x32,auto", "text"),
     };
 
     format!(
         r#"set timeout={timeout}
 set default=0
 
-# Use GRUB's stock graphical terminal with the Lupos splash art as background.
+# Load the explicitly staged PF2 font before selecting gfxterm.  GRUB's
+# firmware console remains a deterministic fallback when graphics or the font
+# are unavailable.
 serial --unit=0 --speed=115200
-insmod all_video
 insmod linux
-set gfxmode=800x600x32,auto
 set gfxpayload={gfxpayload}
-insmod png
-insmod gfxterm
 terminal_input console serial
-terminal_output gfxterm serial
-background_image /boot/grub/splashart.png
+insmod font
+if loadfont $prefix/fonts/unicode.pf2; then
+    insmod all_video
+    set gfxmode={gfxmode}
+    insmod gfxterm
+    terminal_output gfxterm serial
+else
+    terminal_output console serial
+fi
 
 menuentry "lupos" {{
     # linux: GRUB command to load a Linux boot-protocol bzImage.
@@ -8096,7 +9467,39 @@ const LUPOS_LIB_TEST_ARGS: &[&str] = &["test", "-p", "lupos", "--lib", "--", "--
 // tests clobber each other's env (e.g. LUPOS_QEMU_ROOT_DISK) and flake.
 const XTASK_LIB_TEST_ARGS: &[&str] = &["test", "-p", "xtask", "--lib", "--", "--test-threads=1"];
 
+fn cargo_step_compiles_lupos(args: &[&str]) -> bool {
+    args.windows(2)
+        .any(|pair| matches!(pair[0], "-p" | "--package") && pair[1] == KERNEL_PACKAGE)
+        || args.iter().any(|arg| {
+            arg.strip_prefix("-p=") == Some(KERNEL_PACKAGE)
+                || arg.strip_prefix("--package=") == Some(KERNEL_PACKAGE)
+        })
+}
+
+fn kconfig_sync_command(root: &Path) -> Command {
+    let mut command = Command::new("make");
+    command.arg("syncconfig").current_dir(root);
+    command
+}
+
+/// Refresh `.config` and generated Kconfig outputs before consuming them.
+///
+/// The top-level `syncconfig` target owns both parts of the policy: it seeds a
+/// missing `.config` from `configs/lupos_defconfig`, then runs Kconfig's
+/// `--syncconfig` mode so an existing/old configuration and generated headers
+/// are brought up to date.  Calling only this leaf Make target is deliberate:
+/// public Make build/run targets delegate back into `cargo xtask` and would
+/// recurse if invoked from here.
+fn sync_kconfig() -> Result<()> {
+    let root = repo_root()?;
+    let mut command = kconfig_sync_command(&root);
+    run_command(&mut command, "Kconfig sync")
+}
+
 fn run_cargo_step(args: &[&str], label: &str) -> Result<()> {
+    if cargo_step_compiles_lupos(args) {
+        sync_kconfig()?;
+    }
     let mut command = cargo_command();
     command.args(args);
     run_command(&mut command, label)
@@ -10268,6 +11671,25 @@ fn root_disk_cmdline(extra_cmdline: &str) -> String {
     }
 }
 
+fn canonical_image_root_cmdline(extra_cmdline: &str) -> String {
+    const BASE: &str = "root=LABEL=lupos-root rootfstype=ext4 rw";
+    let retained = extra_cmdline
+        .split_ascii_whitespace()
+        .filter(|arg| {
+            !arg.starts_with("root=")
+                && !arg.starts_with("rootfstype=")
+                && !arg.starts_with("rootflags=")
+                && !matches!(*arg, "ro" | "rw")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if retained.is_empty() {
+        BASE.to_owned()
+    } else {
+        format!("{BASE} {retained}")
+    }
+}
+
 fn default_qemu_root_disk_guard_for_mode(mode: BootMode) -> Result<Vec<EnvVarGuard>> {
     let mut guards = Vec::new();
 
@@ -10331,8 +11753,9 @@ const SHIPPED_COMMANDS_ROOT_DISK_BYTES: u64 = 768 * 1024 * 1024;
 // touching the pacman package DB), so cached disks rebuild from the new stage.
 // v2: keep the legacy builder cache distinct after graphics staging changes.
 const LOGIN_ROOT_DISK_MANIFEST_VERSION: &str = "2";
-// v15: replace glycin-based gdk-pixbuf 2.44 with the pre-glycin 2.42.12 build.
-const DIRECT_STAGE_ROOT_DISK_MANIFEST_VERSION: &str = "15";
+// v17: restore the pinned Arch bootstrap's numeric ownership in the ext4
+// image instead of inheriting the unprivileged host user's uid/gid.
+const DIRECT_STAGE_ROOT_DISK_MANIFEST_VERSION: &str = "17";
 
 fn ensure_disk_root_remount_disk() -> Result<PathBuf> {
     let target = xtask_target_dir()?;
@@ -10752,8 +12175,9 @@ fn direct_stage_login_root_disk_overlay_files(
     let mut files = vec![
         initramfs_symlink("sbin/init", "/usr/lib/systemd/systemd"),
         initramfs_symlink("var/run", "/run"),
-        initramfs_file("sbin/poweroff", 0o100755, poweroff.clone()),
-        initramfs_file("usr/sbin/poweroff", 0o100755, poweroff),
+        // Arch is usr-merged: /sbin -> usr/bin and /usr/sbin -> bin, so both
+        // public paths resolve to this single inode in the ext4 image.
+        initramfs_file("sbin/poweroff", 0o100755, poweroff),
         initramfs_file(
             ARCH_PACMAN_XFER_HELPER,
             0o100755,
@@ -11247,8 +12671,10 @@ fn direct_stage_login_root_disk_overlay_files(
         ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes(),
     ));
     files.push(systemd_hook_shim_initramfs_file());
-    files.extend(module_files.iter().cloned());
     files.extend(libkmod_stub_initramfs_files());
+    // Real modules.dep/modules.order must replace the empty libkmod bootstrap
+    // stubs under the same uname release directory.
+    files.extend(module_files.iter().cloned());
     files.extend(extra_initramfs_files());
     dedup_initramfs_files(&mut files);
     files
@@ -11444,7 +12870,10 @@ def emit_remove(rel, host=None):
     if host is None:
         host = host_stage_path(rel)
     if os.path.islink(host):
-        commands.append("unlink %s" % image_path(rel))
+        # debugfs `unlink` deliberately leaves the inode allocated and creates
+        # an fsck-visible orphan. `rm` removes the dirent and deallocates the
+        # symlink exactly as unlink(2) would on a mounted Linux filesystem.
+        commands.append("rm %s" % image_path(rel))
     elif os.path.isdir(host):
         commands.append("rmdir %s" % image_path(rel))
     else:
@@ -11538,7 +12967,35 @@ with open(os.path.join(work, "debugfs.commands"), "w", encoding="utf-8") as out:
 PY
 echo "Creating ext4 image from staged userland..."
 truncate -s {disk_size} "$raw_build"
-mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -E no_copy_xattrs -d {stage_sh} "$raw_build"
+# The bootstrap is intentionally extracted with --no-same-owner so building
+# never needs root. Reapply its pinned numeric metadata inside fakeroot while
+# mkfs.ext4 walks the tree; the host stage itself remains owned by the caller.
+fakeroot -- sh -eu -c '
+stage=$1
+image=$2
+# Debian fakeroot records the requested metadata but its statx compatibility
+# layer can still make coreutils chown report EINVAL. Keep the fake operation,
+# then validate the visible metadata before allowing mkfs.ext4 to consume it.
+fake_chown() {{ chown "$@" 2>/dev/null || :; }}
+fake_chown -hR 0:0 "$stage"
+[ ! -e "$stage/home/lupos" ] || fake_chown -hR 1000:1000 "$stage/home/lupos"
+[ ! -e "$stage/srv/ftp" ] || fake_chown -hR 0:11 "$stage/srv/ftp"
+[ ! -e "$stage/usr/bin/wall" ] || fake_chown -h 0:5 "$stage/usr/bin/wall"
+[ ! -e "$stage/usr/bin/write" ] || fake_chown -h 0:5 "$stage/usr/bin/write"
+[ ! -e "$stage/var/games" ] || fake_chown -hR 0:50 "$stage/var/games"
+[ ! -e "$stage/usr/lib/dbus-daemon-launch-helper" ] || fake_chown -h 0:81 "$stage/usr/lib/dbus-daemon-launch-helper"
+[ ! -e "$stage/var/log/journal/remote" ] || fake_chown -hR 0:975 "$stage/var/log/journal/remote"
+[ ! -e "$stage/var/log/journal" ] || fake_chown -h 0:980 "$stage/var/log/journal"
+[ ! -e "$stage/usr/bin/groupmems" ] || fake_chown -h 0:981 "$stage/usr/bin/groupmems"
+[ ! -e "$stage/var/lib/libuuid" ] || fake_chown -hR 971:971 "$stage/var/lib/libuuid"
+[ ! -e "$stage/var/lib/tpm2-tss/system/keystore" ] || fake_chown -hR 972:972 "$stage/var/lib/tpm2-tss/system/keystore"
+[ ! -e "$stage/var/lib/systemd/network" ] || fake_chown -hR 977:977 "$stage/var/lib/systemd/network"
+[ "$(stat -c %u:%g "$stage/etc/passwd")" = 0:0 ]
+[ ! -e "$stage/home/lupos" ] || [ "$(stat -c %u:%g "$stage/home/lupos")" = 1000:1000 ]
+[ ! -e "$stage/usr/bin/wall" ] || [ "$(stat -c %u:%g "$stage/usr/bin/wall")" = 0:5 ]
+[ ! -e "$stage/var/lib/libuuid" ] || [ "$(stat -c %u:%g "$stage/var/lib/libuuid")" = 971:971 ]
+exec mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -E no_copy_xattrs -d "$stage" "$image"
+' sh {stage_sh} "$raw_build"
 echo "Applying generated root-disk overlay..."
 debugfs -w -f {overlay_work_sh}/debugfs.commands "$raw_build" >/dev/null
 echo "Publishing root disk..."
@@ -11569,6 +13026,10 @@ fn ensure_ext4_root_disk_from_initramfs(
     fstab_contents: &str,
     force_fsck: bool,
 ) -> Result<PathBuf> {
+    // This builder can run before the subsequent kernel build (notably the
+    // disk-root-fsck gate), so synchronize Kconfig before its initramfs reads
+    // `.config` to select and stage modules.
+    sync_kconfig()?;
     let target = xtask_target_dir()?;
     fs::create_dir_all(&target)
         .with_context(|| format!("failed to create {}", target.display()))?;
@@ -12155,9 +13616,10 @@ pub fn run_graphics_x11_tests() -> Result<()> {
 
     let _stage_guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
     let current_cmdline = env::var(LUPOS_KERNEL_CMDLINE_ENV).unwrap_or_default();
-    // No `lupos.synthetic_fb`: the GraphicsX11 GRUB config sets a real VBE
-    // linear framebuffer (`gfxpayload=800x600x32`) so `/dev/fb0` is the
-    // displayed framebuffer — the same path the interactive `--gui` boot uses.
+    // No `lupos.synthetic_fb`: the GraphicsX11 GRUB config keeps GRUB's real
+    // VBE linear framebuffer (`gfxpayload=keep`, 1280x800 preferred) so
+    // `/dev/fb0` is the displayed framebuffer — the same path the interactive
+    // `--gui` boot uses.
     let serial_cmdline = append_kernel_args(
         &current_cmdline,
         &["systemd.show_status=yes", "lupos.serial_getty=1"],
@@ -14695,6 +16157,7 @@ pub fn build_kernel(
     cargo_target_dir: &Path,
 ) -> Result<PathBuf> {
     let root = repo_root()?;
+    sync_kconfig()?;
     let target_json = root.join(CUSTOM_TARGET);
     let release = release_build_enabled();
 
@@ -14783,7 +16246,7 @@ fn build_release_iso(kernel_elf: &Path, target_dir: &Path) -> Result<PathBuf> {
         "release",
         0,
         &grub_cfg,
-        Some(module_stage_initramfs_cpio()),
+        Some(linux_root_initramfs_cpio()),
     )
 }
 
@@ -14821,7 +16284,6 @@ fn build_iso_from_parts(
     let grub_cfg_path = grub_dir.join("grub.cfg");
     fs::write(&grub_cfg_path, grub_cfg.as_bytes())
         .with_context(|| format!("failed to write grub.cfg to {}", grub_cfg_path.display()))?;
-    write_grub_splash_art(&iso_root)?;
 
     // For initramfs-backed modes, generate and write the CPIO image handed to
     // the kernel via the Linux boot-protocol initrd fields.
@@ -14857,6 +16319,11 @@ fn build_iso_from_parts(
 
     let mut command = Command::new("grub-mkrescue");
     command.env("SOURCE_DATE_EPOCH", "0");
+    // The generated grub.cfg selects gfxterm only after loading this exact
+    // platform-independent PF2 font.  State the grub-mkrescue default
+    // explicitly so host packaging defaults cannot silently omit or replace
+    // the glyph set used for GRUB's Unicode menu frame and selection marker.
+    command.arg("--fonts=unicode");
     // Optional override of the GRUB module directory. Hosts that only ship the
     // x86_64-efi GRUB platform produce an EFI-only ISO that legacy SeaBIOS
     // cannot boot; pointing grub-mkrescue at a directory carrying both the
@@ -15032,7 +16499,6 @@ fn build_uefi_grub_disk(
     let early_cfg = work_dir.join("early-grub.cfg");
     let bootx64 = work_dir.join("BOOTX64.EFI");
     let bzimage = work_dir.join("bzImage");
-    let splash = work_dir.join("splashart.png");
     let disk = target_dir.join(format!("lupos-{mode_name}-{run_id}.uefi.img"));
     fs::write(&grub_cfg, uefi_grub_cfg_content(mode))
         .with_context(|| format!("failed to write {}", grub_cfg.display()))?;
@@ -15043,8 +16509,6 @@ fn build_uefi_grub_disk(
     .with_context(|| format!("failed to write {}", early_cfg.display()))?;
     fs::write(&bzimage, build_bzimage_bytes_from_kernel_elf(kernel_elf)?)
         .with_context(|| format!("failed to write {}", bzimage.display()))?;
-    fs::write(&splash, SPLASH_ART_BYTES)
-        .with_context(|| format!("failed to write {}", splash.display()))?;
     let initramfs = if let Some(cpio) = build_initramfs_cpio(mode) {
         let path = work_dir.join("initramfs.cpio");
         fs::write(&path, cpio).with_context(|| format!("failed to write {}", path.display()))?;
@@ -15067,7 +16531,7 @@ fn build_uefi_grub_disk(
         .unwrap_or_default();
     let script = format!(
         r#"set -euo pipefail
-grub-mkimage -O x86_64-efi -d {modules} -p /EFI/BOOT -c {early_cfg} -o {bootx64} part_gpt fat normal configfile linux search search_fs_file serial terminal all_video png gfxterm boot
+grub-mkimage -O x86_64-efi -d {modules} -p /EFI/BOOT -c {early_cfg} -o {bootx64} part_gpt fat normal configfile linux search search_fs_file serial terminal all_video gfxterm boot
 rm -f {disk}
 dd if=/dev/zero of={disk} bs=1M count=64 status=none
 mformat -i {disk} -F ::
@@ -15079,7 +16543,6 @@ mcopy -o -i {disk} {bootx64} ::/EFI/BOOT/BOOTX64.EFI
 mcopy -o -i {disk} {grub_cfg} ::/EFI/BOOT/grub.cfg
 mcopy -o -i {disk} {grub_cfg} ::/boot/grub/grub.cfg
 mcopy -o -i {disk} {bzimage} ::/boot/bzImage
-mcopy -o -i {disk} {splash} ::/boot/grub/splashart.png
 {initrd_copy}
 "#,
         modules = shell_single_quote(&modules),
@@ -15088,7 +16551,6 @@ mcopy -o -i {disk} {splash} ::/boot/grub/splashart.png
         grub_cfg = shell_single_quote(&shell_path(&grub_cfg)),
         disk = disk_sh,
         bzimage = shell_single_quote(&shell_path(&bzimage)),
-        splash = shell_single_quote(&shell_path(&splash)),
         initrd_copy = initrd_copy.trim_end(),
     );
     let mut command = Command::new("bash");
@@ -15596,8 +17058,9 @@ pub fn run_gui_shell_boot() -> Result<()> {
     let _tablet_guard = EnvVarGuard::set(LUPOS_QEMU_USB_TABLET_ENV, "0");
 
     // The fbdev Xorg driver needs a framebuffer that is actually displayed.
-    // The GraphicsX11 GRUB config sets `gfxpayload=800x600x32`, so the kernel
-    // receives a real VBE linear framebuffer (screen_info VLFB) backing
+    // The GraphicsX11 GRUB config sets `gfxpayload=keep` with a 1280x800-first
+    // mode list, so the kernel receives a real VBE linear framebuffer
+    // (screen_info VLFB) backing
     // `/dev/fb0` — the same memory QEMU's `-vga std` shows in the window.  We
     // deliberately do NOT pass `lupos.synthetic_fb`, which would replace it with
     // an off-screen RAM buffer that never reaches the display.
@@ -15687,12 +17150,26 @@ fn run_qemu_iso_display_smoke_legacy() -> Result<()> {
 
 /// Build the GRUB ISO only (no QEMU run) and print the output path.
 fn build_iso_cmd() -> Result<()> {
+    ensure_userland_stage()?;
+    let _stage_guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
+    // Canonical image output is an owned pair, not an ISO whose initramfs or
+    // root= string can silently refer to an ambient external disk.  Linux
+    // boots the small /init-bearing initramfs first; that userspace loads the
+    // modular root transport, mounts this ext4 image, and switch_roots into it.
+    let root_disk = ensure_login_root_disk_for_mode(BootMode::Login)?;
+    let root_disk_arg = root_disk.to_string_lossy().into_owned();
+    let _root_disk_guard = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, &root_disk_arg);
+    let extra_cmdline = env::var(LUPOS_KERNEL_CMDLINE_ENV).unwrap_or_default();
+    let cmdline = canonical_image_root_cmdline(&extra_cmdline);
+    let _cmdline_guard = EnvVarGuard::set(LUPOS_KERNEL_CMDLINE_ENV, &cmdline);
+
     let target_dir = xtask_target_dir()?;
     fs::create_dir_all(&target_dir)?;
     let cargo_target_dir = target_dir.join("cargo-iso");
-    let kernel_elf = build_kernel(BootMode::Hello, false, &cargo_target_dir)?;
-    let iso = build_iso(&kernel_elf, &target_dir, &BootMode::Hello, "iso-cmd", 0)?;
+    let kernel_elf = build_kernel(BootMode::Login, false, &cargo_target_dir)?;
+    let iso = build_iso(&kernel_elf, &target_dir, &BootMode::Login, "iso-cmd", 0)?;
     println!("ISO built: {}", iso.display());
+    println!("Root disk built: {}", root_disk.display());
     Ok(())
 }
 
@@ -17060,6 +18537,11 @@ fn build_bzimage_cmd() -> Result<()> {
 }
 
 fn configured_module_files() -> Result<Vec<InitramfsFile>> {
+    // Module selection and `/etc/modules` staging must observe the same
+    // up-to-date configuration as kernel compilation. This is the common
+    // entry point for `modules`, `modules-install`, `install`, and root-disk /
+    // release staging paths that materialize configured `.ko` files.
+    sync_kconfig()?;
     let mut files = match repo_config_text() {
         Some(text) => {
             let modules = staged_module_specs_from_config_text(&text);
@@ -17069,24 +18551,85 @@ fn configured_module_files() -> Result<Vec<InitramfsFile>> {
         None => Vec::new(),
     };
     if files.is_empty() {
-        files.push(initramfs_file(
-            &format!("lib/modules/{MODULE_VERSION_DIR}/modules.order"),
-            0o100644,
-            Vec::new(),
-        ));
-        files.push(initramfs_file(
-            &format!("lib/modules/{MODULE_VERSION_DIR}/modules.dep"),
-            0o100644,
-            Vec::new(),
-        ));
+        files.extend(libkmod_stub_initramfs_files());
     }
     Ok(files)
+}
+
+fn remove_installed_module_path(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+            .with_context(|| format!("failed to clear stale {}", path.display()))?;
+    } else {
+        fs::remove_file(path)
+            .with_context(|| format!("failed to clear stale {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn reset_installed_module_tree(root: &Path) -> Result<()> {
+    let module_tree = root.join("lib/modules").join(MODULE_VERSION_DIR);
+    // Match vendor Linux scripts/Makefile.modinst: replace the in-tree
+    // `kernel/` payload and build link, but preserve independently installed
+    // `updates/` and `extra/` modules in the same release directory.
+    remove_installed_module_path(&module_tree.join("kernel"))?;
+    remove_installed_module_path(&module_tree.join("build"))?;
+    // These indexes are wholly regenerated from the exact staged artifact
+    // set below. Remove symlinks as well as regular files so writes cannot
+    // escape INSTALL_MOD_PATH.
+    for name in LIBKMOD_INDEX_FILES {
+        remove_installed_module_path(&module_tree.join(name))?;
+    }
+    Ok(())
+}
+
+fn refresh_installed_module_indexes(root: &Path) -> Result<()> {
+    // Vendor scripts/Makefile.modinst invokes depmod after installation, over
+    // the complete release tree. This keeps preserved external `updates/` and
+    // `extra/` modules discoverable alongside the replaced in-tree payload.
+    // Its additional `-e -F System.map` unresolved-symbol audit cannot be
+    // reproduced until Lupos emits a System.map for its actual Rust exports.
+    let output = Command::new(depmod_executable()?)
+        .arg("-a")
+        .arg("-b")
+        .arg(root)
+        .arg(MODULE_VERSION_DIR)
+        .env("LC_ALL", "C")
+        .output()
+        .context("failed to run depmod for installed Linux modules")?;
+    if !output.status.success() {
+        bail!(
+            "depmod failed for installed Linux modules: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn reset_owned_staged_modules_root(root: &Path) -> Result<()> {
+    let modules_root = root.join("lib/modules");
+    if modules_root.exists() {
+        fs::remove_dir_all(&modules_root)
+            .with_context(|| format!("failed to clear stale {}", modules_root.display()))?;
+    }
+    Ok(())
 }
 
 fn build_modules_cmd() -> Result<()> {
     let target_dir = xtask_target_dir()?.join("modules");
     fs::create_dir_all(&target_dir)?;
     let files = configured_module_files()?;
+    // This target is wholly xtask-owned.  Clear obsolete release directories
+    // as well as the current one so a UTS release change cannot leave two
+    // apparently installable module trees behind.
+    reset_owned_staged_modules_root(&target_dir)?;
     let written = write_staged_files(&target_dir, &files)?;
     println!("modules staged under {}", target_dir.display());
     for path in written {
@@ -17102,7 +18645,9 @@ fn install_modules_cmd() -> Result<()> {
     };
     fs::create_dir_all(&target_dir)?;
     let files = configured_module_files()?;
+    reset_installed_module_tree(&target_dir)?;
     let written = write_staged_files(&target_dir, &files)?;
+    refresh_installed_module_indexes(&target_dir)?;
     println!("modules installed under {}", target_dir.display());
     for path in written {
         println!("  {}", path.display());
@@ -17126,7 +18671,9 @@ fn install_cmd() -> Result<()> {
     })?;
     let module_root = install_root.join("modules");
     let files = configured_module_files()?;
+    reset_installed_module_tree(&module_root)?;
     write_staged_files(&module_root, &files)?;
+    refresh_installed_module_indexes(&module_root)?;
     println!("install tree staged under {}", install_root.display());
     Ok(())
 }
@@ -19355,11 +20902,8 @@ failed command output\n";
 
     #[test]
     fn direct_stage_root_disk_overlay_contains_runtime_files_and_modules() {
-        let modules = vec![initramfs_file(
-            "lib/modules/lupos/modules.dep",
-            0o100644,
-            b"dep e1000\n",
-        )];
+        let module_dep_path = format!("lib/modules/{MODULE_VERSION_DIR}/modules.dep");
+        let modules = vec![initramfs_file(&module_dep_path, 0o100644, b"dep e1000\n")];
         let files = direct_stage_login_root_disk_overlay_files(
             BootMode::LoginDisplay,
             SYSTEMD_DISK_ROOT_FSTAB,
@@ -19455,7 +20999,7 @@ failed command output\n";
             "direct-stage root disks must overlay the unlocked Lupos root password"
         );
         assert_eq!(
-            initramfs_file_bytes(&files, "lib/modules/lupos/modules.dep"),
+            initramfs_file_bytes(&files, &module_dep_path),
             Some(&b"dep e1000\n"[..])
         );
         assert!(
@@ -19991,7 +21535,7 @@ failed command output\n";
     }
 
     #[test]
-    fn login_root_disk_boot_keeps_small_module_initrd_line() {
+    fn login_root_disk_boot_keeps_linux_early_initrd_line() {
         let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, r"C:\tmp\login.raw");
         let cfg = grub_cfg_content_with_cmdline(&BootMode::LoginStackTest, "root=/dev/vda");
 
@@ -20530,6 +22074,159 @@ failed command output\n";
             &["test", "-p", "xtask", "--lib", "--", "--test-threads=1"],
             "the default xtask test gate must serialize xtask env-var tests"
         );
+    }
+
+    #[test]
+    fn kconfig_sync_command_uses_only_the_leaf_make_target() {
+        let root = Path::new("/tmp/lupos config sync root");
+        let command = kconfig_sync_command(root);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), "make");
+        assert_eq!(args, ["syncconfig"]);
+        assert_eq!(command.get_current_dir(), Some(root));
+        assert_eq!(render_command(&command), "make syncconfig");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("cargo") || arg == "build"),
+            "Kconfig preparation must not recurse through a cargo-delegating Make target"
+        );
+    }
+
+    #[test]
+    fn make_syncconfig_seeds_and_refreshes_repo_configuration() {
+        let makefile = read_repo_file("Makefile");
+        let start = makefile
+            .find(".PHONY: syncconfig")
+            .expect("Makefile must define the syncconfig target");
+        let end = makefile[start..]
+            .find(".PHONY: config")
+            .expect("syncconfig recipe must end before the config target");
+        let recipe = &makefile[start..start + end];
+
+        assert!(recipe.contains("syncconfig: $(KCONFIG_CONF) $(KCONFIG)"));
+        assert!(recipe.contains("if [ ! -f .config ]; then"));
+        assert!(recipe.contains("--defconfig=$(DEFCONFIG) $(KCONFIG)"));
+        assert!(recipe.contains("--syncconfig $(KCONFIG)"));
+        assert!(
+            !recipe.contains("$(CARGO)") && !recipe.contains("cargo xtask"),
+            "syncconfig must remain a non-recursive Kconfig-only Make target"
+        );
+    }
+
+    #[test]
+    fn cargo_step_sync_policy_is_lupos_package_specific() {
+        assert!(cargo_step_compiles_lupos(LUPOS_LIB_TEST_ARGS));
+        assert!(cargo_step_compiles_lupos(&["test", "--package", "lupos"]));
+        assert!(cargo_step_compiles_lupos(&["check", "-p=lupos"]));
+        assert!(cargo_step_compiles_lupos(&["build", "--package=lupos"]));
+
+        assert!(!cargo_step_compiles_lupos(XTASK_LIB_TEST_ARGS));
+        assert!(!cargo_step_compiles_lupos(&["fmt", "--check"]));
+        assert!(!cargo_step_compiles_lupos(&[
+            "test",
+            "--package",
+            "not-lupos"
+        ]));
+    }
+
+    #[test]
+    fn compile_and_module_entrypoints_sync_before_consuming_config() {
+        let source = read_repo_file("xtask/src/lib.rs");
+
+        let run_cargo_start = source.find("fn run_cargo_step(").expect("run_cargo_step");
+        let run_cargo_end = source[run_cargo_start..]
+            .find("fn run_driver_binary_policy_check(")
+            .expect("run_cargo_step end");
+        let run_cargo = &source[run_cargo_start..run_cargo_start + run_cargo_end];
+        assert!(run_cargo.contains("cargo_step_compiles_lupos(args)"));
+        assert!(
+            run_cargo.find("sync_kconfig()?").unwrap() < run_cargo.find("cargo_command()").unwrap(),
+            "the dev-test Lupos unit compile must sync before spawning cargo"
+        );
+
+        let build_kernel_start = source.find("pub fn build_kernel(").expect("build_kernel");
+        let build_kernel_end = source[build_kernel_start..]
+            .find("pub fn release_build_enabled(")
+            .expect("build_kernel end");
+        let build_kernel = &source[build_kernel_start..build_kernel_start + build_kernel_end];
+        assert!(
+            build_kernel.find("sync_kconfig()?").unwrap()
+                < build_kernel.find("cargo_command()").unwrap(),
+            "kernel builds must sync before spawning cargo"
+        );
+
+        let modules_start = source
+            .find("fn configured_module_files(")
+            .expect("configured_module_files");
+        let modules_end = source[modules_start..]
+            .find("fn build_modules_cmd(")
+            .expect("configured_module_files end");
+        let modules = &source[modules_start..modules_start + modules_end];
+        assert!(
+            modules.find("sync_kconfig()?").unwrap() < modules.find("repo_config_text()").unwrap(),
+            "configured module staging must sync before reading .config"
+        );
+    }
+
+    #[test]
+    fn public_build_install_release_and_run_paths_use_syncing_funnels() {
+        let source = read_repo_file("xtask/src/lib.rs");
+
+        let modules_start = source
+            .find("fn build_modules_cmd(")
+            .expect("modules command");
+        let modules_install_start = source[modules_start..]
+            .find("fn install_modules_cmd(")
+            .map(|offset| modules_start + offset)
+            .expect("modules-install command");
+        let install_start = source[modules_install_start..]
+            .find("fn install_cmd(")
+            .map(|offset| modules_install_start + offset)
+            .expect("install command");
+        let install_end = source[install_start..]
+            .find("struct BootProgressStage")
+            .map(|offset| install_start + offset)
+            .expect("install command end");
+        assert!(
+            source[modules_start..modules_install_start].contains("configured_module_files()?")
+        );
+        assert!(
+            source[modules_install_start..install_start].contains("configured_module_files()?")
+        );
+        assert!(source[install_start..install_end].contains("configured_module_files()?"));
+
+        let iso_start = source
+            .find("pub fn build_iso_artifacts(")
+            .expect("ISO artifact builder");
+        let uefi_start = source[iso_start..]
+            .find("pub fn build_uefi_disk_artifacts(")
+            .map(|offset| iso_start + offset)
+            .expect("UEFI artifact builder");
+        let kernel_start = source[uefi_start..]
+            .find("pub fn build_kernel(")
+            .map(|offset| uefi_start + offset)
+            .expect("kernel builder");
+        assert!(source[iso_start..uefi_start].contains("build_kernel("));
+        assert!(source[uefi_start..kernel_start].contains("build_kernel("));
+
+        let release_start = source.find("fn run_release_cmd(").expect("release command");
+        let release_end = source[release_start..]
+            .find("fn run_mock_ext4_write_journal_replay(")
+            .map(|offset| release_start + offset)
+            .expect("release command end");
+        assert!(source[release_start..release_end].contains("build_kernel("));
+
+        let test_start = source.find("fn dev_test_cmd(").expect("test command");
+        let test_end = source[test_start..]
+            .find("fn dev_build_actions(")
+            .map(|offset| test_start + offset)
+            .expect("test command end");
+        assert!(source[test_start..test_end].contains("run_cargo_step(LUPOS_LIB_TEST_ARGS"));
     }
 
     #[test]
@@ -21149,7 +22846,7 @@ CONFIG_VIRTIO_BLK=m
         }
         assert_eq!(
             etc_modules_from_config_text(config),
-            b"virtio_pci_modern_dev\nvirtio_pci\nvirtio_blk\n"
+            b"virtio_pci_modern_dev\nvirtio_pci_legacy_dev\nvirtio_pci\nvirtio_blk\n"
         );
     }
 
@@ -21168,7 +22865,12 @@ CONFIG_VIRTIO_BLK=m
                 .iter()
                 .map(|spec| spec.module_name)
                 .collect::<Vec<_>>(),
-            vec!["virtio_pci_modern_dev", "virtio_pci", "virtio_blk"]
+            vec![
+                "virtio_pci_modern_dev",
+                "virtio_pci_legacy_dev",
+                "virtio_pci",
+                "virtio_blk",
+            ]
         );
         assert_eq!(
             specs
@@ -21176,7 +22878,10 @@ CONFIG_VIRTIO_BLK=m
                 .find(|spec| spec.module_name == "virtio_pci")
                 .expect("virtio_pci spec")
                 .module_deps,
-            &["kernel/drivers/virtio/virtio_pci_modern_dev.ko"]
+            &[
+                "kernel/drivers/virtio/virtio_pci_legacy_dev.ko",
+                "kernel/drivers/virtio/virtio_pci_modern_dev.ko",
+            ]
         );
     }
 
@@ -21199,21 +22904,369 @@ CONFIG_VIRTIO_BLK=m
             artifacts,
             &[
                 module("virtio_pci_modern_dev"),
+                module("virtio_pci_legacy_dev"),
                 module("virtio_pci"),
                 module("virtio_blk"),
             ],
         );
 
         assert!(script.contains("git -C"));
-        assert!(script.contains("archive --format=tar HEAD"));
-        assert!(script.contains("KBUILD_MODPOST_WARN=1"));
-        assert!(script.contains("-d VIRTIO_PCI_LEGACY"));
+        assert!(script.contains("archive --format=tar --output="));
+        assert!(script.contains(
+            "test -r 'C:\\repo\\lupos\\target\\vendor-linux-src'/scripts/kconfig/symbol.c"
+        ));
+        assert!(script.contains("test -r 'C:\\repo\\lupos\\target\\vendor-linux-src'/drivers/gpu/drm/i915/display/intel_ddi.c"));
+        assert!(script.contains("xtask/vendor_abi_probe'/lupos_abi_layout_probe.c"));
+        assert!(script.contains("lupos-abi-probe'/lupos_abi_layout_probe.c"));
+        assert!(script.contains("lupos_abi_layout_probe.o V=0"));
+        assert!(script.contains("M='C:\\repo\\lupos\\target\\vendor-linux-build/lupos-abi-probe'"));
+        assert_eq!(script.matches("KBUILD_MODPOST_WARN=1 V=0").count(), 1);
+        let combined_module_make = script
+            .lines()
+            .find(|line| line.contains("KBUILD_MODPOST_WARN=1 V=0"))
+            .expect("selected modules must share one modpost pass");
+        for target in [
+            "'drivers/virtio/virtio_pci_modern_dev.ko'",
+            "'drivers/virtio/virtio_pci_legacy_dev.ko'",
+            "'drivers/virtio/virtio_pci.ko'",
+            "'drivers/block/virtio_blk.ko'",
+        ] {
+            assert!(combined_module_make.contains(target));
+        }
+        assert!(script.contains("ARCH=x86_64 KERNELRELEASE='0.1.0-lupos' x86_64_defconfig"));
+        assert_eq!(
+            script.matches("KERNELRELEASE='0.1.0-lupos'").count(),
+            5,
+            "every Kbuild phase must emit modules for the running Lupos release"
+        );
+        assert!(!script.contains("ARCH=x86_64 tinyconfig"));
+        assert!(!script.contains("-d VIRTIO_PCI_LEGACY"));
+        assert!(script.contains("CONFIG_VIRTIO_PCI_LEGACY=y"));
+        assert!(script.contains("CONFIG_VIRTIO_PCI_LIB_LEGACY=m"));
+        assert!(script.contains("CONFIG_APERTURE_HELPERS=y"));
+        assert!(script.contains("CONFIG_SCREEN_INFO=y"));
+        assert!(script.contains("# CONFIG_SYSFB_SIMPLEFB is not set"));
         assert!(script.contains("'drivers/virtio/virtio_pci_modern_dev.ko'"));
         assert!(script.contains("'kernel/drivers/virtio/virtio_pci_modern_dev.ko'"));
+        assert!(script.contains("'drivers/virtio/virtio_pci_legacy_dev.ko'"));
+        assert!(script.contains("'kernel/drivers/virtio/virtio_pci_legacy_dev.ko'"));
         assert!(script.contains("'drivers/virtio/virtio_pci.ko'"));
         assert!(script.contains("'kernel/drivers/virtio/virtio_pci.ko'"));
         assert!(script.contains("'drivers/block/virtio_blk.ko'"));
         assert!(script.contains("'kernel/drivers/block/virtio_blk.ko'"));
+    }
+
+    #[test]
+    fn generic_x86_video_module_staging_is_topological_and_duplicate_free() {
+        let config = "\
+CONFIG_MODULES=y
+CONFIG_DRM=y
+CONFIG_DRM_BOCHS=m
+CONFIG_DRM_I915=m
+CONFIG_DRM_VIRTIO_GPU=m
+";
+        let specs = staged_module_specs_from_config_text(config);
+        let names = specs
+            .iter()
+            .map(|spec| spec.module_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "zlib_deflate",
+                "i2c_core",
+                "i2c_algo_bit",
+                "agpgart",
+                "amd64_agp",
+                "intel_gtt",
+                "intel_agp",
+                "iosf_mbi",
+                "drm_panel_orientation_quirks",
+                "drm",
+                "drm_buddy",
+                "ttm",
+                "drm_kms_helper",
+                "drm_display_helper",
+                "drm_shmem_helper",
+                "virtio_dma_buf",
+                "bochs",
+                "i915",
+                "virtio_gpu",
+            ]
+        );
+
+        let mut all_paths = HashSet::new();
+        let mut all_names = HashSet::new();
+        for spec in DRIVER_MODULES {
+            assert!(
+                all_paths.insert(spec.module_path),
+                "duplicate driver module path: {}",
+                spec.module_path
+            );
+            assert!(
+                all_names.insert(spec.module_name),
+                "duplicate driver module name: {}",
+                spec.module_name
+            );
+        }
+
+        let positions = specs
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| (spec.module_path, index))
+            .collect::<HashMap<_, _>>();
+        for (index, spec) in specs.iter().enumerate() {
+            for dependency in spec.module_deps {
+                let dependency_index = positions.get(dependency).unwrap_or_else(|| {
+                    panic!(
+                        "{} dependency {} is absent from the selected closure",
+                        spec.module_name, dependency
+                    )
+                });
+                assert!(
+                    *dependency_index < index,
+                    "{} must follow dependency {} in /etc/modules",
+                    spec.module_name,
+                    dependency
+                );
+            }
+        }
+
+        assert_eq!(
+            etc_modules_from_config_text(config),
+            b"zlib_deflate\ni2c_core\ni2c_algo_bit\nagpgart\namd64_agp\nintel_gtt\nintel_agp\niosf_mbi\ndrm_panel_orientation_quirks\ndrm\ndrm_buddy\nttm\ndrm_kms_helper\ndrm_display_helper\ndrm_shmem_helper\nvirtio_dma_buf\nbochs\ni915\nvirtio_gpu\n"
+        );
+        assert_eq!(
+            modules_order_from_specs(&specs),
+            b"kernel/arch/x86/platform/intel/iosf_mbi.ko\n\
+kernel/lib/zlib_deflate/zlib_deflate.ko\n\
+kernel/drivers/virtio/virtio_dma_buf.ko\n\
+kernel/drivers/char/agp/agpgart.ko\n\
+kernel/drivers/char/agp/amd64-agp.ko\n\
+kernel/drivers/char/agp/intel-agp.ko\n\
+kernel/drivers/char/agp/intel-gtt.ko\n\
+kernel/drivers/gpu/drm/display/drm_display_helper.ko\n\
+kernel/drivers/gpu/drm/tiny/bochs.ko\n\
+kernel/drivers/gpu/drm/drm.ko\n\
+kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko\n\
+kernel/drivers/gpu/drm/drm_buddy.ko\n\
+kernel/drivers/gpu/drm/drm_shmem_helper.ko\n\
+kernel/drivers/gpu/drm/drm_kms_helper.ko\n\
+kernel/drivers/gpu/drm/ttm/ttm.ko\n\
+kernel/drivers/gpu/drm/i915/i915.ko\n\
+kernel/drivers/gpu/drm/virtio/virtio-gpu.ko\n\
+kernel/drivers/i2c/algos/i2c-algo-bit.ko\n\
+kernel/drivers/i2c/i2c-core.ko\n"
+        );
+
+        let modules_dep = String::from_utf8(modules_dep_from_specs(&specs)).unwrap();
+        assert!(modules_dep.contains(
+            "kernel/drivers/gpu/drm/i915/i915.ko: kernel/drivers/gpu/drm/drm_buddy.ko kernel/drivers/i2c/algos/i2c-algo-bit.ko kernel/arch/x86/platform/intel/iosf_mbi.ko kernel/drivers/gpu/drm/ttm/ttm.ko kernel/lib/zlib_deflate/zlib_deflate.ko kernel/drivers/gpu/drm/display/drm_display_helper.ko kernel/drivers/gpu/drm/drm_kms_helper.ko kernel/drivers/gpu/drm/drm.ko kernel/drivers/i2c/i2c-core.ko kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko kernel/drivers/char/agp/intel-gtt.ko kernel/drivers/char/agp/agpgart.ko\n"
+        ));
+        assert!(modules_dep.contains(
+            "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko: kernel/drivers/virtio/virtio_dma_buf.ko kernel/drivers/gpu/drm/drm_shmem_helper.ko kernel/drivers/gpu/drm/drm_kms_helper.ko kernel/drivers/gpu/drm/drm.ko kernel/drivers/i2c/i2c-core.ko kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko\n"
+        ));
+        assert!(!modules_dep.contains("virtio_ring.ko"));
+        assert!(!modules_dep.contains("drivers/virtio/virtio.ko"));
+        assert!(!modules_dep.contains("bitrev.ko"));
+        assert!(!modules_dep.contains("crc32.ko"));
+    }
+
+    #[test]
+    fn tuned_video_configs_derive_only_their_required_module_closure() {
+        let i915 = staged_module_specs_from_config_text(
+            "CONFIG_DRM_I915=m\n# CONFIG_AGP is not set\n# CONFIG_AGP_AMD64 is not set\n# CONFIG_AGP_INTEL is not set\n",
+        );
+        let i915_names = i915.iter().map(|spec| spec.module_name).collect::<Vec<_>>();
+        assert!(i915_names.contains(&"agpgart"));
+        assert!(i915_names.contains(&"amd64_agp"));
+        assert!(i915_names.contains(&"intel_gtt"));
+        assert!(i915_names.contains(&"intel_agp"));
+        assert!(i915_names.contains(&"i915"));
+        assert!(!i915_names.contains(&"virtio_dma_buf"));
+        assert!(!i915_names.contains(&"virtio_gpu"));
+        assert!(!i915_names.contains(&"bochs"));
+
+        // Generic support tristates can remain =m in a tuned configuration;
+        // they must not pull in another driver's closure by themselves.
+        let virtio = staged_module_specs_from_config_text(
+            "CONFIG_AGP=m\nCONFIG_AGP_AMD64=m\nCONFIG_AGP_INTEL=m\nCONFIG_DRM_KMS_HELPER=m\nCONFIG_DRM_CLIENT_LIB=m\nCONFIG_DRM_GEM_SHMEM_HELPER=m\nCONFIG_DRM_PANEL_ORIENTATION_QUIRKS=m\n# CONFIG_DRM_BOCHS is not set\n# CONFIG_DRM_I915 is not set\nCONFIG_DRM_VIRTIO_GPU=m\n",
+        );
+        assert_eq!(
+            virtio
+                .iter()
+                .map(|spec| spec.module_name)
+                .collect::<Vec<_>>(),
+            vec![
+                "i2c_core",
+                "drm_panel_orientation_quirks",
+                "drm",
+                "drm_kms_helper",
+                "drm_shmem_helper",
+                "virtio_dma_buf",
+                "virtio_gpu",
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_video_vendor_build_forces_each_artifact_symbol_once() {
+        let specs = staged_module_specs_from_config_text(
+            "CONFIG_DRM_BOCHS=m\nCONFIG_DRM_I915=m\nCONFIG_DRM_VIRTIO_GPU=m\n",
+        );
+        let script = vendor_linux_module_build_script_from_shell_paths(
+            "/repo",
+            "/source",
+            "/build",
+            "/artifacts",
+            &specs,
+        );
+        let words = script.split_whitespace().collect::<Vec<_>>();
+        let module_symbols = words
+            .windows(2)
+            .filter_map(|pair| (pair[0] == "-m").then_some(pair[1]))
+            .collect::<Vec<_>>();
+        let unique_symbols = module_symbols.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(module_symbols.len(), unique_symbols.len());
+
+        for spec in &specs {
+            let symbol = spec.symbol.trim_start_matches("CONFIG_");
+            assert_eq!(
+                module_symbols
+                    .iter()
+                    .filter(|entry| **entry == symbol)
+                    .count(),
+                1,
+                "{} must be forced to module exactly once",
+                spec.symbol
+            );
+            assert!(script.contains(&format!(
+                "'{}/{}'",
+                spec.linux_make_dir, spec.linux_make_target
+            )));
+            assert!(script.contains(&format!("'{}'", spec.module_path)));
+        }
+        assert!(!script.contains("-d DRM_FBDEV_EMULATION"));
+        assert!(script.contains("# CONFIG_DRM_FBDEV_EMULATION is not set"));
+        assert!(script.contains("CONFIG_VGA_ARB=y"));
+        assert!(script.contains("CONFIG_APERTURE_HELPERS=y"));
+        assert!(script.contains("CONFIG_VIDEO=y"));
+        assert!(script.contains("CONFIG_SCREEN_INFO=y"));
+        assert!(script.contains("! grep -qx 'CONFIG_SYSFB=y'"));
+        // The vendor objects must use the compiler/runtime facilities the
+        // running Lupos kernel actually implements.  Starting from Linux's
+        // x86_64 defconfig still selects the generic driver closure, while
+        // these explicit settings prevent Kbuild from emitting metadata for
+        // unavailable mitigation, tracing, probing, and ORC runtimes.
+        for disabled in [
+            "CPU_MITIGATIONS",
+            "X86_KERNEL_IBT",
+            "STACKPROTECTOR",
+            "FTRACE",
+            "KPROBES",
+            "JUMP_LABEL",
+            "UNWINDER_ORC",
+        ] {
+            assert!(script.contains(&format!("-d {disabled}")));
+            assert!(script.contains(&format!("# CONFIG_{disabled} is not set")));
+        }
+        assert!(script.contains("-e SMP"));
+        assert!(script.contains("CONFIG_SMP=y"));
+        assert!(script.contains("-e PREEMPT"));
+        assert!(script.contains("CONFIG_PREEMPT=y"));
+        assert!(script.contains("-d PREEMPT_DYNAMIC"));
+        assert!(script.contains("# CONFIG_PREEMPT_DYNAMIC is not set"));
+        assert!(script.contains("-e UNWINDER_FRAME_POINTER"));
+        assert!(script.contains("CONFIG_UNWINDER_FRAME_POINTER=y"));
+    }
+
+    #[test]
+    fn driver_module_manifest_fingerprints_source_policy_and_selected_closure() {
+        let i915 = staged_module_specs_from_config_text("CONFIG_DRM_I915=m\n");
+        let virtio = staged_module_specs_from_config_text("CONFIG_DRM_VIRTIO_GPU=m\n");
+        let identity = |source_head: &str| LinuxDriverModuleBuildIdentity {
+            source_head: source_head.to_owned(),
+            abi_probe_makefile_sha256: "probe-makefile-a".to_owned(),
+            abi_probe_source_sha256: "probe-source-a".to_owned(),
+            toolchain_sha256: "toolchain-a".to_owned(),
+        };
+        let i915_manifest =
+            linux_driver_module_manifest_text(&identity("vendor-head-a"), "config-a", &i915);
+        assert!(i915_manifest.contains("source_head=vendor-head-a"));
+        assert!(i915_manifest.contains(LINUX_DRIVER_MODULE_BUILD_POLICY));
+        assert!(i915_manifest.contains(
+            "module=i915|CONFIG_DRM_I915|kernel/drivers/gpu/drm/i915/i915.ko|drivers/gpu/drm/i915/i915.ko"
+        ));
+        assert_ne!(
+            i915_manifest,
+            linux_driver_module_manifest_text(&identity("vendor-head-b"), "config-a", &i915)
+        );
+        assert_ne!(
+            i915_manifest,
+            linux_driver_module_manifest_text(&identity("vendor-head-a"), "config-a", &virtio)
+        );
+    }
+
+    #[test]
+    fn driver_module_artifact_cache_prunes_and_rejects_unmanifested_ko_files() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "lupos-module-artifact-audit-{}-{nonce}",
+            std::process::id()
+        ));
+        let selected = DRIVER_MODULES
+            .iter()
+            .find(|spec| spec.module_name == "i915")
+            .expect("i915 module spec");
+        let selected_path = root.join(selected.module_path);
+        let stale_path = root.join("kernel/drivers/gpu/drm/clients/drm_client_lib.ko");
+        fs::create_dir_all(selected_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+        fs::write(&selected_path, b"selected").unwrap();
+        fs::write(&stale_path, b"stale").unwrap();
+
+        prune_linux_driver_module_artifacts_under(&root, &[selected]).unwrap();
+        assert!(selected_path.exists());
+        assert!(!stale_path.exists());
+        audit_linux_driver_module_artifact_set_under(&root, &[selected]).unwrap();
+
+        fs::write(&stale_path, b"stale-again").unwrap();
+        let error = audit_linux_driver_module_artifact_set_under(&root, &[selected]).unwrap_err();
+        assert!(error.to_string().contains("extra ["));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn video_artifact_staging_reports_the_audited_runtime_abi_blocker() {
+        let video = staged_module_specs_from_config_text("CONFIG_DRM_I915=m\n");
+        let warning = video_module_runtime_loadability_warning(&video)
+            .expect("video artifacts require a loadability warning");
+        for required_set in [
+            "DRM/KMS",
+            "I2C",
+            "AGP/TTM/GTT",
+            "dma-buf/shmem",
+            "aperture helpers/VGA arbitration",
+            "VIDEO/SCREEN_INFO",
+            "GPU buddy",
+            "i915/virtio-gpu",
+            "not runtime success",
+        ] {
+            assert!(
+                warning.contains(required_set),
+                "missing {required_set}: {warning}"
+            );
+        }
+
+        let storage = staged_module_specs_from_config_text("CONFIG_SCSI=m\n");
+        assert_eq!(video_module_runtime_loadability_warning(&storage), None);
+        assert_eq!(
+            INTENTIONAL_LUPOS_BUILTIN_MODULE_SUBSTITUTES,
+            &["bitrev", "crc32", "virtio", "virtio_ring"]
+        );
     }
 
     #[test]
@@ -21228,7 +23281,7 @@ CONFIG_SATA_AHCI=m
 ";
         assert_eq!(
             etc_modules_from_config_text(config),
-            b"scsi_common\nscsi_mod\nsd_mod\nlibata\nlibahci\nahci\n"
+            b"bsg\nscsi_common\nscsi_mod\nsd_mod\nlibata\nlibahci\nahci\n"
         );
         let specs = staged_module_specs_from_config_text(config);
         assert_eq!(
@@ -21241,6 +23294,8 @@ CONFIG_SATA_AHCI=m
                 "kernel/drivers/ata/libahci.ko",
                 "kernel/drivers/ata/libata.ko",
                 "kernel/drivers/scsi/scsi_mod.ko",
+                "kernel/block/bsg.ko",
+                "kernel/drivers/scsi/scsi_common.ko",
             ]
         );
     }
@@ -21257,7 +23312,7 @@ CONFIG_E1000=m
 ";
         assert_eq!(
             etc_modules_from_config_text(config),
-            b"virtio_pci_modern_dev\nvirtio_pci\nvirtio_blk\nvirtio_net\ne1000\n"
+            b"virtio_pci_modern_dev\nvirtio_pci_legacy_dev\nvirtio_pci\nvirtio_blk\nvirtio_net\ne1000\n"
         );
 
         let config = "\
@@ -24588,8 +26643,9 @@ CONFIG_MODULES=y
         assert_eq!(cfg.matches("rootfstype=ext4").count(), 2);
         assert_eq!(cfg.matches(" rw").count(), 2);
         assert_eq!(cfg.matches("initrd /boot/initramfs.cpio").count(), 2);
-        assert!(cfg.contains("insmod png"));
-        assert!(cfg.contains("background_image /boot/grub/splashart.png"));
+        assert!(!cfg.contains("insmod png"));
+        assert!(!cfg.contains("background_image"));
+        assert!(!cfg.contains("splashart.png"));
         assert!(cfg.contains("lupos recovery"));
         assert!(cfg.contains("os-prober"));
         assert!(!cfg.contains("quiet splash"));
@@ -24603,7 +26659,7 @@ CONFIG_MODULES=y
     }
 
     #[test]
-    fn release_builder_uses_login_kernel_and_module_initrd() {
+    fn release_builder_uses_login_kernel_and_linux_root_initrd() {
         let source = read_repo_file("xtask/src/lib.rs");
         let release_start = source
             .find("fn run_release_cmd()")
@@ -24625,7 +26681,7 @@ CONFIG_MODULES=y
             .expect("release ISO builder should delegate to shared ISO writer");
         let iso_body = &source[iso_start..iso_start + iso_end];
         assert!(iso_body.contains("release_grub_cfg_content()"));
-        assert!(iso_body.contains("Some(module_stage_initramfs_cpio())"));
+        assert!(iso_body.contains("Some(linux_root_initramfs_cpio())"));
 
         let root_start = source
             .find("fn write_release_root(")
@@ -24635,20 +26691,26 @@ CONFIG_MODULES=y
             .expect("release root writer should end before GRUB config");
         let root_body = &source[root_start..root_start + root_end];
         assert!(root_body.contains("\"boot/initramfs.cpio\""));
-        assert!(root_body.contains("module_stage_initramfs_cpio()"));
+        assert!(root_body.contains("linux_root_initramfs_cpio()"));
     }
 
     #[test]
-    fn grub_cfg_uses_lupos_splash_art_for_boot_modes() {
+    fn grub_cfg_uses_plain_background_for_boot_modes() {
         let cfg = grub_cfg_content_with_cmdline(&BootMode::Login, "");
         assert!(cfg.contains("set timeout=2"));
-        assert!(cfg.contains("insmod png"));
         assert!(cfg.contains("set gfxpayload=text"));
-        assert!(cfg.contains("background_image /boot/grub/splashart.png"));
+        assert!(!cfg.contains("insmod png"));
+        assert!(!cfg.contains("background_image"));
+        assert!(!cfg.contains("splashart.png"));
         assert!(cfg.contains("linux /boot/bzImage systemd.show_status=yes"));
         assert!(cfg.contains("initrd /boot/initramfs.cpio"));
         assert!(!cfg.contains("multiboot2 /boot/lupos.elf"));
-        assert!(SPLASH_ART_BYTES.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let graphics_cfg = grub_cfg_content_with_cmdline(&BootMode::GraphicsX11, "");
+        assert!(graphics_cfg.contains("set gfxmode=1280x800x32,1024x768x32,800x600x32,auto"));
+        assert!(graphics_cfg.contains("set gfxpayload=keep"));
+        assert!(!graphics_cfg.contains("background_image"));
+        assert!(!graphics_cfg.contains("splashart.png"));
     }
 
     #[test]
@@ -24658,7 +26720,9 @@ CONFIG_MODULES=y
         assert!(cfg.contains("insmod linux"));
         assert!(cfg.contains("linux /boot/bzImage"));
         assert!(cfg.contains("set gfxpayload=text"));
-        assert!(cfg.contains("background_image /boot/grub/splashart.png"));
+        assert!(!cfg.contains("insmod png"));
+        assert!(!cfg.contains("background_image"));
+        assert!(!cfg.contains("splashart.png"));
         assert!(!cfg.contains("initrd /boot/initramfs.cpio"));
         assert!(!cfg.contains("multiboot2"));
         assert!(!cfg.contains("LUPOS.ELF"));
@@ -24678,23 +26742,25 @@ CONFIG_MODULES=y
         assert!(body.contains("build_bzimage_bytes_from_kernel_elf"));
         assert!(body.contains("::/boot/bzImage"));
         assert!(body.contains("linux search"));
+        assert!(!body.contains("splashart.png"));
+        assert!(!body.contains(" png "));
         assert!(!body.contains("multiboot2"));
         assert!(!body.contains("LUPOS.ELF"));
     }
 
     #[test]
-    fn iso_staging_writes_lupos_splash_art_asset() {
-        let root = repo_root()
-            .expect("repo root")
-            .join("target/xtask-test/iso-splash-stage");
-        let _ = fs::remove_dir_all(&root);
+    fn iso_builder_does_not_stage_grub_background_art() {
+        let source = read_repo_file("xtask/src/lib.rs");
+        let start = source
+            .find("fn build_iso_from_parts(")
+            .expect("shared ISO builder should exist");
+        let end = source[start..]
+            .find("fn uefi_grub_cfg_content(")
+            .expect("shared ISO builder should end before UEFI config");
+        let body = &source[start..start + end];
 
-        let path = write_grub_splash_art(&root).expect("write splash art");
-        assert_eq!(path, root.join("boot/grub/splashart.png"));
-        let bytes = fs::read(&path).expect("read staged splash art");
-        assert_eq!(bytes, SPLASH_ART_BYTES);
-
-        let _ = fs::remove_dir_all(&root);
+        assert!(!body.contains("splashart.png"));
+        assert!(!body.contains("background_image"));
     }
 
     #[test]
@@ -26161,10 +28227,10 @@ CONFIG_MODULES=y
             "etc/modules\tfile\t100644\tlogin-etc",
             "swapfile\tfile\t100600\tgenerated",
             "usr/share/lupos/release.txt\tfile\t100644\tgenerated",
-            "boot/grub/splashart.png\tfile\t100644\trelease-boot",
         ] {
             assert!(manifest.contains(needle), "FHS manifest missing {needle}");
         }
+        assert!(!manifest.contains("boot/grub/splashart.png"));
         assert!(
             manifest.contains("sbin/init\tfile\t100755\tlogin-userland")
                 || manifest.contains("sbin/init\tsymlink\t120777\tlogin-userland"),
@@ -26203,13 +28269,13 @@ CONFIG_MODULES=y
 
         assert!(root.join("boot/bzImage").is_file());
         assert!(root.join("boot/grub/grub.cfg").is_file());
-        assert!(root.join("boot/grub/splashart.png").is_file());
+        assert!(!root.join("boot/grub/splashart.png").exists());
         assert!(root.join("bin/bash").is_file());
         assert!(root.join("sbin/init").is_file());
         assert!(root.join("home/lupos").is_dir());
         assert!(manifest_text.contains("boot/bzImage\tfile\t100644\trelease-boot"));
         assert!(manifest_text.contains("boot/grub/grub.cfg\tfile\t100644\trelease-boot"));
-        assert!(manifest_text.contains("boot/grub/splashart.png\tfile\t100644\trelease-boot"));
+        assert!(!manifest_text.contains("boot/grub/splashart.png"));
         #[cfg(unix)]
         {
             assert_eq!(staged_fs_mode(&root.join("etc/shadow")), 0o600);

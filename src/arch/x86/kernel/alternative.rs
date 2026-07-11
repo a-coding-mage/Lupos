@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/kernel/alternative.c
 //! test-origin: linux:vendor/linux/arch/x86/kernel/alternative.c
 //! x86 alternative instruction patching helpers.

@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/xen
 //! test-origin: linux:vendor/linux/arch/x86/xen
 //! Xen x86 paravirtualization policy.

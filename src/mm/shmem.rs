@@ -1,5 +1,6 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/mm/shmem.c
+//! linux-source: vendor/linux/drivers/base/devtmpfs.c
 //! test-origin: linux:vendor/linux/mm/shmem.c
 //! shmem, memfd, secretmem, and userfaultfd.
 //!
@@ -761,8 +762,9 @@ pub mod tmpfs_vfs {
 
     use alloc::string::String;
     use core::sync::atomic::Ordering;
+    use spin::Mutex;
 
-    use crate::fs::dcache::d_alloc;
+    use crate::fs::dcache::{d_alloc, d_drop, d_lookup};
     use crate::fs::libfs::{
         empty_ram_bytes, empty_ram_dir, ram_file_read, ram_file_write, simple_lookup,
         simple_readdir, simple_rmdir, simple_unlink,
@@ -770,13 +772,22 @@ pub mod tmpfs_vfs {
     use crate::fs::ops::{FileOps, InodeOps, SuperOps};
     use crate::fs::super_block::{FileSystemType, register_filesystem};
     use crate::fs::types::{
-        Inode, InodeKind, InodePrivate, InodeRef, SuperBlock, SuperBlockRef, touch_inode_now,
+        DentryRef, Inode, InodeKind, InodePrivate, InodeRef, SuperBlock, SuperBlockRef,
+        touch_inode_now,
     };
-    use crate::include::uapi::errno::{EEXIST, EINVAL};
+    use crate::include::uapi::errno::{EEXIST, EINVAL, EPERM};
     use crate::linux_driver_abi::input::evdev_chardev::EVDEV_FILE_OPS;
     use crate::linux_driver_abi::video::fbdev::FBDEV_FILE_OPS;
 
     const TMPFS_MAGIC: u64 = 0x01021994;
+
+    // Linux keeps one internal devtmpfs mount and device_add() publishes into
+    // it regardless of when userspace mounts devtmpfs.  Lupos' VFS exposes the
+    // mounted root directly, so retain that root for the equivalent block
+    // device registration callback.
+    static DEVTMPFS_ROOT: Mutex<Option<DentryRef>> = Mutex::new(None);
+    static DEVTMPFS_SUPERBLOCK: Mutex<Option<SuperBlockRef>> = Mutex::new(None);
+    const DEVTMPFS_BLOCK_INODE_MARKER: usize = 0x6465_7674_6d70_626c;
 
     pub static TMPFS_DIR_INODE_OPS: InodeOps = InodeOps {
         name: "tmpfs_dir",
@@ -917,6 +928,23 @@ pub mod tmpfs_vfs {
         i
     }
 
+    fn make_devtmpfs_block(sb: &SuperBlockRef, mode: u32) -> InodeRef {
+        let inode = Inode::new(
+            sb.alloc_ino(),
+            InodeKind::Blockdev,
+            mode,
+            &TMPFS_FILE_INODE_OPS,
+            &crate::block::block_device::BLOCK_DEVICE_FILE_OPS,
+            InodePrivate::Opaque(DEVTMPFS_BLOCK_INODE_MARKER),
+        );
+        // Linux stores the registered device's dev_t in i_rdev.  The native
+        // Lupos BlockDevice registry currently has no dev_t field, so leave
+        // rdev at zero rather than fabricating a major/minor; I/O binds through
+        // the live registry name until that device-model ABI is available.
+        *inode.sb.lock() = Some(sb.clone());
+        inode
+    }
+
     fn dir_map(
         dir: &InodeRef,
     ) -> Result<&spin::Mutex<alloc::collections::BTreeMap<alloc::string::String, InodeRef>>, i32>
@@ -970,8 +998,29 @@ pub mod tmpfs_vfs {
         inode: InodeRef,
     ) -> Result<crate::fs::types::DentryRef, i32> {
         let parent_inode = parent.inode().ok_or(EINVAL)?;
-        insert_tmpfs_inode(&parent_inode, name, inode.clone())?;
-        let child = crate::fs::dcache::d_alloc_child(parent, name);
+        // Hold the parent dcache write side across the RamDir insertion and
+        // d_instantiate, matching Linux's locked negative-dentry creation
+        // path.  In particular, `/init` may have cached a negative `/dev/vda`
+        // while waiting for virtio-blk; device registration must instantiate
+        // that same dentry instead of treating it as an existing device.
+        let mut children = parent.children.write();
+        let (child, newly_hashed) = if let Some(existing) = children.get(name).cloned() {
+            if existing.inode().is_some() {
+                return Err(EEXIST);
+            }
+            (existing, false)
+        } else {
+            let child = d_alloc(name);
+            *child.parent.lock() = Some(parent.clone());
+            children.insert(String::from(name), child.clone());
+            (child, true)
+        };
+        if let Err(errno) = insert_tmpfs_inode(&parent_inode, name, inode.clone()) {
+            if newly_hashed {
+                children.remove(name);
+            }
+            return Err(errno);
+        }
         child.instantiate(inode);
         Ok(child)
     }
@@ -1025,13 +1074,6 @@ pub mod tmpfs_vfs {
             "ptmx",
             make_special(sb, InodeKind::Chardev, 0o666, &TMPFS_FILE_OPS),
         )?;
-        for name in ["vda", "vda1"] {
-            insert_child(
-                &root,
-                name,
-                make_special(sb, InodeKind::Blockdev, 0o660, &TMPFS_FILE_OPS),
-            )?;
-        }
         let pts = insert_child(&root, "pts", make_dir(sb))?;
         insert_child(
             &pts,
@@ -1050,6 +1092,133 @@ pub mod tmpfs_vfs {
         Ok(())
     }
 
+    fn create_devtmpfs_block_node(name: &str) -> Result<(), i32> {
+        let root = DEVTMPFS_ROOT.lock().clone().ok_or(EINVAL)?;
+        let sb = root
+            .inode()
+            .and_then(|inode| inode.sb.lock().clone())
+            .ok_or(EINVAL)?;
+        let node_path = name
+            .strip_prefix("/dev/")
+            .or_else(|| name.strip_prefix("dev/"))
+            .unwrap_or(name)
+            .trim_matches('/');
+        if node_path.is_empty() {
+            return Err(EINVAL);
+        }
+
+        let mut parent = root;
+        let mut components = node_path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .peekable();
+        while let Some(component) = components.next() {
+            if component == "." || component == ".." {
+                return Err(EINVAL);
+            }
+            let is_leaf = components.peek().is_none();
+            if let Some(existing) = d_lookup(&parent, component) {
+                if is_leaf {
+                    // devtmpfs requests are idempotent for an already-published
+                    // block node. A negative dentry is the normal result of
+                    // userspace polling before device_add(); instantiate it.
+                    // Never replace a positive user-created or differently
+                    // typed inode at the requested path.
+                    if let Some(inode) = existing.inode() {
+                        return if inode.kind == InodeKind::Blockdev
+                            && core::ptr::eq(
+                                inode.fops,
+                                &crate::block::block_device::BLOCK_DEVICE_FILE_OPS,
+                            ) {
+                            Ok(())
+                        } else {
+                            Err(EEXIST)
+                        };
+                    }
+                    insert_child(&parent, component, make_devtmpfs_block(&sb, 0o600))?;
+                    return Ok(());
+                }
+                let Some(inode) = existing.inode() else {
+                    parent = insert_child(&parent, component, make_dir(&sb))?;
+                    continue;
+                };
+                if inode.kind != InodeKind::Directory {
+                    return Err(EEXIST);
+                }
+                parent = existing;
+                continue;
+            }
+
+            if is_leaf {
+                insert_child(&parent, component, make_devtmpfs_block(&sb, 0o600))?;
+                return Ok(());
+            }
+
+            parent = insert_child(&parent, component, make_dir(&sb))?;
+        }
+        Err(EINVAL)
+    }
+
+    /// Publish a newly registered block device into the active devtmpfs.
+    /// `device_add()` ignores devtmpfs node-creation errors in Linux, so this
+    /// intentionally remains a best-effort notification.
+    pub fn publish_devtmpfs_block_device(name: &str) {
+        let _ = create_devtmpfs_block_node(name);
+    }
+
+    fn remove_devtmpfs_block_node(name: &str) -> Result<(), i32> {
+        let root = DEVTMPFS_ROOT.lock().clone().ok_or(EINVAL)?;
+        let node_path = name
+            .strip_prefix("/dev/")
+            .or_else(|| name.strip_prefix("dev/"))
+            .unwrap_or(name)
+            .trim_matches('/');
+        let (parent_path, leaf) = node_path.rsplit_once('/').unwrap_or(("", node_path));
+        if leaf.is_empty() || leaf == "." || leaf == ".." {
+            return Err(EINVAL);
+        }
+
+        let mut parent = root;
+        for component in parent_path
+            .split('/')
+            .filter(|component| !component.is_empty())
+        {
+            if component == "." || component == ".." {
+                return Err(EINVAL);
+            }
+            let next = d_lookup(&parent, component).ok_or(EINVAL)?;
+            if next
+                .inode()
+                .is_none_or(|inode| inode.kind != InodeKind::Directory)
+            {
+                return Err(EINVAL);
+            }
+            parent = next;
+        }
+
+        let dentry = d_lookup(&parent, leaf).ok_or(EINVAL)?;
+        let inode = dentry.inode().ok_or(EINVAL)?;
+        if inode.kind != InodeKind::Blockdev
+            || !matches!(
+                &inode.private,
+                InodePrivate::Opaque(marker) if *marker == DEVTMPFS_BLOCK_INODE_MARKER
+            )
+        {
+            // `devtmpfs_delete_node()` only removes inodes it created.
+            return Err(EPERM);
+        }
+        let parent_inode = parent.inode().ok_or(EINVAL)?;
+        simple_unlink(&parent_inode, leaf)?;
+        d_drop(&parent, leaf);
+        Ok(())
+    }
+
+    /// Remove the kernel-created node corresponding to an unregistered block
+    /// device.  User-created block nodes are preserved, matching dev_mynode().
+    pub fn unpublish_devtmpfs_block_device(name: &str) {
+        let _ = remove_devtmpfs_block_node(name);
+    }
+
     fn mount_named(fs_name: &'static str) -> Result<SuperBlockRef, i32> {
         let sb = SuperBlock::alloc(fs_name, TMPFS_MAGIC, &TMPFS_SUPER_OPS);
         let root_inode = make_dir(&sb);
@@ -1064,8 +1233,21 @@ pub mod tmpfs_vfs {
     }
 
     pub fn mount_devtmpfs(_source: &str, _flags: u64, _data: &str) -> Result<SuperBlockRef, i32> {
+        // `devtmpfs_get_tree()` returns the one internal devtmpfs superblock
+        // for every mount.  Keep the initialization lock through the registry
+        // snapshot so a concurrent duplicate mount cannot observe a root that
+        // missed devices registered before publication became active.
+        let mut mounted = DEVTMPFS_SUPERBLOCK.lock();
+        if let Some(sb) = mounted.as_ref() {
+            return Ok(sb.clone());
+        }
         let sb = mount_named("devtmpfs")?;
         populate_devtmpfs(&sb)?;
+        *DEVTMPFS_ROOT.lock() = sb.root();
+        // Close the registration-before-mount window.  Devices registered
+        // after this snapshot publish themselves from register_block_device().
+        crate::block::block_device::publish_registered_block_devices_to_devtmpfs();
+        *mounted = Some(sb.clone());
         Ok(sb)
     }
 
@@ -1127,10 +1309,6 @@ pub mod tmpfs_vfs {
                 kmsg_inode.fops.poll.is_some(),
                 "/dev/kmsg must be pollable for systemd-journald"
             );
-            for name in ["vda", "vda1"] {
-                assert_eq!(child_kind(&sb, name), InodeKind::Blockdev, "{name}");
-            }
-
             let input = d_lookup(&root, "input").expect("input dentry");
             assert_eq!(
                 input.inode().expect("input inode").kind,
@@ -1215,5 +1393,6 @@ pub mod tmpfs_vfs {
 
 pub use tmpfs_vfs::{
     TMPFS_DIR_FILE_OPS, TMPFS_DIR_INODE_OPS, TMPFS_FILE_INODE_OPS, TMPFS_FILE_OPS, TMPFS_SUPER_OPS,
-    mount, mount_devpts, mount_devtmpfs, register,
+    mount, mount_devpts, mount_devtmpfs, publish_devtmpfs_block_device, register,
+    unpublish_devtmpfs_block_device,
 };

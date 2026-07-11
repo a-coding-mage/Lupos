@@ -36,68 +36,68 @@ pub const LINUX_QUEUE_LIMITS_LOGICAL_BLOCK_SIZE_OFFSET: usize = 0x38;
 pub const LINUX_REQUEST_QUEUE_DISK_OFFSET: usize = 0x60;
 pub const LINUX_REQUEST_QUEUE_MQ_KOBJ_OFFSET: usize = 0x68;
 pub const LINUX_REQUEST_QUEUE_LIMITS_OFFSET: usize = 0x70;
-pub const LINUX_REQUEST_QUEUE_PM_ONLY_OFFSET: usize = 0x130;
-pub const LINUX_REQUEST_QUEUE_STATS_OFFSET: usize = 0x138;
-pub const LINUX_REQUEST_QUEUE_RQ_QOS_OFFSET: usize = 0x140;
-pub const LINUX_REQUEST_QUEUE_RQ_QOS_MUTEX_OFFSET: usize = 0x148;
-pub const LINUX_REQUEST_QUEUE_ID_OFFSET: usize = 0x158;
-pub const LINUX_REQUEST_QUEUE_NR_REQUESTS_OFFSET: usize = 0x15c;
-pub const LINUX_REQUEST_QUEUE_ASYNC_DEPTH_OFFSET: usize = 0x160;
-pub const LINUX_REQUEST_QUEUE_TIMEOUT_OFFSET: usize = 0x168;
-pub const LINUX_REQUEST_QUEUE_TIMEOUT_WORK_OFFSET: usize = 0x190;
-pub const LINUX_REQUEST_QUEUE_NR_ACTIVE_REQUESTS_SHARED_TAGS_OFFSET: usize = 0x1b0;
-pub const LINUX_REQUEST_QUEUE_SCHED_SHARED_TAGS_OFFSET: usize = 0x1b8;
-pub const LINUX_REQUEST_QUEUE_ICQ_LIST_OFFSET: usize = 0x1c0;
-pub const LINUX_REQUEST_QUEUE_NODE_OFFSET: usize = 0x1d0;
-pub const LINUX_REQUEST_QUEUE_REQUEUE_LOCK_OFFSET: usize = 0x1d4;
-pub const LINUX_REQUEST_QUEUE_REQUEUE_LIST_OFFSET: usize = 0x1d8;
-pub const LINUX_REQUEST_QUEUE_REQUEUE_WORK_OFFSET: usize = 0x1e8;
-pub const LINUX_REQUEST_QUEUE_FQ_OFFSET: usize = 0x240;
-pub const LINUX_REQUEST_QUEUE_FLUSH_LIST_OFFSET: usize = 0x248;
-pub const LINUX_REQUEST_QUEUE_ELEVATOR_LOCK_OFFSET: usize = 0x258;
-pub const LINUX_REQUEST_QUEUE_SYSFS_LOCK_OFFSET: usize = 0x268;
-pub const LINUX_REQUEST_QUEUE_LIMITS_LOCK_OFFSET: usize = 0x278;
-pub const LINUX_REQUEST_QUEUE_UNUSED_HCTX_LIST_OFFSET: usize = 0x288;
-pub const LINUX_REQUEST_QUEUE_UNUSED_HCTX_LOCK_OFFSET: usize = 0x298;
-pub const LINUX_REQUEST_QUEUE_MQ_FREEZE_DEPTH_OFFSET: usize = 0x298;
-pub const LINUX_REQUEST_QUEUE_RCU_HEAD_OFFSET: usize = 0x2a0;
-pub const LINUX_REQUEST_QUEUE_MQ_FREEZE_WQ_OFFSET: usize = 0x2b0;
-pub const LINUX_REQUEST_QUEUE_MQ_FREEZE_LOCK_OFFSET: usize = 0x2c0;
-pub const LINUX_REQUEST_QUEUE_TAG_SET_OFFSET: usize = 0x2d0;
-pub const LINUX_REQUEST_QUEUE_TAG_SET_LIST_OFFSET: usize = 0x2d8;
-pub const LINUX_REQUEST_QUEUE_DEBUGFS_DIR_OFFSET: usize = 0x2e8;
-pub const LINUX_REQUEST_QUEUE_SCHED_DEBUGFS_DIR_OFFSET: usize = 0x2f0;
-pub const LINUX_REQUEST_QUEUE_RQOS_DEBUGFS_DIR_OFFSET: usize = 0x2f8;
-pub const LINUX_REQUEST_QUEUE_DEBUGFS_MUTEX_OFFSET: usize = 0x300;
-pub const LINUX_REQUEST_QUEUE_SIZE: usize = 0x310;
-pub const LINUX_MUTEX_SIZE: usize = 0x10;
+pub const LINUX_REQUEST_QUEUE_PM_ONLY_OFFSET: usize = 0x13c;
+pub const LINUX_REQUEST_QUEUE_STATS_OFFSET: usize = 0x140;
+pub const LINUX_REQUEST_QUEUE_RQ_QOS_OFFSET: usize = 0x148;
+pub const LINUX_REQUEST_QUEUE_RQ_QOS_MUTEX_OFFSET: usize = 0x150;
+pub const LINUX_REQUEST_QUEUE_ID_OFFSET: usize = 0x168;
+pub const LINUX_REQUEST_QUEUE_NR_REQUESTS_OFFSET: usize = 0x16c;
+pub const LINUX_REQUEST_QUEUE_ASYNC_DEPTH_OFFSET: usize = 0x170;
+pub const LINUX_REQUEST_QUEUE_TIMEOUT_OFFSET: usize = 0x178;
+pub const LINUX_REQUEST_QUEUE_TIMEOUT_WORK_OFFSET: usize = 0x1a0;
+pub const LINUX_REQUEST_QUEUE_NR_ACTIVE_REQUESTS_SHARED_TAGS_OFFSET: usize = 0x1c0;
+pub const LINUX_REQUEST_QUEUE_SCHED_SHARED_TAGS_OFFSET: usize = 0x1c8;
+pub const LINUX_REQUEST_QUEUE_ICQ_LIST_OFFSET: usize = 0x1d0;
+pub const LINUX_REQUEST_QUEUE_NODE_OFFSET: usize = 0x218;
+pub const LINUX_REQUEST_QUEUE_REQUEUE_LOCK_OFFSET: usize = 0x21c;
+pub const LINUX_REQUEST_QUEUE_REQUEUE_LIST_OFFSET: usize = 0x220;
+pub const LINUX_REQUEST_QUEUE_REQUEUE_WORK_OFFSET: usize = 0x230;
+pub const LINUX_REQUEST_QUEUE_FQ_OFFSET: usize = 0x288;
+pub const LINUX_REQUEST_QUEUE_FLUSH_LIST_OFFSET: usize = 0x290;
+pub const LINUX_REQUEST_QUEUE_ELEVATOR_LOCK_OFFSET: usize = 0x2a0;
+pub const LINUX_REQUEST_QUEUE_SYSFS_LOCK_OFFSET: usize = 0x2b8;
+pub const LINUX_REQUEST_QUEUE_LIMITS_LOCK_OFFSET: usize = 0x2d0;
+pub const LINUX_REQUEST_QUEUE_UNUSED_HCTX_LIST_OFFSET: usize = 0x2e8;
+pub const LINUX_REQUEST_QUEUE_UNUSED_HCTX_LOCK_OFFSET: usize = 0x2f8;
+pub const LINUX_REQUEST_QUEUE_MQ_FREEZE_DEPTH_OFFSET: usize = 0x2fc;
+pub const LINUX_REQUEST_QUEUE_RCU_HEAD_OFFSET: usize = 0x300;
+pub const LINUX_REQUEST_QUEUE_MQ_FREEZE_WQ_OFFSET: usize = 0x310;
+pub const LINUX_REQUEST_QUEUE_MQ_FREEZE_LOCK_OFFSET: usize = 0x328;
+pub const LINUX_REQUEST_QUEUE_TAG_SET_OFFSET: usize = 0x340;
+pub const LINUX_REQUEST_QUEUE_TAG_SET_LIST_OFFSET: usize = 0x348;
+pub const LINUX_REQUEST_QUEUE_DEBUGFS_DIR_OFFSET: usize = 0x358;
+pub const LINUX_REQUEST_QUEUE_SCHED_DEBUGFS_DIR_OFFSET: usize = 0x360;
+pub const LINUX_REQUEST_QUEUE_RQOS_DEBUGFS_DIR_OFFSET: usize = 0x368;
+pub const LINUX_REQUEST_QUEUE_DEBUGFS_MUTEX_OFFSET: usize = 0x370;
+pub const LINUX_REQUEST_QUEUE_SIZE: usize = 0x388;
+pub const LINUX_MUTEX_SIZE: usize = 0x18;
 pub const LINUX_BLK_MQ_TAG_SET_DRIVER_DATA_OFFSET: usize = 0x58;
 pub const LINUX_BLK_MQ_TAG_SET_TAGS_OFFSET: usize = 0x60;
 pub const LINUX_BLK_MQ_TAG_SET_SHARED_TAGS_OFFSET: usize = 0x68;
 pub const LINUX_BLK_MQ_TAG_SET_TAG_LIST_LOCK_OFFSET: usize = 0x70;
-pub const LINUX_BLK_MQ_TAG_SET_TAG_LIST_OFFSET: usize = 0x80;
-pub const LINUX_BLK_MQ_TAG_SET_SRCU_OFFSET: usize = 0x90;
-pub const LINUX_BLK_MQ_TAG_SET_TAGS_SRCU_OFFSET: usize = 0x98;
-pub const LINUX_BLK_MQ_TAG_SET_UPDATE_NR_HWQ_LOCK_OFFSET: usize = 0x110;
-pub const LINUX_BLK_MQ_TAG_SET_SIZE: usize = 0x128;
+pub const LINUX_BLK_MQ_TAG_SET_TAG_LIST_OFFSET: usize = 0x88;
+pub const LINUX_BLK_MQ_TAG_SET_SRCU_OFFSET: usize = 0x98;
+pub const LINUX_BLK_MQ_TAG_SET_TAGS_SRCU_OFFSET: usize = 0xa0;
+pub const LINUX_BLK_MQ_TAG_SET_UPDATE_NR_HWQ_LOCK_OFFSET: usize = 0xc0;
+pub const LINUX_BLK_MQ_TAG_SET_SIZE: usize = 0xe0;
 pub const LINUX_BLK_MQ_OPS_POLL_OFFSET: usize = 0x40;
 pub const LINUX_BLK_MQ_OPS_COMPLETE_OFFSET: usize = 0x48;
 pub const LINUX_BLK_MQ_OPS_MAP_QUEUES_OFFSET: usize = 0x80;
-pub const LINUX_BLK_MQ_HW_CTX_QUEUE_OFFSET: usize = 0x90;
-pub const LINUX_BLK_MQ_HW_CTX_FQ_OFFSET: usize = 0x98;
-pub const LINUX_BLK_MQ_HW_CTX_DRIVER_DATA_OFFSET: usize = 0xa0;
-pub const LINUX_BLK_MQ_HW_CTX_CTX_MAP_OFFSET: usize = 0xa8;
-pub const LINUX_BLK_MQ_HW_CTX_DISPATCH_FROM_OFFSET: usize = 0xc8;
-pub const LINUX_BLK_MQ_HW_CTX_DISPATCH_BUSY_OFFSET: usize = 0xd0;
-pub const LINUX_BLK_MQ_HW_CTX_TYPE_OFFSET: usize = 0xd4;
-pub const LINUX_BLK_MQ_HW_CTX_NR_CTX_OFFSET: usize = 0xd6;
-pub const LINUX_BLK_MQ_HW_CTX_CTXS_OFFSET: usize = 0xd8;
-pub const LINUX_BLK_MQ_HW_CTX_TAGS_OFFSET: usize = 0x110;
-pub const LINUX_BLK_MQ_HW_CTX_SCHED_TAGS_OFFSET: usize = 0x118;
-pub const LINUX_BLK_MQ_HW_CTX_NUMA_NODE_OFFSET: usize = 0x120;
-pub const LINUX_BLK_MQ_HW_CTX_QUEUE_NUM_OFFSET: usize = 0x124;
-pub const LINUX_BLK_MQ_HW_CTX_NR_ACTIVE_OFFSET: usize = 0x128;
-pub const LINUX_BLK_MQ_HW_CTX_SIZE: usize = 0x1a0;
+pub const LINUX_BLK_MQ_HW_CTX_QUEUE_OFFSET: usize = 0xb8;
+pub const LINUX_BLK_MQ_HW_CTX_FQ_OFFSET: usize = 0xc0;
+pub const LINUX_BLK_MQ_HW_CTX_DRIVER_DATA_OFFSET: usize = 0xc8;
+pub const LINUX_BLK_MQ_HW_CTX_CTX_MAP_OFFSET: usize = 0xd0;
+pub const LINUX_BLK_MQ_HW_CTX_DISPATCH_FROM_OFFSET: usize = 0xf0;
+pub const LINUX_BLK_MQ_HW_CTX_DISPATCH_BUSY_OFFSET: usize = 0xf8;
+pub const LINUX_BLK_MQ_HW_CTX_TYPE_OFFSET: usize = 0xfc;
+pub const LINUX_BLK_MQ_HW_CTX_NR_CTX_OFFSET: usize = 0xfe;
+pub const LINUX_BLK_MQ_HW_CTX_CTXS_OFFSET: usize = 0x100;
+pub const LINUX_BLK_MQ_HW_CTX_TAGS_OFFSET: usize = 0x140;
+pub const LINUX_BLK_MQ_HW_CTX_SCHED_TAGS_OFFSET: usize = 0x148;
+pub const LINUX_BLK_MQ_HW_CTX_NUMA_NODE_OFFSET: usize = 0x150;
+pub const LINUX_BLK_MQ_HW_CTX_QUEUE_NUM_OFFSET: usize = 0x154;
+pub const LINUX_BLK_MQ_HW_CTX_NR_ACTIVE_OFFSET: usize = 0x158;
+pub const LINUX_BLK_MQ_HW_CTX_SIZE: usize = 0x200;
 pub const LINUX_REQUEST_TAG_OFFSET: usize = 0x20;
 pub const LINUX_REQUEST_INTERNAL_TAG_OFFSET: usize = 0x24;
 pub const LINUX_REQUEST_TIMEOUT_OFFSET: usize = 0x28;
@@ -107,22 +107,23 @@ pub const LINUX_REQUEST_BIO_OFFSET: usize = 0x38;
 pub const LINUX_REQUEST_BIOTAIL_OFFSET: usize = 0x40;
 pub const LINUX_REQUEST_RQ_NEXT_OFFSET: usize = 0x48;
 pub const LINUX_REQUEST_PART_OFFSET: usize = 0x58;
-pub const LINUX_REQUEST_START_TIME_NS_OFFSET: usize = 0x60;
-pub const LINUX_REQUEST_IO_START_TIME_NS_OFFSET: usize = 0x68;
-pub const LINUX_REQUEST_STATS_SECTORS_OFFSET: usize = 0x70;
-pub const LINUX_REQUEST_NR_PHYS_SEGMENTS_OFFSET: usize = 0x72;
-pub const LINUX_REQUEST_NR_INTEGRITY_SEGMENTS_OFFSET: usize = 0x74;
-pub const LINUX_REQUEST_PHYS_GAP_BIT_OFFSET: usize = 0x76;
-pub const LINUX_REQUEST_STATE_OFFSET: usize = 0x78;
-pub const LINUX_REQUEST_REF_OFFSET: usize = 0x7c;
-pub const LINUX_REQUEST_DEADLINE_OFFSET: usize = 0x80;
-pub const LINUX_REQUEST_HASH_OFFSET: usize = 0x88;
-pub const LINUX_REQUEST_SPECIAL_VEC_OFFSET: usize = 0x98;
-pub const LINUX_REQUEST_ELV_OFFSET: usize = 0xb0;
-pub const LINUX_REQUEST_FLUSH_OFFSET: usize = 0xc8;
-pub const LINUX_REQUEST_FIFO_TIME_OFFSET: usize = 0xd8;
-pub const LINUX_REQUEST_END_IO_OFFSET: usize = 0xe0;
-pub const LINUX_REQUEST_SIZE: usize = 0xf0;
+pub const LINUX_REQUEST_ALLOC_TIME_NS_OFFSET: usize = 0x60;
+pub const LINUX_REQUEST_START_TIME_NS_OFFSET: usize = 0x68;
+pub const LINUX_REQUEST_IO_START_TIME_NS_OFFSET: usize = 0x70;
+pub const LINUX_REQUEST_STATS_SECTORS_OFFSET: usize = 0x78;
+pub const LINUX_REQUEST_NR_PHYS_SEGMENTS_OFFSET: usize = 0x7a;
+pub const LINUX_REQUEST_NR_INTEGRITY_SEGMENTS_OFFSET: usize = 0x7c;
+pub const LINUX_REQUEST_PHYS_GAP_BIT_OFFSET: usize = 0x7e;
+pub const LINUX_REQUEST_STATE_OFFSET: usize = 0x80;
+pub const LINUX_REQUEST_REF_OFFSET: usize = 0x84;
+pub const LINUX_REQUEST_DEADLINE_OFFSET: usize = 0x88;
+pub const LINUX_REQUEST_HASH_OFFSET: usize = 0x90;
+pub const LINUX_REQUEST_SPECIAL_VEC_OFFSET: usize = 0xa0;
+pub const LINUX_REQUEST_ELV_OFFSET: usize = 0xb8;
+pub const LINUX_REQUEST_FLUSH_OFFSET: usize = 0xd0;
+pub const LINUX_REQUEST_FIFO_TIME_OFFSET: usize = 0xe0;
+pub const LINUX_REQUEST_END_IO_OFFSET: usize = 0xe8;
+pub const LINUX_REQUEST_SIZE: usize = 0xf8;
 pub(crate) const LINUX_REQUEST_PDU_OFFSET: usize = LINUX_REQUEST_SIZE;
 pub const LINUX_BIO_VEC_BV_PAGE_OFFSET: usize = 0x0;
 pub const LINUX_BIO_VEC_BV_LEN_OFFSET: usize = 0x8;
@@ -147,12 +148,15 @@ pub const LINUX_BIO_BI_IO_VEC_OFFSET: usize = 0x20;
 pub const LINUX_BIO_BI_ITER_OFFSET: usize = 0x28;
 pub const LINUX_BIO_BI_END_IO_OFFSET: usize = 0x40;
 pub const LINUX_BIO_BI_PRIVATE_OFFSET: usize = 0x48;
-pub const LINUX_BIO_BI_VCNT_OFFSET: usize = 0x50;
-pub const LINUX_BIO_BI_MAX_VECS_OFFSET: usize = 0x52;
-pub const LINUX_BIO_BI_CNT_OFFSET: usize = 0x54;
-pub const LINUX_BIO_BI_POOL_OFFSET: usize = 0x58;
-pub const LINUX_BIO_SIZE: usize = 0x60;
-pub const LINUX_BLOCK_DEVICE_SIZE: usize = 0x258;
+pub const LINUX_BIO_BI_BLKG_OFFSET: usize = 0x50;
+pub const LINUX_BIO_ISSUE_TIME_NS_OFFSET: usize = 0x58;
+pub const LINUX_BIO_BI_IOCOST_COST_OFFSET: usize = 0x60;
+pub const LINUX_BIO_BI_VCNT_OFFSET: usize = 0x68;
+pub const LINUX_BIO_BI_MAX_VECS_OFFSET: usize = 0x6a;
+pub const LINUX_BIO_BI_CNT_OFFSET: usize = 0x6c;
+pub const LINUX_BIO_BI_POOL_OFFSET: usize = 0x70;
+pub const LINUX_BIO_SIZE: usize = 0x78;
+pub const LINUX_BLOCK_DEVICE_SIZE: usize = 0x3b8;
 pub const LINUX_BLOCK_DEVICE_BD_STATS_OFFSET: usize = 0x20;
 pub const LINUX_BLOCK_DEVICE_BD_STAMP_OFFSET: usize = 0x28;
 pub const LINUX_BLOCK_DEVICE_BD_FLAGS_OFFSET: usize = 0x30;
@@ -164,21 +168,21 @@ pub const LINUX_BLOCK_DEVICE_BD_CLAIMING_OFFSET: usize = 0x48;
 pub const LINUX_BLOCK_DEVICE_BD_HOLDER_OFFSET: usize = 0x50;
 pub const LINUX_BLOCK_DEVICE_BD_HOLDER_OPS_OFFSET: usize = 0x58;
 pub const LINUX_BLOCK_DEVICE_BD_HOLDER_LOCK_OFFSET: usize = 0x60;
-pub const LINUX_BLOCK_DEVICE_BD_HOLDERS_OFFSET: usize = 0x70;
-pub const LINUX_BLOCK_DEVICE_BD_HOLDER_DIR_OFFSET: usize = 0x78;
-pub const LINUX_BLOCK_DEVICE_BD_FSFREEZE_COUNT_OFFSET: usize = 0x80;
-pub const LINUX_BLOCK_DEVICE_BD_FSFREEZE_MUTEX_OFFSET: usize = 0x88;
-pub const LINUX_BLOCK_DEVICE_BD_META_INFO_OFFSET: usize = 0x98;
-pub const LINUX_BLOCK_DEVICE_BD_WRITERS_OFFSET: usize = 0xa0;
-pub const LINUX_BLOCK_DEVICE_BD_DEVICE_OFFSET: usize = 0xa8;
+pub const LINUX_BLOCK_DEVICE_BD_HOLDERS_OFFSET: usize = 0x78;
+pub const LINUX_BLOCK_DEVICE_BD_HOLDER_DIR_OFFSET: usize = 0x80;
+pub const LINUX_BLOCK_DEVICE_BD_FSFREEZE_COUNT_OFFSET: usize = 0x88;
+pub const LINUX_BLOCK_DEVICE_BD_FSFREEZE_MUTEX_OFFSET: usize = 0x90;
+pub const LINUX_BLOCK_DEVICE_BD_META_INFO_OFFSET: usize = 0xa8;
+pub const LINUX_BLOCK_DEVICE_BD_WRITERS_OFFSET: usize = 0xb0;
+pub const LINUX_BLOCK_DEVICE_BD_DEVICE_OFFSET: usize = 0xc0;
 pub const LINUX_ATOMIC_T_SIZE: usize = 0x4;
 pub const LINUX_DEV_T_SIZE: usize = 0x4;
-pub const LINUX_SPINLOCK_T_SIZE: usize = 0x0;
-pub const LINUX_STRUCT_DEVICE_SIZE: usize = 0x1b0;
+pub const LINUX_SPINLOCK_T_SIZE: usize = 0x4;
+pub const LINUX_STRUCT_DEVICE_SIZE: usize = 0x2f8;
 pub const LINUX_GENDISK_BIO_SPLIT_OFFSET: usize = 0x60;
-pub const LINUX_GENDISK_FLAGS_OFFSET: usize = 0x138;
-pub const LINUX_GENDISK_STATE_OFFSET: usize = 0x140;
-pub const LINUX_GENDISK_SIZE: usize = 0x1f8;
+pub const LINUX_GENDISK_FLAGS_OFFSET: usize = 0x158;
+pub const LINUX_GENDISK_STATE_OFFSET: usize = 0x160;
+pub const LINUX_GENDISK_SIZE: usize = 0x240;
 pub const LINUX_BIO_SET_SIZE: usize = LINUX_GENDISK_FLAGS_OFFSET - LINUX_GENDISK_BIO_SPLIT_OFFSET;
 pub const RQF_SPECIAL_PAYLOAD_BYTE_OFFSET: usize = 0x1d;
 pub const RQF_SPECIAL_PAYLOAD_BYTE_MASK: u8 = 0x10;
@@ -232,13 +236,14 @@ pub struct LinuxBlkMqOps {
     pub cleanup_rq: Option<unsafe extern "C" fn(*mut LinuxRequest)>,
     pub busy: Option<unsafe extern "C" fn(*mut LinuxRequestQueue) -> bool>,
     pub map_queues: Option<unsafe extern "C" fn(*mut LinuxBlkMqTagSet)>,
+    pub show_rq: Option<unsafe extern "C" fn(*mut c_void, *mut LinuxRequest)>,
 }
 
 /// Prefix of `struct blk_mq_hw_ctx`.
 ///
 /// Source: `vendor/linux/include/linux/blk-mq.h` and the Linux-built
 /// `virtio_blk.ko` request path.
-#[repr(C)]
+#[repr(C, align(64))]
 pub struct LinuxBlkMqHwCtx {
     pub _pad_to_queue: [u8; LINUX_BLK_MQ_HW_CTX_QUEUE_OFFSET],
     pub queue: *mut LinuxRequestQueue,
@@ -252,7 +257,7 @@ pub struct LinuxBlkMqHwCtx {
         [u8; LINUX_BLK_MQ_HW_CTX_SIZE - (LINUX_BLK_MQ_HW_CTX_QUEUE_NUM_OFFSET + 4)],
 }
 
-/// Prefix of `struct request` through `end_io_data`, with PDU at `+0xf0`.
+/// Prefix of `struct request` through `end_io_data`, with PDU at `+0xf8`.
 ///
 /// Source: `vendor/linux/include/linux/blk-mq.h:105`; offsets are pinned to
 /// the Linux-built `virtio_blk.ko` path that embeds `struct virtblk_req` in the
@@ -277,13 +282,16 @@ pub struct LinuxRequest {
     pub _pad_to_nr_phys_segments: [u8; LINUX_REQUEST_NR_PHYS_SEGMENTS_OFFSET - 0x60],
     pub nr_phys_segments: u16,
     pub nr_integrity_segments: u16,
-    pub _pad_to_state: [u8; LINUX_REQUEST_STATE_OFFSET - 0x76],
+    pub _pad_to_state:
+        [u8; LINUX_REQUEST_STATE_OFFSET - (LINUX_REQUEST_NR_INTEGRITY_SEGMENTS_OFFSET + 2)],
     pub state: u32,
-    pub _pad_to_special_vec: [u8; LINUX_REQUEST_SPECIAL_VEC_OFFSET - 0x7c],
+    pub _pad_to_special_vec:
+        [u8; LINUX_REQUEST_SPECIAL_VEC_OFFSET - (LINUX_REQUEST_STATE_OFFSET + 4)],
     pub special_vec_bv_page: *mut c_void,
     pub special_vec_bv_len: u32,
     pub special_vec_bv_offset: u32,
-    pub _pad_after_special_vec: [u8; LINUX_REQUEST_ELV_OFFSET - 0xa8],
+    pub _pad_after_special_vec: [u8; LINUX_REQUEST_ELV_OFFSET
+        - (LINUX_REQUEST_SPECIAL_VEC_OFFSET + core::mem::size_of::<LinuxBioVec>())],
     pub elv: [u8; LINUX_REQUEST_FLUSH_OFFSET - LINUX_REQUEST_ELV_OFFSET],
     pub flush: [u8; LINUX_REQUEST_FIFO_TIME_OFFSET - LINUX_REQUEST_FLUSH_OFFSET],
     pub fifo_time: u64,
@@ -338,6 +346,9 @@ pub struct LinuxBio {
     pub bi_cookie: u32,
     pub bi_end_io: *mut c_void,
     pub bi_private: *mut c_void,
+    pub bi_blkg: *mut c_void,
+    pub issue_time_ns: u64,
+    pub bi_iocost_cost: u64,
     pub bi_vcnt: u16,
     pub bi_max_vecs: u16,
     pub bi_cnt: i32,
@@ -483,22 +494,22 @@ pub struct LinuxRequestQueue {
     pub _pad_after_limits: [u8; LINUX_REQUEST_QUEUE_PM_ONLY_OFFSET
         - (0x70 + core::mem::size_of::<LinuxQueueLimits>())],
     pub pm_only: i32,
-    pub _pad_after_pm_only:
-        [u8; LINUX_REQUEST_QUEUE_STATS_OFFSET - (0x130 + core::mem::size_of::<i32>())],
+    pub _pad_after_pm_only: [u8; LINUX_REQUEST_QUEUE_STATS_OFFSET
+        - (LINUX_REQUEST_QUEUE_PM_ONLY_OFFSET + core::mem::size_of::<i32>())],
     pub stats: *mut c_void,
     pub rq_qos: *mut c_void,
     pub rq_qos_mutex: LinuxAbiMutex,
     pub id: i32,
     pub nr_requests: u32,
     pub async_depth: u32,
-    pub _pad_after_async_depth:
-        [u8; LINUX_REQUEST_QUEUE_LIMITS_LOCK_OFFSET - (0x160 + core::mem::size_of::<u32>())],
+    pub _pad_after_async_depth: [u8; LINUX_REQUEST_QUEUE_LIMITS_LOCK_OFFSET
+        - (LINUX_REQUEST_QUEUE_ASYNC_DEPTH_OFFSET + core::mem::size_of::<u32>())],
     pub limits_lock: LinuxAbiMutex,
-    pub _pad_after_limits_lock:
-        [u8; LINUX_REQUEST_QUEUE_TAG_SET_OFFSET - (0x278 + LINUX_MUTEX_SIZE)],
+    pub _pad_after_limits_lock: [u8; LINUX_REQUEST_QUEUE_TAG_SET_OFFSET
+        - (LINUX_REQUEST_QUEUE_LIMITS_LOCK_OFFSET + LINUX_MUTEX_SIZE)],
     pub tag_set: *mut LinuxBlkMqTagSet,
-    pub _pad_after_tag_set:
-        [u8; LINUX_REQUEST_QUEUE_SIZE - (0x2d0 + core::mem::size_of::<*mut LinuxBlkMqTagSet>())],
+    pub _pad_after_tag_set: [u8; LINUX_REQUEST_QUEUE_SIZE
+        - (LINUX_REQUEST_QUEUE_TAG_SET_OFFSET + core::mem::size_of::<*mut LinuxBlkMqTagSet>())],
     pub hctx_table_storage: *mut LinuxBlkMqHwCtx,
 }
 
@@ -921,6 +932,9 @@ fn linux_install_request_bio_mirror(
         bi_cookie: 0,
         bi_end_io: core::ptr::null_mut(),
         bi_private: core::ptr::null_mut(),
+        bi_blkg: core::ptr::null_mut(),
+        issue_time_ns: 0,
+        bi_iocost_cost: 0,
         bi_vcnt: nr_phys_segments,
         bi_max_vecs: nr_phys_segments,
         bi_cnt: 1,
@@ -1612,7 +1626,7 @@ pub unsafe fn linux_blk_mq_alloc_queue(
             - (0x70 + core::mem::size_of::<LinuxQueueLimits>())],
         pm_only: 0,
         _pad_after_pm_only: [0; LINUX_REQUEST_QUEUE_STATS_OFFSET
-            - (0x130 + core::mem::size_of::<i32>())],
+            - (LINUX_REQUEST_QUEUE_PM_ONLY_OFFSET + core::mem::size_of::<i32>())],
         stats: core::ptr::null_mut(),
         rq_qos: core::ptr::null_mut(),
         rq_qos_mutex: LinuxAbiMutex::new(),
@@ -1620,13 +1634,13 @@ pub unsafe fn linux_blk_mq_alloc_queue(
         nr_requests: unsafe { (*set).queue_depth },
         async_depth: unsafe { (*set).queue_depth },
         _pad_after_async_depth: [0; LINUX_REQUEST_QUEUE_LIMITS_LOCK_OFFSET
-            - (0x160 + core::mem::size_of::<u32>())],
+            - (LINUX_REQUEST_QUEUE_ASYNC_DEPTH_OFFSET + core::mem::size_of::<u32>())],
         limits_lock: LinuxAbiMutex::new(),
         _pad_after_limits_lock: [0; LINUX_REQUEST_QUEUE_TAG_SET_OFFSET
-            - (0x278 + LINUX_MUTEX_SIZE)],
+            - (LINUX_REQUEST_QUEUE_LIMITS_LOCK_OFFSET + LINUX_MUTEX_SIZE)],
         tag_set: set,
         _pad_after_tag_set: [0; LINUX_REQUEST_QUEUE_SIZE
-            - (0x2d0 + core::mem::size_of::<*mut LinuxBlkMqTagSet>())],
+            - (LINUX_REQUEST_QUEUE_TAG_SET_OFFSET + core::mem::size_of::<*mut LinuxBlkMqTagSet>())],
         hctx_table_storage: core::ptr::null_mut(),
     }));
     unsafe {
@@ -2467,6 +2481,7 @@ mod tests {
         cleanup_rq: None,
         busy: None,
         map_queues: None,
+        show_rq: None,
     };
 
     unsafe extern "C" fn test_deferred_queue_rq(
@@ -2517,6 +2532,7 @@ mod tests {
         cleanup_rq: None,
         busy: None,
         map_queues: None,
+        show_rq: None,
     };
 
     unsafe extern "C" fn test_no_complete_queue_rq(
@@ -2549,6 +2565,7 @@ mod tests {
         cleanup_rq: None,
         busy: None,
         map_queues: None,
+        show_rq: None,
     };
 
     unsafe extern "C" fn test_retry_queue_rq(
@@ -2597,6 +2614,7 @@ mod tests {
         cleanup_rq: Some(test_retry_cleanup_rq),
         busy: None,
         map_queues: None,
+        show_rq: None,
     };
 
     #[test]
@@ -2631,7 +2649,8 @@ mod tests {
             offset_of!(LinuxBlkMqOps, map_queues),
             LINUX_BLK_MQ_OPS_MAP_QUEUES_OFFSET
         );
-        assert_eq!(size_of::<LinuxBlkMqOps>(), 0x88);
+        assert_eq!(offset_of!(LinuxBlkMqOps, show_rq), 0x88);
+        assert_eq!(size_of::<LinuxBlkMqOps>(), 0x90);
 
         assert_eq!(
             offset_of!(LinuxBlkMqHwCtx, queue),
@@ -2649,14 +2668,14 @@ mod tests {
             offset_of!(LinuxBlkMqHwCtx, _pad_to_queue_num),
             LINUX_BLK_MQ_HW_CTX_CTX_MAP_OFFSET
         );
-        assert_eq!(LINUX_BLK_MQ_HW_CTX_DISPATCH_FROM_OFFSET, 0xc8);
-        assert_eq!(LINUX_BLK_MQ_HW_CTX_DISPATCH_BUSY_OFFSET, 0xd0);
-        assert_eq!(LINUX_BLK_MQ_HW_CTX_TYPE_OFFSET, 0xd4);
-        assert_eq!(LINUX_BLK_MQ_HW_CTX_NR_CTX_OFFSET, 0xd6);
-        assert_eq!(LINUX_BLK_MQ_HW_CTX_CTXS_OFFSET, 0xd8);
-        assert_eq!(LINUX_BLK_MQ_HW_CTX_TAGS_OFFSET, 0x110);
-        assert_eq!(LINUX_BLK_MQ_HW_CTX_SCHED_TAGS_OFFSET, 0x118);
-        assert_eq!(LINUX_BLK_MQ_HW_CTX_NUMA_NODE_OFFSET, 0x120);
+        assert_eq!(LINUX_BLK_MQ_HW_CTX_DISPATCH_FROM_OFFSET, 0xf0);
+        assert_eq!(LINUX_BLK_MQ_HW_CTX_DISPATCH_BUSY_OFFSET, 0xf8);
+        assert_eq!(LINUX_BLK_MQ_HW_CTX_TYPE_OFFSET, 0xfc);
+        assert_eq!(LINUX_BLK_MQ_HW_CTX_NR_CTX_OFFSET, 0xfe);
+        assert_eq!(LINUX_BLK_MQ_HW_CTX_CTXS_OFFSET, 0x100);
+        assert_eq!(LINUX_BLK_MQ_HW_CTX_TAGS_OFFSET, 0x140);
+        assert_eq!(LINUX_BLK_MQ_HW_CTX_SCHED_TAGS_OFFSET, 0x148);
+        assert_eq!(LINUX_BLK_MQ_HW_CTX_NUMA_NODE_OFFSET, 0x150);
         assert_eq!(
             offset_of!(LinuxBlkMqHwCtx, queue_num),
             LINUX_BLK_MQ_HW_CTX_QUEUE_NUM_OFFSET
@@ -2666,6 +2685,7 @@ mod tests {
             LINUX_BLK_MQ_HW_CTX_NR_ACTIVE_OFFSET
         );
         assert_eq!(size_of::<LinuxBlkMqHwCtx>(), LINUX_BLK_MQ_HW_CTX_SIZE);
+        assert_eq!(align_of::<LinuxBlkMqHwCtx>(), 64);
 
         assert_eq!(offset_of!(LinuxRequest, q), 0);
         assert_eq!(offset_of!(LinuxRequest, mq_hctx), 0x10);
@@ -2706,10 +2726,11 @@ mod tests {
         assert_eq!(offset_of!(LinuxRequest, part), LINUX_REQUEST_PART_OFFSET);
         assert_eq!(
             offset_of!(LinuxRequest, _pad_to_nr_phys_segments),
-            LINUX_REQUEST_START_TIME_NS_OFFSET
+            LINUX_REQUEST_ALLOC_TIME_NS_OFFSET
         );
-        assert_eq!(LINUX_REQUEST_IO_START_TIME_NS_OFFSET, 0x68);
-        assert_eq!(LINUX_REQUEST_STATS_SECTORS_OFFSET, 0x70);
+        assert_eq!(LINUX_REQUEST_START_TIME_NS_OFFSET, 0x68);
+        assert_eq!(LINUX_REQUEST_IO_START_TIME_NS_OFFSET, 0x70);
+        assert_eq!(LINUX_REQUEST_STATS_SECTORS_OFFSET, 0x78);
         assert_eq!(
             offset_of!(LinuxRequest, nr_phys_segments),
             LINUX_REQUEST_NR_PHYS_SEGMENTS_OFFSET
@@ -2727,15 +2748,15 @@ mod tests {
             offset_of!(LinuxRequest, _pad_to_special_vec),
             LINUX_REQUEST_REF_OFFSET
         );
-        assert_eq!(LINUX_REQUEST_DEADLINE_OFFSET, 0x80);
-        assert_eq!(LINUX_REQUEST_HASH_OFFSET, 0x88);
+        assert_eq!(LINUX_REQUEST_DEADLINE_OFFSET, 0x88);
+        assert_eq!(LINUX_REQUEST_HASH_OFFSET, 0x90);
         assert_eq!(
             offset_of!(LinuxRequest, special_vec_bv_page),
             LINUX_REQUEST_SPECIAL_VEC_OFFSET
         );
-        assert_eq!(offset_of!(LinuxRequest, special_vec_bv_len), 0xa0);
-        assert_eq!(offset_of!(LinuxRequest, special_vec_bv_offset), 0xa4);
-        assert_eq!(offset_of!(LinuxRequest, _pad_after_special_vec), 0xa8);
+        assert_eq!(offset_of!(LinuxRequest, special_vec_bv_len), 0xa8);
+        assert_eq!(offset_of!(LinuxRequest, special_vec_bv_offset), 0xac);
+        assert_eq!(offset_of!(LinuxRequest, _pad_after_special_vec), 0xb0);
         assert_eq!(offset_of!(LinuxRequest, elv), LINUX_REQUEST_ELV_OFFSET);
         assert_eq!(offset_of!(LinuxRequest, flush), LINUX_REQUEST_FLUSH_OFFSET);
         assert_eq!(
@@ -2750,9 +2771,9 @@ mod tests {
             offset_of!(LinuxRequest, end_io),
             LINUX_REQUEST_END_IO_OFFSET
         );
-        assert_eq!(offset_of!(LinuxRequest, end_io_data), 0xe8);
+        assert_eq!(offset_of!(LinuxRequest, end_io_data), 0xf0);
         assert_eq!(size_of::<LinuxRequest>(), LINUX_REQUEST_SIZE);
-        assert_eq!(LINUX_REQUEST_PDU_OFFSET, 0xf0);
+        assert_eq!(LINUX_REQUEST_PDU_OFFSET, 0xf8);
 
         assert_eq!(
             offset_of!(LinuxBioVec, bv_page),
@@ -2813,6 +2834,15 @@ mod tests {
             offset_of!(LinuxBio, bi_private),
             LINUX_BIO_BI_PRIVATE_OFFSET
         );
+        assert_eq!(offset_of!(LinuxBio, bi_blkg), LINUX_BIO_BI_BLKG_OFFSET);
+        assert_eq!(
+            offset_of!(LinuxBio, issue_time_ns),
+            LINUX_BIO_ISSUE_TIME_NS_OFFSET
+        );
+        assert_eq!(
+            offset_of!(LinuxBio, bi_iocost_cost),
+            LINUX_BIO_BI_IOCOST_COST_OFFSET
+        );
         assert_eq!(offset_of!(LinuxBio, bi_vcnt), LINUX_BIO_BI_VCNT_OFFSET);
         assert_eq!(
             offset_of!(LinuxBio, bi_max_vecs),
@@ -2857,9 +2887,9 @@ mod tests {
             LINUX_BLK_MQ_TAG_SET_TAG_LIST_LOCK_OFFSET + LINUX_MUTEX_SIZE,
             LINUX_BLK_MQ_TAG_SET_TAG_LIST_OFFSET
         );
-        assert_eq!(LINUX_BLK_MQ_TAG_SET_SRCU_OFFSET, 0x90);
-        assert_eq!(LINUX_BLK_MQ_TAG_SET_TAGS_SRCU_OFFSET, 0x98);
-        assert_eq!(LINUX_BLK_MQ_TAG_SET_UPDATE_NR_HWQ_LOCK_OFFSET, 0x110);
+        assert_eq!(LINUX_BLK_MQ_TAG_SET_SRCU_OFFSET, 0x98);
+        assert_eq!(LINUX_BLK_MQ_TAG_SET_TAGS_SRCU_OFFSET, 0xa0);
+        assert_eq!(LINUX_BLK_MQ_TAG_SET_UPDATE_NR_HWQ_LOCK_OFFSET, 0xc0);
         assert_eq!(size_of::<LinuxBlkMqTagSet>(), LINUX_BLK_MQ_TAG_SET_SIZE);
 
         assert_eq!(offset_of!(LinuxQueueLimits, features), 0);
@@ -2950,17 +2980,17 @@ mod tests {
         assert_eq!(LINUX_BLOCK_DEVICE_BD_HOLDER_OFFSET, 0x50);
         assert_eq!(LINUX_BLOCK_DEVICE_BD_HOLDER_OPS_OFFSET, 0x58);
         assert_eq!(LINUX_BLOCK_DEVICE_BD_HOLDER_LOCK_OFFSET, 0x60);
-        assert_eq!(LINUX_BLOCK_DEVICE_BD_HOLDERS_OFFSET, 0x70);
-        assert_eq!(LINUX_BLOCK_DEVICE_BD_HOLDER_DIR_OFFSET, 0x78);
-        assert_eq!(LINUX_BLOCK_DEVICE_BD_FSFREEZE_COUNT_OFFSET, 0x80);
-        assert_eq!(LINUX_BLOCK_DEVICE_BD_FSFREEZE_MUTEX_OFFSET, 0x88);
-        assert_eq!(LINUX_BLOCK_DEVICE_BD_META_INFO_OFFSET, 0x98);
-        assert_eq!(LINUX_BLOCK_DEVICE_BD_WRITERS_OFFSET, 0xa0);
-        assert_eq!(LINUX_BLOCK_DEVICE_BD_DEVICE_OFFSET, 0xa8);
+        assert_eq!(LINUX_BLOCK_DEVICE_BD_HOLDERS_OFFSET, 0x78);
+        assert_eq!(LINUX_BLOCK_DEVICE_BD_HOLDER_DIR_OFFSET, 0x80);
+        assert_eq!(LINUX_BLOCK_DEVICE_BD_FSFREEZE_COUNT_OFFSET, 0x88);
+        assert_eq!(LINUX_BLOCK_DEVICE_BD_FSFREEZE_MUTEX_OFFSET, 0x90);
+        assert_eq!(LINUX_BLOCK_DEVICE_BD_META_INFO_OFFSET, 0xa8);
+        assert_eq!(LINUX_BLOCK_DEVICE_BD_WRITERS_OFFSET, 0xb0);
+        assert_eq!(LINUX_BLOCK_DEVICE_BD_DEVICE_OFFSET, 0xc0);
         assert_eq!(LINUX_ATOMIC_T_SIZE, 0x4);
         assert_eq!(LINUX_DEV_T_SIZE, 0x4);
-        assert_eq!(LINUX_SPINLOCK_T_SIZE, 0x0);
-        assert_eq!(LINUX_STRUCT_DEVICE_SIZE, 0x1b0);
+        assert_eq!(LINUX_SPINLOCK_T_SIZE, 0x4);
+        assert_eq!(LINUX_STRUCT_DEVICE_SIZE, 0x2f8);
         assert_eq!(
             LINUX_BLOCK_DEVICE_BD_FLAGS_OFFSET + LINUX_ATOMIC_T_SIZE,
             LINUX_BLOCK_DEVICE_BD_DEV_OFFSET
@@ -3005,8 +3035,8 @@ mod tests {
             offset_of!(LinuxRequestQueue, pm_only),
             LINUX_REQUEST_QUEUE_PM_ONLY_OFFSET
         );
-        assert_eq!(offset_of!(LinuxRequestQueue, stats), 0x138);
-        assert_eq!(offset_of!(LinuxRequestQueue, rq_qos), 0x140);
+        assert_eq!(offset_of!(LinuxRequestQueue, stats), 0x140);
+        assert_eq!(offset_of!(LinuxRequestQueue, rq_qos), 0x148);
         assert_eq!(
             offset_of!(LinuxRequestQueue, rq_qos_mutex),
             LINUX_REQUEST_QUEUE_RQ_QOS_MUTEX_OFFSET
@@ -3023,23 +3053,23 @@ mod tests {
             offset_of!(LinuxRequestQueue, async_depth),
             LINUX_REQUEST_QUEUE_ASYNC_DEPTH_OFFSET
         );
-        assert_eq!(offset_of!(LinuxRequestQueue, _pad_after_async_depth), 0x164);
-        assert_eq!(LINUX_REQUEST_QUEUE_TIMEOUT_OFFSET, 0x168);
-        assert_eq!(LINUX_REQUEST_QUEUE_TIMEOUT_WORK_OFFSET, 0x190);
+        assert_eq!(offset_of!(LinuxRequestQueue, _pad_after_async_depth), 0x174);
+        assert_eq!(LINUX_REQUEST_QUEUE_TIMEOUT_OFFSET, 0x178);
+        assert_eq!(LINUX_REQUEST_QUEUE_TIMEOUT_WORK_OFFSET, 0x1a0);
         assert_eq!(
             LINUX_REQUEST_QUEUE_NR_ACTIVE_REQUESTS_SHARED_TAGS_OFFSET,
-            0x1b0
+            0x1c0
         );
-        assert_eq!(LINUX_REQUEST_QUEUE_SCHED_SHARED_TAGS_OFFSET, 0x1b8);
-        assert_eq!(LINUX_REQUEST_QUEUE_ICQ_LIST_OFFSET, 0x1c0);
-        assert_eq!(LINUX_REQUEST_QUEUE_NODE_OFFSET, 0x1d0);
-        assert_eq!(LINUX_REQUEST_QUEUE_REQUEUE_LOCK_OFFSET, 0x1d4);
-        assert_eq!(LINUX_REQUEST_QUEUE_REQUEUE_LIST_OFFSET, 0x1d8);
-        assert_eq!(LINUX_REQUEST_QUEUE_REQUEUE_WORK_OFFSET, 0x1e8);
-        assert_eq!(LINUX_REQUEST_QUEUE_FQ_OFFSET, 0x240);
-        assert_eq!(LINUX_REQUEST_QUEUE_FLUSH_LIST_OFFSET, 0x248);
-        assert_eq!(LINUX_REQUEST_QUEUE_ELEVATOR_LOCK_OFFSET, 0x258);
-        assert_eq!(LINUX_REQUEST_QUEUE_SYSFS_LOCK_OFFSET, 0x268);
+        assert_eq!(LINUX_REQUEST_QUEUE_SCHED_SHARED_TAGS_OFFSET, 0x1c8);
+        assert_eq!(LINUX_REQUEST_QUEUE_ICQ_LIST_OFFSET, 0x1d0);
+        assert_eq!(LINUX_REQUEST_QUEUE_NODE_OFFSET, 0x218);
+        assert_eq!(LINUX_REQUEST_QUEUE_REQUEUE_LOCK_OFFSET, 0x21c);
+        assert_eq!(LINUX_REQUEST_QUEUE_REQUEUE_LIST_OFFSET, 0x220);
+        assert_eq!(LINUX_REQUEST_QUEUE_REQUEUE_WORK_OFFSET, 0x230);
+        assert_eq!(LINUX_REQUEST_QUEUE_FQ_OFFSET, 0x288);
+        assert_eq!(LINUX_REQUEST_QUEUE_FLUSH_LIST_OFFSET, 0x290);
+        assert_eq!(LINUX_REQUEST_QUEUE_ELEVATOR_LOCK_OFFSET, 0x2a0);
+        assert_eq!(LINUX_REQUEST_QUEUE_SYSFS_LOCK_OFFSET, 0x2b8);
         assert_eq!(
             offset_of!(LinuxRequestQueue, limits_lock),
             LINUX_REQUEST_QUEUE_LIMITS_LOCK_OFFSET
@@ -3048,14 +3078,11 @@ mod tests {
             offset_of!(LinuxRequestQueue, _pad_after_limits_lock),
             LINUX_REQUEST_QUEUE_UNUSED_HCTX_LIST_OFFSET
         );
-        assert_eq!(
-            LINUX_REQUEST_QUEUE_UNUSED_HCTX_LOCK_OFFSET,
-            LINUX_REQUEST_QUEUE_MQ_FREEZE_DEPTH_OFFSET
-        );
-        assert_eq!(LINUX_REQUEST_QUEUE_UNUSED_HCTX_LOCK_OFFSET, 0x298);
-        assert_eq!(LINUX_REQUEST_QUEUE_RCU_HEAD_OFFSET, 0x2a0);
-        assert_eq!(LINUX_REQUEST_QUEUE_MQ_FREEZE_WQ_OFFSET, 0x2b0);
-        assert_eq!(LINUX_REQUEST_QUEUE_MQ_FREEZE_LOCK_OFFSET, 0x2c0);
+        assert_eq!(LINUX_REQUEST_QUEUE_UNUSED_HCTX_LOCK_OFFSET, 0x2f8);
+        assert_eq!(LINUX_REQUEST_QUEUE_MQ_FREEZE_DEPTH_OFFSET, 0x2fc);
+        assert_eq!(LINUX_REQUEST_QUEUE_RCU_HEAD_OFFSET, 0x300);
+        assert_eq!(LINUX_REQUEST_QUEUE_MQ_FREEZE_WQ_OFFSET, 0x310);
+        assert_eq!(LINUX_REQUEST_QUEUE_MQ_FREEZE_LOCK_OFFSET, 0x328);
         assert_eq!(
             offset_of!(LinuxRequestQueue, tag_set),
             LINUX_REQUEST_QUEUE_TAG_SET_OFFSET
@@ -3064,10 +3091,10 @@ mod tests {
             offset_of!(LinuxRequestQueue, _pad_after_tag_set),
             LINUX_REQUEST_QUEUE_TAG_SET_LIST_OFFSET
         );
-        assert_eq!(LINUX_REQUEST_QUEUE_DEBUGFS_DIR_OFFSET, 0x2e8);
-        assert_eq!(LINUX_REQUEST_QUEUE_SCHED_DEBUGFS_DIR_OFFSET, 0x2f0);
-        assert_eq!(LINUX_REQUEST_QUEUE_RQOS_DEBUGFS_DIR_OFFSET, 0x2f8);
-        assert_eq!(LINUX_REQUEST_QUEUE_DEBUGFS_MUTEX_OFFSET, 0x300);
+        assert_eq!(LINUX_REQUEST_QUEUE_DEBUGFS_DIR_OFFSET, 0x358);
+        assert_eq!(LINUX_REQUEST_QUEUE_SCHED_DEBUGFS_DIR_OFFSET, 0x360);
+        assert_eq!(LINUX_REQUEST_QUEUE_RQOS_DEBUGFS_DIR_OFFSET, 0x368);
+        assert_eq!(LINUX_REQUEST_QUEUE_DEBUGFS_MUTEX_OFFSET, 0x370);
         assert_eq!(
             offset_of!(LinuxRequestQueue, hctx_table_storage),
             LINUX_REQUEST_QUEUE_SIZE
@@ -3097,7 +3124,7 @@ mod tests {
             offset_of!(LinuxGendisk, bio_split),
             LINUX_GENDISK_BIO_SPLIT_OFFSET
         );
-        assert_eq!(LINUX_BIO_SET_SIZE, 0xd8);
+        assert_eq!(LINUX_BIO_SET_SIZE, 0xf8);
         assert_eq!(offset_of!(LinuxGendisk, flags), LINUX_GENDISK_FLAGS_OFFSET);
         assert_eq!(offset_of!(LinuxGendisk, state), LINUX_GENDISK_STATE_OFFSET);
         assert_eq!(size_of::<LinuxGendisk>(), LINUX_GENDISK_SIZE);

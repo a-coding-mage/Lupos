@@ -9,13 +9,12 @@
 //! These are the *canonical* Rust definitions of the two VBE structures the
 //! boot stub fills from INT 10h AX=4F00h / AX=4F01h. The BIOS writes them
 //! byte-for-byte, so the layout is ABI-critical: every field keeps its
-//! Linux offset and the structs are `#[repr(C, packed)]` to forbid padding,
-//! matching the `__attribute__((packed))` in the header. Both structures
-//! are exactly 256 bytes.
+//! Linux offset. The two 256-byte BIOS blocks are packed exactly like the C
+//! header; `far_ptr` itself keeps the header's ordinary C alignment.
 
 /// `far_ptr` — a real-mode `offset:segment` 16:16 far pointer (vesa.h
 /// lines 11-13). Fields are in `off, seg` order, matching the C struct.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Copy, Clone, Default, Debug)]
 pub struct FarPtr {
     /// 16-bit offset within the segment.
@@ -180,11 +179,12 @@ impl Default for VesaModeInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::mem::size_of;
+    use core::mem::{align_of, size_of};
 
     #[test]
     fn far_ptr_is_four_bytes_off_then_seg() {
         assert_eq!(size_of::<FarPtr>(), 4);
+        assert_eq!(align_of::<FarPtr>(), align_of::<u16>());
     }
 
     #[test]

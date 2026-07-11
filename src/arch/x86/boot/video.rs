@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/boot/video.c
 //! linux-source: vendor/linux/arch/x86/boot/video.h
 //! test-origin: linux:vendor/linux/arch/x86/boot/video.c
@@ -560,8 +560,15 @@ pub fn save_screen<M: VideoMem>(mem: &mut M, st: &mut VideoState) {
     st.saved.cury = st.screen_info.orig_y as i32;
 
     let cells = (st.saved.x * st.saved.y) as usize;
+    let guarded_cells = match cells.checked_add(512 / core::mem::size_of::<u16>()) {
+        Some(guarded) => guarded,
+        None => {
+            st.saved.data = None;
+            return;
+        }
+    };
     let mut data = alloc::vec::Vec::new();
-    if data.try_reserve_exact(cells).is_err() {
+    if data.try_reserve_exact(guarded_cells).is_err() {
         st.saved.data = None; // Not enough heap to save the screen.
         return;
     }
@@ -665,7 +672,7 @@ where
     M: VideoMem,
     T: VideoTty,
     P: FnMut(&mut [C], bool),
-    S: FnMut(&mut [C], u16) -> i32,
+    S: FnMut(&mut [C], &mut VideoState, u16) -> i32,
     E: FnMut(),
 {
     // RESET_HEAP() — the Vec-backed mode lists own their storage, so the
@@ -681,7 +688,7 @@ where
             mode = mode_menu(cards, tty, &mut probe_scan) as u16;
         }
 
-        if set_mode(cards, mode) == 0 {
+        if set_mode(cards, st, mode) == 0 {
             break;
         }
 
@@ -692,6 +699,7 @@ where
         mode = ASK_VGA;
     }
     requested_mode = mode;
+    st.video_mode = mode;
 
     vesa_store_edid();
     store_mode_params(bios, mem, st);
@@ -1419,7 +1427,7 @@ mod tests {
             &mut st,
             VIDEO_80X25,
             |_, _| probe_calls += 1,
-            |c, m| {
+            |c, _, m| {
                 c[0].set_mode(&ModeInfo {
                     mode: m,
                     ..Default::default()
@@ -1430,6 +1438,7 @@ mod tests {
         );
 
         assert_eq!(final_mode, VIDEO_80X25);
+        assert_eq!(st.video_mode, VIDEO_80X25);
         assert_eq!(probe_calls, 1);
         assert_eq!(edid_calls, 1);
     }
@@ -1460,11 +1469,12 @@ mod tests {
             &mut st,
             0xBAD,
             |_, _| {},
-            |_, m| if m == 0xf00 { 0 } else { -1 },
+            |_, _, m| if m == 0xf00 { 0 } else { -1 },
             || {},
             |_| {},
         );
         assert_eq!(final_mode, 0xf00);
+        assert_eq!(st.video_mode, 0xf00);
     }
 
     // ---- indexed register helpers ------------------------------------

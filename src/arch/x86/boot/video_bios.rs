@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/boot/video-bios.c
 //! test-origin: linux:vendor/linux/arch/x86/boot/video-bios.c
 //! Standard video-BIOS text-mode driver (silent + scanned).
@@ -44,6 +44,23 @@ pub trait BiosArea {
 /// `orig_mode` carries `boot_params.screen_info.orig_video_mode` (the C code
 /// reads it from boot_params under `#ifndef _WAKEUP`).
 pub fn set_bios_mode<B: BiosCaller>(bios: &B, st: &mut VideoState, mode: u8) -> i32 {
+    set_bios_mode_for_build(bios, st, mode, true)
+}
+
+/// `_WAKEUP` build of `set_bios_mode()`.
+///
+/// Linux compiles the failed-mode revert block out of the real-mode wakeup
+/// object.  The wrapper must therefore not use [`set_bios_mode`] directly.
+pub(crate) fn set_bios_mode_wakeup<B: BiosCaller>(bios: &B, st: &mut VideoState, mode: u8) -> i32 {
+    set_bios_mode_for_build(bios, st, mode, false)
+}
+
+fn set_bios_mode_for_build<B: BiosCaller>(
+    bios: &B,
+    st: &mut VideoState,
+    mode: u8,
+    revert_failed_mode: bool,
+) -> i32 {
     let mut ireg = BiosRegs::default();
     let mut oreg = BiosRegs::default();
 
@@ -63,7 +80,7 @@ pub fn set_bios_mode<B: BiosCaller>(bios: &B, st: &mut VideoState, mode: u8) -> 
         return 0; // Mode change OK.
     }
 
-    if new_mode != st.screen_info.orig_video_mode {
+    if revert_failed_mode && new_mode != st.screen_info.orig_video_mode {
         // Mode setting failed, but we didn't end up where we started.
         // That's bad. Try to revert to the original video mode.
         ireg.set_ax(st.screen_info.orig_video_mode as u16);
@@ -78,6 +95,15 @@ pub fn bios_set_mode<B: BiosCaller>(bios: &B, st: &mut VideoState, mi: &ModeInfo
     set_bios_mode(bios, st, (mi.mode - VIDEO_FIRST_BIOS) as u8)
 }
 
+/// `_WAKEUP` build of `bios_set_mode()`; see [`set_bios_mode_wakeup`].
+pub(crate) fn bios_set_mode_wakeup<B: BiosCaller>(
+    bios: &B,
+    st: &mut VideoState,
+    mi: &ModeInfo,
+) -> i32 {
+    set_bios_mode_wakeup(bios, st, (mi.mode - VIDEO_FIRST_BIOS) as u8)
+}
+
 /// `bios_probe()` (video-bios.c:61-116) — the destructive scan. For each BIOS
 /// mode 0x14..0x7f it skips already-defined modes, sets the mode, and verifies
 /// it is a text mode by checking:
@@ -87,15 +113,54 @@ pub fn bios_set_mode<B: BiosCaller>(bios: &B, st: &mut VideoState, mi: &ModeInfo
 /// Verified modes are appended (text, x=cols, y=rows). The original mode is
 /// restored at the end. Returns the number of modes found.
 ///
-/// `cards` is the full card array used by `mode_defined`. The discovered modes
-/// are returned to the caller, which installs them on the BIOS card (the C code
-/// builds the list on the heap via `GET_HEAP`).
+/// `heap_bytes` is the number of bytes available from the setup heap at
+/// `video_bios.modes = GET_HEAP(..., 0)`. The loop stops at the same pre-mode
+/// `heap_free(sizeof(struct mode_info))` check as Linux. `cards` is represented
+/// by `already_defined`; discovered modes are returned for installation on the
+/// BIOS card.
 pub fn bios_probe<B, A>(
     bios: &B,
     io: &PortIoOps,
     area: &mut A,
     st: &mut VideoState,
+    heap_bytes: usize,
     already_defined: &dyn Fn(u16) -> bool,
+) -> alloc::vec::Vec<ModeInfo>
+where
+    B: BiosCaller,
+    A: BiosArea,
+{
+    bios_probe_for_build(bios, io, area, st, heap_bytes, already_defined, false)
+}
+
+/// `_WAKEUP` build of `bios_probe()`.
+///
+/// The included Linux source restores hard-coded BIOS mode `0x03` because
+/// `boot_params.screen_info.orig_video_mode` is unavailable, and every mode
+/// set uses the no-revert wakeup variant.
+pub(crate) fn bios_probe_wakeup<B, A>(
+    bios: &B,
+    io: &PortIoOps,
+    area: &mut A,
+    st: &mut VideoState,
+    heap_bytes: usize,
+    already_defined: &dyn Fn(u16) -> bool,
+) -> alloc::vec::Vec<ModeInfo>
+where
+    B: BiosCaller,
+    A: BiosArea,
+{
+    bios_probe_for_build(bios, io, area, st, heap_bytes, already_defined, true)
+}
+
+fn bios_probe_for_build<B, A>(
+    bios: &B,
+    io: &PortIoOps,
+    area: &mut A,
+    st: &mut VideoState,
+    mut heap_bytes: usize,
+    already_defined: &dyn Fn(u16) -> bool,
+    wakeup: bool,
 ) -> alloc::vec::Vec<ModeInfo>
 where
     B: BiosCaller,
@@ -103,7 +168,11 @@ where
 {
     let mut out = alloc::vec::Vec::new();
 
-    let saved_mode = st.screen_info.orig_video_mode;
+    let saved_mode = if wakeup {
+        0x03
+    } else {
+        st.screen_info.orig_video_mode
+    };
 
     // The card is only probed for EGA/VGA adapters; the dispatcher already
     // gates on adapter via the safety bucket, but the C code re-checks:
@@ -116,12 +185,25 @@ where
 
     let mut mode: u16 = 0x14;
     while mode <= 0x7f {
+        // `heap_free(sizeof(struct mode_info))` is tested before any other
+        // per-mode work.  GET_HEAP consumes the bytes only for an accepted
+        // mode, so rejected/skipped candidates leave the budget unchanged.
+        let mode_bytes = core::mem::size_of::<ModeInfo>();
+        if heap_bytes < mode_bytes {
+            break;
+        }
+
         if already_defined(VIDEO_FIRST_BIOS + mode) {
             mode += 1;
             continue;
         }
 
-        if set_bios_mode(bios, st, mode as u8) != 0 {
+        let set_result = if wakeup {
+            set_bios_mode_wakeup(bios, st, mode as u8)
+        } else {
+            set_bios_mode(bios, st, mode as u8)
+        };
+        if set_result != 0 {
             mode += 1;
             continue;
         }
@@ -146,17 +228,26 @@ where
             continue;
         }
 
-        out.push(ModeInfo {
+        let mi = ModeInfo {
             mode: VIDEO_FIRST_BIOS + mode,
             x: area.rdfs16(0x44a),
             y: area.rdfs8(0x484) as u16 + 1,
             depth: 0, // text
-        });
+        };
+        if out.try_reserve_exact(1).is_err() {
+            break;
+        }
+        out.push(mi);
+        heap_bytes -= mode_bytes;
 
         mode += 1;
     }
 
-    set_bios_mode(bios, st, saved_mode);
+    if wakeup {
+        set_bios_mode_wakeup(bios, st, saved_mode);
+    } else {
+        set_bios_mode(bios, st, saved_mode);
+    }
 
     out
 }
@@ -169,6 +260,7 @@ pub fn bios_probe_with_cards<B, A, C>(
     io: &PortIoOps,
     area: &mut A,
     st: &mut VideoState,
+    heap_bytes: usize,
     cards: &[C],
 ) -> alloc::vec::Vec<ModeInfo>
 where
@@ -176,7 +268,7 @@ where
     A: BiosArea,
     C: CardInfo,
 {
-    bios_probe(bios, io, area, st, &|m| mode_defined(cards, m))
+    bios_probe(bios, io, area, st, heap_bytes, &|m| mode_defined(cards, m))
 }
 
 #[cfg(test)]
@@ -353,7 +445,7 @@ mod tests {
             adapter: super::super::video::ADAPTER_CGA,
             ..Default::default()
         };
-        let modes = bios_probe(&bios, &io, &mut area, &mut st, &|_| false);
+        let modes = bios_probe(&bios, &io, &mut area, &mut st, usize::MAX, &|_| false);
         assert!(modes.is_empty());
     }
 
@@ -367,7 +459,7 @@ mod tests {
             ..Default::default()
         };
         // Nothing is already defined => every mode 0x14..0x7f is collected.
-        let modes = bios_probe(&bios, &io, &mut area, &mut st, &|_| false);
+        let modes = bios_probe(&bios, &io, &mut area, &mut st, usize::MAX, &|_| false);
         let expected = (0x7f - 0x14 + 1) as usize;
         assert_eq!(modes.len(), expected);
         // First mode is VIDEO_FIRST_BIOS + 0x14, x=80, y=25.
@@ -394,7 +486,7 @@ mod tests {
             ..Default::default()
         };
         // Pretend 0x14 is already defined => it should be skipped.
-        let modes = bios_probe(&bios, &io, &mut area, &mut st, &|m| {
+        let modes = bios_probe(&bios, &io, &mut area, &mut st, usize::MAX, &|m| {
             m == VIDEO_FIRST_BIOS + 0x14
         });
         assert!(!modes.iter().any(|m| m.mode == VIDEO_FIRST_BIOS + 0x14));
@@ -411,7 +503,64 @@ mod tests {
             adapter: super::super::video::ADAPTER_VGA,
             ..Default::default()
         };
-        let modes = bios_probe(&bios, &io, &mut area, &mut st, &|_| false);
+        let modes = bios_probe(&bios, &io, &mut area, &mut st, usize::MAX, &|_| false);
         assert!(modes.is_empty());
+    }
+
+    #[test]
+    fn bios_probe_breaks_before_mode_work_when_heap_cannot_fit_mode_info() {
+        let bios = ScanBios::new();
+        let io = scan_io_text();
+        let mut area = FakeArea { cols: 80, rows: 24 };
+        let mut st = VideoState {
+            adapter: super::super::video::ADAPTER_VGA,
+            screen_info: super::super::video::ScreenInfo {
+                orig_video_mode: 0x07,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let modes = bios_probe(
+            &bios,
+            &io,
+            &mut area,
+            &mut st,
+            core::mem::size_of::<ModeInfo>() - 1,
+            &|_| false,
+        );
+
+        assert!(modes.is_empty());
+        // The scan performs no candidate-mode calls, but still restores the
+        // original mode after breaking out of the loop.
+        assert_eq!(
+            bios.calls.borrow().as_slice(),
+            &[(0x00, 0x07), (0x0f, 0x07)]
+        );
+    }
+
+    #[test]
+    fn bios_probe_consumes_heap_only_for_registered_modes() {
+        let bios = ScanBios::new();
+        let io = scan_io_text();
+        let mut area = FakeArea { cols: 80, rows: 24 };
+        let mut st = VideoState {
+            adapter: super::super::video::ADAPTER_VGA,
+            ..Default::default()
+        };
+
+        let modes = bios_probe(
+            &bios,
+            &io,
+            &mut area,
+            &mut st,
+            core::mem::size_of::<ModeInfo>(),
+            &|m| m == VIDEO_FIRST_BIOS + 0x14,
+        );
+
+        // Skipping 0x14 does not consume GET_HEAP space; 0x15 is registered,
+        // and the next iteration stops when heap_free becomes false.
+        assert_eq!(modes.len(), 1);
+        assert_eq!(modes[0].mode, VIDEO_FIRST_BIOS + 0x15);
     }
 }

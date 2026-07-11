@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/mm
 //! test-origin: linux:vendor/linux/mm
 /// Platform-independent page-fault handler — demand paging state machine.
@@ -34,9 +34,9 @@ use crate::arch::x86::mm::paging::{
     self, __pte, _PAGE_ACCESSED, _PAGE_NX, _PAGE_PRESENT, _PAGE_TABLE, _PAGE_USER, PAGE_MASK,
     PAGE_SHIFT, PAGE_SIZE, flush_tlb_page, flush_tlb_range, p4d_offset, pfn_pte, pfn_to_virt,
     pgd_offset_pgd, pgd_t, pgprot_t, pmd_alloc, pmd_huge, pmd_none, pmd_offset, pmd_t, pte_alloc,
-    pte_mkdirty, pte_mkwrite, pte_mkyoung, pte_none, pte_offset_kernel, pte_pfn, pte_present,
-    pte_t, pte_write, pte_wrprotect, ptep_get, ptep_get_and_clear, pud_alloc, pud_huge, pud_none,
-    pud_offset, pud_t, set_pte_at,
+    pte_mkdirty, pte_mkspecial, pte_mkwrite, pte_mkyoung, pte_none, pte_offset_kernel, pte_pfn,
+    pte_present, pte_special, pte_t, pte_write, pte_wrprotect, ptep_get, ptep_get_and_clear,
+    pud_alloc, pud_huge, pud_none, pud_offset, pud_t, set_pte_at,
 };
 use crate::mm::address_space::{AS_SHARED_ANON, AddressSpace};
 use crate::mm::buddy::{page_to_pfn, pfn_to_page, pfn_valid, with_global_buddy};
@@ -44,7 +44,9 @@ use crate::mm::mm_types::{MmStruct, VmAreaStruct};
 use crate::mm::page::Page;
 use crate::mm::page_flags::{GFP_KERNEL, GfpFlags, PG_SWAPBACKED};
 use crate::mm::rmap::anon_vma_prepare;
-use crate::mm::vm_flags::{VM_SHARED, VM_WRITE};
+use crate::mm::vm_flags::{
+    VM_DONTDUMP, VM_DONTEXPAND, VM_IO, VM_MAYSHARE, VM_MAYWRITE, VM_PFNMAP, VM_SHARED, VM_WRITE,
+};
 
 // ---------------------------------------------------------------------------
 // VM_FAULT_* return codes — `vm_fault_t`
@@ -344,7 +346,7 @@ fn handle_pte_fault(vmf: &mut VmFault) -> VmFaultFlags {
 
         // PTE is present.  Write-protect fault → COW.
         let pfn = pte_pfn(vmf.orig_pte) as usize;
-        if !pfn_valid(pfn) {
+        if !pte_special(vmf.orig_pte) && !pfn_valid(pfn) {
             // A stale or poisoned userspace PTE must not crash the kernel.
             // Clear it and let the normal missing-PTE path rebuild the mapping.
             set_pte_at((*vmf.vma).vm_mm as *mut (), vmf.address, vmf.pte, __pte(0));
@@ -359,6 +361,9 @@ fn handle_pte_fault(vmf: &mut VmFault) -> VmFaultFlags {
             && !pte_write(vmf.orig_pte)
             && ((*vmf.vma).vm_flags & (VM_SHARED | VM_WRITE)) == (VM_SHARED | VM_WRITE)
         {
+            if pte_special(vmf.orig_pte) {
+                return wp_pfn_shared(vmf);
+            }
             let entry = pte_mkwrite(pte_mkdirty(pte_mkyoung(vmf.orig_pte)));
             set_pte_at((*vmf.vma).vm_mm as *mut (), vmf.address, vmf.pte, entry);
             flush_tlb_page(vmf.address);
@@ -577,6 +582,38 @@ fn do_shared_anonymous_page(vmf: &mut VmFault) -> VmFaultFlags {
 // do_wp_page + wp_page_copy + wp_page_reuse — copy-on-write (M14)
 // ---------------------------------------------------------------------------
 
+/// Handle a shared write-protect fault on a raw PFN mapping.
+///
+/// This is Linux `wp_pfn_shared()`: honor an optional `pfn_mkwrite` callback,
+/// then reuse the existing PTE instead of ever COW-copying a shared mapping.
+fn wp_pfn_shared(vmf: &mut VmFault) -> VmFaultFlags {
+    unsafe {
+        let vma = vmf.vma;
+        if vma.is_null() {
+            return VM_FAULT_SIGBUS;
+        }
+
+        if (*vma).vm_ops != 0 {
+            let ops = &*((*vma).vm_ops as *const VmOperationsStruct);
+            if let Some(pfn_mkwrite) = ops.pfn_mkwrite {
+                vmf.flags |= FAULT_FLAG_MKWRITE;
+                let ret = pfn_mkwrite(vmf as *mut VmFault);
+                if ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE) != 0 {
+                    return ret;
+                }
+            }
+        }
+
+        if ptep_get(vmf.pte) != vmf.orig_pte {
+            return VM_FAULT_NOPAGE;
+        }
+        let entry = pte_mkwrite(pte_mkdirty(pte_mkyoung(vmf.orig_pte)));
+        set_pte_at((*vma).vm_mm as *mut (), vmf.address, vmf.pte, entry);
+        flush_tlb_page(vmf.address);
+        0
+    }
+}
+
 /// Handle a write-protect fault on a present PTE.
 ///
 /// Dispatches between:
@@ -588,6 +625,16 @@ fn do_shared_anonymous_page(vmf: &mut VmFault) -> VmFaultFlags {
 /// Ref: Linux `mm/memory.c` — `do_wp_page()` line 4149
 fn do_wp_page(vmf: &mut VmFault) -> VmFaultFlags {
     unsafe {
+        // vm_normal_page() returns NULL for a PTE-special VM_PFNMAP entry.
+        // Shared mappings reuse the raw PFN; only a private mapping allocates
+        // an anonymous copy because there is no struct-page refcount to test.
+        if pte_special(vmf.orig_pte) {
+            if (*vmf.vma).vm_flags & (VM_SHARED | VM_MAYSHARE) != 0 {
+                return wp_pfn_shared(vmf);
+            }
+            return wp_page_copy(vmf);
+        }
+
         let pfn = paging::pte_pfn(vmf.orig_pte) as usize;
         let page_ptr = pfn_to_page(pfn);
 
@@ -609,8 +656,8 @@ fn do_wp_page(vmf: &mut VmFault) -> VmFaultFlags {
 /// Full COW copy path — allocate a new page, copy the old content, install a
 /// writable PTE in the faulting mm, and release the old page's references.
 ///
-/// Called from `do_wp_page` when the faulting page has `refcount > 1` (shared
-/// between parent and child after `copy_page_range`).
+/// Called from `do_wp_page` when a normal page has `refcount > 1`, or when a
+/// private PFNMAP PTE has no `struct page` and must become anonymous.
 ///
 /// # Return value
 /// `VM_FAULT_DONE_COW` on success, `VM_FAULT_OOM` if allocation fails.
@@ -627,13 +674,49 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
             None => return VM_FAULT_OOM,
         };
 
-        // 2. Copy the old page's content into the new page.
-        //    Both pages are accessible via the kernel direct map.
+        // 2. Copy the old mapping's content into the new page. Linux's
+        //    __wp_page_copy_user() reads through the userspace address when
+        //    vm_normal_page() returned NULL for a special PFN mapping; there
+        //    is deliberately no pfn_to_page() in that case.
         let old_pfn = paging::pte_pfn(vmf.orig_pte) as usize;
-        let old_page = pfn_to_page(old_pfn);
-        let src = pfn_to_virt(old_pfn);
+        let old_page = if pte_special(vmf.orig_pte) {
+            core::ptr::null_mut()
+        } else {
+            pfn_to_page(old_pfn)
+        };
         let dst = pfn_to_virt(page_to_pfn(new_page));
-        core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE as usize);
+        if old_page.is_null() {
+            let mut not_copied = crate::arch::x86::kernel::uaccess::copy_from_user(
+                dst as *mut u8,
+                vmf.address as *const u8,
+                PAGE_SIZE as usize,
+            );
+            if not_copied != 0 {
+                // Linux retries under the PTL, then zero-fills an unreadable
+                // but still-stable PFN source. Lupos has no per-PTE lock yet;
+                // revalidate the PTE around the retry so a concurrent change
+                // causes a harmless fault retry instead of copying stale data.
+                if ptep_get(vmf.pte) != vmf.orig_pte {
+                    with_global_buddy(|b| b.free_pages(new_page, 0));
+                    return 0;
+                }
+                not_copied = crate::arch::x86::kernel::uaccess::copy_from_user(
+                    dst as *mut u8,
+                    vmf.address as *const u8,
+                    PAGE_SIZE as usize,
+                );
+                if ptep_get(vmf.pte) != vmf.orig_pte {
+                    with_global_buddy(|b| b.free_pages(new_page, 0));
+                    return 0;
+                }
+                if not_copied != 0 {
+                    core::ptr::write_bytes(dst as *mut u8, 0, PAGE_SIZE as usize);
+                }
+            }
+        } else {
+            let src = pfn_to_virt(old_pfn);
+            core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE as usize);
+        }
 
         // 3. Initialise the new page's refcount/mapcount.
         //    One PTE (below) will map it, so mapcount = 0 (exclusive).
@@ -656,19 +739,25 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
         // 5. Atomically replace the old PTE with the new one.
         //    `ptep_get_and_clear` clears the PTE; the subsequent TLB flush
         //    ensures the CPU stops using the old mapping.
+        if ptep_get(vmf.pte) != vmf.orig_pte {
+            with_global_buddy(|b| b.free_pages(new_page, 0));
+            return 0;
+        }
         ptep_get_and_clear(mm as *mut (), vmf.address, vmf.pte);
         set_pte_at(mm as *mut (), vmf.address, vmf.pte, new_entry);
         flush_tlb_page(vmf.address);
 
         // 6. Release the old page's references from this mm.
         //    mapcount: one fewer PTE maps it.
-        (*old_page)._mapcount.fetch_sub(1, Ordering::Relaxed);
-        //    refcount: this mm no longer holds a reference.
-        let rc = (*old_page).put_page();
-        if rc <= 0 {
-            // No remaining references — return the page to the buddy allocator.
-            crate::mm::lru::remove_lru_page(old_page);
-            with_global_buddy(|b| b.free_pages(old_page, 0));
+        if !old_page.is_null() {
+            (*old_page)._mapcount.fetch_sub(1, Ordering::Relaxed);
+            //    refcount: this mm no longer holds a reference.
+            let rc = (*old_page).put_page();
+            if rc <= 0 {
+                // No remaining references — return the page to the buddy allocator.
+                crate::mm::lru::remove_lru_page(old_page);
+                with_global_buddy(|b| b.free_pages(old_page, 0));
+            }
         }
 
         VM_FAULT_DONE_COW
@@ -776,7 +865,8 @@ pub unsafe fn copy_page_range(
 /// For each present source PTE:
 /// 1. Write-protect the source PTE.
 /// 2. Install the same read-only PTE in the destination.
-/// 3. Increment the backing page's `_refcount` and `_mapcount`.
+/// 3. Increment a normal backing page's `_refcount` and `_mapcount`; raw
+///    PTE-special PFN mappings have no `struct page` and skip accounting.
 ///
 /// # Safety
 /// `dst_mm`, `src_mm`, `dst_pmd`, `src_pmd` must be valid.
@@ -806,9 +896,6 @@ unsafe fn copy_pte_range(
                 continue;
             }
 
-            let pfn = paging::pte_pfn(src_pte) as usize;
-            let page = pfn_to_page(pfn);
-
             let ro_pte = pte_wrprotect(src_pte);
             set_pte_at(_src_mm as *mut (), cur, src_ptep, ro_pte);
             flush_tlb_page(cur);
@@ -816,6 +903,17 @@ unsafe fn copy_pte_range(
             // Install the same read-only PTE in the destination.
             let dst_ptep = pte_offset_kernel(dst_pmd, cur);
             set_pte_at(dst_mm as *mut (), cur, dst_ptep, ro_pte);
+
+            // vm_normal_page() returns NULL for PTE-special PFNMAP entries.
+            // Linux copies the raw PTE to the child but deliberately performs
+            // no struct-page refcount, mapcount, rmap, or RSS accounting.
+            if pte_special(src_pte) {
+                cur += PAGE_SIZE as u64;
+                continue;
+            }
+
+            let pfn = paging::pte_pfn(src_pte) as usize;
+            let page = pfn_to_page(pfn);
 
             // Bump refcount: destination mm now holds a reference.
             (*page).get_page();
@@ -987,10 +1085,27 @@ pub static LUPOS_DEVICE_PFN_VM_OPS: VmOperationsStruct = VmOperationsStruct {
     access: None,
 };
 
-unsafe extern "C" fn lupos_device_pfn_fault(vmf: *mut VmFault) -> VmFaultFlags {
-    use crate::arch::x86::mm::paging::{_PAGE_DIRTY, _PAGE_PWT, _PAGE_RW};
-    use alloc::sync::Arc;
+/// Record the PFN mapping prepared by a file's one-time `->mmap` callback.
+///
+/// Linux's `remap_pfn_range()` installs the complete PTE range while mmap is
+/// creating the VMA. Lupos currently materializes those PTEs lazily, so the
+/// equivalent immutable mapping state is retained in the VMA and consumed by
+/// `lupos_device_pfn_fault()`. `vm_private_data` stores a PFN-address bias so
+/// VMA splits can advance `vm_pgoff` without needing to rewrite private state.
+pub fn prepare_lupos_device_pfn_mapping(vma: &mut VmAreaStruct, mapped_phys: u64) {
+    // remap_pfn_range() replaces vm_pgoff with the first mapped PFN for a
+    // private COW mapping. vm_normal_page() and /proc VMA reporting rely on
+    // this rule; shared mappings retain the file-provided offset.
+    if vma.vm_flags & (VM_SHARED | VM_MAYWRITE) == VM_MAYWRITE {
+        vma.vm_pgoff = mapped_phys >> PAGE_SHIFT;
+    }
+    let byte_off = vma.vm_pgoff.wrapping_shl(PAGE_SHIFT as u32);
+    vma.vm_private_data = mapped_phys.wrapping_sub(byte_off) as usize;
+    vma.vm_flags |= VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP;
+    vma.vm_ops = &LUPOS_DEVICE_PFN_VM_OPS as *const VmOperationsStruct as usize;
+}
 
+unsafe extern "C" fn lupos_device_pfn_fault(vmf: *mut VmFault) -> VmFaultFlags {
     if vmf.is_null() {
         return VM_FAULT_SIGBUS;
     }
@@ -1001,58 +1116,29 @@ unsafe extern "C" fn lupos_device_pfn_fault(vmf: *mut VmFault) -> VmFaultFlags {
             return VM_FAULT_SIGBUS;
         }
 
-        // Ask the backing device which physical address maps this page offset.
-        // The driver's `->mmap` returns the physical base for the given byte
-        // offset (see `fbdev_mmap`); a device without one cannot be PFN-mapped.
-        let file_ptr = (*vma).vm_file as *const crate::fs::types::File;
-        let Some(mmap_fn) = (*file_ptr).fops.mmap else {
+        if (*vmf).address < (*vma).vm_start || (*vmf).address >= (*vma).vm_end {
             return VM_FAULT_SIGBUS;
-        };
-        Arc::increment_strong_count(file_ptr);
-        let file = Arc::from_raw(file_ptr);
-        let byte_off = (*vmf).pgoff << PAGE_SHIFT;
-        let phys = mmap_fn(&file, (*vmf).address, PAGE_SIZE as usize, 0, 0, byte_off);
-        drop(file);
-        let phys = match phys {
-            Ok(p) => p,
-            Err(_) => return VM_FAULT_SIGBUS,
-        };
+        }
+
+        // The file's mmap callback already validated the complete VMA and
+        // recorded the physical-address bias. Faults only materialize the PTE
+        // selected by the VMA's page offset; they never call ->mmap again.
+        let byte_off = (*vmf).pgoff.wrapping_shl(PAGE_SHIFT as u32);
+        let phys = ((*vma).vm_private_data as u64).wrapping_add(byte_off);
 
         let ptep = match pte_alloc((*vmf).pmd, (*vmf).address, _PAGE_TABLE) {
             Some(p) => p,
             None => return VM_FAULT_OOM,
         };
 
-        // Install a fully permissive, write-combining PTE.  The MMIO frame has
-        // no `struct page`, so a later write-protect fault could never be
-        // resolved (`pfn_valid` is false for it) — map it present + writable +
-        // dirty up front so the CPU never faults on this page again.
-        let prot = pgprot_t(
-            _PAGE_PRESENT
-                | _PAGE_USER
-                | _PAGE_ACCESSED
-                | _PAGE_RW
-                | _PAGE_DIRTY
-                | _PAGE_PWT
-                | _PAGE_NX,
-        );
+        // `remap_pfn_range()` uses the VMA's page protection unchanged and
+        // marks the PTE special. In particular, do not grant write access or
+        // select a cache mode that the mmap callback did not request.
+        let prot = pgprot_t((*vma).vm_page_prot);
         let pfn = phys >> PAGE_SHIFT;
-        let entry = pte_mkyoung(pfn_pte(pfn, prot));
+        let entry = pte_mkspecial(pfn_pte(pfn, prot));
         set_pte_at((*vma).vm_mm as *mut (), (*vmf).address, ptep, entry);
         (*vmf).pte = ptep;
-        // A true MMIO aperture (e.g. a VESA LFB) has no `struct page`, so
-        // `pfn_valid` is false and teardown's `put_page_from_pte` no-ops on it —
-        // leave `vmf.page` null and skip rss/refcount bookkeeping.  A RAM-backed
-        // framebuffer (the synthetic-fb test mode) *does* have a `struct page`;
-        // there we must take the reference that `put_page_from_pte` will later
-        // drop, or the driver's frame would be freed out from under it.
-        if pfn_valid(pfn as usize) {
-            let page = pfn_to_page(pfn as usize);
-            if !page.is_null() {
-                (*page)._refcount.fetch_add(1, Ordering::Relaxed);
-                (*page)._mapcount.fetch_add(1, Ordering::Relaxed);
-            }
-        }
         VM_FAULT_NOPAGE
     }
 }

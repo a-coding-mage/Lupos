@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/video/video-common.c
 //! test-origin: linux:vendor/linux/arch/x86/video/video-common.c
 //! x86 boot/video common helpers.
@@ -6,52 +6,97 @@
 //! Port / mirror:
 //! - vendor/linux/arch/x86/video/video-common.c
 
-use crate::include::uapi::errno::EINVAL;
+use crate::arch::x86::mm::paging::{
+    __pgprot, _PAGE_PAT, _PAGE_PCD, _PAGE_PWT, pgprot_t, pgprot_val,
+};
+use crate::arch::x86::mm::pat::{PageCacheMode, pgprot_with_cachemode};
+use crate::kernel::module::{export_symbol, find_symbol};
+use crate::linux_driver_abi::base::LinuxDevice;
+use crate::linux_driver_abi::pci::device::{IORESOURCE_MEM, LinuxPciDev};
+use crate::linux_driver_abi::pci::driver::linux_pci_bus_type_ptr;
+use spin::Mutex;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VideoMode {
-    pub columns: u16,
-    pub rows: u16,
-    pub depth: u8,
+/// Persistent copy of `sysfb_primary_display.screen`'s memory resource.
+/// Native DRM removal disables the firmware fbdev backend, but Linux retains
+/// this boot-display identity for `video_is_primary_device()` and vgaarb.
+static PRIMARY_DISPLAY_RESOURCE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+pub fn set_primary_display_resource(base: u64, size: u64) {
+    *PRIMARY_DISPLAY_RESOURCE.lock() = (base != 0 && size != 0).then_some((base, size));
 }
 
-pub const fn video_mode_valid(mode: VideoMode) -> Result<(), i32> {
-    if mode.columns == 0 || mode.rows == 0 {
-        return Err(EINVAL);
+pub fn primary_display_resource() -> Option<(u64, u64)> {
+    *PRIMARY_DISPLAY_RESOURCE.lock()
+}
+
+/// Port of Linux `pgprot_framebuffer()`. The address arguments are part of the
+/// architecture hook even though x86 currently needs only the protection and
+/// boot CPU family.
+#[unsafe(no_mangle)]
+pub extern "C" fn pgprot_framebuffer(
+    prot: pgprot_t,
+    _vm_start: usize,
+    _vm_end: usize,
+    _offset: usize,
+) -> pgprot_t {
+    let cache_mask = _PAGE_PWT | _PAGE_PCD | _PAGE_PAT;
+    let uncached = __pgprot(pgprot_val(prot) & !cache_mask);
+    // Every x86_64 processor has family > 3, so the condition in Linux's
+    // shared i386/x86_64 source is unconditionally true for this target.
+    pgprot_with_cachemode(uncached, PageCacheMode::UncachedMinus)
+}
+
+fn pci_is_display(pdev: *const LinuxPciDev) -> bool {
+    !pdev.is_null() && unsafe { (*pdev).class >> 16 == 0x03 }
+}
+
+fn resource_contains_framebuffer(pdev: *const LinuxPciDev) -> bool {
+    let Some((base, size)) = primary_display_resource() else {
+        return false;
+    };
+    let Some(end) = base.checked_add(size - 1) else {
+        return false;
+    };
+
+    unsafe {
+        (*pdev).resource.iter().take(6).any(|resource| {
+            resource.flags & IORESOURCE_MEM != 0
+                && resource.start != 0
+                && resource.start <= base
+                && resource.end >= end
+        })
     }
-    match mode.depth {
-        0 | 4 | 8 | 15 | 16 | 24 | 32 => Ok(()),
-        _ => Err(EINVAL),
+}
+
+/// `video_is_primary_device()` from `arch/x86/video/video-common.c`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn video_is_primary_device(dev: *mut LinuxDevice) -> bool {
+    if dev.is_null() || unsafe { (*dev).bus } != linux_pci_bus_type_ptr() {
+        return false;
+    }
+    let pdev = unsafe {
+        crate::linux_driver_abi::pci::device::linux_pci_dev_from_device(dev.cast_const())
+    };
+    if !pci_is_display(pdev) {
+        return false;
+    }
+    pdev == crate::linux_driver_abi::video::vgaarb::vga_default_device()
+        || resource_contains_framebuffer(pdev)
+}
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
     }
 }
 
-pub const fn video_text_cells(mode: VideoMode) -> Result<u32, i32> {
-    match video_mode_valid(mode) {
-        Ok(()) => Ok((mode.columns as u32) * (mode.rows as u32)),
-        Err(err) => Err(err),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FramebufferProt {
-    pub cache_mask_cleared: bool,
-    pub uc_minus: bool,
-}
-
-pub const fn pgprot_framebuffer(cpu_family: u8) -> FramebufferProt {
-    FramebufferProt {
-        cache_mask_cleared: true,
-        uc_minus: cpu_family > 3,
-    }
-}
-
-pub const fn video_is_primary_device(
-    is_pci: bool,
-    is_display: bool,
-    is_vga_default: bool,
-    matches_screen_resource: bool,
-) -> bool {
-    is_pci && is_display && (is_vga_default || matches_screen_resource)
+pub fn register_module_exports() {
+    export_symbol_once("pgprot_framebuffer", pgprot_framebuffer as usize, false);
+    export_symbol_once(
+        "video_is_primary_device",
+        video_is_primary_device as usize,
+        false,
+    );
 }
 
 #[cfg(test)]
@@ -59,7 +104,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn common_video_mode_rejects_empty_or_unknown_depth() {
+    fn common_video_exports_match_x86_source_contract() {
         let source = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/vendor/linux/arch/x86/video/video-common.c"
@@ -76,25 +121,17 @@ mod tests {
         assert!(source.contains("EXPORT_SYMBOL(video_is_primary_device);"));
         assert!(source.contains("MODULE_LICENSE(\"GPL\");"));
 
+        use crate::arch::x86::mm::paging::{_PAGE_NX, _PAGE_RW};
+        let input = __pgprot(_PAGE_RW | _PAGE_NX | _PAGE_PAT | _PAGE_PWT);
+        let modern = pgprot_framebuffer(input, 0x1000, 0x2000, 0);
         assert_eq!(
-            video_text_cells(VideoMode {
-                columns: 80,
-                rows: 25,
-                depth: 0,
-            }),
-            Ok(2000)
+            pgprot_val(modern) & (_PAGE_RW | _PAGE_NX),
+            _PAGE_RW | _PAGE_NX
         );
         assert_eq!(
-            video_mode_valid(VideoMode {
-                columns: 80,
-                rows: 25,
-                depth: 7,
-            }),
-            Err(EINVAL)
+            pgprot_val(modern) & (_PAGE_PAT | _PAGE_PCD | _PAGE_PWT),
+            _PAGE_PCD
         );
-        assert!(pgprot_framebuffer(6).uc_minus);
-        assert!(!pgprot_framebuffer(3).uc_minus);
-        assert!(video_is_primary_device(true, true, false, true));
-        assert!(!video_is_primary_device(true, false, true, true));
+        assert!(!unsafe { video_is_primary_device(core::ptr::null_mut()) });
     }
 }

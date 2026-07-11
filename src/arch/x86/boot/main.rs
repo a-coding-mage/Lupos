@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: stub
 //! linux-source: vendor/linux/arch/x86/boot/main.c
 //! test-origin: linux:vendor/linux/arch/x86/boot/main.c
 //! Real-mode `main()` orchestrator.

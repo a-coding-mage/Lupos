@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/boot/video-vga.c
 //! test-origin: linux:vendor/linux/arch/x86/boot/video-vga.c
 //! Common all-VGA text-mode driver.
@@ -338,6 +338,25 @@ impl VgaModeTable {
 /// VGA (AL==0x1a) from EGA. Records `orig_video_ega_bx`/`orig_video_isVGA`,
 /// sets `st.adapter`, and returns the table + mode count.
 pub fn vga_probe<B: BiosCaller>(bios: &B, st: &mut VideoState) -> (VgaModeTable, i32) {
+    vga_probe_for_build(bios, st, true)
+}
+
+/// `_WAKEUP` build of `vga_probe()`.
+///
+/// The real-mode object still detects and records the `adapter` global, but
+/// both writes into `boot_params.screen_info` are excluded by `_WAKEUP`.
+pub(crate) fn vga_probe_wakeup<B: BiosCaller>(
+    bios: &B,
+    st: &mut VideoState,
+) -> (VgaModeTable, i32) {
+    vga_probe_for_build(bios, st, false)
+}
+
+fn vga_probe_for_build<B: BiosCaller>(
+    bios: &B,
+    st: &mut VideoState,
+    store_screen_info: bool,
+) -> (VgaModeTable, i32) {
     let mut ireg = BiosRegs::default();
     let mut oreg = BiosRegs::default();
 
@@ -347,7 +366,9 @@ pub fn vga_probe<B: BiosCaller>(bios: &B, st: &mut VideoState) -> (VgaModeTable,
     set_bl(&mut ireg, 0x10); // Check EGA/VGA.
     bios.intcall(0x10, &ireg, Some(&mut oreg));
 
-    st.screen_info.orig_video_ega_bx = oreg.bx();
+    if store_screen_info {
+        st.screen_info.orig_video_ega_bx = oreg.bx();
+    }
 
     // If we have MDA/CGA/HGC then BL will be unchanged at 0x10.
     if bl(&oreg) != 0x10 {
@@ -357,7 +378,9 @@ pub fn vga_probe<B: BiosCaller>(bios: &B, st: &mut VideoState) -> (VgaModeTable,
 
         if oreg.al() == 0x1a {
             st.adapter = ADAPTER_VGA;
-            st.screen_info.orig_video_isvga = 1;
+            if store_screen_info {
+                st.screen_info.orig_video_isvga = 1;
+            }
         } else {
             st.adapter = ADAPTER_EGA;
         }

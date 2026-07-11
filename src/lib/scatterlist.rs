@@ -18,6 +18,8 @@ pub struct LinuxScatterList {
     pub length: u32,
     pub dma_address: usize,
     pub dma_length: u32,
+    /// Present under the selected vendor `CONFIG_NEED_SG_DMA_FLAGS=y` ABI.
+    pub dma_flags: u32,
 }
 
 #[repr(C)]
@@ -62,6 +64,7 @@ pub unsafe extern "C" fn linux_sg_init_one(
         (*sg).length = len;
         (*sg).dma_address = buf as usize;
         (*sg).dma_length = len;
+        (*sg).dma_flags = 0;
     }
 }
 
@@ -128,6 +131,7 @@ mod tests {
                 length: 0,
                 dma_address: 0,
                 dma_length: 0,
+                dma_flags: 0,
             };
             let data = [1u8; 4];
             linux_sg_init_one(&mut sg, data.as_ptr().cast(), data.len() as u32);
@@ -139,6 +143,7 @@ mod tests {
             assert_eq!(core::mem::offset_of!(LinuxScatterList, length), 0xc);
             assert_eq!(core::mem::offset_of!(LinuxScatterList, dma_address), 0x10);
             assert_eq!(core::mem::offset_of!(LinuxScatterList, dma_length), 0x18);
+            assert_eq!(core::mem::offset_of!(LinuxScatterList, dma_flags), 0x1c);
             assert_eq!(core::mem::size_of::<LinuxScatterList>(), 0x20);
 
             let mut table = LinuxSgTable {

@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel
 //! test-origin: linux:vendor/linux/kernel
 //! Linux-like console router and VT text buffer.
@@ -31,6 +31,10 @@ lazy_static! {
 }
 
 static FBCON_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Serializes host tests that mutate global console/fbcon state, including
+/// framebuffer detach tests in sibling modules.
+#[cfg(test)]
+pub(crate) static TEST_CONSOLE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 static CURSOR_BLINK_ON: AtomicBool = AtomicBool::new(true);
 static CURSOR_LAST_TSC: AtomicU64 = AtomicU64::new(0);
 const CURSOR_BLINK_CYCLES: u64 = 250_000_000;
@@ -1021,6 +1025,10 @@ pub fn set_fbcon_enabled(enabled: bool) {
     }
 }
 
+pub fn fbcon_enabled() -> bool {
+    FBCON_ENABLED.load(Ordering::Acquire)
+}
+
 pub fn refresh_cursor_blink() {
     let now = read_tsc();
     let last = CURSOR_LAST_TSC.load(Ordering::Acquire);
@@ -1166,11 +1174,6 @@ pub fn bell_armed_for_tests() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serializes tests around the global console state (CONSOLE,
-    /// FBCON_ENABLED, cursor atomics) â€” same convention as
-    /// `security::lsm_list::TEST_LSM_LOCK` / `fs::mount::TEST_MOUNT_LOCK`.
-    static TEST_CONSOLE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
     #[test]
     fn write_updates_cells_and_dirty_rows_without_rendering() {

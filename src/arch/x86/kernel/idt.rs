@@ -588,7 +588,7 @@ fn exception_name(vector: u8) -> &'static str {
 /// the `isr_common` stub — never call this from Rust code directly.
 extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) {
     // SAFETY: frame is constructed by isr_common on the exception stack.
-    let frame = unsafe { &*frame };
+    let frame = unsafe { &mut *frame };
     let vector = frame.vector as u8;
     let is_irq = matches!(
         vector,
@@ -914,7 +914,7 @@ fn on_ipi_ping() {
 }
 
 /// Generic handler for all other CPU exceptions.
-fn on_generic(frame: &ExceptionFrame, vector: u8) {
+fn on_generic(frame: &mut ExceptionFrame, vector: u8) {
     if vector == VEC_INVALID_OPCODE {
         if is_user_exception(frame) {
             let task = unsafe { crate::kernel::sched::get_current() };
@@ -928,6 +928,28 @@ fn on_generic(frame: &ExceptionFrame, vector: u8) {
                 crate::kernel::exit::do_exit(ill_exit_code() as i64);
             }
         }
+
+        // vendor/linux/arch/x86/kernel/traps.c::handle_bug treats UD2 as a
+        // compact WARN/BUG call before ordinary exception entry. Restore the
+        // interrupted IF state while reporting, then advance past UD2 only
+        // for a recoverable warning. A real BUG remains at its faulting RIP
+        // and falls through to the fatal invalid-opcode path below.
+        let interrupted_irqs_enabled = frame.rflags & (1 << 9) != 0;
+        if interrupted_irqs_enabled {
+            crate::kernel::locking::local_irq_enable();
+        }
+        let bug_trap = crate::kernel::bug::report_bug(frame.rip as usize);
+        if interrupted_irqs_enabled {
+            crate::kernel::locking::local_irq_disable();
+        }
+        match bug_trap {
+            crate::kernel::bug::BugTrapType::Warn => {
+                frame.rip = frame.rip.wrapping_add(2);
+                return;
+            }
+            crate::kernel::bug::BugTrapType::Bug | crate::kernel::bug::BugTrapType::None => {}
+        }
+
         let interrupted_sp =
             unsafe { (frame as *const ExceptionFrame as *const u8).add(160) as *const u64 };
         log_error!(

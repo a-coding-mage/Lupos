@@ -30,6 +30,7 @@ pub mod sysctl_test;
 // M27 / M28 must be declared before `task` because `task` re-exports
 // `cred::Cred` and `nsproxy::Nsproxy` and embeds `seccomp::Seccomp` inline.
 pub mod bpf; // M27
+pub mod bug;
 pub mod capability; // M27
 pub mod cfi;
 pub mod cgroup; // M32

@@ -34,7 +34,7 @@ impl McfgEntry {
     #[inline]
     pub fn config_addr(&self, bus: u8, dev: u8, func: u8, offset: u16) -> u64 {
         self.base
-            + ((bus as u64 - self.bus_start as u64) << 20)
+            + ((bus as u64) << 20)
             + ((dev as u64) << 15)
             + ((func as u64) << 12)
             + (offset as u64)
@@ -43,7 +43,8 @@ impl McfgEntry {
     /// Read a 32-bit dword from PCI configuration space via MMIO.
     ///
     /// # Safety
-    /// The identity mapping of the first 4 GiB must be in place (boot guarantee).
+    /// The selected ECAM physical range must be mapped into the kernel address
+    /// space before this accessor is used.
     pub unsafe fn read32(&self, bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
         let addr = self.config_addr(bus, dev, func, offset) as *const u32;
         unsafe { core::ptr::read_volatile(addr) }
@@ -77,6 +78,15 @@ impl McfgEntry {
     pub unsafe fn read8(&self, bus: u8, dev: u8, func: u8, offset: u16) -> u8 {
         let addr = self.config_addr(bus, dev, func, offset) as *const u8;
         unsafe { core::ptr::read_volatile(addr) }
+    }
+
+    /// Write an 8-bit byte to PCI configuration space.
+    ///
+    /// # Safety
+    /// Same as `read32`.
+    pub unsafe fn write8(&self, bus: u8, dev: u8, func: u8, offset: u16, val: u8) {
+        let addr = self.config_addr(bus, dev, func, offset) as *mut u8;
+        unsafe { core::ptr::write_volatile(addr, val) }
     }
 }
 

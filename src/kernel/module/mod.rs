@@ -33,7 +33,7 @@ pub mod tracking;
 pub mod tree_lookup;
 
 pub use loader::{
-    KernelModule, LoadModuleError, delete_module, find_module, inserted_modules, load_module,
-    with_module_address,
+    KernelModule, LoadModuleError, ModuleState, delete_module, find_module, inserted_modules,
+    load_module, with_module_address,
 };
 pub use symbols::{ExportedSymbol, export_symbol, find_symbol};

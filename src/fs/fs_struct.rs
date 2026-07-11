@@ -1,17 +1,17 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/fs/fs_struct.c
 //! test-origin: linux:vendor/linux/fs/fs_struct.c
 //! `struct fs_struct` — per-task filesystem root + cwd.
 //!
-//! Faithful port of `vendor/linux/fs/fs_struct.c` onto Lupos's `DentryRef` and
-//! task model. Lupos has no separate `struct vfsmount`, so Linux `struct path`
-//! collapses to a bare `DentryRef` (an `Arc<Dentry>`); Linux `path_get` /
-//! `path_put` map onto `Arc` clone / drop, and Linux's explicit `int users`
-//! reference count is kept exactly (it is *not* the `Arc` strong count).
+//! Faithful port of `vendor/linux/fs/fs_struct.c` onto Lupos's `VfsPath` and
+//! task model.  As in Linux, root and pwd retain both the mount and dentry;
+//! Linux `path_get` / `path_put` map onto `Arc` clone / drop, and Linux's
+//! explicit `int users` reference count is kept exactly (it is *not* the
+//! `Arc` strong count).
 //!
 //! The `fs_struct` is owned by `task_struct` via `M39FsFields::fs` (a raw
-//! `*mut FsStruct`). The legacy string-based cwd helpers below remain Lupos's
-//! path-resolver bridge and are unchanged.
+//! `*mut FsStruct`). Legacy string helpers are derived from the retained paths
+//! and are not used as pathname-lookup identity.
 
 extern crate alloc;
 
@@ -24,6 +24,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
+use super::mount::VfsPath;
 use super::types::DentryRef;
 use crate::include::uapi::errno::EINVAL;
 use crate::kernel::task::TaskStruct;
@@ -36,14 +37,14 @@ pub struct FsStruct {
     pub in_exec: AtomicBool,
     /// Linux `int umask`.
     pub umask: AtomicU32,
-    /// Linux `struct path root` (Lupos has no `mnt`, so just the dentry).
-    pub root: Mutex<Option<DentryRef>>,
+    /// Linux `struct path root`.
+    pub root: Mutex<Option<VfsPath>>,
     /// Linux `struct path pwd`.
-    pub pwd: Mutex<Option<DentryRef>>,
+    pub pwd: Mutex<Option<VfsPath>>,
 }
 
 impl FsStruct {
-    fn boxed(umask: u32, root: Option<DentryRef>, pwd: Option<DentryRef>) -> *mut FsStruct {
+    fn boxed(umask: u32, root: Option<VfsPath>, pwd: Option<VfsPath>) -> *mut FsStruct {
         Box::into_raw(Box::new(FsStruct {
             users: AtomicU32::new(1),
             in_exec: AtomicBool::new(false),
@@ -79,13 +80,13 @@ pub unsafe fn set_task_fs(task: *mut TaskStruct, fs: *mut FsStruct) {
     }
 }
 
-fn root_dentry() -> Option<DentryRef> {
-    crate::fs::mount::rootfs().map(|m| m.root.clone())
+fn root_path() -> Option<VfsPath> {
+    crate::fs::mount::namespace_root_path()
 }
 
 /// Linux `init_fs` — the initial task's fs (umask 022, root/pwd at the VFS root).
 pub fn init_fs() -> *mut FsStruct {
-    let r = root_dentry();
+    let r = root_path();
     FsStruct::boxed(0o022, r.clone(), r)
 }
 
@@ -99,7 +100,7 @@ pub unsafe fn ensure_task_fs(task: *mut TaskStruct) -> *mut FsStruct {
     if !existing.is_null() {
         return existing;
     }
-    let r = root_dentry();
+    let r = root_path();
     let fresh = FsStruct::boxed(0o022, r.clone(), r);
     unsafe { set_task_fs(task, fresh) };
     fresh
@@ -115,15 +116,23 @@ pub fn current_fs() -> *mut FsStruct {
     unsafe { ensure_task_fs(task) }
 }
 
-pub fn current_root_and_pwd() -> Option<(DentryRef, DentryRef)> {
+pub fn current_root_and_pwd_paths() -> Option<(VfsPath, VfsPath)> {
     let fs = current_fs();
     if fs.is_null() {
         return None;
     }
     let fs = unsafe { &*fs };
-    let root = fs.root.lock().clone().or_else(root_dentry)?;
+    let root = fs.root.lock().clone().or_else(root_path)?;
     let pwd = fs.pwd.lock().clone().unwrap_or_else(|| root.clone());
     Some((root, pwd))
+}
+
+/// Dentry-only compatibility accessor for subsystems that have not yet grown
+/// a `struct path` parameter.  Pathname lookup must use
+/// `current_root_and_pwd_paths()`.
+pub fn current_root_and_pwd() -> Option<(DentryRef, DentryRef)> {
+    let (root, pwd) = current_root_and_pwd_paths()?;
+    Some((root.dentry, pwd.dentry))
 }
 
 fn path_components_below_root(root: &DentryRef, dentry: &DentryRef) -> Option<Vec<String>> {
@@ -159,42 +168,58 @@ pub fn path_from_root(root: &DentryRef, dentry: &DentryRef) -> Option<String> {
 }
 
 pub fn path_from_current_root(dentry: &DentryRef) -> Option<String> {
-    let (root, _) = current_root_and_pwd()?;
-    path_from_root(&root, dentry)
+    let (root, _) = current_root_and_pwd_paths()?;
+    let path = VfsPath::new(root.mount.clone(), dentry.clone());
+    crate::fs::mount::path_between(&root, &path)
 }
 
-pub fn visible_path_for_current_root(dentry: &DentryRef) -> String {
-    path_from_current_root(dentry).unwrap_or_else(|| crate::fs::file::dentry_path(dentry))
+pub fn visible_path_for_current_root(path: &VfsPath) -> String {
+    current_root_and_pwd_paths()
+        .and_then(|(root, _)| crate::fs::mount::path_between(&root, path))
+        .unwrap_or_else(|| crate::fs::file::dentry_path(&path.dentry))
 }
 
 // ── fs_struct.c functions ───────────────────────────────────────────────────
 
 /// Linux `set_fs_root` — replace `fs->root`, dropping (`path_put`) the old one.
-pub fn set_fs_root(fs: &FsStruct, dentry: DentryRef) {
-    let old = fs.root.lock().replace(dentry);
+pub fn set_fs_root_path(fs: &FsStruct, path: VfsPath) {
+    let old = fs.root.lock().replace(path);
     drop(old);
 }
 
+pub fn set_fs_root(fs: &FsStruct, dentry: DentryRef) {
+    if let Some(path) = VfsPath::for_dentry(dentry) {
+        set_fs_root_path(fs, path);
+    }
+}
+
 /// Linux `set_fs_pwd` — replace `fs->pwd`, dropping the old one.
-pub fn set_fs_pwd(fs: &FsStruct, dentry: DentryRef) {
-    let old = fs.pwd.lock().replace(dentry);
+pub fn set_fs_pwd_path(fs: &FsStruct, path: VfsPath) {
+    let old = fs.pwd.lock().replace(path);
     drop(old);
+}
+
+pub fn set_fs_pwd(fs: &FsStruct, dentry: DentryRef) {
+    if let Some(path) = VfsPath::for_dentry(dentry) {
+        set_fs_pwd_path(fs, path);
+    }
 }
 
 /// Linux `replace_path` — if `slot` still points at `old`, swap in `new` and
 /// report a hit. `Arc` clone/drop balances Linux's `path_get`/`path_put`.
-fn replace_path(slot: &Mutex<Option<DentryRef>>, old: &DentryRef, new: &DentryRef) -> bool {
+fn replace_path(slot: &Mutex<Option<VfsPath>>, old: &VfsPath, new: &VfsPath) -> bool {
     let mut guard = slot.lock();
-    let is_match = guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, old));
+    let is_match = guard.as_ref().is_some_and(|cur| cur.equal(old));
     if is_match {
         *guard = Some(new.clone());
     }
     is_match
 }
 
-/// Linux `chroot_fs_refs` — after a chroot, rewrite every task whose root or
-/// pwd still pointed at `old_root` so it points at `new_root` instead.
-pub fn chroot_fs_refs(old_root: &DentryRef, new_root: &DentryRef) {
+/// Linux `chroot_fs_refs` — after a namespace root transition, rewrite every
+/// task whose root or pwd still pointed at `old_root`.  Linux `chroot(2)` does
+/// not call this helper.
+pub fn chroot_fs_refs(old_root: &VfsPath, new_root: &VfsPath) {
     let current = unsafe { crate::kernel::sched::get_current() };
     if !current.is_null() {
         let fs = unsafe { task_fs(current) };
@@ -340,11 +365,18 @@ pub fn set_current_cwd_path(path: &str) {
 }
 
 pub fn absolute_from_cwd(path: &str) -> String {
-    if let Some((root, pwd)) = current_root_and_pwd() {
+    if let Some((root, pwd)) = current_root_and_pwd_paths() {
         let mut components = if path.starts_with('/') {
             Vec::new()
         } else {
-            path_components_below_root(&root, &pwd).unwrap_or_default()
+            crate::fs::mount::path_between(&root, &pwd)
+                .map(|path| {
+                    path.split('/')
+                        .filter(|component| !component.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default()
         };
         for part in path.split('/') {
             match part {
@@ -356,17 +388,7 @@ pub fn absolute_from_cwd(path: &str) -> String {
             }
         }
 
-        let root_path = crate::fs::file::dentry_path(&root);
-        let visible = join_components(&components);
-        if root_path == "/" {
-            return visible;
-        }
-        if visible == "/" {
-            return root_path;
-        }
-        let mut out = root_path;
-        out.push_str(&visible);
-        return normalize_path(&out);
+        return join_components(&components);
     }
 
     if path.starts_with('/') {
@@ -388,7 +410,9 @@ pub fn absolute_from_cwd(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::types::Dentry;
+    use crate::fs::mount::Mount;
+    use crate::fs::ops::NOOP_SUPER_OPS;
+    use crate::fs::types::{Dentry, SuperBlock};
     use crate::kernel::sched;
     use crate::kernel::task::TaskStruct;
 
@@ -396,6 +420,12 @@ mod tests {
         let dentry = Dentry::new_negative(name);
         *dentry.parent.lock() = Some(parent.clone());
         dentry
+    }
+
+    fn test_mount(root: &DentryRef) -> Arc<Mount> {
+        let sb = SuperBlock::alloc("fs-struct-test", 0, &NOOP_SUPER_OPS);
+        *sb.root.lock() = Some(root.clone());
+        Mount::alloc(sb, root.clone(), 0)
     }
 
     #[test]
@@ -419,17 +449,19 @@ mod tests {
     fn set_root_and_pwd_replace_and_release() {
         let fs = init_fs();
         let f = unsafe { &*fs };
+        let mount_root = Dentry::new_negative("/");
+        let mount = test_mount(&mount_root);
         let a = Dentry::new_negative("a");
         let b = Dentry::new_negative("b");
-        set_fs_root(f, a.clone());
-        set_fs_pwd(f, b.clone());
-        assert!(Arc::ptr_eq(f.root.lock().as_ref().unwrap(), &a));
-        assert!(Arc::ptr_eq(f.pwd.lock().as_ref().unwrap(), &b));
+        set_fs_root_path(f, VfsPath::new(mount.clone(), a.clone()));
+        set_fs_pwd_path(f, VfsPath::new(mount.clone(), b.clone()));
+        assert!(Arc::ptr_eq(&f.root.lock().as_ref().unwrap().dentry, &a));
+        assert!(Arc::ptr_eq(&f.pwd.lock().as_ref().unwrap().dentry, &b));
         // Replacing root drops the old reference (only our `a`/`b` remain).
         let c = Dentry::new_negative("c");
-        set_fs_root(f, c.clone());
+        set_fs_root_path(f, VfsPath::new(mount, c.clone()));
         assert_eq!(Arc::strong_count(&a), 1);
-        assert!(Arc::ptr_eq(f.root.lock().as_ref().unwrap(), &c));
+        assert!(Arc::ptr_eq(&f.root.lock().as_ref().unwrap().dentry, &c));
         unsafe { put_fs_struct(fs) };
     }
 
@@ -438,12 +470,17 @@ mod tests {
         let old = Dentry::new_negative("old");
         let new = Dentry::new_negative("new");
         let other = Dentry::new_negative("other");
-        let slot = Mutex::new(Some(old.clone()));
-        assert!(replace_path(&slot, &old, &new));
-        assert!(Arc::ptr_eq(slot.lock().as_ref().unwrap(), &new));
+        let mount_root = Dentry::new_negative("/");
+        let mount = test_mount(&mount_root);
+        let old_path = VfsPath::new(mount.clone(), old.clone());
+        let new_path = VfsPath::new(mount.clone(), new.clone());
+        let other_path = VfsPath::new(mount, other.clone());
+        let slot = Mutex::new(Some(old_path.clone()));
+        assert!(replace_path(&slot, &old_path, &new_path));
+        assert!(Arc::ptr_eq(&slot.lock().as_ref().unwrap().dentry, &new));
         // A second call with the now-stale `old` must not match.
-        assert!(!replace_path(&slot, &old, &other));
-        assert!(Arc::ptr_eq(slot.lock().as_ref().unwrap(), &new));
+        assert!(!replace_path(&slot, &old_path, &other_path));
+        assert!(Arc::ptr_eq(&slot.lock().as_ref().unwrap().dentry, &new));
     }
 
     #[test]
@@ -452,12 +489,13 @@ mod tests {
         let p = unsafe { &*parent };
         p.umask.store(0o027, Ordering::Relaxed);
         let root = Dentry::new_negative("root");
-        set_fs_root(p, root.clone());
+        let mount = test_mount(&root);
+        set_fs_root_path(p, VfsPath::new(mount, root.clone()));
         let child = copy_fs_struct(p);
         let c = unsafe { &*child };
         assert_eq!(c.users.load(Ordering::Relaxed), 1);
         assert_eq!(c.umask.load(Ordering::Relaxed), 0o027);
-        assert!(Arc::ptr_eq(c.root.lock().as_ref().unwrap(), &root));
+        assert!(Arc::ptr_eq(&c.root.lock().as_ref().unwrap().dentry, &root));
         unsafe { put_fs_struct(child) };
         unsafe { put_fs_struct(parent) };
     }
@@ -536,14 +574,17 @@ mod tests {
         let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         let old = Dentry::new_negative("/");
         let new = child(&old, "jail");
-        let fs = FsStruct::boxed(0o022, Some(old.clone()), Some(old.clone()));
+        let mount = test_mount(&old);
+        let old_path = VfsPath::new(mount.clone(), old.clone());
+        let new_path = VfsPath::new(mount, new.clone());
+        let fs = FsStruct::boxed(0o022, Some(old_path.clone()), Some(old_path.clone()));
         unsafe {
             set_task_fs(&mut *task, fs);
             sched::set_current(&mut *task);
-            chroot_fs_refs(&old, &new);
+            chroot_fs_refs(&old_path, &new_path);
             let f = &*fs;
-            assert!(Arc::ptr_eq(f.root.lock().as_ref().unwrap(), &new));
-            assert!(Arc::ptr_eq(f.pwd.lock().as_ref().unwrap(), &new));
+            assert!(Arc::ptr_eq(&f.root.lock().as_ref().unwrap().dentry, &new));
+            assert!(Arc::ptr_eq(&f.pwd.lock().as_ref().unwrap().dentry, &new));
             exit_fs(&mut *task);
             sched::set_current(previous);
         }
@@ -556,13 +597,18 @@ mod tests {
         let host = Dentry::new_negative("/");
         let jail = child(&host, "jail");
         let work = child(&jail, "work");
-        let fs = FsStruct::boxed(0o022, Some(jail.clone()), Some(work.clone()));
+        let mount = test_mount(&host);
+        let fs = FsStruct::boxed(
+            0o022,
+            Some(VfsPath::new(mount.clone(), jail.clone())),
+            Some(VfsPath::new(mount, work.clone())),
+        );
         unsafe {
             set_task_fs(&mut *task, fs);
             sched::set_current(&mut *task);
-            assert_eq!(absolute_from_cwd("file"), "/jail/work/file");
-            assert_eq!(absolute_from_cwd("../etc"), "/jail/etc");
-            assert_eq!(absolute_from_cwd("/../../etc"), "/jail/etc");
+            assert_eq!(absolute_from_cwd("file"), "/work/file");
+            assert_eq!(absolute_from_cwd("../etc"), "/etc");
+            assert_eq!(absolute_from_cwd("/../../etc"), "/etc");
             assert_eq!(path_from_current_root(&work).as_deref(), Some("/work"));
             exit_fs(&mut *task);
             sched::set_current(previous);

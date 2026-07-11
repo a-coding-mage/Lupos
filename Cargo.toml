@@ -3,9 +3,12 @@ members = ["xtask"]
 default-members = ["xtask"]
 resolver = "3"
 
+[workspace.package]
+version = "0.1.0"
+
 [package]
 name = "lupos"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 publish = false
 

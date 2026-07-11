@@ -566,11 +566,13 @@ pub mod buffer {
 ///
 /// Ref: https://wiki.osdev.org/Text_UI
 use self::buffer::{Color, VgaChar, Writer};
+use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
 /// Physical address of the VGA text buffer (standard on all VGA-compatible PCs).
 const VGA_BUFFER_ADDR: usize = 0xB8000;
+static VGACON_ENABLED: AtomicBool = AtomicBool::new(true);
 
 lazy_static! {
     /// Global VGA writer instance.
@@ -592,19 +594,51 @@ lazy_static! {
 
 /// Initialize the VGA display by clearing the screen.
 pub fn init() {
-    WRITER.lock().clear();
+    let mut writer = WRITER.lock();
+    VGACON_ENABLED.store(true, Ordering::Release);
+    writer.clear();
+}
+
+/// Unregister the legacy VGA console when a native graphics driver takes over.
+/// This is the output-side effect of Linux `vga_remove_vgacon()`.
+pub fn detach() {
+    // Linux holds console_lock() across the dummy-console takeover.  WRITER is
+    // the serialization point for Lupos's legacy console: changing the state
+    // while holding it, paired with the post-lock checks below, guarantees no
+    // printk/render that observed the old state can touch 0xb8000 after this
+    // function returns to a native DRM driver.
+    let _writer = WRITER.lock();
+    VGACON_ENABLED.store(false, Ordering::Release);
+}
+
+pub fn is_enabled() -> bool {
+    VGACON_ENABLED.load(Ordering::Acquire)
 }
 
 /// Internal helper used by the `print!` / `println!` macros.
 #[doc(hidden)]
 pub fn _print(args: core::fmt::Arguments<'_>) {
+    if !is_enabled() {
+        return;
+    }
     use core::fmt::Write;
-    WRITER.lock().write_fmt(args).unwrap();
+    let mut writer = WRITER.lock();
+    if !is_enabled() {
+        return;
+    }
+    writer.write_fmt(args).unwrap();
 }
 
 /// Render parsed VT output into the legacy VGA text console.
 pub fn render_batch(batch: &crate::kernel::console::RenderBatch) {
-    WRITER.lock().render_console_batch(batch);
+    if !is_enabled() {
+        return;
+    }
+    let mut writer = WRITER.lock();
+    if !is_enabled() {
+        return;
+    }
+    writer.render_console_batch(batch);
 }
 
 /// Print to the VGA text buffer (no trailing newline).

@@ -28,6 +28,11 @@ pub struct MmapArgStruct {
 }
 
 pub unsafe fn sys_mmap(addr: u64, len: u64, prot: u32, flags: u32, fd: i32, off: u64) -> i64 {
+    // x86-64 `sys_mmap` accepts a byte offset and rejects offsets that are not
+    // page aligned before converting them to the internal page offset.
+    if off & (crate::arch::x86::mm::paging::PAGE_SIZE - 1) != 0 {
+        return -(EINVAL as i64);
+    }
     let task = unsafe { sched::get_current() };
     if task.is_null() {
         return -(EBADF as i64);

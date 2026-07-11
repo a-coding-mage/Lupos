@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/boot/compressed/misc.c
 //! test-origin: linux:vendor/linux/arch/x86/boot/compressed/misc.c
 //! Decompressor entry point (`extract_kernel`) plus ELF parsing,
@@ -8,7 +8,9 @@
 //! - vendor/linux/arch/x86/boot/compressed/misc.c
 //! - vendor/linux/arch/x86/boot/compressed/misc.h
 //!
-//! This is a faithful 1:1 translation of misc.c. The decompressor runs
+//! This is a source-shaped model of misc.c. The live bzImage still uses the
+//! assembly extractor documented below, so this cannot claim complete runtime
+//! parity. The decompressor model runs
 //! with no host hardware available, so the raw operations that cannot
 //! execute inside a host unit test are routed through explicit seams
 //! (the [`MiscEnv`] trait). Linux itself indirects most of these via

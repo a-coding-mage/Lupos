@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/dma
 //! test-origin: linux:vendor/linux/kernel/dma
 //! DMA API — M55.
@@ -21,8 +21,13 @@ extern crate alloc;
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use core::ffi::c_void;
 
+use crate::include::uapi::errno::EIO;
 use crate::kernel::module::{export_symbol, find_symbol};
+#[cfg(not(test))]
+use crate::mm::buddy::{is_buddy_ready, with_global_buddy};
 use crate::mm::buddy::{page_in_mem_map, page_to_pfn};
+#[cfg(not(test))]
+use crate::mm::frame::PAGE_SIZE;
 use crate::mm::page::Page;
 
 pub mod dummy;
@@ -42,6 +47,11 @@ pub enum DmaDirection {
 
 /// Device-visible DMA address (bus address in Linux terminology).
 pub type DmaAddr = u64;
+
+/// `DMA_MAPPING_ERROR` for the staged x86_64 ABI.
+///
+/// Source: `vendor/linux/include/linux/dma-mapping.h`.
+pub const DMA_MAPPING_ERROR: DmaAddr = DmaAddr::MAX;
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
@@ -72,15 +82,127 @@ pub fn register_module_exports() {
     export_symbol_once("dma_unmap_page_attrs", dma_unmap_page_attrs as usize, false);
 }
 
+const LINUX_DEVICE_DMA_MASK_OFFSET: usize = 584;
+const LINUX_DEVICE_COHERENT_DMA_MASK_OFFSET: usize = 592;
+
+unsafe fn linux_device_streaming_dma_mask(dev: *const c_void) -> Option<u64> {
+    if dev.is_null() {
+        return None;
+    }
+    let mask_ptr = unsafe {
+        dev.cast::<u8>()
+            .add(LINUX_DEVICE_DMA_MASK_OFFSET)
+            .cast::<*mut u64>()
+            .read()
+    };
+    if mask_ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { mask_ptr.read() })
+    }
+}
+
+unsafe fn linux_device_coherent_dma_mask(dev: *const c_void) -> Option<u64> {
+    if dev.is_null() {
+        return None;
+    }
+    let mask = unsafe {
+        dev.cast::<u8>()
+            .add(LINUX_DEVICE_COHERENT_DMA_MASK_OFFSET)
+            .cast::<u64>()
+            .read()
+    };
+    (mask != 0).then_some(mask)
+}
+
+fn dma_range_fits_mask(addr: DmaAddr, size: usize, mask: u64) -> bool {
+    size != 0
+        && addr != DMA_MAPPING_ERROR
+        && u64::try_from(size)
+            .ok()
+            .and_then(|size| addr.checked_add(size - 1))
+            .is_some_and(|end| end <= mask)
+}
+
+fn direct_dma_required_mask() -> Option<u64> {
+    #[cfg(test)]
+    {
+        // Host allocations are not backed by Lupos's physical allocator.
+        None
+    }
+
+    #[cfg(not(test))]
+    {
+        if !is_buddy_ready() {
+            return None;
+        }
+
+        let end_pfn = with_global_buddy(|buddy| {
+            buddy
+                .zones
+                .iter()
+                .filter_map(|zone| zone.zone_start_pfn.checked_add(zone.spanned_pages))
+                .max()
+                .unwrap_or(0)
+        });
+        if end_pfn == 0 {
+            return None;
+        }
+
+        u64::try_from(end_pfn)
+            .ok()?
+            .checked_mul(PAGE_SIZE as u64)?
+            .checked_sub(1)
+    }
+}
+
+fn direct_dma_mask_covers(mask: u64, required_mask: Option<u64>) -> bool {
+    // An all-ones dma_addr_t covers every address this ABI can represent even
+    // before the physical allocator is online. Narrower masks are safe only
+    // once the complete buddy-managed physical range is known. Lupos does not
+    // yet have Linux's ZONE_DMA32, SWIOTLB, or IOMMU fallback, so accepting a
+    // conventional 32-bit mask unconditionally would let later mappings escape
+    // the mask the driver was promised.
+    mask == u64::MAX || required_mask.is_some_and(|required| mask >= required)
+}
+
+fn direct_dma_mask_supported(mask: u64) -> bool {
+    direct_dma_mask_covers(mask, direct_dma_required_mask())
+}
+
 /// `dma_set_mask` - `vendor/linux/kernel/dma/mapping.c:917`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_set_mask(_dev: *mut c_void, _mask: u64) -> i32 {
+pub unsafe extern "C" fn dma_set_mask(dev: *mut c_void, mask: u64) -> i32 {
+    if dev.is_null() || !direct_dma_mask_supported(mask) {
+        return -EIO;
+    }
+    let mask_ptr = unsafe {
+        dev.cast::<u8>()
+            .add(LINUX_DEVICE_DMA_MASK_OFFSET)
+            .cast::<*mut u64>()
+            .read()
+    };
+    if mask_ptr.is_null() {
+        return -EIO;
+    }
+    unsafe {
+        mask_ptr.write(mask);
+    }
     0
 }
 
 /// `dma_set_coherent_mask` - `vendor/linux/kernel/dma/mapping.c:936`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_set_coherent_mask(_dev: *mut c_void, _mask: u64) -> i32 {
+pub unsafe extern "C" fn dma_set_coherent_mask(dev: *mut c_void, mask: u64) -> i32 {
+    if dev.is_null() || !direct_dma_mask_supported(mask) {
+        return -EIO;
+    }
+    unsafe {
+        dev.cast::<u8>()
+            .add(LINUX_DEVICE_COHERENT_DMA_MASK_OFFSET)
+            .cast::<u64>()
+            .write(mask);
+    }
     0
 }
 
@@ -107,17 +229,31 @@ pub unsafe extern "C" fn __dma_sync_single_for_device(
 /// `dma_alloc_attrs` - `vendor/linux/kernel/dma/mapping.c:631`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dma_alloc_attrs(
-    _dev: *mut c_void,
+    dev: *mut c_void,
     size: usize,
     dma_handle: *mut DmaAddr,
     _flag: u32,
     _attrs: usize,
 ) -> *mut c_void {
+    let Some(mask) = (unsafe { linux_device_coherent_dma_mask(dev) }) else {
+        return core::ptr::null_mut();
+    };
     let Some((ptr, dma)) = dma_alloc_coherent(size) else {
         return core::ptr::null_mut();
     };
+    if !dma_range_fits_mask(dma, size, mask) {
+        unsafe {
+            dma_free_coherent(ptr, size);
+        }
+        if !dma_handle.is_null() {
+            unsafe {
+                dma_handle.write(DMA_MAPPING_ERROR);
+            }
+        }
+        return core::ptr::null_mut();
+    }
     if !dma_handle.is_null() {
-        unsafe { *dma_handle = dma };
+        unsafe { dma_handle.write(dma) };
     }
     ptr.cast()
 }
@@ -137,18 +273,18 @@ pub unsafe extern "C" fn dma_free_attrs(
 /// `dma_map_page_attrs` - `vendor/linux/kernel/dma/mapping.c:191`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dma_map_page_attrs(
-    _dev: *mut c_void,
+    dev: *mut c_void,
     page: *mut Page,
     offset: usize,
     size: usize,
     dir: DmaDirection,
     _attrs: usize,
 ) -> DmaAddr {
-    if page.is_null() || !page_in_mem_map(page) {
-        return 0;
+    if page.is_null() || !page_in_mem_map(page) || dir == DmaDirection::None {
+        return DMA_MAPPING_ERROR;
     }
     let ptr = crate::arch::x86::mm::paging::pfn_to_virt(page_to_pfn(page)).wrapping_add(offset);
-    dma_map_single(ptr, size, dir)
+    unsafe { dma_map_single_for_device(dev, ptr, size, dir) }
 }
 
 /// `dma_unmap_page_attrs` - `vendor/linux/kernel/dma/mapping.c:242`.
@@ -211,6 +347,35 @@ pub unsafe fn dma_free_coherent(ptr: *mut u8, size: usize) {
 #[inline]
 pub fn dma_map_single(ptr: *const u8, _size: usize, _dir: DmaDirection) -> DmaAddr {
     dma_addr_from_cpu_addr(ptr).unwrap_or(0)
+}
+
+/// Direct-map a CPU address for a specific Linux device.
+///
+/// This is the no-IOMMU/no-SWIOTLB branch of
+/// `vendor/linux/kernel/dma/direct.h:dma_direct_map_phys()`: the active
+/// streaming mask is checked after translating the CPU address.  Lupos does
+/// not claim Linux's bounce-buffer fallback, so an address outside the mask is
+/// rejected with `DMA_MAPPING_ERROR`.
+pub unsafe fn dma_map_single_for_device(
+    dev: *mut c_void,
+    ptr: *const u8,
+    size: usize,
+    dir: DmaDirection,
+) -> DmaAddr {
+    if dir == DmaDirection::None {
+        return DMA_MAPPING_ERROR;
+    }
+    let Some(mask) = (unsafe { linux_device_streaming_dma_mask(dev) }) else {
+        return DMA_MAPPING_ERROR;
+    };
+    let Some(dma) = dma_addr_from_cpu_addr(ptr) else {
+        return DMA_MAPPING_ERROR;
+    };
+    if dma_range_fits_mask(dma, size, mask) {
+        dma
+    } else {
+        DMA_MAPPING_ERROR
+    }
 }
 
 /// `dma_unmap_single`.
@@ -277,11 +442,56 @@ mod tests {
             crate::kernel::module::find_symbol("dma_set_coherent_mask"),
             Some(dma_set_coherent_mask as usize)
         );
-        assert_eq!(unsafe { dma_set_mask(core::ptr::null_mut(), u64::MAX) }, 0);
+        assert_eq!(
+            unsafe { dma_set_mask(core::ptr::null_mut(), u64::MAX) },
+            -EIO
+        );
         assert_eq!(
             unsafe { dma_set_coherent_mask(core::ptr::null_mut(), u64::MAX) },
-            0
+            -EIO
         );
+    }
+
+    #[test]
+    fn dma_mask_helpers_update_target_config_device_fields() {
+        #[repr(C, align(8))]
+        struct DeviceStorage([u8; 760]);
+
+        let mut storage = DeviceStorage([0; 760]);
+        let mut streaming_mask = u32::MAX as u64;
+        unsafe {
+            storage
+                .0
+                .as_mut_ptr()
+                .add(LINUX_DEVICE_DMA_MASK_OFFSET)
+                .cast::<*mut u64>()
+                .write(core::ptr::addr_of_mut!(streaming_mask));
+
+            assert_eq!(dma_set_mask(storage.0.as_mut_ptr().cast(), u64::MAX), 0);
+            assert_eq!(streaming_mask, u64::MAX);
+            assert_eq!(
+                dma_set_coherent_mask(storage.0.as_mut_ptr().cast(), u64::MAX),
+                0
+            );
+            assert_eq!(
+                storage
+                    .0
+                    .as_ptr()
+                    .add(LINUX_DEVICE_COHERENT_DMA_MASK_OFFSET)
+                    .cast::<u64>()
+                    .read(),
+                u64::MAX
+            );
+            assert_eq!(dma_set_mask(storage.0.as_mut_ptr().cast(), 0), -EIO);
+        }
+    }
+
+    #[test]
+    fn direct_dma_masks_fail_closed_without_a_known_address_ceiling() {
+        assert!(direct_dma_mask_covers(u64::MAX, None));
+        assert!(!direct_dma_mask_covers(u32::MAX as u64, None));
+        assert!(direct_dma_mask_covers(0x1_ffff_ffff, Some(0x1_ffff_ffff)));
+        assert!(!direct_dma_mask_covers(0xffff_ffff, Some(0x1_0000_0000)));
     }
 
     #[test]

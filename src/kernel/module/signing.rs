@@ -1,7 +1,12 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/module/signing.c
 //! test-origin: linux:vendor/linux/kernel/module/signing.c
 //! Module signature marker handling and signature-enforcement decisions.
+//!
+//! The parsing/policy helper mirrors `signing.c`, but the production
+//! `init_module`/`finit_module` path does not yet connect it to a keyring and
+//! lockdown policy.  It must not be described as complete until signature
+//! stripping and verification run before ELF parsing in the live loader.
 
 extern crate alloc;
 

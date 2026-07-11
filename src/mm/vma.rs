@@ -84,8 +84,18 @@ fn lupos_file_vm_ops_tag() -> usize {
     &crate::mm::fault::LUPOS_FILE_VM_OPS as *const crate::mm::fault::VmOperationsStruct as usize
 }
 
+fn lupos_device_pfn_vm_ops_tag() -> usize {
+    &crate::mm::fault::LUPOS_DEVICE_PFN_VM_OPS as *const crate::mm::fault::VmOperationsStruct
+        as usize
+}
+
 fn vma_owns_lupos_file(vma: *const VmAreaStruct) -> bool {
-    !vma.is_null() && unsafe { (*vma).vm_file != 0 && (*vma).vm_ops == lupos_file_vm_ops_tag() }
+    !vma.is_null()
+        && unsafe {
+            (*vma).vm_file != 0
+                && ((*vma).vm_ops == lupos_file_vm_ops_tag()
+                    || (*vma).vm_ops == lupos_device_pfn_vm_ops_tag())
+        }
 }
 
 /// Take another reference on the file owned by a duplicated Lupos file VMA.

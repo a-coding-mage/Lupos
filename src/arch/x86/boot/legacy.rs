@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/boot
 //! test-origin: linux:vendor/linux/arch/x86/boot
 //! Linux x86 legacy boot option helpers.

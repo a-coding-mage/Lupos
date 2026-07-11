@@ -86,7 +86,9 @@ pub fn register_module_exports() {
     crate::arch::x86::kernel::head64::register_module_exports();
     crate::arch::x86::kernel::cpu::common::register_module_exports();
     crate::arch::x86::entry::thunk::register_module_exports();
+    crate::arch::x86::video::register_module_exports();
     crate::mm::ioremap::register_module_exports();
+    crate::mm::mm_init::register_module_exports();
     crate::mm::page_alloc::register_module_exports();
     crate::mm::slab::register_module_exports();
     crate::mm::vmalloc::register_module_exports();
@@ -98,13 +100,20 @@ pub fn register_module_exports() {
     crate::kernel::time::sleep_timeout::register_module_exports();
     crate::kernel::workqueue::register_module_exports();
     crate::kernel::locking::preempt::register_module_exports();
+    crate::kernel::locking::raw_spinlock::register_module_exports();
     crate::kernel::locking::mutex::register_module_exports();
+    crate::fs::sysfs::register_module_exports();
     crate::net::core::page_pool::register_module_exports();
     crate::net::module_abi::register_module_exports();
     base::register_module_exports();
     pci::register_module_exports();
     block::register_module_exports();
     storage_core::register_module_exports();
+    video::register_module_exports();
+    // `gpu::drm::module_abi` remains an implementation work inventory.  Its
+    // side-table/fabricated-object shims do not yet preserve the Linux object
+    // and lifetime contracts, so registering them would turn honest
+    // unresolved-symbol failures into memory corruption during DRM probe.
     #[cfg(any(test, CONFIG_VIRTIO = "y", CONFIG_VIRTIO = "m"))]
     virtio::register_module_exports();
 }

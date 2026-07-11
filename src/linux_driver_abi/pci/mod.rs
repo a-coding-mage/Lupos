@@ -42,4 +42,5 @@ pub fn register_module_exports() {
     access::register_module_exports();
     pci::register_module_exports();
     iomap::register_module_exports();
+    msi::register_module_exports();
 }

@@ -1,11 +1,11 @@
-//! linux-parity: complete
+//! linux-parity: stub
 //! linux-source: vendor/linux/drivers/gpu/drm
 //! test-origin: linux:vendor/linux/drivers/gpu/drm
-//! DRM stub — M57.
+//! DRM device/minor registry stub — M57.
 //!
-//! Mirrors `include/drm/drm_device.h` and `drivers/gpu/drm/drm_drv.c`.
-//! Provides a `DrmDevice` and `drm_dev_register` so the device model has a
-//! DRM class entry under `/sys/class/drm/`.  No KMS or modesetting yet.
+//! Provides a small `DrmDevice` and minor registry for existing acceptance
+//! tests. It does not yet implement Linux's DRM core, KMS, file operations, or
+//! the module ABI required by vendor-built GPU drivers.
 //!
 //! References:
 //!   - `include/drm/drm_device.h:75`  — `struct drm_device`
@@ -14,6 +14,7 @@
 extern crate alloc;
 
 pub mod linux_sources;
+pub mod module_abi;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;

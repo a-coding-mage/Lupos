@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/boot/video-vesa.c
 //! test-origin: linux:vendor/linux/arch/x86/boot/video-vesa.c
 //! VESA (VBE) text and linear-framebuffer mode driver.
@@ -13,8 +13,8 @@
 //! graphics modes. `vesa_set_mode` re-queries the chosen mode and programs it.
 //! The graphics-mode parameter capture (`vesa_store_mode_params_graphics`),
 //! the DAC-width and protected-mode-info queries, and EDID retrieval are all
-//! ported. INT 10h goes through [`BiosCaller`]; the mode-list walk and the
-//! `&vginfo/&vminfo` pointers thread the [`VesaMem`] seam.
+//! ported. INT 10h goes through [`BiosCaller`]; the mode-list walk and exact
+//! `ES:DI` addresses of `&vginfo/&vminfo` thread the [`VesaMem`] seam.
 //!
 //! `CONFIG_BOOT_VESA_SUPPORT`, `CONFIG_FIRMWARE_EDID` and the `_WAKEUP` build
 //! switches are represented by the `vesa_support`/`firmware_edid`/`wakeup`
@@ -22,7 +22,7 @@
 
 use super::biosregs::{BiosCaller, BiosRegs};
 use super::regs::initregs;
-use super::vesa::{VESA_MAGIC, VesaGeneralInfo, VesaModeInfo};
+use super::vesa::{FarPtr, VESA_MAGIC, VesaGeneralInfo, VesaModeInfo};
 use super::video::{ModeInfo, ScreenInfo, VIDEO_FIRST_VESA, VIDEO_TYPE_VLFB, VideoState};
 
 /// `video_vesa` card metadata (video-vesa.c:272-279).
@@ -56,17 +56,18 @@ impl Default for VesaConfig {
 }
 
 /// Seam for the far-segment memory the VESA probe touches: `set_fs`, the
-/// 16-bit mode-list walk (`rdfs16`), and the `&vginfo`/`&vminfo` pointers the
-/// BIOS fills. Production wiring backs these with real buffers; tests stub it.
+/// 16-bit mode-list walk (`rdfs16`), and the `ES:DI` addresses of the
+/// `&vginfo`/`&vminfo` buffers the BIOS fills. Production wiring backs these
+/// with real buffers; tests stub it.
 pub trait VesaMem {
     /// `set_fs(seg)`.
     fn set_fs(&mut self, seg: u16);
     /// `rdfs16(addr)`.
     fn rdfs16(&self, addr: u32) -> u16;
-    /// The address (`di`) the BIOS should fill `&vginfo` at.
-    fn vginfo_ptr(&self) -> u32;
-    /// The address (`di`) the BIOS should fill `&vminfo` at.
-    fn vminfo_ptr(&self) -> u32;
+    /// The real-mode `ES:DI` address the BIOS should fill `&vginfo` at.
+    fn vginfo_ptr(&self) -> FarPtr;
+    /// The real-mode `ES:DI` address the BIOS should fill `&vminfo` at.
+    fn vminfo_ptr(&self) -> FarPtr;
 }
 
 /// `vesa_probe()` (video-vesa.c:31-102) — query the VBE controller info,
@@ -75,22 +76,23 @@ pub trait VesaMem {
 ///
 /// The C code stores `vginfo`/`vminfo` in file-scope statics that the BIOS
 /// fills; here the caller owns them and supplies a `query_mode` closure that
-/// runs AX=4F01h into `vminfo` for a given VBE mode (mirroring the
-/// `intcall(0x10, &ireg, &oreg)` with `di = &vminfo`). The closure returns the
-/// BIOS AX and lets the probe inspect the freshly filled `vminfo`.
+/// runs AX=4F01h into `vminfo` at the supplied `ES:DI` address. The closure
+/// returns the BIOS AX and lets the probe inspect the freshly filled `vminfo`.
+/// `heap_bytes` is the setup-heap space available at the initial GET_HEAP.
 pub fn vesa_probe<B, M, Q>(
     bios: &B,
     mem: &mut M,
     vginfo: &mut VesaGeneralInfo,
     vminfo: &mut VesaModeInfo,
     cfg: &VesaConfig,
+    mut heap_bytes: usize,
     mut query_mode: Q,
 ) -> alloc::vec::Vec<ModeInfo>
 where
     B: BiosCaller,
     M: VesaMem,
-    // Returns BIOS AX for AX=4F01h; fills *vminfo for `vbe_mode`.
-    Q: FnMut(u16, &mut VesaModeInfo) -> u16,
+    // Returns BIOS AX for AX=4F01h; fills *vminfo at the supplied ES:DI.
+    Q: FnMut(u16, FarPtr, &mut VesaModeInfo) -> u16,
 {
     let mut out = alloc::vec::Vec::new();
 
@@ -98,7 +100,9 @@ where
     let mut oreg = BiosRegs::default();
     initregs(&mut ireg);
     ireg.set_ax(0x4f00);
-    set_di(&mut ireg, mem.vginfo_ptr() as u16);
+    let vginfo_ptr = mem.vginfo_ptr();
+    ireg.es = vginfo_ptr.seg;
+    set_di(&mut ireg, vginfo_ptr.off);
     bios.intcall(0x10, &ireg, Some(&mut oreg));
 
     if oreg.ax() != 0x004f
@@ -121,8 +125,10 @@ where
         }
         mode_ptr += 2;
 
-        // Heap check omitted (Vec grows); mirrors the !heap_free break only in
-        // the genuinely out-of-memory case, which does not occur here.
+        let mode_bytes = core::mem::size_of::<ModeInfo>();
+        if heap_bytes < mode_bytes {
+            break; // Heap full, can't save mode info.
+        }
 
         if mode & !0x1ff != 0 {
             continue;
@@ -131,15 +137,16 @@ where
         // memset(&vminfo, 0, ...).
         *vminfo = VesaModeInfo::default();
 
-        let ax = query_mode(mode, vminfo);
+        let ax = query_mode(mode, mem.vminfo_ptr(), vminfo);
         if ax != 0x004f {
             continue;
         }
 
         let mode_attr = read_packed_u16(vminfo, 0);
+        let mut accepted = None;
         if (mode_attr & 0x15) == 0x05 {
             // Text Mode, TTY BIOS supported, supported by hardware.
-            out.push(ModeInfo {
+            accepted = Some(ModeInfo {
                 mode: mode + VIDEO_FIRST_VESA,
                 x: read_packed_u16(vminfo, 18), // h_res
                 y: read_packed_u16(vminfo, 20), // v_res
@@ -153,13 +160,21 @@ where
             if cfg.vesa_support {
                 // Graphics mode, color, linear frame buffer supported. Only
                 // register if the framebuffer is configured.
-                out.push(ModeInfo {
+                accepted = Some(ModeInfo {
                     mode: mode + VIDEO_FIRST_VESA,
                     x: read_packed_u16(vminfo, 18),           // h_res
                     y: read_packed_u16(vminfo, 20),           // v_res
                     depth: read_packed_u8(vminfo, 25) as u16, // bpp (cast to u16)
                 });
             }
+        }
+
+        if let Some(mi) = accepted {
+            if out.try_reserve_exact(1).is_err() {
+                break;
+            }
+            out.push(mi);
+            heap_bytes -= mode_bytes;
         }
     }
 
@@ -170,12 +185,13 @@ where
 /// classify it as text or linear-framebuffer graphics, set it via AX=4F02h, and
 /// either capture text rows/cols (`force_x/force_y`) or the graphics params.
 ///
-/// `query_mode` runs AX=4F01h into `vminfo` (returns BIOS AX), and
-/// `store_graphics` is invoked for the graphics path (the C
+/// `query_mode` runs AX=4F01h into `vminfo` at `vminfo_destination` (returns
+/// BIOS AX), and `store_graphics` is invoked for the graphics path (the C
 /// `vesa_store_mode_params_graphics`, which is a no-op under `_WAKEUP`).
 pub fn vesa_set_mode<B, Q, G>(
     bios: &B,
     vminfo: &mut VesaModeInfo,
+    vminfo_destination: FarPtr,
     st: &mut VideoState,
     cfg: &VesaConfig,
     mi: &ModeInfo,
@@ -184,7 +200,7 @@ pub fn vesa_set_mode<B, Q, G>(
 ) -> i32
 where
     B: BiosCaller,
-    Q: FnMut(u16, &mut VesaModeInfo) -> u16,
+    Q: FnMut(u16, FarPtr, &mut VesaModeInfo) -> u16,
     G: FnMut(&mut VideoState, &VesaModeInfo),
 {
     let mut vesa_mode = mi.mode - VIDEO_FIRST_VESA;
@@ -193,7 +209,7 @@ where
     *vminfo = VesaModeInfo::default();
 
     // AX=4F01h Get Mode Info.
-    let ax = query_mode(vesa_mode, vminfo);
+    let ax = query_mode(vesa_mode, vminfo_destination, vminfo);
     if ax != 0x004f {
         return -1;
     }
@@ -340,6 +356,7 @@ pub fn vesa_store_edid<B, R>(
     bios: &B,
     vginfo: &VesaGeneralInfo,
     cfg: &VesaConfig,
+    destination: FarPtr,
     mut read_edid: R,
 ) -> Option<[u8; 128]>
 where
@@ -372,8 +389,11 @@ where
 
     ireg.set_ax(0x4f15); // VBE DDC.
     set_bx(&mut ireg, 0x0001); // Read EDID.
-    // ireg.es = ds(); ireg.di = &boot_params.edid_info; — the read closure
-    // captures the destination, mirroring the ES:DI pointer.
+    // Linux passes ds():&boot_params.edid_info as the real-mode destination.
+    // The caller owns that boot-parameter storage in this translation and
+    // supplies its exact segment:offset address.
+    ireg.es = destination.seg;
+    set_di(&mut ireg, destination.off);
     bios.intcall(0x10, &ireg, Some(&mut oreg));
 
     edid = read_edid();
@@ -474,7 +494,8 @@ mod tests {
 
     struct StubBios {
         replies: RefCell<alloc::collections::VecDeque<BiosRegs>>,
-        calls: RefCell<Vec<(u16, u16)>>, // (ax, bx)
+        // (ax, bx, es, di, cx, dx)
+        calls: RefCell<Vec<(u16, u16, u16, u16, u16, u16)>>,
     }
     impl StubBios {
         fn new() -> Self {
@@ -494,7 +515,14 @@ mod tests {
     }
     impl BiosCaller for StubBios {
         fn intcall(&self, _int_no: u8, ireg: &BiosRegs, oreg: Option<&mut BiosRegs>) {
-            self.calls.borrow_mut().push((ireg.ax(), ireg.bx()));
+            self.calls.borrow_mut().push((
+                ireg.ax(),
+                ireg.bx(),
+                ireg.es,
+                ireg.di(),
+                ireg.cx(),
+                ireg.dx(),
+            ));
             if let Some(o) = oreg {
                 *o = self.replies.borrow_mut().pop_front().unwrap_or_default();
             }
@@ -510,11 +538,17 @@ mod tests {
         fn rdfs16(&self, _addr: u32) -> u16 {
             self.mode_words.borrow_mut().pop_front().unwrap_or(0xffff)
         }
-        fn vginfo_ptr(&self) -> u32 {
-            0x1000
+        fn vginfo_ptr(&self) -> FarPtr {
+            FarPtr {
+                off: 0x1000,
+                seg: 0x9000,
+            }
         }
-        fn vminfo_ptr(&self) -> u32 {
-            0x2000
+        fn vminfo_ptr(&self) -> FarPtr {
+            FarPtr {
+                off: 0x2000,
+                seg: 0x9000,
+            }
         }
     }
 
@@ -546,9 +580,15 @@ mod tests {
         let mut vginfo = VesaGeneralInfo::default();
         let mut vminfo = VesaModeInfo::default();
         let cfg = VesaConfig::default();
-        let modes = vesa_probe(&bios, &mut mem, &mut vginfo, &mut vminfo, &cfg, |_, _| {
-            0x004f
-        });
+        let modes = vesa_probe(
+            &bios,
+            &mut mem,
+            &mut vginfo,
+            &mut vminfo,
+            &cfg,
+            usize::MAX,
+            |_, _, _| 0x004f,
+        );
         assert!(modes.is_empty());
     }
 
@@ -566,9 +606,15 @@ mod tests {
         let mut vginfo = vginfo_from(&g);
         let mut vminfo = VesaModeInfo::default();
         let cfg = VesaConfig::default();
-        let modes = vesa_probe(&bios, &mut mem, &mut vginfo, &mut vminfo, &cfg, |_, _| {
-            0x004f
-        });
+        let modes = vesa_probe(
+            &bios,
+            &mut mem,
+            &mut vginfo,
+            &mut vminfo,
+            &cfg,
+            usize::MAX,
+            |_, _, _| 0x004f,
+        );
         assert!(modes.is_empty());
     }
 
@@ -595,7 +641,10 @@ mod tests {
             &mut vginfo,
             &mut vminfo,
             &cfg,
-            |_mode, vm| {
+            usize::MAX,
+            |_mode, destination, vm| {
+                let destination = (destination.seg, destination.off);
+                assert_eq!(destination, (0x9000, 0x2000));
                 // Fill vminfo: text mode attr 0x05, h_res 132, v_res 60.
                 let mut b = [0u8; 256];
                 write_u16(&mut b, 0, 0x05); // mode_attr text+hw
@@ -615,6 +664,11 @@ mod tests {
                 y: 60,
                 depth: 0
             }
+        );
+        assert_eq!(
+            bios.calls.borrow()[0],
+            (0x4f00, 0, 0x9000, 0x1000, 0, 0),
+            "controller query must address vginfo through ES:DI"
         );
     }
 
@@ -638,7 +692,8 @@ mod tests {
             &mut vginfo,
             &mut vminfo,
             &cfg,
-            |_mode, vm| {
+            usize::MAX,
+            |_mode, _destination, vm| {
                 // attr 0x99, memory_layout 6, memory_planes 1, bpp 16, 1024x768.
                 let mut b = [0u8; 256];
                 write_u16(&mut b, 0, 0x99); // mode_attr
@@ -679,10 +734,18 @@ mod tests {
         let mut vminfo = VesaModeInfo::default();
         let cfg = VesaConfig::default();
         let mut queried = false;
-        let modes = vesa_probe(&bios, &mut mem, &mut vginfo, &mut vminfo, &cfg, |_, _| {
-            queried = true;
-            0x004f
-        });
+        let modes = vesa_probe(
+            &bios,
+            &mut mem,
+            &mut vginfo,
+            &mut vminfo,
+            &cfg,
+            usize::MAX,
+            |_, _, _| {
+                queried = true;
+                0x004f
+            },
+        );
         assert!(modes.is_empty());
         assert!(!queried, "mode with high bits must be skipped before query");
     }
@@ -709,7 +772,8 @@ mod tests {
             &mut vginfo,
             &mut vminfo,
             &cfg,
-            |_mode, vm| {
+            usize::MAX,
+            |_mode, _destination, vm| {
                 let mut b = [0u8; 256];
                 write_u16(&mut b, 0, 0x99);
                 b[24] = 1;
@@ -720,6 +784,37 @@ mod tests {
             },
         );
         assert!(modes.is_empty());
+    }
+
+    #[test]
+    fn vesa_probe_breaks_before_query_when_heap_cannot_fit_mode_info() {
+        let bios = StubBios::new();
+        bios.push_ax(0x004f);
+        let mut mem = StubMem {
+            mode_words: RefCell::new([0x0108u16, 0xffff].into_iter().collect()),
+        };
+        let mut g = [0u8; 256];
+        write_u32(&mut g, 0, VESA_MAGIC);
+        write_u16(&mut g, 4, 0x0200);
+        let mut vginfo = vginfo_from(&g);
+        let mut vminfo = VesaModeInfo::default();
+        let mut queried = false;
+
+        let modes = vesa_probe(
+            &bios,
+            &mut mem,
+            &mut vginfo,
+            &mut vminfo,
+            &VesaConfig::default(),
+            core::mem::size_of::<ModeInfo>() - 1,
+            |_, _, _| {
+                queried = true;
+                0x004f
+            },
+        );
+
+        assert!(modes.is_empty());
+        assert!(!queried);
     }
 
     // ---- vesa_set_mode -----------------------------------------------
@@ -741,10 +836,14 @@ mod tests {
         let rv = vesa_set_mode(
             &bios,
             &mut vminfo,
+            FarPtr {
+                off: 0x2000,
+                seg: 0x9000,
+            },
             &mut st,
             &cfg,
             &mi,
-            |_m, vm| {
+            |_m, _destination, vm| {
                 let mut b = [0u8; 256];
                 write_u16(&mut b, 0, 0x05); // text
                 *vm = vminfo_from(&b);
@@ -779,10 +878,14 @@ mod tests {
         let rv = vesa_set_mode(
             &bios,
             &mut vminfo,
+            FarPtr {
+                off: 0x2000,
+                seg: 0x9000,
+            },
             &mut st,
             &cfg,
             &mi,
-            |_m, vm| {
+            |_m, _destination, vm| {
                 let mut b = [0u8; 256];
                 write_u16(&mut b, 0, 0x99); // graphics+lfb
                 *vm = vminfo_from(&b);
@@ -813,10 +916,14 @@ mod tests {
         let rv = vesa_set_mode(
             &bios,
             &mut vminfo,
+            FarPtr {
+                off: 0x2000,
+                seg: 0x9000,
+            },
             &mut st,
             &cfg,
             &mi,
-            |_m, vm| {
+            |_m, _destination, vm| {
                 let mut b = [0u8; 256];
                 write_u16(&mut b, 0, 0x00); // neither text nor graphics
                 *vm = vminfo_from(&b);
@@ -842,10 +949,14 @@ mod tests {
         let rv = vesa_set_mode(
             &bios,
             &mut vminfo,
+            FarPtr {
+                off: 0x2000,
+                seg: 0x9000,
+            },
             &mut st,
             &cfg,
             &mi,
-            |_, _| 0xffff,
+            |_, _, _| 0xffff,
             |_, _| {},
         );
         assert_eq!(rv, -1);
@@ -945,7 +1056,19 @@ mod tests {
             firmware_edid: false,
             ..Default::default()
         };
-        assert!(vesa_store_edid(&bios, &vginfo, &cfg, || [0u8; 128]).is_none());
+        assert!(
+            vesa_store_edid(
+                &bios,
+                &vginfo,
+                &cfg,
+                FarPtr {
+                    off: 0x1234,
+                    seg: 0x9000,
+                },
+                || [0u8; 128],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -956,7 +1079,17 @@ mod tests {
         write_u16(&mut g, 4, 0x0102);
         let vginfo = vginfo_from(&g);
         let cfg = VesaConfig::default();
-        let block = vesa_store_edid(&bios, &vginfo, &cfg, || [0xAB; 128]).unwrap();
+        let block = vesa_store_edid(
+            &bios,
+            &vginfo,
+            &cfg,
+            FarPtr {
+                off: 0x1234,
+                seg: 0x9000,
+            },
+            || [0xAB; 128],
+        )
+        .unwrap();
         assert!(block.iter().all(|&b| b == 0x13));
         assert!(bios.calls.borrow().is_empty());
     }
@@ -970,9 +1103,25 @@ mod tests {
         write_u16(&mut g, 4, 0x0200);
         let vginfo = vginfo_from(&g);
         let cfg = VesaConfig::default();
-        let block = vesa_store_edid(&bios, &vginfo, &cfg, || [0x42; 128]).unwrap();
+        let block = vesa_store_edid(
+            &bios,
+            &vginfo,
+            &cfg,
+            FarPtr {
+                off: 0x2468,
+                seg: 0x9000,
+            },
+            || [0x42; 128],
+        )
+        .unwrap();
         assert!(block.iter().all(|&b| b == 0x42));
         // Two DDC calls were issued.
-        assert_eq!(bios.calls.borrow().len(), 2);
+        let calls = bios.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        // Capability query: BX=CX=DX=0 and ES:DI=0000:0000.
+        assert_eq!(calls[0], (0x4f15, 0, 0, 0, 0, 0));
+        // Read: BX=1, controller/block remain zero, and ES:DI is the caller's
+        // exact boot_params.edid_info real-mode address.
+        assert_eq!(calls[1], (0x4f15, 1, 0x9000, 0x2468, 0, 0));
     }
 }

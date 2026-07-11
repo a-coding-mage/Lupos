@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/mm/ioremap.c
 //! test-origin: linux:vendor/linux/arch/x86/mm/ioremap.c
 //! x86 ioremap helpers.
@@ -6,6 +6,9 @@
 //! Linux's ioremap path maps device physical ranges into a vmalloc-like kernel
 //! virtual window with a cache mode selected by PAT. Lupos keeps the same
 //! alignment and offset semantics here and backs it with `map_kernel_page`.
+//! It does not yet implement Linux's memtype reservation/alias arbitration or
+//! reusable vmalloc-area allocator, so callers must not treat cache-mode
+//! conflict handling and long-lived VA reuse as complete.
 //!
 //! References:
 //! - `vendor/linux/arch/x86/mm/ioremap.c`

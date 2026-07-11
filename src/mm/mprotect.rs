@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/mm/mprotect.c
 //! test-origin: linux:vendor/linux/mm/mprotect.c
 /// Memory protection — `mprotect` and PTE-level permission updates.
@@ -19,8 +19,9 @@
 /// - Linux `include/uapi/asm-generic/mman-common.h` — PROT_* values
 use crate::arch::x86::mm::paging::{
     _PAGE_ACCESSED, _PAGE_NX, _PAGE_PRESENT, _PAGE_RW, _PAGE_USER, PAGE_MASK, PAGE_SIZE,
-    flush_tlb_range, p4d_offset, pgd_none, pgd_offset_pgd, pgd_t, pmd_huge, pmd_none, pmd_offset,
-    pte_offset_kernel, pte_present, pte_t, ptep_get, pud_huge, pud_none, pud_offset, set_pte,
+    flush_tlb_range, p4d_offset, pgd_none, pgd_offset_pgd, pgd_t, pgprot_modify, pgprot_t,
+    pmd_huge, pmd_none, pmd_offset, pte_offset_kernel, pte_present, pte_t, ptep_get, pud_huge,
+    pud_none, pud_offset, set_pte,
 };
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
 use crate::mm::mmap::{PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, TASK_SIZE};
@@ -183,7 +184,11 @@ pub unsafe fn mprotect_fixup(
         // Preserve VM_MAY* and other non-prot flags from old; replace prot bits.
         let keep_mask: VmFlags = !(VM_READ | VM_WRITE | VM_EXEC);
         (*target_vma).vm_flags = (old_flags & keep_mask) | new_flags;
-        (*target_vma).vm_page_prot = vm_get_page_prot((*target_vma).vm_flags);
+        (*target_vma).vm_page_prot = pgprot_modify(
+            pgprot_t((*target_vma).vm_page_prot),
+            pgprot_t(vm_get_page_prot((*target_vma).vm_flags)),
+        )
+        .0;
         let _ = insert_vma(mm, target_vma);
     }
 

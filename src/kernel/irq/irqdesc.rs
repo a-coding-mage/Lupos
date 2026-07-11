@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/irq/irqdesc.c
 //! test-origin: linux:vendor/linux/kernel/irq/irqdesc.c
 //! `struct irq_desc` — per-IRQ descriptor (M37).
@@ -6,7 +6,7 @@
 //! Mirrors `vendor/linux/include/linux/irqdesc.h`.  Lupos M37 ships a
 //! 256-entry static array (one per x86 vector) protected by a `RawSpinLock`.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -68,6 +68,10 @@ pub struct IrqDesc {
     pub status: AtomicU32,
     pub stat: Mutex<IrqStat>,
     pub affinity: AtomicU32, // bitmap of permitted CPUs
+    /// Linux `irq_desc::affinity_hint`.  The mask is owned by the caller, as
+    /// it is in Linux; `__irq_apply_affinity_hint()` only publishes the
+    /// pointer while holding the descriptor lock.
+    pub affinity_hint: AtomicUsize,
 }
 
 impl IrqDesc {
@@ -82,6 +86,7 @@ impl IrqDesc {
                 last_jiffies: 0,
             }),
             affinity: AtomicU32::new(!0u32),
+            affinity_hint: AtomicUsize::new(0),
         }
     }
 

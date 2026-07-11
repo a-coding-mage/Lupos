@@ -12,3 +12,7 @@ pub mod pcidev_msi;
 
 pub use api::{pci_alloc_irq_vectors, pci_free_irq_vectors};
 pub use msi::MsiMsg;
+
+pub fn register_module_exports() {
+    api::register_module_exports();
+}

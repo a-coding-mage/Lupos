@@ -139,6 +139,7 @@ pub mod mempool;
 pub mod memremap;
 pub mod migration;
 pub mod mlock;
+pub mod mm_init;
 pub mod mm_inline;
 pub mod mm_public;
 pub mod mmap_lock;
