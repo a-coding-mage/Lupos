@@ -30,8 +30,9 @@ use super::{
     TIOCSPGRP, TIOCSWINSZ, Winsize,
 };
 use crate::fs::ops::{FileOps, IoctlFn, PollFn};
-use crate::fs::types::FileRef;
-use crate::include::uapi::errno::{EAGAIN, EFAULT, EINVAL, EIO, ENODEV, ENOTTY};
+use crate::fs::types::{DentryRef, FileRef, InodePrivate};
+use crate::include::uapi::errno::{EAGAIN, EFAULT, EINVAL, EIO, ENODEV, ENOTTY, ENXIO};
+use crate::include::uapi::fcntl::{O_ACCMODE, O_NOCTTY, O_WRONLY};
 use crate::kernel::sched::wait::WaitQueueHead;
 use crate::kernel::task::task_state::TASK_INTERRUPTIBLE;
 
@@ -76,6 +77,7 @@ const VSUSP: usize = 10;
 
 // Signals raised by the line discipline.
 const SIGHUP: i32 = 1;
+const SIGCONT: i32 = 18;
 const SIGINT: i32 = 2;
 const SIGQUIT: i32 = 3;
 const SIGTSTP: i32 = 20;
@@ -89,6 +91,7 @@ pub const UNIX98_PTY_SLAVE_MAJOR: u32 = 136;
 /// processing).
 pub struct Pty {
     pub index: u32,
+    token: usize,
     locked: AtomicBool,
     packet: AtomicBool,
     master_open: AtomicBool,
@@ -118,8 +121,13 @@ pub struct Pty {
 
 impl Pty {
     fn new(index: u32) -> Arc<Self> {
+        Self::new_with_token(index, index as usize + 1)
+    }
+
+    fn new_with_token(index: u32, token: usize) -> Arc<Self> {
         Arc::new(Self {
             index,
+            token,
             // Linux allocates a devpts slave locked; unlockpt() clears it.
             locked: AtomicBool::new(true),
             packet: AtomicBool::new(false),
@@ -338,30 +346,54 @@ lazy_static! {
     static ref PTYS: Mutex<BTreeMap<u32, Arc<Pty>>> = Mutex::new(BTreeMap::new());
 }
 static NEXT_HINT: AtomicU32 = AtomicU32::new(0);
+static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(1);
 
 /// Allocate a fresh pty pair and materialise its `/dev/pts/N` slave node.
-fn pty_alloc() -> Arc<Pty> {
+fn pty_alloc() -> Result<Arc<Pty>, i32> {
     let mut reg = PTYS.lock();
     // Lowest free index (Linux devpts uses an ida — a compact index space).
     let mut index = NEXT_HINT.load(Ordering::Relaxed);
     while reg.contains_key(&index) {
         index += 1;
     }
-    let pty = Pty::new(index);
+    let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let pty = Pty::new_with_token(index, token);
     reg.insert(index, pty.clone());
     NEXT_HINT.store(index + 1, Ordering::Relaxed);
-    drop(reg);
-    let _ = crate::init::rootfs::devpts_create_slave(index);
-    pty
+    if let Err(errno) = crate::init::rootfs::devpts_create_slave(index, token) {
+        reg.remove(&index);
+        let _ = NEXT_HINT.fetch_min(index, Ordering::Relaxed);
+        return Err(errno);
+    }
+    Ok(pty)
 }
 
 fn pty_lookup(index: u32) -> Option<Arc<Pty>> {
     PTYS.lock().get(&index).cloned()
 }
 
-fn pty_free(index: u32) {
-    PTYS.lock().remove(&index);
-    crate::init::rootfs::devpts_remove_slave(index);
+fn pty_lookup_by_token(token: usize) -> Option<Arc<Pty>> {
+    PTYS.lock().values().find(|pty| pty.token == token).cloned()
+}
+
+fn pty_lookup_by_token_locked(
+    reg: &BTreeMap<u32, Arc<Pty>>,
+    token: usize,
+) -> Option<(u32, Arc<Pty>)> {
+    reg.iter()
+        .find(|(_, pty)| pty.token == token)
+        .map(|(index, pty)| (*index, pty.clone()))
+}
+
+fn pty_free_locked(reg: &mut BTreeMap<u32, Arc<Pty>>, index: u32) {
+    if !reg.contains_key(&index) {
+        return;
+    }
+    // Remove the devpts name while the registry still owns this index, so a
+    // concurrently allocated replacement cannot have its fresh node removed.
+    let token = reg.get(&index).map(|pty| pty.token).unwrap_or(0);
+    crate::init::rootfs::devpts_remove_slave(index, token);
+    reg.remove(&index);
     // Reuse freed slots first so the pts namespace stays compact.
     let _ = NEXT_HINT.fetch_min(index, Ordering::Relaxed);
 }
@@ -370,6 +402,7 @@ fn pty_free(index: u32) {
 pub fn reset_for_tests() {
     PTYS.lock().clear();
     NEXT_HINT.store(0, Ordering::Relaxed);
+    NEXT_TOKEN.store(1, Ordering::Relaxed);
 }
 
 // ── File ↔ pty association ─────────────────────────────────────────────────────
@@ -377,41 +410,170 @@ pub fn reset_for_tests() {
 /// The master pty for this `/dev/ptmx` handle.  Allocation is lazy: the first
 /// operation on a freshly opened master (always an unlockpt/ptsname ioctl in
 /// practice) creates the pair and stashes `index + 1` in `file.private`.
-fn master_pty(file: &FileRef) -> Arc<Pty> {
+fn master_pty(file: &FileRef) -> Result<Arc<Pty>, i32> {
     let mut slot = file.private.lock();
     if *slot != 0 {
         if let Some(pty) = pty_lookup((*slot - 1) as u32) {
-            return pty;
+            return Ok(pty);
         }
     }
-    let pty = pty_alloc();
+    let pty = pty_alloc()?;
     *slot = (pty.index + 1) as usize;
-    pty
+    Ok(pty)
 }
 
-/// The slave pty for a `/dev/pts/N` handle, identified by the numeric dentry
-/// name.  There is no VFS `open` hook, so each slave `File` "attaches" on its
-/// first operation: it stamps `file.private` and bumps `slave_open_count`
-/// exactly once.  `dup(2)`/`fork(2)` share one `File`, so a pty opened once and
-/// inherited by a shell is counted once and its `release` decrements once —
-/// giving the master an accurate "last slave closed" (`EIO`) edge.
-fn slave_attach(file: &FileRef) -> Option<Arc<Pty>> {
-    let index: u32 = file.dentry.name.parse().ok()?;
-    let pty = pty_lookup(index)?;
+fn current_pid() -> Option<i32> {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    (!task.is_null()).then(|| unsafe { (*task).pid })
+}
+
+fn claim_as_controlling_tty(pty: &Arc<Pty>) -> Result<(), i32> {
+    let pid = current_pid().ok_or(ENODEV)?;
+    let sid = crate::kernel::session::session_id(pid).unwrap_or(pid);
+    let pgrp = crate::kernel::session::process_group(pid).unwrap_or(pid);
+    crate::kernel::session::claim_controlling_tty(
+        pid,
+        crate::kernel::session::ControllingTty::Unix98Pty(pty.index, pty.token),
+    )?;
+    pty.session.store(sid, Ordering::Release);
+    pty.pgrp.store(pgrp, Ordering::Release);
+    Ok(())
+}
+
+fn claim_as_controlling_tty_locked(pty: &Arc<Pty>) -> Result<(), i32> {
+    if !pty.master_open.load(Ordering::Acquire) {
+        return Err(EIO);
+    }
+    claim_as_controlling_tty(pty)
+}
+
+fn claim_as_controlling_tty_live(pty: &Arc<Pty>) -> Result<(), i32> {
+    let reg = PTYS.lock();
+    let Some(current) = reg.get(&pty.index) else {
+        return Err(EIO);
+    };
+    if !Arc::ptr_eq(current, pty) || current.token != pty.token {
+        return Err(EIO);
+    }
+    claim_as_controlling_tty_locked(pty)
+}
+
+fn bind_slave_locked(file: &FileRef, pty: &Arc<Pty>) {
     let mut slot = file.private.lock();
     if *slot == 0 {
-        *slot = (index + 1) as usize;
+        *slot = pty.token;
         pty.slave_open_count.fetch_add(1, Ordering::AcqRel);
         pty.slave_ever_opened.store(true, Ordering::Release);
     }
+}
+
+fn dentry_pty_token(dentry: &DentryRef) -> Option<usize> {
+    let inode = dentry.inode()?;
+    match &inode.private {
+        InodePrivate::Opaque(token) if *token != 0 => Some(*token),
+        _ => None,
+    }
+}
+
+fn open_bound_slave(
+    dentry: DentryRef,
+    flags: u32,
+    mode: u32,
+    index: u32,
+    token: Option<usize>,
+    claim_ctty: bool,
+    missing_errno: i32,
+) -> Result<FileRef, i32> {
+    let mut reg = PTYS.lock();
+    let pty = reg.get(&index).cloned().ok_or(missing_errno)?;
+    if token.is_some_and(|token| token != pty.token) {
+        return Err(EIO);
+    }
+    if !pty.master_open.load(Ordering::Acquire) || pty.locked.load(Ordering::Acquire) {
+        return Err(EIO);
+    }
+
+    let file = crate::fs::file::alloc_file(dentry, flags, mode, &PTS_SLAVE_FILE_OPS);
+    bind_slave_locked(&file, &pty);
+    if claim_ctty && flags & O_NOCTTY == 0 && flags & O_ACCMODE != O_WRONLY {
+        // Linux silently leaves the process without a controlling tty when
+        // the automatic open-time eligibility checks fail.
+        let _ = claim_as_controlling_tty_locked(&pty);
+    }
+    drop(reg);
+    Ok(file)
+}
+
+/// Open a concrete `/dev/pts/N` slave. Linux performs the lock/count and
+/// controlling-terminal transition in `tty_open()` before returning the fd.
+pub fn open_slave(dentry: DentryRef, flags: u32, mode: u32, index: u32) -> Result<FileRef, i32> {
+    let token = dentry_pty_token(&dentry).ok_or(EIO)?;
+    open_bound_slave(dentry, flags, mode, index, Some(token), true, EIO)
+}
+
+/// Reopen the caller's controlling terminal through `/dev/tty`, or return
+/// Linux's `ENXIO` when the current session has no controlling endpoint.
+pub fn open_current_tty(dentry: DentryRef, flags: u32, mode: u32) -> Result<FileRef, i32> {
+    let pid = current_pid().ok_or(ENXIO)?;
+    match crate::kernel::session::controlling_tty(pid).ok_or(ENXIO)? {
+        crate::kernel::session::ControllingTty::Console(_) => Ok(crate::fs::file::alloc_file(
+            dentry,
+            flags,
+            mode,
+            &crate::init::rootfs::CONSOLE_FILE_OPS,
+        )),
+        crate::kernel::session::ControllingTty::Unix98Pty(index, token) => {
+            open_bound_slave(dentry, flags, mode, index, Some(token), false, ENXIO)
+        }
+    }
+}
+
+/// Open `/dev/ptmx`. Linux allocates the UNIX98 pair during `ptmx_open()`, so
+/// devpts creation failures are visible from `open(2)`, not deferred to the
+/// first ioctl/read/write on the master.
+pub fn open_ptmx(dentry: DentryRef, flags: u32, mode: u32) -> Result<FileRef, i32> {
+    let pty = pty_alloc()?;
+    let file = crate::fs::file::alloc_file(dentry, flags, mode, &PTMX_FILE_OPS);
+    *file.private.lock() = (pty.index + 1) as usize;
+    Ok(file)
+}
+
+/// Return the slave bound by the open-time tty dispatcher. Directly allocated
+/// test/compat files retain the old lazy fallback based on their numeric dentry
+/// name. `dup(2)`/`fork(2)` share one `File`, so a pty opened once and inherited
+/// by a shell is counted once and its `release` decrements once — giving the
+/// master an accurate "last slave closed" (`EIO`) edge.
+fn slave_attach(file: &FileRef) -> Option<Arc<Pty>> {
+    let token = *file.private.lock();
+    if token != 0 {
+        return pty_lookup_by_token(token);
+    }
+    let index: u32 = file.dentry.name.parse().ok()?;
+    let token = dentry_pty_token(&file.dentry)?;
+    let reg = PTYS.lock();
+    let pty = reg.get(&index)?.clone();
+    if pty.token != token
+        || !pty.master_open.load(Ordering::Acquire)
+        || pty.locked.load(Ordering::Acquire)
+    {
+        return None;
+    }
+    bind_slave_locked(file, &pty);
     Some(pty)
 }
 
 /// Look up a slave's pty without attaching (for `release`, which must not
 /// resurrect a count).
 fn slave_lookup(file: &FileRef) -> Option<Arc<Pty>> {
+    let token = *file.private.lock();
+    if token != 0 {
+        return pty_lookup_by_token(token);
+    }
     let index: u32 = file.dentry.name.parse().ok()?;
-    pty_lookup(index)
+    let token = dentry_pty_token(&file.dentry)?;
+    let reg = PTYS.lock();
+    let pty = reg.get(&index)?.clone();
+    (pty.token == token).then_some(pty)
 }
 
 #[cfg(not(test))]
@@ -438,7 +600,7 @@ fn ptmx_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i3
     if buf.is_empty() {
         return Ok(0);
     }
-    let pty = master_pty(file);
+    let pty = master_pty(file)?;
     loop {
         let n = pty.master_read(buf);
         if n > 0 {
@@ -489,7 +651,7 @@ fn ptmx_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i3
 }
 
 fn ptmx_write(file: &FileRef, buf: &[u8], pos: &mut u64) -> Result<usize, i32> {
-    let pty = master_pty(file);
+    let pty = master_pty(file)?;
     if pty.slave_ever_opened.load(Ordering::Acquire)
         && pty.slave_open_count.load(Ordering::Acquire) == 0
     {
@@ -502,7 +664,9 @@ fn ptmx_write(file: &FileRef, buf: &[u8], pos: &mut u64) -> Result<usize, i32> {
 
 fn ptmx_poll(file: &FileRef, mut table: Option<&mut crate::fs::select::PollTable>) -> u32 {
     use crate::fs::eventpoll::{EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDNORM, EPOLLWRNORM};
-    let pty = master_pty(file);
+    let Ok(pty) = master_pty(file) else {
+        return EPOLLHUP;
+    };
     // `n_tty_poll()` registers both queues before sampling state.
     crate::fs::select::poll_wait(file, &pty.master_read_wait, table.as_deref_mut());
     crate::fs::select::poll_wait(file, &pty.master_write_wait, table.as_deref_mut());
@@ -520,7 +684,7 @@ fn ptmx_poll(file: &FileRef, mut table: Option<&mut crate::fs::select::PollTable
 }
 
 fn ptmx_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
-    let pty = master_pty(file);
+    let pty = master_pty(file)?;
     match cmd {
         TIOCGPTN => {
             put_user_u32(arg, pty.index)?;
@@ -562,26 +726,43 @@ fn ptmx_release(file: FileRef) {
         }
         (*slot - 1) as u32
     };
-    if let Some(pty) = pty_lookup(index) {
+    let mut wake = None;
+    let mut hup_session = 0;
+    {
+        let mut reg = PTYS.lock();
+        let Some(pty) = reg.get(&index).cloned() else {
+            return;
+        };
         pty.master_open.store(false, Ordering::Release);
+        // Closing the master hangs up the slave session. Linux clears the
+        // controlling-tty association and sends SIGCONT with SIGHUP so a
+        // job-control-stopped shell cannot remain stopped forever.
+        crate::kernel::session::clear_controlling_tty(
+            crate::kernel::session::ControllingTty::Unix98Pty(index, pty.token),
+        );
+        hup_session = pty.session.swap(0, Ordering::AcqRel);
+        pty.pgrp.store(0, Ordering::Release);
+        // Keep the linked tty object alive while an already-open slave file
+        // (including a poll-table file pin) still refers to its wait queues.
+        // The devpts node is removed now, as Linux does in the master close.
+        if pty.slave_open_count.load(Ordering::Acquire) == 0 {
+            pty_free_locked(&mut reg, index);
+        } else {
+            crate::init::rootfs::devpts_remove_slave(index, pty.token);
+        }
+        wake = Some(pty);
+    }
+    if let Some(pty) = wake {
         // Linux `pty_close()` wakes read/write waiters on both linked ttys so
         // blocked I/O and pollers can observe `TTY_OTHER_CLOSED`/hangup.
         pty.master_read_wait.wake_up_all();
         pty.master_write_wait.wake_up_all();
         pty.slave_read_wait.wake_up_all();
         pty.slave_write_wait.wake_up_all();
-        // Closing the master hangs up the slave session.
-        let pgrp = pty.pgrp.load(Ordering::Acquire);
-        if pgrp > 0 {
-            crate::kernel::signal::send_signal_to_process_group(pgrp, SIGHUP);
-        }
-        // Keep the linked tty object alive while an already-open slave file
-        // (including a poll-table file pin) still refers to its wait queues.
-        // The devpts node is removed now, as Linux does in the master close.
-        crate::init::rootfs::devpts_remove_slave(index);
-        if pty.slave_open_count.load(Ordering::Acquire) == 0 {
-            pty_free(index);
-        }
+    }
+    if hup_session > 0 {
+        crate::kernel::signal::send_signal_to_process_group(hup_session, SIGHUP);
+        crate::kernel::signal::send_signal_to_process_group(hup_session, SIGCONT);
     }
 }
 
@@ -670,20 +851,29 @@ fn pts_release(file: FileRef) {
     if *file.private.lock() == 0 {
         return;
     }
-    if let Some(pty) = slave_lookup(&file) {
+    let token = *file.private.lock();
+    let mut wake = None;
+    {
+        let mut reg = PTYS.lock();
+        let Some((index, pty)) = pty_lookup_by_token_locked(&reg, token) else {
+            return;
+        };
         let prev = pty
             .slave_open_count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             })
             .unwrap_or(0);
+        if prev == 1 && !pty.master_open.load(Ordering::Acquire) {
+            pty_free_locked(&mut reg, index);
+        }
+        wake = Some(pty);
+    }
+    if let Some(pty) = wake {
         pty.master_read_wait.wake_up_all();
         pty.master_write_wait.wake_up_all();
         pty.slave_read_wait.wake_up_all();
         pty.slave_write_wait.wake_up_all();
-        if prev == 1 && !pty.master_open.load(Ordering::Acquire) {
-            pty_free(pty.index);
-        }
     }
 }
 
@@ -728,11 +918,7 @@ fn pty_common_ioctl(pty: &Arc<Pty>, cmd: u32, arg: u64) -> Result<i64, i32> {
             Ok(0)
         }
         TIOCSCTTY => {
-            let (sid, pgrp) = current_session_and_pgrp().unwrap_or((0, 0));
-            pty.session.store(sid, Ordering::Release);
-            if pgrp != 0 && pty.pgrp.load(Ordering::Acquire) == 0 {
-                pty.pgrp.store(pgrp, Ordering::Release);
-            }
+            claim_as_controlling_tty_live(pty)?;
             Ok(0)
         }
         TIOCGPGRP => {
@@ -776,17 +962,6 @@ fn kernel_termios_from2(t2: KernelTermios2) -> KernelTermios {
         c_ispeed: t2.c_ispeed,
         c_ospeed: t2.c_ospeed,
     }
-}
-
-fn current_session_and_pgrp() -> Option<(i32, i32)> {
-    let task = unsafe { crate::kernel::sched::get_current() };
-    if task.is_null() {
-        return None;
-    }
-    let pid = unsafe { (*task).pid };
-    let sid = crate::kernel::session::session_id(pid).unwrap_or(pid);
-    let pgrp = crate::kernel::session::process_group(pid).unwrap_or(pid);
-    Some((sid, pgrp))
 }
 
 // ── userspace copy helpers ─────────────────────────────────────────────────────
