@@ -1,17 +1,19 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/sched/clock.c
 //! test-origin: linux:vendor/linux/kernel/sched/clock.c
 //! Scheduler clock helpers.
 //!
-//! Mirrors `vendor/linux/kernel/sched/clock.c`. The authoritative scheduler
-//! clock remains the per-entity helper in `entity.rs`; this module provides the
-//! Linux utility surface around it.
+//! Provides the Linux scheduler-clock utility surface around the shared
+//! high-resolution clock. Full unstable-clock and per-CPU synchronization from
+//! `vendor/linux/kernel/sched/clock.c` is not yet implemented.
 
 use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 pub use super::entity::SCHED_CLOCK_NS;
 
-pub const NSEC_PER_SCHED_TICK: u64 = 25_000_000;
+/// Periodic scheduler-tick duration for the configured `HZ=250`.
+/// `sched_clock_ns()` itself is high-resolution and is not tick-derived.
+pub const NSEC_PER_SCHED_TICK: u64 = crate::kernel::time::jiffies::NSEC_PER_TICK;
 pub const SCHED_CLOCK_STABLE_LOG_PREFIX: &str = "sched_clock: Marking stable";
 
 static SCHED_CLOCK_STABLE: AtomicBool = AtomicBool::new(false);
@@ -110,7 +112,7 @@ mod tests {
 
     #[test]
     fn sched_clock_tick_conversion_saturates() {
-        assert_eq!(sched_clock_from_ticks(2, NSEC_PER_SCHED_TICK), 50_000_000);
+        assert_eq!(sched_clock_from_ticks(2, NSEC_PER_SCHED_TICK), 8_000_000);
         assert_eq!(sched_clock_from_ticks(u64::MAX, 2), u64::MAX);
     }
 

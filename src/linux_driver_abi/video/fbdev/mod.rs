@@ -275,7 +275,7 @@ fn fbdev_llseek(file: &FileRef, off: i64, whence: i32) -> Result<u64, i32> {
     Ok(target)
 }
 
-fn fbdev_poll(_file: &FileRef) -> u32 {
+fn fbdev_poll(_file: &FileRef, _table: Option<&mut crate::fs::select::PollTable>) -> u32 {
     fbdev_poll_mask()
 }
 

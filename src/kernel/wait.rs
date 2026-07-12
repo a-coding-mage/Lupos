@@ -25,9 +25,7 @@ use core::sync::atomic::Ordering;
 use crate::arch::x86::kernel::uaccess::copy_to_user;
 use crate::kernel::exit::release_task;
 use crate::kernel::sched;
-use crate::kernel::signal::{
-    SIGCHLD, exit_if_fatal_signal_pending_current, has_unblocked_pending_signals,
-};
+use crate::kernel::signal::{SIGCHLD, SIGKILL, has_unblocked_pending_signals};
 use crate::kernel::task::task_state::{
     __TASK_STOPPED, EXIT_ZOMBIE, TASK_INTERRUPTIBLE, TASK_RUNNING,
 };
@@ -252,7 +250,10 @@ unsafe fn find_zombie_child(
                 return;
             }
             let state = (*c).__state.load(Ordering::Acquire);
-            if (*c).m26.exit_state & EXIT_ZOMBIE != 0 && state & EXIT_ZOMBIE != 0 {
+            if (*c).m26.exit_state & EXIT_ZOMBIE != 0
+                && state & EXIT_ZOMBIE != 0
+                && !crate::kernel::signal::delay_group_leader(c)
+            {
                 found = c;
             }
         });
@@ -372,7 +373,7 @@ unsafe fn for_each_real_child(
         let n = (*parent).m26.children_count as usize;
         for i in 0..n.min(MAX_CHILDREN) {
             let c = (*parent).m26.children[i];
-            if !c.is_null() && pid_matches(parent, target, (*c).pid) {
+            if !c.is_null() && (*c).m26.exit_signal >= 0 && pid_matches(parent, target, (*c).pid) {
                 f(c);
             }
         }
@@ -386,6 +387,11 @@ unsafe fn for_each_real_child(
             if !task.is_null()
                 && task != parent
                 && unsafe { (*task).m26.real_parent } == parent
+                // Linux never links CLONE_THREAD members on the natural
+                // parent's children list. Its negative exit_signal is the
+                // thread_group_leader() discriminator; ptrace wait traversal
+                // remains separate and may still select an individual TID.
+                && unsafe { (*task).m26.exit_signal } >= 0
                 && !unsafe { child_in_array(parent, task) }
             {
                 f(task);
@@ -396,6 +402,7 @@ unsafe fn for_each_real_child(
                 if !task.is_null()
                     && task != parent
                     && (*task).m26.real_parent == parent
+                    && (*task).m26.exit_signal >= 0
                     && pid_matches(parent, target, (*task).pid)
                     && !child_in_array(parent, task)
                 {
@@ -462,7 +469,8 @@ unsafe fn has_exiting_wait_target(parent: *mut TaskStruct, target: WaitTarget) -
     let mut found = false;
     unsafe {
         for_each_real_child(parent, target, |c| {
-            if (*c).m26.exit_state & EXIT_ZOMBIE != 0 {
+            let state = (*c).__state.load(Ordering::Acquire);
+            if (*c).m26.exit_state & EXIT_ZOMBIE != 0 && state & EXIT_ZOMBIE == 0 {
                 found = true;
             }
         });
@@ -470,7 +478,8 @@ unsafe fn has_exiting_wait_target(parent: *mut TaskStruct, target: WaitTarget) -
             return true;
         }
         for_each_ptrace_wait_match(parent, target, |task| {
-            if (*task).m26.exit_state & EXIT_ZOMBIE != 0 {
+            let state = (*task).__state.load(Ordering::Acquire);
+            if (*task).m26.exit_state & EXIT_ZOMBIE != 0 && state & EXIT_ZOMBIE == 0 {
                 found = true;
             }
         });
@@ -546,12 +555,87 @@ unsafe fn report_stopped_task(task: *mut TaskStruct, stat_addr: *mut i32, option
 
 /// Append `parent` to `child.wait_waiters` so `exit_notify` will wake it.
 unsafe fn add_waiter(child: *mut TaskStruct, parent: *mut TaskStruct) {
+    if child.is_null() || parent.is_null() {
+        return;
+    }
     unsafe {
-        let count = (*child).m26.wait_count as usize;
+        let count = ((*child).m26.wait_count as usize).min(MAX_WAITERS);
+        if (&(*child).m26.wait_waiters)[..count]
+            .iter()
+            .any(|waiter| *waiter == parent)
+        {
+            return;
+        }
         if count < MAX_WAITERS {
             (*child).m26.wait_waiters[count] = parent;
             (*child).m26.wait_count = (count + 1) as u32;
         }
+    }
+}
+
+/// Remove every registration of `parent` from one task's child-exit queue.
+unsafe fn remove_waiter(child: *mut TaskStruct, parent: *mut TaskStruct) {
+    if child.is_null() || parent.is_null() {
+        return;
+    }
+    unsafe {
+        let count = ((*child).m26.wait_count as usize).min(MAX_WAITERS);
+        let mut write = 0;
+        for read in 0..count {
+            let waiter = (*child).m26.wait_waiters[read];
+            if !waiter.is_null() && waiter != parent {
+                (*child).m26.wait_waiters[write] = waiter;
+                write += 1;
+            }
+        }
+        for slot in &mut (&mut (*child).m26.wait_waiters)[write..] {
+            *slot = core::ptr::null_mut();
+        }
+        (*child).m26.wait_count = write as u32;
+    }
+}
+
+/// Remove the current task from every live per-child wait queue.
+///
+/// Linux installs one `child_wait` entry on `current->signal->wait_chldexit`
+/// and unconditionally calls `remove_wait_queue()` before `do_wait()` returns.
+/// Lupos currently stores the inverse relation on each child, so a live-task
+/// scan is the equivalent operation and also covers a child whose pgrp or
+/// ptrace relationship changed while the syscall slept.
+unsafe fn remove_wait_registrations(parent: *mut TaskStruct) {
+    if parent.is_null() {
+        return;
+    }
+
+    unsafe {
+        // Preserve stack-backed test/process-bootstrap children which are not
+        // present in either global task registry.
+        let count = ((*parent).m26.children_count as usize).min(MAX_CHILDREN);
+        for index in 0..count {
+            remove_waiter((*parent).m26.children[index], parent);
+        }
+
+        let mut remove = |task: *mut TaskStruct| {
+            remove_waiter(task, parent);
+        };
+        crate::kernel::fork::for_each_heap_task(&mut remove);
+        sched::for_each_pool_task(&mut remove);
+    }
+}
+
+struct WaitRegistrationGuard {
+    parent: *mut TaskStruct,
+}
+
+impl WaitRegistrationGuard {
+    fn new(parent: *mut TaskStruct) -> Self {
+        Self { parent }
+    }
+}
+
+impl Drop for WaitRegistrationGuard {
+    fn drop(&mut self) {
+        unsafe { remove_wait_registrations(self.parent) };
     }
 }
 
@@ -601,12 +685,9 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
     } else {
         WaitTarget::Pid(pid)
     };
+    let _wait_registration_guard = WaitRegistrationGuard::new(parent);
 
     loop {
-        unsafe {
-            exit_if_fatal_signal_pending_current();
-        }
-
         // Fast path: zombie child already available?
         if let Some(child) = unsafe { find_zombie_child(parent, target) } {
             let child_pid = unsafe { (*child).pid };
@@ -788,12 +869,9 @@ pub unsafe fn sys_waitid(
     if parent.is_null() {
         return EINVAL;
     }
+    let _wait_registration_guard = WaitRegistrationGuard::new(parent);
 
     loop {
-        unsafe {
-            exit_if_fatal_signal_pending_current();
-        }
-
         if let Some(child) = unsafe { find_zombie_child(parent, target) } {
             let child_pid = unsafe { (*child).pid };
             let exit_code = unsafe { (*child).m26.exit_code };
@@ -982,15 +1060,15 @@ unsafe fn exit_group_peers(current: *mut TaskStruct, code: i64) {
         if task.is_null() || task == current || (*task).tgid != tgid {
             return;
         }
-        crate::kernel::futex::robust::exit_robust_list((*task).pid);
-        crate::kernel::futex::core_ops::futex_exit_release(task);
-        crate::kernel::exit::exit_clear_child_tid(task);
-        crate::kernel::exit::exit_mm(task);
-        crate::kernel::exit::exit_files(task);
-        crate::kernel::cgroup::mark_pid_exited_from_cgroup((*task).pid);
         (*task).m26.exit_code = code as i32;
-        crate::kernel::sched::dequeue_task(task);
-        crate::kernel::exit::notify_exit_and_publish_zombie(task);
+
+        // Linux zap_other_threads() never tears a peer down remotely, even
+        // when that peer is off-CPU: an off-CPU task may still own live
+        // stack-resident waitqueue/futex state. Queue SIGKILL and wake it so
+        // it unwinds the blocked syscall and reaches do_exit() in its own
+        // context before finish_task_switch() releases its kernel stack.
+        let _ = crate::kernel::signal::send_signal_to_task(task, SIGKILL);
+        crate::kernel::sched::request_reschedule((*task).thread_info.cpu);
     };
     crate::kernel::fork::for_each_heap_task(&mut visit);
     crate::kernel::sched::for_each_pool_task(&mut visit);

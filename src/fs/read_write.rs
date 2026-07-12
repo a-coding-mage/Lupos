@@ -78,7 +78,18 @@ pub fn vfs_write(file: &FileRef, buf: &[u8]) -> Result<usize, i32> {
     if flags & O_APPEND != 0 {
         *pos = inode.size.load(core::sync::atomic::Ordering::Acquire);
     }
-    write(file, buf, &mut *pos)
+    let start = *pos;
+    let result = write(file, buf, &mut *pos);
+    if let Ok(written) = result {
+        unsafe {
+            crate::mm::filemap::filemap_update_cached_range(
+                inode.mapping(),
+                start,
+                &buf[..written.min(buf.len())],
+            );
+        }
+    }
+    result
 }
 
 pub fn vfs_lseek(file: &FileRef, off: i64, whence: i32) -> Result<u64, i32> {

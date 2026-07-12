@@ -1,11 +1,10 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/fs/eventfd.c
 //! test-origin: linux:vendor/linux/fs/eventfd.c
 //! eventfd — counter-style fd for thread/process notifications.
 //!
-//! ABI parity with vendor/linux/fs/eventfd.c.
-//! M60 implements the in-kernel counter semantics; full VFS-fd integration
-//! is deferred until FileOps gains a poll() slot.
+//! Counter and poll readiness semantics mirror vendor/linux/fs/eventfd.c.
+//! Interruptible blocking reads and writes are not implemented yet.
 
 extern crate alloc;
 
@@ -18,9 +17,11 @@ use spin::Mutex;
 
 use crate::fs::anon_inode::alloc_anon_file;
 use crate::fs::ops::FileOps;
+use crate::fs::select::{self, POLLERR, POLLIN, POLLOUT, PollTable};
 use crate::fs::types::FileRef;
 use crate::include::uapi::errno::{EAGAIN, EBADF, EINVAL};
 use crate::include::uapi::fcntl::{O_NONBLOCK, O_RDWR};
+use crate::kernel::sched::wait::WaitQueueHead;
 use crate::kernel::{files, sched};
 
 /// `EFD_*` flags — byte-identical to Linux UAPI.
@@ -32,6 +33,7 @@ pub const EFD_NONBLOCK: i32 = 0o0004000;
 pub struct EventFd {
     pub count: AtomicU64,
     pub flags: i32,
+    wqh: WaitQueueHead,
 }
 
 static EVENTFD_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -58,6 +60,7 @@ impl EventFd {
         Self {
             count: AtomicU64::new(initval),
             flags,
+            wqh: WaitQueueHead::new(),
         }
     }
 
@@ -65,16 +68,25 @@ impl EventFd {
     /// in EFD_SEMAPHORE mode).  Returns EAGAIN when a read would block.
     /// Linux: vendor/linux/fs/eventfd.c::eventfd_read
     pub fn read(&self) -> Result<u64, i32> {
-        let v = self.count.load(Ordering::Acquire);
-        if v == 0 {
-            return Err(EAGAIN);
-        }
-        if self.flags & EFD_SEMAPHORE != 0 {
-            self.count.fetch_sub(1, Ordering::AcqRel);
-            Ok(1)
-        } else {
-            self.count.store(0, Ordering::Release);
-            Ok(v)
+        loop {
+            let count = self.count.load(Ordering::Acquire);
+            if count == 0 {
+                return Err(EAGAIN);
+            }
+            let value = if self.flags & EFD_SEMAPHORE != 0 {
+                1
+            } else {
+                count
+            };
+            if self
+                .count
+                .compare_exchange(count, count - value, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // eventfd_read() wakes EPOLLOUT after consuming the counter.
+                self.wqh.wake_up_all();
+                return Ok(value);
+            }
         }
     }
 
@@ -83,12 +95,22 @@ impl EventFd {
         if val == u64::MAX {
             return Err(EINVAL);
         }
-        let cur = self.count.load(Ordering::Acquire);
-        if cur.saturating_add(val) >= u64::MAX {
-            return Err(EAGAIN);
+        loop {
+            let count = self.count.load(Ordering::Acquire);
+            if u64::MAX - count <= val {
+                return Err(EAGAIN);
+            }
+            if self
+                .count
+                .compare_exchange(count, count + val, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // eventfd_write() wakes EPOLLIN after every successful write,
+                // including a write of zero.
+                self.wqh.wake_up_all();
+                return Ok(8);
+            }
         }
-        self.count.fetch_add(val, Ordering::AcqRel);
-        Ok(8)
     }
 
     /// poll() mask — EPOLLIN if readable, EPOLLOUT if writable.
@@ -96,10 +118,13 @@ impl EventFd {
         let mut mask = 0u32;
         let v = self.count.load(Ordering::Acquire);
         if v > 0 {
-            mask |= 0x0001; // EPOLLIN
+            mask |= POLLIN as u32;
+        }
+        if v == u64::MAX {
+            mask |= POLLERR as u32;
         }
         if v < u64::MAX - 1 {
-            mask |= 0x0004; // EPOLLOUT
+            mask |= POLLOUT as u32;
         }
         mask
     }
@@ -138,10 +163,16 @@ fn eventfd_file_write(file: &FileRef, buf: &[u8], _pos: &mut u64) -> Result<usiz
     eventfd_from_file(file)?.write(value)
 }
 
-fn eventfd_file_poll(file: &FileRef) -> u32 {
-    eventfd_from_file(file)
-        .map(|e| e.poll_mask())
-        .unwrap_or(0x0008)
+fn eventfd_file_poll(file: &FileRef, table: Option<&mut PollTable>) -> u32 {
+    match eventfd_from_file(file) {
+        Ok(eventfd) => {
+            // Linux eventfd_poll() registers before reading count so a writer
+            // cannot change readiness between the sample and queue insertion.
+            select::poll_wait(file, &eventfd.wqh, table);
+            eventfd.poll_mask()
+        }
+        Err(_) => POLLERR as u32,
+    }
 }
 
 fn eventfd_release(file: FileRef) {

@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/fs
 //! test-origin: linux:vendor/linux/fs
 //! pidfd support for child-exit polling.
@@ -17,6 +17,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -25,10 +26,12 @@ use spin::Mutex;
 
 use crate::fs::anon_inode::alloc_anon_file_with_ino;
 use crate::fs::ops::{FileOps, SuperOps};
+use crate::fs::select::{POLLHUP, POLLRDNORM, PollTable, poll_wait};
 use crate::fs::syscalls::POLLIN;
 use crate::fs::types::{FileRef, SuperBlock};
 use crate::include::uapi::errno::{EBADF, EFAULT, EINVAL, ENOTTY, ESRCH};
 use crate::kernel::pid::{KPid, get_pid, put_pid};
+use crate::kernel::sched::wait::WaitQueueHead;
 use crate::kernel::task::TaskStruct;
 use crate::kernel::task::task_state::{EXIT_DEAD, EXIT_ZOMBIE};
 use crate::kernel::{files, sched};
@@ -103,12 +106,16 @@ struct PidfdInfo {
     __spare1: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PidFdState {
     pid: i32,
     task: *mut TaskStruct,
     kpid: *mut KPid,
     exited: bool,
+    /// Linux stores this queue in `struct pid`.  Keeping the Rust queue in an
+    /// `Arc` gives poll-table registrations a stable address while the file
+    /// pin held by `PollTable` keeps the corresponding state alive.
+    wait_pidfd: Arc<WaitQueueHead>,
 }
 
 unsafe impl Send for PidFdState {}
@@ -160,21 +167,37 @@ fn task_has_exited(task: *mut TaskStruct) -> bool {
         return true;
     }
     unsafe {
-        ((*task).m26.exit_state & (EXIT_ZOMBIE | EXIT_DEAD) != 0)
-            || ((*task).__state.load(Ordering::Acquire) & (EXIT_ZOMBIE | EXIT_DEAD) != 0)
+        let exited = ((*task).m26.exit_state & (EXIT_ZOMBIE | EXIT_DEAD) != 0)
+            || ((*task).__state.load(Ordering::Acquire) & (EXIT_ZOMBIE | EXIT_DEAD) != 0);
+        // Linux pidfd_poll() intentionally hides a prematurely exited thread
+        // group leader until its last subthread leaves the group.
+        exited && !crate::kernel::signal::delay_group_leader(task)
     }
 }
 
-fn pidfd_file_poll(file: &FileRef) -> u32 {
+fn pidfd_file_poll(file: &FileRef, table: Option<&mut PollTable>) -> u32 {
     let token = *file.private.lock();
-    let mut table = PIDFDS.lock();
-    let Some(state) = table.get_mut(&token) else {
+    let mut states = PIDFDS.lock();
+    let Some(state) = states.get_mut(&token) else {
         return crate::fs::syscalls::POLLERR as u32;
     };
+
+    // `pidfd_poll()` registers on `pid->wait_pidfd` before looking up and
+    // testing the task.  Keeping that order closes the exit/check/sleep race.
+    poll_wait(file, state.wait_pidfd.as_ref(), table);
+
     if !state.exited && task_has_exited(state.task) {
         state.exited = true;
     }
-    if state.exited { POLLIN as u32 } else { 0 }
+    if !state.exited {
+        return 0;
+    }
+
+    let mut mask = (POLLIN | POLLRDNORM) as u32;
+    if state.task.is_null() {
+        mask |= POLLHUP as u32;
+    }
+    mask
 }
 
 fn pidfd_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
@@ -328,6 +351,7 @@ fn install_pidfd_state(
             task,
             kpid,
             exited,
+            wait_pidfd: Arc::new(WaitQueueHead::new()),
         },
     );
 
@@ -402,20 +426,59 @@ fn state_for_file(file: &FileRef) -> Result<PidFdState, i32> {
         return Err(EBADF);
     }
     let token = *file.private.lock();
-    PIDFDS.lock().get(&token).copied().ok_or(EBADF)
+    PIDFDS.lock().get(&token).cloned().ok_or(EBADF)
 }
 
 pub fn notify_task_exit(task: *mut TaskStruct) {
     if task.is_null() {
         return;
     }
-    let pid = unsafe { (*task).pid };
-    let mut table = PIDFDS.lock();
-    for state in table.values_mut() {
-        if state.task == task || state.pid == pid {
-            state.exited = true;
-            state.task = core::ptr::null_mut();
+    if unsafe { crate::kernel::signal::delay_group_leader(task) } {
+        return;
+    }
+    let kpid = unsafe { (*task).m26.thread_pid };
+    let queues = {
+        let mut table = PIDFDS.lock();
+        let mut queues = Vec::new();
+        for state in table.values_mut() {
+            if state.task == task || (!kpid.is_null() && state.kpid == kpid) {
+                state.exited = true;
+                queues.push(state.wait_pidfd.clone());
+            }
         }
+        queues
+    };
+
+    // A persistent epoll callback can immediately poll this pidfd again, so
+    // never invoke waitqueue callbacks while holding PIDFDS.
+    for queue in queues {
+        queue.wake_up_all();
+    }
+}
+
+/// Publish the `pid_task(pid, PIDTYPE_PID) == NULL` transition made by
+/// Linux's `release_task()` / `detach_pid()` and wake pollers a second time so
+/// they can observe `POLLHUP`.
+pub fn notify_task_reap(task: *mut TaskStruct) {
+    if task.is_null() {
+        return;
+    }
+    let kpid = unsafe { (*task).m26.thread_pid };
+    let queues = {
+        let mut table = PIDFDS.lock();
+        let mut queues = Vec::new();
+        for state in table.values_mut() {
+            if state.task == task || (!kpid.is_null() && state.kpid == kpid) {
+                state.exited = true;
+                state.task = core::ptr::null_mut();
+                queues.push(state.wait_pidfd.clone());
+            }
+        }
+        queues
+    };
+
+    for queue in queues {
+        queue.wake_up_all();
     }
 }
 
@@ -454,10 +517,10 @@ mod tests {
                 .expect("files")
                 .get(fd)
                 .expect("file");
-            assert_eq!(pidfd_file_poll(&file), 0);
+            assert_eq!(pidfd_file_poll(&file, None), 0);
 
             notify_task_exit(&mut *target as *mut TaskStruct);
-            assert_eq!(pidfd_file_poll(&file), POLLIN as u32);
+            assert_eq!(pidfd_file_poll(&file, None), (POLLIN | POLLRDNORM) as u32);
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);

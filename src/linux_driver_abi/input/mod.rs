@@ -36,6 +36,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::include::uapi::errno::EEXIST;
+use crate::kernel::sched::wait::WaitQueueHead;
 
 // ── input_event ABI — `include/uapi/linux/input.h` ───────────────────────────
 // MUST match Linux exactly (used by evdev readers).
@@ -86,6 +87,12 @@ pub struct InputDev {
     pub id: u32,
     /// Event queue consumed by evdev readers.
     pub events: Mutex<Vec<InputEvent>>,
+    /// Readers and poll/epoll callbacks waiting for an evdev packet.
+    ///
+    /// Linux keeps this waitqueue in each `struct evdev_client`.  Lupos does
+    /// not yet materialize per-open evdev clients, so the current single
+    /// device queue and its waitqueue have the same lifetime and ownership.
+    pub(crate) event_wait: WaitQueueHead,
     /// Handlers attached to this device.
     pub handlers: Mutex<Vec<Arc<InputHandler>>>,
 }
@@ -96,6 +103,7 @@ impl InputDev {
             name: String::from(name),
             id,
             events: Mutex::new(Vec::new()),
+            event_wait: WaitQueueHead::new(),
             handlers: Mutex::new(Vec::new()),
         })
     }
@@ -112,6 +120,12 @@ impl InputDev {
             value,
         };
         self.events.lock().push(ev);
+        // `evdev_pass_values()` publishes a completed packet before waking
+        // readers and poll callbacks.  The in-tree producers terminate each
+        // keyboard/mouse packet with EV_SYN/SYN_REPORT (code zero).
+        if event_type == EV_SYN && code == 0 {
+            self.event_wait.wake_up_all();
+        }
         let handlers: Vec<Arc<InputHandler>> = self.handlers.lock().iter().cloned().collect();
         for h in handlers.iter() {
             (h.event)(self, &ev);

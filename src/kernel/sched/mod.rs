@@ -99,7 +99,7 @@ pub fn register_module_exports() {
     swait::register_module_exports();
 }
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -194,6 +194,12 @@ unsafe fn seed_current_task_stack(_task: *mut TaskStruct) {}
 #[cfg(not(test))]
 static mut CURRENT_TASK: [*mut TaskStruct; MAX_CPUS] = [core::ptr::null_mut(); MAX_CPUS];
 
+/// Autoreaped current tasks cannot drop their own kernel stack. Linux keeps a
+/// final current-task reference until finish_task_switch(); this per-CPU slot
+/// carries the equivalent ownership across Lupos's stack switch.
+static DEFERRED_TASK_RELEASE: [AtomicPtr<TaskStruct>; MAX_CPUS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+
 #[cfg(test)]
 std::thread_local! {
     static TEST_CURRENT_TASK: core::cell::Cell<*mut TaskStruct> =
@@ -231,6 +237,19 @@ static PRODUCTION_SCHED_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Number of CPUs that have joined the production scheduler.
 static SCHED_ONLINE_CPUS: AtomicU32 = AtomicU32::new(0);
+
+/// Logical CPUs which are currently active for task placement.
+///
+/// This is Lupos's `cpu_active_mask`.  Keep it distinct from the compile-time
+/// `NR_CPUS` width: Linux's `sched_getaffinity()` intersects a task's allowed
+/// mask with `cpu_active_mask`, so userspace must never infer 64 runnable CPUs
+/// merely because `cpumask_t` contains 64 bits.
+static SCHED_ACTIVE_CPUS: AtomicU64 = AtomicU64::new(1);
+
+/// Snapshot Linux's `cpu_active_mask` in the task cpumask representation.
+pub fn cpu_active_mask() -> entity::CpuMask {
+    entity::CpuMask(SCHED_ACTIVE_CPUS.load(Ordering::Acquire))
+}
 
 // ── Run queue ────────────────────────────────────────────────────────────────
 
@@ -400,9 +419,22 @@ pub unsafe fn set_current(task: *mut TaskStruct) {
     #[cfg(not(test))]
     {
         let cpu = current_cpu_index();
-        unsafe {
-            CURRENT_TASK[cpu] = task;
-        }
+        unsafe { set_current_on_cpu(cpu, task) };
+    }
+}
+
+/// Install the current task in an explicitly identified logical-CPU slot.
+///
+/// Linux's AP bring-up writes its per-CPU `current_task` before marking that
+/// CPU online.  It cannot discover the slot through the online mask at that
+/// point, so `sched_init_ap()` passes the already-known logical CPU directly.
+#[cfg(not(test))]
+unsafe fn set_current_on_cpu(cpu: usize, task: *mut TaskStruct) {
+    let cpu = cpu.min(MAX_CPUS - 1);
+    unsafe {
+        CURRENT_TASK[cpu] = task;
+    }
+    if cpu == 0 {
         crate::arch::x86::kernel::cpu::common::set_linux_current_task(task);
     }
 }
@@ -424,6 +456,78 @@ unsafe fn set_need_resched(task: *mut TaskStruct) {
     }
     unsafe {
         (*task).thread_info.flags |= crate::kernel::task::TIF_NEED_RESCHED;
+    }
+}
+
+/// Record an autoreaped outgoing task for post-switch reclamation.
+///
+/// Requiring both Linux states keeps unrelated kthreads which use TASK_DEAD
+/// but have no EXIT_DEAD lifecycle out of the process-release path.
+unsafe fn prepare_task_switch_release(task: *mut TaskStruct) {
+    if task.is_null() {
+        return;
+    }
+    let task_state = unsafe { (*task).__state.load(Ordering::Acquire) };
+    let exit_state = unsafe { (*task).m26.exit_state };
+    if task_state != crate::kernel::task::task_state::TASK_DEAD
+        || exit_state != crate::kernel::task::task_state::EXIT_DEAD
+    {
+        return;
+    }
+
+    let slot = &DEFERRED_TASK_RELEASE[current_cpu_index()];
+    let installed = slot.compare_exchange(
+        core::ptr::null_mut(),
+        task,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    debug_assert!(
+        installed.is_ok(),
+        "post-switch task release slot must be empty"
+    );
+}
+
+/// Linux `finish_task_switch()`'s final TASK_DEAD ownership drop.
+///
+/// This runs on the incoming task's kernel stack. `prev` is the actual task
+/// returned by `__switch_to`, not the stale local restored with that stack.
+/// Only CLONE_THREAD autoreap places a pointer in this slot.
+pub unsafe fn finish_task_switch(prev: *mut TaskStruct) {
+    let slot = &DEFERRED_TASK_RELEASE[current_cpu_index()];
+    let deferred = slot.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    if !deferred.is_null() && deferred != prev {
+        // Never free an ownership token that does not match the architecture
+        // switch result. Preserve it for diagnosis rather than guessing.
+        slot.store(deferred, Ordering::Release);
+    }
+
+    // A remote exit_group can publish TASK_DEAD after the outgoing CPU passed
+    // prepare_task_switch_release() but before the physical stack switch. Read
+    // the state again here, exactly where Linux finish_task_switch() samples
+    // prev->__state. Keep on_cpu set until release finishes so another CPU can
+    // never mistake this still-owned stack for an immediately freeable task.
+    let autoreap = !prev.is_null()
+        && unsafe {
+            (*prev).__state.load(Ordering::Acquire) == crate::kernel::task::task_state::TASK_DEAD
+                && (*prev).m26.exit_state == crate::kernel::task::task_state::EXIT_DEAD
+        };
+    if deferred == prev || autoreap {
+        unsafe {
+            crate::kernel::exit::release_task(prev);
+        }
+    } else if !prev.is_null() {
+        unsafe {
+            (*prev).m29.on_cpu = 0;
+        }
+    }
+}
+
+/// Linux `schedule_tail(prev)`: first operation on a newly-forked task's
+/// synthetic return path.
+pub unsafe extern "C" fn schedule_tail(prev: *mut TaskStruct) {
+    unsafe {
+        finish_task_switch(prev);
     }
 }
 
@@ -779,7 +883,9 @@ pub unsafe fn legacy_schedule() -> bool {
         seed_current_task_stack(prev);
         record_switch_attempt(prev, next);
         prepare_switch_to_task(next);
-        __switch_to_asm(prev, next);
+        prepare_task_switch_release(prev);
+        let last = __switch_to_asm(prev, next);
+        finish_task_switch(last);
     }
     false
 }
@@ -835,9 +941,6 @@ pub unsafe fn __schedule() {
             (*next).m29.wake_cpu = cpu as i32;
             clear_need_resched(next);
         }
-        if !prev.is_null() && next != prev {
-            (*prev).m29.on_cpu = 0;
-        }
         this_rq.current = next;
         (prev, next)
     })
@@ -856,7 +959,9 @@ pub unsafe fn __schedule() {
         seed_current_task_stack(prev);
         record_switch_attempt(prev, next);
         prepare_switch_to_task(next);
-        __switch_to_asm(prev, next);
+        prepare_task_switch_release(prev);
+        let last = __switch_to_asm(prev, next);
+        finish_task_switch(last);
     }
 }
 
@@ -958,26 +1063,44 @@ pub unsafe fn schedule_with_irqs_enabled() {
     }
     #[cfg(not(test))]
     {
-        crate::kernel::locking::local_irq_enable();
-        let idle = unsafe { schedule() };
-        if idle {
-            // Idle == every runnable task yielded. Drain pending Linux-driver
-            // hardware completions that have no native IRQ wakeup yet before
-            // halting; if we handled one, return so the next schedule picks up the
-            // now-runnable waiter instead of halting.
-            if pump_driver_abi_events_on_idle() {
-                crate::kernel::locking::local_irq_enable();
+        loop {
+            crate::kernel::locking::local_irq_enable();
+            let idle = unsafe { schedule() };
+            crate::kernel::locking::local_irq_enable();
+            let current = unsafe { get_current() };
+            if current.is_null() || unsafe { task_runnable(current) } {
                 return;
             }
+
+            if idle && pump_driver_abi_events_on_idle() {
+                continue;
+            }
+
+            // Drop the tick's stale reschedule request before closing the
+            // check/halt race. Any real wake or newly-runnable peer arriving
+            // after this point sets it again.
             unsafe {
-                // sti+hlt as a single sequence -- sti has a one-instruction grace
-                // window so a newly-pending interrupt cannot be missed between
-                // enabling IRQs and halting. Same idiom as
-                // halt_loop_with_softirq() (src/init/main.rs).
-                core::arch::asm!("sti; hlt", options(nomem, nostack, preserves_flags));
+                clear_need_resched(current);
+            }
+            crate::kernel::locking::local_irq_disable();
+            let woke = unsafe { task_runnable(current) };
+            let need_resched = unsafe {
+                (*current).thread_info.flags & crate::kernel::task::TIF_NEED_RESCHED != 0
+            };
+            if woke || need_resched {
+                crate::kernel::locking::local_irq_enable();
+                continue;
+            }
+
+            unsafe {
+                // Linux's idle loop disables IRQs, performs the final
+                // need-resched check, then uses sti;hlt so a pending interrupt
+                // cannot be lost in between. Return from HLT is only a reason
+                // to re-run schedule; the sleeping syscall does not resume
+                // until its task is genuinely TASK_RUNNING.
+                core::arch::asm!("sti; hlt", options(nostack));
             }
         }
-        crate::kernel::locking::local_irq_enable();
     }
 }
 
@@ -1135,11 +1258,17 @@ pub fn kthread_entry_stub_addr() -> u64 {
 unsafe extern "C" fn kthread_entry_stub() -> ! {
     core::arch::naked_asm!(
         // R12 = func, RBX = arg (both are callee-saved, set by kthread_create)
+        // RAX = prev from __switch_to. Every freshly-forked task, including a
+        // kernel thread, must finish the outgoing switch before entering its
+        // body.
+        "mov rdi, rax",
+        "call {schedule_tail}",
         "mov rdi, rbx", // arg → first argument register
         "call r12",     // func(arg)
         // Should never reach here; halt if the thread returns.
         "2: hlt",
         "jmp 2b",
+        schedule_tail = sym schedule_tail,
     );
 }
 
@@ -1226,6 +1355,7 @@ pub unsafe fn sched_init() {
         rq0.idle = bsp_task;
         rq0.current = bsp_task;
     });
+    SCHED_ACTIVE_CPUS.store(1, Ordering::Release);
     SCHED_ONLINE_CPUS.store(1, Ordering::Release);
 }
 
@@ -1275,6 +1405,14 @@ pub unsafe fn sched_init_ap(cpu: u32) -> *mut TaskStruct {
         };
     }
 
+    #[cfg(not(test))]
+    unsafe {
+        // AP_READY_COUNT is intentionally published only after the AP is fully
+        // initialized, so select the per-CPU current slot from the explicit
+        // logical CPU rather than current_cpu_index()'s pre-online fast path.
+        set_current_on_cpu(cpu, idle_task);
+    }
+    #[cfg(test)]
     unsafe {
         set_current(idle_task);
     }
@@ -1282,6 +1420,7 @@ pub unsafe fn sched_init_ap(cpu: u32) -> *mut TaskStruct {
         this_rq.idle = idle_task;
         this_rq.current = idle_task;
     });
+    SCHED_ACTIVE_CPUS.fetch_or(1u64 << cpu, Ordering::AcqRel);
     SCHED_ONLINE_CPUS.fetch_add(1, Ordering::AcqRel);
     PRODUCTION_SCHED_ENABLED.store(true, Ordering::Release);
     idle_task
@@ -1440,6 +1579,20 @@ pub unsafe fn try_to_wake_up(p: *mut TaskStruct, wake_flags: u32) -> bool {
 }
 
 pub unsafe fn wake_task(p: *mut TaskStruct) -> bool {
+    unsafe { try_to_wake_up(p, class::ENQUEUE_WAKEUP) }
+}
+
+/// Normal waitqueue/timer wake, equivalent to Linux
+/// `try_to_wake_up(p, TASK_NORMAL, WF_*)`. Unlike signal/ptrace-specific wake
+/// paths this must never resume a stopped or traced task.
+pub unsafe fn wake_task_normal(p: *mut TaskStruct) -> bool {
+    if p.is_null() {
+        return false;
+    }
+    let state = unsafe { (*p).__state.load(Ordering::Acquire) };
+    if state & crate::kernel::task::task_state::TASK_NORMAL == 0 {
+        return false;
+    }
     unsafe { try_to_wake_up(p, class::ENQUEUE_WAKEUP) }
 }
 

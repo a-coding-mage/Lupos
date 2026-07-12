@@ -16,9 +16,9 @@ use super::{
     FUTEX_CMP_REQUEUE, FUTEX_CMP_REQUEUE_PI, FUTEX_LOCK_PI, FUTEX_LOCK_PI2, FUTEX_PRIVATE_FLAG,
     FUTEX_REQUEUE, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET,
     FUTEX_WAIT_REQUEUE_PI, FUTEX_WAITV_MAX, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP,
-    FUTEX2_PRIVATE, FutexWaitv, futex_cmp_requeue_pi, futex_lock_pi, futex_requeue,
-    futex_trylock_pi, futex_unlock_pi, futex_wait, futex_wait_requeue_pi, futex_waitv, futex_wake,
-    futex_wake_op,
+    FUTEX2_PRIVATE, FutexDeadline, FutexWaitv, futex_cmp_requeue_pi, futex_lock_pi, futex_requeue,
+    futex_trylock_pi, futex_unlock_pi, futex_wait, futex_wait_deadline, futex_wait_requeue_pi,
+    futex_waitv_deadline, futex_wake, futex_wake_op,
 };
 
 use crate::kernel::time::{CLOCK_MONOTONIC, CLOCK_REALTIME};
@@ -85,10 +85,21 @@ pub unsafe fn sys_futex_waitv(
     timeout_ns: u64,
     clockid: i32,
 ) -> i64 {
+    let deadline = (timeout_ns != 0).then(|| FutexDeadline::relative_monotonic(timeout_ns));
+    unsafe { sys_futex_waitv_deadline(waiters, nr_waiters, flags, deadline, clockid) }
+}
+
+pub unsafe fn sys_futex_waitv_deadline(
+    waiters: u64,
+    nr_waiters: usize,
+    flags: u32,
+    deadline: Option<FutexDeadline>,
+    clockid: i32,
+) -> i64 {
     if flags != 0 || waiters == 0 || nr_waiters == 0 || nr_waiters > FUTEX_WAITV_MAX {
         return -super::EINVAL as i64;
     }
-    if timeout_ns != 0 && clockid != CLOCK_MONOTONIC && clockid != CLOCK_REALTIME {
+    if deadline.is_some() && clockid != CLOCK_MONOTONIC && clockid != CLOCK_REALTIME {
         return -super::EINVAL as i64;
     }
     let mut local = vec![FutexWaitv::default(); nr_waiters];
@@ -112,7 +123,7 @@ pub unsafe fn sys_futex_waitv(
             return -super::EINVAL as i64;
         }
     }
-    unsafe { futex_waitv(&local, timeout_ns) }
+    unsafe { futex_waitv_deadline(&local, deadline) }
 }
 
 pub unsafe fn sys_futex_wake2(uaddr: u64, mask: u64, nr: i32, flags: u32) -> i64 {
@@ -126,6 +137,17 @@ pub unsafe fn sys_futex_wake2(uaddr: u64, mask: u64, nr: i32, flags: u32) -> i64
 }
 
 pub unsafe fn sys_futex_wait2(uaddr: u64, val: u64, mask: u64, flags: u32, timeout_ns: u64) -> i64 {
+    let deadline = (timeout_ns != 0).then(|| FutexDeadline::relative_monotonic(timeout_ns));
+    unsafe { sys_futex_wait2_deadline(uaddr, val, mask, flags, deadline) }
+}
+
+pub unsafe fn sys_futex_wait2_deadline(
+    uaddr: u64,
+    val: u64,
+    mask: u64,
+    flags: u32,
+    deadline: Option<FutexDeadline>,
+) -> i64 {
     if val > u32::MAX as u64 || mask > u32::MAX as u64 {
         return -super::EINVAL as i64;
     }
@@ -133,11 +155,11 @@ pub unsafe fn sys_futex_wait2(uaddr: u64, val: u64, mask: u64, flags: u32, timeo
         return -(errno as i64);
     }
     unsafe {
-        futex_wait(
+        futex_wait_deadline(
             uaddr,
             val as u32,
             mask as u32,
-            timeout_ns,
+            deadline,
             flags & FUTEX2_PRIVATE != 0,
         )
     }

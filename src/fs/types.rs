@@ -19,6 +19,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, RwLock};
 
 use super::ops::{FileOps, InodeOps, SuperOps};
+use crate::mm::address_space::AddressSpace;
 
 pub type Ino = u64;
 
@@ -96,6 +97,10 @@ pub struct Inode {
     pub i_count: AtomicUsize,
     pub ops: &'static InodeOps,
     pub fops: &'static FileOps,
+    /// Linux `inode::i_data`, with `i_mapping` pointing at this same object.
+    /// Keeping the mapping in the inode makes independently opened mappings of
+    /// one file share page-cache pages, as they do in vendor Linux.
+    pub i_data: AddressSpace,
     pub sb: Mutex<Option<SuperBlockRef>>,
     /// In-memory extended attributes for VFS-backed synthetic filesystems.
     /// Linux keeps this behind each filesystem's xattr handlers; Lupos stores
@@ -114,7 +119,7 @@ impl Inode {
         fops: &'static FileOps,
         private: InodePrivate,
     ) -> InodeRef {
-        Arc::new(Self {
+        let mut inode = Arc::new(Self {
             ino,
             kind,
             mode: AtomicU32::new(mode | kind.s_ifmt()),
@@ -129,16 +134,41 @@ impl Inode {
             i_count: AtomicUsize::new(1),
             ops,
             fops,
+            i_data: AddressSpace::new(),
             sb: Mutex::new(None),
             xattrs: Mutex::new(BTreeMap::new()),
             private,
-        })
+        });
+        let host = Arc::as_ptr(&inode) as *mut u8;
+        // No reference has escaped yet, so the embedded mapping can be linked
+        // to its stable Arc allocation exactly once before returning it.
+        Arc::get_mut(&mut inode)
+            .expect("new inode must be uniquely owned")
+            .i_data
+            .host = host;
+        inode
     }
     pub fn is_dir(&self) -> bool {
         self.kind == InodeKind::Directory
     }
     pub fn is_reg(&self) -> bool {
         self.kind == InodeKind::Regular
+    }
+
+    #[inline]
+    pub fn mapping(&self) -> *mut AddressSpace {
+        (&raw const self.i_data).cast_mut()
+    }
+}
+
+impl Drop for Inode {
+    fn drop(&mut self) {
+        // The final inode reference can only disappear after every File/VMA
+        // reference has gone away.  Linux's evict path then truncates i_data so
+        // cached folios cannot retain a dangling mapping pointer.
+        unsafe {
+            crate::mm::filemap::truncate_inode_pages_final(&raw mut self.i_data);
+        }
     }
 }
 
@@ -243,6 +273,10 @@ impl File {
     }
     pub fn inode(&self) -> Option<InodeRef> {
         self.dentry.inode()
+    }
+
+    pub fn mapping(&self) -> Option<*mut AddressSpace> {
+        self.inode().map(|inode| inode.mapping())
     }
 }
 

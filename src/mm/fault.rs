@@ -1019,6 +1019,137 @@ unsafe extern "C" fn lupos_file_fault(vmf: *mut VmFault) -> VmFaultFlags {
             return VM_FAULT_SIGBUS;
         }
 
+        let file_ptr = (*vma).vm_file as *const crate::fs::types::File;
+        Arc::increment_strong_count(file_ptr);
+        let file = Arc::from_raw(file_ptr);
+        let cacheable = (*vma).vm_flags & VM_SHARED == 0
+            && file.fops.read.is_some()
+            && file.inode().is_some_and(|inode| inode.is_reg());
+        let ret = if cacheable {
+            lupos_cached_file_fault(vmf, &file)
+        } else {
+            lupos_uncached_file_fault(vmf, &file)
+        };
+        drop(file);
+        ret
+    }
+}
+
+/// Current Rust-VFS equivalent of Linux's `filemap_fault()` plus
+/// `finish_fault()` for a private regular-file mapping.
+///
+/// Lupos installs PTEs inside the VMA fault callback, so this consumes the
+/// lookup reference as the PTE reference and unlocks the cache page before
+/// returning instead of propagating `VM_FAULT_LOCKED` to a missing upper
+/// `finish_fault()` layer.
+unsafe fn lupos_cached_file_fault(
+    vmf: *mut VmFault,
+    file: &crate::fs::types::FileRef,
+) -> VmFaultFlags {
+    use crate::mm::address_space::{page_uptodate, set_page_uptodate, unlock_page};
+    use crate::mm::filemap::{filemap_grab_folio, find_lock_page};
+
+    unsafe {
+        let vma = (*vmf).vma;
+        let Some(inode) = file.inode() else {
+            return VM_FAULT_SIGBUS;
+        };
+        let mapping = inode.mapping();
+        let index = (*vmf).pgoff;
+        let max_idx = inode
+            .size
+            .load(Ordering::Acquire)
+            .saturating_add(PAGE_SIZE - 1)
+            / PAGE_SIZE;
+        if index >= max_idx {
+            return VM_FAULT_SIGBUS;
+        }
+
+        let mut page = find_lock_page(mapping, index);
+        if page.is_null() {
+            page = filemap_grab_folio(mapping, index);
+        }
+        if page.is_null() {
+            return VM_FAULT_OOM;
+        }
+
+        if !page_uptodate(page) {
+            let page_virt = pfn_to_virt(page_to_pfn(page)) as *mut u8;
+            core::ptr::write_bytes(page_virt, 0, PAGE_SIZE as usize);
+            let Some(read) = file.fops.read else {
+                unlock_page(page);
+                (*page).put_page();
+                return VM_FAULT_SIGBUS;
+            };
+            let mut pos = index.saturating_mul(PAGE_SIZE);
+            let buf = core::slice::from_raw_parts_mut(page_virt, PAGE_SIZE as usize);
+            if read(file, buf, &mut pos).is_err() {
+                unlock_page(page);
+                (*page).put_page();
+                return VM_FAULT_SIGBUS;
+            }
+            set_page_uptodate(page);
+        }
+
+        // Linux rechecks both page identity and i_size under the folio lock;
+        // truncate or invalidation may have raced the backing read.
+        let max_idx = inode
+            .size
+            .load(Ordering::Acquire)
+            .saturating_add(PAGE_SIZE - 1)
+            / PAGE_SIZE;
+        if (*page).mapping != mapping as usize
+            || (*page).index != index as usize
+            || index >= max_idx
+        {
+            unlock_page(page);
+            (*page).put_page();
+            return VM_FAULT_SIGBUS;
+        }
+
+        let ptep = match pte_alloc((*vmf).pmd, (*vmf).address, _PAGE_TABLE) {
+            Some(p) => p,
+            None => {
+                unlock_page(page);
+                (*page).put_page();
+                return VM_FAULT_OOM;
+            }
+        };
+        if !pte_none(ptep_get(ptep)) {
+            unlock_page(page);
+            (*page).put_page();
+            return VM_FAULT_NOPAGE;
+        }
+
+        let prot = if (*vma).vm_page_prot != 0 {
+            pgprot_t((*vma).vm_page_prot)
+        } else {
+            pgprot_t(_PAGE_PRESENT | _PAGE_USER | _PAGE_ACCESSED | _PAGE_NX)
+        };
+        // A private file mapping always starts read-only.  A write fault must
+        // COW away from the mapping reference rather than modify the cache.
+        let entry = pte_wrprotect(pte_mkyoung(pfn_pte(page_to_pfn(page) as u64, prot)));
+        set_pte_at((*vma).vm_mm as *mut (), (*vmf).address, ptep, entry);
+        (*page)._mapcount.fetch_add(1, Ordering::Relaxed);
+        (*vmf).page = page;
+        (*vmf).pte = ptep;
+        add_mm_rss((*vma).vm_mm, 1);
+        crate::mm::lru::mark_page_accessed(page);
+        unlock_page(page);
+
+        // Do not put `page`: the caller reference is now owned by this PTE.
+        0
+    }
+}
+
+/// Legacy one-page-per-VMA-fault path retained for shared/device-like files
+/// until those mappings have Linux page_mkwrite/writeback coherence.
+unsafe fn lupos_uncached_file_fault(
+    vmf: *mut VmFault,
+    file: &crate::fs::types::FileRef,
+) -> VmFaultFlags {
+    unsafe {
+        let vma = (*vmf).vma;
         let page_ptr = match with_global_buddy(|b| b.alloc_pages(0, GFP_KERNEL)) {
             Some(p) => p,
             None => return VM_FAULT_OOM,
@@ -1029,15 +1160,11 @@ unsafe extern "C" fn lupos_file_fault(vmf: *mut VmFault) -> VmFaultFlags {
         let page_virt = pfn_to_virt(page_to_pfn(page_ptr)) as *mut u8;
         core::ptr::write_bytes(page_virt, 0, PAGE_SIZE as usize);
 
-        let file_ptr = (*vma).vm_file as *const crate::fs::types::File;
-        Arc::increment_strong_count(file_ptr);
-        let file = Arc::from_raw(file_ptr);
         if let Some(read) = file.fops.read {
             let mut pos = (*vmf).pgoff.saturating_mul(PAGE_SIZE);
             let buf = core::slice::from_raw_parts_mut(page_virt, PAGE_SIZE as usize);
-            let _ = read(&file, buf, &mut pos);
+            let _ = read(file, buf, &mut pos);
         }
-        drop(file);
 
         let ptep = match pte_alloc((*vmf).pmd, (*vmf).address, _PAGE_TABLE) {
             Some(p) => p,

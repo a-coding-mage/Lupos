@@ -469,7 +469,10 @@ fn kernfs_read_scratch_len(node: &KernfsNode) -> usize {
     }
 }
 
-fn kernfs_poll(file: &super::types::FileRef) -> u32 {
+fn kernfs_poll(
+    file: &super::types::FileRef,
+    _table: Option<&mut crate::fs::select::PollTable>,
+) -> u32 {
     let Some(inode) = file.inode() else {
         return 0;
     };

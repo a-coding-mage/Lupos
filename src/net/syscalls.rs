@@ -580,22 +580,29 @@ fn socket_file_write(file: &FileRef, buf: &[u8], _pos: &mut u64) -> Result<usize
     socket::sendmsg(&sock, buf)
 }
 
-fn socket_file_poll(file: &FileRef) -> u32 {
+fn socket_file_poll(file: &FileRef, mut table: Option<&mut crate::fs::select::PollTable>) -> u32 {
     let Ok(sock) = socket_from_file(file) else {
         return crate::fs::select::POLLERR as u32;
     };
     let mask = {
         let socket = sock.lock();
+        // Linux sock_poll_wait(): install the caller before sampling state.
+        // Queue registration and the readiness check therefore share the
+        // socket lock with every producer and cannot lose an intervening wake.
+        crate::fs::select::poll_wait(file, &socket.recv_wait, table.as_deref_mut());
         let mut mask = 0u32;
+        let hung_up = socket::stream_hangup_locked(&socket);
         let readable = if socket.state == SocketState::Listening {
             !socket.backlog.is_empty()
+                || socket.shutdown & socket::RCV_SHUTDOWN != 0
+                || socket.pending_error != 0
         } else {
             // A hung-up stream is readable: the pending read drains to EOF
             // (Linux tcp_poll() reports EPOLLIN once the peer closes).
-            // TODO(parity): Linux also raises EPOLLHUP here; systemd's PID1
-            // event loop currently fails manager startup when it sees it —
-            // re-add once the sd-event interaction is understood.
-            !socket.recvq.is_empty() || socket::stream_hangup_locked(&socket)
+            !socket.recvq.is_empty()
+                || socket.shutdown & socket::RCV_SHUTDOWN != 0
+                || hung_up
+                || socket.pending_error != 0
         };
         if readable {
             // Linux AF_UNIX poll reports normal readable data as both EPOLLIN and
@@ -610,7 +617,17 @@ fn socket_file_poll(file: &FileRef) -> u32 {
             // EPOLLWRNORM.
             mask |= (crate::fs::select::POLLOUT | crate::fs::select::POLLWRNORM) as u32;
         }
-        if socket.state == SocketState::Closed {
+        if socket.shutdown & socket::RCV_SHUTDOWN != 0 || hung_up {
+            mask |= 0x2000; // EPOLLRDHUP
+            mask |= (crate::fs::select::POLLIN | crate::fs::select::POLLRDNORM) as u32;
+        }
+        if socket.shutdown == socket::SHUTDOWN_MASK
+            || socket.state == SocketState::Closed
+            || hung_up
+        {
+            mask |= crate::fs::select::POLLHUP as u32;
+        }
+        if socket.pending_error != 0 {
             mask |= crate::fs::select::POLLERR as u32;
         }
         mask
@@ -672,14 +689,17 @@ fn check_socket_create(family: i32, kind: u16, protocol: i32) -> Result<(), i32>
 }
 
 fn install_socket_with(sock: SocketRef, file_flags: u32, cloexec: bool) -> Result<i32, i32> {
+    let files = current_files()?;
     let token = SOCKET_TOKEN.fetch_add(1, Ordering::AcqRel);
     SOCKETS.lock().insert(token, sock);
     let file = alloc_anon_file("socket", &SOCKET_FILE_OPS, token);
     file.flags.store(file_flags, Ordering::Release);
-    match current_files()?.install(file, cloexec) {
+    match files.install(file, cloexec) {
         Ok(fd) => Ok(fd),
         Err(errno) => {
-            SOCKETS.lock().remove(&token);
+            if let Some(sock) = SOCKETS.lock().remove(&token) {
+                socket::release_socket(&sock);
+            }
             Err(errno)
         }
     }
@@ -706,22 +726,41 @@ fn drop_file_refs(fds: alloc::vec::Vec<FileRef>) {
     }
 }
 
+struct FileRefGuard {
+    files: alloc::vec::Vec<FileRef>,
+}
+
+impl FileRefGuard {
+    fn new(files: alloc::vec::Vec<FileRef>) -> Self {
+        Self { files }
+    }
+
+    fn take(&mut self) -> alloc::vec::Vec<FileRef> {
+        core::mem::take(&mut self.files)
+    }
+}
+
+impl core::ops::Deref for FileRefGuard {
+    type Target = alloc::vec::Vec<FileRef>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.files
+    }
+}
+
+impl Drop for FileRefGuard {
+    fn drop(&mut self) {
+        drop_file_refs(core::mem::take(&mut self.files));
+    }
+}
+
 fn recvmsg_is_nonblocking(file: &FileRef, flags: i32) -> bool {
     flags & MSG_DONTWAIT != 0 || socket_file_is_nonblocking(file)
 }
 
 fn socket_recv_ready(sock: &SocketRef) -> bool {
     let socket = sock.lock();
-    if socket.state == SocketState::Listening {
-        !socket.backlog.is_empty()
-    } else {
-        // Peer hangup makes the socket "ready": the blocked reader must wake
-        // up and observe EOF instead of sleeping forever (Linux sk_wq wakeup
-        // on tcp_fin / unix_release_sock).
-        !socket.recvq.is_empty()
-            || socket.state == SocketState::Closed
-            || socket::stream_hangup_locked(&socket)
-    }
+    socket::socket_recv_ready_locked(&socket)
 }
 
 fn task_by_pid_for_pidfd(pid: i32) -> *mut crate::kernel::task::TaskStruct {
@@ -763,17 +802,20 @@ fn install_scm_pidfd(cred: &socket::SocketCred) -> Result<Option<i32>, i32> {
 
 #[cfg(not(test))]
 fn wait_for_socket_recv(sock: &SocketRef, timeout_ns: u64) -> Result<(), i32> {
-    let mut wait_state = SocketRecvWaitState::default();
     let deadline_ns = if timeout_ns == 0 {
         None
     } else {
         Some(crate::kernel::time::ktime_get().saturating_add(timeout_ns))
     };
-    while !socket_recv_ready(sock) {
+    let task = unsafe { sched::get_current() };
+    if task.is_null() {
+        return Err(EAGAIN);
+    }
+
+    loop {
         unsafe {
             crate::kernel::signal::exit_if_fatal_signal_pending_current();
         }
-        crate::init::rootfs::drain_console_control_bytes();
         if crate::kernel::signal::current_has_unblocked_pending_signals() {
             return Err(EINTR);
         }
@@ -782,12 +824,59 @@ fn wait_for_socket_recv(sock: &SocketRef, timeout_ns: u64) -> Result<(), i32> {
                 return Err(EAGAIN);
             }
         }
-        wait_state.maintenance();
+
+        // Linux's wait-event ordering is prepare, recheck, schedule, finish.
+        // The prepare helper takes the socket lock, rechecks recv/backlog/EOF,
+        // and registers this task before a producer can change that condition.
+        // If readiness already won the race, return so the syscall retries the
+        // actual recv/accept operation immediately.
+        if !unsafe { socket::prepare_socket_recv_wait(sock, task) } {
+            return Ok(());
+        }
+
+        // Signals and absolute receive timeouts may have become visible while
+        // the task was being linked. Always unlink before returning.
+        if crate::kernel::signal::current_has_unblocked_pending_signals() {
+            unsafe {
+                socket::finish_socket_recv_wait(sock, task);
+            }
+            return Err(EINTR);
+        }
+        if let Some(deadline_ns) = deadline_ns
+            && crate::kernel::time::ktime_get() >= deadline_ns
+        {
+            unsafe {
+                socket::finish_socket_recv_wait(sock, task);
+            }
+            return Err(EAGAIN);
+        }
+        if socket_recv_ready(sock) {
+            unsafe {
+                socket::finish_socket_recv_wait(sock, task);
+            }
+            return Ok(());
+        }
+
+        // Data/EOF producers provide the normal wakeup. Linux leaves an
+        // infinite receive wait untimed; a finite SO_RCVTIMEO arms only its
+        // actual remaining deadline, not a 250 Hz re-poll timer.
+        let task_id = task as usize;
+        let timer_armed = deadline_ns.map(|deadline| {
+            let remaining = deadline.saturating_sub(crate::kernel::time::ktime_get());
+            let timeout = crate::kernel::time::timeconv::nsecs_to_jiffies64(remaining).max(1);
+            let wake_at = crate::kernel::time::jiffies::jiffies().saturating_add(timeout);
+            crate::kernel::time::sleep_timeout::arm_wakeup(task_id, wake_at);
+        });
         unsafe {
             crate::kernel::sched::schedule_with_irqs_enabled();
         }
+        if timer_armed.is_some() {
+            crate::kernel::time::sleep_timeout::cancel_wakeup(task_id);
+        }
+        unsafe {
+            socket::finish_socket_recv_wait(sock, task);
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -797,39 +886,6 @@ static TEST_SOCKET_RECV_WAIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 fn wait_for_socket_recv(_sock: &SocketRef, _timeout_ns: u64) -> Result<(), i32> {
     TEST_SOCKET_RECV_WAIT_CALLS.fetch_add(1, Ordering::AcqRel);
     Err(EAGAIN)
-}
-
-#[cfg(not(test))]
-#[derive(Default)]
-struct SocketRecvWaitState {
-    last_tick_tsc: u64,
-    spins: u32,
-}
-
-#[cfg(not(test))]
-impl SocketRecvWaitState {
-    fn maintenance(&mut self) {
-        crate::linux_driver_abi::video::fbdev::core::refresh_cursor_blink();
-        if self.should_tick() {
-            crate::kernel::time::clockevents::tick_handle_periodic();
-        }
-        core::hint::spin_loop();
-    }
-
-    fn should_tick(&mut self) -> bool {
-        self.spins = self.spins.wrapping_add(1);
-        let tsc = crate::kernel::time::clocksource::read_tsc();
-        if tsc == 0 {
-            return self.spins & 0x3ff == 0;
-        }
-        let last = self.last_tick_tsc;
-        if last == 0 || tsc.saturating_sub(last) >= 1_000_000 {
-            self.last_tick_tsc = tsc;
-            true
-        } else {
-            false
-        }
-    }
 }
 
 fn read_sockaddr(ptr: *const u8, len: u32) -> Result<SockAddr, i32> {
@@ -1220,11 +1276,12 @@ pub unsafe fn sys_accept4(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: i32)
         Err(errno) => return -(errno as i64),
     };
     let listener_nonblocking = socket_file_is_nonblocking(&listener_file);
+    let listener_timeout_ns = listener.lock().recv_timeout_ns;
     let accepted = loop {
         match socket::accept4(&listener) {
             Ok(sock) => break sock,
             Err(EAGAIN) if !listener_nonblocking => {
-                if let Err(errno) = wait_for_socket_recv(&listener, 0) {
+                if let Err(errno) = wait_for_socket_recv(&listener, listener_timeout_ns) {
                     return -(errno as i64);
                 }
             }
@@ -1237,6 +1294,7 @@ pub unsafe fn sys_accept4(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: i32)
         let peer = accepted.lock().peer.clone();
         if let Some(peer) = peer {
             if let Err(errno) = write_sockaddr(&peer, addr, addrlen) {
+                socket::release_socket(&accepted);
                 return -(errno as i64);
             }
         }
@@ -1281,10 +1339,34 @@ pub unsafe fn sys_socketpair(family: i32, sock_type: i32, protocol: i32, sv: *mu
     0
 }
 
-pub unsafe fn sys_shutdown(fd: i32, _how: i32) -> i64 {
+pub unsafe fn sys_shutdown(fd: i32, how: i32) -> i64 {
+    let local_bits = match how {
+        0 => socket::RCV_SHUTDOWN,
+        1 => socket::SEND_SHUTDOWN,
+        2 => socket::SHUTDOWN_MASK,
+        _ => return -(EINVAL as i64),
+    };
     match socket_from_fd(fd) {
         Ok(sock) => {
-            sock.lock().state = SocketState::Closed;
+            let (peer, sock_type) = {
+                let mut socket = sock.lock();
+                socket.shutdown |= local_bits;
+                (socket.peer_socket.clone(), socket.sock_type)
+            };
+            socket::wake_socket_recv(&sock);
+            if matches!(sock_type, socket::SOCK_STREAM | socket::SOCK_SEQPACKET)
+                && let Some(peer) = peer
+            {
+                let mut peer_bits = 0;
+                if local_bits & socket::SEND_SHUTDOWN != 0 {
+                    peer_bits |= socket::RCV_SHUTDOWN;
+                }
+                if local_bits & socket::RCV_SHUTDOWN != 0 {
+                    peer_bits |= socket::SEND_SHUTDOWN;
+                }
+                peer.lock().shutdown |= peer_bits;
+                socket::wake_socket_recv(&peer);
+            }
             0
         }
         Err(errno) => -(errno as i64),
@@ -1821,7 +1903,8 @@ pub unsafe fn sys_recvfrom(
     // Ref: vendor/linux/net/socket.c::__sys_recvfrom.
     loop {
         match socket::recvmsg_full(&sock, out, flags) {
-            Ok((n, peer, _, _, real_len)) => {
+            Ok((n, peer, files, _, real_len)) => {
+                drop_file_refs(files);
                 if (!src.is_null() || !src_len.is_null())
                     && let Some(peer) = peer
                 {
@@ -1994,6 +2077,7 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
             Err(errno) => return -(errno as i64),
         }
     };
+    let mut files = FileRefGuard::new(files);
     #[cfg(not(test))]
     trace_unix_recvmsg(
         fd,
@@ -2119,10 +2203,22 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
         };
         let mut installed: alloc::vec::Vec<i32> = alloc::vec::Vec::with_capacity(files.len());
         let cloexec = flags & MSG_CMSG_CLOEXEC != 0;
-        for file in files {
+        let mut incoming = files.take().into_iter();
+        while let Some(file) = incoming.next() {
+            // Preserve one explicit reference across install(): on an error
+            // FileRef's plain Arc drop cannot run the VFS release hook, while
+            // fput(cleanup) can. On success the installed fd keeps it alive.
+            let cleanup = crate::fs::file::fget(&file);
             match ft.install(file, cloexec) {
-                Ok(fd) => installed.push(fd),
+                Ok(fd) => {
+                    crate::fs::file::fput(cleanup);
+                    installed.push(fd)
+                }
                 Err(_) => {
+                    crate::fs::file::fput(cleanup);
+                    for remaining in incoming {
+                        crate::fs::file::fput(remaining);
+                    }
                     for installed_fd in &installed {
                         let _ = ft.close(*installed_fd);
                     }
@@ -2150,7 +2246,12 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
             )
         } {
             Ok(result) => result,
-            Err(errno) => return -(errno as i64),
+            Err(errno) => {
+                for fd in &installed {
+                    let _ = ft.close(*fd);
+                }
+                return -(errno as i64);
+            }
         };
         control_written = written;
         if truncated {

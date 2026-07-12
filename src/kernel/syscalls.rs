@@ -9,6 +9,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
+use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -206,16 +207,40 @@ impl RseqRegistry {
 static RSEQ_REGISTRY: Mutex<RseqRegistry> = Mutex::new(RseqRegistry::new());
 
 struct RealItimerState {
-    timer: crate::kernel::time::hrtimer::Hrtimer,
-    interval_ns: u64,
+    timer: UnsafeCell<crate::kernel::time::hrtimer::Hrtimer>,
+    interval_ns: AtomicU64,
 }
+
+unsafe impl Send for RealItimerState {}
+unsafe impl Sync for RealItimerState {}
 
 impl RealItimerState {
     const fn new() -> Self {
         Self {
-            timer: crate::kernel::time::hrtimer::Hrtimer::new(),
-            interval_ns: 0,
+            timer: UnsafeCell::new(crate::kernel::time::hrtimer::Hrtimer::new()),
+            interval_ns: AtomicU64::new(0),
         }
+    }
+
+    #[inline]
+    fn timer_ptr(&self) -> *mut crate::kernel::time::hrtimer::Hrtimer {
+        self.timer.get()
+    }
+
+    fn cancel_synchronously(&self) {
+        loop {
+            let ret = crate::kernel::time::hrtimer::hrtimer_try_to_cancel(self.timer_ptr());
+            if ret >= 0 {
+                return;
+            }
+            crate::kernel::time::hrtimer::hrtimer_cancel_wait_running(self.timer_ptr());
+        }
+    }
+}
+
+impl Drop for RealItimerState {
+    fn drop(&mut self) {
+        self.cancel_synchronously();
     }
 }
 
@@ -231,10 +256,12 @@ pub fn release_task_real_itimer(tgid: i32) {
     if tgid <= 0 {
         return;
     }
-    let mut timers = REAL_ITIMERS.lock();
-    if let Some(mut state) = timers.remove(&tgid) {
-        let timer = &mut state.timer as *mut crate::kernel::time::hrtimer::Hrtimer;
-        let _ = crate::kernel::time::hrtimer::hrtimer_cancel(timer);
+    let state = {
+        let mut timers = REAL_ITIMERS.lock();
+        timers.remove(&tgid)
+    };
+    if let Some(state) = state {
+        state.cancel_synchronously();
     }
 }
 
@@ -1022,17 +1049,11 @@ fn real_itimer_snapshot() -> ITimerVal {
     let Some(state) = timers.get(&pid) else {
         return ITimerVal::default();
     };
-    let remaining = if state.timer.state == crate::kernel::time::hrtimer::HRTIMER_STATE_ENQUEUED {
-        state
-            .timer
-            .expires_ns
-            .saturating_sub(state.timer.base_now())
-    } else {
-        0
-    };
     ITimerVal {
-        it_interval: ns_to_timeval(state.interval_ns),
-        it_value: ns_to_timeval(remaining),
+        it_interval: ns_to_timeval(state.interval_ns.load(Ordering::Acquire)),
+        it_value: ns_to_timeval(crate::kernel::time::hrtimer::hrtimer_get_remaining(
+            state.timer_ptr(),
+        )),
     }
 }
 
@@ -1051,12 +1072,29 @@ fn current_real_itimer_key() -> i32 {
     }
 }
 
+fn current_real_itimer_target() -> *mut crate::kernel::task::TaskStruct {
+    let task = unsafe { sched::get_current() };
+    if task.is_null() {
+        return core::ptr::null_mut();
+    }
+    let leader = unsafe { (*task).m26.group_leader };
+    if !leader.is_null() && unsafe { (*leader).tgid == (*task).tgid } {
+        leader
+    } else {
+        task
+    }
+}
+
 fn real_itimer_fired(
-    t: &mut crate::kernel::time::hrtimer::Hrtimer,
+    t: *mut crate::kernel::time::hrtimer::Hrtimer,
 ) -> crate::kernel::time::hrtimer::HrtimerRestart {
-    let tgid = t.data as i32;
+    let tgid = if t.is_null() {
+        0
+    } else {
+        unsafe { (*t).data as i32 }
+    };
     if tgid > 0 {
-        let _ = crate::kernel::signal::send_signal_to_process(tgid, crate::kernel::signal::SIGALRM);
+        let _ = crate::kernel::signal::queue_itimer_sigalrm_noalloc(tgid);
     }
     crate::kernel::time::hrtimer::HrtimerRestart::NoRestart
 }
@@ -1069,58 +1107,76 @@ pub fn rearm_real_itimer_after_sigalrm(pid: i32) {
     if pid <= 0 {
         return;
     }
-    let mut timers = REAL_ITIMERS.lock();
-    let Some(state) = timers.get_mut(&pid) else {
+    let timers = REAL_ITIMERS.lock();
+    let Some(state) = timers.get(&pid) else {
         return;
     };
-    if state.timer.state == crate::kernel::time::hrtimer::HRTIMER_STATE_ENQUEUED
-        || state.interval_ns == 0
-    {
+    let interval_ns = state.interval_ns.load(Ordering::Acquire);
+    if interval_ns == 0 {
         return;
     }
-    let timer = &mut state.timer as *mut crate::kernel::time::hrtimer::Hrtimer;
-    crate::kernel::time::hrtimer::hrtimer_start(
-        timer,
-        state.interval_ns,
-        crate::kernel::time::hrtimer::HrtimerMode::Rel,
-    );
+    let timer_ptr = state.timer_ptr();
+    loop {
+        let cancel = crate::kernel::time::hrtimer::hrtimer_try_to_cancel(timer_ptr);
+        if cancel < 0 {
+            crate::kernel::time::hrtimer::hrtimer_cancel_wait_running(timer_ptr);
+            continue;
+        }
+        if cancel > 0 {
+            // A newer setitimer() setting was already queued. Preserve its
+            // absolute expiry rather than forwarding the old generation.
+            crate::kernel::time::hrtimer::hrtimer_restart(timer_ptr);
+            return;
+        }
+        unsafe {
+            let _ = crate::kernel::time::hrtimer::hrtimer_forward_now(&mut *timer_ptr, interval_ns);
+        }
+        crate::kernel::time::hrtimer::hrtimer_restart(timer_ptr);
+        return;
+    }
 }
 
 fn arm_real_itimer(value_ns: u64, interval_ns: u64, target_tgid: i32) -> ITimerVal {
+    // Linux allocates signal/process state before an hrtimer can publish it to
+    // the interrupt path. Bind the existing group leader here so expiry never
+    // needs the allocating task registry or lazy SignalState construction.
+    if value_ns != 0 {
+        let target = current_real_itimer_target();
+        if !target.is_null() && unsafe { (*target).tgid == target_tgid } {
+            let _ = unsafe { crate::kernel::signal::prepare_timer_signal_target(target) };
+        }
+    }
+
     let mut timers = REAL_ITIMERS.lock();
     let state = timers
         .entry(target_tgid)
         .or_insert_with(|| Box::new(RealItimerState::new()));
-    let old = {
-        let remaining = if state.timer.state == crate::kernel::time::hrtimer::HRTIMER_STATE_ENQUEUED
-        {
-            state
-                .timer
-                .expires_ns
-                .saturating_sub(state.timer.base_now())
-        } else {
-            0
-        };
-        ITimerVal {
-            it_interval: ns_to_timeval(state.interval_ns),
-            it_value: ns_to_timeval(remaining),
-        }
+    let state = state.as_ref();
+    let timer_ptr = state.timer_ptr();
+    let old = ITimerVal {
+        it_interval: ns_to_timeval(state.interval_ns.load(Ordering::Acquire)),
+        it_value: ns_to_timeval(crate::kernel::time::hrtimer::hrtimer_get_remaining(
+            timer_ptr,
+        )),
     };
 
-    let timer = &mut state.timer as *mut crate::kernel::time::hrtimer::Hrtimer;
-    let _ = crate::kernel::time::hrtimer::hrtimer_cancel(timer);
+    state.cancel_synchronously();
+    let timer = unsafe { &mut *timer_ptr };
     crate::kernel::time::hrtimer::hrtimer_init(
-        &mut state.timer,
+        timer,
         // Linux initializes signal_struct::real_timer with CLOCK_MONOTONIC.
         crate::kernel::time::hrtimer::ClockBase::Monotonic,
         crate::kernel::time::hrtimer::HrtimerMode::Abs,
     );
-    state.interval_ns = if value_ns == 0 { 0 } else { interval_ns };
-    state.timer.function = Some(real_itimer_fired);
-    state.timer.data = target_tgid.max(0) as usize;
+    state.interval_ns.store(
+        if value_ns == 0 { 0 } else { interval_ns },
+        Ordering::Release,
+    );
+    timer.function = Some(real_itimer_fired);
+    timer.data = target_tgid.max(0) as usize;
     if value_ns != 0 {
         crate::kernel::time::hrtimer::hrtimer_start(
-            timer,
+            timer_ptr,
             value_ns,
             crate::kernel::time::hrtimer::HrtimerMode::Rel,
         );
@@ -2854,7 +2910,7 @@ mod tests {
         timer.data = 0;
 
         assert_eq!(
-            real_itimer_fired(&mut timer),
+            real_itimer_fired(&mut timer as *mut _),
             crate::kernel::time::hrtimer::HrtimerRestart::NoRestart
         );
     }
@@ -2869,9 +2925,9 @@ mod tests {
 
         let timers = REAL_ITIMERS.lock();
         let state = timers.get(&pid).expect("real itimer state");
-        assert_eq!(state.interval_ns, 0);
+        assert_eq!(state.interval_ns.load(Ordering::Acquire), 0);
         assert_eq!(
-            state.timer.state,
+            crate::kernel::time::hrtimer::hrtimer_state_snapshot(state.timer_ptr()),
             crate::kernel::time::hrtimer::HRTIMER_STATE_INACTIVE
         );
         drop(timers);
@@ -2886,26 +2942,25 @@ mod tests {
 
         let _ = arm_real_itimer(1_000_000_000, 1_000_000_000, pid);
         {
-            let mut timers = REAL_ITIMERS.lock();
-            let state = timers.get_mut(&pid).expect("real itimer state");
-            let timer = &mut state.timer as *mut crate::kernel::time::hrtimer::Hrtimer;
-            let _ = crate::kernel::time::hrtimer::hrtimer_cancel(timer);
-            state.timer.expires_ns = state.timer.base_now().saturating_sub(1);
-            state.interval_ns = 1_000_000_000;
-            state.timer.state = crate::kernel::time::hrtimer::HRTIMER_STATE_INACTIVE;
+            let timers = REAL_ITIMERS.lock();
+            let state = timers.get(&pid).expect("real itimer state");
+            state.cancel_synchronously();
+            let timer = unsafe { &mut *state.timer_ptr() };
+            timer.expires_ns = timer.base_now().saturating_sub(1);
+            state.interval_ns.store(1_000_000_000, Ordering::Release);
+            timer.state = crate::kernel::time::hrtimer::HRTIMER_STATE_INACTIVE;
         }
 
         rearm_real_itimer_after_sigalrm(pid);
 
-        let mut timers = REAL_ITIMERS.lock();
-        let state = timers.get_mut(&pid).expect("real itimer state");
+        let timers = REAL_ITIMERS.lock();
+        let state = timers.get(&pid).expect("real itimer state");
         assert_eq!(
-            state.timer.state,
+            crate::kernel::time::hrtimer::hrtimer_state_snapshot(state.timer_ptr()),
             crate::kernel::time::hrtimer::HRTIMER_STATE_ENQUEUED
         );
-        assert!(state.timer.expires_ns > state.timer.base_now());
-        let timer = &mut state.timer as *mut crate::kernel::time::hrtimer::Hrtimer;
-        let _ = crate::kernel::time::hrtimer::hrtimer_cancel(timer);
+        assert!(crate::kernel::time::hrtimer::hrtimer_get_remaining(state.timer_ptr()) > 0);
+        state.cancel_synchronously();
         drop(timers);
         release_task_real_itimer(pid);
     }

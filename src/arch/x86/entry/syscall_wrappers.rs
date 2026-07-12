@@ -118,7 +118,34 @@ unsafe fn read_timespec(ptr: u64) -> Result<crate::kernel::time::Timespec64, i32
     }
 }
 
-fn futex_abs_timeout_duration_ns(
+fn futex_absolute_deadline(
+    ts: crate::kernel::time::Timespec64,
+    clockid: i32,
+) -> Result<crate::kernel::futex::FutexDeadline, i32> {
+    let deadline = match clockid {
+        crate::kernel::time::CLOCK_MONOTONIC => {
+            crate::kernel::futex::FutexDeadline::monotonic(ts.to_ns())
+        }
+        crate::kernel::time::CLOCK_REALTIME => {
+            crate::kernel::futex::FutexDeadline::realtime(ts.to_ns())
+        }
+        _ => return Err(crate::kernel::time::posix_clock::EINVAL),
+    };
+    Ok(deadline)
+}
+
+fn futex_relative_deadline(
+    ts: crate::kernel::time::Timespec64,
+) -> crate::kernel::futex::FutexDeadline {
+    crate::kernel::futex::FutexDeadline::monotonic(
+        crate::kernel::time::ktime_get().saturating_add(ts.to_ns()),
+    )
+}
+
+// The PI/requeue timeout paths still expose their historical relative-duration
+// core API.  Keep their conversion separate from the absolute wait API so the
+// FUTEX_WAIT/FUTEX_WAIT_BITSET/FUTEX_WAITV fix cannot silently change them.
+fn futex_remaining_duration_ns(
     ts: crate::kernel::time::Timespec64,
     clockid: i32,
 ) -> Result<u64, i32> {
@@ -128,6 +155,21 @@ fn futex_abs_timeout_duration_ns(
         _ => return Err(crate::kernel::time::posix_clock::EINVAL),
     };
     Ok(ts.to_ns().saturating_sub(now))
+}
+
+fn legacy_timed_futex_restart_result(result: i64, has_timeout: bool) -> i64 {
+    const ERESTARTSYS: i64 = 512;
+    const ERESTART_RESTARTBLOCK: i64 = 516;
+
+    if has_timeout && result == -ERESTARTSYS {
+        // Linux installs futex_wait_restart and returns this code.  Lupos has
+        // the signal-side restart-syscall routing but no materialized per-task
+        // restart_block (sys_restart_syscall currently returns EINTR).  Using
+        // the existing routing preserves Linux's handler-visible EINTR and,
+        // critically, never restarts a relative wait with its full duration.
+        return -ERESTART_RESTARTBLOCK;
+    }
+    result
 }
 
 // ── Task — clone / fork / execve ────────────────────────────────────────────
@@ -2072,9 +2114,13 @@ pub unsafe extern "C" fn __x64_sys_sched_setaffinity(regs: *mut PtRegs) -> i64 {
         return -(crate::kernel::sched::syscalls::EINVAL as i64);
     }
     let mask = match unsafe { crate::arch::x86::kernel::uaccess::get_user_u64(mask_ptr) } {
-        Ok(mask) => crate::kernel::sched::entity::CpuMask(mask),
+        Ok(mask) => {
+            crate::kernel::sched::entity::CpuMask(mask & crate::kernel::sched::cpu_active_mask().0)
+        }
         Err(errno) => return errno as i64,
     };
+    // Linux __sched_setaffinity() intersects the user request with the
+    // task's cpuset-allowed CPUs; a request containing no active CPU fails.
     if mask.weight() == 0 {
         return -(crate::kernel::sched::syscalls::EINVAL as i64);
     }
@@ -2095,14 +2141,19 @@ pub unsafe extern "C" fn __x64_sys_sched_getaffinity(regs: *mut PtRegs) -> i64 {
     let cpusetsize = r.arg1() as usize;
     let mask_ptr = r.arg2() as *mut u64;
     let needed = core::mem::size_of::<crate::kernel::sched::entity::CpuMask>();
-    if mask_ptr.is_null() || cpusetsize < needed {
+    // vendor/linux/kernel/sched/syscalls.c::sys_sched_getaffinity requires an
+    // unsigned-long-aligned buffer large enough for nr_cpu_ids.
+    if cpusetsize < needed || cpusetsize & (core::mem::size_of::<u64>() - 1) != 0 {
         return -(crate::kernel::sched::syscalls::EINVAL as i64);
     }
     let task = unsafe { task_for_pid(r.arg0() as i32) };
     if task.is_null() {
         return -(crate::kernel::sched::syscalls::ESRCH as i64);
     }
-    let mask = unsafe { (*task).m29.cpus_mask.0 };
+    // Linux sched_getaffinity(): cpumask_and(mask, &p->cpus_mask,
+    // cpu_active_mask).  Returning the compile-time NR_CPUS mask here made
+    // Mesa/llvmpipe create dozens of workers in a one-vCPU guest.
+    let mask = unsafe { (*task).m29.cpus_mask.0 } & crate::kernel::sched::cpu_active_mask().0;
     if let Err(errno) = unsafe { crate::arch::x86::kernel::uaccess::put_user_u64(mask_ptr, mask) } {
         return errno as i64;
     }
@@ -2157,32 +2208,60 @@ pub unsafe extern "C" fn __x64_sys_futex(regs: *mut PtRegs) -> i64 {
     } else {
         crate::kernel::time::CLOCK_MONOTONIC
     };
+    if matches!(
+        cmd,
+        crate::kernel::futex::FUTEX_WAIT | crate::kernel::futex::FUTEX_WAIT_BITSET
+    ) {
+        let deadline = if raw_timeout == 0 {
+            None
+        } else {
+            let ts = match unsafe { read_timespec(raw_timeout) } {
+                Ok(ts) => ts,
+                Err(errno) => return -(errno as i64),
+            };
+            Some(if cmd == crate::kernel::futex::FUTEX_WAIT {
+                futex_relative_deadline(ts)
+            } else {
+                match futex_absolute_deadline(ts, clockid) {
+                    Ok(deadline) => deadline,
+                    Err(errno) => return -(errno as i64),
+                }
+            })
+        };
+        if cmd == crate::kernel::futex::FUTEX_WAIT
+            && op & crate::kernel::futex::FUTEX_CLOCK_REALTIME != 0
+        {
+            return -(crate::kernel::futex::ENOSYS as i64);
+        }
+        let bitset = if cmd == crate::kernel::futex::FUTEX_WAIT {
+            crate::kernel::futex::FUTEX_BITSET_MATCH_ANY
+        } else {
+            r.arg5() as u32
+        };
+        let result = unsafe {
+            crate::kernel::futex::futex_wait_deadline(
+                r.arg0(),
+                r.arg2() as u32,
+                bitset,
+                deadline,
+                op & crate::kernel::futex::FUTEX_PRIVATE_FLAG != 0,
+            )
+        };
+        return legacy_timed_futex_restart_result(result, deadline.is_some());
+    }
     let timeout_clockid = if cmd == crate::kernel::futex::FUTEX_LOCK_PI {
         crate::kernel::time::CLOCK_REALTIME
     } else {
         clockid
     };
     let timeout = match cmd {
-        crate::kernel::futex::FUTEX_WAIT if raw_timeout != 0 => {
-            match unsafe { read_timespec(raw_timeout) } {
-                Ok(ts) => {
-                    let ns = ts.to_ns();
-                    if ns == 0 {
-                        return 1;
-                    }
-                    ns
-                }
-                Err(errno) => return -(errno as i64),
-            }
-        }
-        crate::kernel::futex::FUTEX_WAIT_BITSET
-        | crate::kernel::futex::FUTEX_LOCK_PI
+        crate::kernel::futex::FUTEX_LOCK_PI
         | crate::kernel::futex::FUTEX_LOCK_PI2
         | crate::kernel::futex::FUTEX_WAIT_REQUEUE_PI
             if raw_timeout != 0 =>
         {
             match unsafe { read_timespec(raw_timeout) }
-                .and_then(|ts| futex_abs_timeout_duration_ns(ts, timeout_clockid))
+                .and_then(|ts| futex_remaining_duration_ns(ts, timeout_clockid))
             {
                 Ok(0) => 1,
                 Ok(ns) => ns,
@@ -2242,19 +2321,26 @@ pub unsafe extern "C" fn __x64_sys_futex_waitv(regs: *mut PtRegs) -> i64 {
     let r = unsafe { &*regs };
     let nr = r.arg1() as usize;
     let clockid = r.arg4() as i32;
-    let timeout = if r.arg3() == 0 {
-        0
+    if r.arg2() != 0 || r.arg0() == 0 || nr == 0 || nr > crate::kernel::futex::FUTEX_WAITV_MAX {
+        return -(crate::kernel::futex::EINVAL as i64);
+    }
+    let deadline = if r.arg3() == 0 {
+        None
     } else {
-        match unsafe { read_timespec(r.arg3()) }
-            .and_then(|ts| futex_abs_timeout_duration_ns(ts, clockid))
+        match unsafe { read_timespec(r.arg3()) }.and_then(|ts| futex_absolute_deadline(ts, clockid))
         {
-            Ok(0) => 1,
-            Ok(ns) => ns,
+            Ok(deadline) => Some(deadline),
             Err(errno) => return -(errno as i64),
         }
     };
     unsafe {
-        crate::kernel::futex::sys_futex_waitv(r.arg0(), nr, r.arg2() as u32, timeout, clockid)
+        crate::kernel::futex::sys_futex_waitv_deadline(
+            r.arg0(),
+            nr,
+            r.arg2() as u32,
+            deadline,
+            clockid,
+        )
     }
 }
 
@@ -2267,24 +2353,34 @@ pub unsafe extern "C" fn __x64_sys_futex_wake(regs: *mut PtRegs) -> i64 {
 
 pub unsafe extern "C" fn __x64_sys_futex_wait(regs: *mut PtRegs) -> i64 {
     let r = unsafe { &*regs };
-    let timeout = if r.arg4() == 0 {
-        0
+    let value = r.arg1();
+    let mask = r.arg2();
+    let flags = r.arg3() as u32;
+    if value > u32::MAX as u64 || mask > u32::MAX as u64 {
+        return -(crate::kernel::futex::EINVAL as i64);
+    }
+    if let Err(errno) =
+        unsafe { crate::kernel::futex::core_ops::futex2_prepare_key(r.arg0(), flags) }
+    {
+        return -(errno as i64);
+    }
+    let deadline = if r.arg4() == 0 {
+        None
     } else {
         match unsafe { read_timespec(r.arg4()) }
-            .and_then(|ts| futex_abs_timeout_duration_ns(ts, r.arg5() as i32))
+            .and_then(|ts| futex_absolute_deadline(ts, r.arg5() as i32))
         {
-            Ok(0) => 1,
-            Ok(ns) => ns,
+            Ok(deadline) => Some(deadline),
             Err(errno) => return -(errno as i64),
         }
     };
     unsafe {
-        crate::kernel::futex::sys_futex_wait2(
+        crate::kernel::futex::futex_wait_deadline(
             r.arg0(),
-            r.arg1(),
-            r.arg2(),
-            r.arg3() as u32,
-            timeout,
+            value as u32,
+            mask as u32,
+            deadline,
+            flags & crate::kernel::futex::FUTEX2_PRIVATE != 0,
         )
     }
 }

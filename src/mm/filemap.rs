@@ -155,18 +155,23 @@ pub unsafe fn filemap_add_folio(
         return -12; // -ENOMEM
     }
     unsafe {
-        let existing = (*mapping)
-            .i_pages
-            .xa_store(index, core::ptr::NonNull::new(page).unwrap());
-        if existing.is_some() {
-            // Restore old entry and report conflict.
-            (*mapping).i_pages.xa_store(index, existing.unwrap());
-            return -17; // -EEXIST
-        }
         (*page).mapping = mapping as usize;
         (*page).index = index as usize;
         (*page).init_lru();
+        // The XArray owns a reference independent of the allocating/lookup
+        // caller.  Acquire it before publishing the page so a concurrent
+        // lookup can never observe an entry without its mapping reference.
         (*page).get_page();
+        if (*mapping)
+            .i_pages
+            .xa_insert(index, core::ptr::NonNull::new(page).unwrap())
+            .is_err()
+        {
+            (*page).put_page();
+            (*page).mapping = 0;
+            (*page).index = 0;
+            return -17; // -EEXIST
+        }
         (*mapping).nrpages.fetch_add(1, Ordering::Relaxed);
         track_mapping(mapping);
         lru_cache_add(page);
@@ -222,13 +227,10 @@ pub unsafe fn find_get_page(mapping: *mut AddressSpace, index: u64) -> *mut Page
         return ptr::null_mut();
     }
     unsafe {
-        if let Some(nn) = (*mapping).i_pages.xa_load(index) {
-            let page = nn.as_ptr();
-            (*page).get_page();
-            page
-        } else {
-            ptr::null_mut()
-        }
+        (*mapping)
+            .i_pages
+            .xa_load_get(index)
+            .map_or(ptr::null_mut(), |page| page.as_ptr())
     }
 }
 
@@ -241,15 +243,61 @@ pub unsafe fn find_lock_page(mapping: *mut AddressSpace, index: u64) -> *mut Pag
     if mapping.is_null() {
         return ptr::null_mut();
     }
-    unsafe {
-        if let Some(nn) = (*mapping).i_pages.xa_load(index) {
-            let page = nn.as_ptr();
-            (*page).get_page();
-            lock_page(page);
-            page
-        } else {
-            ptr::null_mut()
+    loop {
+        let page = unsafe { find_get_page(mapping, index) };
+        if page.is_null() {
+            return ptr::null_mut();
         }
+        unsafe { lock_page(page) };
+        if unsafe { (*page).mapping == mapping as usize && (*page).index == index as usize } {
+            return page;
+        }
+        unsafe {
+            unlock_page(page);
+            (*page).put_page();
+        }
+    }
+}
+
+/// Reflect a completed direct VFS write into any already-uptodate cache pages.
+///
+/// Lupos filesystems still perform their Rust-native `FileOps::write` against
+/// the backing store.  Until those paths are converted to
+/// `generic_perform_write`, this is the coherence bridge corresponding to
+/// Linux's buffered write updating the same page-cache folios used by private
+/// mappings.  Missing pages remain missing and will be read from the updated
+/// backing store on their next fault.
+pub unsafe fn filemap_update_cached_range(mapping: *mut AddressSpace, pos: u64, data: &[u8]) {
+    if mapping.is_null() || data.is_empty() {
+        return;
+    }
+
+    let mut copied = 0usize;
+    while copied < data.len() {
+        let offset = pos.saturating_add(copied as u64);
+        let index = offset / PAGE_SIZE;
+        let in_page = (offset % PAGE_SIZE) as usize;
+        let chunk = (PAGE_SIZE as usize - in_page).min(data.len() - copied);
+        let page = unsafe { find_lock_page(mapping, index) };
+        if !page.is_null() {
+            if unsafe { page_uptodate(page) } {
+                let dst = unsafe { page_kaddr(page) };
+                if !dst.is_null() {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(copied),
+                            dst.add(in_page),
+                            chunk,
+                        );
+                    }
+                }
+            }
+            unsafe {
+                unlock_page(page);
+                (*page).put_page();
+            }
+        }
+        copied += chunk;
     }
 }
 
@@ -281,6 +329,11 @@ pub unsafe fn filemap_grab_folio(mapping: *mut AddressSpace, index: u64) -> *mut
             None => return ptr::null_mut(),
         };
 
+        // The freshly allocated folio is returned with one caller reference;
+        // filemap_add_folio() takes the separate mapping/XArray reference.
+        (*page)._refcount.store(1, Ordering::Relaxed);
+        lock_page(page);
+
         // In test mode, allocate a data buffer and store it in page->private.
         #[cfg(test)]
         {
@@ -300,11 +353,11 @@ pub unsafe fn filemap_grab_folio(mapping: *mut AddressSpace, index: u64) -> *mut
                     (*page).private = 0;
                 }
             }
+            unlock_page(page);
+            (*page).put_page();
             super::buddy::with_global_buddy(|b| b.free_pages(page, 0));
             return find_lock_page(mapping, index);
         }
-
-        lock_page(page);
         page
     }
 }
@@ -632,6 +685,12 @@ unsafe fn alloc_page_cache_page(_gfp: GfpFlags) -> *mut Page {
     let page = unsafe { super::buddy::with_global_buddy(|b| b.alloc_pages(0, GFP_KERNEL)) };
     match page {
         Some(page) => {
+            // Linux page-cache allocation returns a folio with the caller's
+            // allocation reference already held.  Insertion takes a second,
+            // independent mapping reference.
+            unsafe {
+                (*page)._refcount.store(1, Ordering::Relaxed);
+            }
             #[cfg(test)]
             unsafe {
                 extern crate alloc;
@@ -741,6 +800,7 @@ pub unsafe fn __filemap_get_folio(
             }
         }
         unsafe {
+            (*created).put_page();
             super::buddy::with_global_buddy(|b| b.free_pages(created, 0));
         }
         return unsafe { find_get_page(mapping, index) };

@@ -311,9 +311,6 @@ pub fn on_tick(frame: Option<&ExceptionFrame>) {
     }
     crate::kernel::watchdog::watchdog_tick(cpu, frame);
     crate::kernel::sched::scheduler_tick();
-    if cpu == 0 {
-        crate::kernel::softirq::raise_softirq(crate::kernel::softirq::SoftIrqVec::Timer);
-    }
 }
 
 #[cfg(feature = "test-timer")]

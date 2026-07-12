@@ -10,7 +10,7 @@
 use super::types::{Dentry, DentryRef, File, FileRef, Inode, InodeRef, SuperBlock, SuperBlockRef};
 use crate::mm::mm_types::VmAreaStruct;
 
-pub type PollFn = fn(&FileRef) -> u32;
+pub type PollFn = fn(&FileRef, Option<&mut crate::fs::select::PollTable>) -> u32;
 pub type IoctlFn = fn(&FileRef, cmd: u32, arg: u64) -> Result<i64, i32>;
 /// Rust-native equivalent of Linux `file_operations::mmap`.
 ///

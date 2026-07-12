@@ -35,7 +35,6 @@ use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::block::bio::{BIO_OP_READ, BIO_OP_WRITE, BioRef};
 use crate::include::uapi::errno::{E2BIG, EINVAL, EIO, ENODEV, ENOMEM, ENOSPC, EOPNOTSUPP};
 use crate::kernel::dma::{
     DMA_MAPPING_ERROR, DmaAddr, DmaDirection, dma_alloc_attrs, dma_alloc_coherent, dma_free_attrs,
@@ -51,10 +50,6 @@ use crate::linux_driver_abi::base::{
     LinuxBusType, LinuxDevice, LinuxDeviceDriver, LinuxListHead, linux_device_add,
     linux_device_initialize, linux_device_set_name_index, linux_device_unregister,
     linux_driver_register, linux_driver_unregister, register_linux_bus_type,
-};
-use crate::linux_driver_abi::block::{
-    LINUX_REQUEST_PDU_OFFSET, LinuxBlockBackendHooks, LinuxRequest, LinuxRequestQueue,
-    blk_mq_complete_request, linux_disk_name, register_linux_block_backend_hooks,
 };
 use crate::mm::page::Page;
 
@@ -253,7 +248,9 @@ struct LinuxVirtqueueBackend {
     ring_ready: bool,
     callbacks_enabled: bool,
     pending_notify: bool,
-    last_used_idx: u32,
+    // Split-ring indices are u16 and wrap exactly as in
+    // `vendor/linux/drivers/virtio/virtio_ring.c::vring_virtqueue`.
+    last_used_idx: u16,
     avail_idx_shadow: u16,
     free_list: Vec<u16>,
     submitted: Vec<LinuxVirtqueueToken>,
@@ -624,34 +621,36 @@ fn linux_virtqueue_register_backend(
     for idx in (0..num).rev() {
         free_list.push(idx);
     }
-    let mut backends = LINUX_VIRTQUEUE_BACKENDS.lock();
-    backends.retain(|backend| backend.vq != vq as usize);
-    backends.push(LinuxVirtqueueBackend {
-        vq: vq as usize,
-        notify,
-        dma_dev: dma_dev as usize,
-        use_map_api,
-        ring_cpu: ring_cpu as usize,
-        ring_dma,
-        ring_len,
-        layout,
-        ring_ready: true,
-        callbacks_enabled: true,
-        pending_notify: false,
-        last_used_idx: 0,
-        avail_idx_shadow: 0,
-        free_list,
-        submitted: Vec::new(),
+    linux_virtqueue_with_backends_mut(|backends| {
+        backends.retain(|backend| backend.vq != vq as usize);
+        backends.push(LinuxVirtqueueBackend {
+            vq: vq as usize,
+            notify,
+            dma_dev: dma_dev as usize,
+            use_map_api,
+            ring_cpu: ring_cpu as usize,
+            ring_dma,
+            ring_len,
+            layout,
+            ring_ready: true,
+            callbacks_enabled: true,
+            pending_notify: false,
+            last_used_idx: 0,
+            avail_idx_shadow: 0,
+            free_list,
+            submitted: Vec::new(),
+        });
     });
 }
 
 fn linux_virtqueue_remove_backend(vq: *mut LinuxVirtqueue) {
-    let mut backends = LINUX_VIRTQUEUE_BACKENDS.lock();
-    if let Some(pos) = backends
-        .iter()
-        .position(|backend| backend.vq == vq as usize)
-    {
-        let backend = backends.remove(pos);
+    let backend = linux_virtqueue_with_backends_mut(|backends| {
+        backends
+            .iter()
+            .position(|backend| backend.vq == vq as usize)
+            .map(|pos| backends.remove(pos))
+    });
+    if let Some(backend) = backend {
         unsafe {
             if backend.use_map_api {
                 dma_free_attrs(
@@ -668,6 +667,21 @@ fn linux_virtqueue_remove_backend(vq: *mut LinuxVirtqueue) {
     }
 }
 
+/// Serialize access to the split-ring bookkeeping like Linux's virtqueue
+/// spinlock users: the lock cannot be interrupted by a device completion that
+/// re-enters `virtqueue_get_buf()` on the same CPU.
+fn linux_virtqueue_with_backends_mut<R>(f: impl FnOnce(&mut Vec<LinuxVirtqueueBackend>) -> R) -> R {
+    let flags = local_irq_save();
+    preempt_disable();
+    let result = {
+        let mut backends = LINUX_VIRTQUEUE_BACKENDS.lock();
+        f(&mut backends)
+    };
+    local_irq_restore(flags);
+    preempt_enable();
+    result
+}
+
 fn linux_virtqueue_with_backend_mut<R>(
     vq: *mut LinuxVirtqueue,
     f: impl FnOnce(&mut LinuxVirtqueueBackend) -> R,
@@ -675,16 +689,16 @@ fn linux_virtqueue_with_backend_mut<R>(
     if vq.is_null() {
         return None;
     }
-    LINUX_VIRTQUEUE_BACKENDS
-        .lock()
-        .iter_mut()
-        .find(|backend| backend.vq == vq as usize)
-        .map(f)
+    linux_virtqueue_with_backends_mut(|backends| {
+        backends
+            .iter_mut()
+            .find(|backend| backend.vq == vq as usize)
+            .map(f)
+    })
 }
 
 fn poll_virtqueues() -> usize {
-    let ready = {
-        let mut backends = LINUX_VIRTQUEUE_BACKENDS.lock();
+    let ready = linux_virtqueue_with_backends_mut(|backends| {
         backends
             .iter_mut()
             .filter_map(|backend| {
@@ -695,11 +709,11 @@ fn poll_virtqueues() -> usize {
                 if vq.is_null() || unsafe { (*vq).reset.load(Ordering::Acquire) } {
                     return None;
                 }
-                let used_idx = unsafe { linux_vring_used_idx(backend) } as u32;
+                let used_idx = unsafe { linux_vring_used_idx(backend) };
                 (used_idx != backend.last_used_idx).then_some(backend.vq)
             })
             .collect::<Vec<_>>()
-    };
+    });
     for vq in ready.iter().copied() {
         unsafe {
             vring_interrupt(0, vq as *mut c_void);
@@ -708,269 +722,15 @@ fn poll_virtqueues() -> usize {
     ready.len()
 }
 
-pub(crate) fn take_used_buffer_for_token(data: *mut c_void) -> bool {
-    if data.is_null() {
-        return false;
-    }
-    let data = data as usize;
-    let mut backends = LINUX_VIRTQUEUE_BACKENDS.lock();
-    for backend in backends.iter_mut() {
-        if !backend.ring_ready {
-            continue;
-        }
-        let vq = backend.vq as *mut LinuxVirtqueue;
-        if vq.is_null() || unsafe { (*vq).reset.load(Ordering::Acquire) } {
-            continue;
-        }
-        let used_idx = unsafe { linux_vring_used_idx(backend) };
-        if backend.last_used_idx as u16 == used_idx {
-            continue;
-        }
-        core::sync::atomic::fence(Ordering::SeqCst);
-        let slot = backend.last_used_idx as usize % unsafe { (*vq).num_max as usize };
-        let elem = unsafe { linux_vring_used_elem(backend, slot) };
-        let Some(pos) = backend
-            .submitted
-            .iter()
-            .position(|token| token.head as u32 == elem.id)
-        else {
-            unsafe {
-                (*vq).reset.store(true, Ordering::Release);
-            }
-            return false;
-        };
-        if backend.submitted[pos].data != data {
-            continue;
-        }
-        let token = backend.submitted.remove(pos);
-        backend.last_used_idx = backend.last_used_idx.wrapping_add(1);
-        for desc in token.descriptors.iter().copied() {
-            unsafe {
-                linux_vring_write_desc(backend, desc, LinuxVringDesc::default());
-            }
-            backend.free_list.push(desc);
-        }
-        unsafe {
-            (*vq).num_free = (*vq)
-                .num_free
-                .saturating_add(token.descriptors.len() as u32)
-                .min((*vq).num_max);
-        }
-        return true;
-    }
-    false
-}
-
 pub(crate) fn has_virtqueue_backend(vq: *mut LinuxVirtqueue) -> bool {
     if vq.is_null() {
         return false;
     }
-    LINUX_VIRTQUEUE_BACKENDS
-        .lock()
-        .iter()
-        .any(|backend| backend.vq == vq as usize && backend.ring_ready)
-}
-
-const LINUX_VIRTIO_BLK_NUM_VQS_OFFSET: usize = 0x16c;
-const LINUX_VIRTIO_BLK_VQS_OFFSET: usize = 0x180;
-const LINUX_VIRTIO_BLK_VQ_STRIDE: usize = 0x18;
-const VIRTIO_BLK_T_IN: u32 = 0;
-const VIRTIO_BLK_T_OUT: u32 = 1;
-const VIRTIO_BLK_S_OK: u8 = 0;
-const VIRTIO_BLK_S_IOERR: u8 = 1;
-const VIRTIO_BLK_COMPLETION_SPINS: usize = 1_000_000;
-
-#[repr(C)]
-struct LinuxVirtioBlkOutHdr {
-    type_: u32,
-    ioprio: u32,
-    sector: u64,
-}
-
-fn linux_virtio_blk_try_complete_request(rq: *mut LinuxRequest) -> bool {
-    if rq.is_null() {
-        return false;
-    }
-    let pdu = unsafe {
-        (rq.cast::<u8>())
-            .add(LINUX_REQUEST_PDU_OFFSET)
-            .cast::<c_void>()
-    };
-    if !take_used_buffer_for_token(pdu) {
-        return false;
-    }
-    unsafe {
-        blk_mq_complete_request(rq);
-    }
-    true
-}
-
-fn linux_virtio_blk_vq_for_queue(q: *mut LinuxRequestQueue) -> Option<*mut LinuxVirtqueue> {
-    if q.is_null() {
-        return None;
-    }
-    let disk = unsafe { (*q).disk };
-    let name = linux_disk_name(disk).ok()?;
-    if !name.starts_with("vd") {
-        return None;
-    }
-    let vblk = unsafe { (*q).queuedata }.cast::<u8>();
-    if vblk.is_null() {
-        return None;
-    }
-    let num_vqs = unsafe { *vblk.add(LINUX_VIRTIO_BLK_NUM_VQS_OFFSET).cast::<i32>() };
-    if num_vqs <= 0 {
-        return None;
-    }
-    let hctx = if q.is_null() {
-        core::ptr::null_mut()
-    } else {
-        let table = unsafe {
-            (*q).queue_hw_ctx as *mut *mut crate::linux_driver_abi::block::LinuxBlkMqHwCtx
-        };
-        if table.is_null() {
-            core::ptr::null_mut()
-        } else {
-            unsafe { *table }
-        }
-    };
-    let queue_num = if hctx.is_null() {
-        0
-    } else {
-        unsafe { (*hctx).queue_num as usize }
-    };
-    if queue_num >= num_vqs as usize {
-        return None;
-    }
-    let vqs = unsafe { *vblk.add(LINUX_VIRTIO_BLK_VQS_OFFSET).cast::<*mut u8>() };
-    if vqs.is_null() {
-        return None;
-    }
-    let vq = unsafe {
-        *vqs.add(queue_num.checked_mul(LINUX_VIRTIO_BLK_VQ_STRIDE)?)
-            .cast::<*mut LinuxVirtqueue>()
-    };
-    has_virtqueue_backend(vq).then_some(vq)
-}
-
-fn linux_virtio_status_result(status: u8) -> Result<(), i32> {
-    match status {
-        VIRTIO_BLK_S_OK => Ok(()),
-        VIRTIO_BLK_S_IOERR => Err(EIO),
-        _ => Err(EIO),
-    }
-}
-
-fn linux_sg_entry() -> crate::lib::scatterlist::LinuxScatterList {
-    crate::lib::scatterlist::LinuxScatterList {
-        page_link: 0,
-        offset: 0,
-        length: 0,
-        dma_address: 0,
-        dma_length: 0,
-        dma_flags: 0,
-    }
-}
-
-fn linux_virtio_blk_submit_bio(q: *mut LinuxRequestQueue, bio: &BioRef) -> Option<Result<(), i32>> {
-    // If a Linux-built block driver installed mq_ops, let its queue_rq path own
-    // the request PDU token. The direct backend below uses a status-byte token,
-    // which is only valid when no vendor virtio_blk completion callback will
-    // interpret used-buffer tokens as `struct virtblk_req *`.
-    if !q.is_null() && !unsafe { (*q).mq_ops }.is_null() {
-        return None;
-    }
-    if bio.op.0 != BIO_OP_READ && bio.op.0 != BIO_OP_WRITE {
-        return None;
-    }
-    let vq = linux_virtio_blk_vq_for_queue(q)?;
-    let vecs = bio.vecs.lock();
-    if vecs.is_empty() || bio.total_size() == 0 {
-        return Some(Ok(()));
-    }
-    let mut guards = Vec::with_capacity(vecs.len());
-    for vec in vecs.iter() {
-        let guard = vec.data.lock();
-        if vec.off > guard.len() || vec.len > guard.len().saturating_sub(vec.off) {
-            return Some(Err(EINVAL));
-        }
-        if u32::try_from(vec.len).is_err() {
-            return Some(Err(EINVAL));
-        }
-        guards.push((guard, vec.off, vec.len));
-    }
-
-    let mut hdr = LinuxVirtioBlkOutHdr {
-        type_: match bio.op.0 {
-            BIO_OP_READ => VIRTIO_BLK_T_IN.to_le(),
-            BIO_OP_WRITE => VIRTIO_BLK_T_OUT.to_le(),
-            _ => return None,
-        },
-        ioprio: 0,
-        sector: bio.sector.to_le(),
-    };
-    let mut status = 0xffu8;
-    let mut sg_entries = Vec::with_capacity(guards.len() + 2);
-    let mut hdr_sg = linux_sg_entry();
-    unsafe {
-        crate::lib::scatterlist::linux_sg_init_one(
-            &mut hdr_sg,
-            (&mut hdr as *mut LinuxVirtioBlkOutHdr).cast::<c_void>(),
-            core::mem::size_of::<LinuxVirtioBlkOutHdr>() as u32,
-        );
-    }
-    sg_entries.push(hdr_sg);
-    for (guard, off, len) in guards.iter_mut() {
-        let mut sg = linux_sg_entry();
-        let ptr = unsafe { guard.as_mut_ptr().add(*off).cast::<c_void>() };
-        unsafe {
-            crate::lib::scatterlist::linux_sg_init_one(&mut sg, ptr, *len as u32);
-        }
-        sg_entries.push(sg);
-    }
-    let mut status_sg = linux_sg_entry();
-    unsafe {
-        crate::lib::scatterlist::linux_sg_init_one(
-            &mut status_sg,
-            (&mut status as *mut u8).cast::<c_void>(),
-            core::mem::size_of::<u8>() as u32,
-        );
-    }
-    sg_entries.push(status_sg);
-
-    let mut sg_ptrs = Vec::with_capacity(sg_entries.len());
-    for sg in sg_entries.iter_mut() {
-        sg_ptrs.push((sg as *mut crate::lib::scatterlist::LinuxScatterList).cast::<c_void>());
-    }
-    let data_sgs = guards.len() as u32;
-    let (out_sgs, in_sgs) = if bio.op.0 == BIO_OP_WRITE {
-        (1 + data_sgs, 1)
-    } else {
-        (1, data_sgs + 1)
-    };
-    let token = (&mut status as *mut u8).cast::<c_void>();
-    let add = unsafe { virtqueue_add_sgs(vq, sg_ptrs.as_mut_ptr(), out_sgs, in_sgs, token, 0) };
-    if add < 0 {
-        return Some(Err((-add) as i32));
-    }
-    if !unsafe { virtqueue_kick(vq) } {
-        return Some(Err(EIO));
-    }
-    for _ in 0..VIRTIO_BLK_COMPLETION_SPINS {
-        if take_used_buffer_for_token(token) {
-            return Some(linux_virtio_status_result(status));
-        }
-        core::hint::spin_loop();
-    }
-    crate::log_warn!(
-        "virtio",
-        "linux_virtio_blk_submit_bio: timeout op={} sector={} bytes={} segments={}",
-        bio.op.0,
-        bio.sector,
-        bio.total_size(),
-        guards.len()
-    );
-    Some(Err(EIO))
+    linux_virtqueue_with_backends_mut(|backends| {
+        backends
+            .iter()
+            .any(|backend| backend.vq == vq as usize && backend.ring_ready)
+    })
 }
 
 fn linux_scatterlist_count(mut sg: *const crate::lib::scatterlist::LinuxScatterList) -> u32 {
@@ -1347,10 +1107,6 @@ unsafe fn linux_virtio_embedded_device(dev: *mut c_void) -> *mut LinuxDevice {
 /// are retired.
 pub fn register_module_exports() {
     crate::linux_driver_abi::register_driver_abi_poller("virtio", poll_virtqueues);
-    register_linux_block_backend_hooks(LinuxBlockBackendHooks {
-        try_complete_request: linux_virtio_blk_try_complete_request,
-        submit_bio: linux_virtio_blk_submit_bio,
-    });
     export_symbol_once(
         "__register_virtio_driver",
         __register_virtio_driver as usize,
@@ -2098,9 +1854,7 @@ pub unsafe extern "C" fn vring_transport_features(_vdev: *mut LinuxVirtioDevice)
 /// `virtqueue_add_sgs` — `vendor/linux/drivers/virtio/virtio_ring.c:2819`.
 /// Exposes descriptors for a virtqueue created by Linux transport code.
 ///
-/// Linux-built function drivers normally own request construction. The block
-/// ABI also uses this for a guarded synchronous virtio-blk fast path after the
-/// Linux driver has discovered the device and registered the gendisk.
+/// Linux-built function drivers own request construction.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn virtqueue_add_sgs(
     vq: *mut LinuxVirtqueue,
@@ -2270,6 +2024,19 @@ pub unsafe extern "C" fn virtqueue_add_sgs(
             }
         }
         let head = descriptors[0];
+        unsafe {
+            (*vq).num_free -= descriptors.len() as u32;
+        }
+        // Linux installs desc_state[head].data before publishing the head in
+        // avail->idx. The device may consume as soon as that index is visible,
+        // so completion lookup must already know the token at that point.
+        backend.submitted.push(LinuxVirtqueueToken {
+            data: data as usize,
+            len: 0,
+            ctx: 0,
+            head,
+            descriptors,
+        });
         let slot = backend.avail_idx_shadow as usize % unsafe { (*vq).num_max as usize };
         unsafe {
             linux_vring_write_avail_ring(backend, slot, head);
@@ -2279,16 +2046,6 @@ pub unsafe extern "C" fn virtqueue_add_sgs(
         unsafe {
             linux_vring_write_avail_idx(backend, backend.avail_idx_shadow);
         }
-        unsafe {
-            (*vq).num_free -= descriptors.len() as u32;
-        }
-        backend.submitted.push(LinuxVirtqueueToken {
-            data: data as usize,
-            len: 0,
-            ctx: 0,
-            head,
-            descriptors,
-        });
         backend.pending_notify = true;
         0
     })
@@ -2565,7 +2322,7 @@ pub unsafe extern "C" fn virtqueue_get_buf_ctx(
             return None;
         }
         let used_idx = unsafe { linux_vring_used_idx(backend) };
-        if backend.last_used_idx as u16 == used_idx {
+        if backend.last_used_idx == used_idx {
             return None;
         }
         core::sync::atomic::fence(Ordering::SeqCst);
@@ -2639,7 +2396,7 @@ pub unsafe extern "C" fn virtqueue_disable_cb(vq: *mut LinuxVirtqueue) {
 pub unsafe extern "C" fn virtqueue_enable_cb_prepare(vq: *mut LinuxVirtqueue) -> u32 {
     linux_virtqueue_with_backend_mut(vq, |backend| {
         backend.callbacks_enabled = true;
-        backend.last_used_idx
+        u32::from(backend.last_used_idx)
     })
     .unwrap_or(0)
 }
@@ -2651,7 +2408,7 @@ pub unsafe extern "C" fn virtqueue_poll(vq: *mut LinuxVirtqueue, last_used_idx: 
         if !backend.ring_ready {
             return false;
         }
-        unsafe { linux_vring_used_idx(backend) as u32 != last_used_idx }
+        unsafe { linux_vring_used_idx(backend) != last_used_idx as u16 }
     })
     .unwrap_or(false)
 }
@@ -2664,7 +2421,7 @@ pub unsafe extern "C" fn virtqueue_enable_cb(vq: *mut LinuxVirtqueue) -> bool {
         if !backend.ring_ready {
             return true;
         }
-        unsafe { linux_vring_used_idx(backend) as u32 == backend.last_used_idx }
+        unsafe { linux_vring_used_idx(backend) == backend.last_used_idx }
     })
     .unwrap_or(true)
 }

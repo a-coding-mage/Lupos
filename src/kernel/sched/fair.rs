@@ -399,7 +399,10 @@ mod tests {
         assert_eq!(rq.cfs.current, ptr);
         let first_runtime = task.m29.se.sum_exec_runtime;
 
-        crate::arch::x86::kernel::apic_timer::TIMER_TICKS.store(2, Ordering::Release);
+        // With the configured Linux HZ=250 clock, two additional ticks provide
+        // 8 ms of runtime and exceed the default CFS slice.  The former 2 here
+        // depended on the removed, incorrect 25 ms-per-tick scheduler clock.
+        crate::arch::x86::kernel::apic_timer::TIMER_TICKS.store(3, Ordering::Release);
         unsafe {
             task_tick_fair(&mut rq, ptr, true);
         }

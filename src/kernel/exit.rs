@@ -23,11 +23,16 @@ extern crate alloc;
 
 use crate::arch::x86::kernel::uaccess;
 use crate::kernel::fork::heap_task_release;
+use crate::kernel::locking::SpinLock;
 use crate::kernel::pid;
 use crate::kernel::sched;
 use crate::kernel::signal::{self, SIGCHLD};
-use crate::kernel::task::task_state::{EXIT_DEAD, EXIT_ZOMBIE};
+use crate::kernel::task::task_state::{EXIT_DEAD, EXIT_ZOMBIE, TASK_DEAD};
 use crate::kernel::task::{MAX_CHILDREN, TaskStruct};
+
+/// Linux serializes exit-state publication, `__exit_signal()`, and the
+/// last-nonleader leader notification with `tasklist_lock` held for write.
+static TASKLIST_LOCK: SpinLock<()> = SpinLock::new(());
 
 pub unsafe fn exit_clear_child_tid(tsk: *mut TaskStruct) {
     if tsk.is_null() {
@@ -244,48 +249,82 @@ fn wake_exit_waiters(waiters: &[*mut TaskStruct; crate::kernel::task::MAX_WAITER
     }
 }
 
-/// Run exit notifications, then publish the reapable zombie state.
+/// Run exit notifications, then publish the Linux terminal task state.
 ///
-/// `m26.exit_state` is set before the waiter snapshot to advertise that exit is
-/// in progress while `__state` remains non-zombie.  Waiters treat this
-/// half-published state as a reason not to sleep, which closes the lost-wakeup
-/// window for waiters that register after the snapshot but before EXIT_ZOMBIE is
-/// visible in `__state`.  Once `__state` is visible, `sys_wait4()` may call
-/// `release_task()` and make `tsk` dangling, so that store remains the last task
-/// access before waking the snapshotted waiters.
-pub unsafe fn notify_exit_and_publish_zombie(tsk: *mut TaskStruct) {
+/// Natural children become EXIT_ZOMBIE and remain waitable. Linux gives every
+/// CLONE_THREAD member `exit_signal = -1`; an untraced member is autoreaped, so
+/// its exit state becomes EXIT_DEAD and its scheduler state becomes TASK_DEAD.
+/// A current autoreaped task is released only by `finish_task_switch()` after
+/// the CPU has changed stacks.
+///
+/// For waitable children, `m26.exit_state` is set before the waiter snapshot to
+/// close the lost-wakeup window. Once `__state = EXIT_ZOMBIE` is visible,
+/// `sys_wait4()` may make `tsk` dangling, so the state store remains the last
+/// access before waking those waiters.
+pub unsafe fn notify_exit_and_publish_zombie(tsk: *mut TaskStruct) -> bool {
+    if tsk.is_null() {
+        return false;
+    }
+
+    let mut waiters = [core::ptr::null_mut(); crate::kernel::task::MAX_WAITERS];
+    let mut waiter_count = 0;
+    let (tasklist_guard, irq_flags) = TASKLIST_LOCK.lock_irqsave();
+    let autoreap = unsafe {
+        // Linux thread_group_leader(p) is exactly p->exit_signal >= 0.
+        // Ptrace owns reaping for traced non-leaders, so only untraced
+        // subthreads take the automatic EXIT_DEAD path.
+        let autoreap = (*tsk).m26.exit_signal < 0 && (*tsk).m26.ptrace == 0;
+        // Linux leaves an untraced group leader in EXIT_ZOMBIE, but neither
+        // notifies its parent nor lets wait reap it while subthreads remain.
+        let delay_leader = (*tsk).m26.ptrace == 0 && signal::delay_group_leader(tsk);
+        let exit_state = if autoreap { EXIT_DEAD } else { EXIT_ZOMBIE };
+        let task_state = if autoreap { TASK_DEAD } else { EXIT_ZOMBIE };
+
+        (*tsk).m26.exit_state = exit_state;
+        if !delay_leader {
+            (waiters, waiter_count) = take_exit_waiters(tsk);
+        }
+        exit_notify_locked(tsk, false);
+
+        (*tsk).__state.store(task_state, Ordering::Release);
+        if !delay_leader {
+            notify_parent_exit(tsk);
+        }
+        autoreap
+    };
+    SpinLock::unlock_irqrestore(tasklist_guard, irq_flags);
+    wake_exit_waiters(&waiters, waiter_count);
+    autoreap
+}
+
+/// `do_notify_parent()` plus its pidfd wakeup. The caller must have completed
+/// every other access to `tsk` before this can make its parent runnable.
+unsafe fn notify_parent_exit(tsk: *mut TaskStruct) {
     if tsk.is_null() {
         return;
     }
-
     unsafe {
-        (*tsk).m26.exit_state = EXIT_ZOMBIE;
-        let (waiters, waiter_count) = take_exit_waiters(tsk);
-        exit_notify(tsk);
+        let parent = (*tsk).m26.real_parent;
+        let sig = (*tsk).m26.exit_signal;
+        crate::fs::pidfd::notify_task_exit(tsk);
 
-        (*tsk).__state.store(EXIT_ZOMBIE, Ordering::Release);
-        wake_exit_waiters(&waiters, waiter_count);
+        if !parent.is_null() && sig > 0 {
+            let _ = signal::send_signal_to_task(parent, sig);
+        }
+
+        // Default exit_signal to SIGCHLD if not explicitly set (so the parent
+        // observes a notification even from kthread-style children).
+        let _ = SIGCHLD; // referenced here so the import isn't unused
     }
 }
 
-/// Notify the parent of `tsk`'s exit and reparent its children.
-///
-/// Steps:
-/// 1. Reparent `tsk`'s children to `tsk`'s real_parent (closest sub-reaper
-///    proxy until M28's namespace reaper logic lands).
-/// 2. Send `tsk.exit_signal` (default SIGCHLD) to the real_parent so a
-///    waiting `wait4` observes pending work.
-/// 3. Waiter wakeups are intentionally deferred until after the caller publishes
-///    EXIT_ZOMBIE; publishing it earlier lets wait4 reap `tsk` while this
-///    helper is still dereferencing it.
-pub unsafe fn exit_notify(tsk: *mut TaskStruct) {
+/// `exit_notify()` body that runs with `TASKLIST_LOCK` held.
+unsafe fn exit_notify_locked(tsk: *mut TaskStruct, notify_parent: bool) {
     if tsk.is_null() {
         return;
     }
     unsafe {
-        crate::fs::pidfd::notify_task_exit(tsk);
-
-        // 1. Reparent children to the closest child subreaper, falling back
+        // Reparent children to the closest child subreaper, falling back
         // to our real_parent when no subreaper ancestor exists.
         let new_parent = find_child_reaper(tsk);
         let n = (*tsk).m26.children_count as usize;
@@ -298,17 +337,22 @@ pub unsafe fn exit_notify(tsk: *mut TaskStruct) {
             }
         }
 
-        // 2. Send exit_signal (typically SIGCHLD) to the real parent.
-        let parent = (*tsk).m26.real_parent;
-        let sig = (*tsk).m26.exit_signal;
-        if !parent.is_null() && sig > 0 {
-            let _ = signal::send_signal_to_task(parent, sig);
+        if notify_parent {
+            notify_parent_exit(tsk);
         }
-
-        // Default exit_signal to SIGCHLD if not explicitly set (so the parent
-        // observes a notification even from kthread-style children).
-        let _ = SIGCHLD; // referenced here so the import isn't unused
     }
+}
+
+/// Notify the parent of `tsk`'s exit and reparent its children.
+///
+/// Waiter wakeups remain the responsibility of the state-publication caller.
+pub unsafe fn exit_notify(tsk: *mut TaskStruct) {
+    let (tasklist_guard, irq_flags) = TASKLIST_LOCK.lock_irqsave();
+    let delay_leader = !tsk.is_null()
+        && unsafe { (*tsk).m26.ptrace == 0 }
+        && unsafe { signal::delay_group_leader(tsk) };
+    unsafe { exit_notify_locked(tsk, !delay_leader) };
+    SpinLock::unlock_irqrestore(tasklist_guard, irq_flags);
 }
 
 /// Reap a zombie child: drop refs, free heap, remove from parent's list.
@@ -317,17 +361,33 @@ pub unsafe fn exit_notify(tsk: *mut TaskStruct) {
 /// for the user-space caller.  After this returns, `p` is dangling.
 ///
 /// # Safety
-/// `p` must be a `*mut TaskStruct` previously returned by `kernel_clone` and
-/// must currently be in `EXIT_ZOMBIE`.  No other CPU may hold a pointer to it.
+/// `p` must be a `*mut TaskStruct` previously returned by `kernel_clone` and be
+/// either a wait-reaped EXIT_ZOMBIE or an autoreaped EXIT_DEAD task which has
+/// switched off its kernel stack. No other CPU may hold a pointer to it.
 pub unsafe fn release_task(p: *mut TaskStruct) {
     if p.is_null() {
         return;
     }
 
+    let mut leader_waiters = [core::ptr::null_mut(); crate::kernel::task::MAX_WAITERS];
+    let mut leader_waiter_count = 0;
     unsafe {
-        // 1. Remove from parent's children array.
+        let leader = (*p).m26.group_leader;
+        let is_nonleader = (*p).m26.exit_signal < 0 && !leader.is_null() && leader != p;
+
+        // Linux `pidfs_exit()` runs before `__exit_signal()` removes the task
+        // from PID and thread-group indexes.
+        crate::fs::pidfd::notify_task_reap(p);
+
+        let (tasklist_guard, irq_flags) = TASKLIST_LOCK.lock_irqsave();
+
+        // 1. Remove from the parent's children array as part of the local
+        // `__exit_signal()` equivalent.
         let parent = (*p).m26.real_parent;
-        if !parent.is_null() {
+        // Linux only links thread-group leaders on the natural children list;
+        // a CLONE_THREAD member (exit_signal < 0) must not dereference or edit
+        // that parent's child list during __unhash_process().
+        if (*p).m26.exit_signal >= 0 && !parent.is_null() {
             let count = (*parent).m26.children_count as usize;
             let mut found_at: Option<usize> = None;
             for i in 0..count.min(MAX_CHILDREN) {
@@ -347,6 +407,28 @@ pub unsafe fn release_task(p: *mut TaskStruct) {
             }
         }
 
+        // `__exit_signal()` removes p from signal->thread_head before testing
+        // thread_group_empty(leader). The SignalState binding is Lupos's
+        // authoritative membership entry, so clear it at exactly that point.
+        crate::kernel::signal::release_signal_task_binding(p);
+
+        (*p).__state.store(EXIT_DEAD, Ordering::Release);
+        (*p).m26.exit_state = EXIT_DEAD;
+
+        // Linux release_task(): the last nonleader publishes the already-dead
+        // leader to its parent. Until this point wait/pidfd deliberately hide
+        // that EXIT_ZOMBIE leader via delay_group_leader().
+        if is_nonleader
+            && signal::thread_group_empty(leader)
+            && (*leader).m26.exit_state == EXIT_ZOMBIE
+        {
+            (leader_waiters, leader_waiter_count) = take_exit_waiters(leader);
+            notify_parent_exit(leader);
+        }
+
+        SpinLock::unlock_irqrestore(tasklist_guard, irq_flags);
+        wake_exit_waiters(&leader_waiters, leader_waiter_count);
+
         // 2. Drop the KPid refcount (clears the bitmap bit when refcount hits 0).
         let thread_pid = (*p).m26.thread_pid;
         (*p).m26.thread_pid = core::ptr::null_mut();
@@ -355,24 +437,26 @@ pub unsafe fn release_task(p: *mut TaskStruct) {
         }
 
         // 3. Remove from the run queue so the scheduler stops considering it.
-        sched::dequeue_task(p);
+        // The exit-group peer path may already have dequeued a non-current
+        // task. Linux's dequeue is conditional on on_rq; avoid accounting a
+        // production runqueue twice while retaining the legacy queue's
+        // pointer-based idempotent removal.
+        if !sched::production_smp_scheduler_enabled() || (*p).m29.on_rq != 0 {
+            sched::dequeue_task(p);
+        }
         crate::kernel::cgroup::forget_pid_cgroup((*p).pid);
 
-        // 4. Mark EXIT_DEAD just before the final drop, so any concurrent
-        //    observer sees the transient state (Linux symmetry).
-        (*p).__state.store(EXIT_DEAD, Ordering::Release);
-        (*p).m26.exit_state = EXIT_DEAD;
-
-        // 5. Notify the LSM layer that the task is being torn down.
+        // 4. Notify the LSM layer that the task is being torn down.
         crate::security::security_task_free((*p).pid as u32);
 
-        // 6. Drop task-owned shared state that is not released during do_exit.
+        // 5. Drop task-owned shared state that is not released during do_exit.
         crate::kernel::syscalls::release_process_rlimits(p);
         crate::kernel::syscalls::release_task_rseq_registration(p);
+        crate::kernel::time::posix_timers::release_task_posix_timers((*p).pid);
         crate::kernel::syscalls::release_task_real_itimer((*p).pid);
         crate::kernel::fork::cleanup_task_shared_state(p);
 
-        // 7. Drop the heap allocations (TaskStruct + kernel stack).  After
+        // 6. Drop the heap allocations (TaskStruct + kernel stack).  After
         //    this returns, `p` is dangling.
         heap_task_release(p);
     }

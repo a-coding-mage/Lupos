@@ -3574,7 +3574,7 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
 
         // 5. hrtimer fires.
         static FIRED: AtomicU32 = AtomicU32::new(0);
-        fn cb(_t: &mut Hrtimer) -> HrtimerRestart {
+        fn cb(_t: *mut Hrtimer) -> HrtimerRestart {
             FIRED.fetch_add(1, Ordering::AcqRel);
             HrtimerRestart::NoRestart
         }
@@ -3940,17 +3940,23 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             init::rootfs::read_rootfs_file("/etc/hostname").unwrap(),
             b"lupos\n"
         );
-        let modules = init::rootfs::read_rootfs_file("/etc/modules").unwrap_or_default();
-        for module_name in modules
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-        {
-            let module_name = core::str::from_utf8(module_name).unwrap_or("");
+        const QEMU_EARLY_ROOT_MODULES: &[&str] = &[
+            "virtio_pci_modern_dev",
+            "virtio_pci_legacy_dev",
+            "virtio_pci",
+            "virtio_blk",
+        ];
+        assert_eq!(
+            init::rootfs::read_rootfs_file("/etc/modules").unwrap_or_default(),
+            b"virtio_pci_modern_dev\nvirtio_pci_legacy_dev\nvirtio_pci\nvirtio_blk\n",
+            "initramfs-rootfs: staged module list does not match the QEMU early-root closure"
+        );
+        for module_name in QEMU_EARLY_ROOT_MODULES {
             assert!(
                 kernel::module::inserted_modules()
                     .iter()
-                    .any(|name| name == module_name),
-                "initramfs-rootfs: modprobe did not insert configured module {}",
+                    .any(|name| name == *module_name),
+                "initramfs-rootfs: modprobe did not insert QEMU early-root module {}",
                 module_name
             );
         }
@@ -5281,7 +5287,10 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         use fs::signalfd::SignalfdSiginfo;
         use io_uring::{Cqe, IORING_OP_NOP, IoRingCtx, IoUringParams, Sqe};
 
-        fn vdso_iouring_poll_readable(_: &fs::types::FileRef) -> u32 {
+        fn vdso_iouring_poll_readable(
+            _: &fs::types::FileRef,
+            _: Option<&mut fs::select::PollTable>,
+        ) -> u32 {
             EPOLLIN
         }
 
@@ -5355,6 +5364,7 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         let ep = EventPoll::new();
         ep.add(
             ready_fd,
+            files.get(ready_fd).unwrap(),
             EpollEvent {
                 events: EPOLLIN,
                 data: 0xdead_beef,

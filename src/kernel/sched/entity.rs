@@ -28,7 +28,7 @@
 //!   * `vendor/linux/include/linux/sched.h` (struct sched_rt_entity, ~623)
 //!   * `vendor/linux/include/linux/sched.h` (struct sched_dl_entity, ~644)
 
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 // ── Load weight ──────────────────────────────────────────────────────────────
 
@@ -394,24 +394,31 @@ const _: () = assert!(core::mem::size_of::<CpuMask>() == 8);
 
 // ── Per-CPU clock helper (used by sched_class.update_curr) ───────────────────
 
-/// Monotonic per-CPU scheduler clock, in nanoseconds.
+/// Last scheduler-clock value observed through [`sched_clock_ns`].
 ///
-/// Currently single-writer (the LAPIC tick handler) on the BSP; will become
-/// per-CPU in M34 alongside GS-relative storage.
+/// This keeps the scheduler-facing clock monotonic across CPUs while the
+/// shared timekeeping clock supplies the actual high-resolution reading.
 pub static SCHED_CLOCK_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Return the current scheduler-clock value in nanoseconds.
 ///
-/// Backed by `apic_timer::TIMER_TICKS` × `NSEC_PER_TICK`.
+/// Linux x86 uses a TSC-derived `sched_clock()` and falls back to
+/// `jiffies * (NSEC_PER_SEC / HZ)` only when no TSC is available. Use Lupos's
+/// shared high-resolution scheduler clock instead of advancing CFS by an
+/// assumed amount on each LAPIC interrupt.
 pub fn sched_clock_ns() -> u64 {
-    use crate::arch::x86::kernel::apic_timer::TIMER_TICKS;
-    use core::sync::atomic::Ordering;
-
-    /// Nominal nanoseconds per LAPIC tick (we run ~40 Hz on QEMU = 25 ms).
-    const NSEC_PER_TICK: u64 = 25_000_000;
-
-    let ticks = TIMER_TICKS.load(Ordering::Acquire);
-    ticks.saturating_mul(NSEC_PER_TICK)
+    let now = crate::kernel::time::sched_clock::sched_clock();
+    // Host-side Rust unit tests do not initialize the kernel timekeeper/TSC,
+    // while the existing Linux-derived scheduler fixtures advance the LAPIC
+    // tick counter explicitly.  Use the configured HZ fallback only in that
+    // environment; production keeps the high-resolution Linux clock above.
+    #[cfg(test)]
+    let now = now.max(
+        crate::arch::x86::kernel::apic_timer::TIMER_TICKS
+            .load(Ordering::Acquire)
+            .saturating_mul(crate::kernel::time::jiffies::NSEC_PER_TICK),
+    );
+    SCHED_CLOCK_NS.fetch_max(now, Ordering::AcqRel).max(now)
 }
 
 #[cfg(test)]

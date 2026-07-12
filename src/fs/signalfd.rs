@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/fs/signalfd.c
 //! test-origin: linux:vendor/linux/fs/signalfd.c
 //! signalfd — read signals as fd events.
@@ -15,7 +15,7 @@ use spin::Mutex;
 
 use crate::fs::anon_inode::alloc_anon_file;
 use crate::fs::ops::FileOps;
-use crate::fs::select::POLLIN;
+use crate::fs::select::{self, POLLIN, PollTable};
 use crate::fs::types::FileRef;
 use crate::include::uapi::errno::{EAGAIN, EBADF, EFAULT, EINVAL};
 use crate::kernel::{files, sched};
@@ -89,7 +89,15 @@ fn mask_for_file(file: &FileRef) -> Option<u64> {
     SIGNALFDS.lock().get(&token).copied()
 }
 
-fn signalfd_poll(file: &FileRef) -> u32 {
+fn signalfd_poll(file: &FileRef, table: Option<&mut PollTable>) -> u32 {
+    let Some(waitqueue) = crate::kernel::signal::current_signalfd_waitqueue() else {
+        return 0;
+    };
+    // Linux attaches signalfd to the polling task's sighand, not to the task
+    // which created the file.  Register before reading the mutable mask or
+    // pending bits so signal enqueue and signalfd4(fd, new_mask) cannot race a
+    // waiter into sleeping after their wakeup.
+    select::poll_wait(file, &waitqueue, table);
     let Some(mask) = mask_for_file(file) else {
         return 0;
     };
@@ -163,6 +171,9 @@ pub unsafe fn sys_signalfd4(fd: i32, mask: *const u8, sizemask: usize, flags: i3
         }
         let token = *file.private.lock();
         SIGNALFDS.lock().insert(token, first_word);
+        if let Some(waitqueue) = crate::kernel::signal::current_signalfd_waitqueue() {
+            waitqueue.wake_up_all();
+        }
         trace_signalfd_mask(fd, first_word, flags, fd);
         return fd as i64;
     }
@@ -312,7 +323,7 @@ mod tests {
                 ),
                 0
             );
-            assert_eq!(signalfd_poll(&file), 0);
+            assert_eq!(signalfd_poll(&file, None), 0);
 
             let mut buf = [0u8; core::mem::size_of::<SignalfdSiginfo>()];
             let mut pos = 0;
@@ -345,7 +356,7 @@ mod tests {
             let ft = files::get_task_files(&mut *current as *mut TaskStruct).unwrap();
             let file = ft.get(fd as i32).unwrap();
 
-            assert_eq!(signalfd_poll(&file), 0);
+            assert_eq!(signalfd_poll(&file, None), 0);
             assert_eq!(
                 crate::kernel::signal::send_signal_to_task(
                     &mut *current as *mut TaskStruct,
@@ -353,7 +364,7 @@ mod tests {
                 ),
                 0
             );
-            assert_eq!(signalfd_poll(&file), POLLIN as u32);
+            assert_eq!(signalfd_poll(&file, None), POLLIN as u32);
 
             let mut buf = [0u8; core::mem::size_of::<SignalfdSiginfo>()];
             let mut pos = 0;
@@ -363,7 +374,7 @@ mod tests {
             );
             let info = core::ptr::read_unaligned(buf.as_ptr() as *const SignalfdSiginfo);
             assert_eq!(info.ssi_signo, SIGCHLD as u32);
-            assert_eq!(signalfd_poll(&file), 0);
+            assert_eq!(signalfd_poll(&file, None), 0);
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);

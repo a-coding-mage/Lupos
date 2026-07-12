@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/time/sleep_timeout.c
 //! test-origin: linux:vendor/linux/kernel/time/sleep_timeout.c
 //! Sleep timeout coverage for M36.
@@ -87,9 +87,10 @@ pub fn sleep_timers_expire(now: u64) {
         let task = timer.task as *mut crate::kernel::task::TaskStruct;
         if !task.is_null() {
             unsafe {
-                (*task)
-                    .__state
-                    .store(task_state::TASK_RUNNING, Ordering::Release);
+                // `wake_up_process()` is what Linux timer expiry uses: merely
+                // storing TASK_RUNNING loses the wake once the production
+                // scheduler has dequeued a sleeping task.
+                crate::kernel::sched::wake_task_normal(task);
             }
         }
         false
@@ -166,38 +167,16 @@ fn schedule_timeout_runtime(timeout_jiffies: u64) -> u64 {
 
     let expire = jiffies().saturating_add(timeout_jiffies);
     let current = unsafe { crate::kernel::sched::get_current() };
-    let sleep_state = if current.is_null() {
-        task_state::TASK_RUNNING
-    } else {
-        unsafe { (*current).__state.load(Ordering::Acquire) }
-    };
 
-    // Event-driven path: a real task in a sleeping state, not in atomic context,
-    // can be dequeued and woken by the timer wheel at its deadline. The CPU then
-    // halts (or runs other tasks) for the duration instead of busy-yielding.
-    let can_sleep = !current.is_null()
-        && crate::kernel::locking::preempt::preempt_count() == 0
-        && (sleep_state & task_state::NON_RUNNABLE_MASK) != 0;
-
-    if can_sleep {
+    // Linux arms once and calls schedule() once. A condition/signal wake makes
+    // the task runnable and returns early with the remaining timeout; the timer
+    // wake returns at expiry. Re-storing `sleep_state` in a loop would erase a
+    // real early wake.
+    if !current.is_null() && crate::kernel::locking::preempt::preempt_count() == 0 {
         let task_id = current as usize;
         sleep_timer_add(task_id, expire);
-        while time_before(jiffies(), expire) {
-            // Re-arm the sleep state (a wakeup may have reset it to RUNNING).
-            set_current_task_state(sleep_state);
-            // Re-check after arming so a deadline/wake that raced in is not lost.
-            if !time_before(jiffies(), expire) {
-                break;
-            }
-            // Interruptible sleeps return early on a pending signal.
-            if sleep_state & (task_state::TASK_INTERRUPTIBLE | task_state::TASK_WAKEKILL) != 0
-                && crate::kernel::signal::has_pending_signals(current)
-            {
-                break;
-            }
-            unsafe {
-                crate::kernel::sched::schedule_with_irqs_enabled();
-            }
+        unsafe {
+            crate::kernel::sched::schedule_with_irqs_enabled();
         }
         sleep_timer_remove(task_id);
         set_current_task_state(task_state::TASK_RUNNING);
