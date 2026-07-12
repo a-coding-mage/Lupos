@@ -66,6 +66,23 @@ pub fn open_special_tty(
     }
 }
 
+/// Linux `tty_update_time()` — `drivers/tty/tty_io.c`. A tty read bumps the
+/// inode's atime and a write bumps mtime (unlike a regular file, ctime is
+/// left untouched). Updates are coarsened to ~8s granularity — Linux only
+/// stores when the new value differs from the old in bits above the low 3 —
+/// so a `stat()` can't be used to read exact I/O timing off the tty.
+pub fn tty_update_time(file: &crate::fs::types::FileRef, mtime: bool) {
+    let Some(inode) = file.dentry.inode() else {
+        return;
+    };
+    let now = crate::fs::types::current_inode_timestamp_secs();
+    let field = if mtime { &inode.mtime } else { &inode.atime };
+    let prev = field.load(Ordering::Acquire);
+    if (now ^ prev) & !7 != 0 {
+        field.store(now, Ordering::Release);
+    }
+}
+
 // ── TTY ioctl numbers (ABI-stable — from `include/uapi/asm-generic/ioctls.h`) ──
 pub const TIOCSCTTY: u32 = 0x540E;
 pub const TIOCGPGRP: u32 = 0x540F;
@@ -87,6 +104,8 @@ pub const TCFLSH: u32 = 0x540B;
 pub const TIOCEXCL: u32 = 0x540C;
 pub const TIOCNXCL: u32 = 0x540D;
 pub const TIOCGSID: u32 = 0x5429;
+pub const TIOCNOTTY: u32 = 0x5422;
+pub const TIOCSTI: u32 = 0x5412;
 
 // ── VT / KD ioctl numbers — `include/uapi/linux/{vt,kd}.h` ────────────────────
 // Required by Xorg + Weston when they grab the console for graphics mode.
@@ -392,6 +411,33 @@ static COMPAT_TTY_PGRP: AtomicI32 = AtomicI32::new(0);
 // `KDSIGACCEPT`, consumed by the kbrequest delivery path.
 static COMPAT_SPAWNSIG: AtomicI32 = AtomicI32::new(0);
 static COMPAT_SPAWNPID: AtomicI32 = AtomicI32::new(0);
+
+// `tty_legacy_tiocsti` — `drivers/tty/tty_io.c`. Gate for unprivileged
+// `TIOCSTI`; the build config sets `CONFIG_LEGACY_TIOCSTI=y`, so it starts
+// enabled. Toggled at runtime via `/proc/sys/dev/tty/legacy_tiocsti`.
+static TTY_LEGACY_TIOCSTI: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+// `tty_ldisc_autoload` — `drivers/tty/tty_ldisc.c`, `CONFIG_LDISC_AUTOLOAD=y`.
+// Only surfaced through `/proc/sys/dev/tty/ldisc_autoload` for now; Lupos has
+// no modular line disciplines to gate yet.
+static TTY_LDISC_AUTOLOAD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+pub fn legacy_tiocsti_enabled() -> bool {
+    TTY_LEGACY_TIOCSTI.load(Ordering::Acquire)
+}
+
+pub fn set_legacy_tiocsti(enabled: bool) {
+    TTY_LEGACY_TIOCSTI.store(enabled, Ordering::Release);
+}
+
+pub fn ldisc_autoload_enabled() -> bool {
+    TTY_LDISC_AUTOLOAD.load(Ordering::Acquire)
+}
+
+pub fn set_ldisc_autoload(enabled: bool) {
+    TTY_LDISC_AUTOLOAD.store(enabled, Ordering::Release);
+}
 
 /// `_NSIG` on x86_64 (`include/uapi/asm-generic/signal.h`).
 const NSIG: i32 = 64;

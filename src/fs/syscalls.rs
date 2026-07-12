@@ -3245,6 +3245,7 @@ fn insert_special_node(
     name: &str,
     mode: u32,
     kind: InodeKind,
+    dev: u32,
 ) -> Result<(), i32> {
     let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
     let fops = if kind == InodeKind::Blockdev {
@@ -3260,6 +3261,14 @@ fn insert_special_node(
         fops,
         InodePrivate::None,
     );
+    // Linux `init_special_inode()` stamps `i_rdev` for both S_ISCHR and
+    // S_ISBLK. Lupos's block-device lookup is name-based (see
+    // `block_device_for_file`), but chardev opens dispatch on rdev via
+    // `linux_driver_abi::tty::open_special_tty`, so a `mknod(2)`-created
+    // `/dev/ptmx`-alike needs this to actually reach the right driver.
+    if matches!(kind, InodeKind::Chardev | InodeKind::Blockdev) {
+        inode.rdev.store(dev as u64, Ordering::Release);
+    }
     *inode.sb.lock() = Some(sb);
     match &dir.private {
         InodePrivate::RamDir(children) => {
@@ -3273,7 +3282,7 @@ fn insert_special_node(
     Ok(())
 }
 
-pub unsafe fn sys_mknodat(dirfd: i32, pathname: *const u8, mode: u32, _dev: u32) -> i64 {
+pub unsafe fn sys_mknodat(dirfd: i32, pathname: *const u8, mode: u32, dev: u32) -> i64 {
     let path = match unsafe { user_path(pathname) } {
         Ok(path) => path,
         Err(errno) => return -(errno as i64),
@@ -3310,7 +3319,7 @@ pub unsafe fn sys_mknodat(dirfd: i32, pathname: *const u8, mode: u32, _dev: u32)
             super::inotify::notify_create(&parent, last, false);
             return Ok(());
         }
-        insert_special_node(&parent, &dir, last, mode, kind)?;
+        insert_special_node(&parent, &dir, last, mode, kind, dev)?;
         super::inotify::notify_create(&parent, last, kind == InodeKind::Directory);
         Ok(())
     })()

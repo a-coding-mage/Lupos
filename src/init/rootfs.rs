@@ -572,7 +572,7 @@ pub fn push_console_input_for_tests(bytes: &[u8]) {
 }
 
 fn console_read(
-    _file: &crate::fs::types::FileRef,
+    file: &crate::fs::types::FileRef,
     buf: &mut [u8],
     pos: &mut u64,
 ) -> Result<usize, i32> {
@@ -582,6 +582,9 @@ fn console_read(
 
     loop {
         if let Some(n) = console_read_ready_or_signal(buf, pos)? {
+            if n > 0 {
+                crate::linux_driver_abi::tty::tty_update_time(file, false);
+            }
             return Ok(n);
         }
 
@@ -614,12 +617,15 @@ fn console_read(
 }
 
 fn console_write(
-    _file: &crate::fs::types::FileRef,
+    file: &crate::fs::types::FileRef,
     buf: &[u8],
     pos: &mut u64,
 ) -> Result<usize, i32> {
     crate::kernel::console::write_bytes(buf);
     *pos = pos.saturating_add(buf.len() as u64);
+    if !buf.is_empty() {
+        crate::linux_driver_abi::tty::tty_update_time(file, true);
+    }
     Ok(buf.len())
 }
 
@@ -678,6 +684,43 @@ fn console_ioctl(file: &crate::fs::types::FileRef, cmd: u32, arg: u64) -> Result
             // not prevent the underlying tty ioctl from running here.
             let _ = crate::kernel::session::claim_controlling_tty(pid, tty);
         }
+    }
+    if cmd == crate::linux_driver_abi::tty::TIOCSTI {
+        // `tiocsti()` — `drivers/tty/tty_io.c`. Fake console input; same
+        // legacy-sysctl (EIO) and controlling-tty (EPERM) gates as the pty
+        // path, both bypassed by CAP_SYS_ADMIN in the *current* process.
+        let admin = crate::kernel::capability::capable(crate::kernel::capability::CAP_SYS_ADMIN);
+        if !crate::linux_driver_abi::tty::legacy_tiocsti_enabled() && !admin {
+            return Err(crate::include::uapi::errno::EIO);
+        }
+        let task = unsafe { crate::kernel::sched::get_current() };
+        if task.is_null() {
+            return Err(crate::include::uapi::errno::EIO);
+        }
+        let pid = unsafe { (*task).pid };
+        let is_ctty = matches!(
+            crate::kernel::session::controlling_tty(pid),
+            Some(crate::kernel::session::ControllingTty::Console(_))
+        );
+        if !is_ctty && !admin {
+            return Err(crate::include::uapi::errno::EPERM);
+        }
+        if arg == 0 {
+            return Err(crate::include::uapi::errno::EFAULT);
+        }
+        let mut ch = 0u8;
+        let not_copied = unsafe {
+            crate::arch::x86::kernel::uaccess::copy_from_user(
+                &mut ch as *mut u8,
+                arg as *const u8,
+                1,
+            )
+        };
+        if not_copied != 0 {
+            return Err(crate::include::uapi::errno::EFAULT);
+        }
+        process_console_input_byte(ch);
+        return Ok(0);
     }
     crate::linux_driver_abi::tty::tty_ioctl_compat(cmd, arg)
 }
@@ -1760,8 +1803,22 @@ fn rebase_current_fs_to_namespace_root(root: &DentryRef) {
     crate::fs::fs_struct::set_current_cwd_path("/");
 }
 
+/// The root a fresh absolute path should be created under. Mirrors what
+/// `path_walk`/`resolve_path_follow` actually resolve `/`-prefixed lookups
+/// against (`fs_struct::current_root_and_pwd_paths()`) rather than the
+/// boot-time `mount::rootfs()` singleton, which a userspace `switch_root(8)`
+/// (`mount(..., MS_MOVE) + chroot()`, not `pivot_root(2)`) never updates.
+/// Falls back to `mount::rootfs()` when there is no current task yet (early
+/// boot, before any process exists to own an `fs_struct`).
+fn ensure_dir_root() -> Result<DentryRef, i32> {
+    crate::fs::fs_struct::current_root_and_pwd()
+        .map(|(root, _pwd)| root)
+        .or_else(|| mount::rootfs().map(|m| m.root.clone()))
+        .ok_or(EINVAL)
+}
+
 fn ensure_dir(path: &str, mode: u32) -> Result<DentryRef, i32> {
-    let root = mount::rootfs().ok_or(EINVAL)?.root.clone();
+    let root = ensure_dir_root()?;
     if path == "/" || path.is_empty() {
         return Ok(root);
     }

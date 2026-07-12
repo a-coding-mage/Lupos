@@ -141,6 +141,36 @@ pub fn clear_controlling_tty(tty: ControllingTty) {
     CONTROLLING_TTYS.lock().retain(|entry| entry.tty != tty);
 }
 
+/// Linux `is_current_pgrp_orphaned()` (`kernel/pid.c`, called from
+/// `__tty_check_change()`). A process group is orphaned unless some member
+/// has a parent that is in the same session but a *different* group — i.e. a
+/// job-control shell is still around to `SIGCONT` it after a stop. Orphaned
+/// background groups get `EIO` instead of `SIGTTIN`/`SIGTTOU` + a stop, since
+/// nothing would ever resume them.
+pub fn pgrp_is_orphaned(pid: i32) -> bool {
+    let pgrp = process_group(pid).unwrap_or(pid);
+    let sid = session_id(pid).unwrap_or(pid);
+    let mut has_anchor = false;
+    fork::for_each_heap_task(|task| {
+        if has_anchor || task.is_null() {
+            return;
+        }
+        let member_pid = unsafe { (*task).pid };
+        if process_group(member_pid) != Some(pgrp) {
+            return;
+        }
+        let parent = unsafe { (*task).m26.real_parent };
+        if parent.is_null() {
+            return;
+        }
+        let parent_pid = unsafe { (*parent).pid };
+        if process_group(parent_pid) != Some(pgrp) && session_id(parent_pid) == Some(sid) {
+            has_anchor = true;
+        }
+    });
+    !has_anchor
+}
+
 /// Inherit the parent's session and process group for a freshly forked child.
 ///
 /// Linux keeps these IDs in the PID/session relationships copied by
