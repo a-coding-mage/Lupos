@@ -49,6 +49,8 @@ pub const TIOCSPTLCK: u32 = 0x4004_5431;
 pub const TIOCGPTLCK: u32 = 0x8004_5439;
 /// `TIOCPKT` — enable/disable packet mode (`_IOW('T', 0x20, int)`).
 pub const TIOCPKT: u32 = 0x5420;
+/// `TIOCGPKT` — read packet-mode state (`_IOR('T', 0x38, int)`).
+pub const TIOCGPKT: u32 = 0x8004_5438;
 /// `FIONREAD` / `TIOCINQ` — bytes available for reading.
 pub const FIONREAD: u32 = 0x541B;
 
@@ -292,7 +294,21 @@ impl Pty {
     }
 
     fn master_read(&self, buf: &mut [u8]) -> usize {
-        drain_into(&mut self.to_master.lock(), buf)
+        let mut queue = self.to_master.lock();
+        if queue.is_empty() || buf.is_empty() {
+            return 0;
+        }
+
+        if self.packet.load(Ordering::Acquire) {
+            // `n_tty_read()` prefixes ordinary packet-mode payload with
+            // `TIOCPKT_DATA` (zero).  Control-status packets use a non-zero
+            // byte and contain no payload; Lupos does not currently generate
+            // any of those asynchronous status transitions.
+            buf[0] = 0;
+            return 1 + drain_into(&mut queue, &mut buf[1..]);
+        }
+
+        drain_into(&mut queue, buf)
     }
 
     fn slave_read(&self, buf: &mut [u8]) -> usize {
@@ -522,6 +538,10 @@ fn ptmx_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
         TIOCPKT => {
             let v = get_user_i32(arg)?;
             pty.packet.store(v != 0, Ordering::Release);
+            Ok(0)
+        }
+        TIOCGPKT => {
+            put_user_u32(arg, pty.packet.load(Ordering::Acquire) as u32)?;
             Ok(0)
         }
         // On the master, TIOCINQ/FIONREAD reports bytes readable *from* the
