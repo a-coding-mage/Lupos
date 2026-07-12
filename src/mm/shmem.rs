@@ -777,6 +777,7 @@ pub mod tmpfs_vfs {
     };
     use crate::include::uapi::errno::{EEXIST, EINVAL, EPERM};
     use crate::linux_driver_abi::input::evdev_chardev::EVDEV_FILE_OPS;
+    use crate::linux_driver_abi::tty::pty::PTMX_FILE_OPS;
     use crate::linux_driver_abi::video::fbdev::FBDEV_FILE_OPS;
 
     const TMPFS_MAGIC: u64 = 0x01021994;
@@ -928,6 +929,22 @@ pub mod tmpfs_vfs {
         i
     }
 
+    /// Create the UNIX98 pty multiplexor inode used by devtmpfs and devpts.
+    ///
+    /// Linux's `pty_init()` registers `ptmx_fops` on `(TTYAUX_MAJOR, 2)`, and
+    /// `devpts::mknod_ptmx()` creates each devpts `ptmx` inode with that same
+    /// device number.  Lupos binds character-device operations directly to the
+    /// inode, so both halves must be installed here together.
+    fn make_ptmx(sb: &SuperBlockRef) -> InodeRef {
+        use crate::init::noinitramfs::{mkdev, new_encode_dev};
+
+        let inode = make_special(sb, InodeKind::Chardev, 0o666, &PTMX_FILE_OPS);
+        inode
+            .rdev
+            .store(new_encode_dev(mkdev(5, 2)) as u64, Ordering::Release);
+        inode
+    }
+
     fn make_devtmpfs_block(sb: &SuperBlockRef, mode: u32) -> InodeRef {
         let inode = Inode::new(
             sb.alloc_ino(),
@@ -1069,17 +1086,9 @@ pub mod tmpfs_vfs {
                 make_special(sb, InodeKind::Chardev, 0o666, &TMPFS_FILE_OPS),
             )?;
         }
-        insert_child(
-            &root,
-            "ptmx",
-            make_special(sb, InodeKind::Chardev, 0o666, &TMPFS_FILE_OPS),
-        )?;
+        insert_child(&root, "ptmx", make_ptmx(sb))?;
         let pts = insert_child(&root, "pts", make_dir(sb))?;
-        insert_child(
-            &pts,
-            "ptmx",
-            make_special(sb, InodeKind::Chardev, 0o666, &TMPFS_FILE_OPS),
-        )?;
+        insert_child(&pts, "ptmx", make_ptmx(sb))?;
         let input = insert_child(&root, "input", make_dir(sb))?;
         for (idx, name) in ["event0", "event1"].into_iter().enumerate() {
             let node = make_special(sb, InodeKind::Chardev, 0o660, &EVDEV_FILE_OPS);
@@ -1254,11 +1263,7 @@ pub mod tmpfs_vfs {
     pub fn mount_devpts(_source: &str, _flags: u64, _data: &str) -> Result<SuperBlockRef, i32> {
         let sb = mount_named("devpts")?;
         let root = sb.root().ok_or(EINVAL)?;
-        insert_child(
-            &root,
-            "ptmx",
-            make_special(&sb, InodeKind::Chardev, 0o666, &TMPFS_FILE_OPS),
-        )?;
+        insert_child(&root, "ptmx", make_ptmx(&sb))?;
         Ok(sb)
     }
 
