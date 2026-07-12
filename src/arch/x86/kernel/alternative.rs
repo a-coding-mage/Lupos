@@ -176,6 +176,29 @@ pub fn alternatives_patched() -> bool {
     ALTERNATIVES_PATCHED.load(Ordering::Acquire)
 }
 
+/// Linux `alternatives_smp_module_add()` for Lupos' current SMP text state.
+///
+/// `vendor/linux/arch/x86/kernel/alternative.c` returns immediately unless
+/// the core kernel was first rewritten for UP execution (`uniproc_patched`).
+/// Lupos never performs that global lock-prefix-to-DS-prefix rewrite, so its
+/// module text already contains the SMP-safe `0xf0` lock prefixes and there is
+/// no UP patch to apply or module entry to retain for a later CPU hotplug.
+/// Linux does not dereference the lock-table or text ranges on that branch, so
+/// section presence is all the current module finalizer needs to pass here.
+///
+/// The return value records Linux's `smp_alt_modules` list membership for the
+/// matching `module_arch_cleanup()` path. It is always false until Lupos gains
+/// the global UP-alternatives transition and the live text-poke support needed
+/// to reverse it safely.
+pub const fn alternatives_smp_module_add() -> bool {
+    false
+}
+
+/// Linux `alternatives_smp_module_del()` for a module finalized above.
+pub fn alternatives_smp_module_del(registered: bool) {
+    debug_assert!(!registered);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -308,7 +308,7 @@ pub fn dump_page(page: &Page) -> PageDebugSnapshot {
     PageDebugSnapshot {
         flags: page.flags.load(Ordering::Relaxed),
         page_type: decode_page_type(page.page_type.load(Ordering::Relaxed)),
-        mapcount: page._mapcount.load(Ordering::Relaxed),
+        mapcount: page._mapcount().load(Ordering::Relaxed),
         refcount: page._refcount.load(Ordering::Relaxed),
         private: page.private,
     }

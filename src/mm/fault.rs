@@ -461,7 +461,7 @@ fn do_anonymous_page(vmf: &mut VmFault) -> VmFaultFlags {
         // place; fork's COW path increments it when the page is truly shared.
         (*page_ptr)._refcount.store(1, Ordering::Relaxed);
         // mapcount = 0 means exactly one PTE maps this page (exclusive).
-        (*page_ptr)._mapcount.store(0, Ordering::Relaxed);
+        (*page_ptr)._mapcount().store(0, Ordering::Relaxed);
 
         // Store the AnonVma pointer in page.mapping so try_to_unmap can walk
         // back to this page's VMA when the page is evicted to swap.
@@ -534,7 +534,7 @@ fn do_shared_anonymous_page(vmf: &mut VmFault) -> VmFaultFlags {
             }
 
             (*page)._refcount.store(1, Ordering::Relaxed);
-            (*page)._mapcount.store(-1, Ordering::Relaxed);
+            (*page)._mapcount().store(-1, Ordering::Relaxed);
             (*page).mapping = mapping as usize;
             (*page).index = index as usize;
             (*page).set_flag(PG_SWAPBACKED);
@@ -552,7 +552,7 @@ fn do_shared_anonymous_page(vmf: &mut VmFault) -> VmFaultFlags {
         };
 
         (*page_ptr).get_page();
-        (*page_ptr)._mapcount.fetch_add(1, Ordering::Relaxed);
+        (*page_ptr)._mapcount().fetch_add(1, Ordering::Relaxed);
 
         let base_prot = if (*vma).vm_page_prot != 0 {
             pgprot_t((*vma).vm_page_prot)
@@ -721,7 +721,7 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
         // 3. Initialise the new page's refcount/mapcount.
         //    One PTE (below) will map it, so mapcount = 0 (exclusive).
         (*new_page)._refcount.store(1, Ordering::Relaxed);
-        (*new_page)._mapcount.store(0, Ordering::Relaxed);
+        (*new_page)._mapcount().store(0, Ordering::Relaxed);
 
         // 4. Build a new writable PTE for the new page.
         let new_pfn = page_to_pfn(new_page) as u64;
@@ -750,7 +750,7 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
         // 6. Release the old page's references from this mm.
         //    mapcount: one fewer PTE maps it.
         if !old_page.is_null() {
-            (*old_page)._mapcount.fetch_sub(1, Ordering::Relaxed);
+            (*old_page)._mapcount().fetch_sub(1, Ordering::Relaxed);
             //    refcount: this mm no longer holds a reference.
             let rc = (*old_page).put_page();
             if rc <= 0 {
@@ -918,7 +918,7 @@ unsafe fn copy_pte_range(
             // Bump refcount: destination mm now holds a reference.
             (*page).get_page();
             // Bump mapcount: one more PTE maps this page.
-            (*page)._mapcount.fetch_add(1, Ordering::Relaxed);
+            (*page)._mapcount().fetch_add(1, Ordering::Relaxed);
 
             // Update destination RSS.
             add_mm_rss(dst_mm, 1);
@@ -1130,7 +1130,7 @@ unsafe fn lupos_cached_file_fault(
         // COW away from the mapping reference rather than modify the cache.
         let entry = pte_wrprotect(pte_mkyoung(pfn_pte(page_to_pfn(page) as u64, prot)));
         set_pte_at((*vma).vm_mm as *mut (), (*vmf).address, ptep, entry);
-        (*page)._mapcount.fetch_add(1, Ordering::Relaxed);
+        (*page)._mapcount().fetch_add(1, Ordering::Relaxed);
         (*vmf).page = page;
         (*vmf).pte = ptep;
         add_mm_rss((*vma).vm_mm, 1);
@@ -1155,7 +1155,7 @@ unsafe fn lupos_uncached_file_fault(
             None => return VM_FAULT_OOM,
         };
         (*page_ptr)._refcount.store(1, Ordering::Relaxed);
-        (*page_ptr)._mapcount.store(0, Ordering::Relaxed);
+        (*page_ptr)._mapcount().store(0, Ordering::Relaxed);
 
         let page_virt = pfn_to_virt(page_to_pfn(page_ptr)) as *mut u8;
         core::ptr::write_bytes(page_virt, 0, PAGE_SIZE as usize);
@@ -1350,7 +1350,7 @@ pub unsafe extern "C" fn filemap_fault(vmf: *mut VmFault) -> VmFaultFlags {
         };
         let entry = pte_mkyoung(pfn_pte(pfn, prot)); // read-only by default
         set_pte_at(mm as *mut (), (*vmf).address, ptep, entry);
-        (*page)._mapcount.fetch_add(1, Ordering::Relaxed);
+        (*page)._mapcount().fetch_add(1, Ordering::Relaxed);
 
         (*vmf).page = page;
         (*vmf).pte = ptep;
@@ -1480,7 +1480,7 @@ fn do_swap_page(vmf: &mut VmFault) -> VmFaultFlags {
         ptep_get_and_clear(mm as *mut (), vmf.address, ptep);
         set_pte_at(mm as *mut (), vmf.address, ptep, new_pte);
         flush_tlb_page(vmf.address);
-        (*page)._mapcount.fetch_add(1, Ordering::Relaxed);
+        (*page)._mapcount().fetch_add(1, Ordering::Relaxed);
 
         // --- Step 4: clean up swap slot ---
         swap_cache_delete(page);
@@ -2069,7 +2069,7 @@ mod tests {
         let pfn = paging::pte_pfn(pte) as usize;
         let page_ptr = crate::mm::buddy::pfn_to_page(pfn);
         assert_eq!(
-            unsafe { (*page_ptr)._mapcount.load(Ordering::Relaxed) },
+            unsafe { (*page_ptr)._mapcount().load(Ordering::Relaxed) },
             0,
             "_mapcount must be 0 after single fault"
         );
@@ -2132,7 +2132,7 @@ mod tests {
         // Simulate fork: bump _mapcount to 1 (two PTEs reference the page).
         let pfn = paging::pte_pfn(pte) as usize;
         let page_ptr = crate::mm::buddy::pfn_to_page(pfn);
-        unsafe { (*page_ptr)._mapcount.store(1, Ordering::Relaxed) };
+        unsafe { (*page_ptr)._mapcount().store(1, Ordering::Relaxed) };
 
         // smaps_for_range should now count it as shared_dirty.
         let stats = unsafe {
@@ -2150,7 +2150,7 @@ mod tests {
         assert_eq!(stats.private_dirty, 0, "private_dirty must be zero");
 
         // Restore _mapcount to avoid affecting other tests.
-        unsafe { (*page_ptr)._mapcount.store(0, Ordering::Relaxed) };
+        unsafe { (*page_ptr)._mapcount().store(0, Ordering::Relaxed) };
     }
 
     // ── Utility ─────────────────────────────────────────────────────────────

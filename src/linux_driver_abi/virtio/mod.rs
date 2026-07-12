@@ -1040,6 +1040,17 @@ unsafe extern "C" fn linux_virtio_dev_probe(dev: *mut c_void) -> i32 {
 
     err = unsafe { probe(vdev) };
     if err != 0 {
+        if let Some(id) = linux_virtio_device_id(vdev) {
+            crate::log_warn!(
+                "virtio",
+                "Linux virtio driver probe failed: device={} vendor={:#x} errno={}",
+                id.device,
+                id.vendor,
+                err
+            );
+        } else {
+            crate::log_warn!("virtio", "Linux virtio driver probe failed: errno={}", err);
+        }
         unsafe {
             virtio_add_status(vdev, VIRTIO_CONFIG_S_FAILED as u32);
         }
@@ -1907,6 +1918,12 @@ pub unsafe extern "C" fn virtqueue_add_sgs(
             .cast::<crate::lib::scatterlist::LinuxScatterList>();
         let mut seen = 0u32;
         while !sg.is_null() && seen < 1024 {
+            let flags = unsafe { (*sg).page_link & crate::lib::scatterlist::SG_PAGE_LINK_MASK };
+            if flags & crate::lib::scatterlist::SG_CHAIN != 0 {
+                let next = unsafe { (*sg).page_link & !crate::lib::scatterlist::SG_PAGE_LINK_MASK };
+                sg = next as *mut crate::lib::scatterlist::LinuxScatterList;
+                continue;
+            }
             let len = unsafe {
                 if (*sg).dma_length != 0 {
                     (*sg).dma_length
@@ -1914,8 +1931,19 @@ pub unsafe extern "C" fn virtqueue_add_sgs(
                     (*sg).length
                 }
             };
-            let cpu_addr = unsafe { (*sg).dma_address as *const u8 };
-            if len == 0 || cpu_addr.is_null() {
+            let premapped_dma =
+                unsafe { ((*sg).dma_length != 0).then_some((*sg).dma_address as DmaAddr) };
+            let page = unsafe {
+                ((*sg).page_link & !crate::lib::scatterlist::SG_PAGE_LINK_MASK)
+                    as *mut crate::mm::page::Page
+            };
+            let cpu_addr = if page.is_null() || !crate::mm::buddy::page_in_mem_map(page) {
+                core::ptr::null()
+            } else {
+                let pfn = crate::mm::buddy::page_to_pfn(page);
+                unsafe { crate::arch::x86::mm::paging::pfn_to_virt(pfn).add((*sg).offset as usize) }
+            };
+            if len == 0 || (premapped_dma.is_none() && cpu_addr.is_null()) {
                 crate::log_warn!(
                     "virtio",
                     "virtqueue_add_sgs rejected sg list={} len={} cpu={:p}",
@@ -1925,20 +1953,24 @@ pub unsafe extern "C" fn virtqueue_add_sgs(
                 );
                 return -EINVAL;
             }
-            let dma = unsafe {
-                virtqueue_map_single_attrs(
-                    vq,
-                    cpu_addr.cast_mut().cast(),
-                    len as usize,
-                    if writable {
-                        DmaDirection::FromDevice
-                    } else {
-                        DmaDirection::ToDevice
-                    },
-                    0,
-                )
+            let dma = if let Some(dma) = premapped_dma {
+                dma
+            } else {
+                unsafe {
+                    virtqueue_map_single_attrs(
+                        vq,
+                        cpu_addr.cast_mut().cast(),
+                        len as usize,
+                        if writable {
+                            DmaDirection::FromDevice
+                        } else {
+                            DmaDirection::ToDevice
+                        },
+                        0,
+                    )
+                }
             };
-            if unsafe { virtqueue_map_mapping_error(vq, dma) } != 0 {
+            if premapped_dma.is_none() && unsafe { virtqueue_map_mapping_error(vq, dma) } != 0 {
                 crate::log_warn!(
                     "virtio",
                     "virtqueue_add_sgs dma map failed list={} len={} cpu={:p}",
@@ -1950,7 +1982,6 @@ pub unsafe extern "C" fn virtqueue_add_sgs(
             }
             entries.push((dma, len, writable));
 
-            let flags = unsafe { (*sg).page_link & crate::lib::scatterlist::SG_PAGE_LINK_MASK };
             seen = seen.saturating_add(1);
             if flags & crate::lib::scatterlist::SG_END != 0 {
                 break;
@@ -2084,10 +2115,23 @@ pub unsafe extern "C" fn virtqueue_add_inbuf_ctx(
     sg: *mut c_void,
     num: u32,
     data: *mut c_void,
-    _ctx: *mut c_void,
+    ctx: *mut c_void,
     gfp: u32,
 ) -> i32 {
-    unsafe { virtqueue_add_inbuf(vq, sg, num, data, gfp) }
+    let result = unsafe { virtqueue_add_inbuf(vq, sg, num, data, gfp) };
+    if result == 0 {
+        let _ = linux_virtqueue_with_backend_mut(vq, |backend| {
+            if let Some(token) = backend
+                .submitted
+                .iter_mut()
+                .rev()
+                .find(|token| token.data == data as usize)
+            {
+                token.ctx = ctx as usize;
+            }
+        });
+    }
+    result
 }
 
 /// `virtqueue_add_inbuf_premapped` — `vendor/linux/drivers/virtio/virtio_ring.c`.
@@ -2097,10 +2141,10 @@ pub unsafe extern "C" fn virtqueue_add_inbuf_premapped(
     sg: *mut c_void,
     num: u32,
     data: *mut c_void,
-    _ctx: *mut c_void,
+    ctx: *mut c_void,
     gfp: u32,
 ) -> i32 {
-    unsafe { virtqueue_add_inbuf(vq, sg, num, data, gfp) }
+    unsafe { virtqueue_add_inbuf_ctx(vq, sg, num, data, ctx, gfp) }
 }
 
 /// `virtqueue_add_outbuf` — `vendor/linux/drivers/virtio/virtio_ring.c`.

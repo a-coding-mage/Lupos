@@ -1010,6 +1010,11 @@ pub fn register_module_exports() {
     );
     export_symbol_once("kfree", linux_kfree as usize, true);
     export_symbol_once("kmalloc_caches", linux_kmalloc_caches as usize, true);
+    export_symbol_once(
+        "__kvmalloc_node_noprof",
+        linux___kvmalloc_node_noprof as usize,
+        true,
+    );
 }
 
 /// `__kmalloc_noprof` - `vendor/linux/include/linux/slab.h`.
@@ -1026,6 +1031,16 @@ pub unsafe extern "C" fn linux___kmalloc_cache_noprof(
     size: usize,
 ) -> *mut u8 {
     unsafe { __kmalloc_cache_noprof(cache_type, flags, size) }
+}
+
+/// `__kvmalloc_node_noprof` - `vendor/linux/mm/util.c`.
+#[unsafe(export_name = "__kvmalloc_node_noprof")]
+pub unsafe extern "C" fn linux___kvmalloc_node_noprof(
+    size: usize,
+    flags: GfpFlags,
+    node: i32,
+) -> *mut u8 {
+    unsafe { __kvmalloc_node_noprof(size, flags, node) }
 }
 
 /// `kfree` - `vendor/linux/mm/slab_common.c`.

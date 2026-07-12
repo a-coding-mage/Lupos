@@ -36,6 +36,7 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 }
 
 pub fn register_module_exports() {
+    export_symbol_once("sg_init_table", linux_sg_init_table as usize, true);
     export_symbol_once("sg_init_one", linux_sg_init_one as usize, true);
     export_symbol_once(
         "sg_alloc_table_chained",
@@ -49,22 +50,44 @@ pub fn register_module_exports() {
     );
 }
 
+/// `sg_init_table` - `vendor/linux/lib/scatterlist.c:130`.
+///
+/// The selected vendor configuration has `CONFIG_DEBUG_SG=n`, so the marker
+/// initialization is exactly a zero fill followed by `SG_END` on the final
+/// entry.
+pub unsafe extern "C" fn linux_sg_init_table(sgl: *mut LinuxScatterList, nents: u32) {
+    if sgl.is_null() || nents == 0 {
+        return;
+    }
+    unsafe {
+        core::ptr::write_bytes(sgl, 0, nents as usize);
+        (*sgl.add(nents as usize - 1)).page_link |= SG_END;
+    }
+}
+
 /// `sg_init_one` - `vendor/linux/lib/scatterlist.c`.
 pub unsafe extern "C" fn linux_sg_init_one(
     sg: *mut LinuxScatterList,
     buf: *const c_void,
     len: u32,
 ) {
-    if sg.is_null() {
+    if sg.is_null() || buf.is_null() {
         return;
     }
+    let Some(phys) = crate::arch::x86::mm::paging::virt_to_phys(buf as u64) else {
+        crate::log_warn!(
+            "scatterlist",
+            "sg_init_one rejected unmapped kernel buffer {:p}",
+            buf
+        );
+        return;
+    };
+    let page = crate::mm::buddy::pfn_to_page((phys as usize) >> 12);
     unsafe {
-        (*sg).page_link = (buf as usize & !SG_PAGE_LINK_MASK) | SG_END;
-        (*sg).offset = 0;
+        linux_sg_init_table(sg, 1);
+        (*sg).page_link = (page as usize & !SG_PAGE_LINK_MASK) | SG_END;
+        (*sg).offset = (phys as usize & 0xfff) as u32;
         (*sg).length = len;
-        (*sg).dma_address = buf as usize;
-        (*sg).dma_length = len;
-        (*sg).dma_flags = 0;
     }
 }
 
@@ -134,10 +157,10 @@ mod tests {
                 dma_flags: 0,
             };
             let data = [1u8; 4];
-            linux_sg_init_one(&mut sg, data.as_ptr().cast(), data.len() as u32);
-            assert_eq!(sg.length, 4);
-            assert_eq!(sg.page_link & SG_END, SG_END);
-            assert_eq!(sg.dma_address, data.as_ptr() as usize);
+            linux_sg_init_table(&mut sg, 1);
+            assert_eq!(sg.length, 0);
+            assert_eq!(sg.page_link, SG_END);
+            assert_eq!(sg.dma_address, 0);
             assert_eq!(core::mem::offset_of!(LinuxScatterList, page_link), 0);
             assert_eq!(core::mem::offset_of!(LinuxScatterList, offset), 0x8);
             assert_eq!(core::mem::offset_of!(LinuxScatterList, length), 0xc);

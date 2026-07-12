@@ -55,7 +55,18 @@ pub const START_KERNEL_MAP: u64 = 0xffff_ffff_8000_0000;
 
 static LINUX_PAGE_OFFSET_BASE: u64 = PAGE_OFFSET_BASE_L4;
 static LINUX_PHYS_BASE: u64 = 0x0020_0000;
-static LINUX_VMEMMAP_BASE: u64 = VMEMMAP_BASE_L4;
+static mut LINUX_VMEMMAP_BASE: u64 = VMEMMAP_BASE_L4;
+
+/// Point Linux-built inline `pfn_to_page()`/`page_to_pfn()` arithmetic at the
+/// flat `mem_map` allocated by Lupos. The exported base may be biased when the
+/// first represented PFN is nonzero, exactly as sparsemem's vmemmap base is.
+pub fn set_linux_vmemmap_base(mem_map: *mut crate::mm::page::Page, base_pfn: usize) {
+    let bias =
+        (base_pfn as u64).saturating_mul(core::mem::size_of::<crate::mm::page::Page>() as u64);
+    unsafe {
+        LINUX_VMEMMAP_BASE = (mem_map as u64).wrapping_sub(bias);
+    }
+}
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {

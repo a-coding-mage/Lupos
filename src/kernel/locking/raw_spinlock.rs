@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use super::irqflags::{
     IrqFlags, local_irq_disable, local_irq_enable, local_irq_restore, local_irq_save,
 };
-use super::preempt::{preempt_disable, preempt_enable};
+use super::preempt::{local_bh_disable, local_bh_enable, preempt_disable, preempt_enable};
 use super::qspinlock::QSpinLock;
 use crate::kernel::module::{export_symbol, find_symbol};
 
@@ -29,6 +29,15 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 }
 
 pub fn register_module_exports() {
+    export_symbol_once("_raw_spin_lock", linux_raw_spin_lock as usize, false);
+    export_symbol_once("_raw_spin_trylock", linux_raw_spin_trylock as usize, false);
+    export_symbol_once("_raw_spin_unlock", linux_raw_spin_unlock as usize, false);
+    export_symbol_once("_raw_spin_lock_bh", linux_raw_spin_lock_bh as usize, false);
+    export_symbol_once(
+        "_raw_spin_unlock_bh",
+        linux_raw_spin_unlock_bh as usize,
+        false,
+    );
     export_symbol_once(
         "_raw_spin_lock_irqsave",
         linux_raw_spin_lock_irqsave as usize,
@@ -49,6 +58,51 @@ pub fn register_module_exports() {
         linux_raw_spin_unlock_irq as usize,
         false,
     );
+}
+
+/// `_raw_spin_lock` — `vendor/linux/kernel/locking/spinlock.c:156` and
+/// `vendor/linux/include/linux/spinlock_api_smp.h:143`.
+#[unsafe(export_name = "_raw_spin_lock")]
+pub unsafe extern "C" fn linux_raw_spin_lock(lock: *mut QSpinLock) {
+    preempt_disable();
+    unsafe { &*lock }.lock();
+}
+
+/// `_raw_spin_trylock` —
+/// `vendor/linux/include/linux/spinlock_api_smp.h:90`.
+#[unsafe(export_name = "_raw_spin_trylock")]
+pub unsafe extern "C" fn linux_raw_spin_trylock(lock: *mut QSpinLock) -> i32 {
+    preempt_disable();
+    if unsafe { &*lock }.try_lock() {
+        1
+    } else {
+        preempt_enable();
+        0
+    }
+}
+
+/// `_raw_spin_unlock` —
+/// `vendor/linux/include/linux/spinlock_api_smp.h:157`.
+#[unsafe(export_name = "_raw_spin_unlock")]
+pub unsafe extern "C" fn linux_raw_spin_unlock(lock: *mut QSpinLock) {
+    unsafe { &*lock }.unlock();
+    preempt_enable();
+}
+
+/// `_raw_spin_lock_bh` —
+/// `vendor/linux/include/linux/spinlock_api_smp.h:136`.
+#[unsafe(export_name = "_raw_spin_lock_bh")]
+pub unsafe extern "C" fn linux_raw_spin_lock_bh(lock: *mut QSpinLock) {
+    local_bh_disable();
+    unsafe { &*lock }.lock();
+}
+
+/// `_raw_spin_unlock_bh` —
+/// `vendor/linux/include/linux/spinlock_api_smp.h:190`.
+#[unsafe(export_name = "_raw_spin_unlock_bh")]
+pub unsafe extern "C" fn linux_raw_spin_unlock_bh(lock: *mut QSpinLock) {
+    unsafe { &*lock }.unlock();
+    local_bh_enable();
 }
 
 /// `_raw_spin_lock_irqsave` —

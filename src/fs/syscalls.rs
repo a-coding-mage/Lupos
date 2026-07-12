@@ -1564,6 +1564,8 @@ unsafe fn poll_impl(fds: *mut PollFd, nfds: usize, timeout_ns: Option<u64>) -> i
     let mut wait_state = ConsoleWaitState::default();
 
     loop {
+        #[cfg(not(test))]
+        let _ = crate::linux_driver_abi::poll_driver_abi_events_for_wait();
         unsafe {
             crate::kernel::signal::exit_if_fatal_signal_pending_current();
         }

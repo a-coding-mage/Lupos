@@ -25,6 +25,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
+use crate::arch::x86::kernel::module::{X86ModuleMetadata, module_finalize};
 use crate::include::uapi::errno::{EBUSY, EEXIST, EINVAL, ENOENT, ENOEXEC};
 use crate::kernel::bug::{
     BUG_ENTRY_BUG_ADDR_OFFSET, BUG_ENTRY_FILE_OFFSET, BUG_ENTRY_FLAGS_OFFSET,
@@ -135,6 +136,8 @@ pub enum ModuleState {
 pub struct LoadedSection {
     #[cfg(test)]
     data: Vec<u8>,
+    #[cfg(test)]
+    borrowed: *mut u8,
     #[cfg(not(test))]
     ptr: *mut u8,
     len: usize,
@@ -149,6 +152,7 @@ impl LoadedSection {
         {
             Ok(Self {
                 data: alloc::vec![0u8; len],
+                borrowed: core::ptr::null_mut(),
                 len,
             })
         }
@@ -175,10 +179,29 @@ impl LoadedSection {
         Ok(section)
     }
 
+    /// Build several host-test sections inside one retained allocation.
+    ///
+    /// A Linux `kernel_symbol` uses signed PREL32 offsets, while independent
+    /// glibc allocations can land in arenas more than 2 GiB apart.  Runtime
+    /// sections use the contiguous x86 module window; this helper lets the
+    /// corresponding host test model that invariant deterministically.
+    #[cfg(test)]
+    fn borrowed_for_prel32_test(bytes: &mut [u8]) -> Self {
+        Self {
+            data: Vec::new(),
+            borrowed: bytes.as_mut_ptr(),
+            len: bytes.len(),
+        }
+    }
+
     fn as_ptr(&self) -> *const u8 {
         #[cfg(test)]
         {
-            self.data.as_ptr()
+            if self.borrowed.is_null() {
+                self.data.as_ptr()
+            } else {
+                self.borrowed
+            }
         }
 
         #[cfg(not(test))]
@@ -190,7 +213,11 @@ impl LoadedSection {
     fn as_mut_ptr(&mut self) -> *mut u8 {
         #[cfg(test)]
         {
-            self.data.as_mut_ptr()
+            if self.borrowed.is_null() {
+                self.data.as_mut_ptr()
+            } else {
+                self.borrowed
+            }
         }
 
         #[cfg(not(test))]
@@ -202,7 +229,14 @@ impl LoadedSection {
     fn as_slice(&self) -> &[u8] {
         #[cfg(test)]
         {
-            self.data.as_slice()
+            if self.borrowed.is_null() {
+                self.data.as_slice()
+            } else {
+                // SAFETY: the test-only constructor receives a live mutable
+                // slice, and its caller retains that backing allocation until
+                // after every section view is dropped.
+                unsafe { core::slice::from_raw_parts(self.borrowed, self.len) }
+            }
         }
 
         #[cfg(not(test))]
@@ -214,7 +248,13 @@ impl LoadedSection {
     fn as_mut_slice(&mut self) -> &mut [u8] {
         #[cfg(test)]
         {
-            self.data.as_mut_slice()
+            if self.borrowed.is_null() {
+                self.data.as_mut_slice()
+            } else {
+                // SAFETY: the PREL32 test creates disjoint section views into
+                // its retained backing allocation.
+                unsafe { core::slice::from_raw_parts_mut(self.borrowed, self.len) }
+            }
         }
 
         #[cfg(not(test))]
@@ -263,6 +303,10 @@ pub struct KernelModule {
     /// address here is required because vendor drivers pass `THIS_MODULE`
     /// through their public ABI.
     this_module_addr: usize,
+    /// x86 finalization state. This precedes `sections` so Linux's
+    /// `module_arch_cleanup()` equivalent runs while its section memory is
+    /// still retained.
+    _arch_metadata: X86ModuleMetadata,
     /// Linux `module_bug_list` membership. This field precedes `sections` so
     /// drop cleanup unlinks the BUG table before its backing memory is freed.
     bug_registration: ModuleBugRegistration,
@@ -1099,7 +1143,6 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
         ".return_sites",
         ".call_sites",
         ".ibt_endbr_seal",
-        ".smp_locks",
         ".orc_unwind",
         ".orc_unwind_ip",
         "__jump_table",
@@ -1379,6 +1422,18 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
         }
     }
 
+    // `post_relocation()` invokes the x86 `module_finalize()` hook after all
+    // RELA records have reached their runtime addresses. In particular,
+    // `.smp_locks` is a table of relocated PREL32 offsets. Linux's
+    // `alternatives_smp_module_add()` leaves those entries and their existing
+    // SMP-safe lock prefixes untouched unless the whole kernel was previously
+    // patched for UP execution; Lupos never enters that UP-patched state.
+    let arch_section_names = shdrs
+        .iter()
+        .filter_map(|sh| sec_name(sh))
+        .collect::<Vec<_>>();
+    let arch_metadata = module_finalize(&arch_section_names);
+
     // ── 7. Resolve `mod->init` / `mod->exit` ──────────────────────────────────
     // Linux invokes the function pointers in the relocated struct module.  Do
     // not substitute similarly named ELF globals: malformed input may define
@@ -1441,6 +1496,7 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
     let module = Arc::new(KernelModule {
         name: mod_name.clone(),
         this_module_addr,
+        _arch_metadata: arch_metadata,
         bug_registration,
         sections,
         exported_symbols,
@@ -1479,6 +1535,13 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
             );
         }
     }
+
+    // Linux worker threads may execute work queued by module_init() before
+    // the caller observes a successful load.  Lupos's cooperative workqueue
+    // model drains those callbacks here in task context; virtio-net uses this
+    // path to publish its initial carrier state from config_work.
+    #[cfg(not(test))]
+    crate::kernel::workqueue::drain_system_workqueues();
 
     // `do_init_module()` makes the descriptor live only after init succeeds.
     module.set_state(ModuleState::Live);
@@ -1581,7 +1644,7 @@ mod tests {
         let delta = to as isize - from as isize;
         assert!(
             delta >= i32::MIN as isize && delta <= i32::MAX as isize,
-            "test sections must be within the x86 module PREL32 window"
+            "test sections must be within the x86 module PREL32 window: from={from:#x} to={to:#x} delta={delta}"
         );
         delta as i32
     }
@@ -1701,22 +1764,25 @@ mod tests {
 
     #[test]
     fn parses_linux_prel32_ksymtab_exports() {
+        let mut backing = alloc::vec![0u8; 64];
+        backing[28] = KSYM_FLAG_GPL_ONLY;
+        backing[32..50].copy_from_slice(b"vp_modern_avq_num\0");
         let mut sections = BTreeMap::new();
         sections.insert(
             String::from(".text"),
-            LoadedSection::new_zeroed(16).expect("text allocation"),
+            LoadedSection::borrowed_for_prel32_test(&mut backing[0..16]),
         );
         sections.insert(
             String::from("__ksymtab"),
-            LoadedSection::new_zeroed(LINUX_KERNEL_SYMBOL_SIZE).expect("ksymtab allocation"),
+            LoadedSection::borrowed_for_prel32_test(&mut backing[16..28]),
         );
         sections.insert(
             String::from("__kflagstab"),
-            LoadedSection::from_bytes(&[KSYM_FLAG_GPL_ONLY]).expect("flags allocation"),
+            LoadedSection::borrowed_for_prel32_test(&mut backing[28..29]),
         );
         sections.insert(
             String::from("__ksymtab_strings"),
-            LoadedSection::from_bytes(b"vp_modern_avq_num\0").expect("strings allocation"),
+            LoadedSection::borrowed_for_prel32_test(&mut backing[32..50]),
         );
 
         let value_addr = sections[".text"].as_ptr() as usize + 4;

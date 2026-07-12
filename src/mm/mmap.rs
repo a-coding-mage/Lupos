@@ -813,7 +813,7 @@ unsafe fn put_page_from_pte(pte: pte_t, release_shared_anon: bool) {
         return;
     }
     let page = unsafe { &*page_ptr };
-    page._mapcount
+    page._mapcount()
         .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     let prev = page
         ._refcount

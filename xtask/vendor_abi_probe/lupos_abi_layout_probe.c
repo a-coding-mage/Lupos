@@ -14,11 +14,15 @@
 #include <linux/kthread.h>
 #include <linux/mount.h>
 #include <linux/module.h>
+#include <linux/netdevice.h>
 #include <linux/pagemap.h>
 #include <linux/pci.h>
 #include <linux/scatterlist.h>
+#include <linux/skbuff.h>
 #include <linux/virtio.h>
 #include <linux/workqueue.h>
+#include <net/netdev_rx_queue.h>
+#include <net/page_pool/types.h>
 
 #define ABI_OFFSET(type, member, expected) \
 	_Static_assert(offsetof(type, member) == (expected), \
@@ -258,6 +262,117 @@ ABI_OFFSET(struct scatterlist, dma_address, 16);
 ABI_OFFSET(struct scatterlist, dma_length, 24);
 ABI_OFFSET(struct scatterlist, dma_flags, 28);
 ABI_SIZE(struct scatterlist, 32);
+
+/* Network-driver hot-path records embedded in or dereferenced by
+ * virtio_net.ko.  These layouts are especially sensitive to SMP, NETPOLL,
+ * PAGE_POOL, XPS, RPS, BQL, SYSFS and skb feature configuration. */
+_Static_assert(_Alignof(struct net_device) == 64,
+	       "struct net_device alignment changed");
+ABI_OFFSET(struct net_device, netdev_ops, 8);
+ABI_OFFSET(struct net_device, _tx, 24);
+ABI_OFFSET(struct net_device, real_num_tx_queues, 40);
+ABI_OFFSET(struct net_device, num_tc, 54);
+ABI_OFFSET(struct net_device, mtu, 56);
+ABI_OFFSET(struct net_device, xps_maps, 128);
+ABI_OFFSET(struct net_device, state, 168);
+ABI_OFFSET(struct net_device, flags, 176);
+ABI_OFFSET(struct net_device, ifindex, 224);
+ABI_OFFSET(struct net_device, real_num_rx_queues, 228);
+ABI_OFFSET(struct net_device, _rx, 232);
+ABI_OFFSET(struct net_device, name, 288);
+ABI_OFFSET(struct net_device, addr_len, 808);
+ABI_OFFSET(struct net_device, priv_len, 824);
+ABI_OFFSET(struct net_device, dev_addr, 1088);
+ABI_OFFSET(struct net_device, num_rx_queues, 1096);
+ABI_OFFSET(struct net_device, num_tx_queues, 1176);
+ABI_OFFSET(struct net_device, tx_global_lock, 1196);
+ABI_OFFSET(struct net_device, reg_state, 1432);
+ABI_OFFSET(struct net_device, dev_addr_shadow, 2472);
+ABI_OFFSET(struct net_device, napi_config, 2544);
+ABI_OFFSET(struct net_device, num_napi_configs, 2552);
+ABI_SIZE(struct net_device, 2624);
+
+_Static_assert(_Alignof(struct netdev_queue) == 64,
+	       "struct netdev_queue alignment changed");
+ABI_OFFSET(struct netdev_queue, dev, 0);
+ABI_OFFSET(struct netdev_queue, dql, 128);
+ABI_OFFSET(struct netdev_queue, _xmit_lock, 256);
+ABI_OFFSET(struct netdev_queue, xmit_lock_owner, 260);
+ABI_OFFSET(struct netdev_queue, state, 272);
+ABI_OFFSET(struct netdev_queue, napi, 280);
+ABI_OFFSET(struct netdev_queue, numa_node, 288);
+ABI_SIZE(struct netdev_queue, 320);
+ABI_OFFSET(struct netdev_rx_queue, dev, 152);
+ABI_OFFSET(struct netdev_rx_queue, napi, 160);
+ABI_SIZE(struct netdev_rx_queue, 256);
+
+ABI_OFFSET(struct napi_struct, state, 0);
+ABI_OFFSET(struct napi_struct, poll_list, 8);
+ABI_OFFSET(struct napi_struct, weight, 24);
+ABI_OFFSET(struct napi_struct, poll, 32);
+ABI_OFFSET(struct napi_struct, poll_owner, 40);
+ABI_OFFSET(struct napi_struct, list_owner, 44);
+ABI_OFFSET(struct napi_struct, dev, 48);
+ABI_OFFSET(struct napi_struct, gro.rx_list, 264);
+ABI_OFFSET(struct napi_struct, gro_flush_timeout, 376);
+ABI_OFFSET(struct napi_struct, irq_suspend_timeout, 384);
+ABI_OFFSET(struct napi_struct, defer_hard_irqs, 392);
+ABI_OFFSET(struct napi_struct, napi_id, 396);
+ABI_OFFSET(struct napi_struct, dev_list, 400);
+ABI_OFFSET(struct napi_struct, napi_hash_node, 416);
+ABI_OFFSET(struct napi_struct, irq, 432);
+ABI_OFFSET(struct napi_struct, napi_rmap_idx, 496);
+ABI_OFFSET(struct napi_struct, config, 504);
+ABI_SIZE(struct napi_struct, 512);
+ABI_OFFSET(struct napi_config, gro_flush_timeout, 0);
+ABI_OFFSET(struct napi_config, irq_suspend_timeout, 8);
+ABI_OFFSET(struct napi_config, defer_hard_irqs, 16);
+ABI_OFFSET(struct napi_config, napi_id, 36);
+ABI_SIZE(struct napi_config, 40);
+
+ABI_OFFSET(struct sk_buff, dev, 16);
+ABI_OFFSET(struct sk_buff, len, 112);
+ABI_OFFSET(struct sk_buff, data_len, 116);
+ABI_OFFSET(struct sk_buff, mac_len, 120);
+_Static_assert(CLONED_OFFSET == 126, "struct sk_buff cloned flags moved");
+_Static_assert(PKT_TYPE_OFFSET == 128, "struct sk_buff pkt_type flags moved");
+ABI_OFFSET(struct sk_buff, alloc_cpu, 136);
+ABI_OFFSET(struct sk_buff, napi_id, 160);
+ABI_OFFSET(struct sk_buff, protocol, 180);
+ABI_OFFSET(struct sk_buff, transport_header, 182);
+ABI_OFFSET(struct sk_buff, network_header, 184);
+ABI_OFFSET(struct sk_buff, mac_header, 186);
+ABI_OFFSET(struct sk_buff, tail, 188);
+ABI_OFFSET(struct sk_buff, end, 192);
+ABI_OFFSET(struct sk_buff, head, 200);
+ABI_OFFSET(struct sk_buff, data, 208);
+ABI_OFFSET(struct sk_buff, truesize, 216);
+ABI_OFFSET(struct sk_buff, users, 220);
+ABI_SIZE(struct sk_buff, 232);
+ABI_OFFSET(struct skb_shared_info, nr_frags, 2);
+ABI_OFFSET(struct skb_shared_info, dataref, 32);
+ABI_OFFSET(struct skb_shared_info, frags, 48);
+ABI_SIZE(struct skb_shared_info, 320);
+
+ABI_OFFSET(struct page_pool_params, slow, 48);
+ABI_OFFSET(struct page_pool_params, slow.flags, 60);
+ABI_OFFSET(struct page_pool_params, slow.init_callback, 64);
+ABI_SIZE(struct page_pool_params, 80);
+_Static_assert(_Alignof(struct page_pool) == 64,
+	       "struct page_pool alignment changed");
+ABI_OFFSET(struct page_pool, cpuid, 48);
+ABI_OFFSET(struct page_pool, pages_state_hold_cnt, 52);
+ABI_OFFSET(struct page_pool, frag_users, 64);
+ABI_OFFSET(struct page_pool, frag_page, 72);
+ABI_OFFSET(struct page_pool, frag_offset, 80);
+ABI_OFFSET(struct page_pool, user_cnt, 1572);
+ABI_OFFSET(struct page_pool, slow, 1584);
+ABI_SIZE(struct page_pool, 1664);
+
+ABI_OFFSET(struct page, page_type, 48);
+ABI_OFFSET(struct page, _mapcount, 48);
+ABI_OFFSET(struct page, _refcount, 52);
+ABI_SIZE(struct page, 64);
 
 ABI_OFFSET(struct block_device, bd_stats, 32);
 ABI_OFFSET(struct block_device, bd_holder_lock, 96);

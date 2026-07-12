@@ -518,6 +518,7 @@ pub fn wait_for_aps(expected: usize, timeout_cycles: u64) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn ap_main(apic_id: u64) -> ! {
     let cpu_slot = (apic_id as usize).min(crate::kernel::sched::MAX_CPUS - 1);
+    crate::arch::x86::kernel::setup_percpu::setup_percpu_segment(cpu_slot);
     unsafe {
         crate::arch::x86::kernel::gdt::init_ap(cpu_slot);
         crate::arch::x86::kernel::fpu::init();

@@ -16,7 +16,7 @@
 //! `in_atomic()` ≡ `preempt_count() != 0`.  Sleeping in atomic context is a
 //! bug; `might_sleep()` `WARN_ON`s when violated.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
 
 use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::sched::MAX_CPUS;
@@ -40,9 +40,6 @@ pub const PREEMPT_MASK: u32 = ((1u32 << PREEMPT_BITS) - 1) << PREEMPT_SHIFT;
 pub const SOFTIRQ_MASK: u32 = ((1u32 << SOFTIRQ_BITS) - 1) << SOFTIRQ_SHIFT;
 pub const NMI_MASK: u32 = ((1u32 << NMI_BITS) - 1) << NMI_SHIFT;
 pub const HARDIRQ_MASK: u32 = ((1u32 << HARDIRQ_BITS) - 1) << HARDIRQ_SHIFT;
-
-/// One per-CPU preempt counter.  Index = LAPIC ID.
-static PREEMPT_COUNT: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
@@ -86,64 +83,69 @@ fn cpu_index() -> usize {
     }
 }
 
+#[inline]
+fn counter() -> &'static core::sync::atomic::AtomicU32 {
+    crate::arch::x86::kernel::setup_percpu::preempt_count_slot(cpu_index())
+}
+
 /// Read the current CPU's preempt count.
 #[inline]
 pub fn preempt_count() -> u32 {
-    PREEMPT_COUNT[cpu_index()].load(Ordering::Acquire)
+    counter().load(Ordering::Acquire)
 }
 
 /// Increment the preempt-disable counter.
 #[inline]
 pub fn preempt_disable() {
-    PREEMPT_COUNT[cpu_index()].fetch_add(PREEMPT_OFFSET, Ordering::AcqRel);
+    counter().fetch_add(PREEMPT_OFFSET, Ordering::AcqRel);
 }
 
 /// Decrement the preempt-disable counter.
 #[inline]
 pub fn preempt_enable() {
-    PREEMPT_COUNT[cpu_index()].fetch_sub(PREEMPT_OFFSET, Ordering::AcqRel);
+    counter().fetch_sub(PREEMPT_OFFSET, Ordering::AcqRel);
 }
 
 #[inline]
 pub fn local_bh_disable() {
-    PREEMPT_COUNT[cpu_index()].fetch_add(SOFTIRQ_OFFSET, Ordering::AcqRel);
+    counter().fetch_add(SOFTIRQ_OFFSET, Ordering::AcqRel);
 }
 
 #[inline]
 pub fn local_bh_enable() {
-    PREEMPT_COUNT[cpu_index()].fetch_sub(SOFTIRQ_OFFSET, Ordering::AcqRel);
+    counter().fetch_sub(SOFTIRQ_OFFSET, Ordering::AcqRel);
 }
 
 /// `__local_bh_disable_ip` — `vendor/linux/kernel/softirq.c`.
 #[unsafe(export_name = "__local_bh_disable_ip")]
 pub extern "C" fn linux___local_bh_disable_ip(_ip: usize, cnt: u32) {
-    PREEMPT_COUNT[cpu_index()].fetch_add(cnt, Ordering::AcqRel);
+    counter().fetch_add(cnt, Ordering::AcqRel);
 }
 
 /// `__local_bh_enable_ip` — `vendor/linux/kernel/softirq.c`.
 #[unsafe(export_name = "__local_bh_enable_ip")]
 pub extern "C" fn linux___local_bh_enable_ip(_ip: usize, cnt: u32) {
-    PREEMPT_COUNT[cpu_index()].fetch_sub(cnt, Ordering::AcqRel);
+    counter().fetch_sub(cnt, Ordering::AcqRel);
 }
 
 #[inline]
 pub fn __irq_enter_raw() {
-    PREEMPT_COUNT[cpu_index()].fetch_add(HARDIRQ_OFFSET, Ordering::AcqRel);
+    counter().fetch_add(HARDIRQ_OFFSET, Ordering::AcqRel);
 }
 
 #[inline]
 pub fn __irq_exit_raw() {
-    PREEMPT_COUNT[cpu_index()].fetch_sub(HARDIRQ_OFFSET, Ordering::AcqRel);
+    counter().fetch_sub(HARDIRQ_OFFSET, Ordering::AcqRel);
 }
 
 #[inline]
 pub fn __nmi_enter_raw() {
-    PREEMPT_COUNT[cpu_index()].fetch_add(NMI_OFFSET, Ordering::AcqRel);
+    counter().fetch_add(NMI_OFFSET, Ordering::AcqRel);
 }
 
 #[inline]
 pub fn __nmi_exit_raw() {
-    PREEMPT_COUNT[cpu_index()].fetch_sub(NMI_OFFSET, Ordering::AcqRel);
+    counter().fetch_sub(NMI_OFFSET, Ordering::AcqRel);
 }
 
 /// `in_atomic()` — true if any of preempt_disable / softirq / hardirq is held.

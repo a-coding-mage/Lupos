@@ -14,6 +14,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::include::uapi::errno::{EBUSY, EINVAL, ENODEV};
+use crate::kernel::locking::qspinlock::QSpinLock;
 use crate::net::skbuff::SkBuff;
 
 pub const IFF_UP: u32 = 0x1;
@@ -44,6 +45,9 @@ pub struct NetDevice {
     pub carrier: AtomicBool,
     pub tx_packets: AtomicU64,
     pub rx_packets: AtomicU64,
+    /// Authoritative configured Linux `struct net_device` for a vendor-built
+    /// C driver, when this registry entry represents one.
+    pub linux_dev: Option<usize>,
 }
 
 impl NetDevice {
@@ -73,13 +77,24 @@ static NEXT_IFINDEX: AtomicU32 = AtomicU32::new(1);
 static NETDEV_INIT_DONE: AtomicBool = AtomicBool::new(false);
 
 lazy_static! {
-    static ref RTNL: Mutex<()> = Mutex::new(());
     static ref NETDEV_BY_NAME: Mutex<BTreeMap<String, NetDeviceRef>> = Mutex::new(BTreeMap::new());
 }
 
+static RTNL: QSpinLock = QSpinLock::new();
+
 pub fn rtnl_lock<T>(f: impl FnOnce() -> T) -> T {
-    let _guard = RTNL.lock();
-    f()
+    RTNL.lock();
+    let result = f();
+    RTNL.unlock();
+    result
+}
+
+pub fn linux_rtnl_lock() {
+    RTNL.lock();
+}
+
+pub fn linux_rtnl_unlock() {
+    RTNL.unlock();
 }
 
 pub fn init() {
@@ -116,6 +131,7 @@ fn register_loopback_netdevice() -> Result<NetDeviceRef, i32> {
             carrier: AtomicBool::new(false),
             tx_packets: AtomicU64::new(0),
             rx_packets: AtomicU64::new(0),
+            linux_dev: None,
         });
         registry.insert(String::from("lo"), dev.clone());
         Ok(dev)
@@ -145,10 +161,66 @@ pub fn register_netdevice(
             carrier: AtomicBool::new(false),
             tx_packets: AtomicU64::new(0),
             rx_packets: AtomicU64::new(0),
+            linux_dev: None,
         });
         registry.insert(String::from(name), dev.clone());
         Ok(dev)
     })
+}
+
+pub fn register_linux_netdevice_locked(
+    name: &str,
+    mtu: u32,
+    dev_addr: [u8; 6],
+    linux_dev: *mut u8,
+) -> Result<NetDeviceRef, i32> {
+    validate_mtu(mtu)?;
+    if linux_dev.is_null() {
+        return Err(EINVAL);
+    }
+    let mut registry = NETDEV_BY_NAME.lock();
+    if registry.contains_key(name) {
+        return Err(EBUSY);
+    }
+    let dev = Arc::new(NetDevice {
+        ifindex: NEXT_IFINDEX.fetch_add(1, Ordering::AcqRel),
+        name: String::from(name),
+        mtu,
+        flags: AtomicU32::new(IFF_BROADCAST | IFF_MULTICAST),
+        dev_addr,
+        ops: &LINUX_NETDEV_OPS,
+        carrier: AtomicBool::new(false),
+        tx_packets: AtomicU64::new(0),
+        rx_packets: AtomicU64::new(0),
+        linux_dev: Some(linux_dev as usize),
+    });
+    registry.insert(String::from(name), dev.clone());
+    Ok(dev)
+}
+
+pub fn lookup_linux_netdevice(linux_dev: *const u8) -> Option<NetDeviceRef> {
+    let address = linux_dev as usize;
+    NETDEV_BY_NAME
+        .lock()
+        .values()
+        .find(|dev| dev.linux_dev == Some(address))
+        .cloned()
+}
+
+pub fn unregister_linux_netdevice_locked(linux_dev: *const u8) -> Result<(), i32> {
+    let address = linux_dev as usize;
+    let name = NETDEV_BY_NAME
+        .lock()
+        .iter()
+        .find(|(_, dev)| dev.linux_dev == Some(address))
+        .map(|(name, _)| name.clone());
+    match name {
+        Some(name) => {
+            NETDEV_BY_NAME.lock().remove(&name);
+            Ok(())
+        }
+        None => Err(ENODEV),
+    }
 }
 
 pub fn validate_mtu(mtu: u32) -> Result<(), i32> {
@@ -181,7 +253,19 @@ pub fn list_netdevices() -> alloc::vec::Vec<NetDeviceRef> {
 pub fn set_device_up(dev: &NetDeviceRef) -> Result<(), i32> {
     (dev.ops.open)(dev)?;
     dev.flags.fetch_or(IFF_UP | IFF_RUNNING, Ordering::AcqRel);
-    dev.carrier.store(true, Ordering::Release);
+    if let Some(raw) = dev.linux_dev.map(|ptr| ptr as *mut u8) {
+        unsafe {
+            let flags = raw.add(176).cast::<u32>();
+            flags.write_unaligned(flags.read_unaligned() | IFF_UP);
+            let state = &*raw.add(168).cast::<AtomicU64>();
+            state.fetch_or(1, Ordering::AcqRel);
+        }
+        if !dev.carrier_ok() {
+            dev.flags.fetch_and(!IFF_RUNNING, Ordering::AcqRel);
+        }
+    } else {
+        dev.carrier.store(true, Ordering::Release);
+    }
     Ok(())
 }
 
@@ -190,6 +274,14 @@ pub fn set_device_down(dev: &NetDeviceRef) -> Result<(), i32> {
     dev.flags
         .fetch_and(!(IFF_UP | IFF_RUNNING), Ordering::AcqRel);
     dev.carrier.store(false, Ordering::Release);
+    if let Some(raw) = dev.linux_dev.map(|ptr| ptr as *mut u8) {
+        unsafe {
+            let flags = raw.add(176).cast::<u32>();
+            flags.write_unaligned(flags.read_unaligned() & !IFF_UP);
+            let state = &*raw.add(168).cast::<AtomicU64>();
+            state.fetch_and(!1, Ordering::AcqRel);
+        }
+    }
     Ok(())
 }
 
@@ -219,6 +311,46 @@ fn dummy_start_xmit(dev: &NetDeviceRef, _skb: SkBuff) -> Result<(), i32> {
     Ok(())
 }
 
+unsafe fn linux_netdev_op(dev: &NetDeviceRef, offset: usize) -> Option<usize> {
+    let raw = dev.linux_dev? as *mut u8;
+    let ops = unsafe { raw.add(8).cast::<*const u8>().read_unaligned() };
+    if ops.is_null() {
+        return None;
+    }
+    let function = unsafe { ops.add(offset).cast::<usize>().read_unaligned() };
+    (function != 0).then_some(function)
+}
+
+fn linux_open(dev: &NetDeviceRef) -> Result<(), i32> {
+    let Some(raw) = dev.linux_dev.map(|ptr| ptr as *mut u8) else {
+        return Err(ENODEV);
+    };
+    let Some(function) = (unsafe { linux_netdev_op(dev, 16) }) else {
+        return Ok(());
+    };
+    let open: unsafe extern "C" fn(*mut u8) -> i32 = unsafe { core::mem::transmute(function) };
+    let result = unsafe { open(raw) };
+    if result == 0 { Ok(()) } else { Err(-result) }
+}
+
+fn linux_stop(dev: &NetDeviceRef) -> Result<(), i32> {
+    let Some(raw) = dev.linux_dev.map(|ptr| ptr as *mut u8) else {
+        return Err(ENODEV);
+    };
+    let Some(function) = (unsafe { linux_netdev_op(dev, 24) }) else {
+        return Ok(());
+    };
+    let stop: unsafe extern "C" fn(*mut u8) -> i32 = unsafe { core::mem::transmute(function) };
+    let result = unsafe { stop(raw) };
+    if result == 0 { Ok(()) } else { Err(-result) }
+}
+
+fn linux_start_xmit(_dev: &NetDeviceRef, _skb: SkBuff) -> Result<(), i32> {
+    // The raw skb bridge is installed with the packet path; fail closed until
+    // a configured C `struct sk_buff` can be passed to ndo_start_xmit.
+    Err(crate::include::uapi::errno::EOPNOTSUPP)
+}
+
 pub fn transmit(dev: &NetDeviceRef, skb: SkBuff) -> Result<(), i32> {
     (dev.ops.start_xmit)(dev, skb)
 }
@@ -235,6 +367,13 @@ pub static LOOPBACK_NETDEV_OPS: NetDeviceOps = NetDeviceOps {
     open: dummy_open,
     stop: dummy_stop,
     start_xmit: dummy_start_xmit,
+};
+
+pub static LINUX_NETDEV_OPS: NetDeviceOps = NetDeviceOps {
+    name: "linux-module",
+    open: linux_open,
+    stop: linux_stop,
+    start_xmit: linux_start_xmit,
 };
 
 #[cfg(test)]

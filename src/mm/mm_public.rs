@@ -61,7 +61,7 @@ pub fn thp_size(page: *const Page) -> usize {
 }
 
 pub fn page_mapped(page: *const Page) -> bool {
-    !page.is_null() && unsafe { (*page)._mapcount.load(Ordering::Relaxed) >= 0 }
+    !page.is_null() && unsafe { (*page)._mapcount().load(Ordering::Relaxed) >= 0 }
 }
 
 pub fn put_page_testzero(page: *const Page) -> bool {

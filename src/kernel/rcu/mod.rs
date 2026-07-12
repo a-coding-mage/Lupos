@@ -25,3 +25,30 @@ pub use tree::{
     synchronize_rcu,
 };
 pub use types::{RcuHead, rcu_head_init};
+
+use crate::kernel::module::{export_symbol, find_symbol};
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+/// Register the out-of-line PREEMPT_RCU entry points referenced by modules
+/// built with the vendor configuration.
+pub fn register_module_exports() {
+    export_symbol_once("__rcu_read_lock", linux___rcu_read_lock as usize, true);
+    export_symbol_once("__rcu_read_unlock", linux___rcu_read_unlock as usize, true);
+}
+
+/// `__rcu_read_lock()` — `vendor/linux/kernel/rcu/tree_plugin.h:412`.
+#[unsafe(export_name = "__rcu_read_lock")]
+pub extern "C" fn linux___rcu_read_lock() {
+    tree::rcu_read_lock();
+}
+
+/// `__rcu_read_unlock()` — `vendor/linux/kernel/rcu/tree_plugin.h:430`.
+#[unsafe(export_name = "__rcu_read_unlock")]
+pub extern "C" fn linux___rcu_read_unlock() {
+    tree::rcu_read_unlock();
+}

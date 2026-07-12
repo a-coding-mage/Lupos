@@ -7,10 +7,10 @@
 //! - vendor/linux/arch/x86/kernel/module.c
 //!
 //! The relocation writer delegates to the runtime loader's bounded x86_64
-//! implementation.  `module_finalize()` below only inventories metadata; it
-//! does not run the vendor ITS/FineIBT, return thunk, call thunk, alternatives,
-//! IBT sealing, SMP-lock, or ORC registration sequence.  The runtime loader
-//! therefore rejects those sections before allocation.
+//! implementation. `module_finalize()` mirrors the vendor section scan and
+//! finalizes `.smp_locks` for Lupos' current SMP text state. The runtime loader
+//! still rejects ITS/FineIBT, return thunk, call thunk, alternatives, IBT
+//! sealing, and ORC metadata which need unimplemented patching or registration.
 
 #![allow(dead_code)]
 
@@ -18,16 +18,30 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use crate::arch::x86::kernel::alternative::{
+    alternatives_smp_module_add, alternatives_smp_module_del,
+};
 use crate::kernel::module::relocate::{Rela, RelocType, apply_rela};
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub struct X86ModuleMetadata {
     pub has_jump_entries: bool,
     pub has_orc_unwind: bool,
     pub has_alternatives: bool,
+    pub has_smp_locks: bool,
     /// True only after `.altinstructions` has actually been patched.  Merely
     /// finding the section is not equivalent to Linux `apply_alternatives()`.
     pub alternatives_applied: bool,
+    /// Membership in Linux's `smp_alt_modules` list. This remains false while
+    /// Lupos keeps the SMP-safe lock prefixes and never enters the globally
+    /// UP-patched state.
+    smp_locks_registered: bool,
+}
+
+impl Drop for X86ModuleMetadata {
+    fn drop(&mut self) {
+        alternatives_smp_module_del(self.smp_locks_registered);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,11 +86,14 @@ pub fn clear_relocate_add(mem: &mut [u8], relocs: &[ResolvedRela]) {
 }
 
 pub fn module_finalize(sections: &[&str]) -> X86ModuleMetadata {
+    let has_smp_locks = sections.contains(&".smp_locks");
     X86ModuleMetadata {
         has_jump_entries: sections.iter().any(|s| *s == "__jump_table"),
         has_orc_unwind: sections.iter().any(|s| *s == ".orc_unwind"),
         has_alternatives: sections.iter().any(|s| *s == ".altinstructions"),
+        has_smp_locks,
         alternatives_applied: false,
+        smp_locks_registered: has_smp_locks && alternatives_smp_module_add(),
     }
 }
 
