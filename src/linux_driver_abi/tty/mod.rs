@@ -40,6 +40,32 @@ use spin::Mutex;
 
 use ldisc::NTtyState;
 
+/// Open-time dispatch for tty clone/devpts character devices.
+///
+/// Linux reaches these through `chrdev_open()` and `tty_open()`. Lupos binds
+/// most device operations directly to inodes, so `openat` calls this narrow
+/// dispatcher before allocating a generic `File`; that is where PTY open
+/// counts and automatic controlling-terminal assignment must occur.
+pub fn open_special_tty(
+    dentry: crate::fs::types::DentryRef,
+    flags: u32,
+    mode: u32,
+) -> Option<Result<crate::fs::types::FileRef, i32>> {
+    let inode = dentry.inode()?;
+    if inode.kind != crate::fs::types::InodeKind::Chardev {
+        return None;
+    }
+    let dev = inode.rdev.load(Ordering::Acquire) as u32;
+    let major = (dev & 0x000f_ff00) >> 8;
+    let minor = (dev & 0xff) | ((dev >> 12) & 0x000f_ff00);
+    match (major, minor) {
+        (5, 0) => Some(pty::open_current_tty(dentry, flags, mode)),
+        (5, 2) => Some(pty::open_ptmx(dentry, flags, mode)),
+        (pty::UNIX98_PTY_SLAVE_MAJOR, index) => Some(pty::open_slave(dentry, flags, mode, index)),
+        _ => None,
+    }
+}
+
 // ── TTY ioctl numbers (ABI-stable — from `include/uapi/asm-generic/ioctls.h`) ──
 pub const TIOCSCTTY: u32 = 0x540E;
 pub const TIOCGPGRP: u32 = 0x540F;

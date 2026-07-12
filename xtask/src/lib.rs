@@ -3910,7 +3910,9 @@ fn graphics_x11_probe_script() -> Vec<u8> {
     concat!(
         "#!/bin/sh\n",
         "export PATH=/usr/bin:/bin:/usr/sbin:/sbin\n",
-        "[ ! -r /run/lightdm/root/:0 ] || export XAUTHORITY=/run/lightdm/root/:0\n",
+        // The probe starts before LightDM creates the authority file.  Export
+        // its stable path now so later X clients read the cookie once it exists.
+        "export XAUTHORITY=/run/lightdm/root/:0\n",
         "echo 'graphics-x11: probe begin'\n",
         "xorg_log=/var/log/Xorg.0.log\n",
         "direct_xorg_log=/tmp/lupos-Xorg.0.log\n",
@@ -4044,6 +4046,13 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // Lupos currently exposes TASK_COMM_LEN-sized cmdlines through procfs,
         // so match the observable 15-byte prefix of lightdm-gtk-greeter.
         "if wait_for_process 'lightdm-gtk-gre' 30; then echo 'graphics-x11: greeter ok'; else echo 'graphics-x11: greeter missing'; for f in /var/log/lightdm/*.log; do [ -s \"$f\" ] && printf 'graphics-x11: greeter-log %s begin\\n' \"$f\" && tail -80 \"$f\" && printf 'graphics-x11: greeter-log %s end\\n' \"$f\"; done; fi\n",
+        // A greeter process exists long before it finishes its cold GTK/font
+        // initialization under TCG.  Starting xterm in that interval makes a
+        // short host-style deadline measure X-server contention, so wait for
+        // LightDM's protocol connection before exercising the application.
+        "echo 'graphics-x11: greeter-ready-probe begin'\n",
+        "i=0; while [ \"$i\" -lt 120 ] && ! grep -q 'Greeter connected' /var/log/lightdm/lightdm.log 2>/dev/null; do i=$((i + 1)); sleep 1; done\n",
+        "if grep -q 'Greeter connected' /var/log/lightdm/lightdm.log 2>/dev/null; then echo 'graphics-x11: greeter-ready ok'; else echo 'graphics-x11: greeter-ready missing'; fi\n",
         "echo 'graphics-x11: timeout-sanity begin'\n",
         "if timeout 3 sh -c 'sleep 30' >/tmp/lupos-timeout-sanity.log 2>&1; then\n",
         "    echo 'graphics-x11: timeout-sanity unexpected-ok'\n",
@@ -4075,6 +4084,29 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    echo 'graphics-x11: pointer not-detected'\n",
         "fi\n",
         "if [ -s \"$ptr_log\" ]; then echo 'graphics-x11: pointer-log begin'; grep -iE 'LuposMouse|event1|pointer|relative axes' \"$ptr_log\" | tail -25; echo 'graphics-x11: pointer-log end'; fi\n",
+        // Exercise the application and interactive job-control path from the
+        // reported regression, not just a second openpty(3) consumer. Bash's
+        // interactive startup blocks itself with SIGTTIN unless xterm's slave
+        // open made it the session's controlling tty and foreground pgrp.
+        "echo 'graphics-x11: xterm-shell-probe begin'\n",
+        "rm -f /tmp/lupos-xterm-shell.ok /tmp/lupos-xterm-shell.log\n",
+        "if [ ! -x /usr/bin/xterm ]; then\n",
+        "    echo 'graphics-x11: xterm-shell missing-xterm'\n",
+        "elif [ ! -x /usr/bin/bash ]; then\n",
+        "    echo 'graphics-x11: xterm-shell missing-bash'\n",
+        "elif [ ! -S /tmp/.X11-unix/X0 ]; then\n",
+        "    echo 'graphics-x11: xterm-shell missing-xserver'\n",
+        "else\n",
+        "    DISPLAY=:0 timeout -k 10 90 /usr/bin/xterm -geometry 40x8+0+0 -e /usr/bin/bash --noprofile --norc -i -c 'case \"$-\" in *i*) ;; *) exit 70;; esac; case \"$-\" in *m*) ;; *) exit 71;; esac; test -t 0 && test -t 1 && test -t 2 || exit 72; tty_path=\"$(tty)\" || exit 73; case \"$tty_path\" in /dev/pts/[0-9]*) ;; *) exit 74;; esac; stty -a </dev/tty >/dev/null 2>&1 || exit 75; printf \"XTERM_INTERACTIVE_OK flags=%s tty=%s pid=%s\\n\" \"$-\" \"$tty_path\" \"$$\" > /tmp/lupos-xterm-shell.ok' >/tmp/lupos-xterm-shell.log 2>&1\n",
+        "    xrc=$?\n",
+        "    if [ \"$xrc\" -eq 0 ] && grep -q XTERM_INTERACTIVE_OK /tmp/lupos-xterm-shell.ok 2>/dev/null; then\n",
+        "        echo 'graphics-x11: xterm-shell ok'\n",
+        "        printf 'graphics-x11: xterm-shell-state '; cat /tmp/lupos-xterm-shell.ok\n",
+        "    else\n",
+        "        printf 'graphics-x11: xterm-shell failed rc=%s marker=%s\\n' \"$xrc\" \"$(cat /tmp/lupos-xterm-shell.ok 2>/dev/null || true)\"\n",
+        "    fi\n",
+        "    if [ -s /tmp/lupos-xterm-shell.log ]; then echo 'graphics-x11: xterm-shell-log begin'; tail -40 /tmp/lupos-xterm-shell.log; echo 'graphics-x11: xterm-shell-log end'; fi\n",
+        "fi\n",
         // UNIX98 pty end-to-end check: util-linux `script` calls openpty()
         // (open /dev/ptmx -> grantpt -> unlockpt -> ptsname -> open /dev/pts/N),
         // forks a child on the slave, and reads the child's output back through
@@ -4086,23 +4118,20 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "elif [ ! -x /usr/bin/script ]; then\n",
         "    echo 'graphics-x11: pty-roundtrip no-script'\n",
         "else\n",
-        // Round-tripping the marker through the pty (master reads what the
-        // child wrote to the slave) exercises the entire path xterm needs:
-        // openpt -> unlockpt -> ptsname -> open slave -> fork/exec on the slave
-        // -> bidirectional IO -> slave-close EOF back to the master.  That is
-        // the pass criterion; util-linux `script`'s own exit status also covers
-        // typescript bookkeeping/teardown beyond the pty itself.\n",
-        // `timeout` guards against util-linux `script`'s teardown occasionally
-        // wedging after a successful round-trip; the marker in .out already
-        // proves the pty path, so a killed teardown must not stall the probe.
-        "    timeout -k 5 20 script -qec 'echo PTY_ROUNDTRIP_OK' /tmp/lupos-pty.log >/tmp/lupos-pty.out 2>/tmp/lupos-pty.err; sc=$?\n",
-        "    if grep -q PTY_ROUNDTRIP_OK /tmp/lupos-pty.out /tmp/lupos-pty.log 2>/dev/null; then\n",
+        // Feed commands into an interactive child rather than using `-c echo`,
+        // which only proves slave-to-master output.  The side-effect file can
+        // only be created after the shell consumes master-to-slave input; a
+        // script(1)'s status is reported separately; the real-xterm probe above
+        // owns the clean child-exit/PTY-teardown acceptance criterion.
+        "    rm -f /tmp/lupos-pty-child.ok /tmp/lupos-pty.log /tmp/lupos-pty.out /tmp/lupos-pty.err\n",
+        "    printf '%s\\n' 'printf PTY_INPUT_OK > /tmp/lupos-pty-child.ok' 'exit' | timeout -k 5 20 script -q -e -f -c /bin/sh /tmp/lupos-pty.log >/tmp/lupos-pty.out 2>/tmp/lupos-pty.err; sc=$?\n",
+        "    if grep -q PTY_INPUT_OK /tmp/lupos-pty-child.ok 2>/dev/null; then\n",
         "        printf 'graphics-x11: pty-roundtrip ok (script-rc=%s)\\n' \"$sc\"\n",
         "    else\n",
-        "        printf 'graphics-x11: pty-roundtrip failed rc=%s\\n' \"$sc\"\n",
+        "        printf 'graphics-x11: pty-roundtrip failed rc=%s marker=%s\\n' \"$sc\" \"$(cat /tmp/lupos-pty-child.ok 2>/dev/null || true)\"\n",
         "    fi\n",
         "    if [ -e /dev/pts/0 ]; then echo 'graphics-x11: devpts-slave present'; fi\n",
-        "    for f in /tmp/lupos-pty.log /tmp/lupos-pty.out /tmp/lupos-pty.err; do\n",
+        "    for f in /tmp/lupos-pty-child.ok /tmp/lupos-pty.log /tmp/lupos-pty.out /tmp/lupos-pty.err; do\n",
         "        if [ -s \"$f\" ]; then printf 'graphics-x11: pty-diag %s begin\\n' \"$f\"; tail -30 \"$f\"; printf '\\ngraphics-x11: pty-diag %s end\\n' \"$f\"; fi\n",
         "    done\n",
         "fi\n",
@@ -13725,10 +13754,13 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: xorg-log present",
         "graphics-x11: lightdm ok",
         "graphics-x11: greeter ok",
+        "graphics-x11: greeter-ready ok",
         "graphics-x11: timeout-sanity ok",
         "graphics-x11: xclient-roundtrip ok",
         "graphics-x11: pointer ok",
         "graphics-x11: pty-roundtrip ok",
+        "graphics-x11: xterm-shell ok",
+        "graphics-x11: xterm-shell-state XTERM_INTERACTIVE_OK",
         // The pre-glycin gdk-pixbuf loads PNG icons in-process (no glycin
         // subprocess), a private D-Bus session bus round-trips, and the XFCE
         // complete desktop process set actually comes up.
@@ -13755,6 +13787,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: xorg-log missing",
         "graphics-x11: lightdm missing",
         "graphics-x11: greeter missing",
+        "graphics-x11: greeter-ready missing",
         "graphics-x11: timeout-sanity unexpected-ok",
         "graphics-x11: timeout-sanity failed",
         "graphics-x11: xclient-roundtrip failed",
@@ -13762,6 +13795,10 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: pty-roundtrip failed",
         "graphics-x11: pty-roundtrip no-ptmx",
         "graphics-x11: pty-roundtrip no-script",
+        "graphics-x11: xterm-shell failed",
+        "graphics-x11: xterm-shell missing-xterm",
+        "graphics-x11: xterm-shell missing-bash",
+        "graphics-x11: xterm-shell missing-xserver",
         "graphics-x11: pointer not-detected",
         "graphics-x11: pixbuf failed",
         "graphics-x11: dbus failed",

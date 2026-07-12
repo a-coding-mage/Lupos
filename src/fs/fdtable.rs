@@ -85,6 +85,7 @@ impl FilesStruct {
         cloexec: bool,
     ) -> Result<i32, i32> {
         if min_fd >= NR_OPEN_MAX {
+            fput(file);
             return Err(EMFILE);
         }
         let mut t = self.table.lock();
@@ -97,7 +98,11 @@ impl FilesStruct {
         }
 
         let fd = t.len().max(min_fd);
-        self.ensure_len_locked(&mut t, fd + 1)?;
+        if let Err(errno) = self.ensure_len_locked(&mut t, fd + 1) {
+            drop(t);
+            fput(file);
+            return Err(errno);
+        }
         t[fd].file = Some(file);
         t[fd].flags = if cloexec { FD_CLOEXEC } else { 0 };
         Ok(fd as i32)

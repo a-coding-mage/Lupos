@@ -35,7 +35,9 @@ use crate::fs::ops::FileOps;
 use crate::fs::ramfs::{RAMFS_FILE_INODE_OPS, RAMFS_FILE_OPS, ramfs_symlink};
 use crate::fs::read_write::{vfs_read, vfs_write};
 use crate::fs::super_block::mount_fs;
-use crate::fs::types::{Inode, InodeKind, InodePrivate, init_inode_metadata, touch_inode_now};
+use crate::fs::types::{
+    Dentry, Inode, InodeKind, InodePrivate, InodeRef, init_inode_metadata, touch_inode_now,
+};
 use crate::fs::{self, DentryRef};
 use crate::include::uapi::errno::{EINVAL, ENODEV, ENOENT, ENOEXEC, ENOSPC, EOPNOTSUPP, EROFS};
 use crate::include::uapi::fcntl::{O_NONBLOCK, O_RDONLY, O_RDWR};
@@ -648,9 +650,34 @@ fn console_poll(
     mask
 }
 
-fn console_ioctl(_file: &crate::fs::types::FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
+fn console_ioctl(file: &crate::fs::types::FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
     if cmd == crate::linux_driver_abi::tty::TIOCGWINSZ {
         refresh_console_winsize();
+    }
+    if cmd == crate::linux_driver_abi::tty::TIOCSCTTY {
+        let task = unsafe { crate::kernel::sched::get_current() };
+        if !task.is_null() {
+            let pid = unsafe { (*task).pid };
+            let rdev = file
+                .inode()
+                .map(|inode| inode.rdev.load(Ordering::Acquire))
+                .unwrap_or(0);
+            let clone_rdev =
+                crate::init::noinitramfs::new_encode_dev(crate::init::noinitramfs::mkdev(5, 0))
+                    as u64;
+            let tty = if rdev == clone_rdev {
+                crate::kernel::session::controlling_tty(pid)
+                    .filter(|tty| matches!(tty, crate::kernel::session::ControllingTty::Console(_)))
+                    .unwrap_or(crate::kernel::session::ControllingTty::Console(rdev))
+            } else {
+                crate::kernel::session::ControllingTty::Console(rdev)
+            };
+            // Keep the existing console compatibility path authoritative for
+            // early getty/login process-group setup. The side-table claim is
+            // used only to resolve `/dev/tty`; Linux eligibility failures do
+            // not prevent the underlying tty ioctl from running here.
+            let _ = crate::kernel::session::claim_controlling_tty(pid, tty);
+        }
     }
     crate::linux_driver_abi::tty::tty_ioctl_compat(cmd, arg)
 }
@@ -1837,7 +1864,17 @@ fn create_special_node(
     mode: u32,
     fops: &'static FileOps,
 ) -> Result<(), i32> {
-    create_special_node_with_metadata(path, kind, mode, 0, 0, 1, 0, fops)
+    create_special_node_with_metadata_and_private(
+        path,
+        kind,
+        mode,
+        0,
+        0,
+        1,
+        0,
+        fops,
+        empty_ram_bytes(),
+    )
 }
 
 fn create_special_node_with_metadata(
@@ -1849,6 +1886,30 @@ fn create_special_node_with_metadata(
     nlink: u32,
     mtime: u64,
     fops: &'static FileOps,
+) -> Result<(), i32> {
+    create_special_node_with_metadata_and_private(
+        path,
+        kind,
+        mode,
+        uid,
+        gid,
+        nlink,
+        mtime,
+        fops,
+        empty_ram_bytes(),
+    )
+}
+
+fn create_special_node_with_metadata_and_private(
+    path: &str,
+    kind: InodeKind,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u32,
+    mtime: u64,
+    fops: &'static FileOps,
+    private: InodePrivate,
 ) -> Result<(), i32> {
     let (parent_path, leaf) = split_parent(path)?;
     let parent = ensure_dir(parent_path, DEFAULT_DIR_MODE)?;
@@ -1867,7 +1928,7 @@ fn create_special_node_with_metadata(
         mode,
         &RAMFS_FILE_INODE_OPS,
         fops,
-        empty_ram_bytes(),
+        private,
     );
     init_inode_metadata(&inode, uid, gid, nlink, mtime);
     *inode.sb.lock() = Some(sb);
@@ -1929,29 +1990,97 @@ fn replace_special_node(
     create_special_node(path, kind, mode, fops)
 }
 
+fn devpts_inode_token(inode: &InodeRef) -> Option<usize> {
+    match &inode.private {
+        InodePrivate::Opaque(token) if *token != 0 => Some(*token),
+        _ => None,
+    }
+}
+
 /// devpts: materialise `/dev/pts/<index>` for a freshly allocated pty slave.
 /// Called from the pty master allocation path.  Linux's devpts creates this
 /// node (char major 136) when `/dev/ptmx` hands out a new master.
-pub(crate) fn devpts_create_slave(index: u32) -> Result<(), i32> {
-    let path = alloc::format!("/dev/pts/{}", index);
-    create_special_node(
-        &path,
+pub(crate) fn devpts_create_slave(index: u32, token: usize) -> Result<(), i32> {
+    use crate::init::noinitramfs::{mkdev, new_encode_dev};
+
+    let leaf = alloc::format!("{}", index);
+    let parent = ensure_dir("/dev/pts", DEFAULT_DIR_MODE)?;
+    let parent_inode = parent.inode().ok_or(EINVAL)?;
+    let sb = parent_inode.sb.lock().clone().ok_or(EINVAL)?;
+    let inode = Inode::new(
+        sb.alloc_ino(),
         InodeKind::Chardev,
         0o620,
+        &RAMFS_FILE_INODE_OPS,
         &crate::linux_driver_abi::tty::pty::PTS_SLAVE_FILE_OPS,
-    )?;
-    set_node_rdev(
-        &path,
-        crate::linux_driver_abi::tty::pty::UNIX98_PTY_SLAVE_MAJOR,
-        index,
+        InodePrivate::Opaque(token),
     );
+    init_inode_metadata(&inode, 0, 0, 1, 0);
+    inode.rdev.store(
+        new_encode_dev(mkdev(
+            crate::linux_driver_abi::tty::pty::UNIX98_PTY_SLAVE_MAJOR,
+            index,
+        )) as u64,
+        Ordering::Release,
+    );
+    *inode.sb.lock() = Some(sb);
+
+    let inserted_new = match &parent_inode.private {
+        InodePrivate::RamDir(children) => {
+            let mut dentries = parent.children.write();
+            let mut children = children.lock();
+            let inserted_new = children.insert(leaf.clone(), inode.clone()).is_none();
+            let child = Dentry::new_negative(&leaf);
+            *child.parent.lock() = Some(parent.clone());
+            child.instantiate(inode);
+            dentries.insert(leaf.clone(), child);
+            inserted_new
+        }
+        _ => return Err(EINVAL),
+    };
+    if inserted_new {
+        crate::fs::ramfs::dir_account_insert(&parent_inode);
+    }
+    touch_inode_now(&parent_inode);
     Ok(())
 }
 
 /// devpts: tear down `/dev/pts/<index>` when its pty pair is freed.
-pub(crate) fn devpts_remove_slave(index: u32) {
-    let path = alloc::format!("/dev/pts/{}", index);
-    let _ = remove_special_node(&path);
+pub(crate) fn devpts_remove_slave(index: u32, token: usize) {
+    let leaf = alloc::format!("{}", index);
+    let Some(parent) = path_walk("/dev/pts") else {
+        return;
+    };
+    let Some(parent_inode) = parent.inode() else {
+        return;
+    };
+
+    let removed = match &parent_inode.private {
+        InodePrivate::RamDir(children) => {
+            let mut dentries = parent.children.write();
+            let mut children = children.lock();
+            let Some(inode) = children.get(leaf.as_str()).cloned() else {
+                return;
+            };
+            if devpts_inode_token(&inode) != Some(token) {
+                return;
+            }
+            children.remove(leaf.as_str());
+            let cached_matches = dentries
+                .get(leaf.as_str())
+                .and_then(|dentry| dentry.inode())
+                .is_some_and(|cached| Arc::ptr_eq(&cached, &inode));
+            if cached_matches {
+                dentries.remove(leaf.as_str());
+            }
+            true
+        }
+        _ => false,
+    };
+    if removed {
+        crate::fs::ramfs::dir_account_remove(&parent_inode);
+        touch_inode_now(&parent_inode);
+    }
 }
 
 /// Assign a device number (`st_rdev`) to an already-created special node.

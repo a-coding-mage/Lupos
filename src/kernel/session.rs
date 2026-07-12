@@ -25,6 +25,24 @@ struct SessionEntry {
 
 static SESSIONS: Mutex<Vec<SessionEntry>> = Mutex::new(Vec::new());
 
+/// The terminal attached to a session.  Linux stores this as
+/// `signal_struct::tty`; keeping the stable device identity here gives every
+/// process in the session the same `/dev/tty` view without coupling task state
+/// to a particular tty implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControllingTty {
+    Console(u64),
+    Unix98Pty(u32, usize),
+}
+
+#[derive(Clone, Copy)]
+struct ControllingTtyEntry {
+    sid: i32,
+    tty: ControllingTty,
+}
+
+static CONTROLLING_TTYS: Mutex<Vec<ControllingTtyEntry>> = Mutex::new(Vec::new());
+
 fn current_pid() -> Result<i32, i32> {
     let task = unsafe { sched::get_current() };
     if task.is_null() {
@@ -86,6 +104,41 @@ pub fn session_id(pid: i32) -> Option<i32> {
         .iter()
         .find(|entry| entry.pid == pid)
         .map(|entry| entry.sid)
+}
+
+/// Return the controlling terminal visible to `pid` through `/dev/tty`.
+pub fn controlling_tty(pid: i32) -> Option<ControllingTty> {
+    let sid = session_id(pid).unwrap_or(pid);
+    CONTROLLING_TTYS
+        .lock()
+        .iter()
+        .find(|entry| entry.sid == sid)
+        .map(|entry| entry.tty)
+}
+
+/// Attach `tty` to a session leader that does not already have a controlling
+/// terminal.  This is the state transition performed by Linux
+/// `tty_open_proc_set_tty()` for a readable tty opened without `O_NOCTTY`.
+pub fn claim_controlling_tty(pid: i32, tty: ControllingTty) -> Result<(), i32> {
+    let sid = session_id(pid).unwrap_or(pid);
+    if pid != sid {
+        return Err(EPERM);
+    }
+
+    let mut table = CONTROLLING_TTYS.lock();
+    if let Some(entry) = table.iter().find(|entry| entry.sid == sid) {
+        return if entry.tty == tty { Ok(()) } else { Err(EPERM) };
+    }
+    if table.iter().any(|entry| entry.tty == tty) {
+        return Err(EPERM);
+    }
+    table.push(ControllingTtyEntry { sid, tty });
+    Ok(())
+}
+
+/// Drop every session reference to a tty that is being hung up.
+pub fn clear_controlling_tty(tty: ControllingTty) {
+    CONTROLLING_TTYS.lock().retain(|entry| entry.tty != tty);
 }
 
 /// Inherit the parent's session and process group for a freshly forked child.
@@ -170,6 +223,7 @@ pub unsafe fn sys_setpgid(pid: i32, pgid: i32) -> i64 {
 #[cfg(test)]
 pub fn reset_for_tests() {
     SESSIONS.lock().clear();
+    CONTROLLING_TTYS.lock().clear();
 }
 
 #[cfg(test)]

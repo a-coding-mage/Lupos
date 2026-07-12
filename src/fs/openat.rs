@@ -322,6 +322,18 @@ fn do_openat2_with_path_hint(
         } else {
             inode.fops
         };
+        if flags & O_PATH == 0
+            && let Some(result) = crate::linux_driver_abi::tty::open_special_tty(
+                dentry.clone(),
+                file_status_flags_for_open(flags),
+                mode,
+            )
+        {
+            return Ok(OpenResult {
+                file: result?,
+                cloexec: flags & O_CLOEXEC != 0,
+            });
+        }
         let f = alloc_file(dentry, file_status_flags_for_open(flags), mode, fops);
         return Ok(OpenResult {
             file: f,
@@ -464,6 +476,18 @@ fn do_openat2_with_path_hint(
     } else {
         inode.fops
     };
+    if flags & O_PATH == 0
+        && let Some(result) = crate::linux_driver_abi::tty::open_special_tty(
+            dentry.clone(),
+            file_status_flags_for_open(flags),
+            mode,
+        )
+    {
+        return Ok(OpenResult {
+            file: result?,
+            cloexec: flags & O_CLOEXEC != 0,
+        });
+    }
     let f = alloc_file(dentry, file_status_flags_for_open(flags), mode, fops);
     Ok(OpenResult {
         file: f,
