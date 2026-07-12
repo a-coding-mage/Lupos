@@ -2186,6 +2186,28 @@ pub fn has_unblocked_pending_signals(task: *const crate::kernel::task::TaskStruc
     task_has_unblocked_pending_signal_state(task)
 }
 
+/// Linux `is_ignored()` — `drivers/tty/tty_jobctrl.c`. Used by
+/// `__tty_check_change()` to decide whether a background job-control signal
+/// (SIGTTIN/SIGTTOU) should actually be delivered: `sig` is blocked, or the
+/// process installed an explicit `SIG_IGN` handler for it. Unlike
+/// [`signal_ignored_for_state`], a *default*-ignored signal does not count —
+/// SIGTTIN/SIGTTOU both default to `Stop`, so this only matters for the
+/// explicit-handler and blocked-mask cases the kernel checks.
+pub fn signal_is_blocked_or_explicitly_ignored(pid: i32, sig: i32) -> bool {
+    if !valid_signal(sig) {
+        return false;
+    }
+    let table = SIGNAL_TABLE.lock();
+    table
+        .states
+        .iter()
+        .find(|state| state.pid == pid)
+        .is_some_and(|state| {
+            state.blocked.contains(sig)
+                || handler_kind(&state.actions[sig as usize]) == HandlerKind::Ignore
+        })
+}
+
 fn task_has_unblocked_pending_signal_state(task: *const crate::kernel::task::TaskStruct) -> bool {
     if task.is_null() {
         return false;

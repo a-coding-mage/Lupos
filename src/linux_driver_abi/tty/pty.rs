@@ -26,13 +26,16 @@ use spin::Mutex;
 
 use super::{
     KernelTermios, KernelTermios2, TCFLSH, TCGETS, TCGETS2, TCSBRK, TCSETS, TCSETS2, TCSETSF,
-    TCSETSF2, TCSETSW, TCSETSW2, TIOCEXCL, TIOCGPGRP, TIOCGSID, TIOCGWINSZ, TIOCNXCL, TIOCSCTTY,
-    TIOCSPGRP, TIOCSWINSZ, Winsize,
+    TCSETSF2, TCSETSW, TCSETSW2, TIOCEXCL, TIOCGPGRP, TIOCGSID, TIOCGWINSZ, TIOCNOTTY, TIOCNXCL,
+    TIOCSCTTY, TIOCSPGRP, TIOCSTI, TIOCSWINSZ, Winsize,
 };
 use crate::fs::ops::{FileOps, IoctlFn, PollFn};
 use crate::fs::types::{DentryRef, FileRef, InodePrivate};
-use crate::include::uapi::errno::{EAGAIN, EFAULT, EINVAL, EIO, ENODEV, ENOTTY, ENXIO};
-use crate::include::uapi::fcntl::{O_ACCMODE, O_NOCTTY, O_WRONLY};
+use crate::include::uapi::errno::{
+    EAGAIN, EBUSY, EFAULT, EINVAL, EIO, ENODEV, ENOTTY, ENXIO, EPERM,
+};
+use crate::include::uapi::fcntl::{O_ACCMODE, O_CLOEXEC, O_NOCTTY, O_WRONLY};
+use crate::kernel::capability::CAP_SYS_ADMIN;
 use crate::kernel::sched::wait::WaitQueueHead;
 use crate::kernel::task::task_state::TASK_INTERRUPTIBLE;
 
@@ -54,6 +57,12 @@ pub const TIOCPKT: u32 = 0x5420;
 pub const TIOCGPKT: u32 = 0x8004_5438;
 /// `FIONREAD` / `TIOCINQ` — bytes available for reading.
 pub const FIONREAD: u32 = 0x541B;
+/// `TIOCOUTQ` — bytes not yet drained from the output buffer.
+pub const TIOCOUTQ: u32 = 0x5411;
+/// `TIOCGPTPEER` — safely open the slave from the master fd (`_IO('T', 0x41)`).
+pub const TIOCGPTPEER: u32 = 0x5441;
+/// `TIOCGEXCL` — read `TTY_EXCLUSIVE` state (`_IOR('T', 0x40, int)`).
+pub const TIOCGEXCL: u32 = 0x8004_5440;
 
 // ── termios flag bits we honour (asm-generic/termbits.h) ──────────────────────
 const IGNCR: u32 = 0x0080;
@@ -66,6 +75,9 @@ const ICANON: u32 = 0x0002;
 const ECHO: u32 = 0x0008;
 const ECHOE: u32 = 0x0010;
 const NOFLSH: u32 = 0x0080;
+// `TOSTOP` (asm-generic/termbits.h) — background writes to the controlling
+// tty get SIGTTOU only when this bit is set; unset by default.
+const TOSTOP: u32 = 0x0100;
 
 // c_cc indexes (asm-generic/termbits.h).
 const VINTR: usize = 0;
@@ -81,6 +93,8 @@ const SIGCONT: i32 = 18;
 const SIGINT: i32 = 2;
 const SIGQUIT: i32 = 3;
 const SIGTSTP: i32 = 20;
+const SIGTTIN: i32 = 21;
+const SIGTTOU: i32 = 22;
 
 /// Linux UNIX98 pty slave major (`drivers/tty/pty.c` — `UNIX98_PTY_SLAVE_MAJOR`).
 pub const UNIX98_PTY_SLAVE_MAJOR: u32 = 136;
@@ -117,6 +131,10 @@ pub struct Pty {
     slave_write_wait: WaitQueueHead,
     pgrp: AtomicI32,
     session: AtomicI32,
+    /// `TTY_EXCLUSIVE` — set by `TIOCEXCL`, cleared by `TIOCNXCL`. While set,
+    /// further slave opens are rejected with `EBUSY` for non-`CAP_SYS_ADMIN`
+    /// callers (`drivers/tty/tty_io.c::tty_open()`).
+    exclusive: AtomicBool,
 }
 
 impl Pty {
@@ -150,6 +168,7 @@ impl Pty {
             slave_write_wait: WaitQueueHead::new(),
             pgrp: AtomicI32::new(0),
             session: AtomicI32::new(0),
+            exclusive: AtomicBool::new(false),
         })
     }
 
@@ -458,6 +477,43 @@ fn claim_as_controlling_tty_live(pty: &Arc<Pty>) -> Result<(), i32> {
     claim_as_controlling_tty_locked(pty)
 }
 
+/// `true` if `pty`'s slave is `pid`'s controlling terminal right now.
+fn is_controlling_tty(pid: i32, pty: &Arc<Pty>) -> bool {
+    matches!(
+        crate::kernel::session::controlling_tty(pid),
+        Some(crate::kernel::session::ControllingTty::Unix98Pty(index, token))
+            if index == pty.index && token == pty.token
+    )
+}
+
+/// Linux `__tty_check_change()` — `drivers/tty/tty_jobctrl.c`. A background
+/// process (not in `pty.pgrp`) that reads or writes its controlling tty gets
+/// stopped via `SIGTTIN`/`SIGTTOU` instead of silently proceeding. If the
+/// signal is blocked/explicitly ignored, or the caller's process group is
+/// orphaned (no job-control shell left to `SIGCONT` it), the syscall just
+/// fails with `EIO` rather than sending a signal nothing will ever undo.
+fn tty_check_change(pty: &Arc<Pty>, sig: i32) -> Result<(), i32> {
+    let Some(pid) = current_pid() else {
+        return Ok(());
+    };
+    if !is_controlling_tty(pid, pty) {
+        return Ok(());
+    }
+    let pgrp = crate::kernel::session::process_group(pid).unwrap_or(pid);
+    let tty_pgrp = pty.pgrp.load(Ordering::Acquire);
+    if tty_pgrp == 0 || pgrp == tty_pgrp {
+        return Ok(());
+    }
+    if crate::kernel::signal::signal_is_blocked_or_explicitly_ignored(pid, sig) {
+        return if sig == SIGTTIN { Err(EIO) } else { Ok(()) };
+    }
+    if crate::kernel::session::pgrp_is_orphaned(pid) {
+        return Err(EIO);
+    }
+    crate::kernel::signal::send_signal_to_process_group(pgrp, sig);
+    Err(ERESTARTSYS)
+}
+
 fn bind_slave_locked(file: &FileRef, pty: &Arc<Pty>) {
     let mut slot = file.private.lock();
     if *slot == 0 {
@@ -491,6 +547,12 @@ fn open_bound_slave(
     }
     if !pty.master_open.load(Ordering::Acquire) || pty.locked.load(Ordering::Acquire) {
         return Err(EIO);
+    }
+    // `tty_open()` — a `TIOCEXCL`'d tty rejects further opens unless the
+    // caller has `CAP_SYS_ADMIN`.
+    if pty.exclusive.load(Ordering::Acquire) && !crate::kernel::capability::capable(CAP_SYS_ADMIN)
+    {
+        return Err(EBUSY);
     }
 
     let file = crate::fs::file::alloc_file(dentry, flags, mode, &PTS_SLAVE_FILE_OPS);
@@ -604,6 +666,7 @@ fn ptmx_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i3
     loop {
         let n = pty.master_read(buf);
         if n > 0 {
+            super::tty_update_time(file, false);
             return Ok(n);
         }
         // `pty_close(slave)` sets `TTY_OTHER_CLOSED` on the master;
@@ -659,6 +722,9 @@ fn ptmx_write(file: &FileRef, buf: &[u8], pos: &mut u64) -> Result<usize, i32> {
     }
     pty.master_write(buf);
     *pos = pos.saturating_add(buf.len() as u64);
+    if !buf.is_empty() {
+        super::tty_update_time(file, true);
+    }
     Ok(buf.len())
 }
 
@@ -714,8 +780,37 @@ fn ptmx_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
             put_user_u32(arg, pty.to_master.lock().len() as u32)?;
             Ok(0)
         }
-        _ => pty_common_ioctl(&pty, cmd, arg),
+        // `ptm_open_peer()` — race-free slave open for callers that hold only
+        // the master fd (e.g. don't trust/have access to the /dev/pts mount).
+        // `arg` carries the new fd's open flags; unlike other ioctls this one
+        // returns the installed fd number itself, not 0.
+        TIOCGPTPEER => open_ptpeer(&pty, arg as u32),
+        _ => pty_common_ioctl(&pty, cmd, arg, true),
     }
+}
+
+fn current_files() -> Result<Arc<crate::fs::fdtable::FilesStruct>, i32> {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return Err(ENODEV);
+    }
+    unsafe { crate::kernel::files::get_task_files(task) }.ok_or(ENODEV)
+}
+
+/// `ptm_open_peer()` — `drivers/tty/pty.c`. Opens the slave through the same
+/// in-kernel path `/dev/pts/<n>` resolves to and installs it as a new fd in
+/// the caller's table, exactly as `dentry_open()` + `FD_ADD()` do upstream.
+fn open_ptpeer(pty: &Arc<Pty>, flags: u32) -> Result<i64, i32> {
+    let path = alloc::format!("/dev/pts/{}", pty.index);
+    let dentry = crate::fs::mount::path_walk(&path).ok_or(ENODEV)?;
+    // Guard against the slot having been freed and reused between
+    // `master_pty()` above and this lookup.
+    if dentry_pty_token(&dentry) != Some(pty.token) {
+        return Err(ENODEV);
+    }
+    let slave = open_bound_slave(dentry, flags, 0, pty.index, Some(pty.token), true, ENODEV)?;
+    let fd = current_files()?.install(slave, flags & O_CLOEXEC != 0)?;
+    Ok(fd as i64)
 }
 
 fn ptmx_release(file: FileRef) {
@@ -773,9 +868,13 @@ fn pts_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i32
         return Ok(0);
     }
     let pty = slave_attach(file).ok_or(EIO)?;
+    // Linux `job_control()` — a background process reading its controlling
+    // tty is stopped with SIGTTIN before the first read attempt.
+    tty_check_change(&pty, SIGTTIN)?;
     loop {
         let n = pty.slave_read(buf);
         if n > 0 {
+            super::tty_update_time(file, false);
             return Ok(n);
         }
         // Master gone → EOF for the slave.
@@ -816,11 +915,19 @@ fn pts_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i32
 
 fn pts_write(file: &FileRef, buf: &[u8], pos: &mut u64) -> Result<usize, i32> {
     let pty = slave_attach(file).ok_or(EIO)?;
+    // Linux `n_tty_write()` — background writes only get SIGTTOU when the
+    // slave's termios has `TOSTOP` set (unset by default, per POSIX).
+    if pty.termios.lock().c_lflag & TOSTOP != 0 {
+        tty_check_change(&pty, SIGTTOU)?;
+    }
     if !pty.master_open.load(Ordering::Acquire) {
         return Err(EIO);
     }
     pty.slave_write(buf);
     *pos = pos.saturating_add(buf.len() as u64);
+    if !buf.is_empty() {
+        super::tty_update_time(file, true);
+    }
     Ok(buf.len())
 }
 
@@ -843,7 +950,7 @@ fn pts_poll(file: &FileRef, mut table: Option<&mut crate::fs::select::PollTable>
 
 fn pts_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
     let pty = slave_attach(file).ok_or(ENODEV)?;
-    pty_common_ioctl(&pty, cmd, arg)
+    pty_common_ioctl(&pty, cmd, arg, false)
 }
 
 fn pts_release(file: FileRef) {
@@ -879,7 +986,7 @@ fn pts_release(file: FileRef) {
 
 // ── Shared job-control / termios ioctls ────────────────────────────────────────
 
-fn pty_common_ioctl(pty: &Arc<Pty>, cmd: u32, arg: u64) -> Result<i64, i32> {
+fn pty_common_ioctl(pty: &Arc<Pty>, cmd: u32, arg: u64, is_master: bool) -> Result<i64, i32> {
     match cmd {
         TCGETS => {
             let t = *pty.termios.lock();
@@ -921,17 +1028,80 @@ fn pty_common_ioctl(pty: &Arc<Pty>, cmd: u32, arg: u64) -> Result<i64, i32> {
             claim_as_controlling_tty_live(pty)?;
             Ok(0)
         }
+        // `tiocgpgrp()` (`tty_jobctrl.c`): via the *master* fd this reports
+        // the slave's pgrp unconditionally (the master usually isn't anyone's
+        // controlling tty); via the *slave* fd the caller must own it as its
+        // controlling terminal or get `ENOTTY`.
         TIOCGPGRP => {
+            if !is_master {
+                let pid = current_pid().ok_or(ENOTTY)?;
+                if !is_controlling_tty(pid, pty) {
+                    return Err(ENOTTY);
+                }
+            }
             put_user_u32(arg, pty.pgrp.load(Ordering::Acquire) as u32)?;
             Ok(0)
         }
+        // `tiocspgrp()`: always checked against the slave, regardless of
+        // which fd the ioctl arrived on — the caller must have this pty as
+        // its controlling terminal, and the target pgrp must belong to the
+        // caller's session.
         TIOCSPGRP => {
+            match tty_check_change(pty, SIGTTOU) {
+                Err(EIO) => return Err(ENOTTY),
+                other => other?,
+            }
             let pgrp = get_user_i32(arg)?;
+            if pgrp < 0 {
+                return Err(EINVAL);
+            }
+            let pid = current_pid().ok_or(ENOTTY)?;
+            if !is_controlling_tty(pid, pty) {
+                return Err(ENOTTY);
+            }
+            let caller_sid = crate::kernel::session::session_id(pid).unwrap_or(pid);
+            let target_sid = crate::kernel::session::session_id(pgrp).unwrap_or(pgrp);
+            if target_sid != caller_sid {
+                return Err(EPERM);
+            }
             pty.pgrp.store(pgrp, Ordering::Release);
             Ok(0)
         }
         TIOCGSID => {
-            put_user_u32(arg, pty.session.load(Ordering::Acquire) as u32)?;
+            if !is_master {
+                let pid = current_pid().ok_or(ENOTTY)?;
+                if !is_controlling_tty(pid, pty) {
+                    return Err(ENOTTY);
+                }
+            }
+            let sid = pty.session.load(Ordering::Acquire);
+            if sid == 0 {
+                return Err(ENOTTY);
+            }
+            put_user_u32(arg, sid as u32)?;
+            Ok(0)
+        }
+        // `tiocnotty()`: only meaningful via the slave fd — Linux checks the
+        // ioctl's own `tty` (the master struct for `/dev/ptmx`, which is
+        // never anyone's controlling terminal), so the master side always
+        // reports `ENOTTY` here.
+        TIOCNOTTY => {
+            if is_master {
+                return Err(ENOTTY);
+            }
+            let pid = current_pid().ok_or(ENOTTY)?;
+            if !is_controlling_tty(pid, pty) {
+                return Err(ENOTTY);
+            }
+            let pgrp = pty.pgrp.swap(0, Ordering::AcqRel);
+            pty.session.store(0, Ordering::Release);
+            crate::kernel::session::clear_controlling_tty(
+                crate::kernel::session::ControllingTty::Unix98Pty(pty.index, pty.token),
+            );
+            if pgrp > 0 {
+                crate::kernel::signal::send_signal_to_process_group(pgrp, SIGHUP);
+                crate::kernel::signal::send_signal_to_process_group(pgrp, SIGCONT);
+            }
             Ok(0)
         }
         // On the slave, TIOCINQ/FIONREAD reports bytes readable *from* the
@@ -941,9 +1111,93 @@ fn pty_common_ioctl(pty: &Arc<Pty>, cmd: u32, arg: u64) -> Result<i64, i32> {
             put_user_u32(arg, n)?;
             Ok(0)
         }
-        // Break/flush/exclusive-mode requests are accepted as no-ops, matching
-        // the console tty compat path (`tty_ioctl_compat`).
-        TCSBRK | TCFLSH | TIOCEXCL | TIOCNXCL => Ok(0),
+        // `n_tty_ioctl()` TIOCOUTQ — `tty_chars_in_buffer()`: bytes written to
+        // this end that the peer has not consumed yet. A pty's "output
+        // buffer" is the linked side's read queue.
+        TIOCOUTQ => {
+            let n = if is_master {
+                pty.to_slave.lock().len() as u32
+            } else {
+                pty.to_master.lock().len() as u32
+            };
+            put_user_u32(arg, n)?;
+            Ok(0)
+        }
+        // Break requests are accepted as no-ops, matching the console tty
+        // compat path (`tty_ioctl_compat`) — pty has no line to hold in break.
+        TCSBRK => Ok(0),
+        // `tty_perform_flush()` (`drivers/tty/tty_ioctl.c`) — discard the
+        // buffered data for this fd's own read side (`TCIFLUSH`), write side
+        // (`TCOFLUSH`), or both (`TCIOFLUSH`). "Read"/"write" flip depending
+        // on which end of the pair the ioctl arrived on.
+        TCFLSH => {
+            match arg as u32 {
+                0 => {
+                    if is_master {
+                        pty.to_master.lock().clear();
+                    } else {
+                        pty.to_slave.lock().clear();
+                        pty.canon.lock().clear();
+                    }
+                }
+                1 => {
+                    if is_master {
+                        pty.to_slave.lock().clear();
+                        pty.canon.lock().clear();
+                    } else {
+                        pty.to_master.lock().clear();
+                    }
+                }
+                2 => {
+                    pty.to_master.lock().clear();
+                    pty.to_slave.lock().clear();
+                    pty.canon.lock().clear();
+                }
+                _ => return Err(EINVAL),
+            }
+            Ok(0)
+        }
+        TIOCEXCL => {
+            pty.exclusive.store(true, Ordering::Release);
+            Ok(0)
+        }
+        TIOCNXCL => {
+            pty.exclusive.store(false, Ordering::Release);
+            Ok(0)
+        }
+        TIOCGEXCL => {
+            put_user_u32(arg, pty.exclusive.load(Ordering::Acquire) as u32)?;
+            Ok(0)
+        }
+        // `ptm_open_peer()` rejects any tty whose driver isn't `ptm_driver` —
+        // i.e. calling this through the slave fd always fails.
+        TIOCGPTPEER => Err(EIO),
+        // `tiocsti()` — `drivers/tty/tty_io.c`. Fake an input character.
+        // Gated by the `legacy_tiocsti` sysctl (EIO) and by controlling-tty
+        // ownership (EPERM); CAP_SYS_ADMIN bypasses both. Note both checks
+        // use the *current* process's capabilities, not the fd opener's.
+        TIOCSTI => {
+            let admin = crate::kernel::capability::capable(CAP_SYS_ADMIN);
+            if !super::legacy_tiocsti_enabled() && !admin {
+                return Err(EIO);
+            }
+            let pid = current_pid().ok_or(EIO)?;
+            if !is_controlling_tty(pid, pty) && !admin {
+                return Err(EPERM);
+            }
+            let ch = get_user_u8(arg)?;
+            if is_master {
+                // Fake input *to the master*: bytes a master read() would
+                // see, i.e. the slave-output queue, unprocessed.
+                pty.to_master.lock().push_back(ch);
+                pty.master_read_wait.wake_up_all();
+            } else {
+                // Fake input to the slave: run the byte through the same
+                // n_tty input processing a real master write performs.
+                pty.master_write(&[ch]);
+            }
+            Ok(0)
+        }
         _ => Err(ENOTTY),
     }
 }
@@ -971,6 +1225,17 @@ fn put_user_u32(arg: u64, val: u32) -> Result<(), i32> {
         return Err(EFAULT);
     }
     unsafe { crate::arch::x86::kernel::uaccess::put_user_u32(arg as *mut u32, val) }.map_err(|e| -e)
+}
+
+fn get_user_u8(arg: u64) -> Result<u8, i32> {
+    if arg == 0 {
+        return Err(EFAULT);
+    }
+    let mut ch = 0u8;
+    let not_copied = unsafe {
+        crate::arch::x86::kernel::uaccess::copy_from_user(&mut ch as *mut u8, arg as *const u8, 1)
+    };
+    if not_copied == 0 { Ok(ch) } else { Err(EFAULT) }
 }
 
 fn get_user_i32(arg: u64) -> Result<i32, i32> {

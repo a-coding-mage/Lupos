@@ -4053,6 +4053,16 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "echo 'graphics-x11: greeter-ready-probe begin'\n",
         "i=0; while [ \"$i\" -lt 120 ] && ! grep -q 'Greeter connected' /var/log/lightdm/lightdm.log 2>/dev/null; do i=$((i + 1)); sleep 1; done\n",
         "if grep -q 'Greeter connected' /var/log/lightdm/lightdm.log 2>/dev/null; then echo 'graphics-x11: greeter-ready ok'; else echo 'graphics-x11: greeter-ready missing'; fi\n",
+        // The tty sysctls Linux registers from `tty_init()` (drivers/tty/
+        // tty_io.c::tty_table).  The vendor kselftest tty_tiocsti_test.c
+        // skips entirely when this file is absent, so its presence (and the
+        // CONFIG_LEGACY_TIOCSTI=y default of 1) is the observable contract.
+        "echo 'graphics-x11: tty-sysctl-probe begin'\n",
+        "if [ \"$(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null)\" = '1' ] && [ \"$(cat /proc/sys/dev/tty/ldisc_autoload 2>/dev/null)\" = '1' ]; then\n",
+        "    echo 'graphics-x11: tty-sysctl ok'\n",
+        "else\n",
+        "    printf 'graphics-x11: tty-sysctl missing legacy_tiocsti=%s ldisc_autoload=%s\\n' \"$(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null || echo ENOENT)\" \"$(cat /proc/sys/dev/tty/ldisc_autoload 2>/dev/null || echo ENOENT)\"\n",
+        "fi\n",
         "echo 'graphics-x11: timeout-sanity begin'\n",
         "if timeout 3 sh -c 'sleep 30' >/tmp/lupos-timeout-sanity.log 2>&1; then\n",
         "    echo 'graphics-x11: timeout-sanity unexpected-ok'\n",
@@ -13755,6 +13765,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: lightdm ok",
         "graphics-x11: greeter ok",
         "graphics-x11: greeter-ready ok",
+        "graphics-x11: tty-sysctl ok",
         "graphics-x11: timeout-sanity ok",
         "graphics-x11: xclient-roundtrip ok",
         "graphics-x11: pointer ok",
@@ -13788,6 +13799,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: lightdm missing",
         "graphics-x11: greeter missing",
         "graphics-x11: greeter-ready missing",
+        "graphics-x11: tty-sysctl missing",
         "graphics-x11: timeout-sanity unexpected-ok",
         "graphics-x11: timeout-sanity failed",
         "graphics-x11: xclient-roundtrip failed",

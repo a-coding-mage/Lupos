@@ -687,6 +687,63 @@ fn add_abi_sysctls(dir: &Arc<KernfsNode>) {
     add_child(dir, abi);
 }
 
+fn legacy_tiocsti_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    let v = crate::linux_driver_abi::tty::legacy_tiocsti_enabled() as u32;
+    super::util::copy_into(buf, &format!("{v}\n"))
+}
+
+fn legacy_tiocsti_store(_node: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize, i32> {
+    // Linux `proc_dobool` — only 0 and 1 are accepted.
+    let v = parse_usize_sysctl(buf)?;
+    if v > 1 {
+        return Err(EINVAL);
+    }
+    crate::linux_driver_abi::tty::set_legacy_tiocsti(v != 0);
+    Ok(buf.len())
+}
+
+fn ldisc_autoload_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    let v = crate::linux_driver_abi::tty::ldisc_autoload_enabled() as u32;
+    super::util::copy_into(buf, &format!("{v}\n"))
+}
+
+fn ldisc_autoload_store(_node: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize, i32> {
+    // Linux `proc_dointvec_minmax` with extra1=SYSCTL_ZERO, extra2=SYSCTL_ONE.
+    let v = parse_usize_sysctl(buf)?;
+    if v > 1 {
+        return Err(EINVAL);
+    }
+    crate::linux_driver_abi::tty::set_ldisc_autoload(v != 0);
+    Ok(buf.len())
+}
+
+fn add_dev_sysctls(dir: &Arc<KernfsNode>) {
+    // Linux `tty_init()` — `register_sysctl_init("dev/tty", tty_table)`,
+    // `drivers/tty/tty_io.c::tty_table`.
+    let dev = KernfsNode::new_dir("dev", 0o555);
+    let tty = KernfsNode::new_dir("tty", 0o555);
+    add_child(
+        &tty,
+        KernfsNode::new_file(
+            "legacy_tiocsti",
+            0o644,
+            Some(legacy_tiocsti_show),
+            Some(legacy_tiocsti_store),
+        ),
+    );
+    add_child(
+        &tty,
+        KernfsNode::new_file(
+            "ldisc_autoload",
+            0o644,
+            Some(ldisc_autoload_show),
+            Some(ldisc_autoload_store),
+        ),
+    );
+    add_child(&dev, tty);
+    add_child(dir, dev);
+}
+
 pub fn new_sys_dir() -> Arc<KernfsNode> {
     let dir = KernfsNode::new_dir("sys", 0o555);
     let kernel = KernfsNode::new_dir("kernel", 0o555);
@@ -696,6 +753,7 @@ pub fn new_sys_dir() -> Arc<KernfsNode> {
     let vm = KernfsNode::new_dir("vm", 0o555);
     add_vm_sysctls(&vm);
     add_child(&dir, vm);
+    add_dev_sysctls(&dir);
 
     let fs = KernfsNode::new_dir("fs", 0o555);
     add_child(
