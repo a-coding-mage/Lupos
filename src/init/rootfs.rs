@@ -757,10 +757,15 @@ pub fn bootstrap_initramfs_rootfs_with_options(options: &BootOptions) -> Result<
             mount_boot_partition_if_available()?;
             mount_pseudo_filesystems()?;
             let _ = options.console_on_rootfs_ready(path_exists);
-            // Acceptance-only legacy gates inspect module state before PID1.
+            // Acceptance-only legacy gates inspect module state or run static
+            // PID1 payloads before vendor-style userspace module loading.
             // Production disk-root images carry /init and load modules from
             // early userspace, matching vendor Linux.
-            #[cfg(any(feature = "test-initramfs-rootfs", feature = "test-disk-root-remount"))]
+            #[cfg(any(
+                feature = "test-initramfs-rootfs",
+                feature = "test-disk-root-remount",
+                feature = "test-pid1-handoff"
+            ))]
             load_configured_modules()?;
             return Ok(());
         }
@@ -782,7 +787,11 @@ pub fn bootstrap_initramfs_rootfs_with_options(options: &BootOptions) -> Result<
     mount_boot_partition_if_available()?;
     mount_pseudo_filesystems()?;
     let _ = options.console_on_rootfs_ready(path_exists);
-    #[cfg(any(feature = "test-initramfs-rootfs", feature = "test-disk-root-remount"))]
+    #[cfg(any(
+        feature = "test-initramfs-rootfs",
+        feature = "test-disk-root-remount",
+        feature = "test-pid1-handoff"
+    ))]
     load_configured_modules()?;
     Ok(())
 }

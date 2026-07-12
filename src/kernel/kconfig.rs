@@ -52,7 +52,18 @@ pub const CONFIG_HID: Tristate = config_value!(CONFIG_HID);
 pub const CONFIG_USB: Tristate = config_value!(CONFIG_USB);
 pub const CONFIG_USB_XHCI: Tristate = config_value!(CONFIG_USB_XHCI);
 pub const CONFIG_SOUND: Tristate = config_value!(CONFIG_SOUND);
+pub const CONFIG_SND: Tristate = config_value!(CONFIG_SND);
+pub const CONFIG_SND_TIMER: Tristate = config_value!(CONFIG_SND_TIMER);
+pub const CONFIG_SND_PCM: Tristate = config_value!(CONFIG_SND_PCM);
+pub const CONFIG_SND_HWDEP: Tristate = config_value!(CONFIG_SND_HWDEP);
+pub const CONFIG_SND_HDA_CORE: Tristate = config_value!(CONFIG_SND_HDA_CORE);
+pub const CONFIG_SND_INTEL_SOUNDWIRE_ACPI: Tristate =
+    config_value!(CONFIG_SND_INTEL_SOUNDWIRE_ACPI);
+pub const CONFIG_SND_INTEL_DSP_CONFIG: Tristate = config_value!(CONFIG_SND_INTEL_DSP_CONFIG);
+pub const CONFIG_SND_HDA: Tristate = config_value!(CONFIG_SND_HDA);
+pub const CONFIG_SND_HDA_HWDEP: Tristate = config_value!(CONFIG_SND_HDA_HWDEP);
 pub const CONFIG_SND_HDA_INTEL: Tristate = config_value!(CONFIG_SND_HDA_INTEL);
+pub const CONFIG_SND_HDA_GENERIC: Tristate = config_value!(CONFIG_SND_HDA_GENERIC);
 pub const CONFIG_VIRTIO: Tristate = config_value!(CONFIG_VIRTIO);
 pub const CONFIG_VIRTIO_PCI: Tristate = config_value!(CONFIG_VIRTIO_PCI);
 pub const CONFIG_VIRTIO_BLK: Tristate = config_value!(CONFIG_VIRTIO_BLK);
@@ -143,8 +154,48 @@ pub const CONFIG_SYMBOLS: &[ConfigSymbol] = &[
         value: CONFIG_SOUND,
     },
     ConfigSymbol {
+        name: "CONFIG_SND",
+        value: CONFIG_SND,
+    },
+    ConfigSymbol {
+        name: "CONFIG_SND_TIMER",
+        value: CONFIG_SND_TIMER,
+    },
+    ConfigSymbol {
+        name: "CONFIG_SND_PCM",
+        value: CONFIG_SND_PCM,
+    },
+    ConfigSymbol {
+        name: "CONFIG_SND_HWDEP",
+        value: CONFIG_SND_HWDEP,
+    },
+    ConfigSymbol {
+        name: "CONFIG_SND_HDA_CORE",
+        value: CONFIG_SND_HDA_CORE,
+    },
+    ConfigSymbol {
+        name: "CONFIG_SND_INTEL_SOUNDWIRE_ACPI",
+        value: CONFIG_SND_INTEL_SOUNDWIRE_ACPI,
+    },
+    ConfigSymbol {
+        name: "CONFIG_SND_INTEL_DSP_CONFIG",
+        value: CONFIG_SND_INTEL_DSP_CONFIG,
+    },
+    ConfigSymbol {
+        name: "CONFIG_SND_HDA",
+        value: CONFIG_SND_HDA,
+    },
+    ConfigSymbol {
+        name: "CONFIG_SND_HDA_HWDEP",
+        value: CONFIG_SND_HDA_HWDEP,
+    },
+    ConfigSymbol {
         name: "CONFIG_SND_HDA_INTEL",
         value: CONFIG_SND_HDA_INTEL,
+    },
+    ConfigSymbol {
+        name: "CONFIG_SND_HDA_GENERIC",
+        value: CONFIG_SND_HDA_GENERIC,
     },
     ConfigSymbol {
         name: "CONFIG_VIRTIO",

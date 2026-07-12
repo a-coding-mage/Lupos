@@ -139,13 +139,72 @@ endmenu
 menu "Sound support"
 
 config SOUND
-	bool "Sound card support"
+	tristate "Sound card support"
+	default m if MODULES
+	default y
+
+config SND
+	tristate "Advanced Linux Sound Architecture"
+	depends on SOUND
+	default m if MODULES
+
+config SND_TIMER
+	tristate
+	depends on SND
+	default m if SND
+
+config SND_PCM
+	tristate
+	depends on SND
+	select SND_TIMER
+	default m if SND
+
+config SND_HWDEP
+	tristate
+	depends on SND
+	default m if SND_HDA_HWDEP
+
+config SND_HDA_CORE
+	tristate
+	depends on SND
+	select SND_PCM
+	default m if SND_HDA
+
+config SND_INTEL_SOUNDWIRE_ACPI
+	tristate
+	depends on SND && ACPI
+	default m if SND_INTEL_DSP_CONFIG
+
+config SND_INTEL_DSP_CONFIG
+	tristate
+	depends on SND
+	select SND_INTEL_SOUNDWIRE_ACPI if ACPI
+	default m if SND_HDA_INTEL
+
+config SND_HDA
+	tristate
+	depends on SND
+	select SND_PCM
+	select SND_HDA_CORE
+	default m if SND_HDA_INTEL
+
+config SND_HDA_HWDEP
+	bool "Build hwdep interface for HD-audio driver"
+	depends on SND_HDA
+	select SND_HWDEP
 	default y
 
 config SND_HDA_INTEL
-	bool "Intel HD Audio support"
-	depends on SOUND && PCI
-	default y
+	tristate "Intel HD Audio support"
+	depends on SND && PCI
+	select SND_HDA
+	select SND_INTEL_DSP_CONFIG
+	default m if MODULES
+
+config SND_HDA_GENERIC
+	tristate "Generic HD-audio codec parser"
+	depends on SND_HDA
+	default m if SND_HDA_INTEL
 
 endmenu
 

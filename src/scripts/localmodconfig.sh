@@ -17,8 +17,10 @@ DEFCONFIG="${DEFCONFIG:-configs/lupos_defconfig}"
 # CONFIG_DRM_VIRTIO_GPU=m
 # CONFIG_USB_XHCI=y
 # CONFIG_HID=y
-# CONFIG_SOUND=y
-# CONFIG_SND_HDA_INTEL=y
+# CONFIG_SOUND=m
+# CONFIG_SND=m
+# CONFIG_SND_HDA_INTEL=m
+# CONFIG_SND_HDA_GENERIC=m
 # CONFIG_VIRTIO_PCI_LIB=m
 # CONFIG_VIRTIO_PCI=m
 # CONFIG_VIRTIO_BLK=m
@@ -159,8 +161,18 @@ fi
 
 if has "Audio|HDA|HD Audio|0403|ICH9|Intel.*Audio|qemu|bochs|kvm"; then
 	emit PCI
-	emit SOUND
-	emit SND_HDA_INTEL
+	emit_module SOUND
+	emit_module SND
+	emit_module SND_TIMER
+	emit_module SND_PCM
+	emit_module SND_HWDEP
+	emit_module SND_HDA_CORE
+	emit_module SND_INTEL_SOUNDWIRE_ACPI
+	emit_module SND_INTEL_DSP_CONFIG
+	emit_module SND_HDA
+	emit SND_HDA_HWDEP
+	emit_module SND_HDA_INTEL
+	emit_module SND_HDA_GENERIC
 fi
 
 if has "virtio|1af4:|qemu|bochs|kvm"; then
