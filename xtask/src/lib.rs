@@ -3095,6 +3095,143 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         linux_make_target: "e1000.ko",
         module_deps: &[],
     },
+    // Vendor-built ALSA/HDA modules.  The x86_64 defconfig enables the HDA
+    // controller; Lupos stages the whole Linux module closure because the
+    // kernel does not reimplement soundcore/ALSA/HDA in Rust.  Keep codec
+    // drivers before snd_hda_intel so probing sees registered codec parsers,
+    // matching vendor/linux/sound/hda/Makefile ordering.
+    DriverModuleSpec {
+        symbol: "CONFIG_SOUND",
+        module_name: "soundcore",
+        module_path: "kernel/sound/soundcore.ko",
+        vendor_linux_ref: "vendor/linux/sound/sound_core.c",
+        linux_make_dir: "sound",
+        linux_make_target: "soundcore.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND",
+        module_name: "snd",
+        module_path: "kernel/sound/core/snd.ko",
+        vendor_linux_ref: "vendor/linux/sound/core/sound.c",
+        linux_make_dir: "sound/core",
+        linux_make_target: "snd.ko",
+        module_deps: &["kernel/sound/soundcore.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND_TIMER",
+        module_name: "snd_timer",
+        module_path: "kernel/sound/core/snd-timer.ko",
+        vendor_linux_ref: "vendor/linux/sound/core/timer.c",
+        linux_make_dir: "sound/core",
+        linux_make_target: "snd-timer.ko",
+        module_deps: &["kernel/sound/core/snd.ko", "kernel/sound/soundcore.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND_PCM",
+        module_name: "snd_pcm",
+        module_path: "kernel/sound/core/snd-pcm.ko",
+        vendor_linux_ref: "vendor/linux/sound/core/pcm.c",
+        linux_make_dir: "sound/core",
+        linux_make_target: "snd-pcm.ko",
+        module_deps: &[
+            "kernel/sound/core/snd-timer.ko",
+            "kernel/sound/core/snd.ko",
+            "kernel/sound/soundcore.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND_HWDEP",
+        module_name: "snd_hwdep",
+        module_path: "kernel/sound/core/snd-hwdep.ko",
+        vendor_linux_ref: "vendor/linux/sound/core/hwdep.c",
+        linux_make_dir: "sound/core",
+        linux_make_target: "snd-hwdep.ko",
+        module_deps: &["kernel/sound/core/snd.ko", "kernel/sound/soundcore.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND_HDA_CORE",
+        module_name: "snd_hda_core",
+        module_path: "kernel/sound/hda/core/snd-hda-core.ko",
+        vendor_linux_ref: "vendor/linux/sound/hda/core/bus.c",
+        linux_make_dir: "sound/hda/core",
+        linux_make_target: "snd-hda-core.ko",
+        module_deps: &[
+            "kernel/sound/core/snd-pcm.ko",
+            "kernel/sound/core/snd-timer.ko",
+            "kernel/sound/core/snd.ko",
+            "kernel/sound/soundcore.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND_INTEL_SOUNDWIRE_ACPI",
+        module_name: "snd_intel_sdw_acpi",
+        module_path: "kernel/sound/hda/core/snd-intel-sdw-acpi.ko",
+        vendor_linux_ref: "vendor/linux/sound/hda/core/intel-sdw-acpi.c",
+        linux_make_dir: "sound/hda/core",
+        linux_make_target: "snd-intel-sdw-acpi.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND_INTEL_DSP_CONFIG",
+        module_name: "snd_intel_dspcfg",
+        module_path: "kernel/sound/hda/core/snd-intel-dspcfg.ko",
+        vendor_linux_ref: "vendor/linux/sound/hda/core/intel-dsp-config.c",
+        linux_make_dir: "sound/hda/core",
+        linux_make_target: "snd-intel-dspcfg.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND_HDA",
+        module_name: "snd_hda_codec",
+        module_path: "kernel/sound/hda/common/snd-hda-codec.ko",
+        vendor_linux_ref: "vendor/linux/sound/hda/common/codec.c",
+        linux_make_dir: "sound/hda/common",
+        linux_make_target: "snd-hda-codec.ko",
+        module_deps: &[
+            "kernel/sound/core/snd-hwdep.ko",
+            "kernel/sound/hda/core/snd-hda-core.ko",
+            "kernel/sound/core/snd-pcm.ko",
+            "kernel/sound/core/snd-timer.ko",
+            "kernel/sound/core/snd.ko",
+            "kernel/sound/soundcore.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND_HDA_GENERIC",
+        module_name: "snd_hda_codec_generic",
+        module_path: "kernel/sound/hda/codecs/snd-hda-codec-generic.ko",
+        vendor_linux_ref: "vendor/linux/sound/hda/codecs/generic.c",
+        linux_make_dir: "sound/hda/codecs",
+        linux_make_target: "snd-hda-codec-generic.ko",
+        module_deps: &[
+            "kernel/sound/hda/common/snd-hda-codec.ko",
+            "kernel/sound/core/snd-hwdep.ko",
+            "kernel/sound/hda/core/snd-hda-core.ko",
+            "kernel/sound/core/snd-pcm.ko",
+            "kernel/sound/core/snd-timer.ko",
+            "kernel/sound/core/snd.ko",
+            "kernel/sound/soundcore.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND_HDA_INTEL",
+        module_name: "snd_hda_intel",
+        module_path: "kernel/sound/hda/controllers/snd-hda-intel.ko",
+        vendor_linux_ref: "vendor/linux/sound/hda/controllers/intel.c",
+        linux_make_dir: "sound/hda/controllers",
+        linux_make_target: "snd-hda-intel.ko",
+        module_deps: &[
+            "kernel/sound/hda/core/snd-intel-dspcfg.ko",
+            "kernel/sound/hda/common/snd-hda-codec.ko",
+            "kernel/sound/core/snd-hwdep.ko",
+            "kernel/sound/hda/core/snd-hda-core.ko",
+            "kernel/sound/core/snd-pcm.ko",
+            "kernel/sound/core/snd-timer.ko",
+            "kernel/sound/core/snd.ko",
+            "kernel/sound/soundcore.ko",
+        ],
+    },
     // Vendor-built graphics modules. This is a topological superset: the
     // activation policy below derives support modules from the selected DRM
     // driver instead of requiring every hidden vendor Kconfig symbol to be
@@ -3463,7 +3600,7 @@ fn systemd_getty_override() -> Vec<u8> {
         "[Unit]\n\
          DefaultDependencies=no\n\
          ConditionKernelCommandLine=lupos.display_getty=1\n\
-         After=tmp.mount systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service\n\
+         After=tmp.mount systemd-modules-load.service systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service\n\
          \n\
          [Service]\n\
          Type=simple\n\
@@ -3480,6 +3617,7 @@ fn systemd_serial_getty_override() -> Vec<u8> {
     concat!(
         "[Unit]\n",
         "ConditionKernelCommandLine=lupos.serial_getty=1\n",
+        "After=systemd-modules-load.service\n",
         "\n",
         "[Service]\n",
         "ExecStart=\n",
@@ -3499,7 +3637,7 @@ fn systemd_lupos_terminal_target_unit() -> Vec<u8> {
         "Description=Lupos Terminal Login\n",
         "Documentation=man:systemd.target(5)\n",
         "DefaultDependencies=no\n",
-        "Wants=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service getty@tty1.service lupos-serial-getty.service\n",
+        "Wants=systemd-modules-load.service systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service getty@tty1.service lupos-serial-getty.service\n",
         "AllowIsolate=yes\n",
     )
     .as_bytes()
@@ -3513,7 +3651,7 @@ fn systemd_lupos_serial_getty_unit() -> Vec<u8> {
         "Documentation=man:agetty(8) man:login(1)\n",
         "DefaultDependencies=no\n",
         "ConditionKernelCommandLine=lupos.serial_getty=1\n",
-        "After=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service\n",
+        "After=systemd-modules-load.service systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service\n",
         "\n",
         "[Service]\n",
         "Type=simple\n",
@@ -5827,7 +5965,7 @@ fn prune_systemd_service_churn_for_critical_runtime(files: &mut Vec<InitramfsFil
 
 fn ping_smoke_userland_files() -> Vec<InitramfsFile> {
     let host = ping_smoke_host().unwrap_or_else(|_| DEFAULT_PING_HOST.to_string());
-    vec![
+    let mut files = vec![
         initramfs_file("sbin/init", 0o100755, build_ping_smoke_elf64(&host)),
         initramfs_file("etc/hostname", 0o100644, b"lupos\n".to_vec()),
         initramfs_file(
@@ -5835,7 +5973,10 @@ fn ping_smoke_userland_files() -> Vec<InitramfsFile> {
             0o100644,
             b"nameserver 10.0.2.3\n".to_vec(),
         ),
-    ]
+    ];
+    files.extend(module_load_request_files_from_repo_config());
+    files.extend(staged_module_files_from_repo_config());
+    files
 }
 
 fn env_flag_is_enabled(name: &str) -> bool {
@@ -7807,12 +7948,46 @@ fn module_list_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
     list.into_bytes()
 }
 
+const SYSTEMD_MODULES_LOAD_CONF_PATH: &str = "usr/lib/modules-load.d/lupos.conf";
+
+fn module_load_request_files_from_specs(modules: &[&DriverModuleSpec]) -> Vec<InitramfsFile> {
+    let module_list = module_list_from_specs(modules);
+    vec![
+        initramfs_file("etc/modules", 0o100644, module_list.clone()),
+        // Vendor Linux distributions do not have the kernel read /etc/modules.
+        // systemd-modules-load consumes modules-load.d(5), one module name per
+        // line, so keep it byte-for-byte aligned with the legacy SysV request.
+        initramfs_file(SYSTEMD_MODULES_LOAD_CONF_PATH, 0o100644, module_list),
+    ]
+}
+
+fn module_load_request_files_from_config_text(text: &str) -> Vec<InitramfsFile> {
+    module_load_request_files_from_specs(&staged_module_specs_from_config_text(text))
+}
+
+fn module_load_request_files_from_repo_config() -> Vec<InitramfsFile> {
+    repo_config_text()
+        .map(|text| module_load_request_files_from_config_text(&text))
+        .unwrap_or_else(|| module_load_request_files_from_specs(&[]))
+}
+
 /// Alias-resolution order emitted by the vendor Kbuild tree for the effective
 /// x86_64 configuration, filtered to artifacts staged by Lupos. This is not a
 /// dependency/load order; `/etc/modules` retains the explicit topological order
 /// above. Both `modules.order` and depmod's `modules.dep` line order follow this
 /// vendor Kbuild order.
 const VENDOR_KBUILD_MODULE_ORDER: &[&str] = &[
+    "soundcore",
+    "snd",
+    "snd_hwdep",
+    "snd_timer",
+    "snd_pcm",
+    "snd_hda_core",
+    "snd_intel_sdw_acpi",
+    "snd_intel_dspcfg",
+    "snd_hda_codec",
+    "snd_hda_codec_generic",
+    "snd_hda_intel",
     "iosf_mbi",
     "bsg",
     "zlib_deflate",
@@ -8123,11 +8298,7 @@ fn login_release_root_files() -> Vec<InitramfsFile> {
     let configured_modules =
         configured_module_files().expect("configured Linux driver module artifacts must be staged");
     let mut files = login_userland_files_with_stage(stage.as_deref());
-    files.push(initramfs_file(
-        "etc/modules",
-        0o100644,
-        etc_modules_from_repo_config(),
-    ));
+    files.extend(module_load_request_files_from_repo_config());
     files.extend(configured_modules);
     files.push(initramfs_file(
         "usr/share/lupos/release.txt",
@@ -8140,7 +8311,7 @@ fn login_release_root_files() -> Vec<InitramfsFile> {
 }
 
 fn fhs_entry_origin(path: &str) -> &'static str {
-    if path.starts_with("lib/modules/") {
+    if path == SYSTEMD_MODULES_LOAD_CONF_PATH || path.starts_with("lib/modules/") {
         "configured-module-staging"
     } else if path.starts_with("etc/") {
         "login-etc"
@@ -8328,10 +8499,12 @@ fn create_release_disk_images(qcow2: &Path, vdi: &Path, rootfs: &Path) -> Result
 }
 
 fn module_stage_initramfs_files() -> Vec<InitramfsFile> {
-    let mut files = vec![
-        initramfs_file("etc/hostname", 0o100644, b"lupos\n".to_vec()),
-        initramfs_file("etc/modules", 0o100644, etc_modules_from_repo_config()),
-    ];
+    let mut files = vec![initramfs_file(
+        "etc/hostname",
+        0o100644,
+        b"lupos\n".to_vec(),
+    )];
+    files.extend(module_load_request_files_from_repo_config());
     files.extend(staged_module_files_from_repo_config());
     files
 }
@@ -8484,13 +8657,13 @@ fn linux_root_initramfs_files() -> Vec<InitramfsFile> {
         initramfs_file("etc", 0o40755, Vec::new()),
         initramfs_file("init", 0o100755, build_initramfs_init_binary()),
         initramfs_file("etc/hostname", 0o100644, b"lupos\n".to_vec()),
-        initramfs_file("etc/modules", 0o100644, module_list_from_specs(&modules)),
         initramfs_file(
             "etc/initramfs.modules",
             0o100644,
             early_root_module_paths(&modules),
         ),
     ];
+    files.extend(module_load_request_files_from_specs(&modules));
     files.extend(
         staged_module_files_from_specs(&modules)
             .expect("early root Linux driver modules must be staged"),
@@ -8517,11 +8690,7 @@ fn initramfs_files(mode: &BootMode) -> Option<Vec<InitramfsFile>> {
         BootMode::InitramfsRootfsTest => {
             let modules = initramfs_rootfs_test_module_specs_from_repo_config();
             let mut files = login_userland_files();
-            files.push(initramfs_file(
-                "etc/modules",
-                0o100644,
-                module_list_from_specs(&modules),
-            ));
+            files.extend(module_load_request_files_from_specs(&modules));
             files.extend(
                 staged_module_files_from_specs(&modules)
                     .expect("initramfs-rootfs QEMU module closure must be staged"),
@@ -8543,21 +8712,13 @@ fn initramfs_files(mode: &BootMode) -> Option<Vec<InitramfsFile>> {
             } else {
                 login_userland_files()
             };
-            files.push(initramfs_file(
-                "etc/modules",
-                0o100644,
-                etc_modules_from_repo_config(),
-            ));
+            files.extend(module_load_request_files_from_repo_config());
             files.extend(staged_module_files_from_repo_config());
             Some(files)
         }
         BootMode::ShippedCommandsTest => {
             let mut files = shipped_commands_userland_files();
-            files.push(initramfs_file(
-                "etc/modules",
-                0o100644,
-                etc_modules_from_repo_config(),
-            ));
+            files.extend(module_load_request_files_from_repo_config());
             files.extend(staged_module_files_from_repo_config());
             Some(files)
         }
@@ -8586,11 +8747,7 @@ fn initramfs_files(mode: &BootMode) -> Option<Vec<InitramfsFile>> {
                 ),
                 _ => {}
             }
-            files.push(initramfs_file(
-                "etc/modules",
-                0o100644,
-                etc_modules_from_repo_config(),
-            ));
+            files.extend(module_load_request_files_from_repo_config());
             files.extend(staged_module_files_from_repo_config());
             Some(files)
         }
@@ -12302,7 +12459,6 @@ fn direct_stage_login_root_disk_overlay_files(
         ),
         initramfs_file("etc/fstab", 0o100644, fstab_contents.as_bytes().to_vec()),
         initramfs_file("etc/nsswitch.conf", 0o100644, SYSTEMD_NSSWITCH.as_bytes()),
-        initramfs_file("etc/modules", 0o100644, etc_modules_from_repo_config()),
         initramfs_file(
             "etc/pacman.d/mirrorlist",
             0o100644,
@@ -12479,6 +12635,7 @@ fn direct_stage_login_root_disk_overlay_files(
             "/usr/lib/systemd/system/dev-mqueue.mount",
         ),
     ];
+    files.extend(module_load_request_files_from_repo_config());
 
     if include_journald {
         files.push(initramfs_symlink(
@@ -12792,18 +12949,36 @@ fn ensure_gui_shell_root_disk() -> Result<PathBuf> {
     fs::create_dir_all(&target)
         .with_context(|| format!("failed to create {}", target.display()))?;
     let raw = target.join("gui-shell.raw");
+    let rootfs = target.join("gui-shell-rootfs-work");
+    let mut module_overlay = module_load_request_files_from_repo_config();
+    module_overlay.extend(configured_module_files()?);
     let stage_sh = shell_single_quote(&shell_path(&stage));
+    let rootfs_sh = shell_single_quote(&shell_path(&rootfs));
     let raw_sh = shell_single_quote(&shell_path(&raw));
+    let script = format!(
+        r#"set -euo pipefail
+rm -rf {rootfs_sh}
+mkdir -p {rootfs_sh}
+cp -a {stage_sh}/. {rootfs_sh}/
+"#
+    );
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(script);
+    run_command(&mut command, "gui-shell rootfs module overlay source build")?;
+    write_staged_files(&rootfs, &module_overlay)
+        .context("failed to overlay configured Linux modules into gui-shell rootfs")?;
+
     let script = format!(
         r#"set -euo pipefail
 rm -f {raw_sh}
 truncate -s {GUI_SHELL_ROOT_DISK_SIZE} {raw_sh}
-mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -E no_copy_xattrs -d {stage_sh} {raw_sh}
+mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -E no_copy_xattrs -d {rootfs_sh} {raw_sh}
 "#
     );
     let mut command = Command::new("bash");
     command.arg("-lc").arg(script);
     run_command(&mut command, "gui-shell ext4 root image build")?;
+    let _ = fs::remove_dir_all(&rootfs);
     Ok(raw)
 }
 
@@ -20889,6 +21064,48 @@ failed command output\n";
     }
 
     #[test]
+    fn gui_shell_root_disk_builder_overlays_configured_modules() {
+        let source = read_repo_file("xtask/src/lib.rs");
+        let builder = source
+            .split("fn ensure_gui_shell_root_disk")
+            .nth(1)
+            .expect("gui-shell builder source")
+            .split("fn ensure_direct_stage_login_root_disk")
+            .next()
+            .expect("gui-shell builder body");
+
+        assert!(builder.contains("module_load_request_files_from_repo_config()"));
+        assert!(builder.contains("configured_module_files()?"));
+        assert!(builder.contains("write_staged_files(&rootfs, &module_overlay)"));
+        assert!(builder.contains("-d {rootfs_sh}"));
+    }
+
+    #[test]
+    fn ping_smoke_initramfs_stages_configured_modules_for_static_pid1() {
+        let xtask_source = read_repo_file("xtask/src/lib.rs");
+        let files_fn = xtask_source
+            .split("fn ping_smoke_userland_files")
+            .nth(1)
+            .expect("ping-smoke files source")
+            .split("fn env_flag_is_enabled")
+            .next()
+            .expect("ping-smoke files body");
+        assert!(files_fn.contains("module_load_request_files_from_repo_config()"));
+        assert!(files_fn.contains("staged_module_files_from_repo_config()"));
+
+        let rootfs_source = read_repo_file("src/init/rootfs.rs");
+        let bootstrap = rootfs_source
+            .split("pub fn bootstrap_initramfs_rootfs_with_options")
+            .nth(1)
+            .expect("rootfs bootstrap source")
+            .split("#[derive(Clone, Debug, Eq, PartialEq)]")
+            .next()
+            .expect("rootfs bootstrap body");
+        assert!(bootstrap.contains("feature = \"test-pid1-handoff\""));
+        assert!(bootstrap.contains("load_configured_modules()?"));
+    }
+
+    #[test]
     fn direct_stage_root_disk_manifest_changes_for_cache_inputs() {
         const PACMAN_CONF: &[u8] = b"[options]\nDisableSandbox\n";
         const PACMAN_MIRRORLIST: &[u8] =
@@ -21084,6 +21301,11 @@ failed command output\n";
         assert_eq!(
             initramfs_file_bytes(&files, "etc/modules"),
             Some(etc_modules_from_repo_config().as_slice())
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, SYSTEMD_MODULES_LOAD_CONF_PATH),
+            Some(etc_modules_from_repo_config().as_slice()),
+            "systemd root disks must request the same configured vendor modules through modules-load.d"
         );
         assert_eq!(
             initramfs_file_bytes(&files, "etc/pacman.d/mirrorlist"),
@@ -21628,7 +21850,7 @@ failed command output\n";
         );
         assert!(
             direct_builder.contains(
-                "mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -E no_copy_xattrs -d {stage_sh}"
+                "exec mkfs.ext4 -q -F -L lupos-root -O ^metadata_csum,^64bit -E no_copy_xattrs -d \"$stage\" \"$image\""
             ),
             "direct-stage builds must format ext4 straight from the staged tree without copying host xattrs"
         );
@@ -22556,8 +22778,10 @@ failed command output\n";
             "CONFIG_SERIAL_8250=y",
             "CONFIG_NET=y",
             "CONFIG_NETDEVICES=y",
-            "CONFIG_SOUND=y",
-            "CONFIG_SND_HDA_INTEL=y",
+            "CONFIG_SOUND=m",
+            "CONFIG_SND=m",
+            "CONFIG_SND_HDA_INTEL=m",
+            "CONFIG_SND_HDA_GENERIC=m",
             "CONFIG_VIRTIO_PCI_LIB=m",
             "CONFIG_VIRTIO_PCI=m",
             "CONFIG_VIRTIO_BLK=m",
@@ -22595,7 +22819,9 @@ failed command output\n";
             "pub const CONFIG_SYMBOLS",
             "config_value!(CONFIG_X86_64)",
             "config_value!(CONFIG_SOUND)",
+            "config_value!(CONFIG_SND)",
             "config_value!(CONFIG_SND_HDA_INTEL)",
+            "config_value!(CONFIG_SND_HDA_GENERIC)",
             "config_value!(CONFIG_VIRTIO_NET)",
         ] {
             assert!(
@@ -22687,8 +22913,10 @@ failed command output\n";
             "CONFIG_DRM=y",
             "CONFIG_USB_XHCI=y",
             "CONFIG_HID=y",
-            "CONFIG_SOUND=y",
-            "CONFIG_SND_HDA_INTEL=y",
+            "CONFIG_SOUND=m",
+            "CONFIG_SND=m",
+            "CONFIG_SND_HDA_INTEL=m",
+            "CONFIG_SND_HDA_GENERIC=m",
             "CONFIG_VIRTIO_PCI_LIB=m",
             "CONFIG_VIRTIO_PCI=m",
             "CONFIG_VIRTIO_BLK=m",
@@ -22717,7 +22945,9 @@ failed command output\n";
             "config HID",
             "config INPUT",
             "config SOUND",
+            "config SND",
             "config SND_HDA_INTEL",
+            "config SND_HDA_GENERIC",
         ] {
             assert!(
                 kconfig_text.contains(needle),
@@ -22737,8 +22967,10 @@ failed command output\n";
             "CONFIG_USB_XHCI=y",
             "CONFIG_INPUT=y",
             "CONFIG_HID=y",
-            "CONFIG_SOUND=y",
-            "CONFIG_SND_HDA_INTEL=y",
+            "CONFIG_SOUND=m",
+            "CONFIG_SND=m",
+            "CONFIG_SND_HDA_INTEL=m",
+            "CONFIG_SND_HDA_GENERIC=m",
         ] {
             assert!(
                 lupos_defconfig_text.contains(needle),
@@ -22762,6 +22994,9 @@ failed command output\n";
             "config VIRTIO_BLK\n\ttristate",
             "config VIRTIO_NET\n\ttristate",
             "config E1000\n\ttristate",
+            "config SOUND\n\ttristate",
+            "config SND\n\ttristate",
+            "config SND_HDA_INTEL\n\ttristate",
         ] {
             assert!(
                 text.contains(needle),
@@ -23223,7 +23458,7 @@ kernel/drivers/i2c/i2c-core.ko\n"
 
         let modules_dep = String::from_utf8(modules_dep_from_specs(&specs)).unwrap();
         assert!(modules_dep.contains(
-            "kernel/drivers/gpu/drm/i915/i915.ko: kernel/drivers/gpu/drm/drm_buddy.ko kernel/drivers/i2c/algos/i2c-algo-bit.ko kernel/arch/x86/platform/intel/iosf_mbi.ko kernel/drivers/gpu/drm/ttm/ttm.ko kernel/lib/zlib_deflate/zlib_deflate.ko kernel/drivers/gpu/drm/display/drm_display_helper.ko kernel/drivers/gpu/drm/drm_kms_helper.ko kernel/drivers/gpu/drm/drm.ko kernel/drivers/i2c/i2c-core.ko kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko kernel/drivers/char/agp/intel-gtt.ko kernel/drivers/char/agp/agpgart.ko\n"
+            "kernel/drivers/gpu/drm/i915/i915.ko: kernel/drivers/i2c/algos/i2c-algo-bit.ko kernel/lib/zlib_deflate/zlib_deflate.ko kernel/arch/x86/platform/intel/iosf_mbi.ko kernel/drivers/gpu/drm/drm_buddy.ko kernel/drivers/gpu/drm/display/drm_display_helper.ko kernel/drivers/gpu/drm/ttm/ttm.ko kernel/drivers/gpu/drm/drm_kms_helper.ko kernel/drivers/gpu/drm/drm.ko kernel/drivers/i2c/i2c-core.ko kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko kernel/drivers/char/agp/intel-gtt.ko kernel/drivers/char/agp/agpgart.ko\n"
         ));
         assert!(modules_dep.contains(
             "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko: kernel/drivers/virtio/virtio_dma_buf.ko kernel/drivers/gpu/drm/drm_shmem_helper.ko kernel/drivers/gpu/drm/drm_kms_helper.ko kernel/drivers/gpu/drm/drm.ko kernel/drivers/i2c/i2c-core.ko kernel/drivers/gpu/drm/drm_panel_orientation_quirks.ko\n"
@@ -23463,6 +23698,54 @@ CONFIG_SATA_AHCI=m
     }
 
     #[test]
+    fn generic_x86_hda_module_staging_is_topological_and_codec_first() {
+        let config = "\
+CONFIG_MODULES=y
+CONFIG_SOUND=m
+CONFIG_SND=m
+CONFIG_SND_TIMER=m
+CONFIG_SND_PCM=m
+CONFIG_SND_HWDEP=m
+CONFIG_SND_HDA_CORE=m
+CONFIG_SND_INTEL_SOUNDWIRE_ACPI=m
+CONFIG_SND_INTEL_DSP_CONFIG=m
+CONFIG_SND_HDA=m
+CONFIG_SND_HDA_INTEL=m
+CONFIG_SND_HDA_GENERIC=m
+";
+        let expected = b"soundcore\nsnd\nsnd_timer\nsnd_pcm\nsnd_hwdep\nsnd_hda_core\nsnd_intel_sdw_acpi\nsnd_intel_dspcfg\nsnd_hda_codec\nsnd_hda_codec_generic\nsnd_hda_intel\n";
+        assert_eq!(etc_modules_from_config_text(config), expected);
+
+        let specs = staged_module_specs_from_config_text(config);
+        let positions = specs
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| (spec.module_path, index))
+            .collect::<HashMap<_, _>>();
+        for (index, spec) in specs.iter().enumerate() {
+            for dependency in spec.module_deps {
+                let dependency_index = positions.get(dependency).unwrap_or_else(|| {
+                    panic!(
+                        "{} dependency {} is absent from the selected HDA closure",
+                        spec.module_name, dependency
+                    )
+                });
+                assert!(
+                    *dependency_index < index,
+                    "{} must follow dependency {} in /etc/modules",
+                    spec.module_name,
+                    dependency
+                );
+            }
+        }
+        assert!(
+            positions["kernel/sound/hda/codecs/snd-hda-codec-generic.ko"]
+                < positions["kernel/sound/hda/controllers/snd-hda-intel.ko"],
+            "HDA codec parsers must be loaded before the Intel HDA controller probes codecs"
+        );
+    }
+
+    #[test]
     fn initramfs_modules_file_tracks_config_m_only() {
         let config = "\
 CONFIG_MODULES=y
@@ -23475,6 +23758,12 @@ CONFIG_E1000=m
         assert_eq!(
             etc_modules_from_config_text(config),
             b"virtio_pci_modern_dev\nvirtio_pci_legacy_dev\nvirtio_pci\nvirtio_blk\nvirtio_net\ne1000\n"
+        );
+        let module_list = etc_modules_from_config_text(config);
+        let request_files = module_load_request_files_from_config_text(config);
+        assert_eq!(
+            initramfs_file_bytes(&request_files, SYSTEMD_MODULES_LOAD_CONF_PATH),
+            Some(module_list.as_slice())
         );
 
         let config = "\
@@ -24197,7 +24486,7 @@ CONFIG_MODULES=y
         assert!(unit.contains("Type=simple"));
         assert!(!unit.contains("Type=idle"));
         assert!(unit.contains(
-            "After=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service"
+            "After=systemd-modules-load.service systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service"
         ));
         assert!(unit.contains("ExecStart=-/usr/sbin/agetty --noclear --nohostname"));
 
@@ -24217,6 +24506,7 @@ CONFIG_MODULES=y
             .expect("lupos-terminal.target staged");
         let target = core::str::from_utf8(&target.2).expect("target utf-8");
         for wanted in [
+            "systemd-modules-load.service",
             "systemd-journald.socket",
             "systemd-journald-dev-log.socket",
             "systemd-journald.service",
@@ -24248,7 +24538,7 @@ CONFIG_MODULES=y
                 .expect("lupos serial getty unit staged");
         let serial_unit = core::str::from_utf8(&serial_unit.2).expect("serial unit utf-8");
         assert!(serial_unit.contains(
-            "After=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service"
+            "After=systemd-modules-load.service systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service"
         ));
         assert!(serial_unit.contains("agetty --noclear --nohostname"));
 
@@ -26437,6 +26727,7 @@ CONFIG_MODULES=y
                 .expect("lupos-terminal.target must be staged");
         let terminal_target_body = core::str::from_utf8(&terminal_target.2).unwrap();
         for wanted in [
+            "systemd-modules-load.service",
             "systemd-journald.socket",
             "systemd-journald-dev-log.socket",
             "systemd-journald.service",
@@ -26475,9 +26766,9 @@ CONFIG_MODULES=y
         assert!(!serial_unit_body.contains("Type=idle"));
         assert!(
             serial_unit_body.contains(
-                "After=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service"
+                "After=systemd-modules-load.service systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service"
             ),
-            "serial getty must wait for journald's /dev/log sink: {serial_unit_body}"
+            "serial getty must wait for modules-load and journald's /dev/log sink: {serial_unit_body}"
         );
         assert!(serial_unit_body.contains("agetty --noclear --nohostname"));
 
@@ -28387,6 +28678,7 @@ CONFIG_MODULES=y
             "sbin/swapon\tfile\t100755\tlogin-userland",
             "sbin/swapoff\tfile\t100755\tlogin-userland",
             "etc/modules\tfile\t100644\tlogin-etc",
+            "usr/lib/modules-load.d/lupos.conf\tfile\t100644\tconfigured-module-staging",
             "swapfile\tfile\t100600\tgenerated",
             "usr/share/lupos/release.txt\tfile\t100644\tgenerated",
         ] {
