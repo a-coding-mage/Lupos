@@ -25,6 +25,7 @@ pub mod ringbuffer;
 pub mod sysctl;
 
 use alloc::string::String;
+use core::ffi::c_char;
 use core::fmt::Write;
 
 pub use crate::{log_debug, log_error, log_info, log_trace, log_warn};
@@ -39,6 +40,62 @@ pub use ringbuffer::PRINTK_RB;
 pub fn init() {
     // Currently nothing to do — `PRINTK_RB` is a `static` initialised at compile time.
     // Future: console handover, deferred-print thread, etc.
+}
+
+/// Register printk entry points used by vendor-built modules.
+pub fn register_module_exports() {
+    if crate::kernel::module::find_symbol("_printk").is_none() {
+        crate::kernel::module::export_symbol("_printk", linux_printk as usize, false);
+    }
+}
+
+/// x86-64 C-variadic trampoline for Linux `_printk(const char *fmt, ...)`.
+#[unsafe(naked)]
+#[unsafe(export_name = "_printk")]
+pub unsafe extern "C" fn linux_printk() {
+    core::arch::naked_asm!(
+        "sub rsp, 40",
+        "mov qword ptr [rsp], rsi",
+        "mov qword ptr [rsp + 8], rdx",
+        "mov qword ptr [rsp + 16], rcx",
+        "mov qword ptr [rsp + 24], r8",
+        "mov qword ptr [rsp + 32], r9",
+        "lea rsi, [rsp]",
+        "lea rdx, [rsp + 48]",
+        "call {helper}",
+        "add rsp, 40",
+        "ret",
+        helper = sym linux_printk_helper,
+    );
+}
+
+#[inline(never)]
+unsafe extern "C" fn linux_printk_helper(
+    fmt: *const c_char,
+    register_args: *const usize,
+    stack_args: *const usize,
+) -> i32 {
+    let mut message_buf = [0u8; log::MSG_CAP];
+    let message_len = unsafe {
+        crate::linux_driver_abi::base::printf::vscnprintf_n(
+            message_buf.as_mut_ptr(),
+            message_buf.len(),
+            fmt,
+            register_args,
+            5,
+            stack_args,
+        )
+    };
+    let parsed = levels::parse_prefix(&message_buf[..message_len]);
+    let message = core::str::from_utf8(&message_buf[parsed.consumed..message_len]).unwrap_or("");
+    let message = message.strip_suffix('\n').unwrap_or(message);
+    let level = match parsed.level {
+        0..=3 => log::Level::Error,
+        4 => log::Level::Warn,
+        _ => log::Level::Info,
+    };
+    log::_log(level, "", format_args!("{message}"));
+    message_len.min(i32::MAX as usize) as i32
 }
 
 /// Emit a record into the printk ring.  Parses any leading `<n>` prefix.

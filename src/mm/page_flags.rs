@@ -718,7 +718,7 @@ pub fn folio_mapcount(folio: *const Page) -> i32 {
     if folio.is_null() {
         0
     } else {
-        unsafe { (*folio)._mapcount.load(Ordering::Relaxed) + 1 }
+        unsafe { (*folio)._mapcount().load(Ordering::Relaxed) + 1 }
     }
 }
 

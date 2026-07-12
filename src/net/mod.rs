@@ -73,6 +73,7 @@ pub mod virtio_net;
 #[path = "8021q/mod.rs"]
 pub mod vlan_8021q;
 pub mod vmw_vsock;
+pub mod wire;
 pub mod wireless;
 pub mod x25;
 pub mod xdp;

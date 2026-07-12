@@ -461,7 +461,7 @@ pub unsafe fn try_to_unmap(page: *mut Page, entry: SwpEntry, _flags: u32) -> boo
                     ptep_get_and_clear(mm as *mut (), addr, ptep);
                     set_pte_at(mm as *mut (), addr, ptep, swap_pte);
                     flush_tlb_page(addr);
-                    (*page)._mapcount.fetch_sub(1, Ordering::Relaxed);
+                    (*page)._mapcount().fetch_sub(1, Ordering::Relaxed);
                     break;
                 }
             }
@@ -469,7 +469,7 @@ pub unsafe fn try_to_unmap(page: *mut Page, entry: SwpEntry, _flags: u32) -> boo
         }
     }
 
-    unsafe { (*page)._mapcount.load(Ordering::Acquire) < 0 }
+    unsafe { (*page)._mapcount().load(Ordering::Acquire) < 0 }
 }
 
 // We need the Page type from memory::page.
@@ -497,7 +497,7 @@ pub fn folio_set_large_mapcount(folio: *mut Page, count: i32) {
     if !folio.is_null() {
         unsafe {
             (*folio)
-                ._mapcount
+                ._mapcount()
                 .store(count.saturating_sub(1), Ordering::Release);
         }
     }
@@ -506,7 +506,7 @@ pub fn folio_set_large_mapcount(folio: *mut Page, count: i32) {
 pub fn folio_add_large_mapcount(folio: *mut Page, nr: i32) {
     if !folio.is_null() {
         unsafe {
-            (*folio)._mapcount.fetch_add(nr, Ordering::AcqRel);
+            (*folio)._mapcount().fetch_add(nr, Ordering::AcqRel);
         }
     }
 }
@@ -515,14 +515,14 @@ pub fn folio_add_return_large_mapcount(folio: *mut Page, nr: i32) -> i32 {
     if folio.is_null() {
         0
     } else {
-        unsafe { (*folio)._mapcount.fetch_add(nr, Ordering::AcqRel) + nr + 1 }
+        unsafe { (*folio)._mapcount().fetch_add(nr, Ordering::AcqRel) + nr + 1 }
     }
 }
 
 pub fn folio_sub_large_mapcount(folio: *mut Page, nr: i32) {
     if !folio.is_null() {
         unsafe {
-            (*folio)._mapcount.fetch_sub(nr, Ordering::AcqRel);
+            (*folio)._mapcount().fetch_sub(nr, Ordering::AcqRel);
         }
     }
 }
@@ -531,7 +531,7 @@ pub fn folio_sub_return_large_mapcount(folio: *mut Page, nr: i32) -> i32 {
     if folio.is_null() {
         0
     } else {
-        unsafe { (*folio)._mapcount.fetch_sub(nr, Ordering::AcqRel) - nr + 1 }
+        unsafe { (*folio)._mapcount().fetch_sub(nr, Ordering::AcqRel) - nr + 1 }
     }
 }
 
@@ -656,7 +656,7 @@ pub fn folio_referenced(
     }
     let mapped = unsafe {
         (*_folio)
-            ._mapcount
+            ._mapcount()
             .load(Ordering::Acquire)
             .saturating_add(1)
     };
@@ -893,9 +893,9 @@ mod tests {
             assert!(__folio_large_mapcount_sanity_checks(&folio, 2));
 
             folio_set_large_mapcount(&mut folio, 1);
-            assert_eq!(folio._mapcount.load(Ordering::Acquire), 0);
+            assert_eq!(folio._mapcount().load(Ordering::Acquire), 0);
             folio_add_large_mapcount(&mut folio, 2);
-            assert_eq!(folio._mapcount.load(Ordering::Acquire), 2);
+            assert_eq!(folio._mapcount().load(Ordering::Acquire), 2);
             assert_eq!(folio_sub_return_large_mapcount(&mut folio, 1), 2);
 
             assert_eq!(__folio_try_dup_anon_rmap(&mut folio, &mut page, vma), 0);

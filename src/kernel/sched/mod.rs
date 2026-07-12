@@ -1357,6 +1357,7 @@ pub unsafe fn sched_init() {
     });
     SCHED_ACTIVE_CPUS.store(1, Ordering::Release);
     SCHED_ONLINE_CPUS.store(1, Ordering::Release);
+    crate::kernel::cpuhotplug::reset_cpu_maps();
 }
 
 /// Bring an AP into the production scheduler as that CPU's idle task.
@@ -1422,6 +1423,7 @@ pub unsafe fn sched_init_ap(cpu: u32) -> *mut TaskStruct {
     });
     SCHED_ACTIVE_CPUS.fetch_or(1u64 << cpu, Ordering::AcqRel);
     SCHED_ONLINE_CPUS.fetch_add(1, Ordering::AcqRel);
+    crate::kernel::cpuhotplug::set_cpu_online(cpu as u32, true);
     PRODUCTION_SCHED_ENABLED.store(true, Ordering::Release);
     idle_task
 }

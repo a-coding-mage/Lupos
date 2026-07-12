@@ -23,8 +23,8 @@ use crate::fs::fdtable::FilesStruct;
 use crate::fs::ops::{FileOps, NOOP_FILE_OPS, NOOP_INODE_OPS};
 use crate::fs::types::{FileRef, Inode, InodeKind, InodePrivate};
 use crate::include::uapi::errno::{
-    EADDRINUSE, EAGAIN, EBADF, EFAULT, EINTR, EINVAL, ENOENT, ENOPROTOOPT, ENOSYS, ENOTCONN,
-    ENOTDIR, EPERM, ERANGE,
+    EADDRINUSE, EAGAIN, EBADF, EFAULT, EINPROGRESS, EINTR, EINVAL, ENOENT, ENOPROTOOPT, ENOSYS,
+    ENOTCONN, ENOTDIR, EPERM, ERANGE,
 };
 use crate::include::uapi::fcntl::{O_NONBLOCK, O_RDWR};
 use crate::kernel::capability::{CAP_NET_RAW, capable};
@@ -813,6 +813,7 @@ fn wait_for_socket_recv(sock: &SocketRef, timeout_ns: u64) -> Result<(), i32> {
     }
 
     loop {
+        let _ = crate::linux_driver_abi::poll_driver_abi_events_for_wait();
         unsafe {
             crate::kernel::signal::exit_if_fatal_signal_pending_current();
         }
@@ -1254,16 +1255,38 @@ pub unsafe fn sys_listen(fd: i32, _backlog: i32) -> i64 {
 }
 
 pub unsafe fn sys_connect(fd: i32, addr: *const u8, addrlen: u32) -> i64 {
-    let sock = match socket_from_fd(fd) {
-        Ok(sock) => sock,
+    let (file, sock) = match socket_file_from_fd(fd) {
+        Ok(pair) => pair,
         Err(errno) => return -(errno as i64),
     };
     let parsed = read_sockaddr(addr, addrlen);
-    let ret = match parsed.clone().and_then(|sa| socket::connect(&sock, sa)) {
+    match parsed.and_then(|sa| socket::connect(&sock, sa)) {
         Ok(()) => 0,
+        Err(EINPROGRESS) if socket_file_is_nonblocking(&file) => -(EINPROGRESS as i64),
+        Err(EINPROGRESS) => loop {
+            let _ = crate::linux_driver_abi::poll_driver_abi_events_for_wait();
+            let outcome = {
+                let mut socket = sock.lock();
+                if socket.state == SocketState::Connected {
+                    Some(Ok(()))
+                } else if socket.pending_error != 0 {
+                    let error = socket.pending_error;
+                    socket.pending_error = 0;
+                    Some(Err(error))
+                } else {
+                    None
+                }
+            };
+            if let Some(outcome) = outcome {
+                break outcome.map(|_| 0).unwrap_or_else(|errno| -(errno as i64));
+            }
+            if crate::kernel::signal::current_has_unblocked_pending_signals() {
+                break -(EINTR as i64);
+            }
+            unsafe { crate::kernel::sched::schedule_with_irqs_enabled() };
+        },
         Err(errno) => -(errno as i64),
-    };
-    ret
+    }
 }
 
 pub unsafe fn sys_accept4(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: i32) -> i64 {

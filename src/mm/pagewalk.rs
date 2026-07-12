@@ -837,7 +837,7 @@ pub unsafe fn smaps_for_range(
             let page = pfn_to_page(pfn);
             // _mapcount == 0  → exactly one PTE → private
             // _mapcount >= 1  → two or more PTEs → shared
-            let mapcount = (*page)._mapcount.load(Ordering::Relaxed);
+            let mapcount = (*page)._mapcount().load(Ordering::Relaxed);
             if mapcount >= 1 {
                 stats.shared_dirty += PAGE_SIZE as usize;
             } else {

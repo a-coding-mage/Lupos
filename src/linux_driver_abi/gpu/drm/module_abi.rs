@@ -498,7 +498,6 @@ unsafe extern "C" fn linux_kfree_const(ptr: *mut u8) {
     kfree(ptr);
 }
 
-#[unsafe(export_name = "__kvmalloc_node_noprof")]
 unsafe extern "C" fn linux_kvmalloc_node(size: usize, flags: u32, _node: i32) -> *mut u8 {
     let ptr = unsafe { crate::mm::slab::linux___kmalloc_noprof(size, flags) };
     if !ptr.is_null() {

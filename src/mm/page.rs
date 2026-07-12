@@ -16,10 +16,9 @@
 /// | 24     |  8   | mapping     | address_space pointer (M7: unused)             |
 /// | 32     |  8   | index       | Offset within mapping (M7: unused)             |
 /// | 40     |  8   | private     | Buddy order when PageBuddy; fs-private data    |
-/// | 48     |  4   | page_type   | PGTY_buddy, PGTY_slab, etc.                   |
-/// | 52     |  4   | _mapcount   | Page table reference count                    |
-/// | 56     |  4   | _refcount   | Usage reference count                         |
-/// | 60     |  4   | _pad        | Alignment padding to 64 bytes                 |
+/// | 48     |  4   | page_type / _mapcount union                                |
+/// | 52     |  4   | _refcount   | Usage reference count                         |
+/// | 56     |  8   | _pad        | Alignment padding to 64 bytes                 |
 ///
 /// Ref: Linux include/linux/mm_types.h — struct page
 ///      Linux include/linux/page-flags.h — PageBuddy, set_buddy_order
@@ -62,16 +61,12 @@ pub struct Page {
     /// Ref: Linux mm_types.h:115, mm/internal.h:685 (buddy_order)
     pub private: usize,
 
-    /// Page type tag (top byte) for non-mapcount pages.
+    /// Page type tag (top byte) for non-mapcount pages. Linux overlays this
+    /// word with `_mapcount`; [`Page::_mapcount`] provides that signed view.
     /// `PGTY_BUDDY` (0xf0) when free in the buddy system.
     /// `PAGE_TYPE_NONE` (0xFFFF_FFFF) when untyped.
     /// Ref: Linux page-flags.h:925 — enum pagetype
     pub page_type: AtomicU32,
-
-    /// Page table reference count (how many PTEs map this page).
-    /// -1 means unmapped.
-    /// Ref: Linux mm_types.h:180
-    pub _mapcount: AtomicI32,
 
     /// Usage reference count.  0 = free, >0 = in use.
     /// `get_page()` increments, `put_page()` decrements.
@@ -79,7 +74,7 @@ pub struct Page {
     pub _refcount: AtomicI32,
 
     /// Padding to reach exactly 64 bytes (cache-line aligned).
-    pub _pad: u32,
+    pub _pad: [u32; 2],
 }
 
 // Compile-time assertion: struct Page must be exactly 64 bytes.
@@ -102,10 +97,18 @@ impl Page {
             index: 0,
             private: 0,
             page_type: AtomicU32::new(PAGE_TYPE_NONE),
-            _mapcount: AtomicI32::new(-1),
             _refcount: AtomicI32::new(0),
-            _pad: 0,
+            _pad: [0; 2],
         }
+    }
+
+    /// Signed mapcount view of Linux's `page_type/_mapcount` union.
+    #[inline]
+    pub fn _mapcount(&self) -> &AtomicI32 {
+        // AtomicU32 and AtomicI32 have identical size, alignment, and atomic
+        // representation; Linux selects the active interpretation by page
+        // state in the same union word.
+        unsafe { &*core::ptr::from_ref(&self.page_type).cast::<AtomicI32>() }
     }
 
     /// Initialize the page's lru list node to point to itself.
@@ -264,7 +267,7 @@ mod tests {
     #[test]
     fn page_default_mapcount_minus_one() {
         let page = Page::new();
-        assert_eq!(page._mapcount.load(Ordering::Relaxed), -1);
+        assert_eq!(page._mapcount().load(Ordering::Relaxed), -1);
     }
 
     /// set_buddy_order stores the order and marks as PageBuddy.
@@ -327,8 +330,7 @@ mod tests {
         assert_eq!(mem::offset_of!(Page, index), 32);
         assert_eq!(mem::offset_of!(Page, private), 40);
         assert_eq!(mem::offset_of!(Page, page_type), 48);
-        assert_eq!(mem::offset_of!(Page, _mapcount), 52);
-        assert_eq!(mem::offset_of!(Page, _refcount), 56);
-        assert_eq!(mem::offset_of!(Page, _pad), 60);
+        assert_eq!(mem::offset_of!(Page, _refcount), 52);
+        assert_eq!(mem::offset_of!(Page, _pad), 56);
     }
 }

@@ -120,7 +120,7 @@ pub fn account_anon_pages(delta: isize) {
 }
 
 pub fn page_vma_mapped(page: &Page) -> bool {
-    page._mapcount.load(core::sync::atomic::Ordering::Acquire) >= 0
+    page._mapcount().load(core::sync::atomic::Ordering::Acquire) >= 0
 }
 
 pub fn page_ext(pfn: u64) -> Option<PageExt> {

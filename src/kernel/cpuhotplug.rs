@@ -4,10 +4,25 @@
 //! Minimal CPU hotplug state exports for Linux-built modules.
 
 use core::ffi::{c_char, c_void};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::kernel::locking::percpu_rwsem::PerCpuRwSem;
 use crate::kernel::module::{export_symbol, find_symbol};
 
 pub type CpuHpCallback = Option<unsafe extern "C" fn(cpu: u32) -> i32>;
+
+/// `struct cpumask __cpu_online_mask` for the vendor configuration's
+/// `CONFIG_NR_CPUS=64`.
+///
+/// Linux stores one native word in this configuration. Keep the object itself
+/// atomic because `set_cpu_online()` may be called while modules read it.
+#[repr(transparent)]
+struct LinuxCpuMask(AtomicU64);
+
+static LINUX_CPU_ONLINE_MASK: LinuxCpuMask = LinuxCpuMask(AtomicU64::new(1));
+static LINUX_NUM_ONLINE_CPUS: AtomicU32 = AtomicU32::new(1);
+static LINUX_NR_CPU_IDS: AtomicU32 = AtomicU32::new(1);
+static CPU_HOTPLUG_LOCK: PerCpuRwSem = PerCpuRwSem::new();
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
@@ -16,6 +31,23 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 }
 
 pub fn register_module_exports() {
+    export_symbol_once(
+        "__cpu_online_mask",
+        core::ptr::addr_of!(LINUX_CPU_ONLINE_MASK) as usize,
+        false,
+    );
+    export_symbol_once(
+        "__num_online_cpus",
+        core::ptr::addr_of!(LINUX_NUM_ONLINE_CPUS) as usize,
+        false,
+    );
+    export_symbol_once(
+        "nr_cpu_ids",
+        core::ptr::addr_of!(LINUX_NR_CPU_IDS) as usize,
+        false,
+    );
+    export_symbol_once("cpus_read_lock", cpus_read_lock as usize, true);
+    export_symbol_once("cpus_read_unlock", cpus_read_unlock as usize, true);
     export_symbol_once("__cpuhp_setup_state", __cpuhp_setup_state as usize, false);
     export_symbol_once(
         "__cpuhp_setup_state_cpuslocked",
@@ -43,6 +75,56 @@ pub fn register_module_exports() {
         __cpuhp_remove_state_cpuslocked as usize,
         false,
     );
+}
+
+/// Reset the CPU maps to the boot CPU, matching the initial
+/// `set_cpu_online(0, true)` sequence in `vendor/linux/kernel/cpu.c`.
+pub fn reset_cpu_maps() {
+    LINUX_CPU_ONLINE_MASK.0.store(1, Ordering::Release);
+    LINUX_NUM_ONLINE_CPUS.store(1, Ordering::Release);
+    LINUX_NR_CPU_IDS.store(1, Ordering::Release);
+}
+
+/// Publish an online CPU to the module-facing Linux cpumask objects.
+pub fn set_cpu_online(cpu: u32, online: bool) {
+    if cpu >= 64 {
+        return;
+    }
+    let bit = 1u64 << cpu;
+    if online {
+        let old = LINUX_CPU_ONLINE_MASK.0.fetch_or(bit, Ordering::AcqRel);
+        if old & bit == 0 {
+            LINUX_NUM_ONLINE_CPUS.fetch_add(1, Ordering::AcqRel);
+        }
+        LINUX_NR_CPU_IDS.fetch_max(cpu + 1, Ordering::AcqRel);
+    } else {
+        let old = LINUX_CPU_ONLINE_MASK.0.fetch_and(!bit, Ordering::AcqRel);
+        if old & bit != 0 {
+            LINUX_NUM_ONLINE_CPUS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+pub fn cpu_online_mask() -> u64 {
+    LINUX_CPU_ONLINE_MASK.0.load(Ordering::Acquire)
+}
+
+pub fn nr_cpu_ids() -> u32 {
+    LINUX_NR_CPU_IDS.load(Ordering::Acquire)
+}
+
+/// `cpus_read_lock()` — `vendor/linux/kernel/cpu.c:488`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cpus_read_lock() {
+    while !CPU_HOTPLUG_LOCK.down_read_trylock() {
+        core::hint::spin_loop();
+    }
+}
+
+/// `cpus_read_unlock()` — `vendor/linux/kernel/cpu.c:499`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cpus_read_unlock() {
+    CPU_HOTPLUG_LOCK.up_read();
 }
 
 /// `__cpuhp_setup_state` - `vendor/linux/kernel/cpu.c:2527`.

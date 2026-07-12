@@ -7,7 +7,7 @@ extern crate alloc;
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -17,8 +17,8 @@ use spin::Mutex;
 use crate::fs::file::fput;
 use crate::fs::types::FileRef;
 use crate::include::uapi::errno::{
-    EADDRINUSE, EAFNOSUPPORT, EAGAIN, ECONNREFUSED, ECONNRESET, EINVAL, ENOPROTOOPT, ENOTCONN,
-    EOPNOTSUPP, EPERM, EPIPE, EPROTONOSUPPORT,
+    EADDRINUSE, EAFNOSUPPORT, EAGAIN, ECONNREFUSED, ECONNRESET, EINPROGRESS, EINVAL, ENETDOWN,
+    ENODEV, ENOPROTOOPT, ENOTCONN, EOPNOTSUPP, EPERM, EPIPE, EPROTONOSUPPORT,
 };
 use crate::kernel::capability::{CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE, capable};
 use crate::kernel::cred::GroupInfo;
@@ -148,6 +148,7 @@ pub enum SocketState {
     Created,
     Bound,
     Listening,
+    Connecting,
     Connected,
     Closed,
 }
@@ -179,6 +180,7 @@ pub struct KernelSocket {
     pub recv_ttl: bool,
     pub recv_timeout_ns: u64,
     pub send_timeout_ns: u64,
+    pub(crate) wire_tcp: Option<crate::net::wire::TcpState>,
 }
 
 /// Packet sitting in a socket's `recvq`.
@@ -197,11 +199,23 @@ pub struct QueuedPacket {
 
 lazy_static! {
     static ref BOUND: Mutex<BTreeMap<SockAddr, Vec<SocketRef>>> = Mutex::new(BTreeMap::new());
+    static ref INET_SOCKETS: Mutex<Vec<Weak<Mutex<KernelSocket>>>> = Mutex::new(Vec::new());
 }
 
 static NEXT_EPHEMERAL_PORT: AtomicU32 = AtomicU32::new(0);
 
 static NEXT_NETLINK_AUTOBIND_PORTID: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Ethernet receive handoff from a vendor-built Linux net driver after its
+/// NAPI/GRO path selects `GRO_NORMAL`.
+pub fn receive_linux_ethernet_frame(linux_dev: *mut u8, frame: &[u8]) {
+    if frame.len() < 14 {
+        return;
+    }
+    if let Some(dev) = crate::net::device::lookup_linux_netdevice(linux_dev) {
+        crate::net::device::record_rx(&dev);
+        crate::net::wire::receive_frame(linux_dev, frame);
+    }
+}
 
 pub fn unbind_unix_path(path: &str) {
     BOUND.lock().remove(&SockAddr::Unix(String::from(path)));
@@ -370,7 +384,7 @@ pub fn socket(family: u16, sock_type: u16, protocol: u16) -> Result<SocketRef, i
     } else {
         None
     };
-    Ok(Arc::new(Mutex::new(KernelSocket {
+    let socket = Arc::new(Mutex::new(KernelSocket {
         family,
         sock_type,
         protocol,
@@ -394,7 +408,21 @@ pub fn socket(family: u16, sock_type: u16, protocol: u16) -> Result<SocketRef, i
         recv_ttl: false,
         recv_timeout_ns: 0,
         send_timeout_ns: 0,
-    })))
+        wire_tcp: None,
+    }));
+    if family == AF_INET {
+        let mut sockets = INET_SOCKETS.lock();
+        sockets.retain(|entry| entry.strong_count() != 0);
+        sockets.push(Arc::downgrade(&socket));
+    }
+    Ok(socket)
+}
+
+pub(crate) fn inet_socket_snapshot() -> Vec<SocketRef> {
+    let mut sockets = INET_SOCKETS.lock();
+    let live = sockets.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+    sockets.retain(|entry| entry.strong_count() != 0);
+    live
 }
 
 fn validate_inet_socket(sock_type: u16, protocol: u16) -> Result<(), i32> {
@@ -410,11 +438,11 @@ fn validate_inet_socket(sock_type: u16, protocol: u16) -> Result<(), i32> {
     }
 }
 
-fn qemu_guest_ipv4() -> u32 {
+pub(crate) fn qemu_guest_ipv4() -> u32 {
     ipv4(10, 0, 2, 15)
 }
 
-fn qemu_dns_ipv4() -> u32 {
+pub(crate) fn qemu_dns_ipv4() -> u32 {
     ipv4(10, 0, 2, 3)
 }
 
@@ -423,7 +451,7 @@ fn next_ephemeral_port() -> u16 {
     32768u16 + (next % 28232) as u16
 }
 
-fn autobind_inet(socket: &mut KernelSocket) {
+pub(crate) fn autobind_inet(socket: &mut KernelSocket) {
     if socket.family == AF_INET && socket.local.is_none() {
         socket.local = Some(SockAddr::Inet {
             addr: qemu_guest_ipv4(),
@@ -653,8 +681,8 @@ pub fn connect(sock: &SocketRef, peer: SockAddr) -> Result<(), i32> {
     }
     // A SYN to a closed loopback port is answered with RST in Linux
     // (vendor/linux/net/ipv4/tcp_ipv4.c::tcp_v4_send_reset), so connect()
-    // fails with ECONNREFUSED.  Non-loopback destinations fall through to
-    // the synthesized external-host path (QEMU user-net 10.0.2.x).
+    // fails with ECONNREFUSED.  Non-loopback destinations use the real
+    // device-backed IPv4 path below.
     if matches!(family, AF_INET | AF_INET6)
         && sock_type == SOCK_STREAM
         && listener.is_none()
@@ -763,6 +791,13 @@ pub fn connect(sock: &SocketRef, peer: SockAddr) -> Result<(), i32> {
         wake_socket_recv(&listener);
         wake_socket_recv(sock);
         return Ok(());
+    }
+    if family == AF_INET && sock_type == SOCK_STREAM {
+        let SockAddr::Inet { addr, port } = peer else {
+            return Err(EAFNOSUPPORT);
+        };
+        crate::net::wire::tcp_connect(sock, addr, port)?;
+        return Err(EINPROGRESS);
     }
     {
         let mut socket = sock.lock();
@@ -910,6 +945,10 @@ pub fn sendmsg_with_fds(
         wake_socket_recv(&peer_socket);
         return Ok(bytes.len());
     }
+    if family == AF_INET && sock_type == SOCK_STREAM && state == SocketState::Connected {
+        drop_file_refs(fds);
+        return crate::net::wire::tcp_send(sock, bytes);
+    }
     if matches!(sock_type, SOCK_STREAM | SOCK_SEQPACKET) {
         drop_file_refs(fds);
         return Err(disconnected);
@@ -927,9 +966,17 @@ pub fn sendmsg_with_fds(
         drop_file_refs(fds);
         return Ok(n);
     }
+    // Keep the old deterministic DNS/ICMP responder solely as unit-test
+    // scaffolding.  Production traffic must always reach the device-backed
+    // path, which is the behavior exercised by the QEMU/vendor selftests.
+    #[cfg(test)]
     if let Some(n) = synthesize_external_inet_response(sock, bytes, &peer) {
         drop_file_refs(fds);
         return Ok(n);
+    }
+    if let Some(result) = crate::net::wire::send_inet(sock, bytes, &peer) {
+        drop_file_refs(fds);
+        return result;
     }
     if !matches!(peer, SockAddr::Unix(_)) && !fds.is_empty() {
         drop_file_refs(core::mem::take(&mut fds));
@@ -989,9 +1036,14 @@ pub fn sendto_with_fds(
         drop_file_refs(fds);
         return Ok(n);
     }
+    #[cfg(test)]
     if let Some(n) = synthesize_external_inet_response(sock, bytes, &dest) {
         drop_file_refs(fds);
         return Ok(n);
+    }
+    if let Some(result) = crate::net::wire::send_inet(sock, bytes, &dest) {
+        drop_file_refs(fds);
+        return result;
     }
     let target = match BOUND
         .lock()
@@ -1113,14 +1165,25 @@ fn synthesize_route_netlink(sock: &SocketRef, bytes: &[u8]) {
         RTM_GETADDR | RTM_GETNEIGH | RTM_GETNEXTHOP | RTM_GETROUTE => {
             queue_netlink_done(sock, &header)
         }
-        // systemd's loopback_setup (vendor/systemd/systemd-260.1/src/shared/
-        // loopback-setup.c) sends RTM_SETLINK to bring lo UP and
-        // RTM_NEWADDR to attach 127.0.0.1/::1.  Linux's
-        // vendor/linux/net/core/rtnetlink.c always returns success after
-        // applying these to the loopback device.  Reply with NLMSG_ERROR
-        // err=0 (the canonical "ACK success") so sd_netlink_call() returns
-        // 0 and systemd's main flow advances past loopback_setup.
-        RTM_SETLINK | RTM_NEWLINK | RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR => {
+        // Linux applies IFF_UP transitions under RTNL before acknowledging
+        // RTM_SETLINK (and RTM_NEWLINK when it identifies an existing link).
+        RTM_SETLINK => {
+            let error = apply_rtnl_setlink(bytes, &header).map_or_else(|errno| -errno, |_| 0);
+            queue_netlink_error(sock, bytes, error);
+        }
+        RTM_NEWLINK => {
+            let ifindex = rtnl_link_ifindex(bytes, &header).unwrap_or(0);
+            let error = if ifindex == 0 {
+                0
+            } else {
+                apply_rtnl_setlink(bytes, &header).map_or_else(|errno| -errno, |_| 0)
+            };
+            queue_netlink_error(sock, bytes, error);
+        }
+        // Address creation/removal is acknowledged for the configured
+        // loopback addresses; the IPv4 device path currently uses its QEMU
+        // user-net address directly.
+        RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR => {
             queue_netlink_error(sock, bytes, 0);
         }
         // systemd treats qdisc and fib-rule EOPNOTSUPP as optional-kernel
@@ -1129,6 +1192,37 @@ fn synthesize_route_netlink(sock: &SocketRef, bytes: &[u8]) {
         RTM_GETQDISC | RTM_GETRULE => queue_netlink_error(sock, bytes, -(EOPNOTSUPP as i32)),
         _ => queue_netlink_error(sock, bytes, -(EOPNOTSUPP as i32)),
     }
+}
+
+fn rtnl_link_ifindex(bytes: &[u8], header: &NetlinkHeader) -> Result<u32, i32> {
+    if header.len < NLMSG_HDRLEN + 16 || bytes.len() < NLMSG_HDRLEN + 16 {
+        return Err(EINVAL);
+    }
+    let ifindex = i32::from_ne_bytes(bytes[20..24].try_into().unwrap());
+    u32::try_from(ifindex).map_err(|_| EINVAL)
+}
+
+fn apply_rtnl_setlink(bytes: &[u8], header: &NetlinkHeader) -> Result<(), i32> {
+    let ifindex = rtnl_link_ifindex(bytes, header)?;
+    if ifindex == 0 {
+        return Err(ENODEV);
+    }
+    let dev = crate::net::device::list_netdevices()
+        .into_iter()
+        .find(|dev| dev.ifindex == ifindex)
+        .ok_or(ENODEV)?;
+    let flags = u32::from_ne_bytes(bytes[24..28].try_into().unwrap());
+    let change = u32::from_ne_bytes(bytes[28..32].try_into().unwrap());
+    if change & crate::net::device::IFF_UP != 0 {
+        if flags & crate::net::device::IFF_UP != 0 {
+            if !dev.is_up() {
+                crate::net::device::set_device_up(&dev)?;
+            }
+        } else if dev.is_up() {
+            crate::net::device::set_device_down(&dev)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1700,6 +1794,7 @@ pub fn set_netlink_membership(sock: &SocketRef, group: u32, add: bool) -> Result
     Ok(())
 }
 
+#[cfg(test)]
 fn synthesize_external_inet_response(
     sock: &SocketRef,
     bytes: &[u8],
@@ -1761,6 +1856,7 @@ fn synthesize_external_inet_response(
     None
 }
 
+#[cfg(test)]
 fn build_dns_a_response(query: &[u8]) -> Option<Vec<u8>> {
     if query.len() < 12 {
         return None;
@@ -1807,6 +1903,7 @@ fn build_dns_a_response(query: &[u8]) -> Option<Vec<u8>> {
     Some(response)
 }
 
+#[cfg(test)]
 fn build_icmp_echo_reply(packet: &[u8]) -> Option<Vec<u8>> {
     if packet.len() < 8 || packet[0] != 8 {
         return None;
@@ -1887,6 +1984,9 @@ pub fn stream_hangup_locked(socket: &KernelSocket) -> bool {
     }
     if socket.state != SocketState::Connected {
         return false;
+    }
+    if let Some(tcp) = &socket.wire_tcp {
+        return tcp.fin_received;
     }
     match &socket.peer_socket {
         // In the in-kernel SocketRef API, the peer link can be the final Arc
@@ -2232,6 +2332,10 @@ mod tests {
         // NLM_F_REQUEST | NLM_F_ACK = 0x05.
         req[6..8].copy_from_slice(&0x0005u16.to_ne_bytes());
         req[8..12].copy_from_slice(&0xCAFEu32.to_ne_bytes());
+        let lo = crate::net::device::lookup_netdevice("lo").expect("loopback device");
+        req[20..24].copy_from_slice(&(lo.ifindex as i32).to_ne_bytes());
+        req[24..28].copy_from_slice(&crate::net::device::IFF_UP.to_ne_bytes());
+        req[28..32].copy_from_slice(&crate::net::device::IFF_UP.to_ne_bytes());
 
         assert_eq!(
             sendto(&sock, &req, SockAddr::Netlink { pid: 0, groups: 0 }).unwrap(),
@@ -2793,18 +2897,18 @@ mod tests {
             Err(ECONNREFUSED)
         );
 
-        // Non-loopback destinations keep the synthesized external-host path
-        // (QEMU user-net 10.0.2.x) so DNS/HTTP smoke flows stay intact.
+        // With no device registered in this unit-test process, an external
+        // connect reports the same ENETDOWN error as Linux.
         let external = socket(AF_INET, SOCK_STREAM, 0).unwrap();
-        assert!(
+        assert_eq!(
             connect(
                 &external,
                 SockAddr::Inet {
                     addr: ipv4(10, 0, 2, 2),
                     port: 80,
                 },
-            )
-            .is_ok()
+            ),
+            Err(ENETDOWN)
         );
     }
 

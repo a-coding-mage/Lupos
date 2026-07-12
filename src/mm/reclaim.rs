@@ -506,7 +506,7 @@ mod tests {
         let mptr = mapping.as_mut() as *mut AddressSpace;
         let page = alloc_test_page();
         unsafe { filemap_add_folio(mptr, page, 0, GFP_KERNEL) };
-        unsafe { (*page)._mapcount.store(0, Ordering::Relaxed) };
+        unsafe { (*page)._mapcount().store(0, Ordering::Relaxed) };
         lru_add_drain();
 
         let stats = shrink_lruvec(&ScanControl {
@@ -521,7 +521,7 @@ mod tests {
         assert!(unsafe { (&*mptr).i_pages.xa_load(0).is_some() });
         assert_eq!(unsafe { (*page).refcount() }, 1);
 
-        unsafe { (*page)._mapcount.store(-1, Ordering::Relaxed) };
+        unsafe { (*page)._mapcount().store(-1, Ordering::Relaxed) };
         unsafe { filemap_remove_folio(page) };
         unsafe { free_test_page(page) };
     }

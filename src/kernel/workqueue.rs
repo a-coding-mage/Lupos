@@ -181,6 +181,21 @@ pub static SYSTEM_LONG_WQ: LazyWq = LazyWq::new("events_long", 0);
 pub static SYSTEM_UNBOUND_WQ: LazyWq = LazyWq::new("events_unbound", WQ_UNBOUND);
 pub static SYSTEM_HIGHPRI_WQ: LazyWq = LazyWq::new("events_highpri", WQ_HIGHPRI);
 
+/// Run pending work from the Linux system workqueues in cooperative task
+/// context.  Vendor drivers queue onto these through `schedule_work()` and
+/// `queue_work_on()`; until worker kthreads are available, syscall wait and
+/// module-load boundaries provide the same safe, lock-free execution point.
+pub fn drain_system_workqueues() {
+    for queue in [
+        SYSTEM_WQ.get(),
+        SYSTEM_LONG_WQ.get(),
+        SYSTEM_UNBOUND_WQ.get(),
+        SYSTEM_HIGHPRI_WQ.get(),
+    ] {
+        flush_workqueue(&queue);
+    }
+}
+
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
         export_symbol(name, addr, gpl_only);

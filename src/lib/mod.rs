@@ -33,6 +33,7 @@ pub mod decompress;
 pub mod devmem_is_allowed;
 pub mod dhry_run;
 pub mod dim;
+pub mod dynamic_queue_limits;
 pub mod earlycpio;
 pub mod errname;
 pub mod extable;
@@ -133,6 +134,7 @@ pub fn register_module_exports() {
     debug_locks::register_module_exports();
     dec_and_lock::register_module_exports();
     dim::register_module_exports();
+    dynamic_queue_limits::register_module_exports();
     errname::register_module_exports();
     fault_inject_usercopy::register_module_exports();
     find_bit::register_module_exports();

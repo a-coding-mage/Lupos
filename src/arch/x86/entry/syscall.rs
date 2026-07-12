@@ -703,6 +703,7 @@ unsafe fn rdmsr(msr: u32) -> u64 {
 /// - Must run on the target physical CPU (MSRs are per-CPU registers).
 /// - Not re-entrant; call once from `kernel_main`.
 pub unsafe fn init() {
+    crate::arch::x86::kernel::setup_percpu::setup_percpu_segment(0);
     unsafe {
         // 1. Enable SCE in EFER.
         //    arch/x86/boot/header.S set LME (bit 8) and the CPU set LMA (bit 10) automatically.

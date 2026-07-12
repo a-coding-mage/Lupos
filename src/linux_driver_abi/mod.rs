@@ -79,10 +79,30 @@ pub(crate) fn poll_driver_abi_events() -> usize {
     handled
 }
 
+/// Surface vendor-driver completions at a syscall wait boundary, then run any
+/// softirqs those callbacks scheduled.  This is task context: unlike hard-IRQ
+/// exit, callers hold no socket, epoll, or console locks while the vendor
+/// callback and NET_RX action run.
+pub(crate) fn poll_driver_abi_events_for_wait() -> usize {
+    #[cfg(not(test))]
+    {
+        let handled = poll_driver_abi_events();
+        crate::kernel::workqueue::drain_system_workqueues();
+        crate::kernel::softirq::do_softirq();
+        crate::kernel::workqueue::drain_system_workqueues();
+        handled
+    }
+    #[cfg(test)]
+    {
+        0
+    }
+}
+
 /// Register Linux driver ABI symbols before vendor-built `.ko` modules load.
 pub fn register_module_exports() {
     crate::lib::register_module_exports();
     crate::kernel::params::register_module_exports();
+    crate::kernel::printk::register_module_exports();
     crate::arch::x86::kernel::head64::register_module_exports();
     crate::arch::x86::kernel::cpu::common::register_module_exports();
     crate::arch::x86::entry::thunk::register_module_exports();
@@ -95,6 +115,7 @@ pub fn register_module_exports() {
     crate::kernel::dma::register_module_exports();
     crate::kernel::cpuhotplug::register_module_exports();
     crate::kernel::irq::register_module_exports();
+    crate::kernel::rcu::register_module_exports();
     crate::kernel::sched::register_module_exports();
     crate::kernel::time::jiffies::register_module_exports();
     crate::kernel::time::sleep_timeout::register_module_exports();

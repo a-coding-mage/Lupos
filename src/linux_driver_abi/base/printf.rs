@@ -22,16 +22,17 @@ enum Length {
 
 struct LinuxVaCursor {
     register_args: *const usize,
+    register_count: usize,
     stack_args: *const usize,
     index: usize,
 }
 
 impl LinuxVaCursor {
     unsafe fn next(&mut self) -> usize {
-        let value = if self.index < 4 {
+        let value = if self.index < self.register_count {
             unsafe { self.register_args.add(self.index).read() }
         } else {
-            unsafe { self.stack_args.add(self.index - 4).read() }
+            unsafe { self.stack_args.add(self.index - self.register_count).read() }
         };
         self.index += 1;
         value
@@ -175,6 +176,20 @@ pub(crate) unsafe fn vscnprintf(
     register_args: *const usize,
     stack_args: *const usize,
 ) -> usize {
+    unsafe { vscnprintf_n(buf, size, fmt, register_args, 4, stack_args) }
+}
+
+/// Variant used by ABI trampolines with a different number of fixed integer
+/// arguments. `_printk(fmt, ...)`, for example, has five remaining SysV
+/// integer argument registers while `_dev_info(dev, fmt, ...)` has four.
+pub(crate) unsafe fn vscnprintf_n(
+    buf: *mut u8,
+    size: usize,
+    fmt: *const core::ffi::c_char,
+    register_args: *const usize,
+    register_count: usize,
+    stack_args: *const usize,
+) -> usize {
     if buf.is_null()
         || size == 0
         || fmt.is_null()
@@ -187,6 +202,7 @@ pub(crate) unsafe fn vscnprintf(
     let format = unsafe { c_bytes(fmt, 8192) };
     let mut args = LinuxVaCursor {
         register_args,
+        register_count,
         stack_args,
         index: 0,
     };

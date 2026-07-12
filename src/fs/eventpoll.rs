@@ -1083,6 +1083,8 @@ pub unsafe fn sys_epoll_wait(
     let current = unsafe { sched::get_current() };
 
     loop {
+        #[cfg(not(test))]
+        let _ = crate::linux_driver_abi::poll_driver_abi_events_for_wait();
         unsafe {
             crate::kernel::signal::exit_if_fatal_signal_pending_current();
         }

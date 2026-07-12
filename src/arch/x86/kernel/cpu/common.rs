@@ -6,11 +6,10 @@
 //! Also carries the single-CPU cpumask objects Linux modules reference from
 //! `vendor/linux/kernel/cpu.c`.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::kernel::module::{export_symbol, find_symbol};
 
-static LINUX_PREEMPT_COUNT: AtomicU32 = AtomicU32::new(0);
 static LINUX_CONST_CURRENT_TASK: AtomicUsize = AtomicUsize::new(0);
 
 /// `struct cpumask` - `vendor/linux/include/linux/cpumask_types.h`.
@@ -30,7 +29,7 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 pub fn register_module_exports() {
     export_symbol_once(
         "__preempt_count",
-        core::ptr::addr_of!(LINUX_PREEMPT_COUNT) as usize,
+        crate::arch::x86::kernel::setup_percpu::preempt_count_symbol(),
         true,
     );
     export_symbol_once(
@@ -41,6 +40,16 @@ pub fn register_module_exports() {
     export_symbol_once(
         "__cpu_possible_mask",
         core::ptr::addr_of!(LINUX_CPU_POSSIBLE_MASK) as usize,
+        false,
+    );
+    export_symbol_once(
+        "cpu_number",
+        crate::arch::x86::kernel::setup_percpu::cpu_number_symbol(),
+        false,
+    );
+    export_symbol_once(
+        "this_cpu_off",
+        crate::arch::x86::kernel::setup_percpu::this_cpu_off_symbol(),
         false,
     );
 }

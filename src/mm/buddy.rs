@@ -187,7 +187,7 @@ impl BuddyAllocator {
                 (*current)
                     .page_type
                     .store(PAGE_TYPE_NONE, Ordering::Relaxed);
-                (*current)._mapcount.store(-1, Ordering::Relaxed);
+                (*current)._mapcount().store(-1, Ordering::Relaxed);
                 (*current)._refcount.store(0, Ordering::Relaxed);
                 (*current).init_lru();
             }
@@ -240,6 +240,7 @@ impl BuddyAllocator {
         MEM_MAP_PTR.store(mem_map_ptr, Ordering::Relaxed);
         MEM_MAP_BASE_PFN.store(0, Ordering::Relaxed);
         MEM_MAP_COUNT.store(mem_map_pages, Ordering::Relaxed);
+        crate::arch::x86::kernel::head64::set_linux_vmemmap_base(mem_map_ptr, 0);
 
         // 3. Initialize all Page structs to default state.
         for i in 0..mem_map_pages {
