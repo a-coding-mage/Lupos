@@ -3,7 +3,9 @@ extern crate alloc;
 
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -174,6 +176,7 @@ const LUPOS_OVMF_VARS_ENV: &str = "LUPOS_OVMF_VARS";
 /// Override the GRUB module directory passed to `grub-mkrescue -d`, so hosts
 /// lacking the i386-pc GRUB platform can still produce a BIOS-bootable ISO.
 const LUPOS_GRUB_LIBDIR_ENV: &str = "LUPOS_GRUB_LIBDIR";
+const TMPDIR_ENV: &str = "TMPDIR";
 const DEFAULT_QEMU_MEMORY: &str = "1024M";
 const GUI_SHELL_QEMU_MEMORY: &str = "4096M";
 const GRAPHICS_ROOT_DISK_SIZE: &str = "12G";
@@ -4493,9 +4496,10 @@ fn run_syscall_evidence_command(root: &Path, command: &str) -> Result<ExitStatus
     let program = parts
         .next()
         .ok_or_else(|| anyhow!("empty syscall evidence command"))?;
-    Command::new(program)
-        .args(parts)
-        .current_dir(root)
+    let mut child = Command::new(program);
+    child.args(parts).current_dir(root);
+    configure_subprocess_tmpdir(&mut child)?;
+    child
         .status()
         .with_context(|| format!("failed to run syscall evidence command: {command}"))
 }
@@ -6895,17 +6899,18 @@ fn linux_driver_module_artifact_is_elf(spec: &DriverModuleSpec) -> bool {
 
 fn vendor_linux_source_head() -> Result<String> {
     let vendor_linux = repo_root()?.join("vendor/linux");
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(&vendor_linux)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to query source revision in {}",
-                vendor_linux.display()
-            )
-        })?;
+        .args(["rev-parse", "HEAD"]);
+    configure_subprocess_tmpdir(&mut command)?;
+    let output = command.output().with_context(|| {
+        format!(
+            "failed to query source revision in {}",
+            vendor_linux.display()
+        )
+    })?;
     if !output.status.success() {
         bail!(
             "git rev-parse failed for {}: {}",
@@ -6920,11 +6925,14 @@ fn vendor_linux_source_head() -> Result<String> {
 }
 
 fn sha256_bytes(label: &str, bytes: &[u8]) -> Result<String> {
-    let mut child = Command::new("sha256sum")
+    let mut command = Command::new("sha256sum");
+    command
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_subprocess_tmpdir(&mut command)?;
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to start sha256sum for {label}"))?;
     child
@@ -7127,9 +7135,10 @@ fn linux_driver_module_toolchain_sha256() -> Result<String> {
                     identity.clone()
                 } else {
                     let executable_sha256 = sha256_file(&path)?;
-                    let output = Command::new(&path)
-                        .arg("--version")
-                        .env("LC_ALL", "C")
+                    let mut command = Command::new(&path);
+                    command.arg("--version").env("LC_ALL", "C");
+                    configure_subprocess_tmpdir(&mut command)?;
+                    let output = command
                         .output()
                         .with_context(|| format!("failed to query {} --version", path.display()))?;
                     let version = format!(
@@ -7339,9 +7348,10 @@ fn prune_and_audit_linux_driver_module_artifact_set(modules: &[&DriverModuleSpec
 }
 
 fn nm_output(path: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("nm")
-        .args(args)
-        .arg(path)
+    let mut command = Command::new("nm");
+    command.args(args).arg(path);
+    configure_subprocess_tmpdir(&mut command)?;
+    let output = command
         .output()
         .with_context(|| format!("failed to inspect module symbols in {}", path.display()))?;
     if !output.status.success() {
@@ -7906,13 +7916,16 @@ fn depmod_index_files(
                 .with_context(|| format!("failed to seed depmod {name}"))?;
         }
 
-        let output = Command::new(depmod_executable()?)
+        let mut command = Command::new(depmod_executable()?);
+        command
             .arg("-b")
             .arg(&temp_root)
             .arg("-C")
             .arg("/dev/null")
             .arg(MODULE_VERSION_DIR)
-            .env("LC_ALL", "C")
+            .env("LC_ALL", "C");
+        configure_subprocess_tmpdir(&mut command)?;
+        let output = command
             .output()
             .context("failed to run depmod for staged Linux modules")?;
         if !output.status.success() {
@@ -8315,6 +8328,41 @@ const EARLY_ROOT_MODULE_NAMES: &[&str] = &[
     "ahci",
 ];
 
+/// The complete module closure exercised by the QEMU virtio-blk root-binding
+/// gate.  Unlike the production early-root initramfs above, this test does not
+/// attach an AHCI controller, so loading every optional storage/network/video
+/// module selected by the generic `.config` would test unrelated hardware
+/// closures rather than the active root transport.
+const INITRAMFS_ROOTFS_TEST_MODULE_NAMES: &[&str] = &[
+    "virtio_pci_modern_dev",
+    "virtio_pci_legacy_dev",
+    "virtio_pci",
+    "virtio_blk",
+];
+
+fn initramfs_rootfs_test_module_specs_from_repo_config() -> Vec<&'static DriverModuleSpec> {
+    let text = repo_config_text().expect("initramfs-rootfs test requires a synchronized .config");
+    let selected = staged_module_specs_from_config_text(&text);
+    // Keep the shared vendor-module artifact cache bound to the complete
+    // configured Kbuild invocation.  Only the boot-test CPIO is filtered.
+    ensure_linux_driver_module_artifacts(&selected)
+        .expect("configured Linux driver module artifacts must be built");
+    INITRAMFS_ROOTFS_TEST_MODULE_NAMES
+        .iter()
+        .map(|name| {
+            selected
+                .iter()
+                .copied()
+                .find(|spec| spec.module_name == *name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "initramfs-rootfs QEMU gate requires Linux-built {name}.ko selected as a module in .config"
+                    )
+                })
+        })
+        .collect()
+}
+
 fn early_root_module_specs_from_repo_config() -> Vec<&'static DriverModuleSpec> {
     let Some(text) = repo_config_text() else {
         return Vec::new();
@@ -8428,13 +8476,17 @@ fn initramfs_files(mode: &BootMode) -> Option<Vec<InitramfsFile>> {
             build_minimal_elf64(),
         )]),
         BootMode::InitramfsRootfsTest => {
+            let modules = initramfs_rootfs_test_module_specs_from_repo_config();
             let mut files = login_userland_files();
             files.push(initramfs_file(
                 "etc/modules",
                 0o100644,
-                etc_modules_from_repo_config(),
+                module_list_from_specs(&modules),
             ));
-            files.extend(staged_module_files_from_repo_config());
+            files.extend(
+                staged_module_files_from_specs(&modules)
+                    .expect("initramfs-rootfs QEMU module closure must be staged"),
+            );
             Some(files)
         }
         BootMode::DiskRootRemountTest => Some(module_stage_initramfs_files()),
@@ -9522,6 +9574,7 @@ fn run_driver_binary_policy_check() -> Result<()> {
         .args(["--hidden", "-g", "!.git", "-g", "!target", "-n"])
         .arg(forbidden)
         .arg(".");
+    configure_subprocess_tmpdir(&mut command)?;
     let output = command
         .output()
         .context("failed to run driver binary-only policy scan with rg")?;
@@ -11950,12 +12003,17 @@ fn login_root_disk_manifest_matches(
 }
 
 fn login_root_disk_image_is_clean(raw: &Path) -> bool {
-    Command::new("e2fsck")
+    let mut command = Command::new("e2fsck");
+    command
         .arg("-fn")
         .arg(raw)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    if configure_subprocess_tmpdir(&mut command).is_err() {
+        return false;
+    }
+    command
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -16404,9 +16462,10 @@ fn ensure_grub_x86_64_efi_modules(target_dir: &Path) -> Result<String> {
   fi
 done
 "#;
-    let output = Command::new("bash")
-        .arg("-lc")
-        .arg(installed)
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(installed);
+    configure_subprocess_tmpdir(&mut command)?;
+    let output = command
         .output()
         .context("failed to locate installed GRUB x86_64 EFI modules")?;
     if !output.status.success() {
@@ -18596,12 +18655,15 @@ fn refresh_installed_module_indexes(root: &Path) -> Result<()> {
     // `extra/` modules discoverable alongside the replaced in-tree payload.
     // Its additional `-e -F System.map` unresolved-symbol audit cannot be
     // reproduced until Lupos emits a System.map for its actual Rust exports.
-    let output = Command::new(depmod_executable()?)
+    let mut command = Command::new(depmod_executable()?);
+    command
         .arg("-a")
         .arg("-b")
         .arg(root)
         .arg(MODULE_VERSION_DIR)
-        .env("LC_ALL", "C")
+        .env("LC_ALL", "C");
+    configure_subprocess_tmpdir(&mut command)?;
+    let output = command
         .output()
         .context("failed to run depmod for installed Linux modules")?;
     if !output.status.success() {
@@ -19566,7 +19628,46 @@ fn feature_list(mode: BootMode, exit_after_boot: bool) -> Vec<&'static str> {
 
 // Path strings for shell scripts come from `shell_path` (native, Linux-only).
 
+/// Give xtask-owned child processes a repository-backed temporary directory.
+///
+/// Several host tools (notably `grub-mkrescue`) may need substantially more
+/// scratch space than a tmpfs-backed `/tmp` provides.  A non-empty TMPDIR set
+/// explicitly either on the command or by the user remains authoritative;
+/// otherwise children use `<repo>/target/xtask/tmp`.  Setting this only on the
+/// child avoids mutating the process-global environment from library/test
+/// callers.
+fn configure_subprocess_tmpdir(command: &mut Command) -> Result<()> {
+    let command_tmpdir: Option<Option<&OsStr>> = command.get_envs().find_map(|(name, value)| {
+        if name == OsStr::new(TMPDIR_ENV) {
+            Some(value)
+        } else {
+            None
+        }
+    });
+    let has_explicit_tmpdir = match command_tmpdir {
+        Some(Some(value)) => !value.is_empty(),
+        // An explicit removal or empty value does not provide a usable child
+        // temporary directory, even if the parent has TMPDIR set.
+        Some(None) => false,
+        None => env::var_os(TMPDIR_ENV).is_some_and(|value| !value.is_empty()),
+    };
+    if has_explicit_tmpdir {
+        return Ok(());
+    }
+
+    let temp_dir = xtask_target_dir()?.join("tmp");
+    fs::create_dir_all(&temp_dir).with_context(|| {
+        format!(
+            "failed to create xtask subprocess temporary directory {}",
+            temp_dir.display()
+        )
+    })?;
+    command.env(TMPDIR_ENV, temp_dir);
+    Ok(())
+}
+
 fn run_command(command: &mut Command, label: &str) -> Result<()> {
+    configure_subprocess_tmpdir(command)?;
     let rendered = render_command(command);
     let status = command
         .status()
@@ -19580,6 +19681,7 @@ fn run_command(command: &mut Command, label: &str) -> Result<()> {
 }
 
 fn run_command_stdout(command: &mut Command, label: &str) -> Result<String> {
+    configure_subprocess_tmpdir(command)?;
     let rendered = render_command(command);
     let output = command
         .output()
@@ -19718,14 +19820,19 @@ fn qemu_run_lock_owner_has_process_ids(owner: &QemuRunLockOwner) -> bool {
 }
 
 fn process_is_running_conservative(pid: u32) -> bool {
-    Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg("kill -0 \"$1\" 2>/dev/null")
         .arg("sh")
         .arg(pid.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    if configure_subprocess_tmpdir(&mut command).is_err() {
+        return true;
+    }
+    command
         .status()
         .map(|status| status.success())
         .unwrap_or(true)
@@ -19812,10 +19919,15 @@ fn linux_boot_time_unix() -> Option<u64> {
 }
 
 fn clock_ticks_per_second() -> u64 {
-    Command::new("getconf")
+    let mut command = Command::new("getconf");
+    command
         .arg("CLK_TCK")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    if configure_subprocess_tmpdir(&mut command).is_err() {
+        return 100;
+    }
+    command
         .output()
         .ok()
         .and_then(|output| {
@@ -19885,6 +19997,7 @@ fn spawn_qemu_guard(
     lock: &QemuRunLock,
     label: &str,
 ) -> Result<QemuGuard> {
+    configure_subprocess_tmpdir(command)?;
     let guard = QemuGuard::new(
         command
             .spawn()

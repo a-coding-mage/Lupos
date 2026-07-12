@@ -264,10 +264,14 @@ fn should_resched_after_user_fault(frame: &ExceptionFrame, ec: u64, task: *mut T
 
 fn resched_after_user_fault(frame: &ExceptionFrame, ec: u64, task: *mut TaskStruct) {
     if should_resched_after_user_fault(frame, ec, task) {
-        // Mirrors Linux's exit-to-user-mode reschedule loop. Legacy single-CPU
-        // tasks can otherwise monopolize the CPU while resolving long bursts
-        // of user faults, because the timer tick only sets TIF_NEED_RESCHED.
-        unsafe { sched::schedule_with_irqs_enabled() };
+        // Mirror Linux's exit-to-user-mode loop: enable interrupts around the
+        // runnable reschedule, then restore the IRQ-off page-fault return
+        // invariant.  This is not a blocking sleep, so it must not use
+        // `schedule_with_irqs_enabled()`; that helper may halt when the
+        // faulting task is the only runnable task.
+        crate::kernel::locking::local_irq_enable();
+        let _ = unsafe { sched::schedule() };
+        crate::kernel::locking::local_irq_disable();
     }
 }
 

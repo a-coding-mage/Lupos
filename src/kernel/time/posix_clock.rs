@@ -170,11 +170,15 @@ pub fn sys_clock_getres(clock: ClockId) -> Result<Timespec64, i32> {
     }
 }
 
-fn nanosleep_timer_wake(t: &mut Hrtimer) -> HrtimerRestart {
-    let task = t.data as *mut crate::kernel::task::TaskStruct;
+fn nanosleep_timer_wake(t: *mut Hrtimer) -> HrtimerRestart {
+    let task = if t.is_null() {
+        core::ptr::null_mut()
+    } else {
+        unsafe { (*t).data as *mut crate::kernel::task::TaskStruct }
+    };
     if !task.is_null() {
         unsafe {
-            crate::kernel::sched::wake_task(task);
+            crate::kernel::sched::wake_task_normal(task);
         }
     }
     HrtimerRestart::NoRestart
@@ -200,12 +204,7 @@ pub fn sys_clock_nanosleep(
     let target = if abs_time {
         requested_ns
     } else {
-        let duration_ns = if requested_ns > 0 && requested_ns < NSEC_PER_TICK.saturating_mul(10) {
-            NSEC_PER_TICK.saturating_mul(10)
-        } else {
-            requested_ns
-        };
-        now_ns.saturating_add(duration_ns)
+        now_ns.saturating_add(requested_ns)
     };
     if target <= now_ns {
         return Ok(());
@@ -226,13 +225,35 @@ pub fn sys_clock_nanosleep(
         t.data = unsafe { crate::kernel::sched::get_current() } as usize;
     }
     t.function = Some(nanosleep_timer_wake);
+
+    // Linux sets TASK_INTERRUPTIBLE before arming the sleeper.  Keep IRQs
+    // disabled across that state publication and hrtimer enqueue so a very
+    // short timer cannot expire before the task becomes sleepable and lose
+    // its wakeup.
+    #[cfg(not(test))]
+    {
+        let current = unsafe { crate::kernel::sched::get_current() };
+        if !current.is_null() {
+            crate::kernel::locking::local_irq_disable();
+            unsafe {
+                (*current).__state.store(
+                    crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+                    core::sync::atomic::Ordering::Release,
+                );
+            }
+        }
+    }
     hrtimer_start(&mut t as *mut Hrtimer, target_mono, HrtimerMode::Abs);
 
-    while ktime_get() < target_mono {
+    loop {
         #[cfg(not(test))]
         {
             crate::init::rootfs::drain_console_control_bytes();
             let current = unsafe { crate::kernel::sched::get_current() };
+            crate::kernel::locking::local_irq_disable();
+            if ktime_get() >= target_mono {
+                break;
+            }
             if crate::kernel::signal::has_pending_signals(current) {
                 if !current.is_null() {
                     unsafe {
@@ -242,6 +263,7 @@ pub fn sys_clock_nanosleep(
                         );
                     }
                 }
+                crate::kernel::locking::local_irq_enable();
                 // Linux writes the remaining time only for interrupted
                 // RELATIVE sleeps (hrtimer_nanosleep -> nanosleep_copyout);
                 // `remain` is the syscall wrapper's kernel-side scratch
@@ -256,9 +278,6 @@ pub fn sys_clock_nanosleep(
                     Err(crate::include::uapi::errno::EINTR),
                 );
             }
-            // The current cooperative scheduler only drains timer softirqs from
-            // the idle loop. A userspace sleep can run with no idle slice, so
-            // advance the periodic tick here before yielding.
             if !current.is_null() {
                 unsafe {
                     (*current).__state.store(
@@ -267,13 +286,15 @@ pub fn sys_clock_nanosleep(
                     );
                 }
             }
-            crate::kernel::time::clockevents::tick_handle_periodic();
             unsafe {
                 crate::kernel::sched::schedule_with_irqs_enabled();
             }
         }
         #[cfg(test)]
         {
+            if ktime_get() >= target_mono {
+                break;
+            }
             // In tests, advance the monotonic clock manually so we exit.
             super::timekeeping::tick_advance_walltime();
             hrtimer_run_queues();
@@ -292,6 +313,7 @@ pub fn sys_clock_nanosleep(
                 );
             }
         }
+        crate::kernel::locking::local_irq_enable();
     }
     finish_nanosleep_timer(&mut t as *mut Hrtimer, Ok(()))
 }

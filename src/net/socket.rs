@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/net/socket.c
 //! test-origin: linux:vendor/linux/net/socket.c
 //! Socket layer scaffolding for AF_INET, AF_INET6, AF_UNIX, AF_PACKET, AF_NETLINK.
@@ -17,14 +17,16 @@ use spin::Mutex;
 use crate::fs::file::fput;
 use crate::fs::types::FileRef;
 use crate::include::uapi::errno::{
-    EADDRINUSE, EAFNOSUPPORT, EAGAIN, ECONNREFUSED, EINVAL, ENOPROTOOPT, ENOTCONN, EOPNOTSUPP,
-    EPERM, EPIPE, EPROTONOSUPPORT,
+    EADDRINUSE, EAFNOSUPPORT, EAGAIN, ECONNREFUSED, ECONNRESET, EINVAL, ENOPROTOOPT, ENOTCONN,
+    EOPNOTSUPP, EPERM, EPIPE, EPROTONOSUPPORT,
 };
 use crate::kernel::capability::{CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE, capable};
 use crate::kernel::cred::GroupInfo;
 use crate::kernel::pid::{KPid, get_pid, put_pid};
 use crate::kernel::sched;
+use crate::kernel::sched::wait::WaitQueueHead;
 use crate::kernel::task::TaskStruct;
+use crate::kernel::task::task_state::TASK_INTERRUPTIBLE;
 use crate::net::fib::ipv4;
 use crate::net::ip::{IPPROTO_ICMP, IPPROTO_TCP, IPPROTO_UDP, checksum};
 use crate::net::rtnetlink::{
@@ -73,6 +75,10 @@ pub const SO_PEERPIDFD: u32 = 77;
 pub const SO_PASSRIGHTS: u32 = 83;
 pub const SO_PEERGROUPS: u32 = 59;
 pub const IP_RECVTTL: u32 = 12;
+
+pub const RCV_SHUTDOWN: u8 = 1;
+pub const SEND_SHUTDOWN: u8 = 2;
+pub const SHUTDOWN_MASK: u8 = RCV_SHUTDOWN | SEND_SHUTDOWN;
 
 pub type SocketRef = Arc<Mutex<KernelSocket>>;
 
@@ -151,10 +157,16 @@ pub struct KernelSocket {
     pub sock_type: u16,
     pub protocol: u16,
     pub state: SocketState,
+    /// Linux `sk_shutdown` (`RCV_SHUTDOWN` / `SEND_SHUTDOWN`).
+    pub shutdown: u8,
+    /// Pending `sk_err`, consumed by the next receive / SO_ERROR query.
+    pub pending_error: i32,
     pub local: Option<SockAddr>,
     pub peer: Option<SockAddr>,
     pub recvq: VecDeque<QueuedPacket>,
     pub backlog: VecDeque<SocketRef>,
+    /// `sk->sk_wq->wait`: receive/accept/poll sleepers for this socket.
+    pub recv_wait: Arc<WaitQueueHead>,
     pub peer_socket: Option<SocketRef>,
     pub cred: SocketCred,
     pub peer_cred: Option<SocketCred>,
@@ -202,10 +214,77 @@ pub fn release_bound_socket(sock: &SocketRef) {
     });
 }
 
+/// Test the receive-side condition while the socket lock is held.
+///
+/// This is the condition behind Linux's `sk_sleep(sk)` wait queue: listeners
+/// become readable when an accept child is queued, data sockets when a packet
+/// is queued, and streams when shutdown/disconnect makes the next read return
+/// EOF.
+pub fn socket_recv_ready_locked(socket: &KernelSocket) -> bool {
+    if socket.state == SocketState::Listening {
+        !socket.backlog.is_empty()
+            || socket.shutdown & RCV_SHUTDOWN != 0
+            || socket.pending_error != 0
+    } else {
+        !socket.recvq.is_empty()
+            || socket.shutdown & RCV_SHUTDOWN != 0
+            || socket.pending_error != 0
+            || socket.state == SocketState::Closed
+            || stream_hangup_locked(socket)
+    }
+}
+
+/// Prepare an interruptible receive wait without a condition/waitqueue race.
+///
+/// Like `prepare_to_wait()` followed by the condition check in Linux
+/// `wait_event_interruptible()`, both registration and the readiness recheck
+/// happen under the socket lock used by every receive-side producer. `false`
+/// means the condition won the race and the caller must retry without
+/// scheduling.
+///
+/// # Safety
+/// `task` must be the live current task for the duration of the wait.
+pub unsafe fn prepare_socket_recv_wait(sock: &SocketRef, task: *mut TaskStruct) -> bool {
+    let socket = sock.lock();
+    if socket_recv_ready_locked(&socket) {
+        return false;
+    }
+    unsafe {
+        socket.recv_wait.prepare_to_wait(task, TASK_INTERRUPTIBLE);
+    }
+    true
+}
+
+/// Remove a receive waiter and restore `TASK_RUNNING`, matching
+/// `finish_wait()` in the Linux wait-event loop.
+///
+/// # Safety
+/// `task` must still identify the task passed to
+/// [`prepare_socket_recv_wait`].
+pub unsafe fn finish_socket_recv_wait(sock: &SocketRef, task: *mut TaskStruct) {
+    let wait = sock.lock().recv_wait.clone();
+    unsafe {
+        wait.finish_wait(task);
+    }
+}
+
+/// Wake all receive, accept, poll, and epoll waiters after a readiness change.
+pub fn wake_socket_recv(sock: &SocketRef) -> usize {
+    // Do not invoke persistent poll callbacks under the socket lock. epoll_ctl
+    // and ready collection acquire eventpoll state before polling the socket;
+    // retaining the socket lock here would create the inverse lock order.
+    let wait = sock.lock().recv_wait.clone();
+    wait.wake_up_all()
+}
+
 pub fn release_socket(sock: &SocketRef) {
+    release_socket_inner(sock, false);
+}
+
+fn release_socket_inner(sock: &SocketRef, embrion: bool) {
     release_bound_socket(sock);
 
-    let (peer, backlog) = {
+    let (peer, backlog, packets, reset_peer) = {
         let mut socket = sock.lock();
         // Linux unix_release_sock() removes the endpoint from lookup, marks it
         // closed/shutdown, clears the held peer pointer, and releases unaccepted
@@ -213,24 +292,48 @@ pub fn release_socket(sock: &SocketRef) {
         // peer sock references with sock_hold(); Lupos mirrors that with Arc
         // links and breaks the opposite link here to avoid an Arc cycle.
         socket.state = SocketState::Closed;
+        socket.shutdown = SHUTDOWN_MASK;
         let peer = socket.peer_socket.take();
-        socket.recvq.clear();
-        (peer, socket.backlog.drain(..).collect::<Vec<_>>())
+        let reset_peer = (embrion || !socket.recvq.is_empty())
+            && matches!(socket.sock_type, SOCK_STREAM | SOCK_SEQPACKET);
+        let packets = socket.recvq.drain(..).collect::<Vec<_>>();
+        (
+            peer,
+            socket.backlog.drain(..).collect::<Vec<_>>(),
+            packets,
+            reset_peer,
+        )
     };
+    wake_socket_recv(sock);
 
     if let Some(peer) = peer {
-        let mut peer_locked = peer.lock();
-        if peer_locked
-            .peer_socket
-            .as_ref()
-            .is_some_and(|linked| Arc::ptr_eq(linked, sock))
         {
-            peer_locked.peer_socket = None;
+            let mut peer_locked = peer.lock();
+            if reset_peer {
+                peer_locked.pending_error = ECONNRESET;
+            }
+            if matches!(peer_locked.sock_type, SOCK_STREAM | SOCK_SEQPACKET) {
+                peer_locked.shutdown = SHUTDOWN_MASK;
+            }
+            if peer_locked
+                .peer_socket
+                .as_ref()
+                .is_some_and(|linked| Arc::ptr_eq(linked, sock))
+            {
+                peer_locked.peer_socket = None;
+            }
         }
+        // unix_release_sock()/tcp close wakes the peer so a blocked read can
+        // recheck the now-observable EOF condition.
+        wake_socket_recv(&peer);
+    }
+
+    for packet in packets {
+        drop_file_refs(packet.fds);
     }
 
     for queued in backlog {
-        release_socket(&queued);
+        release_socket_inner(&queued, true);
     }
 }
 
@@ -272,10 +375,13 @@ pub fn socket(family: u16, sock_type: u16, protocol: u16) -> Result<SocketRef, i
         sock_type,
         protocol,
         state: SocketState::Created,
+        shutdown: 0,
+        pending_error: 0,
         local,
         peer: None,
         recvq: VecDeque::new(),
         backlog: VecDeque::new(),
+        recv_wait: Arc::new(WaitQueueHead::new()),
         peer_socket: None,
         cred: current_peer_cred(),
         peer_cred: None,
@@ -636,8 +742,26 @@ pub fn connect(sock: &SocketRef, peer: SockAddr) -> Result<(), i32> {
             socket.timestamp_new = listener_timestamp_new;
         }
         {
-            listener.lock().backlog.push_back(accepted);
+            let mut listener_guard = listener.lock();
+            if listener_guard.state != SocketState::Listening
+                || listener_guard.shutdown & RCV_SHUTDOWN != 0
+            {
+                drop(listener_guard);
+                {
+                    let mut client = sock.lock();
+                    client.state = SocketState::Created;
+                    client.peer = None;
+                    client.peer_socket = None;
+                    client.peer_cred = None;
+                }
+                accepted.lock().peer_socket = None;
+                release_socket(&accepted);
+                return Err(ECONNREFUSED);
+            }
+            listener_guard.backlog.push_back(accepted);
         }
+        wake_socket_recv(&listener);
+        wake_socket_recv(sock);
         return Ok(());
     }
     {
@@ -651,6 +775,7 @@ pub fn connect(sock: &SocketRef, peer: SockAddr) -> Result<(), i32> {
         socket.peer = Some(peer);
         socket.state = SocketState::Connected;
     }
+    wake_socket_recv(sock);
     Ok(())
 }
 
@@ -684,6 +809,14 @@ fn trace_proc_unix_connect(
 pub fn accept4(sock: &SocketRef) -> Result<SocketRef, i32> {
     let mut socket = sock.lock();
     if socket.state != SocketState::Listening {
+        return Err(EINVAL);
+    }
+    if socket.pending_error != 0 {
+        let error = socket.pending_error;
+        socket.pending_error = 0;
+        return Err(error);
+    }
+    if socket.shutdown & RCV_SHUTDOWN != 0 {
         return Err(EINVAL);
     }
     socket.backlog.pop_front().ok_or(EAGAIN)
@@ -736,7 +869,7 @@ pub fn sendmsg_with_fds(
     mut fds: Vec<FileRef>,
 ) -> Result<usize, i32> {
     let cred = current_scm_cred();
-    let (peer_socket, peer_addr, local_addr, family, sock_type, state) = {
+    let (peer_socket, peer_addr, local_addr, family, sock_type, state, shutdown) = {
         let socket = sock.lock();
         (
             socket.peer_socket.clone(),
@@ -745,6 +878,7 @@ pub fn sendmsg_with_fds(
             socket.family,
             socket.sock_type,
             socket.state,
+            socket.shutdown,
         )
     };
     if family != AF_UNIX && !fds.is_empty() {
@@ -755,22 +889,25 @@ pub fn sendmsg_with_fds(
     } else {
         ENOTCONN
     };
-    if state == SocketState::Closed {
+    if state == SocketState::Closed || shutdown & SEND_SHUTDOWN != 0 {
         drop_file_refs(fds);
         return Err(disconnected);
     }
     if let Some(peer_socket) = peer_socket {
-        let mut target = peer_socket.lock();
-        if target.state == SocketState::Closed {
-            drop_file_refs(fds);
-            return Err(disconnected);
+        {
+            let mut target = peer_socket.lock();
+            if target.state == SocketState::Closed || target.shutdown & RCV_SHUTDOWN != 0 {
+                drop_file_refs(fds);
+                return Err(disconnected);
+            }
+            target.recvq.push_back(QueuedPacket {
+                bytes: bytes.to_vec(),
+                peer: local_addr,
+                fds,
+                cred,
+            });
         }
-        target.recvq.push_back(QueuedPacket {
-            bytes: bytes.to_vec(),
-            peer: local_addr,
-            fds,
-            cred,
-        });
+        wake_socket_recv(&peer_socket);
         return Ok(bytes.len());
     }
     if matches!(sock_type, SOCK_STREAM | SOCK_SEQPACKET) {
@@ -808,17 +945,21 @@ pub fn sendmsg_with_fds(
             return Err(ENOTCONN);
         }
     };
-    let mut target = target.lock();
-    if target.state == SocketState::Closed {
-        drop_file_refs(fds);
-        return Err(ENOTCONN);
+    {
+        let mut target_locked = target.lock();
+        if target_locked.state == SocketState::Closed || target_locked.shutdown & RCV_SHUTDOWN != 0
+        {
+            drop_file_refs(fds);
+            return Err(ENOTCONN);
+        }
+        target_locked.recvq.push_back(QueuedPacket {
+            bytes: bytes.to_vec(),
+            peer: local_addr,
+            fds,
+            cred,
+        });
     }
-    target.recvq.push_back(QueuedPacket {
-        bytes: bytes.to_vec(),
-        peer: local_addr,
-        fds,
-        cred,
-    });
+    wake_socket_recv(&target);
     Ok(bytes.len())
 }
 
@@ -833,7 +974,15 @@ pub fn sendto_with_fds(
     mut fds: Vec<FileRef>,
 ) -> Result<usize, i32> {
     let cred = current_scm_cred();
-    if sock.lock().family != AF_UNIX && !fds.is_empty() {
+    let (family, state, shutdown) = {
+        let socket = sock.lock();
+        (socket.family, socket.state, socket.shutdown)
+    };
+    if state == SocketState::Closed || shutdown & SEND_SHUTDOWN != 0 {
+        drop_file_refs(fds);
+        return Err(ENOTCONN);
+    }
+    if family != AF_UNIX && !fds.is_empty() {
         drop_file_refs(core::mem::take(&mut fds));
     }
     if let Some(n) = synthesize_netlink_send(sock, bytes, Some(&dest)) {
@@ -857,7 +1006,7 @@ pub fn sendto_with_fds(
     };
     let local = {
         let socket = sock.lock();
-        if socket.state == SocketState::Closed {
+        if socket.state == SocketState::Closed || socket.shutdown & SEND_SHUTDOWN != 0 {
             drop_file_refs(fds);
             return Err(ENOTCONN);
         }
@@ -869,17 +1018,21 @@ pub fn sendto_with_fds(
         drop_file_refs(fds);
         Vec::new()
     };
-    let mut target = target.lock();
-    if target.state == SocketState::Closed {
-        drop_file_refs(fds);
-        return Err(ENOTCONN);
+    {
+        let mut target_locked = target.lock();
+        if target_locked.state == SocketState::Closed || target_locked.shutdown & RCV_SHUTDOWN != 0
+        {
+            drop_file_refs(fds);
+            return Err(ENOTCONN);
+        }
+        target_locked.recvq.push_back(QueuedPacket {
+            bytes: bytes.to_vec(),
+            peer: local,
+            fds,
+            cred,
+        });
     }
-    target.recvq.push_back(QueuedPacket {
-        bytes: bytes.to_vec(),
-        peer: local,
-        fds,
-        cred,
-    });
+    wake_socket_recv(&target);
     Ok(bytes.len())
 }
 
@@ -1069,18 +1222,21 @@ fn queue_netlink_error(sock: &SocketRef, bytes: &[u8], error: i32) {
         ack[20..36].copy_from_slice(&bytes[..NLMSG_HDRLEN]);
     }
 
-    sock.lock().recvq.push_back(QueuedPacket {
-        bytes: ack,
-        peer: Some(SockAddr::Netlink { pid: 0, groups: 0 }),
-        fds: Vec::new(),
-        cred: SocketCred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-            groups: GroupInfo::default(),
-            pid_ref: None,
-        },
-    });
+    {
+        sock.lock().recvq.push_back(QueuedPacket {
+            bytes: ack,
+            peer: Some(SockAddr::Netlink { pid: 0, groups: 0 }),
+            fds: Vec::new(),
+            cred: SocketCred {
+                pid: 0,
+                uid: 0,
+                gid: 0,
+                groups: GroupInfo::default(),
+                pid_ref: None,
+            },
+        });
+    }
+    wake_socket_recv(sock);
 }
 
 fn queue_netlink_done(sock: &SocketRef, req: &NetlinkHeader) {
@@ -1375,18 +1531,21 @@ fn push_rta_bytes(msg: &mut Vec<u8>, rta_type: u16, value: &[u8], nul: bool) {
 }
 
 fn enqueue_netlink_packet(sock: &SocketRef, bytes: Vec<u8>) {
-    sock.lock().recvq.push_back(QueuedPacket {
-        bytes,
-        peer: Some(SockAddr::Netlink { pid: 0, groups: 0 }),
-        fds: Vec::new(),
-        cred: SocketCred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-            groups: GroupInfo::default(),
-            pid_ref: None,
-        },
-    });
+    {
+        sock.lock().recvq.push_back(QueuedPacket {
+            bytes,
+            peer: Some(SockAddr::Netlink { pid: 0, groups: 0 }),
+            fds: Vec::new(),
+            cred: SocketCred {
+                pid: 0,
+                uid: 0,
+                gid: 0,
+                groups: GroupInfo::default(),
+                pid_ref: None,
+            },
+        });
+    }
+    wake_socket_recv(sock);
 }
 
 fn kobject_uevent_subscribed(socket: &KernelSocket) -> bool {
@@ -1571,6 +1730,8 @@ fn synthesize_external_inet_response(
                     pid_ref: None,
                 },
             });
+            drop(socket);
+            wake_socket_recv(sock);
             return Some(bytes.len());
         }
         return None;
@@ -1593,6 +1754,8 @@ fn synthesize_external_inet_response(
                 pid_ref: None,
             },
         });
+        drop(socket);
+        wake_socket_recv(sock);
         return Some(bytes.len());
     }
     None
@@ -1662,7 +1825,8 @@ pub fn recvmsg(sock: &SocketRef, out: &mut [u8]) -> Result<usize, i32> {
 }
 
 pub fn recvfrom(sock: &SocketRef, out: &mut [u8]) -> Result<(usize, Option<SockAddr>), i32> {
-    let (len, peer, _, _, _) = recvmsg_full(sock, out, 0)?;
+    let (len, peer, fds, _, _) = recvmsg_full(sock, out, 0)?;
+    drop_file_refs(fds);
     Ok((len, peer))
 }
 
@@ -1718,10 +1882,17 @@ pub fn stream_hangup_locked(socket: &KernelSocket) -> bool {
     if socket.state == SocketState::Closed {
         return true;
     }
+    if socket.shutdown & RCV_SHUTDOWN != 0 {
+        return true;
+    }
     if socket.state != SocketState::Connected {
         return false;
     }
     match &socket.peer_socket {
+        // In the in-kernel SocketRef API, the peer link can be the final Arc
+        // after its caller drops the endpoint without a VFS file wrapper.
+        // That is the same lifetime boundary as unix_release_sock().
+        Some(peer) if Arc::strong_count(peer) == 1 => true,
         Some(peer) => peer
             .try_lock()
             .map(|peer| peer.state == SocketState::Closed)
@@ -1738,7 +1909,19 @@ pub fn recvmsg_full(
     let mut socket = sock.lock();
     let peek = flags & MSG_PEEK != 0;
     let is_stream = socket.sock_type == SOCK_STREAM;
-    if socket.recvq.is_empty() && stream_hangup_locked(&socket) {
+    if matches!(socket.sock_type, SOCK_STREAM | SOCK_SEQPACKET)
+        && !matches!(socket.state, SocketState::Connected | SocketState::Closed)
+    {
+        return Err(ENOTCONN);
+    }
+    if socket.recvq.is_empty() && socket.pending_error != 0 {
+        let error = socket.pending_error;
+        socket.pending_error = 0;
+        return Err(error);
+    }
+    if socket.recvq.is_empty()
+        && (socket.shutdown & RCV_SHUTDOWN != 0 || stream_hangup_locked(&socket))
+    {
         // EOF: queued bytes were already drained and the peer is gone.
         return Ok((0, None, Vec::new(), SocketCred::default(), 0));
     }
@@ -1844,11 +2027,15 @@ pub fn get_recv_ttl(sock: &SocketRef) -> Result<u32, i32> {
 }
 
 pub fn getsockopt(sock: &SocketRef, opt: u32) -> Result<u32, i32> {
-    let socket = sock.lock();
+    let mut socket = sock.lock();
     match opt {
         SO_REUSEADDR => Ok(socket.reuseaddr as u32),
         SO_TYPE => Ok(socket.sock_type as u32),
-        SO_ERROR => Ok(0),
+        SO_ERROR => {
+            let error = socket.pending_error;
+            socket.pending_error = 0;
+            Ok(error as u32)
+        }
         SO_SNDBUF | SO_RCVBUF | SO_SNDBUFFORCE | SO_RCVBUFFORCE => Ok(212_992),
         SO_PASSCRED => Ok(socket.passcred as u32),
         SO_PASSPIDFD => Ok(socket.passpidfd as u32),
@@ -2783,7 +2970,7 @@ mod tests {
         assert_eq!(bind(&replacement, addr), Ok(()));
 
         let mut out = [0u8; 1];
-        assert_eq!(recvmsg(&client, &mut out), Ok(0));
+        assert_eq!(recvmsg(&client, &mut out), Err(ECONNRESET));
         assert_eq!(
             sendmsg(&client, b"x"),
             Err(crate::include::uapi::errno::EPIPE)

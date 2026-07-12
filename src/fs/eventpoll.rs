@@ -1,21 +1,21 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/fs/eventpoll.c
 //! test-origin: linux:vendor/linux/fs/eventpoll.c
 //! epoll — event multiplexer.
 //!
 //! ABI parity with vendor/linux/fs/eventpoll.c and uapi/linux/eventpoll.h.
-//! M60 implements the in-kernel data structures and basic add/wait semantics.
-//! Real fd-driven wakeup chains are deferred (need FileOps::poll slot).
+//! The ready-list and persistent poll-wakeup path mirror Linux eventpoll.  The
+//! remaining gaps are the bounded reverse-path accounting, EPOLLEXCLUSIVE, and
+//! the POLLFREE/RCU teardown protocol used by the fully concurrent C code.
 
 extern crate alloc;
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use lazy_static::lazy_static;
-use spin::Mutex;
 
 use crate::fs::anon_inode::alloc_anon_file;
 use crate::fs::fdtable::FilesStruct;
@@ -24,6 +24,8 @@ use crate::fs::ops::FileOps;
 use crate::fs::select;
 use crate::fs::types::FileRef;
 use crate::include::uapi::errno::{EBADF, EEXIST, EFAULT, EINTR, EINVAL, ENOENT, EPERM};
+use crate::kernel::locking::{Mutex, SpinLock};
+use crate::kernel::sched::wait::WaitQueueHead;
 use crate::kernel::{files, sched};
 
 /// `EPOLL_CTL_*` opcodes — byte-identical to Linux UAPI.
@@ -39,8 +41,13 @@ pub const EPOLLERR: u32 = 0x0008;
 pub const EPOLLHUP: u32 = 0x0010;
 pub const EPOLLRDNORM: u32 = 0x0040;
 pub const EPOLLWRNORM: u32 = 0x0100;
+pub const EPOLLWAKEUP: u32 = 1 << 29;
+pub const EPOLLEXCLUSIVE: u32 = 1 << 28;
 pub const EPOLLET: u32 = 1 << 31;
 pub const EPOLLONESHOT: u32 = 1 << 30;
+
+const EP_PRIVATE_BITS: u32 = EPOLLWAKEUP | EPOLLONESHOT | EPOLLET | EPOLLEXCLUSIVE;
+const EP_MAX_NESTS: usize = 4;
 
 /// `EPOLL_CLOEXEC` flag for `epoll_create1`.
 pub const EPOLL_CLOEXEC: i32 = 0o2000000;
@@ -54,24 +61,146 @@ pub struct EpollEvent {
 }
 
 /// In-kernel state for one EpollItem (ep_item in Linux).
-#[derive(Clone)]
 pub struct EpItem {
+    id: usize,
     pub fd: i32,
-    pub file: FileRef,
-    pub events: u32,
-    pub data: u64,
-    pub last_ready: u32,
+    file: Option<FileRef>,
+    events: AtomicU32,
+    data: AtomicU64,
+    /// Only process-side eventpoll operations take this mutex.  In particular,
+    /// `ep_poll_callback()` never touches it from IRQ context.
+    poll_table: Mutex<select::PollTable>,
+    /// Only used by the one-jiffy compatibility scan for poll implementations
+    /// which expose no waitqueue.  Real epoll edges are callback-driven.
+    fallback_last_ready: AtomicU32,
+    callback_driven: AtomicBool,
+}
+
+impl EpItem {
+    fn file(&self) -> &FileRef {
+        self.file.as_ref().expect("live epitem has a file")
+    }
+
+    fn events(&self) -> u32 {
+        self.events.load(Ordering::Acquire)
+    }
+
+    fn data(&self) -> u64 {
+        self.data.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for EpItem {
+    fn drop(&mut self) {
+        // Linux unregisters every poll hook before dropping the watched-file
+        // relationship.  Keeping the FileRef in an Option lets Drop transfer
+        // the actual reference to fput rather than bypassing the release hook.
+        self.poll_table.lock().finish();
+        if let Some(file) = self.file.take() {
+            fput(file);
+        }
+    }
+}
+
+struct EpItemSlot {
+    item: Arc<EpItem>,
+    queued: bool,
+    /// Embedded ready-list links, equivalent to Linux `epitem.rdllink`.
+    /// IDs replace C pointers while keeping callback linkage allocation-free.
+    ready_prev: Option<usize>,
+    ready_next: Option<usize>,
+}
+
+struct EventPollState {
+    items: Vec<EpItemSlot>,
+    ready_head: Option<usize>,
+    ready_tail: Option<usize>,
+    ready_len: usize,
 }
 
 /// In-kernel state for one EventPoll instance.
 pub struct EventPoll {
-    pub items: spin::Mutex<Vec<EpItem>>,
+    token: usize,
+    /// Linux `eventpoll.mtx`: serializes ADD/MOD/DEL and ready scans while
+    /// allowing f_op->poll(), allocation and user access to sleep/fault.
+    mtx: Mutex<()>,
+    state: SpinLock<EventPollState>,
+    /// Linux `eventpoll.wq`: sleepers in epoll_wait().
+    wait_queue: WaitQueueHead,
+    /// Linux `eventpoll.poll_wait`: poll/select and enclosing epolls.
+    poll_wait: WaitQueueHead,
+    /// Pins callbacks which already resolved this epoll before release removed
+    /// it from EPOLLS.  Release drains these pins in task context so an IRQ-side
+    /// Arc drop can never perform final EventPoll/Vec destruction.
+    active_callbacks: AtomicUsize,
 }
 
 static EPOLL_TOKEN: AtomicUsize = AtomicUsize::new(1);
+static EPITEM_TOKEN: AtomicUsize = AtomicUsize::new(1);
+static EPOLL_NEST_LOCK: Mutex<()> = Mutex::new(());
+static EPOLL_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+struct EpollRegistry {
+    entries: Vec<(usize, Arc<EventPoll>)>,
+}
+
+impl EpollRegistry {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn get(&self, token: &usize) -> Option<&Arc<EventPoll>> {
+        let idx = self
+            .entries
+            .binary_search_by_key(token, |(entry_token, _)| *entry_token)
+            .ok()?;
+        Some(&self.entries[idx].1)
+    }
+
+    fn remove(&mut self, token: &usize) -> Option<Arc<EventPoll>> {
+        let idx = self
+            .entries
+            .binary_search_by_key(token, |(entry_token, _)| *entry_token)
+            .ok()?;
+        Some(self.entries.remove(idx).1)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 lazy_static! {
-    static ref EPOLLS: Mutex<BTreeMap<usize, Arc<EventPoll>>> = Mutex::new(BTreeMap::new());
+    static ref EPOLLS: SpinLock<EpollRegistry> = SpinLock::new(EpollRegistry::new());
+}
+
+/// The callback path resolves its `EventPoll` through this registry, so every
+/// registry access uses the same irqsave discipline as Linux's `ep->lock`.
+fn with_epolls_irqsave<R>(f: impl FnOnce(&mut EpollRegistry) -> R) -> R {
+    let (mut epolls, irqflags) = EPOLLS.lock_irqsave();
+    let result = f(&mut epolls);
+    SpinLock::unlock_irqrestore(epolls, irqflags);
+    result
+}
+
+fn insert_epoll_registry(token: usize, ep: Arc<EventPoll>) {
+    let _registry = EPOLL_REGISTRY_LOCK.lock();
+    let count = with_epolls_irqsave(|epolls| epolls.entries.len());
+    let mut replacement = Vec::with_capacity(count.saturating_add(1));
+    let old_storage = with_epolls_irqsave(|epolls| {
+        debug_assert_eq!(epolls.entries.len(), count);
+        replacement.append(&mut epolls.entries);
+        replacement.push((token, ep));
+        core::mem::replace(&mut epolls.entries, replacement)
+    });
+    drop(old_storage);
+}
+
+fn remove_epoll_registry(token: usize) -> Option<Arc<EventPoll>> {
+    let _registry = EPOLL_REGISTRY_LOCK.lock();
+    with_epolls_irqsave(|epolls| epolls.remove(&token))
 }
 
 static EPOLL_FILE_OPS: FileOps = FileOps {
@@ -89,148 +218,535 @@ static EPOLL_FILE_OPS: FileOps = FileOps {
 
 impl EventPoll {
     pub fn new() -> Self {
+        Self::new_with_token(0)
+    }
+
+    fn new_with_token(token: usize) -> Self {
         Self {
-            items: spin::Mutex::new(Vec::new()),
+            token,
+            mtx: Mutex::new(()),
+            state: SpinLock::new(EventPollState {
+                items: Vec::new(),
+                ready_head: None,
+                ready_tail: None,
+                ready_len: 0,
+            }),
+            wait_queue: WaitQueueHead::new(),
+            poll_wait: WaitQueueHead::new(),
+            active_callbacks: AtomicUsize::new(0),
+        }
+    }
+
+    /// `spin_lock_irqsave(&ep->lock, flags)` around item publication and the
+    /// ready list.  No allocation, f_op->poll(), user access or sleeping lock
+    /// is permitted inside this closure.
+    fn with_state_irqsave<R>(&self, f: impl FnOnce(&mut EventPollState) -> R) -> R {
+        let (mut state, irqflags) = self.state.lock_irqsave();
+        let result = f(&mut state);
+        SpinLock::unlock_irqrestore(state, irqflags);
+        result
+    }
+
+    fn item_index_locked(state: &EventPollState, id: usize) -> Option<usize> {
+        // EPITEM_TOKEN is monotonic and process-side insertion appends while
+        // removal preserves order, so IRQ callbacks need only O(log n) lookup.
+        state
+            .items
+            .binary_search_by_key(&id, |slot| slot.item.id)
+            .ok()
+    }
+
+    fn enqueue_locked(state: &mut EventPollState, id: usize) -> bool {
+        let Some(idx) = Self::item_index_locked(state, id) else {
+            return false;
+        };
+        if state.items[idx].queued {
+            return false;
+        }
+
+        let previous = state.ready_tail;
+        if let Some(previous_id) = previous {
+            let Some(previous_idx) = Self::item_index_locked(state, previous_id) else {
+                return false;
+            };
+            state.items[previous_idx].ready_next = Some(id);
+        } else {
+            state.ready_head = Some(id);
+        }
+
+        state.items[idx].queued = true;
+        state.items[idx].ready_prev = previous;
+        state.items[idx].ready_next = None;
+        state.ready_tail = Some(id);
+        state.ready_len += 1;
+        true
+    }
+
+    fn enqueue_front_locked(state: &mut EventPollState, id: usize) -> bool {
+        let Some(idx) = Self::item_index_locked(state, id) else {
+            return false;
+        };
+        if state.items[idx].queued {
+            return false;
+        }
+
+        let next = state.ready_head;
+        if let Some(next_id) = next {
+            let Some(next_idx) = Self::item_index_locked(state, next_id) else {
+                return false;
+            };
+            state.items[next_idx].ready_prev = Some(id);
+        } else {
+            state.ready_tail = Some(id);
+        }
+
+        state.items[idx].queued = true;
+        state.items[idx].ready_prev = None;
+        state.items[idx].ready_next = next;
+        state.ready_head = Some(id);
+        state.ready_len += 1;
+        true
+    }
+
+    fn unlink_ready_locked(state: &mut EventPollState, id: usize) -> bool {
+        let Some(idx) = Self::item_index_locked(state, id) else {
+            return false;
+        };
+        if !state.items[idx].queued {
+            return false;
+        }
+
+        let previous = state.items[idx].ready_prev;
+        let next = state.items[idx].ready_next;
+        if let Some(previous_id) = previous {
+            if let Some(previous_idx) = Self::item_index_locked(state, previous_id) {
+                state.items[previous_idx].ready_next = next;
+            }
+        } else {
+            state.ready_head = next;
+        }
+        if let Some(next_id) = next {
+            if let Some(next_idx) = Self::item_index_locked(state, next_id) {
+                state.items[next_idx].ready_prev = previous;
+            }
+        } else {
+            state.ready_tail = previous;
+        }
+
+        state.items[idx].queued = false;
+        state.items[idx].ready_prev = None;
+        state.items[idx].ready_next = None;
+        state.ready_len -= 1;
+        true
+    }
+
+    fn pop_ready_front_locked(state: &mut EventPollState) -> Option<usize> {
+        let id = state.ready_head?;
+        Self::unlink_ready_locked(state, id).then_some(id)
+    }
+
+    fn wake_ready_waiters(&self) {
+        self.wait_queue.wake_up_all();
+        self.poll_wait.wake_up_all();
+    }
+
+    fn synchronize_callbacks(&self) {
+        while self.active_callbacks.load(Ordering::Acquire) != 0 {
+            #[cfg(not(test))]
+            unsafe {
+                sched::schedule_with_irqs_enabled();
+            }
+            #[cfg(test)]
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Snapshot stable epitem references without allocating under `ep->lock`.
+    /// The caller holds `mtx`, so callbacks may alter ready links but no item
+    /// can be inserted or removed between the capacity and copy phases.
+    fn items_snapshot_locked(&self) -> Vec<Arc<EpItem>> {
+        let count = self.with_state_irqsave(|state| state.items.len());
+        let mut items = Vec::with_capacity(count);
+        self.with_state_irqsave(|state| {
+            debug_assert!(state.items.len() <= items.capacity());
+            items.extend(state.items.iter().map(|slot| slot.item.clone()));
+        });
+        items
+    }
+
+    /// Publish a fully allocated epitem without growing or freeing a Vec while
+    /// interrupts are disabled.  IDs make moving slots transparent to ready
+    /// links and callbacks.
+    fn insert_item_locked(&self, item: Arc<EpItem>) {
+        let count = self.with_state_irqsave(|state| state.items.len());
+        let mut replacement = Vec::with_capacity(count.saturating_add(1));
+        let old_storage = self.with_state_irqsave(|state| {
+            debug_assert_eq!(state.items.len(), count);
+            replacement.append(&mut state.items);
+            replacement.push(EpItemSlot {
+                item,
+                queued: false,
+                ready_prev: None,
+                ready_next: None,
+            });
+            core::mem::replace(&mut state.items, replacement)
+        });
+        drop(old_storage);
+    }
+
+    /// Re-poll only legacy sources which failed to expose a waitqueue during
+    /// ADD.  The one-jiffy fallback in epoll_wait bounds their latency; normal
+    /// pipe/socket/nested-epoll readiness never takes this path.
+    fn queue_unregistered_ready_locked(&self) {
+        let has_fallback = self.with_state_irqsave(|state| {
+            state.items.iter().any(|slot| {
+                !slot.item.callback_driven.load(Ordering::Acquire)
+                    && slot.item.events() & !EP_PRIVATE_BITS != 0
+            })
+        });
+        if !has_fallback {
+            return;
+        }
+        for item in self.items_snapshot_locked() {
+            let events = item.events();
+            if item.callback_driven.load(Ordering::Acquire) || events & !EP_PRIVATE_BITS == 0 {
+                continue;
+            }
+            let ready = events & select::poll_mask(item.file());
+            let previous = item.fallback_last_ready.swap(ready, Ordering::AcqRel);
+            let should_queue = if events & EPOLLET != 0 {
+                ready & !previous != 0
+            } else {
+                ready != 0
+            };
+            if should_queue {
+                self.with_state_irqsave(|state| {
+                    Self::enqueue_locked(state, item.id);
+                });
+            }
         }
     }
 
     pub fn add(&self, fd: i32, file: FileRef, ev: EpollEvent) -> Result<(), i32> {
-        let mut items = self.items.lock();
-        if items
-            .iter()
-            .any(|e| e.fd == fd && Arc::ptr_eq(&e.file, &file))
-        {
+        let _mtx = self.mtx.lock();
+        let exists = self.with_state_irqsave(|state| {
+            state
+                .items
+                .iter()
+                .any(|slot| slot.item.fd == fd && Arc::ptr_eq(slot.item.file(), &file))
+        });
+        if exists {
             return Err(EEXIST);
         }
-        let evbits = ev.events | EPOLLERR | EPOLLHUP;
-        let evdata = ev.data;
-        items.push(EpItem {
+
+        let id = EPITEM_TOKEN.fetch_add(1, Ordering::AcqRel);
+        let events = ev.events | EPOLLERR | EPOLLHUP;
+        let data = ev.data;
+        let item = Arc::new(EpItem {
+            id,
             fd,
-            file: fget(&file),
-            events: evbits,
-            data: evdata,
-            last_ready: 0,
+            file: Some(fget(&file)),
+            events: AtomicU32::new(events),
+            data: AtomicU64::new(data),
+            poll_table: Mutex::new(select::PollTable::new_callback(
+                id,
+                ep_poll_callback,
+                self.token,
+                id,
+            )),
+            fallback_last_ready: AtomicU32::new(0),
+            callback_driven: AtomicBool::new(false),
         });
+        self.insert_item_locked(item.clone());
+
+        // Register before sampling readiness, as ep_insert()/ep_item_poll() do.
+        // The item is already published, so a racing callback either queues it
+        // or the readiness sample below observes the event.
+        let mask = if self.token == 0 {
+            select::poll_mask(item.file())
+        } else {
+            let mut table = item.poll_table.lock();
+            let mask = select::poll_mask_with_table(item.file(), Some(&mut table));
+            item.callback_driven
+                .store(table.has_registrations(), Ordering::Release);
+            mask
+        };
+        let ready = events & mask;
+        item.fallback_last_ready.store(ready, Ordering::Release);
+        let queued =
+            self.with_state_irqsave(|state| ready != 0 && Self::enqueue_locked(state, item.id));
+        if queued {
+            self.wake_ready_waiters();
+        }
         Ok(())
     }
 
     fn remove_matching(&self, mut matches: impl FnMut(&EpItem) -> bool) -> usize {
-        let removed = {
-            let mut items = self.items.lock();
-            let mut removed = Vec::new();
-            let mut idx = 0;
-            while idx < items.len() {
-                if matches(&items[idx]) {
-                    removed.push(items.remove(idx).file);
-                } else {
-                    idx += 1;
-                }
-            }
-            removed
-        };
-        let count = removed.len();
-        for file in removed {
-            // epoll owns a real file reference. Dropping the Arc directly would
-            // bypass the watched file's release hook; Linux drops epitems via
-            // fput in vendor/linux/fs/eventpoll.c.
-            fput(file);
+        let _mtx = self.mtx.lock();
+        let mut count = 0;
+        loop {
+            let removed = self.with_state_irqsave(|state| {
+                let idx = state
+                    .items
+                    .iter()
+                    .position(|slot| matches(slot.item.as_ref()))?;
+                let id = state.items[idx].item.id;
+                Self::unlink_ready_locked(state, id);
+                Some(state.items.remove(idx))
+            });
+            let Some(removed) = removed else {
+                break;
+            };
+            let item = removed.item;
+            // Unhook every persistent callback before dropping the epitem's
+            // watched-file reference.  This is Linux ep_unregister_pollwait()
+            // followed by the epitem fput ordering.
+            item.poll_table.lock().finish();
+            drop(item);
+            count += 1;
         }
         count
     }
 
     pub fn del(&self, fd: i32, file: &FileRef) -> Result<(), i32> {
-        if self.remove_matching(|e| e.fd == fd && Arc::ptr_eq(&e.file, file)) == 0 {
+        if self.remove_matching(|item| item.fd == fd && Arc::ptr_eq(item.file(), file)) == 0 {
             return Err(ENOENT);
         }
         Ok(())
     }
 
     pub fn modify(&self, fd: i32, file: &FileRef, ev: EpollEvent) -> Result<(), i32> {
-        let mut items = self.items.lock();
-        for item in items.iter_mut() {
-            if item.fd == fd && Arc::ptr_eq(&item.file, file) {
-                item.events = ev.events | EPOLLERR | EPOLLHUP;
-                item.data = ev.data;
-                item.last_ready = 0;
-                return Ok(());
-            }
+        let _mtx = self.mtx.lock();
+        let item = self.with_state_irqsave(|state| {
+            state
+                .items
+                .iter()
+                .find(|slot| slot.item.fd == fd && Arc::ptr_eq(slot.item.file(), file))
+                .map(|slot| slot.item.clone())
+        });
+        let Some(item) = item else {
+            return Err(ENOENT);
+        };
+
+        let events = ev.events | EPOLLERR | EPOLLHUP;
+        item.events.store(events, Ordering::SeqCst);
+        item.data.store(ev.data, Ordering::Release);
+        item.fallback_last_ready.store(0, Ordering::Release);
+        let mask = select::poll_mask(item.file());
+        let ready = events & mask;
+        item.fallback_last_ready.store(ready, Ordering::Release);
+        let queued =
+            self.with_state_irqsave(|state| ready != 0 && Self::enqueue_locked(state, item.id));
+        if queued {
+            self.wake_ready_waiters();
         }
-        Err(ENOENT)
+        Ok(())
     }
 
     pub fn remove_closed_file(&self, fd: i32, file: &FileRef) {
-        self.remove_matching(|e| e.fd == fd && Arc::ptr_eq(&e.file, file));
+        self.remove_matching(|item| item.fd == fd && Arc::ptr_eq(item.file(), file));
+    }
+
+    fn remove_file(&self, file: &FileRef) {
+        self.remove_matching(|item| Arc::ptr_eq(item.file(), file));
     }
 
     pub fn clear(&self) {
         self.remove_matching(|_| true);
     }
 
-    fn collect_ready(&self, out: &mut [EpollEvent], consume: bool) -> Result<usize, i32> {
-        let mut items = self.items.lock();
+    fn collect_ready_with(
+        &self,
+        maxevents: usize,
+        consume: bool,
+        mut deliver: impl FnMut(usize, EpollEvent) -> Result<(), i32>,
+    ) -> Result<usize, i32> {
+        let _mtx = self.mtx.lock();
+        self.queue_unregistered_ready_locked();
+        let scan_count = self.with_state_irqsave(|state| state.ready_len);
         let mut n = 0usize;
-        for item in items.iter_mut() {
-            if n >= out.len() {
+
+        for _ in 0..scan_count {
+            if n >= maxevents {
                 break;
             }
-            let mask = select::poll_mask(&item.file);
-            let ready = item.events & mask;
-            let deliver_ready = if ready == 0 {
-                0
-            } else if item.events & EPOLLET != 0 {
-                ready & !item.last_ready
-            } else {
-                ready
+            let item = self.with_state_irqsave(|state| {
+                let id = Self::pop_ready_front_locked(state)?;
+                let idx = Self::item_index_locked(state, id)?;
+                Some(state.items[idx].item.clone())
+            });
+            let Some(item) = item else {
+                continue;
             };
-            item.last_ready = ready;
-            if deliver_ready != 0 {
-                trace_epoll_ready(
-                    item.fd,
-                    item.file.fops.name,
-                    item.events,
-                    mask,
-                    ready,
-                    item.data,
-                );
-                out[n] = EpollEvent {
-                    events: ready,
-                    data: item.data,
-                };
-                if item.events & EPOLLONESHOT != 0 {
-                    item.events &= EPOLLONESHOT | EPOLLET;
-                }
-                if consume {
-                    crate::fs::kernfs::consume_poll_event(&item.file);
-                }
-                n += 1;
+
+            let events = item.events();
+            let mask = select::poll_mask(item.file());
+            let ready = events & mask;
+            if !item.callback_driven.load(Ordering::Acquire) {
+                item.fallback_last_ready.store(ready, Ordering::Release);
             }
+            if ready == 0 {
+                continue;
+            }
+
+            let event = EpollEvent {
+                events: ready,
+                data: item.data(),
+            };
+            trace_epoll_ready(
+                item.fd,
+                item.file().fops.name,
+                events,
+                mask,
+                ready,
+                event.data,
+            );
+            if let Err(errno) = deliver(n, event) {
+                self.with_state_irqsave(|state| {
+                    Self::enqueue_front_locked(state, item.id);
+                });
+                return if n == 0 { Err(errno) } else { Ok(n) };
+            }
+
+            if events & EPOLLONESHOT != 0 {
+                item.events.fetch_and(EP_PRIVATE_BITS, Ordering::AcqRel);
+            } else if events & EPOLLET == 0 {
+                self.with_state_irqsave(|state| {
+                    Self::enqueue_locked(state, item.id);
+                });
+            }
+            if consume {
+                crate::fs::kernfs::consume_poll_event(item.file());
+            }
+            n += 1;
         }
         Ok(n)
     }
 
     /// Collect currently ready events by polling the watched files.
     pub fn wait_ready(&self, _files: &FilesStruct, out: &mut [EpollEvent]) -> Result<usize, i32> {
-        self.collect_ready(out, true)
+        self.collect_ready_with(out.len(), true, |idx, event| {
+            out[idx] = event;
+            Ok(())
+        })
     }
 
-    fn peek_ready(&self, _files: &FilesStruct, out: &mut [EpollEvent]) -> Result<usize, i32> {
-        let items = self.items.lock();
-        let mut n = 0usize;
-        for item in items.iter() {
-            if n >= out.len() {
-                break;
+    fn wait_ready_user(&self, out: *mut EpollEvent, maxevents: usize) -> Result<usize, i32> {
+        self.collect_ready_with(maxevents, true, |idx, event| {
+            let offset = idx
+                .checked_mul(core::mem::size_of::<EpollEvent>())
+                .ok_or(EFAULT)?;
+            let destination = out.cast::<u8>().wrapping_add(offset);
+            let not_copied = unsafe {
+                crate::arch::x86::kernel::uaccess::copy_to_user(
+                    destination,
+                    (&event as *const EpollEvent).cast::<u8>(),
+                    core::mem::size_of::<EpollEvent>(),
+                )
+            };
+            if not_copied == 0 { Ok(()) } else { Err(EFAULT) }
+        })
+    }
+
+    fn has_ready(&self) -> bool {
+        let _mtx = self.mtx.lock();
+        self.queue_unregistered_ready_locked();
+        let scan_count = self.with_state_irqsave(|state| state.ready_len);
+        for _ in 0..scan_count {
+            let item = self.with_state_irqsave(|state| {
+                let id = Self::pop_ready_front_locked(state)?;
+                let idx = Self::item_index_locked(state, id)?;
+                Some(state.items[idx].item.clone())
+            });
+            let Some(item) = item else {
+                continue;
+            };
+            let events = item.events();
+            let ready = events & select::poll_mask(item.file());
+            if !item.callback_driven.load(Ordering::Acquire) {
+                item.fallback_last_ready.store(ready, Ordering::Release);
             }
-            let mask = select::poll_mask(&item.file);
-            let ready = item.events & mask;
             if ready != 0 {
-                out[n] = EpollEvent {
-                    events: ready,
-                    data: item.data,
-                };
-                n += 1;
+                self.with_state_irqsave(|state| {
+                    Self::enqueue_front_locked(state, item.id);
+                });
+                return true;
             }
         }
-        Ok(n)
+        false
+    }
+
+    fn needs_fallback_scan(&self) -> bool {
+        self.with_state_irqsave(|state| {
+            state.items.iter().any(|slot| {
+                !slot.item.callback_driven.load(Ordering::Acquire)
+                    && slot.item.events() & !EP_PRIVATE_BITS != 0
+            })
+        })
+    }
+
+    #[cfg(not(test))]
+    fn prepare_to_wait(&self, current: *mut crate::kernel::task::TaskStruct) -> bool {
+        // Install first, then test the ready list. A callback before insertion
+        // leaves a visible ready item; a callback after insertion either makes
+        // that test fail or wakes the installed task. This avoids growing the
+        // waitqueue Vec while ep->lock has IRQs disabled.
+        unsafe {
+            self.wait_queue
+                .prepare_to_wait(current, crate::kernel::task::task_state::TASK_INTERRUPTIBLE);
+        }
+        self.with_state_irqsave(|state| state.ready_head.is_none())
+    }
+}
+
+/// Persistent equivalent of Linux `ep_poll_callback()`.  Tokens, rather than
+/// raw epitem pointers, make callbacks which raced DEL/release safely no-op.
+struct ActiveEpCallback {
+    ep: Option<Arc<EventPoll>>,
+    active_callbacks: *const AtomicUsize,
+}
+
+impl Drop for ActiveEpCallback {
+    fn drop(&mut self) {
+        // Release the callback's Arc while the active pin is still visible.
+        // A concurrent epoll_release therefore continues to own/wait on its
+        // Arc; only after this drop is incapable of being final do we publish
+        // the zero which lets task-side destruction proceed.
+        drop(self.ep.take());
+        unsafe {
+            (*self.active_callbacks).fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+fn ep_poll_callback(ep_token: usize, item_id: usize) {
+    let Some(active) = with_epolls_irqsave(|epolls| {
+        let ep = epolls.get(&ep_token)?.clone();
+        ep.active_callbacks.fetch_add(1, Ordering::AcqRel);
+        let active_callbacks = &ep.active_callbacks as *const AtomicUsize;
+        Some(ActiveEpCallback {
+            ep: Some(ep),
+            active_callbacks,
+        })
+    }) else {
+        return;
+    };
+    let ep = active.ep.as_ref().expect("active callback owns epoll");
+    let enabled = ep.with_state_irqsave(|state| {
+        let Some(idx) = EventPoll::item_index_locked(state, item_id) else {
+            return false;
+        };
+        let item = state.items[idx].item.as_ref();
+        if item.events() & !EP_PRIVATE_BITS == 0 {
+            return false;
+        }
+        EventPoll::enqueue_locked(state, item_id);
+        true
+    });
+    if enabled {
+        // Linux wakes both epoll_wait sleepers and pollers of this epoll fd,
+        // even when the epitem was already linked on the ready list.
+        ep.wake_ready_waiters();
     }
 }
 
@@ -247,7 +763,7 @@ fn epoll_from_file(file: &FileRef) -> Result<(usize, Arc<EventPoll>), i32> {
         return Err(EBADF);
     }
     let token = *file.private.lock();
-    let ep = EPOLLS.lock().get(&token).cloned().ok_or(EBADF)?;
+    let ep = with_epolls_irqsave(|epolls| epolls.get(&token).cloned()).ok_or(EBADF)?;
     Ok((token, ep))
 }
 
@@ -256,66 +772,133 @@ fn epoll_from_fd(fd: i32) -> Result<Arc<EventPoll>, i32> {
     epoll_from_file(&file).map(|(_, ep)| ep)
 }
 
-fn epoll_path_reaches(
-    start_token: usize,
-    target_token: usize,
-    visited: &mut BTreeSet<usize>,
-) -> Result<bool, i32> {
-    if start_token == target_token {
-        return Ok(true);
-    }
-    if !visited.insert(start_token) {
-        return Ok(false);
-    }
-
-    let ep = EPOLLS.lock().get(&start_token).cloned().ok_or(EBADF)?;
-    let items = ep.items.lock().clone();
-    for item in items {
-        if item.file.fops.name != EPOLL_FILE_OPS.name {
-            continue;
+/// Snapshot the registry without letting Vec growth invoke GFP_KERNEL while
+/// the IRQ-safe registry lock is held.  Creation/release may change its length
+/// between passes, in which case the process-side caller simply retries.
+fn epolls_snapshot() -> Vec<(usize, Arc<EventPoll>)> {
+    loop {
+        let count = with_epolls_irqsave(|epolls| epolls.len());
+        let mut snapshot = Vec::with_capacity(count);
+        let complete = with_epolls_irqsave(|epolls| {
+            if epolls.len() > snapshot.capacity() {
+                return false;
+            }
+            snapshot.extend(
+                epolls
+                    .entries
+                    .iter()
+                    .map(|(token, ep)| (*token, ep.clone())),
+            );
+            true
+        });
+        if complete {
+            return snapshot;
         }
-        let (next_token, _) = epoll_from_file(&item.file)?;
-        if epoll_path_reaches(next_token, target_token, visited)? {
-            return Ok(true);
-        }
     }
-    Ok(false)
 }
 
-pub fn notify_fd_closed(files: &FilesStruct, fd: i32, file: &FileRef) {
-    if Arc::strong_count(file) > 2 {
+fn nested_targets_snapshot(ep: &EventPoll) -> Vec<usize> {
+    let _mtx = ep.mtx.lock();
+    ep.items_snapshot_locked()
+        .into_iter()
+        .filter(|item| item.file().fops.name == EPOLL_FILE_OPS.name)
+        .map(|item| *item.file().private.lock())
+        .collect()
+}
+
+fn nested_path_valid(
+    graph: &BTreeMap<usize, Vec<usize>>,
+    token: usize,
+    depth: usize,
+    visiting: &mut BTreeSet<usize>,
+) -> bool {
+    if depth > EP_MAX_NESTS || !visiting.insert(token) {
+        return false;
+    }
+    let valid = graph.get(&token).is_none_or(|targets| {
+        targets
+            .iter()
+            .all(|target| nested_path_valid(graph, *target, depth + 1, visiting))
+    });
+    visiting.remove(&token);
+    valid
+}
+
+/// Linux serializes full nested checks with epnested_mutex and rejects both
+/// loops and paths deeper than EP_MAX_NESTS.  Checking every root also covers
+/// an existing outer epoll chain above `source_token`, not only the new edge's
+/// downward subtree.
+fn nested_graph_accepts(source_token: usize, target_token: usize) -> bool {
+    let mut graph = BTreeMap::new();
+    for (token, ep) in epolls_snapshot() {
+        graph.insert(token, nested_targets_snapshot(&ep));
+    }
+    graph.entry(source_token).or_default().push(target_token);
+
+    let roots: Vec<_> = graph.keys().copied().collect();
+    roots
+        .into_iter()
+        .all(|root| nested_path_valid(&graph, root, 0, &mut BTreeSet::new()))
+}
+
+pub fn notify_fd_closed(file: &FileRef) {
+    if file.fops.poll.is_none() {
         return;
     }
-    let epolls: Vec<_> = files
-        .open_file_refs()
-        .into_iter()
-        .filter_map(|ep_file| epoll_from_file(&ep_file).ok().map(|(_, ep)| ep))
-        .collect();
+    // File::f_count is Lupos' logical Linux file reference count: dup/fork and
+    // SCM_RIGHTS use fget(), while FilesStruct::get() Arc clones are temporary
+    // Rust lifetime pins and deliberately do not change it. Each epitem owns
+    // one artificial fget, and each PollTableEntry owns one more to keep its
+    // raw waitqueue pointer alive. Discount exactly those implementation pins;
+    // the closing fd's not-yet-fput reference must then be the sole remainder.
+    let epolls: Vec<_> = epolls_snapshot().into_iter().map(|(_, ep)| ep).collect();
+    let internal_refs = epolls
+        .iter()
+        .map(|ep| {
+            let _mtx = ep.mtx.lock();
+            ep.items_snapshot_locked()
+                .into_iter()
+                .filter(|item| Arc::ptr_eq(item.file(), file))
+                .map(|item| 1usize.saturating_add(item.poll_table.lock().registration_count()))
+                .sum::<usize>()
+        })
+        .sum::<usize>();
+    if file.f_count.load(Ordering::Acquire) != internal_refs.saturating_add(1) {
+        return;
+    }
+
+    // Linux eventpoll_release_file() walks file->f_ep and removes this open-file
+    // description from every watching epoll, including inherited epoll objects
+    // which are not present in the closing task's FilesStruct.
     for ep in epolls {
-        ep.remove_closed_file(fd, file);
+        ep.remove_file(file);
     }
 }
 
 fn epoll_release(file: FileRef) {
     let token = *file.private.lock();
-    if let Some(ep) = EPOLLS.lock().remove(&token) {
+    let ep = remove_epoll_registry(token);
+    if let Some(ep) = ep {
+        // Removal prevents new callback pins. Drain callbacks which cloned the
+        // registry Arc before removal, then tear down poll hooks and storage in
+        // this task context (the POLLFREE/RCU lifetime guarantee in Linux).
+        ep.synchronize_callbacks();
         ep.clear();
     }
 }
 
-fn epoll_poll(file: &FileRef) -> u32 {
+fn epoll_poll(file: &FileRef, table: Option<&mut select::PollTable>) -> u32 {
     let token = *file.private.lock();
-    let Some(ep) = EPOLLS.lock().get(&token).cloned() else {
+    let Some(ep) = with_epolls_irqsave(|epolls| epolls.get(&token).cloned()) else {
         return EPOLLERR;
     };
-    let Ok(files) = current_files() else {
-        return EPOLLERR;
-    };
-    let mut out = [EpollEvent { events: 0, data: 0 }; 1];
-    match ep.peek_ready(files.as_ref(), &mut out) {
-        Ok(n) if n != 0 => EPOLLIN,
-        Ok(_) => 0,
-        Err(_) => EPOLLERR,
+    // Linux ep_eventpoll_poll() registers on poll_wait before checking the
+    // ready list, closing the nested-epoll/poll check-to-sleep race.
+    select::poll_wait(file, &ep.poll_wait, table);
+    if ep.has_ready() {
+        EPOLLIN | EPOLLRDNORM
+    } else {
+        0
     }
 }
 
@@ -325,12 +908,13 @@ pub unsafe fn sys_epoll_create1(flags: i32) -> i64 {
         return -(EINVAL as i64);
     }
     let token = EPOLL_TOKEN.fetch_add(1, Ordering::AcqRel);
-    EPOLLS.lock().insert(token, Arc::new(EventPoll::new()));
+    let ep = Arc::new(EventPoll::new_with_token(token));
+    insert_epoll_registry(token, ep);
     let file = alloc_anon_file("eventpoll", &EPOLL_FILE_OPS, token);
     match current_files().and_then(|ft| ft.install(file, flags & EPOLL_CLOEXEC != 0)) {
         Ok(fd) => fd as i64,
         Err(errno) => {
-            EPOLLS.lock().remove(&token);
+            remove_epoll_registry(token);
             -(errno as i64)
         }
     }
@@ -368,24 +952,42 @@ pub unsafe fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEven
     if target.fops.poll.is_none() {
         return -(EPERM as i64);
     }
-    if op == EPOLL_CTL_ADD && target.fops.name == EPOLL_FILE_OPS.name {
+    // Linux's epnested_mutex covers the complete check-and-insert interval.
+    // Without this serialization, concurrent A->B and B->A additions can both
+    // pass their independent checks and create a callback-recursion cycle.
+    let nest_guard = if op == EPOLL_CTL_ADD && target.fops.name == EPOLL_FILE_OPS.name {
+        let guard = EPOLL_NEST_LOCK.lock();
         let (target_token, _) = match epoll_from_file(&target) {
             Ok(ep) => ep,
             Err(errno) => return -(errno as i64),
         };
-        let mut visited = BTreeSet::new();
-        match epoll_path_reaches(target_token, ep_token, &mut visited) {
-            Ok(true) => return -(EINVAL as i64),
-            Ok(false) => {}
-            Err(errno) => return -(errno as i64),
+        if !nested_graph_accepts(ep_token, target_token) {
+            return -(EINVAL as i64);
         }
-    }
-    let ev = if op == EPOLL_CTL_DEL {
-        EpollEvent { events: 0, data: 0 }
-    } else if event.is_null() {
-        return -(EFAULT as i64);
+        Some(guard)
     } else {
-        unsafe { *event }
+        None
+    };
+    let ev = match op {
+        EPOLL_CTL_DEL => EpollEvent { events: 0, data: 0 },
+        EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
+            if event.is_null() {
+                return -(EFAULT as i64);
+            }
+            let mut ev = core::mem::MaybeUninit::<EpollEvent>::uninit();
+            let not_copied = unsafe {
+                crate::arch::x86::kernel::uaccess::copy_from_user(
+                    ev.as_mut_ptr().cast::<u8>(),
+                    event.cast::<u8>(),
+                    core::mem::size_of::<EpollEvent>(),
+                )
+            };
+            if not_copied != 0 {
+                return -(EFAULT as i64);
+            }
+            unsafe { ev.assume_init() }
+        }
+        _ => return -(EINVAL as i64),
     };
     trace_epoll_ctl(epfd, op, fd, target.fops.name, ev.events, ev.data);
     let result = match op {
@@ -394,6 +996,7 @@ pub unsafe fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEven
         EPOLL_CTL_MOD => ep.modify(fd, &target, ev),
         _ => Err(EINVAL),
     };
+    drop(nest_guard);
     match result {
         Ok(()) => 0,
         Err(errno) => -(errno as i64),
@@ -455,13 +1058,13 @@ pub unsafe fn sys_epoll_wait(
     maxevents: i32,
     timeout: i32,
 ) -> i64 {
-    if events.is_null() || maxevents <= 0 {
-        return -(if events.is_null() { EFAULT } else { EINVAL } as i64);
+    const EP_MAX_EVENTS: usize = i32::MAX as usize / core::mem::size_of::<EpollEvent>();
+    if maxevents <= 0 || maxevents as usize > EP_MAX_EVENTS {
+        return -(EINVAL as i64);
     }
-    let files = match current_files() {
-        Ok(files) => files,
-        Err(errno) => return -(errno as i64),
-    };
+    if events.is_null() {
+        return -(EFAULT as i64);
+    }
     let ep = match epoll_from_fd(epfd) {
         Ok(ep) => ep,
         Err(errno) => return -(errno as i64),
@@ -476,20 +1079,14 @@ pub unsafe fn sys_epoll_wait(
     };
     #[cfg(not(test))]
     let mut wait_state = EventWaitState::default();
+    #[cfg(not(test))]
+    let current = unsafe { sched::get_current() };
 
     loop {
         unsafe {
             crate::kernel::signal::exit_if_fatal_signal_pending_current();
         }
-        #[cfg(not(test))]
-        {
-            crate::init::rootfs::drain_console_control_bytes();
-            if crate::kernel::signal::current_has_unblocked_pending_signals() {
-                return -(EINTR as i64);
-            }
-        }
-        let out = unsafe { core::slice::from_raw_parts_mut(events, maxevents as usize) };
-        match ep.wait_ready(files.as_ref(), out) {
+        match ep.wait_ready_user(events, maxevents as usize) {
             Ok(n) if n != 0 => {
                 return n as i64;
             }
@@ -498,6 +1095,10 @@ pub unsafe fn sys_epoll_wait(
             }
             Ok(_) => {}
             Err(errno) => return -(errno as i64),
+        }
+        #[cfg(not(test))]
+        if crate::kernel::signal::current_has_unblocked_pending_signals() {
+            return -(EINTR as i64);
         }
         if let Some(deadline_ns) = deadline_ns {
             if crate::kernel::time::ktime_get() >= deadline_ns {
@@ -508,16 +1109,33 @@ pub unsafe fn sys_epoll_wait(
         #[cfg(not(test))]
         {
             wait_state.maintenance();
-            // No fd-ready wakeup chain exists yet, so we must re-poll the set —
-            // but sleep ~1 tick (event-driven via the timer wheel) between polls
-            // instead of busy-yielding while RUNNABLE. Busy-yielding here kept the
-            // task in the round-robin and starved peers (e.g. systemd's epoll
-            // loop stealing CPU from the generators it is waiting on); sleeping
-            // lets the CPU halt / peers run, and the timer wakes us to re-poll.
-            crate::kernel::time::sleep_timeout::schedule_timeout_with_state(
-                1,
-                crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
-            );
+            let task = current as usize;
+            // prepare_to_wait() installs the waiter before the final locked
+            // ready-list check, closing the callback/check/schedule race.
+            if ep.prepare_to_wait(current) {
+                let deadline_timeout = deadline_ns.map(|deadline| {
+                    let remaining = deadline.saturating_sub(crate::kernel::time::ktime_get());
+                    crate::kernel::time::timeconv::nsecs_to_jiffies64(remaining).max(1)
+                });
+                let timeout = if ep.needs_fallback_scan() {
+                    Some(1)
+                } else {
+                    deadline_timeout
+                };
+                if let Some(timeout) = timeout {
+                    let wake_at = crate::kernel::time::jiffies::jiffies().saturating_add(timeout);
+                    crate::kernel::time::sleep_timeout::arm_wakeup(task, wake_at);
+                }
+                unsafe {
+                    sched::schedule_with_irqs_enabled();
+                }
+                if timeout.is_some() {
+                    crate::kernel::time::sleep_timeout::cancel_wakeup(task);
+                }
+            }
+            unsafe {
+                ep.wait_queue.finish_wait(current);
+            }
         }
         #[cfg(test)]
         {
@@ -532,10 +1150,22 @@ pub unsafe fn sys_epoll_pwait(
     events: *mut EpollEvent,
     maxevents: i32,
     timeout: i32,
-    _sigmask: *const u8,
-    _sigsetsize: usize,
+    sigmask: *const u8,
+    sigsetsize: usize,
 ) -> i64 {
-    unsafe { sys_epoll_wait(epfd, events, maxevents, timeout) }
+    let error = unsafe {
+        crate::kernel::signal::set_user_sigmask(
+            sigmask.cast::<crate::kernel::signal::SigSet>(),
+            sigsetsize,
+        )
+    };
+    if error != 0 {
+        return error;
+    }
+
+    let result = unsafe { sys_epoll_wait(epfd, events, maxevents, timeout) };
+    crate::kernel::signal::restore_saved_sigmask_unless(result == -(EINTR as i64));
+    result
 }
 
 pub unsafe fn sys_epoll_pwait2(
@@ -543,8 +1173,8 @@ pub unsafe fn sys_epoll_pwait2(
     events: *mut EpollEvent,
     maxevents: i32,
     timeout: *const crate::kernel::time::Timespec64,
-    _sigmask: *const u8,
-    _sigsetsize: usize,
+    sigmask: *const u8,
+    sigsetsize: usize,
 ) -> i64 {
     let timeout_ms = if timeout.is_null() {
         -1
@@ -557,24 +1187,30 @@ pub unsafe fn sys_epoll_pwait2(
         let ms = ns.saturating_add(999_999) / 1_000_000;
         ms.min(i32::MAX as u64) as i32
     };
-    unsafe { sys_epoll_wait(epfd, events, maxevents, timeout_ms) }
+    let error = unsafe {
+        crate::kernel::signal::set_user_sigmask(
+            sigmask.cast::<crate::kernel::signal::SigSet>(),
+            sigsetsize,
+        )
+    };
+    if error != 0 {
+        return error;
+    }
+
+    let result = unsafe { sys_epoll_wait(epfd, events, maxevents, timeout_ms) };
+    crate::kernel::signal::restore_saved_sigmask_unless(result == -(EINTR as i64));
+    result
 }
 
 #[cfg(not(test))]
 #[derive(Default)]
-struct EventWaitState {
-    last_tick_tsc: u64,
-    spins: u32,
-}
+struct EventWaitState;
 
 #[cfg(not(test))]
 impl EventWaitState {
     fn maintenance(&mut self) {
         crate::init::rootfs::drain_console_control_bytes();
         crate::linux_driver_abi::video::fbdev::core::refresh_cursor_blink();
-        if self.should_tick() {
-            crate::kernel::time::clockevents::tick_handle_periodic();
-        }
         // Lupos' current scheduler is cooperative on the boot CPU (schedule()
         // only switches tasks at explicit call sites; it never preempts from
         // an interrupt). Every epoll_wait caller (systemd, journald, udevd,
@@ -590,21 +1226,6 @@ impl EventWaitState {
         // the scheduler has confirmed under the runqueue lock that no other
         // task anywhere is runnable, so it never delays other callers.
         core::hint::spin_loop();
-    }
-
-    fn should_tick(&mut self) -> bool {
-        self.spins = self.spins.wrapping_add(1);
-        let tsc = crate::kernel::time::clocksource::read_tsc();
-        if tsc == 0 {
-            return self.spins & 0x3ff == 0;
-        }
-        let last = self.last_tick_tsc;
-        if last == 0 || tsc.saturating_sub(last) >= 1_000_000 {
-            self.last_tick_tsc = tsc;
-            true
-        } else {
-            false
-        }
     }
 }
 
@@ -624,7 +1245,7 @@ mod tests {
         write: None,
         llseek: None,
         fsync: None,
-        poll: Some(|_| EPOLLIN),
+        poll: Some(|_, _| EPOLLIN),
         ioctl: None,
         mmap: None,
         release: None,
@@ -643,14 +1264,14 @@ mod tests {
         write: None,
         llseek: None,
         fsync: None,
-        poll: Some(|_| EPOLLIN),
+        poll: Some(|_, _| EPOLLIN),
         ioctl: None,
         mmap: None,
         release: Some(release_watched_file),
         readdir: None,
     };
 
-    fn test_poll_mask(file: &FileRef) -> u32 {
+    fn test_poll_mask(file: &FileRef, _table: Option<&mut select::PollTable>) -> u32 {
         *file.private.lock() as u32
     }
 
@@ -735,12 +1356,17 @@ mod tests {
 
         ep.add(4, old_file.clone(), ev).unwrap();
         ep.add(4, new_file.clone(), ev).unwrap();
-        assert_eq!(ep.items.lock().len(), 2);
+        assert_eq!(ep.with_state_irqsave(|state| state.items.len()), 2);
 
         ep.remove_closed_file(4, &old_file);
-        let items = ep.items.lock();
-        assert_eq!(items.len(), 1);
-        assert!(Arc::ptr_eq(&items[0].file, &new_file));
+        let (item_count, retained_new_file) = ep.with_state_irqsave(|state| {
+            (
+                state.items.len(),
+                Arc::ptr_eq(state.items[0].item.file(), &new_file),
+            )
+        });
+        assert_eq!(item_count, 1);
+        assert!(retained_new_file);
     }
 
     #[test]
@@ -812,9 +1438,10 @@ mod tests {
             },
         )
         .unwrap();
-        let items = ep.items.lock();
-        assert_eq!(items[0].events, EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP);
-        assert_eq!(items[0].data, 2);
+        let (events, data) = ep
+            .with_state_irqsave(|state| (state.items[0].item.events(), state.items[0].item.data()));
+        assert_eq!(events, EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP);
+        assert_eq!(data, 2);
     }
 
     #[test]

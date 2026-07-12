@@ -154,7 +154,7 @@ impl FilesStruct {
             slot.flags = 0;
             file
         };
-        super::eventpoll::notify_fd_closed(self, fd, &file);
+        super::eventpoll::notify_fd_closed(&file);
         fput(file);
         Ok(())
     }
@@ -190,7 +190,7 @@ impl FilesStruct {
             }
         };
         if let Some(file) = replaced {
-            super::eventpoll::notify_fd_closed(self, newfd as i32, &file);
+            super::eventpoll::notify_fd_closed(&file);
             fput(file);
         }
         Ok(newfd as i32)
@@ -214,8 +214,8 @@ impl FilesStruct {
                 t[i] = Slot::empty();
             }
         }
-        for (fd, file) in to_put {
-            super::eventpoll::notify_fd_closed(self, fd, &file);
+        for (_fd, file) in to_put {
+            super::eventpoll::notify_fd_closed(&file);
             fput(file);
         }
         Ok(())
@@ -240,8 +240,8 @@ impl FilesStruct {
                 }
             }
         }
-        for (fd, file) in to_put {
-            super::eventpoll::notify_fd_closed(self, fd, &file);
+        for (_fd, file) in to_put {
+            super::eventpoll::notify_fd_closed(&file);
             fput(file);
         }
     }
@@ -334,6 +334,11 @@ impl Drop for FilesStruct {
             }
         }
         for file in to_put {
+            // Task exit closes descriptors through files_struct destruction,
+            // not sys_close(). Linux still reaches eventpoll_release_file()
+            // from the final fput, so run the same pre-fput logical-close hook
+            // used by close/close_range/close-on-exec.
+            super::eventpoll::notify_fd_closed(&file);
             fput(file);
         }
     }

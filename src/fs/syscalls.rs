@@ -1552,10 +1552,7 @@ pub unsafe fn sys_poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i64 {
 }
 
 unsafe fn poll_impl(fds: *mut PollFd, nfds: usize, timeout_ns: Option<u64>) -> i64 {
-    if nfds == 0 {
-        return 0;
-    }
-    if fds.is_null() {
+    if nfds != 0 && fds.is_null() {
         return -(EFAULT as i64);
     }
     let ft = match current_files() {
@@ -1573,19 +1570,29 @@ unsafe fn poll_impl(fds: *mut PollFd, nfds: usize, timeout_ns: Option<u64>) -> i
         #[cfg(not(test))]
         crate::init::rootfs::drain_console_control_bytes();
 
-        let ready = match unsafe { select::poll_once(ft.as_ref(), fds, nfds) } {
+        let current = unsafe { sched::get_current() };
+        let mut poll_table = select::PollTable::new(current);
+        let ready = match unsafe {
+            select::poll_once_with_table(ft.as_ref(), fds, nfds, Some(&mut poll_table))
+        } {
             Ok(ready) => ready,
-            Err(errno) => return -(errno as i64),
+            Err(errno) => {
+                poll_table.finish();
+                return -(errno as i64);
+            }
         };
         if ready != 0 || timeout_ns == Some(0) {
+            poll_table.finish();
             return ready;
         }
         #[cfg(not(test))]
         if crate::kernel::signal::current_has_unblocked_pending_signals() {
+            poll_table.finish();
             return -(EINTR as i64);
         }
         if let Some(deadline_ns) = deadline_ns {
             if crate::kernel::time::ktime_get() >= deadline_ns {
+                poll_table.finish();
                 return 0;
             }
         }
@@ -1593,13 +1600,11 @@ unsafe fn poll_impl(fds: *mut PollFd, nfds: usize, timeout_ns: Option<u64>) -> i
         #[cfg(not(test))]
         {
             wait_state.maintenance();
-            crate::kernel::time::sleep_timeout::schedule_timeout_with_state(
-                1,
-                crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
-            );
+            poll_schedule(current, &mut poll_table, deadline_ns);
         }
         #[cfg(test)]
         {
+            poll_table.finish();
             crate::kernel::time::timekeeping::tick_advance_walltime();
             crate::kernel::time::hrtimer_run_queues();
         }
@@ -1629,9 +1634,6 @@ unsafe fn select_impl(
 ) -> i64 {
     if nfds < 0 {
         return -(EINVAL as i64);
-    }
-    if nfds == 0 {
-        return 0;
     }
     let ft = match current_files() {
         Ok(ft) => ft,
@@ -1672,31 +1674,49 @@ unsafe fn select_impl(
         let read_ptr = fdset_kernel_ptr(readfds, &mut read_ready);
         let write_ptr = fdset_kernel_ptr(writefds, &mut write_ready);
         let except_ptr = fdset_kernel_ptr(exceptfds, &mut except_ready);
+        let current = unsafe { sched::get_current() };
+        let mut poll_table = select::PollTable::new(current);
         let ready = match unsafe {
-            select::select_once(ft.as_ref(), nfds, read_ptr, write_ptr, except_ptr)
+            select::select_once_with_table(
+                ft.as_ref(),
+                nfds,
+                read_ptr,
+                write_ptr,
+                except_ptr,
+                Some(&mut poll_table),
+            )
         } {
             Ok(ready) => ready,
-            Err(errno) => return -(errno as i64),
+            Err(errno) => {
+                poll_table.finish();
+                return -(errno as i64);
+            }
         };
         if let Err(errno) = unsafe { restore_fdset(readfds, &read_ready) } {
+            poll_table.finish();
             return -(errno as i64);
         }
         if let Err(errno) = unsafe { restore_fdset(writefds, &write_ready) } {
+            poll_table.finish();
             return -(errno as i64);
         }
         if let Err(errno) = unsafe { restore_fdset(exceptfds, &except_ready) } {
+            poll_table.finish();
             return -(errno as i64);
         }
         if ready != 0 {
+            poll_table.finish();
             return ready;
         }
         #[cfg(not(test))]
         if crate::kernel::signal::current_has_unblocked_pending_signals() {
+            poll_table.finish();
             return -(EINTR as i64);
         }
 
         if let Some(deadline_ns) = deadline_ns {
             if crate::kernel::time::ktime_get() >= deadline_ns {
+                poll_table.finish();
                 return 0;
             }
         }
@@ -1704,49 +1724,74 @@ unsafe fn select_impl(
         #[cfg(not(test))]
         {
             wait_state.maintenance();
-            crate::kernel::time::sleep_timeout::schedule_timeout_with_state(
-                1,
-                crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
-            );
+            poll_schedule(current, &mut poll_table, deadline_ns);
         }
         #[cfg(test)]
         {
+            poll_table.finish();
             crate::kernel::time::timekeeping::tick_advance_walltime();
             crate::kernel::time::hrtimer_run_queues();
         }
     }
 }
 
+/// Sleep after a poll/select scan while retaining its waitqueue entries.
+///
+/// Poll registrations do not alter task state.  Linux changes state once, then
+/// checks the sticky `poll_wqueues.triggered` bit before scheduling; the same
+/// handshake here prevents a wake on an early fd from being overwritten while
+/// a later fd is registered.
+#[cfg(not(test))]
+fn poll_schedule(
+    current: *mut crate::kernel::task::TaskStruct,
+    table: &mut select::PollTable,
+    deadline_ns: Option<u64>,
+) {
+    if current.is_null() {
+        table.finish();
+        return;
+    }
+
+    let task = current as usize;
+    if table.prepare_to_sleep() {
+        let timeout = deadline_ns.map(|deadline| {
+            let remaining = deadline.saturating_sub(crate::kernel::time::ktime_get());
+            crate::kernel::time::timeconv::nsecs_to_jiffies64(remaining).max(1)
+        });
+        let timeout = if table.has_unregistered_sources() {
+            Some(timeout.unwrap_or(1).min(1))
+        } else {
+            timeout
+        };
+        if let Some(timeout) = timeout {
+            let wake_at = crate::kernel::time::jiffies::jiffies().saturating_add(timeout);
+            crate::kernel::time::sleep_timeout::arm_wakeup(task, wake_at);
+        }
+        unsafe {
+            sched::schedule_with_irqs_enabled();
+        }
+        if timeout.is_some() {
+            crate::kernel::time::sleep_timeout::cancel_wakeup(task);
+        }
+    }
+    table.finish();
+    unsafe {
+        (*current).__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+    }
+}
+
 #[cfg(not(test))]
 #[derive(Default)]
-struct ConsoleWaitState {
-    last_tick_tsc: u64,
-    spins: u32,
-}
+struct ConsoleWaitState;
 
 #[cfg(not(test))]
 impl ConsoleWaitState {
     fn maintenance(&mut self) {
         crate::linux_driver_abi::video::fbdev::core::refresh_cursor_blink();
-        if self.should_tick() {
-            crate::kernel::time::clockevents::tick_handle_periodic();
-        }
         core::hint::spin_loop();
-    }
-
-    fn should_tick(&mut self) -> bool {
-        self.spins = self.spins.wrapping_add(1);
-        let tsc = crate::kernel::time::clocksource::read_tsc();
-        if tsc == 0 {
-            return self.spins & 0x3ff == 0;
-        }
-        let last = self.last_tick_tsc;
-        if last == 0 || tsc.saturating_sub(last) >= 1_000_000 {
-            self.last_tick_tsc = tsc;
-            true
-        } else {
-            false
-        }
     }
 }
 
@@ -3633,7 +3678,10 @@ fn userfaultfd_file_read(_file: &FileRef, _buf: &mut [u8], _pos: &mut u64) -> Re
     Err(ENOSYS)
 }
 
-fn userfaultfd_file_poll(_file: &FileRef) -> u32 {
+fn userfaultfd_file_poll(
+    _file: &FileRef,
+    _table: Option<&mut crate::fs::select::PollTable>,
+) -> u32 {
     POLLIN as u32
 }
 

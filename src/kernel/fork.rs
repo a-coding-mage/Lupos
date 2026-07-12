@@ -337,7 +337,17 @@ pub unsafe extern "C" fn user_fork_child_set_tid() {}
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kernel_fork_child_entry() -> ! {
-    core::arch::naked_asm!("mov rdi, rbx", "call r12", "2: hlt", "jmp 2b",);
+    core::arch::naked_asm!(
+        // Linux ret_from_fork calls schedule_tail(prev) before entering the
+        // new task. __switch_to returns the outgoing task in RAX.
+        "mov rdi, rax",
+        "call {schedule_tail}",
+        "mov rdi, rbx",
+        "call r12",
+        "2: hlt",
+        "jmp 2b",
+        schedule_tail = sym crate::kernel::sched::schedule_tail,
+    );
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -363,7 +373,12 @@ pub fn kernel_fork_child_entry_addr() -> u64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn user_fork_child_return() -> ! {
     core::arch::naked_asm!(
+        // RSP is eight bytes off call alignment at this synthetic return
+        // site. Align it once, then perform Linux schedule_tail(prev) before
+        // any child-return work. __switch_to left prev in RAX.
+        "mov rdi, rax",
         "sub rsp, 8",
+        "call {schedule_tail}",
         "call {set_child_tid}",
         "call {load_tls}",
         "add rsp, 8",
@@ -388,6 +403,7 @@ pub unsafe extern "C" fn user_fork_child_return() -> ! {
         "mov rsp, [rsp + 152]",
         "swapgs",
         "sysretq",
+        schedule_tail = sym crate::kernel::sched::schedule_tail,
         set_child_tid = sym user_fork_child_set_tid,
         load_tls = sym load_current_user_tls_base,
     );
@@ -443,6 +459,7 @@ pub unsafe fn copy_process(
     if args.exit_signal < 0 || args.exit_signal > 64 {
         return Err(-22); // EINVAL: invalid signal number
     }
+    let clone_thread = args.flags & CLONE_THREAD != 0;
 
     // ── 2. Allocate the child TaskStruct on the heap ────────────────────────
     let child: *mut TaskStruct = alloc_task_struct_zeroed();
@@ -494,11 +511,7 @@ pub unsafe fn copy_process(
 
         (*child).pid = nr;
         // tgid: join parent's thread group for CLONE_THREAD; own group otherwise.
-        (*child).tgid = if args.flags & CLONE_THREAD != 0 {
-            (*parent).tgid
-        } else {
-            nr
-        };
+        (*child).tgid = if clone_thread { (*parent).tgid } else { nr };
         crate::kernel::syscalls::inherit_process_rlimits(parent, child);
         crate::kernel::session::inherit_from_parent((*parent).pid, nr);
         let task_alloc_err = crate::security::security_task_alloc(nr as u32, args.flags);
@@ -509,15 +522,26 @@ pub unsafe fn copy_process(
         task_allocated = true;
 
         // ── 6b. M26: link parent → child ─────────────────────────────────────
-        (*child).m26.real_parent = parent;
-        (*child).m26.parent = parent;
-        (*child).m26.group_leader = if args.flags & CLONE_THREAD != 0 {
+        // Linux copy_process(): CLONE_THREAD members inherit the process
+        // parent's parentage and are not natural children of the thread that
+        // called clone(2). ptrace_init_task() then initializes parent from
+        // real_parent in the untraced case.
+        (*child).m26.real_parent = if clone_thread {
+            (*parent).m26.real_parent
+        } else {
+            parent
+        };
+        (*child).m26.parent = (*child).m26.real_parent;
+        (*child).m26.group_leader = if clone_thread {
             // Inherit the parent's group leader for thread-group siblings.
             (*parent).m26.group_leader
         } else {
             child // own group leader
         };
-        (*child).m26.exit_signal = args.exit_signal;
+        // Linux uses a negative exit_signal as thread_group_leader()'s exact
+        // discriminator. Untraced non-leader threads are therefore
+        // self-reaped and never reported through the natural-child wait path.
+        (*child).m26.exit_signal = if clone_thread { -1 } else { args.exit_signal };
         if (*parent).m27.mdwe_flags
             & (crate::kernel::task::TASK_CTRL_HAS_CHILD_SUBREAPER
                 | crate::kernel::task::TASK_CTRL_CHILD_SUBREAPER)
@@ -692,15 +716,22 @@ pub unsafe fn copy_process(
 
         // ── 12. Copy comm from parent ────────────────────────────────────────
         (*child).comm = (*parent).comm;
-        let parent_count = (*parent).m26.children_count as usize;
-        if parent_count < crate::kernel::task::MAX_CHILDREN {
-            (*parent).m26.children[parent_count] = child;
-            (*parent).m26.children_count = (parent_count + 1) as u32;
+        if !clone_thread {
+            let parent_count = (*parent).m26.children_count as usize;
+            if parent_count < crate::kernel::task::MAX_CHILDREN {
+                (*parent).m26.children[parent_count] = child;
+                (*parent).m26.children_count = (parent_count + 1) as u32;
+            }
         }
         if args.flags & crate::kernel::clone::CLONE_CHILD_SETTID != 0 {
             register_child_set_tid(nr, args.child_tid);
         }
-        crate::kernel::signal::inherit_signal_state_for_clone((*parent).pid, nr, (*child).tgid);
+        crate::kernel::signal::inherit_signal_state_for_clone(
+            (*parent).pid,
+            nr,
+            (*child).tgid,
+            child,
+        );
     }
 
     Ok(child)

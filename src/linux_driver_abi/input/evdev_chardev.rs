@@ -1,5 +1,5 @@
-//! linux-parity: complete
-//! linux-source: vendor/linux/drivers/input
+//! linux-parity: partial
+//! linux-source: vendor/linux/drivers/input/evdev.c
 //! test-origin: linux:vendor/linux/drivers/input
 //! Evdev character device — `/dev/input/eventN`.
 //!
@@ -7,6 +7,10 @@
 //! devices so userspace consumers (libinput, X.Org, Weston) can open
 //! `/dev/input/event0`, poll for readability, read `struct input_event`
 //! records, and issue the canonical evdev ioctls.
+//!
+//! Remaining deviations from `evdev.c` are the pre-existing device-wide event
+//! queue (rather than one `evdev_client` ring per open file), missing revoke /
+//! disconnect state, async notification and the evdev write path.
 //!
 //! References:
 //!   - `vendor/linux/drivers/input/evdev.c`               — the upstream handler
@@ -19,6 +23,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::mem::size_of;
+use core::sync::atomic::Ordering;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -26,6 +31,9 @@ use super::{EV_ABS, EV_KEY, EV_REL, EV_SYN, InputDev, InputEvent};
 use crate::fs::ops::{FileOps, IoctlFn, PollFn};
 use crate::fs::types::FileRef;
 use crate::include::uapi::errno::{EFAULT, EINVAL, ENODEV, ENOTTY};
+use crate::include::uapi::fcntl::O_NONBLOCK;
+use crate::kernel::task::{TaskStruct, task_state};
+use crate::kernel::{sched, signal};
 
 // ── Evdev ABI constants — `include/uapi/linux/input.h` ────────────────────────
 
@@ -44,6 +52,7 @@ const IOC_SIZEMASK: u32 = 0x3fff;
 const IOC_NONE: u32 = 0;
 const IOC_WRITE: u32 = 1;
 const IOC_READ: u32 = 2;
+const ERESTARTSYS: i32 = 512;
 
 const fn ioc(dir: u32, ty: u32, nr: u32, size: u32) -> u32 {
     (dir << IOC_DIRSHIFT) | (ty << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT) | (size << IOC_SIZESHIFT)
@@ -147,40 +156,90 @@ fn with_slot<R>(file: &FileRef, f: impl FnOnce(&EvdevSlot) -> Result<R, i32>) ->
 
 fn evdev_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i32> {
     let stride = size_of::<InputEvent>();
-    if buf.len() < stride {
+    if !buf.is_empty() && buf.len() < stride {
         return Err(EINVAL);
     }
-    let events = with_slot(file, |slot| Ok(slot.dev.drain_events()))?;
-    let take = core::cmp::min(buf.len() / stride, events.len());
-    if take == 0 {
-        // Linux blocks here when O_NONBLOCK is not set; return EAGAIN so userspace
-        // can fall back to poll.
-        return Err(crate::include::uapi::errno::EAGAIN);
+    let dev = with_slot(file, |slot| Ok(slot.dev.clone()))?;
+    if buf.is_empty() {
+        return if dev.events.lock().is_empty()
+            && file.flags.load(Ordering::Acquire) & O_NONBLOCK != 0
+        {
+            Err(crate::include::uapi::errno::EAGAIN)
+        } else {
+            Ok(0)
+        };
     }
-    for (i, ev) in events.iter().take(take).enumerate() {
-        let dst = &mut buf[i * stride..(i + 1) * stride];
-        let bytes =
-            unsafe { core::slice::from_raw_parts((ev as *const InputEvent) as *const u8, stride) };
-        dst.copy_from_slice(bytes);
-    }
-    // Re-queue any events that didn't fit — preserves order across reads.
-    if events.len() > take {
-        let dev = with_slot(file, |slot| Ok(slot.dev.clone()))?;
-        let mut q = dev.events.lock();
-        for ev in events.into_iter().skip(take).rev() {
-            q.insert(0, ev);
+
+    let task = unsafe { sched::get_current() };
+    loop {
+        // Linux's wait_event_interruptible() links the reader before its final
+        // packet-head test.  Preserve that ordering so a producer cannot wake
+        // between an empty-queue sample and the task becoming sleepable.
+        if !task.is_null() {
+            unsafe {
+                dev.event_wait
+                    .prepare_to_wait(task, task_state::TASK_INTERRUPTIBLE);
+            }
         }
+
+        let mut events = dev.events.lock();
+        if !events.is_empty() {
+            let take = core::cmp::min(buf.len() / stride, events.len());
+            for (i, ev) in events.iter().take(take).enumerate() {
+                let dst = &mut buf[i * stride..(i + 1) * stride];
+                let bytes = unsafe {
+                    core::slice::from_raw_parts((ev as *const InputEvent) as *const u8, stride)
+                };
+                dst.copy_from_slice(bytes);
+            }
+            events.drain(..take);
+            drop(events);
+            finish_evdev_wait(&dev, task);
+            return Ok(take * stride);
+        }
+        drop(events);
+
+        if file.flags.load(Ordering::Acquire) & O_NONBLOCK != 0 || task.is_null() {
+            finish_evdev_wait(&dev, task);
+            return Err(crate::include::uapi::errno::EAGAIN);
+        }
+        if signal::has_unblocked_pending_signals(task) {
+            finish_evdev_wait(&dev, task);
+            // `wait_event_interruptible()` returns the internal Linux restart
+            // errno; syscall exit performs the SA_RESTART/EINTR conversion.
+            return Err(ERESTARTSYS);
+        }
+
+        unsafe {
+            sched::schedule_with_irqs_enabled();
+        }
+        finish_evdev_wait(&dev, task);
     }
-    Ok(take * stride)
 }
 
-fn evdev_poll(file: &FileRef) -> u32 {
-    use crate::fs::eventpoll::EPOLLIN;
-    with_slot(file, |slot| {
-        let queued = !slot.dev.events.lock().is_empty();
-        Ok(if queued { EPOLLIN } else { 0 })
-    })
-    .unwrap_or(0)
+fn finish_evdev_wait(dev: &InputDev, task: *mut TaskStruct) {
+    if !task.is_null() {
+        unsafe {
+            dev.event_wait.finish_wait(task);
+        }
+    }
+}
+
+fn evdev_poll(file: &FileRef, table: Option<&mut crate::fs::select::PollTable>) -> u32 {
+    use crate::fs::eventpoll::{EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDNORM, EPOLLWRNORM};
+
+    let Ok(dev) = with_slot(file, |slot| Ok(slot.dev.clone())) else {
+        return EPOLLHUP | EPOLLERR;
+    };
+    // Linux `evdev_poll()` registers first and samples the packet queue only
+    // afterwards.  Event enqueue therefore either becomes visible here or
+    // wakes the installed poll/epoll callback.
+    crate::fs::select::poll_wait(file, &dev.event_wait, table);
+    let mut mask = EPOLLOUT | EPOLLWRNORM;
+    if !dev.events.lock().is_empty() {
+        mask |= EPOLLIN | EPOLLRDNORM;
+    }
+    mask
 }
 
 fn evdev_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
@@ -403,7 +462,7 @@ mod tests {
         // the dentry name to identify the minor.
         let parent = Dentry::new_negative("input");
         let child = d_alloc_child(&parent, name);
-        File::new(child, 0, 0o666, &EVDEV_FILE_OPS)
+        File::new(child, O_NONBLOCK, 0o666, &EVDEV_FILE_OPS)
     }
 
     // Each test uses a unique (minor, device_id, dentry name) so cargo's
@@ -435,9 +494,18 @@ mod tests {
     #[test]
     fn evdev_poll_reports_pollin_when_queued() {
         let (dev, file) = setup_dev(101, 0xE101);
-        assert_eq!(evdev_poll(&file), 0);
+        assert_eq!(
+            evdev_poll(&file, None),
+            crate::fs::eventpoll::EPOLLOUT | crate::fs::eventpoll::EPOLLWRNORM
+        );
         dev.input_event(EV_KEY, KEY_ENTER, 1);
-        assert_eq!(evdev_poll(&file), crate::fs::eventpoll::EPOLLIN);
+        assert_eq!(
+            evdev_poll(&file, None),
+            crate::fs::eventpoll::EPOLLIN
+                | crate::fs::eventpoll::EPOLLOUT
+                | crate::fs::eventpoll::EPOLLRDNORM
+                | crate::fs::eventpoll::EPOLLWRNORM
+        );
     }
 
     #[test]

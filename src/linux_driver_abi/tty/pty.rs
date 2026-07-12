@@ -31,7 +31,14 @@ use super::{
 };
 use crate::fs::ops::{FileOps, IoctlFn, PollFn};
 use crate::fs::types::FileRef;
-use crate::include::uapi::errno::{EAGAIN, EFAULT, EINTR, EINVAL, EIO, ENODEV, ENOTTY};
+use crate::include::uapi::errno::{EAGAIN, EFAULT, EINVAL, EIO, ENODEV, ENOTTY};
+use crate::kernel::sched::wait::WaitQueueHead;
+use crate::kernel::task::task_state::TASK_INTERRUPTIBLE;
+
+/// Internal restart errno returned by Linux `n_tty_wait_for_input()` when an
+/// unblocked signal interrupts a blocking read.  Syscall exit turns this into
+/// either a restarted `read(2)` or userspace `EINTR`, according to `SA_RESTART`.
+const ERESTARTSYS: i32 = 512;
 
 // ── UNIX98 pty ioctls — `include/uapi/asm-generic/ioctls.h` ───────────────────
 /// `TIOCGPTN` — get the slave pty number (`_IOR('T', 0x30, unsigned int)`).
@@ -85,7 +92,7 @@ pub struct Pty {
     master_open: AtomicBool,
     slave_open_count: AtomicUsize,
     /// Sticky: set once any slave fd has attached.  The master only reports
-    /// hang-up/EOF after the slave has been opened and then fully closed, so a
+    /// hang-up/`EIO` after the slave has been opened and then fully closed, so a
     /// master that reads before its slave is spawned blocks instead of seeing a
     /// spurious EOF.
     slave_ever_opened: AtomicBool,
@@ -97,6 +104,12 @@ pub struct Pty {
     to_master: Mutex<VecDeque<u8>>,
     /// Canonical-mode line-assembly buffer for the slave input side.
     canon: Mutex<Vec<u8>>,
+    /// Linux `tty_struct::{read_wait,write_wait}` for the master endpoint.
+    master_read_wait: WaitQueueHead,
+    master_write_wait: WaitQueueHead,
+    /// Linux `tty_struct::{read_wait,write_wait}` for the slave endpoint.
+    slave_read_wait: WaitQueueHead,
+    slave_write_wait: WaitQueueHead,
     pgrp: AtomicI32,
     session: AtomicI32,
 }
@@ -121,6 +134,10 @@ impl Pty {
             to_slave: Mutex::new(VecDeque::new()),
             to_master: Mutex::new(VecDeque::new()),
             canon: Mutex::new(Vec::new()),
+            master_read_wait: WaitQueueHead::new(),
+            master_write_wait: WaitQueueHead::new(),
+            slave_read_wait: WaitQueueHead::new(),
+            slave_write_wait: WaitQueueHead::new(),
             pgrp: AtomicI32::new(0),
             session: AtomicI32::new(0),
         })
@@ -223,6 +240,11 @@ impl Pty {
         if !echo_out.is_empty() {
             self.output_to_master(&echo_out);
         }
+        if self.slave_readable() {
+            // `n_tty_receive_buf_common()` publishes committed input and wakes
+            // `tty->read_wait` after the line discipline makes it readable.
+            self.slave_read_wait.wake_up_all();
+        }
     }
 
     fn raise_signal(
@@ -249,18 +271,24 @@ impl Pty {
     }
 
     fn output_to_master(&self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
         let termios = *self.termios.lock();
         let opost = termios.c_oflag & OPOST != 0;
         let onlcr = termios.c_oflag & ONLCR != 0;
-        let mut q = self.to_master.lock();
-        for &b in data {
-            if opost && onlcr && b == b'\n' {
-                q.push_back(b'\r');
-                q.push_back(b'\n');
-            } else {
-                q.push_back(b);
+        {
+            let mut q = self.to_master.lock();
+            for &b in data {
+                if opost && onlcr && b == b'\n' {
+                    q.push_back(b'\r');
+                    q.push_back(b'\n');
+                } else {
+                    q.push_back(b);
+                }
             }
         }
+        self.master_read_wait.wake_up_all();
     }
 
     fn master_read(&self, buf: &mut [u8]) -> usize {
@@ -350,7 +378,7 @@ fn master_pty(file: &FileRef) -> Arc<Pty> {
 /// first operation: it stamps `file.private` and bumps `slave_open_count`
 /// exactly once.  `dup(2)`/`fork(2)` share one `File`, so a pty opened once and
 /// inherited by a shell is counted once and its `release` decrements once —
-/// giving the master an accurate "last slave closed" (EOF) edge.
+/// giving the master an accurate "last slave closed" (`EIO`) edge.
 fn slave_attach(file: &FileRef) -> Option<Arc<Pty>> {
     let index: u32 = file.dentry.name.parse().ok()?;
     let pty = pty_lookup(index)?;
@@ -380,9 +408,8 @@ fn pty_yield() {
 #[cfg(test)]
 fn pty_yield() {}
 
-fn current_has_signal() -> bool {
-    let current = unsafe { crate::kernel::sched::get_current() };
-    !current.is_null() && crate::kernel::signal::has_pending_signals(current)
+fn task_has_unblocked_signal(task: *mut crate::kernel::task::TaskStruct) -> bool {
+    !task.is_null() && crate::kernel::signal::has_unblocked_pending_signals(task)
 }
 
 fn is_nonblock(file: &FileRef) -> bool {
@@ -401,36 +428,71 @@ fn ptmx_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i3
         if n > 0 {
             return Ok(n);
         }
-        // Slave was opened and has now fully closed, nothing buffered → the
-        // pty has hung up: report EOF to the master reader.
+        // `pty_close(slave)` sets `TTY_OTHER_CLOSED` on the master;
+        // `n_tty_wait_for_input()` reports `-EIO` once buffered data is gone.
         if pty.slave_ever_opened.load(Ordering::Acquire)
             && pty.slave_open_count.load(Ordering::Acquire) == 0
         {
-            return Ok(0);
+            return Err(EIO);
         }
         if is_nonblock(file) {
             return Err(EAGAIN);
         }
-        if current_has_signal() {
-            return Err(EINTR);
+
+        let current = unsafe { crate::kernel::sched::get_current() };
+        if current.is_null() {
+            pty_yield();
+            continue;
         }
-        pty_yield();
+        unsafe {
+            pty.master_read_wait
+                .prepare_to_wait(current, TASK_INTERRUPTIBLE);
+        }
+        // Linux installs the wait entry before its final availability/hangup
+        // test, closing the producer-wakeup versus schedule race.
+        if pty.master_readable()
+            || (pty.slave_ever_opened.load(Ordering::Acquire)
+                && pty.slave_open_count.load(Ordering::Acquire) == 0)
+        {
+            unsafe {
+                pty.master_read_wait.finish_wait(current);
+            }
+            continue;
+        }
+        if task_has_unblocked_signal(current) {
+            unsafe {
+                pty.master_read_wait.finish_wait(current);
+            }
+            return Err(ERESTARTSYS);
+        }
+        unsafe {
+            crate::kernel::sched::schedule_with_irqs_enabled();
+            pty.master_read_wait.finish_wait(current);
+        }
     }
 }
 
 fn ptmx_write(file: &FileRef, buf: &[u8], pos: &mut u64) -> Result<usize, i32> {
     let pty = master_pty(file);
+    if pty.slave_ever_opened.load(Ordering::Acquire)
+        && pty.slave_open_count.load(Ordering::Acquire) == 0
+    {
+        return Err(EIO);
+    }
     pty.master_write(buf);
     *pos = pos.saturating_add(buf.len() as u64);
     Ok(buf.len())
 }
 
-fn ptmx_poll(file: &FileRef) -> u32 {
-    use crate::fs::eventpoll::{EPOLLHUP, EPOLLIN, EPOLLOUT};
+fn ptmx_poll(file: &FileRef, mut table: Option<&mut crate::fs::select::PollTable>) -> u32 {
+    use crate::fs::eventpoll::{EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDNORM, EPOLLWRNORM};
     let pty = master_pty(file);
-    let mut mask = EPOLLOUT;
+    // `n_tty_poll()` registers both queues before sampling state.
+    crate::fs::select::poll_wait(file, &pty.master_read_wait, table.as_deref_mut());
+    crate::fs::select::poll_wait(file, &pty.master_write_wait, table.as_deref_mut());
+    let mut mask = EPOLLOUT | EPOLLWRNORM;
     if pty.master_readable() {
-        mask |= EPOLLIN;
+        mask |= EPOLLIN | EPOLLRDNORM;
     }
     if pty.slave_ever_opened.load(Ordering::Acquire)
         && pty.slave_open_count.load(Ordering::Acquire) == 0
@@ -482,13 +544,25 @@ fn ptmx_release(file: FileRef) {
     };
     if let Some(pty) = pty_lookup(index) {
         pty.master_open.store(false, Ordering::Release);
+        // Linux `pty_close()` wakes read/write waiters on both linked ttys so
+        // blocked I/O and pollers can observe `TTY_OTHER_CLOSED`/hangup.
+        pty.master_read_wait.wake_up_all();
+        pty.master_write_wait.wake_up_all();
+        pty.slave_read_wait.wake_up_all();
+        pty.slave_write_wait.wake_up_all();
         // Closing the master hangs up the slave session.
         let pgrp = pty.pgrp.load(Ordering::Acquire);
         if pgrp > 0 {
             crate::kernel::signal::send_signal_to_process_group(pgrp, SIGHUP);
         }
+        // Keep the linked tty object alive while an already-open slave file
+        // (including a poll-table file pin) still refers to its wait queues.
+        // The devpts node is removed now, as Linux does in the master close.
+        crate::init::rootfs::devpts_remove_slave(index);
+        if pty.slave_open_count.load(Ordering::Acquire) == 0 {
+            pty_free(index);
+        }
     }
-    pty_free(index);
 }
 
 // ── Slave (`/dev/pts/N`) file operations ───────────────────────────────────────
@@ -510,28 +584,55 @@ fn pts_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i32
         if is_nonblock(file) {
             return Err(EAGAIN);
         }
-        if current_has_signal() {
-            return Err(EINTR);
+
+        let current = unsafe { crate::kernel::sched::get_current() };
+        if current.is_null() {
+            pty_yield();
+            continue;
         }
-        pty_yield();
+        unsafe {
+            pty.slave_read_wait
+                .prepare_to_wait(current, TASK_INTERRUPTIBLE);
+        }
+        if pty.slave_readable() || !pty.master_open.load(Ordering::Acquire) {
+            unsafe {
+                pty.slave_read_wait.finish_wait(current);
+            }
+            continue;
+        }
+        if task_has_unblocked_signal(current) {
+            unsafe {
+                pty.slave_read_wait.finish_wait(current);
+            }
+            return Err(ERESTARTSYS);
+        }
+        unsafe {
+            crate::kernel::sched::schedule_with_irqs_enabled();
+            pty.slave_read_wait.finish_wait(current);
+        }
     }
 }
 
 fn pts_write(file: &FileRef, buf: &[u8], pos: &mut u64) -> Result<usize, i32> {
     let pty = slave_attach(file).ok_or(EIO)?;
+    if !pty.master_open.load(Ordering::Acquire) {
+        return Err(EIO);
+    }
     pty.slave_write(buf);
     *pos = pos.saturating_add(buf.len() as u64);
     Ok(buf.len())
 }
 
-fn pts_poll(file: &FileRef) -> u32 {
-    use crate::fs::eventpoll::{EPOLLHUP, EPOLLIN, EPOLLOUT};
+fn pts_poll(file: &FileRef, mut table: Option<&mut crate::fs::select::PollTable>) -> u32 {
+    use crate::fs::eventpoll::{EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDNORM, EPOLLWRNORM};
     let Some(pty) = slave_attach(file) else {
         return EPOLLHUP;
     };
-    let mut mask = EPOLLOUT;
+    crate::fs::select::poll_wait(file, &pty.slave_read_wait, table.as_deref_mut());
+    crate::fs::select::poll_wait(file, &pty.slave_write_wait, table.as_deref_mut());
+    let mut mask = EPOLLOUT | EPOLLWRNORM;
     if pty.slave_readable() {
-        mask |= EPOLLIN;
+        mask |= EPOLLIN | EPOLLRDNORM;
     }
     if !pty.master_open.load(Ordering::Acquire) {
         mask |= EPOLLHUP;
@@ -550,9 +651,19 @@ fn pts_release(file: FileRef) {
         return;
     }
     if let Some(pty) = slave_lookup(&file) {
-        let prev = pty.slave_open_count.load(Ordering::Acquire);
-        pty.slave_open_count
-            .store(prev.saturating_sub(1), Ordering::Release);
+        let prev = pty
+            .slave_open_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .unwrap_or(0);
+        pty.master_read_wait.wake_up_all();
+        pty.master_write_wait.wake_up_all();
+        pty.slave_read_wait.wake_up_all();
+        pty.slave_write_wait.wake_up_all();
+        if prev == 1 && !pty.master_open.load(Ordering::Acquire) {
+            pty_free(pty.index);
+        }
     }
 }
 

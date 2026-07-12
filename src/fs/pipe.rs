@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/fs/pipe.c
 //! test-origin: linux:vendor/linux/fs/pipe.c
 //! Pipe file descriptors.
@@ -26,6 +26,7 @@ use crate::kernel::{files, sched};
 
 use super::anon_inode::alloc_anon_file;
 use super::ops::FileOps;
+use super::select::{self, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use super::types::FileRef;
 
 const PIPE_BUF_CAPACITY: usize = 65_536;
@@ -91,16 +92,21 @@ fn pipe_file_nonblocking(file: &FileRef) -> bool {
 fn pipe_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i32> {
     let pipe = pipe_from_file(file)?;
     loop {
-        {
+        let read = {
             let mut q = pipe.buf.lock();
             if !q.is_empty() {
                 let n = buf.len().min(q.len());
                 for byte in buf.iter_mut().take(n) {
                     *byte = q.pop_front().unwrap_or_default();
                 }
-                pipe.write_wait.wake_up_all();
-                return Ok(n);
+                Some(n)
+            } else {
+                None
             }
+        };
+        if let Some(n) = read {
+            pipe.write_wait.wake_up_all();
+            return Ok(n);
         }
 
         if pipe.writers.load(AtomicOrdering::Acquire) == 0 {
@@ -140,7 +146,7 @@ fn pipe_write(file: &FileRef, buf: &[u8], _pos: &mut u64) -> Result<usize, i32> 
             return Err(EPIPE);
         }
 
-        {
+        let written = {
             let mut q = pipe.buf.lock();
             if q.len() < PIPE_BUF_CAPACITY {
                 let n = buf.len().min(PIPE_BUF_CAPACITY - q.len());
@@ -148,9 +154,14 @@ fn pipe_write(file: &FileRef, buf: &[u8], _pos: &mut u64) -> Result<usize, i32> 
                 if n == 0 {
                     return Err(EPIPE);
                 }
-                pipe.read_wait.wake_up_all();
-                return Ok(n);
+                Some(n)
+            } else {
+                None
             }
+        };
+        if let Some(n) = written {
+            pipe.read_wait.wake_up_all();
+            return Ok(n);
         }
 
         if pipe_file_nonblocking(file) {
@@ -179,21 +190,35 @@ fn pipe_write(file: &FileRef, buf: &[u8], _pos: &mut u64) -> Result<usize, i32> 
     }
 }
 
-fn pipe_read_poll(file: &FileRef) -> u32 {
-    match pipe_from_file(file) {
-        Ok(pipe) if !pipe.buf.lock().is_empty() => 0x0001,
-        Ok(pipe) if pipe.writers.load(AtomicOrdering::Acquire) == 0 => 0x0001,
-        Ok(_) => 0,
-        Err(_) => 0x0008,
+fn pipe_read_poll(file: &FileRef, table: Option<&mut PollTable>) -> u32 {
+    let Ok(pipe) = pipe_from_file(file) else {
+        return POLLERR as u32;
+    };
+    // Linux registers first and only then samples the racy pipe state.
+    select::poll_wait(file, &pipe.read_wait, table);
+    let mut mask = 0;
+    if !pipe.buf.lock().is_empty() {
+        mask |= (POLLIN | POLLRDNORM) as u32;
     }
+    if pipe.writers.load(AtomicOrdering::Acquire) == 0 {
+        mask |= POLLHUP as u32;
+    }
+    mask
 }
 
-fn pipe_write_poll(file: &FileRef) -> u32 {
-    match pipe_from_file(file) {
-        Ok(pipe) if pipe.buf.lock().len() < PIPE_BUF_CAPACITY => 0x0004,
-        Ok(_) => 0,
-        Err(_) => 0x0008,
+fn pipe_write_poll(file: &FileRef, table: Option<&mut PollTable>) -> u32 {
+    let Ok(pipe) = pipe_from_file(file) else {
+        return POLLERR as u32;
+    };
+    select::poll_wait(file, &pipe.write_wait, table);
+    let mut mask = 0;
+    if pipe.buf.lock().len() < PIPE_BUF_CAPACITY {
+        mask |= (POLLOUT | POLLWRNORM) as u32;
     }
+    if pipe.readers.load(AtomicOrdering::Acquire) == 0 {
+        mask |= POLLERR as u32;
+    }
+    mask
 }
 
 fn pipe_release(file: FileRef) {
@@ -208,18 +233,20 @@ fn pipe_release(file: FileRef) {
                 count.checked_sub(1)
             })
             .ok();
-        pipe.write_wait.wake_up_all();
     } else if mode == O_WRONLY {
         pipe.writers
             .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |count| {
                 count.checked_sub(1)
             })
             .ok();
-        pipe.read_wait.wake_up_all();
     }
-    if pipe.readers.load(AtomicOrdering::Acquire) == 0
-        && pipe.writers.load(AtomicOrdering::Acquire) == 0
-    {
+    let no_readers = pipe.readers.load(AtomicOrdering::Acquire) == 0;
+    let no_writers = pipe.writers.load(AtomicOrdering::Acquire) == 0;
+    if no_readers != no_writers {
+        pipe.read_wait.wake_up_all();
+        pipe.write_wait.wake_up_all();
+    }
+    if no_readers && no_writers {
         PIPES.lock().remove(&token);
     }
 }
@@ -376,7 +403,10 @@ mod tests {
         let mut pos = 0;
 
         assert_eq!(pipe_read(&reader, &mut out, &mut pos), Ok(0));
-        assert_eq!(pipe_read_poll(&reader) & 0x0001, 0x0001);
+        assert_eq!(
+            pipe_read_poll(&reader, None) & POLLHUP as u32,
+            POLLHUP as u32
+        );
 
         PIPES.lock().remove(&token);
     }
@@ -453,9 +483,12 @@ mod tests {
         reader.flags.store(O_RDONLY, AtomicOrdering::Release);
         writer.flags.store(O_WRONLY, AtomicOrdering::Release);
 
-        assert_eq!(pipe_read_poll(&reader) & 0x0001, 0);
+        assert_eq!(pipe_read_poll(&reader, None) & POLLHUP as u32, 0);
         pipe_release(writer);
-        assert_eq!(pipe_read_poll(&reader) & 0x0001, 0x0001);
+        assert_eq!(
+            pipe_read_poll(&reader, None) & POLLHUP as u32,
+            POLLHUP as u32
+        );
 
         PIPES.lock().remove(&token);
     }

@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/fs
 //! test-origin: linux:vendor/linux/fs
 //! inotify â€” file-system change notifications.
@@ -10,6 +10,7 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
@@ -23,6 +24,7 @@ use crate::fs::types::{DentryRef, FileRef, InodeKind, InodeRef};
 use crate::include::uapi::errno::{
     EAGAIN, EBADF, EEXIST, EFAULT, EINVAL, EMFILE, ENOENT, ENOSPC, ENOTDIR,
 };
+use crate::kernel::sched::wait::WaitQueueHead;
 use crate::kernel::{files, sched};
 
 /// `struct inotify_event` â€” variable-length: trailing `name` array follows.
@@ -128,6 +130,7 @@ impl InotifyQueue {
 struct InotifyInstance {
     watches: Mutex<Vec<InotifyWatch>>,
     queue: Mutex<InotifyQueue>,
+    notification_waitq: WaitQueueHead,
     next_wd: AtomicI32,
 }
 
@@ -149,7 +152,8 @@ const MAX_USER_INSTANCES: usize = 8;
 static INOTIFY_TOKEN: AtomicUsize = AtomicUsize::new(1);
 
 lazy_static! {
-    static ref INOTIFIES: Mutex<BTreeMap<usize, InotifyInstance>> = Mutex::new(BTreeMap::new());
+    static ref INOTIFIES: Mutex<BTreeMap<usize, Arc<InotifyInstance>>> =
+        Mutex::new(BTreeMap::new());
 }
 
 static INOTIFY_FILE_OPS: FileOps = FileOps {
@@ -210,16 +214,17 @@ fn inotify_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize,
     Ok(copied)
 }
 
-fn inotify_poll(file: &FileRef) -> u32 {
+fn inotify_poll(file: &FileRef, table: Option<&mut crate::fs::select::PollTable>) -> u32 {
     let token = *file.private.lock();
-    let table = INOTIFIES.lock();
-    let Some(instance) = table.get(&token) else {
+    let instances = INOTIFIES.lock();
+    let Some(instance) = instances.get(&token) else {
         return 0;
     };
+    crate::fs::select::poll_wait(file, &instance.notification_waitq, table);
     if instance.queue.lock().is_empty() {
         0
     } else {
-        crate::fs::eventpoll::EPOLLIN
+        crate::fs::eventpoll::EPOLLIN | crate::fs::eventpoll::EPOLLRDNORM
     }
 }
 
@@ -236,11 +241,12 @@ pub unsafe fn sys_inotify_init1(flags: i32) -> i64 {
     let token = INOTIFY_TOKEN.fetch_add(1, Ordering::AcqRel);
     table.insert(
         token,
-        InotifyInstance {
+        Arc::new(InotifyInstance {
             watches: Mutex::new(Vec::new()),
             queue: Mutex::new(InotifyQueue::new()),
+            notification_waitq: WaitQueueHead::new(),
             next_wd: AtomicI32::new(1),
-        },
+        }),
     );
     drop(table);
     let file = alloc_anon_file("inotify", &INOTIFY_FILE_OPS, token);
@@ -386,10 +392,10 @@ fn encode_event(wd: i32, mask: u32, name: Option<&str>) -> Vec<u8> {
     out
 }
 
-fn enqueue_event(queue: &mut InotifyQueue, wd: i32, mask: u32, name: Option<&str>) {
+fn enqueue_event(queue: &mut InotifyQueue, wd: i32, mask: u32, name: Option<&str>) -> bool {
     if queue.events.len() < MAX_QUEUED_EVENTS {
         queue.events.push_back(encode_event(wd, mask, name));
-        return;
+        return true;
     }
 
     if !queue.overflow_queued {
@@ -398,7 +404,9 @@ fn enqueue_event(queue: &mut InotifyQueue, wd: i32, mask: u32, name: Option<&str
             .events
             .push_back(encode_event(-1, IN_Q_OVERFLOW, None));
         queue.overflow_queued = true;
+        return true;
     }
+    false
 }
 
 fn queue_event_for_inode(inode: &InodeRef, mask: u32, name: Option<&str>) {
@@ -407,8 +415,9 @@ fn queue_event_for_inode(inode: &InodeRef, mask: u32, name: Option<&str>) {
     if event_bits == 0 {
         return;
     }
-    let mut table = INOTIFIES.lock();
-    for instance in table.values_mut() {
+    let table = INOTIFIES.lock();
+    let mut wake_instances = Vec::new();
+    for instance in table.values() {
         let events = {
             let watches = instance.watches.lock();
             watches
@@ -421,9 +430,22 @@ fn queue_event_for_inode(inode: &InodeRef, mask: u32, name: Option<&str>) {
             continue;
         }
         let mut queue = instance.queue.lock();
+        let mut enqueued = false;
         for (wd, event_mask) in events {
-            enqueue_event(&mut queue, wd, event_mask, name);
+            enqueued |= enqueue_event(&mut queue, wd, event_mask, name);
         }
+        drop(queue);
+        if enqueued {
+            wake_instances.push(instance.clone());
+        }
+    }
+    drop(table);
+
+    // Mirrors fsnotify_insert_event(): publish under notification_lock, then
+    // wake notification_waitq after dropping the queue/global locks.  The Arc
+    // pins the file-private instance across a concurrent final close.
+    for instance in wake_instances {
+        instance.notification_waitq.wake_up_all();
     }
 }
 
@@ -601,7 +623,7 @@ mod tests {
             let ft = files::get_task_files(&*current as *const TaskStruct as *mut TaskStruct)
                 .expect("task files");
             let file = ft.get(ifd as i32).expect("inotify fd");
-            assert_ne!(super::inotify_poll(&file) & EPOLLIN, 0);
+            assert_ne!(super::inotify_poll(&file, None) & EPOLLIN, 0);
 
             let mut buf = [0u8; 64];
             let n = vfs_read(&file, &mut buf).expect("inotify event");

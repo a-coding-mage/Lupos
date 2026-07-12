@@ -103,6 +103,32 @@ impl XArray {
         self.inner.lock().entries.get(&index).copied()
     }
 
+    /// Load a page and acquire its caller reference while the XArray lock is
+    /// still held.  Linux's `filemap_get_entry()` performs the equivalent
+    /// `folio_try_get_rcu()` before an entry can be removed and freed.
+    pub fn xa_load_get(&self, index: u64) -> Option<NonNull<Page>> {
+        let inner = self.inner.lock();
+        let page = inner.entries.get(&index).copied()?;
+        unsafe { page.as_ref() }.get_page();
+        Some(page)
+    }
+
+    /// Insert only when `index` is empty, under one XArray critical section.
+    /// Returns the supplied page on success or the existing entry on conflict.
+    pub fn xa_insert(
+        &self,
+        index: u64,
+        page: NonNull<Page>,
+    ) -> Result<NonNull<Page>, NonNull<Page>> {
+        let mut inner = self.inner.lock();
+        if let Some(existing) = inner.entries.get(&index).copied() {
+            Err(existing)
+        } else {
+            inner.entries.insert(index, page);
+            Ok(page)
+        }
+    }
+
     /// Store `page` at `index`.  Returns the previous entry, if any.
     ///
     /// Callers must manage refcounts themselves (consistent with Linux).

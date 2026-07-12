@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/fs/timerfd.c
 //! test-origin: linux:vendor/linux/fs/timerfd.c
 //! timerfd syscall glue.
@@ -17,6 +17,7 @@ use spin::Mutex;
 use crate::arch::x86::kernel::uaccess;
 use crate::include::uapi::errno::{EAGAIN, EBADF, EFAULT, EINVAL};
 use crate::include::uapi::fcntl::O_NONBLOCK;
+use crate::kernel::task::{TaskStruct, task_state};
 use crate::kernel::time::{Itimerspec64, TimerFd};
 use crate::kernel::{files, sched};
 
@@ -66,29 +67,76 @@ fn timerfd_file_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<u
     }
     let token = *file.private.lock();
     let tfd = TIMERFDS.lock().get(&token).cloned().ok_or(EBADF)?;
-    let ticks = crate::kernel::time::timerfd::timerfd_read(&tfd);
-    if ticks == 0 {
-        return Err(EAGAIN);
+    let task = unsafe { sched::get_current() };
+
+    loop {
+        // Linux's wait_event_interruptible_locked_irq() links the reader
+        // before its final ctx->ticks test.  Preserve that order so an expiry
+        // between the test and schedule cannot be lost.
+        if !task.is_null() {
+            unsafe {
+                tfd.wait
+                    .prepare_to_wait(task, task_state::TASK_INTERRUPTIBLE);
+            }
+        }
+
+        let ticks = crate::kernel::time::timerfd::timerfd_read(&tfd);
+        if ticks != 0 {
+            finish_timerfd_wait(&tfd, task);
+            buf[..8].copy_from_slice(&ticks.to_ne_bytes());
+            return Ok(8);
+        }
+
+        if file.flags.load(Ordering::Acquire) & O_NONBLOCK != 0 || task.is_null() {
+            finish_timerfd_wait(&tfd, task);
+            return Err(EAGAIN);
+        }
+
+        // wait_event_interruptible() reports -ERESTARTSYS when an unblocked
+        // signal wins the wait.  The syscall-exit signal code performs the
+        // Linux restart/EINTR conversion from this internal errno.
+        if crate::kernel::signal::has_unblocked_pending_signals(task) {
+            finish_timerfd_wait(&tfd, task);
+            return Err(512);
+        }
+
+        unsafe {
+            sched::schedule_with_irqs_enabled();
+        }
+        finish_timerfd_wait(&tfd, task);
     }
-    buf[..8].copy_from_slice(&ticks.to_ne_bytes());
-    Ok(8)
 }
 
-fn timerfd_file_poll(file: &FileRef) -> u32 {
+fn finish_timerfd_wait(tfd: &TimerFd, task: *mut TaskStruct) {
+    if !task.is_null() {
+        unsafe {
+            tfd.wait.finish_wait(task);
+        }
+    }
+}
+
+fn timerfd_file_poll(file: &FileRef, table: Option<&mut crate::fs::select::PollTable>) -> u32 {
     let token = *file.private.lock();
-    match TIMERFDS.lock().get(&token) {
-        Some(tfd) if tfd.ticks.load(Ordering::Acquire) > 0 => 0x0001,
-        Some(_) => 0,
-        None => 0x0008,
+    let Some(tfd) = TIMERFDS.lock().get(&token).cloned() else {
+        return crate::fs::select::POLLERR as u32;
+    };
+
+    // `timerfd_poll()` registers first, then samples ticks.  An expiry either
+    // becomes visible to this load or wakes the installed poll/epoll waiter.
+    crate::fs::select::poll_wait(file, &tfd.wait, table);
+    if tfd.has_ticks() {
+        crate::fs::select::POLLIN as u32
+    } else {
+        0
     }
 }
 
 fn timerfd_release(file: FileRef) {
     let token = *file.private.lock();
-    if let Some(tfd) = TIMERFDS.lock().remove(&token) {
-        let mut timer = tfd.timer.lock();
-        crate::kernel::time::hrtimer_cancel(&mut *timer as *mut crate::kernel::time::Hrtimer);
-    }
+    // Removing the registry's Arc lets the final in-flight file operation or
+    // poll pin determine lifetime.  TimerFd::drop performs synchronous
+    // hrtimer cancellation before the object and waitqueue are freed.
+    TIMERFDS.lock().remove(&token);
 }
 
 fn copy_itimerspec_to_user(dst: *mut Itimerspec64, value: &Itimerspec64) -> Result<(), i32> {
@@ -114,7 +162,7 @@ pub unsafe fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
         return -(EINVAL as i64);
     }
     let tfd = match crate::kernel::time::timerfd::sys_timerfd_create(clockid, flags) {
-        Ok(tfd) => Arc::new(tfd),
+        Ok(tfd) => tfd,
         Err(errno) => return -(errno as i64),
     };
     let token = TIMERFD_TOKEN.fetch_add(1, Ordering::AcqRel);
@@ -180,9 +228,8 @@ mod tests {
 
     #[test]
     fn timerfd_file_read_exports_u64_ticks() {
-        let tfd =
-            Arc::new(crate::kernel::time::timerfd::sys_timerfd_create(CLOCK_MONOTONIC, 0).unwrap());
-        tfd.ticks.store(3, Ordering::Release);
+        let tfd = crate::kernel::time::timerfd::sys_timerfd_create(CLOCK_MONOTONIC, 0).unwrap();
+        tfd.set_pending_for_test(false, 3);
         let token = TIMERFD_TOKEN.fetch_add(1, Ordering::AcqRel);
         TIMERFDS.lock().insert(token, tfd);
         let file = alloc_anon_file("timerfd-test", &TIMERFD_FILE_OPS, token);

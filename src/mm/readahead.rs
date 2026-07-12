@@ -252,6 +252,10 @@ pub unsafe fn page_cache_ra_unbounded(
             // Unlock the page — the readahead callback will lock it again
             // when it begins I/O, then unlock on completion.
             super::address_space::unlock_page(page);
+            // filemap_grab_folio() returns a caller reference in addition to
+            // the XArray reference.  Readahead retains only the latter after
+            // staging the page, matching page_cache_ra_unbounded().
+            (*page).put_page();
         }
 
         (*rac)._nr_pages = nr_to_read;

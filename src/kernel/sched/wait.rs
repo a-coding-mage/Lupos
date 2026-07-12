@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/sched/wait.c
 //! test-origin: linux:vendor/linux/kernel/sched/wait.c
 //! Scheduler wait queues.
@@ -9,15 +9,33 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering, fence};
 
 use spin::Mutex;
 
 use crate::kernel::task::{TaskStruct, task_state};
 
 pub struct WaitQueueHead {
-    waiters: Mutex<Vec<*mut TaskStruct>>,
+    waiters: Mutex<Vec<WaitQueueEntry>>,
+}
+
+pub type WaitQueueCallback = fn(usize, usize);
+
+enum WaitQueueEntry {
+    Task {
+        task: *mut TaskStruct,
+        /// `poll_wqueues.triggered` for poll/select registrations.  Generic
+        /// wait-event entries leave this unset.
+        triggered: Option<Arc<AtomicBool>>,
+    },
+    Callback {
+        id: usize,
+        callback: WaitQueueCallback,
+        data1: usize,
+        data2: usize,
+    },
 }
 
 unsafe impl Send for WaitQueueHead {}
@@ -30,8 +48,21 @@ impl WaitQueueHead {
         }
     }
 
+    fn with_waiters<R>(&self, f: impl FnOnce(&mut Vec<WaitQueueEntry>) -> R) -> R {
+        // Linux waitqueue locks are irqsave spinlocks. Every access must mask
+        // local IRQs so an interrupt-side wake cannot spin on a lock held by
+        // the task frame it interrupted.
+        let flags = crate::kernel::locking::irqflags::local_irq_save();
+        let result = {
+            let mut waiters = self.waiters.lock();
+            f(&mut waiters)
+        };
+        crate::kernel::locking::irqflags::local_irq_restore(flags);
+        result
+    }
+
     pub fn len(&self) -> usize {
-        self.waiters.lock().len()
+        self.with_waiters(|waiters| waiters.len())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -42,53 +73,160 @@ impl WaitQueueHead {
         if task.is_null() {
             return;
         }
-        let mut waiters = self.waiters.lock();
-        if !waiters.iter().any(|&queued| queued == task) {
-            waiters.push(task);
+        self.with_waiters(|waiters| {
+            if !waiters.iter().any(|queued| {
+                matches!(queued, WaitQueueEntry::Task { task: queued, .. } if *queued == task)
+            }) {
+                waiters.push(WaitQueueEntry::Task {
+                    task,
+                    triggered: None,
+                });
+            }
+            unsafe {
+                (*task).__state.store(state, Ordering::SeqCst);
+            }
+        });
+    }
+
+    /// Install the callback state used by Linux `poll_wait()` without changing
+    /// the polling task's scheduler state.  `poll_schedule_timeout()` owns the
+    /// later RUNNING -> INTERRUPTIBLE transition and checks this sticky flag to
+    /// close the registration/sleep race.
+    pub unsafe fn add_poll_wait(&self, task: *mut TaskStruct, triggered: Arc<AtomicBool>) {
+        if task.is_null() {
+            return;
         }
-        unsafe {
-            (*task).__state.store(state, Ordering::Release);
-        }
+        self.with_waiters(|waiters| {
+            if let Some(entry) = waiters.iter_mut().find(|entry| {
+                matches!(entry, WaitQueueEntry::Task { task: queued, .. } if *queued == task)
+            }) {
+                if let WaitQueueEntry::Task {
+                    triggered: entry_triggered,
+                    ..
+                } = entry
+                {
+                    *entry_triggered = Some(triggered);
+                }
+            } else {
+                waiters.push(WaitQueueEntry::Task {
+                    task,
+                    triggered: Some(triggered),
+                });
+            }
+        });
+        fence(Ordering::SeqCst);
+    }
+
+    /// Install a persistent poll callback, as eventpoll's `ep_ptable_queue_proc`
+    /// does for every waitqueue exposed by the watched file.
+    pub fn add_callback(&self, id: usize, callback: WaitQueueCallback, data1: usize, data2: usize) {
+        self.with_waiters(|waiters| {
+            if waiters.iter().any(
+                |entry| matches!(entry, WaitQueueEntry::Callback { id: queued, .. } if *queued == id),
+            ) {
+                return;
+            }
+            waiters.push(WaitQueueEntry::Callback {
+                id,
+                callback,
+                data1,
+                data2,
+            });
+        });
+        fence(Ordering::SeqCst);
+    }
+
+    pub fn remove_callback(&self, id: usize) {
+        self.with_waiters(|waiters| {
+            waiters.retain(|entry| {
+                !matches!(entry, WaitQueueEntry::Callback { id: queued, .. } if *queued == id)
+            });
+        });
     }
 
     pub unsafe fn finish_wait(&self, task: *mut TaskStruct) {
         if task.is_null() {
             return;
         }
-        let mut waiters = self.waiters.lock();
-        if let Some(pos) = waiters.iter().position(|&queued| queued == task) {
-            waiters.remove(pos);
+        self.with_waiters(|waiters| {
+            if let Some(pos) = waiters.iter().position(|queued| {
+                matches!(queued, WaitQueueEntry::Task { task: queued, .. } if *queued == task)
+            }) {
+                waiters.remove(pos);
+            }
+            unsafe {
+                (*task)
+                    .__state
+                    .store(task_state::TASK_RUNNING, Ordering::Release);
+            }
+        });
+    }
+
+    fn wake_callbacks(&self) {
+        let mut last_id = None;
+        loop {
+            let next = self.with_waiters(|waiters| {
+                waiters
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        WaitQueueEntry::Callback {
+                            id,
+                            callback,
+                            data1,
+                            data2,
+                        } if last_id.is_none_or(|last| *id > last) => {
+                            Some((*id, *callback, *data1, *data2))
+                        }
+                        _ => None,
+                    })
+                    .min_by_key(|(id, _, _, _)| *id)
+            });
+            let Some((id, callback, data1, data2)) = next else {
+                break;
+            };
+            last_id = Some(id);
+            callback(data1, data2);
         }
-        unsafe {
-            (*task)
-                .__state
-                .store(task_state::TASK_RUNNING, Ordering::Release);
-        }
+    }
+
+    fn take_one_task(&self) -> Option<WaitQueueEntry> {
+        self.with_waiters(|waiters| {
+            waiters
+                .iter()
+                .rposition(|entry| matches!(entry, WaitQueueEntry::Task { .. }))
+                .map(|pos| waiters.remove(pos))
+        })
     }
 
     pub fn wake_up_one(&self) -> Option<*mut TaskStruct> {
-        let task = self.waiters.lock().pop();
-        if let Some(task) = task {
-            unsafe {
-                (*task)
-                    .__state
-                    .store(task_state::TASK_RUNNING, Ordering::Release);
+        self.wake_callbacks();
+        let entry = self.take_one_task();
+        if let Some(WaitQueueEntry::Task { task, triggered }) = entry {
+            if let Some(triggered) = triggered {
+                triggered.store(true, Ordering::SeqCst);
             }
+            unsafe {
+                crate::kernel::sched::wake_task_normal(task);
+            }
+            return Some(task);
         }
-        task
+        None
     }
 
     pub fn wake_up_all(&self) -> usize {
-        let mut waiters = self.waiters.lock();
-        let count = waiters.len();
-        for &task in waiters.iter() {
-            unsafe {
-                (*task)
-                    .__state
-                    .store(task_state::TASK_RUNNING, Ordering::Release);
+        self.wake_callbacks();
+        let mut count = 0;
+        while let Some(entry) = self.take_one_task() {
+            if let WaitQueueEntry::Task { task, triggered } = entry {
+                if let Some(triggered) = triggered {
+                    triggered.store(true, Ordering::SeqCst);
+                }
+                unsafe {
+                    crate::kernel::sched::wake_task_normal(task);
+                }
+                count += 1;
             }
         }
-        waiters.clear();
         count
     }
 }

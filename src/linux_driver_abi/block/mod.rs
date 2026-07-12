@@ -198,7 +198,6 @@ pub const BLK_STS_DEV_RESOURCE: u8 = 13;
 #[cfg(test)]
 const RQF_DONTPREP: u32 = 1 << 3;
 const RQF_SPECIAL_PAYLOAD: u32 = 1 << 12;
-const REQUEST_COMPLETION_SPINS: usize = 1_000_000;
 
 pub type LinuxBlkStatus = u8;
 
@@ -580,16 +579,9 @@ struct LinuxGendiskBlockDevice {
     disk: usize,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct LinuxBlockBackendHooks {
-    pub try_complete_request: fn(*mut LinuxRequest) -> bool,
-    pub submit_bio: fn(*mut LinuxRequestQueue, &BioRef) -> Option<Result<(), i32>>,
-}
-
 static LINUX_BLOCK_MAJORS: Mutex<Vec<LinuxBlockMajor>> = Mutex::new(Vec::new());
 static LINUX_DISKS: Mutex<Vec<LinuxDiskRegistration>> = Mutex::new(Vec::new());
 static LINUX_REQUESTS: Mutex<Vec<LinuxRequestAllocation>> = Mutex::new(Vec::new());
-static LINUX_BLOCK_BACKEND_HOOKS: Mutex<Vec<LinuxBlockBackendHooks>> = Mutex::new(Vec::new());
 
 static NEXT_BLOCK_MAJOR: AtomicU32 = AtomicU32::new(240);
 
@@ -681,17 +673,6 @@ pub fn register_module_exports() {
         set_capacity_and_notify as usize,
         true,
     );
-}
-
-pub(crate) fn register_linux_block_backend_hooks(hooks: LinuxBlockBackendHooks) {
-    let mut registered = LINUX_BLOCK_BACKEND_HOOKS.lock();
-    if registered.iter().any(|existing| {
-        core::ptr::fn_addr_eq(existing.try_complete_request, hooks.try_complete_request)
-            && core::ptr::fn_addr_eq(existing.submit_bio, hooks.submit_bio)
-    }) {
-        return;
-    }
-    registered.push(hooks);
 }
 
 unsafe fn cstr_to_string(ptr: *const c_char) -> Result<String, i32> {
@@ -999,11 +980,6 @@ fn linux_blk_status_retryable(status: LinuxBlkStatus) -> bool {
     )
 }
 
-fn linux_try_complete_backend_request(rq: *mut LinuxRequest) -> bool {
-    let hooks = LINUX_BLOCK_BACKEND_HOOKS.lock().clone();
-    hooks.iter().any(|hook| (hook.try_complete_request)(rq))
-}
-
 fn linux_poll_request_queue(rq: *mut LinuxRequest) -> i32 {
     if rq.is_null() {
         return 0;
@@ -1081,11 +1057,6 @@ fn linux_request_poll_cpu_relax(iteration: usize) {
             }
         }
     }
-}
-
-fn linux_backend_submit_bio(q: *mut LinuxRequestQueue, bio: &BioRef) -> Option<Result<(), i32>> {
-    let hooks = LINUX_BLOCK_BACKEND_HOOKS.lock().clone();
-    hooks.iter().find_map(|hook| (hook.submit_bio)(q, bio))
 }
 
 /// `blk_mq_alloc_request` - `vendor/linux/block/blk-mq.c`.
@@ -1533,35 +1504,10 @@ pub unsafe extern "C" fn blk_execute_rq(rq: *mut LinuxRequest, _at_head: bool) -
         return status;
     }
 
-    let mut driver_event_polls = 0usize;
-    let mut mq_polls = 0usize;
-    for _ in 0..REQUEST_COMPLETION_SPINS {
-        if let Some(status) = linux_request_completed_status(rq) {
-            return status;
-        }
-        if linux_try_complete_backend_request(rq) {
-            continue;
-        }
-        driver_event_polls =
-            driver_event_polls.saturating_add(crate::linux_driver_abi::poll_driver_abi_events());
-        if linux_poll_request_queue(rq) > 0 {
-            mq_polls = mq_polls.saturating_add(1);
-        }
-        unsafe {
-            crate::kernel::sched::schedule_with_irqs_enabled();
-        }
-    }
-
-    crate::log_warn!(
-        "block",
-        "blk_execute_rq: timeout op={} bytes={} state={} driver_events={} mq_polls={}",
-        unsafe { (*rq).cmd_flags },
-        unsafe { (*rq).data_len },
-        unsafe { (*rq).state },
-        driver_event_polls,
-        mq_polls
-    );
-    BLK_STS_IOERR
+    // `vendor/linux/block/blk-mq.c::blk_execute_rq()` waits on its completion
+    // without a caller-side deadline.  The request and any caller-owned
+    // passthrough buffer must remain live until `blk_mq_end_request()` runs.
+    block_io_wait_for_completion(rq)
 }
 
 /// `blk_status_to_errno` - `vendor/linux/block/blk-core.c`.
@@ -1977,24 +1923,24 @@ fn block_facade_acquire() -> Result<BlockFacadeGuard, i32> {
 const BLOCK_FACADE_ACQUIRE_SPIN_LIMIT: usize = 2048;
 #[cfg(test)]
 const BLOCK_FACADE_ACQUIRE_SPIN_LIMIT: usize = 64;
-#[cfg(not(test))]
-const BLOCK_IO_COMPLETION_POLL_LIMIT: usize = 100_000;
-#[cfg(test)]
-const BLOCK_IO_COMPLETION_POLL_LIMIT: usize = 1024;
-
 /// Poll a block request until it reaches `MQ_RQ_COMPLETE`.
 ///
 /// The synchronous facade is used while discovering and mounting the root disk,
 /// where sleeping for an interrupt is fragile: QEMU/VirtualBox can complete the
 /// emulated request without delivering an IRQ path that wakes the submitting
-/// task. Each pass drives the software reaper and backend poll hook directly,
-/// then performs a CPU/VM-exit relax. The poll limit is a safety net for a lost
-/// completion when jiffies are not advancing.
+/// task. Each pass drives the software reaper and the driver's `mq_ops::poll`,
+/// then performs a CPU/VM-exit relax.
+///
+/// There is deliberately no production poll-count timeout. Vendor Linux keeps
+/// an in-flight request and its driver PDU alive until the driver ends it. In
+/// particular, virtio-blk has no `blk_mq_ops::timeout` callback, so
+/// `blk_mq_rq_timed_out()` re-arms the request timer and continues waiting.
+/// Returning merely because the host executed a chosen number of spins would
+/// let the synchronous facade free memory still owned by the virtqueue, turning
+/// a late `virtblk_done()` into a use-after-free.
 fn block_io_wait_for_completion(rq: *mut LinuxRequest) -> LinuxBlkStatus {
     let current = unsafe { crate::kernel::sched::get_current() };
     let pump_global_driver_events = !linux_request_targets_virtio_disk(rq);
-    let deadline = crate::kernel::time::jiffies::jiffies()
-        .saturating_add(crate::kernel::time::jiffies::HZ.saturating_mul(60));
     let mut wait_polls = 0usize;
     if current.is_null() {
         // No task context (early boot): poll until completion.
@@ -2002,18 +1948,10 @@ fn block_io_wait_for_completion(rq: *mut LinuxRequest) -> LinuxBlkStatus {
             if let Some(status) = linux_request_completed_status(rq) {
                 return status;
             }
-            if linux_try_complete_backend_request(rq) {
-                continue;
-            }
             if pump_global_driver_events {
                 let _ = crate::linux_driver_abi::poll_driver_abi_events();
             }
             let _ = linux_poll_request_queue(rq);
-            if crate::kernel::time::jiffies::jiffies() >= deadline
-                || wait_polls >= BLOCK_IO_COMPLETION_POLL_LIMIT
-            {
-                return BLK_STS_TIMEOUT;
-            }
             linux_request_poll_cpu_relax(wait_polls);
             wait_polls = wait_polls.saturating_add(1);
         }
@@ -2023,19 +1961,20 @@ fn block_io_wait_for_completion(rq: *mut LinuxRequest) -> LinuxBlkStatus {
         if let Some(status) = linux_request_completed_status(rq) {
             break status;
         }
-        if linux_try_complete_backend_request(rq) {
-            continue;
-        }
         if pump_global_driver_events {
             let _ = crate::linux_driver_abi::poll_driver_abi_events();
         }
         let _ = linux_poll_request_queue(rq);
-        if crate::kernel::time::jiffies::jiffies() >= deadline
-            || wait_polls >= BLOCK_IO_COMPLETION_POLL_LIMIT
-        {
-            break BLK_STS_TIMEOUT;
+        if pump_global_driver_events {
+            // SCSI/libata completion can require a peer completion or error-
+            // handling task to run. `blk_wait_io()` sleeps/yields in vendor
+            // Linux; preserve that progress guarantee for task-context waits.
+            linux_request_wait_cpu_relax(wait_polls);
+        } else {
+            // The virtio backend is polled directly above and does not need a
+            // peer task; avoid adding a scheduler-tick delay to every root read.
+            linux_request_poll_cpu_relax(wait_polls);
         }
-        linux_request_poll_cpu_relax(wait_polls);
         wait_polls = wait_polls.saturating_add(1);
     };
     unsafe {
@@ -2188,9 +2127,6 @@ fn linux_queue_submit_bio(q: *mut LinuxRequestQueue, bio: &BioRef) -> Result<(),
 fn linux_gendisk_submit_bio(bdev: &BlockDeviceRef, bio: &BioRef) -> Result<(), i32> {
     let backing = linux_gendisk_backing(bdev)?;
     let q = linux_gendisk_request_queue(&backing)?;
-    if let Some(result) = linux_backend_submit_bio(q, bio) {
-        return result;
-    }
     linux_queue_submit_bio(q, bio)
 }
 
@@ -2419,8 +2355,6 @@ mod tests {
     static POLL_QUEUE_RQ_CALLS: AtomicUsize = AtomicUsize::new(0);
     static POLL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static POLL_REQUEST: AtomicUsize = AtomicUsize::new(0);
-    static NO_COMPLETE_QUEUE_RQ_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static NO_COMPLETE_REQUEST: AtomicUsize = AtomicUsize::new(0);
     static RETRY_QUEUE_RQ_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RETRY_CLEANUP_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RETRY_FIRST_REQUEST: AtomicUsize = AtomicUsize::new(0);
@@ -2524,39 +2458,6 @@ mod tests {
         get_rq_budget_token: None,
         timeout: None,
         poll: Some(test_poll),
-        complete: None,
-        init_hctx: None,
-        exit_hctx: None,
-        init_request: None,
-        exit_request: None,
-        cleanup_rq: None,
-        busy: None,
-        map_queues: None,
-        show_rq: None,
-    };
-
-    unsafe extern "C" fn test_no_complete_queue_rq(
-        _hctx: *mut LinuxBlkMqHwCtx,
-        bd: *const LinuxBlkMqQueueData,
-    ) -> LinuxBlkStatus {
-        NO_COMPLETE_QUEUE_RQ_CALLS.fetch_add(1, Ordering::AcqRel);
-        unsafe {
-            NO_COMPLETE_REQUEST.store((*bd).rq as usize, Ordering::Release);
-            blk_mq_start_request((*bd).rq.cast());
-        }
-        BLK_STS_OK
-    }
-
-    static NO_COMPLETE_MQ_OPS: LinuxBlkMqOps = LinuxBlkMqOps {
-        queue_rq: Some(test_no_complete_queue_rq),
-        commit_rqs: None,
-        queue_rqs: None,
-        get_budget: None,
-        put_budget: None,
-        set_rq_budget_token: None,
-        get_rq_budget_token: None,
-        timeout: None,
-        poll: None,
         complete: None,
         init_hctx: None,
         exit_hctx: None,
@@ -3494,56 +3395,6 @@ mod tests {
                     .lock()
                     .iter()
                     .all(|allocation| allocation.ptr != POLL_REQUEST.load(Ordering::Acquire))
-            );
-
-            put_disk(disk);
-            blk_mq_free_tag_set(&mut set);
-        }
-    }
-
-    #[test]
-    fn linux_queue_submit_bio_times_out_lost_completion_without_jiffies() {
-        unsafe {
-            NO_COMPLETE_QUEUE_RQ_CALLS.store(0, Ordering::Release);
-            NO_COMPLETE_REQUEST.store(0, Ordering::Release);
-            crate::kernel::time::jiffies::_reset_for_tests();
-
-            let mut set = core::mem::zeroed::<LinuxBlkMqTagSet>();
-            set.ops = (&NO_COMPLETE_MQ_OPS as *const LinuxBlkMqOps).cast::<c_void>();
-            set.nr_hw_queues = 1;
-            set.queue_depth = 16;
-            set.cmd_size = 0x20;
-            assert_eq!(blk_mq_alloc_tag_set(&mut set), 0);
-
-            let mut limits = core::mem::zeroed::<LinuxQueueLimits>();
-            limits.logical_block_size = 512;
-            let disk = __blk_mq_alloc_disk(
-                &mut set,
-                &limits,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-            );
-            assert!(!disk.is_null());
-
-            let mem = MemBlockDevice::new("linux-rq-no-complete-bio", 1 << 20);
-            let bdev = BlockDevice::wrap(mem, mem_block_device_ops());
-            let bio = bio_alloc(bdev, BioOp(BIO_OP_WRITE), 4);
-            bio.add_vec(BioVec::new(alloc::vec![0x66; 512]));
-
-            assert_eq!(linux_queue_submit_bio((*disk).queue, &bio), Err(EIO));
-            let request = NO_COMPLETE_REQUEST.load(Ordering::Acquire);
-            assert_ne!(request, 0);
-            assert_eq!(NO_COMPLETE_QUEUE_RQ_CALLS.load(Ordering::Acquire), 1);
-            assert!(
-                LINUX_REQUESTS
-                    .lock()
-                    .iter()
-                    .all(|allocation| allocation.ptr != request)
-            );
-            assert_eq!(
-                crate::kernel::time::jiffies::jiffies(),
-                0,
-                "the lost-completion guard must not depend on timer ticks"
             );
 
             put_disk(disk);

@@ -1,4 +1,5 @@
-//! linux-parity: complete
+//! linux-parity: partial
+//! linux-deviation: timed legacy futex waits use Linux absolute hrtimer-sleeper deadlines, but Lupos does not yet materialize the per-task restart_block needed for a handler-free restart_syscall continuation.
 //! linux-source: vendor/linux/kernel/futex
 //! test-origin: linux:vendor/linux/kernel/futex
 //! Core futex operations — `futex_wait`, `futex_wake`, `futex_requeue`,
@@ -13,7 +14,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -26,6 +27,139 @@ use super::{
 
 // Kernel-internal restart pseudo-errno from vendor/linux/include/linux/errno.h.
 const ERESTARTSYS: i32 = 512;
+
+/// An absolute futex timeout and the clock against which it expires.
+///
+/// Linux converts relative `FUTEX_WAIT` timeouts to an absolute monotonic
+/// `ktime_t` in `futex_init_timeout()` and leaves `FUTEX_WAIT_BITSET`/futex2
+/// deadlines absolute on their selected clock.  Carrying that representation
+/// into the wait core avoids restarting timeout accounting after user-copy or
+/// waiter setup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FutexDeadline {
+    clock: crate::kernel::time::hrtimer::ClockBase,
+    expires_ns: u64,
+}
+
+impl FutexDeadline {
+    pub const fn monotonic(expires_ns: u64) -> Self {
+        Self {
+            clock: crate::kernel::time::hrtimer::ClockBase::Monotonic,
+            expires_ns,
+        }
+    }
+
+    pub const fn realtime(expires_ns: u64) -> Self {
+        Self {
+            clock: crate::kernel::time::hrtimer::ClockBase::Realtime,
+            expires_ns,
+        }
+    }
+
+    pub fn relative_monotonic(duration_ns: u64) -> Self {
+        Self::monotonic(crate::kernel::time::ktime_get().saturating_add(duration_ns))
+    }
+
+    fn now(self) -> u64 {
+        match self.clock {
+            crate::kernel::time::hrtimer::ClockBase::Realtime
+            | crate::kernel::time::hrtimer::ClockBase::Tai => crate::kernel::time::ktime_get_real(),
+            crate::kernel::time::hrtimer::ClockBase::Boottime => {
+                crate::kernel::time::ktime_get_boottime()
+            }
+            crate::kernel::time::hrtimer::ClockBase::Monotonic
+            | crate::kernel::time::hrtimer::ClockBase::MonotonicRaw => {
+                crate::kernel::time::ktime_get()
+            }
+        }
+    }
+}
+
+/// Stack-resident equivalent of Linux `struct hrtimer_sleeper` used by the
+/// futex wait paths.  The timer is the first field so its callback can recover
+/// the containing sleeper exactly as Linux's `container_of()` does.
+#[repr(C)]
+struct FutexTimeoutSleeper {
+    timer: crate::kernel::time::hrtimer::Hrtimer,
+    task: AtomicUsize,
+    deadline: FutexDeadline,
+}
+
+impl FutexTimeoutSleeper {
+    fn new(task: *mut crate::kernel::task::TaskStruct, deadline: FutexDeadline) -> Self {
+        let mut timeout = Self {
+            timer: crate::kernel::time::hrtimer::Hrtimer::new(),
+            task: AtomicUsize::new(task as usize),
+            deadline,
+        };
+        crate::kernel::time::hrtimer::hrtimer_init(
+            &mut timeout.timer,
+            deadline.clock,
+            crate::kernel::time::hrtimer::HrtimerMode::Abs,
+        );
+        timeout.timer.function = Some(futex_timeout_wake);
+        timeout
+    }
+
+    fn start(&mut self) {
+        // Linux's hrtimer_sleeper_start_expires() does not enqueue an already
+        // expired userspace timer.  Preserve that fast path even though the
+        // current Lupos clockevent backend services hrtimers from the tick.
+        if self.deadline.now() >= self.deadline.expires_ns {
+            self.task.store(0, Ordering::Release);
+            return;
+        }
+        crate::kernel::time::hrtimer::hrtimer_start(
+            &mut self.timer,
+            self.deadline.expires_ns,
+            crate::kernel::time::hrtimer::HrtimerMode::Abs,
+        );
+    }
+
+    fn expired(&self) -> bool {
+        self.task.load(Ordering::Acquire) == 0 || self.deadline.now() >= self.deadline.expires_ns
+    }
+
+    fn cancel(&mut self) {
+        let _ = crate::kernel::time::hrtimer::hrtimer_cancel(&mut self.timer);
+        self.task.store(0, Ordering::Release);
+    }
+}
+
+fn futex_timeout_wake(
+    timer: *mut crate::kernel::time::hrtimer::Hrtimer,
+) -> crate::kernel::time::hrtimer::HrtimerRestart {
+    if timer.is_null() {
+        return crate::kernel::time::hrtimer::HrtimerRestart::NoRestart;
+    }
+    let timeout = timer.cast::<FutexTimeoutSleeper>();
+    let task = unsafe { (*timeout).task.swap(0, Ordering::AcqRel) }
+        as *mut crate::kernel::task::TaskStruct;
+    if !task.is_null() {
+        unsafe {
+            crate::kernel::sched::wake_task_normal(task);
+        }
+    }
+    crate::kernel::time::hrtimer::HrtimerRestart::NoRestart
+}
+
+fn finish_futex_timeout(
+    timeout: &mut FutexTimeoutSleeper,
+    has_timeout: bool,
+    task: *mut crate::kernel::task::TaskStruct,
+) {
+    if !task.is_null() {
+        unsafe {
+            (*task).__state.store(
+                crate::kernel::task::task_state::TASK_RUNNING,
+                Ordering::Release,
+            );
+        }
+    }
+    if has_timeout {
+        timeout.cancel();
+    }
+}
 
 // ── Hash bucket (vendor/linux/kernel/futex/core.c::futex_hash) ───────────────
 
@@ -347,7 +481,34 @@ fn remove_waitv_waiters(waitv_id: u64) {
     }
 }
 
+/// Unqueue a complete waitv set while retaining a wake which won the bucket
+/// lock before timeout or signal cleanup.  Removing each entry while its
+/// bucket is locked gives the same wake-vs-unqueue ordering that Linux derives
+/// from `futex_unqueue_multiple()` and each `q->lock_ptr`.
+fn unqueue_waitv_waiters(waitv_id: u64) -> Option<usize> {
+    let mut woken = None;
+    for bucket in BUCKETS.iter() {
+        let mut b = bucket.lock();
+        let mut i = 0;
+        while i < b.waiters.len() {
+            if b.waiters[i].waitv_id != waitv_id {
+                i += 1;
+                continue;
+            }
+            let waiter = b.waiters.remove(i);
+            if waiter.awoken && woken.is_none() {
+                woken = Some(waiter.waitv_index);
+            }
+        }
+    }
+    woken
+}
+
 fn remove_waiter_any_bucket(pid: i32, uaddr: u64) {
+    let _ = unqueue_waiter_any_bucket(pid, uaddr);
+}
+
+fn unqueue_waiter_any_bucket(pid: i32, uaddr: u64) -> Option<bool> {
     for bucket in BUCKETS.iter() {
         let mut b = bucket.lock();
         if let Some(idx) = b
@@ -355,10 +516,10 @@ fn remove_waiter_any_bucket(pid: i32, uaddr: u64) {
             .iter()
             .position(|w| w.task_pid == pid && (w.uaddr == uaddr || w.requeue_pi))
         {
-            b.waiters.remove(idx);
-            return;
+            return Some(b.waiters.remove(idx).awoken);
         }
     }
+    None
 }
 
 fn waiter_location(pid: i32, original_uaddr: u64, requeue_pi: bool) -> Option<(usize, u64, bool)> {
@@ -374,16 +535,19 @@ fn waiter_location(pid: i32, original_uaddr: u64, requeue_pi: bool) -> Option<(u
 }
 
 fn remove_waiter_at(bucket_idx: usize, pid: i32, uaddr: u64) -> bool {
+    unqueue_waiter_at(bucket_idx, pid, uaddr).is_some()
+}
+
+fn unqueue_waiter_at(bucket_idx: usize, pid: i32, uaddr: u64) -> Option<bool> {
     let mut b = BUCKETS[bucket_idx].lock();
     if let Some(idx) = b
         .waiters
         .iter()
         .position(|w| w.task_pid == pid && w.uaddr == uaddr)
     {
-        b.waiters.remove(idx);
-        true
+        Some(b.waiters.remove(idx).awoken)
     } else {
-        false
+        None
     }
 }
 
@@ -442,7 +606,7 @@ unsafe fn futex_wait_impl(
     uaddr: u64,
     val: u32,
     bitset: u32,
-    timeout_ns: u64,
+    deadline: Option<FutexDeadline>,
     private: bool,
     requeue_pi: bool,
 ) -> i64 {
@@ -472,6 +636,9 @@ unsafe fn futex_wait_impl(
     } else {
         unsafe { (*cur).pid }
     };
+    let has_timeout = deadline.is_some();
+    let mut timeout =
+        FutexTimeoutSleeper::new(cur, deadline.unwrap_or(FutexDeadline::monotonic(0)));
     {
         let mut b = BUCKETS[bucket_idx].lock();
         let observed = match unsafe { futex_get(uaddr) } {
@@ -481,13 +648,11 @@ unsafe fn futex_wait_impl(
         if observed != val {
             return -EAGAIN as i64;
         }
-        if timeout_ns == 0 {
-            unsafe {
-                (*cur).__state.store(
-                    crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
-                    Ordering::Release,
-                );
-            }
+        unsafe {
+            (*cur).__state.store(
+                crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+                Ordering::Release,
+            );
         }
         b.waiters.push(FutexQ {
             uaddr,
@@ -501,9 +666,20 @@ unsafe fn futex_wait_impl(
             awoken: false,
         });
     }
+    if has_timeout {
+        timeout.start();
+    }
 
-    let start = crate::kernel::sched::sched_clock_ns();
     loop {
+        // A spurious scheduler wake leaves the futex queued.  Publish the
+        // interruptible state again before inspecting persistent wake, timer,
+        // and signal conditions so none of them can be lost before schedule.
+        unsafe {
+            (*cur).__state.store(
+                crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+                Ordering::Release,
+            );
+        }
         if requeue_pi
             && (crate::kernel::signal::has_pending_signals(cur)
                 || crate::kernel::signal::has_current_pending_signal_mask(
@@ -515,12 +691,7 @@ unsafe fn futex_wait_impl(
             {
                 if current_uaddr != uaddr {
                     let _ = remove_waiter_at(requeued_bucket, pid, current_uaddr);
-                    unsafe {
-                        (*cur).__state.store(
-                            crate::kernel::task::task_state::TASK_RUNNING,
-                            Ordering::Release,
-                        );
-                    }
+                    finish_futex_timeout(&mut timeout, has_timeout, cur);
                     return -EAGAIN as i64;
                 }
                 let _ = crate::kernel::signal::dequeue_current_pending_signal_mask(
@@ -535,14 +706,7 @@ unsafe fn futex_wait_impl(
             } else {
                 remove_waiter(bucket_idx, pid, uaddr);
             }
-            if !cur.is_null() {
-                unsafe {
-                    (*cur).__state.store(
-                        crate::kernel::task::task_state::TASK_RUNNING,
-                        Ordering::Release,
-                    );
-                }
-            }
+            finish_futex_timeout(&mut timeout, has_timeout, cur);
             unsafe { crate::kernel::signal::exit_current_for_signal(sig) };
         }
 
@@ -572,71 +736,50 @@ unsafe fn futex_wait_impl(
                     }
                 }
             }
-            if !woken && timeout_ns > 0 {
-                let now = crate::kernel::sched::sched_clock_ns();
-                if now.saturating_sub(start) >= timeout_ns {
-                    if requeue_pi {
-                        if let Some((current_bucket, current_uaddr, _)) =
-                            waiter_location(pid, uaddr, requeue_pi)
-                        {
-                            let _ = remove_waiter_at(current_bucket, pid, current_uaddr);
-                        }
+            if !woken && has_timeout && timeout.expired() {
+                let wake_won = if requeue_pi {
+                    if let Some((current_bucket, current_uaddr, _)) =
+                        waiter_location(pid, uaddr, requeue_pi)
+                    {
+                        unqueue_waiter_at(current_bucket, pid, current_uaddr)
                     } else {
-                        let mut b = BUCKETS[bucket_idx].lock();
-                        if let Some(idx) = b
-                            .waiters
-                            .iter()
-                            .position(|w| w.task_pid == pid && w.uaddr == uaddr)
-                        {
-                            b.waiters.remove(idx);
-                        }
+                        None
                     }
+                } else {
+                    unqueue_waiter_at(bucket_idx, pid, uaddr)
+                };
+                if wake_won == Some(true) {
+                    woken = true;
+                } else {
                     timed_out = true;
                 }
             }
         }
         if woken {
-            if !cur.is_null() {
-                unsafe {
-                    (*cur).__state.store(
-                        crate::kernel::task::task_state::TASK_RUNNING,
-                        Ordering::Release,
-                    );
-                }
-            }
+            finish_futex_timeout(&mut timeout, has_timeout, cur);
             return 0;
         }
         if timed_out {
-            if !cur.is_null() {
-                unsafe {
-                    (*cur).__state.store(
-                        crate::kernel::task::task_state::TASK_RUNNING,
-                        Ordering::Release,
-                    );
-                }
-            }
+            finish_futex_timeout(&mut timeout, has_timeout, cur);
             return -ETIMEDOUT as i64;
         }
         if crate::kernel::signal::has_unblocked_pending_signals(cur) {
-            if requeue_pi {
-                remove_waiter_any_bucket(pid, uaddr);
+            let wake_won = if requeue_pi {
+                unqueue_waiter_any_bucket(pid, uaddr)
             } else {
-                remove_waiter(bucket_idx, pid, uaddr);
+                unqueue_waiter_at(bucket_idx, pid, uaddr)
+            };
+            if wake_won == Some(true) {
+                finish_futex_timeout(&mut timeout, has_timeout, cur);
+                return 0;
             }
-            if !cur.is_null() {
-                unsafe {
-                    (*cur).__state.store(
-                        crate::kernel::task::task_state::TASK_RUNNING,
-                        Ordering::Release,
-                    );
-                }
-            }
+            finish_futex_timeout(&mut timeout, has_timeout, cur);
             // Linux's futex wait paths return -ERESTARTSYS here; the arch
             // signal-exit path turns it into EINTR or restarts the syscall.
             return -ERESTARTSYS as i64;
         }
         #[cfg(test)]
-        if timeout_ns == 0 {
+        if !has_timeout {
             if requeue_pi {
                 if let Some((current_bucket, current_uaddr, _)) =
                     waiter_location(pid, uaddr, requeue_pi)
@@ -653,12 +796,7 @@ unsafe fn futex_wait_impl(
                     b.waiters.remove(idx);
                 }
             }
-            unsafe {
-                (*cur).__state.store(
-                    crate::kernel::task::task_state::TASK_RUNNING,
-                    Ordering::Release,
-                );
-            }
+            finish_futex_timeout(&mut timeout, has_timeout, cur);
             return -ETIMEDOUT as i64;
         }
         unsafe {
@@ -668,7 +806,18 @@ unsafe fn futex_wait_impl(
 }
 
 pub unsafe fn futex_wait(uaddr: u64, val: u32, bitset: u32, timeout_ns: u64, private: bool) -> i64 {
-    unsafe { futex_wait_impl(uaddr, val, bitset, timeout_ns, private, false) }
+    let deadline = (timeout_ns != 0).then(|| FutexDeadline::relative_monotonic(timeout_ns));
+    unsafe { futex_wait_impl(uaddr, val, bitset, deadline, private, false) }
+}
+
+pub unsafe fn futex_wait_deadline(
+    uaddr: u64,
+    val: u32,
+    bitset: u32,
+    deadline: Option<FutexDeadline>,
+    private: bool,
+) -> i64 {
+    unsafe { futex_wait_impl(uaddr, val, bitset, deadline, private, false) }
 }
 
 pub unsafe fn futex_wait_requeue_pi_prepare(
@@ -678,7 +827,8 @@ pub unsafe fn futex_wait_requeue_pi_prepare(
     timeout_ns: u64,
     private: bool,
 ) -> i64 {
-    unsafe { futex_wait_impl(uaddr, val, bitset, timeout_ns, private, true) }
+    let deadline = (timeout_ns != 0).then(|| FutexDeadline::relative_monotonic(timeout_ns));
+    unsafe { futex_wait_impl(uaddr, val, bitset, deadline, private, true) }
 }
 
 // ── futex_wake ───────────────────────────────────────────────────────────────
@@ -1138,6 +1288,11 @@ pub unsafe fn futex_wake_op(
 }
 
 pub unsafe fn futex_waitv(waiters: &[FutexWaitv], timeout_ns: u64) -> i64 {
+    let deadline = (timeout_ns != 0).then(|| FutexDeadline::relative_monotonic(timeout_ns));
+    unsafe { futex_waitv_deadline(waiters, deadline) }
+}
+
+pub unsafe fn futex_waitv_deadline(waiters: &[FutexWaitv], deadline: Option<FutexDeadline>) -> i64 {
     if waiters.is_empty() || waiters.len() > super::FUTEX_WAITV_MAX {
         return -EINVAL as i64;
     }
@@ -1160,34 +1315,25 @@ pub unsafe fn futex_waitv(waiters: &[FutexWaitv], timeout_ns: u64) -> i64 {
 
     let waitv_id = WAITV_SEQ.fetch_add(1, Ordering::AcqRel);
     let pid = unsafe { (*cur).pid };
-    if timeout_ns == 0 {
-        unsafe {
-            (*cur).__state.store(
-                crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
-                Ordering::Release,
-            );
-        }
+    let has_timeout = deadline.is_some();
+    let mut timeout =
+        FutexTimeoutSleeper::new(cur, deadline.unwrap_or(FutexDeadline::monotonic(0)));
+    unsafe {
+        (*cur).__state.store(
+            crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+            Ordering::Release,
+        );
     }
 
     for (index, waiter) in waiters.iter().enumerate() {
         if waiter.flags & FUTEX_32 == 0 || waiter._reserved != 0 {
             remove_waitv_waiters(waitv_id);
-            unsafe {
-                (*cur).__state.store(
-                    crate::kernel::task::task_state::TASK_RUNNING,
-                    Ordering::Release,
-                );
-            }
+            finish_futex_timeout(&mut timeout, has_timeout, cur);
             return -EINVAL as i64;
         }
         if waiter.val > u32::MAX as u64 {
             remove_waitv_waiters(waitv_id);
-            unsafe {
-                (*cur).__state.store(
-                    crate::kernel::task::task_state::TASK_RUNNING,
-                    Ordering::Release,
-                );
-            }
+            finish_futex_timeout(&mut timeout, has_timeout, cur);
             return -EINVAL as i64;
         }
         let private = waiter.flags & super::FUTEX2_PRIVATE != 0;
@@ -1199,24 +1345,14 @@ pub unsafe fn futex_waitv(waiters: &[FutexWaitv], timeout_ns: u64) -> i64 {
             Err(errno) => {
                 drop(b);
                 remove_waitv_waiters(waitv_id);
-                unsafe {
-                    (*cur).__state.store(
-                        crate::kernel::task::task_state::TASK_RUNNING,
-                        Ordering::Release,
-                    );
-                }
+                finish_futex_timeout(&mut timeout, has_timeout, cur);
                 return -(errno as i64);
             }
         };
         if observed != waiter.val as u32 {
             drop(b);
             remove_waitv_waiters(waitv_id);
-            unsafe {
-                (*cur).__state.store(
-                    crate::kernel::task::task_state::TASK_RUNNING,
-                    Ordering::Release,
-                );
-            }
+            finish_futex_timeout(&mut timeout, has_timeout, cur);
             return -EAGAIN as i64;
         }
         b.waiters.push(FutexQ {
@@ -1231,49 +1367,44 @@ pub unsafe fn futex_waitv(waiters: &[FutexWaitv], timeout_ns: u64) -> i64 {
             awoken: false,
         });
     }
+    if has_timeout {
+        timeout.start();
+    }
 
-    let start = crate::kernel::sched::sched_clock_ns();
     loop {
+        // As in futex_wait_multiple_setup(), state publication precedes every
+        // wake/timeout/signal check.  A wake which raced an earlier spurious
+        // scheduler return therefore cannot be overwritten before schedule.
+        unsafe {
+            (*cur).__state.store(
+                crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+                Ordering::Release,
+            );
+        }
         if let Some(index) = take_awoken_waitv_index(waitv_id) {
-            unsafe {
-                (*cur).__state.store(
-                    crate::kernel::task::task_state::TASK_RUNNING,
-                    Ordering::Release,
-                );
-            }
+            finish_futex_timeout(&mut timeout, has_timeout, cur);
             return index as i64;
         }
-        if timeout_ns > 0
-            && crate::kernel::sched::sched_clock_ns().saturating_sub(start) >= timeout_ns
-        {
-            remove_waitv_waiters(waitv_id);
-            unsafe {
-                (*cur).__state.store(
-                    crate::kernel::task::task_state::TASK_RUNNING,
-                    Ordering::Release,
-                );
+        if has_timeout && timeout.expired() {
+            if let Some(index) = unqueue_waitv_waiters(waitv_id) {
+                finish_futex_timeout(&mut timeout, has_timeout, cur);
+                return index as i64;
             }
+            finish_futex_timeout(&mut timeout, has_timeout, cur);
             return -ETIMEDOUT as i64;
         }
         if crate::kernel::signal::has_unblocked_pending_signals(cur) {
-            remove_waitv_waiters(waitv_id);
-            unsafe {
-                (*cur).__state.store(
-                    crate::kernel::task::task_state::TASK_RUNNING,
-                    Ordering::Release,
-                );
+            if let Some(index) = unqueue_waitv_waiters(waitv_id) {
+                finish_futex_timeout(&mut timeout, has_timeout, cur);
+                return index as i64;
             }
+            finish_futex_timeout(&mut timeout, has_timeout, cur);
             return -ERESTARTSYS as i64;
         }
         #[cfg(test)]
-        if timeout_ns == 0 {
+        if !has_timeout {
             remove_waitv_waiters(waitv_id);
-            unsafe {
-                (*cur).__state.store(
-                    crate::kernel::task::task_state::TASK_RUNNING,
-                    Ordering::Release,
-                );
-            }
+            finish_futex_timeout(&mut timeout, has_timeout, cur);
             return -ETIMEDOUT as i64;
         }
         unsafe {

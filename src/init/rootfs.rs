@@ -170,7 +170,10 @@ fn dev_kmsg_write(
     Ok(buf.len())
 }
 
-fn dev_kmsg_poll(file: &crate::fs::types::FileRef) -> u32 {
+fn dev_kmsg_poll(
+    file: &crate::fs::types::FileRef,
+    _table: Option<&mut crate::fs::select::PollTable>,
+) -> u32 {
     let cursor = *file.private.lock() as u64;
     let next = cursor.max(crate::kernel::printk::PRINTK_RB.tail());
     if next < crate::kernel::printk::PRINTK_RB.head() {
@@ -631,7 +634,10 @@ pub(crate) static CONSOLE_FILE_OPS: FileOps = FileOps {
     readdir: None,
 };
 
-fn console_poll(_file: &crate::fs::types::FileRef) -> u32 {
+fn console_poll(
+    _file: &crate::fs::types::FileRef,
+    _table: Option<&mut crate::fs::select::PollTable>,
+) -> u32 {
     drain_console_control_bytes();
     #[cfg(not(test))]
     crate::kernel::console::maintenance_budgeted();
@@ -2900,19 +2906,19 @@ mod tests {
         let file = alloc_file(console, O_RDWR, 0o600, inode.fops);
         reset_console_buffers();
         assert_eq!(
-            console_poll(&file) & crate::fs::select::POLLIN as u32,
+            console_poll(&file, None) & crate::fs::select::POLLIN as u32,
             0,
             "canonical tty input should not be readable before a line is complete"
         );
         push_console_input_for_tests(b"root");
         assert_eq!(
-            console_poll(&file) & crate::fs::select::POLLIN as u32,
+            console_poll(&file, None) & crate::fs::select::POLLIN as u32,
             0,
             "canonical tty input should wait for Enter"
         );
         push_console_input_for_tests(b"\n");
         assert_ne!(
-            console_poll(&file) & crate::fs::select::POLLIN as u32,
+            console_poll(&file, None) & crate::fs::select::POLLIN as u32,
             0,
             "canonical tty input should become readable after Enter"
         );
