@@ -11,11 +11,51 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering, fence};
 
 use spin::Mutex;
 
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::task::{TaskStruct, task_state};
+
+const WQ_FLAG_WOKEN: u32 = 0x02;
+
+#[repr(C)]
+struct LinuxListHead {
+    next: *mut LinuxListHead,
+    prev: *mut LinuxListHead,
+}
+
+type LinuxWaitQueueFunc =
+    unsafe extern "C" fn(*mut LinuxWaitQueueEntry, u32, i32, *mut c_void) -> i32;
+
+#[repr(C)]
+struct LinuxWaitQueueEntry {
+    flags: u32,
+    private: *mut c_void,
+    func: Option<LinuxWaitQueueFunc>,
+    entry: LinuxListHead,
+}
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "default_wake_function",
+        linux_default_wake_function as usize,
+        false,
+    );
+    export_symbol_once(
+        "woken_wake_function",
+        linux_woken_wake_function as usize,
+        false,
+    );
+}
 
 pub struct WaitQueueHead {
     waiters: Mutex<Vec<WaitQueueEntry>>,
@@ -243,6 +283,44 @@ pub fn wake_up(queue: &WaitQueueHead) -> usize {
     queue.wake_up_all()
 }
 
+/// `default_wake_function` - `vendor/linux/kernel/sched/core.c:7564`.
+unsafe extern "C" fn linux_default_wake_function(
+    entry: *mut LinuxWaitQueueEntry,
+    mode: u32,
+    wake_flags: i32,
+    _key: *mut c_void,
+) -> i32 {
+    if entry.is_null() {
+        return 0;
+    }
+    let task = unsafe { (*entry).private.cast::<TaskStruct>() };
+    if task.is_null() {
+        return 0;
+    }
+    let state = unsafe { (*task).__state.load(Ordering::Acquire) };
+    if state & mode == 0 {
+        return 0;
+    }
+    unsafe { crate::kernel::sched::try_to_wake_up(task, wake_flags as u32) as i32 }
+}
+
+/// `woken_wake_function` - `vendor/linux/kernel/sched/wait.c:457`.
+unsafe extern "C" fn linux_woken_wake_function(
+    entry: *mut LinuxWaitQueueEntry,
+    mode: u32,
+    wake_flags: i32,
+    key: *mut c_void,
+) -> i32 {
+    if entry.is_null() {
+        return 0;
+    }
+    fence(Ordering::SeqCst);
+    unsafe {
+        (*entry).flags |= WQ_FLAG_WOKEN;
+        linux_default_wake_function(entry, mode, wake_flags, key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +348,63 @@ mod tests {
         assert_eq!(q.wake_up_all(), 1);
         assert_eq!(t.__state.load(Ordering::Acquire), task_state::TASK_RUNNING);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn waitqueue_wake_exports_match_linux_source_contract() {
+        let wait_source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/kernel/sched/wait.c"
+        ));
+        let core_source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/kernel/sched/core.c"
+        ));
+        assert!(core_source.contains("int default_wake_function"));
+        assert!(core_source.contains("return try_to_wake_up(curr->private, mode, wake_flags);"));
+        assert!(wait_source.contains("wq_entry->flags |= WQ_FLAG_WOKEN;"));
+        assert!(wait_source.contains("EXPORT_SYMBOL(woken_wake_function);"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("default_wake_function"),
+            Some(linux_default_wake_function as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("woken_wake_function"),
+            Some(linux_woken_wake_function as usize)
+        );
+    }
+
+    #[test]
+    fn woken_wake_function_sets_woken_and_wakes_matching_task_state() {
+        let mut task = task();
+        task.__state
+            .store(task_state::TASK_UNINTERRUPTIBLE, Ordering::Release);
+        let mut entry = LinuxWaitQueueEntry {
+            flags: 0,
+            private: (&mut *task as *mut TaskStruct).cast(),
+            func: None,
+            entry: LinuxListHead {
+                next: core::ptr::null_mut(),
+                prev: core::ptr::null_mut(),
+            },
+        };
+
+        let ret = unsafe {
+            linux_woken_wake_function(
+                &mut entry,
+                task_state::TASK_UNINTERRUPTIBLE,
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+
+        assert_eq!(ret, 1);
+        assert_eq!(entry.flags & WQ_FLAG_WOKEN, WQ_FLAG_WOKEN);
+        assert_eq!(
+            task.__state.load(Ordering::Acquire),
+            task_state::TASK_RUNNING
+        );
     }
 }

@@ -10,8 +10,11 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::ffi::c_void;
 use lazy_static::lazy_static;
 use spin::Mutex;
+
+use crate::kernel::module::{export_symbol, find_symbol};
 
 use super::types::SuperBlockRef;
 
@@ -34,6 +37,19 @@ pub const FS_USERNS_MOUNT: u32 = 1 << 3;
 lazy_static! {
     static ref REGISTRY: Mutex<BTreeMap<String, FileSystemType>> = Mutex::new(BTreeMap::new());
 }
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("kill_anon_super", linux_kill_anon_super as usize, false);
+}
+
+/// `kill_anon_super` - `vendor/linux/fs/super.c`.
+pub unsafe extern "C" fn linux_kill_anon_super(_sb: *mut c_void) {}
 
 pub fn init_registry() {
     // No-op — Mutex::new in the lazy_static initializer already runs lazily.

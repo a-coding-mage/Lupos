@@ -28,6 +28,7 @@ use core::ffi::c_void;
 
 use crate::arch::x86::kernel::uaccess;
 use crate::include::uapi::errno::EINTR;
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::sched;
 use crate::kernel::sched::wait::WaitQueueHead;
 
@@ -101,6 +102,16 @@ const NO_SYSCALL: u64 = u64::MAX;
 
 const SS_ONSTACK: u32 = 1;
 const SS_DISABLE: u32 = 2;
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("recalc_sigpending", linux_recalc_sigpending as usize, false);
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2236,6 +2247,12 @@ fn recalc_tif_sigpending(task: *mut crate::kernel::task::TaskStruct) -> bool {
     pending
 }
 
+/// `recalc_sigpending` - `vendor/linux/kernel/signal.c`.
+pub unsafe extern "C" fn linux_recalc_sigpending() {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    let _ = recalc_tif_sigpending(task);
+}
+
 pub fn current_has_unblocked_pending_signals() -> bool {
     let task = unsafe { crate::kernel::sched::get_current() };
     has_unblocked_pending_signals(task)
@@ -3132,6 +3149,57 @@ mod tests {
         assert!(s.contains(2));
         s.remove(2);
         assert!(!s.contains(2));
+    }
+
+    #[test]
+    fn recalc_sigpending_export_matches_linux_source() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/kernel/signal.c"
+        ));
+        assert!(source.contains("void recalc_sigpending(void)"));
+        assert!(source.contains("EXPORT_SYMBOL(recalc_sigpending);"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("recalc_sigpending"),
+            Some(linux_recalc_sigpending as usize)
+        );
+    }
+
+    #[test]
+    fn recalc_sigpending_recomputes_current_thread_flag() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 188;
+        current.tgid = 188;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            register_test_task(188, 188);
+            current.thread_info.flags |= crate::kernel::task::TIF_SIGPENDING;
+            linux_recalc_sigpending();
+            assert_eq!(
+                current.thread_info.flags & crate::kernel::task::TIF_SIGPENDING,
+                0
+            );
+
+            {
+                let mut table = SIGNAL_TABLE.lock();
+                table
+                    .get_by_pid_mut(188)
+                    .expect("registered")
+                    .pending
+                    .add(SIGTERM);
+            }
+            linux_recalc_sigpending();
+            assert!(current.thread_info.flags & crate::kernel::task::TIF_SIGPENDING != 0);
+
+            sched::set_current(previous);
+        }
+        reset_for_tests();
     }
 
     #[test]

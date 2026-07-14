@@ -100,6 +100,7 @@ pub fn register_module_exports() {
         page_pool_put_unrefed_netmem as usize,
         true,
     );
+    export_symbol_once("__put_netmem", __put_netmem as usize, false);
 }
 
 /// `page_pool_create` — `vendor/linux/net/core/page_pool.c`.
@@ -348,6 +349,10 @@ pub unsafe fn recycle_skb_page(page: *mut Page) -> bool {
     true
 }
 
+/// `__put_netmem` — `vendor/linux/net/core/skbuff.c`.
+#[unsafe(export_name = "__put_netmem")]
+pub unsafe extern "C" fn __put_netmem(_netmem: usize) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +364,20 @@ mod tests {
         assert_eq!(size_of::<LinuxPagePool>(), 1664);
         assert_eq!(align_of::<LinuxPagePool>(), 64);
         assert_eq!(offset_of!(LinuxPagePool, bytes), 0);
+    }
+
+    #[test]
+    fn netmem_release_export_matches_vendor_skb_symbol() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/net/core/skbuff.c"
+        ));
+        assert!(source.contains("EXPORT_SYMBOL(__put_netmem);"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("__put_netmem"),
+            Some(__put_netmem as usize)
+        );
     }
 }

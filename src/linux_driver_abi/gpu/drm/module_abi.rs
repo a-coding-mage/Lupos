@@ -693,47 +693,7 @@ unsafe extern "C" fn linux_sysfs_streq(s1: *const c_char, s2: *const c_char) -> 
     (a == b) as i32
 }
 
-// ── sort/list_sort ─────────────────────────────────────────────────────────
-
-type CmpFn = unsafe extern "C" fn(*const c_void, *const c_void) -> i32;
-type SwapFn = unsafe extern "C" fn(*mut c_void, *mut c_void, i32);
-
-/// `sort` — `vendor/linux/lib/sort.c` (insertion sort variant; the chain only
-/// sorts small mode lists).
-#[unsafe(export_name = "sort")]
-unsafe extern "C" fn linux_sort(
-    base: *mut u8,
-    num: usize,
-    size: usize,
-    cmp: Option<CmpFn>,
-    swap: Option<SwapFn>,
-) {
-    let Some(cmp) = cmp else { return };
-    if base.is_null() || size == 0 {
-        return;
-    }
-    unsafe {
-        for i in 1..num {
-            let mut j = i;
-            while j > 0 {
-                let a = base.add((j - 1) * size);
-                let b = base.add(j * size);
-                if cmp(a.cast(), b.cast()) <= 0 {
-                    break;
-                }
-                match swap {
-                    Some(swap) => swap(a.cast(), b.cast(), size as i32),
-                    None => {
-                        for off in 0..size {
-                            core::ptr::swap(a.add(off), b.add(off));
-                        }
-                    }
-                }
-                j -= 1;
-            }
-        }
-    }
-}
+// ── list_sort ──────────────────────────────────────────────────────────────
 
 type ListCmpFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32;
 
@@ -788,6 +748,8 @@ lazy_static! {
     static ref IDRS: Mutex<BTreeMap<usize, BTreeMap<u64, usize>>> = Mutex::new(BTreeMap::new());
     static ref XARRAYS: Mutex<BTreeMap<usize, BTreeMap<u64, usize>>> = Mutex::new(BTreeMap::new());
 }
+
+const MAX_XA_STORE_RANGE_SLOTS: u64 = 1 << 16;
 
 #[unsafe(export_name = "idr_alloc")]
 unsafe extern "C" fn linux_idr_alloc(
@@ -914,6 +876,36 @@ unsafe extern "C" fn linux_xa_store(
         return entries.remove(&index).unwrap_or(0) as *mut c_void;
     }
     entries.insert(index, entry as usize).unwrap_or(0) as *mut c_void
+}
+
+#[unsafe(export_name = "xa_store_range")]
+unsafe extern "C" fn linux_xa_store_range(
+    xa: *mut c_void,
+    first: u64,
+    last: u64,
+    entry: *mut c_void,
+    _gfp: u32,
+) -> *mut c_void {
+    if first > last {
+        return (-(EINVAL as isize)) as *mut c_void;
+    }
+    let Some(count) = last.checked_sub(first).and_then(|span| span.checked_add(1)) else {
+        return (-(EINVAL as isize)) as *mut c_void;
+    };
+    if count > MAX_XA_STORE_RANGE_SLOTS {
+        return (-(ENOMEM as isize)) as *mut c_void;
+    }
+    let mut table = XARRAYS.lock();
+    let entries = table.entry(xa as usize).or_default();
+    if entry.is_null() {
+        entries.retain(|&index, _| index < first || index > last);
+    } else {
+        let value = entry as usize;
+        for index in first..=last {
+            entries.insert(index, value);
+        }
+    }
+    core::ptr::null_mut()
 }
 
 #[unsafe(export_name = "xa_load")]
@@ -1394,11 +1386,6 @@ unsafe extern "C" fn linux_flush_delayed_work(dwork: *mut c_void) -> i32 {
     armed.is_some() as i32
 }
 
-#[unsafe(export_name = "current_work")]
-unsafe extern "C" fn linux_current_work() -> *mut c_void {
-    core::ptr::null_mut()
-}
-
 #[unsafe(export_name = "hrtimer_setup")]
 unsafe extern "C" fn linux_hrtimer_setup(
     timer: *mut c_void,
@@ -1662,7 +1649,6 @@ unsafe extern "C" fn linux_vmf_insert_pfn(_vmf: *mut c_void, _pfn: u64) -> i32 {
     0x0002
 }
 
-#[unsafe(export_name = "unmap_mapping_range")]
 unsafe extern "C" fn linux_unmap_mapping_range(
     _mapping: *mut c_void,
     _start: i64,
@@ -2599,7 +2585,6 @@ pub fn register_module_exports() {
         ("scnprintf", linux_scnprintf as usize),
         ("simple_strtol", linux_simple_strtol as usize),
         ("sysfs_streq", linux_sysfs_streq as usize),
-        ("sort", linux_sort as usize),
         ("list_sort", linux_list_sort as usize),
         ("idr_alloc", linux_idr_alloc as usize),
         ("idr_remove", linux_idr_remove as usize),
@@ -2611,6 +2596,7 @@ pub fn register_module_exports() {
         ("idr_preload", linux_idr_preload as usize),
         ("ida_destroy", linux_ida_destroy as usize),
         ("xa_store", linux_xa_store as usize),
+        ("xa_store_range", linux_xa_store_range as usize),
         ("xa_load", linux_xa_load as usize),
         ("xa_erase", linux_xa_erase as usize),
         ("__xa_alloc", linux_xa_alloc as usize),
@@ -2685,7 +2671,6 @@ pub fn register_module_exports() {
         ),
         ("cancel_work_sync", linux_cancel_work_sync as usize),
         ("flush_delayed_work", linux_flush_delayed_work as usize),
-        ("current_work", linux_current_work as usize),
         ("hrtimer_setup", linux_hrtimer_setup as usize),
         (
             "hrtimer_start_range_ns",

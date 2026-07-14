@@ -9,9 +9,11 @@
 //! cooperative-friendly variant; reader/writer fairness ordering matches Linux.
 
 use core::cell::UnsafeCell;
+use core::ffi::{c_char, c_void};
 use core::sync::atomic::{AtomicI64, Ordering};
 
 use super::raw_spinlock::RawSpinLock;
+use crate::kernel::module::{export_symbol, find_symbol};
 
 /// Linux constants:
 ///   `RWSEM_READER_BIAS = 0x100`        — one reader = +0x100
@@ -178,6 +180,208 @@ impl<'a, T> core::ops::DerefMut for RwWriteGuard<'a, T> {
 impl<'a, T> Drop for RwWriteGuard<'a, T> {
     fn drop(&mut self) {
         self.parent.release_write();
+    }
+}
+
+/// Prefix of Linux `struct rw_semaphore` for the staged x86_64 config.
+///
+/// `CONFIG_RWSEM_SPIN_ON_OWNER=y`, debug lock allocation and debug rwsems are
+/// off. The module ABI only needs the first word for Lupos's lock operations;
+/// the remaining fields are initialized enough for Linux-built modules that
+/// inspect the target layout.
+#[repr(C)]
+pub struct LinuxRwSemaphore {
+    count: AtomicI64,
+    owner: AtomicI64,
+    osq_tail: AtomicI64,
+    wait_lock: RawSpinLock,
+    first_waiter: *mut c_void,
+}
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("__init_rwsem", linux___init_rwsem as usize, false);
+    export_symbol_once("down_read", linux_down_read as usize, false);
+    export_symbol_once(
+        "down_read_interruptible",
+        linux_down_read_interruptible as usize,
+        false,
+    );
+    export_symbol_once(
+        "down_read_killable",
+        linux_down_read_killable as usize,
+        false,
+    );
+    export_symbol_once("down_read_trylock", linux_down_read_trylock as usize, false);
+    export_symbol_once("up_read", linux_up_read as usize, false);
+    export_symbol_once("down_write", linux_down_write as usize, false);
+    export_symbol_once(
+        "down_write_killable",
+        linux_down_write_killable as usize,
+        false,
+    );
+    export_symbol_once(
+        "down_write_trylock",
+        linux_down_write_trylock as usize,
+        false,
+    );
+    export_symbol_once("up_write", linux_up_write as usize, false);
+    export_symbol_once("downgrade_write", linux_downgrade_write as usize, false);
+}
+
+unsafe fn raw_count(sem: *mut LinuxRwSemaphore) -> Option<&'static AtomicI64> {
+    if sem.is_null() {
+        None
+    } else {
+        Some(unsafe { &(*sem).count })
+    }
+}
+
+#[unsafe(export_name = "__init_rwsem")]
+pub unsafe extern "C" fn linux___init_rwsem(
+    sem: *mut LinuxRwSemaphore,
+    _name: *const c_char,
+    _key: *mut c_void,
+) {
+    if sem.is_null() {
+        return;
+    }
+    unsafe {
+        (*sem).count.store(0, Ordering::Release);
+        (*sem).owner.store(0, Ordering::Release);
+        (*sem).osq_tail.store(0, Ordering::Release);
+        (*sem).wait_lock = RawSpinLock::new();
+        (*sem).first_waiter = core::ptr::null_mut();
+    }
+}
+
+fn raw_down_read(count: &AtomicI64) {
+    loop {
+        let cur = count.load(Ordering::Acquire);
+        if cur & RWSEM_WRITER_LOCKED == 0 {
+            if count
+                .compare_exchange(
+                    cur,
+                    cur + RWSEM_READER_BIAS,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        } else {
+            #[cfg(not(test))]
+            unsafe {
+                crate::kernel::sched::schedule_with_irqs_enabled();
+            }
+            #[cfg(test)]
+            core::hint::spin_loop();
+        }
+    }
+}
+
+fn raw_down_write(count: &AtomicI64) {
+    loop {
+        if count
+            .compare_exchange(0, RWSEM_WRITER_LOCKED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
+        #[cfg(not(test))]
+        unsafe {
+            crate::kernel::sched::schedule_with_irqs_enabled();
+        }
+        #[cfg(test)]
+        core::hint::spin_loop();
+    }
+}
+
+#[unsafe(export_name = "down_read")]
+pub unsafe extern "C" fn linux_down_read(sem: *mut LinuxRwSemaphore) {
+    if let Some(count) = unsafe { raw_count(sem) } {
+        raw_down_read(count);
+    }
+}
+
+#[unsafe(export_name = "down_read_interruptible")]
+pub unsafe extern "C" fn linux_down_read_interruptible(sem: *mut LinuxRwSemaphore) -> i32 {
+    unsafe { linux_down_read(sem) };
+    0
+}
+
+#[unsafe(export_name = "down_read_killable")]
+pub unsafe extern "C" fn linux_down_read_killable(sem: *mut LinuxRwSemaphore) -> i32 {
+    unsafe { linux_down_read(sem) };
+    0
+}
+
+#[unsafe(export_name = "down_read_trylock")]
+pub unsafe extern "C" fn linux_down_read_trylock(sem: *mut LinuxRwSemaphore) -> i32 {
+    let Some(count) = (unsafe { raw_count(sem) }) else {
+        return 0;
+    };
+    let cur = count.load(Ordering::Acquire);
+    if cur & RWSEM_WRITER_LOCKED != 0 {
+        return 0;
+    }
+    count
+        .compare_exchange(
+            cur,
+            cur + RWSEM_READER_BIAS,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok() as i32
+}
+
+#[unsafe(export_name = "up_read")]
+pub unsafe extern "C" fn linux_up_read(sem: *mut LinuxRwSemaphore) {
+    if let Some(count) = unsafe { raw_count(sem) } {
+        count.fetch_sub(RWSEM_READER_BIAS, Ordering::AcqRel);
+    }
+}
+
+#[unsafe(export_name = "down_write")]
+pub unsafe extern "C" fn linux_down_write(sem: *mut LinuxRwSemaphore) {
+    if let Some(count) = unsafe { raw_count(sem) } {
+        raw_down_write(count);
+    }
+}
+
+#[unsafe(export_name = "down_write_killable")]
+pub unsafe extern "C" fn linux_down_write_killable(sem: *mut LinuxRwSemaphore) -> i32 {
+    unsafe { linux_down_write(sem) };
+    0
+}
+
+#[unsafe(export_name = "down_write_trylock")]
+pub unsafe extern "C" fn linux_down_write_trylock(sem: *mut LinuxRwSemaphore) -> i32 {
+    let Some(count) = (unsafe { raw_count(sem) }) else {
+        return 0;
+    };
+    count
+        .compare_exchange(0, RWSEM_WRITER_LOCKED, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok() as i32
+}
+
+#[unsafe(export_name = "up_write")]
+pub unsafe extern "C" fn linux_up_write(sem: *mut LinuxRwSemaphore) {
+    if let Some(count) = unsafe { raw_count(sem) } {
+        count.fetch_and(!RWSEM_WRITER_LOCKED, Ordering::AcqRel);
+    }
+}
+
+#[unsafe(export_name = "downgrade_write")]
+pub unsafe extern "C" fn linux_downgrade_write(sem: *mut LinuxRwSemaphore) {
+    if let Some(count) = unsafe { raw_count(sem) } {
+        count.store(RWSEM_READER_BIAS, Ordering::Release);
     }
 }
 

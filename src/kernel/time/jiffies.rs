@@ -43,6 +43,44 @@ pub fn msecs_to_jiffies(ms: u64) -> u64 {
 }
 
 #[inline]
+pub fn usecs_to_jiffies(us: u64) -> u64 {
+    (us.saturating_mul(HZ) + 999_999) / 1_000_000
+}
+
+fn round_jiffies_common(j: u64, force_up: bool) -> u64 {
+    let original = j;
+    let rem = j % HZ;
+    let rounded = if rem < HZ / 4 && !force_up {
+        j - rem
+    } else {
+        j - rem + HZ
+    };
+    if time_after(rounded, jiffies()) {
+        rounded
+    } else {
+        original
+    }
+}
+
+pub fn round_jiffies(j: u64) -> u64 {
+    round_jiffies_common(j, false)
+}
+
+pub fn round_jiffies_relative(j: u64) -> u64 {
+    let now = jiffies();
+    round_jiffies_common(now.saturating_add(j), false).saturating_sub(now)
+}
+
+pub fn round_jiffies_up(j: u64) -> u64 {
+    round_jiffies_common(j, true)
+}
+
+pub fn round_jiffies_up_relative(j: u64) -> u64 {
+    let now = jiffies();
+    round_jiffies_common(now.saturating_add(j), true).saturating_sub(now)
+}
+
+#[inline]
 pub fn time_after(a: u64, b: u64) -> bool {
     (a as i64).wrapping_sub(b as i64) > 0
 }
@@ -71,6 +109,75 @@ pub fn register_module_exports() {
     if find_symbol("jiffies_64").is_none() {
         export_symbol("jiffies_64", addr, false);
     }
+    if find_symbol("__usecs_to_jiffies").is_none() {
+        export_symbol(
+            "__usecs_to_jiffies",
+            linux___usecs_to_jiffies as usize,
+            false,
+        );
+    }
+    if find_symbol("__round_jiffies_relative").is_none() {
+        export_symbol(
+            "__round_jiffies_relative",
+            linux___round_jiffies_relative as usize,
+            true,
+        );
+    }
+    if find_symbol("round_jiffies").is_none() {
+        export_symbol("round_jiffies", linux_round_jiffies as usize, true);
+    }
+    if find_symbol("round_jiffies_relative").is_none() {
+        export_symbol(
+            "round_jiffies_relative",
+            linux_round_jiffies_relative as usize,
+            true,
+        );
+    }
+    if find_symbol("__round_jiffies_up_relative").is_none() {
+        export_symbol(
+            "__round_jiffies_up_relative",
+            linux___round_jiffies_up_relative as usize,
+            true,
+        );
+    }
+    if find_symbol("round_jiffies_up").is_none() {
+        export_symbol("round_jiffies_up", linux_round_jiffies_up as usize, true);
+    }
+    if find_symbol("round_jiffies_up_relative").is_none() {
+        export_symbol(
+            "round_jiffies_up_relative",
+            linux_round_jiffies_up_relative as usize,
+            true,
+        );
+    }
+}
+
+extern "C" fn linux___usecs_to_jiffies(us: u32) -> u64 {
+    usecs_to_jiffies(us as u64)
+}
+
+extern "C" fn linux___round_jiffies_relative(j: u64, _cpu: i32) -> u64 {
+    round_jiffies_relative(j)
+}
+
+extern "C" fn linux_round_jiffies(j: u64) -> u64 {
+    round_jiffies(j)
+}
+
+extern "C" fn linux_round_jiffies_relative(j: u64) -> u64 {
+    round_jiffies_relative(j)
+}
+
+extern "C" fn linux___round_jiffies_up_relative(j: u64, _cpu: i32) -> u64 {
+    round_jiffies_up_relative(j)
+}
+
+extern "C" fn linux_round_jiffies_up(j: u64) -> u64 {
+    round_jiffies_up(j)
+}
+
+extern "C" fn linux_round_jiffies_up_relative(j: u64) -> u64 {
+    round_jiffies_up_relative(j)
 }
 
 /// Reset to zero — used by tests only.
@@ -102,6 +209,7 @@ mod tests {
         // 1000 ms = HZ jiffies
         assert_eq!(msecs_to_jiffies(1000), HZ);
         assert_eq!(jiffies_to_msecs(HZ), 1000);
+        assert_eq!(usecs_to_jiffies(1_000_000), HZ);
     }
 
     #[test]
@@ -109,5 +217,12 @@ mod tests {
         // a > b
         assert!(time_after(100, 50));
         assert!(time_before(50, 100));
+    }
+
+    #[test]
+    fn round_jiffies_up_never_rounds_down() {
+        _reset_for_tests();
+        assert_eq!(round_jiffies_up(HZ), HZ * 2);
+        assert_eq!(round_jiffies_up_relative(1), HZ);
     }
 }

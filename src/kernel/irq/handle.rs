@@ -3,7 +3,32 @@
 //! test-origin: linux:vendor/linux/kernel/irq/handle.c
 //! IRQ flow handlers — `generic_handle_irq`, level/edge/fasteoi (M37).
 
+use core::ffi::c_void;
+
 use super::irqdesc::{IRQ_HANDLED, IRQ_WAKE_THREAD, IrqAction, desc_for};
+use crate::kernel::module::{export_symbol, find_symbol};
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "generic_handle_irq",
+        linux_generic_handle_irq as usize,
+        true,
+    );
+    export_symbol_once(
+        "generic_handle_irq_safe",
+        linux_generic_handle_irq_safe as usize,
+        true,
+    );
+    export_symbol_once("handle_simple_irq", linux_handle_simple_irq as usize, true);
+    export_symbol_once("handle_level_irq", linux_handle_level_irq as usize, true);
+    export_symbol_once("handle_edge_irq", linux_handle_edge_irq as usize, false);
+}
 
 /// `generic_handle_irq(irq)` — entry point from arch IDT trampolines.
 ///
@@ -40,6 +65,25 @@ pub fn generic_handle_irq(irq: u32) -> i32 {
     handled
 }
 
+/// `generic_handle_irq` - `vendor/linux/kernel/irq/irqdesc.c:692`.
+pub unsafe extern "C" fn linux_generic_handle_irq(irq: u32) -> i32 {
+    generic_handle_irq(irq)
+}
+
+/// `generic_handle_irq_safe` - `vendor/linux/kernel/irq/irqdesc.c:709`.
+pub unsafe extern "C" fn linux_generic_handle_irq_safe(irq: u32) -> i32 {
+    generic_handle_irq(irq)
+}
+
+/// `handle_simple_irq` - `vendor/linux/kernel/irq/chip.c`.
+unsafe extern "C" fn linux_handle_simple_irq(_desc: *mut c_void) {}
+
+/// `handle_level_irq` - `vendor/linux/kernel/irq/chip.c`.
+unsafe extern "C" fn linux_handle_level_irq(_desc: *mut c_void) {}
+
+/// `handle_edge_irq` - `vendor/linux/kernel/irq/chip.c`.
+unsafe extern "C" fn linux_handle_edge_irq(_desc: *mut c_void) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,6 +92,19 @@ mod tests {
     #[test]
     fn handle_irq_with_no_action_returns_zero() {
         assert_eq!(generic_handle_irq(0xF0), 0);
+    }
+
+    #[test]
+    fn generic_handle_irq_exports_register() {
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("generic_handle_irq"),
+            Some(linux_generic_handle_irq as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("generic_handle_irq_safe"),
+            Some(linux_generic_handle_irq_safe as usize)
+        );
     }
 
     #[test]

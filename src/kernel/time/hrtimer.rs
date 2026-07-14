@@ -9,11 +9,17 @@
 //! is invoked from `tick_handle_periodic` (and later from a one-shot LAPIC
 //! programmable event in M37).
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+use core::ffi::c_void;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use lazy_static::lazy_static;
 use spin::Mutex;
 
 use super::timekeeping::{ktime_get, ktime_get_boottime, ktime_get_real};
+use crate::kernel::module::{export_symbol, find_symbol};
 
 /// Linux `enum hrtimer_base` — clock bases.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +59,153 @@ pub enum HrtimerRestart {
 /// cannot soundly overlap an exclusive `&mut Hrtimer` borrow.
 pub type HrtimerCallback = fn(*mut Hrtimer) -> HrtimerRestart;
 
+type LinuxHrtimerCallback = unsafe extern "C" fn(*mut LinuxHrtimer) -> i32;
+
+const CLOCK_REALTIME_ID: i32 = 0;
+const CLOCK_MONOTONIC_ID: i32 = 1;
+const CLOCK_BOOTTIME_ID: i32 = 7;
+const CLOCK_TAI_ID: i32 = 11;
+const LINUX_HRTIMER_MODE_REL: u32 = 0x01;
+const LINUX_HRTIMER_MODE_SOFT: u32 = 0x04;
+const LINUX_HRTIMER_MODE_HARD: u32 = 0x08;
+const LINUX_HRTIMER_MODE_LAZY_REARM: u32 = 0x10;
+const LINUX_HRTIMER_NORESTART: i32 = 0;
+const LINUX_HRTIMER_RESTART: i32 = 1;
+const LOW_RES_NSEC: u32 = crate::kernel::time::jiffies::NSEC_PER_TICK as u32;
+
+#[unsafe(export_name = "hrtimer_resolution")]
+pub static LINUX_HRTIMER_RESOLUTION: u32 = LOW_RES_NSEC;
+
+#[repr(C)]
+pub struct LinuxTimerqueueLinkedNode {
+    pub node: crate::lib::rbtree::LinuxRbNodeLinked,
+    pub expires: i64,
+}
+
+#[repr(C)]
+pub struct LinuxHrtimer {
+    pub node: LinuxTimerqueueLinkedNode,
+    pub base: *mut c_void,
+    pub is_queued: u8,
+    pub is_rel: u8,
+    pub is_soft: u8,
+    pub is_hard: u8,
+    pub is_lazy: u8,
+    _pad_after_flags: [u8; 3],
+    pub _softexpires: i64,
+    pub function: Option<LinuxHrtimerCallback>,
+}
+
+#[repr(C)]
+struct LinuxHrtimerClockBaseStub {
+    cpu_base: usize,
+    index: u32,
+    clockid: i32,
+}
+
+#[derive(Clone, Copy)]
+struct RawHrtimerState {
+    clock_id: i32,
+    active: bool,
+    running: bool,
+}
+
+struct RawHrtimerStates {
+    entries: Vec<(usize, RawHrtimerState)>,
+}
+
+impl RawHrtimerStates {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn position(&self, timer: usize) -> Option<usize> {
+        self.entries.iter().position(|(key, _)| *key == timer)
+    }
+
+    fn get(&self, timer: &usize) -> Option<&RawHrtimerState> {
+        self.position(*timer).map(|idx| &self.entries[idx].1)
+    }
+
+    fn get_mut(&mut self, timer: &usize) -> Option<&mut RawHrtimerState> {
+        self.position(*timer).map(|idx| &mut self.entries[idx].1)
+    }
+
+    fn insert(&mut self, timer: usize, state: RawHrtimerState) {
+        if let Some(idx) = self.position(timer) {
+            self.entries[idx].1 = state;
+        } else {
+            self.entries.push((timer, state));
+        }
+    }
+
+    fn get_mut_or_insert(
+        &mut self,
+        timer: usize,
+        default: RawHrtimerState,
+    ) -> &mut RawHrtimerState {
+        if let Some(idx) = self.position(timer) {
+            return &mut self.entries[idx].1;
+        }
+        self.entries.push((timer, default));
+        let idx = self.entries.len() - 1;
+        &mut self.entries[idx].1
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&usize, &RawHrtimerState)> + '_ {
+        self.entries.iter().map(|(key, value)| (key, value))
+    }
+}
+
+const RAW_CLOCK_BASES: [LinuxHrtimerClockBaseStub; 8] = [
+    LinuxHrtimerClockBaseStub {
+        cpu_base: 0,
+        index: 0,
+        clockid: CLOCK_MONOTONIC_ID,
+    },
+    LinuxHrtimerClockBaseStub {
+        cpu_base: 0,
+        index: 1,
+        clockid: CLOCK_REALTIME_ID,
+    },
+    LinuxHrtimerClockBaseStub {
+        cpu_base: 0,
+        index: 2,
+        clockid: CLOCK_BOOTTIME_ID,
+    },
+    LinuxHrtimerClockBaseStub {
+        cpu_base: 0,
+        index: 3,
+        clockid: CLOCK_TAI_ID,
+    },
+    LinuxHrtimerClockBaseStub {
+        cpu_base: 0,
+        index: 4,
+        clockid: CLOCK_MONOTONIC_ID,
+    },
+    LinuxHrtimerClockBaseStub {
+        cpu_base: 0,
+        index: 5,
+        clockid: CLOCK_REALTIME_ID,
+    },
+    LinuxHrtimerClockBaseStub {
+        cpu_base: 0,
+        index: 6,
+        clockid: CLOCK_BOOTTIME_ID,
+    },
+    LinuxHrtimerClockBaseStub {
+        cpu_base: 0,
+        index: 7,
+        clockid: CLOCK_TAI_ID,
+    },
+];
+
+lazy_static! {
+    static ref RAW_HRTIMERS: Mutex<RawHrtimerStates> = Mutex::new(RawHrtimerStates::new());
+}
+
 /// `struct hrtimer` — opaque-shape Linux primitive.
 #[repr(C)]
 pub struct Hrtimer {
@@ -74,6 +227,99 @@ unsafe impl Sync for Hrtimer {}
 
 pub const HRTIMER_STATE_INACTIVE: u8 = 0;
 pub const HRTIMER_STATE_ENQUEUED: u8 = 1;
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "hrtimer_resolution",
+        &raw const LINUX_HRTIMER_RESOLUTION as usize,
+        true,
+    );
+    export_symbol_once("hrtimer_active", linux_hrtimer_active as usize, true);
+    export_symbol_once("hrtimer_cancel", linux_hrtimer_cancel as usize, true);
+    export_symbol_once(
+        "hrtimer_cb_get_time",
+        linux_hrtimer_cb_get_time as usize,
+        true,
+    );
+    export_symbol_once("hrtimer_forward", linux_hrtimer_forward as usize, true);
+    export_symbol_once("hrtimer_setup", linux_hrtimer_setup as usize, true);
+    export_symbol_once(
+        "hrtimer_start_range_ns",
+        linux_hrtimer_start_range_ns as usize,
+        true,
+    );
+    export_symbol_once(
+        "hrtimer_try_to_cancel",
+        linux_hrtimer_try_to_cancel as usize,
+        true,
+    );
+}
+
+fn raw_clockid_to_base(clock_id: i32) -> usize {
+    match clock_id {
+        CLOCK_REALTIME_ID => 1,
+        CLOCK_BOOTTIME_ID => 2,
+        CLOCK_TAI_ID => 3,
+        _ => 0,
+    }
+}
+
+fn raw_setup_clock_id(clock_id: i32, mode: u32) -> i32 {
+    if clock_id == CLOCK_REALTIME_ID && mode & LINUX_HRTIMER_MODE_REL != 0 {
+        CLOCK_MONOTONIC_ID
+    } else {
+        match clock_id {
+            CLOCK_REALTIME_ID | CLOCK_MONOTONIC_ID | CLOCK_BOOTTIME_ID | CLOCK_TAI_ID => clock_id,
+            _ => CLOCK_MONOTONIC_ID,
+        }
+    }
+}
+
+fn raw_base_index(clock_id: i32, mode: u32) -> usize {
+    let soft_offset = if mode & LINUX_HRTIMER_MODE_SOFT != 0 {
+        4
+    } else {
+        0
+    };
+    soft_offset + raw_clockid_to_base(clock_id)
+}
+
+fn raw_clock_now(clock_id: i32) -> u64 {
+    match clock_id {
+        CLOCK_REALTIME_ID | CLOCK_TAI_ID => ktime_get_real(),
+        CLOCK_BOOTTIME_ID => ktime_get_boottime(),
+        _ => ktime_get(),
+    }
+}
+
+fn raw_saturating_i64(ns: u64) -> i64 {
+    ns.min(i64::MAX as u64) as i64
+}
+
+unsafe fn raw_timerqueue_linked_init(timer: *mut LinuxHrtimer) {
+    unsafe {
+        let rb = core::ptr::addr_of_mut!((*timer).node.node.node);
+        (*rb).__rb_parent_color = rb as usize;
+        (*timer).node.node.prev = core::ptr::null_mut();
+        (*timer).node.node.next = core::ptr::null_mut();
+        (*timer).node.expires = 0;
+    }
+}
+
+unsafe fn raw_set_timer_active(timer: *mut LinuxHrtimer, active: bool) {
+    unsafe {
+        (*timer).is_queued = u8::from(active);
+    }
+    if let Some(state) = RAW_HRTIMERS.lock().get_mut(&(timer as usize)) {
+        state.active = active;
+    }
+}
 
 impl Hrtimer {
     pub const fn new() -> Self {
@@ -427,6 +673,237 @@ pub fn hrtimer_restart(t: *mut Hrtimer) {
     hrtimer_start(t, expires, HrtimerMode::Abs);
 }
 
+/// `hrtimer_setup` - `vendor/linux/kernel/time/hrtimer.c:1921`.
+pub unsafe extern "C" fn linux_hrtimer_setup(
+    timer: *mut LinuxHrtimer,
+    function: Option<LinuxHrtimerCallback>,
+    clock_id: i32,
+    mode: u32,
+) {
+    if timer.is_null() {
+        return;
+    }
+
+    let clock_id = raw_setup_clock_id(clock_id, mode);
+    let base_index = raw_base_index(clock_id, mode);
+    unsafe {
+        core::ptr::write_bytes(timer.cast::<u8>(), 0, core::mem::size_of::<LinuxHrtimer>());
+        raw_timerqueue_linked_init(timer);
+        (*timer).base = RAW_CLOCK_BASES.as_ptr().add(base_index) as *mut c_void;
+        (*timer).is_soft = u8::from(mode & LINUX_HRTIMER_MODE_SOFT != 0);
+        (*timer).is_hard = u8::from(mode & LINUX_HRTIMER_MODE_HARD != 0);
+        (*timer).is_lazy = u8::from(mode & LINUX_HRTIMER_MODE_LAZY_REARM != 0);
+        (*timer).function = function;
+    }
+
+    RAW_HRTIMERS.lock().insert(
+        timer as usize,
+        RawHrtimerState {
+            clock_id,
+            active: false,
+            running: false,
+        },
+    );
+}
+
+/// `hrtimer_start_range_ns` - `vendor/linux/kernel/time/hrtimer.c:1493`.
+pub unsafe extern "C" fn linux_hrtimer_start_range_ns(
+    timer: *mut LinuxHrtimer,
+    tim: i64,
+    delta_ns: u64,
+    mode: u32,
+) {
+    if timer.is_null() {
+        return;
+    }
+
+    let mut states = RAW_HRTIMERS.lock();
+    let state = states.get_mut_or_insert(
+        timer as usize,
+        RawHrtimerState {
+            clock_id: CLOCK_MONOTONIC_ID,
+            active: false,
+            running: false,
+        },
+    );
+    let soft = if mode & LINUX_HRTIMER_MODE_REL != 0 {
+        raw_clock_now(state.clock_id).saturating_add(tim.max(0) as u64)
+    } else {
+        tim.max(0) as u64
+    };
+    let hard = soft.saturating_add(delta_ns);
+
+    state.active = true;
+    unsafe {
+        (*timer).node.expires = raw_saturating_i64(hard);
+        (*timer)._softexpires = raw_saturating_i64(soft);
+        (*timer).is_rel = u8::from(mode & LINUX_HRTIMER_MODE_REL != 0);
+        (*timer).is_queued = 1;
+    }
+}
+
+/// `hrtimer_active` - `vendor/linux/kernel/time/hrtimer.c:1967`.
+pub unsafe extern "C" fn linux_hrtimer_active(timer: *const LinuxHrtimer) -> bool {
+    if timer.is_null() {
+        return false;
+    }
+    if unsafe { (*timer).is_queued != 0 } {
+        return true;
+    }
+    RAW_HRTIMERS
+        .lock()
+        .get(&(timer as usize))
+        .map(|state| state.active || state.running)
+        .unwrap_or(false)
+}
+
+/// `hrtimer_try_to_cancel` - `vendor/linux/kernel/time/hrtimer.c:1611`.
+pub unsafe extern "C" fn linux_hrtimer_try_to_cancel(timer: *mut LinuxHrtimer) -> i32 {
+    if timer.is_null() {
+        return 0;
+    }
+    let mut states = RAW_HRTIMERS.lock();
+    let Some(state) = states.get_mut(&(timer as usize)) else {
+        unsafe {
+            (*timer).is_queued = 0;
+        }
+        return 0;
+    };
+    if state.running {
+        return -1;
+    }
+    if state.active || unsafe { (*timer).is_queued != 0 } {
+        state.active = false;
+        unsafe {
+            (*timer).is_queued = 0;
+        }
+        return 1;
+    }
+    0
+}
+
+/// `hrtimer_cancel` - `vendor/linux/kernel/time/hrtimer.c:1745`.
+pub unsafe extern "C" fn linux_hrtimer_cancel(timer: *mut LinuxHrtimer) -> i32 {
+    loop {
+        let ret = unsafe { linux_hrtimer_try_to_cancel(timer) };
+        if ret >= 0 {
+            return ret;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// `hrtimer_forward` - `vendor/linux/kernel/time/hrtimer.c:1061`.
+pub unsafe extern "C" fn linux_hrtimer_forward(
+    timer: *mut LinuxHrtimer,
+    now: i64,
+    interval: i64,
+) -> u64 {
+    if timer.is_null() || interval <= 0 {
+        return 0;
+    }
+    if unsafe { (*timer).is_queued != 0 } {
+        return 0;
+    }
+
+    let mut expires = unsafe { (*timer).node.expires };
+    let delta = now.saturating_sub(expires);
+    if delta < 0 {
+        return 0;
+    }
+
+    let interval = interval.max(1);
+    let mut overruns = 1u64;
+    if delta >= interval {
+        overruns = (delta / interval) as u64;
+        expires = expires.saturating_add(interval.saturating_mul(overruns as i64));
+        if expires > now {
+            unsafe {
+                (*timer).node.expires = expires;
+                (*timer)._softexpires = expires;
+            }
+            return overruns;
+        }
+        overruns = overruns.saturating_add(1);
+    }
+
+    expires = expires.saturating_add(interval);
+    unsafe {
+        (*timer).node.expires = expires;
+        (*timer)._softexpires = expires;
+    }
+    overruns
+}
+
+/// `hrtimer_cb_get_time` - `vendor/linux/kernel/time/hrtimer.c:1858`.
+pub unsafe extern "C" fn linux_hrtimer_cb_get_time(timer: *const LinuxHrtimer) -> i64 {
+    let clock_id = RAW_HRTIMERS
+        .lock()
+        .get(&(timer as usize))
+        .map(|state| state.clock_id)
+        .unwrap_or(CLOCK_MONOTONIC_ID);
+    raw_saturating_i64(raw_clock_now(clock_id))
+}
+
+fn run_raw_hrtimer_queues() {
+    loop {
+        let due = {
+            let mut states = RAW_HRTIMERS.lock();
+            let due_key = states
+                .iter()
+                .filter_map(|(&timer, state)| {
+                    if state.active
+                        && unsafe { (*(timer as *const LinuxHrtimer)).node.expires }
+                            <= raw_saturating_i64(raw_clock_now(state.clock_id))
+                    {
+                        Some((timer, unsafe {
+                            (*(timer as *const LinuxHrtimer)).node.expires
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .min_by_key(|(_, expires)| *expires)
+                .map(|(timer, _)| timer);
+
+            due_key.and_then(|timer| {
+                let state = states.get_mut(&timer)?;
+                state.active = false;
+                state.running = true;
+                unsafe {
+                    (*(timer as *mut LinuxHrtimer)).is_queued = 0;
+                }
+                Some((timer, state.clock_id))
+            })
+        };
+
+        let Some((timer, clock_id)) = due else {
+            break;
+        };
+        let timer_ptr = timer as *mut LinuxHrtimer;
+        let restart = unsafe {
+            match (*timer_ptr).function {
+                Some(function) => function(timer_ptr),
+                None => LINUX_HRTIMER_NORESTART,
+            }
+        };
+
+        let mut states = RAW_HRTIMERS.lock();
+        if let Some(state) = states.get_mut(&timer) {
+            state.running = false;
+            if restart == LINUX_HRTIMER_RESTART && !state.active {
+                let expires = unsafe { (*timer_ptr).node.expires };
+                if expires > raw_saturating_i64(raw_clock_now(clock_id)) {
+                    state.active = true;
+                    unsafe {
+                        (*timer_ptr).is_queued = 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// `hrtimer_run_queues()` — fire any timers whose absolute expiry has passed.
 /// Called from `tick_handle_periodic`.
 pub fn hrtimer_run_queues() {
@@ -491,6 +968,7 @@ pub fn hrtimer_run_queues() {
             }
         }
     }
+    run_raw_hrtimer_queues();
 }
 
 pub fn fired_count() -> u64 {

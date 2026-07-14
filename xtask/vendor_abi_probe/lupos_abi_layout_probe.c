@@ -9,18 +9,34 @@
 #include <linux/bio.h>
 #include <linux/blk-mq.h>
 #include <linux/blkdev.h>
+#include <linux/dma-fence.h>
+#include <linux/dma-fence-chain.h>
+#include <linux/dma-resv.h>
 #include <linux/fs.h>
+#include <linux/fs_context.h>
+#include <linux/folio_batch.h>
+#include <linux/hdmi.h>
 #include <linux/hrtimer.h>
+#include <linux/input.h>
+#include <linux/input/mt.h>
 #include <linux/kthread.h>
+#include <linux/list_lru.h>
 #include <linux/mount.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/pagemap.h>
 #include <linux/pci.h>
+#include <linux/platform_device.h>
+#include <linux/pseudo_fs.h>
+#include <linux/rbtree.h>
 #include <linux/scatterlist.h>
+#include <linux/seq_buf.h>
 #include <linux/skbuff.h>
+#include <linux/srcu.h>
 #include <linux/virtio.h>
+#include <linux/ww_mutex.h>
 #include <linux/workqueue.h>
+#include <linux/xarray.h>
 #include <net/netdev_rx_queue.h>
 #include <net/page_pool/types.h>
 
@@ -41,7 +57,10 @@ ABI_OFFSET(struct device, driver_data, 120);
 ABI_OFFSET(struct device, dma_mask, 584);
 ABI_OFFSET(struct device, coherent_dma_mask, 592);
 ABI_OFFSET(struct device, dma_parms, 616);
+ABI_OFFSET(struct device, release, 712);
 ABI_SIZE(struct device, 760);
+
+ABI_OFFSET(struct platform_device, dev, 16);
 
 ABI_OFFSET(struct device_driver, name, 0);
 ABI_OFFSET(struct device_driver, bus, 8);
@@ -50,6 +69,42 @@ ABI_OFFSET(struct device_driver, remove, 72);
 ABI_OFFSET(struct device_driver, pm, 120);
 ABI_OFFSET(struct device_driver, p, 136);
 ABI_SIZE(struct device_driver, 152);
+
+ABI_OFFSET(struct class, name, 0);
+ABI_OFFSET(struct class, class_release, 40);
+ABI_SIZE(struct class, 96);
+ABI_OFFSET(struct attribute, name, 0);
+ABI_OFFSET(struct attribute, mode, 8);
+ABI_SIZE(struct attribute, 16);
+ABI_OFFSET(struct class_attribute, attr, 0);
+ABI_OFFSET(struct class_attribute, show, 16);
+ABI_OFFSET(struct class_attribute, store, 24);
+ABI_SIZE(struct class_attribute, 32);
+ABI_OFFSET(struct class_attribute_string, attr, 0);
+ABI_OFFSET(struct class_attribute_string, str, 32);
+ABI_SIZE(struct class_attribute_string, 40);
+
+ABI_OFFSET(struct rb_node, __rb_parent_color, 0);
+ABI_OFFSET(struct rb_node, rb_right, 8);
+ABI_OFFSET(struct rb_node, rb_left, 16);
+ABI_SIZE(struct rb_node, 24);
+ABI_OFFSET(struct rb_root, rb_node, 0);
+ABI_SIZE(struct rb_root, 8);
+ABI_OFFSET(struct rb_node_linked, node, 0);
+ABI_OFFSET(struct rb_node_linked, prev, 24);
+
+ABI_OFFSET(struct xarray, xa_flags, 4);
+ABI_OFFSET(struct xarray, xa_head, 8);
+ABI_SIZE(struct xarray, 16);
+_Static_assert(__GFP_BITS_SHIFT == 25, "__GFP_BITS_SHIFT changed");
+ABI_OFFSET(struct rb_node_linked, next, 32);
+ABI_SIZE(struct rb_node_linked, 40);
+ABI_OFFSET(struct rb_root_cached, rb_root, 0);
+ABI_OFFSET(struct rb_root_cached, rb_leftmost, 8);
+ABI_SIZE(struct rb_root_cached, 16);
+ABI_OFFSET(struct rb_root_linked, rb_root, 0);
+ABI_OFFSET(struct rb_root_linked, rb_leftmost, 8);
+ABI_SIZE(struct rb_root_linked, 16);
 
 ABI_OFFSET(struct pci_dev, bus, 16);
 ABI_OFFSET(struct pci_dev, devfn, 56);
@@ -111,12 +166,80 @@ ABI_OFFSET(struct virtio_driver, probe, 200);
 ABI_OFFSET(struct virtio_driver, shutdown, 264);
 ABI_SIZE(struct virtio_driver, 272);
 
+ABI_OFFSET(struct input_dev, propbit, 32);
+ABI_OFFSET(struct input_dev, evbit, 40);
+ABI_OFFSET(struct input_dev, keybit, 48);
+ABI_OFFSET(struct input_dev, relbit, 144);
+ABI_OFFSET(struct input_dev, absbit, 152);
+ABI_OFFSET(struct input_dev, mscbit, 160);
+ABI_OFFSET(struct input_dev, ledbit, 168);
+ABI_OFFSET(struct input_dev, sndbit, 176);
+ABI_OFFSET(struct input_dev, ffbit, 184);
+ABI_OFFSET(struct input_dev, swbit, 200);
+ABI_OFFSET(struct input_dev, timer, 272);
+ABI_OFFSET(struct input_dev, mt, 320);
+ABI_OFFSET(struct input_dev, absinfo, 328);
+ABI_OFFSET(struct input_dev, key, 336);
+ABI_OFFSET(struct input_dev, led, 432);
+ABI_OFFSET(struct input_dev, snd, 440);
+ABI_OFFSET(struct input_dev, sw, 448);
+ABI_OFFSET(struct input_dev, event, 480);
+ABI_OFFSET(struct input_dev, dev, 536);
+ABI_OFFSET(struct input_dev, h_list, 1296);
+ABI_OFFSET(struct input_dev, node, 1312);
+ABI_OFFSET(struct input_dev, num_vals, 1328);
+ABI_OFFSET(struct input_dev, max_vals, 1332);
+ABI_OFFSET(struct input_dev, vals, 1336);
+ABI_OFFSET(struct input_dev, devres_managed, 1344);
+ABI_SIZE(struct input_dev, 1384);
+ABI_SIZE(struct input_value, 8);
+ABI_SIZE(struct input_absinfo, 24);
+ABI_OFFSET(struct input_mt, num_slots, 4);
+ABI_OFFSET(struct input_mt, red, 24);
+ABI_OFFSET(struct input_mt, slots, 32);
+
+ABI_OFFSET(struct file, f_mode, 4);
+ABI_OFFSET(struct file, f_op, 8);
 ABI_OFFSET(struct file, f_mapping, 16);
+ABI_OFFSET(struct file, private_data, 24);
 ABI_OFFSET(struct file, f_inode, 32);
+ABI_OFFSET(struct file, f_flags, 40);
 ABI_SIZE(struct file, 176);
 ABI_OFFSET(struct inode, i_mapping, 48);
+ABI_OFFSET(struct inode, i_private, 536);
 ABI_SIZE(struct inode, 544);
+ABI_OFFSET(struct address_space, host, 0);
 ABI_SIZE(struct address_space, 152);
+
+ABI_OFFSET(struct fs_context, ops, 0);
+ABI_OFFSET(struct fs_context, fs_private, 40);
+ABI_OFFSET(struct fs_context, sb_flags, 128);
+ABI_OFFSET(struct fs_context, s_iflags, 136);
+ABI_SIZE(struct fs_context, 144);
+ABI_SIZE(struct fs_context_operations, 48);
+ABI_OFFSET(struct pseudo_fs_context, ops, 0);
+ABI_OFFSET(struct pseudo_fs_context, eops, 8);
+ABI_OFFSET(struct pseudo_fs_context, xattr, 16);
+ABI_OFFSET(struct pseudo_fs_context, dops, 24);
+ABI_OFFSET(struct pseudo_fs_context, magic, 32);
+ABI_OFFSET(struct pseudo_fs_context, s_d_flags, 40);
+ABI_SIZE(struct pseudo_fs_context, 48);
+
+ABI_OFFSET(struct dma_fence, ops, 8);
+ABI_OFFSET(struct dma_fence, cb_list, 16);
+ABI_OFFSET(struct dma_fence, context, 32);
+ABI_OFFSET(struct dma_fence, seqno, 40);
+ABI_OFFSET(struct dma_fence, flags, 48);
+ABI_OFFSET(struct dma_fence, refcount, 56);
+ABI_OFFSET(struct dma_fence, error, 60);
+ABI_SIZE(struct dma_fence, 64);
+ABI_SIZE(struct dma_fence_ops, 56);
+ABI_OFFSET(struct dma_fence_cb, func, 16);
+ABI_SIZE(struct dma_fence_cb, 24);
+ABI_OFFSET(struct dma_fence_chain, prev, 64);
+ABI_OFFSET(struct dma_fence_chain, prev_seqno, 72);
+ABI_OFFSET(struct dma_fence_chain, fence, 80);
+ABI_SIZE(struct dma_fence_chain, 120);
 
 ABI_OFFSET(struct fb_info, node, 4);
 ABI_OFFSET(struct fb_info, var, 64);
@@ -126,10 +249,52 @@ ABI_OFFSET(struct fb_info, screen_base, 688);
 ABI_OFFSET(struct fb_info, par, 728);
 ABI_SIZE(struct fb_info, 744);
 
+ABI_OFFSET(struct hdmi_any_infoframe, type, 0);
+ABI_OFFSET(struct hdmi_any_infoframe, version, 4);
+ABI_OFFSET(struct hdmi_any_infoframe, length, 5);
+ABI_SIZE(struct hdmi_any_infoframe, 8);
+ABI_OFFSET(struct hdmi_avi_infoframe, colorspace, 8);
+ABI_OFFSET(struct hdmi_avi_infoframe, video_code, 40);
+ABI_OFFSET(struct hdmi_avi_infoframe, ycc_quantization_range, 44);
+ABI_OFFSET(struct hdmi_avi_infoframe, top_bar, 52);
+ABI_SIZE(struct hdmi_avi_infoframe, 60);
+ABI_OFFSET(struct hdmi_spd_infoframe, vendor, 6);
+ABI_OFFSET(struct hdmi_spd_infoframe, product, 14);
+ABI_OFFSET(struct hdmi_spd_infoframe, sdi, 32);
+ABI_SIZE(struct hdmi_spd_infoframe, 36);
+ABI_OFFSET(struct hdmi_audio_infoframe, coding_type, 8);
+ABI_OFFSET(struct hdmi_audio_infoframe, channel_allocation, 24);
+ABI_SIZE(struct hdmi_audio_infoframe, 28);
+ABI_OFFSET(struct hdmi_vendor_infoframe, oui, 8);
+ABI_OFFSET(struct hdmi_vendor_infoframe, vic, 12);
+ABI_OFFSET(struct hdmi_vendor_infoframe, s3d_struct, 16);
+ABI_SIZE(struct hdmi_vendor_infoframe, 24);
+ABI_OFFSET(struct hdmi_drm_infoframe, eotf, 8);
+ABI_OFFSET(struct hdmi_drm_infoframe, display_primaries, 16);
+ABI_OFFSET(struct hdmi_drm_infoframe, white_point, 28);
+ABI_SIZE(struct hdmi_drm_infoframe, 40);
+ABI_SIZE(union hdmi_infoframe, 60);
+
 ABI_OFFSET(struct delayed_work, timer, 32);
+ABI_OFFSET(struct kthread_worker, flags, 0);
+ABI_OFFSET(struct kthread_worker, work_list, 8);
+ABI_OFFSET(struct kthread_worker, delayed_work_list, 24);
+ABI_OFFSET(struct kthread_worker, task, 40);
+ABI_OFFSET(struct kthread_worker, current_work, 48);
+ABI_SIZE(struct kthread_worker, 56);
+ABI_OFFSET(struct kthread_work, node, 0);
 ABI_OFFSET(struct kthread_work, func, 16);
+ABI_OFFSET(struct kthread_work, worker, 24);
+ABI_OFFSET(struct kthread_work, canceling, 32);
+ABI_SIZE(struct kthread_work, 40);
 ABI_OFFSET(struct vfsmount, mnt_sb, 8);
 ABI_OFFSET(struct hrtimer, node.expires, 40);
+ABI_OFFSET(struct hrtimer, base, 48);
+ABI_OFFSET(struct hrtimer, is_queued, 56);
+ABI_OFFSET(struct hrtimer, is_rel, 57);
+ABI_OFFSET(struct hrtimer, is_soft, 58);
+ABI_OFFSET(struct hrtimer, is_hard, 59);
+ABI_OFFSET(struct hrtimer, is_lazy, 60);
 ABI_OFFSET(struct hrtimer, _softexpires, 64);
 ABI_OFFSET(struct hrtimer, function, 72);
 ABI_SIZE(struct hrtimer, 80);
@@ -138,7 +303,60 @@ ABI_SIZE(struct hrtimer, 80);
  * BLK_RQ_ALLOC_TIME, PM, BLK_CGROUP, MUTEX_SPIN_ON_OWNER and BLK_DEBUG_FS
  * all change records dereferenced by the vendor storage drivers. */
 ABI_SIZE(spinlock_t, 4);
+ABI_OFFSET(struct mutex, owner, 0);
+ABI_OFFSET(struct mutex, wait_lock, 8);
+ABI_OFFSET(struct mutex, first_waiter, 16);
 ABI_SIZE(struct mutex, 24);
+ABI_OFFSET(struct ww_class, stamp, 0);
+ABI_OFFSET(struct ww_class, acquire_name, 8);
+ABI_OFFSET(struct ww_class, mutex_name, 16);
+ABI_OFFSET(struct ww_class, is_wait_die, 24);
+ABI_SIZE(struct ww_class, 32);
+ABI_OFFSET(struct ww_acquire_ctx, task, 0);
+ABI_OFFSET(struct ww_acquire_ctx, stamp, 8);
+ABI_OFFSET(struct ww_acquire_ctx, acquired, 16);
+ABI_OFFSET(struct ww_acquire_ctx, wounded, 20);
+ABI_OFFSET(struct ww_acquire_ctx, is_wait_die, 22);
+ABI_SIZE(struct ww_acquire_ctx, 24);
+ABI_OFFSET(struct ww_mutex, base, 0);
+ABI_OFFSET(struct ww_mutex, ctx, 24);
+ABI_SIZE(struct ww_mutex, 32);
+ABI_OFFSET(struct dma_resv, lock, 0);
+ABI_OFFSET(struct dma_resv, fences, 32);
+ABI_SIZE(struct dma_resv, 40);
+ABI_OFFSET(struct dma_resv_iter, obj, 0);
+ABI_OFFSET(struct dma_resv_iter, usage, 8);
+ABI_OFFSET(struct dma_resv_iter, fence, 16);
+ABI_OFFSET(struct dma_resv_iter, fence_usage, 24);
+ABI_OFFSET(struct dma_resv_iter, index, 28);
+ABI_OFFSET(struct dma_resv_iter, fences, 32);
+ABI_OFFSET(struct dma_resv_iter, num_fences, 40);
+ABI_OFFSET(struct dma_resv_iter, is_restarted, 44);
+ABI_SIZE(struct dma_resv_iter, 48);
+ABI_OFFSET(struct list_lru_one, list, 0);
+ABI_OFFSET(struct list_lru_one, nr_items, 16);
+ABI_OFFSET(struct list_lru_one, lock, 24);
+ABI_SIZE(struct list_lru_one, 32);
+ABI_OFFSET(struct list_lru_node, lru, 0);
+ABI_OFFSET(struct list_lru_node, nr_items, 32);
+ABI_SIZE(struct list_lru_node, 64);
+ABI_OFFSET(struct list_lru, node, 0);
+ABI_SIZE(struct list_lru, 8);
+_Static_assert(MAX_NUMNODES == 64, "MAX_NUMNODES changed");
+_Static_assert(NR_NODE_STATES == 6, "NR_NODE_STATES changed");
+_Static_assert(N_POSSIBLE == 0, "N_POSSIBLE changed");
+_Static_assert(N_ONLINE == 1, "N_ONLINE changed");
+_Static_assert(N_NORMAL_MEMORY == 2, "N_NORMAL_MEMORY changed");
+_Static_assert(N_MEMORY == 3, "N_MEMORY changed");
+_Static_assert(N_CPU == 4, "N_CPU changed");
+ABI_SIZE(nodemask_t, 8);
+ABI_OFFSET(struct zone, node, 88);
+ABI_OFFSET(struct zone, zone_pgdat, 96);
+ABI_OFFSET(struct zone, managed_pages, 144);
+ABI_SIZE(struct zone, 1344);
+ABI_OFFSET(struct pglist_data, node_zones, 0);
+_Static_assert(sizeof(struct pglist_data) <= 131072,
+	       "struct pglist_data exceeds Lupos node-data buffer");
 ABI_SIZE(struct queue_limits, 192);
 ABI_OFFSET(struct queue_limits, logical_block_size, 56);
 
@@ -157,6 +375,16 @@ ABI_OFFSET(struct blk_mq_tag_set, srcu, 152);
 ABI_OFFSET(struct blk_mq_tag_set, tags_srcu, 160);
 ABI_OFFSET(struct blk_mq_tag_set, update_nr_hwq_lock, 192);
 ABI_SIZE(struct blk_mq_tag_set, 224);
+
+ABI_SIZE(struct srcu_ctr, 16);
+ABI_OFFSET(struct srcu_data, srcu_reader_flavor, 32);
+ABI_SIZE(struct srcu_data, 384);
+ABI_OFFSET(struct srcu_struct, srcu_ctrp, 0);
+ABI_OFFSET(struct srcu_struct, sda, 8);
+ABI_OFFSET(struct srcu_struct, srcu_reader_flavor, 16);
+ABI_OFFSET(struct srcu_struct, srcu_sup, 24);
+ABI_SIZE(struct srcu_struct, 32);
+ABI_SIZE(struct srcu_usage, 384);
 
 _Static_assert(_Alignof(struct blk_mq_hw_ctx) == 64,
 	       "struct blk_mq_hw_ctx alignment changed");
@@ -373,6 +601,17 @@ ABI_OFFSET(struct page, page_type, 48);
 ABI_OFFSET(struct page, _mapcount, 48);
 ABI_OFFSET(struct page, _refcount, 52);
 ABI_SIZE(struct page, 64);
+
+ABI_OFFSET(struct folio_batch, nr, 0);
+ABI_OFFSET(struct folio_batch, i, 1);
+ABI_OFFSET(struct folio_batch, percpu_pvec_drained, 2);
+ABI_OFFSET(struct folio_batch, folios, 8);
+ABI_SIZE(struct folio_batch, 256);
+
+ABI_OFFSET(struct seq_buf, buffer, 0);
+ABI_OFFSET(struct seq_buf, size, 8);
+ABI_OFFSET(struct seq_buf, len, 16);
+ABI_SIZE(struct seq_buf, 24);
 
 ABI_OFFSET(struct block_device, bd_stats, 32);
 ABI_OFFSET(struct block_device, bd_holder_lock, 96);

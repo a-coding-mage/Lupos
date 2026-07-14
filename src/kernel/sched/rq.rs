@@ -18,16 +18,61 @@ extern crate alloc;
 
 use crate::kernel::locking::raw_spinlock::RawSpinLocked;
 use crate::kernel::task::TaskStruct;
-use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 use super::entity::SchedEntity;
 use super::sched_clock_ns;
 
 // ── CFS sub-runqueue ─────────────────────────────────────────────────────────
 
+/// Sorted task pointer map keyed by `(runtime key, task pointer)`.
+///
+/// Linux uses rb-trees for CFS and deadline ordering.  Lupos keeps the same
+/// total ordering with a compact sorted vector so the hard-tick scheduler path
+/// does not depend on `alloc::collections::BTreeMap` iterator state.
+pub struct TaskOrderMap {
+    entries: Vec<((u64, usize), *mut TaskStruct)>,
+}
+
+unsafe impl Send for TaskOrderMap {}
+
+impl TaskOrderMap {
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn position(&self, key: &(u64, usize)) -> Result<usize, usize> {
+        self.entries
+            .binary_search_by(|(entry_key, _)| entry_key.cmp(key))
+    }
+
+    pub fn insert(&mut self, key: (u64, usize), value: *mut TaskStruct) {
+        match self.position(&key) {
+            Ok(idx) => self.entries[idx].1 = value,
+            Err(idx) => self.entries.insert(idx, (key, value)),
+        }
+    }
+
+    pub fn remove(&mut self, key: &(u64, usize)) -> Option<*mut TaskStruct> {
+        self.position(key)
+            .ok()
+            .map(|idx| self.entries.remove(idx).1)
+    }
+
+    pub fn contains_key(&self, key: &(u64, usize)) -> bool {
+        self.position(key).is_ok()
+    }
+
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&(u64, usize), &*mut TaskStruct)> + '_ {
+        self.entries.iter().map(|(key, value)| (key, value))
+    }
+}
+
 /// CFS runqueue (`struct cfs_rq` in Linux).
 ///
-/// `tasks_timeline` is the rb-tree (here a `BTreeMap`) keyed by `vruntime`.
+/// `tasks_timeline` is the rb-tree equivalent keyed by `vruntime`.
 /// `min_vruntime` is the current floor — new tasks join the tree at
 /// `min_vruntime` so they aren't given a free CPU shot.
 pub struct CfsRq {
@@ -40,7 +85,7 @@ pub struct CfsRq {
     /// Ordered map keyed by (vruntime, task pointer cast to usize) → task.
     /// The compound key disambiguates entities that share a vruntime so the
     /// map remains a strict total order without dropping entries.
-    pub tasks_timeline: BTreeMap<(u64, usize), *mut TaskStruct>,
+    pub tasks_timeline: TaskOrderMap,
     /// Currently running entity on this CPU (NULL if idle).
     pub current: *mut TaskStruct,
     /// Last update timestamp (ns since boot), updated by `update_curr`.
@@ -55,7 +100,7 @@ impl CfsRq {
             nr_running: 0,
             min_vruntime: 0,
             load_weight: 0,
-            tasks_timeline: BTreeMap::new(),
+            tasks_timeline: TaskOrderMap::new(),
             current: core::ptr::null_mut(),
             last_update_ns: 0,
         }
@@ -196,7 +241,7 @@ impl RtRq {
 /// Deadline runqueue — EDF order keyed on absolute deadline.
 pub struct DlRq {
     pub nr_running: u32,
-    pub root: BTreeMap<(u64, usize), *mut TaskStruct>,
+    pub root: TaskOrderMap,
     /// Total used bandwidth (sum of `dl_runtime / dl_period`) on this CPU,
     /// scaled by `BW_SHIFT = 20` (Linux `BW_SHIFT`).
     pub running_bw: u64,
@@ -217,7 +262,7 @@ impl DlRq {
     pub const fn new() -> Self {
         Self {
             nr_running: 0,
-            root: BTreeMap::new(),
+            root: TaskOrderMap::new(),
             running_bw: 0,
             bw_cap: DEFAULT_DL_BW_CAP,
             current: core::ptr::null_mut(),

@@ -14,13 +14,19 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::arch::x86::mm::ioremap::{
-    IoremapMapping as X86IoremapMapping, ioremap as x86_ioremap, iounmap as x86_iounmap,
+    IoremapMapping as X86IoremapMapping, ioremap as x86_ioremap,
+    ioremap_cachemode as x86_ioremap_cachemode, ioremap_wc as x86_ioremap_wc,
+    iounmap as x86_iounmap,
 };
+use crate::arch::x86::mm::pat::cachemode::PageCacheMode;
 use crate::kernel::module::{export_symbol, find_symbol};
 
 pub const PAGE_SHIFT: u64 = 12;
 pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
 pub const PAGE_MASK: u64 = !(PAGE_SIZE - 1);
+const MEMREMAP_WB: usize = 1 << 0;
+const MEMREMAP_WT: usize = 1 << 1;
+const MEMREMAP_WC: usize = 1 << 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoremapMapping {
@@ -47,16 +53,74 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 
 pub fn register_module_exports() {
     export_symbol_once("ioremap", linux_ioremap as usize, false);
+    export_symbol_once("ioremap_cache", linux_ioremap_cache as usize, false);
+    export_symbol_once("ioremap_wc", linux_ioremap_wc as usize, false);
+    export_symbol_once("devm_ioremap", linux_devm_ioremap as usize, false);
+    export_symbol_once("devm_ioremap_wc", linux_devm_ioremap_wc as usize, false);
     export_symbol_once("iounmap", linux_iounmap as usize, false);
+    export_symbol_once("memremap", linux_memremap as usize, false);
+    export_symbol_once("memunmap", linux_memunmap as usize, false);
+}
+
+fn register_mapping(mapping: X86IoremapMapping) -> *mut c_void {
+    let addr = mapping.virt as usize;
+    IOREMAPS.lock().push(RegisteredIoremap { addr, mapping });
+    addr as *mut c_void
 }
 
 unsafe extern "C" fn linux_ioremap(phys_addr: u64, size: usize) -> *mut c_void {
     let Ok(mapping) = (unsafe { x86_ioremap(phys_addr, size as u64) }) else {
         return core::ptr::null_mut();
     };
-    let addr = mapping.virt as usize;
-    IOREMAPS.lock().push(RegisteredIoremap { addr, mapping });
-    addr as *mut c_void
+    register_mapping(mapping)
+}
+
+unsafe extern "C" fn linux_ioremap_cache(phys_addr: u64, size: usize) -> *mut c_void {
+    let Ok(mapping) =
+        (unsafe { x86_ioremap_cachemode(phys_addr, size as u64, PageCacheMode::WriteBack) })
+    else {
+        return core::ptr::null_mut();
+    };
+    register_mapping(mapping)
+}
+
+unsafe extern "C" fn linux_ioremap_wc(phys_addr: u64, size: usize) -> *mut c_void {
+    let Ok(mapping) = (unsafe { x86_ioremap_wc(phys_addr, size as u64) }) else {
+        return core::ptr::null_mut();
+    };
+    register_mapping(mapping)
+}
+
+unsafe extern "C" fn linux_devm_ioremap(
+    _dev: *mut c_void,
+    phys_addr: u64,
+    size: usize,
+) -> *mut c_void {
+    unsafe { linux_ioremap(phys_addr, size) }
+}
+
+unsafe extern "C" fn linux_devm_ioremap_wc(
+    _dev: *mut c_void,
+    phys_addr: u64,
+    size: usize,
+) -> *mut c_void {
+    unsafe { linux_ioremap_wc(phys_addr, size) }
+}
+
+unsafe extern "C" fn linux_memremap(phys_addr: u64, size: usize, flags: usize) -> *mut c_void {
+    if flags == 0 {
+        return core::ptr::null_mut();
+    }
+    if flags & MEMREMAP_WB != 0 {
+        return unsafe { linux_ioremap_cache(phys_addr, size) };
+    }
+    if flags & MEMREMAP_WT != 0 {
+        return unsafe { linux_ioremap_cache(phys_addr, size) };
+    }
+    if flags & MEMREMAP_WC != 0 {
+        return unsafe { linux_ioremap_wc(phys_addr, size) };
+    }
+    core::ptr::null_mut()
 }
 
 unsafe extern "C" fn linux_iounmap(addr: *mut c_void) {
@@ -72,6 +136,10 @@ unsafe extern "C" fn linux_iounmap(addr: *mut c_void) {
         drop(maps);
         unsafe { x86_iounmap(mapping) };
     }
+}
+
+unsafe extern "C" fn linux_memunmap(addr: *mut c_void) {
+    unsafe { linux_iounmap(addr) };
 }
 
 pub const fn page_align(size: u64) -> u64 {
@@ -136,5 +204,26 @@ mod tests {
         assert!(generic_ioremap_prot(0x1000, 0, true, true, true).is_none());
         assert!(generic_ioremap_prot(0x1000, 0x20, false, true, true).is_none());
         assert!(generic_iounmap_should_vunmap(true));
+    }
+
+    #[test]
+    fn registers_vendor_ioremap_symbols() {
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("ioremap_cache"),
+            Some(linux_ioremap_cache as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("devm_ioremap"),
+            Some(linux_devm_ioremap as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("memremap"),
+            Some(linux_memremap as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("memunmap"),
+            Some(linux_memunmap as usize)
+        );
     }
 }

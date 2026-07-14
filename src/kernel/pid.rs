@@ -31,6 +31,8 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
+use crate::kernel::module::{export_symbol, find_symbol};
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Default maximum PID value on 64-bit Linux (`/proc/sys/kernel/pid_max`).
@@ -169,6 +171,21 @@ impl PidNamespace {
 pub static INIT_PID_NS: PidNamespace = PidNamespace::new();
 
 static PIDFS_INO_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("__task_pid_nr_ns", linux___task_pid_nr_ns as usize, false);
+    export_symbol_once("pid_task", linux_pid_task as usize, false);
+    export_symbol_once("get_task_pid", linux_get_task_pid as usize, true);
+    export_symbol_once("pid_nr_ns", linux_pid_nr_ns as usize, true);
+    export_symbol_once("pid_vnr", linux_pid_vnr as usize, true);
+    export_symbol_once("put_pid", linux_put_pid as usize, true);
+}
 
 // ── alloc_pid ────────────────────────────────────────────────────────────────
 
@@ -366,6 +383,150 @@ pub unsafe fn put_pid(pid: *mut KPid) {
         // SAFETY: caller guarantees `pid` was obtained from Box::into_raw.
         drop(unsafe { Box::from_raw(pid) });
     }
+}
+
+/// `pid_nr_ns` - `vendor/linux/kernel/pid.c`.
+unsafe extern "C" fn linux_pid_nr_ns(pid: *mut KPid, ns: *mut PidNamespace) -> i32 {
+    if pid.is_null() || ns.is_null() {
+        return 0;
+    }
+    let pid_ref = unsafe { &*pid };
+    if pid_ref.numbers[0].ns == ns {
+        pid_ref.numbers[0].nr
+    } else {
+        0
+    }
+}
+
+/// `pid_vnr` - `vendor/linux/kernel/pid.c`.
+unsafe extern "C" fn linux_pid_vnr(pid: *mut KPid) -> i32 {
+    if pid.is_null() {
+        0
+    } else {
+        unsafe { (*pid).numbers[0].nr }
+    }
+}
+
+/// `__task_pid_nr_ns` - `vendor/linux/kernel/pid.c`.
+unsafe extern "C" fn linux___task_pid_nr_ns(
+    task: *const crate::kernel::task::TaskStruct,
+    type_: i32,
+    ns: *mut PidNamespace,
+) -> i32 {
+    if task.is_null() {
+        return 0;
+    }
+    if !ns.is_null() && !core::ptr::eq(ns, &INIT_PID_NS as *const PidNamespace as *mut PidNamespace)
+    {
+        return 0;
+    }
+    task_pid_type_nr(task as *mut crate::kernel::task::TaskStruct, type_).unwrap_or(0)
+}
+
+fn task_pid_type_nr(task: *mut crate::kernel::task::TaskStruct, type_: i32) -> Option<i32> {
+    if task.is_null() {
+        return None;
+    }
+    let task = unsafe { &*task };
+    Some(match type_ {
+        0 => task.pid,
+        1 => task.tgid,
+        2 => crate::kernel::session::process_group(task.pid).unwrap_or(task.pid),
+        3 => crate::kernel::session::session_id(task.pid).unwrap_or(task.pid),
+        _ => return None,
+    })
+}
+
+fn task_matches_pid_type(task: *mut crate::kernel::task::TaskStruct, nr: i32, type_: i32) -> bool {
+    task_pid_type_nr(task, type_) == Some(nr)
+}
+
+fn find_task_by_pid_type(nr: i32, type_: i32) -> *mut crate::kernel::task::TaskStruct {
+    if !(0..PidType::Max as i32).contains(&type_) {
+        return core::ptr::null_mut();
+    }
+
+    let current = unsafe { crate::kernel::sched::get_current() };
+    if task_matches_pid_type(current, nr, type_) {
+        return current;
+    }
+
+    if type_ == PidType::Pid as i32 {
+        let heap = crate::kernel::fork::find_heap_task_by_pid(nr);
+        if !heap.is_null() {
+            return heap;
+        }
+        return crate::kernel::sched::find_pool_task_by_pid(nr);
+    }
+
+    let mut found: *mut crate::kernel::task::TaskStruct = core::ptr::null_mut();
+    crate::kernel::fork::for_each_heap_task(|task| {
+        if found.is_null() && task_matches_pid_type(task, nr, type_) {
+            found = task;
+        }
+    });
+    if !found.is_null() {
+        return found;
+    }
+
+    crate::kernel::sched::for_each_pool_task(|task| {
+        if found.is_null() && task_matches_pid_type(task, nr, type_) {
+            found = task;
+        }
+    });
+    found
+}
+
+/// `pid_task` - `vendor/linux/kernel/pid.c`.
+unsafe extern "C" fn linux_pid_task(
+    pid: *mut KPid,
+    type_: i32,
+) -> *mut crate::kernel::task::TaskStruct {
+    if pid.is_null() {
+        return core::ptr::null_mut();
+    }
+    let nr = unsafe { (*pid).numbers[0].nr };
+    find_task_by_pid_type(nr, type_)
+}
+
+unsafe fn task_pid_ptr(task: *mut crate::kernel::task::TaskStruct, type_: i32) -> *mut KPid {
+    if task.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    match type_ {
+        0 => unsafe { core::ptr::addr_of!((*task).m26.thread_pid).read() },
+        1 => {
+            let leader = unsafe { core::ptr::addr_of!((*task).m26.group_leader).read() };
+            if !leader.is_null() {
+                unsafe { core::ptr::addr_of!((*leader).m26.thread_pid).read() }
+            } else if unsafe { core::ptr::addr_of!((*task).pid).read() }
+                == unsafe { core::ptr::addr_of!((*task).tgid).read() }
+            {
+                unsafe { core::ptr::addr_of!((*task).m26.thread_pid).read() }
+            } else {
+                core::ptr::null_mut()
+            }
+        }
+        _ => core::ptr::null_mut(),
+    }
+}
+
+/// `get_task_pid` - `vendor/linux/kernel/pid.c:506`.
+unsafe extern "C" fn linux_get_task_pid(
+    task: *mut crate::kernel::task::TaskStruct,
+    type_: i32,
+) -> *mut KPid {
+    let pid = unsafe { task_pid_ptr(task, type_) };
+    if !pid.is_null() {
+        get_pid(unsafe { &*pid });
+    }
+    pid
+}
+
+/// `put_pid` - `vendor/linux/kernel/pid.c`.
+unsafe extern "C" fn linux_put_pid(pid: *mut KPid) {
+    unsafe { put_pid(pid) };
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
@@ -601,5 +762,48 @@ mod tests {
     fn put_pid_null_is_a_noop() {
         // Must not panic or crash.
         unsafe { put_pid(core::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn get_task_pid_exports_and_takes_reference() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/kernel/pid.c"
+        ));
+        assert!(source.contains("EXPORT_SYMBOL_GPL(get_task_pid);"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("get_task_pid"),
+            Some(linux_get_task_pid as usize)
+        );
+
+        let raw = Box::into_raw(Box::new(KPid {
+            count: AtomicU32::new(1),
+            pidfs_ino: 1,
+            level: 0,
+            numbers: [Upid {
+                nr: 42,
+                ns: core::ptr::null_mut(),
+            }],
+        }));
+        let layout = core::alloc::Layout::new::<crate::kernel::task::TaskStruct>();
+        let task =
+            unsafe { alloc::alloc::alloc_zeroed(layout) }.cast::<crate::kernel::task::TaskStruct>();
+        assert!(!task.is_null());
+        unsafe {
+            core::ptr::addr_of_mut!((*task).pid).write(42);
+            core::ptr::addr_of_mut!((*task).tgid).write(42);
+            core::ptr::addr_of_mut!((*task).m26.thread_pid).write(raw);
+        }
+
+        let got = unsafe { linux_get_task_pid(task, PidType::Pid as i32) };
+        assert_eq!(got, raw);
+        assert_eq!(unsafe { (*raw).count.load(Ordering::Relaxed) }, 2);
+
+        unsafe { linux_put_pid(got) };
+        assert_eq!(unsafe { (*raw).count.load(Ordering::Relaxed) }, 1);
+        unsafe { linux_put_pid(raw) };
+        unsafe { alloc::alloc::dealloc(task.cast::<u8>(), layout) };
     }
 }

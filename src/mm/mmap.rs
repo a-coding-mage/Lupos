@@ -33,7 +33,9 @@ use crate::arch::x86::mm::paging::{
     pgd_offset_pgd, pgd_t, pmd_huge, pmd_none, pmd_offset, pte_offset_kernel, pte_pfn, pte_present,
     pte_special, pte_t, ptep_get, ptep_get_and_clear, pud_huge, pud_none, pud_offset,
 };
+use crate::include::uapi::errno::EINVAL;
 use crate::include::uapi::fcntl::{O_ACCMODE, O_RDWR, O_WRONLY};
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::mm::address_space::{AS_SHARED_ANON, AddressSpace};
 use crate::mm::buddy::{pfn_valid, with_global_buddy};
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
@@ -46,6 +48,16 @@ use crate::mm::vma::{
     find_vma, find_vma_prev, insert_vma, remove_vma, vm_area_dup, vm_area_free, vma_file_put_raw,
     vma_merge,
 };
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("vm_mmap", linux_vm_mmap as usize, false);
+}
 
 // ---------------------------------------------------------------------------
 // Linux ABI constants — include/uapi/asm-generic/mman-common.h + x86 overrides
@@ -517,6 +529,54 @@ pub unsafe fn vm_mmap(
         return Err(-22);
     }
     unsafe { do_mmap(mm, addr, len, prot, flags, offset >> PAGE_SHIFT, file) }
+}
+
+/// `vm_mmap()` — `vendor/linux/mm/util.c:608`.
+///
+/// Linux maps into `current->mm` and accepts a byte offset, validating overflow
+/// and page alignment before converting to `pgoff`.
+pub unsafe extern "C" fn linux_vm_mmap(
+    file: *mut core::ffi::c_void,
+    addr: u64,
+    len: u64,
+    prot: u64,
+    flag: u64,
+    offset: u64,
+) -> u64 {
+    let Some(page_aligned_len) = len
+        .checked_add(PAGE_SIZE - 1)
+        .map(|value| value & PAGE_MASK)
+    else {
+        return (-(EINVAL as i64)) as u64;
+    };
+    if offset.checked_add(page_aligned_len).is_none() || offset & (PAGE_SIZE - 1) != 0 {
+        return (-(EINVAL as i64)) as u64;
+    }
+
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return (-(EINVAL as i64)) as u64;
+    }
+
+    let mm = unsafe { (*task).mm };
+    if mm.is_null() {
+        return (-(EINVAL as i64)) as u64;
+    }
+
+    match unsafe {
+        vm_mmap(
+            &mut *mm,
+            file as usize,
+            addr,
+            len,
+            prot as u32,
+            flag as u32,
+            offset,
+        )
+    } {
+        Ok(mapped) => mapped,
+        Err(errno) => errno as u64,
+    }
 }
 
 /// Write present `MAP_SHARED` file-backed pages in `[start, start + len)` back

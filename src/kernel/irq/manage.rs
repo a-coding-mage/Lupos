@@ -43,6 +43,20 @@ pub fn register_module_exports() {
     export_symbol_once("free_irq", linux_free_irq as usize, false);
     export_symbol_once("synchronize_irq", linux_synchronize_irq as usize, false);
     export_symbol_once(
+        "synchronize_hardirq",
+        linux_synchronize_hardirq as usize,
+        false,
+    );
+    export_symbol_once("enable_irq", linux_enable_irq as usize, false);
+    export_symbol_once("disable_irq", linux_disable_irq as usize, false);
+    export_symbol_once(
+        "disable_irq_nosync",
+        linux_disable_irq_nosync as usize,
+        false,
+    );
+    export_symbol_once("irq_wake_thread", linux_irq_wake_thread as usize, true);
+    export_symbol_once("disable_hardirq", linux_disable_hardirq as usize, false);
+    export_symbol_once(
         "__irq_apply_affinity_hint",
         linux_irq_apply_affinity_hint as usize,
         true,
@@ -276,6 +290,45 @@ pub unsafe extern "C" fn linux_free_irq(irq: u32, dev_id: *mut c_void) -> *const
 #[unsafe(export_name = "synchronize_irq")]
 pub unsafe extern "C" fn linux_synchronize_irq(_irq: u32) {}
 
+/// `synchronize_hardirq` - `vendor/linux/kernel/irq/manage.c:105`.
+#[unsafe(export_name = "synchronize_hardirq")]
+pub unsafe extern "C" fn linux_synchronize_hardirq(_irq: u32) -> bool {
+    true
+}
+
+/// `enable_irq` - `vendor/linux/kernel/irq/manage.c`.
+#[unsafe(export_name = "enable_irq")]
+pub unsafe extern "C" fn linux_enable_irq(irq: u32) {
+    enable_irq(irq);
+}
+
+/// `disable_irq` - `vendor/linux/kernel/irq/manage.c`.
+#[unsafe(export_name = "disable_irq")]
+pub unsafe extern "C" fn linux_disable_irq(irq: u32) {
+    disable_irq(irq);
+}
+
+/// `disable_irq_nosync` - `vendor/linux/kernel/irq/manage.c:701`.
+#[unsafe(export_name = "disable_irq_nosync")]
+pub unsafe extern "C" fn linux_disable_irq_nosync(irq: u32) {
+    disable_irq(irq);
+}
+
+/// `irq_wake_thread` - `vendor/linux/kernel/irq/manage.c:1293`.
+///
+/// Lupos has no Linux IRQ kthread model yet. Export the core wake hook so
+/// vendor modules can link; IRQ dispatch continues to use the registered
+/// primary/thread handlers in the local descriptor model.
+#[unsafe(export_name = "irq_wake_thread")]
+pub unsafe extern "C" fn linux_irq_wake_thread(_irq: u32, _dev_id: *mut c_void) {}
+
+/// `disable_hardirq` - `vendor/linux/kernel/irq/manage.c`.
+#[unsafe(export_name = "disable_hardirq")]
+pub unsafe extern "C" fn linux_disable_hardirq(irq: u32) -> bool {
+    unsafe { linux_disable_irq(irq) };
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +408,42 @@ mod tests {
         assert_eq!(
             crate::kernel::module::find_symbol("synchronize_irq"),
             Some(linux_synchronize_irq as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("synchronize_hardirq"),
+            Some(linux_synchronize_hardirq as usize)
+        );
+        assert!(unsafe { linux_synchronize_hardirq(0x70) });
+        assert_eq!(
+            crate::kernel::module::find_symbol("enable_irq"),
+            Some(linux_enable_irq as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("disable_irq"),
+            Some(linux_disable_irq as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("disable_irq_nosync"),
+            Some(linux_disable_irq_nosync as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("irq_wake_thread"),
+            Some(linux_irq_wake_thread as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("disable_hardirq"),
+            Some(linux_disable_hardirq as usize)
+        );
+    }
+
+    #[test]
+    fn irq_wake_thread_export_tracks_linux_gpl_symbol() {
+        let source = include_str!("../../../vendor/linux/kernel/irq/manage.c");
+        assert!(source.contains("EXPORT_SYMBOL_GPL(irq_wake_thread);"));
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("irq_wake_thread"),
+            Some(linux_irq_wake_thread as usize)
         );
     }
 

@@ -133,6 +133,7 @@ pub mod ksm;
     feature = "test-userspace-kselftests",
 ))]
 pub mod kunit;
+pub mod list_lru;
 pub mod memcg;
 pub mod mempolicy;
 pub mod mempool;

@@ -43,6 +43,13 @@ pub struct LinuxIrqAffinity {
     priv_: *mut c_void,
 }
 
+/// `struct msix_entry` - `vendor/linux/include/linux/pci.h:1748`.
+#[repr(C)]
+pub struct LinuxMsixEntry {
+    vector: u32,
+    entry: u16,
+}
+
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
         export_symbol(name, addr, gpl_only);
@@ -50,6 +57,11 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 }
 
 pub fn register_module_exports() {
+    export_symbol_once(
+        "pci_alloc_irq_vectors",
+        linux_pci_alloc_irq_vectors as usize,
+        false,
+    );
     export_symbol_once(
         "pci_alloc_irq_vectors_affinity",
         linux_pci_alloc_irq_vectors_affinity as usize,
@@ -60,12 +72,33 @@ pub fn register_module_exports() {
         linux_pci_free_irq_vectors as usize,
         false,
     );
+    export_symbol_once("pci_enable_msi", linux_pci_enable_msi as usize, false);
+    export_symbol_once(
+        "pci_enable_msix_range",
+        linux_pci_enable_msix_range as usize,
+        false,
+    );
+    export_symbol_once("pci_disable_msi", linux_pci_disable_msi as usize, false);
+    export_symbol_once("pci_disable_msix", linux_pci_disable_msix as usize, false);
     export_symbol_once("pci_irq_vector", linux_pci_irq_vector as usize, false);
     export_symbol_once(
         "pci_irq_get_affinity",
         linux_pci_irq_get_affinity as usize,
         false,
     );
+}
+
+/// `pci_alloc_irq_vectors` - `vendor/linux/drivers/pci/msi/api.c:232`.
+#[unsafe(export_name = "pci_alloc_irq_vectors")]
+pub unsafe extern "C" fn linux_pci_alloc_irq_vectors(
+    dev: *mut c_void,
+    min_vecs: u32,
+    max_vecs: u32,
+    flags: u32,
+) -> i32 {
+    unsafe {
+        linux_pci_alloc_irq_vectors_affinity(dev, min_vecs, max_vecs, flags, core::ptr::null_mut())
+    }
 }
 
 pub fn pci_alloc_irq_vectors(min_vecs: u32, max_vecs: u32) -> Result<u32, i32> {
@@ -184,6 +217,52 @@ pub unsafe extern "C" fn linux_pci_alloc_irq_vectors_affinity(
     nvecs
 }
 
+/// `pci_enable_msi` - `vendor/linux/drivers/pci/msi/api.c:30`.
+#[unsafe(export_name = "pci_enable_msi")]
+pub unsafe extern "C" fn linux_pci_enable_msi(dev: *mut c_void) -> i32 {
+    let rc = unsafe { linux_pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI) };
+    if rc < 0 { rc } else { 0 }
+}
+
+/// `pci_enable_msix_range` - `vendor/linux/drivers/pci/msi/api.c:107`.
+#[unsafe(export_name = "pci_enable_msix_range")]
+pub unsafe extern "C" fn linux_pci_enable_msix_range(
+    dev: *mut c_void,
+    entries: *mut LinuxMsixEntry,
+    minvec: i32,
+    maxvec: i32,
+) -> i32 {
+    if maxvec < minvec {
+        return -ERANGE;
+    }
+    if minvec <= 0 || maxvec <= 0 {
+        return -EINVAL;
+    }
+
+    let rc = unsafe {
+        linux_pci_alloc_irq_vectors_affinity(
+            dev,
+            minvec as u32,
+            maxvec as u32,
+            PCI_IRQ_MSIX,
+            core::ptr::null_mut(),
+        )
+    };
+    if rc <= 0 || entries.is_null() {
+        return rc;
+    }
+
+    for index in 0..rc {
+        let vector = unsafe { linux_pci_irq_vector(dev, index as u32) };
+        if vector < 0 {
+            unsafe { linux_pci_free_irq_vectors(dev) };
+            return vector;
+        }
+        unsafe { (*entries.add(index as usize)).vector = vector as u32 };
+    }
+    rc
+}
+
 /// `pci_irq_vector` - `vendor/linux/drivers/pci/msi/api.c:311`.
 #[unsafe(export_name = "pci_irq_vector")]
 pub unsafe extern "C" fn linux_pci_irq_vector(dev: *mut c_void, nr: u32) -> i32 {
@@ -220,12 +299,129 @@ pub unsafe extern "C" fn linux_pci_free_irq_vectors(_dev: *mut c_void) {
     // mode is enabled.  Lupos never reports MSI allocation success above.
 }
 
+/// `pci_disable_msi` - `vendor/linux/drivers/pci/msi/api.c:51`.
+#[unsafe(export_name = "pci_disable_msi")]
+pub unsafe extern "C" fn linux_pci_disable_msi(_dev: *mut c_void) {
+    // Lupos never reports successful MSI allocation, so there is no MSI state
+    // to tear down and INTx remains the active fallback.
+}
+
+/// `pci_disable_msix` - `vendor/linux/drivers/pci/msi/api.c:193`.
+#[unsafe(export_name = "pci_disable_msix")]
+pub unsafe extern "C" fn linux_pci_disable_msix(_dev: *mut c_void) {
+    // See `linux_pci_disable_msi`.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linux_driver_abi::pci::device::{
+        LinuxPciDeviceAbiState, PCI_CONFIG_SPACE_SIZE, PCI_STD_NUM_BARS,
+        register_linux_pci_device_state, unregister_linux_pci_device_state,
+    };
 
     #[test]
     fn invalid_vector_range_returns_einval() {
         assert_eq!(pci_alloc_irq_vectors(2, 1), Err(EINVAL));
+    }
+
+    #[test]
+    fn pci_enable_msi_exports_legacy_single_vector_api() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/drivers/pci/msi/api.c"
+        ));
+        assert!(source.contains("int pci_enable_msi(struct pci_dev *dev)"));
+        assert!(source.contains("EXPORT_SYMBOL(pci_enable_msi);"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("pci_enable_msi"),
+            Some(linux_pci_enable_msi as usize)
+        );
+        assert_eq!(
+            unsafe { linux_pci_enable_msi(core::ptr::null_mut()) },
+            -EINVAL
+        );
+
+        let mut token = 0u8;
+        let dev = (&mut token as *mut u8).cast::<c_void>();
+        register_linux_pci_device_state(
+            dev,
+            LinuxPciDeviceAbiState {
+                config_space: [0; PCI_CONFIG_SPACE_SIZE],
+                bars: [None; PCI_STD_NUM_BARS],
+            },
+        );
+        assert_eq!(unsafe { linux_pci_enable_msi(dev) }, -ENOTSUPP);
+        unregister_linux_pci_device_state(dev);
+    }
+
+    #[test]
+    fn pci_enable_msix_range_exports_legacy_msix_api() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/drivers/pci/msi/api.c"
+        ));
+        assert!(source.contains("int pci_enable_msix_range(struct pci_dev *dev"));
+        assert!(source.contains("EXPORT_SYMBOL(pci_enable_msix_range);"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("pci_enable_msix_range"),
+            Some(linux_pci_enable_msix_range as usize)
+        );
+        assert_eq!(
+            unsafe {
+                linux_pci_enable_msix_range(core::ptr::null_mut(), core::ptr::null_mut(), 2, 1)
+            },
+            -ERANGE
+        );
+        assert_eq!(
+            unsafe {
+                linux_pci_enable_msix_range(core::ptr::null_mut(), core::ptr::null_mut(), 1, 1)
+            },
+            -EINVAL
+        );
+
+        let mut token = 0u8;
+        let dev = (&mut token as *mut u8).cast::<c_void>();
+        register_linux_pci_device_state(
+            dev,
+            LinuxPciDeviceAbiState {
+                config_space: [0; PCI_CONFIG_SPACE_SIZE],
+                bars: [None; PCI_STD_NUM_BARS],
+            },
+        );
+        assert_eq!(
+            unsafe { linux_pci_enable_msix_range(dev, core::ptr::null_mut(), 1, 1) },
+            -ENOTSUPP
+        );
+        unregister_linux_pci_device_state(dev);
+    }
+
+    #[test]
+    fn pci_msi_disable_exports_are_noops_without_msi_state() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/drivers/pci/msi/api.c"
+        ));
+        assert!(source.contains("EXPORT_SYMBOL(pci_disable_msi);"));
+        assert!(source.contains("EXPORT_SYMBOL(pci_disable_msix);"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("pci_disable_msi"),
+            Some(linux_pci_disable_msi as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("pci_disable_msix"),
+            Some(linux_pci_disable_msix as usize)
+        );
+
+        unsafe {
+            linux_pci_disable_msi(core::ptr::null_mut());
+            linux_pci_disable_msix(core::ptr::null_mut());
+        }
     }
 }

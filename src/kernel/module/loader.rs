@@ -16,16 +16,18 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ffi::c_char;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::arch::x86::kernel::module::{X86ModuleMetadata, module_finalize};
+use crate::arch::x86::kernel::module::{
+    X86ModuleFinalizeError, X86ModuleMetadata, module_finalize,
+};
 use crate::include::uapi::errno::{EBUSY, EEXIST, EINVAL, ENOENT, ENOEXEC};
 use crate::kernel::bug::{
     BUG_ENTRY_BUG_ADDR_OFFSET, BUG_ENTRY_FILE_OFFSET, BUG_ENTRY_FLAGS_OFFSET,
@@ -33,7 +35,10 @@ use crate::kernel::bug::{
     ModuleBugFinalizeError, ModuleBugRegistration, module_bug_finalize,
 };
 use crate::kernel::module::relocate::{Rela, RelocType, apply_rela};
-use crate::kernel::module::symbols::{export_module_symbol, find_symbol, unexport_module_symbols};
+use crate::kernel::module::symbols::{
+    export_module_symbol, export_symbol, find_symbol, unexport_module_symbols,
+};
+use crate::kernel::rcu::srcu::{ModuleSrcuError, ModuleSrcuRegistration, module_srcu_finalize};
 
 // ── ELF constants ─────────────────────────────────────────────────────────────
 
@@ -146,6 +151,75 @@ pub struct LoadedSection {
 unsafe impl Send for LoadedSection {}
 unsafe impl Sync for LoadedSection {}
 
+pub(crate) struct NameMap<T> {
+    entries: Vec<(String, T)>,
+}
+
+impl<T> NameMap<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    pub(crate) fn insert(&mut self, name: String, value: T) -> Option<T> {
+        if let Some((_, existing)) = self.entries.iter_mut().find(|(key, _)| key == &name) {
+            return Some(core::mem::replace(existing, value));
+        }
+        self.entries.push((name, value));
+        None
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&T> {
+        self.entries
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    }
+
+    pub(crate) fn get_mut(&mut self, name: &str) -> Option<&mut T> {
+        self.entries
+            .iter_mut()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    }
+
+    pub(crate) fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    pub(crate) fn remove(&mut self, name: &str) -> Option<T> {
+        self.entries
+            .iter()
+            .position(|(key, _)| key == name)
+            .map(|index| self.entries.remove(index).1)
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
+        self.entries.iter().map(|(key, _)| key)
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().map(|(_, value)| value)
+    }
+
+    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.entries.iter_mut().map(|(_, value)| value)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &T)> {
+        self.entries.iter().map(|(key, value)| (key, value))
+    }
+}
+
+impl<T> core::ops::Index<&str> for NameMap<T> {
+    type Output = T;
+
+    fn index(&self, index: &str) -> &Self::Output {
+        self.get(index).expect("module section must exist")
+    }
+}
+
 impl LoadedSection {
     fn new_zeroed(len: usize) -> Result<Self, LoadModuleError> {
         #[cfg(test)]
@@ -173,7 +247,7 @@ impl LoadedSection {
         }
     }
 
-    fn from_bytes(bytes: &[u8]) -> Result<Self, LoadModuleError> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, LoadModuleError> {
         let mut section = Self::new_zeroed(bytes.len())?;
         section.as_mut_slice().copy_from_slice(bytes);
         Ok(section)
@@ -194,7 +268,7 @@ impl LoadedSection {
         }
     }
 
-    fn as_ptr(&self) -> *const u8 {
+    pub(crate) fn as_ptr(&self) -> *const u8 {
         #[cfg(test)]
         {
             if self.borrowed.is_null() {
@@ -226,7 +300,7 @@ impl LoadedSection {
         }
     }
 
-    fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         #[cfg(test)]
         {
             if self.borrowed.is_null() {
@@ -245,7 +319,7 @@ impl LoadedSection {
         }
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         #[cfg(test)]
         {
             if self.borrowed.is_null() {
@@ -282,6 +356,10 @@ impl LoadedSection {
         )
         .map_err(|_| LoadModuleError::UnsupportedSection(String::from("module W^X")))
     }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
 }
 
 #[cfg(not(test))]
@@ -307,11 +385,14 @@ pub struct KernelModule {
     /// `module_arch_cleanup()` equivalent runs while its section memory is
     /// still retained.
     _arch_metadata: X86ModuleMetadata,
+    /// Linux module SRCU notifier state. This precedes `sections` so module
+    /// static SRCU allocations are released before their owning C objects.
+    srcu_registration: ModuleSrcuRegistration,
     /// Linux `module_bug_list` membership. This field precedes `sections` so
     /// drop cleanup unlinks the BUG table before its backing memory is freed.
     bug_registration: ModuleBugRegistration,
     /// Loaded section data.  We keep them alive for the module's lifetime.
-    pub sections: BTreeMap<String, LoadedSection>,
+    sections: NameMap<LoadedSection>,
     /// Linux `__ksymtab` exports owned by this loaded module.
     pub exported_symbols: Vec<String>,
     /// Configured offsets of `mod->init` and `mod->exit`, recovered from the
@@ -360,6 +441,123 @@ impl KernelModule {
     }
 }
 
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("__module_get", linux___module_get as usize, false);
+    export_symbol_once("try_module_get", linux_try_module_get as usize, false);
+    export_symbol_once("module_put", linux_module_put as usize, false);
+    export_symbol_once("__symbol_get", linux___symbol_get as usize, true);
+    export_symbol_once("__symbol_put", linux___symbol_put as usize, false);
+    export_symbol_once("symbol_put_addr", linux_symbol_put_addr as usize, true);
+    export_symbol_once("__request_module", linux___request_module as usize, false);
+}
+
+fn module_refcnt(this_module_addr: usize) -> &'static AtomicU32 {
+    let ptr = (this_module_addr + LINUX_STRUCT_MODULE_REFCNT_OFFSET) as *const AtomicU32;
+    unsafe { &*ptr }
+}
+
+unsafe extern "C" fn linux___module_get(module: *mut u8) {
+    if module.is_null() {
+        return;
+    }
+    module_refcnt(module as usize).fetch_add(1, Ordering::AcqRel);
+}
+
+unsafe extern "C" fn linux_try_module_get(module: *mut u8) -> bool {
+    if module.is_null() {
+        return true;
+    }
+    let addr = module as usize;
+    if unsafe { read_module_state(addr) } != ModuleState::Live {
+        return false;
+    }
+    let refcnt = module_refcnt(addr);
+    let mut old = refcnt.load(Ordering::Acquire);
+    loop {
+        if old == 0 {
+            return false;
+        }
+        match refcnt.compare_exchange_weak(
+            old,
+            old.saturating_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(cur) => old = cur,
+        }
+    }
+}
+
+unsafe fn c_symbol_name(symbol: *const c_char) -> Option<&'static str> {
+    if symbol.is_null() {
+        return None;
+    }
+    let bytes = symbol.cast::<u8>();
+    let mut len = 0usize;
+    while len < 512 {
+        if unsafe { *bytes.add(len) } == 0 {
+            let slice = unsafe { core::slice::from_raw_parts(bytes, len) };
+            return core::str::from_utf8(slice).ok();
+        }
+        len += 1;
+    }
+    None
+}
+
+/// `__symbol_get` - `vendor/linux/kernel/module/main.c:1467`.
+unsafe extern "C" fn linux___symbol_get(symbol: *const c_char) -> *mut u8 {
+    let Some(name) = (unsafe { c_symbol_name(symbol) }) else {
+        return core::ptr::null_mut();
+    };
+    find_symbol(name)
+        .map(|addr| addr as *mut u8)
+        .unwrap_or(core::ptr::null_mut())
+}
+
+/// `__symbol_put` - `vendor/linux/kernel/module/main.c:884`.
+unsafe extern "C" fn linux___symbol_put(symbol: *const c_char) {
+    if let Some(name) = unsafe { c_symbol_name(symbol) } {
+        let _ = find_symbol(name);
+    }
+}
+
+/// `symbol_put_addr` - `vendor/linux/kernel/module/main.c:898`.
+unsafe extern "C" fn linux_symbol_put_addr(_addr: *mut u8) {}
+
+/// `__request_module` - `vendor/linux/kernel/module/kmod.c`.
+///
+/// Lupos does not have a userspace modprobe helper.  Linux returns `-ENOENT`
+/// when module auto-loading is unavailable, and callers are required to verify
+/// the requested service before using it.
+#[unsafe(export_name = "__request_module")]
+unsafe extern "C" fn linux___request_module(_wait: bool, _fmt: *const c_char) -> i32 {
+    -ENOENT
+}
+
+unsafe extern "C" fn linux_module_put(module: *mut u8) {
+    if module.is_null() {
+        return;
+    }
+    let refcnt = module_refcnt(module as usize);
+    let mut old = refcnt.load(Ordering::Acquire);
+    loop {
+        if old == 0 {
+            return;
+        }
+        match refcnt.compare_exchange_weak(old, old - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(cur) => old = cur,
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct ModuleExport {
     name: String,
@@ -370,11 +568,11 @@ struct ModuleExport {
 // ── Global module table ───────────────────────────────────────────────────────
 
 lazy_static! {
-    static ref MODULES: Mutex<BTreeMap<String, Arc<KernelModule>>> = Mutex::new(BTreeMap::new());
+    static ref MODULES: Mutex<NameMap<Arc<KernelModule>>> = Mutex::new(NameMap::new());
     /// Names are reserved from `MODULE_STATE_UNFORMED` until the module's
     /// descriptor is finally freed.  Linux does the same by linking the
     /// unformed module into its module list before relocation.
-    static ref MODULE_IDENTITIES: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+    static ref MODULE_IDENTITIES: Mutex<NameMap<usize>> = Mutex::new(NameMap::new());
 }
 
 unsafe fn read_module_state(this_module_addr: usize) -> ModuleState {
@@ -419,7 +617,7 @@ unsafe fn initialize_module_list_head(this_module_addr: usize, offset: usize) {
     }
 }
 
-fn loaded_section_pointer(sections: &BTreeMap<String, LoadedSection>, name: &str) -> Option<usize> {
+fn loaded_section_pointer(sections: &NameMap<LoadedSection>, name: &str) -> Option<usize> {
     sections
         .get(name)
         .filter(|section| section.len != 0)
@@ -431,7 +629,7 @@ fn loaded_section_pointer(sections: &BTreeMap<String, LoadedSection>, name: &str
 /// module code observes `THIS_MODULE`.
 fn initialize_embedded_module(
     this_module_addr: usize,
-    sections: &BTreeMap<String, LoadedSection>,
+    sections: &NameMap<LoadedSection>,
 ) -> Result<(), LoadModuleError> {
     let syms = sections.get("__ksymtab");
     let num_syms = syms.map_or(0, |section| section.len / LINUX_KERNEL_SYMBOL_SIZE);
@@ -568,6 +766,21 @@ where
     false
 }
 
+pub fn search_module_extable_fixup(fault_ip: u64) -> Option<u64> {
+    let modules = MODULES.lock();
+    for module in modules.values() {
+        let Some(extable) = module.sections.get("__ex_table") else {
+            continue;
+        };
+        if let Some(fixup) =
+            crate::arch::x86::kernel::extable::search_extable_slice(extable.as_slice(), fault_ip)
+        {
+            return Some(fixup);
+        }
+    }
+    None
+}
+
 // ── ELF parsing helpers ───────────────────────────────────────────────────────
 
 fn read_u8(d: &[u8], off: usize) -> Option<u8> {
@@ -601,6 +814,11 @@ fn section_data_range(data: &[u8], sh: &Shdr) -> Option<(usize, usize)> {
 
 fn should_load_section(sh: &Shdr) -> bool {
     sh.sh_type != SHT_NULL && (sh._flags & SHF_ALLOC) != 0
+}
+
+fn touch_module_load_watchdog() {
+    #[cfg(not(test))]
+    crate::kernel::watchdog::touch_softlockup_watchdog();
 }
 
 /// Null-terminated string from a strtab at `base + idx`.
@@ -723,7 +941,7 @@ struct SimplifiedSymbol {
 fn symbol_section_addr(
     sym: &Sym,
     shdrs: &[Shdr],
-    sections: &BTreeMap<String, LoadedSection>,
+    sections: &NameMap<LoadedSection>,
     elf: &[u8],
     shstrtab_range: (usize, usize),
 ) -> Option<u64> {
@@ -741,7 +959,7 @@ fn symbol_section_addr(
     Some(sec_data.as_ptr() as u64 + sym.value)
 }
 
-fn loaded_cstr_at(sections: &BTreeMap<String, LoadedSection>, addr: usize) -> Option<&str> {
+fn loaded_cstr_at(sections: &NameMap<LoadedSection>, addr: usize) -> Option<&str> {
     for section in sections.values() {
         let base = section.as_ptr() as usize;
         let Some(offset) = addr.checked_sub(base) else {
@@ -758,7 +976,7 @@ fn loaded_cstr_at(sections: &BTreeMap<String, LoadedSection>, addr: usize) -> Op
 }
 
 fn loaded_section_at(
-    sections: &BTreeMap<String, LoadedSection>,
+    sections: &NameMap<LoadedSection>,
     addr: usize,
     size: usize,
 ) -> Option<(&str, &LoadedSection, usize)> {
@@ -777,7 +995,7 @@ fn loaded_section_at(
     None
 }
 
-fn loaded_bounded_cstr_at(sections: &BTreeMap<String, LoadedSection>, addr: usize) -> Option<&str> {
+fn loaded_bounded_cstr_at(sections: &NameMap<LoadedSection>, addr: usize) -> Option<&str> {
     let (_, section, offset) = loaded_section_at(sections, addr, 1)?;
     let available = (section.len - offset).min(MAX_BUG_STRING_LEN);
     let bytes = &section.as_slice()[offset..offset + available];
@@ -790,8 +1008,8 @@ fn loaded_bounded_cstr_at(sections: &BTreeMap<String, LoadedSection>, addr: usiz
 /// publishes the table. This is the loader's fail-closed boundary: report_bug
 /// may only dereference addresses proven to remain inside retained sections.
 fn validate_module_bug_table(
-    sections: &BTreeMap<String, LoadedSection>,
-    section_flags: &BTreeMap<String, u64>,
+    sections: &NameMap<LoadedSection>,
+    section_flags: &NameMap<u64>,
 ) -> Result<(usize, usize), LoadModuleError> {
     let Some(table) = sections.get("__bug_table") else {
         return Ok((0, 0));
@@ -822,23 +1040,23 @@ fn validate_module_bug_table(
         .ok_or(LoadModuleError::BadElf)?;
         let (bug_section_name, bug_section, bug_offset) =
             loaded_section_at(sections, bug_addr, 2).ok_or(LoadModuleError::BadElf)?;
-        if section_flags.get(bug_section_name).copied().unwrap_or(0) & SHF_EXECINSTR == 0
-            || bug_section.as_slice()[bug_offset..bug_offset + 2] != [0x0f, 0x0b]
-        {
-            return Err(LoadModuleError::UnsupportedSection(String::from(
-                "__bug_table non-UD2 entry",
-            )));
-        }
-
         let entry_flags = read_u16(table.as_slice(), entry_offset + BUG_ENTRY_FLAGS_OFFSET)
             .ok_or(LoadModuleError::BadElf)?;
-        // x86 BUGFLAG_ARGS entries use the static-call __WARN_trap path and
-        // its register-backed varargs decoder rather than a UD2 exception.
-        // That ABI is not installed yet, so accepting one would leave an
-        // apparently formed table with no safe reporting path.
-        if entry_flags & BUGFLAG_ARGS != 0 {
+        let valid_instruction = if entry_flags & BUGFLAG_ARGS != 0 {
+            // x86 __WARN_printf/__WARN_printf_taint emit a __bug_table
+            // entry for the static-call __WARN_trap path. That entry points
+            // at ordinary text reached after a LEA of the bug entry, not at a
+            // UD2 or WARNINSN opcode, so the fail-closed part here is the
+            // executable-section and bounded metadata validation below.
+            true
+        } else {
+            bug_section.as_slice()[bug_offset..bug_offset + 2] == [0x0f, 0x0b]
+        };
+        if section_flags.get(bug_section_name).copied().unwrap_or(0) & SHF_EXECINSTR == 0
+            || !valid_instruction
+        {
             return Err(LoadModuleError::UnsupportedSection(String::from(
-                "__bug_table BUGFLAG_ARGS",
+                "__bug_table instruction entry",
             )));
         }
 
@@ -899,7 +1117,7 @@ fn resolve_prel32_addr(
 }
 
 fn module_exports_from_sections(
-    sections: &BTreeMap<String, LoadedSection>,
+    sections: &NameMap<LoadedSection>,
 ) -> Result<Vec<ModuleExport>, LoadModuleError> {
     let Some(ksymtab) = sections.get("__ksymtab") else {
         return Ok(Vec::new());
@@ -999,6 +1217,7 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
             .ok_or(LoadModuleError::BadElf)?;
         shdrs.push(Shdr::from(elf, off).ok_or(LoadModuleError::BadElf)?);
     }
+    touch_module_load_watchdog();
 
     // Linux relies on section zero as the absent-section sentinel.
     let null_sh = &shdrs[0];
@@ -1047,6 +1266,7 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
     }) {
         return Err(LoadModuleError::BadElf);
     }
+    touch_module_load_watchdog();
 
     // Vendor Linux requires a unique .modinfo section (when present), a
     // unique struct-module section, and exactly one static symbol table.
@@ -1138,7 +1358,6 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
     // module section memory or publishing anything until the corresponding
     // vendor lifecycle is implemented.
     const UNSUPPORTED_FINALIZATION_SECTIONS: &[&str] = &[
-        ".altinstructions",
         ".retpoline_sites",
         ".return_sites",
         ".call_sites",
@@ -1146,9 +1365,6 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
         ".orc_unwind",
         ".orc_unwind_ip",
         "__jump_table",
-        ".static_call_sites",
-        "__ex_table",
-        "___srcu_struct_ptrs",
         "__bpf_raw_tp_map",
         ".BTF",
         ".BTF.base",
@@ -1165,7 +1381,6 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
         "_kprobe_blacklist",
         ".printk_index",
         "__dyndbg",
-        "__dyndbg_classes",
         ".kunit_test_suites",
         ".kunit_init_test_suites",
         ".cfi_sites",
@@ -1187,6 +1402,20 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
             Some("__bug_table") if sh.size % BUG_ENTRY_SIZE as u64 != 0 => {
                 return Err(LoadModuleError::BadElf);
             }
+            Some(".altinstructions") if sh.size % 14 != 0 => {
+                return Err(LoadModuleError::BadElf);
+            }
+            Some(".static_call_sites") if sh.size % 8 != 0 => {
+                return Err(LoadModuleError::BadElf);
+            }
+            Some("__ex_table")
+                if sh.size % crate::arch::x86::kernel::extable::EXTABLE_ENTRY_SIZE as u64 != 0 =>
+            {
+                return Err(LoadModuleError::BadElf);
+            }
+            Some("__dyndbg_classes") if sh.size % 56 != 0 => {
+                return Err(LoadModuleError::BadElf);
+            }
             _ => {}
         }
     }
@@ -1194,8 +1423,8 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
     // ── 3. Copy loaded sections into module memory ───────────────────────────
     // Linux lays out non-null SHF_ALLOC sections for runtime. The ELF
     // symtab/strtab remain readable from the original module bytes below.
-    let mut sections: BTreeMap<String, LoadedSection> = BTreeMap::new();
-    let mut loaded_section_flags: BTreeMap<String, u64> = BTreeMap::new();
+    let mut sections: NameMap<LoadedSection> = NameMap::new();
+    let mut loaded_section_flags: NameMap<u64> = NameMap::new();
     for sh in shdrs.iter() {
         if !should_load_section(sh) {
             continue;
@@ -1221,6 +1450,7 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
         loaded_section_flags.insert(name.clone(), sh._flags);
         sections.insert(name, data);
     }
+    touch_module_load_watchdog();
 
     // ── 4. Publish the unformed Linux module identity ────────────────────────
     // `move_module()` returns the relocated copy of `__this_module`, then
@@ -1315,6 +1545,7 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
 
         simplified_symbols.push(simplified);
     }
+    touch_module_load_watchdog();
 
     // ── 6. Apply RELA relocations ─────────────────────────────────────────────
     // Each relocation section targets the section named by `sh_info`.
@@ -1421,6 +1652,7 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
             }
         }
     }
+    touch_module_load_watchdog();
 
     // `post_relocation()` invokes the x86 `module_finalize()` hook after all
     // RELA records have reached their runtime addresses. In particular,
@@ -1428,11 +1660,14 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
     // `alternatives_smp_module_add()` leaves those entries and their existing
     // SMP-safe lock prefixes untouched unless the whole kernel was previously
     // patched for UP execution; Lupos never enters that UP-patched state.
-    let arch_section_names = shdrs
-        .iter()
-        .filter_map(|sh| sec_name(sh))
-        .collect::<Vec<_>>();
-    let arch_metadata = module_finalize(&arch_section_names);
+    let arch_metadata = module_finalize(&mut sections).map_err(|error| match error {
+        X86ModuleFinalizeError::BadSection(name) => {
+            LoadModuleError::UnsupportedSection(String::from(name))
+        }
+        X86ModuleFinalizeError::Unsupported(name) => {
+            LoadModuleError::UnsupportedSection(String::from(name))
+        }
+    })?;
 
     // ── 7. Resolve `mod->init` / `mod->exit` ──────────────────────────────────
     // Linux invokes the function pointers in the relocated struct module.  Do
@@ -1482,6 +1717,15 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
                 }
             },
         )?;
+    let srcu_registration = module_srcu_finalize(
+        sections
+            .get("___srcu_struct_ptrs")
+            .map(|section| section.as_slice()),
+    )
+    .map_err(|error| match error {
+        ModuleSrcuError::BadSection => LoadModuleError::BadElf,
+        ModuleSrcuError::OutOfMemory => LoadModuleError::OutOfMemory,
+    })?;
 
     // Linux performs this only after every relocation and architecture
     // finalizer has completed.  Text becomes ROX, read-only data becomes
@@ -1497,6 +1741,7 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
         name: mod_name.clone(),
         this_module_addr,
         _arch_metadata: arch_metadata,
+        srcu_registration,
         bug_registration,
         sections,
         exported_symbols,
@@ -1514,11 +1759,14 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
 
     // ── 9. Call init_module() ─────────────────────────────────────────────────
     if let Some(init_fn) = module.init() {
+        touch_module_load_watchdog();
         let rc = unsafe { init_fn() };
+        touch_module_load_watchdog();
         if rc < 0 {
             module.set_state(ModuleState::Going);
             MODULES.lock().remove(&mod_name);
             unexport_module_symbols(&mod_name);
+            module.srcu_registration.cleanup();
             module.bug_registration.cleanup();
             identity.release_before_descriptor();
             // `-EEXIST` is reserved by [f]init_module for an already-loaded
@@ -1542,6 +1790,7 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
     // path to publish its initial carrier state from config_work.
     #[cfg(not(test))]
     crate::kernel::workqueue::drain_system_workqueues();
+    touch_module_load_watchdog();
 
     // `do_init_module()` makes the descriptor live only after init succeeds.
     module.set_state(ModuleState::Live);
@@ -1583,6 +1832,7 @@ pub fn delete_module(name: &str) -> Result<(), i32> {
         }
     }
     unexport_module_symbols(name);
+    module.srcu_registration.cleanup();
     module.bug_registration.cleanup();
     let mut identities = MODULE_IDENTITIES.lock();
     if identities.get(name).copied() == Some(module.this_module_addr()) {
@@ -1743,7 +1993,7 @@ mod tests {
                 _entsize: 0,
             },
         ];
-        let mut sections = BTreeMap::new();
+        let mut sections = NameMap::new();
         sections.insert(
             String::from(".text"),
             LoadedSection::new_zeroed(8).expect("test section allocation"),
@@ -1767,7 +2017,7 @@ mod tests {
         let mut backing = alloc::vec![0u8; 64];
         backing[28] = KSYM_FLAG_GPL_ONLY;
         backing[32..50].copy_from_slice(b"vp_modern_avq_num\0");
-        let mut sections = BTreeMap::new();
+        let mut sections = NameMap::new();
         sections.insert(
             String::from(".text"),
             LoadedSection::borrowed_for_prel32_test(&mut backing[0..16]),
@@ -1808,8 +2058,32 @@ mod tests {
     }
 
     #[test]
+    fn module_lifetime_exports_include_symbol_get_put_cluster() {
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("__symbol_get"),
+            Some(linux___symbol_get as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("__symbol_put"),
+            Some(linux___symbol_put as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("symbol_put_addr"),
+            Some(linux_symbol_put_addr as usize)
+        );
+
+        let name = b"__symbol_put\0";
+        assert_eq!(
+            unsafe { linux___symbol_get(name.as_ptr().cast()) },
+            linux___symbol_put as *mut u8
+        );
+        unsafe { linux___symbol_put(name.as_ptr().cast()) };
+    }
+
+    #[test]
     fn rejects_exported_symbols_without_linux_flagstab() {
-        let mut sections = BTreeMap::new();
+        let mut sections = NameMap::new();
         sections.insert(
             String::from("__ksymtab"),
             LoadedSection::new_zeroed(LINUX_KERNEL_SYMBOL_SIZE).expect("ksymtab allocation"),

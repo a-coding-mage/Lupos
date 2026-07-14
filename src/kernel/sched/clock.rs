@@ -9,6 +9,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
+use crate::kernel::module::{export_symbol, find_symbol};
+
 pub use super::entity::SCHED_CLOCK_NS;
 
 /// Periodic scheduler-tick duration for the configured `HZ=250`.
@@ -37,6 +39,22 @@ pub fn sched_clock_cpu(_cpu: u32) -> u64 {
 
 pub fn local_clock() -> u64 {
     sched_clock_cpu(super::current_cpu())
+}
+
+/// `local_clock` - `vendor/linux/kernel/sched/clock.c:317`.
+#[unsafe(export_name = "local_clock")]
+pub extern "C" fn linux_local_clock() -> u64 {
+    local_clock()
+}
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("local_clock", linux_local_clock as usize, true);
 }
 
 pub const fn sched_clock_from_ticks(ticks: u64, nsec_per_tick: u64) -> u64 {
@@ -129,5 +147,20 @@ mod tests {
                 sched_clock_offset: -80,
             }
         );
+    }
+
+    #[test]
+    fn local_clock_export_matches_vendor_contract() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/kernel/sched/clock.c"
+        ));
+
+        assert!(source.contains("u64 local_clock(void)"));
+        assert!(source.contains("EXPORT_SYMBOL_GPL(local_clock);"));
+
+        register_module_exports();
+        assert_eq!(find_symbol("local_clock"), Some(linux_local_clock as usize));
+        assert!(linux_local_clock() <= sched_clock_ns());
     }
 }

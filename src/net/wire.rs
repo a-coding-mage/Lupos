@@ -352,6 +352,10 @@ pub(crate) fn send_inet(
                 datagram[2..4].copy_from_slice(&port.to_be_bytes());
                 datagram[4..6].copy_from_slice(&(length as u16).to_be_bytes());
                 datagram[8..].copy_from_slice(bytes);
+                let checksum = transport_checksum(GUEST_IPV4, addr, IPPROTO_UDP, &datagram);
+                datagram[6..8].copy_from_slice(
+                    &(if checksum == 0 { 0xffff } else { checksum }).to_be_bytes(),
+                );
                 send_ipv4(addr, IPPROTO_UDP, &datagram)
             }
             _ => Err(EINVAL),

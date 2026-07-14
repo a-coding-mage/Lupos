@@ -4,6 +4,48 @@
 //! MMU notifier visible ABI surface for Lupos' no-secondary-MMU target.
 
 use crate::include::uapi::errno::{EINVAL, EOVERFLOW};
+use crate::kernel::module::{export_symbol, find_symbol};
+
+const LINUX_MMU_INTERVAL_RB_PARENT_COLOR: usize = 0;
+const LINUX_MMU_INTERVAL_RB_RIGHT: usize = 8;
+const LINUX_MMU_INTERVAL_RB_LEFT: usize = 16;
+const LINUX_MMU_INTERVAL_START: usize = 24;
+const LINUX_MMU_INTERVAL_LAST: usize = 32;
+const LINUX_MMU_INTERVAL_SUBTREE_LAST: usize = 40;
+const LINUX_MMU_INTERVAL_OPS: usize = 48;
+const LINUX_MMU_INTERVAL_MM: usize = 56;
+const LINUX_MMU_INTERVAL_DEFERRED_NEXT: usize = 64;
+const LINUX_MMU_INTERVAL_DEFERRED_PPREV: usize = 72;
+const LINUX_MMU_INTERVAL_INVALIDATE_SEQ: usize = 80;
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "mmu_interval_read_begin",
+        linux_mmu_interval_read_begin as usize,
+        true,
+    );
+    export_symbol_once(
+        "mmu_interval_notifier_insert",
+        linux_mmu_interval_notifier_insert as usize,
+        true,
+    );
+    export_symbol_once(
+        "mmu_interval_notifier_insert_locked",
+        linux_mmu_interval_notifier_insert_locked as usize,
+        true,
+    );
+    export_symbol_once(
+        "mmu_interval_notifier_remove",
+        linux_mmu_interval_notifier_remove as usize,
+        true,
+    );
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -156,6 +198,80 @@ pub fn mmu_interval_notifier_remove(mni: *mut u8) {
         interval.inserted = false;
         interval.mm = core::ptr::null_mut();
         interval.ops = core::ptr::null();
+    }
+}
+
+unsafe fn linux_mni_write_usize(mni: *mut u8, offset: usize, value: usize) {
+    unsafe { (mni.add(offset) as *mut usize).write(value) };
+}
+
+unsafe fn linux_mni_read_u64(mni: *mut u8, offset: usize) -> u64 {
+    unsafe { (mni.add(offset) as *const u64).read() }
+}
+
+/// `mmu_interval_read_begin` - `vendor/linux/mm/mmu_notifier.c:188`.
+pub unsafe extern "C" fn linux_mmu_interval_read_begin(mni: *mut u8) -> u64 {
+    if mni.is_null() {
+        return 0;
+    }
+    unsafe { linux_mni_read_u64(mni, LINUX_MMU_INTERVAL_INVALIDATE_SEQ) }
+}
+
+/// `mmu_interval_notifier_insert` - `vendor/linux/mm/mmu_notifier.c:1018`.
+pub unsafe extern "C" fn linux_mmu_interval_notifier_insert(
+    mni: *mut u8,
+    mm: *mut u8,
+    start: u64,
+    length: u64,
+    ops: *const u8,
+) -> i32 {
+    unsafe { linux_mmu_interval_notifier_insert_locked(mni, mm, start, length, ops) }
+}
+
+/// `mmu_interval_notifier_insert_locked` - `vendor/linux/mm/mmu_notifier.c:1041`.
+pub unsafe extern "C" fn linux_mmu_interval_notifier_insert_locked(
+    mni: *mut u8,
+    mm: *mut u8,
+    start: u64,
+    length: u64,
+    ops: *const u8,
+) -> i32 {
+    if mni.is_null() || mm.is_null() || ops.is_null() {
+        return -EINVAL;
+    }
+    let Some(last) = length
+        .checked_sub(1)
+        .and_then(|delta| start.checked_add(delta))
+    else {
+        return -EOVERFLOW;
+    };
+
+    unsafe {
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_RB_PARENT_COLOR, 0);
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_RB_RIGHT, 0);
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_RB_LEFT, 0);
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_START, start as usize);
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_LAST, last as usize);
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_SUBTREE_LAST, last as usize);
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_OPS, ops as usize);
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_MM, mm as usize);
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_DEFERRED_NEXT, 0);
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_DEFERRED_PPREV, 0);
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_INVALIDATE_SEQ, 1);
+    }
+    0
+}
+
+/// `mmu_interval_notifier_remove` - `vendor/linux/mm/mmu_notifier.c:1085`.
+pub unsafe extern "C" fn linux_mmu_interval_notifier_remove(mni: *mut u8) {
+    if mni.is_null() {
+        return;
+    }
+    unsafe {
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_OPS, 0);
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_MM, 0);
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_DEFERRED_NEXT, 0);
+        linux_mni_write_usize(mni, LINUX_MMU_INTERVAL_DEFERRED_PPREV, 0);
     }
 }
 

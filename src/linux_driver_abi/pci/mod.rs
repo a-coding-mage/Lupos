@@ -38,6 +38,7 @@ lazy_static! {
 }
 
 pub fn register_module_exports() {
+    device::register_module_exports();
     driver::register_module_exports();
     access::register_module_exports();
     pci::register_module_exports();

@@ -21,15 +21,17 @@ extern crate alloc;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ffi::c_void;
 
 use spin::Mutex;
 
 use crate::include::uapi::errno::{EINVAL, ENODEV, ENOMEM, EPERM};
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::mm::address_space::AddressSpace;
 use crate::mm::frame::PAGE_SIZE;
 use crate::mm::mm_types::VmAreaStruct;
 use crate::mm::page::Page;
-use crate::mm::page_flags::GfpFlags;
+use crate::mm::page_flags::{GFP_KERNEL, GfpFlags};
 
 pub const MFD_CLOEXEC: u32 = 0x0001;
 pub const MFD_ALLOW_SEALING: u32 = 0x0002;
@@ -47,6 +49,34 @@ pub const F_SEAL_SHRINK: u32 = 0x0002;
 pub const F_SEAL_GROW: u32 = 0x0004;
 pub const F_SEAL_WRITE: u32 = 0x0008;
 pub const F_SEAL_FUTURE_WRITE: u32 = 0x0010;
+
+const LINUX_INODE_I_MAPPING_OFFSET: usize = 48;
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("shmem_file_setup", linux_shmem_file_setup as usize, true);
+    export_symbol_once(
+        "shmem_read_folio_gfp",
+        linux_shmem_read_folio_gfp as usize,
+        true,
+    );
+    export_symbol_once(
+        "shmem_read_mapping_page_gfp",
+        linux_shmem_read_mapping_page_gfp as usize,
+        true,
+    );
+    export_symbol_once(
+        "shmem_truncate_range",
+        linux_shmem_truncate_range as usize,
+        true,
+    );
+    export_symbol_once("shmem_writeout", linux_shmem_writeout as usize, true);
+}
 pub const F_SEAL_EXEC: u32 = 0x0020;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -560,7 +590,7 @@ pub fn shmem_unuse(_swap: u32, _page: *mut Page) -> i32 {
 
 pub fn shmem_unlock_mapping(_mapping: *mut AddressSpace) {}
 
-pub fn shmem_truncate_range(mapping: *mut AddressSpace, start: u64, end: u64) {
+pub fn shmem_truncate_mapping_range(mapping: *mut AddressSpace, start: u64, end: u64) {
     unsafe { crate::mm::filemap::truncate_inode_pages_range(mapping, start, end) };
 }
 
@@ -580,12 +610,16 @@ pub fn shmem_get_folio(
     if page.is_null() { -ENOMEM } else { 0 }
 }
 
-pub fn shmem_read_folio_gfp(mapping: *mut AddressSpace, folio: *mut Page, gfp: GfpFlags) -> i32 {
+pub fn shmem_read_folio_into_gfp(
+    mapping: *mut AddressSpace,
+    folio: *mut Page,
+    gfp: GfpFlags,
+) -> i32 {
     unsafe { crate::mm::filemap::mapping_read_folio_gfp(mapping, folio, gfp) }
 }
 
 pub fn shmem_read_folio(mapping: *mut AddressSpace, folio: *mut Page) -> i32 {
-    shmem_read_folio_gfp(mapping, folio, crate::mm::page_flags::GFP_KERNEL)
+    shmem_read_folio_into_gfp(mapping, folio, GFP_KERNEL)
 }
 
 pub fn shmem_read_mapping_page_gfp(
@@ -600,8 +634,54 @@ pub fn shmem_read_mapping_page(mapping: *mut AddressSpace, index: u64) -> *mut P
     shmem_read_mapping_page_gfp(mapping, index, crate::mm::page_flags::GFP_KERNEL)
 }
 
-pub fn shmem_writeout(_folio: *mut Page, _wbc: *mut u8) -> i32 {
+pub fn shmem_writeout_folio(_folio: *mut Page, _wbc: *mut u8) -> i32 {
     -EINVAL
+}
+
+pub unsafe extern "C" fn linux_shmem_file_setup(
+    name: *const u8,
+    size: i64,
+    flags: u64,
+) -> *mut c_void {
+    shmem_file_setup(name, size.max(0) as u64, flags).cast()
+}
+
+/// `shmem_read_folio_gfp` - `vendor/linux/mm/shmem.c:5922`.
+pub unsafe extern "C" fn linux_shmem_read_folio_gfp(
+    mapping: *mut AddressSpace,
+    index: u64,
+    gfp: GfpFlags,
+) -> *mut Page {
+    shmem_read_mapping_page_gfp(mapping, index, gfp)
+}
+
+pub unsafe extern "C" fn linux_shmem_read_mapping_page_gfp(
+    mapping: *mut AddressSpace,
+    index: u64,
+    gfp: GfpFlags,
+) -> *mut Page {
+    shmem_read_mapping_page_gfp(mapping, index, gfp)
+}
+
+pub unsafe extern "C" fn linux_shmem_truncate_range(inode: *mut c_void, start: i64, end: u64) {
+    if inode.is_null() {
+        return;
+    }
+    let mapping = unsafe {
+        *inode
+            .cast::<u8>()
+            .add(LINUX_INODE_I_MAPPING_OFFSET)
+            .cast::<*mut AddressSpace>()
+    };
+    shmem_truncate_mapping_range(mapping, start.max(0) as u64, end);
+}
+
+pub unsafe extern "C" fn linux_shmem_writeout(
+    folio: *mut Page,
+    _plug: *mut *mut c_void,
+    _folio_list: *mut c_void,
+) -> i32 {
+    shmem_writeout_folio(folio, core::ptr::null_mut())
 }
 
 pub fn shmem_init() -> i32 {

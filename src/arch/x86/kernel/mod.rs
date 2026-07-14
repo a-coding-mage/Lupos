@@ -47,6 +47,7 @@ pub mod crash;
 pub mod crash_dump_32;
 pub mod crash_dump_64;
 pub mod devicetree;
+pub mod dmi;
 pub mod doublefault_32;
 pub mod dumpstack;
 pub mod dumpstack_32;

@@ -651,12 +651,42 @@ pub fn register_module_exports() {
         blk_mq_num_possible_queues as usize,
         true,
     );
+    export_symbol_once("blk_mq_unique_tag", blk_mq_unique_tag as usize, false);
     export_symbol_once("blk_mq_map_queues", blk_mq_map_queues as usize, true);
     export_symbol_once("blk_mq_map_hw_queues", blk_mq_map_hw_queues as usize, true);
     export_symbol_once("__blk_rq_map_sg", __blk_rq_map_sg as usize, true);
     export_symbol_once("blk_rq_map_kern", blk_rq_map_kern as usize, true);
     export_symbol_once("blk_execute_rq", blk_execute_rq as usize, true);
+    export_symbol_once("blk_dump_rq_flags", blk_dump_rq_flags as usize, false);
     export_symbol_once("blk_status_to_errno", blk_status_to_errno as usize, true);
+    export_symbol_once("blk_set_pm_only", blk_set_pm_only as usize, true);
+    export_symbol_once("blk_clear_pm_only", blk_clear_pm_only as usize, true);
+    export_symbol_once("blk_pm_runtime_init", blk_pm_runtime_init as usize, false);
+    export_symbol_once(
+        "blkdev_compat_ptr_ioctl",
+        blkdev_compat_ptr_ioctl as usize,
+        false,
+    );
+    export_symbol_once(
+        "blk_pre_runtime_resume",
+        blk_pre_runtime_resume as usize,
+        false,
+    );
+    export_symbol_once(
+        "blk_post_runtime_resume",
+        blk_post_runtime_resume as usize,
+        false,
+    );
+    export_symbol_once(
+        "blk_pre_runtime_suspend",
+        blk_pre_runtime_suspend as usize,
+        false,
+    );
+    export_symbol_once(
+        "blk_post_runtime_suspend",
+        blk_post_runtime_suspend as usize,
+        false,
+    );
     export_symbol_once(
         "queue_limits_commit_update_frozen",
         queue_limits_commit_update_frozen as usize,
@@ -666,6 +696,7 @@ pub fn register_module_exports() {
     export_symbol_once("device_add_disk", device_add_disk as usize, true);
     export_symbol_once("put_disk", put_disk as usize, true);
     export_symbol_once("del_gendisk", del_gendisk as usize, true);
+    export_symbol_once("invalidate_bdev", invalidate_bdev as usize, false);
     export_symbol_once("set_disk_ro", set_disk_ro as usize, true);
     export_symbol_once("set_capacity", set_capacity as usize, true);
     export_symbol_once(
@@ -674,6 +705,37 @@ pub fn register_module_exports() {
         true,
     );
 }
+
+/// `blk_set_pm_only` - `vendor/linux/block/blk-core.c`.
+pub unsafe extern "C" fn blk_set_pm_only(_q: *mut c_void) {}
+
+/// `blk_clear_pm_only` - `vendor/linux/block/blk-core.c`.
+pub unsafe extern "C" fn blk_clear_pm_only(_q: *mut c_void) {}
+
+/// `blk_pm_runtime_init` - `vendor/linux/block/blk-pm.c`.
+pub unsafe extern "C" fn blk_pm_runtime_init(_q: *mut c_void, _dev: *mut c_void) {}
+
+/// `blkdev_compat_ptr_ioctl` - `vendor/linux/block/ioctl.c`.
+pub unsafe extern "C" fn blkdev_compat_ptr_ioctl(
+    _bdev: *mut c_void,
+    _mode: u32,
+    _cmd: u32,
+    _arg: usize,
+) -> i32 {
+    -crate::include::uapi::errno::ENOTTY
+}
+
+/// `blk_pre_runtime_resume` - `vendor/linux/block/blk-pm.c`.
+pub unsafe extern "C" fn blk_pre_runtime_resume(_q: *mut c_void) {}
+
+/// `blk_post_runtime_resume` - `vendor/linux/block/blk-pm.c`.
+pub unsafe extern "C" fn blk_post_runtime_resume(_q: *mut c_void) {}
+
+/// `blk_pre_runtime_suspend` - `vendor/linux/block/blk-pm.c`.
+pub unsafe extern "C" fn blk_pre_runtime_suspend(_q: *mut c_void) {}
+
+/// `blk_post_runtime_suspend` - `vendor/linux/block/blk-pm.c`.
+pub unsafe extern "C" fn blk_post_runtime_suspend(_q: *mut c_void, _err: i32) {}
 
 unsafe fn cstr_to_string(ptr: *const c_char) -> Result<String, i32> {
     if ptr.is_null() {
@@ -1349,6 +1411,28 @@ pub unsafe extern "C" fn blk_mq_num_possible_queues(max_queues: u32) -> u32 {
     }
 }
 
+/// `blk_mq_unique_tag` - `vendor/linux/block/blk-mq-tag.c`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn blk_mq_unique_tag(rq: *mut LinuxRequest) -> u32 {
+    const BLK_MQ_UNIQUE_TAG_BITS: u32 = 16;
+    const BLK_MQ_UNIQUE_TAG_MASK: u32 = (1 << BLK_MQ_UNIQUE_TAG_BITS) - 1;
+
+    if rq.is_null() {
+        return 0;
+    }
+
+    let tag = unsafe { (*rq).tag };
+    let tag = if tag < 0 { 0 } else { tag as u32 } & BLK_MQ_UNIQUE_TAG_MASK;
+    let queue_num = unsafe {
+        if (*rq).mq_hctx.is_null() {
+            0
+        } else {
+            (*(*rq).mq_hctx).queue_num
+        }
+    };
+    (queue_num << BLK_MQ_UNIQUE_TAG_BITS) | tag
+}
+
 /// `blk_mq_map_queues` - `vendor/linux/block/blk-mq-cpumap.c`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn blk_mq_map_queues(map: *mut LinuxBlkMqQueueMap) {
@@ -1508,6 +1592,26 @@ pub unsafe extern "C" fn blk_execute_rq(rq: *mut LinuxRequest, _at_head: bool) -
     // without a caller-side deadline.  The request and any caller-owned
     // passthrough buffer must remain live until `blk_mq_end_request()` runs.
     block_io_wait_for_completion(rq)
+}
+
+/// `blk_dump_rq_flags` - `vendor/linux/block/blk-mq.c`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn blk_dump_rq_flags(rq: *mut LinuxRequest, msg: *const c_char) {
+    let message = if msg.is_null() {
+        "<null>"
+    } else {
+        unsafe {
+            let len = crate::lib::string::c_strlen(msg, 128);
+            core::str::from_utf8(core::slice::from_raw_parts(msg.cast::<u8>(), len))
+                .unwrap_or("<non-utf8>")
+        }
+    };
+    let flags = if rq.is_null() {
+        0
+    } else {
+        unsafe { (*rq).cmd_flags }
+    };
+    crate::log_info!("block", "{}: flags=0x{:x}", message, flags);
 }
 
 /// `blk_status_to_errno` - `vendor/linux/block/blk-core.c`.
@@ -2272,6 +2376,10 @@ pub unsafe extern "C" fn del_gendisk(disk: *mut LinuxGendisk) {
         (*disk).state &= !(1usize << GD_ADDED);
     }
 }
+
+/// `invalidate_bdev` - `vendor/linux/block/bdev.c`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn invalidate_bdev(_bdev: *mut c_void) {}
 
 /// `set_disk_ro` — `vendor/linux/block/genhd.c`.
 #[unsafe(no_mangle)]

@@ -20,6 +20,7 @@ use spin::Mutex;
 
 use crate::arch::x86::include::asm::io::{inb, inl, inw, outb, outl, outw};
 use crate::arch::x86::pci::early::{PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_PORT};
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::linux_driver_abi::base::{
     LinuxBusType, LinuxDevice, LinuxListHead, linux_device_register,
 };
@@ -49,6 +50,8 @@ pub const LINUX_PCI_BUS_ABI_SIZE: usize = 0x418;
 const LINUX_DEVICE_DMA_MASK_OFFSET: usize = 584;
 const LINUX_DEVICE_COHERENT_DMA_MASK_OFFSET: usize = 592;
 const LINUX_DEVICE_DMA_PARMS_OFFSET: usize = 616;
+const PCI_STATUS: usize = 0x06;
+const PCI_STATUS_ERROR_BITS: u16 = 0xf900;
 static PCI_EXCLUSIVE_RESOURCE_NAME: [u8; 14] = *b"PCI Exclusive\0";
 static PCI_BUSN_RESOURCE_NAME: [u8; 9] = *b"PCI busn\0";
 
@@ -64,6 +67,7 @@ pub const IORESOURCE_PREFETCH: usize = 0x0000_2000;
 pub const IORESOURCE_MEM_64: usize = 0x0010_0000;
 pub const IORESOURCE_READONLY: usize = 0x0000_4000;
 pub const IORESOURCE_SIZEALIGN: usize = 0x0004_0000;
+pub const IORESOURCE_BUSY: usize = 0x8000_0000;
 pub const IORESOURCE_ROM_ENABLE: usize = 0x0000_0001;
 pub const IORESOURCE_PCI_FIXED: usize = 0x0000_0010;
 pub const IORESOURCE_DISABLED: usize = 0x1000_0000;
@@ -852,6 +856,150 @@ lazy_static! {
 
 pub(crate) static LINUX_PCI_CONFIG_IO_LOCK: Mutex<()> = Mutex::new(());
 
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("pci_dev_get", pci_dev_get as usize, true);
+    export_symbol_once("pci_dev_put", pci_dev_put as usize, true);
+    export_symbol_once("pci_get_slot", pci_get_slot as usize, false);
+    export_symbol_once(
+        "pci_get_domain_bus_and_slot",
+        pci_get_domain_bus_and_slot as usize,
+        false,
+    );
+    export_symbol_once("pci_get_device", pci_get_device as usize, false);
+    export_symbol_once("pci_get_class", pci_get_class as usize, false);
+    export_symbol_once("p2sb_bar", linux_p2sb_bar as usize, true);
+    export_symbol_once("request_resource", linux_request_resource as usize, false);
+    export_symbol_once("release_resource", linux_release_resource as usize, false);
+    export_symbol_once("__request_region", linux___request_region as usize, false);
+    export_symbol_once("__release_region", linux___release_region as usize, false);
+    export_symbol_once(
+        "__devm_request_region",
+        linux___devm_request_region as usize,
+        false,
+    );
+    export_symbol_once(
+        "__devm_release_region",
+        linux___devm_release_region as usize,
+        false,
+    );
+}
+
+#[unsafe(export_name = "pci_dev_get")]
+pub unsafe extern "C" fn pci_dev_get(dev: *mut LinuxPciDev) -> *mut LinuxPciDev {
+    dev
+}
+
+#[unsafe(export_name = "pci_dev_put")]
+pub unsafe extern "C" fn pci_dev_put(_dev: *mut LinuxPciDev) {}
+
+/// `pci_get_slot` - `vendor/linux/drivers/pci/search.c:196`.
+#[unsafe(export_name = "pci_get_slot")]
+pub unsafe extern "C" fn pci_get_slot(bus: *mut LinuxPciBus, devfn: u32) -> *mut LinuxPciDev {
+    if bus.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    LINUX_PCI_OBJECTS
+        .lock()
+        .iter()
+        .find_map(|entry| {
+            let raw = entry.raw as *mut LinuxPciDev;
+            let matches = unsafe { (*raw).bus == bus.cast::<c_void>() && (*raw).devfn == devfn };
+            matches.then_some(unsafe { pci_dev_get(raw) })
+        })
+        .unwrap_or(core::ptr::null_mut())
+}
+
+/// `pci_get_domain_bus_and_slot` - `vendor/linux/drivers/pci/search.c:230`.
+#[unsafe(export_name = "pci_get_domain_bus_and_slot")]
+pub unsafe extern "C" fn pci_get_domain_bus_and_slot(
+    domain: i32,
+    bus: u32,
+    devfn: u32,
+) -> *mut LinuxPciDev {
+    let Ok(seg) = u16::try_from(domain) else {
+        return core::ptr::null_mut();
+    };
+    let Ok(bus) = u8::try_from(bus) else {
+        return core::ptr::null_mut();
+    };
+
+    LINUX_PCI_OBJECTS
+        .lock()
+        .iter()
+        .find_map(|entry| {
+            let entry_devfn = ((entry.dev as u32) << 3) | entry.func as u32;
+            if entry.seg == seg && entry.bus == bus && entry_devfn == devfn {
+                let raw = entry.raw as *mut LinuxPciDev;
+                Some(unsafe { pci_dev_get(raw) })
+            } else {
+                None
+            }
+        })
+        .unwrap_or(core::ptr::null_mut())
+}
+
+fn pci_search_after(
+    from: *mut LinuxPciDev,
+    mut matches: impl FnMut(*const LinuxPciDev) -> bool,
+) -> *mut LinuxPciDev {
+    let devices = LINUX_PCI_OBJECTS.lock();
+    let start = if from.is_null() {
+        0
+    } else {
+        devices
+            .iter()
+            .position(|entry| entry.raw == from as usize)
+            .map(|pos| pos + 1)
+            .unwrap_or(0)
+    };
+    devices
+        .iter()
+        .skip(start)
+        .find_map(|entry| {
+            let raw = entry.raw as *mut LinuxPciDev;
+            matches(raw.cast_const()).then_some(raw)
+        })
+        .unwrap_or(core::ptr::null_mut())
+}
+
+#[unsafe(export_name = "pci_get_device")]
+pub unsafe extern "C" fn pci_get_device(
+    vendor: u32,
+    device: u32,
+    from: *mut LinuxPciDev,
+) -> *mut LinuxPciDev {
+    const PCI_ANY_ID: u32 = u32::MAX;
+    let found = pci_search_after(from, |raw| unsafe {
+        (vendor == PCI_ANY_ID || (*raw).vendor as u32 == vendor)
+            && (device == PCI_ANY_ID || (*raw).device as u32 == device)
+    });
+    unsafe { pci_dev_put(from) };
+    found
+}
+
+#[unsafe(export_name = "pci_get_class")]
+pub unsafe extern "C" fn pci_get_class(class: u32, from: *mut LinuxPciDev) -> *mut LinuxPciDev {
+    let found = pci_search_after(from, |raw| unsafe { (*raw).class == class });
+    unsafe { pci_dev_put(from) };
+    found
+}
+
+/// `p2sb_bar` fallback - `vendor/linux/include/linux/platform_data/x86/p2sb.h`.
+pub unsafe extern "C" fn linux_p2sb_bar(
+    _bus: *mut LinuxPciBus,
+    _devfn: u32,
+    _mem: *mut LinuxResource,
+) -> i32 {
+    -crate::include::uapi::errno::ENODEV
+}
+
 pub unsafe fn linux_pci_dev_from_device(dev: *const LinuxDevice) -> *mut LinuxPciDev {
     if dev.is_null() {
         return core::ptr::null_mut();
@@ -922,7 +1070,7 @@ fn linux_pci_domain_busn_resource(seg: u16) -> *mut LinuxResource {
 }
 
 #[cfg(test)]
-fn registered_linux_pci_bus(seg: u16, number: u8) -> *mut LinuxPciBus {
+pub(crate) fn registered_linux_pci_bus(seg: u16, number: u8) -> *mut LinuxPciBus {
     LINUX_PCI_BUSES
         .lock()
         .iter()
@@ -931,7 +1079,10 @@ fn registered_linux_pci_bus(seg: u16, number: u8) -> *mut LinuxPciBus {
         .unwrap_or(core::ptr::null_mut())
 }
 
-unsafe fn linux_resource_request(parent: *mut LinuxResource, resource: *mut LinuxResource) -> bool {
+pub(crate) unsafe fn linux_resource_request(
+    parent: *mut LinuxResource,
+    resource: *mut LinuxResource,
+) -> bool {
     if parent.is_null() || resource.is_null() {
         return false;
     }
@@ -963,6 +1114,186 @@ unsafe fn linux_resource_request(parent: *mut LinuxResource, resource: *mut Linu
         *link = resource;
     }
     true
+}
+
+unsafe fn linux_resource_release(resource: *mut LinuxResource) -> i32 {
+    if resource.is_null() {
+        return -crate::include::uapi::errno::EINVAL;
+    }
+    let parent = unsafe { (*resource).parent };
+    if parent.is_null() {
+        unsafe {
+            (*resource).sibling = core::ptr::null_mut();
+            (*resource).child = core::ptr::null_mut();
+        }
+        return 0;
+    }
+
+    let mut link = unsafe { core::ptr::addr_of_mut!((*parent).child) };
+    while unsafe { !(*link).is_null() } {
+        let current = unsafe { *link };
+        if current == resource {
+            unsafe {
+                *link = (*resource).sibling;
+                (*resource).parent = core::ptr::null_mut();
+                (*resource).sibling = core::ptr::null_mut();
+            }
+            return 0;
+        }
+        link = unsafe { core::ptr::addr_of_mut!((*current).sibling) };
+    }
+    -crate::include::uapi::errno::EINVAL
+}
+
+/// `request_resource` - `vendor/linux/kernel/resource.c`.
+unsafe extern "C" fn linux_request_resource(
+    parent: *mut LinuxResource,
+    resource: *mut LinuxResource,
+) -> i32 {
+    if unsafe { linux_resource_request(parent, resource) } {
+        0
+    } else {
+        -crate::include::uapi::errno::EBUSY
+    }
+}
+
+/// `release_resource` - `vendor/linux/kernel/resource.c`.
+unsafe extern "C" fn linux_release_resource(resource: *mut LinuxResource) -> i32 {
+    unsafe { linux_resource_release(resource) }
+}
+
+unsafe fn linux_region_request(
+    mut parent: *mut LinuxResource,
+    resource: *mut LinuxResource,
+    flags: i32,
+) -> bool {
+    if parent.is_null() || resource.is_null() {
+        return false;
+    }
+
+    'retry: loop {
+        unsafe {
+            if (*parent).flags & IORESOURCE_UNSET != 0
+                || (*parent).start > (*resource).start
+                || (*parent).end < (*resource).end
+            {
+                return false;
+            }
+
+            (*resource).flags = ((*parent).flags & IORESOURCE_TYPE_BITS)
+                | IORESOURCE_BUSY
+                | (flags as usize & !IORESOURCE_TYPE_BITS);
+            (*resource).desc = (*parent).desc;
+
+            let mut child = (*parent).child;
+            while !child.is_null() {
+                if (*child).end < (*resource).start || (*resource).end < (*child).start {
+                    child = (*child).sibling;
+                    continue;
+                }
+
+                if (*child).flags & IORESOURCE_BUSY == 0
+                    && (*child).start <= (*resource).start
+                    && (*child).end >= (*resource).end
+                {
+                    parent = child;
+                    continue 'retry;
+                }
+
+                return false;
+            }
+
+            let mut link = core::ptr::addr_of_mut!((*parent).child);
+            while !(*link).is_null() && (**link).start < (*resource).start {
+                link = core::ptr::addr_of_mut!((**link).sibling);
+            }
+            (*resource).parent = parent;
+            (*resource).sibling = *link;
+            *link = resource;
+            return true;
+        }
+    }
+}
+
+/// `__request_region` - `vendor/linux/kernel/resource.c`.
+unsafe extern "C" fn linux___request_region(
+    parent: *mut LinuxResource,
+    start: u64,
+    n: u64,
+    name: *const c_char,
+    flags: i32,
+) -> *mut LinuxResource {
+    if parent.is_null() || n == 0 {
+        return core::ptr::null_mut();
+    }
+    let end = start.saturating_add(n.saturating_sub(1));
+    let mut resource = Box::new(LinuxResource {
+        start,
+        end,
+        name,
+        flags: unsafe { ((*parent).flags & IORESOURCE_TYPE_BITS) | IORESOURCE_BUSY }
+            | flags as usize,
+        desc: 0,
+        parent: core::ptr::null_mut(),
+        sibling: core::ptr::null_mut(),
+        child: core::ptr::null_mut(),
+    });
+    let raw = (&mut *resource) as *mut LinuxResource;
+    if unsafe { linux_region_request(parent, raw, flags) } {
+        Box::into_raw(resource)
+    } else {
+        core::ptr::null_mut()
+    }
+}
+
+/// `__release_region` - `vendor/linux/kernel/resource.c`.
+unsafe extern "C" fn linux___release_region(parent: *mut LinuxResource, start: u64, n: u64) {
+    if parent.is_null() || n == 0 {
+        return;
+    }
+    let end = start.saturating_add(n.saturating_sub(1));
+    let mut link = unsafe { core::ptr::addr_of_mut!((*parent).child) };
+    while unsafe { !(*link).is_null() } {
+        let current = unsafe { *link };
+        if unsafe { (*current).start <= start && (*current).end >= end } {
+            if unsafe { (*current).flags & IORESOURCE_BUSY == 0 } {
+                link = unsafe { core::ptr::addr_of_mut!((*current).child) };
+                continue;
+            }
+            if unsafe { (*current).start != start || (*current).end != end } {
+                return;
+            }
+            unsafe {
+                *link = (*current).sibling;
+                (*current).parent = core::ptr::null_mut();
+                (*current).sibling = core::ptr::null_mut();
+                drop(Box::from_raw(current));
+            }
+            return;
+        }
+        link = unsafe { core::ptr::addr_of_mut!((*current).sibling) };
+    }
+}
+
+/// `__devm_request_region` - `vendor/linux/kernel/resource.c:1754`.
+unsafe extern "C" fn linux___devm_request_region(
+    _dev: *mut LinuxDevice,
+    parent: *mut LinuxResource,
+    start: u64,
+    n: u64,
+    name: *const c_char,
+) -> *mut LinuxResource {
+    unsafe { linux___request_region(parent, start, n, name, 0) }
+}
+
+/// `__devm_release_region` - `vendor/linux/kernel/resource.c:1779`.
+unsafe extern "C" fn linux___devm_release_region(
+    _dev: *mut LinuxDevice,
+    parent: *mut LinuxResource,
+    start: u64,
+    n: u64,
+) {
+    unsafe { linux___release_region(parent, start, n) };
 }
 
 unsafe fn linux_pci_find_parent_resource(
@@ -1548,11 +1879,43 @@ pub fn linux_pci_config_write(dev: *const c_void, offset: usize, width: usize, v
     if offset + width <= PCI_CONFIG_SPACE_SIZE {
         let mut states = LINUX_PCI_DEVICE_STATES.lock();
         if let Some(current) = states.iter_mut().find(|entry| entry.dev == dev as usize) {
-            let bytes = value.to_le_bytes();
-            current.state.config_space[offset..offset + width].copy_from_slice(&bytes[..width]);
+            update_cached_config_write(&mut current.state.config_space, offset, width, value);
         }
     }
     true
+}
+
+fn update_cached_config_write(
+    config_space: &mut [u8; PCI_CONFIG_SPACE_SIZE],
+    offset: usize,
+    width: usize,
+    value: u32,
+) {
+    let end = offset + width;
+    let status_overlap = status_write_overlap(offset, width, value);
+    let old_status = status_overlap
+        .map(|_| u16::from_le_bytes([config_space[PCI_STATUS], config_space[PCI_STATUS + 1]]));
+    let bytes = value.to_le_bytes();
+    config_space[offset..end].copy_from_slice(&bytes[..width]);
+
+    if let (Some(written_status), Some(old_status)) = (status_overlap, old_status) {
+        let status = old_status & !(written_status & PCI_STATUS_ERROR_BITS);
+        config_space[PCI_STATUS..PCI_STATUS + 2].copy_from_slice(&status.to_le_bytes());
+    }
+}
+
+fn status_write_overlap(offset: usize, width: usize, value: u32) -> Option<u16> {
+    let end = offset.checked_add(width)?;
+    if offset >= PCI_STATUS + 2 || end <= PCI_STATUS {
+        return None;
+    }
+
+    let mut status_bytes = [0u8; 2];
+    let write_bytes = value.to_le_bytes();
+    for index in offset.max(PCI_STATUS)..end.min(PCI_STATUS + 2) {
+        status_bytes[index - PCI_STATUS] = write_bytes[index - offset];
+    }
+    Some(u16::from_le_bytes(status_bytes))
 }
 
 const fn pci_config_access_is_aligned(offset: usize, width: usize) -> bool {
@@ -1687,6 +2050,37 @@ mod tests {
             2,
             0
         ));
+
+        unregister_linux_pci_device_state(dev);
+    }
+
+    #[test]
+    fn linux_pci_config_write_clears_status_w1c_bits_in_cache() {
+        const PCI_STATUS_CAP_LIST: u16 = 0x0010;
+        const PCI_STATUS_SIG_TARGET_ABORT: u16 = 0x0800;
+        const PCI_STATUS_REC_MASTER_ABORT: u16 = 0x2000;
+
+        let mut token = 0u8;
+        let dev = (&mut token as *mut u8).cast::<c_void>();
+        let mut state = LinuxPciDeviceAbiState {
+            config_space: [0; PCI_CONFIG_SPACE_SIZE],
+            bars: [None; PCI_STD_NUM_BARS],
+        };
+        let status =
+            PCI_STATUS_CAP_LIST | PCI_STATUS_SIG_TARGET_ABORT | PCI_STATUS_REC_MASTER_ABORT;
+        state.config_space[PCI_STATUS..PCI_STATUS + 2].copy_from_slice(&status.to_le_bytes());
+        register_linux_pci_device_state(dev, state);
+
+        assert!(linux_pci_config_write(
+            dev,
+            PCI_STATUS,
+            2,
+            PCI_STATUS_SIG_TARGET_ABORT as u32
+        ));
+        assert_eq!(
+            linux_pci_config_read(dev, PCI_STATUS, 2),
+            Some((PCI_STATUS_CAP_LIST | PCI_STATUS_REC_MASTER_ABORT) as u32)
+        );
 
         unregister_linux_pci_device_state(dev);
     }
@@ -1895,5 +2289,141 @@ mod tests {
             );
         }
         assert_eq!(linux_pci_raw_device_for_slot(0, 0, 30, 0), raw);
+    }
+
+    #[test]
+    fn pci_get_domain_bus_and_slot_finds_registered_device() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/drivers/pci/search.c"
+        ));
+        assert!(source.contains("struct pci_dev *pci_get_domain_bus_and_slot"));
+        assert!(source.contains("EXPORT_SYMBOL(pci_get_domain_bus_and_slot);"));
+
+        register_module_exports();
+        assert_eq!(
+            find_symbol("pci_get_domain_bus_and_slot"),
+            Some(pci_get_domain_bus_and_slot as usize)
+        );
+
+        crate::linux_driver_abi::pci::driver::register_module_exports();
+        let pdev =
+            PciDev::new_with_subsystem(0x7f7e, 5, 9, 3, 0x8086, 0x1234, 0x03, 0x00, 0x00, 1, 0, 0);
+        let raw = register_linux_pci_device(
+            &pdev,
+            crate::linux_driver_abi::pci::driver::linux_pci_bus_type_ptr(),
+        );
+        let devfn = (9u32 << 3) | 3;
+
+        let found = unsafe { pci_get_domain_bus_and_slot(0x7f7e, 5, devfn) };
+        assert_eq!(found, raw);
+        unsafe { pci_dev_put(found) };
+        assert!(unsafe { pci_get_domain_bus_and_slot(0x7f7e, 6, devfn) }.is_null());
+        assert!(unsafe { pci_get_domain_bus_and_slot(-1, 5, devfn) }.is_null());
+    }
+
+    #[test]
+    fn p2sb_bar_export_uses_linux_disabled_config_fallback() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/include/linux/platform_data/x86/p2sb.h"
+        ));
+        assert!(source.contains("static inline int p2sb_bar"));
+        assert!(source.contains("return -ENODEV;"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("p2sb_bar"),
+            Some(linux_p2sb_bar as usize)
+        );
+        assert_eq!(
+            unsafe { linux_p2sb_bar(core::ptr::null_mut(), 0, core::ptr::null_mut()) },
+            -crate::include::uapi::errno::ENODEV
+        );
+    }
+
+    #[test]
+    fn devm_request_region_descends_into_non_busy_parent() {
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("__devm_request_region"),
+            Some(linux___devm_request_region as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("__devm_release_region"),
+            Some(linux___devm_release_region as usize)
+        );
+
+        let mut root = LinuxResource {
+            start: 0,
+            end: u64::MAX,
+            name: core::ptr::null(),
+            flags: IORESOURCE_MEM,
+            desc: 0,
+            parent: core::ptr::null_mut(),
+            sibling: core::ptr::null_mut(),
+            child: core::ptr::null_mut(),
+        };
+        let mut bar = LinuxResource {
+            start: 0x1000,
+            end: 0x1fff,
+            name: core::ptr::null(),
+            flags: IORESOURCE_MEM,
+            desc: 0,
+            parent: core::ptr::null_mut(),
+            sibling: core::ptr::null_mut(),
+            child: core::ptr::null_mut(),
+        };
+
+        unsafe {
+            assert!(linux_resource_request(
+                core::ptr::addr_of_mut!(root),
+                core::ptr::addr_of_mut!(bar)
+            ));
+
+            let first = linux___devm_request_region(
+                core::ptr::null_mut(),
+                core::ptr::addr_of_mut!(root),
+                0x1000,
+                0x1000,
+                core::ptr::null(),
+            );
+            assert!(!first.is_null());
+            assert_eq!((*first).parent, core::ptr::addr_of_mut!(bar));
+            assert_eq!((*first).flags & IORESOURCE_BUSY, IORESOURCE_BUSY);
+            assert_eq!(bar.child, first);
+
+            let conflict = linux___devm_request_region(
+                core::ptr::null_mut(),
+                core::ptr::addr_of_mut!(root),
+                0x1800,
+                0x100,
+                core::ptr::null(),
+            );
+            assert!(conflict.is_null());
+
+            linux___devm_release_region(
+                core::ptr::null_mut(),
+                core::ptr::addr_of_mut!(root),
+                0x1000,
+                0x1000,
+            );
+            assert!(bar.child.is_null());
+
+            let second = linux___devm_request_region(
+                core::ptr::null_mut(),
+                core::ptr::addr_of_mut!(root),
+                0x1000,
+                0x1000,
+                core::ptr::null(),
+            );
+            assert!(!second.is_null());
+            linux___devm_release_region(
+                core::ptr::null_mut(),
+                core::ptr::addr_of_mut!(root),
+                0x1000,
+                0x1000,
+            );
+        }
     }
 }

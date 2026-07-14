@@ -18,6 +18,7 @@ use crate::include::uapi::errno::{EINVAL, ENOMEM, ENOSPC, EPERM};
 use crate::init::version;
 use crate::kernel::capability::CAP_SYS_ADMIN;
 use crate::kernel::clone::CLONE_NEWUTS;
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::user_namespace::{INIT_USER_NS, UserNamespace};
 
 /// Length of one `new_utsname` field (Linux: `__NEW_UTS_LEN + 1 = 65`).
@@ -60,11 +61,10 @@ pub const fn pack65(s: &str) -> [u8; NEW_UTS_LEN_PLUS_NUL] {
 
 #[repr(C)]
 pub struct UtsNamespace {
-    pub ns: NsCommon,
     pub name: NewUtsname,
     pub user_ns: *const UserNamespace,
     pub ucounts: usize,
-    pub in_nstree: bool,
+    pub ns: NsCommon,
 }
 
 unsafe impl Send for UtsNamespace {}
@@ -109,7 +109,6 @@ pub static UTS_OPS: NsOperations = NsOperations {
 
 /// Singleton init UTS namespace populated with Lupos identity strings.
 pub static INIT_UTS_NS: UtsNamespace = UtsNamespace {
-    ns: NsCommon::sticky(&UTS_OPS as *const _, PROC_DYNAMIC_FIRST + 1),
     name: NewUtsname {
         sysname: pack65(version::UTS_SYSNAME),
         nodename: pack65(version::UTS_NODENAME),
@@ -120,8 +119,22 @@ pub static INIT_UTS_NS: UtsNamespace = UtsNamespace {
     },
     user_ns: &INIT_USER_NS,
     ucounts: 0,
-    in_nstree: true,
+    ns: NsCommon::sticky(&UTS_OPS as *const _, PROC_DYNAMIC_FIRST + 1),
 };
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "init_uts_ns",
+        core::ptr::addr_of!(INIT_UTS_NS) as usize,
+        true,
+    );
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UtsNsProcOperations {
@@ -435,6 +448,9 @@ fn clone_uts_ns_runtime(
         old_ns
     };
     let b = Box::new(UtsNamespace {
+        name: unsafe { (*src).name },
+        user_ns,
+        ucounts: 1,
         ns: NsCommon {
             count: core::sync::atomic::AtomicUsize::new(1),
             stashed: core::ptr::null_mut(),
@@ -442,10 +458,6 @@ fn clone_uts_ns_runtime(
             inum: alloc_ns_inum(),
             _pad: 0,
         },
-        name: unsafe { (*src).name },
-        user_ns,
-        ucounts: 1,
-        in_nstree: true,
     });
     if !user_ns.is_null() {
         unsafe {
@@ -744,13 +756,32 @@ mod tests {
     }
 
     #[test]
+    fn uts_namespace_c_layout_matches_vendor_prefix() {
+        use core::mem::offset_of;
+
+        assert_eq!(offset_of!(UtsNamespace, name), 0);
+        assert_eq!(offset_of!(UtsNamespace, user_ns), 392);
+        assert_eq!(offset_of!(UtsNamespace, ucounts), 400);
+        assert_eq!(offset_of!(UtsNamespace, ns), 408);
+    }
+
+    #[test]
+    fn init_uts_ns_export_registers_for_modules() {
+        register_module_exports();
+
+        assert_eq!(
+            crate::kernel::module::find_symbol("init_uts_ns"),
+            Some(core::ptr::addr_of!(INIT_UTS_NS) as usize)
+        );
+    }
+
+    #[test]
     fn copy_utsname_clones_name() {
         let n = copy_utsname(&INIT_UTS_NS, &INIT_USER_NS).unwrap();
         unsafe {
             assert_eq!((*n).name.sysname, INIT_UTS_NS.name.sysname);
             assert_eq!((*n).user_ns, &INIT_USER_NS as *const _);
             assert_eq!((*n).ucounts, 1);
-            assert!((*n).in_nstree);
             uts_put(n as *mut _);
         }
     }
@@ -770,7 +801,6 @@ mod tests {
         unsafe {
             assert_eq!((*cloned).name.domainname, INIT_UTS_NS.name.domainname);
             assert_eq!((*cloned).ucounts, 1);
-            assert!((*cloned).in_nstree);
             uts_put(cloned as *mut _);
         }
     }

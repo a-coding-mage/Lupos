@@ -16,16 +16,62 @@ DEFCONFIG="${DEFCONFIG:-configs/lupos_defconfig}"
 # CONFIG_DRM_I915=m
 # CONFIG_DRM_VIRTIO_GPU=m
 # CONFIG_USB_XHCI=y
+# CONFIG_USB_MON=m
+# CONFIG_USB_EHCI_HCD=m
+# CONFIG_USB_EHCI_PCI=m
+# CONFIG_USB_OHCI_HCD=m
+# CONFIG_USB_OHCI_HCD_PCI=m
+# CONFIG_USB_UHCI_HCD=m
 # CONFIG_HID=y
+# CONFIG_USB_PRINTER=m
 # CONFIG_SOUND=m
 # CONFIG_SND=m
+# CONFIG_SND_HRTIMER=m
+# CONFIG_SND_SEQ_DEVICE=m
+# CONFIG_SND_SEQUENCER=m
+# CONFIG_SND_SEQ_DUMMY=m
 # CONFIG_SND_HDA_INTEL=m
 # CONFIG_SND_HDA_GENERIC=m
 # CONFIG_VIRTIO_PCI_LIB=m
 # CONFIG_VIRTIO_PCI=m
 # CONFIG_VIRTIO_BLK=m
+# CONFIG_VIRTIO_CONSOLE=m
+# CONFIG_VIRTIO_INPUT=m
+# CONFIG_SCSI_COMMON=m
+# CONFIG_SCSI=m
+# CONFIG_BLK_DEV_SD=m
+# CONFIG_CDROM=m
+# CONFIG_BLK_DEV_SR=m
+# CONFIG_CHR_DEV_SG=m
+# CONFIG_SCSI_SPI_ATTRS=m
+# CONFIG_SCSI_VIRTIO=m
+# CONFIG_USB_STORAGE=m
+# CONFIG_I2C=m
+# CONFIG_I2C_SMBUS=m
+# CONFIG_I2C_I801=m
+# CONFIG_ATA=m
+# CONFIG_SATA_AHCI=m
+# CONFIG_ATA_PIIX=m
+# CONFIG_PATA_AMD=m
+# CONFIG_PATA_OLDPIIX=m
+# CONFIG_PATA_SCH=m
 # CONFIG_VIRTIO_NET=m
+# CONFIG_NETCONSOLE=m
+# CONFIG_NET_9P=m
+# CONFIG_NET_9P_VIRTIO=m
+# CONFIG_MII=m
+# CONFIG_PHYLIB=m
+# CONFIG_PHY_PACKAGE=m
+# CONFIG_REALTEK_PHY=m
+# CONFIG_E100=m
 # CONFIG_E1000=m
+# CONFIG_E1000E=m
+# CONFIG_SKY2=m
+# CONFIG_TIGON3=m
+# CONFIG_FORCEDETH=m
+# CONFIG_8139TOO=m
+# CONFIG_R8169=m
+# CONFIG_X86_PKG_TEMP_THERMAL=m
 
 detect="$(mktemp)"
 tmp="$(mktemp)"
@@ -146,6 +192,12 @@ fi
 if has "USB|xHCI|EHCI|OHCI|UHCI|0c03"; then
 	emit USB
 	emit PCI
+	emit_module USB_MON
+	emit_module USB_EHCI_HCD
+	emit_module USB_EHCI_PCI
+	emit_module USB_OHCI_HCD
+	emit_module USB_OHCI_HCD_PCI
+	emit_module USB_UHCI_HCD
 fi
 
 if has "xHCI|0c03:30|USB controller.*xHCI|8086:.*USB|1022:.*USB"; then
@@ -159,11 +211,27 @@ if has "HID|Keyboard|Mouse|Touchpad|Input|USB"; then
 	emit HID
 fi
 
+if has "USB.*(Printer|printing)|Printer.*USB|usblp|class.*printer"; then
+	emit USB
+	emit_module USB_PRINTER
+fi
+
+if has "SMBus|I2C|I801|82801|ICH|PCH|0c05|Intel.*SMBus|qemu|bochs|kvm"; then
+	emit PCI
+	emit_module I2C
+	emit_module I2C_SMBUS
+	emit_module I2C_I801
+fi
+
 if has "Audio|HDA|HD Audio|0403|ICH9|Intel.*Audio|qemu|bochs|kvm"; then
 	emit PCI
 	emit_module SOUND
 	emit_module SND
 	emit_module SND_TIMER
+	emit_module SND_HRTIMER
+	emit_module SND_SEQ_DEVICE
+	emit_module SND_SEQUENCER
+	emit_module SND_SEQ_DUMMY
 	emit_module SND_PCM
 	emit_module SND_HWDEP
 	emit_module SND_HDA_CORE
@@ -180,15 +248,41 @@ if has "virtio|1af4:|qemu|bochs|kvm"; then
 	emit VIRTIO
 	emit_module VIRTIO_PCI_LIB
 	emit_module VIRTIO_PCI
+	emit_module VIRTIO_CONSOLE
+	emit INPUT
+	emit_module VIRTIO_INPUT
 fi
 
 if has "virtio.*(net|network|ethernet)|(net|network|ethernet).*virtio|1af4:(1000|1041)|qemu|bochs|kvm"; then
 	emit NET
 	emit NETDEVICES
 	emit_module VIRTIO_NET
+	emit_module NETCONSOLE
+	emit_module NET_9P
+	emit_module NET_9P_VIRTIO
+fi
+
+if has "GenuineIntel|Intel.*CPU|thermal|qemu|bochs|kvm"; then
+	emit NET
+	emit_module X86_PKG_TEMP_THERMAL
 fi
 
 if has "virtio.*(blk|block|storage|scsi)|(blk|block|storage|scsi).*virtio|1af4:(1001|1042)|qemu|bochs|kvm"; then
+	emit_module SCSI_COMMON
+	emit_module SCSI
+	emit_module BLK_DEV_SD
+	emit_module CDROM
+	emit_module BLK_DEV_SR
+	emit_module CHR_DEV_SG
+	emit_module SCSI_SPI_ATTRS
+	emit_module SCSI_VIRTIO
+	emit_module USB_STORAGE
+	emit_module ATA
+	emit_module SATA_AHCI
+	emit_module ATA_PIIX
+	emit_module PATA_AMD
+	emit_module PATA_OLDPIIX
+	emit_module PATA_SCH
 	emit_module VIRTIO_BLK
 fi
 
@@ -197,6 +291,60 @@ if has "Intel.*(8254|e1000|PRO/1000)|Ethernet controller.*8086:(100e|100f|1010|1
 	emit NET
 	emit NETDEVICES
 	emit_module E1000
+fi
+
+if has "Intel.*(PRO/100|8255|82562|82557|82558|82559)|Ethernet controller.*8086:(1029|1030|1031|1032|1033|1034|1035|1036|1037|1038|1039|103a|103b|103c|103d|103e|1050|1051|1059|1064|1065|1068|1069|106a|106b|1091|1092|1093|1094|1095|1209|1229|2449|2459|245d|27dc)|8086:(1029|1030|1031|1032|1033|1034|1035|1036|1037|1038|1039|103a|103b|103c|103d|103e|1050|1051|1059|1064|1065|1068|1069|106a|106b|1091|1092|1093|1094|1095|1209|1229|2449|2459|245d|27dc)"; then
+	emit PCI
+	emit NET
+	emit NETDEVICES
+	emit_module MII
+	emit_module E100
+fi
+
+if has "Intel.*(e1000e|PCI-Express.*Gigabit|I21[7-9]|8257|8258)|Ethernet controller.*8086:(10a4|10a5|10bc|10bd|10bf|10c0|10c2|10c3|10c4|10c5|10cb|10cc|10cd|10ce|10d3|10d5|10d9|10da|10de|10df|10ea|10eb|10ef|10f0|10f5|10f6|1501|1502|1503|150c|150d|150e|150f|1510|1511|1516|1518|1525|153a|153b|1559|155a|156f|1570|15a0|15a1|15a2|15a3|15b7|15b8|15bb|15bc|15bd|15be|15d6|15d7|15d8|15e3|15e4|15e5|15e6|15e7|15e8|15f4|15f5|15f9|15fa|15fb|15fc|1a1c)|8086:(10a4|10a5|10bc|10bd|10bf|10c0|10c2|10c3|10c4|10c5|10cb|10cc|10cd|10ce|10d3|10d5|10d9|10da|10de|10df|10ea|10eb|10ef|10f0|10f5|10f6|1501|1502|1503|150a|150c|150d|150e|150f|1510|1511|1516|1518|1525|153a|153b|1559|155a|156f|1570|15a0|15a1|15a2|15a3|15b7|15b8|15bb|15bc|15bd|15be|15d6|15d7|15d8|15e3|15e4|15e5|15e6|15e7|15e8|15f4|15f5|15f9|15fa|15fb|15fc|1a1c)"; then
+	emit PCI
+	emit NET
+	emit NETDEVICES
+	emit_module E1000E
+fi
+
+if has "Marvell.*(Yukon|88E80)|SysKonnect|11ab:(4360|4361|4362|4363|4364|4365|4366|4367|4368|4369|436a|436b|436c|436d|436e|436f|4370|4371|4372|4373|4374|4375|4376|4377)"; then
+	emit PCI
+	emit NET
+	emit NETDEVICES
+	emit_module SKY2
+fi
+
+if has "Broadcom.*(Tigon3|NetXtreme)|14e4:(16|17)[0-9a-f][0-9a-f]|tg3"; then
+	emit PCI
+	emit NET
+	emit NETDEVICES
+	emit_module PHYLIB
+	emit_module TIGON3
+fi
+
+if has "nForce.*Ethernet|NVIDIA.*Ethernet|10de:.*(Ethernet|network)|forcedeth"; then
+	emit PCI
+	emit NET
+	emit NETDEVICES
+	emit_module FORCEDETH
+fi
+
+if has "Real[Tt]ek.*(8139|8129|8130)|RTL-?81(29|30|39)|10ec:8139"; then
+	emit PCI
+	emit NET
+	emit NETDEVICES
+	emit_module MII
+	emit_module 8139TOO
+fi
+
+if has "Real[Tt]ek.*(8169|8168|8101|8125)|RTL-?81(69|68|01|25)|10ec:(8168|8169|8125|8126)|r8169"; then
+	emit PCI
+	emit NET
+	emit NETDEVICES
+	emit_module PHYLIB
+	emit_module REALTEK_PHY
+	emit_module R8169
 fi
 
 echo "*** localmodconfig: writing .config from detected PCI/ACPI/DMI devices"

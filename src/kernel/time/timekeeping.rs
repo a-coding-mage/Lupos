@@ -7,7 +7,11 @@
 //! wall-clock and monotonic readings.  Lupos M36 advances them tick-by-tick
 //! via `tick_advance_walltime`; NTP slewing arrives in M59.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    ffi::c_void,
+    ptr::addr_of_mut,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use super::jiffies::NSEC_PER_TICK;
 
@@ -35,6 +39,31 @@ impl Timekeeper {
 }
 
 pub static TK: Timekeeper = Timekeeper::new();
+
+#[repr(C)]
+struct LinuxSystemCounterval {
+    cycles: u64,
+    cs_id: i32,
+    use_nsecs: bool,
+}
+
+#[repr(C)]
+struct LinuxSystemDeviceCrosststamp {
+    clock_id: i32,
+    device: i64,
+    sys_counter: LinuxSystemCounterval,
+    sys_systime: i64,
+    sys_monoraw: i64,
+}
+
+type LinuxGetDeviceTimeFn = unsafe extern "C" fn(
+    device_time: *mut i64,
+    system_counterval: *mut LinuxSystemCounterval,
+    ctx: *mut c_void,
+) -> i32;
+
+const _: () = assert!(core::mem::size_of::<LinuxSystemCounterval>() == 16);
+const _: () = assert!(core::mem::size_of::<LinuxSystemDeviceCrosststamp>() == 48);
 
 /// TSC counter snapshot taken at the most recent `tick_advance_walltime`
 /// call.  Read by `ktime_get` to interpolate sub-tick resolution between
@@ -142,6 +171,193 @@ pub fn ktime_get() -> u64 {
     let khz = crate::arch::x86::kernel::tsc::tsc_khz();
     let delta_ns = crate::arch::x86::kernel::tsc::cycles_to_ns(delta, khz);
     base.saturating_add(delta_ns)
+}
+
+pub fn register_module_exports() {
+    use crate::kernel::module::{export_symbol, find_symbol};
+
+    if find_symbol("ktime_get").is_none() {
+        export_symbol("ktime_get", linux_ktime_get as usize, true);
+    }
+    if find_symbol("ktime_get_mono_fast_ns").is_none() {
+        export_symbol(
+            "ktime_get_mono_fast_ns",
+            linux_ktime_get_mono_fast_ns as usize,
+            true,
+        );
+    }
+    if find_symbol("ktime_get_raw").is_none() {
+        export_symbol("ktime_get_raw", linux_ktime_get_raw as usize, true);
+    }
+    if find_symbol("ktime_get_raw_fast_ns").is_none() {
+        export_symbol(
+            "ktime_get_raw_fast_ns",
+            linux_ktime_get_raw_fast_ns as usize,
+            true,
+        );
+    }
+    if find_symbol("ktime_get_with_offset").is_none() {
+        export_symbol(
+            "ktime_get_with_offset",
+            linux_ktime_get_with_offset as usize,
+            true,
+        );
+    }
+    if find_symbol("ktime_get_snapshot_id").is_none() {
+        export_symbol(
+            "ktime_get_snapshot_id",
+            linux_ktime_get_snapshot_id as usize,
+            true,
+        );
+    }
+    if find_symbol("ktime_get_ts64").is_none() {
+        export_symbol("ktime_get_ts64", linux_ktime_get_ts64 as usize, true);
+    }
+    if find_symbol("ktime_get_raw_ts64").is_none() {
+        export_symbol(
+            "ktime_get_raw_ts64",
+            linux_ktime_get_raw_ts64 as usize,
+            false,
+        );
+    }
+    if find_symbol("ktime_get_real_ts64").is_none() {
+        export_symbol(
+            "ktime_get_real_ts64",
+            linux_ktime_get_real_ts64 as usize,
+            false,
+        );
+    }
+    if find_symbol("get_device_system_crosststamp").is_none() {
+        export_symbol(
+            "get_device_system_crosststamp",
+            linux_get_device_system_crosststamp as usize,
+            true,
+        );
+    }
+}
+
+unsafe extern "C" fn linux_ktime_get() -> i64 {
+    ktime_get().min(i64::MAX as u64) as i64
+}
+
+unsafe extern "C" fn linux_ktime_get_mono_fast_ns() -> u64 {
+    ktime_get()
+}
+
+unsafe extern "C" fn linux_ktime_get_raw() -> i64 {
+    ktime_get().min(i64::MAX as u64) as i64
+}
+
+unsafe extern "C" fn linux_ktime_get_raw_fast_ns() -> u64 {
+    ktime_get()
+}
+
+unsafe extern "C" fn linux_ktime_get_with_offset(offset: i32) -> i64 {
+    const TK_OFFS_REAL: i32 = 0;
+    const TK_OFFS_BOOT: i32 = 1;
+    const TK_OFFS_TAI: i32 = 2;
+
+    let ns = match offset {
+        TK_OFFS_REAL => ktime_get_real(),
+        TK_OFFS_BOOT => ktime_get_boottime(),
+        TK_OFFS_TAI => ktime_get_real().saturating_add(
+            TK.tai_offset
+                .load(Ordering::Acquire)
+                .saturating_mul(NSEC_PER_SEC),
+        ),
+        _ => ktime_get(),
+    };
+    ns.min(i64::MAX as u64) as i64
+}
+
+#[unsafe(export_name = "ktime_get_snapshot_id")]
+unsafe extern "C" fn linux_ktime_get_snapshot_id(
+    _clock_id: i32,
+    _snapshot: *mut core::ffi::c_void,
+) {
+}
+
+#[repr(C)]
+struct LinuxTimespec64 {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// `ktime_get_ts64` - `vendor/linux/kernel/time/timekeeping.c`.
+#[unsafe(export_name = "ktime_get_ts64")]
+unsafe extern "C" fn linux_ktime_get_ts64(ts: *mut LinuxTimespec64) {
+    if ts.is_null() {
+        return;
+    }
+    let ns = ktime_get();
+    unsafe {
+        (*ts).tv_sec = (ns / NSEC_PER_SEC) as i64;
+        (*ts).tv_nsec = (ns % NSEC_PER_SEC) as i64;
+    }
+}
+
+/// `ktime_get_raw_ts64` - `vendor/linux/kernel/time/timekeeping.c:1881`.
+unsafe extern "C" fn linux_ktime_get_raw_ts64(ts: *mut LinuxTimespec64) {
+    if ts.is_null() {
+        return;
+    }
+    // Lupos has not implemented NTP slewing yet, so raw monotonic and
+    // monotonic currently advance from the same tick/TSC source.
+    let ns = ktime_get();
+    unsafe {
+        (*ts).tv_sec = (ns / NSEC_PER_SEC) as i64;
+        (*ts).tv_nsec = (ns % NSEC_PER_SEC) as i64;
+    }
+}
+
+/// `ktime_get_real_ts64` - `vendor/linux/kernel/time/timekeeping.c:940`.
+unsafe extern "C" fn linux_ktime_get_real_ts64(ts: *mut LinuxTimespec64) {
+    if ts.is_null() {
+        return;
+    }
+    let ns = ktime_get_real();
+    unsafe {
+        (*ts).tv_sec = (ns / NSEC_PER_SEC) as i64;
+        (*ts).tv_nsec = (ns % NSEC_PER_SEC) as i64;
+    }
+}
+
+/// `get_device_system_crosststamp` - `vendor/linux/kernel/time/timekeeping.c:1516`.
+#[unsafe(export_name = "get_device_system_crosststamp")]
+unsafe extern "C" fn linux_get_device_system_crosststamp(
+    get_time_fn: Option<LinuxGetDeviceTimeFn>,
+    ctx: *mut c_void,
+    _history_begin: *mut c_void,
+    xtstamp: *mut LinuxSystemDeviceCrosststamp,
+) -> i32 {
+    let Some(get_time_fn) = get_time_fn else {
+        return -crate::include::uapi::errno::EINVAL;
+    };
+    if xtstamp.is_null() {
+        return -crate::include::uapi::errno::EINVAL;
+    }
+
+    let clock_id = unsafe { (*xtstamp).clock_id };
+    if clock_id != super::posix_clock::CLOCK_REALTIME {
+        return -crate::include::uapi::errno::ENODEV;
+    }
+
+    let ret = unsafe {
+        get_time_fn(
+            addr_of_mut!((*xtstamp).device),
+            addr_of_mut!((*xtstamp).sys_counter),
+            ctx,
+        )
+    };
+    if ret != 0 {
+        return ret;
+    }
+
+    unsafe {
+        (*xtstamp).sys_systime = ktime_get_real() as i64;
+        (*xtstamp).sys_monoraw = ktime_get() as i64;
+    }
+    0
 }
 
 /// `ktime_get_real()` — CLOCK_REALTIME in nanoseconds.

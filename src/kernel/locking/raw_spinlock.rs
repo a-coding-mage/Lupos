@@ -58,6 +58,11 @@ pub fn register_module_exports() {
         linux_raw_spin_unlock_irq as usize,
         false,
     );
+    export_symbol_once(
+        "__cond_resched_lock",
+        linux___cond_resched_lock as usize,
+        false,
+    );
 }
 
 /// `_raw_spin_lock` — `vendor/linux/kernel/locking/spinlock.c:156` and
@@ -144,6 +149,27 @@ pub unsafe extern "C" fn linux_raw_spin_unlock_irq(lock: *mut QSpinLock) {
     unsafe { &*lock }.unlock();
     local_irq_enable();
     preempt_enable();
+}
+
+/// `__cond_resched_lock` — `vendor/linux/kernel/sched/core.c:7804`.
+#[unsafe(export_name = "__cond_resched_lock")]
+pub unsafe extern "C" fn linux___cond_resched_lock(lock: *mut QSpinLock) -> i32 {
+    if lock.is_null() {
+        return 0;
+    }
+
+    unsafe { &*lock }.unlock();
+    #[cfg(not(test))]
+    {
+        preempt_enable();
+        unsafe {
+            crate::kernel::sched::schedule_with_irqs_enabled();
+        }
+        preempt_disable();
+    }
+    unsafe { &*lock }.lock();
+
+    1
 }
 
 /// Ticket spinlock state — `next` and `owner` packed into a single 32-bit word
@@ -363,5 +389,35 @@ mod tests {
         }
         let g = l.lock();
         assert_eq!(*g, 42);
+    }
+
+    #[test]
+    fn raw_spin_exports_include_cond_resched_lock() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/kernel/sched/core.c"
+        ));
+        assert!(source.contains("EXPORT_SYMBOL(__cond_resched_lock);"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("__cond_resched_lock"),
+            Some(linux___cond_resched_lock as usize)
+        );
+    }
+
+    #[test]
+    fn cond_resched_lock_reacquires_qspinlock() {
+        let lock = QSpinLock::new();
+        lock.lock();
+        assert!(lock.is_locked());
+
+        assert_eq!(
+            unsafe { linux___cond_resched_lock(&lock as *const QSpinLock as *mut QSpinLock) },
+            1
+        );
+        assert!(lock.is_locked());
+        lock.unlock();
+        assert!(!lock.is_locked());
     }
 }

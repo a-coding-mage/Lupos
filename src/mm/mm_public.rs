@@ -5,16 +5,26 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use core::ffi::c_void;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arch::x86::mm::paging::{p4d_t, pgd_t, pgprot_t, pmd_t, pte_t, pud_t};
-use crate::include::uapi::errno::{EFAULT, EINVAL, ENOMEM, EOPNOTSUPP};
+use crate::arch::x86::mm::paging::{
+    _PAGE_TABLE, PGDIR_SIZE, PMD_SIZE, PUD_SIZE, p4d_t, pfn_pte, pgd_offset_pgd, pgd_t, pgprot_t,
+    pmd_alloc, pmd_t, pte_alloc, pte_mkspecial, pte_none, pte_t, ptep_get, pud_alloc, pud_t,
+    set_pte_at,
+};
+use crate::include::uapi::errno::{EFAULT, EINVAL, ENOMEM, ENXIO, EOPNOTSUPP};
+use crate::kernel::module::{export_symbol, find_symbol};
+use crate::mm::fault::{VM_FAULT_NOPAGE, VM_FAULT_OOM, VM_FAULT_SIGBUS, VmFaultFlags};
 use crate::mm::frame::PAGE_SIZE;
 use crate::mm::list::ListHead;
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
 use crate::mm::page::Page;
-use crate::mm::page_flags::{PG_RESERVED, compound_order};
-use crate::mm::vm_flags::{VM_GROWSDOWN, VM_SHARED, VM_WRITE, VmFlags};
+use crate::mm::page_flags::{__GFP_ZERO, GFP_KERNEL, PG_RESERVED, compound_order};
+use crate::mm::slab::{linux___kmalloc_noprof, linux_kfree};
+use crate::mm::vm_flags::{
+    VM_GROWSDOWN, VM_MAYWRITE, VM_MIXEDMAP, VM_PFNMAP, VM_SHARED, VM_WRITE, VmFlags,
+};
 use crate::mm::vma::{find_vma, insert_vma, remove_vma};
 
 const PAGE_SHIFT: usize = 12;
@@ -24,11 +34,87 @@ const PTE_SPECIAL: u64 = 1 << 10;
 const PMD_SPECIAL: u64 = 1 << 10;
 const PUD_SPECIAL: u64 = 1 << 10;
 
-static TOTALRAM_PAGES: AtomicU64 = AtomicU64::new(0);
+type LinuxPteFn = unsafe extern "C" fn(*mut pte_t, u64, *mut c_void) -> i32;
+
+pub(crate) static TOTALRAM_PAGES: AtomicU64 = AtomicU64::new(0);
 static POISONED_PAGES: AtomicU64 = AtomicU64::new(0);
 static MEMBLK_POISONED_PAGES: AtomicU64 = AtomicU64::new(0);
 static PGTABLE_BYTES: AtomicU64 = AtomicU64::new(0);
 static ZERO_PAGE: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "io_remap_pfn_range",
+        linux_io_remap_pfn_range as usize,
+        false,
+    );
+    export_symbol_once("remap_pfn_range", linux_remap_pfn_range as usize, false);
+    export_symbol_once("vm_insert_page", vm_insert_page as usize, false);
+    export_symbol_once("vm_insert_pages", vm_insert_pages as usize, false);
+    export_symbol_once("vm_map_pages", vm_map_pages as usize, false);
+    export_symbol_once("vm_map_pages_zero", vm_map_pages_zero as usize, false);
+    export_symbol_once("vmf_insert_pfn", linux_vmf_insert_pfn as usize, false);
+    export_symbol_once(
+        "vmf_insert_pfn_prot",
+        linux_vmf_insert_pfn_prot as usize,
+        false,
+    );
+    export_symbol_once(
+        "mm_get_unmapped_area",
+        linux_mm_get_unmapped_area as usize,
+        false,
+    );
+    export_symbol_once("find_vma", linux_find_vma as usize, false);
+    export_symbol_once(
+        "apply_to_page_range",
+        linux_apply_to_page_range as usize,
+        true,
+    );
+    export_symbol_once("vm_iomap_memory", linux_vm_iomap_memory as usize, false);
+    export_symbol_once(
+        "zap_special_vma_range",
+        linux_zap_special_vma_range as usize,
+        true,
+    );
+    export_symbol_once(
+        "unmap_mapping_pages",
+        linux_unmap_mapping_pages as usize,
+        true,
+    );
+    export_symbol_once(
+        "unmap_mapping_range",
+        linux_unmap_mapping_range as usize,
+        false,
+    );
+    export_symbol_once("si_meminfo", linux_si_meminfo as usize, false);
+    export_symbol_once("shrinker_alloc", linux_shrinker_alloc as usize, true);
+    export_symbol_once("shrinker_register", linux_shrinker_register as usize, true);
+    export_symbol_once("shrinker_free", linux_shrinker_free as usize, true);
+    export_symbol_once(
+        "register_oom_notifier",
+        linux_register_oom_notifier as usize,
+        true,
+    );
+    export_symbol_once(
+        "unregister_oom_notifier",
+        linux_unregister_oom_notifier as usize,
+        true,
+    );
+    export_symbol_once("dma_pool_create_node", dma_pool_create_node as usize, false);
+    export_symbol_once("dma_pool_destroy", dma_pool_destroy as usize, false);
+    export_symbol_once("dma_pool_alloc", dma_pool_alloc as usize, false);
+    export_symbol_once("dma_pool_free", dma_pool_free as usize, false);
+    export_symbol_once("dmam_pool_create", dmam_pool_create as usize, false);
+    export_symbol_once("dmam_pool_destroy", dmam_pool_destroy as usize, false);
+    export_symbol_once("pcpu_alloc_noprof", pcpu_alloc_noprof as usize, true);
+    export_symbol_once("__copy_overflow", __copy_overflow as usize, false);
+}
 
 pub unsafe fn __mm_zero_struct_page(page: *mut Page) {
     if !page.is_null() {
@@ -609,6 +695,147 @@ pub unsafe fn vma_lookup(mm: *const MmStruct, addr: u64) -> *mut VmAreaStruct {
     }
 }
 
+/// `find_vma` - `vendor/linux/mm/mmap.c:903`.
+#[unsafe(export_name = "find_vma")]
+pub unsafe extern "C" fn linux_find_vma(mm: *const MmStruct, addr: u64) -> *mut VmAreaStruct {
+    if mm.is_null() {
+        return core::ptr::null_mut();
+    }
+    find_vma(unsafe { &*mm }, addr).unwrap_or(core::ptr::null_mut())
+}
+
+fn level_addr_end(addr: u64, end: u64, size: u64) -> u64 {
+    let boundary = addr.wrapping_add(size) & !(size - 1);
+    if boundary == 0 || boundary > end {
+        end
+    } else {
+        boundary
+    }
+}
+
+fn pgd_addr_end(addr: u64, end: u64) -> u64 {
+    level_addr_end(addr, end, PGDIR_SIZE)
+}
+
+fn pud_addr_end(addr: u64, end: u64) -> u64 {
+    level_addr_end(addr, end, PUD_SIZE)
+}
+
+fn pmd_addr_end(addr: u64, end: u64) -> u64 {
+    level_addr_end(addr, end, PMD_SIZE)
+}
+
+unsafe fn linux_apply_to_pte_range(
+    pmd: *mut pmd_t,
+    mut addr: u64,
+    end: u64,
+    func: Option<LinuxPteFn>,
+    data: *mut c_void,
+) -> i32 {
+    let mut pte = match unsafe { pte_alloc(pmd, addr, _PAGE_TABLE) } {
+        Some(pte) => pte,
+        None => return -ENOMEM,
+    };
+
+    while addr != end {
+        if let Some(func) = func {
+            let err = unsafe { func(pte, addr, data) };
+            if err != 0 {
+                return err;
+            }
+        }
+        addr = addr.wrapping_add(PAGE_SIZE as u64);
+        pte = unsafe { pte.add(1) };
+    }
+
+    0
+}
+
+unsafe fn linux_apply_to_pmd_range(
+    pud: *mut pud_t,
+    mut addr: u64,
+    end: u64,
+    func: Option<LinuxPteFn>,
+    data: *mut c_void,
+) -> i32 {
+    let mut pmd = match unsafe { pmd_alloc(pud, addr, _PAGE_TABLE) } {
+        Some(pmd) => pmd,
+        None => return -ENOMEM,
+    };
+
+    while addr != end {
+        let next = pmd_addr_end(addr, end);
+        let err = unsafe { linux_apply_to_pte_range(pmd, addr, next, func, data) };
+        if err != 0 {
+            return err;
+        }
+        addr = next;
+        pmd = unsafe { pmd.add(1) };
+    }
+
+    0
+}
+
+unsafe fn linux_apply_to_pud_range(
+    pgd: *mut pgd_t,
+    mut addr: u64,
+    end: u64,
+    func: Option<LinuxPteFn>,
+    data: *mut c_void,
+) -> i32 {
+    let mut pud = match unsafe { pud_alloc(pgd, addr, _PAGE_TABLE) } {
+        Some(pud) => pud,
+        None => return -ENOMEM,
+    };
+
+    while addr != end {
+        let next = pud_addr_end(addr, end);
+        let err = unsafe { linux_apply_to_pmd_range(pud, addr, next, func, data) };
+        if err != 0 {
+            return err;
+        }
+        addr = next;
+        pud = unsafe { pud.add(1) };
+    }
+
+    0
+}
+
+/// `apply_to_page_range` - `vendor/linux/mm/memory.c:3506`.
+#[unsafe(export_name = "apply_to_page_range")]
+pub unsafe extern "C" fn linux_apply_to_page_range(
+    mm: *mut MmStruct,
+    mut addr: u64,
+    size: u64,
+    func: Option<LinuxPteFn>,
+    data: *mut c_void,
+) -> i32 {
+    let Some(end) = addr.checked_add(size) else {
+        return -EINVAL;
+    };
+    if mm.is_null() || addr >= end {
+        return -EINVAL;
+    }
+
+    let pgd_base = unsafe { (*mm).pgd as *mut pgd_t };
+    if pgd_base.is_null() {
+        return -EINVAL;
+    }
+
+    let mut pgd = unsafe { pgd_offset_pgd(pgd_base, addr) };
+    while addr != end {
+        let next = pgd_addr_end(addr, end);
+        let err = unsafe { linux_apply_to_pud_range(pgd, addr, next, func, data) };
+        if err != 0 {
+            return err;
+        }
+        addr = next;
+        pgd = unsafe { pgd.add(1) };
+    }
+
+    0
+}
+
 pub unsafe fn range_in_vma(vma: *const VmAreaStruct, start: u64, end: u64) -> bool {
     !vma.is_null() && unsafe { start >= (*vma).vm_start && end <= (*vma).vm_end && start <= end }
 }
@@ -1037,10 +1264,8 @@ pub fn totalram_pages_dec() {
     totalram_pages_add(-1);
 }
 
-pub fn si_meminfo_node(_nid: i32, val: *mut u64) {
-    if !val.is_null() {
-        unsafe { *val = totalram_pages() };
-    }
+pub fn si_meminfo_node(val: *mut LinuxSysInfo, _nid: i32) {
+    fill_si_meminfo(val);
 }
 
 pub fn show_mem(_filter: u32, _nodemask: *const u8) {}
@@ -1639,10 +1864,65 @@ pub fn init_on_free() -> bool {
     want_init_on_free()
 }
 
-pub fn si_meminfo(info: *mut u64) {
-    if !info.is_null() {
-        unsafe { *info = totalram_pages() };
+#[repr(C)]
+pub struct LinuxSysInfo {
+    pub uptime: i64,
+    pub loads: [u64; 3],
+    pub totalram: u64,
+    pub freeram: u64,
+    pub sharedram: u64,
+    pub bufferram: u64,
+    pub totalswap: u64,
+    pub freeswap: u64,
+    pub procs: u16,
+    pub pad: u16,
+    pub totalhigh: u64,
+    pub freehigh: u64,
+    pub mem_unit: u32,
+    pub _f: [u8; 0],
+}
+
+impl LinuxSysInfo {
+    const fn zeroed() -> Self {
+        Self {
+            uptime: 0,
+            loads: [0; 3],
+            totalram: 0,
+            freeram: 0,
+            sharedram: 0,
+            bufferram: 0,
+            totalswap: 0,
+            freeswap: 0,
+            procs: 0,
+            pad: 0,
+            totalhigh: 0,
+            freehigh: 0,
+            mem_unit: 0,
+            _f: [],
+        }
     }
+}
+
+fn fill_si_meminfo(info: *mut LinuxSysInfo) {
+    if info.is_null() {
+        return;
+    }
+
+    let value = LinuxSysInfo {
+        totalram: totalram_pages(),
+        freeram: crate::mm::page_alloc::nr_free_buffer_pages() as u64,
+        mem_unit: PAGE_SIZE as u32,
+        ..LinuxSysInfo::zeroed()
+    };
+    unsafe { info.write(value) };
+}
+
+pub fn si_meminfo(info: *mut LinuxSysInfo) {
+    fill_si_meminfo(info);
+}
+
+unsafe extern "C" fn linux_si_meminfo(info: *mut LinuxSysInfo) {
+    fill_si_meminfo(info);
 }
 
 pub fn si_mem_available() -> u64 {
@@ -1742,7 +2022,15 @@ pub fn kfence_sample_interval() -> u64 {
 
 pub fn __might_fault(_file: *const u8, _line: i32) {}
 
-pub fn __copy_overflow(_size: usize) {}
+/// `__copy_overflow` - `vendor/linux/mm/maccess.c`.
+pub unsafe extern "C" fn __copy_overflow(size: i32, count: usize) {
+    crate::log_warn!(
+        "maccess",
+        "Buffer overflow detected ({} < {})!",
+        size,
+        count
+    );
+}
 
 pub fn __check_object_size(_ptr: *const u8, _n: usize, _to_user: bool) {}
 
@@ -1790,11 +2078,11 @@ pub fn apply_to_page_range(
     apply_to_existing_page_range(mm, addr, size, callback, data)
 }
 
-pub fn vm_insert_page(vma: *mut VmAreaStruct, addr: u64, page: *mut Page) -> i32 {
+pub extern "C" fn vm_insert_page(vma: *mut VmAreaStruct, addr: u64, page: *mut Page) -> i32 {
     vmf_insert_page(vma, addr, page)
 }
 
-pub fn vm_insert_pages(
+pub extern "C" fn vm_insert_pages(
     vma: *mut VmAreaStruct,
     addr: u64,
     pages: *mut *mut Page,
@@ -1815,21 +2103,145 @@ pub fn vm_insert_pages(
     0
 }
 
-pub fn vm_map_pages(vma: *mut VmAreaStruct, pages: *mut *mut Page, num: usize) -> i32 {
-    let mut nr = num;
-    vm_insert_pages(vma, unsafe { (*vma).vm_start }, pages, &mut nr)
+fn __vm_map_pages(vma: *mut VmAreaStruct, pages: *mut *mut Page, num: usize, offset: u64) -> i32 {
+    if vma.is_null() || pages.is_null() {
+        return -EFAULT;
+    }
+    let Ok(offset) = usize::try_from(offset) else {
+        return -ENXIO;
+    };
+    if offset >= num {
+        return -ENXIO;
+    }
+    let count =
+        unsafe { ((*vma).vm_end.saturating_sub((*vma).vm_start)).div_ceil(PAGE_SIZE as u64) }
+            as usize;
+    if count > num.saturating_sub(offset) {
+        return -ENXIO;
+    }
+    let mut nr = count;
+    vm_insert_pages(
+        vma,
+        unsafe { (*vma).vm_start },
+        unsafe { pages.add(offset) },
+        &mut nr,
+    )
 }
 
-pub fn vm_map_pages_zero(vma: *mut VmAreaStruct, pages: *mut *mut Page, num: usize) -> i32 {
-    vm_map_pages(vma, pages, num)
+pub extern "C" fn vm_map_pages(vma: *mut VmAreaStruct, pages: *mut *mut Page, num: usize) -> i32 {
+    let offset = if vma.is_null() {
+        0
+    } else {
+        unsafe { (*vma).vm_pgoff }
+    };
+    __vm_map_pages(vma, pages, num, offset)
 }
 
-pub fn vmf_insert_pfn(_vma: *mut VmAreaStruct, _addr: u64, _pfn: u64) -> i32 {
-    -EOPNOTSUPP
+pub extern "C" fn vm_map_pages_zero(
+    vma: *mut VmAreaStruct,
+    pages: *mut *mut Page,
+    num: usize,
+) -> i32 {
+    __vm_map_pages(vma, pages, num, 0)
 }
 
-pub fn vmf_insert_pfn_prot(_vma: *mut VmAreaStruct, _addr: u64, _pfn: u64, _pgprot: u64) -> i32 {
-    -EOPNOTSUPP
+fn insert_pfn(vma: *mut VmAreaStruct, addr: u64, pfn: u64, prot: pgprot_t) -> VmFaultFlags {
+    if vma.is_null() || pfn > (u64::MAX >> PAGE_SHIFT) {
+        return VM_FAULT_SIGBUS;
+    }
+
+    unsafe {
+        if addr < (*vma).vm_start || addr >= (*vma).vm_end {
+            return VM_FAULT_SIGBUS;
+        }
+
+        let mm = (*vma).vm_mm;
+        if mm.is_null() || (*mm).pgd == 0 {
+            return VM_FAULT_SIGBUS;
+        }
+
+        let pgdp = pgd_offset_pgd((*mm).pgd as *mut pgd_t, addr);
+        let pudp = match pud_alloc(pgdp, addr, _PAGE_TABLE) {
+            Some(pudp) => pudp,
+            None => return VM_FAULT_OOM,
+        };
+        let pmdp = match pmd_alloc(pudp, addr, _PAGE_TABLE) {
+            Some(pmdp) => pmdp,
+            None => return VM_FAULT_OOM,
+        };
+        let ptep = match pte_alloc(pmdp, addr, _PAGE_TABLE) {
+            Some(ptep) => ptep,
+            None => return VM_FAULT_OOM,
+        };
+
+        if !pte_none(ptep_get(ptep)) {
+            return VM_FAULT_NOPAGE;
+        }
+
+        let entry = pte_mkspecial(pfn_pte(pfn, prot));
+        set_pte_at(mm.cast(), addr, ptep, entry);
+    }
+
+    VM_FAULT_NOPAGE
+}
+
+pub fn vmf_insert_pfn(vma: *mut VmAreaStruct, addr: u64, pfn: u64) -> VmFaultFlags {
+    if vma.is_null() {
+        return VM_FAULT_SIGBUS;
+    }
+
+    let prot = unsafe {
+        if (*vma).vm_page_prot != 0 {
+            pgprot_t((*vma).vm_page_prot)
+        } else {
+            pgprot_t(crate::mm::pgprot::vm_get_page_prot((*vma).vm_flags))
+        }
+    };
+    vmf_insert_pfn_prot(vma, addr, pfn, prot)
+}
+
+pub fn vmf_insert_pfn_prot(
+    vma: *mut VmAreaStruct,
+    addr: u64,
+    pfn: u64,
+    pgprot: pgprot_t,
+) -> VmFaultFlags {
+    if vma.is_null() {
+        return VM_FAULT_SIGBUS;
+    }
+
+    unsafe {
+        let flags = (*vma).vm_flags;
+        let is_pfnmap = flags & VM_PFNMAP != 0;
+        let is_mixedmap = flags & VM_MIXEDMAP != 0;
+        if is_pfnmap == is_mixedmap {
+            return VM_FAULT_SIGBUS;
+        }
+        if is_pfnmap && flags & (VM_SHARED | VM_MAYWRITE) == VM_MAYWRITE {
+            return VM_FAULT_SIGBUS;
+        }
+    }
+
+    insert_pfn(vma, addr, pfn, pgprot)
+}
+
+/// `vmf_insert_pfn` - `vendor/linux/mm/memory.c`.
+unsafe extern "C" fn linux_vmf_insert_pfn(
+    vma: *mut VmAreaStruct,
+    addr: u64,
+    pfn: u64,
+) -> VmFaultFlags {
+    vmf_insert_pfn(vma, addr, pfn)
+}
+
+/// `vmf_insert_pfn_prot` - `vendor/linux/mm/memory.c`.
+unsafe extern "C" fn linux_vmf_insert_pfn_prot(
+    vma: *mut VmAreaStruct,
+    addr: u64,
+    pfn: u64,
+    pgprot: pgprot_t,
+) -> VmFaultFlags {
+    vmf_insert_pfn_prot(vma, addr, pfn, pgprot)
 }
 
 pub fn vmf_insert_mixed(_vma: *mut VmAreaStruct, _addr: u64, _pfn: u64) -> i32 {
@@ -1854,10 +2266,65 @@ pub fn vm_iomap_memory(vma: *mut VmAreaStruct, start: u64, len: u64) -> i32 {
     )
 }
 
+/// `io_remap_pfn_range` - `vendor/linux/mm/memory.c`.
+#[unsafe(export_name = "io_remap_pfn_range")]
+unsafe extern "C" fn linux_io_remap_pfn_range(
+    vma: *mut VmAreaStruct,
+    addr: u64,
+    pfn: u64,
+    size: u64,
+    prot: u64,
+) -> i32 {
+    io_remap_pfn_range(vma, addr, pfn, size, prot)
+}
+
+/// `remap_pfn_range` - `vendor/linux/mm/memory.c`.
+#[unsafe(export_name = "remap_pfn_range")]
+unsafe extern "C" fn linux_remap_pfn_range(
+    vma: *mut VmAreaStruct,
+    addr: u64,
+    pfn: u64,
+    size: u64,
+    prot: u64,
+) -> i32 {
+    remap_pfn_range(vma, addr, pfn, size, prot)
+}
+
+/// `vm_iomap_memory` - `vendor/linux/mm/memory.c`.
+#[unsafe(export_name = "vm_iomap_memory")]
+unsafe extern "C" fn linux_vm_iomap_memory(vma: *mut VmAreaStruct, start: u64, len: u64) -> i32 {
+    if vma.is_null() {
+        return -EFAULT;
+    }
+    vm_iomap_memory(vma, start, len)
+}
+
 pub fn unmap_mapping_pages(_mapping: *mut u8, _start: u64, _nr: u64, _even_cows: bool) {}
 
 pub fn unmap_mapping_range(mapping: *mut u8, holebegin: u64, holelen: u64, _even_cows: bool) {
     unmap_shared_mapping_range(mapping, holebegin, holelen);
+}
+
+/// `unmap_mapping_pages` - `vendor/linux/mm/memory.c`.
+#[unsafe(export_name = "unmap_mapping_pages")]
+unsafe extern "C" fn linux_unmap_mapping_pages(
+    mapping: *mut u8,
+    start: u64,
+    nr: u64,
+    even_cows: bool,
+) {
+    unmap_mapping_pages(mapping, start, nr, even_cows);
+}
+
+/// `unmap_mapping_range` - `vendor/linux/mm/memory.c`.
+#[unsafe(export_name = "unmap_mapping_range")]
+unsafe extern "C" fn linux_unmap_mapping_range(
+    mapping: *mut u8,
+    holebegin: u64,
+    holelen: u64,
+    even_cows: bool,
+) {
+    unmap_mapping_range(mapping, holebegin, holelen, even_cows);
 }
 
 pub fn follow_pfnmap_start(_vma: *mut VmAreaStruct, _addr: u64, _ctx: *mut u8) -> i32 {
@@ -1866,8 +2333,35 @@ pub fn follow_pfnmap_start(_vma: *mut VmAreaStruct, _addr: u64, _ctx: *mut u8) -
 
 pub fn follow_pfnmap_end(_ctx: *mut u8) {}
 
-pub fn zap_special_vma_range(vma: *mut VmAreaStruct, _start: u64, _size: u64) {
+fn special_vma_range_should_zap(vma: *const VmAreaStruct, start: u64, size: u64) -> bool {
+    if vma.is_null() {
+        return false;
+    }
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    unsafe {
+        if start < (*vma).vm_start || end > (*vma).vm_end {
+            return false;
+        }
+        if (*vma).vm_flags & (VM_PFNMAP | VM_MIXEDMAP) == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn zap_special_vma_range(vma: *mut VmAreaStruct, start: u64, size: u64) {
+    if !special_vma_range_should_zap(vma.cast_const(), start, size) {
+        return;
+    }
     zap_vma(vma);
+}
+
+/// `zap_special_vma_range` - `vendor/linux/mm/memory.c:2260`.
+#[unsafe(export_name = "zap_special_vma_range")]
+unsafe extern "C" fn linux_zap_special_vma_range(vma: *mut VmAreaStruct, start: u64, size: u64) {
+    zap_special_vma_range(vma, start, size);
 }
 
 pub fn find_vma_intersection(mm: *const MmStruct, start: u64, end: u64) -> *mut VmAreaStruct {
@@ -1890,6 +2384,39 @@ pub fn mm_get_unmapped_area(
     flags: u64,
 ) -> u64 {
     unsafe { vm_unmapped_area(mm, len, addr, u64::MAX & PAGE_MASK, flags) }
+}
+
+/// `mm_get_unmapped_area` - `vendor/linux/mm/mmap.c`.
+unsafe extern "C" fn linux_mm_get_unmapped_area(
+    _file: *mut u8,
+    addr: u64,
+    len: u64,
+    _pgoff: u64,
+    flags: u64,
+) -> u64 {
+    if flags & crate::mm::mmap::MAP_FIXED as u64 != 0 {
+        return addr;
+    }
+
+    let current = unsafe { crate::kernel::sched::get_current() };
+    let mm = if current.is_null() {
+        core::ptr::null_mut()
+    } else {
+        let task = unsafe { &*current };
+        if !task.mm.is_null() {
+            task.mm
+        } else {
+            task.active_mm
+        }
+    };
+    if mm.is_null() || len == 0 {
+        return (-(ENOMEM as i64)) as u64;
+    }
+
+    match unsafe { crate::mm::mmap::get_unmapped_area(&*mm, addr, len, flags as u32) } {
+        Ok(area) => area,
+        Err(errno) => (errno as i64) as u64,
+    }
 }
 
 pub fn can_do_mlock() -> bool {
@@ -2379,8 +2906,18 @@ pub unsafe fn dma_pool_free(_pool: *mut u8, vaddr: *mut u8, _dma: u64) {
     }
 }
 
-pub fn pcpu_alloc_noprof(_size: usize, _align: usize, _reserved: bool, _gfp: u32) -> *mut u8 {
-    Box::into_raw(Box::new(0u8))
+/// `pcpu_alloc_noprof` - `vendor/linux/mm/percpu.c:1736`.
+#[unsafe(export_name = "pcpu_alloc_noprof")]
+pub unsafe extern "C" fn pcpu_alloc_noprof(
+    size: usize,
+    align: usize,
+    _reserved: bool,
+    gfp: u32,
+) -> *mut u8 {
+    if size == 0 || align > PAGE_SIZE || !align.is_power_of_two() {
+        return core::ptr::null_mut();
+    }
+    unsafe { linux___kmalloc_noprof(size, gfp | __GFP_ZERO) }
 }
 
 pub fn __per_cpu_offset(_cpu: usize) -> usize {
@@ -2482,16 +3019,67 @@ pub fn unregister_oom_notifier(_nb: *mut u8) -> i32 {
     0
 }
 
-pub fn shrinker_alloc(_flags: u32, _fmt: *const u8) -> *mut u8 {
-    Box::into_raw(Box::new(0u8))
+unsafe extern "C" fn linux_register_oom_notifier(nb: *mut u8) -> i32 {
+    register_oom_notifier(nb)
 }
 
-pub fn shrinker_register(_shrinker: *mut u8) {}
+unsafe extern "C" fn linux_unregister_oom_notifier(nb: *mut u8) -> i32 {
+    unregister_oom_notifier(nb)
+}
+
+const LINUX_SHRINKER_ALLOC_SIZE: usize = 256;
+const LINUX_SHRINKER_SEEKS_OFFSET: usize = 24;
+const LINUX_SHRINKER_FLAGS_OFFSET: usize = 28;
+const LINUX_SHRINKER_REGISTERED: u32 = 1 << 0;
+const LINUX_SHRINKER_ALLOCATED: u32 = 1 << 1;
+const LINUX_DEFAULT_SEEKS: i32 = 2;
+
+pub fn shrinker_alloc(flags: u32, _fmt: *const u8) -> *mut u8 {
+    let shrinker =
+        unsafe { linux___kmalloc_noprof(LINUX_SHRINKER_ALLOC_SIZE, GFP_KERNEL | __GFP_ZERO) };
+    if !shrinker.is_null() {
+        unsafe {
+            shrinker
+                .add(LINUX_SHRINKER_SEEKS_OFFSET)
+                .cast::<i32>()
+                .write(LINUX_DEFAULT_SEEKS);
+            shrinker
+                .add(LINUX_SHRINKER_FLAGS_OFFSET)
+                .cast::<u32>()
+                .write(flags | LINUX_SHRINKER_ALLOCATED);
+        }
+    }
+    shrinker
+}
+
+pub fn shrinker_register(shrinker: *mut u8) {
+    if shrinker.is_null() {
+        return;
+    }
+
+    unsafe {
+        let flags = shrinker.add(LINUX_SHRINKER_FLAGS_OFFSET).cast::<u32>();
+        flags.write(flags.read() | LINUX_SHRINKER_REGISTERED);
+    }
+}
 
 pub unsafe fn shrinker_free(shrinker: *mut u8) {
-    if !shrinker.is_null() {
-        unsafe { drop(Box::from_raw(shrinker)) };
-    }
+    unsafe { linux_kfree(shrinker) };
+}
+
+#[unsafe(export_name = "shrinker_alloc")]
+pub unsafe extern "C" fn linux_shrinker_alloc(flags: u32, fmt: *const u8) -> *mut u8 {
+    shrinker_alloc(flags, fmt)
+}
+
+#[unsafe(export_name = "shrinker_register")]
+pub unsafe extern "C" fn linux_shrinker_register(shrinker: *mut u8) {
+    shrinker_register(shrinker);
+}
+
+#[unsafe(export_name = "shrinker_free")]
+pub unsafe extern "C" fn linux_shrinker_free(shrinker: *mut u8) {
+    unsafe { shrinker_free(shrinker) };
 }
 
 pub fn shrinker_debugfs_rename(_shrinker: *mut u8, _fmt: *const u8) -> i32 {
@@ -2557,5 +3145,170 @@ unsafe fn zero_segment(base: *mut u8, start: usize, end: usize) {
     if start < end && start < PAGE_SIZE {
         let len = (end.min(PAGE_SIZE)) - start;
         unsafe { core::ptr::write_bytes(base.add(start), 0, len) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    unsafe extern "C" fn count_apply_to_page_range_pte(
+        pte: *mut pte_t,
+        addr: u64,
+        data: *mut c_void,
+    ) -> i32 {
+        if pte.is_null() || data.is_null() {
+            return -EINVAL;
+        }
+        unsafe {
+            (*pte).0 = addr | 1;
+            (*(data as *const AtomicU64)).fetch_add(1, Ordering::AcqRel);
+        }
+        0
+    }
+
+    #[test]
+    fn exports_find_vma_for_linux_modules() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/mm/memory.c"
+        ));
+        assert!(source.contains("EXPORT_SYMBOL_GPL(apply_to_page_range);"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("find_vma"),
+            Some(linux_find_vma as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("apply_to_page_range"),
+            Some(linux_apply_to_page_range as usize)
+        );
+    }
+
+    #[test]
+    fn zap_special_vma_range_exports_vendor_guard() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/mm/memory.c"
+        ));
+        assert!(source.contains("void zap_special_vma_range(struct vm_area_struct *vma"));
+        assert!(source.contains("EXPORT_SYMBOL_GPL(zap_special_vma_range);"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("zap_special_vma_range"),
+            Some(linux_zap_special_vma_range as usize)
+        );
+
+        let normal = VmAreaStruct::new(0x1000, 0x3000, 0);
+        let pfnmap = VmAreaStruct::new(0x1000, 0x3000, VM_PFNMAP);
+        let mixed = VmAreaStruct::new(0x1000, 0x3000, VM_MIXEDMAP);
+
+        assert!(!special_vma_range_should_zap(&normal, 0x1000, 0x1000));
+        assert!(!special_vma_range_should_zap(&pfnmap, 0x0fff, 0x1000));
+        assert!(!special_vma_range_should_zap(&pfnmap, 0x2000, 0x2000));
+        assert!(special_vma_range_should_zap(&pfnmap, 0x1000, 0x1000));
+        assert!(special_vma_range_should_zap(&mixed, 0x1000, 0x2000));
+    }
+
+    #[test]
+    fn dma_pool_exports_match_vendor_dmapool_symbols() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/mm/dmapool.c"
+        ));
+        for export in [
+            "EXPORT_SYMBOL(dma_pool_create_node);",
+            "EXPORT_SYMBOL(dma_pool_destroy);",
+            "EXPORT_SYMBOL(dma_pool_alloc);",
+            "EXPORT_SYMBOL(dma_pool_free);",
+            "EXPORT_SYMBOL(dmam_pool_create);",
+            "EXPORT_SYMBOL(dmam_pool_destroy);",
+        ] {
+            assert!(source.contains(export));
+        }
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("dma_pool_create_node"),
+            Some(dma_pool_create_node as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("dma_pool_alloc"),
+            Some(dma_pool_alloc as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("dma_pool_free"),
+            Some(dma_pool_free as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("dma_pool_destroy"),
+            Some(dma_pool_destroy as usize)
+        );
+    }
+
+    #[test]
+    fn percpu_allocator_export_matches_vendor_symbol() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/mm/percpu.c"
+        ));
+        assert!(source.contains("EXPORT_SYMBOL_GPL(pcpu_alloc_noprof);"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("pcpu_alloc_noprof"),
+            Some(pcpu_alloc_noprof as usize)
+        );
+    }
+
+    #[test]
+    fn linux_find_vma_returns_covering_or_next_vma() {
+        let mut mm = MmStruct::new(0);
+        let mut first = Box::new(VmAreaStruct::new(0x1000, 0x2000, 0));
+        let mut second = Box::new(VmAreaStruct::new(0x4000, 0x5000, 0));
+
+        unsafe {
+            insert_vma(&mut mm, first.as_mut() as *mut VmAreaStruct).unwrap();
+            insert_vma(&mut mm, second.as_mut() as *mut VmAreaStruct).unwrap();
+
+            assert_eq!(
+                linux_find_vma(&mm as *const MmStruct, 0x1800),
+                first.as_mut() as *mut VmAreaStruct
+            );
+            assert_eq!(
+                linux_find_vma(&mm as *const MmStruct, 0x2000),
+                second.as_mut() as *mut VmAreaStruct
+            );
+            assert!(linux_find_vma(&mm as *const MmStruct, 0x5000).is_null());
+
+            remove_vma(&mut mm, first.as_mut() as *mut VmAreaStruct);
+            remove_vma(&mut mm, second.as_mut() as *mut VmAreaStruct);
+        }
+    }
+
+    #[test]
+    fn linux_apply_to_page_range_allocates_ptes_and_invokes_callback() {
+        let pgd = crate::arch::x86::mm::paging::init_pgd_for_test();
+        let mut mm = MmStruct::new(pgd as usize);
+        let count = AtomicU64::new(0);
+        let start = 0x0040_0000u64;
+        let size = (PAGE_SIZE * 3) as u64;
+
+        assert_eq!(
+            unsafe {
+                linux_apply_to_page_range(
+                    &mut mm as *mut MmStruct,
+                    start,
+                    size,
+                    Some(count_apply_to_page_range_pte),
+                    (&count as *const AtomicU64).cast_mut().cast(),
+                )
+            },
+            0
+        );
+        assert_eq!(count.load(Ordering::Acquire), 3);
     }
 }

@@ -32,6 +32,11 @@ const MODULE_INIT_VALID_FLAGS: i32 =
 const MAX_MODULE_FILE_SIZE: u64 = i32::MAX as u64;
 const MAX_RW_COUNT: usize = 0x7fff_f000;
 
+fn touch_module_load_watchdog() {
+    #[cfg(not(test))]
+    crate::kernel::watchdog::touch_softlockup_watchdog();
+}
+
 struct CopiedModuleImage {
     ptr: *mut u8,
     len: usize,
@@ -119,6 +124,7 @@ unsafe fn copy_module_from_user(
             return Err(EFAULT);
         }
         copied += count;
+        touch_module_load_watchdog();
     }
     Ok(image)
 }
@@ -164,6 +170,7 @@ fn read_module_file(file: &FileRef) -> Result<Vec<u8>, i32> {
             return Err(EIO);
         }
         copied = copied.checked_add(count).ok_or(EIO)?;
+        touch_module_load_watchdog();
     }
     if copied != file_size || pos != file_size as u64 {
         return Err(EIO);
@@ -180,10 +187,13 @@ pub unsafe fn sys_init_module(module_image: *const u8, len: usize, _params: *con
         Ok(bytes) => bytes,
         Err(errno) => return -(errno as i64),
     };
-    match load_module(bytes.as_slice()) {
+    touch_module_load_watchdog();
+    let result = match load_module(bytes.as_slice()) {
         Ok(_) => 0,
         Err(err) => -(load_errno(err) as i64),
-    }
+    };
+    touch_module_load_watchdog();
+    result
 }
 
 pub unsafe fn sys_finit_module(fd: i32, _params: *const u8, flags: i32) -> i64 {
@@ -222,10 +232,13 @@ pub unsafe fn sys_finit_module(fd: i32, _params: *const u8, flags: i32) -> i64 {
         return -(ENOEXEC as i64);
     }
 
-    match load_module(&bytes) {
+    touch_module_load_watchdog();
+    let result = match load_module(&bytes) {
         Ok(_) => 0,
         Err(err) => -(load_errno(err) as i64),
-    }
+    };
+    touch_module_load_watchdog();
+    result
 }
 
 pub unsafe fn sys_delete_module(name: *const u8, _flags: u32) -> i64 {

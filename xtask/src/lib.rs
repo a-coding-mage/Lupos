@@ -1758,6 +1758,15 @@ fn build_dns_a_query(host: &str) -> Vec<u8> {
     query
 }
 
+fn parse_ipv4_literal(value: &str) -> Option<[u8; 4]> {
+    let octets = value
+        .split('.')
+        .map(str::parse::<u8>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    octets.try_into().ok()
+}
+
 fn sockaddr_in_bytes(addr: [u8; 4], port: u16) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&2u16.to_le_bytes()); // AF_INET
@@ -1777,7 +1786,36 @@ fn build_icmp_echo_request() -> Vec<u8> {
     packet
 }
 
-fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
+/// `nlmsghdr` + `ifinfomsg` bringing one interface up — the exact
+/// RTM_SETLINK request `ip link set <dev> up` issues on Linux.
+fn build_rtnl_link_up(ifindex: u32) -> Vec<u8> {
+    const RTM_SETLINK: u16 = 19;
+    const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_ACK: u16 = 4;
+    const IFF_UP: u32 = 1;
+    let mut msg = Vec::with_capacity(32);
+    msg.extend_from_slice(&32u32.to_le_bytes()); // nlmsg_len
+    msg.extend_from_slice(&RTM_SETLINK.to_le_bytes()); // nlmsg_type
+    msg.extend_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_le_bytes()); // nlmsg_flags
+    msg.extend_from_slice(&1u32.to_le_bytes()); // nlmsg_seq
+    msg.extend_from_slice(&0u32.to_le_bytes()); // nlmsg_pid
+    msg.extend_from_slice(&[0, 0, 0, 0]); // ifi_family, pad, ifi_type
+    msg.extend_from_slice(&(ifindex as i32).to_le_bytes()); // ifi_index
+    msg.extend_from_slice(&IFF_UP.to_le_bytes()); // ifi_flags
+    msg.extend_from_slice(&IFF_UP.to_le_bytes()); // ifi_change
+    msg
+}
+
+fn sockaddr_nl_bytes() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&16u16.to_le_bytes()); // AF_NETLINK
+    out.extend_from_slice(&[0u8; 2]); // nl_pad
+    out.extend_from_slice(&[0u8; 4]); // nl_pid: 0 = kernel
+    out.extend_from_slice(&[0u8; 4]); // nl_groups
+    out
+}
+
+fn build_ping_smoke_elf64(host: &str, icmp_addr: [u8; 4]) -> Vec<u8> {
     const CONSOLE_PATH: &[u8] = b"/dev/console\0";
     const HOSTNAME: &[u8] = b"lupos\0";
     const PROC: &[u8] = b"proc\0";
@@ -1802,7 +1840,10 @@ fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
     const SYS_OPENAT: u32 = 257;
 
     const AF_INET: u32 = 2;
+    const AF_NETLINK: u32 = 16;
     const SOCK_DGRAM: u32 = 2;
+    const SOCK_RAW: u32 = 3;
+    const NETLINK_ROUTE: u32 = 0;
     const IPPROTO_ICMP: u32 = 1;
     const IPPROTO_UDP: u32 = 17;
     const HDR_LEN: usize = 0x78;
@@ -1819,6 +1860,7 @@ fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
     struct BranchFixup {
         disp_pos: usize,
         next_off: i64,
+        phase: usize,
     }
 
     fn put_u16(buf: &mut [u8], off: usize, v: u16) {
@@ -1868,7 +1910,12 @@ fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
             target,
         });
     }
-    fn emit_jump_to_fail(code: &mut Vec<u8>, branches: &mut Vec<BranchFixup>, opcode: u8) {
+    fn emit_jump_to_fail(
+        code: &mut Vec<u8>,
+        branches: &mut Vec<BranchFixup>,
+        opcode: u8,
+        phase: usize,
+    ) {
         let jump_start = code.len();
         code.extend_from_slice(&[0x0F, opcode]);
         let disp_pos = code.len();
@@ -1876,15 +1923,16 @@ fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
         branches.push(BranchFixup {
             disp_pos,
             next_off: (HDR_LEN + jump_start + 6) as i64,
+            phase,
         });
     }
-    fn emit_fail_if_negative(code: &mut Vec<u8>, branches: &mut Vec<BranchFixup>) {
+    fn emit_fail_if_negative(code: &mut Vec<u8>, branches: &mut Vec<BranchFixup>, phase: usize) {
         code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
-        emit_jump_to_fail(code, branches, 0x88); // js
+        emit_jump_to_fail(code, branches, 0x88, phase); // js
     }
-    fn emit_fail_if_nonpositive(code: &mut Vec<u8>, branches: &mut Vec<BranchFixup>) {
+    fn emit_fail_if_nonpositive(code: &mut Vec<u8>, branches: &mut Vec<BranchFixup>, phase: usize) {
         code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
-        emit_jump_to_fail(code, branches, 0x8E); // jle
+        emit_jump_to_fail(code, branches, 0x8E, phase); // jle
     }
     fn emit_mount(
         code: &mut Vec<u8>,
@@ -1913,13 +1961,20 @@ fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
         mov_edx(code, len as u32);
         code.extend_from_slice(&[0x0F, 0x05]); // syscall
     }
-    fn emit_socket(code: &mut Vec<u8>, branches: &mut Vec<BranchFixup>, protocol: u32) {
+    fn emit_socket(
+        code: &mut Vec<u8>,
+        branches: &mut Vec<BranchFixup>,
+        family: u32,
+        sock_type: u32,
+        protocol: u32,
+        phase: usize,
+    ) {
         mov_eax(code, SYS_SOCKET);
-        mov_edi(code, AF_INET);
-        mov_esi(code, SOCK_DGRAM);
+        mov_edi(code, family);
+        mov_esi(code, sock_type);
         mov_edx(code, protocol);
         code.extend_from_slice(&[0x0F, 0x05]); // syscall
-        emit_fail_if_negative(code, branches);
+        emit_fail_if_negative(code, branches, phase);
         code.extend_from_slice(&[0x49, 0x89, 0xC5]); // mov r13, rax
     }
     fn emit_sendto(
@@ -1929,6 +1984,8 @@ fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
         packet: usize,
         packet_len: usize,
         sockaddr: usize,
+        sockaddr_len: u32,
+        phase: usize,
     ) {
         mov_eax(code, SYS_SENDTO);
         code.extend_from_slice(&[0x4C, 0x89, 0xEF]); // mov rdi, r13
@@ -1937,15 +1994,16 @@ fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
         code.extend_from_slice(&[0x45, 0x31, 0xD2]); // xor r10d, r10d
         lea_reg(code, fixups, 0x4C, 0x05, sockaddr); // r8
         code.extend_from_slice(&[0x41, 0xB9]);
-        code.extend_from_slice(&(16u32).to_le_bytes()); // mov r9d, 16
+        code.extend_from_slice(&sockaddr_len.to_le_bytes()); // mov r9d, len
         code.extend_from_slice(&[0x0F, 0x05]); // syscall
-        emit_fail_if_negative(code, branches);
+        emit_fail_if_negative(code, branches, phase);
     }
     fn emit_recvfrom(
         code: &mut Vec<u8>,
         fixups: &mut Vec<RipRelFixup>,
         branches: &mut Vec<BranchFixup>,
         recvbuf: usize,
+        phase: usize,
     ) {
         mov_eax(code, SYS_RECVFROM);
         code.extend_from_slice(&[0x4C, 0x89, 0xEF]); // mov rdi, r13
@@ -1955,7 +2013,7 @@ fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
         code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
         code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
         code.extend_from_slice(&[0x0F, 0x05]); // syscall
-        emit_fail_if_nonpositive(code, branches);
+        emit_fail_if_nonpositive(code, branches, phase);
     }
     fn emit_poweroff_and_exit(code: &mut Vec<u8>) {
         mov_eax(code, SYS_REBOOT);
@@ -1969,17 +2027,45 @@ fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
         code.extend_from_slice(&[0x0F, 0x05]); // syscall
     }
 
-    let dns_query = build_dns_a_query(host);
+    let host_is_ipv4_literal = parse_ipv4_literal(host).is_some();
+    let dns_query = if host_is_ipv4_literal {
+        Vec::new()
+    } else {
+        build_dns_a_query(host)
+    };
     let icmp = build_icmp_echo_request();
+    let rtnl_link_up = build_rtnl_link_up(ETH0_IFINDEX);
+    let link_prompt = "root@lupos:~# ip link set eth0 up\n".to_string();
     let prompt = format!("root@lupos:~# ping -c 1 {host}\n");
+    let icmp_addr_text = format!(
+        "{}.{}.{}.{}",
+        icmp_addr[0], icmp_addr[1], icmp_addr[2], icmp_addr[3]
+    );
     let ping_line = format!(
-        "PING {host} (93.184.216.34): {} data bytes\n",
+        "PING {host} ({icmp_addr_text}): {} data bytes\n",
         icmp.len().saturating_sub(8)
     );
     let ok = format!(
-        "64 bytes from 93.184.216.34: icmp_seq=1 ttl=64 time=0.1 ms\n--- {host} ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss\nping-smoke: guest ping ok ({host})\n"
+        "64 bytes from {icmp_addr_text}: icmp_seq=1 ttl=64 time=0.1 ms\n--- {host} ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss\nping-smoke: guest ping ok ({host})\n"
     );
     let fail = format!("ping-smoke: guest ping failed ({host})\n");
+    // One marker per failing syscall so a run pinpoints the phase and errno
+    // instead of collapsing every failure into the shared fail message.
+    const PING_PHASES: [&str; 9] = [
+        "link-socket",
+        "link-sendto",
+        "link-recv",
+        "dns-socket",
+        "dns-sendto",
+        "dns-recv",
+        "icmp-socket",
+        "icmp-sendto",
+        "icmp-recv",
+    ];
+    const ERRNO_BUF: &[u8] = b"0000\n";
+    // net::device::init() registers loopback as ifindex 1 before any driver
+    // loads; the sole QEMU virtio-net NIC therefore always becomes ifindex 2.
+    const ETH0_IFINDEX: u32 = 2;
 
     let mut data = Vec::new();
     let hostname_idx = push_data(&mut data, HOSTNAME.to_vec());
@@ -1993,15 +2079,27 @@ fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
     let tmp_target_idx = push_data(&mut data, TMP_TARGET.to_vec());
     let run_target_idx = push_data(&mut data, RUN_TARGET.to_vec());
     let path_idx = push_data(&mut data, CONSOLE_PATH.to_vec());
+    let link_prompt_idx = push_data(&mut data, link_prompt.as_bytes().to_vec());
+    let rtnl_link_up_idx = push_data(&mut data, rtnl_link_up.clone());
+    let rtnl_addr_idx = push_data(&mut data, sockaddr_nl_bytes());
     let prompt_idx = push_data(&mut data, prompt.as_bytes().to_vec());
     let ping_line_idx = push_data(&mut data, ping_line.as_bytes().to_vec());
     let dns_query_idx = push_data(&mut data, dns_query.clone());
     let dns_addr_idx = push_data(&mut data, sockaddr_in_bytes([10, 0, 2, 3], 53));
     let icmp_idx = push_data(&mut data, icmp.clone());
-    let icmp_addr_idx = push_data(&mut data, sockaddr_in_bytes([93, 184, 216, 34], 0));
+    let icmp_addr_idx = push_data(&mut data, sockaddr_in_bytes(icmp_addr, 0));
     let recvbuf_idx = push_data(&mut data, vec![0u8; RECVBUF_LEN]);
     let ok_idx = push_data(&mut data, ok.as_bytes().to_vec());
     let fail_idx = push_data(&mut data, fail.as_bytes().to_vec());
+    let phase_strs: Vec<(usize, usize)> = PING_PHASES
+        .iter()
+        .map(|name| {
+            let text = format!("ping-smoke: fail phase={name} errno=");
+            let len = text.len();
+            (push_data(&mut data, text.into_bytes()), len)
+        })
+        .collect();
+    let errno_buf_idx = push_data(&mut data, ERRNO_BUF.to_vec());
 
     let mut code = Vec::new();
     let mut fixups = Vec::new();
@@ -2033,21 +2131,66 @@ fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
     code.extend_from_slice(&[0x0F, 0x05]); // syscall
     code.extend_from_slice(&[0x49, 0x89, 0xC4]); // mov r12, rax
 
-    emit_write_console(&mut code, &mut fixups, prompt_idx, prompt.len());
-    emit_write_console(&mut code, &mut fixups, ping_line_idx, ping_line.len());
-
-    emit_socket(&mut code, &mut branches, IPPROTO_UDP);
+    // Linux leaves interfaces administratively down until userspace raises
+    // IFF_UP; mirror `ip link set eth0 up` with the RTM_SETLINK request it
+    // sends before any traffic is attempted.
+    emit_write_console(&mut code, &mut fixups, link_prompt_idx, link_prompt.len());
+    emit_socket(
+        &mut code,
+        &mut branches,
+        AF_NETLINK,
+        SOCK_RAW,
+        NETLINK_ROUTE,
+        0,
+    );
     emit_sendto(
         &mut code,
         &mut fixups,
         &mut branches,
-        dns_query_idx,
-        dns_query.len(),
-        dns_addr_idx,
+        rtnl_link_up_idx,
+        rtnl_link_up.len(),
+        rtnl_addr_idx,
+        12,
+        1,
     );
-    emit_recvfrom(&mut code, &mut fixups, &mut branches, recvbuf_idx);
+    emit_recvfrom(&mut code, &mut fixups, &mut branches, recvbuf_idx, 2);
 
-    emit_socket(&mut code, &mut branches, IPPROTO_ICMP);
+    emit_write_console(&mut code, &mut fixups, prompt_idx, prompt.len());
+
+    if !host_is_ipv4_literal {
+        emit_socket(
+            &mut code,
+            &mut branches,
+            AF_INET,
+            SOCK_DGRAM,
+            IPPROTO_UDP,
+            3,
+        );
+        emit_sendto(
+            &mut code,
+            &mut fixups,
+            &mut branches,
+            dns_query_idx,
+            dns_query.len(),
+            dns_addr_idx,
+            16,
+            4,
+        );
+        emit_recvfrom(&mut code, &mut fixups, &mut branches, recvbuf_idx, 5);
+    }
+
+    // ping(8) prints the header only after the resolver returns, so this
+    // write doubles as the DNS-phase completion marker in the serial log.
+    emit_write_console(&mut code, &mut fixups, ping_line_idx, ping_line.len());
+
+    emit_socket(
+        &mut code,
+        &mut branches,
+        AF_INET,
+        SOCK_DGRAM,
+        IPPROTO_ICMP,
+        6,
+    );
     emit_sendto(
         &mut code,
         &mut fixups,
@@ -2055,13 +2198,48 @@ fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
         icmp_idx,
         icmp.len(),
         icmp_addr_idx,
+        16,
+        7,
     );
-    emit_recvfrom(&mut code, &mut fixups, &mut branches, recvbuf_idx);
+    emit_recvfrom(&mut code, &mut fixups, &mut branches, recvbuf_idx, 8);
 
     emit_write_console(&mut code, &mut fixups, ok_idx, ok.len());
     emit_poweroff_and_exit(&mut code);
 
-    let fail_label_off = (HDR_LEN + code.len()) as i64;
+    // Per-phase fail stubs: preserve the failing syscall's return value, print
+    // the phase marker, then join the shared errno printer below.
+    let mut phase_stub_offs = [0i64; PING_PHASES.len()];
+    let mut shared_jumps: Vec<(usize, i64)> = Vec::new();
+    for (phase, &(str_idx, str_len)) in phase_strs.iter().enumerate() {
+        phase_stub_offs[phase] = (HDR_LEN + code.len()) as i64;
+        code.extend_from_slice(&[0x49, 0x89, 0xC7]); // mov r15, rax
+        emit_write_console(&mut code, &mut fixups, str_idx, str_len);
+        let jump_start = code.len();
+        code.push(0xE9); // jmp rel32 -> shared errno printer
+        let disp_pos = code.len();
+        code.extend_from_slice(&[0u8; 4]);
+        shared_jumps.push((disp_pos, (HDR_LEN + jump_start + 5) as i64));
+    }
+
+    // Shared errno printer: |r15| rendered as four zero-padded decimal digits
+    // into the writable errno data slot, printed, then the legacy fail path.
+    let shared_errno_off = (HDR_LEN + code.len()) as i64;
+    code.extend_from_slice(&[0x4C, 0x89, 0xF8]); // mov rax, r15
+    code.extend_from_slice(&[0x48, 0xF7, 0xD8]); // neg rax
+    lea_reg(&mut code, &mut fixups, 0x48, 0x3D, errno_buf_idx); // rdi
+    code.extend_from_slice(&[0xB9, 0x0A, 0x00, 0x00, 0x00]); // mov ecx, 10
+    for slot in [3u8, 2, 1, 0] {
+        code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        code.extend_from_slice(&[0x48, 0xF7, 0xF1]); // div rcx
+        code.extend_from_slice(&[0x80, 0xC2, 0x30]); // add dl, '0'
+        if slot == 0 {
+            code.extend_from_slice(&[0x88, 0x17]); // mov [rdi], dl
+        } else {
+            code.extend_from_slice(&[0x88, 0x57, slot]); // mov [rdi+slot], dl
+        }
+    }
+    emit_write_console(&mut code, &mut fixups, errno_buf_idx, ERRNO_BUF.len());
+
     emit_write_console(&mut code, &mut fixups, fail_idx, fail.len());
     emit_poweroff_and_exit(&mut code);
 
@@ -2081,11 +2259,18 @@ fn build_ping_smoke_elf64(host: &str) -> Vec<u8> {
         code[fix.disp_pos..fix.disp_pos + 4].copy_from_slice(&disp32.to_le_bytes());
     }
     for branch in &branches {
-        let disp = fail_label_off - branch.next_off;
+        let disp = phase_stub_offs[branch.phase] - branch.next_off;
         let disp32: i32 = disp
             .try_into()
             .expect("ping-smoke: branch displacement does not fit i32");
         code[branch.disp_pos..branch.disp_pos + 4].copy_from_slice(&disp32.to_le_bytes());
+    }
+    for &(disp_pos, next_off) in &shared_jumps {
+        let disp = shared_errno_off - next_off;
+        let disp32: i32 = disp
+            .try_into()
+            .expect("ping-smoke: shared errno jump displacement does not fit i32");
+        code[disp_pos..disp_pos + 4].copy_from_slice(&disp32.to_le_bytes());
     }
 
     let total_len = off as usize;
@@ -2403,6 +2588,11 @@ const LUPOS_KERNEL_CMDLINE_ENV: &str = "LUPOS_KERNEL_CMDLINE";
 const DEFAULT_LUPOS_DISTRO: &str = "arch";
 const LUPOS_PING_HOST_ENV: &str = "LUPOS_PING_HOST";
 const DEFAULT_PING_HOST: &str = "example.com";
+const LUPOS_PING_ICMP_ADDR_ENV: &str = "LUPOS_PING_ICMP_ADDR";
+/// Default ICMP echo destination: the QEMU slirp gateway. libslirp answers
+/// echo requests to its own vhost address internally, so the smoke test does
+/// not depend on internet reachability or host ping_group_range settings.
+const DEFAULT_PING_ICMP_ADDR: [u8; 4] = [10, 0, 2, 2];
 const ARCH_PACMAN_MIRRORLIST: &str = concat!(
     "## Lupos stages a pinned Arch Archive subset locally because the guest does\n",
     "## not yet provide TCP networking for libalpm downloads.\n",
@@ -2997,6 +3187,55 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         ],
     },
     DriverModuleSpec {
+        symbol: "CONFIG_CDROM",
+        module_name: "cdrom",
+        module_path: "kernel/drivers/cdrom/cdrom.ko",
+        vendor_linux_ref: "vendor/linux/drivers/cdrom/cdrom.c",
+        linux_make_dir: "drivers/cdrom",
+        linux_make_target: "cdrom.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_BLK_DEV_SR",
+        module_name: "sr_mod",
+        module_path: "kernel/drivers/scsi/sr_mod.ko",
+        vendor_linux_ref: "vendor/linux/drivers/scsi/sr.c",
+        linux_make_dir: "drivers/scsi",
+        linux_make_target: "sr_mod.ko",
+        module_deps: &[
+            "kernel/drivers/cdrom/cdrom.ko",
+            "kernel/drivers/scsi/scsi_mod.ko",
+            "kernel/block/bsg.ko",
+            "kernel/drivers/scsi/scsi_common.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_CHR_DEV_SG",
+        module_name: "sg",
+        module_path: "kernel/drivers/scsi/sg.ko",
+        vendor_linux_ref: "vendor/linux/drivers/scsi/sg.c",
+        linux_make_dir: "drivers/scsi",
+        linux_make_target: "sg.ko",
+        module_deps: &[
+            "kernel/drivers/scsi/scsi_mod.ko",
+            "kernel/block/bsg.ko",
+            "kernel/drivers/scsi/scsi_common.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SCSI_SPI_ATTRS",
+        module_name: "scsi_transport_spi",
+        module_path: "kernel/drivers/scsi/scsi_transport_spi.ko",
+        vendor_linux_ref: "vendor/linux/drivers/scsi/scsi_transport_spi.c",
+        linux_make_dir: "drivers/scsi",
+        linux_make_target: "scsi_transport_spi.ko",
+        module_deps: &[
+            "kernel/drivers/scsi/scsi_mod.ko",
+            "kernel/block/bsg.ko",
+            "kernel/drivers/scsi/scsi_common.ko",
+        ],
+    },
+    DriverModuleSpec {
         symbol: "CONFIG_ATA",
         module_name: "libata",
         module_path: "kernel/drivers/ata/libata.ko",
@@ -3039,6 +3278,62 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         ],
     },
     DriverModuleSpec {
+        symbol: "CONFIG_ATA_PIIX",
+        module_name: "ata_piix",
+        module_path: "kernel/drivers/ata/ata_piix.ko",
+        vendor_linux_ref: "vendor/linux/drivers/ata/ata_piix.c",
+        linux_make_dir: "drivers/ata",
+        linux_make_target: "ata_piix.ko",
+        module_deps: &[
+            "kernel/drivers/ata/libata.ko",
+            "kernel/drivers/scsi/scsi_mod.ko",
+            "kernel/block/bsg.ko",
+            "kernel/drivers/scsi/scsi_common.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_PATA_AMD",
+        module_name: "pata_amd",
+        module_path: "kernel/drivers/ata/pata_amd.ko",
+        vendor_linux_ref: "vendor/linux/drivers/ata/pata_amd.c",
+        linux_make_dir: "drivers/ata",
+        linux_make_target: "pata_amd.ko",
+        module_deps: &[
+            "kernel/drivers/ata/libata.ko",
+            "kernel/drivers/scsi/scsi_mod.ko",
+            "kernel/block/bsg.ko",
+            "kernel/drivers/scsi/scsi_common.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_PATA_OLDPIIX",
+        module_name: "pata_oldpiix",
+        module_path: "kernel/drivers/ata/pata_oldpiix.ko",
+        vendor_linux_ref: "vendor/linux/drivers/ata/pata_oldpiix.c",
+        linux_make_dir: "drivers/ata",
+        linux_make_target: "pata_oldpiix.ko",
+        module_deps: &[
+            "kernel/drivers/ata/libata.ko",
+            "kernel/drivers/scsi/scsi_mod.ko",
+            "kernel/block/bsg.ko",
+            "kernel/drivers/scsi/scsi_common.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_PATA_SCH",
+        module_name: "pata_sch",
+        module_path: "kernel/drivers/ata/pata_sch.ko",
+        vendor_linux_ref: "vendor/linux/drivers/ata/pata_sch.c",
+        linux_make_dir: "drivers/ata",
+        linux_make_target: "pata_sch.ko",
+        module_deps: &[
+            "kernel/drivers/ata/libata.ko",
+            "kernel/drivers/scsi/scsi_mod.ko",
+            "kernel/block/bsg.ko",
+            "kernel/drivers/scsi/scsi_common.ko",
+        ],
+    },
+    DriverModuleSpec {
         symbol: "CONFIG_VIRTIO_PCI_LIB",
         module_name: "virtio_pci_modern_dev",
         module_path: "kernel/drivers/virtio/virtio_pci_modern_dev.ko",
@@ -3069,6 +3364,95 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         ],
     },
     DriverModuleSpec {
+        symbol: "CONFIG_SCSI_VIRTIO",
+        module_name: "virtio_scsi",
+        module_path: "kernel/drivers/scsi/virtio_scsi.ko",
+        vendor_linux_ref: "vendor/linux/drivers/scsi/virtio_scsi.c",
+        linux_make_dir: "drivers/scsi",
+        linux_make_target: "virtio_scsi.ko",
+        module_deps: &[
+            "kernel/drivers/scsi/scsi_mod.ko",
+            "kernel/block/bsg.ko",
+            "kernel/drivers/scsi/scsi_common.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_USB_EHCI_HCD",
+        module_name: "ehci_hcd",
+        module_path: "kernel/drivers/usb/host/ehci-hcd.ko",
+        vendor_linux_ref: "vendor/linux/drivers/usb/host/ehci-hcd.c",
+        linux_make_dir: "drivers/usb/host",
+        linux_make_target: "ehci-hcd.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_USB_EHCI_PCI",
+        module_name: "ehci_pci",
+        module_path: "kernel/drivers/usb/host/ehci-pci.ko",
+        vendor_linux_ref: "vendor/linux/drivers/usb/host/ehci-pci.c",
+        linux_make_dir: "drivers/usb/host",
+        linux_make_target: "ehci-pci.ko",
+        module_deps: &["kernel/drivers/usb/host/ehci-hcd.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_USB_OHCI_HCD",
+        module_name: "ohci_hcd",
+        module_path: "kernel/drivers/usb/host/ohci-hcd.ko",
+        vendor_linux_ref: "vendor/linux/drivers/usb/host/ohci-hcd.c",
+        linux_make_dir: "drivers/usb/host",
+        linux_make_target: "ohci-hcd.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_USB_OHCI_HCD_PCI",
+        module_name: "ohci_pci",
+        module_path: "kernel/drivers/usb/host/ohci-pci.ko",
+        vendor_linux_ref: "vendor/linux/drivers/usb/host/ohci-pci.c",
+        linux_make_dir: "drivers/usb/host",
+        linux_make_target: "ohci-pci.ko",
+        module_deps: &["kernel/drivers/usb/host/ohci-hcd.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_USB_UHCI_HCD",
+        module_name: "uhci_hcd",
+        module_path: "kernel/drivers/usb/host/uhci-hcd.ko",
+        vendor_linux_ref: "vendor/linux/drivers/usb/host/uhci-hcd.c",
+        linux_make_dir: "drivers/usb/host",
+        linux_make_target: "uhci-hcd.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_USB_MON",
+        module_name: "usbmon",
+        module_path: "kernel/drivers/usb/mon/usbmon.ko",
+        vendor_linux_ref: "vendor/linux/drivers/usb/mon/mon_main.c",
+        linux_make_dir: "drivers/usb/mon",
+        linux_make_target: "usbmon.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_USB_STORAGE",
+        module_name: "usb_storage",
+        module_path: "kernel/drivers/usb/storage/usb-storage.ko",
+        vendor_linux_ref: "vendor/linux/drivers/usb/storage/usb.c",
+        linux_make_dir: "drivers/usb/storage",
+        linux_make_target: "usb-storage.ko",
+        module_deps: &[
+            "kernel/drivers/scsi/scsi_mod.ko",
+            "kernel/block/bsg.ko",
+            "kernel/drivers/scsi/scsi_common.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_USB_PRINTER",
+        module_name: "usblp",
+        module_path: "kernel/drivers/usb/class/usblp.ko",
+        vendor_linux_ref: "vendor/linux/drivers/usb/class/usblp.c",
+        linux_make_dir: "drivers/usb/class",
+        linux_make_target: "usblp.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
         symbol: "CONFIG_VIRTIO_BLK",
         module_name: "virtio_blk",
         module_path: "kernel/drivers/block/virtio_blk.ko",
@@ -3076,6 +3460,97 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         linux_make_dir: "drivers/block",
         linux_make_target: "virtio_blk.ko",
         module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_VIRTIO_CONSOLE",
+        module_name: "virtio_console",
+        module_path: "kernel/drivers/char/virtio_console.ko",
+        vendor_linux_ref: "vendor/linux/drivers/char/virtio_console.c",
+        linux_make_dir: "drivers/char",
+        linux_make_target: "virtio_console.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_VIRTIO_INPUT",
+        module_name: "virtio_input",
+        module_path: "kernel/drivers/virtio/virtio_input.ko",
+        vendor_linux_ref: "vendor/linux/drivers/virtio/virtio_input.c",
+        linux_make_dir: "drivers/virtio",
+        linux_make_target: "virtio_input.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_X86_PKG_TEMP_THERMAL",
+        module_name: "x86_pkg_temp_thermal",
+        module_path: "kernel/drivers/thermal/intel/x86_pkg_temp_thermal.ko",
+        vendor_linux_ref: "vendor/linux/drivers/thermal/intel/x86_pkg_temp_thermal.c",
+        linux_make_dir: "drivers/thermal/intel",
+        linux_make_target: "x86_pkg_temp_thermal.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_MII",
+        module_name: "mii",
+        module_path: "kernel/drivers/net/mii.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/mii.c",
+        linux_make_dir: "drivers/net",
+        linux_make_target: "mii.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_PHYLIB",
+        module_name: "mdio_bus",
+        module_path: "kernel/drivers/net/phy/mdio_bus.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/phy/mdio_bus.c",
+        linux_make_dir: "drivers/net/phy",
+        linux_make_target: "mdio_bus.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_PHYLIB",
+        module_name: "libphy",
+        module_path: "kernel/drivers/net/phy/libphy.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/phy/phy.c",
+        linux_make_dir: "drivers/net/phy",
+        linux_make_target: "libphy.ko",
+        module_deps: &["kernel/drivers/net/phy/mdio_bus.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_PHY_PACKAGE",
+        module_name: "phy_package",
+        module_path: "kernel/drivers/net/phy/phy_package.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/phy/phy_package.c",
+        linux_make_dir: "drivers/net/phy",
+        linux_make_target: "phy_package.ko",
+        module_deps: &[
+            "kernel/drivers/net/phy/libphy.ko",
+            "kernel/drivers/net/phy/mdio_bus.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_PHYLIB",
+        module_name: "mdio_devres",
+        module_path: "kernel/drivers/net/phy/mdio_devres.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/phy/mdio_devres.c",
+        linux_make_dir: "drivers/net/phy",
+        linux_make_target: "mdio_devres.ko",
+        module_deps: &[
+            "kernel/drivers/net/phy/libphy.ko",
+            "kernel/drivers/net/phy/mdio_bus.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_REALTEK_PHY",
+        module_name: "realtek",
+        module_path: "kernel/drivers/net/phy/realtek/realtek.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/phy/realtek/realtek_main.c",
+        linux_make_dir: "drivers/net/phy/realtek",
+        linux_make_target: "realtek.ko",
+        module_deps: &[
+            "kernel/drivers/net/phy/phy_package.ko",
+            "kernel/drivers/net/phy/libphy.ko",
+            "kernel/drivers/net/phy/mdio_bus.ko",
+        ],
     },
     DriverModuleSpec {
         symbol: "CONFIG_VIRTIO_NET",
@@ -3087,6 +3562,54 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         module_deps: &[],
     },
     DriverModuleSpec {
+        symbol: "CONFIG_NETCONSOLE",
+        module_name: "netconsole",
+        module_path: "kernel/drivers/net/netconsole.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/netconsole.c",
+        linux_make_dir: "drivers/net",
+        linux_make_target: "netconsole.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_NET_9P",
+        module_name: "9pnet",
+        module_path: "kernel/net/9p/9pnet.ko",
+        vendor_linux_ref: "vendor/linux/net/9p/mod.c",
+        linux_make_dir: "net/9p",
+        linux_make_target: "9pnet.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_NET_9P_VIRTIO",
+        module_name: "9pnet_virtio",
+        module_path: "kernel/net/9p/9pnet_virtio.ko",
+        vendor_linux_ref: "vendor/linux/net/9p/trans_virtio.c",
+        linux_make_dir: "net/9p",
+        linux_make_target: "9pnet_virtio.ko",
+        module_deps: &["kernel/net/9p/9pnet.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_TIGON3",
+        module_name: "tg3",
+        module_path: "kernel/drivers/net/ethernet/broadcom/tg3.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/ethernet/broadcom/tg3.c",
+        linux_make_dir: "drivers/net/ethernet/broadcom",
+        linux_make_target: "tg3.ko",
+        module_deps: &[
+            "kernel/drivers/net/phy/libphy.ko",
+            "kernel/drivers/net/phy/mdio_bus.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_E100",
+        module_name: "e100",
+        module_path: "kernel/drivers/net/ethernet/intel/e100.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/ethernet/intel/e100.c",
+        linux_make_dir: "drivers/net/ethernet/intel",
+        linux_make_target: "e100.ko",
+        module_deps: &["kernel/drivers/net/mii.ko"],
+    },
+    DriverModuleSpec {
         symbol: "CONFIG_E1000",
         module_name: "e1000",
         module_path: "kernel/drivers/net/ethernet/intel/e1000/e1000.ko",
@@ -3095,11 +3618,60 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         linux_make_target: "e1000.ko",
         module_deps: &[],
     },
+    DriverModuleSpec {
+        symbol: "CONFIG_E1000E",
+        module_name: "e1000e",
+        module_path: "kernel/drivers/net/ethernet/intel/e1000e/e1000e.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/ethernet/intel/e1000e/netdev.c",
+        linux_make_dir: "drivers/net/ethernet/intel/e1000e",
+        linux_make_target: "e1000e.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SKY2",
+        module_name: "sky2",
+        module_path: "kernel/drivers/net/ethernet/marvell/sky2.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/ethernet/marvell/sky2.c",
+        linux_make_dir: "drivers/net/ethernet/marvell",
+        linux_make_target: "sky2.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_FORCEDETH",
+        module_name: "forcedeth",
+        module_path: "kernel/drivers/net/ethernet/nvidia/forcedeth.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/ethernet/nvidia/forcedeth.c",
+        linux_make_dir: "drivers/net/ethernet/nvidia",
+        linux_make_target: "forcedeth.ko",
+        module_deps: &[],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_8139TOO",
+        module_name: "8139too",
+        module_path: "kernel/drivers/net/ethernet/realtek/8139too.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/ethernet/realtek/8139too.c",
+        linux_make_dir: "drivers/net/ethernet/realtek",
+        linux_make_target: "8139too.ko",
+        module_deps: &["kernel/drivers/net/mii.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_R8169",
+        module_name: "r8169",
+        module_path: "kernel/drivers/net/ethernet/realtek/r8169.ko",
+        vendor_linux_ref: "vendor/linux/drivers/net/ethernet/realtek/r8169_main.c",
+        linux_make_dir: "drivers/net/ethernet/realtek",
+        linux_make_target: "r8169.ko",
+        module_deps: &[
+            "kernel/drivers/net/phy/mdio_devres.ko",
+            "kernel/drivers/net/phy/libphy.ko",
+            "kernel/drivers/net/phy/mdio_bus.ko",
+        ],
+    },
     // Vendor-built ALSA/HDA modules.  The x86_64 defconfig enables the HDA
-    // controller; Lupos stages the whole Linux module closure because the
-    // kernel does not reimplement soundcore/ALSA/HDA in Rust.  Keep codec
-    // drivers before snd_hda_intel so probing sees registered codec parsers,
-    // matching vendor/linux/sound/hda/Makefile ordering.
+    // controller and sequencer support; Lupos stages the Linux module closure
+    // because the kernel does not reimplement soundcore/ALSA/HDA in Rust.
+    // Keep codec drivers before snd_hda_intel so probing sees registered
+    // codec parsers, matching vendor/linux/sound/hda/Makefile ordering.
     DriverModuleSpec {
         symbol: "CONFIG_SOUND",
         module_name: "soundcore",
@@ -3126,6 +3698,57 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         linux_make_dir: "sound/core",
         linux_make_target: "snd-timer.ko",
         module_deps: &["kernel/sound/core/snd.ko", "kernel/sound/soundcore.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND_HRTIMER",
+        module_name: "snd_hrtimer",
+        module_path: "kernel/sound/core/snd-hrtimer.ko",
+        vendor_linux_ref: "vendor/linux/sound/core/hrtimer.c",
+        linux_make_dir: "sound/core",
+        linux_make_target: "snd-hrtimer.ko",
+        module_deps: &[
+            "kernel/sound/core/snd-timer.ko",
+            "kernel/sound/core/snd.ko",
+            "kernel/sound/soundcore.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND_SEQ_DEVICE",
+        module_name: "snd_seq_device",
+        module_path: "kernel/sound/core/snd-seq-device.ko",
+        vendor_linux_ref: "vendor/linux/sound/core/seq_device.c",
+        linux_make_dir: "sound/core",
+        linux_make_target: "snd-seq-device.ko",
+        module_deps: &["kernel/sound/core/snd.ko", "kernel/sound/soundcore.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND_SEQUENCER",
+        module_name: "snd_seq",
+        module_path: "kernel/sound/core/seq/snd-seq.ko",
+        vendor_linux_ref: "vendor/linux/sound/core/seq/seq.c",
+        linux_make_dir: "sound/core/seq",
+        linux_make_target: "snd-seq.ko",
+        module_deps: &[
+            "kernel/sound/core/snd-seq-device.ko",
+            "kernel/sound/core/snd-timer.ko",
+            "kernel/sound/core/snd.ko",
+            "kernel/sound/soundcore.ko",
+        ],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_SND_SEQ_DUMMY",
+        module_name: "snd_seq_dummy",
+        module_path: "kernel/sound/core/seq/snd-seq-dummy.ko",
+        vendor_linux_ref: "vendor/linux/sound/core/seq/seq_dummy.c",
+        linux_make_dir: "sound/core/seq",
+        linux_make_target: "snd-seq-dummy.ko",
+        module_deps: &[
+            "kernel/sound/core/seq/snd-seq.ko",
+            "kernel/sound/core/snd-seq-device.ko",
+            "kernel/sound/core/snd-timer.ko",
+            "kernel/sound/core/snd.ko",
+            "kernel/sound/soundcore.ko",
+        ],
     },
     DriverModuleSpec {
         symbol: "CONFIG_SND_PCM",
@@ -3256,6 +3879,15 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         module_deps: &[],
     },
     DriverModuleSpec {
+        symbol: "CONFIG_I2C_SMBUS",
+        module_name: "i2c_smbus",
+        module_path: "kernel/drivers/i2c/i2c-smbus.ko",
+        vendor_linux_ref: "vendor/linux/drivers/i2c/i2c-smbus.c",
+        linux_make_dir: "drivers/i2c",
+        linux_make_target: "i2c-smbus.ko",
+        module_deps: &["kernel/drivers/i2c/i2c-core.ko"],
+    },
+    DriverModuleSpec {
         symbol: "CONFIG_I2C_ALGOBIT",
         module_name: "i2c_algo_bit",
         module_path: "kernel/drivers/i2c/algos/i2c-algo-bit.ko",
@@ -3263,6 +3895,18 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         linux_make_dir: "drivers/i2c/algos",
         linux_make_target: "i2c-algo-bit.ko",
         module_deps: &["kernel/drivers/i2c/i2c-core.ko"],
+    },
+    DriverModuleSpec {
+        symbol: "CONFIG_I2C_I801",
+        module_name: "i2c_i801",
+        module_path: "kernel/drivers/i2c/busses/i2c-i801.ko",
+        vendor_linux_ref: "vendor/linux/drivers/i2c/busses/i2c-i801.c",
+        linux_make_dir: "drivers/i2c/busses",
+        linux_make_target: "i2c-i801.ko",
+        module_deps: &[
+            "kernel/drivers/i2c/i2c-smbus.ko",
+            "kernel/drivers/i2c/i2c-core.ko",
+        ],
     },
     DriverModuleSpec {
         symbol: "CONFIG_AGP",
@@ -5965,8 +6609,21 @@ fn prune_systemd_service_churn_for_critical_runtime(files: &mut Vec<InitramfsFil
 
 fn ping_smoke_userland_files() -> Vec<InitramfsFile> {
     let host = ping_smoke_host().unwrap_or_else(|_| DEFAULT_PING_HOST.to_string());
+    let icmp_addr = if env::var(LUPOS_PING_ICMP_ADDR_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some()
+    {
+        ping_smoke_icmp_addr().unwrap_or(DEFAULT_PING_ICMP_ADDR)
+    } else {
+        parse_ipv4_literal(&host).unwrap_or(DEFAULT_PING_ICMP_ADDR)
+    };
     let mut files = vec![
-        initramfs_file("sbin/init", 0o100755, build_ping_smoke_elf64(&host)),
+        initramfs_file(
+            "sbin/init",
+            0o100755,
+            build_ping_smoke_elf64(&host, icmp_addr),
+        ),
         initramfs_file("etc/hostname", 0o100644, b"lupos\n".to_vec()),
         initramfs_file(
             "etc/resolv.conf",
@@ -7008,11 +7665,22 @@ const DRM_DRIVER_SYMBOLS: &[&str] = &[
     "CONFIG_DRM_I915",
     "CONFIG_DRM_VIRTIO_GPU",
 ];
+const I2C_CORE_DRIVER_SYMBOLS: &[&str] = &[
+    "CONFIG_I2C",
+    "CONFIG_I2C_SMBUS",
+    "CONFIG_I2C_I801",
+    "CONFIG_DRM_BOCHS",
+    "CONFIG_DRM_I915",
+    "CONFIG_DRM_VIRTIO_GPU",
+];
+const I2C_SMBUS_DRIVER_SYMBOLS: &[&str] = &["CONFIG_I2C_SMBUS", "CONFIG_I2C_I801"];
+const I2C_ALGOBIT_DRIVER_SYMBOLS: &[&str] = &["CONFIG_I2C_ALGOBIT", "CONFIG_DRM_I915"];
 const I915_DRIVER_SYMBOLS: &[&str] = &["CONFIG_DRM_I915"];
 const SHMEM_DRM_DRIVER_SYMBOLS: &[&str] = &["CONFIG_DRM_BOCHS", "CONFIG_DRM_VIRTIO_GPU"];
 const VIRTIO_GPU_DRIVER_SYMBOLS: &[&str] = &["CONFIG_DRM_VIRTIO_GPU"];
 const VIRTIO_PCI_DRIVER_SYMBOLS: &[&str] = &["CONFIG_VIRTIO_PCI"];
 const SCSI_DRIVER_SYMBOLS: &[&str] = &["CONFIG_SCSI"];
+const NINEP_DRIVER_SYMBOLS: &[&str] = &["CONFIG_NET_9P", "CONFIG_NET_9P_VIRTIO"];
 
 /// Hidden/support symbols are derived from the selected graphics driver. This
 /// keeps a tuned config such as virtio-gpu-only from inheriting the generic
@@ -7020,14 +7688,16 @@ const SCSI_DRIVER_SYMBOLS: &[&str] = &["CONFIG_SCSI"];
 fn derived_driver_activation_symbols(spec: &DriverModuleSpec) -> Option<&'static [&'static str]> {
     match spec.module_name {
         "bsg" => Some(SCSI_DRIVER_SYMBOLS),
-        "zlib_deflate" | "i2c_algo_bit" | "agpgart" | "amd64_agp" | "intel_gtt" | "intel_agp"
-        | "iosf_mbi" | "drm_buddy" | "ttm" | "drm_display_helper" => Some(I915_DRIVER_SYMBOLS),
-        "i2c_core" | "drm_panel_orientation_quirks" | "drm" | "drm_kms_helper" => {
-            Some(DRM_DRIVER_SYMBOLS)
-        }
+        "zlib_deflate" | "agpgart" | "amd64_agp" | "intel_gtt" | "intel_agp" | "iosf_mbi"
+        | "drm_buddy" | "ttm" | "drm_display_helper" => Some(I915_DRIVER_SYMBOLS),
+        "i2c_core" => Some(I2C_CORE_DRIVER_SYMBOLS),
+        "i2c_smbus" => Some(I2C_SMBUS_DRIVER_SYMBOLS),
+        "i2c_algo_bit" => Some(I2C_ALGOBIT_DRIVER_SYMBOLS),
+        "drm_panel_orientation_quirks" | "drm" | "drm_kms_helper" => Some(DRM_DRIVER_SYMBOLS),
         "drm_shmem_helper" => Some(SHMEM_DRM_DRIVER_SYMBOLS),
         "virtio_dma_buf" => Some(VIRTIO_GPU_DRIVER_SYMBOLS),
         "virtio_pci_legacy_dev" => Some(VIRTIO_PCI_DRIVER_SYMBOLS),
+        "9pnet" => Some(NINEP_DRIVER_SYMBOLS),
         _ => None,
     }
 }
@@ -7981,7 +8651,11 @@ const VENDOR_KBUILD_MODULE_ORDER: &[&str] = &[
     "snd",
     "snd_hwdep",
     "snd_timer",
+    "snd_hrtimer",
     "snd_pcm",
+    "snd_seq_device",
+    "snd_seq",
+    "snd_seq_dummy",
     "snd_hda_core",
     "snd_intel_sdw_acpi",
     "snd_intel_dspcfg",
@@ -7994,6 +8668,7 @@ const VENDOR_KBUILD_MODULE_ORDER: &[&str] = &[
     "virtio_pci_modern_dev",
     "virtio_pci_legacy_dev",
     "virtio_pci",
+    "virtio_scsi",
     "virtio_dma_buf",
     "agpgart",
     "amd64_agp",
@@ -8010,16 +8685,53 @@ const VENDOR_KBUILD_MODULE_ORDER: &[&str] = &[
     "i915",
     "virtio_gpu",
     "virtio_blk",
+    "virtio_console",
+    "virtio_input",
     "scsi_mod",
     "scsi_common",
+    "scsi_transport_spi",
     "sd_mod",
-    "e1000",
+    "sr_mod",
+    "sg",
+    "usbmon",
+    "ehci_hcd",
+    "ehci_pci",
+    "ohci_hcd",
+    "ohci_pci",
+    "uhci_hcd",
+    "usblp",
+    "usb_storage",
+    "cdrom",
+    "mii",
+    "netconsole",
+    "mdio_bus",
+    "libphy",
+    "phy_package",
+    "mdio_devres",
+    "realtek",
     "virtio_net",
+    "9pnet",
+    "9pnet_virtio",
+    "tg3",
+    "e100",
+    "e1000",
+    "e1000e",
+    "sky2",
+    "forcedeth",
+    "8139too",
+    "r8169",
     "i2c_algo_bit",
     "i2c_core",
+    "i2c_smbus",
+    "i2c_i801",
+    "x86_pkg_temp_thermal",
     "libata",
     "ahci",
     "libahci",
+    "ata_piix",
+    "pata_amd",
+    "pata_oldpiix",
+    "pata_sch",
 ];
 
 fn modules_order_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
@@ -8072,12 +8784,9 @@ fn modules_dep_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
 }
 
 const VIDEO_MODULE_RUNTIME_LOADABILITY_WARNING: &str = "vendor-built video .ko artifacts are configured from Linux x86_64_defconfig with the explicit Lupos runtime contract and staged. \
-The minimized storage-module path has a real struct-module lifecycle and final W^X permissions, \
-but each generic video module remains fail-closed when it needs an unimplemented Linux finalizer \
-or ABI export. The audited remaining closure includes alternatives/SMP locks/static calls and \
-DRM/KMS, I2C, AGP/TTM/GTT, dma-buf/shmem, aperture helpers/VGA arbitration, \
-VIDEO/SCREEN_INFO framebuffer handoff, GPU buddy, and bochs/i915/virtio-gpu support; artifact \
-staging alone is not runtime success";
+Runtime loadability is validated by cargo xtask run --ping-smoke, which must load the DRM support \
+stack plus bochs, i915, and virtio_gpu from vendor/linux artifacts and complete the QEMU user-net \
+ICMP smoke. Artifact staging alone is not runtime success.";
 
 fn video_module_runtime_loadability_warning(modules: &[&DriverModuleSpec]) -> Option<&'static str> {
     modules
@@ -14276,20 +14985,123 @@ fn ping_smoke_host() -> Result<String> {
     }
 }
 
+fn ping_smoke_icmp_addr() -> Result<[u8; 4]> {
+    let Some(value) = env::var(LUPOS_PING_ICMP_ADDR_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(DEFAULT_PING_ICMP_ADDR);
+    };
+    let octets: Vec<u8> = value
+        .trim()
+        .split('.')
+        .map(|octet| octet.parse::<u8>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| anyhow!("{LUPOS_PING_ICMP_ADDR_ENV} must be a dotted-quad IPv4 address"))?;
+    let addr: [u8; 4] = octets
+        .try_into()
+        .map_err(|_| anyhow!("{LUPOS_PING_ICMP_ADDR_ENV} must be a dotted-quad IPv4 address"))?;
+    Ok(addr)
+}
+
+const PING_SMOKE_FORBIDDEN_DRIVER_MARKERS: &[&str] = &[
+    PANIC_PREFIX,
+    "unresolved Linux module symbol",
+    "unsupported Linux module finalization",
+    "requires unsupported",
+    SOFTLOCKUP_WATCHDOG_BANNER,
+];
+
+fn ping_smoke_expected_driver_modules() -> Vec<&'static str> {
+    repo_config_text()
+        .map(|text| {
+            staged_module_specs_from_config_text(&text)
+                .into_iter()
+                .map(|spec| spec.module_name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn modprobe_loaded_module(line: &str) -> Option<&str> {
+    line.split("modprobe: loaded ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+}
+
+fn modprobe_failed_module(line: &str) -> Option<(&str, &str)> {
+    let rest = line.split("modprobe: failed to load module ").nth(1)?;
+    let (module, detail) = rest.split_once(':')?;
+    Some((module.trim(), detail.trim()))
+}
+
+fn allowed_ping_smoke_module_failure(module: &str, detail: &str) -> bool {
+    // x86_64 defconfig includes amd64_agp, but QEMU's generic machine has no
+    // AMD64 AGP bridge. Vendor Linux's module init returns -ENODEV there.
+    if module == "amd64_agp" && detail.starts_with("errno 19") {
+        return true;
+    }
+
+    // x86_pkg_temp_thermal gates init on Intel X86_FEATURE_PTS. QEMU's default
+    // CPU model does not guarantee package thermal sensors, so vendor Linux may
+    // reject the module with -ENODEV even though the .ko payload and ABI linked.
+    module == "x86_pkg_temp_thermal" && detail.starts_with("errno 19")
+}
+
+fn assert_ping_smoke_driver_runtime_log(log: &str, expected_modules: &[&str]) -> Result<()> {
+    let stripped = strip_ansi_escapes(log);
+    let expected = expected_modules.iter().copied().collect::<HashSet<_>>();
+    let mut loaded = HashSet::<String>::new();
+    let mut allowed_failed = HashSet::<String>::new();
+
+    for line in stripped.lines() {
+        for marker in PING_SMOKE_FORBIDDEN_DRIVER_MARKERS {
+            if line.contains(marker) {
+                bail!(
+                    "ping-smoke driver runtime log contained forbidden marker {marker:?}: {}",
+                    line.trim()
+                );
+            }
+        }
+
+        if let Some(module) = modprobe_loaded_module(line) {
+            loaded.insert(module.to_owned());
+        }
+
+        if let Some((module, detail)) = modprobe_failed_module(line) {
+            if expected.contains(module) && allowed_ping_smoke_module_failure(module, detail) {
+                allowed_failed.insert(module.to_owned());
+                continue;
+            }
+            bail!(
+                "ping-smoke driver module {module} failed to load unexpectedly: {}",
+                line.trim()
+            );
+        }
+    }
+
+    let missing = expected_modules
+        .iter()
+        .copied()
+        .filter(|module| !loaded.contains(*module) && !allowed_failed.contains(*module))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "ping-smoke did not load expected vendor-built driver modules: {}",
+            missing.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
 /// Boot the default distro and verify guest networking with `ping -c 1`.
 pub fn run_ping_smoke() -> Result<()> {
     ensure_userland_stage()?;
     let host = ping_smoke_host()?;
     let marker = format!("ping-smoke: guest ping ok ({host})");
     let _host_guard = EnvVarGuard::set(LUPOS_PING_HOST_ENV, &host);
-    let run = build_and_run_iso(
-        BootMode::PingSmoke,
-        RunOptions {
-            exit_after_boot: true,
-            qemu_timeout: Some(Duration::from_secs(120)),
-            smp_count: 1,
-        },
-    )?;
+    let run = build_and_run_iso(BootMode::PingSmoke, ping_smoke_run_options())?;
 
     let actual_code = run
         .status
@@ -14302,8 +15114,14 @@ pub fn run_ping_smoke() -> Result<()> {
         );
     }
     if !serial_log_contains(&run.serial_output, &marker) {
+        let phase_detail = run
+            .serial_output
+            .lines()
+            .find(|line| line.contains("ping-smoke: fail phase="))
+            .map(|line| format!(" ({})", line.trim()))
+            .unwrap_or_default();
         bail!(
-            "ping smoke did not observe successful guest ping to {host}\nserial log:\n{}",
+            "ping smoke did not observe successful guest ping to {host}{phase_detail}\nserial log:\n{}",
             run.serial_output
         );
     }
@@ -14313,6 +15131,15 @@ pub fn run_ping_smoke() -> Result<()> {
             run.serial_output
         );
     }
+    let expected_driver_modules = ping_smoke_expected_driver_modules();
+    assert_ping_smoke_driver_runtime_log(&run.serial_output, &expected_driver_modules)
+        .with_context(|| {
+            format!(
+                "ping smoke driver runtime validation failed for {} expected modules\nserial log:\n{}",
+                expected_driver_modules.len(),
+                run.serial_output
+            )
+        })?;
 
     Ok(())
 }
@@ -15993,10 +16820,52 @@ fn run_source_tristate_module_staging() -> Result<()> {
 CONFIG_MODULES=y
 CONFIG_VIRTIO_BLK=m
 # CONFIG_VIRTIO_NET is not set
+# CONFIG_MII is not set
+# CONFIG_E100 is not set
 # CONFIG_E1000 is not set
+# CONFIG_E1000E is not set
+# CONFIG_SKY2 is not set
+# CONFIG_FORCEDETH is not set
+# CONFIG_8139TOO is not set
 ";
-    let err =
-        staged_module_files_from_config_text(config).expect_err("missing Linux .ko must fail");
+    let repo_config =
+        repo_config_text().context("source-tristate-module-staging requires repo .config")?;
+    let repo_selected = staged_module_specs_from_config_text(&repo_config);
+    ensure_linux_driver_module_artifacts(&repo_selected)?;
+    let files = staged_module_files_from_config_text(config)?;
+    let virtio_blk_path =
+        format!("lib/modules/{MODULE_VERSION_DIR}/kernel/drivers/block/virtio_blk.ko");
+    let virtio_blk = initramfs_file_bytes(&files, &virtio_blk_path)
+        .with_context(|| format!("{virtio_blk_path} must be staged"))?;
+    if !virtio_blk.starts_with(b"\x7fELF") {
+        bail!("staged virtio_blk must be a vendor-built ELF module");
+    }
+    if files.iter().any(|(path, _, _)| {
+        path.contains("virtio_net.ko")
+            || path.contains("mii.ko")
+            || path.contains("e100.ko")
+            || path.contains("e1000.ko")
+            || path.contains("e1000e.ko")
+            || path.contains("sky2.ko")
+            || path.contains("forcedeth.ko")
+            || path.contains("8139too.ko")
+    }) {
+        bail!("unset tristate modules must not be staged");
+    }
+    if etc_modules_from_config_text(config) != b"virtio_blk\n" {
+        bail!("tristate module request list must follow selected config");
+    }
+
+    let missing = DriverModuleSpec {
+        symbol: "CONFIG_LUPOS_MISSING_TEST_MODULE",
+        module_name: "lupos_missing_test_module",
+        module_path: "kernel/drivers/lupos/missing-test.ko",
+        vendor_linux_ref: "vendor/linux/scripts/Makefile.modinst",
+        linux_make_dir: "drivers/lupos",
+        linux_make_target: "missing-test.ko",
+        module_deps: &[],
+    };
+    let err = module_payload(&missing).expect_err("missing Linux .ko must fail");
     if !err.to_string().contains("Linux-built module artifact") {
         bail!("module staging must require Linux-built .ko artifacts: {err}");
     }
@@ -19576,6 +20445,17 @@ fn phase17_late_boot_run_options() -> RunOptions {
     }
 }
 
+fn ping_smoke_run_options() -> RunOptions {
+    RunOptions {
+        exit_after_boot: true,
+        // Ping smoke now validates the staged vendor driver stack, including
+        // the DRM support chain, so it needs the same TCG-tolerant window as
+        // late boot driver gates.
+        qemu_timeout: Some(Duration::from_secs(300)),
+        smp_count: 1,
+    }
+}
+
 fn feature_list(mode: BootMode, exit_after_boot: bool) -> Vec<&'static str> {
     let mut features = Vec::new();
 
@@ -22080,6 +22960,14 @@ failed command output\n";
     }
 
     #[test]
+    fn ping_smoke_uses_extended_driver_stack_timeout_budget() {
+        let options = ping_smoke_run_options();
+        assert!(options.exit_after_boot);
+        assert_eq!(options.qemu_timeout, Some(Duration::from_secs(300)));
+        assert_eq!(options.smp_count, 1);
+    }
+
+    #[test]
     fn smp_runtime_gate_uses_extended_timeout_budget() {
         let options = phase17_smp_runtime_run_options();
         assert!(options.exit_after_boot);
@@ -22778,15 +23666,55 @@ failed command output\n";
             "CONFIG_SERIAL_8250=y",
             "CONFIG_NET=y",
             "CONFIG_NETDEVICES=y",
+            "CONFIG_I2C=m",
+            "CONFIG_I2C_SMBUS=m",
+            "CONFIG_I2C_I801=m",
             "CONFIG_SOUND=m",
             "CONFIG_SND=m",
+            "CONFIG_SND_HRTIMER=m",
+            "CONFIG_SND_SEQ_DEVICE=m",
+            "CONFIG_SND_SEQUENCER=m",
+            "CONFIG_SND_SEQ_DUMMY=m",
             "CONFIG_SND_HDA_INTEL=m",
             "CONFIG_SND_HDA_GENERIC=m",
+            "CONFIG_CDROM=m",
+            "CONFIG_BLK_DEV_SR=m",
+            "CONFIG_CHR_DEV_SG=m",
+            "CONFIG_SCSI_SPI_ATTRS=m",
+            "CONFIG_SCSI_VIRTIO=m",
+            "CONFIG_USB_MON=m",
+            "CONFIG_USB_EHCI_HCD=m",
+            "CONFIG_USB_EHCI_PCI=m",
+            "CONFIG_USB_OHCI_HCD=m",
+            "CONFIG_USB_OHCI_HCD_PCI=m",
+            "CONFIG_USB_UHCI_HCD=m",
+            "CONFIG_USB_STORAGE=m",
+            "CONFIG_ATA_PIIX=m",
+            "CONFIG_PATA_AMD=m",
+            "CONFIG_PATA_OLDPIIX=m",
+            "CONFIG_PATA_SCH=m",
             "CONFIG_VIRTIO_PCI_LIB=m",
             "CONFIG_VIRTIO_PCI=m",
             "CONFIG_VIRTIO_BLK=m",
+            "CONFIG_VIRTIO_CONSOLE=m",
+            "CONFIG_VIRTIO_INPUT=m",
             "CONFIG_VIRTIO_NET=m",
+            "CONFIG_NETCONSOLE=m",
+            "CONFIG_NET_9P=m",
+            "CONFIG_NET_9P_VIRTIO=m",
+            "CONFIG_MII=m",
+            "CONFIG_PHYLIB=m",
+            "CONFIG_PHY_PACKAGE=m",
+            "CONFIG_REALTEK_PHY=m",
+            "CONFIG_E100=m",
             "CONFIG_E1000=m",
+            "CONFIG_E1000E=m",
+            "CONFIG_SKY2=m",
+            "CONFIG_TIGON3=m",
+            "CONFIG_FORCEDETH=m",
+            "CONFIG_8139TOO=m",
+            "CONFIG_R8169=m",
+            "CONFIG_X86_PKG_TEMP_THERMAL=m",
         ] {
             assert!(
                 defconfig_text.contains(needle),
@@ -22820,9 +23748,51 @@ failed command output\n";
             "config_value!(CONFIG_X86_64)",
             "config_value!(CONFIG_SOUND)",
             "config_value!(CONFIG_SND)",
+            "config_value!(CONFIG_SND_HRTIMER)",
+            "config_value!(CONFIG_SND_SEQ_DEVICE)",
+            "config_value!(CONFIG_SND_SEQUENCER)",
+            "config_value!(CONFIG_SND_SEQ_DUMMY)",
             "config_value!(CONFIG_SND_HDA_INTEL)",
             "config_value!(CONFIG_SND_HDA_GENERIC)",
+            "config_value!(CONFIG_I2C)",
+            "config_value!(CONFIG_I2C_SMBUS)",
+            "config_value!(CONFIG_I2C_ALGOBIT)",
+            "config_value!(CONFIG_I2C_I801)",
+            "config_value!(CONFIG_USB_PCI)",
+            "config_value!(CONFIG_USB_EHCI_HCD)",
+            "config_value!(CONFIG_USB_EHCI_PCI)",
+            "config_value!(CONFIG_USB_OHCI_HCD)",
+            "config_value!(CONFIG_USB_OHCI_HCD_PCI)",
+            "config_value!(CONFIG_USB_UHCI_HCD)",
+            "config_value!(CONFIG_CDROM)",
+            "config_value!(CONFIG_BLK_DEV_SR)",
+            "config_value!(CONFIG_CHR_DEV_SG)",
+            "config_value!(CONFIG_SCSI_SPI_ATTRS)",
+            "config_value!(CONFIG_SCSI_VIRTIO)",
+            "config_value!(CONFIG_USB_MON)",
+            "config_value!(CONFIG_USB_PRINTER)",
+            "config_value!(CONFIG_USB_STORAGE)",
+            "config_value!(CONFIG_ATA_PIIX)",
+            "config_value!(CONFIG_PATA_AMD)",
+            "config_value!(CONFIG_PATA_OLDPIIX)",
+            "config_value!(CONFIG_PATA_SCH)",
             "config_value!(CONFIG_VIRTIO_NET)",
+            "config_value!(CONFIG_NETCONSOLE)",
+            "config_value!(CONFIG_NET_9P)",
+            "config_value!(CONFIG_NET_9P_VIRTIO)",
+            "config_value!(CONFIG_VIRTIO_CONSOLE)",
+            "config_value!(CONFIG_VIRTIO_INPUT)",
+            "config_value!(CONFIG_MII)",
+            "config_value!(CONFIG_PHYLIB)",
+            "config_value!(CONFIG_REALTEK_PHY)",
+            "config_value!(CONFIG_E100)",
+            "config_value!(CONFIG_E1000E)",
+            "config_value!(CONFIG_SKY2)",
+            "config_value!(CONFIG_TIGON3)",
+            "config_value!(CONFIG_FORCEDETH)",
+            "config_value!(CONFIG_8139TOO)",
+            "config_value!(CONFIG_R8169)",
+            "config_value!(CONFIG_X86_PKG_TEMP_THERMAL)",
         ] {
             assert!(
                 kconfig_text.contains(needle),
@@ -22912,16 +23882,64 @@ failed command output\n";
             "CONFIG_FRAMEBUFFER=y",
             "CONFIG_DRM=y",
             "CONFIG_USB_XHCI=y",
+            "CONFIG_USB_MON=m",
+            "CONFIG_USB_EHCI_HCD=m",
+            "CONFIG_USB_EHCI_PCI=m",
+            "CONFIG_USB_OHCI_HCD=m",
+            "CONFIG_USB_OHCI_HCD_PCI=m",
+            "CONFIG_USB_UHCI_HCD=m",
             "CONFIG_HID=y",
+            "CONFIG_USB_PRINTER=m",
+            "CONFIG_I2C=m",
+            "CONFIG_I2C_SMBUS=m",
+            "CONFIG_I2C_I801=m",
             "CONFIG_SOUND=m",
             "CONFIG_SND=m",
+            "CONFIG_SND_HRTIMER=m",
+            "CONFIG_SND_SEQ_DEVICE=m",
+            "CONFIG_SND_SEQUENCER=m",
+            "CONFIG_SND_SEQ_DUMMY=m",
             "CONFIG_SND_HDA_INTEL=m",
             "CONFIG_SND_HDA_GENERIC=m",
+            "CONFIG_CDROM=m",
+            "CONFIG_BLK_DEV_SR=m",
+            "CONFIG_CHR_DEV_SG=m",
+            "CONFIG_SCSI_SPI_ATTRS=m",
+            "CONFIG_SCSI_VIRTIO=m",
+            "CONFIG_USB_MON=m",
+            "CONFIG_USB_EHCI_HCD=m",
+            "CONFIG_USB_EHCI_PCI=m",
+            "CONFIG_USB_OHCI_HCD=m",
+            "CONFIG_USB_OHCI_HCD_PCI=m",
+            "CONFIG_USB_UHCI_HCD=m",
+            "CONFIG_USB_PRINTER=m",
+            "CONFIG_USB_STORAGE=m",
+            "CONFIG_ATA_PIIX=m",
+            "CONFIG_PATA_AMD=m",
+            "CONFIG_PATA_OLDPIIX=m",
+            "CONFIG_PATA_SCH=m",
             "CONFIG_VIRTIO_PCI_LIB=m",
             "CONFIG_VIRTIO_PCI=m",
             "CONFIG_VIRTIO_BLK=m",
+            "CONFIG_VIRTIO_CONSOLE=m",
+            "CONFIG_VIRTIO_INPUT=m",
             "CONFIG_VIRTIO_NET=m",
+            "CONFIG_NETCONSOLE=m",
+            "CONFIG_NET_9P=m",
+            "CONFIG_NET_9P_VIRTIO=m",
+            "CONFIG_MII=m",
+            "CONFIG_PHYLIB=m",
+            "CONFIG_PHY_PACKAGE=m",
+            "CONFIG_REALTEK_PHY=m",
+            "CONFIG_E100=m",
             "CONFIG_E1000=m",
+            "CONFIG_E1000E=m",
+            "CONFIG_SKY2=m",
+            "CONFIG_TIGON3=m",
+            "CONFIG_FORCEDETH=m",
+            "CONFIG_8139TOO=m",
+            "CONFIG_R8169=m",
+            "CONFIG_X86_PKG_TEMP_THERMAL=m",
         ] {
             assert!(
                 text.contains(needle) || script_text.contains(needle),
@@ -22942,12 +23960,54 @@ failed command output\n";
             "config FRAMEBUFFER",
             "config DRM",
             "config USB_XHCI",
+            "config USB_PCI",
+            "config USB_EHCI_HCD",
+            "config USB_EHCI_PCI",
+            "config USB_OHCI_HCD",
+            "config USB_OHCI_HCD_PCI",
+            "config USB_UHCI_HCD",
             "config HID",
             "config INPUT",
+            "config NETCONSOLE",
+            "config NET_9P",
+            "config NET_9P_VIRTIO",
+            "config I2C",
+            "config I2C_SMBUS",
+            "config I2C_I801",
+            "config USB_MON",
+            "config USB_PRINTER",
             "config SOUND",
             "config SND",
+            "config SND_HRTIMER",
+            "config SND_SEQ_DEVICE",
+            "config SND_SEQUENCER",
+            "config SND_SEQ_DUMMY",
             "config SND_HDA_INTEL",
             "config SND_HDA_GENERIC",
+            "config CDROM",
+            "config BLK_DEV_SR",
+            "config CHR_DEV_SG",
+            "config SCSI_SPI_ATTRS",
+            "config SCSI_VIRTIO",
+            "config VIRTIO_INPUT",
+            "config USB_STORAGE",
+            "config MII",
+            "config PHYLIB",
+            "config PHY_PACKAGE",
+            "config REALTEK_PHY",
+            "config E100",
+            "config E1000",
+            "config E1000E",
+            "config SKY2",
+            "config TIGON3",
+            "config FORCEDETH",
+            "config 8139TOO",
+            "config R8169",
+            "config X86_PKG_TEMP_THERMAL",
+            "config ATA_PIIX",
+            "config PATA_AMD",
+            "config PATA_OLDPIIX",
+            "config PATA_SCH",
         ] {
             assert!(
                 kconfig_text.contains(needle),
@@ -22967,10 +24027,51 @@ failed command output\n";
             "CONFIG_USB_XHCI=y",
             "CONFIG_INPUT=y",
             "CONFIG_HID=y",
+            "CONFIG_USB_MON=m",
+            "CONFIG_USB_EHCI_HCD=m",
+            "CONFIG_USB_EHCI_PCI=m",
+            "CONFIG_USB_OHCI_HCD=m",
+            "CONFIG_USB_OHCI_HCD_PCI=m",
+            "CONFIG_USB_UHCI_HCD=m",
+            "CONFIG_USB_PRINTER=m",
+            "CONFIG_I2C=m",
+            "CONFIG_I2C_SMBUS=m",
+            "CONFIG_I2C_I801=m",
             "CONFIG_SOUND=m",
             "CONFIG_SND=m",
+            "CONFIG_SND_HRTIMER=m",
+            "CONFIG_SND_SEQ_DEVICE=m",
+            "CONFIG_SND_SEQUENCER=m",
+            "CONFIG_SND_SEQ_DUMMY=m",
             "CONFIG_SND_HDA_INTEL=m",
             "CONFIG_SND_HDA_GENERIC=m",
+            "CONFIG_CDROM=m",
+            "CONFIG_BLK_DEV_SR=m",
+            "CONFIG_CHR_DEV_SG=m",
+            "CONFIG_SCSI_SPI_ATTRS=m",
+            "CONFIG_SCSI_VIRTIO=m",
+            "CONFIG_USB_STORAGE=m",
+            "CONFIG_VIRTIO_INPUT=m",
+            "CONFIG_NETCONSOLE=m",
+            "CONFIG_NET_9P=m",
+            "CONFIG_NET_9P_VIRTIO=m",
+            "CONFIG_MII=m",
+            "CONFIG_PHYLIB=m",
+            "CONFIG_PHY_PACKAGE=m",
+            "CONFIG_REALTEK_PHY=m",
+            "CONFIG_E100=m",
+            "CONFIG_E1000=m",
+            "CONFIG_E1000E=m",
+            "CONFIG_SKY2=m",
+            "CONFIG_TIGON3=m",
+            "CONFIG_FORCEDETH=m",
+            "CONFIG_8139TOO=m",
+            "CONFIG_R8169=m",
+            "CONFIG_X86_PKG_TEMP_THERMAL=m",
+            "CONFIG_ATA_PIIX=m",
+            "CONFIG_PATA_AMD=m",
+            "CONFIG_PATA_OLDPIIX=m",
+            "CONFIG_PATA_SCH=m",
         ] {
             assert!(
                 lupos_defconfig_text.contains(needle),
@@ -22992,11 +24093,53 @@ failed command output\n";
             "config VIRTIO_PCI_LIB\n\ttristate",
             "config VIRTIO_PCI\n\ttristate",
             "config VIRTIO_BLK\n\ttristate",
+            "config VIRTIO_CONSOLE\n\ttristate",
+            "config VIRTIO_INPUT\n\ttristate",
             "config VIRTIO_NET\n\ttristate",
+            "config NETCONSOLE\n\ttristate",
+            "config NET_9P\n\ttristate",
+            "config NET_9P_VIRTIO\n\ttristate",
+            "config MII\n\ttristate",
+            "config PHYLIB\n\ttristate",
+            "config PHY_PACKAGE\n\ttristate",
+            "config REALTEK_PHY\n\ttristate",
+            "config E100\n\ttristate",
             "config E1000\n\ttristate",
+            "config E1000E\n\ttristate",
+            "config SKY2\n\ttristate",
+            "config TIGON3\n\ttristate",
+            "config FORCEDETH\n\ttristate",
+            "config 8139TOO\n\ttristate",
+            "config R8169\n\ttristate",
+            "config X86_PKG_TEMP_THERMAL\n\ttristate",
+            "config I2C\n\ttristate",
+            "config I2C_SMBUS\n\ttristate",
+            "config I2C_ALGOBIT\n\ttristate",
+            "config I2C_I801\n\ttristate",
             "config SOUND\n\ttristate",
             "config SND\n\ttristate",
+            "config SND_HRTIMER\n\ttristate",
+            "config SND_SEQ_DEVICE\n\ttristate",
+            "config SND_SEQUENCER\n\ttristate",
+            "config SND_SEQ_DUMMY\n\ttristate",
             "config SND_HDA_INTEL\n\ttristate",
+            "config CDROM\n\ttristate",
+            "config BLK_DEV_SR\n\ttristate",
+            "config CHR_DEV_SG\n\ttristate",
+            "config SCSI_SPI_ATTRS\n\ttristate",
+            "config SCSI_VIRTIO\n\ttristate",
+            "config USB_EHCI_HCD\n\ttristate",
+            "config USB_EHCI_PCI\n\ttristate",
+            "config USB_MON\n\ttristate",
+            "config USB_OHCI_HCD\n\ttristate",
+            "config USB_OHCI_HCD_PCI\n\ttristate",
+            "config USB_PRINTER\n\ttristate",
+            "config USB_STORAGE\n\ttristate",
+            "config USB_UHCI_HCD\n\ttristate",
+            "config ATA_PIIX\n\ttristate",
+            "config PATA_AMD\n\ttristate",
+            "config PATA_OLDPIIX\n\ttristate",
+            "config PATA_SCH\n\ttristate",
         ] {
             assert!(
                 text.contains(needle),
@@ -23221,7 +24364,13 @@ CONFIG_VIRTIO_PCI_LIB=m
 CONFIG_VIRTIO_PCI=m
 CONFIG_VIRTIO_BLK=m
 # CONFIG_VIRTIO_NET is not set
+# CONFIG_MII is not set
+# CONFIG_E100 is not set
 # CONFIG_E1000 is not set
+# CONFIG_E1000E is not set
+# CONFIG_SKY2 is not set
+# CONFIG_FORCEDETH is not set
+# CONFIG_8139TOO is not set
 ";
         match staged_module_files_from_config_text(config) {
             Ok(files) => {
@@ -23278,6 +24427,212 @@ CONFIG_VIRTIO_BLK=m
             &[
                 "kernel/drivers/virtio/virtio_pci_legacy_dev.ko",
                 "kernel/drivers/virtio/virtio_pci_modern_dev.ko",
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_x86_network_module_staging_tracks_vendor_defconfig_nics() {
+        let config = "\
+CONFIG_MODULES=y
+CONFIG_MII=m
+CONFIG_PHYLIB=m
+CONFIG_PHY_PACKAGE=m
+CONFIG_REALTEK_PHY=m
+CONFIG_VIRTIO_NET=m
+CONFIG_NETCONSOLE=m
+CONFIG_NET_9P=m
+CONFIG_NET_9P_VIRTIO=m
+CONFIG_TIGON3=m
+CONFIG_E100=m
+CONFIG_E1000=m
+CONFIG_E1000E=m
+CONFIG_SKY2=m
+CONFIG_FORCEDETH=m
+CONFIG_8139TOO=m
+CONFIG_R8169=m
+";
+        let specs = staged_module_specs_from_config_text(config);
+
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.module_name)
+                .collect::<Vec<_>>(),
+            vec![
+                "mii",
+                "mdio_bus",
+                "libphy",
+                "phy_package",
+                "mdio_devres",
+                "realtek",
+                "virtio_net",
+                "netconsole",
+                "9pnet",
+                "9pnet_virtio",
+                "tg3",
+                "e100",
+                "e1000",
+                "e1000e",
+                "sky2",
+                "forcedeth",
+                "8139too",
+                "r8169",
+            ]
+        );
+        assert_eq!(
+            etc_modules_from_config_text(config),
+            b"mii\nmdio_bus\nlibphy\nphy_package\nmdio_devres\nrealtek\nvirtio_net\nnetconsole\n9pnet\n9pnet_virtio\ntg3\ne100\ne1000\ne1000e\nsky2\nforcedeth\n8139too\nr8169\n"
+        );
+        assert_eq!(
+            modules_order_from_specs(&specs),
+            b"kernel/drivers/net/mii.ko\n\
+kernel/drivers/net/netconsole.ko\n\
+kernel/drivers/net/phy/mdio_bus.ko\n\
+kernel/drivers/net/phy/libphy.ko\n\
+kernel/drivers/net/phy/phy_package.ko\n\
+kernel/drivers/net/phy/mdio_devres.ko\n\
+kernel/drivers/net/phy/realtek/realtek.ko\n\
+kernel/drivers/net/virtio_net.ko\n\
+kernel/net/9p/9pnet.ko\n\
+kernel/net/9p/9pnet_virtio.ko\n\
+kernel/drivers/net/ethernet/broadcom/tg3.ko\n\
+kernel/drivers/net/ethernet/intel/e100.ko\n\
+kernel/drivers/net/ethernet/intel/e1000/e1000.ko\n\
+kernel/drivers/net/ethernet/intel/e1000e/e1000e.ko\n\
+kernel/drivers/net/ethernet/marvell/sky2.ko\n\
+kernel/drivers/net/ethernet/nvidia/forcedeth.ko\n\
+kernel/drivers/net/ethernet/realtek/8139too.ko\n\
+kernel/drivers/net/ethernet/realtek/r8169.ko\n"
+        );
+
+        let by_name = specs
+            .iter()
+            .map(|spec| (spec.module_name, *spec))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            by_name["e100"].vendor_linux_ref,
+            "vendor/linux/drivers/net/ethernet/intel/e100.c"
+        );
+        assert_eq!(by_name["e100"].module_deps, &["kernel/drivers/net/mii.ko"]);
+        assert_eq!(
+            by_name["8139too"].vendor_linux_ref,
+            "vendor/linux/drivers/net/ethernet/realtek/8139too.c"
+        );
+        assert_eq!(
+            by_name["8139too"].module_deps,
+            &["kernel/drivers/net/mii.ko"]
+        );
+        assert_eq!(
+            by_name["e1000e"].vendor_linux_ref,
+            "vendor/linux/drivers/net/ethernet/intel/e1000e/netdev.c"
+        );
+        assert_eq!(
+            by_name["9pnet_virtio"].module_deps,
+            &["kernel/net/9p/9pnet.ko"]
+        );
+        assert_eq!(
+            by_name["netconsole"].vendor_linux_ref,
+            "vendor/linux/drivers/net/netconsole.c"
+        );
+        assert_eq!(by_name["netconsole"].linux_make_dir, "drivers/net");
+        assert_eq!(by_name["netconsole"].linux_make_target, "netconsole.ko");
+        assert!(by_name["netconsole"].module_deps.is_empty());
+        assert_eq!(
+            by_name["sky2"].vendor_linux_ref,
+            "vendor/linux/drivers/net/ethernet/marvell/sky2.c"
+        );
+        assert_eq!(
+            by_name["forcedeth"].vendor_linux_ref,
+            "vendor/linux/drivers/net/ethernet/nvidia/forcedeth.c"
+        );
+    }
+
+    #[test]
+    fn generic_netconsole_module_staging_tracks_vendor_console_driver() {
+        let config = "\
+CONFIG_MODULES=y
+CONFIG_NETCONSOLE=m
+";
+        let specs = staged_module_specs_from_config_text(config);
+
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.module_name)
+                .collect::<Vec<_>>(),
+            vec!["netconsole"]
+        );
+        assert_eq!(etc_modules_from_config_text(config), b"netconsole\n");
+        assert_eq!(
+            modules_order_from_specs(&specs),
+            b"kernel/drivers/net/netconsole.ko\n"
+        );
+
+        let netconsole = specs
+            .iter()
+            .find(|spec| spec.module_name == "netconsole")
+            .expect("netconsole spec");
+        assert_eq!(
+            netconsole.vendor_linux_ref,
+            "vendor/linux/drivers/net/netconsole.c"
+        );
+        assert_eq!(netconsole.linux_make_dir, "drivers/net");
+        assert_eq!(netconsole.linux_make_target, "netconsole.ko");
+        assert!(netconsole.module_deps.is_empty());
+    }
+
+    #[test]
+    fn generic_i2c_smbus_module_staging_loads_core_before_bus_driver() {
+        let config = "\
+CONFIG_MODULES=y
+CONFIG_I2C=m
+CONFIG_I2C_SMBUS=m
+CONFIG_I2C_I801=m
+";
+        let specs = staged_module_specs_from_config_text(config);
+
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.module_name)
+                .collect::<Vec<_>>(),
+            vec!["i2c_core", "i2c_smbus", "i2c_i801"]
+        );
+        assert_eq!(
+            etc_modules_from_config_text(config),
+            b"i2c_core\ni2c_smbus\ni2c_i801\n"
+        );
+        assert_eq!(
+            modules_order_from_specs(&specs),
+            b"kernel/drivers/i2c/i2c-core.ko\n\
+kernel/drivers/i2c/i2c-smbus.ko\n\
+kernel/drivers/i2c/busses/i2c-i801.ko\n"
+        );
+
+        let i2c_smbus = specs
+            .iter()
+            .find(|spec| spec.module_name == "i2c_smbus")
+            .expect("i2c_smbus spec");
+        assert_eq!(
+            i2c_smbus.vendor_linux_ref,
+            "vendor/linux/drivers/i2c/i2c-smbus.c"
+        );
+        assert_eq!(i2c_smbus.module_deps, &["kernel/drivers/i2c/i2c-core.ko"]);
+
+        let i2c_i801 = specs
+            .iter()
+            .find(|spec| spec.module_name == "i2c_i801")
+            .expect("i2c_i801 spec");
+        assert_eq!(
+            i2c_i801.vendor_linux_ref,
+            "vendor/linux/drivers/i2c/busses/i2c-i801.c"
+        );
+        assert_eq!(
+            i2c_i801.module_deps,
+            &[
+                "kernel/drivers/i2c/i2c-smbus.ko",
+                "kernel/drivers/i2c/i2c-core.ko",
             ]
         );
     }
@@ -23637,26 +24992,25 @@ kernel/drivers/i2c/i2c-core.ko\n"
     }
 
     #[test]
-    fn video_artifact_staging_reports_the_audited_runtime_abi_blocker() {
+    fn video_artifact_staging_reports_runtime_validation_requirement() {
         let video = staged_module_specs_from_config_text("CONFIG_DRM_I915=m\n");
         let warning = video_module_runtime_loadability_warning(&video)
             .expect("video artifacts require a loadability warning");
         for required_set in [
-            "DRM/KMS",
-            "I2C",
-            "AGP/TTM/GTT",
-            "dma-buf/shmem",
-            "aperture helpers/VGA arbitration",
-            "VIDEO/SCREEN_INFO",
-            "GPU buddy",
-            "i915/virtio-gpu",
-            "not runtime success",
+            "vendor-built video .ko artifacts",
+            "Linux x86_64_defconfig",
+            "cargo xtask run --ping-smoke",
+            "bochs, i915, and virtio_gpu",
+            "QEMU user-net",
+            "Artifact staging alone is not runtime success",
         ] {
             assert!(
                 warning.contains(required_set),
                 "missing {required_set}: {warning}"
             );
         }
+        assert!(!warning.contains("fail-closed"));
+        assert!(!warning.contains("unimplemented Linux finalizer"));
 
         let storage = staged_module_specs_from_config_text("CONFIG_SCSI=m\n");
         assert_eq!(video_module_runtime_loadability_warning(&storage), None);
@@ -23667,18 +25021,103 @@ kernel/drivers/i2c/i2c-core.ko\n"
     }
 
     #[test]
+    fn ping_smoke_driver_runtime_log_accepts_loaded_modules_and_qemu_enodev() {
+        let log = "\
+[   19.619150] modprobe: loaded virtio_net
+[   19.820000] modprobe: loaded 9pnet
+[   19.930000] modprobe: loaded 9pnet_virtio
+[   27.112358] modprobe: failed to load module x86_pkg_temp_thermal: errno 19 (continuing)
+[   33.594698] modprobe: loading amd64_agp
+[   35.208916] modprobe: failed to load module amd64_agp: errno 19 (continuing)
+[   49.568139] modprobe: loaded i915
+ping-smoke: guest ping ok (10.0.2.2)
+";
+
+        assert_ping_smoke_driver_runtime_log(
+            log,
+            &[
+                "virtio_net",
+                "9pnet",
+                "9pnet_virtio",
+                "x86_pkg_temp_thermal",
+                "amd64_agp",
+                "i915",
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ping_smoke_driver_runtime_log_rejects_missing_expected_module() {
+        let err = assert_ping_smoke_driver_runtime_log(
+            "[   19.619150] modprobe: loaded virtio_net\n",
+            &["virtio_net", "i915"],
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("did not load expected vendor-built driver modules: i915")
+        );
+    }
+
+    #[test]
+    fn ping_smoke_driver_runtime_log_rejects_unexpected_module_failure() {
+        let err = assert_ping_smoke_driver_runtime_log(
+            "[   19.619150] modprobe: failed to load module virtio_net: errno 2 (continuing)\n",
+            &["virtio_net"],
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("driver module virtio_net failed to load unexpectedly")
+        );
+    }
+
+    #[test]
+    fn ping_smoke_driver_runtime_log_rejects_abi_and_watchdog_markers() {
+        for marker in [
+            "unresolved Linux module symbol: foo",
+            "unsupported Linux module finalization: .altinstructions",
+            "i915 requires unsupported Linux module finalization",
+            "BUG: soft lockup - CPU#0 stuck for 20s!",
+        ] {
+            let err = assert_ping_smoke_driver_runtime_log(marker, &[]).unwrap_err();
+            assert!(
+                err.to_string().contains("forbidden marker"),
+                "marker {marker:?} produced {err}"
+            );
+        }
+    }
+
+    #[test]
     fn generic_storage_module_staging_matches_linux_probe_order() {
         let config = "\
 CONFIG_MODULES=y
 CONFIG_SCSI_COMMON=m
 CONFIG_SCSI=m
 CONFIG_BLK_DEV_SD=m
+CONFIG_CDROM=m
+CONFIG_BLK_DEV_SR=m
+CONFIG_CHR_DEV_SG=m
+CONFIG_SCSI_SPI_ATTRS=m
+CONFIG_SCSI_VIRTIO=m
+CONFIG_USB_STORAGE=m
 CONFIG_ATA=m
 CONFIG_SATA_AHCI=m
+CONFIG_ATA_PIIX=m
+CONFIG_PATA_AMD=m
+CONFIG_PATA_OLDPIIX=m
+CONFIG_PATA_SCH=m
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_PCI_LIB=m
+CONFIG_VIRTIO_PCI_LIB_LEGACY=m
+CONFIG_VIRTIO_PCI=m
 ";
         assert_eq!(
             etc_modules_from_config_text(config),
-            b"bsg\nscsi_common\nscsi_mod\nsd_mod\nlibata\nlibahci\nahci\n"
+            b"bsg\nscsi_common\nscsi_mod\nsd_mod\ncdrom\nsr_mod\nsg\nscsi_transport_spi\nlibata\nlibahci\nahci\nata_piix\npata_amd\npata_oldpiix\npata_sch\nvirtio_pci_modern_dev\nvirtio_pci_legacy_dev\nvirtio_pci\nvirtio_scsi\nusb_storage\n"
         );
         let specs = staged_module_specs_from_config_text(config);
         assert_eq!(
@@ -23695,6 +25134,187 @@ CONFIG_SATA_AHCI=m
                 "kernel/drivers/scsi/scsi_common.ko",
             ]
         );
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.module_name == "sr_mod")
+                .expect("sr_mod spec")
+                .module_deps,
+            &[
+                "kernel/drivers/cdrom/cdrom.ko",
+                "kernel/drivers/scsi/scsi_mod.ko",
+                "kernel/block/bsg.ko",
+                "kernel/drivers/scsi/scsi_common.ko",
+            ]
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.module_name == "usb_storage")
+                .expect("usb_storage spec")
+                .module_deps,
+            &[
+                "kernel/drivers/scsi/scsi_mod.ko",
+                "kernel/block/bsg.ko",
+                "kernel/drivers/scsi/scsi_common.ko",
+            ]
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.module_name == "ata_piix")
+                .expect("ata_piix spec")
+                .module_deps,
+            &[
+                "kernel/drivers/ata/libata.ko",
+                "kernel/drivers/scsi/scsi_mod.ko",
+                "kernel/block/bsg.ko",
+                "kernel/drivers/scsi/scsi_common.ko",
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_usb_printer_module_staging_tracks_vendor_class_driver() {
+        let config = "\
+CONFIG_MODULES=y
+CONFIG_USB_PRINTER=m
+";
+        let specs = staged_module_specs_from_config_text(config);
+
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.module_name)
+                .collect::<Vec<_>>(),
+            vec!["usblp"]
+        );
+        assert_eq!(etc_modules_from_config_text(config), b"usblp\n");
+        assert_eq!(
+            modules_order_from_specs(&specs),
+            b"kernel/drivers/usb/class/usblp.ko\n"
+        );
+
+        let usblp = specs
+            .iter()
+            .find(|spec| spec.module_name == "usblp")
+            .expect("usblp spec");
+        assert_eq!(
+            usblp.vendor_linux_ref,
+            "vendor/linux/drivers/usb/class/usblp.c"
+        );
+        assert_eq!(usblp.linux_make_dir, "drivers/usb/class");
+        assert_eq!(usblp.linux_make_target, "usblp.ko");
+        assert!(usblp.module_deps.is_empty());
+    }
+
+    #[test]
+    fn generic_usb_monitor_module_staging_tracks_vendor_usbmon_driver() {
+        let config = "\
+CONFIG_MODULES=y
+CONFIG_USB_MON=m
+";
+        let specs = staged_module_specs_from_config_text(config);
+
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.module_name)
+                .collect::<Vec<_>>(),
+            vec!["usbmon"]
+        );
+        assert_eq!(etc_modules_from_config_text(config), b"usbmon\n");
+        assert_eq!(
+            modules_order_from_specs(&specs),
+            b"kernel/drivers/usb/mon/usbmon.ko\n"
+        );
+
+        let usbmon = specs
+            .iter()
+            .find(|spec| spec.module_name == "usbmon")
+            .expect("usbmon spec");
+        assert_eq!(
+            usbmon.vendor_linux_ref,
+            "vendor/linux/drivers/usb/mon/mon_main.c"
+        );
+        assert_eq!(usbmon.linux_make_dir, "drivers/usb/mon");
+        assert_eq!(usbmon.linux_make_target, "usbmon.ko");
+        assert!(usbmon.module_deps.is_empty());
+    }
+
+    #[test]
+    fn generic_usb_host_controller_module_staging_tracks_vendor_hcd_drivers() {
+        let config = "\
+CONFIG_MODULES=y
+CONFIG_USB_EHCI_HCD=m
+CONFIG_USB_EHCI_PCI=m
+CONFIG_USB_OHCI_HCD=m
+CONFIG_USB_OHCI_HCD_PCI=m
+CONFIG_USB_UHCI_HCD=m
+";
+        let specs = staged_module_specs_from_config_text(config);
+
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.module_name)
+                .collect::<Vec<_>>(),
+            vec!["ehci_hcd", "ehci_pci", "ohci_hcd", "ohci_pci", "uhci_hcd"]
+        );
+        assert_eq!(
+            etc_modules_from_config_text(config),
+            b"ehci_hcd\nehci_pci\nohci_hcd\nohci_pci\nuhci_hcd\n"
+        );
+        assert_eq!(
+            modules_order_from_specs(&specs),
+            b"kernel/drivers/usb/host/ehci-hcd.ko\nkernel/drivers/usb/host/ehci-pci.ko\nkernel/drivers/usb/host/ohci-hcd.ko\nkernel/drivers/usb/host/ohci-pci.ko\nkernel/drivers/usb/host/uhci-hcd.ko\n"
+        );
+        assert_eq!(
+            modules_dep_from_specs(&specs),
+            b"kernel/drivers/usb/host/ehci-hcd.ko:\nkernel/drivers/usb/host/ehci-pci.ko: kernel/drivers/usb/host/ehci-hcd.ko\nkernel/drivers/usb/host/ohci-hcd.ko:\nkernel/drivers/usb/host/ohci-pci.ko: kernel/drivers/usb/host/ohci-hcd.ko\nkernel/drivers/usb/host/uhci-hcd.ko:\n"
+        );
+
+        for (module_name, vendor_ref, make_target, deps) in [
+            (
+                "ehci_hcd",
+                "vendor/linux/drivers/usb/host/ehci-hcd.c",
+                "ehci-hcd.ko",
+                &[][..],
+            ),
+            (
+                "ehci_pci",
+                "vendor/linux/drivers/usb/host/ehci-pci.c",
+                "ehci-pci.ko",
+                &["kernel/drivers/usb/host/ehci-hcd.ko"][..],
+            ),
+            (
+                "ohci_hcd",
+                "vendor/linux/drivers/usb/host/ohci-hcd.c",
+                "ohci-hcd.ko",
+                &[][..],
+            ),
+            (
+                "ohci_pci",
+                "vendor/linux/drivers/usb/host/ohci-pci.c",
+                "ohci-pci.ko",
+                &["kernel/drivers/usb/host/ohci-hcd.ko"][..],
+            ),
+            (
+                "uhci_hcd",
+                "vendor/linux/drivers/usb/host/uhci-hcd.c",
+                "uhci-hcd.ko",
+                &[][..],
+            ),
+        ] {
+            let spec = specs
+                .iter()
+                .find(|spec| spec.module_name == module_name)
+                .expect("USB HCD spec");
+            assert_eq!(spec.vendor_linux_ref, vendor_ref);
+            assert_eq!(spec.linux_make_dir, "drivers/usb/host");
+            assert_eq!(spec.linux_make_target, make_target);
+            assert_eq!(spec.module_deps, deps);
+        }
     }
 
     #[test]
@@ -23704,6 +25324,10 @@ CONFIG_MODULES=y
 CONFIG_SOUND=m
 CONFIG_SND=m
 CONFIG_SND_TIMER=m
+CONFIG_SND_HRTIMER=m
+CONFIG_SND_SEQ_DEVICE=m
+CONFIG_SND_SEQUENCER=m
+CONFIG_SND_SEQ_DUMMY=m
 CONFIG_SND_PCM=m
 CONFIG_SND_HWDEP=m
 CONFIG_SND_HDA_CORE=m
@@ -23713,7 +25337,7 @@ CONFIG_SND_HDA=m
 CONFIG_SND_HDA_INTEL=m
 CONFIG_SND_HDA_GENERIC=m
 ";
-        let expected = b"soundcore\nsnd\nsnd_timer\nsnd_pcm\nsnd_hwdep\nsnd_hda_core\nsnd_intel_sdw_acpi\nsnd_intel_dspcfg\nsnd_hda_codec\nsnd_hda_codec_generic\nsnd_hda_intel\n";
+        let expected = b"soundcore\nsnd\nsnd_timer\nsnd_hrtimer\nsnd_seq_device\nsnd_seq\nsnd_seq_dummy\nsnd_pcm\nsnd_hwdep\nsnd_hda_core\nsnd_intel_sdw_acpi\nsnd_intel_dspcfg\nsnd_hda_codec\nsnd_hda_codec_generic\nsnd_hda_intel\n";
         assert_eq!(etc_modules_from_config_text(config), expected);
 
         let specs = staged_module_specs_from_config_text(config);
@@ -23746,18 +25370,147 @@ CONFIG_SND_HDA_GENERIC=m
     }
 
     #[test]
+    fn lupos_defconfig_runtime_driver_closure_is_ping_smoke_validated() {
+        let config = read_repo_file("configs/lupos_defconfig");
+        let modules = staged_module_specs_from_config_text(&config);
+        let names = modules
+            .iter()
+            .map(|spec| spec.module_name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "bsg",
+                "scsi_common",
+                "scsi_mod",
+                "sd_mod",
+                "cdrom",
+                "sr_mod",
+                "sg",
+                "scsi_transport_spi",
+                "libata",
+                "libahci",
+                "ahci",
+                "ata_piix",
+                "pata_amd",
+                "pata_oldpiix",
+                "pata_sch",
+                "virtio_pci_modern_dev",
+                "virtio_pci_legacy_dev",
+                "virtio_pci",
+                "virtio_scsi",
+                "ehci_hcd",
+                "ehci_pci",
+                "ohci_hcd",
+                "ohci_pci",
+                "uhci_hcd",
+                "usbmon",
+                "usb_storage",
+                "usblp",
+                "virtio_blk",
+                "virtio_console",
+                "virtio_input",
+                "x86_pkg_temp_thermal",
+                "mii",
+                "mdio_bus",
+                "libphy",
+                "phy_package",
+                "mdio_devres",
+                "realtek",
+                "virtio_net",
+                "netconsole",
+                "9pnet",
+                "9pnet_virtio",
+                "tg3",
+                "e100",
+                "e1000",
+                "e1000e",
+                "sky2",
+                "forcedeth",
+                "8139too",
+                "r8169",
+                "soundcore",
+                "snd",
+                "snd_timer",
+                "snd_hrtimer",
+                "snd_seq_device",
+                "snd_seq",
+                "snd_seq_dummy",
+                "snd_pcm",
+                "snd_hwdep",
+                "snd_hda_core",
+                "snd_intel_sdw_acpi",
+                "snd_intel_dspcfg",
+                "snd_hda_codec",
+                "snd_hda_codec_generic",
+                "snd_hda_intel",
+                "zlib_deflate",
+                "i2c_core",
+                "i2c_smbus",
+                "i2c_algo_bit",
+                "i2c_i801",
+                "agpgart",
+                "amd64_agp",
+                "intel_gtt",
+                "intel_agp",
+                "iosf_mbi",
+                "drm_panel_orientation_quirks",
+                "drm",
+                "drm_buddy",
+                "ttm",
+                "drm_kms_helper",
+                "drm_display_helper",
+                "drm_shmem_helper",
+                "virtio_dma_buf",
+                "bochs",
+                "i915",
+                "virtio_gpu",
+            ]
+        );
+        // QEMU does not expose AMD64 AGP hardware and may not expose Intel
+        // package thermal sensors, so ping-smoke accepts those vendor -ENODEV
+        // probe outcomes while still requiring the requests.
+        assert_eq!(names.len(), 85);
+        assert_eq!(
+            module_list_from_specs(&modules),
+            names
+                .iter()
+                .flat_map(|name| name.bytes().chain(core::iter::once(b'\n')))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn initramfs_modules_file_tracks_config_m_only() {
         let config = "\
 CONFIG_MODULES=y
 CONFIG_VIRTIO_PCI_LIB=m
 CONFIG_VIRTIO_PCI=m
 CONFIG_VIRTIO_BLK=m
+CONFIG_VIRTIO_CONSOLE=m
+CONFIG_VIRTIO_INPUT=m
+CONFIG_X86_PKG_TEMP_THERMAL=m
 CONFIG_VIRTIO_NET=m
+CONFIG_NETCONSOLE=m
+CONFIG_NET_9P=m
+CONFIG_NET_9P_VIRTIO=m
+CONFIG_MII=m
+CONFIG_PHYLIB=m
+CONFIG_PHY_PACKAGE=m
+CONFIG_REALTEK_PHY=m
+CONFIG_TIGON3=m
+CONFIG_E100=m
 CONFIG_E1000=m
+CONFIG_E1000E=m
+CONFIG_SKY2=m
+CONFIG_FORCEDETH=m
+CONFIG_8139TOO=m
+CONFIG_R8169=m
 ";
         assert_eq!(
             etc_modules_from_config_text(config),
-            b"virtio_pci_modern_dev\nvirtio_pci_legacy_dev\nvirtio_pci\nvirtio_blk\nvirtio_net\ne1000\n"
+            b"virtio_pci_modern_dev\nvirtio_pci_legacy_dev\nvirtio_pci\nvirtio_blk\nvirtio_console\nvirtio_input\nx86_pkg_temp_thermal\nmii\nmdio_bus\nlibphy\nphy_package\nmdio_devres\nrealtek\nvirtio_net\nnetconsole\n9pnet\n9pnet_virtio\ntg3\ne100\ne1000\ne1000e\nsky2\nforcedeth\n8139too\nr8169\n"
         );
         let module_list = etc_modules_from_config_text(config);
         let request_files = module_load_request_files_from_config_text(config);
@@ -23771,8 +25524,20 @@ CONFIG_MODULES=y
 # CONFIG_VIRTIO_PCI_LIB is not set
 # CONFIG_VIRTIO_PCI is not set
 # CONFIG_VIRTIO_BLK is not set
+# CONFIG_VIRTIO_CONSOLE is not set
+# CONFIG_VIRTIO_INPUT is not set
+# CONFIG_X86_PKG_TEMP_THERMAL is not set
 # CONFIG_VIRTIO_NET is not set
+# CONFIG_NETCONSOLE is not set
+# CONFIG_NET_9P is not set
+# CONFIG_NET_9P_VIRTIO is not set
+# CONFIG_MII is not set
+# CONFIG_E100 is not set
 # CONFIG_E1000 is not set
+# CONFIG_E1000E is not set
+# CONFIG_SKY2 is not set
+# CONFIG_FORCEDETH is not set
+# CONFIG_8139TOO is not set
 ";
         assert_eq!(etc_modules_from_config_text(config), b"");
     }

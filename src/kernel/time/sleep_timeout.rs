@@ -105,6 +105,12 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 
 pub fn register_module_exports() {
     export_symbol_once("schedule_timeout", linux_schedule_timeout as usize, false);
+    export_symbol_once(
+        "io_schedule_timeout",
+        linux_io_schedule_timeout as usize,
+        false,
+    );
+    export_symbol_once("io_schedule", linux_io_schedule as usize, false);
     export_symbol_once("msleep", msleep as usize, false);
     export_symbol_once("msleep_interruptible", msleep_interruptible as usize, false);
 }
@@ -150,6 +156,28 @@ pub fn schedule_timeout(timeout_jiffies: u64) -> u64 {
 #[unsafe(export_name = "schedule_timeout")]
 pub unsafe extern "C" fn linux_schedule_timeout(timeout_jiffies: u64) -> u64 {
     schedule_timeout(timeout_jiffies)
+}
+
+/// `io_schedule_timeout` - `vendor/linux/kernel/sched/core.c:8136`.
+///
+/// Linux adds IO-wait accounting around `schedule_timeout()`. Lupos does not
+/// yet account per-task IO wait, so the blocking semantics are the exported
+/// scheduler contract here.
+pub unsafe extern "C" fn linux_io_schedule_timeout(timeout_jiffies: i64) -> i64 {
+    if timeout_jiffies < 0 {
+        return 0;
+    }
+    schedule_timeout(timeout_jiffies as u64).min(i64::MAX as u64) as i64
+}
+
+/// `io_schedule` - `vendor/linux/kernel/sched/core.c:8149`.
+pub unsafe extern "C" fn linux_io_schedule() {
+    #[cfg(test)]
+    {}
+    #[cfg(not(test))]
+    unsafe {
+        crate::kernel::sched::schedule_with_irqs_enabled();
+    }
 }
 
 #[cfg(not(test))]

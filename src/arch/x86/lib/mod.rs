@@ -19,6 +19,7 @@ pub mod kaslr;
 pub mod memcpy_32;
 pub mod misc;
 pub mod msr_reg_export;
+pub mod page;
 pub mod pc_conf_reg;
 pub mod strstr_32;
 pub mod usercopy;

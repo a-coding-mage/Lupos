@@ -9,6 +9,11 @@
 //!
 //! Ref: vendor/linux/io_uring/uring_cmd.c
 
+use core::ffi::c_void;
+
+use crate::include::uapi::errno::EOPNOTSUPP;
+use crate::kernel::module::{export_symbol, find_symbol};
+
 use super::sqe::Sqe;
 
 /// `IORING_URING_CMD_*` flags.
@@ -47,6 +52,103 @@ pub fn uring_cmd_prep(sqe: &Sqe) -> Result<IoUringCmd, i32> {
     })
 }
 
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "__io_uring_cmd_do_in_task",
+        linux___io_uring_cmd_do_in_task as usize,
+        true,
+    );
+    export_symbol_once(
+        "__io_uring_cmd_done",
+        linux___io_uring_cmd_done as usize,
+        true,
+    );
+    export_symbol_once(
+        "io_uring_cmd_import_fixed",
+        linux_io_uring_cmd_import_fixed as usize,
+        true,
+    );
+    export_symbol_once(
+        "io_uring_cmd_import_fixed_vec",
+        linux_io_uring_cmd_import_fixed_vec as usize,
+        true,
+    );
+    export_symbol_once(
+        "io_uring_cmd_mark_cancelable",
+        linux_io_uring_cmd_mark_cancelable as usize,
+        true,
+    );
+    export_symbol_once(
+        "io_uring_cmd_issue_blocking",
+        linux_io_uring_cmd_issue_blocking as usize,
+        true,
+    );
+}
+
+#[repr(C)]
+pub struct LinuxIoTwReq {
+    req: *mut c_void,
+}
+
+type LinuxIoReqTwFunc = unsafe extern "C" fn(LinuxIoTwReq, *mut c_void);
+
+/// `__io_uring_cmd_do_in_task` - `vendor/linux/io_uring/uring_cmd.c:125`.
+///
+/// Module-facing `io_kiocb` task-work completion is not modeled yet; users of
+/// BSG/ioctl uring command completion remain unsupported.
+pub unsafe extern "C" fn linux___io_uring_cmd_do_in_task(
+    _ioucmd: *mut c_void,
+    _task_work_cb: Option<LinuxIoReqTwFunc>,
+    _flags: u32,
+) {
+}
+
+/// `__io_uring_cmd_done` - `vendor/linux/io_uring/uring_cmd.c:150`.
+pub unsafe extern "C" fn linux___io_uring_cmd_done(
+    _ioucmd: *mut c_void,
+    _ret: i32,
+    _res2: u64,
+    _issue_flags: u32,
+    _is_cqe32: bool,
+) {
+}
+
+/// `io_uring_cmd_import_fixed` - `vendor/linux/io_uring/uring_cmd.c:289`.
+pub unsafe extern "C" fn linux_io_uring_cmd_import_fixed(
+    _ubuf: u64,
+    _len: usize,
+    _rw: i32,
+    _iter: *mut c_void,
+    _ioucmd: *mut c_void,
+    _issue_flags: u32,
+) -> i32 {
+    -EOPNOTSUPP
+}
+
+/// `io_uring_cmd_import_fixed_vec` - `vendor/linux/io_uring/uring_cmd.c:303`.
+pub unsafe extern "C" fn linux_io_uring_cmd_import_fixed_vec(
+    _ioucmd: *mut c_void,
+    _iovec: *const c_void,
+    _iovec_len: usize,
+    _dir: i32,
+    _iter: *mut c_void,
+    _issue_flags: u32,
+) -> i32 {
+    -EOPNOTSUPP
+}
+
+/// `io_uring_cmd_mark_cancelable` - `vendor/linux/io_uring/uring_cmd.c:101`.
+pub unsafe extern "C" fn linux_io_uring_cmd_mark_cancelable(_cmd: *mut c_void, _issue_flags: u32) {}
+
+/// `io_uring_cmd_issue_blocking` - `vendor/linux/io_uring/uring_cmd.c:325`.
+pub unsafe extern "C" fn linux_io_uring_cmd_issue_blocking(_ioucmd: *mut c_void) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,5 +183,14 @@ mod tests {
         s.len = 0x4142_4344;
         let r = uring_cmd_prep(&s).unwrap();
         assert_eq!(r.cmd_op, 0x4142_4344);
+    }
+
+    #[test]
+    fn module_exports_register_for_bsg_uring_imports() {
+        register_module_exports();
+
+        assert!(crate::kernel::module::find_symbol("__io_uring_cmd_do_in_task").is_some());
+        assert!(crate::kernel::module::find_symbol("__io_uring_cmd_done").is_some());
+        assert!(crate::kernel::module::find_symbol("io_uring_cmd_import_fixed").is_some());
     }
 }

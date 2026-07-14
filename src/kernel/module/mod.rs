@@ -36,4 +36,8 @@ pub use loader::{
     KernelModule, LoadModuleError, ModuleState, delete_module, find_module, inserted_modules,
     load_module, with_module_address,
 };
-pub use symbols::{ExportedSymbol, export_symbol, find_symbol};
+pub use symbols::{ExportedSymbol, export_symbol, find_symbol, find_symbol_gpl_only};
+
+pub fn register_module_exports() {
+    loader::register_module_exports();
+}

@@ -11,3 +11,8 @@ pub mod set_memory;
 
 pub mod cachemode;
 pub use cachemode::*;
+
+pub fn register_module_exports() {
+    cachemode::register_module_exports();
+    set_memory::register_module_exports();
+}

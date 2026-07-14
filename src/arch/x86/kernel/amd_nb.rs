@@ -7,6 +7,7 @@
 //! - vendor/linux/arch/x86/kernel/amd_nb.c
 
 use crate::include::uapi::errno::EINVAL;
+use crate::kernel::module::{export_symbol, find_symbol};
 
 pub const PCI_VENDOR_ID_AMD: u16 = 0x1022;
 pub const PCI_VENDOR_ID_HYGON: u16 = 0x1d94;
@@ -76,6 +77,45 @@ pub struct Resource {
 pub const fn amd_nb_has_feature(info: AmdNorthbridgeInfo, feature: u64) -> bool {
     (info.flags & feature) != 0
 }
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("amd_nb_num", linux_amd_nb_num as usize, true);
+    export_symbol_once(
+        "amd_nb_has_feature",
+        linux_amd_nb_has_feature as usize,
+        true,
+    );
+    export_symbol_once("node_to_amd_nb", linux_node_to_amd_nb as usize, true);
+    export_symbol_once("amd_flush_garts", linux_amd_flush_garts as usize, true);
+}
+
+/// `amd_nb_num` - `vendor/linux/arch/x86/kernel/amd_nb.c`.
+#[unsafe(export_name = "amd_nb_num")]
+unsafe extern "C" fn linux_amd_nb_num() -> u16 {
+    0
+}
+
+/// `amd_nb_has_feature` - `vendor/linux/arch/x86/kernel/amd_nb.c`.
+#[unsafe(export_name = "amd_nb_has_feature")]
+unsafe extern "C" fn linux_amd_nb_has_feature(_feature: u32) -> bool {
+    false
+}
+
+/// `node_to_amd_nb` - `vendor/linux/arch/x86/kernel/amd_nb.c`.
+#[unsafe(export_name = "node_to_amd_nb")]
+unsafe extern "C" fn linux_node_to_amd_nb(_node: i32) -> *mut core::ffi::c_void {
+    core::ptr::null_mut()
+}
+
+/// `amd_flush_garts` - `vendor/linux/arch/x86/kernel/amd_nb.c:242`.
+#[unsafe(export_name = "amd_flush_garts")]
+unsafe extern "C" fn linux_amd_flush_garts() {}
 
 pub const fn amd_gart_present(cpu: AmdCpuInfo) -> bool {
     matches!(cpu.vendor, CpuVendor::Amd)

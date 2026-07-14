@@ -266,8 +266,14 @@ unsafe fn yield_task_fair(rq: &mut Rq) {
     unsafe {
         // Push our vruntime to the rightmost entity so the leftmost picks
         // someone else.  Mirrors Linux `yield_task_fair` heuristic.
-        if let Some(((max_vrt, _), _)) = rq.cfs.tasks_timeline.iter().next_back() {
-            let bump = (*max_vrt).saturating_add(1);
+        let max_vruntime = rq
+            .cfs
+            .tasks_timeline
+            .iter()
+            .next_back()
+            .map(|((max_vrt, _), _)| *max_vrt);
+        if let Some(max_vrt) = max_vruntime {
+            let bump = max_vrt.saturating_add(1);
             let old = (*se).vruntime;
             (*se).vruntime = bump;
             rq.cfs.reinsert(curr, old, bump);

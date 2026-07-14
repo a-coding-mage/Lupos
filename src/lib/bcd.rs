@@ -3,6 +3,8 @@
 //! test-origin: linux:vendor/linux/lib/bcd.c
 //! Binary-coded decimal conversion helpers.
 
+use crate::kernel::module::{export_symbol, find_symbol};
+
 pub const LINUX_SOURCE: &str = "vendor/linux/lib/bcd.c";
 pub const LINUX_BCD_INCLUDE: &str = "#include <linux/bcd.h>";
 pub const LINUX_EXPORT_INCLUDE: &str = "#include <linux/export.h>";
@@ -50,6 +52,27 @@ pub const fn bin2bcd(val: u32) -> u8 {
     ((tens << BCD_HIGH_NIBBLE_SHIFT) | (val - tens * BCD_DECIMAL_BASE)) as u8
 }
 
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(BCD2BIN_SYMBOL, linux_bcd2bin as usize, false);
+    export_symbol_once(BIN2BCD_SYMBOL, linux_bin2bcd as usize, false);
+}
+
+/// `_bcd2bin` - `vendor/linux/lib/bcd.c`.
+pub unsafe extern "C" fn linux_bcd2bin(val: u8) -> u32 {
+    bcd2bin(val)
+}
+
+/// `_bin2bcd` - `vendor/linux/lib/bcd.c`.
+pub unsafe extern "C" fn linux_bin2bcd(val: u32) -> u8 {
+    bin2bcd(val)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +115,18 @@ mod tests {
         assert_eq!(bin2bcd(99), 0x99);
         assert_eq!(bcd2bin(0x00), 0);
         assert_eq!(bcd2bin(0x99), 99);
+    }
+
+    #[test]
+    fn bcd_exports_register_for_modules() {
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("_bcd2bin"),
+            Some(linux_bcd2bin as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("_bin2bcd"),
+            Some(linux_bin2bcd as usize)
+        );
     }
 }

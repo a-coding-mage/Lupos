@@ -39,6 +39,14 @@ impl LinuxVaCursor {
     }
 }
 
+#[repr(C)]
+struct LinuxSysvVaList {
+    gp_offset: u32,
+    _fp_offset: u32,
+    overflow_arg_area: *const usize,
+    reg_save_area: *const u8,
+}
+
 struct BufferWriter {
     buf: *mut u8,
     size: usize,
@@ -55,8 +63,8 @@ impl BufferWriter {
             unsafe {
                 self.buf.add(self.len).write(byte);
             }
-            self.len += 1;
         }
+        self.len = self.len.saturating_add(1);
     }
 
     fn push_bytes(&mut self, bytes: &[u8]) {
@@ -79,8 +87,9 @@ impl BufferWriter {
 
     unsafe fn finish(self) -> usize {
         if self.size != 0 && !self.buf.is_null() {
+            let nul = self.len.min(self.size - 1);
             unsafe {
-                self.buf.add(self.len).write(0);
+                self.buf.add(nul).write(0);
             }
         }
         self.len
@@ -190,8 +199,25 @@ pub(crate) unsafe fn vscnprintf_n(
     register_count: usize,
     stack_args: *const usize,
 ) -> usize {
-    if buf.is_null()
-        || size == 0
+    if size == 0 {
+        return 0;
+    }
+    let written = unsafe { vsnprintf_n(buf, size, fmt, register_args, register_count, stack_args) };
+    if written < size { written } else { size - 1 }
+}
+
+/// C99/Linux `vsnprintf()` return semantics for captured x86-64 ABI
+/// arguments: return the number of bytes that would have been generated,
+/// while truncating the destination to `size - 1` bytes when needed.
+pub(crate) unsafe fn vsnprintf_n(
+    buf: *mut u8,
+    size: usize,
+    fmt: *const core::ffi::c_char,
+    register_args: *const usize,
+    register_count: usize,
+    stack_args: *const usize,
+) -> usize {
+    if (buf.is_null() && size != 0)
         || fmt.is_null()
         || register_args.is_null()
         || stack_args.is_null()
@@ -432,4 +458,142 @@ pub(crate) unsafe fn vscnprintf_n(
     }
 
     unsafe { writer.finish() }
+}
+
+/// Format from a real x86-64 SysV `va_list`.
+///
+/// Linux-built modules pass `va_list` to entry points such as `vsprintf()` as
+/// a pointer to `{ gp_offset, fp_offset, overflow_arg_area, reg_save_area }`.
+/// Kernel format arguments are integer or pointer values, so only the general
+/// purpose register save area and overflow stack area are consumed here.
+pub(crate) unsafe fn vscnprintf_va_list(
+    buf: *mut u8,
+    size: usize,
+    fmt: *const core::ffi::c_char,
+    va_list: *const core::ffi::c_void,
+) -> usize {
+    if size == 0 {
+        return 0;
+    }
+    let written = unsafe { vsnprintf_va_list(buf, size, fmt, va_list) };
+    if written < size { written } else { size - 1 }
+}
+
+/// Format from a real x86-64 SysV `va_list` with Linux `vsnprintf()`
+/// return semantics.
+pub(crate) unsafe fn vsnprintf_va_list(
+    buf: *mut u8,
+    size: usize,
+    fmt: *const core::ffi::c_char,
+    va_list: *const core::ffi::c_void,
+) -> usize {
+    if va_list.is_null() {
+        return 0;
+    }
+
+    let va = unsafe { &*va_list.cast::<LinuxSysvVaList>() };
+    let mut register_args = [0usize; 6];
+    let mut register_count = 0usize;
+    let mut gp_offset = va.gp_offset as usize;
+    while gp_offset < 48 && register_count < register_args.len() {
+        if va.reg_save_area.is_null() {
+            break;
+        }
+        register_args[register_count] = unsafe {
+            va.reg_save_area
+                .add(gp_offset)
+                .cast::<usize>()
+                .read_unaligned()
+        };
+        register_count += 1;
+        gp_offset += core::mem::size_of::<usize>();
+    }
+
+    let zero_overflow = [0usize; 32];
+    let stack_args = if va.overflow_arg_area.is_null() {
+        zero_overflow.as_ptr()
+    } else {
+        va.overflow_arg_area
+    };
+
+    unsafe {
+        vsnprintf_n(
+            buf,
+            size,
+            fmt,
+            register_args.as_ptr(),
+            register_count,
+            stack_args,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vsnprintf_n_returns_would_have_written_count() {
+        let args = [123usize];
+        let stack = [0usize];
+        let fmt = b"num-%u\0";
+        let mut buf = [0u8; 4];
+
+        let written = unsafe {
+            vsnprintf_n(
+                buf.as_mut_ptr(),
+                buf.len(),
+                fmt.as_ptr().cast(),
+                args.as_ptr(),
+                args.len(),
+                stack.as_ptr(),
+            )
+        };
+
+        assert_eq!(written, 7);
+        assert_eq!(&buf, b"num\0");
+    }
+
+    #[test]
+    fn vscnprintf_n_returns_truncated_count() {
+        let args = [123usize];
+        let stack = [0usize];
+        let fmt = b"num-%u\0";
+        let mut buf = [0u8; 4];
+
+        let written = unsafe {
+            vscnprintf_n(
+                buf.as_mut_ptr(),
+                buf.len(),
+                fmt.as_ptr().cast(),
+                args.as_ptr(),
+                args.len(),
+                stack.as_ptr(),
+            )
+        };
+
+        assert_eq!(written, 3);
+        assert_eq!(&buf, b"num\0");
+    }
+
+    #[test]
+    fn vsnprintf_n_counts_with_zero_size_buffer() {
+        let name = b"card\0";
+        let args = [name.as_ptr() as usize, 7usize];
+        let stack = [0usize];
+        let fmt = b"%s-%u\0";
+
+        let written = unsafe {
+            vsnprintf_n(
+                core::ptr::null_mut(),
+                0,
+                fmt.as_ptr().cast(),
+                args.as_ptr(),
+                args.len(),
+                stack.as_ptr(),
+            )
+        };
+
+        assert_eq!(written, 6);
+    }
 }

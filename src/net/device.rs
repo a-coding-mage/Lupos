@@ -97,6 +97,10 @@ pub fn linux_rtnl_unlock() {
     RTNL.unlock();
 }
 
+pub fn linux_rtnl_is_locked() -> bool {
+    RTNL.is_locked()
+}
+
 pub fn init() {
     if NETDEV_INIT_DONE.swap(true, Ordering::AcqRel) {
         return;

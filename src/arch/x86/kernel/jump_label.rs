@@ -18,6 +18,7 @@
 extern crate alloc;
 
 use crate::include::uapi::errno::{EFAULT, EINVAL};
+use crate::kernel::module::{export_symbol, find_symbol};
 
 use super::alternative::{JMP32_INSN_OPCODE, X86_NOP2, x86_nop};
 
@@ -26,6 +27,22 @@ use super::alternative::{JMP32_INSN_OPCODE, X86_NOP2, x86_nop};
 pub const JMP32_INSN_SIZE: usize = 5;
 pub const JMP8_INSN_OPCODE: u8 = 0xEB;
 pub const JMP8_INSN_SIZE: usize = 2;
+
+static STATIC_KEY_INITIALIZED: bool = true;
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "static_key_initialized",
+        &raw const STATIC_KEY_INITIALIZED as usize,
+        false,
+    );
+}
 
 /// `enum jump_label_type` — direction of the transform.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]

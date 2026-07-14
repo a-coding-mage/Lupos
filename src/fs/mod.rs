@@ -105,12 +105,15 @@ pub mod pipe;
 // M40
 pub mod kernfs;
 pub mod proc;
+pub mod procfs_abi;
+pub mod seq_file_abi;
 
 // M41
 pub mod sysfs;
 
 // M42
 pub mod cachefiles;
+pub mod char_dev;
 pub mod debugfs;
 pub mod namespace;
 pub mod nsfs;

@@ -10,6 +10,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use core::ffi::c_void;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use lazy_static::lazy_static;
@@ -21,6 +22,7 @@ use crate::fs::select::{self, POLLERR, POLLIN, POLLOUT, PollTable};
 use crate::fs::types::FileRef;
 use crate::include::uapi::errno::{EAGAIN, EBADF, EINVAL};
 use crate::include::uapi::fcntl::{O_NONBLOCK, O_RDWR};
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::sched::wait::WaitQueueHead;
 use crate::kernel::{files, sched};
 
@@ -40,6 +42,22 @@ static EVENTFD_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 lazy_static! {
     static ref EVENTFDS: Mutex<BTreeMap<usize, Arc<EventFd>>> = Mutex::new(BTreeMap::new());
+}
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("eventfd_ctx_fdget", linux_eventfd_ctx_fdget as usize, true);
+    export_symbol_once("eventfd_ctx_put", linux_eventfd_ctx_put as usize, true);
+    export_symbol_once(
+        "eventfd_signal_mask",
+        linux_eventfd_signal_mask as usize,
+        true,
+    );
 }
 
 static EVENTFD_FILE_OPS: FileOps = FileOps {
@@ -144,6 +162,60 @@ fn eventfd_from_file(file: &FileRef) -> Result<Arc<EventFd>, i32> {
     }
     let token = *file.private.lock();
     EVENTFDS.lock().get(&token).cloned().ok_or(EBADF)
+}
+
+fn err_ptr(errno: i32) -> *mut c_void {
+    (-(errno as isize)) as *mut c_void
+}
+
+fn is_err_ptr<T>(ptr: *mut T) -> bool {
+    (ptr as usize) >= usize::MAX - 4095
+}
+
+unsafe fn eventfd_arc_from_raw(ctx: *mut EventFd) -> Option<Arc<EventFd>> {
+    if ctx.is_null() || is_err_ptr(ctx) {
+        return None;
+    }
+    Some(unsafe { Arc::from_raw(ctx) })
+}
+
+extern "C" fn linux_eventfd_ctx_fdget(fd: i32) -> *mut c_void {
+    let eventfd = match current_files()
+        .and_then(|ft| ft.get(fd))
+        .and_then(|file| eventfd_from_file(&file))
+    {
+        Ok(eventfd) => eventfd,
+        Err(errno) => return err_ptr(errno),
+    };
+    Arc::into_raw(eventfd) as *mut c_void
+}
+
+unsafe extern "C" fn linux_eventfd_ctx_put(ctx: *mut EventFd) {
+    if let Some(eventfd) = unsafe { eventfd_arc_from_raw(ctx) } {
+        drop(eventfd);
+    }
+}
+
+unsafe extern "C" fn linux_eventfd_signal_mask(ctx: *mut EventFd, _mask: u32) {
+    if ctx.is_null() || is_err_ptr(ctx) {
+        return;
+    }
+
+    let eventfd = unsafe { &*ctx };
+    loop {
+        let count = eventfd.count.load(Ordering::Acquire);
+        if count == u64::MAX {
+            break;
+        }
+        if eventfd
+            .count
+            .compare_exchange(count, count + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
+    eventfd.wqh.wake_up_all();
 }
 
 fn eventfd_file_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i32> {
@@ -258,6 +330,17 @@ mod tests {
         assert_eq!(e.poll_mask(), 0x0004); // EPOLLOUT only
         let _ = e.write(5);
         assert_eq!(e.poll_mask(), 0x0005); // EPOLLIN | EPOLLOUT
+    }
+
+    #[test]
+    fn linux_signal_mask_increments_counter() {
+        let e = Arc::new(EventFd::new(0, 0));
+        let ptr = Arc::into_raw(e.clone()) as *mut EventFd;
+        unsafe {
+            linux_eventfd_signal_mask(ptr, POLLIN as u32);
+            linux_eventfd_ctx_put(ptr);
+        }
+        assert_eq!(e.read().unwrap(), 1);
     }
 
     #[test]

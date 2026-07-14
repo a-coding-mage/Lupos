@@ -15,7 +15,43 @@ use crate::mm::buddy::{
     is_buddy_ready, page_in_mem_map, page_to_pfn, pfn_to_page, with_global_buddy,
 };
 use crate::mm::page::Page;
-use crate::mm::page_flags::{GFP_KERNEL, GfpFlags};
+use crate::mm::page_flags::{__GFP_COMP, GFP_KERNEL, GfpFlags};
+
+const LINUX_MAX_NUMNODES: usize = 64;
+const LINUX_NR_NODE_STATES: usize = 6;
+const LINUX_NODE_PRESENT: u64 = 1;
+const LINUX_PGLIST_DATA_BYTES: usize = 128 * 1024;
+const LINUX_MAX_NR_ZONES: usize = 4;
+const LINUX_ZONE_SIZE: usize = 0x540;
+const LINUX_ZONE_NODE_OFFSET: usize = 0x58;
+const LINUX_ZONE_PGDAT_OFFSET: usize = 0x60;
+const LINUX_ZONE_MANAGED_PAGES_OFFSET: usize = 0x90;
+
+#[repr(C, align(64))]
+struct LinuxPglistData {
+    bytes: [u8; LINUX_PGLIST_DATA_BYTES],
+}
+
+impl LinuxPglistData {
+    const fn zeroed() -> Self {
+        Self {
+            bytes: [0; LINUX_PGLIST_DATA_BYTES],
+        }
+    }
+}
+
+static mut LINUX_NODE_STATES: [u64; LINUX_NR_NODE_STATES] = [
+    LINUX_NODE_PRESENT,
+    LINUX_NODE_PRESENT,
+    LINUX_NODE_PRESENT,
+    LINUX_NODE_PRESENT,
+    LINUX_NODE_PRESENT,
+    0,
+];
+static mut LINUX_NODE_DATA: [usize; LINUX_MAX_NUMNODES] = [0; LINUX_MAX_NUMNODES];
+static mut LINUX_CONTIG_PAGE_DATA: LinuxPglistData = LinuxPglistData::zeroed();
+static LINUX_NUMA_NODE: i32 = 0;
+static LINUX_NUMA_MEM: i32 = 0;
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
@@ -24,15 +60,87 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 }
 
 pub fn register_module_exports() {
+    init_linux_node_abi();
+    export_symbol_once(
+        "node_states",
+        core::ptr::addr_of_mut!(LINUX_NODE_STATES) as usize,
+        false,
+    );
+    export_symbol_once(
+        "node_data",
+        core::ptr::addr_of_mut!(LINUX_NODE_DATA) as usize,
+        false,
+    );
+    export_symbol_once("contig_page_data", linux_pgdat_ptr() as usize, false);
+    export_symbol_once(
+        "numa_node",
+        core::ptr::addr_of!(LINUX_NUMA_NODE) as usize,
+        false,
+    );
+    export_symbol_once(
+        "_numa_mem_",
+        core::ptr::addr_of!(LINUX_NUMA_MEM) as usize,
+        false,
+    );
     export_symbol_once("__alloc_pages_noprof", __alloc_pages_noprof as usize, false);
     export_symbol_once("alloc_pages_noprof", alloc_pages_noprof as usize, false);
+    export_symbol_once("folio_alloc_noprof", folio_alloc_noprof as usize, false);
     export_symbol_once(
         "get_free_pages_noprof",
         get_free_pages_noprof as usize,
         false,
     );
+    export_symbol_once(
+        "get_zeroed_page_noprof",
+        get_zeroed_page_noprof as usize,
+        false,
+    );
+    export_symbol_once("split_page", split_page as usize, false);
     export_symbol_once("__free_pages", __free_pages as usize, false);
+    export_symbol_once("free_pages", free_pages as usize, false);
+    export_symbol_once(
+        "alloc_pages_exact_noprof",
+        alloc_pages_exact_noprof as usize,
+        false,
+    );
     export_symbol_once("free_pages_exact", free_pages_exact as usize, false);
+    export_symbol_once(
+        "_totalram_pages",
+        core::ptr::addr_of!(crate::mm::mm_public::TOTALRAM_PAGES) as usize,
+        false,
+    );
+    export_symbol_once("nr_free_buffer_pages", nr_free_buffer_pages as usize, true);
+}
+
+fn linux_pgdat_ptr() -> *mut u8 {
+    core::ptr::addr_of_mut!(LINUX_CONTIG_PAGE_DATA).cast::<u8>()
+}
+
+unsafe fn write_linux_pgdat_usize(offset: usize, value: usize) {
+    unsafe { linux_pgdat_ptr().add(offset).cast::<usize>().write(value) };
+}
+
+unsafe fn write_linux_pgdat_i32(offset: usize, value: i32) {
+    unsafe { linux_pgdat_ptr().add(offset).cast::<i32>().write(value) };
+}
+
+fn init_linux_node_abi() {
+    let pgdat = linux_pgdat_ptr();
+    let managed_pages = crate::mm::mm_public::totalram_pages() as usize;
+    unsafe {
+        core::ptr::addr_of_mut!(LINUX_NODE_DATA)
+            .cast::<usize>()
+            .write(pgdat as usize);
+        for zone in 0..LINUX_MAX_NR_ZONES {
+            let base = zone * LINUX_ZONE_SIZE;
+            write_linux_pgdat_i32(base + LINUX_ZONE_NODE_OFFSET, 0);
+            write_linux_pgdat_usize(base + LINUX_ZONE_PGDAT_OFFSET, pgdat as usize);
+            write_linux_pgdat_usize(
+                base + LINUX_ZONE_MANAGED_PAGES_OFFSET,
+                if zone == 0 { managed_pages } else { 0 },
+            );
+        }
+    }
 }
 
 pub extern "C" fn __alloc_pages_noprof(
@@ -66,7 +174,11 @@ pub fn __alloc_frozen_pages_noprof(
 }
 
 pub fn __folio_alloc_noprof(gfp: GfpFlags, order: u32) -> *mut Page {
-    alloc_pages_noprof(gfp, order)
+    alloc_pages_noprof(gfp | __GFP_COMP, order)
+}
+
+pub extern "C" fn folio_alloc_noprof(gfp: GfpFlags, order: u32) -> *mut Page {
+    __folio_alloc_noprof(gfp, order)
 }
 
 pub extern "C" fn get_free_pages_noprof(gfp: GfpFlags, order: u32) -> usize {
@@ -78,7 +190,7 @@ pub extern "C" fn get_free_pages_noprof(gfp: GfpFlags, order: u32) -> usize {
     }
 }
 
-pub fn get_zeroed_page_noprof(gfp: GfpFlags) -> usize {
+pub extern "C" fn get_zeroed_page_noprof(gfp: GfpFlags) -> usize {
     get_free_pages_noprof(gfp | crate::mm::page_flags::__GFP_ZERO, 0)
 }
 
@@ -86,6 +198,17 @@ pub extern "C" fn __free_pages(page: *mut Page, order: u32) {
     if !page.is_null() && is_buddy_ready() && page_in_mem_map(page) {
         with_global_buddy(|buddy| buddy.free_pages(page, order as usize));
     }
+}
+
+pub extern "C" fn free_pages(addr: usize, order: u32) {
+    if addr == 0 || !is_buddy_ready() {
+        return;
+    }
+    let Some(phys) = virt_to_phys(addr as u64) else {
+        return;
+    };
+    let page = pfn_to_page((phys >> PAGE_SHIFT) as usize);
+    __free_pages(page, order);
 }
 
 fn order_for_pages(pages: usize) -> u32 {
@@ -147,7 +270,7 @@ pub unsafe fn alloc_pages_bulk_noprof(
     allocated
 }
 
-pub fn alloc_pages_exact_noprof(size: usize, gfp: GfpFlags) -> *mut u8 {
+pub extern "C" fn alloc_pages_exact_noprof(size: usize, gfp: GfpFlags) -> *mut u8 {
     let pages = size.div_ceil(crate::mm::frame::PAGE_SIZE);
     let order = order_for_pages(pages);
     let page = alloc_pages_noprof(gfp, order);
@@ -561,6 +684,19 @@ mod tests {
         assert_eq!(nr_free_buffer_pages(), 0);
         assert_eq!(get_num_physpages(), 0);
         assert_eq!(alloc_contig_range_noprof(0, 1, 0, GFP_KERNEL), -95);
+    }
+
+    #[test]
+    fn nr_free_buffer_pages_export_registers_for_modules() {
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("nr_free_buffer_pages"),
+            Some(nr_free_buffer_pages as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("get_zeroed_page_noprof"),
+            Some(get_zeroed_page_noprof as usize)
+        );
     }
 
     #[test]

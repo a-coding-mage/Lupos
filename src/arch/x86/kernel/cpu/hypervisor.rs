@@ -3,6 +3,20 @@
 //! test-origin: linux:vendor/linux/arch/x86/kernel/cpu/hypervisor.c
 //! Common x86 hypervisor detection and init-hook copying.
 
+use crate::kernel::module::{export_symbol, find_symbol};
+
+const X86_HYPER_NATIVE: i32 = 0;
+const X86_HYPER_VMWARE: i32 = 1;
+const X86_HYPER_MS_HYPERV: i32 = 2;
+const X86_HYPER_XEN_PV: i32 = 3;
+const X86_HYPER_XEN_HVM: i32 = 4;
+const X86_HYPER_KVM: i32 = 5;
+const X86_HYPER_JAILHOUSE: i32 = 6;
+const X86_HYPER_ACRN: i32 = 7;
+const X86_HYPER_BHYVE: i32 = 8;
+
+static mut LINUX_X86_HYPER_TYPE: i32 = X86_HYPER_NATIVE;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum X86HypervisorType {
     None,
@@ -32,6 +46,34 @@ pub struct HypervisorPlatform {
     pub init_slots: [Option<usize>; 4],
     pub runtime_slots: [Option<usize>; 4],
     pub init_platform_called: bool,
+}
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "x86_hyper_type",
+        core::ptr::addr_of_mut!(LINUX_X86_HYPER_TYPE) as usize,
+        false,
+    );
+}
+
+pub const fn linux_hypervisor_type_value(hv_type: X86HypervisorType) -> i32 {
+    match hv_type {
+        X86HypervisorType::None => X86_HYPER_NATIVE,
+        X86HypervisorType::XenPv => X86_HYPER_XEN_PV,
+        X86HypervisorType::XenHvm => X86_HYPER_XEN_HVM,
+        X86HypervisorType::Vmware => X86_HYPER_VMWARE,
+        X86HypervisorType::MicrosoftHyperV => X86_HYPER_MS_HYPERV,
+        X86HypervisorType::Kvm => X86_HYPER_KVM,
+        X86HypervisorType::Jailhouse => X86_HYPER_JAILHOUSE,
+        X86HypervisorType::Acrn => X86_HYPER_ACRN,
+        X86HypervisorType::Bhyve => X86_HYPER_BHYVE,
+    }
 }
 
 pub fn parse_nopv() -> bool {
@@ -78,6 +120,9 @@ pub fn init_hypervisor_platform(
         runtime_slots: [None; 4],
         init_platform_called: false,
     };
+    unsafe {
+        LINUX_X86_HYPER_TYPE = linux_hypervisor_type_value(h.hv_type);
+    }
     copy_array(&h.init_slots, &mut platform.init_slots);
     copy_array(&h.runtime_slots, &mut platform.runtime_slots);
     platform.init_platform_called = true;
@@ -135,6 +180,23 @@ mod tests {
         assert!(source.contains("x86_hyper_type = h->type;"));
         assert!(source.contains("x86_init.hyper.init_platform();"));
 
+        assert_eq!(
+            linux_hypervisor_type_value(X86HypervisorType::None),
+            X86_HYPER_NATIVE
+        );
+        assert_eq!(
+            linux_hypervisor_type_value(X86HypervisorType::Vmware),
+            X86_HYPER_VMWARE
+        );
+        assert_eq!(
+            linux_hypervisor_type_value(X86HypervisorType::MicrosoftHyperV),
+            X86_HYPER_MS_HYPERV
+        );
+        assert_eq!(
+            linux_hypervisor_type_value(X86HypervisorType::Kvm),
+            X86_HYPER_KVM
+        );
+
         let hypervisors = [VMWARE, KVM, XEN_PV];
         assert_eq!(
             detect_hypervisor_vendor(false, &hypervisors)
@@ -162,5 +224,15 @@ mod tests {
         assert_eq!(platform.init_slots, [Some(1), None, Some(3), None]);
         assert_eq!(platform.runtime_slots, [None, Some(8), None, None]);
         assert!(platform.init_platform_called);
+        assert_eq!(unsafe { LINUX_X86_HYPER_TYPE }, X86_HYPER_VMWARE);
+    }
+
+    #[test]
+    fn hypervisor_exports_x86_hyper_type_data_symbol() {
+        register_module_exports();
+        assert_eq!(
+            find_symbol("x86_hyper_type"),
+            Some(core::ptr::addr_of_mut!(LINUX_X86_HYPER_TYPE) as usize)
+        );
     }
 }

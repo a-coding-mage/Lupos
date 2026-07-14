@@ -11,9 +11,20 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::include::uapi::errno::EINVAL;
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::sched::MAX_CPUS;
 
 pub static __PER_CPU_OFFSET: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+pub fn register_module_exports() {
+    if find_symbol("__per_cpu_offset").is_none() {
+        export_symbol(
+            "__per_cpu_offset",
+            __PER_CPU_OFFSET.as_ptr() as usize,
+            false,
+        );
+    }
+}
 
 /// Configured `struct softnet_data` size/alignment, verified against the
 /// vendor build (`CONFIG_NR_CPUS=64`, x86-64 generic configuration).
@@ -33,6 +44,7 @@ pub struct LinuxPerCpuArea {
     preempt_count: AtomicU32,
     _header_pad: [u8; 44],
     softnet_data: [u8; LINUX_SOFTNET_DATA_SIZE],
+    cpu_info: [u8; crate::arch::x86::kernel::cpu::common::LINUX_CPUINFO_X86_SIZE],
     initialized: AtomicBool,
     _tail_pad: [u8; 63],
 }
@@ -46,6 +58,7 @@ impl LinuxPerCpuArea {
             preempt_count: AtomicU32::new(0),
             _header_pad: [0; 44],
             softnet_data: [0; LINUX_SOFTNET_DATA_SIZE],
+            cpu_info: [0; crate::arch::x86::kernel::cpu::common::LINUX_CPUINFO_X86_SIZE],
             initialized: AtomicBool::new(false),
             _tail_pad: [0; 63],
         }
@@ -104,6 +117,9 @@ pub fn setup_percpu_segment(cpu: usize) {
     LINUX_PER_CPU_AREAS[cpu]
         .preempt_count
         .store(0, Ordering::Release);
+    crate::arch::x86::kernel::cpu::common::write_linux_cpuinfo_x86(core::ptr::addr_of!(
+        LINUX_PER_CPU_AREAS[cpu].cpu_info
+    ) as *mut u8);
     initialize_softnet_data(cpu);
 
     #[cfg(not(test))]
@@ -144,6 +160,10 @@ pub fn softnet_data_symbol() -> usize {
     core::ptr::addr_of!(LINUX_PER_CPU_AREAS[0].softnet_data) as usize
 }
 
+pub fn cpu_info_symbol() -> usize {
+    core::ptr::addr_of!(LINUX_PER_CPU_AREAS[0].cpu_info) as usize
+}
+
 pub fn preempt_count_slot(cpu: usize) -> &'static AtomicU32 {
     &LINUX_PER_CPU_AREAS[cpu.min(MAX_CPUS - 1)].preempt_count
 }
@@ -168,5 +188,14 @@ mod tests {
             (core::mem::size_of::<LinuxPerCpuArea>() * 2) as u64
         );
         assert_eq!(LINUX_PER_CPU_AREAS[2].cpu_number.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn exports_linux_per_cpu_offset_array_symbol() {
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("__per_cpu_offset"),
+            Some(__PER_CPU_OFFSET.as_ptr() as usize)
+        );
     }
 }

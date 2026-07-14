@@ -18,16 +18,15 @@ use lazy_static::lazy_static;
 #[cfg(not(test))]
 use spin::Mutex;
 
-use crate::arch::x86::mm::paging::{
-    __pgprot, PAGE_MASK, PAGE_SIZE, PMD_SIZE, PUD_SIZE, pgprot_val,
-};
+use crate::arch::x86::mm::paging::{__pgprot, PAGE_MASK, PAGE_SIZE, PMD_SIZE, PUD_SIZE};
 #[cfg(not(test))]
 use crate::arch::x86::mm::paging::{
     _PAGE_ACCESSED, _PAGE_DIRTY, _PAGE_GLOBAL, _PAGE_NX, _PAGE_PRESENT, _PAGE_RW, map_kernel_page,
     unmap_kernel_page, virt_to_phys,
 };
-use crate::arch::x86::mm::pat::{PageCacheMode, pgprot_with_cachemode};
+use crate::arch::x86::mm::pat::{PageCacheMode, cachemode_to_pte_flags};
 use crate::include::uapi::errno::EINVAL;
+use crate::kernel::module::{export_symbol, find_symbol};
 #[cfg(not(test))]
 use crate::mm::buddy::{is_buddy_ready, page_to_pfn, pfn_to_page, with_global_buddy};
 #[cfg(not(test))]
@@ -145,11 +144,37 @@ pub const fn kernel_physical_mapping_init(
     })
 }
 
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("cachemode2protval", linux_cachemode2protval as usize, false);
+}
+
 pub fn cachemode2protval(mode: PageCacheMode) -> u64 {
-    pgprot_val(pgprot_with_cachemode(
-        crate::arch::x86::mm::paging::PAGE_KERNEL,
-        mode,
-    ))
+    cachemode_to_pte_flags(mode)
+}
+
+fn linux_page_cache_mode(mode: u32) -> Option<PageCacheMode> {
+    match mode {
+        0 => Some(PageCacheMode::WriteBack),
+        1 => Some(PageCacheMode::WriteCombining),
+        2 => Some(PageCacheMode::UncachedMinus),
+        3 => Some(PageCacheMode::Uncached),
+        4 => Some(PageCacheMode::WriteThrough),
+        5 => Some(PageCacheMode::WriteProtected),
+        _ => None,
+    }
+}
+
+/// `cachemode2protval` - `vendor/linux/arch/x86/mm/init.c:64`.
+pub extern "C" fn linux_cachemode2protval(mode: u32) -> u64 {
+    linux_page_cache_mode(mode)
+        .map(cachemode2protval)
+        .unwrap_or(0)
 }
 
 pub const fn min_mapping_granularity(use_gbpage: bool) -> u64 {
@@ -416,9 +441,26 @@ mod tests {
     }
 
     #[test]
-    fn cachemode2protval_uses_existing_pat_mapping() {
+    fn cachemode2protval_returns_linux_cache_bits_only() {
         assert_eq!(
-            cachemode2protval(PageCacheMode::Uncached) & (_PAGE_PCD | _PAGE_PWT),
+            cachemode2protval(PageCacheMode::Uncached),
+            _PAGE_PCD | _PAGE_PWT
+        );
+        assert_eq!(
+            cachemode2protval(PageCacheMode::WriteBack) & (_PAGE_PCD | _PAGE_PWT),
+            0
+        );
+    }
+
+    #[test]
+    fn module_exports_include_cachemode2protval() {
+        register_module_exports();
+        assert_eq!(
+            find_symbol("cachemode2protval"),
+            Some(linux_cachemode2protval as usize)
+        );
+        assert_eq!(
+            linux_cachemode2protval(PageCacheMode::Uncached as u32),
             _PAGE_PCD | _PAGE_PWT
         );
     }

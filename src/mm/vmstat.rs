@@ -5,6 +5,8 @@
 
 use core::sync::atomic::{AtomicIsize, Ordering};
 
+use crate::kernel::module::{export_symbol, find_symbol};
+
 /// Lupos x86_64-visible zone-stat item capacity.
 ///
 /// Linux sizes these arrays from `enum zone_stat_item`; the current configured
@@ -22,6 +24,20 @@ static VM_NODE_STAT: [AtomicIsize; NR_VM_NODE_STAT_ITEMS] =
     [const { AtomicIsize::new(0) }; NR_VM_NODE_STAT_ITEMS];
 static VM_EVENTS: [AtomicIsize; NR_VM_EVENT_ITEMS] =
     [const { AtomicIsize::new(0) }; NR_VM_EVENT_ITEMS];
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "mod_node_page_state",
+        linux_mod_node_page_state as usize,
+        false,
+    );
+}
 
 #[inline]
 fn atomic_get(table: &[AtomicIsize], item: usize) -> isize {
@@ -106,6 +122,11 @@ pub fn mod_node_page_state(pgdat: *mut u8, item: usize, delta: isize) {
     __mod_node_page_state(pgdat, item, delta)
 }
 
+/// `mod_node_page_state` - `vendor/linux/mm/vmstat.c`.
+pub unsafe extern "C" fn linux_mod_node_page_state(pgdat: *mut u8, item: u32, delta: isize) {
+    mod_node_page_state(pgdat, item as usize, delta)
+}
+
 pub fn inc_node_page_state(pgdat: *mut u8, item: usize) {
     __inc_node_page_state(pgdat, item)
 }
@@ -181,6 +202,26 @@ mod tests {
         assert_eq!(out[1], 4);
         assert_eq!(out[9], 13);
         assert_eq!(out[2], 0);
+    }
+
+    #[test]
+    fn registers_vmstat_module_symbols() {
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("mod_node_page_state"),
+            Some(linux_mod_node_page_state as usize)
+        );
+    }
+
+    #[test]
+    fn linux_mod_node_page_state_updates_node_counter() {
+        let _guard = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        reset_vmstat_for_test();
+
+        unsafe { linux_mod_node_page_state(core::ptr::null_mut(), 9, -3) };
+        assert_eq!(vm_node_stat(9), -3);
     }
 
     #[test]

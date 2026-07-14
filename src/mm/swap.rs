@@ -30,16 +30,70 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 
 use spin::Mutex;
 
 use crate::arch::x86::mm::paging::{
     arch_swp_entry, arch_swp_offset, arch_swp_type, is_swap_pte, pte_t,
 };
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::mm::frame::PAGE_SIZE;
 use crate::mm::page::Page;
 use crate::mm::page_flags::{PG_SWAPBACKED, PG_SWAPCACHE, PG_UPTODATE, PG_WRITEBACK};
+
+const FOLIO_BATCH_SIZE: usize = 31;
+
+static NR_SWAP_PAGES: AtomicI64 = AtomicI64::new(0);
+
+#[repr(C)]
+pub struct LinuxFolioBatch {
+    nr: u8,
+    i: u8,
+    percpu_pvec_drained: u8,
+    _pad: [u8; 5],
+    folios: [*mut Page; FOLIO_BATCH_SIZE],
+}
+
+const _: () = assert!(core::mem::size_of::<LinuxFolioBatch>() == 256);
+const _: () = assert!(core::mem::offset_of!(LinuxFolioBatch, nr) == 0);
+const _: () = assert!(core::mem::offset_of!(LinuxFolioBatch, i) == 1);
+const _: () = assert!(core::mem::offset_of!(LinuxFolioBatch, percpu_pvec_drained) == 2);
+const _: () = assert!(core::mem::offset_of!(LinuxFolioBatch, folios) == 8);
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "nr_swap_pages",
+        core::ptr::addr_of!(NR_SWAP_PAGES) as usize,
+        true,
+    );
+    export_symbol_once(
+        "folio_mark_accessed",
+        linux_folio_mark_accessed as usize,
+        false,
+    );
+    export_symbol_once(
+        "mark_page_accessed",
+        linux_mark_page_accessed as usize,
+        false,
+    );
+    export_symbol_once(
+        "__folio_batch_release",
+        linux___folio_batch_release as usize,
+        false,
+    );
+    export_symbol_once(
+        "check_move_unevictable_folios",
+        linux_check_move_unevictable_folios as usize,
+        true,
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Generic swap entry — swp_entry_t
@@ -326,6 +380,7 @@ fn swapon_with_path(
     });
 
     NR_SWAPFILES.fetch_add(1, Ordering::Relaxed);
+    NR_SWAP_PAGES.fetch_add(max_pages as i64, Ordering::Relaxed);
     drop(info);
     let _ = crate::mm::zswap::zswap_swapon(swap_type as i32);
     Ok(swap_type)
@@ -349,6 +404,7 @@ pub fn swapoff(swap_type: u8) -> Result<(), i32> {
     if si.inuse_pages > 0 {
         return Err(-16); // EBUSY
     }
+    NR_SWAP_PAGES.fetch_sub(si.max as i64, Ordering::Relaxed);
     // Drop frees the Vec backing stores.
     info[idx] = None;
     NR_SWAPFILES.fetch_sub(1, Ordering::Relaxed);
@@ -438,6 +494,7 @@ fn alloc_slot_in_si(si: &mut SwapInfoStruct) -> Option<u32> {
                     ci.flags = CLUSTER_FLAG_NONFULL;
                 }
                 si.inuse_pages += 1;
+                NR_SWAP_PAGES.fetch_sub(1, Ordering::Relaxed);
                 return Some(offset);
             }
         }
@@ -497,6 +554,7 @@ pub fn free_swap_slot(entry: SwpEntry) {
             };
         }
         si.inuse_pages = si.inuse_pages.saturating_sub(1);
+        NR_SWAP_PAGES.fetch_add(1, Ordering::Relaxed);
         crate::mm::zswap::zswap_invalidate(entry.swp_type(), entry.swp_offset());
     }
 }
@@ -758,12 +816,10 @@ pub fn add_to_swap(page: *mut Page) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn nr_swap_pages() -> u32 {
-    let info = SWAP_INFO.lock();
-    let mut free = 0u32;
-    for si in info.iter().flatten() {
-        free = free.saturating_add(si.max.saturating_sub(si.inuse_pages));
-    }
-    free
+    NR_SWAP_PAGES
+        .load(Ordering::Relaxed)
+        .try_into()
+        .unwrap_or(0)
 }
 
 pub fn get_nr_swap_pages() -> u32 {
@@ -972,6 +1028,14 @@ pub fn folio_mark_accessed(folio: *mut Page) {
     unsafe { crate::mm::lru::mark_page_accessed(folio) };
 }
 
+extern "C" fn linux_folio_mark_accessed(folio: *mut Page) {
+    folio_mark_accessed(folio);
+}
+
+extern "C" fn linux_mark_page_accessed(page: *mut Page) {
+    folio_mark_accessed(page);
+}
+
 pub fn folio_deactivate(_folio: *mut Page) {}
 
 pub fn folio_mark_lazyfree(_folio: *mut Page) -> bool {
@@ -1030,8 +1094,23 @@ pub unsafe fn release_pages(pages: *mut *mut Page, nr: usize) {
     }
 }
 
-pub unsafe fn __folio_batch_release(pages: *mut *mut Page, nr: usize) {
+pub unsafe fn release_folio_array(pages: *mut *mut Page, nr: usize) {
     unsafe { release_pages(pages, nr) };
+}
+
+extern "C" fn linux___folio_batch_release(fbatch: *mut LinuxFolioBatch) {
+    if fbatch.is_null() {
+        return;
+    }
+
+    let batch = unsafe { &mut *fbatch };
+    let nr = usize::from(batch.nr).min(FOLIO_BATCH_SIZE);
+    if nr != 0 {
+        unsafe { release_pages(batch.folios.as_mut_ptr(), nr) };
+    }
+    batch.nr = 0;
+    batch.i = 0;
+    batch.percpu_pvec_drained = 1;
 }
 
 pub fn remove_mapping(_mapping: *mut u8, page: *mut Page) -> bool {
@@ -1045,9 +1124,11 @@ pub fn remove_mapping(_mapping: *mut u8, page: *mut Page) -> bool {
     true
 }
 
-pub fn check_move_unevictable_folios(_folios: *mut *mut Page, _nr: usize) -> usize {
+pub fn check_move_unevictable_folio_array(_folios: *mut *mut Page, _nr: usize) -> usize {
     0
 }
+
+extern "C" fn linux_check_move_unevictable_folios(_fbatch: *mut LinuxFolioBatch) {}
 
 pub fn mem_cgroup_swappiness(_memcg: *const u8) -> i32 {
     60
@@ -1143,6 +1224,7 @@ pub fn reset_swap_state_for_test() {
         *slot = None;
     }
     NR_SWAPFILES.store(0, Ordering::Relaxed);
+    NR_SWAP_PAGES.store(0, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------

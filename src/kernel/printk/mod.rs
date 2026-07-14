@@ -25,7 +25,7 @@ pub mod ringbuffer;
 pub mod sysctl;
 
 use alloc::string::String;
-use core::ffi::c_char;
+use core::ffi::{c_char, c_void};
 use core::fmt::Write;
 
 pub use crate::{log_debug, log_error, log_info, log_trace, log_warn};
@@ -35,6 +35,15 @@ pub use levels::{
 };
 pub use record::{PrintkInfo, PrintkRecord};
 pub use ringbuffer::PRINTK_RB;
+
+/// `oops_in_progress` - `vendor/linux/kernel/printk/printk.c`.
+static mut LINUX_OOPS_IN_PROGRESS: i32 = 0;
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if crate::kernel::module::find_symbol(name).is_none() {
+        crate::kernel::module::export_symbol(name, addr, gpl_only);
+    }
+}
 
 /// Initialize the printk subsystem.  Idempotent.
 pub fn init() {
@@ -47,6 +56,91 @@ pub fn register_module_exports() {
     if crate::kernel::module::find_symbol("_printk").is_none() {
         crate::kernel::module::export_symbol("_printk", linux_printk as usize, false);
     }
+    if crate::kernel::module::find_symbol("vprintk").is_none() {
+        crate::kernel::module::export_symbol("vprintk", linux_vprintk as usize, false);
+    }
+    if crate::kernel::module::find_symbol("dump_stack").is_none() {
+        crate::kernel::module::export_symbol("dump_stack", linux_dump_stack as usize, false);
+    }
+    if crate::kernel::module::find_symbol("oops_in_progress").is_none() {
+        crate::kernel::module::export_symbol(
+            "oops_in_progress",
+            core::ptr::addr_of_mut!(LINUX_OOPS_IN_PROGRESS) as usize,
+            false,
+        );
+    }
+    if crate::kernel::module::find_symbol("panic").is_none() {
+        crate::kernel::module::export_symbol("panic", linux_panic as usize, false);
+    }
+    if crate::kernel::module::find_symbol("__printk_ratelimit").is_none() {
+        crate::kernel::module::export_symbol(
+            "__printk_ratelimit",
+            linux___printk_ratelimit as usize,
+            false,
+        );
+    }
+    export_symbol_once("console_list_lock", linux_console_list_lock as usize, false);
+    export_symbol_once(
+        "console_list_unlock",
+        linux_console_list_unlock as usize,
+        false,
+    );
+    export_symbol_once("register_console", linux_register_console as usize, false);
+    export_symbol_once(
+        "unregister_console",
+        linux_unregister_console as usize,
+        false,
+    );
+    export_symbol_once(
+        "nbcon_enter_unsafe",
+        linux_nbcon_enter_unsafe as usize,
+        true,
+    );
+    export_symbol_once("nbcon_exit_unsafe", linux_nbcon_exit_unsafe as usize, true);
+}
+
+/// `console_list_lock()` — `vendor/linux/kernel/printk/printk.c:247`.
+pub unsafe extern "C" fn linux_console_list_lock() {}
+
+/// `console_list_unlock()` — `vendor/linux/kernel/printk/printk.c:272`.
+pub unsafe extern "C" fn linux_console_list_unlock() {}
+
+/// `register_console()` — `vendor/linux/kernel/printk/printk.c:4060`.
+pub unsafe extern "C" fn linux_register_console(_console: *mut c_void) {}
+
+/// `unregister_console()` — `vendor/linux/kernel/printk/printk.c:4325`.
+pub unsafe extern "C" fn linux_unregister_console(_console: *mut c_void) -> i32 {
+    0
+}
+
+/// `nbcon_enter_unsafe()` — `vendor/linux/kernel/printk/nbcon.c:885`.
+pub unsafe extern "C" fn linux_nbcon_enter_unsafe(_wctxt: *mut c_void) -> bool {
+    false
+}
+
+/// `nbcon_exit_unsafe()` — `vendor/linux/kernel/printk/nbcon.c:909`.
+pub unsafe extern "C" fn linux_nbcon_exit_unsafe(_wctxt: *mut c_void) -> bool {
+    false
+}
+
+/// `dump_stack` - `vendor/linux/lib/dump_stack.c`.
+pub unsafe extern "C" fn linux_dump_stack() {
+    log_warn!("dump_stack", "Linux module requested stack dump");
+}
+
+/// `panic` - `vendor/linux/kernel/panic.c`.
+pub unsafe extern "C" fn linux_panic(_fmt: *const c_char) -> ! {
+    log_error!("panic", "Linux module called panic()");
+    loop {
+        unsafe {
+            core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// `__printk_ratelimit` - `vendor/linux/kernel/printk/printk.c`.
+pub unsafe extern "C" fn linux___printk_ratelimit(_func: *const c_char) -> i32 {
+    1
 }
 
 /// x86-64 C-variadic trampoline for Linux `_printk(const char *fmt, ...)`.
@@ -98,6 +192,11 @@ unsafe extern "C" fn linux_printk_helper(
     message_len.min(i32::MAX as usize) as i32
 }
 
+/// `vprintk` - `vendor/linux/kernel/printk/printk_safe.c:75`.
+pub unsafe extern "C" fn linux_vprintk(_fmt: *const c_char, _args: *mut c_void) -> i32 {
+    0
+}
+
 /// Emit a record into the printk ring.  Parses any leading `<n>` prefix.
 pub fn printk_emit(level: u8, facility: u8, fmt_args: core::fmt::Arguments<'_>) {
     let mut s = String::new();
@@ -143,4 +242,71 @@ macro_rules! printk {
             ::core::format_args!($($arg)*),
         )
     };
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn vprintk_export_tracks_vendor_printk_safe() {
+        let source = include_str!("../../../vendor/linux/kernel/printk/printk_safe.c");
+        assert!(source.contains("EXPORT_SYMBOL(vprintk);"));
+        super::register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("vprintk"),
+            Some(super::linux_vprintk as usize)
+        );
+    }
+
+    #[test]
+    fn netconsole_printk_exports_track_vendor_sources() {
+        let printk = include_str!("../../../vendor/linux/kernel/printk/printk.c");
+        let nbcon = include_str!("../../../vendor/linux/kernel/printk/nbcon.c");
+
+        assert!(printk.contains("EXPORT_SYMBOL(console_list_lock);"));
+        assert!(printk.contains("EXPORT_SYMBOL(console_list_unlock);"));
+        assert!(printk.contains("EXPORT_SYMBOL(register_console);"));
+        assert!(printk.contains("EXPORT_SYMBOL(unregister_console);"));
+        assert!(nbcon.contains("EXPORT_SYMBOL_GPL(nbcon_enter_unsafe);"));
+        assert!(nbcon.contains("EXPORT_SYMBOL_GPL(nbcon_exit_unsafe);"));
+
+        super::register_module_exports();
+        for (name, addr, gpl_only) in [
+            (
+                "console_list_lock",
+                super::linux_console_list_lock as usize,
+                false,
+            ),
+            (
+                "console_list_unlock",
+                super::linux_console_list_unlock as usize,
+                false,
+            ),
+            (
+                "register_console",
+                super::linux_register_console as usize,
+                false,
+            ),
+            (
+                "unregister_console",
+                super::linux_unregister_console as usize,
+                false,
+            ),
+            (
+                "nbcon_enter_unsafe",
+                super::linux_nbcon_enter_unsafe as usize,
+                true,
+            ),
+            (
+                "nbcon_exit_unsafe",
+                super::linux_nbcon_exit_unsafe as usize,
+                true,
+            ),
+        ] {
+            assert_eq!(crate::kernel::module::find_symbol(name), Some(addr));
+            assert_eq!(
+                crate::kernel::module::find_symbol_gpl_only(name),
+                Some(gpl_only)
+            );
+        }
+    }
 }
