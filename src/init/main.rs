@@ -4437,10 +4437,18 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         #[cfg(not(feature = "test-login-stack"))]
         {
             // Drive the cooperative scheduler until PID1 exits.
-            for _ in 0..10_000usize {
+            for round in 0..10_000usize {
                 let state = unsafe { (*init).__state.load(Ordering::Acquire) };
                 if (state & EXIT_ZOMBIE) != 0 {
                     break;
+                }
+                if round % 2_000 == 1_999 && kernel::debug_trace::ping_enabled() {
+                    crate::linux_driver_abi::tty::serial_println!(
+                        "pid1-wait: round={} hardirqs={} softirq-pending={:#x}",
+                        round,
+                        crate::arch::x86::kernel::idt::DEVICE_HARDIRQ_COUNT.load(Ordering::Relaxed),
+                        kernel::softirq::local_softirq_pending()
+                    );
                 }
                 init::rootfs::drain_console_control_bytes();
                 kernel::console::maintenance_budgeted();
@@ -6016,6 +6024,7 @@ fn panic(info: &PanicInfo<'_>) -> ! {
             );
         }
     }
+    dump_panic_stack();
     serial_println!("====================");
     serial_print!("\x1b[0m");
 
@@ -6041,6 +6050,56 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     }
 
     halt_loop()
+}
+
+fn dump_panic_stack() {
+    let rbp: u64;
+    let rsp: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, rbp",
+            "mov {}, rsp",
+            out(reg) rbp,
+            out(reg) rsp,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    serial_println!("  stack: rbp={:#x} rsp={:#x}", rbp, rsp);
+
+    let mut frame = rbp as *const u64;
+    for depth in 0..16 {
+        let frame_addr = frame as u64;
+        if !is_kernel_stack_pointer(frame_addr) {
+            break;
+        }
+
+        let next = unsafe { core::ptr::read_unaligned(frame) };
+        let ret = unsafe { core::ptr::read_unaligned(frame.add(1)) };
+        serial_println!("  bt{}: rbp={:#x} ret={:#x}", depth, frame_addr, ret);
+        if next <= frame_addr || !is_kernel_stack_pointer(next) {
+            break;
+        }
+        frame = next as *const u64;
+    }
+
+    if is_kernel_stack_pointer(rsp) {
+        let stack = rsp as *const u64;
+        for index in 0..160 {
+            let word = unsafe { core::ptr::read_unaligned(stack.add(index)) };
+            if is_lupos_text_pointer(word) {
+                serial_println!("  stack[{}]: ret={:#x}", index, word);
+            }
+        }
+    }
+}
+
+fn is_kernel_stack_pointer(ptr: u64) -> bool {
+    ptr >= crate::arch::x86::mm::paging::PAGE_OFFSET && ptr & 0x7 == 0
+}
+
+fn is_lupos_text_pointer(ptr: u64) -> bool {
+    (0x0020_0000..0x0200_0000).contains(&ptr)
 }
 
 fn halt_loop() -> ! {

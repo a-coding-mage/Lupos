@@ -130,6 +130,8 @@ pub const VIRTIO_CONFIG_S_FAILED: u8 = 0x80;
 pub const VIRTIO_TRANSPORT_F_START: u32 = 28;
 pub const VIRTIO_TRANSPORT_F_END: u32 = 42;
 pub const VIRTIO_FEATURES_U64S: usize = 2;
+pub const VIRTIO_RING_F_EVENT_IDX: u32 = 29;
+pub const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
 pub const VRING_DESC_F_NEXT: u16 = 1;
 pub const VRING_DESC_F_WRITE: u16 = 2;
 pub const VRING_DESC_F_INDIRECT: u16 = 4;
@@ -252,6 +254,13 @@ struct LinuxVirtqueueBackend {
     // `vendor/linux/drivers/virtio/virtio_ring.c::vring_virtqueue`.
     last_used_idx: u16,
     avail_idx_shadow: u16,
+    // Queue size plus the interrupt-suppression state of
+    // `vring_virtqueue_split`: VIRTIO_RING_F_EVENT_IDX negotiation, the
+    // shadowed `avail->flags`, and the racy `event_triggered` hint.
+    num: u16,
+    event: bool,
+    avail_flags_shadow: u16,
+    event_triggered: bool,
     free_list: Vec<u16>,
     submitted: Vec<LinuxVirtqueueToken>,
 }
@@ -577,6 +586,26 @@ unsafe fn linux_vring_write_avail_ring(backend: &LinuxVirtqueueBackend, slot: us
     }
 }
 
+unsafe fn linux_vring_write_avail_flags(backend: &LinuxVirtqueueBackend, value: u16) {
+    unsafe {
+        write_volatile(
+            linux_vring_ptr::<u16>(backend, backend.layout.avail_offset),
+            value,
+        );
+    }
+}
+
+/// `vring_used_event()` — the trailing u16 of the avail ring
+/// (`vendor/linux/include/uapi/linux/virtio_ring.h`). With
+/// VIRTIO_RING_F_EVENT_IDX negotiated the device suppresses interrupts until
+/// `used->idx` passes this value, so the driver must keep republishing it.
+unsafe fn linux_vring_write_used_event(backend: &LinuxVirtqueueBackend, value: u16) {
+    let offset = backend.layout.avail_offset + 4 + backend.num as usize * 2;
+    unsafe {
+        write_volatile(linux_vring_ptr::<u16>(backend, offset), value);
+    }
+}
+
 unsafe fn linux_vring_used_idx(backend: &LinuxVirtqueueBackend) -> u16 {
     unsafe {
         read_volatile(linux_vring_ptr::<u16>(
@@ -617,6 +646,13 @@ fn linux_virtqueue_register_backend(
         return;
     }
     let num = unsafe { (*vq).num_max as u16 };
+    // find_vqs runs after FEATURES_OK, so the negotiated feature words are
+    // final here — mirror `vring_create_virtqueue`'s `virtio_has_feature(
+    // vdev, VIRTIO_RING_F_EVENT_IDX)` capture into `vq->event`.
+    let event = unsafe {
+        let vdev = (*vq).vdev;
+        !vdev.is_null() && linux_virtio_features_has(&(*vdev).features, VIRTIO_RING_F_EVENT_IDX)
+    };
     let mut free_list = Vec::with_capacity(num as usize);
     for idx in (0..num).rev() {
         free_list.push(idx);
@@ -637,6 +673,10 @@ fn linux_virtqueue_register_backend(
             pending_notify: false,
             last_used_idx: 0,
             avail_idx_shadow: 0,
+            num,
+            event,
+            avail_flags_shadow: 0,
+            event_triggered: false,
             free_list,
             submitted: Vec::new(),
         });
@@ -1842,6 +1882,13 @@ pub unsafe extern "C" fn vring_interrupt(_irq: i32, vq: *mut c_void) -> i32 {
     let Some(callback) = (unsafe { (*vq).callback }) else {
         return 0;
     };
+    // "Just a hint for performance: so it's ok that this can be racy!" —
+    // lets virtqueue_disable_cb skip the suppression write for this window.
+    let _ = linux_virtqueue_with_backend_mut(vq, |backend| {
+        if backend.event {
+            backend.event_triggered = true;
+        }
+    });
     unsafe {
         callback(vq.cast::<c_void>());
     }
@@ -2391,6 +2438,13 @@ pub unsafe extern "C" fn virtqueue_get_buf_ctx(
             }
             backend.free_list.push(desc);
         }
+        // While callbacks stay enabled, every consumption republishes the
+        // event index so the device keeps interrupting for later buffers
+        // (`virtqueue_get_buf_ctx_split`'s trailing `virtio_store_mb`).
+        if backend.avail_flags_shadow & VRING_AVAIL_F_NO_INTERRUPT == 0 {
+            unsafe { linux_vring_write_used_event(backend, backend.last_used_idx) };
+            core::sync::atomic::fence(Ordering::SeqCst);
+        }
         Some(token)
     })
     .flatten()
@@ -2427,20 +2481,50 @@ pub unsafe extern "C" fn virtqueue_get_buf(vq: *mut LinuxVirtqueue, len: *mut u3
     unsafe { virtqueue_get_buf_ctx(vq, len, core::ptr::null_mut()) }
 }
 
-/// `virtqueue_disable_cb` — `vendor/linux/drivers/virtio/virtio_ring.c:3104`.
+/// `virtqueue_disable_cb` — `vendor/linux/drivers/virtio/virtio_ring.c:3104`
+/// (split path `virtqueue_disable_cb_split`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn virtqueue_disable_cb(vq: *mut LinuxVirtqueue) {
     let _ = linux_virtqueue_with_backend_mut(vq, |backend| {
         backend.callbacks_enabled = false;
+        if backend.avail_flags_shadow & VRING_AVAIL_F_NO_INTERRUPT == 0 {
+            backend.avail_flags_shadow |= VRING_AVAIL_F_NO_INTERRUPT;
+            // If the device already triggered an event for this window it
+            // won't trigger another: no need to write the suppression.
+            if backend.event_triggered || !backend.ring_ready {
+                return;
+            }
+            unsafe {
+                if backend.event {
+                    linux_vring_write_used_event(backend, 0);
+                } else {
+                    linux_vring_write_avail_flags(backend, backend.avail_flags_shadow);
+                }
+            }
+        }
     });
 }
 
-/// `virtqueue_enable_cb_prepare` — `vendor/linux/drivers/virtio/virtio_ring.c:3124`.
+/// `virtqueue_enable_cb_prepare` — `vendor/linux/drivers/virtio/virtio_ring.c:3124`
+/// (split path `virtqueue_enable_cb_prepare_split`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn virtqueue_enable_cb_prepare(vq: *mut LinuxVirtqueue) -> u32 {
     linux_virtqueue_with_backend_mut(vq, |backend| {
         backend.callbacks_enabled = true;
-        u32::from(backend.last_used_idx)
+        backend.event_triggered = false;
+        let last_used_idx = backend.last_used_idx;
+        if backend.avail_flags_shadow & VRING_AVAIL_F_NO_INTERRUPT != 0 {
+            backend.avail_flags_shadow &= !VRING_AVAIL_F_NO_INTERRUPT;
+            if backend.ring_ready && !backend.event {
+                unsafe { linux_vring_write_avail_flags(backend, backend.avail_flags_shadow) };
+            }
+        }
+        // Always republish the event index so the device re-arms delivery
+        // for anything used past this point.
+        if backend.ring_ready {
+            unsafe { linux_vring_write_used_event(backend, last_used_idx) };
+        }
+        u32::from(last_used_idx)
     })
     .unwrap_or(0)
 }
@@ -2452,6 +2536,7 @@ pub unsafe extern "C" fn virtqueue_poll(vq: *mut LinuxVirtqueue, last_used_idx: 
         if !backend.ring_ready {
             return false;
         }
+        core::sync::atomic::fence(Ordering::SeqCst);
         unsafe { linux_vring_used_idx(backend) != last_used_idx as u16 }
     })
     .unwrap_or(false)
@@ -2460,20 +2545,36 @@ pub unsafe extern "C" fn virtqueue_poll(vq: *mut LinuxVirtqueue, last_used_idx: 
 /// `virtqueue_enable_cb` — `vendor/linux/drivers/virtio/virtio_ring.c:3168`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn virtqueue_enable_cb(vq: *mut LinuxVirtqueue) -> bool {
+    let last_used_idx = unsafe { virtqueue_enable_cb_prepare(vq) };
+    !unsafe { virtqueue_poll(vq, last_used_idx) }
+}
+
+/// `virtqueue_enable_cb_delayed` — `vendor/linux/drivers/virtio/virtio_ring.c:3189`
+/// (split path `virtqueue_enable_cb_delayed_split`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn virtqueue_enable_cb_delayed(vq: *mut LinuxVirtqueue) -> bool {
     linux_virtqueue_with_backend_mut(vq, |backend| {
         backend.callbacks_enabled = true;
+        backend.event_triggered = false;
+        if backend.avail_flags_shadow & VRING_AVAIL_F_NO_INTERRUPT != 0 {
+            backend.avail_flags_shadow &= !VRING_AVAIL_F_NO_INTERRUPT;
+            if backend.ring_ready && !backend.event {
+                unsafe { linux_vring_write_avail_flags(backend, backend.avail_flags_shadow) };
+            }
+        }
         if !backend.ring_ready {
             return true;
         }
-        unsafe { linux_vring_used_idx(backend) == backend.last_used_idx }
+        // TODO: tune this threshold — mirrors the vendor 3/4 heuristic.
+        let bufs =
+            ((backend.avail_idx_shadow.wrapping_sub(backend.last_used_idx) as u32) * 3 / 4) as u16;
+        let used_idx = backend.last_used_idx.wrapping_add(bufs);
+        unsafe { linux_vring_write_used_event(backend, used_idx) };
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let pending = unsafe { linux_vring_used_idx(backend) }.wrapping_sub(backend.last_used_idx);
+        pending <= bufs
     })
     .unwrap_or(true)
-}
-
-/// `virtqueue_enable_cb_delayed` — `vendor/linux/drivers/virtio/virtio_ring.c:3189`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn virtqueue_enable_cb_delayed(vq: *mut LinuxVirtqueue) -> bool {
-    unsafe { virtqueue_enable_cb(vq) }
 }
 
 /// `virtqueue_detach_unused_buf` — `vendor/linux/drivers/virtio/virtio_ring.c:3208`.

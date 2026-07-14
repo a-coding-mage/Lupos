@@ -9,6 +9,9 @@
 //! - vendor/linux/arch/x86/lib/msr-smp.c
 //! - vendor/linux/arch/x86/lib/msr-reg-export.c
 
+use crate::include::uapi::errno::EINVAL;
+use crate::kernel::module::{export_symbol, find_symbol};
+
 pub const MSR_EFER: u32 = 0xC000_0080;
 pub const MSR_STAR: u32 = 0xC000_0081;
 pub const MSR_LSTAR: u32 = 0xC000_0082;
@@ -281,6 +284,48 @@ pub fn wrmsrq_safe_on_cpu(cpu: u32, msr: u32, q: u64) -> Result<(), i32> {
     unsafe { wrmsr_safe(msr, q) }
 }
 
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+fn linux_errno(errno: i32) -> i32 {
+    if errno < 0 { errno } else { -errno }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("rdmsrq_on_cpu", linux_rdmsrq_on_cpu as usize, false);
+    export_symbol_once("wrmsrq_on_cpu", linux_wrmsrq_on_cpu as usize, false);
+}
+
+/// `rdmsrq_on_cpu` - `vendor/linux/arch/x86/lib/msr-smp.c:34`.
+#[unsafe(export_name = "rdmsrq_on_cpu")]
+pub unsafe extern "C" fn linux_rdmsrq_on_cpu(cpu: u32, msr_no: u32, q: *mut u64) -> i32 {
+    if q.is_null() {
+        return -EINVAL;
+    }
+    let mut value = 0u64;
+    match rdmsrq_on_cpu(cpu, msr_no, &mut value) {
+        Ok(()) => {
+            unsafe {
+                q.write(value);
+            }
+            0
+        }
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+/// `wrmsrq_on_cpu` - `vendor/linux/arch/x86/lib/msr-smp.c:49`.
+#[unsafe(export_name = "wrmsrq_on_cpu")]
+pub unsafe extern "C" fn linux_wrmsrq_on_cpu(cpu: u32, msr_no: u32, q: u64) -> i32 {
+    match wrmsrq_on_cpu(cpu, msr_no, q) {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
 // ---------- lib/msr-reg-export.c --------------------------------------------
 //
 // `EXPORT_SYMBOL(rdmsr_safe_regs)` / `EXPORT_SYMBOL(wrmsr_safe_regs)` — the
@@ -376,6 +421,27 @@ mod tests {
         // that consistently regardless of which path was taken.
         assert_eq!((l, h), (0, 0));
         assert_eq!(q, 0);
+    }
+
+    #[test]
+    fn msr_smp_qword_exports_match_vendor_source() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/arch/x86/lib/msr-smp.c"
+        ));
+
+        assert!(source.contains("EXPORT_SYMBOL(rdmsrq_on_cpu);"));
+        assert!(source.contains("EXPORT_SYMBOL(wrmsrq_on_cpu);"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("rdmsrq_on_cpu"),
+            Some(linux_rdmsrq_on_cpu as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("wrmsrq_on_cpu"),
+            Some(linux_wrmsrq_on_cpu as usize)
+        );
     }
 
     #[test]

@@ -13,13 +13,17 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ffi::c_void;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::include::uapi::errno::{EINVAL, ENOMEM};
+use crate::arch::x86::kernel::uaccess::copy_from_user;
+use crate::include::uapi::errno::{EFAULT, EINVAL, ENOMEM};
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::sched;
 use crate::mm::buddy::{page_in_mem_map, page_to_pfn, pfn_to_page};
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
 use crate::mm::page::Page;
+use crate::mm::page_flags::{__GFP_NOWARN, GFP_USER};
 use spin::Mutex;
 
 static VM_MEMORY_COMMITTED: AtomicU64 = AtomicU64::new(0);
@@ -29,6 +33,27 @@ static KSTRDUP_CONST_ALLOCS: Mutex<Vec<ConstDupAlloc>> = Mutex::new(Vec::new());
 struct ConstDupAlloc {
     ptr: usize,
     len: usize,
+}
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("memdup_user", linux_memdup_user as usize, false);
+    export_symbol_once("vmemdup_user", linux_vmemdup_user as usize, false);
+    export_symbol_once("memdup_user_nul", linux_memdup_user_nul as usize, false);
+    export_symbol_once("strndup_user", linux_strndup_user as usize, false);
+    export_symbol_once("kfree_const", linux_kfree_const as usize, false);
+    export_symbol_once("kstrdup", linux_kstrdup as usize, false);
+    export_symbol_once("kstrdup_const", linux_kstrdup_const as usize, false);
+    export_symbol_once("kstrndup", linux_kstrndup as usize, false);
+    export_symbol_once("kmemdup_array", linux_kmemdup_array as usize, false);
+    export_symbol_once("kmemdup_nul", linux_kmemdup_nul as usize, false);
+    export_symbol_once("vma_set_file", linux_vma_set_file as usize, false);
+    export_symbol_once("compat_vma_mmap", linux_compat_vma_mmap as usize, false);
 }
 
 pub fn array_size(count: usize, size: usize) -> Result<usize, i32> {
@@ -178,12 +203,38 @@ pub unsafe fn kmemdup_array(src: *const u8, count: usize, size: usize, gfp: u32)
     unsafe { kmemdup_noprof(src, len, gfp) }
 }
 
+pub unsafe extern "C" fn linux_kmemdup_array(
+    src: *const u8,
+    count: usize,
+    size: usize,
+    gfp: u32,
+) -> *mut u8 {
+    unsafe { kmemdup_array(src, count, size, gfp) }
+}
+
 pub unsafe fn kvmemdup(src: *const u8, len: usize, gfp: u32) -> *mut u8 {
     unsafe { kmemdup_noprof(src, len, gfp) }
 }
 
+#[inline]
+fn err_ptr(errno: i32) -> *mut u8 {
+    (-(errno as isize)) as usize as *mut u8
+}
+
 pub unsafe fn memdup_user(src: *const u8, len: usize) -> *mut u8 {
-    unsafe { kmemdup_noprof(src, len, crate::mm::page_flags::GFP_KERNEL) }
+    let dst = unsafe { crate::mm::slab::kmalloc(len, GFP_USER | __GFP_NOWARN) };
+    if dst.is_null() {
+        return err_ptr(ENOMEM);
+    }
+    if len != 0 && src.is_null() {
+        unsafe { crate::mm::slab::kfree(dst) };
+        return err_ptr(EFAULT);
+    }
+    if unsafe { copy_from_user(dst, src, len) } != 0 {
+        unsafe { crate::mm::slab::kfree(dst) };
+        return err_ptr(EFAULT);
+    }
+    dst
 }
 
 pub unsafe fn vmemdup_user(src: *const u8, len: usize) -> *mut u8 {
@@ -191,30 +242,58 @@ pub unsafe fn vmemdup_user(src: *const u8, len: usize) -> *mut u8 {
 }
 
 pub unsafe fn memdup_user_nul(src: *const u8, len: usize) -> *mut u8 {
-    let dst = unsafe {
-        crate::mm::slab::kmalloc(len.saturating_add(1), crate::mm::page_flags::GFP_KERNEL)
+    let Some(size) = len.checked_add(1) else {
+        return err_ptr(ENOMEM);
     };
-    if !dst.is_null() && !src.is_null() {
-        unsafe {
-            core::ptr::copy_nonoverlapping(src, dst, len);
-            *dst.add(len) = 0;
-        }
+    let dst = unsafe { crate::mm::slab::kmalloc(size, GFP_USER | __GFP_NOWARN) };
+    if dst.is_null() {
+        return err_ptr(ENOMEM);
+    }
+    if len != 0 && src.is_null() {
+        unsafe { crate::mm::slab::kfree(dst) };
+        return err_ptr(EFAULT);
+    }
+    if unsafe { copy_from_user(dst, src, len) } != 0 {
+        unsafe { crate::mm::slab::kfree(dst) };
+        return err_ptr(EFAULT);
+    }
+    unsafe {
+        *dst.add(len) = 0;
     }
     dst
 }
 
 pub unsafe fn strndup_user(src: *const u8, max: usize) -> *mut u8 {
     if src.is_null() {
-        return core::ptr::null_mut();
+        return err_ptr(EFAULT);
     }
     let mut len = 0usize;
     while len < max {
         if unsafe { *src.add(len) } == 0 {
-            break;
+            return unsafe { memdup_user(src, len + 1) };
         }
         len += 1;
     }
+    err_ptr(EINVAL)
+}
+
+pub unsafe extern "C" fn linux_memdup_user(src: *const u8, len: usize) -> *mut u8 {
+    unsafe { memdup_user(src, len) }
+}
+
+pub unsafe extern "C" fn linux_vmemdup_user(src: *const u8, len: usize) -> *mut u8 {
+    unsafe { vmemdup_user(src, len) }
+}
+
+pub unsafe extern "C" fn linux_memdup_user_nul(src: *const u8, len: usize) -> *mut u8 {
     unsafe { memdup_user_nul(src, len) }
+}
+
+pub unsafe extern "C" fn linux_strndup_user(src: *const u8, max: isize) -> *mut u8 {
+    if max <= 0 {
+        return err_ptr(EINVAL);
+    }
+    unsafe { strndup_user(src, max as usize) }
 }
 
 pub unsafe fn kstrndup(src: *const u8, max: usize, gfp: u32) -> *mut u8 {
@@ -238,8 +317,16 @@ pub unsafe fn kstrndup(src: *const u8, max: usize, gfp: u32) -> *mut u8 {
     dst
 }
 
+pub unsafe extern "C" fn linux_kstrndup(src: *const u8, max: usize, gfp: u32) -> *mut u8 {
+    unsafe { kstrndup(src, max, gfp) }
+}
+
 pub unsafe fn kstrdup(src: *const u8, gfp: u32) -> *mut u8 {
     unsafe { kstrndup(src, usize::MAX / 2, gfp) }
+}
+
+pub unsafe extern "C" fn linux_kstrdup(src: *const u8, gfp: u32) -> *mut u8 {
+    unsafe { kstrdup(src, gfp) }
 }
 
 pub unsafe fn kstrdup_const(src: *const u8, _gfp: u32) -> *const u8 {
@@ -266,6 +353,10 @@ pub unsafe fn kstrdup_const(src: *const u8, _gfp: u32) -> *const u8 {
     ptr
 }
 
+pub unsafe extern "C" fn linux_kstrdup_const(src: *const u8, gfp: u32) -> *const u8 {
+    unsafe { kstrdup_const(src, gfp) }
+}
+
 pub unsafe fn kfree_const(ptr: *const u8) {
     if ptr.is_null() {
         return;
@@ -283,6 +374,10 @@ pub unsafe fn kfree_const(ptr: *const u8) {
     }
 }
 
+pub unsafe extern "C" fn linux_kfree_const(ptr: *const u8) {
+    unsafe { kfree_const(ptr) };
+}
+
 pub unsafe fn kmemdup_nul(src: *const u8, len: usize, gfp: u32) -> *mut u8 {
     let dst = unsafe { crate::mm::slab::kmalloc(len.saturating_add(1), gfp) };
     if !dst.is_null() && !src.is_null() {
@@ -292,6 +387,10 @@ pub unsafe fn kmemdup_nul(src: *const u8, len: usize, gfp: u32) -> *mut u8 {
         }
     }
     dst
+}
+
+pub unsafe extern "C" fn linux_kmemdup_nul(src: *const u8, len: usize, gfp: u32) -> *mut u8 {
+    unsafe { kmemdup_nul(src, len, gfp) }
 }
 
 pub fn mem_dump_obj(_ptr: *const u8) -> bool {
@@ -339,6 +438,15 @@ pub fn page_offline_begin(page: *mut Page) -> bool {
 pub fn page_offline_end(_page: *mut Page) {}
 
 pub fn vma_set_file(vma: *mut VmAreaStruct, file: *mut u8) {
+    unsafe { linux_vma_set_file(vma, file.cast()) };
+}
+
+/// `vma_set_file` - `vendor/linux/mm/util.c:318`.
+///
+/// Vendor modules pass Linux-layout `struct file *` values here. Those pointers
+/// are opaque to Lupos' native `Arc<File>` VMA ownership path, so this helper
+/// mirrors the ABI-visible VMA field update without reinterpreting the file.
+pub unsafe extern "C" fn linux_vma_set_file(vma: *mut VmAreaStruct, file: *mut c_void) {
     if !vma.is_null() {
         unsafe {
             (*vma).vm_file = file as usize;
@@ -395,6 +503,15 @@ pub fn compat_vma_mmap(
     pgoff: u64,
 ) -> u64 {
     __compat_vma_mmap(file, addr, len, prot, flag, pgoff)
+}
+
+/// `compat_vma_mmap` - `vendor/linux/mm/util.c:1266`.
+///
+/// Lupos does not yet model Linux's transient `struct vm_area_desc` or
+/// `mmap_prepare` action pipeline for vendor `struct file` objects.  Treat the
+/// compatibility pass as having no extra action to apply.
+pub unsafe extern "C" fn linux_compat_vma_mmap(_file: *mut c_void, _vma: *mut VmAreaStruct) -> i32 {
+    0
 }
 
 pub fn compat_set_desc_from_vma(_desc: *mut u8, _vma: *mut VmAreaStruct) {}

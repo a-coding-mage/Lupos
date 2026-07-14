@@ -14,6 +14,7 @@ use alloc::vec::Vec;
 
 use crate::arch::x86::include::uapi::asm::bootparam::BootParams;
 use crate::include::uapi::errno::{EINVAL, ENOMEM};
+use crate::kernel::module::{export_symbol, find_symbol};
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const SETUP_NONE: u32 = 0;
@@ -29,6 +30,39 @@ pub const SETUP_RNG_SEED: u32 = 9;
 pub const SETUP_ENUM_MAX: u32 = SETUP_RNG_SEED;
 pub const SETUP_INDIRECT: u32 = 0x8000_0000;
 pub const SETUP_KEXEC_KHO: u32 = 0x8000_0001;
+
+/// `pci_mem_start` - `vendor/linux/arch/x86/kernel/e820.c`.
+static mut PCI_MEM_START: usize = 0;
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "pci_mem_start",
+        core::ptr::addr_of_mut!(PCI_MEM_START) as usize,
+        false,
+    );
+    export_symbol_once("e820__mapped_any", linux_e820_mapped_any as usize, true);
+    export_symbol_once(
+        "e820__mapped_raw_any",
+        linux_e820_mapped_any as usize,
+        false,
+    );
+}
+
+/// `e820__mapped_any` - `vendor/linux/arch/x86/kernel/e820.c:99`.
+///
+/// The module ABI does not expose Lupos' boot memory map as a mutable Linux
+/// `e820_table` yet.  Report no overlap so AGP aperture checks fail closed
+/// instead of consuming an invented RAM/reserved map.
+#[unsafe(export_name = "e820__mapped_any")]
+pub unsafe extern "C" fn linux_e820_mapped_any(_start: u64, _end: u64, _type: u32) -> bool {
+    false
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SetupDataHeader {

@@ -12,6 +12,10 @@
 //! - `vendor/linux/arch/x86/kernel/fpu/init.c`
 //! - `vendor/linux/arch/x86/kernel/fpu/xstate.c`
 
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+use crate::kernel::module::{export_symbol, find_symbol};
+
 const CR0_MP: u64 = 1 << 1;
 const CR0_EM: u64 = 1 << 2;
 const CR0_TS: u64 = 1 << 3;
@@ -19,12 +23,25 @@ const CR4_OSFXSR: u64 = 1 << 9;
 const CR4_OSXMMEXCPT: u64 = 1 << 10;
 const CR4_OSXSAVE: u64 = 1 << 18;
 
+const X86_FEATURE_FPU: u32 = 0;
+const X86_FEATURE_XMM: u32 = 0 * 32 + 25;
+const KFPU_387: u32 = 1 << 0;
+const KFPU_MXCSR: u32 = 1 << 1;
+const MXCSR_DEFAULT: u32 = 0x1f80;
+
 pub const XFEATURE_MASK_FP: u64 = 1 << 0;
 pub const XFEATURE_MASK_SSE: u64 = 1 << 1;
 pub const XFEATURE_MASK_YMM: u64 = 1 << 2;
 pub const XFEATURE_MASK_FPSSE: u64 = XFEATURE_MASK_FP | XFEATURE_MASK_SSE;
 pub const XFEATURE_MASK_AVX: u64 = XFEATURE_MASK_FPSSE | XFEATURE_MASK_YMM;
 pub const FXSAVE_AREA_SIZE: usize = 512;
+
+static mut KERNEL_FPU_SAVE: [FxSaveArea; crate::kernel::sched::MAX_CPUS] =
+    [FxSaveArea::zeroed(); crate::kernel::sched::MAX_CPUS];
+static KERNEL_FPU_DEPTH: [AtomicU32; crate::kernel::sched::MAX_CPUS] =
+    [const { AtomicU32::new(0) }; crate::kernel::sched::MAX_CPUS];
+static KERNEL_FPU_LOCKED_BH: [AtomicBool; crate::kernel::sched::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; crate::kernel::sched::MAX_CPUS];
 
 #[inline]
 unsafe fn read_cr0() -> u64 {
@@ -124,14 +141,22 @@ pub const fn xsave_supported_size(leaf_d0: crate::arch::x86::kernel::cpuid::Cpui
 /// # Safety
 /// The CPU must support FXSAVE/FXRSTOR and `state` must be writable memory.
 #[cfg(not(test))]
-pub unsafe fn save_fxstate(state: &mut FxSaveArea) {
+unsafe fn save_fxstate_raw(state: *mut FxSaveArea) {
     unsafe {
         core::arch::asm!(
             "fxsave64 [{ptr}]",
-            ptr = in(reg) state.bytes.as_mut_ptr(),
+            ptr = in(reg) state.cast::<u8>(),
             options(nostack, preserves_flags),
         );
     }
+}
+
+#[cfg(test)]
+unsafe fn save_fxstate_raw(_state: *mut FxSaveArea) {}
+
+#[cfg(not(test))]
+pub unsafe fn save_fxstate(state: &mut FxSaveArea) {
+    unsafe { save_fxstate_raw(state as *mut FxSaveArea) };
 }
 
 #[cfg(test)]
@@ -142,18 +167,137 @@ pub unsafe fn save_fxstate(_state: &mut FxSaveArea) {}
 /// # Safety
 /// The state image must have been produced by FXSAVE on a compatible CPU.
 #[cfg(not(test))]
-pub unsafe fn restore_fxstate(state: &FxSaveArea) {
+unsafe fn restore_fxstate_raw(state: *const FxSaveArea) {
     unsafe {
         core::arch::asm!(
             "fxrstor64 [{ptr}]",
-            ptr = in(reg) state.bytes.as_ptr(),
+            ptr = in(reg) state.cast::<u8>(),
             options(nostack, preserves_flags),
         );
     }
 }
 
 #[cfg(test)]
+unsafe fn restore_fxstate_raw(_state: *const FxSaveArea) {}
+
+#[cfg(not(test))]
+pub unsafe fn restore_fxstate(state: &FxSaveArea) {
+    unsafe { restore_fxstate_raw(state as *const FxSaveArea) };
+}
+
+#[cfg(test)]
 pub unsafe fn restore_fxstate(_state: &FxSaveArea) {}
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("irq_fpu_usable", irq_fpu_usable as usize, false);
+    export_symbol_once(
+        "kernel_fpu_begin_mask",
+        kernel_fpu_begin_mask as usize,
+        true,
+    );
+    export_symbol_once("kernel_fpu_end", kernel_fpu_end as usize, true);
+}
+
+#[inline]
+fn current_cpu_index() -> usize {
+    crate::kernel::sched::current_cpu() as usize
+}
+
+#[cfg(not(test))]
+#[inline]
+unsafe fn ldmxcsr_default() {
+    let mxcsr = MXCSR_DEFAULT;
+    unsafe {
+        core::arch::asm!("ldmxcsr [{ptr}]", ptr = in(reg) &mxcsr, options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(test)]
+#[inline]
+unsafe fn ldmxcsr_default() {}
+
+/// Linux `irq_fpu_usable()`.
+pub extern "C" fn irq_fpu_usable() -> bool {
+    let cpu = current_cpu_index();
+    if crate::kernel::locking::preempt::in_nmi() {
+        return false;
+    }
+    if KERNEL_FPU_DEPTH[cpu].load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    if !crate::kernel::locking::preempt::in_hardirq() {
+        return true;
+    }
+    !crate::kernel::locking::preempt::in_softirq()
+}
+
+/// Linux `kernel_fpu_begin_mask()`.
+pub extern "C" fn kernel_fpu_begin_mask(kfpu_mask: u32) {
+    let cpu = current_cpu_index();
+    if KERNEL_FPU_DEPTH[cpu].load(Ordering::Acquire) != 0 {
+        KERNEL_FPU_DEPTH[cpu].fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    let locked_bh = !crate::kernel::locking::irqs_disabled();
+    if locked_bh {
+        crate::kernel::locking::preempt::local_bh_disable();
+    }
+    let depth = KERNEL_FPU_DEPTH[cpu].fetch_add(1, Ordering::AcqRel);
+    if depth != 0 {
+        if locked_bh {
+            crate::kernel::locking::preempt::local_bh_enable();
+        }
+        return;
+    }
+    KERNEL_FPU_LOCKED_BH[cpu].store(locked_bh, Ordering::Release);
+
+    unsafe {
+        let state = core::ptr::addr_of_mut!(KERNEL_FPU_SAVE[cpu]);
+        save_fxstate_raw(state);
+    }
+
+    if kfpu_mask & KFPU_MXCSR != 0
+        && crate::arch::x86::kernel::cpu::common::boot_cpu_has(X86_FEATURE_XMM)
+    {
+        unsafe { ldmxcsr_default() };
+    }
+
+    if kfpu_mask & KFPU_387 != 0
+        && crate::arch::x86::kernel::cpu::common::boot_cpu_has(X86_FEATURE_FPU)
+    {
+        unsafe {
+            core::arch::asm!("fninit", options(nomem, nostack));
+        }
+    }
+}
+
+/// Linux `kernel_fpu_end()`.
+pub extern "C" fn kernel_fpu_end() {
+    let cpu = current_cpu_index();
+    let depth = KERNEL_FPU_DEPTH[cpu].load(Ordering::Acquire);
+    if depth == 0 {
+        return;
+    }
+
+    if KERNEL_FPU_DEPTH[cpu].fetch_sub(1, Ordering::AcqRel) != 1 {
+        return;
+    }
+
+    unsafe {
+        let state = core::ptr::addr_of!(KERNEL_FPU_SAVE[cpu]);
+        restore_fxstate_raw(state);
+    }
+
+    if KERNEL_FPU_LOCKED_BH[cpu].swap(false, Ordering::AcqRel) {
+        crate::kernel::locking::preempt::local_bh_enable();
+    }
+}
 
 /// Enable the architectural bits required for x87 and SSE instructions.
 ///

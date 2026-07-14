@@ -22,13 +22,18 @@
 //!   - `drivers/base/driver.c:225` — `driver_register`
 //!   - `drivers/base/dd.c:1215` — `__driver_attach`
 
+pub mod auxiliary;
 pub mod bus;
 pub mod class;
+pub mod component;
 pub mod device;
 pub mod driver;
+pub mod firmware;
 pub mod linux_sources;
 pub mod platform;
 pub(crate) mod printf;
+pub mod property;
+pub mod regmap;
 
 pub use bus::{
     BusType, LinuxBusType, bus_register, bus_unregister, linux_bus_type_registered,
@@ -55,6 +60,14 @@ pub use platform::{
 };
 
 pub fn register_module_exports() {
+    auxiliary::register_module_exports();
+    bus::register_module_exports();
+    class::register_module_exports();
     device::register_module_exports();
     driver::register_module_exports();
+    platform::register_module_exports();
+    component::register_module_exports();
+    property::register_module_exports();
+    regmap::register_module_exports();
+    firmware::register_module_exports();
 }

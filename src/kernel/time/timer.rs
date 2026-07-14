@@ -6,7 +6,10 @@
 //! Mirrors `vendor/linux/kernel/time/timer.c`.  High-resolution timers live in
 //! `hrtimer.rs`; this module models the jiffies-based `struct timer_list`.
 
+use core::ffi::c_void;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::kernel::module::{export_symbol, find_symbol};
 
 pub type TimerCallback = fn(u64);
 
@@ -31,6 +34,31 @@ impl TimerList {
 }
 
 static FIRED_TIMERS: AtomicU64 = AtomicU64::new(0);
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("timer_delete", linux_timer_delete as usize, false);
+    export_symbol_once("timer_delete_sync", linux_timer_delete as usize, false);
+    export_symbol_once("timer_delete_sync_try", linux_timer_delete as usize, false);
+    export_symbol_once("timer_shutdown", linux_timer_delete as usize, true);
+    export_symbol_once("timer_shutdown_sync", linux_timer_delete as usize, true);
+}
+
+/// `timer_delete`/`timer_delete_sync` - `vendor/linux/kernel/time/timer.c`.
+///
+/// Linux-built modules pass the vendor `struct timer_list`, whose layout is
+/// not this file's compact Rust test model.  Until Lupos owns a Linux timer
+/// wheel for module callbacks, report "not pending" without touching the
+/// foreign object.
+#[unsafe(export_name = "timer_delete")]
+pub unsafe extern "C" fn linux_timer_delete(_timer: *mut c_void) -> i32 {
+    0
+}
 
 pub fn timer_setup(timer: &mut TimerList, function: TimerCallback, data: u64) {
     timer.function = Some(function);

@@ -11,8 +11,83 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use core::ffi::c_void;
 
 use spin::Mutex;
+
+use crate::kernel::module::{export_symbol, find_symbol};
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "irq_domain_instantiate",
+        linux_irq_domain_instantiate as usize,
+        false,
+    );
+    export_symbol_once(
+        "__irq_resolve_mapping",
+        linux___irq_resolve_mapping as usize,
+        true,
+    );
+    export_symbol_once(
+        "irq_create_mapping_affinity",
+        linux_irq_create_mapping_affinity as usize,
+        true,
+    );
+    export_symbol_once("irq_domain_remove", linux_irq_domain_remove as usize, true);
+    export_symbol_once(
+        "irq_dispose_mapping",
+        linux_irq_dispose_mapping as usize,
+        true,
+    );
+}
+
+/// `irq_domain_instantiate` - `vendor/linux/kernel/irq/irqdomain.c`.
+pub unsafe extern "C" fn linux_irq_domain_instantiate(_info: *const c_void) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// `irq_create_mapping_affinity` - `vendor/linux/kernel/irq/irqdomain.c:822`.
+pub unsafe extern "C" fn linux_irq_create_mapping_affinity(
+    _domain: *mut c_void,
+    _hwirq: u64,
+    _affinity: *const c_void,
+) -> u32 {
+    0
+}
+
+/// `__irq_resolve_mapping` - `vendor/linux/kernel/irq/irqdomain.c:1054`.
+///
+/// Lupos has no module-created IRQ domain objects yet.  Returning NULL mirrors
+/// "no mapping found"; callers using the inline `irq_find_mapping()` see virq
+/// zero and follow their no-IRQ fallback path.
+#[unsafe(export_name = "__irq_resolve_mapping")]
+pub unsafe extern "C" fn linux___irq_resolve_mapping(
+    _domain: *mut c_void,
+    _hwirq: u64,
+    irq: *mut u32,
+) -> *mut c_void {
+    if !irq.is_null() {
+        unsafe {
+            *irq = 0;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// `irq_domain_remove` - `vendor/linux/kernel/irq/irqdomain.c`.
+///
+/// Module-created IRQ domains are not represented as Linux `struct irq_domain`
+/// objects yet. Preserve teardown ABI for fail-closed users.
+pub unsafe extern "C" fn linux_irq_domain_remove(_domain: *mut c_void) {}
+
+/// `irq_dispose_mapping` - `vendor/linux/kernel/irq/irqdomain.c`.
+pub unsafe extern "C" fn linux_irq_dispose_mapping(_virq: u32) {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IrqDomainKind {

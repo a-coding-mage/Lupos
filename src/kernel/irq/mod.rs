@@ -46,5 +46,10 @@ pub use manage::{
 };
 
 pub fn register_module_exports() {
+    irqdesc::register_module_exports();
+    chip::register_module_exports();
+    dummychip::register_module_exports();
+    handle::register_module_exports();
+    irqdomain::register_module_exports();
     manage::register_module_exports();
 }

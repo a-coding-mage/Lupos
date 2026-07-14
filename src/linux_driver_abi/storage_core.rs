@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::include::uapi::errno::{EINVAL, ENODEV, ENOMEM};
+use crate::include::uapi::errno::{EINVAL, ENODEV, ENOENT, ENOMEM, ERANGE};
 use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::workqueue::{
     SYSTEM_HIGHPRI_WQ, SYSTEM_LONG_WQ, SYSTEM_UNBOUND_WQ, SYSTEM_WQ, WorkStruct, Workqueue,
@@ -37,7 +37,7 @@ use crate::linux_driver_abi::block::{
     linux_blk_mq_alloc_disk_for_queue as block_blk_mq_alloc_disk_for_queue,
     linux_blk_mq_alloc_queue as block_blk_mq_alloc_queue,
 };
-use crate::linux_driver_abi::pci::device::linux_pci_config_read;
+use crate::linux_driver_abi::pci::device::{linux_pci_config_read, linux_pci_config_write};
 
 const PAGE_SIZE: usize = 4096;
 const CLOCKS_PER_SEC: u64 = 100;
@@ -46,6 +46,8 @@ const SG_PAGE_LINK_MASK: usize = crate::lib::scatterlist::SG_PAGE_LINK_MASK;
 const LINUX_TIMER_LIST_FLAGS_OFFSET: usize = 0x20;
 const LINUX_TIMER_LIST_SIZE: usize = 0x28;
 const LINUX_WAIT_QUEUE_ENTRY_SIZE: usize = 0x28;
+const LINUX_WAIT_QUEUE_ENTRY_LIST_OFFSET: usize = 0x18;
+const LINUX_LIST_HEAD_PREV_OFFSET: usize = 0x8;
 const LINUX_SCATTERLIST_SIZE: usize = 0x20;
 const LINUX_SCATTERLIST_OFFSET_OFFSET: usize = 0x8;
 const LINUX_SCATTERLIST_LENGTH_OFFSET: usize = 0xc;
@@ -298,12 +300,31 @@ pub fn register_module_exports() {
         linux_class_interface_register,
         false
     );
+    export_fn!(
+        "class_interface_unregister",
+        linux_class_interface_unregister,
+        false
+    );
     export_fn!("dev_set_name", linux_dev_set_name, false);
     export_fn!("dev_driver_string", linux_dev_driver_string, false);
+    export_fn!("device_create", linux_device_create, true);
+    export_fn!("device_destroy", linux_device_destroy, true);
     export_fn!("device_del", linux_device_del, false);
+    export_fn!("device_create_file", linux_device_create_file, true);
     export_fn!("device_remove_file", linux_device_remove_file, false);
+    export_fn!(
+        "device_create_bin_file",
+        linux_device_create_bin_file,
+        false
+    );
+    export_fn!(
+        "device_remove_bin_file",
+        linux_device_remove_bin_file,
+        false
+    );
     export_fn!("device_for_each_child", linux_device_for_each_child, false);
     export_fn!("device_link_add", linux_device_link_add, false);
+    export_fn!("device_link_del", linux_device_link_del, false);
     export_fn!("device_link_remove", linux_device_link_remove, false);
     export_fn!("kobject_uevent_env", linux_kobject_uevent_env, false);
     export_fn!("add_uevent_var", linux_add_uevent_var, false);
@@ -351,7 +372,17 @@ pub fn register_module_exports() {
         crate::mm::mempool::mempool_alloc_pages,
         true
     );
+    export_fn!(
+        "mempool_alloc_slab",
+        crate::mm::mempool::mempool_alloc_slab,
+        true
+    );
     export_fn!("mempool_free", crate::mm::mempool::mempool_free, true);
+    export_fn!(
+        "mempool_free_slab",
+        crate::mm::mempool::mempool_free_slab,
+        true
+    );
     export_fn!(
         "mempool_free_pages",
         crate::mm::mempool::mempool_free_pages,
@@ -382,6 +413,8 @@ pub fn register_module_exports() {
 
     export_fn!("__init_waitqueue_head", linux___init_waitqueue_head, false);
     export_fn!("init_wait_entry", linux_init_wait_entry, false);
+    export_fn!("add_wait_queue", linux_add_wait_queue, false);
+    export_fn!("remove_wait_queue", linux_remove_wait_queue, false);
     export_fn!("prepare_to_wait", linux_prepare_to_wait, false);
     export_fn!("prepare_to_wait_event", linux_prepare_to_wait_event, false);
     export_fn!("finish_wait", linux_finish_wait, false);
@@ -391,6 +424,7 @@ pub fn register_module_exports() {
         linux_autoremove_wake_function,
         false
     );
+    export_fn!("default_wake_function", linux_default_wake_function, false);
     export_fn!(
         "wait_for_completion_timeout",
         linux_wait_for_completion_timeout,
@@ -431,6 +465,7 @@ pub fn register_module_exports() {
     export_fn!("sg_copy_from_buffer", linux_sg_copy_from_buffer, true);
     export_fn!("sg_copy_to_buffer", linux_sg_copy_to_buffer, true);
     export_fn!("sg_miter_start", linux_sg_miter_start, true);
+    export_fn!("sg_miter_skip", linux_sg_miter_skip, false);
     export_fn!("sg_miter_next", linux_sg_miter_next, true);
     export_fn!("sg_miter_stop", linux_sg_miter_stop, true);
 
@@ -478,6 +513,7 @@ pub fn register_module_exports() {
     export_fn!("blk_abort_request", linux_blk_abort_request, true);
     export_fn!("blk_rq_init", linux_blk_rq_init, true);
     export_fn!("blk_rq_map_user", linux_blk_rq_map_user, true);
+    export_fn!("blk_rq_map_user_iov", linux_blk_rq_map_user_iov, true);
     export_fn!("blk_rq_map_user_io", linux_blk_rq_map_user_io, true);
     export_fn!("blk_rq_unmap_user", linux_blk_rq_unmap_user, true);
     export_fn!("blk_execute_rq_nowait", linux_blk_execute_rq_nowait, true);
@@ -511,7 +547,9 @@ pub fn register_module_exports() {
 
     export_fn!("pcim_enable_device", linux_pcim_enable_device, false);
     export_fn!("pcim_pin_device", linux_pcim_pin_device, false);
+    export_fn!("pcim_intx", linux_pcim_intx, true);
     export_fn!("pcim_iomap", linux_pcim_iomap, false);
+    export_fn!("pcim_iomap_region", linux_pcim_iomap_region, false);
     export_fn!("pcim_iomap_regions", linux_pcim_iomap_regions, false);
     export_fn!("pcim_iomap_table", linux_pcim_iomap_table, false);
     export_fn!(
@@ -564,6 +602,16 @@ pub fn register_module_exports() {
         linux_attribute_container_unregister,
         true
     );
+    export_fn!(
+        "anon_transport_class_register",
+        linux_anon_transport_class_register,
+        true
+    );
+    export_fn!(
+        "anon_transport_class_unregister",
+        linux_anon_transport_class_unregister,
+        true
+    );
 
     export_fn!("async_schedule_node", linux_async_schedule_node, false);
     export_fn!(
@@ -574,9 +622,12 @@ pub fn register_module_exports() {
 
     export_fn!("kstrtoull", linux_kstrtoull, false);
     export_fn!("kstrtouint", linux_kstrtouint, false);
+    export_fn!("kstrtou16", linux_kstrtou16, false);
+    export_fn!("kstrtou8", linux_kstrtou8, false);
     export_fn!("kstrtoint", linux_kstrtoint, false);
     export_fn!("kstrtobool", linux_kstrtobool, false);
     export_fn!("kstrdup", linux_kstrdup, false);
+    export_fn!("simple_strtol", linux_simple_strtol, false);
     export_fn!("simple_strtoul", linux_simple_strtoul, false);
     export_fn!("simple_strtoull", linux_simple_strtoull, false);
     export_fn!("sysfs_streq", linux_sysfs_streq, false);
@@ -606,10 +657,21 @@ pub fn register_module_exports() {
 
     export_fn!("__devres_alloc_node", linux___devres_alloc_node, false);
     export_fn!("devres_add", linux_devres_add, false);
+    export_fn!("devres_find", linux_devres_find, true);
+    export_fn!("devres_remove", linux_devres_remove, true);
+    export_fn!("devres_destroy", linux_devres_destroy, true);
+    export_fn!("devres_release", linux_devres_release, true);
     export_fn!("devres_free", linux_devres_free, false);
     export_fn!("devres_open_group", linux_devres_open_group, false);
     export_fn!("devres_release_group", linux_devres_release_group, false);
     export_fn!("devres_remove_group", linux_devres_remove_group, false);
+    export_fn!("__devm_add_action", linux___devm_add_action, true);
+    export_fn!("devm_release_action", linux_devm_release_action, true);
+    export_fn!(
+        "devm_remove_action_nowarn",
+        linux_devm_remove_action_nowarn,
+        true
+    );
     export_fn!("devm_kmalloc", linux_devm_kmalloc, false);
     export_fn!("devm_kfree", linux_devm_kfree, false);
     export_fn!("devm_kasprintf", linux_devm_kasprintf, false);
@@ -699,6 +761,17 @@ struct LinuxClass {
     name: *const c_char,
 }
 
+#[derive(Clone, Copy)]
+struct LinuxCreatedDevice {
+    class: usize,
+    devt: u32,
+    dev: usize,
+}
+
+fn err_ptr(errno: i32) -> *mut c_void {
+    (-(errno as isize)) as *mut c_void
+}
+
 unsafe extern "C" fn linux_class_register(class: *const LinuxClass) -> i32 {
     if class.is_null() {
         return -EINVAL;
@@ -719,6 +792,85 @@ unsafe extern "C" fn linux_class_find_device(
 
 unsafe extern "C" fn linux_class_interface_register(_class_intf: *mut c_void) -> i32 {
     0
+}
+
+unsafe extern "C" fn linux_class_interface_unregister(_class_intf: *mut c_void) {}
+
+unsafe extern "C" fn linux_device_create(
+    class: *const LinuxClass,
+    parent: *mut LinuxDevice,
+    devt: u32,
+    drvdata: *mut c_void,
+    fmt: *const c_char,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+) -> *mut LinuxDevice {
+    if class.is_null() || fmt.is_null() {
+        return err_ptr(ENODEV).cast();
+    }
+
+    let mut name = [0u8; 64];
+    let written = unsafe {
+        format_args(
+            name.as_mut_ptr(),
+            name.len(),
+            fmt,
+            &[arg0, arg1, arg2, arg3],
+        )
+    };
+    if written <= 0 {
+        return err_ptr(EINVAL).cast();
+    }
+
+    let dev = Box::into_raw(Box::new(unsafe { core::mem::zeroed::<LinuxDevice>() }));
+    unsafe {
+        (*dev).parent = parent;
+        (*dev).driver_data = drvdata;
+    }
+    if unsafe {
+        crate::linux_driver_abi::base::linux_device_set_name_bytes(dev, &name[..written as usize])
+    }
+    .is_err()
+    {
+        unsafe {
+            let _ = Box::from_raw(dev);
+        }
+        return err_ptr(EINVAL).cast();
+    }
+
+    let ret = unsafe { crate::linux_driver_abi::base::linux_device_register(dev) };
+    if ret != 0 {
+        unsafe {
+            let _ = Box::from_raw(dev);
+        }
+        return err_ptr(-ret).cast();
+    }
+
+    LINUX_CREATED_DEVICES.lock().push(LinuxCreatedDevice {
+        class: class as usize,
+        devt,
+        dev: dev as usize,
+    });
+    dev
+}
+
+unsafe extern "C" fn linux_device_destroy(class: *const LinuxClass, devt: u32) {
+    let mut devices = LINUX_CREATED_DEVICES.lock();
+    let Some(pos) = devices
+        .iter()
+        .position(|entry| entry.class == class as usize && entry.devt == devt)
+    else {
+        return;
+    };
+    let dev = devices.swap_remove(pos).dev as *mut LinuxDevice;
+    drop(devices);
+
+    unsafe {
+        crate::linux_driver_abi::base::linux_device_unregister(dev);
+        let _ = Box::from_raw(dev);
+    }
 }
 
 unsafe extern "C" fn linux_dev_set_name(
@@ -765,9 +917,22 @@ unsafe extern "C" fn linux_device_del(dev: *mut LinuxDevice) {
     }
 }
 
+unsafe extern "C" fn linux_device_create_file(_dev: *mut LinuxDevice, _attr: *const c_void) -> i32 {
+    0
+}
+
 unsafe extern "C" fn linux_device_remove_file(_dev: *mut LinuxDevice, _attr: *const c_void) -> i32 {
     0
 }
+
+unsafe extern "C" fn linux_device_create_bin_file(
+    _dev: *mut LinuxDevice,
+    _attr: *const c_void,
+) -> i32 {
+    0
+}
+
+unsafe extern "C" fn linux_device_remove_bin_file(_dev: *mut LinuxDevice, _attr: *const c_void) {}
 
 type DeviceChildCallback = unsafe extern "C" fn(*mut LinuxDevice, *mut c_void) -> i32;
 
@@ -786,6 +951,8 @@ unsafe extern "C" fn linux_device_link_add(
 ) -> *mut c_void {
     core::ptr::dangling_mut::<c_void>()
 }
+
+unsafe extern "C" fn linux_device_link_del(_link: *mut c_void) {}
 
 unsafe extern "C" fn linux_device_link_remove(
     _consumer: *mut LinuxDevice,
@@ -1115,6 +1282,54 @@ unsafe extern "C" fn linux_init_wait_entry(wait: *mut c_void, flags: i32) {
     }
 }
 
+unsafe fn wait_entry_list(wait: *mut c_void) -> *mut c_void {
+    unsafe { (wait as *mut u8).add(LINUX_WAIT_QUEUE_ENTRY_LIST_OFFSET) as *mut c_void }
+}
+
+unsafe fn list_next(list: *mut c_void) -> *mut *mut c_void {
+    list as *mut *mut c_void
+}
+
+unsafe fn list_prev(list: *mut c_void) -> *mut *mut c_void {
+    unsafe { (list as *mut u8).add(LINUX_LIST_HEAD_PREV_OFFSET) as *mut *mut c_void }
+}
+
+unsafe extern "C" fn linux_add_wait_queue(queue: *mut LinuxWaitQueueHead, wait: *mut c_void) {
+    if queue.is_null() || wait.is_null() {
+        return;
+    }
+    let head = queue.cast::<c_void>();
+    let entry = unsafe { wait_entry_list(wait) };
+    unsafe {
+        if (*queue).head_next.is_null() || (*queue).head_prev.is_null() {
+            (*queue).head_next = head;
+            (*queue).head_prev = head;
+        }
+        let next = (*queue).head_next;
+        *list_next(entry) = next;
+        *list_prev(entry) = head;
+        *list_prev(next) = entry;
+        (*queue).head_next = entry;
+    }
+}
+
+unsafe extern "C" fn linux_remove_wait_queue(_queue: *mut LinuxWaitQueueHead, wait: *mut c_void) {
+    if wait.is_null() {
+        return;
+    }
+    let entry = unsafe { wait_entry_list(wait) };
+    unsafe {
+        let next = *list_next(entry);
+        let prev = *list_prev(entry);
+        if !next.is_null() && !prev.is_null() {
+            *list_next(prev) = next;
+            *list_prev(next) = prev;
+        }
+        *list_next(entry) = entry;
+        *list_prev(entry) = entry;
+    }
+}
+
 unsafe extern "C" fn linux_prepare_to_wait(
     _queue: *mut LinuxWaitQueueHead,
     _wait: *mut c_void,
@@ -1141,6 +1356,15 @@ unsafe extern "C" fn linux___wake_up(
 }
 
 unsafe extern "C" fn linux_autoremove_wake_function(
+    _wait: *mut c_void,
+    _mode: u32,
+    _sync: i32,
+    _key: *mut c_void,
+) -> i32 {
+    1
+}
+
+unsafe extern "C" fn linux_default_wake_function(
     _wait: *mut c_void,
     _mode: u32,
     _sync: i32,
@@ -1575,6 +1799,39 @@ unsafe extern "C" fn linux_sg_miter_next(miter: *mut LinuxSgMappingIter) -> bool
     }
 }
 
+unsafe extern "C" fn linux_sg_miter_skip(miter: *mut LinuxSgMappingIter, mut offset: i64) -> bool {
+    if miter.is_null() || offset < 0 {
+        return false;
+    }
+    unsafe { linux_sg_miter_stop(miter) };
+
+    unsafe {
+        while offset != 0 {
+            if (*miter).piter.nents == 0 || (*miter).piter.sg.is_null() {
+                return false;
+            }
+            let sg = (*miter).piter.sg;
+            let len = (*sg).length as i64;
+            if offset < len {
+                let skipped = offset as usize;
+                (*miter).addr = linux_sg_cpu_addr(sg).add(skipped).cast::<c_void>();
+                (*miter).page =
+                    ((*sg).page_link & !crate::lib::scatterlist::SG_PAGE_LINK_MASK) as *mut c_void;
+                (*miter).length = (*sg).length as usize - skipped;
+                (*miter).consumed = skipped;
+                (*miter).offset = (*sg).offset.saturating_add(skipped as u32);
+                (*miter).remaining = ((*sg).length as usize - skipped) as u32;
+                return true;
+            }
+            offset -= len;
+            (*miter).piter.sg = sg.add(1);
+            (*miter).piter.nents -= 1;
+        }
+    }
+
+    true
+}
+
 unsafe extern "C" fn linux_sg_miter_stop(_miter: *mut LinuxSgMappingIter) {}
 
 unsafe extern "C" fn linux___blk_mq_end_request(rq: *mut LinuxRequest, status: LinuxBlkStatus) {
@@ -1716,6 +1973,16 @@ unsafe extern "C" fn linux_blk_rq_map_user(
     -ENODEV
 }
 
+unsafe extern "C" fn linux_blk_rq_map_user_iov(
+    _q: *mut LinuxRequestQueue,
+    _rq: *mut LinuxRequest,
+    _map_data: *mut c_void,
+    _iter: *mut c_void,
+    _gfp: u32,
+) -> i32 {
+    -ENODEV
+}
+
 unsafe extern "C" fn linux_blk_rq_map_user_io(
     _q: *mut LinuxRequestQueue,
     _rq: *mut LinuxRequest,
@@ -1781,14 +2048,42 @@ unsafe extern "C" fn linux_pcim_enable_device(dev: *mut c_void) -> i32 {
 
 unsafe extern "C" fn linux_pcim_pin_device(_dev: *mut c_void) {}
 
+unsafe extern "C" fn linux_pcim_intx(dev: *mut c_void, enable: i32) -> i32 {
+    const PCI_COMMAND: usize = 0x04;
+    const PCI_COMMAND_INTX_DISABLE: u16 = 0x0400;
+
+    let Some(command) = linux_pci_config_read(dev.cast_const(), PCI_COMMAND, 2) else {
+        return -EINVAL;
+    };
+    let command = if enable != 0 {
+        (command as u16) & !PCI_COMMAND_INTX_DISABLE
+    } else {
+        (command as u16) | PCI_COMMAND_INTX_DISABLE
+    };
+    if linux_pci_config_write(dev.cast_const(), PCI_COMMAND, 2, command as u32) {
+        0
+    } else {
+        -EINVAL
+    }
+}
+
 #[derive(Clone)]
 struct PcimIomapEntry {
     dev: usize,
     table: Box<[usize; 6]>,
 }
 
+#[derive(Clone, Copy)]
+struct DevmActionEntry {
+    dev: usize,
+    action: usize,
+    data: usize,
+}
+
 lazy_static! {
     static ref PCIM_IOMAPS: Mutex<Vec<PcimIomapEntry>> = Mutex::new(Vec::new());
+    static ref DEVM_ACTIONS: Mutex<Vec<DevmActionEntry>> = Mutex::new(Vec::new());
+    static ref LINUX_CREATED_DEVICES: Mutex<Vec<LinuxCreatedDevice>> = Mutex::new(Vec::new());
 }
 
 static AHCI_BAR5_MMIO: AtomicUsize = AtomicUsize::new(0);
@@ -2135,6 +2430,24 @@ unsafe extern "C" fn linux_pcim_iomap(dev: *mut c_void, bar: i32, maxlen: usize)
     mapped
 }
 
+unsafe extern "C" fn linux_pcim_iomap_region(
+    dev: *mut c_void,
+    bar: i32,
+    name: *const c_char,
+) -> *mut c_void {
+    let ret = unsafe { crate::linux_driver_abi::pci::pci::pci_request_region(dev, bar, name) };
+    if ret != 0 {
+        return linux_error_ptr(-ret);
+    }
+
+    let mapped = unsafe { linux_pcim_iomap(dev, bar, 0) };
+    if mapped.is_null() {
+        unsafe { crate::linux_driver_abi::pci::pci::pci_release_region(dev, bar) };
+        return linux_error_ptr(EINVAL);
+    }
+    mapped
+}
+
 unsafe extern "C" fn linux_pcim_iomap_regions(
     dev: *mut c_void,
     mask: i32,
@@ -2215,7 +2528,11 @@ unsafe extern "C" fn linux_transport_class_unregister(_class: *mut c_void) {}
 unsafe extern "C" fn linux_attribute_container_register(_container: *mut c_void) -> i32 {
     0
 }
-unsafe extern "C" fn linux_attribute_container_unregister(_container: *mut c_void) {}
+unsafe extern "C" fn linux_attribute_container_unregister(_container: *mut c_void) -> i32 {
+    0
+}
+unsafe extern "C" fn linux_anon_transport_class_register(_atc: *mut c_void) {}
+unsafe extern "C" fn linux_anon_transport_class_unregister(_atc: *mut c_void) {}
 
 type AsyncFunc = unsafe extern "C" fn(*mut c_void, u64);
 
@@ -2306,6 +2623,36 @@ unsafe extern "C" fn linux_kstrtouint(s: *const c_char, base: u32, res: *mut u32
     }
 }
 
+unsafe extern "C" fn linux_kstrtou16(s: *const c_char, base: u32, res: *mut u16) -> i32 {
+    let mut value = 0u64;
+    let ret = unsafe { linux_kstrtoull(s, base, &mut value) };
+    if ret < 0 {
+        return ret;
+    }
+    if value > u16::MAX as u64 {
+        return -ERANGE;
+    }
+    if !res.is_null() {
+        unsafe { *res = value as u16 };
+    }
+    0
+}
+
+unsafe extern "C" fn linux_kstrtou8(s: *const c_char, base: u32, res: *mut u8) -> i32 {
+    let mut value = 0u64;
+    let ret = unsafe { linux_kstrtoull(s, base, &mut value) };
+    if ret < 0 {
+        return ret;
+    }
+    if value > u8::MAX as u64 {
+        return -ERANGE;
+    }
+    if !res.is_null() {
+        unsafe { *res = value as u8 };
+    }
+    0
+}
+
 unsafe extern "C" fn linux_kstrtoint(s: *const c_char, base: u32, res: *mut i32) -> i32 {
     if s.is_null() {
         return -EINVAL;
@@ -2371,6 +2718,22 @@ unsafe extern "C" fn linux_simple_strtoul(
     base: u32,
 ) -> u64 {
     unsafe { linux_simple_strtoull(cp, endp, base) }
+}
+
+unsafe extern "C" fn linux_simple_strtol(
+    cp: *const c_char,
+    endp: *mut *mut c_char,
+    base: u32,
+) -> i64 {
+    if cp.is_null() {
+        return 0;
+    }
+    if unsafe { *cp.cast::<u8>() } == b'-' {
+        let value = unsafe { linux_simple_strtoul(cp.add(1), endp, base) };
+        -(value as i64)
+    } else {
+        unsafe { linux_simple_strtoul(cp, endp, base) as i64 }
+    }
 }
 
 unsafe extern "C" fn linux_sysfs_streq(s1: *const c_char, s2: *const c_char) -> bool {
@@ -2811,6 +3174,62 @@ unsafe extern "C" fn linux___devres_alloc_node(
 
 unsafe extern "C" fn linux_devres_add(_dev: *mut LinuxDevice, _res: *mut c_void) {}
 
+unsafe extern "C" fn linux_devres_find(
+    _dev: *mut LinuxDevice,
+    _release: *mut c_void,
+    _match_: *mut c_void,
+    _match_data: *mut c_void,
+) -> *mut c_void {
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn linux_devres_remove(
+    dev: *mut LinuxDevice,
+    release: *mut c_void,
+    match_: *mut c_void,
+    match_data: *mut c_void,
+) -> *mut c_void {
+    unsafe { linux_devres_find(dev, release, match_, match_data) }
+}
+
+unsafe extern "C" fn linux_devres_destroy(
+    dev: *mut LinuxDevice,
+    release: *mut c_void,
+    match_: *mut c_void,
+    match_data: *mut c_void,
+) -> i32 {
+    let res = unsafe { linux_devres_remove(dev, release, match_, match_data) };
+    if res.is_null() {
+        return -ENOENT;
+    }
+    unsafe { linux_devres_free(res) };
+    0
+}
+
+unsafe extern "C" fn linux_devres_release(
+    dev: *mut LinuxDevice,
+    release: Option<unsafe extern "C" fn(*mut LinuxDevice, *mut c_void)>,
+    match_: *mut c_void,
+    match_data: *mut c_void,
+) -> i32 {
+    let res = unsafe {
+        linux_devres_remove(
+            dev,
+            release.map(|f| f as usize).unwrap_or(0) as *mut c_void,
+            match_,
+            match_data,
+        )
+    };
+    if res.is_null() {
+        return -ENOENT;
+    }
+    if let Some(release) = release {
+        unsafe { release(dev, res) };
+    }
+    unsafe { linux_devres_free(res) };
+    0
+}
+
 unsafe extern "C" fn linux_devres_free(res: *mut c_void) {
     if res.is_null() {
         return;
@@ -2832,6 +3251,65 @@ unsafe extern "C" fn linux_devres_release_group(_dev: *mut LinuxDevice, _id: *mu
 }
 
 unsafe extern "C" fn linux_devres_remove_group(_dev: *mut LinuxDevice, _id: *mut c_void) {}
+
+unsafe extern "C" fn linux___devm_add_action(
+    dev: *mut LinuxDevice,
+    action: Option<unsafe extern "C" fn(*mut c_void)>,
+    data: *mut c_void,
+    _name: *const c_char,
+) -> i32 {
+    let Some(action) = action else {
+        return -EINVAL;
+    };
+    let mut actions = DEVM_ACTIONS.lock();
+    if actions.try_reserve_exact(1).is_err() {
+        return -ENOMEM;
+    }
+    actions.push(DevmActionEntry {
+        dev: dev as usize,
+        action: action as usize,
+        data: data as usize,
+    });
+    0
+}
+
+fn remove_devm_action(
+    dev: *mut LinuxDevice,
+    action: Option<unsafe extern "C" fn(*mut c_void)>,
+    data: *mut c_void,
+) -> Option<DevmActionEntry> {
+    let action = action? as usize;
+    let mut actions = DEVM_ACTIONS.lock();
+    let index = actions.iter().rposition(|entry| {
+        entry.dev == dev as usize && entry.action == action && entry.data == data as usize
+    })?;
+    Some(actions.swap_remove(index))
+}
+
+unsafe extern "C" fn linux_devm_remove_action_nowarn(
+    dev: *mut LinuxDevice,
+    action: Option<unsafe extern "C" fn(*mut c_void)>,
+    data: *mut c_void,
+) -> i32 {
+    if remove_devm_action(dev, action, data).is_some() {
+        0
+    } else {
+        -ENOENT
+    }
+}
+
+unsafe extern "C" fn linux_devm_release_action(
+    dev: *mut LinuxDevice,
+    action: Option<unsafe extern "C" fn(*mut c_void)>,
+    data: *mut c_void,
+) {
+    let Some(entry) = remove_devm_action(dev, action, data) else {
+        return;
+    };
+    if let Some(action) = action {
+        unsafe { action(entry.data as *mut c_void) };
+    }
+}
 
 unsafe extern "C" fn linux_devm_kmalloc(
     dev: *mut LinuxDevice,
@@ -2966,9 +3444,63 @@ mod tests {
             Some(linux_pcim_iomap_table as usize)
         );
         assert_eq!(
+            crate::kernel::module::find_symbol("pcim_iomap_region"),
+            Some(linux_pcim_iomap_region as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("devres_destroy"),
+            Some(linux_devres_destroy as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("devm_release_action"),
+            Some(linux_devm_release_action as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("device_create_file"),
+            Some(linux_device_create_file as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("sg_miter_skip"),
+            Some(linux_sg_miter_skip as usize)
+        );
+        assert_eq!(
             crate::kernel::module::find_symbol("root-only-never-present"),
             None
         );
+    }
+
+    static DEVM_ACTION_TEST_VALUE: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn record_devm_action(data: *mut c_void) {
+        DEVM_ACTION_TEST_VALUE.store(data as usize, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn devm_release_action_runs_latest_matching_action_once() {
+        DEVM_ACTION_TEST_VALUE.store(0, Ordering::SeqCst);
+        let mut dev = unsafe { core::mem::zeroed::<LinuxDevice>() };
+        let dev = core::ptr::addr_of_mut!(dev);
+        unsafe {
+            assert_eq!(
+                linux___devm_add_action(
+                    dev,
+                    Some(record_devm_action),
+                    0xabcusize as *mut c_void,
+                    core::ptr::null()
+                ),
+                0
+            );
+            linux_devm_release_action(dev, Some(record_devm_action), 0xabcusize as *mut c_void);
+            assert_eq!(DEVM_ACTION_TEST_VALUE.load(Ordering::SeqCst), 0xabc);
+            assert_eq!(
+                linux_devm_remove_action_nowarn(
+                    dev,
+                    Some(record_devm_action),
+                    0xabcusize as *mut c_void
+                ),
+                -ENOENT
+            );
+        }
     }
 
     #[test]
@@ -2980,6 +3512,24 @@ mod tests {
             0
         );
         assert_eq!(out, 42);
+    }
+
+    #[test]
+    fn narrow_kstrtou_helpers_report_range() {
+        let input = b"65535\n\0";
+        let mut out16 = 0u16;
+        assert_eq!(
+            unsafe { linux_kstrtou16(input.as_ptr().cast(), 10, &mut out16) },
+            0
+        );
+        assert_eq!(out16, u16::MAX);
+
+        let too_wide = b"256\n\0";
+        let mut out8 = 0u8;
+        assert_eq!(
+            unsafe { linux_kstrtou8(too_wide.as_ptr().cast(), 10, &mut out8) },
+            -ERANGE
+        );
     }
 
     #[test]

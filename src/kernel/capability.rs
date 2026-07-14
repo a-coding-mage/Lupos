@@ -19,6 +19,7 @@
 //! Reference: Linux `include/linux/capability.h`, `kernel/capability.c`.
 
 use crate::kernel::cred::{Cred, current_cred};
+use crate::kernel::module::{export_symbol, find_symbol};
 
 // ── Capability bit numbers (Linux uapi/linux/capability.h) ───────────────────
 
@@ -70,6 +71,16 @@ pub const CAP_LAST_CAP: u32 = CAP_CHECKPOINT_RESTORE;
 /// Number of u32 words used to hold the capability bitmask.
 /// Linux: `_KERNEL_CAPABILITY_U32S` (2 since 2.6.26).
 pub const KERNEL_CAPABILITY_U32S: usize = 2;
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("capable", linux_capable as usize, true);
+}
 
 // ── Capability set (kernel_cap_t) ────────────────────────────────────────────
 
@@ -168,6 +179,11 @@ pub fn capable(cap: u32) -> bool {
 /// hierarchy is wired in M28.
 pub fn ns_capable(_user_ns: *const core::ffi::c_void, cap: u32) -> bool {
     capable(cap)
+}
+
+/// `capable` - `vendor/linux/kernel/capability.c`.
+pub unsafe extern "C" fn linux_capable(cap: i32) -> bool {
+    cap >= 0 && capable(cap as u32)
 }
 
 // ── UAPI structs (capget / capset) ───────────────────────────────────────────

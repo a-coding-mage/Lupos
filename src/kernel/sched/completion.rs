@@ -26,6 +26,21 @@ pub fn register_module_exports() {
         linux_wait_for_completion as usize,
         false,
     );
+    export_symbol_once(
+        "try_wait_for_completion",
+        linux_try_wait_for_completion_export as usize,
+        false,
+    );
+    export_symbol_once(
+        "wait_for_completion_interruptible",
+        linux_wait_for_completion_interruptible as usize,
+        false,
+    );
+    export_symbol_once(
+        "wait_for_completion_interruptible_timeout",
+        linux_wait_for_completion_interruptible_timeout as usize,
+        false,
+    );
 }
 
 pub fn init_completion(completion: &Completion) {
@@ -76,6 +91,43 @@ pub unsafe fn linux_try_wait_for_completion_raw(completion: *mut c_void) -> bool
         }
     }
     true
+}
+
+unsafe fn linux_wait_for_completion_jiffies(completion: *mut c_void, timeout: u64) -> u64 {
+    if completion.is_null() {
+        return 0;
+    }
+    if unsafe { linux_try_wait_for_completion_raw(completion) } {
+        return timeout.max(1);
+    }
+    if timeout == 0 {
+        return 0;
+    }
+
+    let expires = crate::kernel::time::jiffies::jiffies().saturating_add(timeout);
+    loop {
+        #[cfg(not(test))]
+        {
+            // Match `linux_wait_for_completion`: raw module completions do not
+            // enqueue on Lupos' native wait queues, so pump vendor-driver events
+            // at the wait boundary before yielding.
+            let _ = crate::linux_driver_abi::poll_driver_abi_events();
+            unsafe {
+                crate::kernel::sched::schedule_with_irqs_enabled();
+            }
+        }
+        #[cfg(test)]
+        return 0;
+
+        if unsafe { linux_try_wait_for_completion_raw(completion) } {
+            return expires
+                .saturating_sub(crate::kernel::time::jiffies::jiffies())
+                .max(1);
+        }
+        if crate::kernel::time::jiffies::jiffies() >= expires {
+            return 0;
+        }
+    }
 }
 
 /// `complete` - `vendor/linux/kernel/sched/completion.c:36`.
@@ -129,6 +181,30 @@ pub unsafe extern "C" fn linux_wait_for_completion(completion: *mut c_void) {
     }
 }
 
+/// `try_wait_for_completion` - `vendor/linux/kernel/sched/completion.c:309`.
+pub unsafe extern "C" fn linux_try_wait_for_completion_export(completion: *mut c_void) -> bool {
+    unsafe { linux_try_wait_for_completion_raw(completion) }
+}
+
+/// `wait_for_completion_interruptible` - `vendor/linux/kernel/sched/completion.c:219`.
+pub unsafe extern "C" fn linux_wait_for_completion_interruptible(completion: *mut c_void) -> i32 {
+    unsafe {
+        linux_wait_for_completion(completion);
+    }
+    0
+}
+
+/// `wait_for_completion_interruptible_timeout` - `vendor/linux/kernel/sched/completion.c:241`.
+pub unsafe extern "C" fn linux_wait_for_completion_interruptible_timeout(
+    completion: *mut c_void,
+    timeout: u64,
+) -> i64 {
+    // Lupos does not deliver Linux task signals into this raw module wait path,
+    // so there is no `-ERESTARTSYS` case here; completion and timeout semantics
+    // match Linux's positive/zero return values.
+    unsafe { linux_wait_for_completion_jiffies(completion, timeout) as i64 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +231,18 @@ mod tests {
             crate::kernel::module::find_symbol("wait_for_completion"),
             Some(linux_wait_for_completion as usize)
         );
+        assert_eq!(
+            crate::kernel::module::find_symbol("try_wait_for_completion"),
+            Some(linux_try_wait_for_completion_export as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("wait_for_completion_interruptible"),
+            Some(linux_wait_for_completion_interruptible as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("wait_for_completion_interruptible_timeout"),
+            Some(linux_wait_for_completion_interruptible_timeout as usize)
+        );
     }
 
     #[test]
@@ -169,6 +257,23 @@ mod tests {
             assert_eq!(raw, u32::MAX);
             linux_wait_for_completion((&mut raw as *mut u32).cast());
             assert_eq!(raw, u32::MAX);
+        }
+    }
+
+    #[test]
+    fn linux_completion_interruptible_timeout_returns_remaining_jiffies() {
+        let mut raw = 1u32;
+        unsafe {
+            assert_eq!(
+                linux_wait_for_completion_interruptible_timeout((&mut raw as *mut u32).cast(), 7),
+                7
+            );
+            assert_eq!(raw, 0);
+
+            assert_eq!(
+                linux_wait_for_completion_interruptible_timeout((&mut raw as *mut u32).cast(), 0),
+                0
+            );
         }
     }
 }

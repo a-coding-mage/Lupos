@@ -8,11 +8,13 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+use core::ffi::c_void;
 use core::sync::atomic::Ordering;
 
 use crate::arch::x86::kernel::uaccess;
 use crate::include::uapi::errno::{EFAULT, EINVAL, EPERM};
 use crate::include::uapi::fcntl::*;
+use crate::kernel::module::{export_symbol, find_symbol};
 
 use super::fdtable::{FilesStruct, NR_OPEN_MAX};
 
@@ -21,6 +23,34 @@ const SETFL_MASK: u32 = O_APPEND | O_NONBLOCK | O_NDELAY | O_DIRECT | O_NOATIME;
 const SEEK_SET: i16 = 0;
 const SEEK_CUR: i16 = 1;
 const SEEK_END: i16 = 2;
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("fasync_helper", linux_fasync_helper as usize, false);
+    export_symbol_once("kill_fasync", linux_kill_fasync as usize, false);
+}
+
+/// `fasync_helper` - `vendor/linux/fs/fcntl.c`.
+///
+/// Lupos does not yet model Linux `struct fasync_struct` ownership. Preserve
+/// the ABI for modules that install fasync file operations, reporting "no
+/// change" without mutating the caller's list.
+pub unsafe extern "C" fn linux_fasync_helper(
+    _fd: i32,
+    _filp: *mut c_void,
+    _on: i32,
+    _fapp: *mut *mut c_void,
+) -> i32 {
+    0
+}
+
+/// `kill_fasync` - `vendor/linux/fs/fcntl.c`.
+pub unsafe extern "C" fn linux_kill_fasync(_fp: *mut *mut c_void, _sig: i32, _band: i32) {}
 
 #[inline]
 fn file_status_flags(flags: u32) -> u32 {

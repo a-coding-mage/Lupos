@@ -428,11 +428,13 @@ fn threads_max_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i3
 }
 
 fn overflowuid_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
-    super::util::copy_into(buf, "65534\n")
+    let v = crate::kernel::sysctl_abi::overflowuid();
+    super::util::copy_into(buf, &format!("{v}\n"))
 }
 
 fn overflowgid_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
-    super::util::copy_into(buf, "65534\n")
+    let v = crate::kernel::sysctl_abi::overflowgid();
+    super::util::copy_into(buf, &format!("{v}\n"))
 }
 
 fn dmesg_restrict_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {

@@ -43,7 +43,9 @@
 /// - Linux `arch/x86/include/asm/pgtable_64_types.h` — `__VMALLOC_BASE_L4`
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::arch::x86::mm::paging::{PAGE_KERNEL, map_kernel_page, unmap_kernel_page, virt_to_phys};
+use crate::arch::x86::mm::paging::{
+    PAGE_KERNEL, map_kernel_page, pgprot_t, unmap_kernel_page, virt_to_phys,
+};
 use crate::include::uapi::errno::EINVAL;
 use crate::kernel::module::{export_symbol, find_symbol};
 use crate::mm::buddy::{page_to_pfn, with_global_buddy};
@@ -117,7 +119,40 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 pub fn register_module_exports() {
     export_symbol_once("is_vmalloc_addr", linux_is_vmalloc_addr as usize, false);
     export_symbol_once("vfree", linux_vfree as usize, false);
+    export_symbol_once("vunmap", linux_vunmap as usize, false);
+    export_symbol_once("vmap", linux_vmap as usize, false);
+    export_symbol_once("vmap_pfn", linux_vmap_pfn as usize, true);
+    export_symbol_once("vm_map_ram", linux_vm_map_ram as usize, false);
+    export_symbol_once("vm_unmap_ram", linux_vm_unmap_ram as usize, false);
+    export_symbol_once("vmalloc_to_page", linux_vmalloc_to_page as usize, false);
+    export_symbol_once("vmalloc_noprof", linux_vmalloc_noprof as usize, false);
+    export_symbol_once("__vmalloc_noprof", linux___vmalloc_noprof as usize, false);
     export_symbol_once("vzalloc_noprof", linux_vzalloc_noprof as usize, false);
+    export_symbol_once(
+        "vmalloc_user_noprof",
+        linux_vmalloc_user_noprof as usize,
+        false,
+    );
+    export_symbol_once(
+        "vzalloc_node_noprof",
+        linux_vzalloc_node_noprof as usize,
+        false,
+    );
+    export_symbol_once(
+        "remap_vmalloc_range",
+        linux_remap_vmalloc_range as usize,
+        false,
+    );
+    export_symbol_once(
+        "register_vmap_purge_notifier",
+        linux_register_vmap_purge_notifier as usize,
+        true,
+    );
+    export_symbol_once(
+        "unregister_vmap_purge_notifier",
+        linux_unregister_vmap_purge_notifier as usize,
+        true,
+    );
 }
 
 unsafe extern "C" fn linux_is_vmalloc_addr(addr: *const u8) -> bool {
@@ -128,8 +163,71 @@ unsafe extern "C" fn linux_vfree(ptr: *mut u8) {
     vfree(ptr);
 }
 
+unsafe extern "C" fn linux_vunmap(ptr: *const u8) {
+    vunmap(ptr.cast_mut());
+}
+
+unsafe extern "C" fn linux_vmap(
+    pages: *const *mut crate::mm::page::Page,
+    count: usize,
+    flags: u32,
+    prot: u64,
+) -> *mut u8 {
+    vmap(pages, count, flags, prot)
+}
+
+unsafe extern "C" fn linux_vmap_pfn(pfns: *const usize, count: u32, prot: pgprot_t) -> *mut u8 {
+    vmap_pfn(pfns, count as usize, prot)
+}
+
+unsafe extern "C" fn linux_vm_map_ram(
+    pages: *const *mut crate::mm::page::Page,
+    count: u32,
+    node: i32,
+) -> *mut u8 {
+    vm_map_ram(pages, count as usize, node)
+}
+
+unsafe extern "C" fn linux_vm_unmap_ram(mem: *mut u8, count: u32) {
+    vm_unmap_ram(mem, count as usize);
+}
+
+unsafe extern "C" fn linux_vmalloc_to_page(addr: *const u8) -> *mut crate::mm::page::Page {
+    vmalloc_to_page(addr)
+}
+
+unsafe extern "C" fn linux_vmalloc_noprof(size: usize) -> *mut u8 {
+    vmalloc_noprof(size)
+}
+
+unsafe extern "C" fn linux___vmalloc_noprof(size: usize, flags: u32) -> *mut u8 {
+    __vmalloc_noprof(size, flags)
+}
+
 unsafe extern "C" fn linux_vzalloc_noprof(size: usize) -> *mut u8 {
     vzalloc_noprof(size)
+}
+
+unsafe extern "C" fn linux_vmalloc_user_noprof(size: usize) -> *mut u8 {
+    vmalloc_user_noprof(size)
+}
+
+unsafe extern "C" fn linux_vzalloc_node_noprof(size: usize, node: i32) -> *mut u8 {
+    vzalloc_node_noprof(size, node)
+}
+
+unsafe extern "C" fn linux_remap_vmalloc_range(
+    vma: *mut crate::mm::mm_types::VmAreaStruct,
+    addr: *mut u8,
+    pgoff: u64,
+) -> i32 {
+    if vma.is_null() {
+        return -EINVAL;
+    }
+    match remap_vmalloc_range(vma as usize, addr, pgoff) {
+        Ok(()) => 0,
+        Err(err) => -err,
+    }
 }
 
 struct VmallocState {
@@ -139,6 +237,9 @@ struct VmallocState {
     /// virtual page has PFN-offset `i` within the vmalloc window.
     /// Zero means "no allocation at this slot".
     nr_pages: [u16; VMALLOC_PAGES],
+    /// Whether the backing frames for the live allocation should be returned
+    /// to the buddy allocator on `vfree`. PFN mappings are caller-owned.
+    free_backing: [bool; VMALLOC_PAGES],
 }
 
 impl VmallocState {
@@ -146,6 +247,7 @@ impl VmallocState {
         VmallocState {
             free: [None; NR_VM_STRUCTS],
             nr_pages: [0u16; VMALLOC_PAGES],
+            free_backing: [false; VMALLOC_PAGES],
         }
     }
 }
@@ -333,6 +435,7 @@ pub fn vmalloc(size: usize) -> *mut u8 {
     // 3. Record the allocation size in the metadata array.
     let window_offset = (va_start - VMALLOC_START) as usize / PAGE_SIZE;
     state.nr_pages[window_offset] = n_pages as u16;
+    state.free_backing[window_offset] = true;
     drop(state);
 
     unsafe {
@@ -376,13 +479,15 @@ pub fn vfree(ptr: *mut u8) {
         // already checked the window range).
         return;
     }
+    let free_backing = state.free_backing[window_offset];
     state.nr_pages[window_offset] = 0;
+    state.free_backing[window_offset] = false;
 
     let alloc_size = n_pages * PAGE_SIZE;
 
     for i in 0..n_pages {
         let va = va_start + (i * PAGE_SIZE) as u64;
-        if let Some(phys) = virt_to_phys(va) {
+        if free_backing && let Some(phys) = virt_to_phys(va) {
             let pfn = phys as usize / PAGE_SIZE;
             let page_ptr = crate::mm::buddy::pfn_to_page(pfn);
             with_global_buddy(|b| b.free_pages(page_ptr, 0));
@@ -736,8 +841,39 @@ pub fn vmap(
     vm_map_ram(pages, count, -1)
 }
 
-pub fn vmap_pfn(_pfns: *const usize, count: usize, _flags: u32, _prot: u64) -> *mut u8 {
-    vmalloc(count.saturating_mul(PAGE_SIZE))
+pub fn vmap_pfn(pfns: *const usize, count: usize, prot: pgprot_t) -> *mut u8 {
+    assert!(
+        VMALLOC_READY.load(Ordering::Acquire),
+        "vmap_pfn: called before vmalloc_init"
+    );
+    if pfns.is_null() || count == 0 || count > u16::MAX as usize {
+        return core::ptr::null_mut();
+    }
+    let Some(alloc_size) = count.checked_mul(PAGE_SIZE) else {
+        return core::ptr::null_mut();
+    };
+
+    let mut state = VMALLOC_LOCK.lock();
+    let Some(va_start) = va_alloc(&mut state, alloc_size) else {
+        return core::ptr::null_mut();
+    };
+
+    for i in 0..count {
+        let pfn = unsafe { *pfns.add(i) };
+        let va = va_start + (i * PAGE_SIZE) as u64;
+        unsafe { map_kernel_page(va, (pfn * PAGE_SIZE) as u64, prot) };
+    }
+
+    let window_offset = (va_start - VMALLOC_START) as usize / PAGE_SIZE;
+    state.nr_pages[window_offset] = count as u16;
+    state.free_backing[window_offset] = false;
+    drop(state);
+
+    unsafe {
+        sync_vmalloc_pgd_slot_to_current_mm(va_start, alloc_size);
+    }
+
+    va_start as *mut u8
 }
 
 pub fn remap_vmalloc_range(_vma: usize, addr: *mut u8, _pgoff: u64) -> Result<(), i32> {
@@ -766,6 +902,14 @@ pub fn register_vmap_purge_notifier(_notifier: usize) -> i32 {
 
 pub fn unregister_vmap_purge_notifier(_notifier: usize) -> i32 {
     0
+}
+
+unsafe extern "C" fn linux_register_vmap_purge_notifier(notifier: usize) -> i32 {
+    register_vmap_purge_notifier(notifier)
+}
+
+unsafe extern "C" fn linux_unregister_vmap_purge_notifier(notifier: usize) -> i32 {
+    unregister_vmap_purge_notifier(notifier)
 }
 
 pub const fn arch_vmap_p4d_supported(_prot: u64) -> bool {
@@ -852,6 +996,9 @@ mod tests {
         for n in state.nr_pages.iter_mut() {
             *n = 0;
         }
+        for owned in state.free_backing.iter_mut() {
+            *owned = false;
+        }
         // Re-register the whole window.
         state.free[0] = Some(VaRange {
             start: VMALLOC_START,
@@ -935,5 +1082,26 @@ mod tests {
         }
         let resolved = crate::arch::x86::mm::paging::virt_to_phys(va);
         assert_eq!(resolved, Some(phys), "PTE round-trip failed");
+    }
+
+    #[test]
+    fn vmap_pfn_maps_caller_owned_pfns() {
+        let _g = TEST_LOCK.lock().unwrap();
+        unsafe { setup() };
+
+        let pfns = [0x1000_0000usize / PAGE_SIZE, 0x1001_0000usize / PAGE_SIZE];
+        let ptr = vmap_pfn(pfns.as_ptr(), pfns.len(), PAGE_KERNEL);
+
+        assert!(!ptr.is_null());
+        assert_eq!(virt_to_phys(ptr as u64), Some(0x1000_0000));
+        assert_eq!(
+            virt_to_phys((ptr as u64) + PAGE_SIZE as u64),
+            Some(0x1001_0000)
+        );
+
+        vfree(ptr);
+
+        assert_eq!(virt_to_phys(ptr as u64), None);
+        assert_eq!(virt_to_phys((ptr as u64) + PAGE_SIZE as u64), None);
     }
 }

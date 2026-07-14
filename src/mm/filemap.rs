@@ -26,6 +26,7 @@
 ///
 /// Ref: Linux `mm/filemap.c`
 ///      Linux `include/linux/pagemap.h`
+use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::Ordering;
 
@@ -48,6 +49,42 @@ use super::writeback::{
 };
 use super::xarray::XaMark;
 use crate::arch::x86::mm::paging::PAGE_SIZE;
+use crate::kernel::module::{export_symbol, find_symbol};
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("folio_unlock", linux_folio_unlock as usize, false);
+    export_symbol_once("unlock_page", linux_unlock_page as usize, false);
+    export_symbol_once("__folio_lock", linux___folio_lock as usize, false);
+    export_symbol_once(
+        "__folio_lock_killable",
+        linux___folio_lock_killable as usize,
+        true,
+    );
+    export_symbol_once("folio_mark_dirty", linux_folio_mark_dirty as usize, false);
+    export_symbol_once("set_page_dirty", linux_set_page_dirty as usize, false);
+    export_symbol_once(
+        "invalidate_mapping_pages",
+        linux_invalidate_mapping_pages as usize,
+        false,
+    );
+    export_symbol_once(
+        "folio_clear_dirty_for_io",
+        linux_folio_clear_dirty_for_io as usize,
+        false,
+    );
+    export_symbol_once(
+        "folio_redirty_for_writepage",
+        linux_folio_redirty_for_writepage as usize,
+        false,
+    );
+    export_symbol_once("writeback_iter", linux_writeback_iter as usize, true);
+}
 
 // ---------------------------------------------------------------------------
 // IOCB flags (subset of Linux IOCB_* — iocb.ki_flags)
@@ -372,19 +409,20 @@ pub unsafe fn filemap_grab_folio(mapping: *mut AddressSpace, index: u64) -> *mut
 /// XArray so the writeback scanner can find it.
 ///
 /// Ref: Linux `set_page_dirty()` — `mm/page-writeback.c`
-pub unsafe fn set_page_dirty(page: *mut Page) {
+pub unsafe fn set_page_dirty(page: *mut Page) -> bool {
     if page.is_null() {
-        return;
+        return false;
     }
     let mapping = unsafe { (*page).mapping as *mut AddressSpace };
     let was_dirty = unsafe { (&*page).flags.load(Ordering::Acquire) & PG_DIRTY != 0 };
+    let mut callback_dirty = false;
 
     unsafe {
         if !mapping.is_null() {
             let a_ops = (*mapping).a_ops;
             if !a_ops.is_null() {
                 if let Some(dirty_fn) = (*a_ops).dirty_folio {
-                    let _ = dirty_fn(mapping, page);
+                    callback_dirty = dirty_fn(mapping, page);
                 }
             }
         }
@@ -400,6 +438,12 @@ pub unsafe fn set_page_dirty(page: *mut Page) {
     } else if is_dirty {
         unsafe { note_page_dirty(page, false) };
     }
+
+    (!was_dirty && is_dirty) || callback_dirty
+}
+
+extern "C" fn linux_set_page_dirty(page: *mut Page) -> bool {
+    unsafe { set_page_dirty(page) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,6 +1418,14 @@ pub unsafe fn invalidate_mapping_pages(mapping: *mut AddressSpace, start: u64, e
     count
 }
 
+extern "C" fn linux_invalidate_mapping_pages(
+    mapping: *mut AddressSpace,
+    start: u64,
+    end: u64,
+) -> u64 {
+    unsafe { invalidate_mapping_pages(mapping, start, end) }
+}
+
 pub unsafe fn invalidate_inode_pages2(mapping: *mut AddressSpace) -> i32 {
     unsafe { invalidate_mapping_pages(mapping, 0, u64::MAX) };
     0
@@ -1647,6 +1699,10 @@ pub unsafe fn __folio_lock(folio: *mut Page) {
     unsafe { lock_page(folio) };
 }
 
+extern "C" fn linux___folio_lock(folio: *mut Page) {
+    unsafe { __folio_lock(folio) };
+}
+
 pub unsafe fn folio_trylock(folio: *mut Page) -> bool {
     unsafe { try_lock_page(folio) }
 }
@@ -1659,12 +1715,24 @@ pub unsafe fn folio_unlock(folio: *mut Page) {
     unsafe { unlock_page(folio) };
 }
 
+extern "C" fn linux_folio_unlock(folio: *mut Page) {
+    unsafe { folio_unlock(folio) };
+}
+
+extern "C" fn linux_unlock_page(page: *mut Page) {
+    unsafe { super::address_space::unlock_page(page) };
+}
+
 pub unsafe fn folio_lock_killable(folio: *mut Page) -> i32 {
     unsafe { lock_page_killable(folio) }
 }
 
 pub unsafe fn __folio_lock_killable(folio: *mut Page) -> i32 {
     unsafe { lock_page_killable(folio) }
+}
+
+extern "C" fn linux___folio_lock_killable(folio: *mut Page) -> i32 {
+    unsafe { __folio_lock_killable(folio) }
 }
 
 pub unsafe fn folio_lock_or_retry(folio: *mut Page, _mm: *mut u8, _flags: u32) -> bool {
@@ -1732,6 +1800,10 @@ pub unsafe fn folio_mark_dirty(folio: *mut Page) -> bool {
     unsafe { writeback_mark_page_dirty(folio) }
 }
 
+extern "C" fn linux_folio_mark_dirty(folio: *mut Page) -> bool {
+    unsafe { folio_mark_dirty(folio) }
+}
+
 pub unsafe fn __folio_mark_dirty(folio: *mut Page, _mapping: *mut AddressSpace) -> bool {
     unsafe { folio_mark_dirty(folio) }
 }
@@ -1755,6 +1827,10 @@ pub unsafe fn folio_clear_dirty_for_io(folio: *mut Page) -> bool {
     unsafe { clear_page_dirty_for_io(folio) }
 }
 
+extern "C" fn linux_folio_clear_dirty_for_io(folio: *mut Page) -> bool {
+    unsafe { folio_clear_dirty_for_io(folio) }
+}
+
 pub unsafe fn __folio_cancel_dirty(folio: *mut Page) -> bool {
     unsafe { clear_page_dirty_for_io(folio) }
 }
@@ -1765,6 +1841,10 @@ pub unsafe fn folio_cancel_dirty(folio: *mut Page) -> bool {
 
 pub unsafe fn folio_redirty_for_writepage(_wbc: *mut u8, folio: *mut Page) -> bool {
     unsafe { folio_mark_dirty(folio) }
+}
+
+extern "C" fn linux_folio_redirty_for_writepage(wbc: *mut u8, folio: *mut Page) -> bool {
+    unsafe { folio_redirty_for_writepage(wbc, folio) }
 }
 
 pub unsafe fn __folio_start_writeback(folio: *mut Page, keep_write: bool) -> bool {
@@ -1859,6 +1939,26 @@ pub unsafe fn writeback_iter(
         );
     }
     super::writeback::wb_workfn() as i32
+}
+
+/// `writeback_iter` - `vendor/linux/mm/page-writeback.c:2471`.
+///
+/// Vendor modules pass the Linux `struct writeback_control`, which has a
+/// different layout from Lupos' native writeback control.  Until Lupos has a
+/// Linux-layout page-cache writeback iterator, terminate the iteration without
+/// handing back folios so callers take the no-writeback path cleanly.
+extern "C" fn linux_writeback_iter(
+    _mapping: *mut AddressSpace,
+    _wbc: *mut c_void,
+    _folio: *mut Page,
+    error: *mut i32,
+) -> *mut Page {
+    if !error.is_null() {
+        unsafe {
+            *error = 0;
+        }
+    }
+    core::ptr::null_mut()
 }
 
 pub fn wb_writeout_inc(_pages: usize) {}
@@ -2077,6 +2177,37 @@ mod tests {
         unsafe { (*page).put_page() }; // find_lock_page ref
         unsafe { filemap_remove_folio(page) };
         unsafe { free_test_page(page) };
+    }
+
+    #[test]
+    fn exported_unlock_page_clears_page_lock_bits() {
+        let _guard = test_guard();
+        let page = alloc_test_page(0);
+
+        use crate::mm::page_flags::{PG_LOCKED, PG_WAITERS};
+        unsafe {
+            (*page)
+                .flags
+                .store(PG_LOCKED | PG_WAITERS, Ordering::Relaxed)
+        };
+
+        linux_unlock_page(page);
+
+        assert_eq!(
+            unsafe { (*page).flags.load(Ordering::Acquire) } & (PG_LOCKED | PG_WAITERS),
+            0
+        );
+
+        unsafe { free_test_page(page) };
+    }
+
+    #[test]
+    fn register_exports_includes_unlock_page() {
+        let _guard = test_guard();
+
+        register_module_exports();
+
+        assert_eq!(find_symbol("unlock_page"), Some(linux_unlock_page as usize));
     }
 
     // ── filemap_read_round_trip_single_page ───────────────────────────────────

@@ -57,6 +57,8 @@ pub fn register() {
 
 pub fn register_module_exports() {
     file::register_module_exports();
+    group::register_module_exports();
+    symlink::register_module_exports();
 }
 
 #[cfg(test)]

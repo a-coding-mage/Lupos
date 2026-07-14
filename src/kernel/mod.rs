@@ -25,8 +25,11 @@ pub mod debug_trace;
 pub mod elfcorehdr;
 pub mod softirq;
 pub mod static_call;
+pub mod stop_machine;
 pub mod syscalls;
+pub mod sysctl_abi;
 pub mod sysctl_test;
+pub mod taint;
 // M27 / M28 must be declared before `task` because `task` re-exports
 // `cred::Cred` and `nsproxy::Nsproxy` and embeds `seccomp::Seccomp` inline.
 pub mod bpf; // M27
@@ -49,6 +52,7 @@ pub mod futex; // M32
 pub mod gcov;
 pub mod groups; // M27a
 pub mod irq; // M37
+pub mod irq_work;
 pub mod kconfig; // M65
 pub mod kheaders;
 pub mod ksyms_common;
@@ -59,6 +63,7 @@ pub mod liveupdate;
 pub mod locking; // M33
 pub mod module; // M56
 pub mod module_signature;
+pub mod notifier;
 pub mod nsproxy; // M28
 pub mod params;
 pub mod pid; // M22
@@ -68,6 +73,7 @@ pub mod printk; // M61
 pub mod ptrace; // M26
 pub mod rcu; // M34
 pub mod regset;
+pub mod relay;
 pub mod resource_kunit;
 pub mod sched;
 pub mod seccomp; // M27

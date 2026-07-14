@@ -12,6 +12,27 @@
 //! before changing memory typing. We expose the same five-function
 //! surface; the SMP-IPI dispatcher is delegated to `crate::arch::x86::kernel::smp`.
 
+use crate::kernel::module::{export_symbol, find_symbol};
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "wbinvd_on_all_cpus",
+        linux_wbinvd_on_all_cpus as usize,
+        false,
+    );
+}
+
+/// `wbinvd_on_all_cpus` - `vendor/linux/arch/x86/lib/cache-smp.c:17`.
+pub unsafe extern "C" fn linux_wbinvd_on_all_cpus() {
+    wbinvd_on_all_cpus();
+}
+
 /// Issue a `WBINVD` on the local CPU.
 ///
 /// Writes back every dirty cache line and invalidates the cache. Slow —

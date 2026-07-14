@@ -27,8 +27,767 @@
 //!   https://wiki.osdev.org/ACPI
 //!   https://wiki.osdev.org/MADT
 
+use core::ffi::c_void;
+
+use crate::include::uapi::errno::{ENODATA, ENODEV, ENOENT};
+use crate::kernel::module::{export_symbol, find_symbol};
+use crate::mm::page_flags::GFP_KERNEL;
+
 /// Maximum number of CPUs we track.  Exceeding this silently truncates.
 pub const MAX_CPUS: usize = 16;
+const AE_OK: u32 = 0;
+const AE_NO_MEMORY: u32 = 4;
+const AE_NOT_FOUND: u32 = 5;
+const AE_BUFFER_OVERFLOW: u32 = 0x000b;
+const AE_BAD_PARAMETER: u32 = 0x1001;
+const ACPI_FULL_PATHNAME: u32 = 0;
+const ACPI_SINGLE_NAME: u32 = 1;
+const ACPI_FULL_PATHNAME_NO_TRAILING: u32 = 2;
+const ACPI_STATE_S0: u32 = 0;
+const ACPI_NO_BUFFER: usize = 0;
+const ACPI_ALLOCATE_BUFFER: usize = usize::MAX;
+const ACPI_ALLOCATE_LOCAL_BUFFER: usize = usize::MAX - 1;
+const ACPI_BACKLIGHT_VENDOR: i32 = 2;
+const ACPI_BACKLIGHT_NATIVE: i32 = 3;
+static ACPI_LUPOS_FULL_PATH: &[u8] = b"\\_SB_.LUPS\0";
+static ACPI_LUPOS_SINGLE_NAME: &[u8] = b"LUPS\0";
+
+static mut ACPI_VIDEO_BACKLIGHT_STRING: [u8; 16] = [0; 16];
+
+#[repr(C)]
+pub struct LinuxAcpiBuffer {
+    pub length: usize,
+    pub pointer: *mut c_void,
+}
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+fn acpi_video_backlight_string_addr() -> usize {
+    core::ptr::addr_of_mut!(ACPI_VIDEO_BACKLIGHT_STRING) as *mut u8 as usize
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "acpi_reconfig_notifier_register",
+        linux_acpi_reconfig_notifier_register as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_reconfig_notifier_unregister",
+        linux_acpi_reconfig_notifier_unregister as usize,
+        false,
+    );
+    export_symbol_once(
+        "register_acpi_bus_type",
+        linux_register_acpi_bus_type as usize,
+        true,
+    );
+    export_symbol_once(
+        "unregister_acpi_bus_type",
+        linux_unregister_acpi_bus_type as usize,
+        true,
+    );
+    export_symbol_once(
+        "acpi_walk_namespace",
+        linux_acpi_walk_namespace as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_pm_device_sleep_state",
+        linux_acpi_pm_device_sleep_state as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_target_system_state",
+        linux_acpi_target_system_state as usize,
+        true,
+    );
+    export_symbol_once("acpi_storage_d3", linux_acpi_storage_d3 as usize, true);
+    export_symbol_once(
+        "acpi_bus_get_status",
+        linux_acpi_bus_get_status as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_bus_power_manageable",
+        linux_acpi_bus_power_manageable as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_bus_set_power",
+        linux_acpi_bus_set_power as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_evaluate_object",
+        linux_acpi_evaluate_object as usize,
+        false,
+    );
+    export_symbol_once("acpi_check_dsm", linux_acpi_check_dsm as usize, false);
+    export_symbol_once("acpi_evaluate_dsm", linux_acpi_evaluate_dsm as usize, false);
+    export_symbol_once(
+        "acpi_notifier_call_chain",
+        linux_acpi_notifier_call_chain as usize,
+        false,
+    );
+    export_symbol_once(
+        "register_acpi_notifier",
+        linux_register_acpi_notifier as usize,
+        false,
+    );
+    export_symbol_once(
+        "unregister_acpi_notifier",
+        linux_unregister_acpi_notifier as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_video_register",
+        linux_acpi_video_register as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_video_unregister",
+        linux_acpi_video_unregister as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_video_register_backlight",
+        linux_acpi_video_register_backlight as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_video_handles_brightness_key_presses",
+        linux_acpi_video_handles_brightness_key_presses as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_video_get_edid",
+        linux_acpi_video_get_edid as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_video_get_levels",
+        linux_acpi_video_get_levels as usize,
+        false,
+    );
+    export_symbol_once(
+        "__acpi_video_get_backlight_type",
+        linux___acpi_video_get_backlight_type as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_video_backlight_string",
+        acpi_video_backlight_string_addr(),
+        false,
+    );
+    export_symbol_once(
+        "acpi_fetch_acpi_dev",
+        linux_acpi_fetch_acpi_dev as usize,
+        true,
+    );
+    export_symbol_once(
+        "acpi_get_local_u64_address",
+        linux_acpi_get_local_u64_address as usize,
+        false,
+    );
+    export_symbol_once("acpi_dev_present", linux_acpi_dev_present as usize, false);
+    export_symbol_once(
+        "acpi_dev_get_resources",
+        linux_acpi_dev_get_resources as usize,
+        true,
+    );
+    export_symbol_once(
+        "acpi_dev_free_resource_list",
+        linux_acpi_dev_free_resource_list as usize,
+        true,
+    );
+    export_symbol_once(
+        "acpi_dev_resource_interrupt",
+        linux_acpi_dev_resource_interrupt as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_check_resource_conflict",
+        linux_acpi_check_resource_conflict as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_install_address_space_handler",
+        linux_acpi_install_address_space_handler as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_remove_address_space_handler",
+        linux_acpi_remove_address_space_handler as usize,
+        false,
+    );
+    export_symbol_once("acpi_os_read_port", linux_acpi_os_read_port as usize, false);
+    export_symbol_once(
+        "acpi_os_write_port",
+        linux_acpi_os_write_port as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_dev_clear_dependencies",
+        linux_acpi_dev_clear_dependencies as usize,
+        true,
+    );
+    export_symbol_once(
+        "acpi_dev_ready_for_enumeration",
+        linux_acpi_dev_ready_for_enumeration as usize,
+        true,
+    );
+    export_symbol_once("acpi_get_handle", linux_acpi_get_handle as usize, false);
+    export_symbol_once("acpi_get_name", linux_acpi_get_name as usize, false);
+    export_symbol_once("acpi_get_table", linux_acpi_get_table as usize, false);
+    export_symbol_once("acpi_set_modalias", linux_acpi_set_modalias as usize, true);
+    export_symbol_once(
+        "acpi_device_modalias",
+        linux_acpi_device_modalias as usize,
+        true,
+    );
+    export_symbol_once(
+        "acpi_device_uevent_modalias",
+        linux_acpi_device_uevent_modalias as usize,
+        true,
+    );
+    export_symbol_once(
+        "acpi_driver_match_device",
+        linux_acpi_driver_match_device as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_match_device_ids",
+        linux_acpi_match_device_ids as usize,
+        false,
+    );
+    export_symbol_once(
+        "acpi_find_child_device",
+        linux_acpi_find_child_device as usize,
+        true,
+    );
+    export_symbol_once(
+        "acpi_initialize_hp_context",
+        linux_acpi_initialize_hp_context as usize,
+        false,
+    );
+    export_symbol_once("acpi_unbind_one", linux_acpi_unbind_one as usize, true);
+    export_symbol_once("acpi_put_table", linux_acpi_put_table as usize, false);
+    export_symbol_once(
+        "acpi_nhlt_get_gbl_table",
+        linux_acpi_nhlt_get_gbl_table as usize,
+        true,
+    );
+    export_symbol_once(
+        "acpi_nhlt_find_endpoint",
+        linux_acpi_nhlt_find_endpoint as usize,
+        true,
+    );
+    export_symbol_once(
+        "acpi_nhlt_put_gbl_table",
+        linux_acpi_nhlt_put_gbl_table as usize,
+        true,
+    );
+}
+
+/// `acpi_reconfig_notifier_register` - `vendor/linux/drivers/acpi/scan.c`.
+pub unsafe extern "C" fn linux_acpi_reconfig_notifier_register(_nb: *mut c_void) -> i32 {
+    0
+}
+
+/// `acpi_reconfig_notifier_unregister` - `vendor/linux/drivers/acpi/scan.c`.
+pub unsafe extern "C" fn linux_acpi_reconfig_notifier_unregister(_nb: *mut c_void) -> i32 {
+    0
+}
+
+/// `register_acpi_bus_type` - `vendor/linux/drivers/acpi/glue.c`.
+pub unsafe extern "C" fn linux_register_acpi_bus_type(bus: *mut c_void) -> i32 {
+    if bus.is_null() { -ENODEV } else { 0 }
+}
+
+/// `unregister_acpi_bus_type` - `vendor/linux/drivers/acpi/glue.c`.
+pub unsafe extern "C" fn linux_unregister_acpi_bus_type(bus: *mut c_void) -> i32 {
+    if bus.is_null() { -ENODEV } else { 0 }
+}
+
+/// `acpi_walk_namespace` - `vendor/linux/drivers/acpi/acpica/nsxfeval.c`.
+pub unsafe extern "C" fn linux_acpi_walk_namespace(
+    _type_: u32,
+    _start_object: *mut c_void,
+    _max_depth: u32,
+    _descending_callback: *mut c_void,
+    _ascending_callback: *mut c_void,
+    _context: *mut c_void,
+    _return_value: *mut *mut c_void,
+) -> u32 {
+    0
+}
+
+/// `acpi_pm_device_sleep_state` - `vendor/linux/drivers/acpi/device_pm.c`.
+pub unsafe extern "C" fn linux_acpi_pm_device_sleep_state(
+    _dev: *mut c_void,
+    _d_min_p: *mut i32,
+    _d_max_in: i32,
+) -> i32 {
+    -ENODEV
+}
+
+/// `acpi_target_system_state` - `vendor/linux/drivers/acpi/sleep.c:101`.
+pub unsafe extern "C" fn linux_acpi_target_system_state() -> u32 {
+    ACPI_STATE_S0
+}
+
+/// `acpi_storage_d3` - `vendor/linux/drivers/acpi/device_pm.c`.
+pub unsafe extern "C" fn linux_acpi_storage_d3(_dev: *mut c_void) -> bool {
+    false
+}
+
+/// `acpi_bus_get_status` - `vendor/linux/drivers/acpi/bus.c`.
+pub unsafe extern "C" fn linux_acpi_bus_get_status(_device: *mut c_void) -> i32 {
+    -ENODEV
+}
+
+/// `acpi_bus_power_manageable` - `vendor/linux/drivers/acpi/device_pm.c`.
+pub unsafe extern "C" fn linux_acpi_bus_power_manageable(_handle: *mut c_void) -> bool {
+    false
+}
+
+/// `acpi_bus_set_power` - `vendor/linux/drivers/acpi/device_pm.c`.
+pub unsafe extern "C" fn linux_acpi_bus_set_power(_handle: *mut c_void, _state: i32) -> i32 {
+    0
+}
+
+/// `acpi_evaluate_object` - `vendor/linux/drivers/acpi/acpica/nsxfeval.c`.
+pub unsafe extern "C" fn linux_acpi_evaluate_object(
+    _object: *mut c_void,
+    _pathname: *const u8,
+    _parameter_objects: *mut c_void,
+    _return_object_buffer: *mut c_void,
+) -> u32 {
+    AE_NOT_FOUND
+}
+
+/// `acpi_check_dsm` - `vendor/linux/drivers/acpi/utils.c:821`.
+pub unsafe extern "C" fn linux_acpi_check_dsm(
+    _handle: *mut c_void,
+    _guid: *const c_void,
+    _rev: u64,
+    _funcs: u64,
+) -> bool {
+    false
+}
+
+/// `acpi_evaluate_dsm` - `vendor/linux/drivers/acpi/utils.c:771`.
+pub unsafe extern "C" fn linux_acpi_evaluate_dsm(
+    _handle: *mut c_void,
+    _guid: *const c_void,
+    _rev: u64,
+    _func: u64,
+    _argv4: *mut c_void,
+) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// `acpi_notifier_call_chain` - `vendor/linux/drivers/acpi/event.c:27`.
+pub unsafe extern "C" fn linux_acpi_notifier_call_chain(
+    _device_class: *const u8,
+    _bus_id: *const u8,
+    _event_type: u32,
+    _data: u32,
+) -> i32 {
+    0
+}
+
+/// `register_acpi_notifier` - `vendor/linux/drivers/acpi/event.c:41`.
+pub unsafe extern "C" fn linux_register_acpi_notifier(nb: *mut c_void) -> i32 {
+    unsafe {
+        crate::kernel::notifier::linux_blocking_notifier_chain_register(core::ptr::null_mut(), nb)
+    }
+}
+
+/// `unregister_acpi_notifier` - `vendor/linux/drivers/acpi/event.c:47`.
+pub unsafe extern "C" fn linux_unregister_acpi_notifier(nb: *mut c_void) -> i32 {
+    unsafe {
+        crate::kernel::notifier::linux_blocking_notifier_chain_unregister(core::ptr::null_mut(), nb)
+    }
+}
+
+/// `acpi_video_register` - `vendor/linux/drivers/acpi/acpi_video.c:2141`.
+pub unsafe extern "C" fn linux_acpi_video_register() -> i32 {
+    -ENODEV
+}
+
+/// `acpi_video_unregister` - `vendor/linux/drivers/acpi/acpi_video.c:2172`.
+pub unsafe extern "C" fn linux_acpi_video_unregister() {}
+
+/// `acpi_video_register_backlight` - `vendor/linux/drivers/acpi/acpi_video.c:2184`.
+pub unsafe extern "C" fn linux_acpi_video_register_backlight() {}
+
+/// `acpi_video_handles_brightness_key_presses` - `vendor/linux/drivers/acpi/acpi_video.c:2195`.
+pub unsafe extern "C" fn linux_acpi_video_handles_brightness_key_presses() -> bool {
+    false
+}
+
+/// `acpi_video_get_edid` - `vendor/linux/drivers/acpi/acpi_video.c:1440`.
+pub unsafe extern "C" fn linux_acpi_video_get_edid(
+    _device: *mut c_void,
+    _display_type: i32,
+    _device_id: i32,
+    edid: *mut *mut c_void,
+) -> i32 {
+    if !edid.is_null() {
+        unsafe {
+            *edid = core::ptr::null_mut();
+        }
+    }
+    -ENODEV
+}
+
+/// `acpi_video_get_levels` - `vendor/linux/drivers/acpi/acpi_video.c:798`.
+pub unsafe extern "C" fn linux_acpi_video_get_levels(
+    _device: *mut c_void,
+    dev_br: *mut *mut c_void,
+    pmax_level: *mut i32,
+) -> i32 {
+    if !dev_br.is_null() {
+        unsafe {
+            *dev_br = core::ptr::null_mut();
+        }
+    }
+    if !pmax_level.is_null() {
+        unsafe {
+            *pmax_level = 0;
+        }
+    }
+    -ENODEV
+}
+
+/// `__acpi_video_get_backlight_type` - `vendor/linux/drivers/acpi/video_detect.c:998`.
+pub unsafe extern "C" fn linux___acpi_video_get_backlight_type(
+    native: bool,
+    auto_detect: *mut bool,
+) -> i32 {
+    if !auto_detect.is_null() {
+        unsafe {
+            *auto_detect = false;
+        }
+    }
+    if native {
+        ACPI_BACKLIGHT_NATIVE
+    } else {
+        ACPI_BACKLIGHT_VENDOR
+    }
+}
+
+/// `acpi_fetch_acpi_dev` - `vendor/linux/drivers/acpi/scan.c`.
+pub unsafe extern "C" fn linux_acpi_fetch_acpi_dev(_handle: *mut c_void) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// `acpi_get_local_u64_address` - `vendor/linux/drivers/acpi/utils.c`.
+pub unsafe extern "C" fn linux_acpi_get_local_u64_address(
+    _handle: *mut c_void,
+    _addr: *mut u64,
+) -> i32 {
+    -ENODATA
+}
+
+/// `acpi_dev_present` - `vendor/linux/drivers/acpi/utils.c`.
+pub unsafe extern "C" fn linux_acpi_dev_present(
+    _hid: *const u8,
+    _uid: *const u8,
+    _hrv: i64,
+) -> bool {
+    false
+}
+
+/// `acpi_dev_get_resources` - `vendor/linux/drivers/acpi/resource.c`.
+pub unsafe extern "C" fn linux_acpi_dev_get_resources(
+    _adev: *mut c_void,
+    _list: *mut c_void,
+    _preproc: *mut c_void,
+    _preproc_data: *mut c_void,
+) -> i32 {
+    0
+}
+
+/// `acpi_dev_free_resource_list` - `vendor/linux/drivers/acpi/resource.c`.
+pub unsafe extern "C" fn linux_acpi_dev_free_resource_list(_list: *mut c_void) {}
+
+/// `acpi_dev_resource_interrupt` - `vendor/linux/drivers/acpi/resource.c`.
+pub unsafe extern "C" fn linux_acpi_dev_resource_interrupt(
+    _ares: *mut c_void,
+    _index: i32,
+    _res: *mut c_void,
+) -> bool {
+    false
+}
+
+/// `acpi_check_resource_conflict` - `vendor/linux/drivers/acpi/osl.c`.
+pub unsafe extern "C" fn linux_acpi_check_resource_conflict(_res: *const c_void) -> i32 {
+    0
+}
+
+/// `acpi_install_address_space_handler` - `vendor/linux/drivers/acpi/acpica/evxfregn.c`.
+pub unsafe extern "C" fn linux_acpi_install_address_space_handler(
+    _device: *mut c_void,
+    _space_id: u8,
+    _handler: *mut c_void,
+    _setup: *mut c_void,
+    _context: *mut c_void,
+) -> u32 {
+    AE_OK
+}
+
+/// `acpi_remove_address_space_handler` - `vendor/linux/drivers/acpi/acpica/evxfregn.c`.
+pub unsafe extern "C" fn linux_acpi_remove_address_space_handler(
+    _device: *mut c_void,
+    _space_id: u8,
+    _handler: *mut c_void,
+) -> u32 {
+    AE_OK
+}
+
+/// `acpi_os_read_port` - `vendor/linux/drivers/acpi/osl.c`.
+pub unsafe extern "C" fn linux_acpi_os_read_port(port: u64, value: *mut u32, width: u32) -> u32 {
+    let mut dummy = 0u32;
+    let out = if value.is_null() {
+        &mut dummy as *mut u32
+    } else {
+        value
+    };
+    if port > u16::MAX as u64 {
+        return AE_BAD_PARAMETER;
+    }
+
+    let port = port as u16;
+    let read = match width {
+        0..=8 => unsafe { crate::arch::x86::include::asm::io::inb(port) as u32 },
+        9..=16 => unsafe { crate::arch::x86::include::asm::io::inw(port) as u32 },
+        17..=32 => unsafe { crate::arch::x86::include::asm::io::inl(port) },
+        _ => return AE_BAD_PARAMETER,
+    };
+    unsafe {
+        out.write(read);
+    }
+    AE_OK
+}
+
+/// `acpi_os_write_port` - `vendor/linux/drivers/acpi/osl.c`.
+pub unsafe extern "C" fn linux_acpi_os_write_port(port: u64, value: u32, width: u32) -> u32 {
+    if port > u16::MAX as u64 {
+        return AE_BAD_PARAMETER;
+    }
+
+    let port = port as u16;
+    match width {
+        0..=8 => unsafe { crate::arch::x86::include::asm::io::outb(port, value as u8) },
+        9..=16 => unsafe { crate::arch::x86::include::asm::io::outw(port, value as u16) },
+        17..=32 => unsafe { crate::arch::x86::include::asm::io::outl(port, value) },
+        _ => return AE_BAD_PARAMETER,
+    }
+    AE_OK
+}
+
+/// `acpi_dev_clear_dependencies` - `vendor/linux/drivers/acpi/scan.c`.
+pub unsafe extern "C" fn linux_acpi_dev_clear_dependencies(_supplier: *mut c_void) {}
+
+/// `acpi_dev_ready_for_enumeration` - `vendor/linux/drivers/acpi/scan.c`.
+pub unsafe extern "C" fn linux_acpi_dev_ready_for_enumeration(_device: *const c_void) -> bool {
+    false
+}
+
+/// `acpi_get_handle` - `vendor/linux/drivers/acpi/acpica/nsxfname.c`.
+pub unsafe extern "C" fn linux_acpi_get_handle(
+    _parent: *mut c_void,
+    _pathname: *const u8,
+    ret_handle: *mut *mut c_void,
+) -> u32 {
+    if !ret_handle.is_null() {
+        unsafe { ret_handle.write(core::ptr::null_mut()) };
+    }
+    AE_NOT_FOUND
+}
+
+unsafe fn acpi_copy_name_to_buffer(buffer: *mut LinuxAcpiBuffer, name: &[u8]) -> u32 {
+    if buffer.is_null() || name.is_empty() {
+        return AE_BAD_PARAMETER;
+    }
+
+    let input_len = unsafe { (*buffer).length };
+    unsafe {
+        (*buffer).length = name.len();
+    }
+
+    match input_len {
+        ACPI_NO_BUFFER => return AE_BUFFER_OVERFLOW,
+        ACPI_ALLOCATE_BUFFER | ACPI_ALLOCATE_LOCAL_BUFFER => {
+            let ptr = unsafe { crate::mm::slab::linux___kmalloc_noprof(name.len(), GFP_KERNEL) };
+            if ptr.is_null() {
+                return AE_NO_MEMORY;
+            }
+            unsafe {
+                (*buffer).pointer = ptr.cast();
+            }
+        }
+        len if len < name.len() => return AE_BUFFER_OVERFLOW,
+        _ => {
+            if unsafe { (*buffer).pointer.is_null() } {
+                return AE_BAD_PARAMETER;
+            }
+        }
+    }
+
+    unsafe {
+        core::ptr::write_bytes((*buffer).pointer.cast::<u8>(), 0, name.len());
+        core::ptr::copy_nonoverlapping(name.as_ptr(), (*buffer).pointer.cast::<u8>(), name.len());
+    }
+    AE_OK
+}
+
+/// `acpi_get_name` - `vendor/linux/drivers/acpi/acpica/nsxfname.c`.
+pub unsafe extern "C" fn linux_acpi_get_name(
+    handle: *mut c_void,
+    name_type: u32,
+    buffer: *mut LinuxAcpiBuffer,
+) -> u32 {
+    if name_type > ACPI_FULL_PATHNAME_NO_TRAILING {
+        return AE_BAD_PARAMETER;
+    }
+    if handle.is_null() {
+        return AE_NOT_FOUND;
+    }
+
+    let name = match name_type {
+        ACPI_SINGLE_NAME => ACPI_LUPOS_SINGLE_NAME,
+        ACPI_FULL_PATHNAME | ACPI_FULL_PATHNAME_NO_TRAILING => ACPI_LUPOS_FULL_PATH,
+        _ => return AE_BAD_PARAMETER,
+    };
+    unsafe { acpi_copy_name_to_buffer(buffer, name) }
+}
+
+/// `acpi_get_table` - `vendor/linux/drivers/acpi/acpica/tbxface.c`.
+pub unsafe extern "C" fn linux_acpi_get_table(
+    _signature: *const u8,
+    _instance: u32,
+    out_table: *mut *mut c_void,
+) -> u32 {
+    if !out_table.is_null() {
+        unsafe { out_table.write(core::ptr::null_mut()) };
+    }
+    AE_NOT_FOUND
+}
+
+unsafe fn copy_cstr_bounded(dst: *mut u8, len: usize, src: *const u8) {
+    if dst.is_null() || len == 0 {
+        return;
+    }
+    if src.is_null() {
+        unsafe { dst.write(0) };
+        return;
+    }
+    let mut offset = 0usize;
+    while offset + 1 < len {
+        let byte = unsafe { src.add(offset).read() };
+        unsafe { dst.add(offset).write(byte) };
+        if byte == 0 {
+            return;
+        }
+        offset += 1;
+    }
+    unsafe { dst.add(offset).write(0) };
+}
+
+/// `acpi_set_modalias` - `vendor/linux/drivers/acpi/bus.c`.
+pub unsafe extern "C" fn linux_acpi_set_modalias(
+    _adev: *mut c_void,
+    default_id: *const u8,
+    modalias: *mut u8,
+    len: usize,
+) {
+    unsafe { copy_cstr_bounded(modalias, len, default_id) };
+}
+
+/// `acpi_device_modalias` - `vendor/linux/drivers/acpi/device_sysfs.c`.
+pub unsafe extern "C" fn linux_acpi_device_modalias(
+    _dev: *mut c_void,
+    _buf: *mut u8,
+    _size: i32,
+) -> i32 {
+    -ENODEV
+}
+
+/// `acpi_device_uevent_modalias` - `vendor/linux/drivers/acpi/device_sysfs.c`.
+pub unsafe extern "C" fn linux_acpi_device_uevent_modalias(
+    _dev: *mut c_void,
+    _env: *mut c_void,
+) -> i32 {
+    -ENODEV
+}
+
+/// `acpi_driver_match_device` - `vendor/linux/drivers/acpi/bus.c`.
+pub unsafe extern "C" fn linux_acpi_driver_match_device(
+    _dev: *mut c_void,
+    _drv: *mut c_void,
+) -> bool {
+    false
+}
+
+/// `acpi_match_device_ids` - `vendor/linux/drivers/acpi/bus.c`.
+pub unsafe extern "C" fn linux_acpi_match_device_ids(
+    _device: *mut c_void,
+    _ids: *const c_void,
+) -> i32 {
+    -ENOENT
+}
+
+/// `acpi_find_child_device` - `vendor/linux/drivers/acpi/glue.c`.
+pub unsafe extern "C" fn linux_acpi_find_child_device(
+    _parent: *mut c_void,
+    _address: u64,
+    _check_children: bool,
+) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// `acpi_initialize_hp_context` - `vendor/linux/drivers/acpi/scan.c`.
+pub unsafe extern "C" fn linux_acpi_initialize_hp_context(
+    _adev: *mut c_void,
+    _hp: *mut c_void,
+    _notify: *mut c_void,
+    _uevent: *mut c_void,
+) {
+}
+
+/// `acpi_unbind_one` - `vendor/linux/drivers/acpi/glue.c`.
+pub unsafe extern "C" fn linux_acpi_unbind_one(_dev: *mut c_void) -> i32 {
+    0
+}
+
+/// `acpi_put_table` - `vendor/linux/drivers/acpi/acpica/tbxface.c`.
+pub unsafe extern "C" fn linux_acpi_put_table(_table: *mut c_void) {}
+
+/// `acpi_nhlt_get_gbl_table` - `vendor/linux/drivers/acpi/nhlt.c`.
+pub unsafe extern "C" fn linux_acpi_nhlt_get_gbl_table() -> u32 {
+    AE_NOT_FOUND
+}
+
+/// `acpi_nhlt_find_endpoint` - `vendor/linux/drivers/acpi/nhlt.c`.
+pub unsafe extern "C" fn linux_acpi_nhlt_find_endpoint(
+    _link_type: i32,
+    _dev_type: i32,
+    _dir: i32,
+    _bus_id: i32,
+) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// `acpi_nhlt_put_gbl_table` - `vendor/linux/drivers/acpi/nhlt.c`.
+pub unsafe extern "C" fn linux_acpi_nhlt_put_gbl_table() {}
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -559,6 +1318,174 @@ mod tests {
     use super::*;
     use std::vec;
     use std::vec::Vec;
+
+    #[test]
+    fn linux_acpi_video_exports_register_for_modules() {
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("acpi_video_register"),
+            Some(linux_acpi_video_register as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("acpi_video_register_backlight"),
+            Some(linux_acpi_video_register_backlight as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("__acpi_video_get_backlight_type"),
+            Some(linux___acpi_video_get_backlight_type as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("acpi_video_backlight_string"),
+            Some(acpi_video_backlight_string_addr())
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("acpi_get_name"),
+            Some(linux_acpi_get_name as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("acpi_target_system_state"),
+            Some(linux_acpi_target_system_state as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("acpi_check_resource_conflict"),
+            Some(linux_acpi_check_resource_conflict as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("acpi_install_address_space_handler"),
+            Some(linux_acpi_install_address_space_handler as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("acpi_remove_address_space_handler"),
+            Some(linux_acpi_remove_address_space_handler as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("acpi_os_read_port"),
+            Some(linux_acpi_os_read_port as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("acpi_os_write_port"),
+            Some(linux_acpi_os_write_port as usize)
+        );
+    }
+
+    #[test]
+    fn linux_acpi_video_reports_no_acpi_video_device() {
+        let mut auto_detect = true;
+        assert_eq!(unsafe { linux_acpi_video_register() }, -ENODEV);
+        assert!(!unsafe { linux_acpi_video_handles_brightness_key_presses() });
+        assert_eq!(
+            unsafe { linux___acpi_video_get_backlight_type(false, &mut auto_detect) },
+            ACPI_BACKLIGHT_VENDOR
+        );
+        assert!(!auto_detect);
+        assert_eq!(
+            unsafe { linux___acpi_video_get_backlight_type(true, core::ptr::null_mut()) },
+            ACPI_BACKLIGHT_NATIVE
+        );
+    }
+
+    #[test]
+    fn linux_acpi_target_system_state_reports_active_s0() {
+        assert_eq!(unsafe { linux_acpi_target_system_state() }, ACPI_STATE_S0);
+    }
+
+    #[test]
+    fn linux_acpi_i2c_compat_exports_report_no_resource_conflict() {
+        assert_eq!(
+            unsafe { linux_acpi_check_resource_conflict(core::ptr::null()) },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                linux_acpi_install_address_space_handler(
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                )
+            },
+            AE_OK
+        );
+        assert_eq!(
+            unsafe {
+                linux_acpi_remove_address_space_handler(
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                )
+            },
+            AE_OK
+        );
+
+        let mut value = 0u32;
+        assert_eq!(
+            unsafe { linux_acpi_os_read_port(0x1_0000, &mut value, 8) },
+            AE_BAD_PARAMETER
+        );
+        assert_eq!(
+            unsafe { linux_acpi_os_write_port(0x1_0000, 0, 8) },
+            AE_BAD_PARAMETER
+        );
+    }
+
+    #[test]
+    fn linux_acpi_get_name_fills_existing_and_allocated_buffers() {
+        let handle = 0x1234usize as *mut c_void;
+        let mut single = [0u8; 8];
+        let mut single_buffer = LinuxAcpiBuffer {
+            length: single.len(),
+            pointer: single.as_mut_ptr().cast(),
+        };
+
+        assert_eq!(
+            unsafe { linux_acpi_get_name(handle, ACPI_SINGLE_NAME, &mut single_buffer) },
+            AE_OK
+        );
+        assert_eq!(single_buffer.length, ACPI_LUPOS_SINGLE_NAME.len());
+        assert_eq!(
+            &single[..ACPI_LUPOS_SINGLE_NAME.len()],
+            ACPI_LUPOS_SINGLE_NAME
+        );
+
+        let mut too_small = LinuxAcpiBuffer {
+            length: ACPI_NO_BUFFER,
+            pointer: core::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { linux_acpi_get_name(handle, ACPI_FULL_PATHNAME, &mut too_small) },
+            AE_BUFFER_OVERFLOW
+        );
+        assert_eq!(too_small.length, ACPI_LUPOS_FULL_PATH.len());
+
+        let mut allocated = LinuxAcpiBuffer {
+            length: ACPI_ALLOCATE_BUFFER,
+            pointer: core::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { linux_acpi_get_name(handle, ACPI_FULL_PATHNAME, &mut allocated) },
+            AE_OK
+        );
+        assert_eq!(allocated.length, ACPI_LUPOS_FULL_PATH.len());
+        assert!(!allocated.pointer.is_null());
+        unsafe {
+            assert_eq!(
+                core::slice::from_raw_parts(
+                    allocated.pointer.cast::<u8>(),
+                    ACPI_LUPOS_FULL_PATH.len()
+                ),
+                ACPI_LUPOS_FULL_PATH
+            );
+            crate::mm::slab::linux_kfree(allocated.pointer.cast());
+        }
+
+        assert_eq!(
+            unsafe {
+                linux_acpi_get_name(core::ptr::null_mut(), ACPI_SINGLE_NAME, &mut single_buffer)
+            },
+            AE_NOT_FOUND
+        );
+    }
 
     // ── RSDP checksum ──────────────────────────────────────────────────────────
 

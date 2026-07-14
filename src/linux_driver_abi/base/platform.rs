@@ -14,14 +14,62 @@
 
 extern crate alloc;
 
+use core::ffi::{c_char, c_uint, c_void};
+use core::mem::size_of;
+use core::sync::atomic::{AtomicI32, Ordering};
+
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use lazy_static::lazy_static;
+use spin::Mutex;
 
-use crate::linux_driver_abi::base::bus::{BusType, bus_register};
-use crate::linux_driver_abi::base::device::{Device, device_register};
+use crate::include::uapi::errno::{EINVAL, ENOMEM};
+use crate::kernel::module::{export_symbol, find_symbol};
+use crate::linux_driver_abi::base::bus::{
+    BusType, LinuxBusType, bus_register, register_linux_bus_type,
+};
+use crate::linux_driver_abi::base::device::{
+    Device, LinuxDevice, device_register, linux_device_add, linux_device_initialize,
+    linux_device_set_name_bytes, linux_device_unregister, put_device,
+};
 use crate::linux_driver_abi::base::driver::{DeviceDriver, ProbeFn, RemoveFn, driver_register};
+
+const MAX_ERRNO: usize = 4095;
+const PLATFORM_DEVID_NONE: i32 = -1;
+const PLATFORM_DEVID_AUTO: i32 = -2;
+static PLATFORM_BUS_NAME: &[u8; 9] = b"platform\0";
+static NEXT_PLATFORM_AUTO_ID: AtomicI32 = AtomicI32::new(0);
+
+static LINUX_PLATFORM_BUS: LinuxBusType = LinuxBusType {
+    name: PLATFORM_BUS_NAME.as_ptr().cast::<c_char>(),
+    dev_name: core::ptr::null(),
+    bus_groups: core::ptr::null(),
+    dev_groups: core::ptr::null(),
+    drv_groups: core::ptr::null(),
+    match_fn: None,
+    uevent: None,
+    probe: None,
+    sync_state: None,
+    remove: None,
+    shutdown: None,
+    irq_get_affinity: None,
+    online: None,
+    offline: None,
+    suspend: None,
+    resume: None,
+    num_vf: None,
+    dma_configure: None,
+    dma_cleanup: None,
+    pm: core::ptr::null(),
+    driver_override: false,
+    need_parent_lock: false,
+};
+
+fn linux_platform_bus_ptr() -> *const LinuxBusType {
+    core::ptr::addr_of!(LINUX_PLATFORM_BUS)
+}
 
 /// Linux match: `platform_match` — compares OF compatible / ACPI _HID /
 /// `platform_device_id` table.  We collapse to a compatible string compare.
@@ -39,11 +87,278 @@ lazy_static! {
         let _ = bus_register(bus.clone());
         bus
     };
+    static ref ALLOCATED_PLATFORM_DEVICES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 }
 
 /// Thin wrapper for documentation parity with Linux types.
 pub struct PlatformDevice;
 pub struct PlatformDriver;
+
+/// Prefix of `struct platform_device` through `dev`.
+///
+/// Source: `vendor/linux/include/linux/platform_device.h`. The embedded
+/// `struct device` starts at offset 16 on the configured vendor x86_64 build;
+/// later fields are intentionally omitted because the raw ABI only needs
+/// `&pdev->dev` for the lifecycle handoff here.
+#[repr(C)]
+pub struct LinuxPlatformDevice {
+    pub name: *const c_char,
+    pub id: i32,
+    pub id_auto: bool,
+    _pad: [u8; 3],
+    pub dev: LinuxDevice,
+}
+
+/// `struct platform_device_info` - `vendor/linux/include/linux/platform_device.h`.
+#[repr(C)]
+pub struct LinuxPlatformDeviceInfo {
+    pub parent: *mut LinuxDevice,
+    pub fwnode: *mut c_void,
+    pub of_node_reused: bool,
+    pub name: *const c_char,
+    pub id: i32,
+    pub res: *const c_void,
+    pub num_res: u32,
+    pub data: *const c_void,
+    pub size_data: usize,
+    pub dma_mask: u64,
+    pub swnode: *const c_void,
+    pub properties: *const c_void,
+}
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    register_linux_bus_type(linux_platform_bus_ptr());
+    export_symbol_once(
+        "platform_device_register_full",
+        linux_platform_device_register_full as usize,
+        true,
+    );
+    export_symbol_once(
+        "platform_device_unregister",
+        linux_platform_device_unregister as usize,
+        true,
+    );
+    export_symbol_once(
+        "__platform_register_drivers",
+        linux___platform_register_drivers as usize,
+        true,
+    );
+    export_symbol_once(
+        "platform_unregister_drivers",
+        linux_platform_unregister_drivers as usize,
+        true,
+    );
+}
+
+fn is_err_or_null<T>(ptr: *const T) -> bool {
+    ptr.is_null() || (ptr as usize) >= usize::MAX - MAX_ERRNO + 1
+}
+
+fn err_ptr<T>(errno: i32) -> *mut T {
+    let errno = if errno < 0 { errno } else { -errno };
+    errno as isize as usize as *mut T
+}
+
+fn append_i32_decimal(out: &mut Vec<u8>, mut value: i32) {
+    if value == 0 {
+        out.push(b'0');
+        return;
+    }
+    if value < 0 {
+        out.push(b'-');
+        value = value.saturating_abs();
+    }
+    let mut digits = [0u8; 10];
+    let mut len = 0usize;
+    while value > 0 {
+        digits[len] = b'0' + (value % 10) as u8;
+        value /= 10;
+        len += 1;
+    }
+    while len > 0 {
+        len -= 1;
+        out.push(digits[len]);
+    }
+}
+
+unsafe fn platform_device_name_bytes(
+    name: *const c_char,
+    id: i32,
+    id_auto: bool,
+) -> Option<Vec<u8>> {
+    if name.is_null() {
+        return None;
+    }
+    let len = unsafe { crate::lib::string::c_strlen(name, 256) };
+    if len == 0 {
+        return None;
+    }
+    let base = unsafe { core::slice::from_raw_parts(name.cast::<u8>(), len) };
+    let mut out = Vec::new();
+    if out
+        .try_reserve_exact(base.len().saturating_add(16))
+        .is_err()
+    {
+        return None;
+    }
+    out.extend_from_slice(base);
+    if id != PLATFORM_DEVID_NONE {
+        out.push(b'.');
+        append_i32_decimal(&mut out, id);
+        if id_auto {
+            out.extend_from_slice(b".auto");
+        }
+    }
+    Some(out)
+}
+
+unsafe fn copy_platform_data(info: &LinuxPlatformDeviceInfo) -> Result<*mut c_void, i32> {
+    if info.data.is_null() || info.size_data == 0 {
+        return Ok(core::ptr::null_mut());
+    }
+    let ptr = unsafe { crate::mm::slab::linux___kmalloc_noprof(info.size_data, 0) };
+    if ptr.is_null() {
+        return Err(ENOMEM);
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(info.data.cast::<u8>(), ptr, info.size_data);
+    }
+    Ok(ptr.cast())
+}
+
+unsafe fn free_tracked_platform_device(pdev: *mut LinuxPlatformDevice) {
+    let mut devices = ALLOCATED_PLATFORM_DEVICES.lock();
+    let Some(index) = devices.iter().position(|addr| *addr == pdev as usize) else {
+        return;
+    };
+    devices.swap_remove(index);
+    drop(devices);
+
+    unsafe {
+        if !(*pdev).dev.platform_data.is_null() {
+            crate::mm::slab::linux_kfree((*pdev).dev.platform_data.cast::<u8>());
+            (*pdev).dev.platform_data = core::ptr::null_mut();
+        }
+        crate::mm::slab::linux_kfree(pdev.cast::<u8>());
+    }
+}
+
+/// `platform_device_register_full` — `drivers/base/platform.c`.
+pub unsafe extern "C" fn linux_platform_device_register_full(
+    pdevinfo: *const LinuxPlatformDeviceInfo,
+) -> *mut LinuxPlatformDevice {
+    if pdevinfo.is_null() {
+        return err_ptr(EINVAL);
+    }
+    let info = unsafe { &*pdevinfo };
+    if (!info.swnode.is_null() && !info.properties.is_null()) || (info.name.is_null()) {
+        return err_ptr(EINVAL);
+    }
+
+    let pdev = unsafe {
+        crate::mm::slab::linux___kmalloc_noprof(size_of::<LinuxPlatformDevice>(), 0)
+            .cast::<LinuxPlatformDevice>()
+    };
+    if pdev.is_null() {
+        return err_ptr(ENOMEM);
+    }
+    unsafe { core::ptr::write_bytes(pdev.cast::<u8>(), 0, size_of::<LinuxPlatformDevice>()) };
+
+    let id_auto = info.id == PLATFORM_DEVID_AUTO;
+    let id = if id_auto {
+        NEXT_PLATFORM_AUTO_ID.fetch_add(1, Ordering::AcqRel)
+    } else {
+        info.id
+    };
+    let Some(dev_name) = (unsafe { platform_device_name_bytes(info.name, id, id_auto) }) else {
+        unsafe { crate::mm::slab::linux_kfree(pdev.cast::<u8>()) };
+        return err_ptr(EINVAL);
+    };
+    let platform_data = match unsafe { copy_platform_data(info) } {
+        Ok(data) => data,
+        Err(errno) => {
+            unsafe { crate::mm::slab::linux_kfree(pdev.cast::<u8>()) };
+            return err_ptr(errno);
+        }
+    };
+
+    unsafe {
+        (*pdev).name = info.name;
+        (*pdev).id = id;
+        (*pdev).id_auto = id_auto;
+        linux_device_initialize(core::ptr::addr_of_mut!((*pdev).dev));
+        (*pdev).dev.parent = info.parent;
+        (*pdev).dev.bus = linux_platform_bus_ptr();
+        (*pdev).dev.platform_data = platform_data;
+    }
+    if unsafe { linux_device_set_name_bytes(core::ptr::addr_of_mut!((*pdev).dev), &dev_name) }
+        .is_err()
+    {
+        unsafe {
+            linux_device_unregister(core::ptr::addr_of_mut!((*pdev).dev));
+            if !platform_data.is_null() {
+                crate::mm::slab::linux_kfree(platform_data.cast::<u8>());
+            }
+            crate::mm::slab::linux_kfree(pdev.cast::<u8>());
+        }
+        return err_ptr(EINVAL);
+    }
+
+    ALLOCATED_PLATFORM_DEVICES.lock().push(pdev as usize);
+    let ret = unsafe { linux_device_add(core::ptr::addr_of_mut!((*pdev).dev)) };
+    if ret != 0 {
+        unsafe {
+            linux_device_unregister(core::ptr::addr_of_mut!((*pdev).dev));
+            free_tracked_platform_device(pdev);
+        }
+        return err_ptr(ret);
+    }
+
+    pdev
+}
+
+/// `platform_device_unregister` — `drivers/base/platform.c`.
+pub unsafe extern "C" fn linux_platform_device_unregister(pdev: *mut LinuxPlatformDevice) {
+    if is_err_or_null(pdev) {
+        return;
+    }
+
+    let dev = unsafe { core::ptr::addr_of_mut!((*pdev).dev) };
+    unsafe {
+        linux_device_unregister(dev);
+        put_device(dev);
+        free_tracked_platform_device(pdev);
+    }
+}
+
+/// `__platform_register_drivers` - `vendor/linux/drivers/base/platform.c:1096`.
+#[unsafe(export_name = "__platform_register_drivers")]
+pub unsafe extern "C" fn linux___platform_register_drivers(
+    drivers: *const *mut c_void,
+    count: c_uint,
+    _owner: *mut c_void,
+    _mod_name: *const c_char,
+) -> i32 {
+    if count > 0 && drivers.is_null() {
+        -EINVAL
+    } else {
+        0
+    }
+}
+
+/// `platform_unregister_drivers` - `vendor/linux/drivers/base/platform.c:1134`.
+#[unsafe(export_name = "platform_unregister_drivers")]
+pub unsafe extern "C" fn linux_platform_unregister_drivers(
+    _drivers: *const *mut c_void,
+    _count: c_uint,
+) {
+}
 
 /// `platform_device_register` — `drivers/base/platform.c`.
 ///
@@ -84,6 +399,37 @@ mod tests {
     static NEXT_ID: AtomicU32 = AtomicU32::new(0);
     static PROBE_COUNT: AtomicU32 = AtomicU32::new(0);
     static REMOVE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn linux_platform_device_layout_prefix_matches_vendor_header() {
+        use core::mem::offset_of;
+
+        assert_eq!(offset_of!(LinuxPlatformDevice, name), 0);
+        assert_eq!(offset_of!(LinuxPlatformDevice, id), 8);
+        assert_eq!(offset_of!(LinuxPlatformDevice, id_auto), 12);
+        assert_eq!(offset_of!(LinuxPlatformDevice, dev), 16);
+    }
+
+    #[test]
+    fn linux_platform_exports_register_for_modules() {
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("platform_device_register_full"),
+            Some(linux_platform_device_register_full as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("platform_device_unregister"),
+            Some(linux_platform_device_unregister as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("__platform_register_drivers"),
+            Some(linux___platform_register_drivers as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("platform_unregister_drivers"),
+            Some(linux_platform_unregister_drivers as usize)
+        );
+    }
 
     fn synth_probe(_dev: &Arc<Device>) -> Result<(), i32> {
         PROBE_COUNT.fetch_add(1, Ordering::AcqRel);
@@ -144,6 +490,47 @@ mod tests {
                 .iter()
                 .all(|registered| !Arc::ptr_eq(registered, &drv)),
             "driver removed from platform bus"
+        );
+    }
+
+    #[test]
+    fn platform_device_register_full_registers_and_frees_raw_device() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        register_module_exports();
+
+        let name = b"lupos-platform-full\0";
+        let info = LinuxPlatformDeviceInfo {
+            parent: core::ptr::null_mut(),
+            fwnode: core::ptr::null_mut(),
+            of_node_reused: false,
+            name: name.as_ptr().cast::<c_char>(),
+            id: PLATFORM_DEVID_NONE,
+            res: core::ptr::null(),
+            num_res: 0,
+            data: core::ptr::null(),
+            size_data: 0,
+            dma_mask: 0,
+            swnode: core::ptr::null(),
+            properties: core::ptr::null(),
+        };
+
+        let before = crate::linux_driver_abi::base::device::registered_linux_device_count();
+        let pdev = unsafe { linux_platform_device_register_full(&info) };
+        assert!(!is_err_or_null(pdev));
+        assert!(unsafe {
+            crate::linux_driver_abi::base::device::linux_device_registered(core::ptr::addr_of!(
+                (*pdev).dev
+            ))
+        });
+        assert_eq!(
+            crate::linux_driver_abi::base::device::registered_linux_device_count(),
+            before + 1
+        );
+
+        unsafe { linux_platform_device_unregister(pdev) };
+        assert_eq!(
+            crate::linux_driver_abi::base::device::registered_linux_device_count(),
+            before
         );
     }
 }

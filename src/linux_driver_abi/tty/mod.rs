@@ -30,13 +30,17 @@ pub mod serial8250;
 
 pub use crate::{serial_print, serial_println};
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
+
+use crate::kernel::module::{export_symbol, find_symbol};
 
 use ldisc::NTtyState;
 
@@ -230,6 +234,124 @@ pub struct Winsize {
     pub ws_col: u16,
     pub ws_xpixel: u16,
     pub ws_ypixel: u16,
+}
+
+/// Opaque HVC state backing `drivers/tty/hvc/hvc_console.c` exports.
+///
+/// Linux's `struct hvc_struct` is private to the HVC core; the virtio console
+/// driver stores the returned pointer and passes it back to HVC entry points
+/// without dereferencing it. Lupos therefore keeps an opaque record instead of
+/// implementing a local console driver.
+#[derive(Clone, Copy, Debug)]
+struct HvcState {
+    vtermno: u32,
+    data: i32,
+    ops: usize,
+    outbuf_size: i32,
+    winsize: Winsize,
+}
+
+lazy_static! {
+    static ref HVC_STATES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+}
+
+static HVC_KICK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn export_tty_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+fn err_ptr<T>(errno: i32) -> *mut T {
+    (usize::MAX - errno as usize + 1) as *mut T
+}
+
+fn hvc_registered_index(hp: *mut c_void, states: &[usize]) -> Option<usize> {
+    let ptr = hp as usize;
+    if ptr == 0 {
+        return None;
+    }
+    states.iter().position(|state| *state == ptr)
+}
+
+fn with_hvc_state_mut<R>(hp: *mut c_void, f: impl FnOnce(&mut HvcState) -> R) -> Option<R> {
+    let states = HVC_STATES.lock();
+    hvc_registered_index(hp, &states)?;
+    Some(f(unsafe { &mut *(hp as *mut HvcState) }))
+}
+
+#[cfg(test)]
+fn hvc_state_snapshot(hp: *mut c_void) -> Option<HvcState> {
+    with_hvc_state_mut(hp, |state| *state)
+}
+
+/// Register HVC symbols exported by `vendor/linux/drivers/tty/hvc/hvc_console.c`.
+pub fn register_module_exports() {
+    export_tty_symbol_once("hvc_instantiate", linux_hvc_instantiate as usize, true);
+    export_tty_symbol_once("hvc_alloc", linux_hvc_alloc as usize, true);
+    export_tty_symbol_once("hvc_remove", linux_hvc_remove as usize, true);
+    export_tty_symbol_once("hvc_poll", linux_hvc_poll as usize, true);
+    export_tty_symbol_once("hvc_kick", linux_hvc_kick as usize, true);
+    export_tty_symbol_once("__hvc_resize", linux___hvc_resize as usize, true);
+}
+
+/// `hvc_instantiate` - `vendor/linux/drivers/tty/hvc/hvc_console.c:285`.
+pub unsafe extern "C" fn linux_hvc_instantiate(
+    _vtermno: u32,
+    _index: i32,
+    _ops: *const c_void,
+) -> i32 {
+    0
+}
+
+/// `hvc_alloc` - `vendor/linux/drivers/tty/hvc/hvc_console.c:911`.
+pub unsafe extern "C" fn linux_hvc_alloc(
+    vtermno: u32,
+    data: i32,
+    ops: *const c_void,
+    outbuf_size: i32,
+) -> *mut c_void {
+    if outbuf_size < 0 {
+        return err_ptr(crate::include::uapi::errno::EINVAL);
+    }
+    let state = Box::new(HvcState {
+        vtermno,
+        data,
+        ops: ops as usize,
+        outbuf_size,
+        winsize: Winsize::default(),
+    });
+    let ptr = Box::into_raw(state);
+    HVC_STATES.lock().push(ptr as usize);
+    ptr.cast()
+}
+
+/// `hvc_remove` - `vendor/linux/drivers/tty/hvc/hvc_console.c:977`.
+pub unsafe extern "C" fn linux_hvc_remove(hp: *mut c_void) {
+    let mut states = HVC_STATES.lock();
+    let Some(index) = hvc_registered_index(hp, &states) else {
+        return;
+    };
+    let ptr = states.swap_remove(index) as *mut HvcState;
+    drop(unsafe { Box::from_raw(ptr) });
+}
+
+/// `hvc_poll` - `vendor/linux/drivers/tty/hvc/hvc_console.c:762`.
+pub unsafe extern "C" fn linux_hvc_poll(_hp: *mut c_void) -> i32 {
+    0
+}
+
+/// `hvc_kick` - `vendor/linux/drivers/tty/hvc/hvc_console.c:313`.
+pub unsafe extern "C" fn linux_hvc_kick() {
+    HVC_KICK_COUNT.fetch_add(1, Ordering::AcqRel);
+}
+
+/// `__hvc_resize` - `vendor/linux/drivers/tty/hvc/hvc_console.c:778`.
+pub unsafe extern "C" fn linux___hvc_resize(hp: *mut c_void, ws: Winsize) {
+    let _ = with_hvc_state_mut(hp, |state| {
+        state.winsize = ws;
+    });
 }
 
 /// Termios flags subset — used by n_tty to decide canonical vs raw mode.
@@ -904,6 +1026,7 @@ pub fn tty_driver_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
 
     static TTY_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
@@ -1158,5 +1281,50 @@ mod tests {
             tty_ioctl_compat(KDSIGACCEPT, 65),
             Err(crate::include::uapi::errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn hvc_alloc_returns_opaque_state_and_remove_releases_it() {
+        let _guard = TTY_TEST_LOCK.lock();
+        let before = HVC_STATES.lock().len();
+        let hp = unsafe { linux_hvc_alloc(7, 3, 0x1000usize as *const c_void, 4096) };
+
+        assert!(!hp.is_null());
+        assert_eq!(HVC_STATES.lock().len(), before + 1);
+        let state = hvc_state_snapshot(hp).expect("hvc state should be registered");
+        assert_eq!(state.vtermno, 7);
+        assert_eq!(state.data, 3);
+        assert_eq!(state.ops, 0x1000);
+        assert_eq!(state.outbuf_size, 4096);
+
+        let ws = Winsize {
+            ws_row: 40,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe { linux___hvc_resize(hp, ws) };
+        assert_eq!(hvc_state_snapshot(hp).unwrap().winsize.ws_col, 120);
+
+        unsafe { linux_hvc_remove(hp) };
+        assert_eq!(HVC_STATES.lock().len(), before);
+    }
+
+    #[test]
+    fn hvc_exports_track_vendor_gpl_symbols() {
+        let source = include_str!("../../../vendor/linux/drivers/tty/hvc/hvc_console.c");
+        for symbol in [
+            "hvc_instantiate",
+            "hvc_kick",
+            "hvc_poll",
+            "__hvc_resize",
+            "hvc_alloc",
+            "hvc_remove",
+        ] {
+            assert!(
+                source.contains(&format!("EXPORT_SYMBOL_GPL({symbol});")),
+                "missing GPL export for {symbol}"
+            );
+        }
     }
 }

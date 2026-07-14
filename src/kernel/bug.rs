@@ -379,18 +379,26 @@ pub fn report_bug(bug_addr: usize) -> BugTrapType {
                 continue;
             }
 
-            // x86 is_valid_bugaddr(): only the UD2 encoding used by the
-            // selected module BUG/WARN macros is recoverable through this
-            // path. The loader also checked this while the table was formed.
-            let instruction =
-                unsafe { core::slice::from_raw_parts(bug_addr as *const u8, LEN_UD2) };
-            if instruction != INSN_UD2 {
-                return BugTrapType::None;
-            }
-
             let flags_addr = entry_addr + BUG_ENTRY_FLAGS_OFFSET;
             let flags_atomic = unsafe { &*(flags_addr as *const AtomicU16) };
             let mut flags = flags_atomic.load(Ordering::Acquire);
+            let instruction_matches = if flags & BUGFLAG_ARGS != 0 {
+                let instruction = unsafe {
+                    core::slice::from_raw_parts(
+                        bug_addr as *const u8,
+                        crate::arch::x86::kernel::static_call::WARNINSN.len(),
+                    )
+                };
+                instruction == crate::arch::x86::kernel::static_call::WARNINSN
+            } else {
+                let instruction =
+                    unsafe { core::slice::from_raw_parts(bug_addr as *const u8, LEN_UD2) };
+                instruction == INSN_UD2
+            };
+            if !instruction_matches {
+                return BugTrapType::None;
+            }
+
             let warning = flags & BUGFLAG_WARNING != 0;
             if warning && flags & BUGFLAG_ONCE != 0 {
                 let previous = flags_atomic.fetch_or(BUGFLAG_DONE, Ordering::AcqRel);
@@ -416,8 +424,9 @@ pub fn report_bug(bug_addr: usize) -> BugTrapType {
             if flags & BUGFLAG_NO_CUT_HERE == 0 {
                 log_info!("bug", "------------[ cut here ]------------");
                 if let Some(format) = format.filter(|format| !format.is_empty()) {
-                    // BUGFLAG_ARGS entries are rejected by the loader. For
-                    // the UD2 path Linux prints this string as data (`%s`).
+                    // Lupos does not yet reconstruct Linux's register-backed
+                    // varargs list for BUGFLAG_ARGS, so it logs the literal
+                    // format string just like the non-args UD2 path.
                     log_warn!("bug", "{}", format);
                 }
             }

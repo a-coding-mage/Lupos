@@ -15,10 +15,102 @@ use crate::arch::x86::mm::paging::{
 };
 use crate::arch::x86::mm::pat::{PageCacheMode, pgprot_with_cachemode};
 use crate::include::uapi::errno::{EINVAL, EOPNOTSUPP};
+use crate::kernel::module::{export_symbol, find_symbol};
 #[cfg(test)]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const DEFAULT_CLFLUSH_LINE_SIZE: usize = 64;
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("set_memory_uc", linux_set_memory_uc as usize, false);
+    export_symbol_once("set_memory_wc", linux_set_memory_wc as usize, false);
+    export_symbol_once("set_memory_wb", linux_set_memory_wb as usize, false);
+    export_symbol_once("set_pages_uc", linux_set_pages_uc as usize, false);
+    export_symbol_once("set_pages_wb", linux_set_pages_wb as usize, false);
+    export_symbol_once(
+        "set_pages_array_uc",
+        linux_set_pages_array_uc as usize,
+        false,
+    );
+    export_symbol_once(
+        "set_pages_array_wc",
+        linux_set_pages_array_wc as usize,
+        false,
+    );
+    export_symbol_once(
+        "set_pages_array_wb",
+        linux_set_pages_array_wb as usize,
+        false,
+    );
+}
+
+unsafe extern "C" fn linux_set_memory_uc(addr: u64, numpages: i32) -> i32 {
+    if numpages < 0 {
+        return -EINVAL;
+    }
+    set_memory_uc(addr, numpages as usize).map_or_else(|err| -err, |()| 0)
+}
+
+unsafe extern "C" fn linux_set_memory_wc(addr: u64, numpages: i32) -> i32 {
+    if numpages < 0 {
+        return -EINVAL;
+    }
+    set_memory_wc(addr, numpages as usize).map_or_else(|err| -err, |()| 0)
+}
+
+unsafe extern "C" fn linux_set_memory_wb(addr: u64, numpages: i32) -> i32 {
+    if numpages < 0 {
+        return -EINVAL;
+    }
+    set_memory_wb(addr, numpages as usize).map_or_else(|err| -err, |()| 0)
+}
+
+unsafe extern "C" fn linux_set_pages_uc(_page: *mut crate::mm::page::Page, numpages: i32) -> i32 {
+    if numpages < 0 { -EINVAL } else { -EOPNOTSUPP }
+}
+
+unsafe extern "C" fn linux_set_pages_wb(_page: *mut crate::mm::page::Page, numpages: i32) -> i32 {
+    if numpages < 0 { -EINVAL } else { -EOPNOTSUPP }
+}
+
+unsafe extern "C" fn linux_set_pages_array_uc(
+    _pages: *mut *mut crate::mm::page::Page,
+    addrinarray: i32,
+) -> i32 {
+    if addrinarray < 0 {
+        -EINVAL
+    } else {
+        -EOPNOTSUPP
+    }
+}
+
+unsafe extern "C" fn linux_set_pages_array_wc(
+    _pages: *mut *mut crate::mm::page::Page,
+    addrinarray: i32,
+) -> i32 {
+    if addrinarray < 0 {
+        -EINVAL
+    } else {
+        -EOPNOTSUPP
+    }
+}
+
+unsafe extern "C" fn linux_set_pages_array_wb(
+    _pages: *mut *mut crate::mm::page::Page,
+    addrinarray: i32,
+) -> i32 {
+    if addrinarray < 0 {
+        -EINVAL
+    } else {
+        -EOPNOTSUPP
+    }
+}
 
 #[cfg(test)]
 const CLFLUSH_LOG_CAP: usize = 16;

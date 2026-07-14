@@ -11,6 +11,7 @@ extern crate alloc;
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
+use core::ffi::c_void;
 use core::sync::atomic::Ordering as AtomicOrdering;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -20,6 +21,7 @@ use spin::Mutex;
 use crate::arch::x86::kernel::uaccess;
 use crate::include::uapi::errno::{EAGAIN, EBADF, EFAULT, EINVAL, EPIPE};
 use crate::include::uapi::fcntl::{O_CLOEXEC, O_NONBLOCK, O_RDONLY, O_WRONLY};
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::sched::wait::WaitQueueHead;
 use crate::kernel::task::task_state::{TASK_INTERRUPTIBLE, TASK_RUNNING};
 use crate::kernel::{files, sched};
@@ -44,6 +46,41 @@ static PIPE_TOKEN: AtomicUsize = AtomicUsize::new(1);
 
 lazy_static! {
     static ref PIPES: Mutex<BTreeMap<usize, Arc<PipeState>>> = Mutex::new(BTreeMap::new());
+}
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("pipe_lock", linux_pipe_lock as usize, false);
+    export_symbol_once("pipe_unlock", linux_pipe_unlock as usize, false);
+    export_symbol_once(
+        "__splice_from_pipe",
+        linux___splice_from_pipe as usize,
+        false,
+    );
+}
+
+/// `pipe_lock` - `vendor/linux/fs/pipe.c:88`.
+pub unsafe extern "C" fn linux_pipe_lock(_pipe: *mut c_void) {}
+
+/// `pipe_unlock` - `vendor/linux/fs/pipe.c:95`.
+pub unsafe extern "C" fn linux_pipe_unlock(_pipe: *mut c_void) {}
+
+/// `__splice_from_pipe` - `vendor/linux/fs/splice.c:596`.
+///
+/// Lupos does not expose Linux-layout `struct pipe_inode_info` or
+/// `struct splice_desc` objects to vendor modules yet. Returning zero mirrors
+/// an empty pipe and avoids dereferencing a foreign VFS layout.
+pub unsafe extern "C" fn linux___splice_from_pipe(
+    _pipe: *mut c_void,
+    _sd: *mut c_void,
+    _actor: *mut c_void,
+) -> isize {
+    0
 }
 
 static PIPE_READ_OPS: FileOps = FileOps {
@@ -521,5 +558,15 @@ mod tests {
         let mut pair = [0i32; 2];
         let ret = unsafe { sys_pipe2(pair.as_mut_ptr(), 0x4000_0000) };
         assert_eq!(ret, -(EINVAL as i64));
+    }
+
+    #[test]
+    fn module_exports_track_vendor_pipe_and_splice_symbols() {
+        let pipe_source = include_str!("../../vendor/linux/fs/pipe.c");
+        let splice_source = include_str!("../../vendor/linux/fs/splice.c");
+
+        assert!(pipe_source.contains("EXPORT_SYMBOL(pipe_lock);"));
+        assert!(pipe_source.contains("EXPORT_SYMBOL(pipe_unlock);"));
+        assert!(splice_source.contains("EXPORT_SYMBOL(__splice_from_pipe);"));
     }
 }

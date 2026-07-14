@@ -95,8 +95,18 @@ extern crate std;
 extern crate alloc;
 
 pub fn register_module_exports() {
+    clock::register_module_exports();
     completion::register_module_exports();
     swait::register_module_exports();
+    wait::register_module_exports();
+    wait_bit::register_module_exports();
+    use crate::kernel::module::{export_symbol, find_symbol};
+    if find_symbol("yield").is_none() {
+        export_symbol("yield", linux_yield as usize, false);
+    }
+    if find_symbol("sched_set_fifo").is_none() {
+        export_symbol("sched_set_fifo", linux_sched_set_fifo as usize, true);
+    }
 }
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -110,6 +120,17 @@ use crate::arch::x86::kernel::switch::{
 use crate::kernel::pid::{INIT_PID_NS, alloc_pid};
 use crate::kernel::task::{LINUX_OFFSET_THREAD, M29SchedFields, TaskStruct, ThreadInfo};
 use crate::kernel::thread::{DescStruct, ThreadStruct};
+
+unsafe extern "C" fn linux_yield() {
+    let _ = unsafe { crate::kernel::sched::syscalls::sys_sched_yield() };
+}
+
+/// `sched_set_fifo` - `vendor/linux/kernel/sched/syscalls.c`.
+unsafe extern "C" fn linux_sched_set_fifo(task: *mut TaskStruct) {
+    let _ = unsafe {
+        syscalls::sys_sched_setscheduler(task, prio::SCHED_FIFO, (prio::MAX_RT_PRIO / 2) as u32)
+    };
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -1076,6 +1097,17 @@ pub unsafe fn schedule_with_irqs_enabled() {
                 continue;
             }
 
+            // Softirqs raised by hard IRQs (e.g. a NAPI NET_RX from a device
+            // interrupt that arrived while every task slept) run at irq_exit
+            // on Linux. Lupos interrupt gates keep IRQs disabled in the ISR,
+            // so this task-context chokepoint is the deferred execution point
+            // — without it, a single blocked task waits on a wakeup that only
+            // the undrained softirq could deliver.
+            if crate::kernel::softirq::local_softirq_pending() != 0 {
+                crate::kernel::softirq::do_softirq();
+                continue;
+            }
+
             // Drop the tick's stale reschedule request before closing the
             // check/halt race. Any real wake or newly-runnable peer arriving
             // after this point sets it again.
@@ -1644,6 +1676,24 @@ mod tests {
         rq.tasks = [core::ptr::null_mut(); MAX_RUN_QUEUE];
         rq.len = 0;
         rq.current_idx = 0;
+    }
+
+    #[test]
+    fn sched_set_fifo_sets_mid_rt_priority() {
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+
+        unsafe {
+            linux_sched_set_fifo(task_ptr);
+        }
+
+        assert_eq!(task.m29.policy, prio::SCHED_FIFO);
+        assert_eq!(task.m29.rt_priority, (prio::MAX_RT_PRIO / 2) as u32);
+        assert_eq!(
+            task.m29.prio,
+            prio::MAX_RT_PRIO - 1 - (prio::MAX_RT_PRIO / 2)
+        );
+        assert_eq!(task.m29.sched_class, &rt::RT_SCHED_CLASS as *const _);
     }
 
     #[test]

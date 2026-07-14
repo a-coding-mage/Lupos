@@ -106,6 +106,10 @@ pub use cqe::Cqe;
 pub use params::{IoCqRingOffsets, IoSqRingOffsets, IoUringParams};
 pub use sqe::Sqe;
 
+pub fn register_module_exports() {
+    uring_cmd::register_module_exports();
+}
+
 /// `IORING_OP_*` opcode constants — byte-identical to Linux UAPI.
 /// Ref: vendor/linux/include/uapi/linux/io_uring.h::IORING_OP_*
 pub const IORING_OP_NOP: u8 = 0;

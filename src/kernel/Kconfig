@@ -105,6 +105,8 @@ config DRM_BOCHS
 config DRM_I915
 	tristate "Intel 915-family graphics support"
 	depends on DRM && PCI
+	select I2C
+	select I2C_ALGOBIT
 	default m if MODULES
 	default n
 
@@ -123,6 +125,30 @@ config HID
 	depends on INPUT
 	default y
 
+menu "I2C support"
+
+config I2C
+	tristate "I2C support"
+	default n
+
+config I2C_SMBUS
+	tristate "SMBus-specific protocols"
+	depends on I2C
+	default n
+
+config I2C_ALGOBIT
+	tristate "I2C bit-banging interfaces"
+	depends on I2C
+	default n
+
+config I2C_I801
+	tristate "Intel 82801 (ICH/PCH) SMBus controller"
+	depends on I2C && PCI
+	select I2C_SMBUS
+	default n
+
+endmenu
+
 menu "USB support"
 
 config USB
@@ -133,6 +159,159 @@ config USB_XHCI
 	bool "xHCI host controller support"
 	depends on USB && PCI
 	default y
+
+config USB_PCI
+	bool "PCI based USB host interface"
+	depends on USB && PCI
+	default y
+
+config USB_EHCI_HCD
+	tristate "EHCI HCD (USB 2.0) support"
+	depends on USB && PCI
+	default n
+
+config USB_EHCI_PCI
+	tristate "EHCI support for PCI-bus USB controllers"
+	depends on USB_EHCI_HCD && USB_PCI
+	default n
+
+config USB_OHCI_HCD
+	tristate "OHCI HCD (USB 1.1) support"
+	depends on USB && PCI
+	default n
+
+config USB_OHCI_HCD_PCI
+	tristate "OHCI support for PCI-bus USB controllers"
+	depends on USB_OHCI_HCD && USB_PCI
+	default n
+
+config USB_UHCI_HCD
+	tristate "UHCI HCD (most Intel and VIA) support"
+	depends on USB && PCI
+	default n
+
+config USB_MON
+	tristate "USB Monitor support"
+	depends on USB
+	default n
+
+config USB_PRINTER
+	tristate "USB Printer support"
+	depends on USB
+	default n
+
+endmenu
+
+menu "Network device support"
+
+config NET
+	bool "Networking support"
+	default y
+
+config NETDEVICES
+	bool "Network device support"
+	depends on NET
+	default y
+
+config NETCONSOLE
+	tristate "Network console logging support"
+	depends on NETDEVICES
+	default n
+
+config NET_9P
+	tristate "Plan 9 Resource Sharing Support (9P2000)"
+	depends on NET
+	default n
+
+config NET_9P_VIRTIO
+	tristate "9P Virtio Transport"
+	depends on NET_9P && VIRTIO
+	default n
+
+config MII
+	tristate
+	depends on NETDEVICES
+	default n
+
+config PHYLIB
+	tristate
+	depends on NETDEVICES
+	default n
+
+config PHY_PACKAGE
+	tristate
+	depends on PHYLIB
+	default n
+
+config REALTEK_PHY
+	tristate
+	depends on PHYLIB
+	select PHY_PACKAGE
+	default n
+
+config E100
+	tristate "Intel(R) PRO/100+ support"
+	depends on NETDEVICES && PCI
+	select MII
+	default n
+
+config E1000
+	tristate "Intel(R) PRO/1000 Gigabit Ethernet support"
+	depends on NETDEVICES && PCI
+	default m if MODULES
+
+config E1000E
+	tristate "Intel(R) PRO/1000 PCI-Express Gigabit Ethernet support"
+	depends on NETDEVICES && PCI
+	default n
+
+config SKY2
+	tristate "Marvell Yukon 2 support"
+	depends on NETDEVICES && PCI
+	default n
+
+config TIGON3
+	tristate "Broadcom Tigon3 support"
+	depends on NETDEVICES && PCI
+	select PHYLIB
+	default n
+
+config FORCEDETH
+	tristate "nForce Ethernet support"
+	depends on NETDEVICES && PCI
+	default n
+
+config 8139TOO
+	tristate "RealTek RTL-8129/8130/8139 PCI Fast Ethernet Adapter support"
+	depends on NETDEVICES && PCI
+	select MII
+	default n
+
+config R8169
+	tristate "Realtek 8169/8168/8101/8125 ethernet support"
+	depends on NETDEVICES && PCI
+	select PHYLIB
+	select REALTEK_PHY
+	default n
+
+endmenu
+
+menu "Thermal drivers"
+
+config X86_THERMAL_VECTOR
+	bool
+	depends on X86_64
+	default y
+
+config INTEL_TCC
+	bool
+	depends on X86_64
+
+config X86_PKG_TEMP_THERMAL
+	tristate "X86 package temperature thermal driver"
+	depends on X86_THERMAL_VECTOR && NET
+	select INTEL_TCC
+	default m if MODULES
 
 endmenu
 
@@ -152,6 +331,29 @@ config SND_TIMER
 	tristate
 	depends on SND
 	default m if SND
+
+config SND_HRTIMER
+	tristate "HR-timer backend support"
+	depends on SND
+	select SND_TIMER
+	default m if SND_SEQUENCER
+
+config SND_SEQ_DEVICE
+	tristate
+	depends on SND
+	default m if SND_SEQUENCER
+
+config SND_SEQUENCER
+	tristate "Sequencer support"
+	depends on SND
+	select SND_TIMER
+	select SND_SEQ_DEVICE
+	default m if MODULES
+
+config SND_SEQ_DUMMY
+	tristate "Sequencer dummy client"
+	depends on SND_SEQUENCER
+	default m if SND_SEQUENCER
 
 config SND_PCM
 	tristate
@@ -225,6 +427,36 @@ config BLK_DEV_SD
 	depends on SCSI
 	default m if MODULES
 
+config CDROM
+	tristate
+	default m if BLK_DEV_SR
+
+config BLK_DEV_SR
+	tristate "SCSI CDROM support"
+	depends on SCSI
+	select CDROM
+	default m if MODULES
+
+config CHR_DEV_SG
+	tristate "SCSI generic support"
+	depends on SCSI
+	default m if MODULES
+
+config SCSI_SPI_ATTRS
+	tristate "SCSI SPI transport attributes"
+	depends on SCSI
+	default m if MODULES
+
+config SCSI_VIRTIO
+	tristate "VirtIO SCSI support"
+	depends on SCSI && VIRTIO
+	default m if MODULES
+
+config USB_STORAGE
+	tristate "USB Mass Storage support"
+	depends on SCSI && USB
+	default m if MODULES
+
 config ATA
 	tristate "Serial ATA and Parallel ATA drivers"
 	depends on BLOCK
@@ -233,6 +465,26 @@ config ATA
 
 config SATA_AHCI
 	tristate "AHCI SATA support"
+	depends on ATA && PCI
+	default m if MODULES
+
+config ATA_PIIX
+	tristate "Intel ESB, ICH, PIIX3, PIIX4 PATA/SATA support"
+	depends on ATA && PCI
+	default m if MODULES
+
+config PATA_AMD
+	tristate "AMD/NVidia PATA support"
+	depends on ATA && PCI
+	default m if MODULES
+
+config PATA_OLDPIIX
+	tristate "Intel PIIX PATA support"
+	depends on ATA && PCI
+	default m if MODULES
+
+config PATA_SCH
+	tristate "Intel SCH PATA support"
 	depends on ATA && PCI
 	default m if MODULES
 
@@ -265,23 +517,15 @@ config VIRTIO_NET
 	depends on VIRTIO_PCI && NETDEVICES
 	default m if MODULES
 
-endmenu
+config VIRTIO_CONSOLE
+	tristate "VirtIO console"
+	depends on VIRTIO
+	default m if MODULES
 
-menu "Network device support"
-
-config NET
-	bool "Networking support"
-	default y
-
-config NETDEVICES
-	bool "Network device support"
-	depends on NET
-	default y
-
-config E1000
-	tristate "Intel PRO/1000 Gigabit Ethernet support"
-	depends on NETDEVICES && PCI
-	default n
+config VIRTIO_INPUT
+	tristate "VirtIO input driver"
+	depends on VIRTIO && INPUT
+	default m if MODULES
 
 endmenu
 

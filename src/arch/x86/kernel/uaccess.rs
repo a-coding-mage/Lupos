@@ -7,8 +7,10 @@
 //!
 //! Implemented: access_ok, copy_from_user/copy_to_user, clear_user,
 //! get_user_u8/u32/u64, put_user_*, cmpxchg_user_u32, VMA fault-in,
-//! strncpy_from_user, strnlen_user, copy_from_user_nmi — each with `__ex_table`
-//! fault recovery matching Linux's `_ASM_EXTABLE_UA` mechanism.
+//! strncpy_from_user, strnlen_user, copy_from_user_nmi, rep_movs_alternative,
+//! rep_stos_alternative
+//! — each with `__ex_table` fault recovery matching Linux's
+//! `_ASM_EXTABLE_UA` mechanism.
 //!
 //! The remaining textual differences from Linux are not ABI-observable for
 //! Lupos's CPU configuration:
@@ -29,10 +31,298 @@
 //! directives below) and rewrites RIP to the fixup label — exactly the Linux
 //! mechanism (Linux uses `_ASM_EXTABLE_UA`).
 
+use crate::kernel::module::{export_symbol, find_symbol};
+
 /// Linux x86-64 task size: `(1 << 47) - PAGE_SIZE`.
 /// Any user pointer at or above this is invalid (kernel half).
 /// Ref: vendor/linux/arch/x86/include/asm/processor.h::TASK_SIZE_MAX
 pub const TASK_SIZE_MAX: u64 = (1u64 << 47) - 4096;
+
+/// `USER_PTR_MAX` - `vendor/linux/arch/x86/kernel/cpu/common.c`.
+#[unsafe(no_mangle)]
+pub static USER_PTR_MAX: u64 = TASK_SIZE_MAX;
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "USER_PTR_MAX",
+        core::ptr::addr_of!(USER_PTR_MAX) as usize,
+        false,
+    );
+    export_symbol_once("__get_user_1", x86___get_user_1 as usize, false);
+    export_symbol_once("__get_user_2", x86___get_user_2 as usize, false);
+    export_symbol_once("__get_user_4", x86___get_user_4 as usize, false);
+    export_symbol_once("__get_user_8", x86___get_user_8 as usize, false);
+    export_symbol_once("__get_user_nocheck_1", x86___get_user_1 as usize, false);
+    export_symbol_once("__get_user_nocheck_2", x86___get_user_2 as usize, false);
+    export_symbol_once("__get_user_nocheck_4", x86___get_user_4 as usize, false);
+    export_symbol_once("__get_user_nocheck_8", x86___get_user_8 as usize, false);
+    export_symbol_once("__put_user_1", x86___put_user_1 as usize, false);
+    export_symbol_once("__put_user_2", x86___put_user_2 as usize, false);
+    export_symbol_once("__put_user_4", x86___put_user_4 as usize, false);
+    export_symbol_once("__put_user_8", x86___put_user_8 as usize, false);
+    export_symbol_once("__put_user_nocheck_1", x86___put_user_1 as usize, false);
+    export_symbol_once("__put_user_nocheck_2", x86___put_user_2 as usize, false);
+    export_symbol_once("__put_user_nocheck_4", x86___put_user_4 as usize, false);
+    export_symbol_once("__put_user_nocheck_8", x86___put_user_8 as usize, false);
+    export_symbol_once(
+        "rep_stos_alternative",
+        x86_rep_stos_alternative as usize,
+        false,
+    );
+    export_symbol_once(
+        "rep_movs_alternative",
+        x86_rep_movs_alternative as usize,
+        false,
+    );
+    export_symbol_once(
+        "copy_to_nontemporal",
+        linux_copy_to_nontemporal as usize,
+        false,
+    );
+    export_symbol_once("strncpy_from_user", linux_strncpy_from_user as usize, false);
+    export_symbol_once("strnlen_user", linux_strnlen_user as usize, false);
+}
+
+/// `rep_stos_alternative` - `vendor/linux/arch/x86/lib/clear_page_64.S:44`.
+///
+/// Linux modules call this through an alternatives-patched `call` from
+/// `__clear_user`, passing the destination in RDI, the byte count in RCX, and
+/// zero in RAX. The only ABI-observable return is RCX, which holds the number
+/// of bytes left uncleared.
+#[unsafe(naked)]
+unsafe extern "C" fn x86_rep_stos_alternative() {
+    core::arch::naked_asm!(
+        "sub rsp, 8",
+        "mov rsi, rcx",
+        "call {body}",
+        "add rsp, 8",
+        "mov rcx, rax",
+        "ret",
+        body = sym rep_stos_alternative_impl,
+    );
+}
+
+unsafe extern "C" fn rep_stos_alternative_impl(dst: *mut u8, len: usize) -> usize {
+    unsafe { clear_user(dst, len) }
+}
+
+/// `rep_movs_alternative` - `vendor/linux/arch/x86/lib/copy_user_64.S:34`.
+///
+/// Linux calls this helper from inline assembly with the `rep movsb` ABI:
+/// destination in RDI, source in RSI, byte count in RCX, and uncopied bytes
+/// returned in RCX. It is not the normal SysV C third-argument register ABI.
+#[unsafe(naked)]
+unsafe extern "C" fn x86_rep_movs_alternative() {
+    core::arch::naked_asm!(
+        "sub rsp, 8",
+        "mov rdx, rcx",
+        "call {body}",
+        "add rsp, 8",
+        "mov rcx, rax",
+        "ret",
+        body = sym rep_movs_alternative_impl,
+    );
+}
+
+unsafe extern "C" fn rep_movs_alternative_impl(dst: *mut u8, src: *const u8, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if dst.is_null() || src.is_null() {
+        return len;
+    }
+    unsafe { __copy_user_generic(dst, src, len) }
+}
+
+/// `copy_to_nontemporal` - `vendor/linux/arch/x86/lib/copy_user_uncached_64.S`.
+///
+/// Non-temporal stores are a cache-policy optimization.  The ABI-visible
+/// contract is the number of bytes left uncopied, so a regular copy is a valid
+/// conservative fallback.
+unsafe extern "C" fn linux_copy_to_nontemporal(dst: *mut u8, src: *const u8, size: usize) -> usize {
+    if size == 0 {
+        return 0;
+    }
+    if dst.is_null() || src.is_null() {
+        return size;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(src, dst, size) };
+    0
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn x86___get_user_1() {
+    core::arch::naked_asm!(
+        "mov rdx, {user_ptr_max}",
+        "cmp rax, rdx",
+        "cmova rax, rdx",
+        "21: movzx edx, byte ptr [rax]",
+        "xor eax, eax",
+        "ret",
+        "22: mov eax, -14",
+        "xor edx, edx",
+        "ret",
+        ".pushsection __ex_table, \"a\"",
+        ".balign 4",
+        ".long (21b - .)",
+        ".long (22b - .)",
+        ".long 3",
+        ".popsection",
+        user_ptr_max = const TASK_SIZE_MAX,
+    );
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn x86___get_user_2() {
+    core::arch::naked_asm!(
+        "mov rdx, {user_ptr_max}",
+        "cmp rax, rdx",
+        "cmova rax, rdx",
+        "21: movzx edx, word ptr [rax]",
+        "xor eax, eax",
+        "ret",
+        "22: mov eax, -14",
+        "xor edx, edx",
+        "ret",
+        ".pushsection __ex_table, \"a\"",
+        ".balign 4",
+        ".long (21b - .)",
+        ".long (22b - .)",
+        ".long 3",
+        ".popsection",
+        user_ptr_max = const TASK_SIZE_MAX,
+    );
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn x86___get_user_4() {
+    core::arch::naked_asm!(
+        "mov rdx, {user_ptr_max}",
+        "cmp rax, rdx",
+        "cmova rax, rdx",
+        "21: mov edx, dword ptr [rax]",
+        "xor eax, eax",
+        "ret",
+        "22: mov eax, -14",
+        "xor edx, edx",
+        "ret",
+        ".pushsection __ex_table, \"a\"",
+        ".balign 4",
+        ".long (21b - .)",
+        ".long (22b - .)",
+        ".long 3",
+        ".popsection",
+        user_ptr_max = const TASK_SIZE_MAX,
+    );
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn x86___get_user_8() {
+    core::arch::naked_asm!(
+        "mov rdx, {user_ptr_max}",
+        "cmp rax, rdx",
+        "cmova rax, rdx",
+        "21: mov rdx, qword ptr [rax]",
+        "xor eax, eax",
+        "ret",
+        "22: mov eax, -14",
+        "xor edx, edx",
+        "ret",
+        ".pushsection __ex_table, \"a\"",
+        ".balign 4",
+        ".long (21b - .)",
+        ".long (22b - .)",
+        ".long 3",
+        ".popsection",
+        user_ptr_max = const TASK_SIZE_MAX,
+    );
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn x86___put_user_1() {
+    core::arch::naked_asm!(
+        "mov rbx, rcx",
+        "sar rbx, 63",
+        "or rcx, rbx",
+        "21: mov byte ptr [rcx], al",
+        "xor ecx, ecx",
+        "ret",
+        "22: mov ecx, -14",
+        "ret",
+        ".pushsection __ex_table, \"a\"",
+        ".balign 4",
+        ".long (21b - .)",
+        ".long (22b - .)",
+        ".long 3",
+        ".popsection",
+    );
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn x86___put_user_2() {
+    core::arch::naked_asm!(
+        "mov rbx, rcx",
+        "sar rbx, 63",
+        "or rcx, rbx",
+        "21: mov word ptr [rcx], ax",
+        "xor ecx, ecx",
+        "ret",
+        "22: mov ecx, -14",
+        "ret",
+        ".pushsection __ex_table, \"a\"",
+        ".balign 4",
+        ".long (21b - .)",
+        ".long (22b - .)",
+        ".long 3",
+        ".popsection",
+    );
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn x86___put_user_4() {
+    core::arch::naked_asm!(
+        "mov rbx, rcx",
+        "sar rbx, 63",
+        "or rcx, rbx",
+        "21: mov dword ptr [rcx], eax",
+        "xor ecx, ecx",
+        "ret",
+        "22: mov ecx, -14",
+        "ret",
+        ".pushsection __ex_table, \"a\"",
+        ".balign 4",
+        ".long (21b - .)",
+        ".long (22b - .)",
+        ".long 3",
+        ".popsection",
+    );
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn x86___put_user_8() {
+    core::arch::naked_asm!(
+        "mov rbx, rcx",
+        "sar rbx, 63",
+        "or rcx, rbx",
+        "21: mov qword ptr [rcx], rax",
+        "xor ecx, ecx",
+        "ret",
+        "22: mov ecx, -14",
+        "ret",
+        ".pushsection __ex_table, \"a\"",
+        ".balign 4",
+        ".long (21b - .)",
+        ".long (22b - .)",
+        ".long 3",
+        ".popsection",
+    );
+}
 
 /// Validate that `[addr, addr + size)` lies entirely in the user half.
 ///
@@ -199,9 +489,10 @@ unsafe fn __copy_user_generic(dst: *mut u8, src: *const u8, n: usize) -> usize {
             "21:rep movsb",
             "22:",
             ".pushsection __ex_table, \"a\"",
-            ".balign 8",
+            ".balign 4",
             ".long (21b - .)",
             ".long (22b - .)",
+            ".long 3",
             ".popsection",
             inout("rcx") left,
             inout("rdi") d,
@@ -224,9 +515,10 @@ pub unsafe fn get_user_u8(src: *const u8) -> Result<u8, i32> {
             "21:mov {val}, byte ptr [{src}]",
             "22:",
             ".pushsection __ex_table, \"a\"",
-            ".balign 8",
+            ".balign 4",
             ".long (21b - .)",
             ".long (22b - .)",
+            ".long 3",
             ".popsection",
             val = out(reg_byte) val,
             src = in(reg) src,
@@ -248,9 +540,10 @@ pub unsafe fn get_user_u32(src: *const u32) -> Result<u32, i32> {
             "21:mov {val:e}, dword ptr [{src}]",
             "22:",
             ".pushsection __ex_table, \"a\"",
-            ".balign 8",
+            ".balign 4",
             ".long (21b - .)",
             ".long (22b - .)",
+            ".long 3",
             ".popsection",
             val = out(reg) val,
             src = in(reg) src,
@@ -272,9 +565,10 @@ pub unsafe fn get_user_u64(src: *const u64) -> Result<u64, i32> {
             "21:mov {val}, qword ptr [{src}]",
             "22:",
             ".pushsection __ex_table, \"a\"",
-            ".balign 8",
+            ".balign 4",
             ".long (21b - .)",
             ".long (22b - .)",
+            ".long 3",
             ".popsection",
             val = out(reg) val,
             src = in(reg) src,
@@ -295,9 +589,10 @@ pub unsafe fn put_user_u8(dst: *mut u8, val: u8) -> Result<(), i32> {
             "21:mov byte ptr [{dst}], {val}",
             "22:",
             ".pushsection __ex_table, \"a\"",
-            ".balign 8",
+            ".balign 4",
             ".long (21b - .)",
             ".long (22b - .)",
+            ".long 3",
             ".popsection",
             dst = in(reg) dst,
             val = in(reg_byte) val,
@@ -318,9 +613,10 @@ pub unsafe fn put_user_u32(dst: *mut u32, val: u32) -> Result<(), i32> {
             "21:mov dword ptr [{dst}], {val:e}",
             "22:",
             ".pushsection __ex_table, \"a\"",
-            ".balign 8",
+            ".balign 4",
             ".long (21b - .)",
             ".long (22b - .)",
+            ".long 3",
             ".popsection",
             dst = in(reg) dst,
             val = in(reg) val,
@@ -349,9 +645,10 @@ pub unsafe fn cmpxchg_user_u32(dst: *mut u32, expected: u32, new: u32) -> Result
             "mov {fault:e}, 0",
             "22:",
             ".pushsection __ex_table, \"a\"",
-            ".balign 8",
+            ".balign 4",
             ".long (21b - .)",
             ".long (22b - .)",
+            ".long 3",
             ".popsection",
             dst = in(reg) dst,
             new = in(reg) new,
@@ -377,9 +674,10 @@ pub unsafe fn put_user_u64(dst: *mut u64, val: u64) -> Result<(), i32> {
             "21:mov qword ptr [{dst}], {val}",
             "22:",
             ".pushsection __ex_table, \"a\"",
-            ".balign 8",
+            ".balign 4",
             ".long (21b - .)",
             ".long (22b - .)",
+            ".long 3",
             ".popsection",
             dst = in(reg) dst,
             val = in(reg) val,
@@ -400,10 +698,12 @@ pub unsafe fn strncpy_from_user(dst: *mut u8, src: *const u8, n: usize) -> i32 {
     let mut count: usize = 0;
     while count < n {
         match unsafe { get_user_u8(src.add(count)) } {
-            Ok(0) => return count as i32,
             Ok(b) => {
                 unsafe {
                     *dst.add(count) = b;
+                }
+                if b == 0 {
+                    return count as i32;
                 }
                 count += 1;
             }
@@ -411,6 +711,18 @@ pub unsafe fn strncpy_from_user(dst: *mut u8, src: *const u8, n: usize) -> i32 {
         }
     }
     count as i32
+}
+
+/// `strncpy_from_user` - `vendor/linux/lib/strncpy_from_user.c:113`.
+pub unsafe extern "C" fn linux_strncpy_from_user(
+    dst: *mut u8,
+    src: *const u8,
+    count: isize,
+) -> isize {
+    if count <= 0 {
+        return 0;
+    }
+    unsafe { strncpy_from_user(dst, src, count as usize) as isize }
 }
 
 /// Zero `n` bytes of user memory, fault-tolerant.
@@ -444,9 +756,10 @@ unsafe fn __clear_user(dst: *mut u8, n: usize) -> usize {
             "21:rep stosb",
             "22:",
             ".pushsection __ex_table, \"a\"",
-            ".balign 8",
+            ".balign 4",
             ".long (21b - .)",
             ".long (22b - .)",
+            ".long 3",
             ".popsection",
             inout("rcx") left,
             inout("rdi") d,
@@ -491,6 +804,11 @@ pub unsafe fn strnlen_user(src: *const u8, count: i64) -> i64 {
     } else {
         0
     }
+}
+
+/// `strnlen_user` - `vendor/linux/lib/strnlen_user.c:92`.
+pub unsafe extern "C" fn linux_strnlen_user(src: *const u8, count: isize) -> isize {
+    unsafe { strnlen_user(src, count as i64) as isize }
 }
 
 /// NMI-safe copy from user space.
@@ -610,11 +928,102 @@ mod tests {
     }
 
     #[test]
+    fn module_exports_include_rep_stos_alternative() {
+        register_module_exports();
+        assert_eq!(
+            find_symbol("rep_stos_alternative"),
+            Some(x86_rep_stos_alternative as usize)
+        );
+        assert_eq!(
+            find_symbol("rep_movs_alternative"),
+            Some(x86_rep_movs_alternative as usize)
+        );
+        assert_eq!(
+            find_symbol("__get_user_nocheck_1"),
+            Some(x86___get_user_1 as usize)
+        );
+        assert_eq!(
+            find_symbol("__get_user_nocheck_8"),
+            Some(x86___get_user_8 as usize)
+        );
+        assert_eq!(
+            find_symbol("__put_user_nocheck_8"),
+            Some(x86___put_user_8 as usize)
+        );
+        assert_eq!(
+            find_symbol("strncpy_from_user"),
+            Some(linux_strncpy_from_user as usize)
+        );
+        assert_eq!(
+            find_symbol("strnlen_user"),
+            Some(linux_strnlen_user as usize)
+        );
+    }
+
+    #[test]
+    fn rep_movs_alternative_source_is_vendor_linux_export() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/arch/x86/lib/copy_user_64.S"
+        ));
+        assert!(source.contains("SYM_FUNC_START(rep_movs_alternative)"));
+        assert!(source.contains("EXPORT_SYMBOL(rep_movs_alternative)"));
+    }
+
+    #[test]
+    fn rep_movs_alternative_impl_copies_bytes_and_reports_success() {
+        let src = *b"lupos-uaccess";
+        let mut dst = [0u8; 13];
+        unsafe {
+            assert_eq!(
+                rep_movs_alternative_impl(dst.as_mut_ptr(), src.as_ptr(), src.len()),
+                0
+            );
+        }
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn rep_movs_alternative_impl_null_pointer_returns_len() {
+        unsafe {
+            assert_eq!(
+                rep_movs_alternative_impl(core::ptr::null_mut(), core::ptr::null(), 16),
+                16
+            );
+        }
+    }
+
+    #[test]
+    fn rep_stos_alternative_invalid_addr_returns_len() {
+        let invalid = (1u64 << 47) as *mut u8;
+        unsafe {
+            assert_eq!(rep_stos_alternative_impl(invalid, 16), 16);
+        }
+    }
+
+    #[test]
     fn test_copy_from_user_invalid_addr_returns_n() {
         let invalid = (1u64 << 47) as *const u8;
         let mut dst = [0u8; 256];
         unsafe {
             assert_eq!(copy_from_user(dst.as_mut_ptr(), invalid, 256), 256);
+        }
+    }
+
+    #[test]
+    fn strncpy_from_user_copies_terminating_nul_and_sign_extends_fault() {
+        let src = b"gpu-debug\0";
+        let mut dst = [0xffu8; 16];
+        unsafe {
+            assert_eq!(
+                linux_strncpy_from_user(dst.as_mut_ptr(), src.as_ptr(), dst.len() as isize),
+                9
+            );
+            assert_eq!(&dst[..10], src);
+            assert_eq!(
+                linux_strncpy_from_user(dst.as_mut_ptr(), (1u64 << 47) as *const u8, 8),
+                -14
+            );
         }
     }
 

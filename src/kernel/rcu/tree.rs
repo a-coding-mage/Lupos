@@ -17,7 +17,7 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 use super::segcblist::SegCbList;
 use super::types::RcuHead;
@@ -143,6 +143,35 @@ pub fn synchronize_rcu() {
     }
 }
 
+/// `get_state_synchronize_rcu()` — snapshot current RCU grace-period state.
+pub fn get_state_synchronize_rcu() -> u64 {
+    fence(Ordering::SeqCst);
+    GP_SEQ.load(Ordering::Acquire)
+}
+
+/// `poll_state_synchronize_rcu()` — true once a later grace period completed.
+pub fn poll_state_synchronize_rcu(oldstate: u64) -> bool {
+    let done = GP_SEQ.load(Ordering::Acquire) != oldstate;
+    if done {
+        fence(Ordering::SeqCst);
+    }
+    done
+}
+
+/// `start_poll_synchronize_rcu()` — snapshot and force progress in Lupos' RCU.
+pub fn start_poll_synchronize_rcu() -> u64 {
+    let oldstate = get_state_synchronize_rcu();
+    synchronize_rcu();
+    oldstate
+}
+
+/// `cond_synchronize_rcu()` — wait only when no grace period has elapsed yet.
+pub fn cond_synchronize_rcu(oldstate: u64) {
+    if !poll_state_synchronize_rcu(oldstate) {
+        synchronize_rcu();
+    }
+}
+
 /// `call_rcu(head, func)` — queue a callback to fire after the next grace period.
 pub fn call_rcu(head: *mut RcuHead, func: unsafe extern "C" fn(*mut RcuHead)) {
     if head.is_null() {
@@ -226,6 +255,15 @@ mod tests {
         let before = gp_seq_now();
         synchronize_rcu();
         assert!(gp_seq_now() > before);
+    }
+
+    #[test]
+    fn conditional_synchronize_uses_gp_state() {
+        rcu_init();
+        let before = get_state_synchronize_rcu();
+        assert!(!poll_state_synchronize_rcu(before));
+        cond_synchronize_rcu(before);
+        assert!(poll_state_synchronize_rcu(before));
     }
 
     #[test]

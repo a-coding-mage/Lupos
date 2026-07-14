@@ -7,9 +7,33 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use core::ffi::{c_char, c_void};
 
 use crate::fs::kernfs::{KernfsNode, add_child};
 use crate::include::uapi::errno::{EEXIST, EFAULT, EINVAL, ENOENT};
+use crate::kernel::module::{export_symbol, find_symbol};
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("sysfs_create_link", linux_sysfs_create_link as usize, true);
+    export_symbol_once(
+        "sysfs_create_link_nowarn",
+        linux_sysfs_create_link_nowarn as usize,
+        true,
+    );
+    export_symbol_once(
+        "sysfs_create_link_sd",
+        linux_sysfs_create_link_sd as usize,
+        true,
+    );
+    export_symbol_once("sysfs_remove_link", linux_sysfs_remove_link as usize, true);
+    export_symbol_once("sysfs_delete_link", linux_sysfs_delete_link as usize, true);
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SysfsCreateLinkSdEnv {
@@ -203,6 +227,54 @@ pub fn sysfs_remove_link(
         remove_by_name_called: true,
         name: String::from(name),
     }
+}
+
+fn linux_create_link_ret(parent_ok: bool, target: *mut c_void, name: *const c_char) -> i32 {
+    if name.is_null() || !parent_ok {
+        return -EINVAL;
+    }
+    if target.is_null() {
+        return -ENOENT;
+    }
+    0
+}
+
+/// `sysfs_create_link` - `vendor/linux/fs/sysfs/symlink.c`.
+pub unsafe extern "C" fn linux_sysfs_create_link(
+    _kobj: *mut c_void,
+    target: *mut c_void,
+    name: *const c_char,
+) -> i32 {
+    linux_create_link_ret(true, target, name)
+}
+
+/// `sysfs_create_link_nowarn` - `vendor/linux/fs/sysfs/symlink.c`.
+pub unsafe extern "C" fn linux_sysfs_create_link_nowarn(
+    kobj: *mut c_void,
+    target: *mut c_void,
+    name: *const c_char,
+) -> i32 {
+    unsafe { linux_sysfs_create_link(kobj, target, name) }
+}
+
+/// `sysfs_create_link_sd` - `vendor/linux/fs/sysfs/symlink.c`.
+pub unsafe extern "C" fn linux_sysfs_create_link_sd(
+    kn: *mut c_void,
+    target: *mut c_void,
+    name: *const c_char,
+) -> i32 {
+    linux_create_link_ret(!kn.is_null(), target, name)
+}
+
+/// `sysfs_remove_link` - `vendor/linux/fs/sysfs/symlink.c`.
+pub unsafe extern "C" fn linux_sysfs_remove_link(_kobj: *mut c_void, _name: *const c_char) {}
+
+/// `sysfs_delete_link` - `vendor/linux/fs/sysfs/symlink.c`.
+pub unsafe extern "C" fn linux_sysfs_delete_link(
+    _kobj: *mut c_void,
+    _target: *mut c_void,
+    _name: *const c_char,
+) {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

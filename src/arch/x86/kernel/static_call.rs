@@ -12,9 +12,12 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use crate::arch::x86::kernel::alternative::{CALL_INSN_OPCODE, JMP32_INSN_OPCODE, x86_nop};
+use crate::arch::x86::kernel::alternative::{
+    CALL_INSN_OPCODE, JMP32_INSN_OPCODE, text_poke_copy, x86_nop,
+};
 use crate::arch::x86::kernel::jump_label::text_gen_insn;
 use crate::include::uapi::errno::EINVAL;
+use crate::kernel::module::{export_symbol, find_symbol};
 
 pub const CALL_INSN_SIZE: usize = 5;
 pub const RET_INSN_OPCODE: u8 = 0xc3;
@@ -22,6 +25,15 @@ pub const TRAMP_UD: [u8; 3] = [0x0f, 0xb9, 0xcc];
 pub const XOR5RAX: [u8; 5] = [0x2e, 0x2e, 0x2e, 0x31, 0xc0];
 pub const RETINSN: [u8; 5] = [RET_INSN_OPCODE, 0xcc, 0xcc, 0xcc, 0xcc];
 pub const WARNINSN: [u8; 5] = [0x67, 0x48, 0x0f, 0xb9, 0x3a];
+pub const STATIC_CALL_SITE_SIZE: usize = 8;
+pub const STATIC_CALL_SITE_TAIL: usize = 1;
+pub const STATIC_CALL_SITE_FLAGS: usize = 3;
+
+pub unsafe extern "C" fn __WARN_trap(_bug: *mut core::ffi::c_void) {}
+
+pub unsafe extern "C" fn __SCT__WARN_trap(_bug: *mut core::ffi::c_void) {
+    unsafe { __WARN_trap(_bug) }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StaticCallInsn {
@@ -69,6 +81,28 @@ pub fn static_call_transform_bytes(
         StaticCallInsn::Ret => Ok(RETINSN.to_vec()),
         StaticCallInsn::Jcc(op) => Ok(static_call_jcc(site, op, func)),
     }
+}
+
+pub fn warn_trap_addr() -> usize {
+    __WARN_trap as usize
+}
+
+pub fn warn_trap_trampoline_addr() -> usize {
+    __SCT__WARN_trap as usize
+}
+
+pub fn register_module_exports() {
+    if find_symbol("__WARN_trap").is_none() {
+        export_symbol("__WARN_trap", warn_trap_addr(), false);
+    }
+    if find_symbol("__SCT__WARN_trap").is_none() {
+        export_symbol("__SCT__WARN_trap", warn_trap_trampoline_addr(), false);
+    }
+}
+
+pub fn static_call_fixup_warn_site(site: &mut [u8]) -> Result<(), i32> {
+    static_call_validate(site, false, false)?;
+    text_poke_copy(&mut site[..WARNINSN.len()], &WARNINSN)
 }
 
 pub fn static_call_jcc(site: u64, op: u8, func: u64) -> Vec<u8> {

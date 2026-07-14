@@ -41,6 +41,7 @@
 /// - Linux `mm/slab_common.c` — common cache infrastructure
 /// - Linux `include/linux/slab.h` — `kmalloc` / `kfree` API
 use core::alloc::{GlobalAlloc, Layout};
+use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(test)]
@@ -1008,12 +1009,57 @@ pub fn register_module_exports() {
         linux___kmalloc_cache_noprof as usize,
         true,
     );
+    export_symbol_once(
+        "__kmalloc_node_track_caller_noprof",
+        linux___kmalloc_node_track_caller_noprof as usize,
+        false,
+    );
     export_symbol_once("kfree", linux_kfree as usize, true);
+    export_symbol_once("ksize", linux_ksize as usize, false);
     export_symbol_once("kmalloc_caches", linux_kmalloc_caches as usize, true);
+    export_symbol_once(
+        "kmem_cache_alloc_noprof",
+        linux_kmem_cache_alloc_noprof as usize,
+        false,
+    );
+    export_symbol_once(
+        "kmem_cache_alloc_node_noprof",
+        linux_kmem_cache_alloc_node_noprof as usize,
+        false,
+    );
+    export_symbol_once(
+        "kmem_cache_alloc_lru_noprof",
+        linux_kmem_cache_alloc_lru_noprof as usize,
+        false,
+    );
+    export_symbol_once("kmem_cache_charge", linux_kmem_cache_charge as usize, false);
+    export_symbol_once("kmem_cache_free", linux_kmem_cache_free as usize, false);
+    export_symbol_once(
+        "kmem_cache_free_bulk",
+        linux_kmem_cache_free_bulk as usize,
+        false,
+    );
+    export_symbol_once(
+        "kmem_cache_alloc_bulk_noprof",
+        linux_kmem_cache_alloc_bulk_noprof as usize,
+        false,
+    );
+    export_symbol_once("kmem_cache_size", linux_kmem_cache_size as usize, false);
+    export_symbol_once("kmem_cache_shrink", linux_kmem_cache_shrink as usize, false);
+    export_symbol_once(
+        "kmem_cache_destroy",
+        linux_kmem_cache_destroy as usize,
+        false,
+    );
     export_symbol_once(
         "__kvmalloc_node_noprof",
         linux___kvmalloc_node_noprof as usize,
         true,
+    );
+    export_symbol_once(
+        "krealloc_node_align_noprof",
+        linux_krealloc_node_align_noprof as usize,
+        false,
     );
 }
 
@@ -1033,6 +1079,86 @@ pub unsafe extern "C" fn linux___kmalloc_cache_noprof(
     unsafe { __kmalloc_cache_noprof(cache_type, flags, size) }
 }
 
+/// `__kmalloc_node_track_caller_noprof` - `vendor/linux/mm/slub.c`.
+pub unsafe extern "C" fn linux___kmalloc_node_track_caller_noprof(
+    size: usize,
+    flags: GfpFlags,
+    node: i32,
+    caller: usize,
+) -> *mut u8 {
+    unsafe { __kmalloc_node_track_caller_noprof(size, flags, node, caller) }
+}
+
+/// `kmem_cache_alloc_noprof` - `vendor/linux/mm/slub.c:4950`.
+pub unsafe extern "C" fn linux_kmem_cache_alloc_noprof(
+    cache: *mut KmemCache,
+    flags: GfpFlags,
+) -> *mut u8 {
+    unsafe { kmem_cache_alloc_noprof(cache, flags) }
+}
+
+/// `kmem_cache_alloc_node_noprof` - `vendor/linux/mm/slub.c:5008`.
+pub unsafe extern "C" fn linux_kmem_cache_alloc_node_noprof(
+    cache: *mut KmemCache,
+    flags: GfpFlags,
+    node: i32,
+) -> *mut u8 {
+    unsafe { kmem_cache_alloc_node_noprof(cache, flags, node) }
+}
+
+/// `kmem_cache_alloc_lru_noprof` - `vendor/linux/mm/slub.c:4967`.
+pub unsafe extern "C" fn linux_kmem_cache_alloc_lru_noprof(
+    cache: *mut KmemCache,
+    lru: *mut c_void,
+    flags: GfpFlags,
+) -> *mut u8 {
+    unsafe { kmem_cache_alloc_lru_noprof(cache, lru as usize, flags) }
+}
+
+/// `kmem_cache_charge` - `vendor/linux/mm/slub.c:4986`.
+pub unsafe extern "C" fn linux_kmem_cache_charge(_objp: *mut c_void, _gfpflags: GfpFlags) -> bool {
+    true
+}
+
+/// `kmem_cache_free` - `vendor/linux/include/linux/slab.h`.
+pub unsafe extern "C" fn linux_kmem_cache_free(cache: *mut KmemCache, ptr: *mut u8) {
+    unsafe { kmem_cache_free(cache, ptr) };
+}
+
+/// `kmem_cache_free_bulk` - `vendor/linux/mm/slub.c:7155`.
+pub unsafe extern "C" fn linux_kmem_cache_free_bulk(
+    cache: *mut KmemCache,
+    nr: usize,
+    ptrs: *mut *mut u8,
+) {
+    unsafe { kmem_cache_free_bulk(cache, nr, ptrs) };
+}
+
+/// `kmem_cache_alloc_bulk_noprof` - `vendor/linux/mm/slub.c:7404`.
+pub unsafe extern "C" fn linux_kmem_cache_alloc_bulk_noprof(
+    cache: *mut KmemCache,
+    flags: GfpFlags,
+    nr: usize,
+    ptrs: *mut *mut u8,
+) -> bool {
+    unsafe { kmem_cache_alloc_bulk_noprof(cache, flags, nr, ptrs) == nr }
+}
+
+/// `kmem_cache_size` - `vendor/linux/mm/slab_common.c:83`.
+pub unsafe extern "C" fn linux_kmem_cache_size(cache: *const KmemCache) -> u32 {
+    kmem_cache_size(cache).min(u32::MAX as usize) as u32
+}
+
+/// `kmem_cache_shrink` - `vendor/linux/mm/slab_common.c:602`.
+pub unsafe extern "C" fn linux_kmem_cache_shrink(cache: *mut KmemCache) -> i32 {
+    kmem_cache_shrink(cache)
+}
+
+/// `kmem_cache_destroy` - `vendor/linux/mm/slab_common.c:527`.
+pub unsafe extern "C" fn linux_kmem_cache_destroy(cache: *mut KmemCache) {
+    kmem_cache_destroy(cache);
+}
+
 /// `__kvmalloc_node_noprof` - `vendor/linux/mm/util.c`.
 #[unsafe(export_name = "__kvmalloc_node_noprof")]
 pub unsafe extern "C" fn linux___kvmalloc_node_noprof(
@@ -1043,10 +1169,25 @@ pub unsafe extern "C" fn linux___kvmalloc_node_noprof(
     unsafe { __kvmalloc_node_noprof(size, flags, node) }
 }
 
+/// `krealloc_node_align_noprof` - `vendor/linux/mm/slub.c:6876`.
+pub unsafe extern "C" fn linux_krealloc_node_align_noprof(
+    ptr: *mut u8,
+    new_size: usize,
+    align: usize,
+    flags: GfpFlags,
+    node: i32,
+) -> *mut u8 {
+    unsafe { krealloc_node_align_noprof(ptr, new_size, align, flags, node) }
+}
+
 /// `kfree` - `vendor/linux/mm/slab_common.c`.
 #[unsafe(export_name = "kfree")]
 pub unsafe extern "C" fn linux_kfree(ptr: *mut u8) {
     unsafe { kfree(ptr) };
+}
+
+pub unsafe extern "C" fn linux_ksize(ptr: *const u8) -> usize {
+    ksize(ptr)
 }
 
 /// `kmalloc_caches` - `vendor/linux/mm/slab_common.c`.
@@ -1504,12 +1645,36 @@ mod tests {
             Some(linux___kmalloc_cache_noprof as usize)
         );
         assert_eq!(
+            crate::kernel::module::find_symbol("__kmalloc_node_track_caller_noprof"),
+            Some(linux___kmalloc_node_track_caller_noprof as usize)
+        );
+        assert_eq!(
             crate::kernel::module::find_symbol("kfree"),
             Some(linux_kfree as usize)
         );
         assert_eq!(
             crate::kernel::module::find_symbol("kmalloc_caches"),
             Some(linux_kmalloc_caches as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("kmem_cache_alloc_noprof"),
+            Some(linux_kmem_cache_alloc_noprof as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("kmem_cache_alloc_node_noprof"),
+            Some(linux_kmem_cache_alloc_node_noprof as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("kmem_cache_alloc_lru_noprof"),
+            Some(linux_kmem_cache_alloc_lru_noprof as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("kmem_cache_free"),
+            Some(linux_kmem_cache_free as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("kmem_cache_alloc_bulk_noprof"),
+            Some(linux_kmem_cache_alloc_bulk_noprof as usize)
         );
     }
 
@@ -1525,6 +1690,13 @@ mod tests {
             assert!(!cache_ptr.is_null());
             linux_kfree(cache_ptr);
             assert!(!linux_kmalloc_caches().is_null());
+
+            let mut cache = make_cache("linux-c-entry-cache", 32);
+            let obj = linux_kmem_cache_alloc_noprof(&mut *cache, GFP_KERNEL);
+            assert!(!obj.is_null());
+            assert_eq!(linux_kmem_cache_size(&*cache), 32);
+            assert!(linux_kmem_cache_charge(obj.cast(), GFP_KERNEL));
+            linux_kmem_cache_free(&mut *cache, obj);
         }
     }
 

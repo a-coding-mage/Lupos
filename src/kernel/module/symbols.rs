@@ -27,8 +27,67 @@ pub struct ExportedSymbol {
     pub owner: Option<String>,
 }
 
+struct SymbolRegistry {
+    entries: Vec<ExportedSymbol>,
+    by_name: Vec<(String, usize)>,
+}
+
+impl SymbolRegistry {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            by_name: Vec::new(),
+        }
+    }
+
+    fn lookup_index(&self, name: &str) -> Result<usize, usize> {
+        self.by_name
+            .binary_search_by(|(symbol_name, _)| symbol_name.as_str().cmp(name))
+    }
+
+    fn insert_lookup_if_absent(&mut self, name: &str, entry_index: usize) {
+        if let Err(index) = self.lookup_index(name) {
+            self.by_name.insert(index, (name.to_string(), entry_index));
+        }
+    }
+
+    fn rebuild_lookup(&mut self) {
+        self.by_name.clear();
+        for (index, symbol) in self.entries.iter().enumerate() {
+            if let Err(lookup_index) = self.lookup_index(symbol.name.as_str()) {
+                self.by_name
+                    .insert(lookup_index, (symbol.name.clone(), index));
+            }
+        }
+    }
+
+    fn push(&mut self, symbol: ExportedSymbol) {
+        let index = self.entries.len();
+        self.insert_lookup_if_absent(symbol.name.as_str(), index);
+        self.entries.push(symbol);
+    }
+
+    fn find_addr(&self, name: &str) -> Option<usize> {
+        self.lookup_index(name)
+            .ok()
+            .and_then(|index| self.by_name.get(index))
+            .map(|(_, entry_index)| *entry_index)
+            .and_then(|index| self.entries.get(index))
+            .map(|symbol| symbol.addr)
+    }
+
+    fn find_gpl_only(&self, name: &str) -> Option<bool> {
+        self.lookup_index(name)
+            .ok()
+            .and_then(|index| self.by_name.get(index))
+            .map(|(_, entry_index)| *entry_index)
+            .and_then(|index| self.entries.get(index))
+            .map(|symbol| symbol.gpl_only)
+    }
+}
+
 lazy_static! {
-    static ref KSYMTAB: Mutex<Vec<ExportedSymbol>> = Mutex::new(Vec::new());
+    static ref KSYMTAB: Mutex<SymbolRegistry> = Mutex::new(SymbolRegistry::new());
 }
 
 /// Register one symbol in the export table.
@@ -49,6 +108,7 @@ pub fn export_symbol(name: &str, addr: usize, gpl_only: bool) {
 pub fn export_module_symbol(owner: &str, name: &str, addr: usize, gpl_only: bool) {
     let mut table = KSYMTAB.lock();
     if let Some(symbol) = table
+        .entries
         .iter_mut()
         .find(|symbol| symbol.owner.as_deref() == Some(owner) && symbol.name == name)
     {
@@ -67,28 +127,36 @@ pub fn export_module_symbol(owner: &str, name: &str, addr: usize, gpl_only: bool
 
 /// Drop every symbol owned by a Linux module being unloaded or rejected.
 pub fn unexport_module_symbols(owner: &str) {
-    KSYMTAB
-        .lock()
+    let mut table = KSYMTAB.lock();
+    table
+        .entries
         .retain(|symbol| symbol.owner.as_deref() != Some(owner));
+    table.rebuild_lookup();
 }
 
 /// Look up a symbol by name.  Returns its address or `None`.
 pub fn find_symbol(name: &str) -> Option<usize> {
-    KSYMTAB
-        .lock()
-        .iter()
-        .find(|s| s.name == name)
-        .map(|s| s.addr)
+    KSYMTAB.lock().find_addr(name)
+}
+
+/// Look up whether a symbol is GPL-only.  Returns `None` for unknown symbols.
+pub fn find_symbol_gpl_only(name: &str) -> Option<bool> {
+    KSYMTAB.lock().find_gpl_only(name)
 }
 
 /// Number of exported symbols (diagnostic).
 pub fn symbol_count() -> usize {
-    KSYMTAB.lock().len()
+    KSYMTAB.lock().entries.len()
 }
 
 /// Names of all exported symbols (diagnostic / `/proc/kallsyms` stub).
 pub fn symbol_names() -> Vec<String> {
-    KSYMTAB.lock().iter().map(|s| s.name.clone()).collect()
+    KSYMTAB
+        .lock()
+        .entries
+        .iter()
+        .map(|s| s.name.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -110,6 +178,21 @@ mod tests {
     }
 
     #[test]
+    fn gpl_only_metadata_uses_lookup_precedence() {
+        export_symbol("lupos_gpl_metadata_test", 1, true);
+        export_module_symbol(
+            "sample_mod_gpl_metadata",
+            "lupos_gpl_metadata_test",
+            2,
+            false,
+        );
+
+        assert_eq!(find_symbol_gpl_only("lupos_gpl_metadata_test"), Some(true));
+        unexport_module_symbols("sample_mod_gpl_metadata");
+        assert_eq!(find_symbol_gpl_only("lupos_gpl_metadata_test"), Some(true));
+    }
+
+    #[test]
     fn module_owned_symbols_are_removed_together() {
         static DUMMY: u64 = 7;
         export_module_symbol(
@@ -124,5 +207,62 @@ mod tests {
         );
         unexport_module_symbols("sample_mod");
         assert!(find_symbol("sample_export").is_none());
+    }
+
+    #[test]
+    fn builtin_symbol_keeps_precedence_over_module_duplicate() {
+        static BUILTIN: u64 = 11;
+        static MODULE: u64 = 12;
+        export_symbol(
+            "lupos_precedence_test",
+            &BUILTIN as *const u64 as usize,
+            false,
+        );
+        export_module_symbol(
+            "sample_mod_precedence",
+            "lupos_precedence_test",
+            &MODULE as *const u64 as usize,
+            false,
+        );
+
+        assert_eq!(
+            find_symbol("lupos_precedence_test"),
+            Some(&BUILTIN as *const u64 as usize)
+        );
+        unexport_module_symbols("sample_mod_precedence");
+        assert_eq!(
+            find_symbol("lupos_precedence_test"),
+            Some(&BUILTIN as *const u64 as usize)
+        );
+    }
+
+    #[test]
+    fn module_duplicate_lookup_falls_back_after_unexport() {
+        static FIRST: u64 = 21;
+        static SECOND: u64 = 22;
+        export_module_symbol(
+            "sample_mod_first",
+            "sample_module_duplicate",
+            &FIRST as *const u64 as usize,
+            false,
+        );
+        export_module_symbol(
+            "sample_mod_second",
+            "sample_module_duplicate",
+            &SECOND as *const u64 as usize,
+            false,
+        );
+
+        assert_eq!(
+            find_symbol("sample_module_duplicate"),
+            Some(&FIRST as *const u64 as usize)
+        );
+        unexport_module_symbols("sample_mod_first");
+        assert_eq!(
+            find_symbol("sample_module_duplicate"),
+            Some(&SECOND as *const u64 as usize)
+        );
+        unexport_module_symbols("sample_mod_second");
+        assert!(find_symbol("sample_module_duplicate").is_none());
     }
 }

@@ -6,7 +6,9 @@
 //! References:
 //! - `vendor/linux/arch/x86/kernel/tsc.c`
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::kernel::module::{export_symbol, find_symbol};
 
 use super::cpuid::CpuidResult;
 use super::cpuid::cpuid;
@@ -82,16 +84,30 @@ pub const fn khz_from_cpuid_leaf16(leaf16: CpuidResult) -> Option<u64> {
 
 /// Global TSC frequency in kHz, populated by `calibrate()`. Zero means
 /// "uncalibrated, do not trust" — callers should fall back to jiffies.
-static TSC_KHZ: AtomicU64 = AtomicU64::new(0);
+static TSC_KHZ: AtomicU32 = AtomicU32::new(0);
+static CPU_KHZ: AtomicU32 = AtomicU32::new(0);
 
 #[inline]
 pub fn tsc_khz() -> u64 {
-    TSC_KHZ.load(Ordering::Relaxed)
+    TSC_KHZ.load(Ordering::Relaxed) as u64
 }
 
 #[inline]
 fn store_tsc_khz(khz: u64) {
+    let khz = khz.min(u32::MAX as u64) as u32;
     TSC_KHZ.store(khz, Ordering::Relaxed);
+    CPU_KHZ.store(khz, Ordering::Relaxed);
+}
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("tsc_khz", core::ptr::addr_of!(TSC_KHZ) as usize, false);
+    export_symbol_once("cpu_khz", core::ptr::addr_of!(CPU_KHZ) as usize, false);
 }
 
 /// Calibrate the TSC and cache the result in [`tsc_khz`].
@@ -290,6 +306,20 @@ mod tests {
     fn cycles_to_usec_returns_zero_when_uncalibrated() {
         // TSC_KHZ defaults to 0; the host-test harness never calls calibrate().
         assert_eq!(cycles_to_usec(1_000_000_000), 0);
+    }
+
+    #[test]
+    fn tsc_frequency_exports_are_linux_width_data_symbols() {
+        register_module_exports();
+        assert_eq!(core::mem::size_of_val(&TSC_KHZ), 4);
+        assert_eq!(
+            crate::kernel::module::find_symbol("tsc_khz"),
+            Some(core::ptr::addr_of!(TSC_KHZ) as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("cpu_khz"),
+            Some(core::ptr::addr_of!(CPU_KHZ) as usize)
+        );
     }
 
     #[test]

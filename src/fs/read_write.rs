@@ -9,9 +9,11 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::ffi::c_void;
 
-use crate::include::uapi::errno::{EBADF, EINVAL, EISDIR, ENOSYS};
+use crate::include::uapi::errno::{EBADF, EINVAL, EISDIR, ENOSYS, ENXIO};
 use crate::include::uapi::fcntl::{O_ACCMODE, O_APPEND, O_PATH, O_RDONLY, O_RDWR, O_WRONLY};
+use crate::kernel::module::{export_symbol, find_symbol};
 
 use super::file::note_file_access_for_integrity;
 use super::permission::check_file_write_mount;
@@ -20,6 +22,176 @@ use super::types::{FileRef, InodeKind};
 const SEEK_SET: i32 = 0;
 const SEEK_CUR: i32 = 1;
 const SEEK_END: i32 = 2;
+const SEEK_DATA: i32 = 3;
+const SEEK_HOLE: i32 = 4;
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("default_llseek", linux_default_llseek as usize, false);
+    export_symbol_once("noop_llseek", linux_noop_llseek as usize, false);
+    export_symbol_once(
+        "generic_file_llseek",
+        linux_generic_file_llseek as usize,
+        false,
+    );
+    export_symbol_once(
+        "generic_file_llseek_size",
+        linux_generic_file_llseek_size as usize,
+        false,
+    );
+    export_symbol_once("fixed_size_llseek", linux_fixed_size_llseek as usize, false);
+    export_symbol_once(
+        "no_seek_end_llseek",
+        linux_no_seek_end_llseek as usize,
+        false,
+    );
+    export_symbol_once(
+        "no_seek_end_llseek_size",
+        linux_no_seek_end_llseek_size as usize,
+        false,
+    );
+    export_symbol_once("stream_open", linux_stream_open as usize, false);
+    export_symbol_once("nonseekable_open", linux_stream_open as usize, false);
+    export_symbol_once("kernel_write", linux_kernel_write as usize, false);
+}
+
+/// `default_llseek` - `vendor/linux/fs/read_write.c`.
+pub unsafe extern "C" fn linux_default_llseek(_file: *mut c_void, offset: i64, whence: i32) -> i64 {
+    match whence {
+        SEEK_SET | SEEK_CUR | SEEK_END if offset >= 0 => offset,
+        _ => -(EINVAL as i64),
+    }
+}
+
+/// `noop_llseek` - `vendor/linux/fs/read_write.c`.
+pub unsafe extern "C" fn linux_noop_llseek(_file: *mut c_void, offset: i64, _whence: i32) -> i64 {
+    offset
+}
+
+fn linux_llseek_setpos(new_offset: i64, maxsize: i64) -> i64 {
+    if new_offset < 0 {
+        return -(EINVAL as i64);
+    }
+    let maxsize = if maxsize < 0 { i64::MAX } else { maxsize };
+    if new_offset > maxsize {
+        return -(EINVAL as i64);
+    }
+    new_offset
+}
+
+fn linux_llseek_compute(offset: i64, whence: i32, maxsize: i64, eof: i64) -> i64 {
+    let eof = eof.max(0);
+    match whence {
+        SEEK_SET | SEEK_CUR => linux_llseek_setpos(offset, maxsize),
+        SEEK_END => match eof.checked_add(offset) {
+            Some(new_offset) => linux_llseek_setpos(new_offset, maxsize),
+            None => -(EINVAL as i64),
+        },
+        SEEK_DATA => {
+            if offset < 0 || offset >= eof {
+                -(ENXIO as i64)
+            } else {
+                linux_llseek_setpos(offset, maxsize)
+            }
+        }
+        SEEK_HOLE => {
+            if offset < 0 || offset >= eof {
+                -(ENXIO as i64)
+            } else {
+                linux_llseek_setpos(eof, maxsize)
+            }
+        }
+        _ => -(EINVAL as i64),
+    }
+}
+
+/// `generic_file_llseek_size` - `vendor/linux/fs/read_write.c`.
+pub unsafe extern "C" fn linux_generic_file_llseek_size(
+    _file: *mut c_void,
+    offset: i64,
+    whence: i32,
+    maxsize: i64,
+    eof: i64,
+) -> i64 {
+    linux_llseek_compute(offset, whence, maxsize, eof)
+}
+
+/// `generic_file_llseek` - `vendor/linux/fs/read_write.c`.
+pub unsafe extern "C" fn linux_generic_file_llseek(
+    file: *mut c_void,
+    offset: i64,
+    whence: i32,
+) -> i64 {
+    unsafe { linux_generic_file_llseek_size(file, offset, whence, i64::MAX, 0) }
+}
+
+/// `fixed_size_llseek` - `vendor/linux/fs/read_write.c`.
+pub unsafe extern "C" fn linux_fixed_size_llseek(
+    file: *mut c_void,
+    offset: i64,
+    whence: i32,
+    size: i64,
+) -> i64 {
+    match whence {
+        SEEK_SET | SEEK_CUR | SEEK_END => unsafe {
+            linux_generic_file_llseek_size(file, offset, whence, size, size)
+        },
+        _ => -(EINVAL as i64),
+    }
+}
+
+/// `no_seek_end_llseek` - `vendor/linux/fs/read_write.c`.
+pub unsafe extern "C" fn linux_no_seek_end_llseek(
+    file: *mut c_void,
+    offset: i64,
+    whence: i32,
+) -> i64 {
+    match whence {
+        SEEK_SET | SEEK_CUR => unsafe {
+            linux_generic_file_llseek_size(file, offset, whence, i64::MAX, 0)
+        },
+        _ => -(EINVAL as i64),
+    }
+}
+
+/// `no_seek_end_llseek_size` - `vendor/linux/fs/read_write.c`.
+pub unsafe extern "C" fn linux_no_seek_end_llseek_size(
+    file: *mut c_void,
+    offset: i64,
+    whence: i32,
+    size: i64,
+) -> i64 {
+    match whence {
+        SEEK_SET | SEEK_CUR => unsafe {
+            linux_generic_file_llseek_size(file, offset, whence, size, 0)
+        },
+        _ => -(EINVAL as i64),
+    }
+}
+
+/// `stream_open` - `vendor/linux/fs/open.c`.
+pub unsafe extern "C" fn linux_stream_open(_inode: *mut c_void, _file: *mut c_void) -> i32 {
+    0
+}
+
+/// `kernel_write` - `vendor/linux/fs/read_write.c:651`.
+///
+/// Vendor modules pass Linux-layout `struct file *` objects. Until Lupos owns
+/// those objects as native `FileRef`s, non-empty writes fail closed instead of
+/// pretending bytes reached a backing file.
+pub unsafe extern "C" fn linux_kernel_write(
+    _file: *mut c_void,
+    _buf: *const c_void,
+    count: usize,
+    _pos: *mut i64,
+) -> isize {
+    if count == 0 { 0 } else { -(EBADF as isize) }
+}
 
 #[inline]
 fn read_allowed(flags: u32) -> bool {
@@ -363,5 +535,101 @@ mod tests {
         let file = alloc_file(dentry, O_WRONLY, 0, &TEST_WRITE_OPS);
 
         assert_eq!(vfs_write(&file, b"handoff timestamp"), Ok(17));
+    }
+
+    #[test]
+    fn registers_llseek_module_exports() {
+        register_module_exports();
+
+        for name in [
+            "default_llseek",
+            "noop_llseek",
+            "generic_file_llseek",
+            "generic_file_llseek_size",
+            "fixed_size_llseek",
+            "no_seek_end_llseek",
+            "no_seek_end_llseek_size",
+            "kernel_write",
+        ] {
+            assert!(
+                crate::kernel::module::find_symbol(name).is_some(),
+                "missing export {name}"
+            );
+        }
+
+        assert_eq!(
+            unsafe {
+                linux_kernel_write(
+                    core::ptr::null_mut(),
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                linux_kernel_write(
+                    core::ptr::null_mut(),
+                    b"x".as_ptr().cast(),
+                    1,
+                    core::ptr::null_mut(),
+                )
+            },
+            -(EBADF as isize)
+        );
+    }
+
+    #[test]
+    fn generic_file_llseek_size_handles_core_whence_values() {
+        unsafe {
+            assert_eq!(
+                linux_generic_file_llseek_size(core::ptr::null_mut(), 12, SEEK_SET, 64, 32),
+                12
+            );
+            assert_eq!(
+                linux_generic_file_llseek_size(core::ptr::null_mut(), -4, SEEK_END, 64, 32),
+                28
+            );
+            assert_eq!(
+                linux_generic_file_llseek_size(core::ptr::null_mut(), 8, SEEK_DATA, 64, 32),
+                8
+            );
+            assert_eq!(
+                linux_generic_file_llseek_size(core::ptr::null_mut(), 8, SEEK_HOLE, 64, 32),
+                32
+            );
+            assert_eq!(
+                linux_generic_file_llseek_size(core::ptr::null_mut(), 32, SEEK_DATA, 64, 32),
+                -(ENXIO as i64)
+            );
+            assert_eq!(
+                linux_generic_file_llseek_size(core::ptr::null_mut(), 65, SEEK_SET, 64, 32),
+                -(EINVAL as i64)
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_and_no_seek_end_llseek_match_linux_acceptance() {
+        unsafe {
+            assert_eq!(
+                linux_fixed_size_llseek(core::ptr::null_mut(), -2, SEEK_END, 8),
+                6
+            );
+            assert_eq!(
+                linux_fixed_size_llseek(core::ptr::null_mut(), 0, SEEK_DATA, 8),
+                -(EINVAL as i64)
+            );
+            assert_eq!(
+                linux_no_seek_end_llseek(core::ptr::null_mut(), 4, SEEK_SET),
+                4
+            );
+            assert_eq!(
+                linux_no_seek_end_llseek(core::ptr::null_mut(), 0, SEEK_END),
+                -(EINVAL as i64)
+            );
+        }
     }
 }

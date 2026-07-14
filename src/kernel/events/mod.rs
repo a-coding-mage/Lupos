@@ -14,9 +14,13 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+use core::ffi::{c_char, c_void};
 use core::sync::atomic::{AtomicI32, Ordering};
 
 use spin::Mutex;
+
+use crate::include::uapi::errno::EOPNOTSUPP;
+use crate::kernel::module::{export_symbol, find_symbol};
 
 pub mod attr;
 pub mod linux_sources;
@@ -50,6 +54,26 @@ struct PerfEventInner {
 static NEXT_FD: AtomicI32 = AtomicI32::new(200);
 static NEXT_ID: AtomicI32 = AtomicI32::new(1);
 static EVENTS: Mutex<alloc::vec::Vec<Arc<PerfEvent>>> = Mutex::new(alloc::vec::Vec::new());
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("perf_pmu_register", linux_perf_pmu_register as usize, true);
+    export_symbol_once(
+        "perf_pmu_unregister",
+        linux_perf_pmu_unregister as usize,
+        true,
+    );
+    export_symbol_once(
+        "perf_event_sysfs_show",
+        linux_perf_event_sysfs_show as usize,
+        true,
+    );
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PerfReadRecord {
@@ -124,6 +148,33 @@ pub fn perf_event_read_record(fd: i32) -> Option<PerfReadRecord> {
         }
     }
     None
+}
+
+/// `perf_pmu_register` - `vendor/linux/kernel/events/core.c:12838`.
+///
+/// Lupos supports the `perf_event_open` software-clock syscall surface, but not
+/// registration of driver-owned hardware PMUs. Fail closed so module callers
+/// can take their normal Linux error paths without a fabricated PMU.
+pub unsafe extern "C" fn linux_perf_pmu_register(
+    _pmu: *mut c_void,
+    _name: *const c_char,
+    _type: i32,
+) -> i32 {
+    -EOPNOTSUPP
+}
+
+/// `perf_pmu_unregister` - `vendor/linux/kernel/events/core.c:13024`.
+pub unsafe extern "C" fn linux_perf_pmu_unregister(_pmu: *mut c_void) -> i32 {
+    0
+}
+
+/// `perf_event_sysfs_show` - `vendor/linux/kernel/events/core.c:15339`.
+pub unsafe extern "C" fn linux_perf_event_sysfs_show(
+    _dev: *mut c_void,
+    _attr: *mut c_void,
+    _page: *mut c_char,
+) -> isize {
+    0
 }
 
 #[cfg(test)]

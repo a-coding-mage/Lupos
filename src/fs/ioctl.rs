@@ -7,9 +7,36 @@
 //! file's `->unlocked_ioctl`. Lupos now exposes the file-operation slot and
 //! keeps the older TTY fallback for nodes that have not been converted yet.
 
+use core::ffi::c_void;
+
 use crate::include::uapi::errno::{EBADF, ENOTTY};
 use crate::include::uapi::fcntl::O_PATH;
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::{files, sched};
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("compat_ptr_ioctl", linux_compat_ptr_ioctl as usize, false);
+}
+
+/// `compat_ptr_ioctl` - `vendor/linux/fs/ioctl.c`.
+///
+/// On x86-64 this helper is used as a file-operation function pointer. Lupos
+/// does not yet expose raw Linux `struct file_operations` dispatch for module
+/// file objects, so preserve the ABI as a fail-closed ioctl handler.
+#[unsafe(export_name = "compat_ptr_ioctl")]
+pub unsafe extern "C" fn linux_compat_ptr_ioctl(
+    _file: *mut c_void,
+    _cmd: u32,
+    _arg: usize,
+) -> isize {
+    -(ENOTTY as isize)
+}
 
 fn is_tty_name(name: &str) -> bool {
     name == "console" || name.starts_with("tty")

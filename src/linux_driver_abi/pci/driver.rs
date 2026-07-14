@@ -18,6 +18,7 @@ use crate::linux_driver_abi::base::{
 };
 use crate::linux_driver_abi::pci::device::{
     LinuxPciDev, linux_pci_dev_from_device, linux_pci_device_state, linux_pci_slot_for_raw,
+    registered_linux_pci_raw_devices,
 };
 
 const PCI_ANY_ID: u32 = u32::MAX;
@@ -79,6 +80,9 @@ pub fn register_module_exports() {
         linux_pci_unregister_driver as usize,
         false,
     );
+    export_symbol_once("pci_add_dynid", linux_pci_add_dynid as usize, true);
+    export_symbol_once("pci_match_id", linux_pci_match_id as usize, false);
+    export_symbol_once("pci_dev_present", linux_pci_dev_present as usize, false);
 }
 
 static LINUX_PCI_BUS: LinuxBusType = LinuxBusType {
@@ -128,11 +132,28 @@ unsafe fn linux_pci_driver_from_driver(driver: *const LinuxDeviceDriver) -> *mut
     }
 }
 
+/// `pci_add_dynid` - `vendor/linux/drivers/pci/pci-driver.c`.
+#[unsafe(export_name = "pci_add_dynid")]
+unsafe extern "C" fn linux_pci_add_dynid(
+    drv: *mut LinuxPciDriver,
+    _vendor: u32,
+    _device: u32,
+    _subvendor: u32,
+    _subdevice: u32,
+    _class: u32,
+    _class_mask: u32,
+    _driver_data: usize,
+) -> i32 {
+    if drv.is_null() { -EINVAL } else { 0 }
+}
+
 fn linux_pci_id_is_terminator(id: &LinuxPciDeviceId) -> bool {
     id.vendor == 0 && id.subvendor == 0 && id.class_mask == 0
 }
 
-unsafe fn linux_pci_match_id(
+/// `pci_match_id` - `vendor/linux/drivers/pci/pci-driver.c`.
+#[unsafe(export_name = "pci_match_id")]
+pub unsafe extern "C" fn linux_pci_match_id(
     ids: *const LinuxPciDeviceId,
     dev: *const c_void,
 ) -> *const LinuxPciDeviceId {
@@ -165,6 +186,34 @@ unsafe fn linux_pci_match_id(
         {
             return unsafe { ids.add(idx) };
         }
+        idx += 1;
+    }
+}
+
+/// `pci_dev_present` - `vendor/linux/drivers/pci/search.c:456`.
+///
+/// This is a hint-style presence check over the current PCI device registry.
+/// It deliberately does not retain a device reference, matching Linux's
+/// documented stale-result semantics for this helper.
+#[unsafe(export_name = "pci_dev_present")]
+pub unsafe extern "C" fn linux_pci_dev_present(ids: *const LinuxPciDeviceId) -> i32 {
+    if ids.is_null() {
+        return 0;
+    }
+
+    let mut idx = 0usize;
+    loop {
+        let id = unsafe { &*ids.add(idx) };
+        if linux_pci_id_is_terminator(id) {
+            return 0;
+        }
+
+        for dev in registered_linux_pci_raw_devices() {
+            if !unsafe { linux_pci_match_id(ids.add(idx), dev.cast_const().cast()) }.is_null() {
+                return 1;
+            }
+        }
+
         idx += 1;
     }
 }
@@ -329,6 +378,10 @@ mod tests {
             crate::kernel::module::find_symbol("pci_unregister_driver"),
             Some(linux_pci_unregister_driver as usize)
         );
+        assert_eq!(
+            crate::kernel::module::find_symbol("pci_dev_present"),
+            Some(linux_pci_dev_present as usize)
+        );
     }
 
     #[test]
@@ -398,6 +451,55 @@ mod tests {
             let matched = linux_pci_match_id(ids.as_ptr(), raw);
             assert_eq!(matched, ids.as_ptr());
             unregister_linux_pci_device_state(raw);
+        }
+    }
+
+    #[test]
+    fn linux_pci_dev_present_matches_registered_raw_device() {
+        unsafe {
+            let pdev = PciDev::new_with_subsystem(
+                0, 0, 30, 0, 0xfefe, 0xcafe, 0x03, 0x00, 0x00, 1, 0x1111, 0x2222,
+            );
+            let raw = crate::linux_driver_abi::pci::device::register_linux_pci_device(
+                &pdev,
+                linux_pci_bus_type_ptr(),
+            );
+            assert!(!raw.is_null());
+
+            let ids = [
+                LinuxPciDeviceId {
+                    vendor: 0x1234,
+                    device: 0x5678,
+                    subvendor: PCI_ANY_ID,
+                    subdevice: PCI_ANY_ID,
+                    class: 0,
+                    class_mask: 0,
+                    driver_data: 0,
+                    override_only: 0,
+                },
+                LinuxPciDeviceId {
+                    vendor: 0xfefe,
+                    device: 0xcafe,
+                    subvendor: 0x1111,
+                    subdevice: 0x2222,
+                    class: 0,
+                    class_mask: 0,
+                    driver_data: 0,
+                    override_only: 0,
+                },
+                LinuxPciDeviceId {
+                    vendor: 0,
+                    device: 0,
+                    subvendor: 0,
+                    subdevice: 0,
+                    class: 0,
+                    class_mask: 0,
+                    driver_data: 0,
+                    override_only: 0,
+                },
+            ];
+
+            assert_eq!(linux_pci_dev_present(ids.as_ptr()), 1);
         }
     }
 

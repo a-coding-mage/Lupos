@@ -3,7 +3,7 @@
 //! test-origin: linux:vendor/linux/lib/vsprintf.c
 //! Minimal exported printf formatting used by Linux-built modules.
 
-use core::ffi::c_char;
+use core::ffi::{c_char, c_void};
 
 use crate::kernel::module::{export_symbol, find_symbol};
 use crate::lib::string::c_strlen;
@@ -17,6 +17,8 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 pub fn register_module_exports() {
     export_symbol_once("snprintf", linux_snprintf as usize, false);
     export_symbol_once("sprintf", linux_sprintf as usize, false);
+    export_symbol_once("vsnprintf", linux_vsnprintf as usize, false);
+    export_symbol_once("vsprintf", linux_vsprintf as usize, false);
 }
 
 unsafe fn write_byte(buf: *mut c_char, size: usize, pos: &mut usize, byte: u8) {
@@ -120,6 +122,41 @@ pub unsafe extern "C" fn linux_sprintf(buf: *mut c_char, fmt: *const c_char, arg
     unsafe { format_one_arg(buf, i32::MAX as usize, fmt, arg0) }
 }
 
+/// `vsprintf` - `vendor/linux/lib/vsprintf.c:3088`.
+#[unsafe(export_name = "vsprintf")]
+pub unsafe extern "C" fn linux_vsprintf(
+    buf: *mut c_char,
+    fmt: *const c_char,
+    args: *const c_void,
+) -> i32 {
+    unsafe {
+        crate::linux_driver_abi::base::printf::vscnprintf_va_list(
+            buf.cast::<u8>(),
+            i32::MAX as usize,
+            fmt,
+            args,
+        )
+        .min(i32::MAX as usize) as i32
+    }
+}
+
+/// `vsnprintf` - `vendor/linux/lib/vsprintf.c:2860`.
+#[unsafe(export_name = "vsnprintf")]
+pub unsafe extern "C" fn linux_vsnprintf(
+    buf: *mut c_char,
+    size: usize,
+    fmt: *const c_char,
+    args: *const c_void,
+) -> i32 {
+    if size > i32::MAX as usize {
+        return 0;
+    }
+    unsafe {
+        crate::linux_driver_abi::base::printf::vsnprintf_va_list(buf.cast::<u8>(), size, fmt, args)
+            .min(i32::MAX as usize) as i32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +172,29 @@ mod tests {
             crate::kernel::module::find_symbol("sprintf"),
             Some(linux_sprintf as usize)
         );
+        assert_eq!(
+            crate::kernel::module::find_symbol("vsnprintf"),
+            Some(linux_vsnprintf as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("vsprintf"),
+            Some(linux_vsprintf as usize)
+        );
+    }
+
+    #[test]
+    fn vsnprintf_export_matches_linux_source_contract() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/lib/vsprintf.c"
+        ));
+
+        assert!(
+            source.contains(
+                "int vsnprintf(char *buf, size_t size, const char *fmt_str, va_list args)"
+            )
+        );
+        assert!(source.contains("EXPORT_SYMBOL(vsnprintf);"));
     }
 
     #[test]

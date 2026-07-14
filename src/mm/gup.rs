@@ -16,6 +16,7 @@ use crate::arch::x86::mm::paging::{
     pud_offset, pud_present,
 };
 use crate::include::uapi::errno::{EFAULT, EINVAL};
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::mm::buddy::{pfn_to_page, pfn_valid};
 use crate::mm::fault::{FAULT_FLAG_USER, FAULT_FLAG_WRITE, handle_mm_fault};
 use crate::mm::mm_types::MmStruct;
@@ -25,6 +26,21 @@ use crate::mm::vm_flags::{VM_READ, VM_WRITE};
 pub const FOLL_WRITE: u32 = 1 << 0;
 pub const FOLL_FORCE: u32 = 1 << 4;
 pub const FOLL_PIN: u32 = 1 << 10;
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "pin_user_pages_fast",
+        linux_pin_user_pages_fast as usize,
+        true,
+    );
+    export_symbol_once("unpin_user_pages", linux_unpin_user_pages as usize, false);
+}
 
 pub fn access_permitted(flags: u64, write: bool) -> bool {
     if write {
@@ -271,6 +287,41 @@ pub unsafe fn get_user_pages_fast_only(
     }
 }
 
+/// `pin_user_pages_fast()` — `vendor/linux/mm/gup.c:3310`.
+pub unsafe extern "C" fn linux_pin_user_pages_fast(
+    start: u64,
+    nr_pages: i32,
+    flags: u32,
+    pages: *mut *mut Page,
+) -> i32 {
+    if nr_pages < 0 {
+        return -EINVAL;
+    }
+
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return -EFAULT;
+    }
+
+    let mm = unsafe { (*task).mm };
+    if mm.is_null() {
+        return -EFAULT;
+    }
+
+    match collect_user_pages(
+        unsafe { &*mm },
+        start,
+        nr_pages as usize,
+        flags | FOLL_PIN,
+        pages,
+        false,
+        true,
+    ) {
+        Ok(nr) => nr as i32,
+        Err(err) => -err,
+    }
+}
+
 pub unsafe fn get_user_pages_remote(
     mm: *mut MmStruct,
     start: u64,
@@ -433,6 +484,10 @@ pub unsafe fn unpin_folios(folios: *mut *mut Page, nr: usize) {
 
 pub unsafe fn unpin_user_pages(pages: *mut *mut Page, nr: usize) {
     unsafe { unpin_folios(pages, nr) };
+}
+
+pub unsafe extern "C" fn linux_unpin_user_pages(pages: *mut *mut Page, nr: usize) {
+    unsafe { unpin_user_pages(pages, nr) };
 }
 
 pub unsafe fn unpin_user_pages_dirty_lock(pages: *mut *mut Page, nr: usize, _make_dirty: bool) {

@@ -46,10 +46,12 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 use alloc::collections::VecDeque;
 use spin::Mutex;
+
+use crate::kernel::module::{export_symbol, find_symbol};
 
 // ── Softirq slot enumeration ──────────────────────────────────────────────────
 //
@@ -133,6 +135,39 @@ static PENDING: AtomicU32 = AtomicU32::new(0);
 /// TODO(M7+): replace with proper preempt counter (`include/linux/preempt.h`).
 static IN_SOFTIRQ: AtomicBool = AtomicBool::new(false);
 
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "__tasklet_schedule",
+        linux___tasklet_schedule as usize,
+        false,
+    );
+    export_symbol_once(
+        "__tasklet_hi_schedule",
+        linux___tasklet_hi_schedule as usize,
+        false,
+    );
+    export_symbol_once("tasklet_setup", linux_tasklet_setup as usize, false);
+    export_symbol_once("tasklet_init", linux_tasklet_init as usize, false);
+    export_symbol_once("tasklet_kill", linux_tasklet_kill as usize, false);
+    export_symbol_once(
+        "tasklet_unlock_spin_wait",
+        linux_tasklet_unlock_spin_wait as usize,
+        false,
+    );
+    export_symbol_once("tasklet_unlock", linux_tasklet_unlock as usize, true);
+    export_symbol_once(
+        "tasklet_unlock_wait",
+        linux_tasklet_unlock_wait as usize,
+        true,
+    );
+}
+
 // ── Public registration / raise / drain ──────────────────────────────────────
 
 /// Initialize the softirq subsystem.
@@ -176,6 +211,12 @@ pub fn raise_softirq(nr: SoftIrqVec) {
 #[inline]
 pub fn in_interrupt() -> bool {
     IN_SOFTIRQ.load(Ordering::Acquire)
+}
+
+/// Snapshot of the pending mask — Linux `local_softirq_pending()`.
+#[inline]
+pub fn local_softirq_pending() -> u32 {
+    PENDING.load(Ordering::Acquire)
 }
 
 /// Drain the pending mask, invoking each registered handler exactly once.
@@ -284,6 +325,147 @@ fn tasklet_action() {
         t.scheduled.store(false, Ordering::Release);
         (t.func)(t.data);
     }
+    linux_tasklet_action();
+}
+
+const TASKLET_STATE_SCHED: usize = 1 << 0;
+const TASKLET_STATE_RUN: usize = 1 << 1;
+
+#[repr(C)]
+pub union LinuxTaskletCallback {
+    pub func: Option<unsafe extern "C" fn(usize)>,
+    pub callback: Option<unsafe extern "C" fn(*mut LinuxTasklet)>,
+}
+
+#[repr(C)]
+pub struct LinuxTasklet {
+    pub next: *mut LinuxTasklet,
+    pub state: AtomicUsize,
+    pub count: AtomicI32,
+    pub use_callback: bool,
+    pub callback: LinuxTaskletCallback,
+    pub data: usize,
+}
+
+static LINUX_TASKLET_LIST: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
+
+unsafe fn schedule_linux_tasklet(t: *mut LinuxTasklet) {
+    if t.is_null() {
+        return;
+    }
+    unsafe {
+        (*t).next = core::ptr::null_mut();
+        (*t).state.fetch_or(TASKLET_STATE_SCHED, Ordering::AcqRel);
+    }
+    LINUX_TASKLET_LIST.lock().push_back(t as usize);
+    raise_softirq(SoftIrqVec::Tasklet);
+}
+
+/// `__tasklet_schedule` - `vendor/linux/kernel/softirq.c:838`.
+pub unsafe extern "C" fn linux___tasklet_schedule(t: *mut LinuxTasklet) {
+    unsafe { schedule_linux_tasklet(t) };
+}
+
+/// `__tasklet_hi_schedule` - `vendor/linux/kernel/softirq.c:846`.
+pub unsafe extern "C" fn linux___tasklet_hi_schedule(t: *mut LinuxTasklet) {
+    unsafe { schedule_linux_tasklet(t) };
+}
+
+/// `tasklet_setup` - `vendor/linux/kernel/softirq.c:975`.
+pub unsafe extern "C" fn linux_tasklet_setup(
+    t: *mut LinuxTasklet,
+    callback: Option<unsafe extern "C" fn(*mut LinuxTasklet)>,
+) {
+    if t.is_null() {
+        return;
+    }
+    unsafe {
+        (*t).next = core::ptr::null_mut();
+        (*t).state.store(0, Ordering::Release);
+        (*t).count.store(0, Ordering::Release);
+        (*t).use_callback = true;
+        (*t).callback.callback = callback;
+        (*t).data = 0;
+    }
+}
+
+/// `tasklet_init` - `vendor/linux/kernel/softirq.c:987`.
+pub unsafe extern "C" fn linux_tasklet_init(
+    t: *mut LinuxTasklet,
+    func: Option<unsafe extern "C" fn(usize)>,
+    data: usize,
+) {
+    if t.is_null() {
+        return;
+    }
+    unsafe {
+        (*t).next = core::ptr::null_mut();
+        (*t).state.store(0, Ordering::Release);
+        (*t).count.store(0, Ordering::Release);
+        (*t).use_callback = false;
+        (*t).callback.func = func;
+        (*t).data = data;
+    }
+}
+
+/// `tasklet_kill` - `vendor/linux/kernel/softirq.c:1022`.
+pub unsafe extern "C" fn linux_tasklet_kill(t: *mut LinuxTasklet) {
+    if t.is_null() {
+        return;
+    }
+    LINUX_TASKLET_LIST
+        .lock()
+        .retain(|queued| *queued != t as usize);
+    unsafe {
+        (*t).state
+            .fetch_and(!(TASKLET_STATE_SCHED | TASKLET_STATE_RUN), Ordering::AcqRel);
+    }
+}
+
+/// `tasklet_unlock` - `vendor/linux/kernel/softirq.c:1036`.
+pub unsafe extern "C" fn linux_tasklet_unlock(t: *mut LinuxTasklet) {
+    if !t.is_null() {
+        unsafe {
+            (*t).state.fetch_and(!TASKLET_STATE_RUN, Ordering::AcqRel);
+        }
+    }
+}
+
+/// `tasklet_unlock_wait` - `vendor/linux/kernel/softirq.c:1042`.
+pub unsafe extern "C" fn linux_tasklet_unlock_wait(_t: *mut LinuxTasklet) {}
+
+/// `tasklet_unlock_spin_wait` - `vendor/linux/kernel/softirq.c:1005`.
+pub unsafe extern "C" fn linux_tasklet_unlock_spin_wait(_t: *mut LinuxTasklet) {}
+
+fn linux_tasklet_action() {
+    loop {
+        let next = LINUX_TASKLET_LIST.lock().pop_front();
+        let Some(raw) = next else { break };
+        let t = raw as *mut LinuxTasklet;
+        if t.is_null() {
+            continue;
+        }
+        let disabled = unsafe { (*t).count.load(Ordering::Acquire) } != 0;
+        if disabled {
+            continue;
+        }
+        unsafe {
+            (*t).state.fetch_or(TASKLET_STATE_RUN, Ordering::AcqRel);
+            let was_scheduled = (*t).state.fetch_and(!TASKLET_STATE_SCHED, Ordering::AcqRel)
+                & TASKLET_STATE_SCHED
+                != 0;
+            if was_scheduled {
+                if (*t).use_callback {
+                    if let Some(callback) = (*t).callback.callback {
+                        callback(t);
+                    }
+                } else if let Some(func) = (*t).callback.func {
+                    func((*t).data);
+                }
+            }
+            (*t).state.fetch_and(!TASKLET_STATE_RUN, Ordering::AcqRel);
+        }
+    }
 }
 
 // ── TDD: softirq boot test (Milestone 6) ──────────────────────────────────────
@@ -376,6 +558,7 @@ mod tests {
             }
         }
         TASKLET_LIST.lock().clear();
+        LINUX_TASKLET_LIST.lock().clear();
         guard
     }
 
@@ -482,5 +665,60 @@ mod tests {
         // Cleanup so other tests don't see leftover state.
         T.scheduled.store(false, Ordering::SeqCst);
         TASKLET_LIST.lock().clear();
+    }
+
+    #[test]
+    fn linux_tasklet_exports_register_for_modules() {
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("__tasklet_schedule"),
+            Some(linux___tasklet_schedule as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("__tasklet_hi_schedule"),
+            Some(linux___tasklet_hi_schedule as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("tasklet_setup"),
+            Some(linux_tasklet_setup as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("tasklet_kill"),
+            Some(linux_tasklet_kill as usize)
+        );
+    }
+
+    unsafe extern "C" fn linux_tasklet_test_callback(_t: *mut LinuxTasklet) {
+        DRAIN_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn linux_tasklet_schedule_runs_callback_from_softirq_drain() {
+        let _guard = reset_state();
+        DRAIN_COUNT.store(0, Ordering::SeqCst);
+        open_softirq(SoftIrqVec::Tasklet, tasklet_action);
+        let mut tasklet = LinuxTasklet {
+            next: core::ptr::null_mut(),
+            state: AtomicUsize::new(0),
+            count: AtomicI32::new(0),
+            use_callback: false,
+            callback: LinuxTaskletCallback { func: None },
+            data: 0,
+        };
+
+        unsafe {
+            linux_tasklet_setup(&mut tasklet, Some(linux_tasklet_test_callback));
+            linux___tasklet_schedule(&mut tasklet);
+        }
+        assert_ne!(
+            PENDING.load(Ordering::SeqCst) & SoftIrqVec::Tasklet.bit(),
+            0
+        );
+        do_softirq();
+        assert_eq!(DRAIN_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tasklet.state.load(Ordering::SeqCst) & TASKLET_STATE_SCHED,
+            0
+        );
     }
 }

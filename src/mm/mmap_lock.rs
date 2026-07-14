@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
 
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -52,6 +53,16 @@ fn mm_key(mm: *const u8) -> usize {
 
 fn vma_key(vma: *const u8) -> usize {
     vma as usize
+}
+
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once("__vma_start_write", linux___vma_start_write as usize, true);
 }
 
 fn with_mm_state<R>(mm: *mut u8, f: impl FnOnce(&mut MmapLockState) -> R) -> R {
@@ -274,6 +285,12 @@ pub fn __vma_start_write(vma: *mut u8) {
     });
 }
 
+/// `__vma_start_write` - `vendor/linux/mm/mmap_lock.c:139`.
+pub extern "C" fn linux___vma_start_write(vma: *mut VmAreaStruct, _state: i32) -> i32 {
+    __vma_start_write(vma as *mut u8);
+    0
+}
+
 pub fn vma_end_write_all(mm: *mut u8) {
     with_mm_state(mm, |state| {
         bump_seq(state);
@@ -387,6 +404,24 @@ mod tests {
         vma_mark_detached(vma);
         assert!(!vma_is_attached(vma));
         assert!(__vma_are_readers_excluded(vma));
+    }
+
+    #[test]
+    fn linux_vma_start_write_export_marks_vma_write_locked() {
+        let _guard = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        reset_for_tests();
+        register_module_exports();
+
+        let vma = 0x2400usize as *mut VmAreaStruct;
+        assert_eq!(
+            find_symbol("__vma_start_write"),
+            Some(linux___vma_start_write as usize)
+        );
+        assert_eq!(linux___vma_start_write(vma, 0), 0);
+        assert!(__is_vma_write_locked(vma as *const u8));
+        assert!(__vma_are_readers_excluded(vma as *const u8));
     }
 
     #[test]

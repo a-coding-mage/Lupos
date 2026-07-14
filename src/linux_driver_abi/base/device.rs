@@ -32,7 +32,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::include::uapi::errno::{EBUSY, EINVAL};
+use crate::include::uapi::errno::{EBUSY, EINVAL, ENODEV};
 use crate::kernel::module::{export_symbol, find_symbol};
 use crate::lib::kobject::{KObject, kobject_add};
 use crate::linux_driver_abi::base::bus::{
@@ -108,8 +108,10 @@ struct LinuxDevicePrivate {
     name: [u8; 64],
 }
 
+const LINUX_DEVICE_RELEASE_OFFSET: usize = 712;
 const KOBJ_STATE_INITIALIZED: u32 = 1 << 0;
 const KOBJ_STATE_IN_SYSFS: u32 = 1 << 1;
+type LinuxDeviceReleaseFn = unsafe extern "C" fn(*mut LinuxDevice);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceState {
@@ -173,10 +175,47 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 pub fn register_module_exports() {
     export_symbol_once("device_initialize", linux_device_initialize as usize, true);
     export_symbol_once("device_add", linux_device_add as usize, true);
+    export_symbol_once("device_attach", linux_device_attach as usize, true);
+    export_symbol_once(
+        "device_bind_driver",
+        linux_device_bind_driver as usize,
+        true,
+    );
     export_symbol_once("device_register", linux_device_register as usize, true);
+    export_symbol_once(
+        "device_release_driver",
+        linux_device_release_driver as usize,
+        true,
+    );
     export_symbol_once("device_unregister", linux_device_unregister as usize, true);
+    export_symbol_once(
+        "device_set_wakeup_enable",
+        device_set_wakeup_enable as usize,
+        true,
+    );
+    export_symbol_once("device_wakeup_enable", device_wakeup_enable as usize, true);
+    export_symbol_once(
+        "device_wakeup_disable",
+        device_wakeup_disable as usize,
+        true,
+    );
+    export_symbol_once(
+        "device_set_wakeup_capable",
+        device_set_wakeup_capable as usize,
+        true,
+    );
     export_symbol_once("get_device", get_device as usize, true);
     export_symbol_once("put_device", put_device as usize, true);
+    export_symbol_once("device_match_name", linux_device_match_name as usize, true);
+    export_symbol_once("device_match_any", linux_device_match_any as usize, true);
+    export_symbol_once(
+        "device_match_acpi_handle",
+        linux_device_match_acpi_handle as usize,
+        false,
+    );
+    export_symbol_once("dev_err_probe", linux_dev_err_probe as usize, true);
+    export_symbol_once("_dev_printk", linux_dev_printk as usize, false);
+    export_symbol_once("_dev_emerg", linux_dev_emerg as usize, false);
     export_symbol_once("_dev_err", linux_dev_err as usize, false);
     export_symbol_once("_dev_warn", linux_dev_warn as usize, false);
     export_symbol_once("_dev_notice", linux_dev_notice as usize, false);
@@ -209,10 +248,56 @@ macro_rules! define_linux_dev_printk_level {
     };
 }
 
+define_linux_dev_printk_level!(linux_dev_emerg, "_dev_emerg", 0);
 define_linux_dev_printk_level!(linux_dev_err, "_dev_err", 3);
 define_linux_dev_printk_level!(linux_dev_warn, "_dev_warn", 4);
 define_linux_dev_printk_level!(linux_dev_notice, "_dev_notice", 5);
 define_linux_dev_printk_level!(linux_dev_info, "_dev_info", 6);
+
+/// x86-64 C-variadic trampoline for Linux
+/// `_dev_printk(const char *level, const struct device *dev, const char *fmt, ...)`.
+#[unsafe(naked)]
+#[unsafe(export_name = "_dev_printk")]
+pub unsafe extern "C" fn linux_dev_printk() {
+    core::arch::naked_asm!(
+        "sub rsp, 32",
+        "mov qword ptr [rsp], rcx",
+        "mov qword ptr [rsp + 8], r8",
+        "mov qword ptr [rsp + 16], r9",
+        "lea rcx, [rsp]",
+        "lea r8, [rsp + 40]",
+        "call {helper}",
+        "add rsp, 32",
+        "ret",
+        helper = sym linux_dev_printk_level_helper,
+    );
+}
+
+unsafe fn linux_dev_printk_level(level: *const c_char) -> u32 {
+    if level.is_null() {
+        return 6;
+    }
+    let bytes = level.cast::<u8>();
+    let first = unsafe { *bytes };
+    let second = unsafe { *bytes.add(1) };
+    if first == 1 && (b'0'..=b'7').contains(&second) {
+        (second - b'0') as u32
+    } else {
+        6
+    }
+}
+
+#[inline(never)]
+unsafe extern "C" fn linux_dev_printk_level_helper(
+    level: *const c_char,
+    dev: *const LinuxDevice,
+    fmt: *const c_char,
+    register_args: *const usize,
+    stack_args: *const usize,
+) {
+    let level = unsafe { linux_dev_printk_level(level) };
+    unsafe { linux_dev_printk_helper(dev, fmt, level, register_args, stack_args) };
+}
 
 unsafe fn linux_device_c_str<'a>(ptr: *const c_char) -> &'a str {
     if ptr.is_null() {
@@ -221,6 +306,28 @@ unsafe fn linux_device_c_str<'a>(ptr: *const c_char) -> &'a str {
     let len = unsafe { crate::lib::string::c_strlen(ptr, 512) };
     let bytes = unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), len) };
     core::str::from_utf8(bytes).unwrap_or("")
+}
+
+unsafe fn linux_sysfs_streq(left: *const c_char, right: *const c_char) -> bool {
+    if left.is_null() || right.is_null() {
+        return false;
+    }
+
+    let mut idx = 0usize;
+    loop {
+        let l = unsafe { *left.cast::<u8>().add(idx) };
+        let r = unsafe { *right.cast::<u8>().add(idx) };
+        if l == r {
+            if l == 0 {
+                return true;
+            }
+            idx += 1;
+            continue;
+        }
+
+        return (l == 0 && r == b'\n' && unsafe { *right.cast::<u8>().add(idx + 1) } == 0)
+            || (l == b'\n' && r == 0 && unsafe { *left.cast::<u8>().add(idx + 1) } == 0);
+    }
 }
 
 #[inline(never)]
@@ -295,6 +402,15 @@ pub fn linux_device_driver(dev: *const LinuxDevice) -> *mut LinuxDeviceDriver {
         .find(|registered| registered.device == dev as usize)
         .map(|registered| registered.driver as *mut LinuxDeviceDriver)
         .unwrap_or(core::ptr::null_mut())
+}
+
+pub fn linux_devices_on_bus(bus: *const LinuxBusType) -> Vec<*mut LinuxDevice> {
+    LINUX_DEVICES
+        .lock()
+        .iter()
+        .filter(|registered| registered.bus == bus as usize)
+        .map(|registered| registered.device as *mut LinuxDevice)
+        .collect()
 }
 
 fn record_linux_device_driver(dev: *mut LinuxDevice, driver: *mut LinuxDeviceDriver) {
@@ -494,6 +610,34 @@ unsafe fn free_linux_device_private(dev: *mut LinuxDevice) {
     }
 }
 
+unsafe fn linux_device_release_fn(dev: *mut LinuxDevice) -> Option<LinuxDeviceReleaseFn> {
+    if dev.is_null() {
+        return None;
+    }
+    unsafe {
+        core::ptr::read(
+            dev.cast::<u8>()
+                .add(LINUX_DEVICE_RELEASE_OFFSET)
+                .cast::<Option<LinuxDeviceReleaseFn>>(),
+        )
+    }
+}
+
+unsafe fn linux_device_release_at_zero(dev: *mut LinuxDevice) {
+    let private = unsafe { (*dev).p };
+    let release = unsafe { linux_device_release_fn(dev) };
+    if let Some(release) = release {
+        unsafe { release(dev) };
+        if !private.is_null() {
+            unsafe {
+                let _ = Box::from_raw(private.cast::<LinuxDevicePrivate>());
+            }
+        }
+    } else {
+        unsafe { free_linux_device_private(dev) };
+    }
+}
+
 /// `device_initialize` — `vendor/linux/drivers/base/core.c`.
 #[unsafe(export_name = "device_initialize")]
 pub unsafe extern "C" fn linux_device_initialize(dev: *mut LinuxDevice) {
@@ -503,10 +647,10 @@ pub unsafe extern "C" fn linux_device_initialize(dev: *mut LinuxDevice) {
 
     unsafe {
         ensure_linux_device_private(dev);
-        (*dev).kobj.state_flags |= KOBJ_STATE_INITIALIZED;
-        if (*dev).kobj.kref == 0 {
-            (*dev).kobj.kref = 1;
-        }
+        crate::lib::kobject::init_linux_kobject_raw(
+            core::ptr::addr_of_mut!((*dev).kobj).cast(),
+            core::ptr::null(),
+        );
     }
 }
 
@@ -599,6 +743,62 @@ pub unsafe extern "C" fn linux_device_add(dev: *mut LinuxDevice) -> i32 {
     0
 }
 
+/// `device_attach` — `vendor/linux/drivers/base/dd.c:1139`.
+#[unsafe(export_name = "device_attach")]
+pub unsafe extern "C" fn linux_device_attach(dev: *mut LinuxDevice) -> i32 {
+    if dev.is_null() {
+        return -EINVAL;
+    }
+
+    let dev_addr = dev as usize;
+    let registered = LINUX_DEVICES
+        .lock()
+        .iter()
+        .find(|registered| registered.device == dev_addr)
+        .copied();
+    let Some(registered) = registered else {
+        return -ENODEV;
+    };
+
+    if registered.driver != 0 || unsafe { !(*dev).driver.is_null() } {
+        return 1;
+    }
+
+    let bus = unsafe { (*dev).bus };
+    if bus.is_null() || !linux_bus_type_registered(bus) {
+        return 0;
+    }
+
+    for driver in crate::linux_driver_abi::base::linux_device_drivers_on_bus(bus) {
+        if unsafe { linux_device_probe_driver(dev, driver) } {
+            record_linux_device_driver(dev, driver);
+            return 1;
+        }
+    }
+
+    0
+}
+
+/// `device_bind_driver` — `vendor/linux/drivers/base/dd.c:543`.
+///
+/// Linux callers set `dev->driver` before calling this helper. The sysfs
+/// links and notifier side effects are not modeled yet; keep the raw device
+/// registry consistent so driver-core users observe the forced binding.
+#[unsafe(export_name = "device_bind_driver")]
+pub unsafe extern "C" fn linux_device_bind_driver(dev: *mut LinuxDevice) -> i32 {
+    if dev.is_null() {
+        return -EINVAL;
+    }
+
+    let driver = unsafe { (*dev).driver };
+    if driver.is_null() {
+        return -ENODEV;
+    }
+
+    record_linux_device_driver(dev, driver);
+    0
+}
+
 /// `device_register` — `vendor/linux/drivers/base/core.c:3795`.
 #[unsafe(export_name = "device_register")]
 pub unsafe extern "C" fn linux_device_register(dev: *mut LinuxDevice) -> i32 {
@@ -625,6 +825,70 @@ pub unsafe extern "C" fn linux_device_unregister(dev: *mut LinuxDevice) {
     }
 }
 
+/// `device_release_driver` — `vendor/linux/drivers/base/dd.c:1388`.
+#[unsafe(export_name = "device_release_driver")]
+pub unsafe extern "C" fn linux_device_release_driver(dev: *mut LinuxDevice) {
+    if dev.is_null() {
+        return;
+    }
+
+    let driver = unsafe { (*dev).driver };
+    if driver.is_null() {
+        record_linux_device_driver(dev, core::ptr::null_mut());
+        return;
+    }
+
+    let bus = unsafe { (*dev).bus };
+    let removed_by_bus = if bus.is_null() {
+        false
+    } else {
+        unsafe {
+            (*bus)
+                .remove
+                .map(|remove| {
+                    remove(dev.cast());
+                    true
+                })
+                .unwrap_or(false)
+        }
+    };
+    if !removed_by_bus {
+        unsafe {
+            if let Some(remove) = (*driver).remove {
+                let _ = remove(dev.cast());
+            }
+        }
+    }
+    unsafe {
+        if let Some(post_unbind) = (*driver).p_cb.post_unbind_rust {
+            post_unbind(dev.cast());
+        }
+        (*dev).driver = core::ptr::null_mut();
+    }
+    record_linux_device_driver(dev, core::ptr::null_mut());
+}
+
+#[unsafe(export_name = "device_wakeup_enable")]
+pub unsafe extern "C" fn device_wakeup_enable(dev: *mut LinuxDevice) -> i32 {
+    if dev.is_null() { -EINVAL } else { 0 }
+}
+
+#[unsafe(export_name = "device_wakeup_disable")]
+pub unsafe extern "C" fn device_wakeup_disable(_dev: *mut LinuxDevice) {}
+
+#[unsafe(export_name = "device_set_wakeup_enable")]
+pub unsafe extern "C" fn device_set_wakeup_enable(dev: *mut LinuxDevice, enable: bool) -> i32 {
+    if enable {
+        unsafe { device_wakeup_enable(dev) }
+    } else {
+        unsafe { device_wakeup_disable(dev) };
+        0
+    }
+}
+
+#[unsafe(export_name = "device_set_wakeup_capable")]
+pub unsafe extern "C" fn device_set_wakeup_capable(_dev: *mut LinuxDevice, _capable: bool) {}
+
 /// `get_device` - `vendor/linux/drivers/base/core.c:3800`.
 #[unsafe(export_name = "get_device")]
 pub unsafe extern "C" fn get_device(dev: *mut LinuxDevice) -> *mut LinuxDevice {
@@ -648,8 +912,49 @@ pub unsafe extern "C" fn put_device(dev: *mut LinuxDevice) {
     unsafe {
         if (*dev).kobj.kref > 0 {
             (*dev).kobj.kref -= 1;
+            if (*dev).kobj.kref == 0 {
+                linux_device_release_at_zero(dev);
+            }
         }
     }
+}
+
+/// `device_match_any` - `vendor/linux/drivers/base/core.c:5430`.
+pub unsafe extern "C" fn linux_device_match_any(
+    _dev: *mut LinuxDevice,
+    _unused: *const c_void,
+) -> i32 {
+    1
+}
+
+/// `device_match_name` - `vendor/linux/drivers/base/core.c:5388`.
+unsafe extern "C" fn linux_device_match_name(dev: *mut LinuxDevice, name: *const c_void) -> i32 {
+    if dev.is_null() || name.is_null() {
+        return 0;
+    }
+
+    unsafe { linux_sysfs_streq(linux_dev_name(&*dev), name.cast::<c_char>()) as i32 }
+}
+
+/// `device_match_acpi_handle` - `vendor/linux/drivers/base/core.c:5424`.
+unsafe extern "C" fn linux_device_match_acpi_handle(
+    _dev: *mut LinuxDevice,
+    _handle: *const c_void,
+) -> i32 {
+    0
+}
+
+/// `dev_err_probe` - `vendor/linux/drivers/base/core.c:5145`.
+unsafe extern "C" fn linux_dev_err_probe(
+    _dev: *const LinuxDevice,
+    err: i32,
+    _fmt: *const c_char,
+    _arg0: usize,
+    _arg1: usize,
+    _arg2: usize,
+    _arg3: usize,
+) -> i32 {
+    err
 }
 
 /// `device_add` — `drivers/base/core.c:3573`.
@@ -768,6 +1073,7 @@ mod tests {
         assert_eq!(offset_of!(LinuxDevice, platform_data), 112);
         assert_eq!(offset_of!(LinuxDevice, driver_data), 120);
         assert_eq!(size_of::<LinuxDevice>(), 128);
+        assert_eq!(LINUX_DEVICE_RELEASE_OFFSET, 712);
     }
 
     #[test]
@@ -783,8 +1089,20 @@ mod tests {
             Some(linux_device_add as usize)
         );
         assert_eq!(
+            crate::kernel::module::find_symbol("device_attach"),
+            Some(linux_device_attach as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("device_bind_driver"),
+            Some(linux_device_bind_driver as usize)
+        );
+        assert_eq!(
             crate::kernel::module::find_symbol("device_register"),
             Some(linux_device_register as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("device_release_driver"),
+            Some(linux_device_release_driver as usize)
         );
         assert_eq!(
             crate::kernel::module::find_symbol("device_unregister"),
@@ -798,26 +1116,78 @@ mod tests {
             crate::kernel::module::find_symbol("put_device"),
             Some(put_device as usize)
         );
+        assert_eq!(
+            crate::kernel::module::find_symbol("device_match_any"),
+            Some(linux_device_match_any as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("device_match_name"),
+            Some(linux_device_match_name as usize)
+        );
+    }
+
+    #[test]
+    fn linux_device_core_exports_track_vendor_sources() {
+        let core = include_str!("../../../vendor/linux/drivers/base/core.c");
+        let dd = include_str!("../../../vendor/linux/drivers/base/dd.c");
+
+        assert!(core.contains("EXPORT_SYMBOL_GPL(device_match_name);"));
+        assert!(dd.contains("EXPORT_SYMBOL_GPL(device_bind_driver);"));
+
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol_gpl_only("device_bind_driver"),
+            Some(true)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol_gpl_only("device_match_name"),
+            Some(true)
+        );
     }
 
     #[test]
     fn linux_get_put_device_update_kobject_refcount() {
         unsafe {
-            let mut dev = core::mem::zeroed::<LinuxDevice>();
+            let mut backing = [0usize; 95];
+            let dev = backing.as_mut_ptr().cast::<LinuxDevice>();
             assert!(get_device(core::ptr::null_mut()).is_null());
             put_device(core::ptr::null_mut());
 
-            linux_device_initialize(&mut dev);
-            assert_eq!(dev.kobj.kref, 1);
-            assert_eq!(get_device(&mut dev), &mut dev as *mut _);
-            assert_eq!(dev.kobj.kref, 2);
-            put_device(&mut dev);
-            assert_eq!(dev.kobj.kref, 1);
-            put_device(&mut dev);
-            assert_eq!(dev.kobj.kref, 0);
-            put_device(&mut dev);
-            assert_eq!(dev.kobj.kref, 0);
-            free_linux_device_private(&mut dev);
+            linux_device_initialize(dev);
+            assert_eq!((*dev).kobj.kref, 1);
+            assert_eq!(get_device(dev), dev);
+            assert_eq!((*dev).kobj.kref, 2);
+            put_device(dev);
+            assert_eq!((*dev).kobj.kref, 1);
+            put_device(dev);
+            assert_eq!((*dev).kobj.kref, 0);
+            put_device(dev);
+            assert_eq!((*dev).kobj.kref, 0);
+        }
+    }
+
+    static DEVICE_RELEASE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn test_device_release(_dev: *mut LinuxDevice) {
+        DEVICE_RELEASE_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn linux_put_device_calls_release_at_zero() {
+        unsafe {
+            DEVICE_RELEASE_COUNT.store(0, Ordering::SeqCst);
+            let mut backing = [0usize; 95];
+            let bytes = backing.as_mut_ptr().cast::<u8>();
+            let dev = bytes.cast::<LinuxDevice>();
+            linux_device_initialize(dev);
+            *bytes
+                .add(LINUX_DEVICE_RELEASE_OFFSET)
+                .cast::<Option<LinuxDeviceReleaseFn>>() = Some(test_device_release);
+
+            put_device(dev);
+            assert_eq!(DEVICE_RELEASE_COUNT.load(Ordering::SeqCst), 1);
+            put_device(dev);
+            assert_eq!(DEVICE_RELEASE_COUNT.load(Ordering::SeqCst), 1);
         }
     }
 
@@ -948,6 +1318,48 @@ mod tests {
             linux_device_unregister(&mut dev);
             assert!(!linux_device_registered(&dev));
             assert_eq!(registered_linux_device_count(), before);
+        }
+    }
+
+    #[test]
+    fn linux_device_bind_driver_records_preselected_driver() {
+        unsafe {
+            let mut dev = core::mem::zeroed::<LinuxDevice>();
+            let dev_name = b"bind-driver0\0";
+            dev.init_name = dev_name.as_ptr().cast::<c_char>();
+            assert_eq!(linux_device_register(&mut dev), 0);
+
+            let mut driver = core::mem::zeroed::<LinuxDeviceDriver>();
+            dev.driver = &mut driver;
+
+            assert_eq!(linux_device_bind_driver(core::ptr::null_mut()), -EINVAL);
+            assert_eq!(linux_device_bind_driver(&mut dev), 0);
+            assert_eq!(linux_device_driver(&dev), &mut driver as *mut _);
+
+            linux_device_unregister(&mut dev);
+        }
+    }
+
+    #[test]
+    fn linux_device_match_name_uses_sysfs_string_rules() {
+        unsafe {
+            let mut dev = core::mem::zeroed::<LinuxDevice>();
+            let dev_name = b"phy0\0";
+            dev.init_name = dev_name.as_ptr().cast::<c_char>();
+
+            assert_eq!(
+                linux_device_match_name(&mut dev, b"phy0\0".as_ptr().cast()),
+                1
+            );
+            assert_eq!(
+                linux_device_match_name(&mut dev, b"phy0\n\0".as_ptr().cast()),
+                1
+            );
+            assert_eq!(
+                linux_device_match_name(&mut dev, b"phy1\0".as_ptr().cast()),
+                0
+            );
+            assert_eq!(linux_device_match_name(&mut dev, core::ptr::null()), 0);
         }
     }
 

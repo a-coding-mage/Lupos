@@ -550,8 +550,7 @@ fn open_bound_slave(
     }
     // `tty_open()` — a `TIOCEXCL`'d tty rejects further opens unless the
     // caller has `CAP_SYS_ADMIN`.
-    if pty.exclusive.load(Ordering::Acquire) && !crate::kernel::capability::capable(CAP_SYS_ADMIN)
-    {
+    if pty.exclusive.load(Ordering::Acquire) && !crate::kernel::capability::capable(CAP_SYS_ADMIN) {
         return Err(EBUSY);
     }
 

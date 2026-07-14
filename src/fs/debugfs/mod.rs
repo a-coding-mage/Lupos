@@ -8,17 +8,22 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::ffi::{c_char, c_void};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::fs::dcache::d_alloc;
-use crate::fs::kernfs::{KernfsNode, ShowFn, StoreFn, add_child, inode_for_node};
+use crate::fs::kernfs::{KernfsNode, ShowFn, StoreFn, add_child, inode_for_node, lookup};
 use crate::fs::ops::SuperOps;
 use crate::fs::super_block::{FileSystemType, register_filesystem};
 use crate::fs::types::{SuperBlock, SuperBlockRef};
+use crate::include::uapi::errno::EINVAL;
+use crate::kernel::module::{export_symbol, find_symbol};
 
 pub mod file;
 pub mod inode;
@@ -36,6 +41,11 @@ pub static DEBUGFS_SUPER_OPS: SuperOps = SuperOps {
 
 lazy_static! {
     pub(super) static ref DEBUGFS_ROOT: Mutex<Option<Arc<KernfsNode>>> = Mutex::new(None);
+    static ref DEBUGFS_DENTRIES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+}
+
+struct DebugfsDentry {
+    node: Arc<KernfsNode>,
 }
 
 pub(super) fn root_node() -> Arc<KernfsNode> {
@@ -93,6 +103,20 @@ pub fn debugfs_create_file(
     f
 }
 
+pub fn debugfs_create_symlink(
+    name: &str,
+    parent: Option<&Arc<KernfsNode>>,
+    target: &str,
+) -> Arc<KernfsNode> {
+    let link = KernfsNode::new_symlink(name, target);
+    let p = match parent {
+        Some(p) => p.clone(),
+        None => root_node(),
+    };
+    add_child(&p, link.clone());
+    link
+}
+
 // `debugfs_create_u32(name, mode, parent, &value)` analogue.
 static U32_BACKING: AtomicU64 = AtomicU64::new(0);
 
@@ -146,6 +170,272 @@ pub fn register() {
     });
 }
 
+fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
+    if find_symbol(name).is_none() {
+        export_symbol(name, addr, gpl_only);
+    }
+}
+
+pub fn register_module_exports() {
+    export_symbol_once(
+        "debugfs_create_dir",
+        linux_debugfs_create_dir as usize,
+        false,
+    );
+    export_symbol_once(
+        "debugfs_create_file_full",
+        linux_debugfs_create_file_full as usize,
+        true,
+    );
+    export_symbol_once(
+        "debugfs_create_file_unsafe",
+        linux_debugfs_create_file_unsafe as usize,
+        true,
+    );
+    export_symbol_once(
+        "debugfs_create_symlink",
+        linux_debugfs_create_symlink as usize,
+        true,
+    );
+    export_symbol_once(
+        "debugfs_create_u32",
+        linux_debugfs_create_u32 as usize,
+        true,
+    );
+    export_symbol_once(
+        "debugfs_create_atomic_t",
+        linux_debugfs_create_atomic_t as usize,
+        true,
+    );
+    export_symbol_once(
+        "debugfs_create_bool",
+        linux_debugfs_create_bool as usize,
+        true,
+    );
+    export_symbol_once(
+        "debugfs_create_str",
+        linux_debugfs_create_str as usize,
+        true,
+    );
+    export_symbol_once("debugfs_attr_read", linux_debugfs_attr_read as usize, true);
+    export_symbol_once(
+        "debugfs_attr_write",
+        linux_debugfs_attr_write as usize,
+        true,
+    );
+    export_symbol_once("debugfs_lookup", linux_debugfs_lookup as usize, true);
+    export_symbol_once(
+        "debugfs_lookup_and_remove",
+        linux_debugfs_lookup_and_remove as usize,
+        true,
+    );
+    export_symbol_once("debugfs_remove", linux_debugfs_remove as usize, false);
+    export_symbol_once(
+        "debugfs_remove_recursive",
+        linux_debugfs_remove as usize,
+        false,
+    );
+}
+
+unsafe fn debugfs_name<'a>(name: *const c_char) -> Option<&'a str> {
+    if name.is_null() {
+        return None;
+    }
+    let len = unsafe { crate::lib::string::c_strlen(name, 255) };
+    let bytes = unsafe { core::slice::from_raw_parts(name.cast::<u8>(), len) };
+    core::str::from_utf8(bytes).ok()
+}
+
+unsafe fn debugfs_parent(parent: *mut c_void) -> Option<Arc<KernfsNode>> {
+    if parent.is_null() {
+        return None;
+    }
+    let parent_addr = parent as usize;
+    if !DEBUGFS_DENTRIES.lock().contains(&parent_addr) {
+        return None;
+    }
+    let dentry = unsafe { &*parent.cast::<DebugfsDentry>() };
+    Some(dentry.node.clone())
+}
+
+fn debugfs_register_dentry(node: Arc<KernfsNode>) -> *mut c_void {
+    let raw = Box::into_raw(Box::new(DebugfsDentry { node }));
+    DEBUGFS_DENTRIES.lock().push(raw as usize);
+    raw.cast()
+}
+
+unsafe fn linux_debugfs_create_file_node(
+    name: *const c_char,
+    mode: u16,
+    parent: *mut c_void,
+    data: *mut c_void,
+) -> *mut c_void {
+    let Some(name) = (unsafe { debugfs_name(name) }) else {
+        return core::ptr::null_mut();
+    };
+    let parent = unsafe { debugfs_parent(parent) };
+    let parent = parent.unwrap_or_else(root_node);
+    let node = debugfs_create_file(name, mode as u32, &parent, None, None);
+    node.priv_ptr.store(data as u64, Ordering::Release);
+    debugfs_register_dentry(node)
+}
+
+/// `debugfs_create_dir` - `vendor/linux/fs/debugfs/inode.c`.
+#[unsafe(export_name = "debugfs_create_dir")]
+unsafe extern "C" fn linux_debugfs_create_dir(
+    name: *const c_char,
+    parent: *mut c_void,
+) -> *mut c_void {
+    let Some(name) = (unsafe { debugfs_name(name) }) else {
+        return core::ptr::null_mut();
+    };
+    let parent = unsafe { debugfs_parent(parent) };
+    let node = debugfs_create_dir(name, parent.as_ref());
+    debugfs_register_dentry(node)
+}
+
+/// `debugfs_create_file_full` - `vendor/linux/fs/debugfs/inode.c`.
+#[unsafe(export_name = "debugfs_create_file_full")]
+unsafe extern "C" fn linux_debugfs_create_file_full(
+    name: *const c_char,
+    mode: u16,
+    parent: *mut c_void,
+    data: *mut c_void,
+    _aux: *const c_void,
+    _fops: *const c_void,
+) -> *mut c_void {
+    unsafe { linux_debugfs_create_file_node(name, mode, parent, data) }
+}
+
+/// `debugfs_create_file_unsafe` - `vendor/linux/fs/debugfs/inode.c`.
+#[unsafe(export_name = "debugfs_create_file_unsafe")]
+unsafe extern "C" fn linux_debugfs_create_file_unsafe(
+    name: *const c_char,
+    mode: u16,
+    parent: *mut c_void,
+    data: *mut c_void,
+    _fops: *const c_void,
+) -> *mut c_void {
+    unsafe { linux_debugfs_create_file_node(name, mode, parent, data) }
+}
+
+/// `debugfs_create_u32` - `vendor/linux/fs/debugfs/file.c:678`.
+unsafe extern "C" fn linux_debugfs_create_u32(
+    name: *const c_char,
+    mode: u16,
+    parent: *mut c_void,
+    value: *mut c_void,
+) {
+    let _ = unsafe { linux_debugfs_create_file_node(name, mode, parent, value) };
+}
+
+/// `debugfs_create_atomic_t` - `vendor/linux/fs/debugfs/file.c:923`.
+unsafe extern "C" fn linux_debugfs_create_atomic_t(
+    name: *const c_char,
+    mode: u16,
+    parent: *mut c_void,
+    value: *mut c_void,
+) {
+    let _ = unsafe { linux_debugfs_create_file_node(name, mode, parent, value) };
+}
+
+/// `debugfs_create_bool` - `vendor/linux/fs/debugfs/file.c:1008`.
+unsafe extern "C" fn linux_debugfs_create_bool(
+    name: *const c_char,
+    mode: u16,
+    parent: *mut c_void,
+    value: *mut c_void,
+) {
+    let _ = unsafe { linux_debugfs_create_file_node(name, mode, parent, value) };
+}
+
+/// `debugfs_create_str` - `vendor/linux/fs/debugfs/file.c`.
+unsafe extern "C" fn linux_debugfs_create_str(
+    name: *const c_char,
+    mode: u16,
+    parent: *mut c_void,
+    value: *mut c_void,
+) {
+    let _ = unsafe { linux_debugfs_create_file_node(name, mode, parent, value) };
+}
+
+/// `debugfs_attr_read` - `vendor/linux/fs/debugfs/file.c`.
+unsafe extern "C" fn linux_debugfs_attr_read(
+    _file: *mut c_void,
+    _buf: *mut c_void,
+    _len: usize,
+    _ppos: *mut i64,
+) -> isize {
+    -(EINVAL as isize)
+}
+
+/// `debugfs_attr_write` - `vendor/linux/fs/debugfs/file.c`.
+unsafe extern "C" fn linux_debugfs_attr_write(
+    _file: *mut c_void,
+    _buf: *const c_void,
+    _len: usize,
+    _ppos: *mut i64,
+) -> isize {
+    -(EINVAL as isize)
+}
+
+/// `debugfs_create_symlink` - `vendor/linux/fs/debugfs/inode.c`.
+#[unsafe(export_name = "debugfs_create_symlink")]
+unsafe extern "C" fn linux_debugfs_create_symlink(
+    name: *const c_char,
+    parent: *mut c_void,
+    target: *const c_char,
+) -> *mut c_void {
+    let Some(name) = (unsafe { debugfs_name(name) }) else {
+        return core::ptr::null_mut();
+    };
+    let Some(target) = (unsafe { debugfs_name(target) }) else {
+        return core::ptr::null_mut();
+    };
+    let parent = unsafe { debugfs_parent(parent) };
+    let node = debugfs_create_symlink(name, parent.as_ref(), target);
+    debugfs_register_dentry(node)
+}
+
+/// `debugfs_lookup` - `vendor/linux/fs/debugfs/inode.c`.
+#[unsafe(export_name = "debugfs_lookup")]
+unsafe extern "C" fn linux_debugfs_lookup(name: *const c_char, parent: *mut c_void) -> *mut c_void {
+    let Some(name) = (unsafe { debugfs_name(name) }) else {
+        return core::ptr::null_mut();
+    };
+    let parent = unsafe { debugfs_parent(parent) }.unwrap_or_else(root_node);
+    let Some(node) = lookup(&parent, name) else {
+        return core::ptr::null_mut();
+    };
+    debugfs_register_dentry(node)
+}
+
+/// `debugfs_lookup_and_remove` - `vendor/linux/fs/debugfs/inode.c:795`.
+#[unsafe(export_name = "debugfs_lookup_and_remove")]
+unsafe extern "C" fn linux_debugfs_lookup_and_remove(name: *const c_char, parent: *mut c_void) {
+    let dentry = unsafe { linux_debugfs_lookup(name, parent) };
+    if !dentry.is_null() {
+        unsafe { linux_debugfs_remove(dentry) };
+    }
+}
+
+/// `debugfs_remove` - `vendor/linux/fs/debugfs/inode.c`.
+#[unsafe(export_name = "debugfs_remove")]
+unsafe extern "C" fn linux_debugfs_remove(dentry: *mut c_void) {
+    if dentry.is_null() {
+        return;
+    }
+    let mut dentries = DEBUGFS_DENTRIES.lock();
+    let Some(index) = dentries.iter().position(|entry| *entry == dentry as usize) else {
+        return;
+    };
+    dentries.swap_remove(index);
+    drop(dentries);
+    unsafe {
+        drop(Box::from_raw(dentry.cast::<DebugfsDentry>()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,7 +446,60 @@ mod tests {
         let root = inode::root();
         let dir = debugfs_create_dir("lupos", Some(&root));
         file::create_file("state", 0o444, &dir, None, None);
+        debugfs_create_symlink("state-link", Some(&dir), "state");
         assert!(crate::fs::kernfs::lookup(&root, "lupos").is_some());
         assert!(crate::fs::kernfs::lookup(&dir, "state").is_some());
+        assert!(crate::fs::kernfs::lookup(&dir, "state-link").is_some());
+    }
+
+    #[test]
+    fn debugfs_module_exports_include_file_lookup_and_symlink() {
+        register_module_exports();
+        assert_eq!(
+            crate::kernel::module::find_symbol("debugfs_create_file_full"),
+            Some(linux_debugfs_create_file_full as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("debugfs_create_symlink"),
+            Some(linux_debugfs_create_symlink as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("debugfs_create_atomic_t"),
+            Some(linux_debugfs_create_atomic_t as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("debugfs_attr_read"),
+            Some(linux_debugfs_attr_read as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("debugfs_lookup"),
+            Some(linux_debugfs_lookup as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("debugfs_lookup_and_remove"),
+            Some(linux_debugfs_lookup_and_remove as usize)
+        );
+    }
+
+    #[test]
+    fn debugfs_value_helpers_create_entries() {
+        *DEBUGFS_ROOT.lock() = None;
+        let name = b"counter\0";
+        let value = 0usize as *mut c_void;
+        unsafe {
+            linux_debugfs_create_atomic_t(name.as_ptr().cast(), 0o644, core::ptr::null_mut(), value)
+        };
+        assert!(crate::fs::kernfs::lookup(&root_node(), "counter").is_some());
+        assert_eq!(
+            unsafe {
+                linux_debugfs_attr_read(
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                )
+            },
+            -(EINVAL as isize)
+        );
     }
 }
