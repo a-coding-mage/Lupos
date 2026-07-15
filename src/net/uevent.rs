@@ -120,7 +120,9 @@ pub fn current_seqnum() -> u64 {
 /// the broadcast queue so a future listener can replay history.  Bumps
 /// `UEVENT_SEQNUM` to match Linux's `kobject_uevent_env` semantics.
 pub fn broadcast_uevent(msg: UeventMessage) {
-    UEVENT_SEQNUM.fetch_add(1, Ordering::AcqRel);
+    let mut msg = msg;
+    let seqnum = UEVENT_SEQNUM.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    push_record(&mut msg.payload, "SEQNUM", &alloc::format!("{seqnum}"));
     {
         let mut q = BROADCAST_QUEUE.lock();
         if q.len() >= QUEUE_HIGH_WATERMARK {
@@ -168,6 +170,21 @@ pub fn announce_class_device(class: &str, name: &str, subsystem: &str, devname: 
     broadcast_uevent(msg);
 }
 
+pub fn announce_netdevice(action: UeventAction, ifname: &str, ifindex: u32) {
+    let devpath = alloc::format!("/devices/virtual/net/{ifname}");
+    let ifindex = alloc::format!("{ifindex}");
+    let msg = UeventMessage::build(
+        action,
+        &devpath,
+        &[
+            ("SUBSYSTEM", "net"),
+            ("INTERFACE", ifname),
+            ("IFINDEX", &ifindex),
+        ],
+    );
+    broadcast_uevent(msg);
+}
+
 fn devpath_for(class: &str, name: &str) -> String {
     let mut s = String::from("/class/");
     s.push_str(class);
@@ -206,6 +223,33 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert!(drained[0].payload.starts_with(b"add@/class/input/event0"));
         assert!(drained[1].payload.starts_with(b"add@/class/graphics/fb0"));
+    }
+
+    #[test]
+    fn netdevice_uevent_uses_linux_virtual_net_devpath() {
+        let _guard = test_lock();
+        let _ = drain_pending();
+        announce_netdevice(UeventAction::Add, "eth0", 2);
+        let drained = drain_pending();
+        assert_eq!(drained.len(), 1);
+        let payload = &drained[0].payload;
+        assert!(payload.starts_with(b"add@/devices/virtual/net/eth0\0"));
+        assert!(
+            payload
+                .windows(b"SUBSYSTEM=net\0".len())
+                .any(|w| w == b"SUBSYSTEM=net\0")
+        );
+        assert!(
+            payload
+                .windows(b"INTERFACE=eth0\0".len())
+                .any(|w| w == b"INTERFACE=eth0\0")
+        );
+        assert!(
+            payload
+                .windows(b"IFINDEX=2\0".len())
+                .any(|w| w == b"IFINDEX=2\0")
+        );
+        assert!(payload.windows(b"SEQNUM=".len()).any(|w| w == b"SEQNUM="));
     }
 
     #[test]

@@ -49,6 +49,7 @@ const UIO_MAXIOV: usize = 1024;
 // Total = 16 bytes; CMSG alignment is sizeof(size_t) = 8.
 const SOL_IP: i32 = 0;
 const SOL_SOCKET: i32 = 1;
+const SOL_PACKET: i32 = 263;
 const SOL_NETLINK: i32 = 270;
 const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
@@ -1496,6 +1497,13 @@ pub unsafe fn sys_setsockopt(fd: i32, level: i32, opt: i32, val: *const u8, len:
     if val.is_null() && len != 0 {
         return -(EFAULT as i64);
     }
+    if level == SOL_PACKET {
+        return match socket_from_fd(fd) {
+            Ok(sock) if sock.lock().family == AF_PACKET => 0,
+            Ok(_) => -(EINVAL as i64),
+            Err(errno) => -(errno as i64),
+        };
+    }
     if level == SOL_IP && opt as u32 == socket::IP_RECVTTL {
         if val.is_null() || len < core::mem::size_of::<u32>() as u32 {
             return -(EINVAL as i64);
@@ -1585,6 +1593,33 @@ pub unsafe fn sys_setsockopt(fd: i32, level: i32, opt: i32, val: *const u8, len:
 pub unsafe fn sys_getsockopt(fd: i32, level: i32, opt: i32, val: *mut u8, len: *mut u32) -> i64 {
     if len.is_null() {
         return -(EFAULT as i64);
+    }
+    if level == SOL_PACKET {
+        return match socket_from_fd(fd) {
+            Ok(sock) if sock.lock().family == AF_PACKET => {
+                if val.is_null() {
+                    return -(EFAULT as i64);
+                }
+                let have = match unsafe { uaccess::get_user_u32(len) } {
+                    Ok(have) => have,
+                    Err(_) => return -(EFAULT as i64),
+                };
+                if have < core::mem::size_of::<u32>() as u32 {
+                    return -(EINVAL as i64);
+                }
+                if unsafe { uaccess::put_user_u32(val as *mut u32, 0) }.is_err() {
+                    return -(EFAULT as i64);
+                }
+                if unsafe { uaccess::put_user_u32(len, core::mem::size_of::<u32>() as u32) }
+                    .is_err()
+                {
+                    return -(EFAULT as i64);
+                }
+                0
+            }
+            Ok(_) => -(EINVAL as i64),
+            Err(errno) => -(errno as i64),
+        };
     }
     if level == SOL_IP && opt as u32 == socket::IP_RECVTTL {
         if val.is_null() {
@@ -2140,7 +2175,9 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
     // truncation, MSG_CTRUNC is OR'd into msg.flags and the cmsg is
     // dropped entirely.  If installing partway through fails (EMFILE),
     // we close the already-installed fds to avoid leaking.
-    let mut out_flags = msgval.flags & !MSG_CTRUNC;
+    // Linux treats `msghdr.msg_flags` as output-only for recvmsg(2); userspace
+    // input bits are ignored rather than reflected back into the result.
+    let mut out_flags = 0;
     let mut control_written = 0usize;
     if passcred {
         #[cfg(not(test))]
@@ -3836,20 +3873,6 @@ mod tests {
                 crate::net::rtnetlink::NETLINK_KOBJECT_UEVENT as i32,
             );
             assert!(fd >= 0);
-            let nl_addr = LinuxSockAddrNetlink {
-                family: AF_NETLINK,
-                pad: 0,
-                pid: 0,
-                groups: 0,
-            };
-            assert_eq!(
-                sys_bind(
-                    fd as i32,
-                    &nl_addr as *const _ as *const u8,
-                    core::mem::size_of::<LinuxSockAddrNetlink>() as u32,
-                ),
-                0
-            );
             let group = 1u32;
             assert_eq!(
                 sys_setsockopt(
@@ -3861,6 +3884,31 @@ mod tests {
                 ),
                 0
             );
+            let mut nl_addr = LinuxSockAddrNetlink {
+                family: 0,
+                pad: 0,
+                pid: 0,
+                groups: 0,
+            };
+            let mut nl_addr_len = core::mem::size_of::<LinuxSockAddrNetlink>() as u32;
+            assert_eq!(
+                sys_getsockname(
+                    fd as i32,
+                    &mut nl_addr as *mut _ as *mut u8,
+                    &mut nl_addr_len,
+                ),
+                0
+            );
+            assert_eq!(
+                nl_addr_len,
+                core::mem::size_of::<LinuxSockAddrNetlink>() as u32
+            );
+            assert_eq!(nl_addr.family, AF_NETLINK);
+            assert_ne!(
+                nl_addr.pid, 0,
+                "membership join should autobind netlink portid"
+            );
+            assert_eq!(nl_addr.groups, 1);
 
             let mut out = [0u8; 256];
             let n = sys_recvfrom(

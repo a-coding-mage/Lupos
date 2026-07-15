@@ -14,6 +14,10 @@ use alloc::sync::Arc;
 use crate::fs::kernfs::KernfsNode;
 use crate::include::uapi::errno::EINVAL;
 use crate::mm::oom::{OOM_SCORE_ADJ_MAX, OOM_SCORE_ADJ_MIN};
+use crate::{
+    kernel::task::TaskStruct,
+    kernel::task::task_state::{EXIT_DEAD, EXIT_ZOMBIE},
+};
 
 pub fn stat_text_with_ppid(pid: i32, comm: &str, state: char, ppid: i32) -> String {
     format!(
@@ -27,55 +31,82 @@ pub fn stat_text(pid: i32, comm: &str, state: char) -> String {
 }
 
 pub fn self_stat_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
-    super::util::copy_into(buf, &stat_text(1, "lupos", 'R'))
-}
-
-pub fn self_status_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
-    let locked_kb = current_locked_vm_kb();
-    let rss_anon_kb = current_rss_anon_kb();
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return super::util::copy_into(buf, &stat_text(1, "lupos", 'R'));
+    }
+    let ppid = task_ppid(task);
+    let state = task_state_char(task);
+    let comm = super::util::task_comm(task);
     super::util::copy_into(
         buf,
-        &format!(
-            "Name:\tlupos\nState:\tR (running)\nTgid:\t1\nPid:\t1\nPPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmLck:\t{:8} kB\nRssAnon:\t{:8} kB\n",
-            locked_kb, rss_anon_kb
-        ),
+        &stat_text_with_ppid(unsafe { (*task).pid }, &comm, state, ppid),
     )
 }
 
-fn current_locked_vm_kb() -> u64 {
-    let current = unsafe { crate::kernel::sched::get_current() };
-    if current.is_null() {
-        return 0;
+pub fn self_status_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return super::util::copy_into(
+            buf,
+            &super::util::format_status(&super::util::ProcStatusView {
+                name: "lupos",
+                state: "R (running)",
+                tgid: 1,
+                pid: 1,
+                ppid: 0,
+                locked_kb: 0,
+                rss_anon_kb: 0,
+                security: super::util::task_status_security(task),
+            }),
+        );
     }
-    let mm = unsafe { (*current).mm };
-    if mm.is_null() {
-        return 0;
-    }
-    unsafe { (*mm).locked_vm.saturating_mul(4) }
+    let comm = super::util::task_comm(task);
+    let text = super::util::format_status(&super::util::ProcStatusView {
+        name: &comm,
+        state: task_state_text(task),
+        tgid: unsafe { (*task).tgid },
+        pid: unsafe { (*task).pid },
+        ppid: task_ppid(task),
+        locked_kb: super::util::task_locked_vm_kb(task),
+        rss_anon_kb: super::util::task_rss_anon_kb(task),
+        security: super::util::task_status_security(task),
+    });
+    super::util::copy_into(buf, &text)
 }
 
-fn current_rss_anon_kb() -> u64 {
-    let current = unsafe { crate::kernel::sched::get_current() };
-    if current.is_null() {
+fn task_ppid(task: *mut TaskStruct) -> i32 {
+    if task.is_null() {
         return 0;
     }
-    let mm = unsafe { (*current).mm };
-    if mm.is_null() {
-        return 0;
+    let parent = unsafe { (*task).m26.real_parent };
+    if parent.is_null() {
+        0
+    } else {
+        unsafe { (*parent).pid }
     }
-    let mm = unsafe { &*mm };
-    let mut kb = 0u64;
-    for (_, _, entry) in mm.mm_mt.collect_entries() {
-        let vma = unsafe { &*(entry as *const crate::mm::mm_types::VmAreaStruct) };
-        if vma.vm_file != 0 || vma.vm_flags & crate::mm::vm_flags::VM_HUGEPAGE == 0 {
-            continue;
-        }
-        if crate::mm::huge::thp_range_was_split(vma.vm_start, vma.vm_end) {
-            continue;
-        }
-        kb = kb.saturating_add((vma.vm_end - vma.vm_start) / 1024);
+}
+
+fn task_state_char(task: *mut TaskStruct) -> char {
+    if task.is_null() {
+        return 'R';
     }
-    kb
+    let exit_state = unsafe {
+        (*task).m26.exit_state | (*task).__state.load(core::sync::atomic::Ordering::Acquire)
+    };
+    if exit_state & (EXIT_ZOMBIE | EXIT_DEAD) != 0 {
+        'Z'
+    } else {
+        'R'
+    }
+}
+
+fn task_state_text(task: *mut TaskStruct) -> &'static str {
+    if task_state_char(task) == 'Z' {
+        "Z (zombie)"
+    } else {
+        "R (running)"
+    }
 }
 
 pub fn self_comm_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
@@ -185,10 +216,12 @@ mod tests {
 
     #[test]
     fn status_includes_linux_vmlck_field() {
-        let mut buf = [0u8; 256];
+        let mut buf = [0u8; 512];
         let node = KernfsNode::new_file("status", 0o444, Some(self_status_show), None);
         let n = self_status_show(&node, &mut buf).unwrap();
         let text = core::str::from_utf8(&buf[..n]).unwrap();
         assert!(text.contains("VmLck:\t"));
+        assert!(text.contains("CapEff:\t"));
+        assert!(text.contains("NoNewPrivs:\t"));
     }
 }
