@@ -14,7 +14,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use spin::{Mutex, RwLock};
 
@@ -288,6 +288,7 @@ pub struct File {
     pub path_hint: Mutex<Option<String>>,
     pub pos: Mutex<u64>,
     pub flags: AtomicU32,
+    pub write_seen: AtomicBool,
     pub mode: u32,
     pub fops: &'static FileOps,
     pub f_count: AtomicUsize,
@@ -302,6 +303,7 @@ impl File {
             path_hint: Mutex::new(None),
             pos: Mutex::new(0),
             flags: AtomicU32::new(flags),
+            write_seen: AtomicBool::new(false),
             mode,
             fops,
             f_count: AtomicUsize::new(1),

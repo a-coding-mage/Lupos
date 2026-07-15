@@ -2963,7 +2963,9 @@ fn renameat2_path(
     super::dcache::d_drop(&old_parent, &old_name);
     super::dcache::d_drop(&new_parent, &new_name);
     let renamed = super::dcache::d_alloc_child(&new_parent, &new_name);
+    let moved_is_dir = old_inode.kind == InodeKind::Directory;
     renamed.instantiate(old_inode);
+    super::inotify::notify_move(&old_parent, &old_name, &new_parent, &new_name, moved_is_dir);
     Ok(())
 }
 

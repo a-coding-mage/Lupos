@@ -853,9 +853,10 @@ pub mod tmpfs_vfs {
     use crate::fs::super_block::{FileSystemType, register_filesystem};
     use crate::fs::types::{
         DentryRef, Inode, InodeKind, InodePrivate, InodeRef, SuperBlock, SuperBlockRef,
-        touch_inode_now,
+        init_inode_metadata, init_inode_owner, touch_inode_now,
     };
     use crate::include::uapi::errno::{EEXIST, EINVAL, EPERM};
+    use crate::include::uapi::stat::S_IFDIR;
     use crate::linux_driver_abi::input::evdev_chardev::EVDEV_FILE_OPS;
     use crate::linux_driver_abi::tty::pty::PTMX_FILE_OPS;
     use crate::linux_driver_abi::video::fbdev::FBDEV_FILE_OPS;
@@ -869,6 +870,7 @@ pub mod tmpfs_vfs {
     static DEVTMPFS_ROOT: Mutex<Option<DentryRef>> = Mutex::new(None);
     static DEVTMPFS_SUPERBLOCK: Mutex<Option<SuperBlockRef>> = Mutex::new(None);
     const DEVTMPFS_BLOCK_INODE_MARKER: usize = 0x6465_7674_6d70_626c;
+    const BOGO_DIRENT_SIZE: u64 = 20;
 
     pub static TMPFS_DIR_INODE_OPS: InodeOps = InodeOps {
         name: "tmpfs_dir",
@@ -950,19 +952,28 @@ pub mod tmpfs_vfs {
         destroy_inode: None,
     };
 
-    fn make_dir(sb: &SuperBlockRef) -> InodeRef {
+    fn make_dir(sb: &SuperBlockRef, dir: Option<&InodeRef>, mode: u32) -> InodeRef {
         let i = Inode::new(
             sb.alloc_ino(),
             InodeKind::Directory,
-            0o755,
+            mode | S_IFDIR,
             &TMPFS_DIR_INODE_OPS,
             &TMPFS_DIR_FILE_OPS,
             empty_ram_dir(),
         );
+        init_inode_owner(&i, dir, mode | S_IFDIR);
+        init_inode_metadata(
+            &i,
+            i.uid.load(Ordering::Acquire),
+            i.gid.load(Ordering::Acquire),
+            2,
+            0,
+        );
+        i.size.store(2 * BOGO_DIRENT_SIZE, Ordering::Release);
         *i.sb.lock() = Some(sb.clone());
         i
     }
-    fn make_reg(sb: &SuperBlockRef, mode: u32) -> InodeRef {
+    fn make_reg(sb: &SuperBlockRef, dir: Option<&InodeRef>, mode: u32) -> InodeRef {
         let i = Inode::new(
             sb.alloc_ino(),
             InodeKind::Regular,
@@ -971,10 +982,23 @@ pub mod tmpfs_vfs {
             &TMPFS_FILE_OPS,
             empty_ram_bytes(),
         );
+        init_inode_owner(&i, dir, mode);
+        init_inode_metadata(
+            &i,
+            i.uid.load(Ordering::Acquire),
+            i.gid.load(Ordering::Acquire),
+            1,
+            0,
+        );
         *i.sb.lock() = Some(sb.clone());
         i
     }
-    fn make_symlink(sb: &SuperBlockRef, mode: u32, target: &str) -> InodeRef {
+    fn make_symlink(
+        sb: &SuperBlockRef,
+        dir: Option<&InodeRef>,
+        mode: u32,
+        target: &str,
+    ) -> InodeRef {
         let i = Inode::new(
             sb.alloc_ino(),
             InodeKind::Symlink,
@@ -982,6 +1006,14 @@ pub mod tmpfs_vfs {
             &TMPFS_SYMLINK_INODE_OPS,
             &TMPFS_SYMLINK_FILE_OPS,
             empty_ram_bytes(),
+        );
+        init_inode_owner(&i, dir, mode);
+        init_inode_metadata(
+            &i,
+            i.uid.load(Ordering::Acquire),
+            i.gid.load(Ordering::Acquire),
+            1,
+            0,
         );
         if let InodePrivate::RamBytes(bytes) = &i.private {
             bytes.lock().extend_from_slice(target.as_bytes());
@@ -1005,6 +1037,7 @@ pub mod tmpfs_vfs {
             fops,
             empty_ram_bytes(),
         );
+        init_inode_metadata(&i, 0, 0, 1, 0);
         *i.sb.lock() = Some(sb.clone());
         i
     }
@@ -1053,17 +1086,17 @@ pub mod tmpfs_vfs {
     }
     fn tmpfs_create(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> {
         let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
-        let i = make_reg(&sb, mode);
+        let i = make_reg(&sb, Some(dir), mode);
         insert_tmpfs_inode(dir, name, i)
     }
-    fn tmpfs_mkdir(dir: &InodeRef, name: &str, _mode: u32) -> Result<InodeRef, i32> {
+    fn tmpfs_mkdir(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> {
         let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
-        let i = make_dir(&sb);
+        let i = make_dir(&sb, Some(dir), mode);
         insert_tmpfs_inode(dir, name, i)
     }
     fn tmpfs_symlink(dir: &InodeRef, name: &str, target: &str, mode: u32) -> Result<InodeRef, i32> {
         let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
-        let i = make_symlink(&sb, mode, target);
+        let i = make_symlink(&sb, Some(dir), mode, target);
         insert_tmpfs_inode(dir, name, i)
     }
 
@@ -1074,6 +1107,12 @@ pub mod tmpfs_vfs {
         }
         entries.insert(alloc::string::String::from(name), inode.clone());
         drop(entries);
+        if inode.kind == InodeKind::Directory {
+            dir.nlink.fetch_add(1, Ordering::AcqRel);
+        }
+        let prev = dir.size.load(Ordering::Acquire);
+        dir.size
+            .store(prev.saturating_add(BOGO_DIRENT_SIZE), Ordering::Release);
         touch_inode_now(dir);
         touch_inode_now(&inode);
         Ok(inode)
@@ -1167,9 +1206,10 @@ pub mod tmpfs_vfs {
             )?;
         }
         insert_child(&root, "ptmx", make_ptmx(sb))?;
-        let pts = insert_child(&root, "pts", make_dir(sb))?;
+        let root_inode = root.inode().ok_or(EINVAL)?;
+        let pts = insert_child(&root, "pts", make_dir(sb, Some(&root_inode), 0o755))?;
         insert_child(&pts, "ptmx", make_ptmx(sb))?;
-        let input = insert_child(&root, "input", make_dir(sb))?;
+        let input = insert_child(&root, "input", make_dir(sb, Some(&root_inode), 0o755))?;
         for (idx, name) in ["event0", "event1"].into_iter().enumerate() {
             let node = make_special(sb, InodeKind::Chardev, 0o660, &EVDEV_FILE_OPS);
             node.rdev.store(dev(13, 64 + idx as u32), Ordering::Release);
@@ -1228,7 +1268,12 @@ pub mod tmpfs_vfs {
                     return Ok(());
                 }
                 let Some(inode) = existing.inode() else {
-                    parent = insert_child(&parent, component, make_dir(&sb))?;
+                    let parent_inode = parent.inode().ok_or(EINVAL)?;
+                    parent = insert_child(
+                        &parent,
+                        component,
+                        make_dir(&sb, Some(&parent_inode), 0o755),
+                    )?;
                     continue;
                 };
                 if inode.kind != InodeKind::Directory {
@@ -1243,7 +1288,12 @@ pub mod tmpfs_vfs {
                 return Ok(());
             }
 
-            parent = insert_child(&parent, component, make_dir(&sb))?;
+            let parent_inode = parent.inode().ok_or(EINVAL)?;
+            parent = insert_child(
+                &parent,
+                component,
+                make_dir(&sb, Some(&parent_inode), 0o755),
+            )?;
         }
         Err(EINVAL)
     }
@@ -1310,7 +1360,7 @@ pub mod tmpfs_vfs {
 
     fn mount_named(fs_name: &'static str) -> Result<SuperBlockRef, i32> {
         let sb = SuperBlock::alloc(fs_name, TMPFS_MAGIC, &TMPFS_SUPER_OPS);
-        let root_inode = make_dir(&sb);
+        let root_inode = make_dir(&sb, None, 0o755);
         let root = d_alloc("/");
         root.instantiate(root_inode);
         *sb.root.lock() = Some(root);
@@ -1367,10 +1417,15 @@ pub mod tmpfs_vfs {
 
     #[cfg(test)]
     mod tests {
+        use alloc::boxed::Box;
         use alloc::sync::Arc;
 
         use super::*;
         use crate::fs::dcache::d_lookup;
+        use crate::include::uapi::stat::S_ISGID;
+        use crate::kernel::capability::KernelCapT;
+        use crate::kernel::cred::{Cred, GroupInfo, INIT_CRED, KGid, KUid};
+        use crate::kernel::{sched, task::TaskStruct};
 
         fn child_kind(sb: &SuperBlockRef, name: &str) -> InodeKind {
             let root = sb.root().expect("root");
@@ -1378,6 +1433,38 @@ pub mod tmpfs_vfs {
                 .and_then(|d| d.inode())
                 .map(|inode| inode.kind)
                 .expect("devtmpfs child")
+        }
+
+        fn install_current(current: &mut TaskStruct, cred: &Cred) -> *mut TaskStruct {
+            let previous = unsafe { sched::get_current() };
+            current.pid = 4343;
+            current.tgid = 4343;
+            current.cred = cred as *const Cred;
+            current.m27.real_cred = cred as *const Cred;
+            unsafe { sched::set_current(current as *mut TaskStruct) };
+            previous
+        }
+
+        fn test_cred(uid: u32, gid: u32) -> Cred {
+            Cred {
+                usage: core::sync::atomic::AtomicUsize::new(1),
+                uid: KUid(uid),
+                gid: KGid(gid),
+                suid: KUid(uid),
+                sgid: KGid(gid),
+                euid: KUid(uid),
+                egid: KGid(gid),
+                fsuid: KUid(uid),
+                fsgid: KGid(gid),
+                cap_inheritable: KernelCapT::empty(),
+                cap_permitted: KernelCapT::empty(),
+                cap_effective: KernelCapT::empty(),
+                cap_bset: KernelCapT::empty(),
+                cap_ambient: KernelCapT::empty(),
+                securebits: 0,
+                group_info: GroupInfo::default(),
+                user_ns: core::ptr::null(),
+            }
         }
 
         #[test]
@@ -1472,6 +1559,47 @@ pub mod tmpfs_vfs {
                 ),
                 Err(EEXIST)
             ));
+        }
+
+        #[test]
+        fn tmpfs_create_uses_current_fsuid_and_fsgid() {
+            let sb = mount("tmpfs", 0, "").expect("mount tmpfs");
+            let root = sb.root().expect("root");
+            let root_inode = root.inode().expect("root inode");
+            let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+            let cred = Box::new(test_cred(977, 977));
+            let previous = install_current(&mut current, &cred);
+
+            let inode = tmpfs_create(&root_inode, "networkd", 0o640).expect("create");
+
+            unsafe { sched::set_current(previous) };
+            current.cred = &raw const INIT_CRED;
+            assert_eq!(inode.uid.load(Ordering::Acquire), 977);
+            assert_eq!(inode.gid.load(Ordering::Acquire), 977);
+            assert_eq!(inode.mode.load(Ordering::Acquire) & 0o7777, 0o640);
+        }
+
+        #[test]
+        fn tmpfs_directory_create_inherits_parent_setgid_gid_and_mode() {
+            let sb = mount("tmpfs", 0, "").expect("mount tmpfs");
+            let root = sb.root().expect("root");
+            let root_inode = root.inode().expect("root inode");
+            root_inode.gid.store(77, Ordering::Release);
+            root_inode.mode.store(
+                root_inode.mode.load(Ordering::Acquire) | S_ISGID,
+                Ordering::Release,
+            );
+
+            let inode = tmpfs_mkdir(&root_inode, "links", 0o750).expect("mkdir");
+
+            assert_eq!(inode.gid.load(Ordering::Acquire), 77);
+            assert_eq!(inode.mode.load(Ordering::Acquire) & 0o7777, S_ISGID | 0o750);
+            assert_eq!(root_inode.nlink.load(Ordering::Acquire), 3);
+            assert_eq!(
+                root_inode.size.load(Ordering::Acquire),
+                3 * BOGO_DIRENT_SIZE
+            );
+            assert_eq!(inode.size.load(Ordering::Acquire), 2 * BOGO_DIRENT_SIZE);
         }
     }
 }

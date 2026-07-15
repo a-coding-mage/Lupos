@@ -7246,6 +7246,22 @@ fn systemd_login_userland_files_with_stage_and_options(
     ];
 
     if options.start_network_daemons {
+        files.push(initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/dbus.socket",
+            "/usr/lib/systemd/system/dbus.socket",
+        ));
+        files.push(initramfs_symlink(
+            "etc/systemd/system/sockets.target.wants/dbus.socket",
+            "/usr/lib/systemd/system/dbus.socket",
+        ));
+        files.push(initramfs_symlink(
+            "etc/systemd/system/dbus-org.freedesktop.network1.service",
+            "/usr/lib/systemd/system/systemd-networkd.service",
+        ));
+        files.push(initramfs_symlink(
+            "etc/systemd/system/dbus-org.freedesktop.resolve1.service",
+            "/usr/lib/systemd/system/systemd-resolved.service",
+        ));
         for (wants_path, target) in [
             (
                 "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.service",
@@ -13222,6 +13238,7 @@ fn direct_stage_delete_list_contents(delete_paths: &[&str]) -> String {
 fn direct_stage_login_root_disk_delete_paths(mode: BootMode) -> Vec<&'static str> {
     let mut paths = vec![
         "etc/systemd/system/default.target",
+        "etc/systemd/system/dbus-org.freedesktop.network1.service",
         "etc/systemd/system/dbus-org.freedesktop.resolve1.service",
         "etc/systemd/system/graphical.target.wants",
         "etc/systemd/system/getty.target.wants",
@@ -13560,6 +13577,22 @@ fn direct_stage_login_root_disk_overlay_files(
     }
 
     if include_network_daemons {
+        files.push(initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/dbus.socket",
+            "/usr/lib/systemd/system/dbus.socket",
+        ));
+        files.push(initramfs_symlink(
+            "etc/systemd/system/sockets.target.wants/dbus.socket",
+            "/usr/lib/systemd/system/dbus.socket",
+        ));
+        files.push(initramfs_symlink(
+            "etc/systemd/system/dbus-org.freedesktop.network1.service",
+            "/usr/lib/systemd/system/systemd-networkd.service",
+        ));
+        files.push(initramfs_symlink(
+            "etc/systemd/system/dbus-org.freedesktop.resolve1.service",
+            "/usr/lib/systemd/system/systemd-resolved.service",
+        ));
         for (wants_path, target) in [
             (
                 "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.service",
@@ -22489,6 +22522,28 @@ failed command output\n";
             });
             assert_eq!(got, target.as_bytes(), "{wants_path} target changed");
         }
+        for (path, target) in [
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/dbus.socket",
+                "/usr/lib/systemd/system/dbus.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/dbus.socket",
+                "/usr/lib/systemd/system/dbus.socket",
+            ),
+            (
+                "etc/systemd/system/dbus-org.freedesktop.network1.service",
+                "/usr/lib/systemd/system/systemd-networkd.service",
+            ),
+            (
+                "etc/systemd/system/dbus-org.freedesktop.resolve1.service",
+                "/usr/lib/systemd/system/systemd-resolved.service",
+            ),
+        ] {
+            let got = find_initramfs_symlink_target(&files, path)
+                .unwrap_or_else(|| panic!("{path} must be present in direct-stage root disks"));
+            assert_eq!(got, target.as_bytes(), "{path} target changed");
+        }
         for (wants_path, target) in [
             (
                 "etc/systemd/system/lupos-terminal.target.wants/systemd-sysusers.service",
@@ -27024,6 +27079,28 @@ CONFIG_MODULES=y
                 .unwrap_or_else(|| panic!("{wants_path} must be present in login-stack overlay"));
             assert_eq!(got, target.as_bytes(), "{wants_path} target changed");
         }
+        for (path, target) in [
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/dbus.socket",
+                "/usr/lib/systemd/system/dbus.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/dbus.socket",
+                "/usr/lib/systemd/system/dbus.socket",
+            ),
+            (
+                "etc/systemd/system/dbus-org.freedesktop.network1.service",
+                "/usr/lib/systemd/system/systemd-networkd.service",
+            ),
+            (
+                "etc/systemd/system/dbus-org.freedesktop.resolve1.service",
+                "/usr/lib/systemd/system/systemd-resolved.service",
+            ),
+        ] {
+            let got = find_initramfs_symlink_target(&files, path)
+                .unwrap_or_else(|| panic!("{path} must be present in login-stack overlay"));
+            assert_eq!(got, target.as_bytes(), "{path} target changed");
+        }
     }
 
     #[test]
@@ -27035,6 +27112,10 @@ CONFIG_MODULES=y
             Path::new("/nonexistent-login-stage"),
         );
         for wants_path in [
+            "etc/systemd/system/lupos-terminal.target.wants/dbus.socket",
+            "etc/systemd/system/sockets.target.wants/dbus.socket",
+            "etc/systemd/system/dbus-org.freedesktop.network1.service",
+            "etc/systemd/system/dbus-org.freedesktop.resolve1.service",
             "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.service",
             "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.socket",
             "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink.socket",

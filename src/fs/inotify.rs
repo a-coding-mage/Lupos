@@ -21,6 +21,7 @@ use crate::arch::x86::kernel::uaccess;
 use crate::fs::anon_inode::alloc_anon_file;
 use crate::fs::ops::FileOps;
 use crate::fs::types::{DentryRef, FileRef, InodeKind, InodeRef};
+use crate::include::uapi::fcntl::{O_ACCMODE, O_RDWR, O_WRONLY};
 use crate::include::uapi::errno::{
     EAGAIN, EBADF, EEXIST, EFAULT, EINVAL, EMFILE, ENOENT, ENOSPC, ENOTDIR,
 };
@@ -449,6 +450,23 @@ fn queue_event_for_inode(inode: &InodeRef, mask: u32, name: Option<&str>) {
     }
 }
 
+fn queue_parent_event(dentry: &DentryRef, mut mask: u32) {
+    let name = dentry.name.as_str();
+    if name.is_empty() {
+        return;
+    }
+    let Some(parent) = dentry.parent.lock().clone() else {
+        return;
+    };
+    let Some(parent_inode) = parent.inode() else {
+        return;
+    };
+    if dentry.inode().is_some_and(|inode| inode.kind == InodeKind::Directory) {
+        mask |= IN_ISDIR;
+    }
+    queue_event_for_inode(&parent_inode, mask, Some(name));
+}
+
 /// Queue the parent-directory `IN_CREATE` event used by Linux fsnotify when a
 /// child dentry is instantiated. This is inode-keyed like
 /// `vendor/linux/fs/notify/inotify/inotify_user.c`: watches attach to the
@@ -467,6 +485,57 @@ pub fn notify_create(parent: &DentryRef, name: &str, is_dir: bool) {
     queue_event_for_inode(&parent_inode, mask, Some(name));
 }
 
+pub fn notify_modify(dentry: &DentryRef) {
+    let Some(inode) = dentry.inode() else {
+        return;
+    };
+    queue_event_for_inode(&inode, IN_MODIFY, None);
+}
+
+pub fn notify_close(file: &FileRef) {
+    let Some(inode) = file.inode() else {
+        return;
+    };
+    if inode.kind == InodeKind::Directory {
+        return;
+    }
+    let opened_for_write = matches!(
+        file.flags.load(Ordering::Acquire) & O_ACCMODE,
+        O_WRONLY | O_RDWR
+    );
+    let wrote = file.write_seen.load(Ordering::Acquire);
+    let mask = if opened_for_write && wrote {
+        IN_CLOSE_WRITE
+    } else {
+        IN_CLOSE_NOWRITE
+    };
+    queue_event_for_inode(&inode, mask, None);
+    queue_parent_event(&file.dentry, mask);
+}
+
+pub fn notify_move(
+    old_parent: &DentryRef,
+    old_name: &str,
+    new_parent: &DentryRef,
+    new_name: &str,
+    is_dir: bool,
+) {
+    let Some(old_parent_inode) = old_parent.inode() else {
+        return;
+    };
+    let Some(new_parent_inode) = new_parent.inode() else {
+        return;
+    };
+    let mut from_mask = IN_MOVED_FROM;
+    let mut to_mask = IN_MOVED_TO;
+    if is_dir {
+        from_mask |= IN_ISDIR;
+        to_mask |= IN_ISDIR;
+    }
+    queue_event_for_inode(&old_parent_inode, from_mask, Some(old_name));
+    queue_event_for_inode(&new_parent_inode, to_mask, Some(new_name));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +546,7 @@ mod tests {
     use crate::fs::mount::{Mount, set_rootfs};
     use crate::fs::read_write::vfs_read;
     use crate::fs::super_block::mount_fs;
+    use crate::include::uapi::fcntl::{O_CREAT, O_TRUNC, O_WRONLY};
     use crate::kernel::{cred::INIT_CRED, files, sched, task::TaskStruct};
     use alloc::boxed::Box;
 
@@ -506,6 +576,29 @@ mod tests {
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
+    }
+
+    fn parse_events(buf: &[u8], len: usize) -> Vec<(i32, u32, String)> {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        while offset + core::mem::size_of::<InotifyEvent>() <= len {
+            let wd = i32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap());
+            let mask = u32::from_ne_bytes(buf[offset + 4..offset + 8].try_into().unwrap());
+            let name_len =
+                u32::from_ne_bytes(buf[offset + 12..offset + 16].try_into().unwrap()) as usize;
+            let mut name = String::new();
+            if name_len != 0 {
+                let name_start = offset + core::mem::size_of::<InotifyEvent>();
+                let raw = &buf[name_start..name_start + name_len];
+                let nul = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+                name = core::str::from_utf8(&raw[..nul])
+                    .map(String::from)
+                    .expect("utf8 event name");
+            }
+            out.push((wd, mask, name));
+            offset += core::mem::size_of::<InotifyEvent>() + name_len;
+        }
+        out
     }
 
     #[test]
@@ -715,6 +808,150 @@ mod tests {
             assert_eq!(
                 sys_inotify_add_watch(fd as i32, b"/run\0".as_ptr() as *const i8, IN_CREATE),
                 -(EINVAL as i64)
+            );
+
+            teardown_current(current, previous);
+        }
+    }
+
+    #[test]
+    fn file_write_generates_modify_and_close_write_events() {
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        let (current, previous) = setup_current_with_rootfs(260);
+        unsafe {
+            assert_eq!(crate::fs::syscalls::sys_mkdir(b"/run\0".as_ptr(), 0o755), 0);
+            let file_fd = crate::fs::syscalls::sys_open(
+                b"/run/netif-state\0".as_ptr(),
+                (O_CREAT | O_WRONLY | O_TRUNC) as i32,
+                0o644,
+            );
+            assert!(file_fd >= 0);
+            assert_eq!(
+                files::get_task_files(&*current as *const TaskStruct as *mut TaskStruct)
+                    .unwrap()
+                    .close(file_fd as i32),
+                Ok(())
+            );
+
+            let ifd = sys_inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+            assert!(ifd >= 0);
+            let wd = sys_inotify_add_watch(
+                ifd as i32,
+                b"/run/netif-state\0".as_ptr() as *const i8,
+                IN_MODIFY | IN_CLOSE_WRITE,
+            );
+            assert!(wd > 0);
+
+            let writer_fd = crate::fs::syscalls::sys_open(
+                b"/run/netif-state\0".as_ptr(),
+                O_WRONLY as i32,
+                0,
+            );
+            assert!(writer_fd >= 0);
+            assert_eq!(
+                crate::fs::read_write::sys_write(writer_fd as i32, b"dns".as_ptr(), 3),
+                3
+            );
+            assert_eq!(
+                files::get_task_files(&*current as *const TaskStruct as *mut TaskStruct)
+                    .unwrap()
+                    .close(writer_fd as i32),
+                Ok(())
+            );
+
+            let ft = files::get_task_files(&*current as *const TaskStruct as *mut TaskStruct)
+                .expect("task files");
+            let file = ft.get(ifd as i32).expect("inotify fd");
+            let mut buf = [0u8; 128];
+            let n = vfs_read(&file, &mut buf).expect("inotify events");
+            let events = parse_events(&buf, n);
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].0, wd as i32);
+            assert_eq!(events[0].1, IN_MODIFY);
+            assert!(events[0].2.is_empty());
+            assert_eq!(events[1].0, wd as i32);
+            assert_eq!(events[1].1, IN_CLOSE_WRITE);
+            assert!(events[1].2.is_empty());
+
+            teardown_current(current, previous);
+        }
+    }
+
+    #[test]
+    fn directory_watch_observes_close_write_and_moved_to_for_child_file() {
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        let (current, previous) = setup_current_with_rootfs(261);
+        unsafe {
+            assert_eq!(crate::fs::syscalls::sys_mkdir(b"/run\0".as_ptr(), 0o755), 0);
+            assert_eq!(crate::fs::syscalls::sys_mkdir(b"/run/systemd\0".as_ptr(), 0o755), 0);
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdir(b"/run/systemd/netif\0".as_ptr(), 0o755),
+                0
+            );
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdir(b"/run/systemd/netif/links\0".as_ptr(), 0o755),
+                0
+            );
+
+            let ifd = sys_inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+            assert!(ifd >= 0);
+            let wd = sys_inotify_add_watch(
+                ifd as i32,
+                b"/run/systemd/netif/links\0".as_ptr() as *const i8,
+                IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE,
+            );
+            assert!(wd > 0);
+
+            let tmp_fd = crate::fs::syscalls::sys_open(
+                b"/run/systemd/netif/links/.tmp\0".as_ptr(),
+                (O_CREAT | O_WRONLY | O_TRUNC) as i32,
+                0o644,
+            );
+            assert!(tmp_fd >= 0);
+            assert_eq!(
+                crate::fs::read_write::sys_write(tmp_fd as i32, b"state".as_ptr(), 5),
+                5
+            );
+            assert_eq!(
+                files::get_task_files(&*current as *const TaskStruct as *mut TaskStruct)
+                    .unwrap()
+                    .close(tmp_fd as i32),
+                Ok(())
+            );
+            assert_eq!(
+                crate::fs::syscalls::sys_rename(
+                    b"/run/systemd/netif/links/.tmp\0".as_ptr(),
+                    b"/run/systemd/netif/links/2\0".as_ptr(),
+                ),
+                0
+            );
+
+            let ft = files::get_task_files(&*current as *const TaskStruct as *mut TaskStruct)
+                .expect("task files");
+            let file = ft.get(ifd as i32).expect("inotify fd");
+            let mut buf = [0u8; 256];
+            let n = vfs_read(&file, &mut buf).expect("directory inotify events");
+            let events = parse_events(&buf, n);
+            assert!(
+                events
+                    .iter()
+                    .any(|(event_wd, mask, name)| *event_wd == wd as i32
+                        && *mask == IN_CREATE
+                        && name == ".tmp")
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|(event_wd, mask, name)| *event_wd == wd as i32
+                        && *mask == IN_CLOSE_WRITE
+                        && name == ".tmp")
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|(event_wd, mask, name)| *event_wd == wd as i32
+                        && *mask == IN_MOVED_TO
+                        && name == "2")
             );
 
             teardown_current(current, previous);

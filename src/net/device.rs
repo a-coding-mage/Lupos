@@ -8,7 +8,7 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -22,9 +22,19 @@ pub const IFF_BROADCAST: u32 = 0x2;
 pub const IFF_LOOPBACK: u32 = 0x8;
 pub const IFF_RUNNING: u32 = 0x40;
 pub const IFF_MULTICAST: u32 = 0x1000;
+pub const IFF_LOWER_UP: u32 = 0x1_0000;
+pub const IFF_DORMANT: u32 = 0x2_0000;
 pub const ETH_MIN_MTU: u32 = 68;
 pub const ETH_MAX_MTU: u32 = 65535;
 pub const LOOPBACK_MTU: u32 = 64 * 1024;
+pub const IF_OPER_UNKNOWN: u8 = 0;
+pub const IF_OPER_DOWN: u8 = 2;
+pub const IF_OPER_TESTING: u8 = 4;
+pub const IF_OPER_DORMANT: u8 = 5;
+pub const IF_OPER_UP: u8 = 6;
+pub const IF_LINK_MODE_DEFAULT: u8 = 0;
+pub const IF_LINK_MODE_DORMANT: u8 = 1;
+pub const IF_LINK_MODE_TESTING: u8 = 2;
 
 pub type NetDeviceRef = Arc<NetDevice>;
 
@@ -43,6 +53,8 @@ pub struct NetDevice {
     pub dev_addr: [u8; 6],
     pub ops: &'static NetDeviceOps,
     pub carrier: AtomicBool,
+    pub operstate: AtomicU8,
+    pub link_mode: AtomicU8,
     pub tx_packets: AtomicU64,
     pub rx_packets: AtomicU64,
     /// Authoritative configured Linux `struct net_device` for a vendor-built
@@ -57,6 +69,82 @@ impl NetDevice {
 
     pub fn carrier_ok(&self) -> bool {
         self.carrier.load(Ordering::Acquire)
+    }
+
+    pub fn operstate(&self) -> u8 {
+        self.operstate.load(Ordering::Acquire)
+    }
+
+    pub fn link_mode(&self) -> u8 {
+        self.link_mode.load(Ordering::Acquire)
+    }
+
+    pub fn userspace_operstate(&self) -> u8 {
+        if self.flags.load(Ordering::Acquire) & IFF_UP == 0 {
+            IF_OPER_DOWN
+        } else {
+            self.operstate()
+        }
+    }
+
+    pub fn userspace_flags(&self) -> u32 {
+        let internal = self.flags.load(Ordering::Acquire);
+        let mut flags = internal & !(IFF_RUNNING | IFF_LOWER_UP | IFF_DORMANT);
+        if internal & IFF_UP != 0 {
+            let operstate = self.operstate();
+            if operstate == IF_OPER_UP || operstate == IF_OPER_UNKNOWN {
+                flags |= IFF_RUNNING;
+            }
+            if self.carrier_ok() {
+                flags |= IFF_LOWER_UP;
+            }
+            if operstate == IF_OPER_DORMANT {
+                flags |= IFF_DORMANT;
+            }
+        }
+        flags
+    }
+
+    pub fn refresh_operstate(&self) {
+        let state = if self.flags.load(Ordering::Acquire) & IFF_LOOPBACK != 0 {
+            IF_OPER_UNKNOWN
+        } else if !self.carrier_ok() {
+            IF_OPER_DOWN
+        } else {
+            match self.link_mode() {
+                IF_LINK_MODE_DORMANT => IF_OPER_DORMANT,
+                IF_LINK_MODE_TESTING => IF_OPER_TESTING,
+                _ => IF_OPER_UP,
+            }
+        };
+        self.operstate.store(state, Ordering::Release);
+    }
+
+    pub fn set_link_mode(&self, value: u8) -> bool {
+        self.link_mode.swap(value, Ordering::AcqRel) != value
+    }
+
+    pub fn set_operstate_from_user(&self, transition: u8) -> bool {
+        let current = self.operstate();
+        let next = match transition {
+            IF_OPER_UP
+                if matches!(current, IF_OPER_DORMANT | IF_OPER_TESTING | IF_OPER_UNKNOWN) =>
+            {
+                IF_OPER_UP
+            }
+            IF_OPER_TESTING if current == IF_OPER_UP || current == IF_OPER_UNKNOWN => {
+                IF_OPER_TESTING
+            }
+            IF_OPER_DORMANT if current == IF_OPER_UP || current == IF_OPER_UNKNOWN => {
+                IF_OPER_DORMANT
+            }
+            _ => current,
+        };
+        if next == current {
+            return false;
+        }
+        self.operstate.store(next, Ordering::Release);
+        true
     }
 
     pub fn stats(&self) -> NetDeviceStats {
@@ -113,9 +201,12 @@ pub fn init() {
     if lookup_netdevice("lo").is_none()
         && let Ok(dev) = register_loopback_netdevice()
     {
-        dev.flags
-            .store(IFF_LOOPBACK | IFF_UP | IFF_RUNNING, Ordering::Release);
+        dev.flags.store(
+            IFF_LOOPBACK | IFF_UP | IFF_RUNNING | IFF_LOWER_UP,
+            Ordering::Release,
+        );
         dev.carrier.store(true, Ordering::Release);
+        dev.refresh_operstate();
     }
 }
 
@@ -134,6 +225,8 @@ fn register_loopback_netdevice() -> Result<NetDeviceRef, i32> {
             dev_addr: [0; 6],
             ops: &LOOPBACK_NETDEV_OPS,
             carrier: AtomicBool::new(false),
+            operstate: AtomicU8::new(IF_OPER_UNKNOWN),
+            link_mode: AtomicU8::new(IF_LINK_MODE_DEFAULT),
             tx_packets: AtomicU64::new(0),
             rx_packets: AtomicU64::new(0),
             linux_dev: None,
@@ -170,6 +263,8 @@ pub fn register_netdevice(
             dev_addr,
             ops,
             carrier: AtomicBool::new(false),
+            operstate: AtomicU8::new(IF_OPER_DOWN),
+            link_mode: AtomicU8::new(IF_LINK_MODE_DEFAULT),
             tx_packets: AtomicU64::new(0),
             rx_packets: AtomicU64::new(0),
             linux_dev: None,
@@ -207,6 +302,8 @@ pub fn register_linux_netdevice_locked(
         dev_addr,
         ops: &LINUX_NETDEV_OPS,
         carrier: AtomicBool::new(false),
+        operstate: AtomicU8::new(IF_OPER_DOWN),
+        link_mode: AtomicU8::new(IF_LINK_MODE_DEFAULT),
         tx_packets: AtomicU64::new(0),
         rx_packets: AtomicU64::new(0),
         linux_dev: Some(linux_dev as usize),
@@ -307,7 +404,9 @@ pub fn set_device_up(dev: &NetDeviceRef) -> Result<(), i32> {
         }
     } else {
         dev.carrier.store(true, Ordering::Release);
+        dev.flags.fetch_or(IFF_LOWER_UP, Ordering::AcqRel);
     }
+    dev.refresh_operstate();
     crate::net::socket::broadcast_rtnl_newlink(dev);
     Ok(())
 }
@@ -315,7 +414,7 @@ pub fn set_device_up(dev: &NetDeviceRef) -> Result<(), i32> {
 pub fn set_device_down(dev: &NetDeviceRef) -> Result<(), i32> {
     (dev.ops.stop)(dev)?;
     dev.flags
-        .fetch_and(!(IFF_UP | IFF_RUNNING), Ordering::AcqRel);
+        .fetch_and(!(IFF_UP | IFF_RUNNING | IFF_LOWER_UP), Ordering::AcqRel);
     dev.carrier.store(false, Ordering::Release);
     if let Some(raw) = dev.linux_dev.map(|ptr| ptr as *mut u8) {
         unsafe {
@@ -325,6 +424,7 @@ pub fn set_device_down(dev: &NetDeviceRef) -> Result<(), i32> {
             state.fetch_and(!1, Ordering::AcqRel);
         }
     }
+    dev.operstate.store(IF_OPER_DOWN, Ordering::Release);
     crate::net::socket::broadcast_rtnl_newlink(dev);
     Ok(())
 }
@@ -332,9 +432,21 @@ pub fn set_device_down(dev: &NetDeviceRef) -> Result<(), i32> {
 pub fn set_carrier(dev: &NetDeviceRef, up: bool) {
     dev.carrier.store(up, Ordering::Release);
     if up {
-        dev.flags.fetch_or(IFF_RUNNING, Ordering::AcqRel);
+        dev.flags
+            .fetch_or(IFF_RUNNING | IFF_LOWER_UP, Ordering::AcqRel);
     } else {
-        dev.flags.fetch_and(!IFF_RUNNING, Ordering::AcqRel);
+        dev.flags
+            .fetch_and(!(IFF_RUNNING | IFF_LOWER_UP), Ordering::AcqRel);
+    }
+    dev.refresh_operstate();
+    #[cfg(not(test))]
+    if crate::kernel::debug_trace::netlink_enabled() {
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-netlink-link action=carrier ifindex={} up={} flags=0x{:x}",
+            dev.ifindex,
+            u8::from(up),
+            dev.flags.load(Ordering::Acquire)
+        );
     }
     crate::net::socket::broadcast_rtnl_newlink(dev);
 }

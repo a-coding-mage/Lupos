@@ -73,6 +73,12 @@ fn active_device() -> Option<crate::net::device::NetDeviceRef> {
     None
 }
 
+fn active_device_by_ifindex(ifindex: u32) -> Option<crate::net::device::NetDeviceRef> {
+    crate::net::device::list_netdevices()
+        .into_iter()
+        .find(|dev| dev.ifindex == ifindex && dev.linux_dev.is_some() && dev.is_up())
+}
+
 fn transmit(dev: &crate::net::device::NetDeviceRef, frame: &[u8]) -> Result<(), i32> {
     let Some(raw) = dev.linux_dev.map(|address| address as *mut u8) else {
         return Err(ENETDOWN);
@@ -112,10 +118,11 @@ fn next_hop(destination: u32) -> u32 {
     }
 }
 
-fn send_ethernet_ipv4(mut frame: Vec<u8>, destination: u32) -> Result<(), i32> {
-    let Some(dev) = active_device() else {
-        return Err(ENETDOWN);
-    };
+fn send_ethernet_ipv4_via(
+    dev: &crate::net::device::NetDeviceRef,
+    mut frame: Vec<u8>,
+    destination: u32,
+) -> Result<(), i32> {
     let hop = next_hop(destination);
     let mut pending_frame = Some(frame);
     let (neighbour, send_arp) = {
@@ -134,7 +141,7 @@ fn send_ethernet_ipv4(mut frame: Vec<u8>, destination: u32) -> Result<(), i32> {
     if let Some(mac) = neighbour {
         frame = pending_frame.expect("resolved IPv4 frame");
         frame[0..6].copy_from_slice(&mac);
-        return transmit(&dev, &frame);
+        return transmit(dev, &frame);
     }
     if send_arp {
         let request = build_arp(
@@ -145,7 +152,7 @@ fn send_ethernet_ipv4(mut frame: Vec<u8>, destination: u32) -> Result<(), i32> {
             [0; 6],
             hop,
         );
-        transmit(&dev, &request)?;
+        transmit(dev, &request)?;
     }
     Ok(())
 }
@@ -154,6 +161,17 @@ fn send_ipv4(destination: u32, protocol: u8, payload: &[u8]) -> Result<(), i32> 
     let Some(dev) = active_device() else {
         return Err(ENETDOWN);
     };
+    send_ipv4_via(&dev, GUEST_IPV4, destination, protocol, 64, payload)
+}
+
+fn send_ipv4_via(
+    dev: &crate::net::device::NetDeviceRef,
+    source: u32,
+    destination: u32,
+    protocol: u8,
+    ttl: u8,
+    payload: &[u8],
+) -> Result<(), i32> {
     let total_length = 20usize.checked_add(payload.len()).ok_or(EINVAL)?;
     if total_length > u16::MAX as usize {
         return Err(EINVAL);
@@ -172,14 +190,14 @@ fn send_ipv4(destination: u32, protocol: u8, payload: &[u8]) -> Result<(), i32> 
     ip[2..4].copy_from_slice(&(total_length as u16).to_be_bytes());
     ip[4..6].copy_from_slice(&identification.to_be_bytes());
     ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
-    ip[8] = 64;
+    ip[8] = ttl;
     ip[9] = protocol;
-    ip[12..16].copy_from_slice(&GUEST_IPV4.to_be_bytes());
+    ip[12..16].copy_from_slice(&source.to_be_bytes());
     ip[16..20].copy_from_slice(&destination.to_be_bytes());
     let sum = checksum(ip);
     ip[10..12].copy_from_slice(&sum.to_be_bytes());
     frame[34..].copy_from_slice(payload);
-    send_ethernet_ipv4(frame, destination)
+    send_ethernet_ipv4_via(dev, frame, destination)
 }
 
 fn transport_checksum(source: u32, destination: u32, protocol: u8, segment: &[u8]) -> u16 {
@@ -319,6 +337,7 @@ pub(crate) fn send_inet(
     sock: &SocketRef,
     bytes: &[u8],
     destination: &SockAddr,
+    send_meta: Option<&crate::net::socket::PacketMeta>,
 ) -> Option<Result<usize, i32>> {
     let SockAddr::Inet { addr, port } = *destination else {
         return None;
@@ -329,20 +348,51 @@ pub(crate) fn send_inet(
     if addr >> 24 == 127 {
         return None;
     }
-    let (sock_type, protocol, source_port) = {
+    let (sock_type, protocol, source_port, preferred_ifindex, source_addr, ttl) = {
         let mut socket = sock.lock();
         if socket.family != AF_INET || !matches!(socket.sock_type, SOCK_DGRAM | SOCK_RAW) {
             return None;
         }
         crate::net::socket::autobind_inet(&mut socket);
         let source_port = match socket.local {
-            Some(SockAddr::Inet { port, .. }) => port,
-            _ => 0,
+            Some(SockAddr::Inet { addr, port }) => (addr, port),
+            _ => (0, 0),
         };
-        (socket.sock_type, socket.protocol, source_port)
+        let source_addr = send_meta
+            .and_then(|meta| meta.local_inet_addr)
+            .filter(|addr| *addr != 0)
+            .or((source_port.0 != 0).then_some(source_port.0))
+            .unwrap_or(GUEST_IPV4);
+        let ttl = send_meta
+            .and_then(|meta| meta.ttl)
+            .filter(|ttl| *ttl != 0)
+            .unwrap_or(64);
+        let preferred_ifindex = send_meta
+            .map(|meta| meta.ifindex)
+            .filter(|ifindex| *ifindex != 0)
+            .unwrap_or(socket.bound_ifindex.max(socket.unicast_ifindex));
+        (
+            socket.sock_type,
+            socket.protocol,
+            source_port.1,
+            preferred_ifindex,
+            source_addr,
+            ttl,
+        )
+    };
+    let dev = if preferred_ifindex != 0 {
+        match active_device_by_ifindex(preferred_ifindex) {
+            Some(dev) => Some(dev),
+            None => return Some(Err(ENETDOWN)),
+        }
+    } else {
+        active_device()
+    };
+    let Some(dev) = dev else {
+        return Some(Err(ENETDOWN));
     };
     let result = if sock_type == SOCK_RAW || protocol == IPPROTO_ICMP as u16 {
-        send_ipv4(addr, IPPROTO_ICMP, bytes)
+        send_ipv4_via(&dev, source_addr, addr, IPPROTO_ICMP, ttl, bytes)
     } else {
         let length = 8usize.checked_add(bytes.len()).ok_or(EINVAL);
         match length {
@@ -352,11 +402,29 @@ pub(crate) fn send_inet(
                 datagram[2..4].copy_from_slice(&port.to_be_bytes());
                 datagram[4..6].copy_from_slice(&(length as u16).to_be_bytes());
                 datagram[8..].copy_from_slice(bytes);
-                let checksum = transport_checksum(GUEST_IPV4, addr, IPPROTO_UDP, &datagram);
+                let checksum = transport_checksum(source_addr, addr, IPPROTO_UDP, &datagram);
                 datagram[6..8].copy_from_slice(
                     &(if checksum == 0 { 0xffff } else { checksum }).to_be_bytes(),
                 );
-                send_ipv4(addr, IPPROTO_UDP, &datagram)
+                #[cfg(not(test))]
+                if crate::kernel::debug_trace::netlink_enabled() && port == 53 {
+                    crate::linux_driver_abi::tty::serial_println!(
+                        "trace-udp-send src={}.{}.{}.{}:{} dst={}.{}.{}.{}:{} len={} checksum=0x{:04x}",
+                        (source_addr >> 24) & 0xff,
+                        (source_addr >> 16) & 0xff,
+                        (source_addr >> 8) & 0xff,
+                        source_addr & 0xff,
+                        source_port,
+                        (addr >> 24) & 0xff,
+                        (addr >> 16) & 0xff,
+                        (addr >> 8) & 0xff,
+                        addr & 0xff,
+                        port,
+                        bytes.len(),
+                        if checksum == 0 { 0xffff } else { checksum }
+                    );
+                }
+                send_ipv4_via(&dev, source_addr, addr, IPPROTO_UDP, ttl, &datagram)
             }
             _ => Err(EINVAL),
         }
@@ -454,6 +522,7 @@ fn queue_packet(sock: &SocketRef, bytes: Vec<u8>, peer: SockAddr) {
         peer: Some(peer),
         fds: Vec::new(),
         cred: SocketCred::default(),
+        meta: crate::net::socket::PacketMeta::default(),
     });
     crate::net::socket::wake_socket_recv(sock);
 }
@@ -536,7 +605,7 @@ fn handle_tcp(source: u32, destination: u32, segment: &[u8]) {
     }
 }
 
-fn handle_udp(source: u32, destination: u32, datagram: &[u8]) {
+fn handle_udp(source: u32, destination: u32, datagram: &[u8], ifindex: u32, ttl: u8) {
     if datagram.len() < 8 {
         return;
     }
@@ -550,21 +619,70 @@ fn handle_udp(source: u32, destination: u32, datagram: &[u8]) {
     if udp_checksum != 0
         && transport_checksum(source, destination, IPPROTO_UDP, &datagram[..length]) != 0
     {
+        #[cfg(not(test))]
+        if crate::kernel::debug_trace::netlink_enabled()
+            && (source_port == 53 || destination_port == 53)
+        {
+            crate::linux_driver_abi::tty::serial_println!(
+                "trace-udp-recv-drop src={}.{}.{}.{}:{} dst={}.{}.{}.{}:{} len={} checksum=0x{:04x} computed=0x{:04x}",
+                (source >> 24) & 0xff,
+                (source >> 16) & 0xff,
+                (source >> 8) & 0xff,
+                source & 0xff,
+                source_port,
+                (destination >> 24) & 0xff,
+                (destination >> 16) & 0xff,
+                (destination >> 8) & 0xff,
+                destination & 0xff,
+                destination_port,
+                length,
+                udp_checksum,
+                transport_checksum(source, destination, IPPROTO_UDP, &datagram[..length]),
+            );
+        }
         return;
     }
+    #[cfg(not(test))]
+    if crate::kernel::debug_trace::netlink_enabled()
+        && (source_port == 53 || destination_port == 53)
+    {
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-udp-recv src={}.{}.{}.{}:{} dst={}.{}.{}.{}:{} len={} checksum=0x{:04x}",
+            (source >> 24) & 0xff,
+            (source >> 16) & 0xff,
+            (source >> 8) & 0xff,
+            source & 0xff,
+            source_port,
+            (destination >> 24) & 0xff,
+            (destination >> 16) & 0xff,
+            (destination >> 8) & 0xff,
+            destination & 0xff,
+            destination_port,
+            length,
+            udp_checksum
+        );
+    }
     if let Some(sock) = matching_socket(IPPROTO_UDP, destination_port, source, source_port) {
-        queue_packet(
-            &sock,
-            datagram[8..length].to_vec(),
-            SockAddr::Inet {
+        sock.lock().recvq.push_back(QueuedPacket {
+            bytes: datagram[8..length].to_vec(),
+            peer: Some(SockAddr::Inet {
                 addr: source,
                 port: source_port,
+            }),
+            fds: Vec::new(),
+            cred: SocketCred::default(),
+            meta: crate::net::socket::PacketMeta {
+                ifindex,
+                local_inet_addr: Some(destination),
+                ttl: Some(ttl),
+                netlink_group: 0,
             },
-        );
+        });
+        crate::net::socket::wake_socket_recv(&sock);
     }
 }
 
-fn handle_ipv4(frame: &[u8]) {
+fn handle_ipv4(linux_dev: *mut u8, frame: &[u8]) {
     if frame.len() < 34 {
         return;
     }
@@ -586,23 +704,35 @@ fn handle_ipv4(frame: &[u8]) {
     }
     let source = u32::from_be_bytes([ip[12], ip[13], ip[14], ip[15]]);
     let destination = u32::from_be_bytes([ip[16], ip[17], ip[18], ip[19]]);
+    let ttl = ip[8];
     if destination != GUEST_IPV4 {
         return;
     }
+    let ifindex = crate::net::device::lookup_linux_netdevice(linux_dev)
+        .map(|dev| dev.ifindex)
+        .unwrap_or(0);
     let payload = &ip[header_length..total_length];
     match ip[9] {
         IPPROTO_TCP => handle_tcp(source, destination, payload),
-        IPPROTO_UDP => handle_udp(source, destination, payload),
+        IPPROTO_UDP => handle_udp(source, destination, payload, ifindex, ttl),
         IPPROTO_ICMP => {
             if let Some(sock) = matching_socket(IPPROTO_ICMP, 0, source, 0) {
-                queue_packet(
-                    &sock,
-                    payload.to_vec(),
-                    SockAddr::Inet {
+                sock.lock().recvq.push_back(QueuedPacket {
+                    bytes: payload.to_vec(),
+                    peer: Some(SockAddr::Inet {
                         addr: source,
                         port: 0,
+                    }),
+                    fds: Vec::new(),
+                    cred: SocketCred::default(),
+                    meta: crate::net::socket::PacketMeta {
+                        ifindex,
+                        local_inet_addr: Some(destination),
+                        ttl: Some(ttl),
+                        netlink_group: 0,
                     },
-                );
+                });
+                crate::net::socket::wake_socket_recv(&sock);
             }
         }
         _ => {}
@@ -615,7 +745,7 @@ pub(crate) fn receive_frame(linux_dev: *mut u8, frame: &[u8]) {
     }
     match u16::from_be_bytes([frame[12], frame[13]]) {
         ETH_P_ARP => handle_arp(linux_dev, frame),
-        ETH_P_IP => handle_ipv4(frame),
+        ETH_P_IP => handle_ipv4(linux_dev, frame),
         _ => {}
     }
 }
