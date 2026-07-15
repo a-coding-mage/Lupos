@@ -1375,7 +1375,11 @@ pub fn get_inet_mtu(sock: &SocketRef) -> Result<u32, i32> {
         (
             socket.family,
             socket.peer.clone(),
-            socket.bound_ifindex.max(socket.unicast_ifindex),
+            if socket.bound_ifindex != 0 {
+                socket.bound_ifindex
+            } else {
+                socket.unicast_ifindex
+            },
         )
     };
     let dev = if preferred_ifindex != 0 {
@@ -2366,6 +2370,10 @@ fn build_rtnl_addr_notification(
     build_rtnl_addr_message(msg_type, header.seq, netlink_reply_portid(sock), 0, ifaddr)
 }
 
+fn build_rtnl_addr_kernel_notification(msg_type: u16, ifaddr: &IfAddrRecord) -> Vec<u8> {
+    build_rtnl_addr_message(msg_type, 0, 0, 0, ifaddr)
+}
+
 fn enqueue_rtnl_ifaddr_requester(
     sock: &SocketRef,
     header: &NetlinkHeader,
@@ -2390,23 +2398,21 @@ fn route_ifaddr_subscribed(socket: &KernelSocket) -> bool {
 }
 
 fn broadcast_rtnl_ifaddr(
-    sock: &SocketRef,
-    header: &NetlinkHeader,
+    _sock: &SocketRef,
+    _header: &NetlinkHeader,
     msg_type: u16,
     ifaddr: &IfAddrRecord,
 ) {
-    let report = rtnl_report_requested(header);
     let listeners = {
         let bound = BOUND.lock();
         bound
             .values()
             .flat_map(|sockets| sockets.iter())
             .filter(|sock| route_ifaddr_subscribed(&sock.lock()))
-            .filter(|listener| !(report && Arc::ptr_eq(listener, sock)))
             .cloned()
             .collect::<Vec<_>>()
     };
-    let packet = build_rtnl_addr_notification(sock, header, msg_type, ifaddr);
+    let packet = build_rtnl_addr_kernel_notification(msg_type, ifaddr);
     for listener in listeners {
         enqueue_netlink_packet_with_groups(
             &listener,
@@ -2460,77 +2466,33 @@ fn derived_route4s_for_ifaddr(ifaddr: &IfAddrRecord) -> Vec<Route4Record> {
         return routes;
     };
     let prefix = ipv4_prefix(ifaddr.address, ifaddr.prefixlen);
-    push_route4_unique(&mut routes, Route4Record {
-        dst: ifaddr.local,
-        dst_len: 32,
-        tos: 0,
-        table: RT_TABLE_LOCAL,
-        protocol: RTPROT_KERNEL,
-        scope: RT_SCOPE_HOST,
-        route_type: RTN_LOCAL,
-        flags: 0,
-        oif: ifaddr.ifindex,
-        gateway: None,
-        priority: Some(ifaddr.rt_priority),
-        prefsrc: Some(ifaddr.local),
-    });
+    push_route4_unique(
+        &mut routes,
+        Route4Record {
+            dst: ifaddr.local,
+            dst_len: 32,
+            tos: 0,
+            table: RT_TABLE_LOCAL,
+            protocol: RTPROT_KERNEL,
+            scope: RT_SCOPE_HOST,
+            route_type: RTN_LOCAL,
+            flags: 0,
+            oif: ifaddr.ifindex,
+            gateway: None,
+            priority: Some(ifaddr.rt_priority),
+            prefsrc: Some(ifaddr.local),
+        },
+    );
     if !dev.is_up() {
         return routes;
     }
     if let Some(broadcast) = ifaddr.broadcast
         && broadcast != u32::MAX
     {
-        push_route4_unique(&mut routes, Route4Record {
-            dst: broadcast,
-            dst_len: 32,
-            tos: 0,
-            table: RT_TABLE_LOCAL,
-            protocol: RTPROT_KERNEL,
-            scope: RT_SCOPE_LINK,
-            route_type: RTN_BROADCAST,
-            flags: 0,
-            oif: ifaddr.ifindex,
-            gateway: None,
-            priority: Some(0),
-            prefsrc: Some(ifaddr.local),
-        });
-    }
-    if prefix != 0 && (prefix != ifaddr.local || ifaddr.prefixlen < 32) {
-        if ifaddr.flags & IFA_F_NOPREFIXROUTE == 0 {
-            push_route4_unique(&mut routes, Route4Record {
-                dst: prefix,
-                dst_len: ifaddr.prefixlen,
-                tos: 0,
-                table: if dev.flags.load(Ordering::Acquire) & crate::net::device::IFF_LOOPBACK != 0
-                {
-                    RT_TABLE_LOCAL
-                } else {
-                    RT_TABLE_MAIN
-                },
-                protocol: RTPROT_KERNEL,
-                scope: if dev.flags.load(Ordering::Acquire) & crate::net::device::IFF_LOOPBACK != 0
-                {
-                    RT_SCOPE_HOST
-                } else {
-                    RT_SCOPE_LINK
-                },
-                route_type: if dev.flags.load(Ordering::Acquire) & crate::net::device::IFF_LOOPBACK
-                    != 0
-                {
-                    RTN_LOCAL
-                } else {
-                    RTN_UNICAST
-                },
-                flags: 0,
-                oif: ifaddr.ifindex,
-                gateway: None,
-                priority: Some(ifaddr.rt_priority),
-                prefsrc: Some(ifaddr.local),
-            });
-        }
-        if ifaddr.prefixlen < 31 {
-            push_route4_unique(&mut routes, Route4Record {
-                dst: prefix | !((u32::MAX) << (32 - ifaddr.prefixlen as u32)),
+        push_route4_unique(
+            &mut routes,
+            Route4Record {
+                dst: broadcast,
                 dst_len: 32,
                 tos: 0,
                 table: RT_TABLE_LOCAL,
@@ -2542,7 +2504,66 @@ fn derived_route4s_for_ifaddr(ifaddr: &IfAddrRecord) -> Vec<Route4Record> {
                 gateway: None,
                 priority: Some(0),
                 prefsrc: Some(ifaddr.local),
-            });
+            },
+        );
+    }
+    if prefix != 0 && (prefix != ifaddr.local || ifaddr.prefixlen < 32) {
+        if ifaddr.flags & IFA_F_NOPREFIXROUTE == 0 {
+            push_route4_unique(
+                &mut routes,
+                Route4Record {
+                    dst: prefix,
+                    dst_len: ifaddr.prefixlen,
+                    tos: 0,
+                    table: if dev.flags.load(Ordering::Acquire) & crate::net::device::IFF_LOOPBACK
+                        != 0
+                    {
+                        RT_TABLE_LOCAL
+                    } else {
+                        RT_TABLE_MAIN
+                    },
+                    protocol: RTPROT_KERNEL,
+                    scope: if dev.flags.load(Ordering::Acquire) & crate::net::device::IFF_LOOPBACK
+                        != 0
+                    {
+                        RT_SCOPE_HOST
+                    } else {
+                        RT_SCOPE_LINK
+                    },
+                    route_type: if dev.flags.load(Ordering::Acquire)
+                        & crate::net::device::IFF_LOOPBACK
+                        != 0
+                    {
+                        RTN_LOCAL
+                    } else {
+                        RTN_UNICAST
+                    },
+                    flags: 0,
+                    oif: ifaddr.ifindex,
+                    gateway: None,
+                    priority: Some(ifaddr.rt_priority),
+                    prefsrc: Some(ifaddr.local),
+                },
+            );
+        }
+        if ifaddr.prefixlen < 31 {
+            push_route4_unique(
+                &mut routes,
+                Route4Record {
+                    dst: prefix | !((u32::MAX) << (32 - ifaddr.prefixlen as u32)),
+                    dst_len: 32,
+                    tos: 0,
+                    table: RT_TABLE_LOCAL,
+                    protocol: RTPROT_KERNEL,
+                    scope: RT_SCOPE_LINK,
+                    route_type: RTN_BROADCAST,
+                    flags: 0,
+                    oif: ifaddr.ifindex,
+                    gateway: None,
+                    priority: Some(0),
+                    prefsrc: Some(ifaddr.local),
+                },
+            );
         }
     }
     routes
@@ -2825,23 +2846,21 @@ fn enqueue_rtnl_route_requester(
 }
 
 fn broadcast_rtnl_route(
-    sock: &SocketRef,
-    header: &NetlinkHeader,
+    _sock: &SocketRef,
+    _header: &NetlinkHeader,
     msg_type: u16,
     route: &Route4Record,
 ) {
-    let report = rtnl_report_requested(header);
     let listeners = {
         let bound = BOUND.lock();
         bound
             .values()
             .flat_map(|sockets| sockets.iter())
             .filter(|sock| route_multicast_subscribed(&sock.lock(), RTNLGRP_IPV4_ROUTE))
-            .filter(|listener| !(report && Arc::ptr_eq(listener, sock)))
             .cloned()
             .collect::<Vec<_>>()
     };
-    let packet = build_rtnl_route_notification(sock, header, msg_type, route);
+    let packet = build_rtnl_route_kernel_notification(msg_type, route);
     for listener in listeners {
         enqueue_netlink_packet_with_groups(
             &listener,
@@ -2870,7 +2889,12 @@ fn broadcast_rtnl_route_kernel(msg_type: u16, route: &Route4Record) {
             seq: 0,
             pid: 0,
         };
-        trace_rtnl_route("broadcast-kernel", &header, Some(route), listeners.len() as i32);
+        trace_rtnl_route(
+            "broadcast-kernel",
+            &header,
+            Some(route),
+            listeners.len() as i32,
+        );
     }
     let packet = build_rtnl_route_kernel_notification(msg_type, route);
     for listener in listeners {
@@ -3663,6 +3687,17 @@ pub fn set_unicast_if(sock: &SocketRef, ifindex: u32) -> Result<(), i32> {
     let mut socket = sock.lock();
     if !matches!(socket.family, AF_INET | AF_INET6) {
         return Err(EINVAL);
+    }
+    if ifindex != 0 {
+        let dev_exists = crate::net::device::list_netdevices()
+            .into_iter()
+            .any(|dev| dev.ifindex == ifindex);
+        if !dev_exists {
+            return Err(EADDRNOTAVAIL);
+        }
+        if socket.bound_ifindex != 0 && socket.bound_ifindex != ifindex {
+            return Err(EINVAL);
+        }
     }
     socket.unicast_ifindex = ifindex;
     Ok(())
@@ -4947,7 +4982,81 @@ mod tests {
         });
         assert_eq!(n, 36);
         assert_eq!(i32::from_ne_bytes(ack[16..20].try_into().unwrap()), 0);
-        assert!(saw_notify, "NLM_F_ECHO should report RTM_NEWADDR to requester");
+        assert!(
+            saw_notify,
+            "NLM_F_ECHO should report RTM_NEWADDR to requester"
+        );
+
+        drop_rtnl_ifaddrs_for_device(dev.ifindex);
+        crate::net::device::unregister_netdevice(name).expect("cleanup");
+    }
+
+    #[test]
+    fn rtnetlink_newaddr_multicast_is_kernel_origin() {
+        let name = "rtaddrgrp1";
+        let _ = crate::net::device::unregister_netdevice(name);
+        let dev = crate::net::device::register_netdevice(
+            name,
+            1500,
+            [2, 0, 0, 0, 0, 0x21],
+            &crate::net::device::DUMMY_NETDEV_OPS,
+        )
+        .expect("device");
+        let requester = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE).unwrap();
+        bind(
+            &requester,
+            SockAddr::Netlink {
+                pid: 0x603d,
+                groups: 0,
+            },
+        )
+        .unwrap();
+        let subscriber = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE).unwrap();
+        bind(
+            &subscriber,
+            SockAddr::Netlink {
+                pid: 0x603c,
+                groups: 1u32 << (RTNLGRP_IPV4_IFADDR - 1),
+            },
+        )
+        .unwrap();
+
+        let mut req = alloc::vec![0u8; NLMSG_HDRLEN + 8];
+        req[4..6].copy_from_slice(&RTM_NEWADDR.to_ne_bytes());
+        req[6..8].copy_from_slice(&0x0005u16.to_ne_bytes());
+        req[8..12].copy_from_slice(&56u32.to_ne_bytes());
+        req[16] = AF_INET as u8;
+        req[17] = 24;
+        req[19] = RT_SCOPE_UNIVERSE;
+        req[20..24].copy_from_slice(&dev.ifindex.to_ne_bytes());
+        push_rta_ipv4(&mut req, IFA_LOCAL, ipv4(10, 0, 2, 18));
+        push_rta_ipv4(&mut req, IFA_ADDRESS, ipv4(10, 0, 2, 18));
+        let req_len = req.len() as u32;
+        req[0..4].copy_from_slice(&req_len.to_ne_bytes());
+
+        sendto(&requester, &req, SockAddr::Netlink { pid: 0, groups: 0 }).expect("send newaddr");
+        let mut ack = [0u8; 128];
+        let _ = recv_until_ack(&requester, &mut ack, |_| {});
+
+        let mut out = [0u8; 1024];
+        loop {
+            let (n, peer) = recvfrom(&subscriber, &mut out).expect("multicast addr");
+            if u16::from_ne_bytes(out[4..6].try_into().unwrap()) == RTM_NEWADDR
+                && u32::from_ne_bytes(out[20..24].try_into().unwrap()) == dev.ifindex
+                && addr_attr_ipv4(&out[..n], IFA_LOCAL) == Some([10, 0, 2, 18])
+            {
+                assert_eq!(u32::from_ne_bytes(out[8..12].try_into().unwrap()), 0);
+                assert_eq!(u32::from_ne_bytes(out[12..16].try_into().unwrap()), 0);
+                assert_eq!(
+                    peer,
+                    Some(SockAddr::Netlink {
+                        pid: 0,
+                        groups: 1u32 << (RTNLGRP_IPV4_IFADDR - 1),
+                    })
+                );
+                break;
+            }
+        }
 
         drop_rtnl_ifaddrs_for_device(dev.ifindex);
         crate::net::device::unregister_netdevice(name).expect("cleanup");
@@ -5009,7 +5118,10 @@ mod tests {
             {
                 assert_eq!(u32::from_ne_bytes(out[8..12].try_into().unwrap()), 0);
                 assert_eq!(u32::from_ne_bytes(out[12..16].try_into().unwrap()), 0);
-                assert_eq!(route_attr_u32(&out[..n], RTA_TABLE), Some(RT_TABLE_MAIN.into()));
+                assert_eq!(
+                    route_attr_u32(&out[..n], RTA_TABLE),
+                    Some(RT_TABLE_MAIN.into())
+                );
                 assert_eq!(route_attr_u32(&out[..n], RTA_PRIORITY), None);
                 assert_eq!(
                     peer,
@@ -5352,7 +5464,100 @@ mod tests {
         });
         assert_eq!(n, 36);
         assert_eq!(i32::from_ne_bytes(ack[16..20].try_into().unwrap()), 0);
-        assert!(saw_notify, "NLM_F_ECHO should report RTM_NEWROUTE to requester");
+        assert!(
+            saw_notify,
+            "NLM_F_ECHO should report RTM_NEWROUTE to requester"
+        );
+
+        ROUTE4S.lock().clear();
+        drop_rtnl_ifaddrs_for_device(dev.ifindex);
+        crate::net::device::unregister_netdevice(name).expect("cleanup");
+    }
+
+    #[test]
+    fn rtnetlink_newroute_multicast_is_kernel_origin() {
+        let name = "rtroutegrp2";
+        let _ = crate::net::device::unregister_netdevice(name);
+        let dev = crate::net::device::register_netdevice(
+            name,
+            1500,
+            [2, 0, 0, 0, 0, 0x20],
+            &crate::net::device::DUMMY_NETDEV_OPS,
+        )
+        .expect("device");
+        ROUTE4S.lock().clear();
+
+        let requester = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE).unwrap();
+        bind(
+            &requester,
+            SockAddr::Netlink {
+                pid: 0x602f,
+                groups: 0,
+            },
+        )
+        .unwrap();
+        let subscriber = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE).unwrap();
+        bind(
+            &subscriber,
+            SockAddr::Netlink {
+                pid: 0x6030,
+                groups: 1u32 << (RTNLGRP_IPV4_ROUTE - 1),
+            },
+        )
+        .unwrap();
+
+        let mut addr = alloc::vec![0u8; NLMSG_HDRLEN + 8];
+        addr[4..6].copy_from_slice(&RTM_NEWADDR.to_ne_bytes());
+        addr[6..8].copy_from_slice(&0x0005u16.to_ne_bytes());
+        addr[8..12].copy_from_slice(&62u32.to_ne_bytes());
+        addr[16] = AF_INET as u8;
+        addr[17] = 24;
+        addr[18] = IFA_F_PERMANENT as u8;
+        addr[19] = RT_SCOPE_UNIVERSE;
+        addr[20..24].copy_from_slice(&dev.ifindex.to_ne_bytes());
+        push_rta_ipv4(&mut addr, IFA_LOCAL, ipv4(10, 0, 2, 26));
+        push_rta_ipv4(&mut addr, IFA_ADDRESS, ipv4(10, 0, 2, 26));
+        push_rta_u32(&mut addr, IFA_FLAGS, IFA_F_PERMANENT);
+        let addr_len = addr.len() as u32;
+        addr[0..4].copy_from_slice(&addr_len.to_ne_bytes());
+        sendto(&requester, &addr, SockAddr::Netlink { pid: 0, groups: 0 }).expect("send addr");
+        let mut ack = [0u8; 128];
+        let _ = recv_until_ack(&requester, &mut ack, |_| {});
+
+        let mut route = alloc::vec![0u8; NLMSG_HDRLEN + 12];
+        route[4..6].copy_from_slice(&RTM_NEWROUTE.to_ne_bytes());
+        route[6..8].copy_from_slice(&0x0605u16.to_ne_bytes());
+        route[8..12].copy_from_slice(&63u32.to_ne_bytes());
+        route[16] = AF_INET as u8;
+        route[20] = RT_TABLE_MAIN;
+        route[21] = RTPROT_BOOT;
+        route[22] = RT_SCOPE_UNIVERSE;
+        route[23] = RTN_UNICAST;
+        push_rta_ipv4(&mut route, RTA_GATEWAY, ipv4(10, 0, 2, 2));
+        let route_len = route.len() as u32;
+        route[0..4].copy_from_slice(&route_len.to_ne_bytes());
+        sendto(&requester, &route, SockAddr::Netlink { pid: 0, groups: 0 }).expect("send route");
+        let _ = recv_until_ack(&requester, &mut ack, |_| {});
+
+        let mut out = [0u8; 1024];
+        loop {
+            let (n, peer) = recvfrom(&subscriber, &mut out).expect("multicast route");
+            if u16::from_ne_bytes(out[4..6].try_into().unwrap()) == RTM_NEWROUTE
+                && out[17] == 0
+                && route_attr_ipv4(&out[..n], RTA_GATEWAY) == Some([10, 0, 2, 2])
+            {
+                assert_eq!(u32::from_ne_bytes(out[8..12].try_into().unwrap()), 0);
+                assert_eq!(u32::from_ne_bytes(out[12..16].try_into().unwrap()), 0);
+                assert_eq!(
+                    peer,
+                    Some(SockAddr::Netlink {
+                        pid: 0,
+                        groups: 1u32 << (RTNLGRP_IPV4_ROUTE - 1),
+                    })
+                );
+                break;
+            }
+        }
 
         ROUTE4S.lock().clear();
         drop_rtnl_ifaddrs_for_device(dev.ifindex);

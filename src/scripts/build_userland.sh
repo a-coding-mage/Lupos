@@ -365,6 +365,7 @@ stage_ready() {
         && [ -e "$STAGE/usr/bin/bash" ] \
         && [ -e "$STAGE/usr/bin/pacman" ] \
         && [ -e "$STAGE/etc/systemd/network/10-lupos-qemu.network" ] \
+        && grep -q '^DNSDefaultRoute=yes$' "$STAGE/etc/systemd/network/10-lupos-qemu.network" \
         && pacman_mirrorlist_ready "$STAGE" \
         && pacman_config_ready "$STAGE" \
         && pacman_offline_repo_ready "$STAGE" \
@@ -1037,6 +1038,7 @@ Name=e* eth* en*
 Address=10.0.2.15/24
 Gateway=10.0.2.2
 DNS=10.0.2.3
+DNSDefaultRoute=yes
 EOF
 
     mkdir -p \

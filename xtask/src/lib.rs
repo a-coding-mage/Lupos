@@ -13100,6 +13100,7 @@ fn direct_stage_root_disk_manifest_from_parts(
     mode: BootMode,
     disk_size: &str,
     stage_profile: &[u8],
+    stage_qemu_network: &[u8],
     package_db: &[u8],
     pacman_conf: &[u8],
     pacman_mirrorlist: &[u8],
@@ -13117,6 +13118,8 @@ fn direct_stage_root_disk_manifest_from_parts(
             "disk_size={}\n",
             "stage_profile_len={}\n",
             "stage_profile_hash={}\n",
+            "stage_qemu_network_len={}\n",
+            "stage_qemu_network_hash={}\n",
             "package_db_len={}\n",
             "package_db_hash={}\n",
             "pacman_conf_len={}\n",
@@ -13139,6 +13142,8 @@ fn direct_stage_root_disk_manifest_from_parts(
         disk_size,
         stage_profile.len(),
         stable_bytes_hash_hex(stage_profile),
+        stage_qemu_network.len(),
+        stable_bytes_hash_hex(stage_qemu_network),
         package_db.len(),
         stable_bytes_hash_hex(package_db),
         pacman_conf.len(),
@@ -13215,6 +13220,7 @@ fn direct_stage_root_disk_manifest(
         mode,
         disk_size,
         &read_stage_manifest_bytes(stage, ".lupos-profile"),
+        &read_stage_manifest_bytes(stage, "etc/systemd/network/10-lupos-qemu.network"),
         &read_stage_manifest_bytes(stage, "var/lib/pacman/local/ALPM_DB_VERSION"),
         &read_stage_manifest_bytes(stage, "etc/pacman.conf"),
         &read_stage_manifest_bytes(stage, "etc/pacman.d/mirrorlist"),
@@ -22292,11 +22298,14 @@ failed command output\n";
             b"Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch\n";
         const PACMAN_REPO_MANIFEST: &str =
             "var/lib/lupos/pacman-repo/extra/os/x86_64/vim.pkg\t9\tcbf29ce484222325\n";
+        const STAGE_QEMU_NETWORK: &[u8] =
+            b"[Match]\nName=e* eth* en*\n\n[Network]\nDNS=10.0.2.3\nDNSDefaultRoute=yes\n";
 
         let base = direct_stage_root_disk_manifest_from_parts(
             BootMode::LoginDisplay,
             LOGIN_ROOT_DISK_SIZE,
             b"arch:base:2026.06.01\n",
+            STAGE_QEMU_NETWORK,
             b"ALPM_DB_VERSION\n",
             PACMAN_CONF,
             PACMAN_MIRRORLIST,
@@ -22312,6 +22321,7 @@ failed command output\n";
                 BootMode::Login,
                 LOGIN_ROOT_DISK_SIZE,
                 b"arch:base:2026.06.01\n",
+                STAGE_QEMU_NETWORK,
                 b"ALPM_DB_VERSION\n",
                 PACMAN_CONF,
                 PACMAN_MIRRORLIST,
@@ -22325,6 +22335,7 @@ failed command output\n";
                 BootMode::LoginDisplay,
                 "769M",
                 b"arch:base:2026.06.01\n",
+                STAGE_QEMU_NETWORK,
                 b"ALPM_DB_VERSION\n",
                 PACMAN_CONF,
                 PACMAN_MIRRORLIST,
@@ -22338,6 +22349,7 @@ failed command output\n";
                 BootMode::LoginDisplay,
                 LOGIN_ROOT_DISK_SIZE,
                 b"arch:base:refreshed\n",
+                STAGE_QEMU_NETWORK,
                 b"ALPM_DB_VERSION\n",
                 PACMAN_CONF,
                 PACMAN_MIRRORLIST,
@@ -22351,6 +22363,21 @@ failed command output\n";
                 BootMode::LoginDisplay,
                 LOGIN_ROOT_DISK_SIZE,
                 b"arch:base:2026.06.01\n",
+                b"[Match]\nName=e* eth* en*\n\n[Network]\nDNS=10.0.2.4\nDNSDefaultRoute=yes\n",
+                b"ALPM_DB_VERSION\n",
+                PACMAN_CONF,
+                PACMAN_MIRRORLIST,
+                PACMAN_REPO_MANIFEST,
+                SYSTEMD_DISK_ROOT_FSTAB,
+                b"overlay-v1",
+                "lib/modules/lupos/modules.dep\t100644\t0\tcbf29ce484222325\n",
+                "etc/systemd/system/default.target\n",
+            ),
+            direct_stage_root_disk_manifest_from_parts(
+                BootMode::LoginDisplay,
+                LOGIN_ROOT_DISK_SIZE,
+                b"arch:base:2026.06.01\n",
+                STAGE_QEMU_NETWORK,
                 b"bash\npacman\nsystemd\n",
                 PACMAN_CONF,
                 PACMAN_MIRRORLIST,
@@ -22364,6 +22391,7 @@ failed command output\n";
                 BootMode::LoginDisplay,
                 LOGIN_ROOT_DISK_SIZE,
                 b"arch:base:2026.06.01\n",
+                STAGE_QEMU_NETWORK,
                 b"ALPM_DB_VERSION\n",
                 b"[options]\n",
                 PACMAN_MIRRORLIST,
@@ -22377,6 +22405,7 @@ failed command output\n";
                 BootMode::LoginDisplay,
                 LOGIN_ROOT_DISK_SIZE,
                 b"arch:base:2026.06.01\n",
+                STAGE_QEMU_NETWORK,
                 b"ALPM_DB_VERSION\n",
                 PACMAN_CONF,
                 b"Server = https://mirror.example/$repo/os/$arch\n",
@@ -22390,6 +22419,7 @@ failed command output\n";
                 BootMode::LoginDisplay,
                 LOGIN_ROOT_DISK_SIZE,
                 b"arch:base:2026.06.01\n",
+                STAGE_QEMU_NETWORK,
                 b"ALPM_DB_VERSION\n",
                 PACMAN_CONF,
                 PACMAN_MIRRORLIST,
@@ -22403,6 +22433,7 @@ failed command output\n";
                 BootMode::LoginDisplay,
                 LOGIN_ROOT_DISK_SIZE,
                 b"arch:base:2026.06.01\n",
+                STAGE_QEMU_NETWORK,
                 b"ALPM_DB_VERSION\n",
                 PACMAN_CONF,
                 PACMAN_MIRRORLIST,
@@ -22416,6 +22447,7 @@ failed command output\n";
                 BootMode::LoginDisplay,
                 LOGIN_ROOT_DISK_SIZE,
                 b"arch:base:2026.06.01\n",
+                STAGE_QEMU_NETWORK,
                 b"ALPM_DB_VERSION\n",
                 PACMAN_CONF,
                 PACMAN_MIRRORLIST,
@@ -22429,6 +22461,7 @@ failed command output\n";
                 BootMode::LoginDisplay,
                 LOGIN_ROOT_DISK_SIZE,
                 b"arch:base:2026.06.01\n",
+                STAGE_QEMU_NETWORK,
                 b"ALPM_DB_VERSION\n",
                 PACMAN_CONF,
                 PACMAN_MIRRORLIST,
@@ -22442,6 +22475,7 @@ failed command output\n";
                 BootMode::LoginDisplay,
                 LOGIN_ROOT_DISK_SIZE,
                 b"arch:base:2026.06.01\n",
+                STAGE_QEMU_NETWORK,
                 b"ALPM_DB_VERSION\n",
                 PACMAN_CONF,
                 PACMAN_MIRRORLIST,
@@ -29456,6 +29490,10 @@ CONFIG_MODULES=y
         assert!(
             net_body.contains("DNS=10.0.2.3"),
             "10-lupos-qemu.network must point DNS at QEMU user-net's 10.0.2.3"
+        );
+        assert!(
+            net_body.contains("DNSDefaultRoute=yes"),
+            "10-lupos-qemu.network must mark the QEMU uplink DNS as the default route for resolved"
         );
 
         // (9) systemctl status cleanliness: the initramfs must NOT ship
