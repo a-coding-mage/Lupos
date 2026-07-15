@@ -370,7 +370,9 @@ pub(crate) fn send_inet(
         let preferred_ifindex = send_meta
             .map(|meta| meta.ifindex)
             .filter(|ifindex| *ifindex != 0)
-            .unwrap_or(socket.bound_ifindex.max(socket.unicast_ifindex));
+            .or((socket.bound_ifindex != 0).then_some(socket.bound_ifindex))
+            .or((socket.unicast_ifindex != 0).then_some(socket.unicast_ifindex))
+            .unwrap_or(0);
         (
             socket.sock_type,
             socket.protocol,

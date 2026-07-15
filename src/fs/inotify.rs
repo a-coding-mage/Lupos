@@ -21,10 +21,10 @@ use crate::arch::x86::kernel::uaccess;
 use crate::fs::anon_inode::alloc_anon_file;
 use crate::fs::ops::FileOps;
 use crate::fs::types::{DentryRef, FileRef, InodeKind, InodeRef};
-use crate::include::uapi::fcntl::{O_ACCMODE, O_RDWR, O_WRONLY};
 use crate::include::uapi::errno::{
     EAGAIN, EBADF, EEXIST, EFAULT, EINVAL, EMFILE, ENOENT, ENOSPC, ENOTDIR,
 };
+use crate::include::uapi::fcntl::{O_ACCMODE, O_RDWR, O_WRONLY};
 use crate::kernel::sched::wait::WaitQueueHead;
 use crate::kernel::{files, sched};
 
@@ -461,7 +461,10 @@ fn queue_parent_event(dentry: &DentryRef, mut mask: u32) {
     let Some(parent_inode) = parent.inode() else {
         return;
     };
-    if dentry.inode().is_some_and(|inode| inode.kind == InodeKind::Directory) {
+    if dentry
+        .inode()
+        .is_some_and(|inode| inode.kind == InodeKind::Directory)
+    {
         mask |= IN_ISDIR;
     }
     queue_event_for_inode(&parent_inode, mask, Some(name));
@@ -842,11 +845,8 @@ mod tests {
             );
             assert!(wd > 0);
 
-            let writer_fd = crate::fs::syscalls::sys_open(
-                b"/run/netif-state\0".as_ptr(),
-                O_WRONLY as i32,
-                0,
-            );
+            let writer_fd =
+                crate::fs::syscalls::sys_open(b"/run/netif-state\0".as_ptr(), O_WRONLY as i32, 0);
             assert!(writer_fd >= 0);
             assert_eq!(
                 crate::fs::read_write::sys_write(writer_fd as i32, b"dns".as_ptr(), 3),
@@ -883,7 +883,10 @@ mod tests {
         let (current, previous) = setup_current_with_rootfs(261);
         unsafe {
             assert_eq!(crate::fs::syscalls::sys_mkdir(b"/run\0".as_ptr(), 0o755), 0);
-            assert_eq!(crate::fs::syscalls::sys_mkdir(b"/run/systemd\0".as_ptr(), 0o755), 0);
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdir(b"/run/systemd\0".as_ptr(), 0o755),
+                0
+            );
             assert_eq!(
                 crate::fs::syscalls::sys_mkdir(b"/run/systemd/netif\0".as_ptr(), 0o755),
                 0

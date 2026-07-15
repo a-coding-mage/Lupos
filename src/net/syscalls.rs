@@ -103,6 +103,14 @@ const ETHTOOL_GLINKSETTINGS: u32 = 0x0000_004c;
 const DUPLEX_FULL: u8 = 0x01;
 const PORT_OTHER: u8 = 0xff;
 
+fn decode_unicast_if_sockopt(value: u32) -> u32 {
+    u32::from_be(value)
+}
+
+fn encode_unicast_if_sockopt(ifindex: u32) -> u32 {
+    ifindex.to_be()
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct LinuxIfreq {
@@ -716,7 +724,16 @@ unsafe fn write_netlink_pktinfo_at(
             core::mem::size_of::<LinuxNlPktinfo>(),
         )
     };
-    unsafe { write_cmsg_bytes_level(control, controllen, offset, SOL_NETLINK, NETLINK_PKTINFO, data) }
+    unsafe {
+        write_cmsg_bytes_level(
+            control,
+            controllen,
+            offset,
+            SOL_NETLINK,
+            NETLINK_PKTINFO,
+            data,
+        )
+    }
 }
 
 #[repr(C)]
@@ -2010,7 +2027,8 @@ pub unsafe fn sys_setsockopt(fd: i32, level: i32, opt: i32, val: *const u8, len:
             Ok(value) => value,
             Err(_) => return -(EFAULT as i64),
         };
-        return match socket_from_fd(fd).and_then(|sock| socket::set_unicast_if(&sock, value)) {
+        let ifindex = decode_unicast_if_sockopt(value);
+        return match socket_from_fd(fd).and_then(|sock| socket::set_unicast_if(&sock, ifindex)) {
             Ok(()) => 0,
             Err(errno) => -(errno as i64),
         };
@@ -2045,7 +2063,9 @@ pub unsafe fn sys_setsockopt(fd: i32, level: i32, opt: i32, val: *const u8, len:
                 Ok(value) => value,
                 Err(_) => return -(EFAULT as i64),
             };
-            return match socket_from_fd(fd).and_then(|sock| socket::set_unicast_if(&sock, value)) {
+            let ifindex = decode_unicast_if_sockopt(value);
+            return match socket_from_fd(fd).and_then(|sock| socket::set_unicast_if(&sock, ifindex))
+            {
                 Ok(()) => 0,
                 Err(errno) => -(errno as i64),
             };
@@ -2294,7 +2314,8 @@ pub unsafe fn sys_getsockopt(fd: i32, level: i32, opt: i32, val: *mut u8, len: *
             return -(EINVAL as i64);
         }
         return match socket_from_fd(fd).and_then(|sock| socket::get_unicast_if(&sock)) {
-            Ok(value) => {
+            Ok(ifindex) => {
+                let value = encode_unicast_if_sockopt(ifindex);
                 if unsafe { uaccess::put_user_u32(val as *mut u32, value) }.is_err() {
                     return -(EFAULT as i64);
                 }
@@ -2351,7 +2372,12 @@ pub unsafe fn sys_getsockopt(fd: i32, level: i32, opt: i32, val: *mut u8, len: *
             socket_from_fd(fd).and_then(|sock| socket::get_unicast_if(&sock))
         };
         return match result {
-            Ok(value) => {
+            Ok(ifindex) => {
+                let value = if opt == IPV6_UNICAST_IF {
+                    encode_unicast_if_sockopt(ifindex)
+                } else {
+                    ifindex
+                };
                 if unsafe { uaccess::put_user_u32(val as *mut u32, value) }.is_err() {
                     return -(EFAULT as i64);
                 }
@@ -4207,16 +4233,19 @@ mod tests {
 
             let lo = crate::net::device::lookup_netdevice("lo").expect("loopback");
             let ifindex = lo.ifindex;
+            let ifindex_sockopt = ifindex.to_be();
             assert_eq!(
                 sys_setsockopt(
                     fd as i32,
                     SOL_IP,
                     IP_UNICAST_IF,
-                    &ifindex as *const u32 as *const u8,
+                    &ifindex_sockopt as *const u32 as *const u8,
                     core::mem::size_of::<u32>() as u32,
                 ),
                 0
             );
+            let sock = socket_from_fd(fd as i32).unwrap();
+            assert_eq!(socket::get_unicast_if(&sock), Ok(ifindex));
             let mut unicast_if = 0u32;
             let mut unicast_if_len = core::mem::size_of::<u32>() as u32;
             assert_eq!(
@@ -4229,7 +4258,7 @@ mod tests {
                 ),
                 0
             );
-            assert_eq!(unicast_if, ifindex);
+            assert_eq!(unicast_if, ifindex_sockopt);
 
             let bind_name = b"lo\0";
             assert_eq!(
@@ -4242,8 +4271,35 @@ mod tests {
                 ),
                 0
             );
-            let sock = socket_from_fd(fd as i32).unwrap();
             assert_eq!(socket::get_bound_ifindex(&sock), Ok(ifindex));
+
+            let fd6 = sys_socket(AF_INET6 as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(fd6 >= 0);
+            assert_eq!(
+                sys_setsockopt(
+                    fd6 as i32,
+                    SOL_IPV6,
+                    IPV6_UNICAST_IF,
+                    &ifindex_sockopt as *const u32 as *const u8,
+                    core::mem::size_of::<u32>() as u32,
+                ),
+                0
+            );
+            let sock6 = socket_from_fd(fd6 as i32).unwrap();
+            assert_eq!(socket::get_unicast_if(&sock6), Ok(ifindex));
+            let mut unicast_if6 = 0u32;
+            let mut unicast_if6_len = core::mem::size_of::<u32>() as u32;
+            assert_eq!(
+                sys_getsockopt(
+                    fd6 as i32,
+                    SOL_IPV6,
+                    IPV6_UNICAST_IF,
+                    &mut unicast_if6 as *mut u32 as *mut u8,
+                    &mut unicast_if6_len,
+                ),
+                0
+            );
+            assert_eq!(unicast_if6, ifindex_sockopt);
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
