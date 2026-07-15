@@ -260,6 +260,11 @@ pub fn vfs_write(file: &FileRef, buf: &[u8]) -> Result<usize, i32> {
                 &buf[..written.min(buf.len())],
             );
         }
+        if written != 0 {
+            file.write_seen
+                .store(true, core::sync::atomic::Ordering::Release);
+            crate::fs::inotify::notify_modify(&file.dentry);
+        }
     }
     result
 }

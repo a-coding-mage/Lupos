@@ -215,14 +215,18 @@ pub fn fget(f: &FileRef) -> FileRef {
 
 pub fn fput(f: FileRef) {
     f.f_count.fetch_sub(1, Ordering::AcqRel);
+    let final_ref = Arc::strong_count(&f) == 1;
+    if final_ref {
+        crate::fs::inotify::notify_close(&f);
+    }
     if let Some(release) = f.fops.release {
-        if Arc::strong_count(&f) == 1 {
+        if final_ref {
             super::file_table::account_released_file();
             release(f);
             return;
         }
     }
-    if Arc::strong_count(&f) == 1 {
+    if final_ref {
         super::file_table::account_released_file();
     }
     drop(f);

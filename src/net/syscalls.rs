@@ -23,11 +23,11 @@ use crate::fs::fdtable::FilesStruct;
 use crate::fs::ops::{FileOps, NOOP_FILE_OPS, NOOP_INODE_OPS};
 use crate::fs::types::{FileRef, Inode, InodeKind, InodePrivate};
 use crate::include::uapi::errno::{
-    EADDRINUSE, EAGAIN, EBADF, EFAULT, EINPROGRESS, EINTR, EINVAL, ENOENT, ENOPROTOOPT, ENOSYS,
-    ENOTCONN, ENOTDIR, EPERM, ERANGE,
+    EADDRINUSE, EAGAIN, EBADF, EFAULT, EINPROGRESS, EINTR, EINVAL, ENODEV, ENOENT, ENOPROTOOPT,
+    ENOSYS, ENOTCONN, ENOTDIR, ENOTTY, EOPNOTSUPP, EPERM, ERANGE,
 };
 use crate::include::uapi::fcntl::{O_NONBLOCK, O_RDWR};
-use crate::kernel::capability::{CAP_NET_RAW, capable};
+use crate::kernel::capability::{CAP_NET_ADMIN, CAP_NET_RAW, capable};
 use crate::kernel::{files, sched};
 use crate::security::security_socket_create;
 
@@ -49,12 +49,24 @@ const UIO_MAXIOV: usize = 1024;
 // Total = 16 bytes; CMSG alignment is sizeof(size_t) = 8.
 const SOL_IP: i32 = 0;
 const SOL_SOCKET: i32 = 1;
+const SOL_IPV6: i32 = 41;
 const SOL_PACKET: i32 = 263;
 const SOL_NETLINK: i32 = 270;
 const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
 const SCM_PIDFD: i32 = 4;
 const IP_TTL: i32 = 2;
+const IP_PKTINFO: i32 = 8;
+const IP_MTU_DISCOVER: i32 = 10;
+const IP_RECVERR: i32 = 11;
+const IP_MTU: i32 = 14;
+const IP_UNICAST_IF: i32 = 50;
+const IP_RECVFRAGSIZE: i32 = 25;
+const IPV6_MTU: i32 = 24;
+const IPV6_RECVERR: i32 = 25;
+const IPV6_RECVPKTINFO: i32 = 49;
+const IPV6_UNICAST_IF: i32 = 76;
+const SO_BINDTODEVICE: i32 = 25;
 const CMSG_HDR_LEN: usize = 16;
 // Linux caps SCM_RIGHTS payloads at 253 descriptors per message.
 const SCM_MAX_FD: usize = 253;
@@ -71,8 +83,130 @@ const MSG_DONTWAIT: i32 = 0x0000_0040;
 const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 const NETLINK_ADD_MEMBERSHIP: i32 = 1;
 const NETLINK_DROP_MEMBERSHIP: i32 = 2;
+const NETLINK_PKTINFO: i32 = 3;
 const NETLINK_LIST_MEMBERSHIPS: i32 = 9;
 const RTNLGRP_MAX: usize = 39;
+const IFNAMSIZ: usize = 16;
+const IFREQ_DATA_LEN: usize = 24;
+const SIOCGIFNAME: u32 = 0x8910;
+const SIOCGIFFLAGS: u32 = 0x8913;
+const SIOCSIFFLAGS: u32 = 0x8914;
+const SIOCGIFMTU: u32 = 0x8921;
+const SIOCGIFHWADDR: u32 = 0x8927;
+const SIOCGIFINDEX: u32 = 0x8933;
+const SIOCETHTOOL: u32 = 0x8946;
+const ARPHRD_ETHER: u16 = 1;
+const ARPHRD_LOOPBACK: u16 = 772;
+const ETHTOOL_GDRVINFO: u32 = 0x0000_0003;
+const ETHTOOL_GLINK: u32 = 0x0000_000a;
+const ETHTOOL_GLINKSETTINGS: u32 = 0x0000_004c;
+const DUPLEX_FULL: u8 = 0x01;
+const PORT_OTHER: u8 = 0xff;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxIfreq {
+    ifr_name: [u8; IFNAMSIZ],
+    ifru: [u8; IFREQ_DATA_LEN],
+}
+
+impl LinuxIfreq {
+    fn ifname(&self) -> String {
+        let len = self
+            .ifr_name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(self.ifr_name.len());
+        let name = &self.ifr_name[..len];
+        let trimmed = match name.iter().position(|byte| *byte == b':') {
+            Some(colon) => &name[..colon],
+            None => name,
+        };
+        String::from_utf8_lossy(trimmed).into_owned()
+    }
+
+    fn set_ifname(&mut self, name: &str) {
+        self.ifr_name.fill(0);
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(IFNAMSIZ.saturating_sub(1));
+        self.ifr_name[..len].copy_from_slice(&bytes[..len]);
+    }
+
+    fn ifindex(&self) -> i32 {
+        i32::from_ne_bytes(self.ifru[..4].try_into().unwrap())
+    }
+
+    fn set_ifindex(&mut self, ifindex: i32) {
+        self.ifru[..4].copy_from_slice(&ifindex.to_ne_bytes());
+    }
+
+    fn flags(&self) -> u16 {
+        u16::from_ne_bytes(self.ifru[..2].try_into().unwrap())
+    }
+
+    fn set_flags(&mut self, flags: u16) {
+        self.ifru[..2].copy_from_slice(&flags.to_ne_bytes());
+    }
+
+    fn set_mtu(&mut self, mtu: i32) {
+        self.ifru[..4].copy_from_slice(&mtu.to_ne_bytes());
+    }
+
+    fn data_ptr(&self) -> *mut u8 {
+        usize::from_ne_bytes(self.ifru[..8].try_into().unwrap()) as *mut u8
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxIfSockaddr {
+    sa_family: u16,
+    sa_data: [u8; 14],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxEthtoolDrvinfo {
+    cmd: u32,
+    driver: [u8; 32],
+    version: [u8; 32],
+    fw_version: [u8; 32],
+    bus_info: [u8; 32],
+    erom_version: [u8; 32],
+    reserved2: [u8; 12],
+    n_priv_flags: u32,
+    n_stats: u32,
+    testinfo_len: u32,
+    eedump_len: u32,
+    regdump_len: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxEthtoolValue {
+    cmd: u32,
+    data: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxEthtoolLinkSettings {
+    cmd: u32,
+    speed: u32,
+    duplex: u8,
+    port: u8,
+    phy_address: u8,
+    autoneg: u8,
+    mdio_support: u8,
+    eth_tp_mdix: u8,
+    eth_tp_mdix_ctrl: u8,
+    link_mode_masks_nwords: i8,
+    transceiver: u8,
+    master_slave_cfg: u8,
+    master_slave_state: u8,
+    rate_matching: u8,
+    reserved: [u32; 7],
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -109,16 +243,30 @@ fn trace_current_ucred() -> LinuxUcred {
 
 #[cfg(not(test))]
 fn trace_unix_interesting_path(path: &str) -> bool {
-    path.contains("systemd")
-        || path.contains("notify")
-        || path.contains("dbus")
-        || path.contains("journal")
+    path.contains("resolve.hook")
+        || path.contains("/run/systemd/resolve")
+        || path.contains("dbus-system-bus")
+        || path.contains("/run/dbus/system_bus_socket")
+}
+
+#[cfg(not(test))]
+fn trace_unix_socket_paths(sock: &SocketRef) -> (Option<String>, Option<String>) {
+    let socket = sock.lock();
+    let local = match socket.local.as_ref() {
+        Some(SockAddr::Unix(path)) if trace_unix_interesting_path(path) => Some(path.clone()),
+        _ => None,
+    };
+    let peer = match socket.peer.as_ref() {
+        Some(SockAddr::Unix(path)) if trace_unix_interesting_path(path) => Some(path.clone()),
+        _ => None,
+    };
+    (local, peer)
 }
 
 #[cfg(not(test))]
 fn trace_payload_prefix(bytes: &[u8]) -> String {
     let mut out = String::new();
-    for &b in bytes.iter().take(96) {
+    for &b in bytes.iter().take(192) {
         match b {
             b'\n' => out.push('|'),
             b'\r' => out.push('~'),
@@ -130,14 +278,20 @@ fn trace_payload_prefix(bytes: &[u8]) -> String {
 }
 
 #[cfg(not(test))]
-fn trace_unix_sendmsg(fd: i32, path: Option<&str>, bytes: &[u8], result: &Result<usize, i32>) {
+fn trace_unix_sendmsg(
+    fd: i32,
+    sock: &SocketRef,
+    path: Option<&str>,
+    bytes: &[u8],
+    result: &Result<usize, i32>,
+) {
     if !crate::kernel::debug_trace::proc_enabled() {
         return;
     }
-    let Some(path) = path else {
-        return;
-    };
-    if !trace_unix_interesting_path(path) {
+    let (local, peer) = trace_unix_socket_paths(sock);
+    let local = local.as_deref().or(path);
+    let peer = peer.as_deref().or(path);
+    if local.is_none() && peer.is_none() {
         return;
     }
     let cred = trace_current_ucred();
@@ -146,9 +300,10 @@ fn trace_unix_sendmsg(fd: i32, path: Option<&str>, bytes: &[u8], result: &Result
         Err(errno) => -(*errno as i64),
     };
     crate::linux_driver_abi::tty::serial_println!(
-        "trace-unix-sendmsg fd={} path={} bytes={} ret={} pid={} uid={} gid={} payload=\"{}\"",
+        "trace-unix-sendmsg fd={} local={} peer={} bytes={} ret={} pid={} uid={} gid={} payload=\"{}\"",
         fd,
-        path,
+        local.unwrap_or("-"),
+        peer.unwrap_or("-"),
         bytes.len(),
         ret,
         cred.pid,
@@ -208,21 +363,20 @@ fn trace_unix_recvmsg(
     if !crate::kernel::debug_trace::proc_enabled() {
         return;
     }
-    let local = {
-        let socket = sock.lock();
-        match socket.local.as_ref() {
-            Some(SockAddr::Unix(path)) if trace_unix_interesting_path(path) => Some(path.clone()),
-            _ => None,
-        }
-    };
+    let (local, peer) = trace_unix_socket_paths(sock);
     let payload = trace_payload_prefix(bytes);
-    if local.is_none() && !payload.contains("READY=") && !payload.contains("STOPPING=") {
+    if local.is_none()
+        && peer.is_none()
+        && !payload.contains("READY=")
+        && !payload.contains("STOPPING=")
+    {
         return;
     }
     crate::linux_driver_abi::tty::serial_println!(
-        "trace-unix-recvmsg fd={} local={} bytes={} fds={} packet_pid={} packet_uid={} packet_gid={} passcred={} passpidfd={} controllen={} flags={:#x} payload=\"{}\"",
+        "trace-unix-recvmsg fd={} local={} peer={} bytes={} fds={} packet_pid={} packet_uid={} packet_gid={} passcred={} passpidfd={} controllen={} flags={:#x} payload=\"{}\"",
         fd,
         local.as_deref().unwrap_or("-"),
+        peer.as_deref().unwrap_or("-"),
         bytes.len(),
         fd_count,
         packet_cred.pid,
@@ -324,28 +478,36 @@ unsafe fn write_cmsg_bytes_level(
     Ok((offset + cmsg_align(total), false))
 }
 
-/// Walk a sender's `msghdr.control` buffer and harvest the file
-/// descriptors carried in any `SOL_SOCKET / SCM_RIGHTS` cmsg.  Unknown
-/// `cmsg_type`s are ignored (matches Linux: `unix_attach_fds` only
-/// honors SCM_RIGHTS, other cmsgs flow through as no-ops).
+#[derive(Default)]
+struct SendMsgControl {
+    scm_fds: alloc::vec::Vec<i32>,
+    scm_cred: Option<socket::SocketCred>,
+    inet_meta: Option<socket::PacketMeta>,
+}
+
+/// Walk a sender's `msghdr.control` buffer and harvest the send-side
+/// control messages Lupos currently honors:
+/// * `SOL_SOCKET / SCM_RIGHTS`
+/// * `SOL_IP / IP_PKTINFO`
+/// * `SOL_IP / IP_TTL`
 ///
 /// # Safety
 /// `control` is a userspace pointer; caller must ensure the page is
 /// readable for `controllen` bytes.  Lupos's net layer does direct
 /// user-pointer dereferences (no uaccess wrapper) — see
 /// `copy_iov_bytes` at line ~242 for the established precedent.
-unsafe fn parse_scm_rights(
+unsafe fn parse_sendmsg_control(
     control: *const u8,
     controllen: usize,
-) -> Result<alloc::vec::Vec<i32>, i32> {
+) -> Result<SendMsgControl, i32> {
     if control.is_null() || controllen == 0 {
-        return Ok(alloc::vec::Vec::new());
+        return Ok(SendMsgControl::default());
     }
     if controllen > SCM_MAX_CONTROL_LEN {
         return Err(EINVAL);
     }
 
-    let mut out = alloc::vec::Vec::new();
+    let mut parsed = SendMsgControl::default();
     let mut off = 0usize;
     while off <= controllen && controllen - off >= CMSG_HDR_LEN {
         // Read cmsg_len (u64), cmsg_level (i32), cmsg_type (i32).
@@ -364,13 +526,59 @@ unsafe fn parse_scm_rights(
                 return Err(EINVAL);
             }
             let nfds = data_len / 4;
-            if out.len().checked_add(nfds).ok_or(EINVAL)? > SCM_MAX_FD {
+            if parsed.scm_fds.len().checked_add(nfds).ok_or(EINVAL)? > SCM_MAX_FD {
                 return Err(EINVAL);
             }
             let data_ptr = unsafe { hdr_ptr.add(CMSG_HDR_LEN) as *const i32 };
             for i in 0..nfds {
                 let fd = unsafe { core::ptr::read_unaligned(data_ptr.add(i)) };
-                out.push(fd);
+                parsed.scm_fds.push(fd);
+            }
+        } else if cmsg_level == SOL_SOCKET && cmsg_type == SCM_CREDENTIALS {
+            if cmsg_len != CMSG_HDR_LEN + core::mem::size_of::<LinuxUcred>() {
+                return Err(EINVAL);
+            }
+            let ucred = unsafe {
+                core::ptr::read_unaligned(hdr_ptr.add(CMSG_HDR_LEN) as *const LinuxUcred)
+            };
+            parsed.scm_cred = Some(socket::validate_unix_scm_credentials(
+                ucred.pid, ucred.uid, ucred.gid,
+            )?);
+        } else if cmsg_level == SOL_IP {
+            match cmsg_type {
+                IP_PKTINFO => {
+                    if cmsg_len != CMSG_HDR_LEN + core::mem::size_of::<LinuxInPktinfo>() {
+                        return Err(EINVAL);
+                    }
+                    let info = unsafe {
+                        core::ptr::read_unaligned(hdr_ptr.add(CMSG_HDR_LEN) as *const LinuxInPktinfo)
+                    };
+                    let meta = parsed
+                        .inet_meta
+                        .get_or_insert_with(socket::PacketMeta::default);
+                    if info.ipi_ifindex != 0 {
+                        meta.ifindex = info.ipi_ifindex;
+                    }
+                    if info.ipi_spec_dst != 0 {
+                        meta.local_inet_addr = Some(u32::from_be(info.ipi_spec_dst));
+                    }
+                }
+                IP_TTL => {
+                    if cmsg_len != CMSG_HDR_LEN + core::mem::size_of::<i32>() {
+                        return Err(EINVAL);
+                    }
+                    let ttl = unsafe {
+                        core::ptr::read_unaligned(hdr_ptr.add(CMSG_HDR_LEN) as *const i32)
+                    };
+                    if !(1..=255).contains(&ttl) {
+                        return Err(EINVAL);
+                    }
+                    parsed
+                        .inet_meta
+                        .get_or_insert_with(socket::PacketMeta::default)
+                        .ttl = Some(ttl as u8);
+                }
+                _ => {}
             }
         }
         let step = cmsg_align(cmsg_len);
@@ -379,7 +587,7 @@ unsafe fn parse_scm_rights(
         }
         off = off.checked_add(step).ok_or(EINVAL)?;
     }
-    Ok(out)
+    Ok(parsed)
 }
 
 /// Serialize an `SCM_RIGHTS` cmsg into the receiver's `msghdr.control`
@@ -457,9 +665,58 @@ unsafe fn write_ipv4_ttl_at(
     control: *mut u8,
     controllen: usize,
     offset: usize,
+    ttl: u8,
 ) -> Result<(usize, bool), i32> {
-    let ttl = 64i32.to_ne_bytes();
+    let ttl = i32::from(ttl).to_ne_bytes();
     unsafe { write_cmsg_bytes_level(control, controllen, offset, SOL_IP, IP_TTL, &ttl) }
+}
+
+unsafe fn write_ipv4_pktinfo_at(
+    control: *mut u8,
+    controllen: usize,
+    offset: usize,
+    meta: &socket::PacketMeta,
+) -> Result<(usize, bool), i32> {
+    let pktinfo = LinuxInPktinfo {
+        ipi_ifindex: meta.ifindex,
+        ipi_spec_dst: meta
+            .local_inet_addr
+            .map(|addr| u32::from_ne_bytes(addr.to_be_bytes()))
+            .unwrap_or(0),
+        ipi_addr: meta
+            .local_inet_addr
+            .map(|addr| u32::from_ne_bytes(addr.to_be_bytes()))
+            .unwrap_or(0),
+    };
+    let data = unsafe {
+        core::slice::from_raw_parts(
+            &pktinfo as *const LinuxInPktinfo as *const u8,
+            core::mem::size_of::<LinuxInPktinfo>(),
+        )
+    };
+    unsafe { write_cmsg_bytes_level(control, controllen, offset, SOL_IP, IP_PKTINFO, data) }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxNlPktinfo {
+    group: u32,
+}
+
+unsafe fn write_netlink_pktinfo_at(
+    control: *mut u8,
+    controllen: usize,
+    offset: usize,
+    group: u32,
+) -> Result<(usize, bool), i32> {
+    let pktinfo = LinuxNlPktinfo { group };
+    let data = unsafe {
+        core::slice::from_raw_parts(
+            &pktinfo as *const LinuxNlPktinfo as *const u8,
+            core::mem::size_of::<LinuxNlPktinfo>(),
+        )
+    };
+    unsafe { write_cmsg_bytes_level(control, controllen, offset, SOL_NETLINK, NETLINK_PKTINFO, data) }
 }
 
 #[repr(C)]
@@ -486,6 +743,14 @@ pub struct LinuxSockAddrIn6 {
     pub flowinfo: u32,
     pub addr: [u8; 16],
     pub scope_id: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxInPktinfo {
+    ipi_ifindex: u32,
+    ipi_spec_dst: u32,
+    ipi_addr: u32,
 }
 
 #[repr(C)]
@@ -536,7 +801,7 @@ static SOCKET_FILE_OPS: FileOps = FileOps {
     llseek: None,
     fsync: None,
     poll: Some(socket_file_poll),
-    ioctl: None,
+    ioctl: Some(socket_file_ioctl),
     mmap: None,
     release: Some(socket_release),
     readdir: None,
@@ -634,6 +899,213 @@ fn socket_file_poll(file: &FileRef, mut table: Option<&mut crate::fs::select::Po
         mask
     };
     mask
+}
+
+fn read_user_struct<T: Copy>(ptr: *const T) -> Result<T, i32> {
+    if ptr.is_null() {
+        return Err(EFAULT);
+    }
+    let mut out = MaybeUninit::<T>::uninit();
+    let left = unsafe {
+        uaccess::copy_from_user(
+            out.as_mut_ptr().cast::<u8>(),
+            ptr.cast::<u8>(),
+            core::mem::size_of::<T>(),
+        )
+    };
+    if left != 0 {
+        return Err(EFAULT);
+    }
+    Ok(unsafe { out.assume_init() })
+}
+
+fn write_user_struct<T: Copy>(ptr: *mut T, value: &T) -> Result<(), i32> {
+    if ptr.is_null() {
+        return Err(EFAULT);
+    }
+    let left = unsafe {
+        uaccess::copy_to_user(
+            ptr.cast::<u8>(),
+            (value as *const T).cast::<u8>(),
+            core::mem::size_of::<T>(),
+        )
+    };
+    if left != 0 {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+
+fn fill_c_string(dst: &mut [u8], value: &str) {
+    dst.fill(0);
+    let bytes = value.as_bytes();
+    let len = bytes.len().min(dst.len().saturating_sub(1));
+    dst[..len].copy_from_slice(&bytes[..len]);
+}
+
+fn parse_ifname_optval(val: *const u8, len: u32) -> Result<Option<String>, i32> {
+    if len == 0 {
+        return Ok(None);
+    }
+    if val.is_null() {
+        return Err(EFAULT);
+    }
+    let copy_len = (len as usize).min(IFNAMSIZ);
+    let mut bytes = alloc::vec![0u8; copy_len];
+    let not_copied = unsafe { uaccess::copy_from_user(bytes.as_mut_ptr(), val, copy_len) };
+    if not_copied != 0 {
+        return Err(EFAULT);
+    }
+    let used = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    if used == 0 {
+        return Ok(None);
+    }
+    let name = core::str::from_utf8(&bytes[..used]).map_err(|_| EINVAL)?;
+    Ok(Some(String::from(name)))
+}
+
+fn socket_ioctl_dev(
+    dev: &crate::net::device::NetDeviceRef,
+    cmd: u32,
+    ifr: &mut LinuxIfreq,
+) -> Result<(), i32> {
+    match cmd {
+        SIOCGIFFLAGS => {
+            ifr.set_flags(dev.flags.load(Ordering::Acquire) as u16);
+            Ok(())
+        }
+        SIOCSIFFLAGS => {
+            if !capable(CAP_NET_ADMIN) {
+                return Err(EPERM);
+            }
+            let requested = ifr.flags();
+            let wants_up = requested & crate::net::device::IFF_UP as u16 != 0;
+            if wants_up && !dev.is_up() {
+                crate::net::device::set_device_up(dev)?;
+            } else if !wants_up && dev.is_up() {
+                crate::net::device::set_device_down(dev)?;
+            }
+            Ok(())
+        }
+        SIOCGIFMTU => {
+            ifr.set_mtu(dev.mtu as i32);
+            Ok(())
+        }
+        SIOCGIFHWADDR => {
+            let mut addr = LinuxIfSockaddr {
+                sa_family: if dev.name == "lo" {
+                    ARPHRD_LOOPBACK
+                } else {
+                    ARPHRD_ETHER
+                },
+                ..Default::default()
+            };
+            addr.sa_data[..dev.dev_addr.len()].copy_from_slice(&dev.dev_addr);
+            ifr.ifru[..core::mem::size_of::<LinuxIfSockaddr>()].copy_from_slice(unsafe {
+                core::slice::from_raw_parts(
+                    (&addr as *const LinuxIfSockaddr).cast::<u8>(),
+                    core::mem::size_of::<LinuxIfSockaddr>(),
+                )
+            });
+            Ok(())
+        }
+        SIOCGIFINDEX => {
+            ifr.set_ifindex(dev.ifindex as i32);
+            Ok(())
+        }
+        _ => Err(ENOTTY),
+    }
+}
+
+fn socket_ioctl_ethtool(
+    dev: &crate::net::device::NetDeviceRef,
+    ifr: &LinuxIfreq,
+) -> Result<(), i32> {
+    let data = ifr.data_ptr();
+    if data.is_null() {
+        return Err(EFAULT);
+    }
+    let cmd = read_user_struct::<u32>(data.cast::<u32>())?;
+    match cmd {
+        ETHTOOL_GDRVINFO => {
+            let mut info =
+                read_user_struct::<LinuxEthtoolDrvinfo>(data.cast::<LinuxEthtoolDrvinfo>())?;
+            info.cmd = ETHTOOL_GDRVINFO;
+            fill_c_string(
+                &mut info.driver,
+                if dev.linux_dev.is_some() {
+                    "linux-netdev"
+                } else {
+                    dev.ops.name
+                },
+            );
+            fill_c_string(&mut info.version, "lupos");
+            fill_c_string(&mut info.bus_info, &dev.name);
+            write_user_struct(data.cast::<LinuxEthtoolDrvinfo>(), &info)
+        }
+        ETHTOOL_GLINK => {
+            let mut value =
+                read_user_struct::<LinuxEthtoolValue>(data.cast::<LinuxEthtoolValue>())?;
+            value.cmd = ETHTOOL_GLINK;
+            value.data = u32::from(dev.carrier_ok());
+            write_user_struct(data.cast::<LinuxEthtoolValue>(), &value)
+        }
+        ETHTOOL_GLINKSETTINGS => {
+            let mut settings = read_user_struct::<LinuxEthtoolLinkSettings>(
+                data.cast::<LinuxEthtoolLinkSettings>(),
+            )?;
+            settings.cmd = ETHTOOL_GLINKSETTINGS;
+            settings.speed = if dev.carrier_ok() { 10_000 } else { 0 };
+            settings.duplex = DUPLEX_FULL;
+            settings.port = PORT_OTHER;
+            settings.phy_address = 0;
+            settings.autoneg = 0;
+            settings.mdio_support = 0;
+            settings.eth_tp_mdix = 0;
+            settings.eth_tp_mdix_ctrl = 0;
+            settings.link_mode_masks_nwords = 0;
+            settings.transceiver = 0;
+            settings.master_slave_cfg = 0;
+            settings.master_slave_state = 0;
+            settings.rate_matching = 0;
+            write_user_struct(data.cast::<LinuxEthtoolLinkSettings>(), &settings)
+        }
+        _ => Err(EOPNOTSUPP),
+    }
+}
+
+fn socket_file_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
+    let _sock = socket_from_file(file)?;
+    if cmd == SIOCGIFNAME {
+        let mut ifr = read_user_struct::<LinuxIfreq>(arg as *const LinuxIfreq)?;
+        let ifindex = ifr.ifindex() as u32;
+        let dev = crate::net::device::list_netdevices()
+            .into_iter()
+            .find(|dev| dev.ifindex == ifindex)
+            .ok_or(ENODEV)?;
+        ifr.set_ifname(&dev.name);
+        write_user_struct(arg as *mut LinuxIfreq, &ifr)?;
+        return Ok(0);
+    }
+
+    let mut ifr = read_user_struct::<LinuxIfreq>(arg as *const LinuxIfreq)?;
+    let name = ifr.ifname();
+    let dev = crate::net::device::lookup_netdevice(&name).ok_or(ENODEV)?;
+    match cmd {
+        SIOCGIFFLAGS | SIOCSIFFLAGS | SIOCGIFMTU | SIOCGIFHWADDR | SIOCGIFINDEX => {
+            socket_ioctl_dev(&dev, cmd, &mut ifr)?;
+            write_user_struct(arg as *mut LinuxIfreq, &ifr)?;
+            Ok(0)
+        }
+        SIOCETHTOOL => {
+            socket_ioctl_ethtool(&dev, &ifr)?;
+            Ok(0)
+        }
+        _ => Err(ENOTTY),
+    }
 }
 
 fn current_files() -> Result<Arc<FilesStruct>, i32> {
@@ -1517,6 +1989,101 @@ pub unsafe fn sys_setsockopt(fd: i32, level: i32, opt: i32, val: *const u8, len:
             Err(errno) => -(errno as i64),
         };
     }
+    if level == SOL_IP && opt == IP_PKTINFO {
+        if val.is_null() || len < core::mem::size_of::<u32>() as u32 {
+            return -(EINVAL as i64);
+        }
+        let value = match unsafe { uaccess::get_user_u32(val as *const u32) } {
+            Ok(value) => value,
+            Err(_) => return -(EFAULT as i64),
+        };
+        return match socket_from_fd(fd).and_then(|sock| socket::set_recv_pktinfo(&sock, value)) {
+            Ok(()) => 0,
+            Err(errno) => -(errno as i64),
+        };
+    }
+    if level == SOL_IP && opt == IP_UNICAST_IF {
+        if val.is_null() || len < core::mem::size_of::<u32>() as u32 {
+            return -(EINVAL as i64);
+        }
+        let value = match unsafe { uaccess::get_user_u32(val as *const u32) } {
+            Ok(value) => value,
+            Err(_) => return -(EFAULT as i64),
+        };
+        return match socket_from_fd(fd).and_then(|sock| socket::set_unicast_if(&sock, value)) {
+            Ok(()) => 0,
+            Err(errno) => -(errno as i64),
+        };
+    }
+    if level == SOL_IP && matches!(opt, IP_RECVERR | IP_MTU_DISCOVER | IP_RECVFRAGSIZE | IP_TTL) {
+        return match socket_from_fd(fd) {
+            Ok(sock) if sock.lock().family == AF_INET => 0,
+            Ok(_) => -(EINVAL as i64),
+            Err(errno) => -(errno as i64),
+        };
+    }
+    if level == SOL_IPV6 && matches!(opt, IPV6_RECVERR | IPV6_RECVPKTINFO | IPV6_UNICAST_IF) {
+        if opt == IPV6_RECVPKTINFO {
+            if val.is_null() || len < core::mem::size_of::<u32>() as u32 {
+                return -(EINVAL as i64);
+            }
+            let value = match unsafe { uaccess::get_user_u32(val as *const u32) } {
+                Ok(value) => value,
+                Err(_) => return -(EFAULT as i64),
+            };
+            return match socket_from_fd(fd).and_then(|sock| socket::set_recv_pktinfo(&sock, value))
+            {
+                Ok(()) => 0,
+                Err(errno) => -(errno as i64),
+            };
+        }
+        if opt == IPV6_UNICAST_IF {
+            if val.is_null() || len < core::mem::size_of::<u32>() as u32 {
+                return -(EINVAL as i64);
+            }
+            let value = match unsafe { uaccess::get_user_u32(val as *const u32) } {
+                Ok(value) => value,
+                Err(_) => return -(EFAULT as i64),
+            };
+            return match socket_from_fd(fd).and_then(|sock| socket::set_unicast_if(&sock, value)) {
+                Ok(()) => 0,
+                Err(errno) => -(errno as i64),
+            };
+        }
+        return match socket_from_fd(fd) {
+            Ok(sock) if sock.lock().family == AF_INET6 => 0,
+            Ok(_) => -(EINVAL as i64),
+            Err(errno) => -(errno as i64),
+        };
+    }
+    if level == SOL_NETLINK && opt == NETLINK_PKTINFO {
+        if val.is_null() || len < core::mem::size_of::<u32>() as u32 {
+            return -(EINVAL as i64);
+        }
+        let value = match unsafe { uaccess::get_user_u32(val as *const u32) } {
+            Ok(value) => value,
+            Err(_) => return -(EFAULT as i64),
+        };
+        #[cfg(not(test))]
+        if crate::kernel::debug_trace::netlink_enabled() {
+            let current = unsafe { sched::get_current() };
+            let pid = if current.is_null() {
+                0
+            } else {
+                unsafe { (*current).pid }
+            };
+            crate::linux_driver_abi::tty::serial_println!(
+                "trace-netlink-pktinfo-setsockopt pid={} fd={} value={}",
+                pid,
+                fd,
+                value
+            );
+        }
+        return match socket_from_fd(fd).and_then(|sock| socket::set_recv_pktinfo(&sock, value)) {
+            Ok(()) => 0,
+            Err(errno) => -(errno as i64),
+        };
+    }
     if level == SOL_NETLINK && matches!(opt, NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP) {
         if val.is_null() {
             return -(EFAULT as i64);
@@ -1533,6 +2100,22 @@ pub unsafe fn sys_setsockopt(fd: i32, level: i32, opt: i32, val: *const u8, len:
         };
     }
     if level == SOL_SOCKET {
+        if opt == SO_BINDTODEVICE {
+            let ifindex = match parse_ifname_optval(val, len) {
+                Ok(Some(name)) => match crate::net::device::lookup_netdevice(&name) {
+                    Some(dev) => dev.ifindex,
+                    None => return -(ENODEV as i64),
+                },
+                Ok(None) => 0,
+                Err(errno) => return -(errno as i64),
+            };
+            return match socket_from_fd(fd)
+                .and_then(|sock| socket::set_bound_ifindex(&sock, ifindex))
+            {
+                Ok(()) => 0,
+                Err(errno) => -(errno as i64),
+            };
+        }
         let opt_u32 = opt as u32;
         if matches!(
             opt_u32,
@@ -1647,6 +2230,141 @@ pub unsafe fn sys_getsockopt(fd: i32, level: i32, opt: i32, val: *mut u8, len: *
             Err(errno) => -(errno as i64),
         };
     }
+    if level == SOL_IP && opt == IP_PKTINFO {
+        if val.is_null() {
+            return -(EFAULT as i64);
+        }
+        let have = match unsafe { uaccess::get_user_u32(len) } {
+            Ok(have) => have,
+            Err(_) => return -(EFAULT as i64),
+        };
+        if have < core::mem::size_of::<u32>() as u32 {
+            return -(EINVAL as i64);
+        }
+        return match socket_from_fd(fd).and_then(|sock| socket::get_recv_pktinfo(&sock)) {
+            Ok(value) => {
+                if unsafe { uaccess::put_user_u32(val as *mut u32, value) }.is_err() {
+                    return -(EFAULT as i64);
+                }
+                if unsafe { uaccess::put_user_u32(len, core::mem::size_of::<u32>() as u32) }
+                    .is_err()
+                {
+                    return -(EFAULT as i64);
+                }
+                0
+            }
+            Err(errno) => -(errno as i64),
+        };
+    }
+    if level == SOL_IP && opt == IP_MTU {
+        if val.is_null() {
+            return -(EFAULT as i64);
+        }
+        let have = match unsafe { uaccess::get_user_u32(len) } {
+            Ok(have) => have,
+            Err(_) => return -(EFAULT as i64),
+        };
+        if have < core::mem::size_of::<u32>() as u32 {
+            return -(EINVAL as i64);
+        }
+        return match socket_from_fd(fd).and_then(|sock| socket::get_inet_mtu(&sock)) {
+            Ok(value) => {
+                if unsafe { uaccess::put_user_u32(val as *mut u32, value) }.is_err() {
+                    return -(EFAULT as i64);
+                }
+                if unsafe { uaccess::put_user_u32(len, core::mem::size_of::<u32>() as u32) }
+                    .is_err()
+                {
+                    return -(EFAULT as i64);
+                }
+                0
+            }
+            Err(errno) => -(errno as i64),
+        };
+    }
+    if level == SOL_IP && opt == IP_UNICAST_IF {
+        if val.is_null() {
+            return -(EFAULT as i64);
+        }
+        let have = match unsafe { uaccess::get_user_u32(len) } {
+            Ok(have) => have,
+            Err(_) => return -(EFAULT as i64),
+        };
+        if have < core::mem::size_of::<u32>() as u32 {
+            return -(EINVAL as i64);
+        }
+        return match socket_from_fd(fd).and_then(|sock| socket::get_unicast_if(&sock)) {
+            Ok(value) => {
+                if unsafe { uaccess::put_user_u32(val as *mut u32, value) }.is_err() {
+                    return -(EFAULT as i64);
+                }
+                if unsafe { uaccess::put_user_u32(len, core::mem::size_of::<u32>() as u32) }
+                    .is_err()
+                {
+                    return -(EFAULT as i64);
+                }
+                0
+            }
+            Err(errno) => -(errno as i64),
+        };
+    }
+    if level == SOL_IPV6 && opt == IPV6_MTU {
+        if val.is_null() {
+            return -(EFAULT as i64);
+        }
+        let have = match unsafe { uaccess::get_user_u32(len) } {
+            Ok(have) => have,
+            Err(_) => return -(EFAULT as i64),
+        };
+        if have < core::mem::size_of::<u32>() as u32 {
+            return -(EINVAL as i64);
+        }
+        return match socket_from_fd(fd).and_then(|sock| socket::get_inet_mtu(&sock)) {
+            Ok(value) => {
+                if unsafe { uaccess::put_user_u32(val as *mut u32, value) }.is_err() {
+                    return -(EFAULT as i64);
+                }
+                if unsafe { uaccess::put_user_u32(len, core::mem::size_of::<u32>() as u32) }
+                    .is_err()
+                {
+                    return -(EFAULT as i64);
+                }
+                0
+            }
+            Err(errno) => -(errno as i64),
+        };
+    }
+    if level == SOL_IPV6 && matches!(opt, IPV6_RECVPKTINFO | IPV6_UNICAST_IF) {
+        if val.is_null() {
+            return -(EFAULT as i64);
+        }
+        let have = match unsafe { uaccess::get_user_u32(len) } {
+            Ok(have) => have,
+            Err(_) => return -(EFAULT as i64),
+        };
+        if have < core::mem::size_of::<u32>() as u32 {
+            return -(EINVAL as i64);
+        }
+        let result = if opt == IPV6_RECVPKTINFO {
+            socket_from_fd(fd).and_then(|sock| socket::get_recv_pktinfo(&sock))
+        } else {
+            socket_from_fd(fd).and_then(|sock| socket::get_unicast_if(&sock))
+        };
+        return match result {
+            Ok(value) => {
+                if unsafe { uaccess::put_user_u32(val as *mut u32, value) }.is_err() {
+                    return -(EFAULT as i64);
+                }
+                if unsafe { uaccess::put_user_u32(len, core::mem::size_of::<u32>() as u32) }
+                    .is_err()
+                {
+                    return -(EFAULT as i64);
+                }
+                0
+            }
+            Err(errno) => -(errno as i64),
+        };
+    }
     if level == SOL_NETLINK {
         return match socket_from_fd(fd)
             .and_then(|sock| unsafe { copy_netlink_getsockopt(&sock, opt, val, len) })
@@ -1727,6 +2445,17 @@ unsafe fn copy_netlink_getsockopt(
         return Err(EINVAL);
     }
     match opt {
+        NETLINK_PKTINFO => {
+            if have < core::mem::size_of::<u32>() as u32 {
+                return Err(EINVAL);
+            }
+            let value = socket::get_recv_pktinfo(sock)?;
+            unsafe {
+                core::ptr::write_unaligned(val as *mut u32, value);
+                core::ptr::write_unaligned(len, core::mem::size_of::<u32>() as u32);
+            }
+            Ok(())
+        }
         NETLINK_LIST_MEMBERSHIPS => {
             let groups = netlink_membership_groups(sock);
             let need = if groups == 0 {
@@ -1961,7 +2690,7 @@ pub unsafe fn sys_recvfrom(
     // Ref: vendor/linux/net/socket.c::__sys_recvfrom.
     loop {
         match socket::recvmsg_full(&sock, out, flags) {
-            Ok((n, peer, files, _, real_len)) => {
+            Ok((n, peer, files, _, real_len, _)) => {
                 drop_file_refs(files);
                 if (!src.is_null() || !src_len.is_null())
                     && let Some(peer) = peer
@@ -2002,12 +2731,13 @@ pub unsafe fn sys_sendmsg(fd: i32, msg: *const LinuxMsghdr, flags: i32) -> i64 {
     // the sender's table; we clone the underlying `FileRef`s now so
     // they survive the sender closing the original fds before the
     // receiver dequeues the packet.
-    let scm_fds = match unsafe { parse_scm_rights(msg.control, msg.controllen) } {
+    let send_control = match unsafe { parse_sendmsg_control(msg.control, msg.controllen) } {
         Ok(v) => v,
         Err(errno) => return -(errno as i64),
     };
-    let mut files = alloc::vec::Vec::with_capacity(scm_fds.len());
-    if !scm_fds.is_empty() {
+    let scm_fd_count = send_control.scm_fds.len();
+    let mut files = alloc::vec::Vec::with_capacity(scm_fd_count);
+    if !send_control.scm_fds.is_empty() {
         let ft = match current_files() {
             Ok(ft) => ft,
             Err(errno) => {
@@ -2015,7 +2745,7 @@ pub unsafe fn sys_sendmsg(fd: i32, msg: *const LinuxMsghdr, flags: i32) -> i64 {
                 return -(errno as i64);
             }
         };
-        for fd in &scm_fds {
+        for fd in &send_control.scm_fds {
             match ft.get(*fd) {
                 Ok(file) => files.push(crate::fs::file::fget(&file)),
                 Err(errno) => {
@@ -2026,12 +2756,12 @@ pub unsafe fn sys_sendmsg(fd: i32, msg: *const LinuxMsghdr, flags: i32) -> i64 {
         }
     }
     #[cfg(not(test))]
-    if crate::kernel::debug_trace::proc_enabled() && !scm_fds.is_empty() {
+    if crate::kernel::debug_trace::proc_enabled() && !send_control.scm_fds.is_empty() {
         let cred = trace_current_ucred();
         crate::linux_driver_abi::tty::serial_println!(
             "trace-proc-sendmsg-scm-rights fd={} nfds={} flags={:#x} pid={} uid={} gid={}",
             fd,
-            scm_fds.len(),
+            scm_fd_count,
             flags,
             cred.pid,
             cred.uid,
@@ -2053,6 +2783,8 @@ pub unsafe fn sys_sendmsg(fd: i32, msg: *const LinuxMsghdr, flags: i32) -> i64 {
     // SCM_RIGHTS on other families — match that.
     #[cfg(not(test))]
     let mut trace_dest_path: Option<String> = None;
+    #[cfg(not(test))]
+    let mut trace_explicit_peer: Option<SockAddr> = None;
     let result = if !msg.name.is_null() && msg.namelen != 0 {
         match read_sockaddr(msg.name as *const u8, msg.namelen) {
             Ok(peer) => {
@@ -2062,7 +2794,18 @@ pub unsafe fn sys_sendmsg(fd: i32, msg: *const LinuxMsghdr, flags: i32) -> i64 {
                 {
                     trace_dest_path = Some(path.clone());
                 }
-                socket::sendto_with_fds(&sock, &bytes, peer, files)
+                #[cfg(not(test))]
+                {
+                    trace_explicit_peer = Some(peer.clone());
+                }
+                socket::sendto_with_fds_meta_cred(
+                    &sock,
+                    &bytes,
+                    peer,
+                    files,
+                    send_control.inet_meta,
+                    send_control.scm_cred,
+                )
             }
             Err(errno) => {
                 drop_file_refs(files);
@@ -2070,16 +2813,22 @@ pub unsafe fn sys_sendmsg(fd: i32, msg: *const LinuxMsghdr, flags: i32) -> i64 {
             }
         }
     } else {
-        socket::sendmsg_with_fds(&sock, &bytes, files)
+        socket::sendmsg_with_fds_meta_cred(
+            &sock,
+            &bytes,
+            files,
+            send_control.inet_meta,
+            send_control.scm_cred,
+        )
     };
     #[cfg(not(test))]
-    trace_unix_sendmsg(fd, trace_dest_path.as_deref(), &bytes, &result);
+    trace_unix_sendmsg(fd, &sock, trace_dest_path.as_deref(), &bytes, &result);
     #[cfg(not(test))]
     trace_notify_sendmsg(
         fd,
         trace_dest_path.as_deref(),
         &bytes,
-        scm_fds.len(),
+        scm_fd_count,
         &result,
     );
     match result {
@@ -2098,12 +2847,13 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
         Err(errno) => return -(errno as i64),
     };
     let nonblocking = recvmsg_is_nonblocking(&file, flags);
-    let (passcred, passpidfd, recv_ttl, recv_timeout_ns) = {
+    let (passcred, passpidfd, recv_ttl, recv_pktinfo, recv_timeout_ns) = {
         let socket = sock.lock();
         (
             socket.passcred,
             socket.passpidfd,
             socket.recv_ttl,
+            socket.recv_pktinfo,
             socket.recv_timeout_ns,
         )
     };
@@ -2124,7 +2874,7 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
     // size + drain netlink datagrams.  See vendor/linux/net/socket.c::
     // sock_recvmsg.  Pass them through to the socket layer.
     let mut tmp = alloc::vec![0u8; recv_tmp_len];
-    let (n, peer, files, packet_cred, real_len) = loop {
+    let (n, peer, files, packet_cred, real_len, had_packet) = loop {
         match socket::recvmsg_full(&sock, &mut tmp, flags) {
             Ok(t) => break t,
             Err(EAGAIN) if !nonblocking => {
@@ -2135,6 +2885,45 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
             Err(errno) => return -(errno as i64),
         }
     };
+    let packet_meta = socket::last_rx_meta(&sock);
+    #[cfg(not(test))]
+    if crate::kernel::debug_trace::netlink_enabled() && had_packet {
+        let family = sock.lock().family;
+        if family == AF_NETLINK && n >= 16 {
+            let current = unsafe { sched::get_current() };
+            let pid = if current.is_null() {
+                0
+            } else {
+                unsafe { (*current).pid }
+            };
+            let msg_type = u16::from_ne_bytes(tmp[4..6].try_into().unwrap());
+            let msg_seq = u32::from_ne_bytes(tmp[8..12].try_into().unwrap());
+            let msg_pid = u32::from_ne_bytes(tmp[12..16].try_into().unwrap());
+            let peer_pid = match peer.as_ref() {
+                Some(SockAddr::Netlink { pid, .. }) => *pid,
+                _ => 0,
+            };
+            let peer_groups = match peer.as_ref() {
+                Some(SockAddr::Netlink { groups, .. }) => *groups,
+                _ => 0,
+            };
+            crate::linux_driver_abi::tty::serial_println!(
+                "trace-netlink-recv pid={} fd={} nlmsg_type={} seq={} hdr_pid={} peer_pid={} peer_groups=0x{:x} pktinfo_group={} recv_pktinfo={} flags=0x{:x} real_len={} copied={}",
+                pid,
+                fd,
+                msg_type,
+                msg_seq,
+                msg_pid,
+                peer_pid,
+                peer_groups,
+                packet_meta.netlink_group,
+                recv_pktinfo,
+                flags,
+                real_len,
+                n,
+            );
+        }
+    }
     let mut files = FileRefGuard::new(files);
     #[cfg(not(test))]
     trace_unix_recvmsg(
@@ -2179,7 +2968,7 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
     // input bits are ignored rather than reflected back into the result.
     let mut out_flags = 0;
     let mut control_written = 0usize;
-    if passcred {
+    if passcred && had_packet {
         #[cfg(not(test))]
         if crate::kernel::debug_trace::proc_enabled() {
             crate::linux_driver_abi::tty::serial_println!(
@@ -2208,7 +2997,7 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
             out_flags |= MSG_CTRUNC;
         }
     }
-    if passpidfd {
+    if passpidfd && had_packet {
         match install_scm_pidfd(&packet_cred) {
             Ok(Some(pidfd)) => {
                 let (written, truncated) = match unsafe {
@@ -2230,9 +3019,61 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
             Err(errno) => return -(errno as i64),
         }
     }
-    if recv_ttl && matches!(peer, Some(SockAddr::Inet { .. })) && sock.lock().family == AF_INET {
+    if had_packet
+        && recv_pktinfo
+        && matches!(peer, Some(SockAddr::Netlink { .. }))
+        && sock.lock().family == AF_NETLINK
+    {
         let (written, truncated) = match unsafe {
-            write_ipv4_ttl_at(msgval.control, msgval.controllen, control_written)
+            write_netlink_pktinfo_at(
+                msgval.control,
+                msgval.controllen,
+                control_written,
+                packet_meta.netlink_group,
+            )
+        } {
+            Ok(result) => result,
+            Err(errno) => return -(errno as i64),
+        };
+        control_written = written;
+        if truncated {
+            out_flags |= MSG_CTRUNC;
+        }
+    }
+    if had_packet
+        && recv_pktinfo
+        && matches!(peer, Some(SockAddr::Inet { .. }))
+        && sock.lock().family == AF_INET
+        && packet_meta.local_inet_addr.is_some()
+    {
+        let (written, truncated) = match unsafe {
+            write_ipv4_pktinfo_at(
+                msgval.control,
+                msgval.controllen,
+                control_written,
+                &packet_meta,
+            )
+        } {
+            Ok(result) => result,
+            Err(errno) => return -(errno as i64),
+        };
+        control_written = written;
+        if truncated {
+            out_flags |= MSG_CTRUNC;
+        }
+    }
+    if had_packet
+        && recv_ttl
+        && matches!(peer, Some(SockAddr::Inet { .. }))
+        && sock.lock().family == AF_INET
+    {
+        let (written, truncated) = match unsafe {
+            write_ipv4_ttl_at(
+                msgval.control,
+                msgval.controllen,
+                control_written,
+                packet_meta.ttl.unwrap_or(64),
+            )
         } {
             Ok(result) => result,
             Err(errno) => return -(errno as i64),
@@ -2486,6 +3327,197 @@ mod tests {
             write_sockaddr(&peer, out.as_mut_ptr(), bad_user_len),
             Err(EFAULT)
         );
+    }
+
+    #[test]
+    fn socket_ioctl_reports_linux_netdevice_metadata() {
+        crate::net::device::init();
+        let name = "ioctl-net0";
+        let _ = crate::net::device::unregister_netdevice(name);
+        let dev = crate::net::device::register_netdevice(
+            name,
+            1500,
+            [2, 0, 0, 0, 0, 9],
+            &crate::net::device::DUMMY_NETDEV_OPS,
+        )
+        .expect("register netdev");
+
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 276;
+        current.tgid = 276;
+        current.cred = &raw const INIT_CRED;
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let fd = sys_socket(AF_INET as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(fd >= 0);
+
+            let mut ifr = LinuxIfreq::default();
+            ifr.set_ifname(name);
+            assert_eq!(
+                crate::fs::ioctl::sys_ioctl(
+                    fd as i32,
+                    SIOCGIFINDEX,
+                    (&mut ifr as *mut LinuxIfreq) as u64
+                ),
+                0
+            );
+            assert_eq!(ifr.ifindex(), dev.ifindex as i32);
+
+            let mut flags_req = LinuxIfreq::default();
+            flags_req.set_ifname(name);
+            assert_eq!(
+                crate::fs::ioctl::sys_ioctl(
+                    fd as i32,
+                    SIOCGIFFLAGS,
+                    (&mut flags_req as *mut LinuxIfreq) as u64
+                ),
+                0
+            );
+            assert_ne!(
+                flags_req.flags() & crate::net::device::IFF_BROADCAST as u16,
+                0
+            );
+
+            let mut mtu_req = LinuxIfreq::default();
+            mtu_req.set_ifname(name);
+            assert_eq!(
+                crate::fs::ioctl::sys_ioctl(
+                    fd as i32,
+                    SIOCGIFMTU,
+                    (&mut mtu_req as *mut LinuxIfreq) as u64
+                ),
+                0
+            );
+            assert_eq!(
+                i32::from_ne_bytes(mtu_req.ifru[..4].try_into().unwrap()),
+                1500
+            );
+
+            let mut hwaddr_req = LinuxIfreq::default();
+            hwaddr_req.set_ifname(name);
+            assert_eq!(
+                crate::fs::ioctl::sys_ioctl(
+                    fd as i32,
+                    SIOCGIFHWADDR,
+                    (&mut hwaddr_req as *mut LinuxIfreq) as u64
+                ),
+                0
+            );
+            let hwaddr = unsafe {
+                core::ptr::read_unaligned(hwaddr_req.ifru.as_ptr().cast::<LinuxIfSockaddr>())
+            };
+            assert_eq!(hwaddr.sa_family, ARPHRD_ETHER);
+            assert_eq!(&hwaddr.sa_data[..6], &[2, 0, 0, 0, 0, 9]);
+
+            let mut name_req = LinuxIfreq::default();
+            name_req.set_ifindex(dev.ifindex as i32);
+            assert_eq!(
+                crate::fs::ioctl::sys_ioctl(
+                    fd as i32,
+                    SIOCGIFNAME,
+                    (&mut name_req as *mut LinuxIfreq) as u64
+                ),
+                0
+            );
+            assert_eq!(name_req.ifname(), name);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(core::ptr::null_mut());
+        }
+        crate::net::device::unregister_netdevice(name).expect("unregister netdev");
+    }
+
+    #[test]
+    fn socket_ioctl_ethtool_glink_and_drvinfo_follow_linux_shape() {
+        crate::net::device::init();
+        let name = "ioctl-ethtool0";
+        let _ = crate::net::device::unregister_netdevice(name);
+        let dev = crate::net::device::register_netdevice(
+            name,
+            1500,
+            [2, 0, 0, 0, 0, 10],
+            &crate::net::device::DUMMY_NETDEV_OPS,
+        )
+        .expect("register netdev");
+        crate::net::device::set_carrier(&dev, true);
+
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 277;
+        current.tgid = 277;
+        current.cred = &raw const INIT_CRED;
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let fd = sys_socket(AF_INET as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(fd >= 0);
+
+            let mut drv = LinuxEthtoolDrvinfo {
+                cmd: ETHTOOL_GDRVINFO,
+                ..Default::default()
+            };
+            let mut ifr = LinuxIfreq::default();
+            ifr.set_ifname(name);
+            ifr.ifru[..8].copy_from_slice(
+                &(((&mut drv as *mut LinuxEthtoolDrvinfo) as usize).to_ne_bytes()),
+            );
+            assert_eq!(
+                crate::fs::ioctl::sys_ioctl(
+                    fd as i32,
+                    SIOCETHTOOL,
+                    (&mut ifr as *mut LinuxIfreq) as u64
+                ),
+                0
+            );
+            assert_eq!(drv.cmd, ETHTOOL_GDRVINFO);
+            assert!(
+                core::str::from_utf8(&drv.driver)
+                    .unwrap()
+                    .starts_with("dummy")
+            );
+
+            let mut glink = LinuxEthtoolValue {
+                cmd: ETHTOOL_GLINK,
+                ..Default::default()
+            };
+            ifr.ifru[..8].copy_from_slice(
+                &(((&mut glink as *mut LinuxEthtoolValue) as usize).to_ne_bytes()),
+            );
+            assert_eq!(
+                crate::fs::ioctl::sys_ioctl(
+                    fd as i32,
+                    SIOCETHTOOL,
+                    (&mut ifr as *mut LinuxIfreq) as u64
+                ),
+                0
+            );
+            assert_eq!(glink.data, 1);
+
+            let mut link = LinuxEthtoolLinkSettings {
+                cmd: ETHTOOL_GLINKSETTINGS,
+                ..Default::default()
+            };
+            ifr.ifru[..8].copy_from_slice(
+                &(((&mut link as *mut LinuxEthtoolLinkSettings) as usize).to_ne_bytes()),
+            );
+            assert_eq!(
+                crate::fs::ioctl::sys_ioctl(
+                    fd as i32,
+                    SIOCETHTOOL,
+                    (&mut ifr as *mut LinuxIfreq) as u64
+                ),
+                0
+            );
+            assert_eq!(link.cmd, ETHTOOL_GLINKSETTINGS);
+            assert_eq!(link.speed, 10_000);
+            assert_eq!(link.duplex, DUPLEX_FULL);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(core::ptr::null_mut());
+        }
+        crate::net::device::unregister_netdevice(name).expect("unregister netdev");
     }
 
     fn unprivileged_cred() -> Box<Cred> {
@@ -2782,7 +3814,8 @@ mod tests {
     #[test]
     fn parse_scm_rights_accepts_scm_max_fd() {
         let control = build_scm_rights_control(SCM_MAX_FD);
-        let fds = unsafe { parse_scm_rights(control.as_ptr(), control.len()).unwrap() };
+        let parsed = unsafe { parse_sendmsg_control(control.as_ptr(), control.len()).unwrap() };
+        let fds = parsed.scm_fds;
         assert_eq!(fds.len(), SCM_MAX_FD);
         assert_eq!(fds[0], 0);
         assert_eq!(fds[SCM_MAX_FD - 1], (SCM_MAX_FD - 1) as i32);
@@ -2791,10 +3824,10 @@ mod tests {
     #[test]
     fn parse_scm_rights_rejects_more_than_scm_max_fd() {
         let control = build_scm_rights_control(SCM_MAX_FD + 1);
-        assert_eq!(
-            unsafe { parse_scm_rights(control.as_ptr(), control.len()) },
+        assert!(matches!(
+            unsafe { parse_sendmsg_control(control.as_ptr(), control.len()) },
             Err(EINVAL)
-        );
+        ));
     }
 
     #[test]
@@ -2805,19 +3838,19 @@ mod tests {
         control[..first.len()].copy_from_slice(&first);
         control[first.len()..].copy_from_slice(&second);
 
-        assert_eq!(
-            unsafe { parse_scm_rights(control.as_ptr(), control.len()) },
+        assert!(matches!(
+            unsafe { parse_sendmsg_control(control.as_ptr(), control.len()) },
             Err(EINVAL)
-        );
+        ));
     }
 
     #[test]
     fn parse_scm_rights_rejects_excessive_control_len_before_allocating() {
         let control = build_scm_rights_control(1);
-        assert_eq!(
-            unsafe { parse_scm_rights(control.as_ptr(), SCM_MAX_CONTROL_LEN + 1) },
+        assert!(matches!(
+            unsafe { parse_sendmsg_control(control.as_ptr(), SCM_MAX_CONTROL_LEN + 1) },
             Err(EINVAL)
-        );
+        ));
     }
 
     #[test]
@@ -2827,11 +3860,88 @@ mod tests {
         control[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
         control[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
 
-        assert_eq!(
-            unsafe { parse_scm_rights(control.as_ptr(), control.len()) },
+        assert!(matches!(
+            unsafe { parse_sendmsg_control(control.as_ptr(), control.len()) },
             Err(EINVAL)
-        );
+        ));
         assert_eq!(cmsg_align(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn parse_sendmsg_control_accepts_ipv4_pktinfo_and_ttl() {
+        let mut control = alloc::vec![0u8; cmsg_align(CMSG_HDR_LEN + core::mem::size_of::<LinuxInPktinfo>())
+            + cmsg_align(CMSG_HDR_LEN + core::mem::size_of::<i32>())];
+        let pktinfo_len = CMSG_HDR_LEN + core::mem::size_of::<LinuxInPktinfo>();
+        control[..8].copy_from_slice(&pktinfo_len.to_ne_bytes());
+        control[8..12].copy_from_slice(&SOL_IP.to_ne_bytes());
+        control[12..16].copy_from_slice(&IP_PKTINFO.to_ne_bytes());
+        let pktinfo = LinuxInPktinfo {
+            ipi_ifindex: 7,
+            ipi_spec_dst: u32::from_ne_bytes(ipv4(10, 0, 2, 15).to_be_bytes()),
+            ipi_addr: 0,
+        };
+        control[CMSG_HDR_LEN..CMSG_HDR_LEN + core::mem::size_of::<LinuxInPktinfo>()]
+            .copy_from_slice(unsafe {
+                core::slice::from_raw_parts(
+                    &pktinfo as *const LinuxInPktinfo as *const u8,
+                    core::mem::size_of::<LinuxInPktinfo>(),
+                )
+            });
+
+        let ttl_off = cmsg_align(pktinfo_len);
+        let ttl_len = CMSG_HDR_LEN + core::mem::size_of::<i32>();
+        control[ttl_off..ttl_off + 8].copy_from_slice(&ttl_len.to_ne_bytes());
+        control[ttl_off + 8..ttl_off + 12].copy_from_slice(&SOL_IP.to_ne_bytes());
+        control[ttl_off + 12..ttl_off + 16].copy_from_slice(&IP_TTL.to_ne_bytes());
+        control[ttl_off + CMSG_HDR_LEN..ttl_off + CMSG_HDR_LEN + core::mem::size_of::<i32>()]
+            .copy_from_slice(&(61i32).to_ne_bytes());
+
+        let parsed = unsafe { parse_sendmsg_control(control.as_ptr(), control.len()) }.unwrap();
+        assert!(parsed.scm_fds.is_empty());
+        assert_eq!(
+            parsed.inet_meta,
+            Some(socket::PacketMeta {
+                ifindex: 7,
+                local_inet_addr: Some(ipv4(10, 0, 2, 15)),
+                ttl: Some(61),
+                netlink_group: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_sendmsg_control_combines_scm_rights_and_pktinfo() {
+        let rights = build_scm_rights_control(2);
+        let pktinfo_len = CMSG_HDR_LEN + core::mem::size_of::<LinuxInPktinfo>();
+        let mut control = alloc::vec![0u8; rights.len() + cmsg_align(pktinfo_len)];
+        control[..rights.len()].copy_from_slice(&rights);
+        let pktinfo_off = rights.len();
+        control[pktinfo_off..pktinfo_off + 8].copy_from_slice(&pktinfo_len.to_ne_bytes());
+        control[pktinfo_off + 8..pktinfo_off + 12].copy_from_slice(&SOL_IP.to_ne_bytes());
+        control[pktinfo_off + 12..pktinfo_off + 16].copy_from_slice(&IP_PKTINFO.to_ne_bytes());
+        let pktinfo = LinuxInPktinfo {
+            ipi_ifindex: 3,
+            ipi_spec_dst: 0,
+            ipi_addr: 0,
+        };
+        control[pktinfo_off + CMSG_HDR_LEN
+            ..pktinfo_off + CMSG_HDR_LEN + core::mem::size_of::<LinuxInPktinfo>()]
+            .copy_from_slice(unsafe {
+                core::slice::from_raw_parts(
+                    &pktinfo as *const LinuxInPktinfo as *const u8,
+                    core::mem::size_of::<LinuxInPktinfo>(),
+                )
+            });
+
+        let parsed = unsafe { parse_sendmsg_control(control.as_ptr(), control.len()) }.unwrap();
+        assert_eq!(parsed.scm_fds, alloc::vec![0, 1]);
+        assert_eq!(
+            parsed.inet_meta,
+            Some(socket::PacketMeta {
+                ifindex: 3,
+                ..socket::PacketMeta::default()
+            })
+        );
     }
 
     #[test]
@@ -3051,6 +4161,265 @@ mod tests {
                 64
             );
 
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn inet_ip_pktinfo_and_unicast_if_sockopts_follow_linux_levels() {
+        crate::net::device::init();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 5562;
+        current.tgid = 5562;
+        current.cred = &raw const INIT_CRED;
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let fd = sys_socket(AF_INET as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(fd >= 0);
+
+            let one = 1u32;
+            assert_eq!(
+                sys_setsockopt(
+                    fd as i32,
+                    SOL_IP,
+                    IP_PKTINFO,
+                    &one as *const u32 as *const u8,
+                    core::mem::size_of::<u32>() as u32,
+                ),
+                0
+            );
+            let mut pktinfo = 0u32;
+            let mut pktinfo_len = core::mem::size_of::<u32>() as u32;
+            assert_eq!(
+                sys_getsockopt(
+                    fd as i32,
+                    SOL_IP,
+                    IP_PKTINFO,
+                    &mut pktinfo as *mut u32 as *mut u8,
+                    &mut pktinfo_len,
+                ),
+                0
+            );
+            assert_eq!(pktinfo, 1);
+
+            let lo = crate::net::device::lookup_netdevice("lo").expect("loopback");
+            let ifindex = lo.ifindex;
+            assert_eq!(
+                sys_setsockopt(
+                    fd as i32,
+                    SOL_IP,
+                    IP_UNICAST_IF,
+                    &ifindex as *const u32 as *const u8,
+                    core::mem::size_of::<u32>() as u32,
+                ),
+                0
+            );
+            let mut unicast_if = 0u32;
+            let mut unicast_if_len = core::mem::size_of::<u32>() as u32;
+            assert_eq!(
+                sys_getsockopt(
+                    fd as i32,
+                    SOL_IP,
+                    IP_UNICAST_IF,
+                    &mut unicast_if as *mut u32 as *mut u8,
+                    &mut unicast_if_len,
+                ),
+                0
+            );
+            assert_eq!(unicast_if, ifindex);
+
+            let bind_name = b"lo\0";
+            assert_eq!(
+                sys_setsockopt(
+                    fd as i32,
+                    SOL_SOCKET,
+                    SO_BINDTODEVICE,
+                    bind_name.as_ptr(),
+                    bind_name.len() as u32,
+                ),
+                0
+            );
+            let sock = socket_from_fd(fd as i32).unwrap();
+            assert_eq!(socket::get_bound_ifindex(&sock), Ok(ifindex));
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn inet_ip_mtu_getsockopt_follows_connected_socket_state() {
+        crate::net::device::init();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 5564;
+        current.tgid = 5564;
+        current.cred = &raw const INIT_CRED;
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let fd = sys_socket(AF_INET as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(fd >= 0);
+
+            let mut mtu = 0u32;
+            let mut mtu_len = core::mem::size_of::<u32>() as u32;
+            assert_eq!(
+                sys_getsockopt(
+                    fd as i32,
+                    SOL_IP,
+                    IP_MTU,
+                    &mut mtu as *mut u32 as *mut u8,
+                    &mut mtu_len,
+                ),
+                -(ENOTCONN as i64)
+            );
+
+            let loopback = LinuxSockAddrIn {
+                family: AF_INET,
+                port: 53u16.to_be(),
+                addr: u32::from_ne_bytes(ipv4(127, 0, 0, 1).to_be_bytes()),
+                zero: [0; 8],
+            };
+            assert_eq!(
+                sys_connect(
+                    fd as i32,
+                    &loopback as *const _ as *const u8,
+                    core::mem::size_of::<LinuxSockAddrIn>() as u32,
+                ),
+                0
+            );
+
+            assert_eq!(
+                sys_getsockopt(
+                    fd as i32,
+                    SOL_IP,
+                    IP_MTU,
+                    &mut mtu as *mut u32 as *mut u8,
+                    &mut mtu_len,
+                ),
+                0
+            );
+            assert_eq!(mtu, crate::net::device::LOOPBACK_MTU);
+            assert_eq!(mtu_len, core::mem::size_of::<u32>() as u32);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn inet_udp_recvmsg_attaches_pktinfo_control_message() {
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 5563;
+        current.tgid = 5563;
+        current.cred = &raw const INIT_CRED;
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let server = sys_socket(AF_INET as i32, socket::SOCK_DGRAM as i32, 0);
+            let client = sys_socket(AF_INET as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(server >= 0);
+            assert!(client >= 0);
+
+            let server_addr = LinuxSockAddrIn {
+                family: AF_INET,
+                port: 5301u16.to_be(),
+                addr: u32::from_ne_bytes(ipv4(127, 0, 0, 53).to_be_bytes()),
+                zero: [0; 8],
+            };
+            let client_addr = LinuxSockAddrIn {
+                family: AF_INET,
+                port: 5302u16.to_be(),
+                addr: u32::from_ne_bytes(ipv4(127, 0, 0, 1).to_be_bytes()),
+                zero: [0; 8],
+            };
+            assert_eq!(
+                sys_bind(
+                    server as i32,
+                    &server_addr as *const _ as *const u8,
+                    core::mem::size_of::<LinuxSockAddrIn>() as u32,
+                ),
+                0
+            );
+            assert_eq!(
+                sys_bind(
+                    client as i32,
+                    &client_addr as *const _ as *const u8,
+                    core::mem::size_of::<LinuxSockAddrIn>() as u32,
+                ),
+                0
+            );
+
+            let one = 1u32;
+            assert_eq!(
+                sys_setsockopt(
+                    server as i32,
+                    SOL_IP,
+                    IP_PKTINFO,
+                    &one as *const u32 as *const u8,
+                    core::mem::size_of::<u32>() as u32,
+                ),
+                0
+            );
+
+            let payload = b"dns";
+            assert_eq!(
+                sys_sendto(
+                    client as i32,
+                    payload.as_ptr(),
+                    payload.len(),
+                    0,
+                    &server_addr as *const _ as *const u8,
+                    core::mem::size_of::<LinuxSockAddrIn>() as u32,
+                ),
+                payload.len() as i64
+            );
+
+            let mut out = [0u8; 16];
+            let mut iov = LinuxIovec {
+                base: out.as_mut_ptr(),
+                len: out.len(),
+            };
+            let mut control = [0u8; 64];
+            let mut hdr = LinuxMsghdr {
+                name: core::ptr::null_mut(),
+                namelen: 0,
+                iov: &mut iov,
+                iovlen: 1,
+                control: control.as_mut_ptr(),
+                controllen: control.len(),
+                flags: 0,
+            };
+            assert_eq!(
+                sys_recvmsg(server as i32, &mut hdr, 0),
+                payload.len() as i64
+            );
+            assert_eq!(&out[..payload.len()], payload);
+            assert_eq!(
+                core::ptr::read_unaligned(control.as_ptr().add(8) as *const i32),
+                SOL_IP
+            );
+            assert_eq!(
+                core::ptr::read_unaligned(control.as_ptr().add(12) as *const i32),
+                IP_PKTINFO
+            );
+            let pktinfo = core::ptr::read_unaligned(
+                control.as_ptr().add(CMSG_HDR_LEN) as *const LinuxInPktinfo
+            );
+            assert_eq!(pktinfo.ipi_ifindex, 0);
+            assert_eq!(
+                pktinfo.ipi_spec_dst,
+                u32::from_ne_bytes(ipv4(127, 0, 0, 53).to_be_bytes())
+            );
+            assert_eq!(pktinfo.ipi_addr, pktinfo.ipi_spec_dst);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
     }
@@ -4498,10 +5867,11 @@ mod tests {
 
             let server = sys_socket(AF_UNIX as i32, socket::SOCK_DGRAM as i32, 0);
             assert!(server >= 0);
+            let server = server as i32;
             let one = 1u32;
             assert_eq!(
                 sys_setsockopt(
-                    server as i32,
+                    server,
                     SOL_SOCKET,
                     socket::SO_PASSCRED as i32,
                     &one as *const u32 as *const u8,
@@ -4511,7 +5881,7 @@ mod tests {
             );
             assert_eq!(
                 sys_setsockopt(
-                    server as i32,
+                    server,
                     SOL_SOCKET,
                     socket::SO_PASSPIDFD as i32,
                     &one as *const u32 as *const u8,
@@ -4520,11 +5890,12 @@ mod tests {
                 0
             );
             let (addr, addr_len) = unix_sockaddr("/run/notify-passcred");
-            assert_eq!(sys_bind(server as i32, addr.as_ptr(), addr_len), 0);
+            assert_eq!(sys_bind(server, addr.as_ptr(), addr_len), 0);
 
             let client = sys_socket(AF_UNIX as i32, socket::SOCK_DGRAM as i32, 0);
             assert!(client >= 0);
-            assert_eq!(sys_connect(client as i32, addr.as_ptr(), addr_len), 0);
+            let client = client as i32;
+            assert_eq!(sys_connect(client, addr.as_ptr(), addr_len), 0);
             let payload = b"READY=1\n";
             assert_eq!(
                 sys_sendto(
@@ -4640,6 +6011,7 @@ mod tests {
 
             let server = sys_socket(AF_UNIX as i32, socket::SOCK_DGRAM as i32, 0);
             assert!(server >= 0);
+            let server = server as i32;
             let one = 1u32;
             assert_eq!(
                 sys_setsockopt(
@@ -4759,6 +6131,280 @@ mod tests {
             service.m26.thread_pid = core::ptr::null_mut();
             put_pid(manager.m26.thread_pid);
             manager.m26.thread_pid = core::ptr::null_mut();
+        }
+    }
+
+    #[test]
+    fn unix_sendmsg_honors_explicit_scm_credentials_like_linux() {
+        use crate::kernel::cred::{INIT_CRED, KGid, KUid, commit_creds, prepare_creds};
+
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        *crate::fs::mount::MOUNTS.root.lock() = None;
+        crate::fs::mount::MOUNTS.by_path.lock().clear();
+        let sb = crate::fs::super_block::mount_fs("ramfs", "", 0, "").expect("ramfs mount");
+        let root = sb.root().expect("root dentry");
+        crate::fs::mount::set_rootfs(crate::fs::mount::Mount::alloc(sb, root, 0));
+
+        let previous = unsafe { sched::get_current() };
+        let mut manager = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        manager.pid = 1;
+        manager.tgid = 1;
+        manager.cred = &raw const INIT_CRED;
+        let manager_kpid = alloc_pid(&INIT_PID_NS, Some(manager.pid)).expect("manager pid alloc");
+        manager.m26.thread_pid = Box::into_raw(manager_kpid);
+
+        let mut service = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        service.pid = 765;
+        service.tgid = 765;
+        service.cred = &raw const INIT_CRED;
+        let service_kpid = alloc_pid(&INIT_PID_NS, Some(service.pid)).expect("service pid alloc");
+        service.m26.thread_pid = Box::into_raw(service_kpid);
+
+        unsafe {
+            files::set_task_files(&mut *manager as *mut TaskStruct, FilesStruct::new());
+            files::set_task_files(&mut *service as *mut TaskStruct, FilesStruct::new());
+
+            sched::set_current(&mut *manager as *mut TaskStruct);
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdirat(AT_FDCWD, b"/run\0".as_ptr(), 0o755),
+                0
+            );
+            let server = sys_socket(AF_UNIX as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(server >= 0);
+            let server = server as i32;
+            let one = 1u32;
+            assert_eq!(
+                sys_setsockopt(
+                    server,
+                    SOL_SOCKET,
+                    socket::SO_PASSCRED as i32,
+                    &one as *const u32 as *const u8,
+                    4,
+                ),
+                0
+            );
+            let (addr, addr_len) = unix_sockaddr("/run/scm-cred-override");
+            assert_eq!(sys_bind(server, addr.as_ptr(), addr_len), 0);
+
+            sched::set_current(&mut *service as *mut TaskStruct);
+            let new = prepare_creds().expect("prepare creds");
+            (*new).uid = KUid(1000);
+            (*new).gid = KGid(1001);
+            (*new).euid = KUid(0);
+            (*new).egid = KGid(0);
+            commit_creds(new);
+
+            let client = sys_socket(AF_UNIX as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(client >= 0);
+            let client = client as i32;
+            let payload = b"READY=1\n";
+            let mut send_iov = [LinuxIovec {
+                base: payload.as_ptr() as *mut u8,
+                len: payload.len(),
+            }];
+            let explicit = socket::SocketCred {
+                pid: 765,
+                uid: 0,
+                gid: 0,
+                groups: crate::kernel::cred::GroupInfo::default(),
+                pid_ref: None,
+            };
+            let mut control = [0u8; 64];
+            let (control_len, truncated) =
+                write_scm_credentials_at(control.as_mut_ptr(), control.len(), 0, &explicit)
+                    .expect("credentials cmsg");
+            assert!(!truncated);
+            let send_hdr = LinuxMsghdr {
+                name: addr.as_ptr() as *mut u8,
+                namelen: addr_len,
+                iov: send_iov.as_mut_ptr(),
+                iovlen: 1,
+                control: control.as_mut_ptr(),
+                controllen: control_len,
+                flags: 0,
+            };
+            assert_eq!(sys_sendmsg(client, &send_hdr, 0), payload.len() as i64);
+
+            sched::set_current(&mut *manager as *mut TaskStruct);
+            let mut body = [0u8; 32];
+            let mut recv_iov = [LinuxIovec {
+                base: body.as_mut_ptr(),
+                len: body.len(),
+            }];
+            let mut recv_control = [0u8; 64];
+            let mut recv_hdr = LinuxMsghdr {
+                name: core::ptr::null_mut(),
+                namelen: 0,
+                iov: recv_iov.as_mut_ptr(),
+                iovlen: 1,
+                control: recv_control.as_mut_ptr(),
+                controllen: recv_control.len(),
+                flags: 0,
+            };
+            assert_eq!(sys_recvmsg(server, &mut recv_hdr, 0), payload.len() as i64);
+            assert_eq!(&body[..payload.len()], payload);
+            assert_eq!(recv_hdr.flags & MSG_CTRUNC, 0);
+
+            let cmsg_len = core::ptr::read_unaligned(recv_control.as_ptr() as *const usize);
+            let cmsg_level = core::ptr::read_unaligned(recv_control.as_ptr().add(8) as *const i32);
+            let cmsg_type = core::ptr::read_unaligned(recv_control.as_ptr().add(12) as *const i32);
+            let cred = core::ptr::read_unaligned(
+                recv_control.as_ptr().add(CMSG_HDR_LEN) as *const LinuxUcred
+            );
+            assert_eq!(cmsg_len, CMSG_HDR_LEN + core::mem::size_of::<LinuxUcred>());
+            assert_eq!(cmsg_level, SOL_SOCKET);
+            assert_eq!(cmsg_type, SCM_CREDENTIALS);
+            assert_eq!(
+                cred,
+                LinuxUcred {
+                    pid: 765,
+                    uid: 0,
+                    gid: 0,
+                }
+            );
+
+            files::drop_task_files(&mut *service as *mut TaskStruct);
+            files::drop_task_files(&mut *manager as *mut TaskStruct);
+            sched::set_current(previous);
+            put_pid(service.m26.thread_pid);
+            service.m26.thread_pid = core::ptr::null_mut();
+            put_pid(manager.m26.thread_pid);
+            manager.m26.thread_pid = core::ptr::null_mut();
+        }
+    }
+
+    #[test]
+    fn unix_sendmsg_rejects_nonexistent_explicit_scm_pid_like_linux() {
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        *crate::fs::mount::MOUNTS.root.lock() = None;
+        crate::fs::mount::MOUNTS.by_path.lock().clear();
+        let sb = crate::fs::super_block::mount_fs("ramfs", "", 0, "").expect("ramfs mount");
+        let root = sb.root().expect("root dentry");
+        crate::fs::mount::set_rootfs(crate::fs::mount::Mount::alloc(sb, root, 0));
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 901;
+        current.tgid = 901;
+        current.cred = &raw const INIT_CRED;
+        let kpid = alloc_pid(&INIT_PID_NS, Some(current.pid)).expect("pid alloc");
+        current.m26.thread_pid = Box::into_raw(kpid);
+
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdirat(AT_FDCWD, b"/run\0".as_ptr(), 0o755),
+                0
+            );
+            let server = sys_socket(AF_UNIX as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(server >= 0);
+            let (addr, addr_len) = unix_sockaddr("/run/scm-cred-esrch");
+            assert_eq!(sys_bind(server as i32, addr.as_ptr(), addr_len), 0);
+
+            let client = sys_socket(AF_UNIX as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(client >= 0);
+            let payload = b"x";
+            let mut send_iov = [LinuxIovec {
+                base: payload.as_ptr() as *mut u8,
+                len: payload.len(),
+            }];
+            let explicit = socket::SocketCred {
+                pid: 32_767,
+                uid: 0,
+                gid: 0,
+                groups: crate::kernel::cred::GroupInfo::default(),
+                pid_ref: None,
+            };
+            let mut control = [0u8; 64];
+            let (control_len, truncated) =
+                write_scm_credentials_at(control.as_mut_ptr(), control.len(), 0, &explicit)
+                    .expect("credentials cmsg");
+            assert!(!truncated);
+            let send_hdr = LinuxMsghdr {
+                name: addr.as_ptr() as *mut u8,
+                namelen: addr_len,
+                iov: send_iov.as_mut_ptr(),
+                iovlen: 1,
+                control: control.as_mut_ptr(),
+                controllen: control_len,
+                flags: 0,
+            };
+            assert_eq!(
+                sys_sendmsg(client as i32, &send_hdr, 0),
+                -(crate::include::uapi::errno::ESRCH as i64)
+            );
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+            put_pid(current.m26.thread_pid);
+            current.m26.thread_pid = core::ptr::null_mut();
+        }
+    }
+
+    #[test]
+    fn unix_stream_eof_does_not_fabricate_scm_credentials() {
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 812;
+        current.tgid = 812;
+        current.cred = &raw const INIT_CRED;
+        let kpid = alloc_pid(&INIT_PID_NS, Some(current.pid)).expect("pid alloc");
+        current.m26.thread_pid = Box::into_raw(kpid);
+
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let mut sv = [0i32; 2];
+            assert_eq!(
+                sys_socketpair(
+                    AF_UNIX as i32,
+                    socket::SOCK_STREAM as i32,
+                    0,
+                    sv.as_mut_ptr()
+                ),
+                0
+            );
+            let one = 1u32;
+            assert_eq!(
+                sys_setsockopt(
+                    sv[1],
+                    SOL_SOCKET,
+                    socket::SO_PASSCRED as i32,
+                    &one as *const u32 as *const u8,
+                    4,
+                ),
+                0
+            );
+            current_files().unwrap().close(sv[0]).expect("close writer");
+
+            let mut body = [0u8; 1];
+            let mut iov = [LinuxIovec {
+                base: body.as_mut_ptr(),
+                len: body.len(),
+            }];
+            let mut control = [0u8; 64];
+            let mut hdr = LinuxMsghdr {
+                name: core::ptr::null_mut(),
+                namelen: 0,
+                iov: iov.as_mut_ptr(),
+                iovlen: 1,
+                control: control.as_mut_ptr(),
+                controllen: control.len(),
+                flags: 0,
+            };
+            assert_eq!(sys_recvmsg(sv[1], &mut hdr, 0), 0);
+            assert_eq!(hdr.controllen, 0);
+            assert_eq!(hdr.flags & MSG_CTRUNC, 0);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+            put_pid(current.m26.thread_pid);
+            current.m26.thread_pid = core::ptr::null_mut();
         }
     }
 

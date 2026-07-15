@@ -13,7 +13,10 @@ use spin::Mutex;
 
 use crate::fs::kernfs::{KernfsNode, add_child, lookup};
 use crate::include::uapi::errno::{EINVAL, ENODEV};
-use crate::net::device::{IFF_LOOPBACK, IFF_UP, LOOPBACK_MTU, NetDeviceRef, list_netdevices};
+use crate::net::device::{
+    IF_OPER_DORMANT, IF_OPER_DOWN, IF_OPER_TESTING, IF_OPER_UNKNOWN, IF_OPER_UP, IFF_LOOPBACK,
+    LOOPBACK_MTU, NetDeviceRef, list_netdevices,
+};
 use crate::net::uevent::UeventAction;
 
 lazy_static! {
@@ -104,7 +107,7 @@ fn netdev_iflink_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i
 
 fn netdev_flags_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
     let dev = netdev_from_node(node)?;
-    let flags = dev.flags.load(Ordering::Acquire);
+    let flags = dev.userspace_flags();
     copy_text(buf, &format!("0x{:x}\n", flags))
 }
 
@@ -125,13 +128,13 @@ fn netdev_tx_queue_len_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<us
 
 fn netdev_operstate_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
     let dev = netdev_from_node(node)?;
-    let flags = dev.flags.load(Ordering::Acquire);
-    let state = if flags & IFF_LOOPBACK != 0 {
-        "unknown"
-    } else if flags & IFF_UP != 0 && dev.carrier_ok() {
-        "up"
-    } else {
-        "down"
+    let state = match dev.userspace_operstate() {
+        IF_OPER_UNKNOWN => "unknown",
+        IF_OPER_DOWN => "down",
+        IF_OPER_TESTING => "testing",
+        IF_OPER_DORMANT => "dormant",
+        IF_OPER_UP => "up",
+        _ => "unknown",
     };
     copy_text(buf, &format!("{state}\n"))
 }
