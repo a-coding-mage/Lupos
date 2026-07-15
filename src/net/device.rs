@@ -102,7 +102,8 @@ pub fn linux_rtnl_is_locked() -> bool {
 }
 
 pub fn init() {
-    if NETDEV_INIT_DONE.swap(true, Ordering::AcqRel) {
+    let already_initialized = NETDEV_INIT_DONE.swap(true, Ordering::AcqRel);
+    if already_initialized && lookup_netdevice("lo").is_some() {
         return;
     }
 
@@ -138,6 +139,12 @@ fn register_loopback_netdevice() -> Result<NetDeviceRef, i32> {
             linux_dev: None,
         });
         registry.insert(String::from("lo"), dev.clone());
+        crate::fs::sysfs::net::register_netdevice(&dev);
+        crate::net::uevent::announce_netdevice(
+            crate::net::uevent::UeventAction::Add,
+            "lo",
+            dev.ifindex,
+        );
         Ok(dev)
     })
 }
@@ -168,6 +175,12 @@ pub fn register_netdevice(
             linux_dev: None,
         });
         registry.insert(String::from(name), dev.clone());
+        crate::fs::sysfs::net::register_netdevice(&dev);
+        crate::net::uevent::announce_netdevice(
+            crate::net::uevent::UeventAction::Add,
+            name,
+            dev.ifindex,
+        );
         Ok(dev)
     })
 }
@@ -199,6 +212,13 @@ pub fn register_linux_netdevice_locked(
         linux_dev: Some(linux_dev as usize),
     });
     registry.insert(String::from(name), dev.clone());
+    crate::fs::sysfs::net::register_netdevice(&dev);
+    crate::net::uevent::announce_netdevice(
+        crate::net::uevent::UeventAction::Add,
+        name,
+        dev.ifindex,
+    );
+    crate::net::socket::broadcast_rtnl_newlink(&dev);
     Ok(dev)
 }
 
@@ -220,7 +240,17 @@ pub fn unregister_linux_netdevice_locked(linux_dev: *const u8) -> Result<(), i32
         .map(|(name, _)| name.clone());
     match name {
         Some(name) => {
+            if let Some(dev) = NETDEV_BY_NAME.lock().get(&name).cloned() {
+                crate::net::uevent::announce_netdevice(
+                    crate::net::uevent::UeventAction::Remove,
+                    &dev.name,
+                    dev.ifindex,
+                );
+                crate::net::socket::drop_rtnl_ifaddrs_for_device(dev.ifindex);
+                crate::net::socket::drop_rtnl_routes_for_device(dev.ifindex);
+            }
             NETDEV_BY_NAME.lock().remove(&name);
+            crate::fs::sysfs::net::unregister_netdevice(&name);
             Ok(())
         }
         None => Err(ENODEV),
@@ -238,7 +268,15 @@ pub fn validate_mtu(mtu: u32) -> Result<(), i32> {
 pub fn unregister_netdevice(name: &str) -> Result<(), i32> {
     rtnl_lock(|| {
         let mut registry = NETDEV_BY_NAME.lock();
-        if registry.remove(name).is_some() {
+        if let Some(dev) = registry.remove(name) {
+            crate::net::uevent::announce_netdevice(
+                crate::net::uevent::UeventAction::Remove,
+                &dev.name,
+                dev.ifindex,
+            );
+            crate::net::socket::drop_rtnl_ifaddrs_for_device(dev.ifindex);
+            crate::net::socket::drop_rtnl_routes_for_device(dev.ifindex);
+            crate::fs::sysfs::net::unregister_netdevice(name);
             Ok(())
         } else {
             Err(ENODEV)
@@ -270,6 +308,7 @@ pub fn set_device_up(dev: &NetDeviceRef) -> Result<(), i32> {
     } else {
         dev.carrier.store(true, Ordering::Release);
     }
+    crate::net::socket::broadcast_rtnl_newlink(dev);
     Ok(())
 }
 
@@ -286,6 +325,7 @@ pub fn set_device_down(dev: &NetDeviceRef) -> Result<(), i32> {
             state.fetch_and(!1, Ordering::AcqRel);
         }
     }
+    crate::net::socket::broadcast_rtnl_newlink(dev);
     Ok(())
 }
 
@@ -296,6 +336,7 @@ pub fn set_carrier(dev: &NetDeviceRef, up: bool) {
     } else {
         dev.flags.fetch_and(!IFF_RUNNING, Ordering::AcqRel);
     }
+    crate::net::socket::broadcast_rtnl_newlink(dev);
 }
 
 pub fn record_rx(dev: &NetDeviceRef) {
@@ -431,5 +472,33 @@ mod tests {
             }
         );
         unregister_netdevice(name).unwrap();
+    }
+
+    #[test]
+    fn register_netdevice_emits_linux_shaped_add_uevent() {
+        let _guard = crate::net::uevent::test_lock();
+        let _ = crate::net::uevent::drain_pending();
+        let name = "netdev-uevent0";
+        let _ = unregister_netdevice(name);
+        let dev = register_netdevice(name, 1500, [2, 0, 0, 0, 0, 4], &DUMMY_NETDEV_OPS).unwrap();
+        let events = crate::net::uevent::drain_pending();
+        let payload = &events
+            .iter()
+            .find(|event| {
+                event
+                    .payload
+                    .starts_with(b"add@/devices/virtual/net/netdev-uevent0\0")
+            })
+            .expect("netdev add uevent")
+            .payload;
+        let ifindex_record = alloc::format!("IFINDEX={}\0", dev.ifindex);
+        assert!(
+            payload
+                .windows(ifindex_record.len())
+                .any(|window| window == ifindex_record.as_bytes()),
+            "payload must carry IFINDEX for the registered netdev"
+        );
+        unregister_netdevice(name).unwrap();
+        let _ = crate::net::uevent::drain_pending();
     }
 }

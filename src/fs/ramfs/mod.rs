@@ -23,7 +23,7 @@ use crate::fs::ops::{FileOps, InodeOps, SuperOps};
 use crate::fs::super_block::{FileSystemType, register_filesystem};
 use crate::fs::types::{
     Inode, InodeKind, InodePrivate, InodeRef, SuperBlock, SuperBlockRef, init_inode_metadata,
-    touch_inode_now,
+    init_inode_owner, touch_inode_now,
 };
 use crate::include::uapi::errno::{EEXIST, EINVAL};
 use crate::include::uapi::stat::S_IFDIR;
@@ -130,7 +130,7 @@ pub static RAMFS_SUPER_OPS: SuperOps = SuperOps {
 // `2 * BOGO_DIRENT_SIZE` to account for the implicit `.` and `..` entries).
 const BOGO_DIRENT_SIZE: u64 = 20;
 
-fn make_dir_inode(sb: &SuperBlockRef, mode: u32) -> InodeRef {
+fn make_dir_inode(sb: &SuperBlockRef, dir: Option<&InodeRef>, mode: u32) -> InodeRef {
     let ino = sb.alloc_ino();
     let i = Inode::new(
         ino,
@@ -140,7 +140,14 @@ fn make_dir_inode(sb: &SuperBlockRef, mode: u32) -> InodeRef {
         &RAMFS_DIR_FILE_OPS,
         empty_ram_dir(),
     );
-    init_inode_metadata(&i, 0, 0, 2, 0);
+    init_inode_owner(&i, dir, mode | S_IFDIR);
+    init_inode_metadata(
+        &i,
+        i.uid.load(Ordering::Acquire),
+        i.gid.load(Ordering::Acquire),
+        2,
+        0,
+    );
     // `.` + `..` self-references → 2 * BOGO_DIRENT_SIZE on fresh dirs.
     i.size.store(2 * BOGO_DIRENT_SIZE, Ordering::Release);
     *i.sb.lock() = Some(sb.clone());
@@ -168,7 +175,7 @@ pub fn dir_account_remove(dir: &InodeRef) {
         .store(prev.saturating_sub(BOGO_DIRENT_SIZE), Ordering::Release);
 }
 
-fn make_reg_inode(sb: &SuperBlockRef, mode: u32) -> InodeRef {
+fn make_reg_inode(sb: &SuperBlockRef, dir: Option<&InodeRef>, mode: u32) -> InodeRef {
     let ino = sb.alloc_ino();
     let i = Inode::new(
         ino,
@@ -178,12 +185,24 @@ fn make_reg_inode(sb: &SuperBlockRef, mode: u32) -> InodeRef {
         &RAMFS_FILE_OPS,
         empty_ram_bytes(),
     );
-    init_inode_metadata(&i, 0, 0, 1, 0);
+    init_inode_owner(&i, dir, mode);
+    init_inode_metadata(
+        &i,
+        i.uid.load(Ordering::Acquire),
+        i.gid.load(Ordering::Acquire),
+        1,
+        0,
+    );
     *i.sb.lock() = Some(sb.clone());
     i
 }
 
-fn make_symlink_inode(sb: &SuperBlockRef, mode: u32, target: &str) -> InodeRef {
+fn make_symlink_inode(
+    sb: &SuperBlockRef,
+    dir: Option<&InodeRef>,
+    mode: u32,
+    target: &str,
+) -> InodeRef {
     let ino = sb.alloc_ino();
     let i = Inode::new(
         ino,
@@ -193,7 +212,14 @@ fn make_symlink_inode(sb: &SuperBlockRef, mode: u32, target: &str) -> InodeRef {
         &RAMFS_SYMLINK_FILE_OPS,
         empty_ram_bytes(),
     );
-    init_inode_metadata(&i, 0, 0, 1, 0);
+    init_inode_owner(&i, dir, mode);
+    init_inode_metadata(
+        &i,
+        i.uid.load(Ordering::Acquire),
+        i.gid.load(Ordering::Acquire),
+        1,
+        0,
+    );
     if let InodePrivate::RamBytes(bytes) = &i.private {
         bytes.lock().extend_from_slice(target.as_bytes());
     }
@@ -215,7 +241,7 @@ fn dir_map(
 
 fn ramfs_create(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> {
     let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
-    let inode = make_reg_inode(&sb, mode);
+    let inode = make_reg_inode(&sb, Some(dir), mode);
     let map = dir_map(dir)?;
     let mut entries = map.lock();
     if entries.contains_key(name) {
@@ -230,7 +256,7 @@ fn ramfs_create(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> 
 
 fn ramfs_mkdir(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> {
     let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
-    let inode = make_dir_inode(&sb, mode);
+    let inode = make_dir_inode(&sb, Some(dir), mode);
     let map = dir_map(dir)?;
     let mut entries = map.lock();
     if entries.contains_key(name) {
@@ -246,7 +272,7 @@ fn ramfs_mkdir(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> {
 
 pub fn ramfs_symlink(dir: &InodeRef, name: &str, target: &str, mode: u32) -> Result<InodeRef, i32> {
     let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
-    let inode = make_symlink_inode(&sb, mode, target);
+    let inode = make_symlink_inode(&sb, Some(dir), mode, target);
     let map = dir_map(dir)?;
     let mut entries = map.lock();
     if entries.contains_key(name) {
@@ -273,7 +299,7 @@ fn ramfs_readlink(inode: &InodeRef, buf: &mut [u8]) -> Result<usize, i32> {
 
 pub fn mount(_source: &str, _flags: u64, _data: &str) -> Result<SuperBlockRef, i32> {
     let sb = SuperBlock::alloc("ramfs", RAMFS_MAGIC, &RAMFS_SUPER_OPS);
-    let root_inode = make_dir_inode(&sb, 0o755);
+    let root_inode = make_dir_inode(&sb, None, 0o755);
     let root = d_alloc("/");
     root.instantiate(root_inode);
     *sb.root.lock() = Some(root);
@@ -295,6 +321,43 @@ mod tests {
     use crate::fs::file::{alloc_file, fput};
     use crate::fs::read_write::{vfs_read, vfs_write};
     use crate::include::uapi::fcntl::O_RDWR;
+    use crate::include::uapi::stat::S_ISGID;
+    use crate::kernel::capability::KernelCapT;
+    use crate::kernel::cred::{Cred, GroupInfo, INIT_CRED, KGid, KUid};
+    use crate::kernel::{sched, task::TaskStruct};
+    use alloc::boxed::Box;
+
+    fn install_current(current: &mut TaskStruct, cred: &Cred) -> *mut TaskStruct {
+        let previous = unsafe { sched::get_current() };
+        current.pid = 4242;
+        current.tgid = 4242;
+        current.cred = cred as *const Cred;
+        current.m27.real_cred = cred as *const Cred;
+        unsafe { sched::set_current(current as *mut TaskStruct) };
+        previous
+    }
+
+    fn test_cred(uid: u32, gid: u32) -> Cred {
+        Cred {
+            usage: core::sync::atomic::AtomicUsize::new(1),
+            uid: KUid(uid),
+            gid: KGid(gid),
+            suid: KUid(uid),
+            sgid: KGid(gid),
+            euid: KUid(uid),
+            egid: KGid(gid),
+            fsuid: KUid(uid),
+            fsgid: KGid(gid),
+            cap_inheritable: KernelCapT::empty(),
+            cap_permitted: KernelCapT::empty(),
+            cap_effective: KernelCapT::empty(),
+            cap_bset: KernelCapT::empty(),
+            cap_ambient: KernelCapT::empty(),
+            securebits: 0,
+            group_info: GroupInfo::default(),
+            user_ns: core::ptr::null(),
+        }
+    }
 
     #[test]
     fn ramfs_round_trip() {
@@ -425,5 +488,46 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = inode.ops.readlink.unwrap()(&inode, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"/usr/lib/systemd/systemd");
+    }
+
+    #[test]
+    fn ramfs_create_uses_current_fsuid_and_fsgid() {
+        let sb = mount("", 0, "").unwrap();
+        let root = sb.root().unwrap();
+        let root_inode = root.inode().unwrap();
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let cred = Box::new(test_cred(1001, 1002));
+        let previous = install_current(&mut current, &cred);
+
+        let inode = ramfs_create(&root_inode, "state", 0o640).unwrap();
+
+        unsafe { sched::set_current(previous) };
+        current.cred = &raw const INIT_CRED;
+        assert_eq!(inode.uid.load(Ordering::Acquire), 1001);
+        assert_eq!(inode.gid.load(Ordering::Acquire), 1002);
+    }
+
+    #[test]
+    fn ramfs_directory_create_inherits_parent_setgid_gid() {
+        let sb = mount("", 0, "").unwrap();
+        let root = sb.root().unwrap();
+        let root_inode = root.inode().unwrap();
+        root_inode.gid.store(77, Ordering::Release);
+        root_inode.mode.store(
+            root_inode.mode.load(Ordering::Acquire) | S_ISGID,
+            Ordering::Release,
+        );
+
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let cred = Box::new(test_cred(1001, 1002));
+        let previous = install_current(&mut current, &cred);
+
+        let inode = ramfs_mkdir(&root_inode, "child", 0o755).unwrap();
+
+        unsafe { sched::set_current(previous) };
+        current.cred = &raw const INIT_CRED;
+        assert_eq!(inode.uid.load(Ordering::Acquire), 1001);
+        assert_eq!(inode.gid.load(Ordering::Acquire), 77);
+        assert_ne!(inode.mode.load(Ordering::Acquire) & S_ISGID, 0);
     }
 }

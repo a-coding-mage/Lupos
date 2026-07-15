@@ -846,7 +846,8 @@ apply_lupos_overlay() {
 127.0.0.1 localhost lupos
 ::1 localhost
 EOF
-    write_file "$S/etc/resolv.conf" <<< "nameserver 10.0.2.3"
+    rm -f "$S/etc/resolv.conf"
+    ln -sfn /run/systemd/resolve/resolv.conf "$S/etc/resolv.conf"
 
     mkdir -p "$S/etc/pacman.d"
     write_file "$S/etc/pacman.d/mirrorlist" <<'EOF'

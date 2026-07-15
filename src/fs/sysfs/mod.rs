@@ -20,6 +20,7 @@ pub mod file;
 pub mod group;
 #[path = "mount.rs"]
 pub mod mount_ops;
+pub mod net;
 pub mod symlink;
 
 const SYSFS_MAGIC: u64 = 0x62656572;

@@ -19,6 +19,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, RwLock};
 
 use super::ops::{FileOps, InodeOps, SuperOps};
+use crate::include::uapi::stat::{S_IFMT, S_ISGID};
+use crate::kernel::cred::current_cred;
 use crate::mm::address_space::AddressSpace;
 
 pub type Ino = u64;
@@ -198,6 +200,41 @@ pub fn init_inode_metadata(inode: &InodeRef, uid: u32, gid: u32, nlink: u32, tim
     inode.atime.store(ts, Ordering::Release);
     inode.mtime.store(ts, Ordering::Release);
     inode.ctime.store(ts, Ordering::Release);
+}
+
+/// Linux `inode_init_owner()` parity for synthetic filesystems.
+///
+/// Ref: `vendor/linux/fs/inode.c::inode_init_owner`
+pub fn init_inode_owner(inode: &InodeRef, dir: Option<&InodeRef>, mode: u32) {
+    let cred = current_cred();
+    let (uid, current_gid) = if cred.is_null() {
+        (0, 0)
+    } else {
+        unsafe { ((*cred).fsuid.0, (*cred).fsgid.0) }
+    };
+
+    let mut owned_mode = mode;
+    let gid = if let Some(parent) =
+        dir.filter(|parent| parent.mode.load(Ordering::Acquire) & S_ISGID != 0)
+    {
+        if inode.kind == InodeKind::Directory {
+            owned_mode |= S_ISGID;
+        }
+        parent.gid.load(Ordering::Acquire)
+    } else {
+        current_gid
+    };
+
+    let file_type = if owned_mode & S_IFMT != 0 {
+        owned_mode & S_IFMT
+    } else {
+        inode.kind.s_ifmt()
+    };
+    let perms = owned_mode & !S_IFMT;
+
+    inode.uid.store(uid, Ordering::Release);
+    inode.gid.store(gid, Ordering::Release);
+    inode.mode.store(file_type | perms, Ordering::Release);
 }
 
 pub fn touch_inode_now(inode: &InodeRef) {

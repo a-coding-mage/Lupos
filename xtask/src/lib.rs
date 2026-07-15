@@ -6538,8 +6538,18 @@ fn parse_sysv_inittab(text: &str) -> Result<Vec<SysvInittabEntry>> {
     Ok(entries)
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct LoginUserlandOptions;
+#[derive(Clone, Copy, Debug)]
+struct LoginUserlandOptions {
+    start_network_daemons: bool,
+}
+
+impl Default for LoginUserlandOptions {
+    fn default() -> Self {
+        Self {
+            start_network_daemons: true,
+        }
+    }
+}
 
 fn login_userland_files() -> Vec<InitramfsFile> {
     let stage = if env_flag_is_enabled(STAGE_REAL_USERLAND_ENV) {
@@ -6569,7 +6579,12 @@ fn critical_runtime_userland_files() -> Vec<InitramfsFile> {
 }
 
 fn critical_runtime_userland_files_with_stage(stage: Option<&Path>) -> Vec<InitramfsFile> {
-    let mut files = login_userland_files_with_stage(stage);
+    let mut files = login_userland_files_with_stage_and_options(
+        stage,
+        LoginUserlandOptions {
+            start_network_daemons: false,
+        },
+    );
     prune_systemd_service_churn_for_critical_runtime(&mut files);
     files
 }
@@ -6603,6 +6618,14 @@ fn prune_systemd_service_churn_for_critical_runtime(files: &mut Vec<InitramfsFil
         "etc/systemd/system/multi-user.target.wants/systemd-logind.service",
         "etc/systemd/system/multi-user.target.wants/systemd-networkd.service",
         "etc/systemd/system/multi-user.target.wants/systemd-resolved.service",
+        "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.service",
+        "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.socket",
+        "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink.socket",
+        "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink-metrics.socket",
+        "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-resolve-hook.socket",
+        "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved.service",
+        "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-varlink.socket",
+        "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-monitor.socket",
     ];
     files.retain(|(path, _, _)| !RUNTIME_PRUNED_WANTS.contains(&path.as_str()));
 }
@@ -6895,7 +6918,7 @@ fn systemd_login_userland_files_with_stage(stage: &Path) -> Vec<InitramfsFile> {
 
 fn systemd_login_userland_files_with_stage_and_options(
     stage: &Path,
-    _options: LoginUserlandOptions,
+    options: LoginUserlandOptions,
 ) -> Vec<InitramfsFile> {
     let busybox =
         staged_userland_bytes(Some(stage), &["bin/busybox"]).unwrap_or_else(build_minimal_elf64);
@@ -7020,7 +7043,10 @@ fn systemd_login_userland_files_with_stage_and_options(
         initramfs_file("etc/securetty", 0o100644, staged_config("etc/securetty", LOGIN_SECURETTY.as_bytes())),
         initramfs_file("etc/shells", 0o100644, staged_config("etc/shells", LOGIN_SHELLS.as_bytes())),
         initramfs_file("etc/hosts", 0o100644, staged_config("etc/hosts", b"127.0.0.1 localhost lupos\n::1 localhost\n")),
-        initramfs_file("etc/resolv.conf", 0o100644, staged_config("etc/resolv.conf", b"nameserver 10.0.2.3\n")),
+        initramfs_symlink(
+            "etc/resolv.conf",
+            "/run/systemd/resolve/resolv.conf",
+        ),
         initramfs_file(
             "etc/fstab",
             0o100644,
@@ -7146,6 +7172,10 @@ fn systemd_login_userland_files_with_stage_and_options(
             "/usr/lib/systemd/system/systemd-tmpfiles-setup.service",
         ),
         initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/systemd-sysusers.service",
+            "/usr/lib/systemd/system/systemd-sysusers.service",
+        ),
+        initramfs_symlink(
             "etc/systemd/system/sysinit.target.wants/systemd-vconsole-setup.service",
             "/usr/lib/systemd/system/systemd-vconsole-setup.service",
         ),
@@ -7157,7 +7187,102 @@ fn systemd_login_userland_files_with_stage_and_options(
             "etc/systemd/system/sysinit.target.wants/dev-mqueue.mount",
             "/usr/lib/systemd/system/dev-mqueue.mount",
         ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/systemd-udevd.service",
+            "/usr/lib/systemd/system/systemd-udevd.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/systemd-udev-trigger.service",
+            "/usr/lib/systemd/system/systemd-udev-trigger.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sockets.target.wants/systemd-udevd-control.socket",
+            "/usr/lib/systemd/system/systemd-udevd-control.socket",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sockets.target.wants/systemd-udevd-kernel.socket",
+            "/usr/lib/systemd/system/systemd-udevd-kernel.socket",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sockets.target.wants/systemd-udevd-varlink.socket",
+            "/usr/lib/systemd/system/systemd-udevd-varlink.socket",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-sysusers.service",
+            "/usr/lib/systemd/system/systemd-sysusers.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-sysctl.service",
+            "/usr/lib/systemd/system/systemd-sysctl.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-tmpfiles-setup-dev.service",
+            "/usr/lib/systemd/system/systemd-tmpfiles-setup-dev.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-tmpfiles-setup.service",
+            "/usr/lib/systemd/system/systemd-tmpfiles-setup.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd.service",
+            "/usr/lib/systemd/system/systemd-udevd.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-udev-trigger.service",
+            "/usr/lib/systemd/system/systemd-udev-trigger.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-control.socket",
+            "/usr/lib/systemd/system/systemd-udevd-control.socket",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-kernel.socket",
+            "/usr/lib/systemd/system/systemd-udevd-kernel.socket",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-varlink.socket",
+            "/usr/lib/systemd/system/systemd-udevd-varlink.socket",
+        ),
     ];
+
+    if options.start_network_daemons {
+        for (wants_path, target) in [
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.service",
+                "/usr/lib/systemd/system/systemd-networkd.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.socket",
+                "/usr/lib/systemd/system/systemd-networkd.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink-metrics.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink-metrics.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-resolve-hook.socket",
+                "/usr/lib/systemd/system/systemd-networkd-resolve-hook.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved.service",
+                "/usr/lib/systemd/system/systemd-resolved.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-varlink.socket",
+                "/usr/lib/systemd/system/systemd-resolved-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-monitor.socket",
+                "/usr/lib/systemd/system/systemd-resolved-monitor.socket",
+            ),
+        ] {
+            files.push(initramfs_symlink(wants_path, target));
+        }
+    }
 
     files.extend(staged_tree_files(
         stage,
@@ -7422,6 +7547,7 @@ fn apply_systemd_login_payload_overrides(files: &mut Vec<InitramfsFile>) {
     let udevd = initramfs_file_bytes(files, "usr/bin/udevadm").map(|bytes| bytes.to_vec());
     for path in [
         "var/run",
+        "etc/resolv.conf",
         "sbin/poweroff",
         "usr/sbin/poweroff",
         "etc/machine-id",
@@ -7432,6 +7558,10 @@ fn apply_systemd_login_payload_overrides(files: &mut Vec<InitramfsFile>) {
         files.retain(|(entry_path, _, _)| entry_path != path);
     }
     files.push(initramfs_symlink("var/run", "/run"));
+    files.push(initramfs_symlink(
+        "etc/resolv.conf",
+        "/run/systemd/resolve/resolv.conf",
+    ));
     files.push(initramfs_file("sbin/poweroff", 0o100755, poweroff.clone()));
     files.push(initramfs_file("usr/sbin/poweroff", 0o100755, poweroff));
     files.push(initramfs_file(
@@ -13122,6 +13252,10 @@ fn direct_stage_login_root_disk_overlay_files(
         mode,
         BootMode::UserspaceSmokeTest | BootMode::RuntimeStressTest
     );
+    let include_network_daemons = !matches!(
+        mode,
+        BootMode::UserspaceSmokeTest | BootMode::RuntimeStressTest
+    );
     let shipped_commands = mode == BootMode::ShippedCommandsTest;
     let graphics_x11 = mode == BootMode::GraphicsX11;
     let mark_update_done = matches!(
@@ -13172,6 +13306,10 @@ fn direct_stage_login_root_disk_overlay_files(
             "etc/pacman.d/mirrorlist",
             0o100644,
             ARCH_PACMAN_MIRRORLIST.as_bytes(),
+        ),
+        initramfs_symlink(
+            "etc/resolv.conf",
+            "/run/systemd/resolve/resolv.conf",
         ),
         initramfs_file("etc/machine-id", 0o100444, SYSTEMD_MACHINE_ID.as_bytes()),
         initramfs_file(
@@ -13332,6 +13470,10 @@ fn direct_stage_login_root_disk_overlay_files(
             "/usr/lib/systemd/system/systemd-tmpfiles-setup.service",
         ),
         initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/systemd-sysusers.service",
+            "/usr/lib/systemd/system/systemd-sysusers.service",
+        ),
+        initramfs_symlink(
             "etc/systemd/system/sysinit.target.wants/systemd-vconsole-setup.service",
             "/usr/lib/systemd/system/systemd-vconsole-setup.service",
         ),
@@ -13342,6 +13484,62 @@ fn direct_stage_login_root_disk_overlay_files(
         initramfs_symlink(
             "etc/systemd/system/sysinit.target.wants/dev-mqueue.mount",
             "/usr/lib/systemd/system/dev-mqueue.mount",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/systemd-udevd.service",
+            "/usr/lib/systemd/system/systemd-udevd.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/systemd-udev-trigger.service",
+            "/usr/lib/systemd/system/systemd-udev-trigger.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sockets.target.wants/systemd-udevd-control.socket",
+            "/usr/lib/systemd/system/systemd-udevd-control.socket",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sockets.target.wants/systemd-udevd-kernel.socket",
+            "/usr/lib/systemd/system/systemd-udevd-kernel.socket",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/sockets.target.wants/systemd-udevd-varlink.socket",
+            "/usr/lib/systemd/system/systemd-udevd-varlink.socket",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-sysusers.service",
+            "/usr/lib/systemd/system/systemd-sysusers.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-sysctl.service",
+            "/usr/lib/systemd/system/systemd-sysctl.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-tmpfiles-setup-dev.service",
+            "/usr/lib/systemd/system/systemd-tmpfiles-setup-dev.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-tmpfiles-setup.service",
+            "/usr/lib/systemd/system/systemd-tmpfiles-setup.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd.service",
+            "/usr/lib/systemd/system/systemd-udevd.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-udev-trigger.service",
+            "/usr/lib/systemd/system/systemd-udev-trigger.service",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-control.socket",
+            "/usr/lib/systemd/system/systemd-udevd-control.socket",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-kernel.socket",
+            "/usr/lib/systemd/system/systemd-udevd-kernel.socket",
+        ),
+        initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-varlink.socket",
+            "/usr/lib/systemd/system/systemd-udevd-varlink.socket",
         ),
     ];
     files.extend(module_load_request_files_from_repo_config());
@@ -13359,6 +13557,45 @@ fn direct_stage_login_root_disk_overlay_files(
             "etc/systemd/system/sockets.target.wants/systemd-journald-dev-log.socket",
             "/usr/lib/systemd/system/systemd-journald-dev-log.socket",
         ));
+    }
+
+    if include_network_daemons {
+        for (wants_path, target) in [
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.service",
+                "/usr/lib/systemd/system/systemd-networkd.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.socket",
+                "/usr/lib/systemd/system/systemd-networkd.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink-metrics.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink-metrics.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-resolve-hook.socket",
+                "/usr/lib/systemd/system/systemd-networkd-resolve-hook.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved.service",
+                "/usr/lib/systemd/system/systemd-resolved.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-varlink.socket",
+                "/usr/lib/systemd/system/systemd-resolved-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-monitor.socket",
+                "/usr/lib/systemd/system/systemd-resolved-monitor.socket",
+            ),
+        ] {
+            files.push(initramfs_symlink(wants_path, target));
+        }
     }
 
     match mode {
@@ -14489,6 +14726,16 @@ pub fn run_login_stack_tests() -> Result<()> {
             send: b"\n",
         },
         SerialExpectStep {
+            label: "curl dns probe",
+            wait_for: "[root@lupos /]#",
+            send: b"curl -fsSI --max-time 20 http://example.com >/tmp/lupos-curl.log 2>&1 && ok='login-stack: curl dns ' && printf '%s\\n' \"${ok}ok\" || { rc=$?; printf 'login-stack: curl failed rc=%s\\n' \"$rc\"; cat /tmp/lupos-curl.log; exit 1; }\n",
+        },
+        SerialExpectStep {
+            label: "curl dns marker",
+            wait_for: "login-stack: curl dns ok",
+            send: b"\n",
+        },
+        SerialExpectStep {
             label: "shutdown",
             wait_for: "[root@lupos /]#",
             send: b" poweroff -f\n",
@@ -14546,6 +14793,7 @@ pub fn run_login_stack_tests() -> Result<()> {
         "login-stack: prompt recovered",
         "login-stack: ls-li metadata ok",
         "login-stack: root fs ok",
+        "login-stack: curl dns ok",
     ] {
         if !serial_log_has_output_line(&run.serial_output, marker) {
             bail!(
@@ -15537,6 +15785,7 @@ fn validate_userland_stage() -> Result<()> {
     }
     if allow_symlinks {
         validate_arch_pam_systemd_session(&stage)?;
+        validate_arch_resolv_conf(&stage)?;
         validate_arch_pacman_config(&stage)?;
         validate_arch_pacman_mirrorlist(&stage)?;
         validate_arch_pacman_offline_repo(&stage)?;
@@ -15700,6 +15949,24 @@ fn validate_arch_pam_systemd_session(stage: &Path) -> Result<()> {
         bail!(
             "staged systemd-user PAM file still uses unsupported systemd 257 user-light class: {}",
             systemd_user_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_arch_resolv_conf(stage: &Path) -> Result<()> {
+    let path = stage.join("etc/resolv.conf");
+    let target = fs::read_link(&path).with_context(|| {
+        format!(
+            "staged /etc/resolv.conf must be a symlink managed by systemd-resolved: {}",
+            path.display()
+        )
+    })?;
+    if target != Path::new("/run/systemd/resolve/resolv.conf") {
+        bail!(
+            "staged /etc/resolv.conf points to {}, expected /run/systemd/resolve/resolv.conf: {}",
+            target.display(),
+            path.display()
         );
     }
     Ok(())
@@ -22191,6 +22458,80 @@ failed command output\n";
             initramfs_file_bytes(&files, "etc/pacman.d/mirrorlist"),
             Some(ARCH_PACMAN_MIRRORLIST.as_bytes())
         );
+        let resolv_conf = find_initramfs_symlink_target(&files, "etc/resolv.conf").expect(
+            "direct-stage root disks must keep /etc/resolv.conf managed by systemd-resolved",
+        );
+        assert_eq!(resolv_conf, b"/run/systemd/resolve/resolv.conf");
+        for (wants_path, target) in [
+            (
+                "etc/systemd/system/sysinit.target.wants/systemd-udevd.service",
+                "/usr/lib/systemd/system/systemd-udevd.service",
+            ),
+            (
+                "etc/systemd/system/sysinit.target.wants/systemd-udev-trigger.service",
+                "/usr/lib/systemd/system/systemd-udev-trigger.service",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-udevd-control.socket",
+                "/usr/lib/systemd/system/systemd-udevd-control.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-udevd-kernel.socket",
+                "/usr/lib/systemd/system/systemd-udevd-kernel.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-udevd-varlink.socket",
+                "/usr/lib/systemd/system/systemd-udevd-varlink.socket",
+            ),
+        ] {
+            let got = find_initramfs_symlink_target(&files, wants_path).unwrap_or_else(|| {
+                panic!("{wants_path} must be present in direct-stage root disks")
+            });
+            assert_eq!(got, target.as_bytes(), "{wants_path} target changed");
+        }
+        for (wants_path, target) in [
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-sysusers.service",
+                "/usr/lib/systemd/system/systemd-sysusers.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-sysctl.service",
+                "/usr/lib/systemd/system/systemd-sysctl.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-tmpfiles-setup-dev.service",
+                "/usr/lib/systemd/system/systemd-tmpfiles-setup-dev.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-tmpfiles-setup.service",
+                "/usr/lib/systemd/system/systemd-tmpfiles-setup.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd.service",
+                "/usr/lib/systemd/system/systemd-udevd.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udev-trigger.service",
+                "/usr/lib/systemd/system/systemd-udev-trigger.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-control.socket",
+                "/usr/lib/systemd/system/systemd-udevd-control.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-kernel.socket",
+                "/usr/lib/systemd/system/systemd-udevd-kernel.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-varlink.socket",
+                "/usr/lib/systemd/system/systemd-udevd-varlink.socket",
+            ),
+        ] {
+            let got = find_initramfs_symlink_target(&files, wants_path).unwrap_or_else(|| {
+                panic!("{wants_path} must be present in direct-stage root disks")
+            });
+            assert_eq!(got, target.as_bytes(), "{wants_path} target changed");
+        }
         let pacman_xfer = find_initramfs_entry(&files, ARCH_PACMAN_XFER_HELPER)
             .expect("direct-stage root disks must include the pacman transfer helper");
         assert_eq!(pacman_xfer.1 & 0o777, 0o755);
@@ -26596,6 +26937,121 @@ CONFIG_MODULES=y
     }
 
     #[test]
+    fn login_stack_direct_stage_overlay_enables_terminal_network_units() {
+        let files = direct_stage_login_root_disk_overlay_files(
+            BootMode::LoginStackTest,
+            SYSTEMD_DISK_ROOT_FSTAB,
+            &[],
+            Path::new("/nonexistent-login-stage"),
+        );
+        for (wants_path, target) in [
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-sysusers.service",
+                "/usr/lib/systemd/system/systemd-sysusers.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-sysctl.service",
+                "/usr/lib/systemd/system/systemd-sysctl.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-tmpfiles-setup-dev.service",
+                "/usr/lib/systemd/system/systemd-tmpfiles-setup-dev.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-tmpfiles-setup.service",
+                "/usr/lib/systemd/system/systemd-tmpfiles-setup.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd.service",
+                "/usr/lib/systemd/system/systemd-udevd.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udev-trigger.service",
+                "/usr/lib/systemd/system/systemd-udev-trigger.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-control.socket",
+                "/usr/lib/systemd/system/systemd-udevd-control.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-kernel.socket",
+                "/usr/lib/systemd/system/systemd-udevd-kernel.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-varlink.socket",
+                "/usr/lib/systemd/system/systemd-udevd-varlink.socket",
+            ),
+        ] {
+            let got = find_initramfs_symlink_target(&files, wants_path)
+                .unwrap_or_else(|| panic!("{wants_path} must be present in login-stack overlay"));
+            assert_eq!(got, target.as_bytes(), "{wants_path} target changed");
+        }
+        for (wants_path, target) in [
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.service",
+                "/usr/lib/systemd/system/systemd-networkd.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.socket",
+                "/usr/lib/systemd/system/systemd-networkd.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink-metrics.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink-metrics.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-resolve-hook.socket",
+                "/usr/lib/systemd/system/systemd-networkd-resolve-hook.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved.service",
+                "/usr/lib/systemd/system/systemd-resolved.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-varlink.socket",
+                "/usr/lib/systemd/system/systemd-resolved-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-monitor.socket",
+                "/usr/lib/systemd/system/systemd-resolved-monitor.socket",
+            ),
+        ] {
+            let got = find_initramfs_symlink_target(&files, wants_path)
+                .unwrap_or_else(|| panic!("{wants_path} must be present in login-stack overlay"));
+            assert_eq!(got, target.as_bytes(), "{wants_path} target changed");
+        }
+    }
+
+    #[test]
+    fn userspace_smoke_direct_stage_overlay_prunes_terminal_network_units() {
+        let files = direct_stage_login_root_disk_overlay_files(
+            BootMode::UserspaceSmokeTest,
+            SYSTEMD_DISK_ROOT_FSTAB,
+            &[],
+            Path::new("/nonexistent-login-stage"),
+        );
+        for wants_path in [
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.service",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.socket",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink.socket",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink-metrics.socket",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-resolve-hook.socket",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved.service",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-varlink.socket",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-monitor.socket",
+        ] {
+            assert!(
+                find_initramfs_symlink_target(&files, wants_path).is_none(),
+                "{wants_path} must be omitted from critical runtime overlays"
+            );
+        }
+    }
+
+    #[test]
     fn critical_runtime_guest_prunes_service_churn_but_keeps_real_pid1_and_tools() {
         let root = repo_root().expect("repo root");
         let stage = root.join("target/xtask-test/critical-runtime-systemd-stage");
@@ -26684,6 +27140,14 @@ CONFIG_MODULES=y
             "etc/systemd/system/multi-user.target.wants/systemd-logind.service",
             "etc/systemd/system/multi-user.target.wants/systemd-networkd.service",
             "etc/systemd/system/multi-user.target.wants/systemd-resolved.service",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.service",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.socket",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink.socket",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink-metrics.socket",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-resolve-hook.socket",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved.service",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-varlink.socket",
+            "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-monitor.socket",
         ] {
             assert!(
                 find_initramfs_entry(&files, pruned).is_none(),
@@ -28099,6 +28563,9 @@ CONFIG_MODULES=y
                 "/etc/nsswitch.conf must keep `{database}` lookups file-only"
             );
         }
+        let resolv_conf = find_initramfs_symlink_target(&files, "etc/resolv.conf")
+            .expect("/etc/resolv.conf must be managed by systemd-resolved");
+        assert_eq!(resolv_conf, b"/run/systemd/resolve/resolv.conf");
         assert!(
             nsswitch.contains("files"),
             "/etc/nsswitch.conf must use the `files` NSS module"
@@ -28631,6 +29098,10 @@ CONFIG_MODULES=y
                 "/usr/lib/systemd/system/systemd-tmpfiles-setup.service",
             ),
             (
+                "etc/systemd/system/sysinit.target.wants/systemd-sysusers.service",
+                "/usr/lib/systemd/system/systemd-sysusers.service",
+            ),
+            (
                 "etc/systemd/system/sysinit.target.wants/systemd-vconsole-setup.service",
                 "/usr/lib/systemd/system/systemd-vconsole-setup.service",
             ),
@@ -28641,6 +29112,14 @@ CONFIG_MODULES=y
             (
                 "etc/systemd/system/sysinit.target.wants/dev-mqueue.mount",
                 "/usr/lib/systemd/system/dev-mqueue.mount",
+            ),
+            (
+                "etc/systemd/system/sysinit.target.wants/systemd-udevd.service",
+                "/usr/lib/systemd/system/systemd-udevd.service",
+            ),
+            (
+                "etc/systemd/system/sysinit.target.wants/systemd-udev-trigger.service",
+                "/usr/lib/systemd/system/systemd-udev-trigger.service",
             ),
         ] {
             let got = find_initramfs_symlink_target(&files, wants_path)
@@ -28766,34 +29245,121 @@ CONFIG_MODULES=y
             find_initramfs_entry(&files, "usr/lib/udev/rules.d/50-udev-default.rules").is_some(),
             "udev's canonical 50-udev-default.rules must be in the initramfs"
         );
-        for wants_path in [
-            "etc/systemd/system/sysinit.target.wants/systemd-udevd.service",
-            "etc/systemd/system/sysinit.target.wants/systemd-udev-trigger.service",
-            "etc/systemd/system/sockets.target.wants/systemd-udevd-control.socket",
-            "etc/systemd/system/sockets.target.wants/systemd-udevd-kernel.socket",
+        for (wants_path, target) in [
+            (
+                "etc/systemd/system/sysinit.target.wants/systemd-udevd.service",
+                "/usr/lib/systemd/system/systemd-udevd.service",
+            ),
+            (
+                "etc/systemd/system/sysinit.target.wants/systemd-udev-trigger.service",
+                "/usr/lib/systemd/system/systemd-udev-trigger.service",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-udevd-control.socket",
+                "/usr/lib/systemd/system/systemd-udevd-control.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-udevd-kernel.socket",
+                "/usr/lib/systemd/system/systemd-udevd-kernel.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-udevd-varlink.socket",
+                "/usr/lib/systemd/system/systemd-udevd-varlink.socket",
+            ),
         ] {
-            assert!(
-                find_initramfs_symlink_target(&files, wants_path).is_none(),
-                "{wants_path} must not be wanted by terminal-login"
-            );
+            let got = find_initramfs_symlink_target(&files, wants_path)
+                .unwrap_or_else(|| panic!("{wants_path} must be enabled for terminal-login udev"));
+            assert_eq!(got, target.as_bytes(), "{wants_path} target changed");
+        }
+        for (wants_path, target) in [
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-sysusers.service",
+                "/usr/lib/systemd/system/systemd-sysusers.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-sysctl.service",
+                "/usr/lib/systemd/system/systemd-sysctl.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-tmpfiles-setup-dev.service",
+                "/usr/lib/systemd/system/systemd-tmpfiles-setup-dev.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-tmpfiles-setup.service",
+                "/usr/lib/systemd/system/systemd-tmpfiles-setup.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd.service",
+                "/usr/lib/systemd/system/systemd-udevd.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udev-trigger.service",
+                "/usr/lib/systemd/system/systemd-udev-trigger.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-control.socket",
+                "/usr/lib/systemd/system/systemd-udevd-control.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-kernel.socket",
+                "/usr/lib/systemd/system/systemd-udevd-kernel.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-udevd-varlink.socket",
+                "/usr/lib/systemd/system/systemd-udevd-varlink.socket",
+            ),
+        ] {
+            let got = find_initramfs_symlink_target(&files, wants_path).unwrap_or_else(|| {
+                panic!("{wants_path} must be enabled for active terminal-login runtime setup")
+            });
+            assert_eq!(got, target.as_bytes(), "{wants_path} target changed");
         }
 
-        // (8) Network daemons are staged but not wanted in terminal-login.
-        // This keeps Bash acceptance independent of DHCP/DNS startup waits.
-        for (wants_path, bin) in [
+        // (8) Terminal-login pulls in the vendor networkd + resolved units so
+        // libc's normal NSS -> resolve path can satisfy curl without a
+        // Lupos-specific DNS helper.
+        for (wants_path, target) in [
             (
-                "etc/systemd/system/multi-user.target.wants/systemd-networkd.service",
-                "usr/lib/systemd/systemd-networkd",
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.service",
+                "/usr/lib/systemd/system/systemd-networkd.service",
             ),
             (
-                "etc/systemd/system/multi-user.target.wants/systemd-resolved.service",
-                "usr/lib/systemd/systemd-resolved",
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.socket",
+                "/usr/lib/systemd/system/systemd-networkd.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink-metrics.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink-metrics.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-resolve-hook.socket",
+                "/usr/lib/systemd/system/systemd-networkd-resolve-hook.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved.service",
+                "/usr/lib/systemd/system/systemd-resolved.service",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-varlink.socket",
+                "/usr/lib/systemd/system/systemd-resolved-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-monitor.socket",
+                "/usr/lib/systemd/system/systemd-resolved-monitor.socket",
             ),
         ] {
-            assert!(
-                find_initramfs_symlink_target(&files, wants_path).is_none(),
-                "{wants_path} must not be wanted by terminal-login"
-            );
+            let got = find_initramfs_symlink_target(&files, wants_path)
+                .unwrap_or_else(|| panic!("{wants_path} must be enabled for terminal-login DNS"));
+            assert_eq!(got, target.as_bytes(), "{wants_path} target changed");
+        }
+        for bin in [
+            "usr/lib/systemd/systemd-networkd",
+            "usr/lib/systemd/systemd-resolved",
+        ] {
             assert!(
                 find_initramfs_entry(&files, bin).is_some(),
                 "{bin} binary must be staged"
@@ -29733,7 +30299,7 @@ CONFIG_MODULES=y
             "xterm-410-1-x86_64.pkg.tar.zst",
             "pam_systemd.so",
             "etc/systemd/network/10-lupos-qemu.network",
-            "nameserver 10.0.2.3",
+            "/run/systemd/resolve/resolv.conf",
         ] {
             assert!(
                 script.contains(needle),

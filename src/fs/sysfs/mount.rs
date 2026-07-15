@@ -418,9 +418,12 @@ pub fn build_root() -> (Arc<KernfsNode>, Arc<KernfsNode>) {
     add_tty_class(&class);
     add_graphics_class(&class);
 
+    let devices = KernfsNode::new_dir("devices", 0o555);
+    crate::fs::sysfs::net::attach_roots(&class, &devices);
+
     for child in [
         kernel.clone(),
-        KernfsNode::new_dir("devices", 0o555),
+        devices,
         KernfsNode::new_dir("bus", 0o555),
         class,
         KernfsNode::new_dir("block", 0o555),

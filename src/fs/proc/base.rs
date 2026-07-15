@@ -174,18 +174,9 @@ unsafe fn task_stat_text(task: *mut TaskStruct) -> alloc::string::String {
         } else {
             'R'
         };
-        ((*task).pid, ppid, state, task_comm(task))
+        ((*task).pid, ppid, state, super::util::task_comm(task))
     };
     super::array::stat_text_with_ppid(pid, &comm, state, ppid)
-}
-
-unsafe fn task_comm(task: *mut TaskStruct) -> alloc::string::String {
-    let bytes = unsafe { &(*task).comm };
-    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-    match core::str::from_utf8(&bytes[..end]) {
-        Ok("") | Err(_) => alloc::string::String::from("lupos"),
-        Ok(comm) => alloc::string::String::from(comm),
-    }
 }
 
 pub fn add_task_common(dir: &Arc<KernfsNode>) {
@@ -291,16 +282,18 @@ fn proc_pid_status_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize,
         } else {
             "R (running)"
         };
-        ((*task).tgid, ppid, state, task_comm(task))
+        ((*task).tgid, ppid, state, super::util::task_comm(task))
     };
-    let text = alloc::format!(
-        "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmLck:\t       0 kB\nRssAnon:\t       0 kB\n",
-        comm,
+    let text = super::util::format_status(&super::util::ProcStatusView {
+        name: &comm,
         state,
         tgid,
         pid,
-        ppid
-    );
+        ppid,
+        locked_kb: super::util::task_locked_vm_kb(task),
+        rss_anon_kb: super::util::task_rss_anon_kb(task),
+        security: super::util::task_status_security(task),
+    });
     super::util::copy_into(buf, &text)
 }
 
@@ -310,7 +303,7 @@ fn proc_pid_comm_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i
     if task.is_null() {
         return Err(ENOENT);
     }
-    let text = alloc::format!("{}\n", unsafe { task_comm(task) });
+    let text = alloc::format!("{}\n", super::util::task_comm(task));
     super::util::copy_into(buf, &text)
 }
 
@@ -330,7 +323,7 @@ fn proc_pid_cmdline_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize
     // argv copying, so avoid the old /proc/<pid>/cmdline bug where a reader
     // saw its own argv; expose the target comm as a stable NUL-terminated
     // fallback until remote mm reads are wired up.
-    let mut text = unsafe { task_comm(task) };
+    let mut text = super::util::task_comm(task);
     text.push('\0');
     super::util::copy_into(buf, &text)
 }

@@ -30,6 +30,7 @@ pub const RTM_NEWADDR: u16 = 20;
 pub const RTM_DELADDR: u16 = 21;
 pub const RTM_GETADDR: u16 = 22;
 pub const RTM_NEWROUTE: u16 = 24;
+pub const RTM_DELROUTE: u16 = 25;
 pub const RTM_GETROUTE: u16 = 26;
 pub const RTM_GETNEIGH: u16 = 30;
 pub const RTM_GETRULE: u16 = 34;
