@@ -5,9 +5,9 @@
 //!
 //! Linux uses arch code to patch alternatives/static calls, write ftrace and
 //! kprobe trampolines, relocate modules, unwind stacks, and JIT BPF programs.
-//! Lupos keeps generic trace/BPF/module state elsewhere; architecture-specific
-//! executable text patching and JIT codegen stay fail-closed here until those
-//! subsystems can allocate and protect executable kernel text.
+//! Lupos keeps generic trace/BPF/module state elsewhere. Runtime text users
+//! share the W^X-safe x86 text-poke backend; facilities without a production
+//! execution path (currently uprobes and the BPF JIT) remain fail-closed.
 
 use crate::include::uapi::errno::EOPNOTSUPP;
 
@@ -23,12 +23,23 @@ pub enum ArchInstrumentation {
     ModuleRelocation,
 }
 
-pub const fn arch_instrumentation_enabled(_kind: ArchInstrumentation) -> bool {
-    false
+pub const fn arch_instrumentation_enabled(kind: ArchInstrumentation) -> bool {
+    matches!(
+        kind,
+        ArchInstrumentation::Ftrace
+            | ArchInstrumentation::Kprobe
+            | ArchInstrumentation::JumpLabel
+            | ArchInstrumentation::StaticCall
+            | ArchInstrumentation::ModuleRelocation
+    )
 }
 
-pub const fn arch_instrumentation_errno(_kind: ArchInstrumentation) -> i32 {
-    EOPNOTSUPP
+pub const fn arch_instrumentation_errno(kind: ArchInstrumentation) -> i32 {
+    if arch_instrumentation_enabled(kind) {
+        0
+    } else {
+        EOPNOTSUPP
+    }
 }
 
 #[cfg(test)]
@@ -36,8 +47,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn executable_text_patchers_are_not_enabled_yet() {
-        assert!(!arch_instrumentation_enabled(ArchInstrumentation::Ftrace));
+    fn implemented_text_patchers_are_enabled_and_unimplemented_jit_is_closed() {
+        assert!(arch_instrumentation_enabled(ArchInstrumentation::Ftrace));
+        assert!(arch_instrumentation_enabled(ArchInstrumentation::Kprobe));
+        assert!(arch_instrumentation_enabled(ArchInstrumentation::JumpLabel));
+        assert!(arch_instrumentation_enabled(
+            ArchInstrumentation::StaticCall
+        ));
+        assert_eq!(arch_instrumentation_errno(ArchInstrumentation::Ftrace), 0);
+        assert!(!arch_instrumentation_enabled(ArchInstrumentation::BpfJit));
+        assert!(!arch_instrumentation_enabled(ArchInstrumentation::Rethook));
         assert_eq!(
             arch_instrumentation_errno(ArchInstrumentation::BpfJit),
             EOPNOTSUPP

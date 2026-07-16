@@ -24,6 +24,12 @@ pub struct ExportedSymbol {
     /// Absolute virtual address of the symbol in the kernel image.
     pub addr: usize,
     pub gpl_only: bool,
+    /// Optional genksyms/gendwarfksyms CRC from `__kcrctab`.
+    ///
+    /// Linux deliberately accepts an unversioned exporting symbol even when
+    /// the importing module carries a version record (and taints the kernel).
+    /// `None` preserves that distinction; a synthetic zero CRC would not.
+    pub crc: Option<u32>,
     pub owner: Option<String>,
 }
 
@@ -84,6 +90,15 @@ impl SymbolRegistry {
             .and_then(|index| self.entries.get(index))
             .map(|symbol| symbol.gpl_only)
     }
+
+    fn find_crc(&self, name: &str) -> Option<u32> {
+        self.lookup_index(name)
+            .ok()
+            .and_then(|index| self.by_name.get(index))
+            .map(|(_, entry_index)| *entry_index)
+            .and_then(|index| self.entries.get(index))
+            .and_then(|symbol| symbol.crc)
+    }
 }
 
 lazy_static! {
@@ -93,10 +108,24 @@ lazy_static! {
 /// Register one symbol in the export table.
 /// Call from `kernel_main` (or anywhere before modules are loaded).
 pub fn export_symbol(name: &str, addr: usize, gpl_only: bool) {
+    export_symbol_with_crc(name, addr, gpl_only, None);
+}
+
+/// Register one built-in export and its optional module-version CRC.
+///
+/// Mirrors the pairing of `__ksymtab` with `__kcrctab` in
+/// `vendor/linux/kernel/module/main.c::find_symbol`.
+pub fn export_symbol_with_crc(
+    name: &str,
+    addr: usize,
+    gpl_only: bool,
+    crc: Option<u32>,
+) {
     KSYMTAB.lock().push(ExportedSymbol {
         name: name.to_string(),
         addr,
         gpl_only,
+        crc,
         owner: None,
     });
 }
@@ -106,6 +135,17 @@ pub fn export_symbol(name: &str, addr: usize, gpl_only: bool) {
 /// Mirrors the module-owned `mod->syms` search path in
 /// `vendor/linux/kernel/module/main.c:find_symbol`.
 pub fn export_module_symbol(owner: &str, name: &str, addr: usize, gpl_only: bool) {
+    export_module_symbol_with_crc(owner, name, addr, gpl_only, None);
+}
+
+/// Register one module-owned export and its optional version CRC.
+pub fn export_module_symbol_with_crc(
+    owner: &str,
+    name: &str,
+    addr: usize,
+    gpl_only: bool,
+    crc: Option<u32>,
+) {
     let mut table = KSYMTAB.lock();
     if let Some(symbol) = table
         .entries
@@ -114,6 +154,7 @@ pub fn export_module_symbol(owner: &str, name: &str, addr: usize, gpl_only: bool
     {
         symbol.addr = addr;
         symbol.gpl_only = gpl_only;
+        symbol.crc = crc;
         return;
     }
 
@@ -121,6 +162,7 @@ pub fn export_module_symbol(owner: &str, name: &str, addr: usize, gpl_only: bool
         name: name.to_string(),
         addr,
         gpl_only,
+        crc,
         owner: Some(owner.to_string()),
     });
 }
@@ -142,6 +184,11 @@ pub fn find_symbol(name: &str) -> Option<usize> {
 /// Look up whether a symbol is GPL-only.  Returns `None` for unknown symbols.
 pub fn find_symbol_gpl_only(name: &str) -> Option<bool> {
     KSYMTAB.lock().find_gpl_only(name)
+}
+
+/// Return the exporting symbol's module-version CRC, if it has one.
+pub fn find_symbol_crc(name: &str) -> Option<u32> {
+    KSYMTAB.lock().find_crc(name)
 }
 
 /// Number of exported symbols (diagnostic).

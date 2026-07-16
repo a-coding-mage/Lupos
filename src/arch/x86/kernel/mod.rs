@@ -119,6 +119,7 @@ pub mod reboot;
 pub mod reboot_fixups_32;
 pub mod resource;
 pub mod rethook;
+pub mod retpoline;
 pub mod rtc;
 pub mod setup;
 pub mod setup_percpu;

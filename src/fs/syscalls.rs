@@ -2203,38 +2203,38 @@ pub unsafe fn sys_unlinkat(dirfd: i32, pathname: *const u8, flags: i32) -> i64 {
         Some(inode) => inode,
         None => return -(ENOENT as i64),
     };
-    let target = crate::fs::dcache::d_lookup(&parent, last);
-    if let Some(target) = &target
-        && target.flags.load(Ordering::Acquire) & crate::fs::types::DCACHE_MOUNTED != 0
-    {
+    let (target, target_inode) = match lookup_child(&parent, &dir, last) {
+        Ok(target) => target,
+        Err(errno) => return -(errno as i64),
+    };
+    if target.flags.load(Ordering::Acquire) & crate::fs::types::DCACHE_MOUNTED != 0 {
         return -(EBUSY as i64);
     }
-    let unbind_unix_path = target
-        .as_ref()
-        .and_then(|target| target.inode())
-        .filter(|inode| inode.kind == InodeKind::Socket)
-        .map(|_| {
-            let base = mount::path_for_dentry(&parent)
-                .unwrap_or_else(|| super::file::dentry_path(&parent));
-            join_path(&base, last)
-        });
-    let op = if flags & AT_REMOVEDIR as i32 != 0 {
-        dir.ops.rmdir
+    let unbind_unix_path = (target_inode.kind == InodeKind::Socket).then(|| {
+        let base =
+            mount::path_for_dentry(&parent).unwrap_or_else(|| super::file::dentry_path(&parent));
+        join_path(&base, last)
+    });
+    let result = if flags & AT_REMOVEDIR as i32 != 0 {
+        match dir.ops.rmdir {
+            Some(op) => op(&dir, last),
+            None => Err(ENOSYS),
+        }
     } else {
-        dir.ops.unlink
+        match dir.ops.unlink {
+            Some(op) => op(&dir, last, &target_inode),
+            None => Err(ENOSYS),
+        }
     };
-    match op {
-        Some(op) => match op(&dir, last) {
-            Ok(()) => {
-                super::dcache::d_drop(&parent, last);
-                if let Some(path) = unbind_unix_path {
-                    crate::net::socket::unbind_unix_path(&path);
-                }
-                0
+    match result {
+        Ok(()) => {
+            super::dcache::d_drop(&parent, last);
+            if let Some(path) = unbind_unix_path {
+                crate::net::socket::unbind_unix_path(&path);
             }
-            Err(errno) => -(errno as i64),
-        },
-        None => -(ENOSYS as i64),
+            0
+        }
+        Err(errno) => -(errno as i64),
     }
 }
 

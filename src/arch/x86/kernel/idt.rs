@@ -154,6 +154,9 @@ pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xF1;
 /// Reschedule IPI vector.
 pub const RESCHEDULE_VECTOR: u8 = 0xF2;
 
+/// Instruction-stream synchronization IPI used by live text patching.
+pub const TEXT_POKE_SYNC_VECTOR: u8 = 0xF3;
+
 // ── IDT gate descriptor ──────────────────────────────────────────────────────
 //
 // A 64-bit IDT gate is 16 bytes.  Bit layout:
@@ -543,6 +546,7 @@ isr_no_error!(isr_timer, TIMER_VECTOR);
 // Vector 0xF1, sent from `tlb::flush_tlb_others` to remote CPUs.
 isr_no_error!(isr_tlb_shootdown, TLB_SHOOTDOWN_VECTOR);
 isr_no_error!(isr_reschedule, RESCHEDULE_VECTOR);
+isr_no_error!(isr_text_poke_sync, TEXT_POKE_SYNC_VECTOR);
 
 // ── Exception handler helpers ────────────────────────────────────────────────
 
@@ -592,30 +596,44 @@ extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) {
     let vector = frame.vector as u8;
     let is_irq = matches!(
         vector,
-        IPI_PING_VECTOR | TIMER_VECTOR | TLB_SHOOTDOWN_VECTOR | RESCHEDULE_VECTOR
+        IPI_PING_VECTOR
+            | TIMER_VECTOR
+            | TLB_SHOOTDOWN_VECTOR
+            | RESCHEDULE_VECTOR
+            | TEXT_POKE_SYNC_VECTOR
     ) || legacy_irq_line(vector).is_some();
     if is_irq {
         crate::kernel::locking::preempt::__irq_enter_raw();
     }
     match vector {
+        VEC_DEBUG => on_debug(frame),
         VEC_NMI => {
             crate::arch::x86::kernel::nmi::exc_nmi(frame);
         }
         VEC_BREAKPOINT => on_breakpoint(frame),
         VEC_PAGE_FAULT => on_page_fault(frame),
         VEC_GENERAL_PROTECTION => on_general_protection(frame),
+        VEC_CONTROL_PROTECTION => on_control_protection(frame),
         VEC_DOUBLE_FAULT => on_double_fault(frame),
         VEC_MACHINE_CHECK => on_machine_check(frame),
         IPI_PING_VECTOR => on_ipi_ping(),
         TIMER_VECTOR => on_timer_interrupt(frame),
         TLB_SHOOTDOWN_VECTOR => on_tlb_shootdown_ipi(),
         RESCHEDULE_VECTOR => on_reschedule_ipi(),
+        TEXT_POKE_SYNC_VECTOR => on_text_poke_sync_ipi(),
         v if legacy_irq_line(v).is_some() => on_legacy_irq(v),
         v => on_generic(frame, v),
     }
     if is_irq {
         irq_exit_resched(frame);
     }
+}
+
+fn on_debug(frame: &mut ExceptionFrame) {
+    if crate::arch::x86::kernel::kprobes::core::kprobe_debug_handler(frame) {
+        return;
+    }
+    on_generic(frame, VEC_DEBUG);
 }
 
 /// LAPIC timer ISR — runs on every periodic tick (Milestone 6).
@@ -647,6 +665,10 @@ fn on_reschedule_ipi() {
     unsafe {
         crate::arch::x86::kernel::apic::eoi();
     }
+}
+
+fn on_text_poke_sync_ipi() {
+    crate::arch::x86::kernel::alternative::text_poke_sync_ipi_handler();
 }
 
 fn legacy_irq_line(vector: u8) -> Option<u8> {
@@ -729,6 +751,9 @@ fn should_irq_exit_resched(
 /// In a debugger-free kernel context we just log it.  A future milestone will
 /// hook this into a kernel debugger / kprobe infrastructure.
 fn on_breakpoint(frame: &ExceptionFrame) {
+    if crate::arch::x86::kernel::alternative::text_poke_bp_handler(frame) {
+        return;
+    }
     if crate::arch::x86::kernel::kprobes::core::kprobe_int3_handler(frame) {
         return;
     }
@@ -823,6 +848,39 @@ fn on_general_protection(frame: &ExceptionFrame) {
         }
     }
     panic!("General Protection Fault");
+}
+
+fn on_control_protection(frame: &ExceptionFrame) {
+    use crate::arch::x86::kernel::cet::{
+        CP_ENDBR, ControlProtectionAction, exc_control_protection_action, kernel_ibt_enabled,
+    };
+
+    let action = exc_control_protection_action(
+        is_user_exception(frame),
+        false,
+        kernel_ibt_enabled(),
+        true,
+        false,
+        frame.error_code,
+    );
+    match action {
+        ControlProtectionAction::ForceSigsegv { code } => panic!(
+            "user control-protection fault at rip={:#018x}, error={:#x}, si_code={code}",
+            frame.rip, frame.error_code
+        ),
+        ControlProtectionAction::KernelBug
+            if frame.error_code & crate::arch::x86::kernel::cet::CP_EC == CP_ENDBR =>
+        {
+            panic!(
+                "kernel IBT violation: missing ENDBR at rip={:#018x}, error={:#x}",
+                frame.rip, frame.error_code
+            )
+        }
+        action => panic!(
+            "unexpected control-protection fault at rip={:#018x}, error={:#x}, action={action:?}",
+            frame.rip, frame.error_code
+        ),
+    }
 }
 
 fn is_user_exception(frame: &ExceptionFrame) -> bool {
@@ -1226,6 +1284,10 @@ pub unsafe fn init() {
     idt.set(
         RESCHEDULE_VECTOR,
         IdtEntry::interrupt_gate(isr_reschedule, cs, 0),
+    );
+    idt.set(
+        TEXT_POKE_SYNC_VECTOR,
+        IdtEntry::interrupt_gate(isr_text_poke_sync, cs, 0),
     );
 
     // Load the IDT.

@@ -56,6 +56,7 @@ use crate::kernel::thread::ThreadStruct;
 /// Computed at compile time using `offset_of!` on the actual Rust struct, so
 /// it automatically stays in sync with the struct layout.
 pub const TASK_THREADSP: usize = offset_of!(TaskStruct, thread) + offset_of!(ThreadStruct, sp);
+pub const TASK_STACK_CANARY: usize = offset_of!(TaskStruct, stack_canary);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SwitchAttempt {
@@ -144,6 +145,9 @@ pub unsafe fn prepare_switch_to_task(next: *mut TaskStruct) {
     if next.is_null() {
         return;
     }
+    unsafe {
+        prepare_switch_stack_canaries(crate::kernel::sched::get_current(), next);
+    }
     let stack_top = unsafe { (*next).stack as u64 };
     if stack_top == 0 {
         return;
@@ -179,7 +183,42 @@ pub unsafe fn prepare_switch_to_task(next: *mut TaskStruct) {
 }
 
 #[cfg(test)]
-pub unsafe fn prepare_switch_to_task(_next: *mut TaskStruct) {}
+pub unsafe fn prepare_switch_to_task(next: *mut TaskStruct) {
+    if !next.is_null() {
+        unsafe {
+            prepare_switch_stack_canaries(core::ptr::null_mut(), next);
+        }
+    }
+}
+
+fn fresh_stack_canary() -> u64 {
+    let canary = crate::kernel::syscalls::next_random_u64() & 0xffff_ffff_ffff_ff00;
+    if canary == 0 {
+        0x6c75_706f_735f_7300
+    } else {
+        canary
+    }
+}
+
+unsafe fn prepare_switch_stack_canaries(prev: *mut TaskStruct, next: *mut TaskStruct) {
+    if !prev.is_null() && unsafe { (*prev).stack_canary } == 0 {
+        let current_guard = crate::arch::x86::kernel::setup_percpu::stack_chk_guard(
+            crate::kernel::sched::current_cpu() as usize,
+        );
+        unsafe {
+            (*prev).stack_canary = if current_guard == 0 {
+                fresh_stack_canary()
+            } else {
+                current_guard
+            };
+        }
+    }
+    if !next.is_null() && unsafe { (*next).stack_canary } == 0 {
+        unsafe {
+            (*next).stack_canary = fresh_stack_canary();
+        }
+    }
+}
 
 // ── Compile-time sanity check ────────────────────────────────────────────────
 
@@ -191,6 +230,7 @@ const _: () = {
         TASK_THREADSP < (1 << 31),
         "TASK_THREADSP too large for 32-bit displacement"
     );
+    assert!(TASK_STACK_CANARY < (1 << 31));
 };
 
 // ── __switch_to_asm ──────────────────────────────────────────────────────────
@@ -270,6 +310,14 @@ pub unsafe extern "C" fn __switch_to_asm(
         // RSI holds `next` (second argument, per SysV ABI).
         "mov rsp, [rsi + {sp}]",
 
+        // Linux entry_64.S updates the per-CPU guard after switching stacks
+        // and before entering compiled code. RBX is scratch here because the
+        // incoming value is restored from the new stack immediately below;
+        // RAX is caller-clobbered and becomes __switch_to's return value.
+        "mov rbx, [rsi + {stack_canary}]",
+        "lea rax, [rip + {percpu_base}]",
+        "mov qword ptr gs:[rax + {guard_offset}], rbx",
+
         // Restore callee-saved registers of `next` from its kernel stack.
         "pop r15",
         "pop r14",
@@ -286,6 +334,9 @@ pub unsafe extern "C" fn __switch_to_asm(
         "jmp {switch_to}",
 
         sp = const TASK_THREADSP,
+        stack_canary = const TASK_STACK_CANARY,
+        percpu_base = sym crate::arch::x86::kernel::setup_percpu::LINUX_PER_CPU_AREAS,
+        guard_offset = const crate::arch::x86::kernel::setup_percpu::STACK_CHK_GUARD_OFFSET,
         switch_to = sym __switch_to,
     );
 }
@@ -453,6 +504,7 @@ unsafe fn load_task_cr3(_task: *mut TaskStruct) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
 
     #[test]
     fn task_threadsp_is_nonzero() {
@@ -481,5 +533,16 @@ mod tests {
         let return_addr_slot = 1usize;
         let frame_size = (callee_saved_regs + return_addr_slot) * 8;
         assert_eq!(frame_size, 56);
+    }
+
+    #[test]
+    fn incoming_task_gets_a_stable_masked_stack_canary() {
+        let mut task: Box<TaskStruct> = Box::new(unsafe { core::mem::zeroed() });
+        unsafe { prepare_switch_to_task(&mut *task) };
+        let canary = task.stack_canary;
+        assert_ne!(canary, 0);
+        assert_eq!(canary & 0xff, 0);
+        unsafe { prepare_switch_to_task(&mut *task) };
+        assert_eq!(task.stack_canary, canary);
     }
 }

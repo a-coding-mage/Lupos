@@ -155,6 +155,7 @@ const SPLASH_ART_BYTES: &[u8] = include_bytes!("../../branding/splashart.png");
 const GRUB_INTERACTIVE_TIMEOUT_SECS: u8 = 2;
 const GRUB_TEST_BOOT_TIMEOUT_SECS: u8 = 3;
 const LUPOS_QEMU_ACCEL_ENV: &str = "LUPOS_QEMU_ACCEL";
+const LUPOS_QEMU_CPU_ENV: &str = "LUPOS_QEMU_CPU";
 const LUPOS_QEMU_ROOT_DISK_ENV: &str = "LUPOS_QEMU_ROOT_DISK";
 const LUPOS_QEMU_MACHINE_ENV: &str = "LUPOS_QEMU_MACHINE";
 /// Selects the QEMU `-audiodev` backend that the Intel HDA codec and the
@@ -436,6 +437,15 @@ const USERSPACE_SMOKE_SCRIPT: &str = concat!(
     "ls / | grep -qx etc\n",
     "ls -a . | grep -qx .bashrc\n",
     "echo userspace-smoke: ls ok\n",
+    // GnuPG uses this hard-link/stat/unlink dotlock protocol. A stale ext4
+    // inode object used to accumulate nlink forever and wedge pacman at
+    // "checking keys in keyring".
+    "dotlock_source=/tmp/lupos-dotlock-source\n",
+    "dotlock_target=/tmp/lupos-dotlock-target\n",
+    ": > \"$dotlock_source\"\n",
+    "for attempt in 1 2 3 4; do ln \"$dotlock_source\" \"$dotlock_target\"; test \"$(stat -c %h \"$dotlock_source\")\" = 2; rm -f \"$dotlock_target\"; test \"$(stat -c %h \"$dotlock_source\")\" = 1; done\n",
+    "rm -f \"$dotlock_source\"\n",
+    "echo userspace-smoke: dotlock-hardlink ok\n",
     "rm -f /var/lib/pacman/db.lck\n",
     "if pacman -Q lupos-pacman-smoke >/dev/null 2>&1; then pacman -Rns --noconfirm --hookdir /usr/share/lupos/empty-hooks lupos-pacman-smoke; fi\n",
     "rm -f /var/lib/pacman/db.lck\n",
@@ -464,6 +474,20 @@ const USERSPACE_SMOKE_SCRIPT: &str = concat!(
     "rm -f /var/lib/pacman/db.lck\n",
     "test ! -e /usr/bin/nano\n",
     "echo userspace-smoke: pacman-sync-install ok\n",
+    // Reproduce the reported desktop command against the bundled package
+    // payload and unchanged Arch snapshot database. This also proves libalpm
+    // resolves yyjson, the only required dependency absent from the base image.
+    "rm -f /var/lib/pacman/db.lck\n",
+    "if pacman -Q fastfetch >/dev/null 2>&1; then pacman -Rns --noconfirm --hookdir /usr/share/lupos/empty-hooks fastfetch; fi\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "pacman -S --noconfirm fastfetch\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "pacman -Q fastfetch yyjson >/dev/null\n",
+    "fastfetch --version | grep -q '^fastfetch 2.63.1'\n",
+    "pacman -Rns --noconfirm --hookdir /usr/share/lupos/empty-hooks fastfetch\n",
+    "rm -f /var/lib/pacman/db.lck\n",
+    "test ! -e /usr/bin/fastfetch\n",
+    "echo userspace-smoke: fastfetch-install ok\n",
     // Install a shared-library package too. gpm runs pacman's ldconfig path,
     // which caught the Arch static-PIE ldconfig crash reported under QEMU.
     "rm -f /var/lib/pacman/db.lck\n",
@@ -726,8 +750,10 @@ const LUPOS_OS_RELEASE: &str = concat!(
 /// `src/init/version.rs::UTS_RELEASE` so libkmod's
 /// `/lib/modules/$(uname -r)/` lookups land on the staged stubs.
 const LUPOS_KERNEL_RELEASE: &str = concat!(env!("CARGO_PKG_VERSION"), "-lupos");
-const LUPOS_MODULE_VERMAGIC: &str =
-    concat!(env!("CARGO_PKG_VERSION"), "-lupos SMP preempt mod_unload ");
+const LUPOS_MODULE_VERMAGIC: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "-lupos SMP preempt mod_unload modversions "
+);
 
 /// Module index filenames libkmod opens from `/lib/modules/<release>/`.
 /// Login payloads seed these as empty files so `kmod_new()` succeeds with a
@@ -791,7 +817,8 @@ pub const FAT_ISO_SUITE_BANNER: &str = "fat-iso-suite: vfat round-trip ok, iso96
 pub const NETWORKING_BANNER: &str = "networking: vendor-linux acceptance ok";
 pub const DEVICE_MODEL_BANNER: &str = "device-model: platform bus probe ok";
 pub const PCI_ACPI_BANNER: &str = "pci-acpi: q35 enumeration + dma + iommu ok";
-pub const MODULE_LOADER_BANNER: &str = "module: hello.ko load+init+exit ok";
+pub const MODULE_LOADER_BANNER: &str =
+    "module: unchanged 9pnet.ko metadata+trace-event+ftrace+kprobe+init+exit ok";
 pub const VIRTIO_TTY_FB_BANNER: &str =
     "phase9-m57: virtio module ABI register ok; n_tty echo ok; fbcon ok";
 pub const INPUT_HID_USB_BANNER: &str = "phase9-m58: xhci probe ok; hid kbd evdev event ok";
@@ -2498,11 +2525,12 @@ static DEPMOD_INDEX_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 const LINUX_DRIVER_MODULE_MANIFEST: &str = ".lupos-build-manifest";
 const LINUX_DRIVER_MODULE_EFFECTIVE_CONFIG: &str = ".lupos-effective-config";
 const LINUX_DRIVER_MODULE_BUILD_POLICY: &str = concat!(
-    "linux-x86_64-lupos-runtime-v3;modules-forced-per-staged-artifact;",
+    "linux-x86_64-lupos-runtime-v4;modules-forced-per-staged-artifact;",
     "vga-arb=y;aperture-helpers=y;video=y;screen-info=y;sysfb=n;",
     "virtio-pci-legacy=vendor-default-y;drm-fbdev=vendor-default-n;",
-    "retpoline=n;stackprotector=n;ftrace=n;ibt=n;kprobes=n;jump-label=n;orc=n;frame-pointer=y;",
-    "lupos-abi-layout-guard=v2;combined-selected-modpost=v1;vermagic-release=",
+    "retpoline=y;stackprotector=strong;ftrace=dynamic;ibt=y;kprobes=y;jump-label=y;orc=y;frame-pointer=n;",
+    "modversions=basic;printk-index=y;dynamic-debug=y;function-error-injection=y;",
+    "lupos-abi-layout-guard=v3;combined-selected-modpost=v1;vermagic-release=",
     env!("CARGO_PKG_VERSION"),
     "-lupos"
 );
@@ -2727,6 +2755,7 @@ const ARCH_PACMAN_XFER_HELPER_SCRIPT: &str = concat!(
     "\n",
     "alias=\n",
     "case \"$base\" in\n",
+    "    fastfetch-2.63.1-1-x86_64.pkg.tar.zst) alias=/p/fastfetch ;;\n",
     "    fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst) alias=/p/fontconfig ;;\n",
     "    freetype2-2.14.3-1-x86_64.pkg.tar.zst) alias=/p/freetype2 ;;\n",
     "    gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst) alias=/p/g ;;\n",
@@ -2755,6 +2784,7 @@ const ARCH_PACMAN_XFER_HELPER_SCRIPT: &str = concat!(
     "    xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst) alias=/p/xorg-xrdb ;;\n",
     "    xorgproto-2025.1-1-any.pkg.tar.zst) alias=/p/xorgproto ;;\n",
     "    xterm-410-1-x86_64.pkg.tar.zst) alias=/p/xterm ;;\n",
+    "    yyjson-0.12.0-1-x86_64.pkg.tar.zst) alias=/p/yyjson ;;\n",
     "esac\n",
     "\n",
     "if [ -n \"$alias\" ]; then\n",
@@ -2769,6 +2799,7 @@ const ARCH_OFFLINE_PACMAN_REPO_ARTIFACTS: &[&str] = &[
     "var/lib/lupos/pacman-repo/core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst",
     "var/lib/lupos/pacman-repo/core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst",
     "var/lib/lupos/pacman-repo/extra/os/x86_64/extra.db",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/fastfetch-2.63.1-1-x86_64.pkg.tar.zst",
     "var/lib/lupos/pacman-repo/extra/os/x86_64/fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst",
     "var/lib/lupos/pacman-repo/extra/os/x86_64/freetype2-2.14.3-1-x86_64.pkg.tar.zst",
     "var/lib/lupos/pacman-repo/extra/os/x86_64/libice-1.1.2-1-x86_64.pkg.tar.zst",
@@ -2795,6 +2826,7 @@ const ARCH_OFFLINE_PACMAN_REPO_ARTIFACTS: &[&str] = &[
     "var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst",
     "var/lib/lupos/pacman-repo/extra/os/x86_64/xorgproto-2025.1-1-any.pkg.tar.zst",
     "var/lib/lupos/pacman-repo/extra/os/x86_64/xterm-410-1-x86_64.pkg.tar.zst",
+    "var/lib/lupos/pacman-repo/extra/os/x86_64/yyjson-0.12.0-1-x86_64.pkg.tar.zst",
 ];
 const ARCH_PACMAN_SYNC_DBS: &[(&str, &str)] = &[
     (
@@ -2807,6 +2839,10 @@ const ARCH_PACMAN_SYNC_DBS: &[(&str, &str)] = &[
     ),
 ];
 const ARCH_PACMAN_PACKAGE_ALIASES: &[(&str, &str)] = &[
+    (
+        "p/fastfetch",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/fastfetch-2.63.1-1-x86_64.pkg.tar.zst",
+    ),
     (
         "p/fontconfig",
         "/var/lib/lupos/pacman-repo/extra/os/x86_64/fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst",
@@ -2918,6 +2954,10 @@ const ARCH_PACMAN_PACKAGE_ALIASES: &[(&str, &str)] = &[
     (
         "p/xterm",
         "/var/lib/lupos/pacman-repo/extra/os/x86_64/xterm-410-1-x86_64.pkg.tar.zst",
+    ),
+    (
+        "p/yyjson",
+        "/var/lib/lupos/pacman-repo/extra/os/x86_64/yyjson-0.12.0-1-x86_64.pkg.tar.zst",
     ),
 ];
 const STAGE_REAL_USERLAND_ENV: &str = "LUPOS_STAGE_REAL_USERLAND";
@@ -4698,6 +4738,10 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // its stable path now so later X clients read the cookie once it exists.
         "export XAUTHORITY=/run/lightdm/root/:0\n",
         "echo 'graphics-x11: probe begin'\n",
+        // Root used this exact shape in the reported terminal failure. `-n`
+        // keeps the gate deterministic while proving sudo can resolve and
+        // execute pacman from its configured secure path.
+        "if sudo -n pacman --version >/dev/null 2>&1; then echo 'graphics-x11: sudo-pacman ok'; else echo 'graphics-x11: sudo-pacman failed'; fi\n",
         "xorg_log=/var/log/Xorg.0.log\n",
         "direct_xorg_log=/tmp/lupos-Xorg.0.log\n",
         "direct_xorg_pid=\n",
@@ -8550,7 +8594,7 @@ fn vendor_linux_module_build_script_from_shell_paths(
          test -r {src}/drivers/gpu/drm/i915/display/intel_ddi.c\n\
          test -r {abi_probe_source}/lupos_abi_layout_probe.c\n\
          make -C {src} O={build} ARCH=x86_64 KERNELRELEASE={kernel_release} x86_64_defconfig >/tmp/lupos-linux-modules-x86_64-defconfig.log\n\
-         {src}/scripts/config --file {build}/.config -e MODULES -e SMP -e PREEMPT -d PREEMPT_LAZY -d PREEMPT_DYNAMIC -d CPU_MITIGATIONS -d X86_KERNEL_IBT -d STACKPROTECTOR -d FTRACE -d KPROBES -d JUMP_LABEL -d UNWINDER_ORC -e UNWINDER_FRAME_POINTER{symbol_args}\n\
+         {src}/scripts/config --file {build}/.config -e MODULES -e SMP -e PREEMPT -d PREEMPT_LAZY -d PREEMPT_DYNAMIC -e CPU_MITIGATIONS -e X86_KERNEL_IBT -e STACKPROTECTOR -e STACKPROTECTOR_STRONG -e FTRACE -e FUNCTION_TRACER -e KPROBES -e JUMP_LABEL -e UNWINDER_ORC -d UNWINDER_FRAME_POINTER -e MODVERSIONS -e GENKSYMS -e BASIC_MODVERSIONS -e PRINTK_INDEX -e DYNAMIC_DEBUG -e FUNCTION_ERROR_INJECTION{symbol_args}\n\
          make -C {src} O={build} ARCH=x86_64 KERNELRELEASE={kernel_release} olddefconfig >/tmp/lupos-linux-modules-olddefconfig.log\n\
          grep -qx 'CONFIG_VGA_ARB=y' {build}/.config\n\
          grep -qx 'CONFIG_APERTURE_HELPERS=y' {build}/.config\n\
@@ -8564,14 +8608,25 @@ fn vendor_linux_module_build_script_from_shell_paths(
          grep -qx 'CONFIG_SMP=y' {build}/.config\n\
          grep -qx 'CONFIG_PREEMPT=y' {build}/.config\n\
          grep -qx '# CONFIG_PREEMPT_DYNAMIC is not set' {build}/.config\n\
-         grep -qx '# CONFIG_CPU_MITIGATIONS is not set' {build}/.config\n\
-         grep -qx '# CONFIG_STACKPROTECTOR is not set' {build}/.config\n\
-         grep -qx '# CONFIG_FTRACE is not set' {build}/.config\n\
-         grep -qx '# CONFIG_KPROBES is not set' {build}/.config\n\
-         grep -qx '# CONFIG_JUMP_LABEL is not set' {build}/.config\n\
-         grep -qx '# CONFIG_X86_KERNEL_IBT is not set' {build}/.config\n\
-         grep -qx '# CONFIG_UNWINDER_ORC is not set' {build}/.config\n\
-         grep -qx 'CONFIG_UNWINDER_FRAME_POINTER=y' {build}/.config\n\
+         grep -qx 'CONFIG_CPU_MITIGATIONS=y' {build}/.config\n\
+         grep -qx 'CONFIG_MITIGATION_RETPOLINE=y' {build}/.config\n\
+         grep -qx 'CONFIG_MITIGATION_RETHUNK=y' {build}/.config\n\
+         grep -qx 'CONFIG_X86_KERNEL_IBT=y' {build}/.config\n\
+         grep -qx 'CONFIG_STACKPROTECTOR=y' {build}/.config\n\
+         grep -qx 'CONFIG_STACKPROTECTOR_STRONG=y' {build}/.config\n\
+         grep -qx 'CONFIG_FTRACE=y' {build}/.config\n\
+         grep -qx 'CONFIG_FUNCTION_TRACER=y' {build}/.config\n\
+         grep -qx 'CONFIG_DYNAMIC_FTRACE=y' {build}/.config\n\
+         grep -qx 'CONFIG_KPROBES=y' {build}/.config\n\
+         grep -qx 'CONFIG_JUMP_LABEL=y' {build}/.config\n\
+         grep -qx 'CONFIG_UNWINDER_ORC=y' {build}/.config\n\
+         grep -qx '# CONFIG_UNWINDER_FRAME_POINTER is not set' {build}/.config\n\
+         grep -qx 'CONFIG_MODVERSIONS=y' {build}/.config\n\
+         grep -qx 'CONFIG_GENKSYMS=y' {build}/.config\n\
+         grep -qx 'CONFIG_BASIC_MODVERSIONS=y' {build}/.config\n\
+         grep -qx 'CONFIG_PRINTK_INDEX=y' {build}/.config\n\
+         grep -qx 'CONFIG_DYNAMIC_DEBUG=y' {build}/.config\n\
+         grep -qx 'CONFIG_FUNCTION_ERROR_INJECTION=y' {build}/.config\n\
          make -C {src} O={build} ARCH=x86_64 KERNELRELEASE={kernel_release} prepare modules_prepare V=0 >/tmp/lupos-linux-modules-prepare.log\n\
          install -D {abi_probe_source}/Makefile {abi_probe_build}/Makefile\n\
          install -D {abi_probe_source}/lupos_abi_layout_probe.c {abi_probe_build}/lupos_abi_layout_probe.c\n\
@@ -9024,6 +9079,28 @@ fn modules_dep_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
     deps.into_bytes()
 }
 
+fn modules_dep_equivalent(left: &[u8], right: &[u8]) -> bool {
+    fn parse(bytes: &[u8]) -> Option<HashMap<String, HashSet<String>>> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let mut modules = HashMap::new();
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let (module, dependencies) = line.split_once(':')?;
+            let dependencies = dependencies
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<HashSet<_>>();
+            if modules.insert(module.to_owned(), dependencies).is_some() {
+                return None;
+            }
+        }
+        Some(modules)
+    }
+
+    parse(left)
+        .zip(parse(right))
+        .is_some_and(|(left, right)| left == right)
+}
+
 const VIDEO_MODULE_RUNTIME_LOADABILITY_WARNING: &str = "vendor-built video .ko artifacts are configured from Linux x86_64_defconfig with the explicit Lupos runtime contract and staged. \
 Runtime loadability is validated by cargo xtask run --ping-smoke, which must load the DRM support \
 stack plus bochs, i915, and virtio_gpu from vendor/linux artifacts and complete the QEMU user-net \
@@ -9101,7 +9178,11 @@ fn depmod_index_files(
 
         let generated_dep =
             fs::read(module_dir.join("modules.dep")).context("depmod did not emit modules.dep")?;
-        if generated_dep != expected_modules_dep {
+        // depmod is allowed to order a module's prerequisite list according
+        // to hash/traversal order. The dependency relation is the ABI-relevant
+        // value; require identical module keys and dependency sets while
+        // retaining Lupos's audited deterministic text ordering in the image.
+        if !modules_dep_equivalent(&generated_dep, expected_modules_dep) {
             bail!(
                 "audited modules.dep differs from depmod output for the exact staged artifacts\nexpected:\n{}generated:\n{}",
                 String::from_utf8_lossy(expected_modules_dep),
@@ -10086,9 +10167,9 @@ pub enum BootMode {
     /// host bridge over ECAM, exercises the DMA API and the passthrough
     /// IOMMU domain.  Acceptance gate for Milestone 55.
     PciAcpiTest,
-    /// Boot with `test-module-loader` feature.  Loads a tiny in-tree `.ko`
-    /// from initramfs, runs init/exit, verifies refcount.  Acceptance gate
-    /// for Milestone 56.
+    /// Boot with `test-module-loader` feature. Loads the unchanged vendor
+    /// 9pnet.ko, exercises its compiler/patch metadata, and runs init/exit.
+    /// Acceptance gate for Milestone 56.
     ModuleLoaderTest,
     /// Boot with `test-virtio-tty-fb` feature.  Exercises the VirtIO core,
     /// the n_tty line discipline, the 8250 uart_port, and the framebuffer
@@ -13279,6 +13360,16 @@ fn arch_offline_pacman_repo_manifest(stage: &Path) -> String {
         manifest.push('\t');
         manifest.push_str(&stable_bytes_hash_hex(&bytes));
         manifest.push('\n');
+        if rel.ends_with(".pkg.tar.zst") {
+            let signature_rel = format!("{rel}.sig");
+            let signature_bytes = read_stage_manifest_bytes(stage, &signature_rel);
+            manifest.push_str(&signature_rel);
+            manifest.push('\t');
+            manifest.push_str(&signature_bytes.len().to_string());
+            manifest.push('\t');
+            manifest.push_str(&stable_bytes_hash_hex(&signature_bytes));
+            manifest.push('\n');
+        }
     }
     for (rel, _) in ARCH_PACMAN_SYNC_DBS {
         let bytes = read_stage_manifest_bytes(stage, rel);
@@ -15100,6 +15191,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "Greeter requests session xfce",
         "Running command /usr/libexec/lupos-lightdm-session startxfce4",
         "graphics-x11: user-session ok",
+        "graphics-x11: sudo-pacman ok",
         "graphics-x11: tty-sysctl ok",
         "graphics-x11: timeout-sanity ok",
         "graphics-x11: curl dns ok",
@@ -15136,6 +15228,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: greeter missing",
         "graphics-x11: greeter-ready missing",
         "graphics-x11: user-session failed",
+        "graphics-x11: sudo-pacman failed",
         "graphics-x11: tty-sysctl missing",
         "graphics-x11: timeout-sanity unexpected-ok",
         "graphics-x11: timeout-sanity failed",
@@ -15214,8 +15307,10 @@ pub fn run_userspace_smoke_tests() -> Result<()> {
         "userspace-smoke: fs ok",
         "userspace-smoke: transcript ok",
         "userspace-smoke: ls ok",
+        "userspace-smoke: dotlock-hardlink ok",
         "userspace-smoke: pacman-install ok",
         "userspace-smoke: pacman-sync-install ok",
+        "userspace-smoke: fastfetch-install ok",
         "userspace-smoke: pacman-shared-lib-install ok",
         "userspace-smoke: pacman-common-set-install ok",
         "userspace-smoke: sleep ok",
@@ -15914,6 +16009,8 @@ fn validate_userland_stage() -> Result<()> {
         "etc/resolv.conf",
         "etc/pacman.conf",
         "etc/pacman.d/mirrorlist",
+        "etc/pacman.d/gnupg/pubring.kbx",
+        "etc/pacman.d/gnupg/trustdb.gpg",
         "etc/systemd/network/10-lupos-qemu.network",
         "var/lib/pacman/local/ALPM_DB_VERSION",
     ];
@@ -16054,18 +16151,42 @@ fn validate_arch_pacman_config(stage: &Path) -> Result<()> {
             helper_path.display()
         );
     }
+    if !body.lines().any(|line| {
+        line.split_once('#')
+            .map_or(line, |(active, _)| active)
+            .trim()
+            == "SigLevel    = Required DatabaseOptional"
+    }) {
+        bail!(
+            "staged pacman config must retain Arch's required package-signature policy: {}",
+            path.display()
+        );
+    }
     for repo in ["core", "extra"] {
-        if !pacman_repo_section_has_line(&body, repo, "SigLevel = Optional TrustAll") {
+        if pacman_repo_section_has_directive(&body, repo, "SigLevel") {
             bail!(
-                "staged pacman config must allow the generated offline {repo} repo without an initialized guest keyring: {}",
+                "staged pacman config must not override Arch's signature policy in [{repo}]: {}",
                 path.display()
             );
         }
     }
+    let legacy_marker = stage.join("etc/pacman.d/gnupg/pubring.gpg");
+    if !legacy_marker.is_file() {
+        bail!(
+            "staged pacman keyring must include libalpm's legacy marker: {}",
+            legacy_marker.display()
+        );
+    }
+    for rel in [
+        "etc/pacman.d/gnupg/pubring.kbx",
+        "etc/pacman.d/gnupg/trustdb.gpg",
+    ] {
+        validate_stage_artifact(stage, rel, false)?;
+    }
     Ok(())
 }
 
-fn pacman_repo_section_has_line(body: &str, repo: &str, expected: &str) -> bool {
+fn pacman_repo_section_has_directive(body: &str, repo: &str, directive: &str) -> bool {
     let mut in_repo = false;
     for line in body.lines() {
         let trimmed = line.trim();
@@ -16076,7 +16197,11 @@ fn pacman_repo_section_has_line(body: &str, repo: &str, expected: &str) -> bool 
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             in_repo = false;
         }
-        if in_repo && trimmed == expected {
+        if in_repo
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(name, _)| name.trim() == directive)
+        {
             return true;
         }
     }
@@ -16102,6 +16227,9 @@ fn validate_arch_pacman_mirrorlist(stage: &Path) -> Result<()> {
 fn validate_arch_pacman_offline_repo(stage: &Path) -> Result<()> {
     for rel in ARCH_OFFLINE_PACMAN_REPO_ARTIFACTS {
         validate_stage_artifact(stage, rel, true)?;
+        if rel.ends_with(".pkg.tar.zst") {
+            validate_stage_artifact(stage, &format!("{rel}.sig"), true)?;
+        }
     }
     Ok(())
 }
@@ -17800,6 +17928,20 @@ pub fn build_kernel(
 ) -> Result<PathBuf> {
     let root = repo_root()?;
     sync_kconfig()?;
+    let loader_test_module = if mode == BootMode::ModuleLoaderTest {
+        let config = fs::read_to_string(root.join(".config"))
+            .context("module-loader test requires a synchronized .config")?;
+        let selected = staged_module_specs_from_config_text(&config);
+        ensure_linux_driver_module_artifacts(&selected)?;
+        let module = selected
+            .iter()
+            .copied()
+            .find(|spec| spec.module_name == "9pnet")
+            .context("module-loader test requires CONFIG_NET_9P=m and the unchanged 9pnet.ko")?;
+        Some(linux_driver_module_artifact(module)?)
+    } else {
+        None
+    };
     let target_json = root.join(CUSTOM_TARGET);
     let release = release_build_enabled();
 
@@ -17820,6 +17962,9 @@ pub fn build_kernel(
     let features = feature_list(mode, exit_after_boot);
     if !features.is_empty() {
         command.arg("--features").arg(features.join(","));
+    }
+    if let Some(module) = loader_test_module {
+        command.env("LUPOS_TEST_VENDOR_MODULE", module);
     }
 
     run_command(&mut command, "kernel build")?;
@@ -18245,6 +18390,7 @@ fn add_qemu_iso_base_args(command: &mut Command, iso_path: &Path, display: &str,
         .arg("-serial")
         .arg(serial);
     add_qemu_default_devices(command);
+    add_qemu_cpu_if_requested(command);
     add_qemu_root_disk_if_requested(command);
     add_qemu_gdb_args(command);
 }
@@ -18306,6 +18452,14 @@ fn qemu_memory_arg(default: &str) -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+fn add_qemu_cpu_if_requested(command: &mut Command) {
+    if let Ok(cpu) = env::var(LUPOS_QEMU_CPU_ENV)
+        && !cpu.trim().is_empty()
+    {
+        command.arg("-cpu").arg(cpu.trim());
+    }
 }
 
 fn qemu_gdb_enabled() -> bool {
@@ -25692,31 +25846,40 @@ kernel/drivers/i2c/i2c-core.ko\n"
         assert!(script.contains("CONFIG_VIDEO=y"));
         assert!(script.contains("CONFIG_SCREEN_INFO=y"));
         assert!(script.contains("! grep -qx 'CONFIG_SYSFB=y'"));
-        // The vendor objects must use the compiler/runtime facilities the
-        // running Lupos kernel actually implements.  Starting from Linux's
-        // x86_64 defconfig still selects the generic driver closure, while
-        // these explicit settings prevent Kbuild from emitting metadata for
-        // unavailable mitigation, tracing, probing, and ORC runtimes.
-        for disabled in [
+        // Vendor objects now retain Linux's normal x86 compiler and runtime
+        // metadata. Lupos consumes it during module formation rather than
+        // weakening Kbuild or rewriting a produced `.ko`.
+        for enabled in [
             "CPU_MITIGATIONS",
             "X86_KERNEL_IBT",
             "STACKPROTECTOR",
+            "STACKPROTECTOR_STRONG",
             "FTRACE",
+            "FUNCTION_TRACER",
             "KPROBES",
             "JUMP_LABEL",
             "UNWINDER_ORC",
+            "MODVERSIONS",
+            "GENKSYMS",
+            "BASIC_MODVERSIONS",
+            "PRINTK_INDEX",
+            "DYNAMIC_DEBUG",
+            "FUNCTION_ERROR_INJECTION",
         ] {
-            assert!(script.contains(&format!("-d {disabled}")));
-            assert!(script.contains(&format!("# CONFIG_{disabled} is not set")));
+            assert!(script.contains(&format!("-e {enabled}")));
+            assert!(script.contains(&format!("CONFIG_{enabled}=y")));
         }
+        assert!(script.contains("CONFIG_MITIGATION_RETPOLINE=y"));
+        assert!(script.contains("CONFIG_MITIGATION_RETHUNK=y"));
+        assert!(script.contains("CONFIG_DYNAMIC_FTRACE=y"));
         assert!(script.contains("-e SMP"));
         assert!(script.contains("CONFIG_SMP=y"));
         assert!(script.contains("-e PREEMPT"));
         assert!(script.contains("CONFIG_PREEMPT=y"));
         assert!(script.contains("-d PREEMPT_DYNAMIC"));
         assert!(script.contains("# CONFIG_PREEMPT_DYNAMIC is not set"));
-        assert!(script.contains("-e UNWINDER_FRAME_POINTER"));
-        assert!(script.contains("CONFIG_UNWINDER_FRAME_POINTER=y"));
+        assert!(script.contains("-d UNWINDER_FRAME_POINTER"));
+        assert!(script.contains("# CONFIG_UNWINDER_FRAME_POINTER is not set"));
     }
 
     #[test]
@@ -27910,9 +28073,12 @@ CONFIG_MODULES=y
             "pacman_config_ready",
             "pacman_offline_repo_ready",
             "stage_arch_pacman_package_cache",
+            "stage_arch_pacman_keyring",
             "normalize_arch_pacman",
             "DisableSandbox",
-            "SigLevel = Optional TrustAll",
+            "archlinux-ultimate",
+            "pubring.kbx",
+            "trustdb.gpg",
             "XferCommand = /usr/lib/lupos/pacman-xfer %u %o",
             "usr/lib/lupos/pacman-xfer",
             "ARCH_OFFLINE_REPO_PACKAGE_ALIASES",
@@ -29171,9 +29337,26 @@ CONFIG_MODULES=y
             "pacman config must not enable DownloadUser until uid switching works in the guest"
         );
         assert!(
-            pacman_conf.contains("SigLevel = Optional TrustAll"),
-            "pacman config must allow the generated offline repos without a guest keyring"
+            pacman_conf
+                .lines()
+                .any(|line| line.trim() == "SigLevel    = Required DatabaseOptional"),
+            "pacman config must retain Arch's package-signature policy"
         );
+        assert!(
+            !["core", "extra"]
+                .iter()
+                .any(|repo| pacman_repo_section_has_directive(pacman_conf, repo, "SigLevel")),
+            "offline repositories must not override Arch's package-signature policy"
+        );
+        for rel in [
+            "etc/pacman.d/gnupg/pubring.kbx",
+            "etc/pacman.d/gnupg/trustdb.gpg",
+        ] {
+            assert!(
+                find_initramfs_entry(&files, rel).is_some(),
+                "initialized Arch package keyring entry {rel} must be staged"
+            );
+        }
         assert!(
             pacman_conf.contains(ARCH_PACMAN_XFER_COMMAND),
             "pacman config must use the Lupos transfer helper"
@@ -29225,6 +29408,43 @@ CONFIG_MODULES=y
                 initramfs_file_is_regular(entry),
                 "{rel} must be a regular file in the boot payload"
             );
+            if rel.ends_with(".pkg.tar.zst") {
+                let signature_rel = format!("{rel}.sig");
+                let signature_entry =
+                    find_initramfs_entry(&files, &signature_rel).unwrap_or_else(|| {
+                        panic!("{signature_rel} must be staged for offline signature verification")
+                    });
+                assert!(
+                    initramfs_file_is_regular(signature_entry),
+                    "{signature_rel} must be a regular vendor signature"
+                );
+            }
+        }
+        // Repository databases are vendor inputs. When the pinned download
+        // cache is available, require exact byte identity all the way into the
+        // boot payload; no filtering or repacking is permitted.
+        let root = repo_root().expect("repo root");
+        for (repo, expected_sha) in [
+            (
+                "core",
+                "45037c1a6abb70a08cd225f1f2e98f6f1a0140117eba54a24843b581bf884a56",
+            ),
+            (
+                "extra",
+                "2c4b923190d67f414ee981a020ca00a9f46c0e4ac44efa33fc067e2369e0387d",
+            ),
+        ] {
+            let cached = root.join(format!(
+                "target/userland/cache/arch-repo/2026/06/01/{repo}/os/x86_64/{repo}.db"
+            ));
+            if let Ok(upstream_bytes) = fs::read(&cached) {
+                let payload_path = format!("var/lib/lupos/pacman-repo/{repo}/os/x86_64/{repo}.db");
+                assert_eq!(
+                    initramfs_file_bytes(&files, &payload_path),
+                    Some(upstream_bytes.as_slice()),
+                    "{repo}.db must be copied byte-for-byte from pinned Arch artifact {expected_sha}"
+                );
+            }
         }
         for (rel, target) in ARCH_PACMAN_PACKAGE_ALIASES {
             let actual = find_initramfs_symlink_target(&files, rel)
@@ -30760,15 +30980,23 @@ CONFIG_MODULES=y
             "pacman_config_ready",
             "pacman_offline_repo_ready",
             "stage_arch_pacman_package_cache",
+            "stage_arch_pacman_keyring",
             "normalize_arch_pacman",
             "DisableSandbox",
-            "SigLevel = Optional TrustAll",
+            "archlinux-ultimate",
+            "pubring.kbx",
+            "trustdb.gpg",
             "XferCommand = /usr/lib/lupos/pacman-xfer %u %o",
             "usr/lib/lupos/pacman-xfer",
             "ARCH_OFFLINE_REPO_PACKAGE_ALIASES",
             "stage_arch_pacman_package_aliases",
             "alias=/p/v",
             "alias=/p/xterm",
+            "alias=/p/fastfetch",
+            "alias=/p/yyjson",
+            "45037c1a6abb70a08cd225f1f2e98f6f1a0140117eba54a24843b581bf884a56",
+            "2c4b923190d67f414ee981a020ca00a9f46c0e4ac44efa33fc067e2369e0387d",
+            "vendor artifacts: never filter their metadata or rebuild their tarballs",
             "ARCH_SYSTEMD_HOOK_SCRIPT=\"usr/share/libalpm/scripts/systemd-hook\"",
             "systemd_hook_ready",
             "skip_live_service_hook()",
@@ -30779,6 +31007,8 @@ CONFIG_MODULES=y
             "fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst",
             "xorg-xinit-1.4.4-1-x86_64.pkg.tar.zst",
             "xterm-410-1-x86_64.pkg.tar.zst",
+            "fastfetch-2.63.1-1-x86_64.pkg.tar.zst",
+            "yyjson-0.12.0-1-x86_64.pkg.tar.zst",
             "pam_systemd.so",
             "etc/systemd/network/10-lupos-qemu.network",
             "/run/systemd/resolve/resolv.conf",
@@ -30795,6 +31025,15 @@ CONFIG_MODULES=y
             assert!(
                 !script.contains(forbidden),
                 "Arch userland script must not retain {forbidden}"
+            );
+        }
+        for forbidden in [
+            "strip_arch_repo_desc_for_guest",
+            "stage_arch_minimal_repo_db",
+        ] {
+            assert!(
+                !script.contains(forbidden),
+                "Arch vendor repository databases must not be rewritten via {forbidden}"
             );
         }
     }
@@ -30852,6 +31091,7 @@ CONFIG_MODULES=y
             "xorg-xinit",
             "xorg-twm",
             "xterm",
+            "sudo",
             "lightdm",
             "lightdm-gtk-greeter",
             "xfce4-session",
@@ -30861,6 +31101,7 @@ CONFIG_MODULES=y
             "xfce4-settings",
             "xfce4-terminal",
             "usr/bin/Xorg",
+            "usr/bin/sudo",
             "usr/bin/startx",
             "usr/bin/lightdm",
             "usr/bin/lightdm-gtk-greeter",

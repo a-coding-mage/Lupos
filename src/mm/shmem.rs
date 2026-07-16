@@ -1347,7 +1347,7 @@ pub mod tmpfs_vfs {
             return Err(EPERM);
         }
         let parent_inode = parent.inode().ok_or(EINVAL)?;
-        simple_unlink(&parent_inode, leaf)?;
+        simple_unlink(&parent_inode, leaf, &inode)?;
         d_drop(&parent, leaf);
         Ok(())
     }

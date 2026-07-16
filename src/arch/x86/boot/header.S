@@ -183,6 +183,7 @@ global linux32_start
 global linux64_start
 extern kernel_main                  ; defined in Rust (src/main.rs)
 extern boot_marker                  ; Rust helper: early 64-bit boot trace
+extern __stack_chk_guard            ; LLVM global stack-protector guard
 
 bits 32
 _start:
@@ -543,6 +544,20 @@ reload_segments_common:
 
     ; Reload the stack pointer in 64-bit mode (same physical address).
     mov rsp, PHYS(stack_top)
+
+    ; Initialize LLVM's bare-metal global stack canary before the first call
+    ; into Rust.  Keep the low byte zero like Linux so unterminated string
+    ; overwrites encounter a terminator before exposing the remaining bytes.
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    xor rax, rsp
+    xor rax, [PHYS(saved_boot_params_ptr)]
+    and rax, -256
+    jnz .stack_guard_ready
+    mov rax, 0x6c75706f735f7300
+.stack_guard_ready:
+    mov [rel __stack_chk_guard], rax
 
     ; =====================================================================
     ; Call kernel_main using the System V AMD64 ABI

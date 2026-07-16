@@ -576,7 +576,7 @@ pub fn simple_lookup(dir: &InodeRef, name: &str) -> Result<InodeRef, i32> {
 }
 
 /// `simple_unlink` — remove a non-directory entry from a `RamDir`.
-pub fn simple_unlink(dir: &InodeRef, name: &str) -> Result<(), i32> {
+pub fn simple_unlink(dir: &InodeRef, name: &str, _target: &InodeRef) -> Result<(), i32> {
     let map = match &dir.private {
         InodePrivate::RamDir(m) => m,
         _ => return Err(EINVAL),

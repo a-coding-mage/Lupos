@@ -21,6 +21,7 @@ pub mod interp;
 pub mod link_iter;
 pub mod linux_sources;
 pub mod maps;
+pub mod module_raw_tracepoints;
 pub mod preload;
 pub mod prog_iter;
 pub mod relo_core;

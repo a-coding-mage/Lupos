@@ -13,6 +13,8 @@ use alloc::vec::Vec;
 
 use spin::Mutex;
 
+pub use crate::kernel::bpf::module_raw_tracepoints::RawTracepointMap;
+
 #[derive(Clone, Copy, Debug)]
 pub struct BpfTraceEvent {
     pub prog_id: u32,
@@ -40,6 +42,21 @@ pub fn record(ev: BpfTraceEvent) {
 
 pub fn drain() -> Vec<BpfTraceEvent> {
     core::mem::take(&mut *EVENTS.lock())
+}
+
+/// `bpf_get_raw_tracepoint()` module fallback.  Built-in maps are not yet
+/// linker-collected by Lupos, while loaded-module maps use the same ownership
+/// and pinning rules as vendor Linux.
+///
+/// # Safety
+/// The returned map must be paired with `put_raw_tracepoint()` before module
+/// teardown.
+pub unsafe fn get_raw_tracepoint(name: &str) -> Option<RawTracepointMap> {
+    unsafe { crate::kernel::bpf::module_raw_tracepoints::get(name) }
+}
+
+pub fn put_raw_tracepoint(map: RawTracepointMap) {
+    crate::kernel::bpf::module_raw_tracepoints::put(map);
 }
 
 #[cfg(test)]

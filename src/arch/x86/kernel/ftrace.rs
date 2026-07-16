@@ -17,6 +17,7 @@
 extern crate alloc;
 
 use crate::include::uapi::errno::{EFAULT, EINVAL};
+use crate::kernel::module::{export_symbol, find_symbol};
 
 use super::alternative::{CALL_INSN_OPCODE, JMP32_INSN_OPCODE, x86_nop};
 use super::jump_label::text_gen_insn;
@@ -27,6 +28,104 @@ pub const MCOUNT_INSN_SIZE: usize = 5;
 /// Linux `MCOUNT_ADDR` — the address ftrace nominally calls when the
 /// kernel is built with `-pg`. Patch-site recognition uses this.
 pub const MCOUNT_ADDR_DEFAULT: u64 = 0xFFFF_FFFF_8000_0000;
+
+// `__fentry__` is the relocation target emitted into every vendor object.
+// Module formation rewrites those calls before the module can execute.  The
+// no-op body is still a valid fallback during formation and is also the exact
+// symbol address used to verify the original call instruction.
+//
+// `lupos_ftrace_caller` preserves the complete integer/flags state because an
+// fentry call occurs before the compiler prologue.  The return address is the
+// instrumented IP plus five; its caller's return address is the next stack
+// word.  The Rust dispatcher only runs after all state has been saved.
+core::arch::global_asm!(
+    ".pushsection .text.lupos.ftrace, \"ax\"",
+    ".balign 16",
+    ".global __fentry__",
+    ".type __fentry__,@function",
+    "__fentry__:",
+    "endbr64",
+    "ret",
+    ".size __fentry__,.-__fentry__",
+    ".balign 16",
+    ".global lupos_ftrace_caller",
+    ".type lupos_ftrace_caller,@function",
+    "lupos_ftrace_caller:",
+    "endbr64",
+    "pushfq",
+    "push rax",
+    "push rcx",
+    "push rdx",
+    "push rbx",
+    "push rbp",
+    "push rsi",
+    "push rdi",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "sub rsp, 8",
+    "mov rdi, [rsp + 136]",
+    "sub rdi, 5",
+    "mov rsi, [rsp + 144]",
+    // Register-aware ftrace callbacks receive the instrumented function's
+    // entry stack pointer and the original BP.  At fentry time that stack
+    // pointer addresses the caller return address, which is exactly the
+    // initial state expected by the module ORC unwinder.
+    "lea rdx, [rsp + 144]",
+    "mov rcx, [rsp + 88]",
+    "call lupos_ftrace_dispatch",
+    "add rsp, 8",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rdi",
+    "pop rsi",
+    "pop rbp",
+    "pop rbx",
+    "pop rdx",
+    "pop rcx",
+    "pop rax",
+    "popfq",
+    "ret",
+    ".size lupos_ftrace_caller,.-lupos_ftrace_caller",
+    ".popsection",
+);
+
+unsafe extern "C" {
+    pub fn __fentry__();
+    pub fn lupos_ftrace_caller();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn lupos_ftrace_dispatch(ip: u64, parent_ip: u64, sp: u64, bp: u64) {
+    crate::kernel::trace::ftrace::ftrace_function_trace_call_with_regs(
+        ip, parent_ip, sp, bp,
+    );
+}
+
+pub fn mcount_addr() -> u64 {
+    __fentry__ as usize as u64
+}
+
+pub fn ftrace_caller_addr() -> u64 {
+    lupos_ftrace_caller as usize as u64
+}
+
+pub fn register_module_exports() {
+    if find_symbol("__fentry__").is_none() {
+        export_symbol("__fentry__", __fentry__ as usize, false);
+    }
+}
 
 /// `ftrace_nop_replace()` — 5-byte NOP.
 pub fn ftrace_nop_replace() -> alloc::vec::Vec<u8> {
@@ -121,6 +220,59 @@ pub fn ftrace_make_call<M: KernelMem, P: FtraceTextPoke>(
     ftrace_modify_code_direct(mem, poker, ip, &old, &new, late)
 }
 
+struct ProductionText;
+
+impl KernelMem for ProductionText {
+    fn read(&self, ip: u64, len: usize) -> Result<alloc::vec::Vec<u8>, i32> {
+        super::alternative::text_poke_read(ip as usize, len)
+    }
+}
+
+impl FtraceTextPoke for ProductionText {
+    fn poke(&self, ip: u64, bytes: &[u8], late: bool) -> Result<(), i32> {
+        if late {
+            super::alternative::text_poke_live(ip as usize, bytes)
+        } else {
+            super::alternative::text_poke_early(ip as usize, bytes)
+        }
+    }
+}
+
+fn rel32_reachable(from: u64, to: u64) -> bool {
+    let next = from.wrapping_add(MCOUNT_INSN_SIZE as u64);
+    let displacement = to.wrapping_sub(next) as u32 as i32;
+    next.wrapping_add_signed(displacement as i64) == to
+}
+
+/// Convert the compiler-emitted `CALL __fentry__` into the initial disabled
+/// NOP form while module text is still writable.
+pub fn prepare_module_callsite(ip: usize, trace_active: bool) -> Result<bool, i32> {
+    let text = ProductionText;
+    ftrace_make_nop(&text, &text, ip as u64, mcount_addr(), mcount_addr(), false)?;
+    if trace_active {
+        if !rel32_reachable(ip as u64, ftrace_caller_addr()) {
+            return Err(EINVAL);
+        }
+        ftrace_make_call(&text, &text, ip as u64, ftrace_caller_addr(), false)?;
+    }
+    Ok(trace_active)
+}
+
+/// Switch a published callsite between NOP and the Lupos ftrace trampoline.
+pub fn set_module_callsite(ip: usize, enabled: bool) -> Result<(), i32> {
+    let text = ProductionText;
+    if enabled {
+        if !rel32_reachable(ip as u64, ftrace_caller_addr()) {
+            return Err(EINVAL);
+        }
+        ftrace_make_call(&text, &text, ip as u64, ftrace_caller_addr(), true)
+    } else {
+        let old = ftrace_call_replace(ip as u64, ftrace_caller_addr(), false);
+        let new = ftrace_nop_replace();
+        ftrace_modify_code_direct(&text, &text, ip as u64, &old, &new, true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +340,24 @@ mod tests {
     fn call_replace_with_jmp_emits_e9_opcode() {
         let bytes = ftrace_call_replace(0x1000, 0x2000, true);
         assert_eq!(bytes[0], JMP32_INSN_OPCODE);
+    }
+
+    #[test]
+    fn rel32_reachability_accepts_the_canonical_address_wrap() {
+        // Lupos follows Linux's top-of-address-space module window while the
+        // boot image also has a low executable alias. x86 adds rel32 modulo
+        // 2^64, so this is a valid positive displacement across address zero.
+        let module_site = 0xffff_ffff_c000_6014;
+        let low_kernel_target = 0x00b6_5260;
+        assert!(rel32_reachable(module_site, low_kernel_target));
+        let call = ftrace_call_replace(module_site, low_kernel_target, false);
+        let displacement = i32::from_le_bytes(call[1..5].try_into().unwrap());
+        assert_eq!(
+            module_site
+                .wrapping_add(MCOUNT_INSN_SIZE as u64)
+                .wrapping_add_signed(displacement as i64),
+            low_kernel_target
+        );
     }
 
     #[test]

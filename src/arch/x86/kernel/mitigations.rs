@@ -4,9 +4,8 @@
 //! x86 runtime patching and hardening feature gates.
 //!
 //! Linux wires CPU alternatives, call thunks, CET/IBT/SHSTK, CFI, and boot-time
-//! validation through this arch area. Lupos currently boots without runtime text
-//! patching; hardening features are explicit policies so callers can fail closed
-//! instead of assuming patched instructions exist.
+//! validation through this arch area. Report the actual selected runtime state;
+//! metadata support is not conflated with enabling a hardware mitigation.
 
 use crate::include::uapi::errno::EOPNOTSUPP;
 
@@ -19,12 +18,22 @@ pub enum MitigationFeature {
     Cfi,
 }
 
-pub const fn mitigation_enabled(_feature: MitigationFeature) -> bool {
-    false
+pub fn mitigation_enabled(feature: MitigationFeature) -> bool {
+    match feature {
+        MitigationFeature::Alternatives => true,
+        MitigationFeature::CetIbt => crate::arch::x86::kernel::cet::kernel_ibt_enabled(),
+        MitigationFeature::CallThunks | MitigationFeature::ShadowStack | MitigationFeature::Cfi => {
+            false
+        }
+    }
 }
 
-pub const fn mitigation_errno(_feature: MitigationFeature) -> i32 {
-    EOPNOTSUPP
+pub fn mitigation_errno(feature: MitigationFeature) -> i32 {
+    if mitigation_enabled(feature) {
+        0
+    } else {
+        EOPNOTSUPP
+    }
 }
 
 #[cfg(test)]
@@ -32,8 +41,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_patch_mitigations_are_explicitly_disabled() {
-        assert!(!mitigation_enabled(MitigationFeature::Alternatives));
+    fn runtime_patch_mitigations_report_the_selected_state() {
+        assert!(mitigation_enabled(MitigationFeature::Alternatives));
+        assert_eq!(mitigation_errno(MitigationFeature::Alternatives), 0);
         assert_eq!(mitigation_errno(MitigationFeature::ShadowStack), EOPNOTSUPP);
     }
 }

@@ -1,20 +1,76 @@
 //! linux-parity: complete
 //! linux-source: vendor/linux/arch/x86/kernel/callthunks.c
 //! test-origin: linux:vendor/linux/arch/x86/kernel/callthunks.c
-//! Call-depth thunk patching model.
+//! Call-depth thunk patching primitives.
 //!
 //! Ports / mirrors:
 //! - vendor/linux/arch/x86/kernel/callthunks.c
 //!
-//! Linux patches direct calls so they target per-function call-depth thunks.
-//! This module ports the address filtering, rel32 encoding, and accounting
-//! decisions while leaving executable text mutation to `alternative.rs`.
+//! Linux patches direct calls so they target a ten-byte accounting sequence
+//! in the destination function's compiler-provided padding.  These helpers
+//! build and validate the exact x86 bytes; module ownership and executable
+//! text mutation remain in `module.rs`/`alternative.rs`.
 
 use crate::arch::x86::kernel::alternative::{CALL_INSN_OPCODE, MAX_PATCH_LEN};
 use crate::include::uapi::errno::EINVAL;
 
 pub const SKL_CALL_THUNK_TEMPLATE_MAX: usize = MAX_PATCH_LEN;
 pub const CALL_INSN_SIZE: usize = 5;
+pub const SKL_CALL_THUNK_SIZE: usize = 10;
+pub const RET_DEPTH_SHIFT: u32 = 5;
+pub const RET_DEPTH_INIT: u64 = 0x8000_0000_0000_0000;
+pub const RET_DEPTH_CREDIT: u64 = u64::MAX;
+
+/// Assemble Linux's `INCREMENT_CALL_DEPTH` template:
+/// `sarq $5, %gs:__x86_call_depth`.
+///
+/// Kernel per-CPU symbols are addressed through a sign-extended absolute
+/// disp32.  Reject an address which cannot be represented by that ABI instead
+/// of silently truncating it.
+pub fn skl_call_thunk_template(percpu_symbol: u64) -> Result<[u8; SKL_CALL_THUNK_SIZE], i32> {
+    let displacement = percpu_symbol as u32;
+    if (displacement as i32 as i64 as u64) != percpu_symbol {
+        return Err(EINVAL);
+    }
+    let mut bytes = [0u8; SKL_CALL_THUNK_SIZE];
+    bytes[..5].copy_from_slice(&[0x65, 0x48, 0xc1, 0x3c, 0x25]);
+    bytes[5..9].copy_from_slice(&displacement.to_le_bytes());
+    bytes[9] = RET_DEPTH_SHIFT as u8;
+    Ok(bytes)
+}
+
+/// Validate and populate one function-padding area.  `Ok(false)` means the
+/// identical thunk was already installed; Linux treats that as idempotent.
+pub fn install_call_thunk_padding(
+    padding: &mut [u8],
+    template: &[u8; SKL_CALL_THUNK_SIZE],
+) -> Result<bool, i32> {
+    if padding.len() != SKL_CALL_THUNK_SIZE {
+        return Err(EINVAL);
+    }
+    if padding == template {
+        return Ok(false);
+    }
+    if !padding.iter().all(|byte| *byte == 0x90) {
+        return Err(EINVAL);
+    }
+    padding.copy_from_slice(template);
+    Ok(true)
+}
+
+pub const fn account_call(depth: u64) -> u64 {
+    ((depth as i64) >> RET_DEPTH_SHIFT) as u64
+}
+
+/// Returns `(new_depth, needs_rsb_stuffing)` for the return-thunk hot path.
+pub const fn account_return(depth: u64) -> (u64, bool) {
+    let shifted = depth << RET_DEPTH_SHIFT;
+    if shifted == 0 {
+        (RET_DEPTH_CREDIT, true)
+    } else {
+        (shifted, false)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CoreText {
@@ -181,5 +237,31 @@ mod tests {
             x86_call_depth_emit_accounting(true, true, &template, &mut out),
             Ok(0)
         );
+    }
+
+    #[test]
+    fn call_depth_template_matches_vendor_encoding() {
+        assert_eq!(
+            skl_call_thunk_template(0xffff_ffff_8123_4560).unwrap(),
+            [0x65, 0x48, 0xc1, 0x3c, 0x25, 0x60, 0x45, 0x23, 0x81, 0x05]
+        );
+        assert_eq!(skl_call_thunk_template(0x1_0000_0000), Err(EINVAL));
+    }
+
+    #[test]
+    fn padding_install_is_validated_and_idempotent() {
+        let template = skl_call_thunk_template(0x1234).unwrap();
+        let mut padding = [0x90; SKL_CALL_THUNK_SIZE];
+        assert_eq!(install_call_thunk_padding(&mut padding, &template), Ok(true));
+        assert_eq!(install_call_thunk_padding(&mut padding, &template), Ok(false));
+        padding[0] = 0xcc;
+        assert_eq!(install_call_thunk_padding(&mut padding, &template), Err(EINVAL));
+    }
+
+    #[test]
+    fn call_depth_arithmetic_matches_linux_saturation_scheme() {
+        assert_eq!(account_call(RET_DEPTH_INIT), 0xfc00_0000_0000_0000);
+        assert_eq!(account_return(0xfc00_0000_0000_0000), (RET_DEPTH_INIT, false));
+        assert_eq!(account_return(0), (RET_DEPTH_CREDIT, true));
     }
 }
