@@ -355,6 +355,25 @@ unsafe fn module_name(module_addr: usize) -> &'static str {
     core::str::from_utf8(&bytes[..len]).unwrap_or("<unknown>")
 }
 
+/// Length of the trapping BUG/WARN instruction at `bug_addr`.
+///
+/// Mirrors the instruction-length side of
+/// `vendor/linux/arch/x86/kernel/traps.c::decode_bug()`: the classic
+/// `ud2` WARN/BUG is 2 bytes, while the `__WARN_trap` pattern
+/// (`67 48 0f b9 3a`, `ud1 (%edx), %rdi` — WARNINSN) is 5.  `handle_bug()`
+/// resumes execution at `regs->ip + len`; advancing a WARNINSN site by only
+/// LEN_UD2 would restart execution in the middle of the instruction and
+/// escalate a recoverable warning into a fatal #UD.
+pub fn bug_insn_len(bug_addr: usize) -> usize {
+    let warninsn = &crate::arch::x86::kernel::static_call::WARNINSN;
+    let bytes = unsafe { core::slice::from_raw_parts(bug_addr as *const u8, warninsn.len()) };
+    if bytes == warninsn {
+        warninsn.len()
+    } else {
+        LEN_UD2
+    }
+}
+
 /// Linux `report_bug()` for an x86 UD2 raised by a loaded C module.
 ///
 /// Core-kernel `__bug_table` lookup is intentionally not claimed here. A
@@ -456,4 +475,23 @@ pub fn report_bug(bug_addr: usize) -> BugTrapType {
         }
     }
     BugTrapType::None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Instruction lengths follow
+    /// `vendor/linux/arch/x86/kernel/traps.c::decode_bug()`: a classic `ud2`
+    /// WARN/BUG is 2 bytes and the `__WARN_trap` pattern (WARNINSN,
+    /// `ud1 (%edx), %rdi`) is 5.  `handle_bug()` resumes at `ip + len`;
+    /// advancing a WARNINSN warning by only LEN_UD2 re-enters the middle of
+    /// the instruction and turns a recoverable module WARN into a fatal #UD.
+    #[test]
+    fn bug_insn_len_matches_vendor_decode_bug() {
+        let warn = crate::arch::x86::kernel::static_call::WARNINSN;
+        assert_eq!(bug_insn_len(warn.as_ptr() as usize), warn.len());
+        let ud2 = [0x0f, 0x0b, 0xcc, 0xcc, 0xcc];
+        assert_eq!(bug_insn_len(ud2.as_ptr() as usize), LEN_UD2);
+    }
 }

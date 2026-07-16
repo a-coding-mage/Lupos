@@ -29,10 +29,39 @@ pub const STATIC_CALL_SITE_SIZE: usize = 8;
 pub const STATIC_CALL_SITE_TAIL: usize = 1;
 pub const STATIC_CALL_SITE_FLAGS: usize = 3;
 
-pub unsafe extern "C" fn __WARN_trap(_bug: *mut core::ffi::c_void) {}
+// The real `__WARN_trap` body and its module-exported static-call trampoline,
+// mirroring vendor/linux/arch/x86/entry/entry.S::__WARN_trap and
+// vendor/linux/arch/x86/kernel/traps.c::EXPORT_STATIC_CALL_TRAMP(WARN_trap).
+// The `ud1 (%edx), %rdi` byte sequence is exactly WARNINSN, the pattern
+// decode_bug() classifies as BUG_UD1_WARN with the bug_entry pointer in
+// pt_regs->di; the #UD handler reports the warning and resumes after the
+// 5-byte insn, so the RET returns to the module caller.
+//
+// The 16-byte alignment is load-bearing: relocated `.static_call_sites` keys
+// resolve to these exported addresses and are masked with
+// STATIC_CALL_SITE_FLAGS before comparison
+// (vendor/linux/kernel/static_call_inline.c::static_call_add_module uses the
+// low key bits as INIT/TAIL flags).  A plain Rust fn has no alignment
+// guarantee, so an unluckily placed stub made the masked comparison fail and
+// every vendor module carrying WARN static-call sites (scsi_mod, libata,
+// drm, snd, libphy, ...) was rejected at load.
+core::arch::global_asm!(
+    ".pushsection .text.lupos.warn_trap, \"ax\"",
+    ".balign 16",
+    ".global __WARN_trap",
+    "__WARN_trap:",
+    ".byte 0x67, 0x48, 0x0f, 0xb9, 0x3a", // ud1 (%edx), %rdi == WARNINSN
+    "ret",
+    ".balign 16",
+    ".global __SCT__WARN_trap",
+    "__SCT__WARN_trap:",
+    "jmp __WARN_trap",
+    ".popsection",
+);
 
-pub unsafe extern "C" fn __SCT__WARN_trap(_bug: *mut core::ffi::c_void) {
-    unsafe { __WARN_trap(_bug) }
+unsafe extern "C" {
+    pub fn __WARN_trap(bug: *mut core::ffi::c_void, ...);
+    pub fn __SCT__WARN_trap(bug: *mut core::ffi::c_void, ...);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

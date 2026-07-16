@@ -1895,22 +1895,30 @@ pub unsafe fn sys_getsockname(fd: i32, addr: *mut u8, addrlen: *mut u32) -> i64 
         let socket = sock.lock();
         (socket.family, socket.local.clone())
     };
-    let local = local.or_else(|| {
-        if family == AF_UNIX {
-            // vendor/linux/net/unix/af_unix.c::unix_getname(): unnamed
-            // AF_UNIX sockets report sa_family=AF_UNIX and length
-            // offsetof(struct sockaddr_un, sun_path), not EINVAL.
-            Some(SockAddr::Unix(String::new()))
-        } else {
-            None
-        }
-    });
+    let local = local.or_else(|| unbound_sockaddr(family));
     match local {
         Some(local) => match write_sockaddr(&local, addr, addrlen) {
             Ok(()) => 0,
             Err(errno) => -(errno as i64),
         },
         None => -(EINVAL as i64),
+    }
+}
+
+fn unbound_sockaddr(family: u16) -> Option<SockAddr> {
+    match family {
+        // vendor/linux/net/unix/af_unix.c::unix_getname(): unnamed AF_UNIX
+        // sockets report only sa_family, not EINVAL.
+        AF_UNIX => Some(SockAddr::Unix(String::new())),
+        // inet_getname()/inet6_getname() report the wildcard address and port
+        // zero before bind/autobind. curl calls this after an IPv6 route
+        // failure while falling back to IPv4.
+        AF_INET => Some(SockAddr::Inet { addr: 0, port: 0 }),
+        AF_INET6 => Some(SockAddr::Inet6 {
+            addr: [0; 16],
+            port: 0,
+        }),
+        _ => None,
     }
 }
 
@@ -3352,6 +3360,21 @@ mod tests {
         assert_eq!(
             write_sockaddr(&peer, out.as_mut_ptr(), bad_user_len),
             Err(EFAULT)
+        );
+    }
+
+    #[test]
+    fn getsockname_unbound_inet_reports_wildcard_address() {
+        assert_eq!(
+            unbound_sockaddr(AF_INET),
+            Some(SockAddr::Inet { addr: 0, port: 0 })
+        );
+        assert_eq!(
+            unbound_sockaddr(AF_INET6),
+            Some(SockAddr::Inet6 {
+                addr: [0; 16],
+                port: 0,
+            })
         );
     }
 

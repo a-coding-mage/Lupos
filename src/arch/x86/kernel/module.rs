@@ -412,18 +412,8 @@ fn finalize_static_call_sites(
         sites.push((site_addr, key_value));
     }
 
-    let warn_tramp = warn_trap_trampoline_addr();
-    let warn_func = warn_trap_addr();
     for (site_addr, key_value) in sites.iter().copied() {
-        if key_value & STATIC_CALL_SITE_TAIL != 0 {
-            return Err(X86ModuleFinalizeError::Unsupported(
-                ".static_call_sites tail",
-            ));
-        }
-        let key_addr = key_value & !STATIC_CALL_SITE_FLAGS;
-        if key_addr != warn_tramp && key_addr != warn_func {
-            return Err(X86ModuleFinalizeError::Unsupported(".static_call_sites"));
-        }
+        classify_warn_static_call_key(key_value)?;
         let site = loaded_mut_at(
             sections,
             site_addr,
@@ -434,6 +424,26 @@ fn finalize_static_call_sites(
             .map_err(|_| X86ModuleFinalizeError::BadSection(".static_call_sites"))?;
     }
     Ok(sites.len())
+}
+
+/// Accept a relocated `.static_call_sites` key that resolves to the exported
+/// WARN_trap trampoline or function, after stripping the INIT flag bit that
+/// `static_call_add_module()` masks with STATIC_CALL_SITE_FLAGS
+/// (vendor/linux/kernel/static_call_inline.c).  The staged vendor artifacts
+/// only ever reference `__SCT__WARN_trap + 0` (no TAIL/INIT addend), and both
+/// exported symbols are 16-byte-aligned asm labels, so a set flag bit can only
+/// come from a genuine site flag, never from symbol placement.
+fn classify_warn_static_call_key(key_value: usize) -> Result<(), X86ModuleFinalizeError> {
+    if key_value & STATIC_CALL_SITE_TAIL != 0 {
+        return Err(X86ModuleFinalizeError::Unsupported(
+            ".static_call_sites tail",
+        ));
+    }
+    let key_addr = key_value & !STATIC_CALL_SITE_FLAGS;
+    if key_addr != warn_trap_trampoline_addr() && key_addr != warn_trap_addr() {
+        return Err(X86ModuleFinalizeError::Unsupported(".static_call_sites"));
+    }
+    Ok(())
 }
 
 fn sort_module_extable(
@@ -468,6 +478,70 @@ mod tests {
         assert_eq!(i32::from_le_bytes(mem[0..4].try_into().unwrap()), 0xc);
         clear_relocate_add(&mut mem, &[rel]);
         assert_eq!(&mem[0..4], &[0; 4]);
+    }
+
+    /// Every staged vendor module with WARN static calls (scsi_mod, libata,
+    /// drm, i915, snd*, libphy, ...) relocates its `.static_call_sites` key
+    /// against the exported `__SCT__WARN_trap`
+    /// (vendor/linux/arch/x86/kernel/traps.c::EXPORT_STATIC_CALL_TRAMP).
+    /// static_call_add_module() masks the low key bits as INIT/TAIL flags
+    /// (vendor/linux/kernel/static_call_inline.c), so the exported addresses
+    /// must be flag-bit clean: an unaligned trampoline made the masked
+    /// comparison fail build-dependently, every such module was rejected with
+    /// ENOEXEC, and `systemd-modules-load` stranded the guest without any
+    /// network/storage/graphics driver.
+    #[test]
+    fn warn_trap_exports_are_flag_bit_clean_and_registered() {
+        crate::arch::x86::kernel::static_call::register_module_exports();
+        let tramp =
+            crate::kernel::module::find_symbol("__SCT__WARN_trap").expect("trampoline exported");
+        let func = crate::kernel::module::find_symbol("__WARN_trap").expect("function exported");
+        assert_eq!(tramp, warn_trap_trampoline_addr());
+        assert_eq!(func, warn_trap_addr());
+        assert_eq!(
+            tramp & STATIC_CALL_SITE_FLAGS,
+            0,
+            "trampoline address must not alias static-call site flag bits"
+        );
+        assert_eq!(
+            func & STATIC_CALL_SITE_FLAGS,
+            0,
+            "__WARN_trap address must not alias static-call site flag bits"
+        );
+    }
+
+    /// The relocated key decision of `finalize_static_call_sites()`:
+    /// WARN_trap keys pass (with the INIT flag masked like
+    /// static_call_add_module()), TAIL sites and foreign keys are rejected.
+    /// The staged artifacts only emit `__SCT__WARN_trap + 0` addends.
+    #[test]
+    fn warn_static_call_key_classification_follows_vendor_masking() {
+        let tramp = warn_trap_trampoline_addr();
+        assert_eq!(classify_warn_static_call_key(tramp), Ok(()));
+        assert_eq!(classify_warn_static_call_key(warn_trap_addr()), Ok(()));
+        // STATIC_CALL_SITE_INIT (bit 1) is masked off before comparison.
+        assert_eq!(classify_warn_static_call_key(tramp | 2), Ok(()));
+        assert_eq!(
+            classify_warn_static_call_key(tramp | STATIC_CALL_SITE_TAIL),
+            Err(X86ModuleFinalizeError::Unsupported(
+                ".static_call_sites tail"
+            ))
+        );
+        assert_eq!(
+            classify_warn_static_call_key(tramp + 16),
+            Err(X86ModuleFinalizeError::Unsupported(".static_call_sites"))
+        );
+    }
+
+    /// A relocated `static_call_mod(WARN_trap)` site is `call __SCT__WARN_trap`;
+    /// the inline transform rewrites it to the vendor WARNINSN
+    /// (`ud1 (%edx), %rdi`, vendor/linux/arch/x86/entry/entry.S::__WARN_trap)
+    /// that handle_bug() reports and skips.
+    #[test]
+    fn warn_site_fixup_rewrites_call_to_warninsn() {
+        let mut site = [0xe8u8, 0, 0, 0, 0];
+        static_call_fixup_warn_site(&mut site).expect("call site must be patchable");
+        assert_eq!(site, crate::arch::x86::kernel::static_call::WARNINSN);
     }
 
     #[test]

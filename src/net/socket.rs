@@ -18,8 +18,8 @@ use crate::fs::file::fput;
 use crate::fs::types::FileRef;
 use crate::include::uapi::errno::{
     EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, ECONNREFUSED, ECONNRESET, EEXIST, EINPROGRESS,
-    EINVAL, ENETDOWN, ENODEV, ENOPROTOOPT, ENOTCONN, EOPNOTSUPP, EPERM, EPIPE, EPROTONOSUPPORT,
-    ESRCH,
+    EINVAL, ENETDOWN, ENETUNREACH, ENODEV, ENOPROTOOPT, ENOTCONN, EOPNOTSUPP, EPERM, EPIPE,
+    EPROTONOSUPPORT, ESRCH,
 };
 use crate::kernel::capability::{CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE, capable};
 use crate::kernel::cred::GroupInfo;
@@ -734,10 +734,35 @@ fn inet_loopback_dest(peer: &SockAddr) -> bool {
     }
 }
 
+fn inet6_unscoped_link_local(peer: &SockAddr) -> bool {
+    matches!(
+        peer,
+        SockAddr::Inet6 { addr, .. } if addr[0] == 0xfe && addr[1] & 0xc0 == 0x80
+    )
+}
+
 pub fn connect(sock: &SocketRef, peer: SockAddr) -> Result<(), i32> {
     let (family, sock_type) = {
         let socket = sock.lock();
         (socket.family, socket.sock_type)
+    };
+    // connect() to the IPv6 any-address means loopback: the BSD'ism kept by
+    // vendor/linux/net/ipv6/tcp_ipv6.c::tcp_v6_connect() and
+    // vendor/linux/net/ipv6/datagram.c::__ip6_datagram_connect(). Do this only
+    // after matching the socket family; an AF_INET socket given sockaddr_in6
+    // must fail EAFNOSUPPORT rather than accidentally reaching IPv6 loopback.
+    let peer = match (family, peer) {
+        (AF_INET6, SockAddr::Inet6 { addr, port }) if addr == [0u8; 16] => {
+            let mut loopback = [0u8; 16];
+            loopback[15] = 1;
+            SockAddr::Inet6 {
+                addr: loopback,
+                port,
+            }
+        }
+        (AF_INET6, peer @ SockAddr::Inet6 { .. }) | (AF_INET, peer @ SockAddr::Inet { .. }) => peer,
+        (AF_INET | AF_INET6, _) => return Err(EAFNOSUPPORT),
+        (_, peer) => peer,
     };
     let mut listener = BOUND
         .lock()
@@ -870,6 +895,29 @@ pub fn connect(sock: &SocketRef, peer: SockAddr) -> Result<(), i32> {
         wake_socket_recv(&listener);
         wake_socket_recv(sock);
         return Ok(());
+    }
+    // No local rendezvous matched.  Linux resolves external IPv6 destinations
+    // through ip6_dst_lookup_flow()
+    // (vendor/linux/net/ipv6/tcp_ipv6.c::tcp_v6_connect(),
+    // vendor/linux/net/ipv6/datagram.c::__ip6_datagram_connect()); Lupos
+    // carries no IPv6 routes (the QEMU network is IPv4-only), so the lookup
+    // fails with ENETUNREACH before any packet is emitted.  glibc's
+    // getaddrinfo() RFC 6724 probe and curl's happy-eyeballs fallback depend
+    // on this errno to drop AAAA candidates and connect over IPv4 instead of
+    // trusting a transport-less fake "success" that EPIPEs on the first send.
+    // (Linux routes v4-mapped ::ffff:a.b.c.d through tcp_v4_connect(); no
+    // Lupos userspace produces mapped addresses, so they take the same
+    // unreachable path.)
+    if family == AF_INET6
+        && let SockAddr::Inet6 { addr, .. } = &peer
+        && !inet_loopback_dest(&peer)
+    {
+        // With no scope-id field in SockAddr, every link-local destination is
+        // unscoped. Linux ip6_dst_lookup_flow() rejects that with EINVAL.
+        if addr[0] == 0xfe && addr[1] & 0xc0 == 0x80 {
+            return Err(EINVAL);
+        }
+        return Err(ENETUNREACH);
     }
     if family == AF_INET && sock_type == SOCK_STREAM {
         let SockAddr::Inet { addr, port } = peer else {
@@ -1135,6 +1183,13 @@ pub fn sendmsg_with_fds_meta_cred(
         drop_file_refs(fds);
         return result;
     }
+    // vendor/linux/net/ipv6/udp.c::udpv6_sendmsg() fails unreachable IPv6
+    // destinations with ENETUNREACH (Lupos has no IPv6 routes); only the
+    // loopback rendezvous below stays local.
+    if family == AF_INET6 && matches!(peer, SockAddr::Inet6 { .. }) && !inet_loopback_dest(&peer) {
+        drop_file_refs(fds);
+        return Err(ENETUNREACH);
+    }
     if !matches!(peer, SockAddr::Unix(_)) && !fds.is_empty() {
         drop_file_refs(core::mem::take(&mut fds));
     }
@@ -1211,6 +1266,25 @@ pub fn sendto_with_fds_meta_cred(
     if family != AF_UNIX && !fds.is_empty() {
         drop_file_refs(core::mem::take(&mut fds));
     }
+    // udpv6_sendmsg() applies the same BSD `::` -> `::1` normalization as
+    // connect(), but only for an AF_INET6 socket. Preserve Linux's
+    // EAFNOSUPPORT for a sockaddr whose family does not match the socket.
+    let dest = match (family, dest) {
+        (AF_INET6, SockAddr::Inet6 { addr, port }) if addr == [0u8; 16] => {
+            let mut loopback = [0u8; 16];
+            loopback[15] = 1;
+            SockAddr::Inet6 {
+                addr: loopback,
+                port,
+            }
+        }
+        (AF_INET6, dest @ SockAddr::Inet6 { .. }) | (AF_INET, dest @ SockAddr::Inet { .. }) => dest,
+        (AF_INET | AF_INET6, _) => {
+            drop_file_refs(fds);
+            return Err(EAFNOSUPPORT);
+        }
+        (_, dest) => dest,
+    };
     if let Some(n) = synthesize_netlink_send(sock, bytes, Some(&dest)) {
         drop_file_refs(fds);
         return Ok(n);
@@ -1223,6 +1297,16 @@ pub fn sendto_with_fds_meta_cred(
     if let Some(result) = crate::net::wire::send_inet(sock, bytes, &dest, send_meta.as_ref()) {
         drop_file_refs(fds);
         return result;
+    }
+    // vendor/linux/net/ipv6/udp.c::udpv6_sendmsg() fails unreachable IPv6
+    // destinations with ENETUNREACH (Lupos has no IPv6 routes); only the
+    // loopback rendezvous below stays local.
+    if family == AF_INET6 && matches!(dest, SockAddr::Inet6 { .. }) && !inet_loopback_dest(&dest) {
+        drop_file_refs(fds);
+        if inet6_unscoped_link_local(&dest) {
+            return Err(EINVAL);
+        }
+        return Err(ENETUNREACH);
     }
     let target = match BOUND
         .lock()
@@ -1493,6 +1577,17 @@ fn apply_rtnl_setlink(sock: &SocketRef, bytes: &[u8], header: &NetlinkHeader) ->
         }
     }
     let flags_changed = dev.flags.load(Ordering::Acquire) != previous_flags;
+    // Linux notifies RTNLGRP_LINK on every effective change.  IFF_UP flag
+    // transitions already multicast the kernel-origin RTM_NEWLINK from
+    // set_device_up()/set_device_down() — Lupos' dev_open()/dev_close()
+    // equivalents of __dev_notify_flags() -> rtmsg_ifinfo()
+    // (vendor/linux/net/core/dev.c); systemd-networkd's link engine depends
+    // on that multicast to observe its own RTM_SETLINK IFF_UP take effect
+    // before it configures addresses, routes, and per-link DNS.  Operstate/
+    // linkmode updates notify here, mirroring netdev_state_change()
+    // (vendor/linux/net/core/rtnetlink.c::do_setlink); notifying for
+    // flags_changed here as well would double-send what set_device_up()
+    // already emitted.
     if state_changed {
         if report {
             broadcast_rtnl_newlink_for_request(sock, header, &dev);
@@ -4088,7 +4183,22 @@ mod tests {
         .expect("device");
         assert!(!dev.is_up(), "fresh dummy device should start down");
 
+        // systemd-networkd subscribes to RTNLGRP_LINK and sends RTM_SETLINK
+        // without NLM_F_ECHO: Linux answers with an ACK plus a kernel-origin
+        // (nlmsg_pid=0, nlmsg_seq=0) RTM_NEWLINK multicast that reaches every
+        // group member, including the requester
+        // (vendor/linux/net/core/dev.c::__dev_notify_flags -> rtmsg_ifinfo,
+        // vendor/linux/net/core/rtnetlink.c::rtmsg_ifinfo_build_skb,
+        // vendor/linux/net/netlink/af_netlink.c::nlmsg_notify).
         let sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE).unwrap();
+        bind(
+            &sock,
+            SockAddr::Netlink {
+                pid: 0x6041,
+                groups: 1u32 << (RTNLGRP_LINK - 1),
+            },
+        )
+        .unwrap();
         let mut req = alloc::vec![0u8; 32];
         req[0..4].copy_from_slice(&32u32.to_ne_bytes());
         req[4..6].copy_from_slice(&RTM_SETLINK.to_ne_bytes());
@@ -4098,18 +4208,28 @@ mod tests {
         req[28..32].copy_from_slice(&0u32.to_ne_bytes());
 
         sendto(&sock, &req, SockAddr::Netlink { pid: 0, groups: 0 }).expect("send");
-        let mut out = [0u8; 64];
+        let mut out = [0u8; 256];
         let mut saw_notify = false;
         let _ = recv_until_ack(&sock, &mut out, |packet| {
             if u16::from_ne_bytes(packet[4..6].try_into().unwrap()) == RTM_NEWLINK
                 && u32::from_ne_bytes(packet[20..24].try_into().unwrap()) == dev.ifindex
             {
+                assert_eq!(
+                    u32::from_ne_bytes(packet[8..12].try_into().unwrap()),
+                    0,
+                    "link-up notification must be kernel-origin (seq=0)"
+                );
+                assert_eq!(
+                    u32::from_ne_bytes(packet[12..16].try_into().unwrap()),
+                    0,
+                    "link-up notification must be kernel-origin (pid=0)"
+                );
                 saw_notify = true;
             }
         });
         assert!(
             saw_notify,
-            "RTM_SETLINK should notify the requester on link-up"
+            "RTM_SETLINK link-up must multicast RTM_NEWLINK to RTNLGRP_LINK"
         );
         assert!(dev.is_up(), "RTM_SETLINK change=0 must still honor IFF_UP");
         crate::net::device::unregister_netdevice(name).expect("cleanup");
@@ -4128,12 +4248,16 @@ mod tests {
         .expect("device");
         crate::net::device::set_device_up(&dev).expect("device up");
 
+        // Like networkd: subscribed to RTNLGRP_LINK, no NLM_F_ECHO.  The
+        // operstate/linkmode change must arrive as the kernel-origin
+        // RTM_NEWLINK multicast (vendor/linux/net/core/rtnetlink.c::
+        // do_setlink -> netdev_state_change -> rtmsg_ifinfo_event).
         let sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE).unwrap();
         bind(
             &sock,
             SockAddr::Netlink {
                 pid: 0x603e,
-                groups: 0,
+                groups: 1u32 << (RTNLGRP_LINK - 1),
             },
         )
         .unwrap();
@@ -4158,6 +4282,16 @@ mod tests {
                 && u32::from_ne_bytes(packet[20..24].try_into().unwrap()) == dev.ifindex
             {
                 saw_notify = true;
+                assert_eq!(
+                    u32::from_ne_bytes(packet[8..12].try_into().unwrap()),
+                    0,
+                    "state-change notification must be kernel-origin (seq=0)"
+                );
+                assert_eq!(
+                    u32::from_ne_bytes(packet[12..16].try_into().unwrap()),
+                    0,
+                    "state-change notification must be kernel-origin (pid=0)"
+                );
                 let flags = u32::from_ne_bytes(packet[24..28].try_into().unwrap());
                 assert_eq!(attr_u8(packet, IFLA_LINKMODE), Some(IF_LINK_MODE_DORMANT));
                 assert_eq!(attr_u8(packet, IFLA_OPERSTATE), Some(IF_OPER_DORMANT));
@@ -4175,7 +4309,7 @@ mod tests {
         });
         assert!(
             saw_notify,
-            "RTM_SETLINK should echo operstate/linkmode updates"
+            "RTM_SETLINK must multicast operstate/linkmode updates to RTNLGRP_LINK"
         );
         crate::net::device::unregister_netdevice(name).expect("cleanup");
     }
@@ -5760,6 +5894,160 @@ mod tests {
                 },
             ),
             Err(ENETDOWN)
+        );
+    }
+
+    #[test]
+    fn inet6_connect_without_route_is_network_unreachable() {
+        // Linux resolves IPv6 destinations through ip6_dst_lookup_flow()
+        // (vendor/linux/net/ipv6/tcp_ipv6.c::tcp_v6_connect,
+        // vendor/linux/net/ipv6/datagram.c::__ip6_datagram_connect).  With no
+        // IPv6 route configured both stream and datagram connects fail with
+        // ENETUNREACH; glibc's getaddrinfo() RFC 6724 probe and curl's
+        // happy-eyeballs IPv4 fallback depend on that errno instead of a fake
+        // instant "success" that EPIPEs on the first send.
+        let mut global = [0u8; 16];
+        global[..4].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8]);
+        global[15] = 1;
+        for sock_type in [SOCK_STREAM, SOCK_DGRAM] {
+            let sock = socket(AF_INET6, sock_type, 0).unwrap();
+            assert_eq!(
+                connect(
+                    &sock,
+                    SockAddr::Inet6 {
+                        addr: global,
+                        port: 80,
+                    },
+                ),
+                Err(ENETUNREACH)
+            );
+        }
+
+        // sendto() to an unreachable IPv6 destination reports the same errno
+        // (vendor/linux/net/ipv6/udp.c::udpv6_sendmsg).
+        let udp = socket(AF_INET6, SOCK_DGRAM, 0).unwrap();
+        assert_eq!(
+            sendto(
+                &udp,
+                b"probe",
+                SockAddr::Inet6 {
+                    addr: global,
+                    port: 53,
+                },
+            ),
+            Err(ENETUNREACH)
+        );
+
+        // Loopback keeps its Linux semantics: a SYN to a closed [::1] port is
+        // refused, not unreachable, and `::` means `::1` (the BSD'ism in
+        // tcp_v6_connect()).
+        let mut loopback = [0u8; 16];
+        loopback[15] = 1;
+        let stream = socket(AF_INET6, SOCK_STREAM, 0).unwrap();
+        assert_eq!(
+            connect(
+                &stream,
+                SockAddr::Inet6 {
+                    addr: loopback,
+                    port: 2206,
+                },
+            ),
+            Err(ECONNREFUSED)
+        );
+        let any = socket(AF_INET6, SOCK_STREAM, 0).unwrap();
+        assert_eq!(
+            connect(
+                &any,
+                SockAddr::Inet6 {
+                    addr: [0u8; 16],
+                    port: 2206,
+                },
+            ),
+            Err(ECONNREFUSED)
+        );
+
+        // udpv6_sendmsg() applies the same any-address normalization. Prove
+        // the datagram reaches a local ::1 binding instead of being rejected
+        // as an unreachable all-zero destination.
+        let receiver = socket(AF_INET6, SOCK_DGRAM, 0).unwrap();
+        bind(
+            &receiver,
+            SockAddr::Inet6 {
+                addr: loopback,
+                port: 2207,
+            },
+        )
+        .unwrap();
+        let sender = socket(AF_INET6, SOCK_DGRAM, 0).unwrap();
+        assert_eq!(
+            sendto(
+                &sender,
+                b"any",
+                SockAddr::Inet6 {
+                    addr: [0u8; 16],
+                    port: 2207,
+                },
+            ),
+            Ok(3)
+        );
+        let mut received = [0u8; 8];
+        assert_eq!(recvfrom(&receiver, &mut received).unwrap().0, 3);
+        assert_eq!(&received[..3], b"any");
+
+        // Address-family validation happens before :: normalization. Linux
+        // returns EAFNOSUPPORT for sockaddr_in6 on an AF_INET socket.
+        let inet_stream = socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        assert_eq!(
+            connect(
+                &inet_stream,
+                SockAddr::Inet6 {
+                    addr: [0u8; 16],
+                    port: 2208,
+                },
+            ),
+            Err(EAFNOSUPPORT)
+        );
+        let inet_udp = socket(AF_INET, SOCK_DGRAM, 0).unwrap();
+        assert_eq!(
+            sendto(
+                &inet_udp,
+                b"wrong-family",
+                SockAddr::Inet6 {
+                    addr: global,
+                    port: 53,
+                },
+            ),
+            Err(EAFNOSUPPORT)
+        );
+
+        // SockAddr currently has no scope-id field, so a link-local address
+        // is necessarily unscoped and ip6_dst_lookup_flow() returns EINVAL.
+        let mut link_local = [0u8; 16];
+        link_local[0] = 0xfe;
+        link_local[1] = 0x80;
+        link_local[15] = 1;
+        let link_stream = socket(AF_INET6, SOCK_STREAM, 0).unwrap();
+        assert_eq!(
+            connect(
+                &link_stream,
+                SockAddr::Inet6 {
+                    addr: link_local,
+                    port: 80,
+                },
+            ),
+            Err(EINVAL)
+        );
+        let link_udp = socket(AF_INET6, SOCK_DGRAM, 0).unwrap();
+        assert_eq!(
+            sendto(
+                &link_udp,
+                b"unscoped",
+                SockAddr::Inet6 {
+                    addr: link_local,
+                    port: 53,
+                },
+            ),
+            Err(EINVAL)
         );
     }
 
