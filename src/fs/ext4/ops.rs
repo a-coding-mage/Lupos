@@ -18,12 +18,13 @@ use crate::block::bio::{BIO_OP_WRITE, BioOp, BioVec, bio_alloc, submit_bio};
 use crate::block::partitions::read_sectors;
 use crate::fs::ops::{FileOps, InodeOps, SuperOps};
 use crate::fs::types::{
-    FileRef, Inode, InodeKind, InodePrivate, InodeRef, SuperBlockRef, touch_inode_now,
+    FileRef, Inode, InodeKind, InodePrivate, InodeRef, SuperBlockRef, init_inode_owner,
+    touch_inode_now,
 };
 use crate::include::uapi::errno::{
     EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EPERM, EROFS, EXDEV,
 };
-use crate::include::uapi::stat::{S_IFDIR, S_IFLNK, S_IFREG};
+use crate::include::uapi::stat::{S_IFDIR, S_IFLNK, S_IFREG, S_ISGID};
 
 use super::dir::read_all as dir_read_all;
 use super::extents;
@@ -140,7 +141,13 @@ fn ext4_create(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> {
     }
     let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
     let sbi = get_sbi(&sb).ok_or(EINVAL)?;
-    let inode = ext4_new_inode(&sbi, &sb, S_IFREG | (mode & 0o7777), InodeKind::Regular)?;
+    let inode = ext4_new_inode(
+        &sbi,
+        &sb,
+        dir,
+        S_IFREG | (mode & 0o7777),
+        InodeKind::Regular,
+    )?;
     if let Err(err) = ext4_add_entry(dir, name, &inode, EXT4_FT_REG_FILE) {
         return Err(err);
     }
@@ -153,7 +160,13 @@ fn ext4_mkdir(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> {
     }
     let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
     let sbi = get_sbi(&sb).ok_or(EINVAL)?;
-    let inode = ext4_new_inode(&sbi, &sb, S_IFDIR | (mode & 0o7777), InodeKind::Directory)?;
+    let inode = ext4_new_inode(
+        &sbi,
+        &sb,
+        dir,
+        S_IFDIR | (mode & 0o7777),
+        InodeKind::Directory,
+    )?;
     ext4_init_new_dir(&sbi, dir, &inode)?;
     if let Err(err) = ext4_add_entry(dir, name, &inode, EXT4_FT_DIR) {
         return Err(err);
@@ -168,7 +181,13 @@ fn ext4_symlink(dir: &InodeRef, name: &str, target: &str, mode: u32) -> Result<I
     }
     let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
     let sbi = get_sbi(&sb).ok_or(EINVAL)?;
-    let inode = ext4_new_inode(&sbi, &sb, S_IFLNK | (mode & 0o7777), InodeKind::Symlink)?;
+    let inode = ext4_new_inode(
+        &sbi,
+        &sb,
+        dir,
+        S_IFLNK | (mode & 0o7777),
+        InodeKind::Symlink,
+    )?;
     let ext_inode = ext4_inode_of(&inode).ok_or(EINVAL)?;
     let mut raw = { *ext_inode.raw.lock() };
     raw.i_size_lo = (target.len() as u32).to_le();
@@ -457,16 +476,22 @@ fn ext4_drop_replaced_inode(sbi: &super::Ext4Sbi, inode: &InodeRef) -> Result<()
 fn ext4_new_inode(
     sbi: &super::Ext4Sbi,
     sb: &SuperBlockRef,
+    dir: &InodeRef,
     mode: u32,
     kind: InodeKind,
 ) -> Result<InodeRef, i32> {
     let ino = ext4_claim_free_inode(sbi, kind == InodeKind::Directory)?;
-    let raw = ext4_new_raw_inode(sbi, mode, kind);
-    write_inode_metadata(sbi, ino, &raw)?;
+    let mut raw = ext4_new_raw_inode(sbi, mode, kind);
+    let private_mode =
+        if kind == InodeKind::Directory && dir.mode.load(Ordering::Acquire) & S_ISGID != 0 {
+            mode | S_ISGID
+        } else {
+            mode
+        };
 
     let ext_inode = alloc::sync::Arc::new(super::Ext4Inode {
         ino,
-        i_mode: mode as u16,
+        i_mode: private_mode as u16,
         i_size: core::sync::atomic::AtomicU64::new(0),
         i_blocks: core::sync::atomic::AtomicU64::new(0),
         raw: spin::Mutex::new(raw),
@@ -486,10 +511,34 @@ fn ext4_new_inode(
             InodeKind::Directory => &EXT4_DIR_FILE_OPS,
             _ => &EXT4_FILE_FILE_OPS,
         },
-        InodePrivate::Opaque(alloc::sync::Arc::into_raw(ext_inode) as usize),
+        InodePrivate::Opaque(alloc::sync::Arc::into_raw(ext_inode.clone()) as usize),
     );
     *inode.sb.lock() = Some(sb.clone());
+    init_inode_owner(&inode, Some(dir), mode);
+    ext4_store_raw_inode_owner(&mut raw, &inode);
+    if let Err(errno) = write_inode_metadata(sbi, ino, &raw) {
+        if let InodePrivate::Opaque(ptr) = &inode.private {
+            // The generic inode has no destructor for filesystem-private
+            // opaque pointers. Reclaim the reference installed above when
+            // inode creation fails before the inode can escape.
+            unsafe { drop(Arc::from_raw(*ptr as *const super::Ext4Inode)) };
+        }
+        return Err(errno);
+    }
+    *ext_inode.raw.lock() = raw;
     Ok(inode)
+}
+
+fn ext4_store_raw_inode_owner(raw: &mut OnDiskInode, inode: &InodeRef) {
+    let mode = inode.mode.load(Ordering::Acquire);
+    let uid = inode.uid.load(Ordering::Acquire);
+    let gid = inode.gid.load(Ordering::Acquire);
+
+    raw.i_mode = (mode as u16).to_le();
+    raw.i_uid = (uid as u16).to_le();
+    raw.i_gid = (gid as u16).to_le();
+    raw._osd2[4..6].copy_from_slice(&((uid >> 16) as u16).to_le_bytes());
+    raw._osd2[6..8].copy_from_slice(&((gid >> 16) as u16).to_le_bytes());
 }
 
 fn ext4_new_raw_inode(sbi: &super::Ext4Sbi, mode: u32, kind: InodeKind) -> OnDiskInode {
@@ -2524,6 +2573,7 @@ fn put_le_u32(bytes: &mut [u8], off: usize, value: u32) -> Result<(), i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
     use alloc::sync::Arc;
     use core::sync::atomic::AtomicU64;
     use spin::Mutex;
@@ -2536,6 +2586,192 @@ mod tests {
     use crate::fs::ext4::super_block::stash_sbi;
     use crate::fs::ext4::{EXT4_SUPER_MAGIC, Ext4Inode, Ext4Sbi};
     use crate::fs::types::{File, Inode, InodePrivate, SuperBlock};
+    use crate::kernel::capability::KernelCapT;
+    use crate::kernel::cred::{Cred, GroupInfo, INIT_CRED, KGid, KUid};
+    use crate::kernel::{sched, task::TaskStruct};
+
+    fn install_current(current: &mut TaskStruct, cred: &Cred) -> *mut TaskStruct {
+        let previous = unsafe { sched::get_current() };
+        current.pid = 4242;
+        current.tgid = 4242;
+        current.cred = cred as *const Cred;
+        current.m27.real_cred = cred as *const Cred;
+        unsafe { sched::set_current(current as *mut TaskStruct) };
+        previous
+    }
+
+    fn test_cred(uid: u32, gid: u32) -> Cred {
+        Cred {
+            usage: core::sync::atomic::AtomicUsize::new(1),
+            uid: KUid(uid),
+            gid: KGid(gid),
+            suid: KUid(uid),
+            sgid: KGid(gid),
+            euid: KUid(uid),
+            egid: KGid(gid),
+            fsuid: KUid(uid),
+            fsgid: KGid(gid),
+            cap_inheritable: KernelCapT::empty(),
+            cap_permitted: KernelCapT::empty(),
+            cap_effective: KernelCapT::empty(),
+            cap_bset: KernelCapT::empty(),
+            cap_ambient: KernelCapT::empty(),
+            securebits: 0,
+            group_info: GroupInfo::default(),
+            user_ns: core::ptr::null(),
+        }
+    }
+
+    fn new_inode_owner_fixture(name: &str) -> (Arc<Ext4Sbi>, SuperBlockRef, InodeRef) {
+        let mem = MemBlockDevice::new(name, 256 * 1024);
+        {
+            let mut data = mem.data.lock();
+            data[1024 + 16..1024 + 20].copy_from_slice(&6u32.to_le_bytes());
+            data[2048 + 14..2048 + 16].copy_from_slice(&6u16.to_le_bytes());
+            for bit in 0..=9 {
+                metadata::bitmap_set(&mut data[4 * 1024..5 * 1024], bit).unwrap();
+            }
+        }
+        let bdev = BlockDevice::wrap(mem, mem_block_device_ops());
+        let sb = SuperBlock::alloc("ext4", EXT4_SUPER_MAGIC as u64, &EXT4_SUPER_OPS);
+        let sbi = Arc::new(Ext4Sbi {
+            bdev,
+            fs_uuid: [0; 16],
+            block_size: 1024,
+            blocks_per_group: 128,
+            inodes_per_group: 16,
+            first_ino: 11,
+            inode_size: 256,
+            want_extra_isize: 32,
+            feature_compat: 0,
+            feature_incompat: 0,
+            feature_ro_compat: 0,
+            inodes_count: 16,
+            blocks_count: 128,
+            group_desc_size: 32,
+            group_descs: alloc::vec![super::super::balloc::Ext4GroupDesc {
+                bg_block_bitmap: 3,
+                bg_inode_bitmap: 4,
+                bg_inode_table: 5,
+                bg_free_blocks_count: 0,
+                bg_free_inodes_count: 6,
+                bg_used_dirs_count: 1,
+            }],
+        });
+        stash_sbi(&sb, sbi.clone()).unwrap();
+
+        let parent = Inode::new(
+            2,
+            InodeKind::Directory,
+            0o755,
+            &EXT4_DIR_INODE_OPS,
+            &EXT4_DIR_FILE_OPS,
+            InodePrivate::None,
+        );
+        *parent.sb.lock() = Some(sb.clone());
+        (sbi, sb, parent)
+    }
+
+    fn create_inode_with_cred(
+        sbi: &Ext4Sbi,
+        sb: &SuperBlockRef,
+        parent: &InodeRef,
+        uid: u32,
+        gid: u32,
+    ) -> InodeRef {
+        create_inode_with_cred_and_mode(
+            sbi,
+            sb,
+            parent,
+            uid,
+            gid,
+            S_IFREG | 0o640,
+            InodeKind::Regular,
+        )
+    }
+
+    fn create_inode_with_cred_and_mode(
+        sbi: &Ext4Sbi,
+        sb: &SuperBlockRef,
+        parent: &InodeRef,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        kind: InodeKind,
+    ) -> InodeRef {
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let cred = Box::new(test_cred(uid, gid));
+        let previous = install_current(&mut current, &cred);
+        let result = ext4_new_inode(sbi, sb, parent, mode, kind);
+        unsafe { sched::set_current(previous) };
+        current.cred = &raw const INIT_CRED;
+        current.m27.real_cred = &raw const INIT_CRED;
+        result.expect("create ext4 inode")
+    }
+
+    #[test]
+    fn ext4_new_inode_persists_non_root_fsuid_and_fsgid() {
+        let (sbi, sb, parent) = new_inode_owner_fixture("ext4-inode-owner");
+        let inode = create_inode_with_cred(&sbi, &sb, &parent, 1000, 1001);
+
+        assert_eq!(inode.uid.load(Ordering::Acquire), 1000);
+        assert_eq!(inode.gid.load(Ordering::Acquire), 1001);
+
+        let raw = ialloc::read_raw_inode(&sbi, inode.ino as u32).unwrap();
+        assert_eq!(le_u16(&raw, 2).unwrap(), 1000);
+        assert_eq!(le_u16(&raw, 24).unwrap(), 1001);
+
+        let persisted = read_inode(&sbi, inode.ino as u32, &sb).unwrap();
+        assert_eq!(persisted.uid.load(Ordering::Acquire), 1000);
+        assert_eq!(persisted.gid.load(Ordering::Acquire), 1001);
+        assert_eq!(persisted.mode.load(Ordering::Acquire), S_IFREG | 0o640);
+    }
+
+    #[test]
+    fn ext4_new_inode_round_trips_32_bit_owner_ids() {
+        let (sbi, sb, parent) = new_inode_owner_fixture("ext4-inode-owner32");
+        let uid = 0x1234_5678;
+        let gid = 0x2345_6789;
+        let inode = create_inode_with_cred(&sbi, &sb, &parent, uid, gid);
+
+        let raw = ialloc::read_raw_inode(&sbi, inode.ino as u32).unwrap();
+        assert_eq!(le_u16(&raw, 2).unwrap(), uid as u16);
+        assert_eq!(le_u16(&raw, 24).unwrap(), gid as u16);
+        assert_eq!(le_u16(&raw, 120).unwrap(), (uid >> 16) as u16);
+        assert_eq!(le_u16(&raw, 122).unwrap(), (gid >> 16) as u16);
+
+        let persisted = read_inode(&sbi, inode.ino as u32, &sb).unwrap();
+        assert_eq!(persisted.uid.load(Ordering::Acquire), uid);
+        assert_eq!(persisted.gid.load(Ordering::Acquire), gid);
+    }
+
+    #[test]
+    fn ext4_new_directory_inherits_setgid_parent_group_and_mode() {
+        let (sbi, sb, parent) = new_inode_owner_fixture("ext4-inode-setgid");
+        parent.mode.store(S_IFDIR | 0o2775, Ordering::Release);
+        parent.gid.store(4242, Ordering::Release);
+
+        let inode = create_inode_with_cred_and_mode(
+            &sbi,
+            &sb,
+            &parent,
+            1000,
+            1001,
+            S_IFDIR | 0o755,
+            InodeKind::Directory,
+        );
+        assert_eq!(inode.uid.load(Ordering::Acquire), 1000);
+        assert_eq!(inode.gid.load(Ordering::Acquire), 4242);
+        assert_eq!(inode.mode.load(Ordering::Acquire), S_IFDIR | 0o2755);
+        assert_eq!(
+            ext4_inode_of(&inode).unwrap().i_mode,
+            (S_IFDIR | 0o2755) as u16
+        );
+
+        let persisted = read_inode(&sbi, inode.ino as u32, &sb).unwrap();
+        assert_eq!(persisted.gid.load(Ordering::Acquire), 4242);
+        assert_eq!(persisted.mode.load(Ordering::Acquire), S_IFDIR | 0o2755);
+    }
 
     #[test]
     fn ext4_block_bitmap_mapping_accounts_for_first_data_block() {

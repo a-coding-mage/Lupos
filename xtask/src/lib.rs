@@ -20,6 +20,8 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 pub(crate) mod audit;
 #[path = "../../src/arch/x86/boot/compressed/mkpiggy.rs"]
@@ -4713,6 +4715,17 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    done\n",
         "    return 1\n",
         "}\n",
+        "process_named_uid() {\n",
+        "    wanted=\"$1\"; wanted_uid=\"$2\"\n",
+        "    for proc in /proc/[0-9]*; do\n",
+        "        [ -r \"$proc/comm\" ] && [ -r \"$proc/status\" ] || continue\n",
+        "        comm=; IFS= read -r comm < \"$proc/comm\" 2>/dev/null || true\n",
+        "        [ \"$comm\" = \"$wanted\" ] || continue\n",
+        "        uid=\"$(awk '/^Uid:/ { print $2; exit }' \"$proc/status\" 2>/dev/null)\"\n",
+        "        [ \"$uid\" = \"$wanted_uid\" ] && return 0\n",
+        "    done\n",
+        "    return 1\n",
+        "}\n",
         "process_named() {\n",
         "    wanted=\"$1\"\n",
         "    for proc in /proc/[0-9]*; do\n",
@@ -4724,9 +4737,9 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    done\n",
         "    return 1\n",
         "}\n",
-        "xfce_desktop_ready() {\n",
+        "user_xfce_desktop_ready() {\n",
         "    for wanted in xfce4-session xfwm4 xfsettingsd xfce4-panel xfdesktop; do\n",
-        "        process_named \"$wanted\" || return 1\n",
+        "        process_named_uid \"$wanted\" 1000 || return 1\n",
         "    done\n",
         "    return 0\n",
         "}\n",
@@ -4835,6 +4848,12 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "echo 'graphics-x11: greeter-ready-probe begin'\n",
         "i=0; while [ \"$i\" -lt 120 ] && ! grep -q 'Greeter connected' /var/log/lightdm/lightdm.log 2>/dev/null; do i=$((i + 1)); sleep 1; done\n",
         "if grep -q 'Greeter connected' /var/log/lightdm/lightdm.log 2>/dev/null; then echo 'graphics-x11: greeter-ready ok'; else echo 'graphics-x11: greeter-ready missing'; fi\n",
+        // The HMP-driven regression login uses the real uid-1000 account.
+        // Requiring its live session manager catches both failed PAM/session
+        // dispatch and the historical root-owned ~/.Xauthority teardown.
+        "echo 'graphics-x11: user-session-probe begin'\n",
+        "i=0; while [ \"$i\" -lt 60 ] && ! process_named_uid xfce4-session 1000; do i=$((i + 1)); sleep 1; done\n",
+        "if process_named_uid xfce4-session 1000; then echo 'graphics-x11: user-session ok'; else echo 'graphics-x11: user-session failed'; fi\n",
         // The tty sysctls Linux registers from `tty_init()` (drivers/tty/
         // tty_io.c::tty_table).  The vendor kselftest tty_tiocsti_test.c
         // skips entirely when this file is absent, so its presence (and the
@@ -4851,6 +4870,19 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "else\n",
         "    rc=\"$?\"\n",
         "    if [ \"$rc\" -eq 124 ]; then echo 'graphics-x11: timeout-sanity ok'; else printf 'graphics-x11: timeout-sanity failed rc=%s\\n' \"$rc\"; fi\n",
+        "fi\n",
+        // Exercise the exact DNS + TCP + HTTP path used from an XFCE terminal.
+        // Retry while networkd applies the static QEMU profile; a successful
+        // response proves this graphical multi-user boot actually enabled the
+        // network services rather than merely staging their unit files.
+        "echo 'graphics-x11: curl-probe begin'\n",
+        "rm -f /tmp/lupos-curl.log\n",
+        "if curl -fsSI --connect-timeout 5 --max-time 10 --retry 12 --retry-all-errors --retry-delay 1 --retry-max-time 60 http://example.com >/tmp/lupos-curl.log 2>&1; then\n",
+        "    echo 'graphics-x11: curl dns ok'\n",
+        "else\n",
+        "    rc=\"$?\"\n",
+        "    printf 'graphics-x11: curl failed rc=%s\\n' \"$rc\"\n",
+        "    cat /tmp/lupos-curl.log 2>/dev/null || true\n",
         "fi\n",
         "echo 'graphics-x11: xclient-probe begin'\n",
         "if [ -x /usr/bin/xmodmap ]; then\n",
@@ -4968,74 +5000,46 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "else\n",
         "    echo 'graphics-x11: dbus no-daemon'\n",
         "fi\n",
-        // XFCE desktop check: launch the same session LightDM dispatches against
-        // its already-running X server, then require the session manager,
-        // window manager, settings daemon, panel, and desktop surface together.
+        // Require the complete desktop launched by the authenticated uid-1000
+        // LightDM session. Starting a second root XFCE session would race the
+        // real desktop and let its processes satisfy these checks accidentally.
         "echo 'graphics-x11: xfce-probe begin'\n",
         "if [ ! -x /usr/bin/startxfce4 ]; then\n",
         "    echo 'graphics-x11: xfce no-startxfce4'\n",
         "elif [ ! -S /tmp/.X11-unix/X0 ]; then\n",
         "    echo 'graphics-x11: xfce no-xserver'\n",
         "else\n",
-        "    export DISPLAY=:0 HOME=/root\n",
-        "    export XDG_CONFIG_DIRS=/etc/xdg XDG_DATA_DIRS=/usr/share\n",
-        "    export XDG_CACHE_HOME=/root/.cache XDG_CONFIG_HOME=/root/.config XDG_RUNTIME_DIR=/tmp/lupos-xfce-runtime\n",
-        "    export NO_AT_BRIDGE=1 GTK_A11Y=none\n",
-        "    mkdir -p /root/.cache /root/.config \"$XDG_RUNTIME_DIR\"\n",
-        "    chmod 700 \"$XDG_RUNTIME_DIR\" 2>/dev/null || true\n",
-        // Detach the session into its own process group/session with setsid and
-        // a null stdin so it can never contend for the probe shell's controlling
-        // terminal or job control while we poll for the window manager.
-        "    setsid sh -c 'dbus-run-session -- startxfce4' </dev/null >/tmp/lupos-xfce.log 2>&1 &\n",
-        // Poll the complete desktop set without spawning a pgrep process for
-        // every component on every iteration. This keeps the gate's own process
-        // pressure small and makes "xfce ok" mean a usable desktop, not just a WM.
         "    i=0\n",
         "    while [ \"$i\" -lt 120 ]; do\n",
-        "        if xfce_desktop_ready; then break; fi\n",
+        "        if user_xfce_desktop_ready; then break; fi\n",
         "        if [ $((i % 15)) -eq 0 ]; then\n",
         "            printf 'graphics-x11: xfce-wait t=%s procs=[' \"$i\"\n",
         "            for p in xfce4-session xfwm4 xfsettingsd xfconfd xfce4-panel xfdesktop; do\n",
-        "                process_named \"$p\" && printf '%s ' \"$p\"\n",
+        "                process_named_uid \"$p\" 1000 && printf '%s ' \"$p\"\n",
         "            done\n",
         "            printf ']\\n'\n",
         "        fi\n",
         "        i=$((i + 1)); sleep 1\n",
         "    done\n",
         "    sleep 5\n",
-        "    xfce_ready=0\n",
-        "    if xfce_desktop_ready; then\n",
-        "        xfce_ready=1\n",
+        "    if user_xfce_desktop_ready; then\n",
         "        echo 'graphics-x11: xfce ok'\n",
         "        for p in xfce4-session xfwm4 xfsettingsd xfce4-panel xfdesktop; do\n",
-        "            printf 'graphics-x11: xfce-proc %s\\n' \"$p\"\n",
+        "            printf 'graphics-x11: xfce-proc %s uid=1000\\n' \"$p\"\n",
         "        done\n",
         "    else\n",
         "        echo 'graphics-x11: xfce failed'\n",
         "        printf 'graphics-x11: xfce-final procs=['\n",
         "        for p in xfce4-session xfwm4 xfsettingsd xfconfd xfce4-panel xfdesktop; do\n",
-        "            process_named \"$p\" && printf '%s ' \"$p\"\n",
+        "            process_named_uid \"$p\" 1000 && printf '%s ' \"$p\"\n",
         "        done\n",
         "        printf ']\\n'\n",
         "    fi\n",
-        "    if [ -s /tmp/lupos-xfce.log ]; then echo 'graphics-x11: xfce-log begin'; tail -80 /tmp/lupos-xfce.log; echo 'graphics-x11: xfce-log end'; fi\n",
-        // Diagnostic: if the WM/panel did not come up under the session, try to
-        // launch them directly so their startup errors surface on the serial log.
-        "    if [ \"$xfce_ready\" -eq 0 ]; then\n",
-        "        if ! process_named xfwm4; then\n",
-        "            DISPLAY=:0 xfwm4 >/tmp/lupos-xfwm4.log 2>&1 &\n",
-        "            sleep 3\n",
-        "            if process_named xfwm4; then echo 'graphics-x11: xfwm4-direct ok'; else echo 'graphics-x11: xfwm4-direct failed'; fi\n",
-        "            echo 'graphics-x11: xfwm4-log begin'; tail -40 /tmp/lupos-xfwm4.log 2>/dev/null; echo 'graphics-x11: xfwm4-log end'\n",
-        "        fi\n",
-        "        if ! process_named xfce4-panel; then\n",
-        "            DISPLAY=:0 xfce4-panel >/tmp/lupos-panel.log 2>&1 &\n",
-        "            sleep 3\n",
-        "            if process_named xfce4-panel; then echo 'graphics-x11: panel-direct ok'; else echo 'graphics-x11: panel-direct failed'; fi\n",
-        "            echo 'graphics-x11: panel-log begin'; tail -40 /tmp/lupos-panel.log 2>/dev/null; echo 'graphics-x11: panel-log end'\n",
-        "        fi\n",
-        "    fi\n",
         "fi\n",
+        // QEMU's synthetic keyboard input is also mirrored into the kernel
+        // console in this configuration. Consume the two credential lines
+        // before returning to the privileged interactive shell.
+        "timeout 3 sh -c 'IFS= read -r _ || exit 0; IFS= read -r _ || true' || true\n",
     )
     .as_bytes()
     .to_vec()
@@ -7263,6 +7267,44 @@ fn systemd_login_userland_files_with_stage_and_options(
             "/usr/lib/systemd/system/systemd-resolved.service",
         ));
         for (wants_path, target) in [
+            // Mirror the vendor units' [Install] graph for the normal distro
+            // boot. GraphicsX11 switches default.target to multi-user.target,
+            // so terminal-only wants leave the desktop without an address,
+            // route, or resolver even though the virtio NIC is present.
+            (
+                "etc/systemd/system/multi-user.target.wants/systemd-networkd.service",
+                "/usr/lib/systemd/system/systemd-networkd.service",
+            ),
+            (
+                "etc/systemd/system/sysinit.target.wants/systemd-resolved.service",
+                "/usr/lib/systemd/system/systemd-resolved.service",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-networkd.socket",
+                "/usr/lib/systemd/system/systemd-networkd.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-networkd-varlink.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-networkd-varlink-metrics.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink-metrics.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-networkd-resolve-hook.socket",
+                "/usr/lib/systemd/system/systemd-networkd-resolve-hook.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-resolved-varlink.socket",
+                "/usr/lib/systemd/system/systemd-resolved-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-resolved-monitor.socket",
+                "/usr/lib/systemd/system/systemd-resolved-monitor.socket",
+            ),
+            // The fast login-stack target does not pull in the standard
+            // multi-user/sysinit/sockets graph, so retain its explicit wants.
             (
                 "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.service",
                 "/usr/lib/systemd/system/systemd-networkd.service",
@@ -8755,9 +8797,40 @@ fn module_payload(spec: &DriverModuleSpec) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Modules whose `.ko` artifacts stay staged but whose AUTOLOAD is deferred
+/// until their Lupos runtime ABI is complete.
+///
+/// `ahci`: the vendor probe reads a corrupted `ahci_host_priv` through the
+/// storage glue (cap low byte and port_map zeroed while the raw BAR reads
+/// 0xc0141f05/0x3f) and dies in a wild #UD after "ports implemented".  Every
+/// QEMU disk-boot mode carries the boot ISO on the Q35 AHCI controller, so
+/// autoloading ahci kills boot before login.
+///
+/// `bochs`/`virtio_gpu`/`i915`: Lupos Xorg drives the firmware framebuffer
+/// through the synthetic-fb wrapper; letting the DRM display drivers bind the
+/// QEMU VGA changes the /dev/fb*//dev/dri topology and the X server
+/// crash-loops under lightdm (graphics-x11 gate: "xorg-proc missing").
+///
+/// `i2c_i801`: binds the Q35 SMBus at 00:1f.3; the host-notify IRQ-domain
+/// allocation fails intermittently (-ENOMEM, IRQ-pool dependent) and a
+/// failed probe's devres teardown of its threaded IRQ on the shared line
+/// wedges boot around 5-6s (observed on `run --gui`, release kernel).
+/// QEMU's SMBus serves nothing Lupos needs yet.
+///
+/// Explicit `modprobe` and PCI-driven loading on a fixed ABI remain possible;
+/// remove entries here as each runtime surface lands.
+const RUNTIME_DEFERRED_MODULE_NAMES: &[&str] = &["ahci", "bochs", "virtio_gpu", "i915", "i2c_i801"];
+
+fn module_autoload_deferred(name: &str) -> bool {
+    RUNTIME_DEFERRED_MODULE_NAMES.contains(&name)
+}
+
 fn module_list_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
     let mut list = String::new();
     for spec in modules {
+        if module_autoload_deferred(spec.module_name) {
+            continue;
+        }
         list.push_str(spec.module_name);
         list.push('\n');
     }
@@ -8765,6 +8838,20 @@ fn module_list_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
 }
 
 const SYSTEMD_MODULES_LOAD_CONF_PATH: &str = "usr/lib/modules-load.d/lupos.conf";
+const MODPROBE_DEFER_CONF_PATH: &str = "etc/modprobe.d/lupos-deferred.conf";
+
+fn modprobe_defer_conf_contents() -> Vec<u8> {
+    let mut contents = String::from(
+        "# Autoload deferred until the Lupos runtime ABI for these drivers is\n\
+         # complete (see xtask RUNTIME_DEFERRED_MODULE_NAMES).\n",
+    );
+    for name in RUNTIME_DEFERRED_MODULE_NAMES {
+        contents.push_str("blacklist ");
+        contents.push_str(name);
+        contents.push('\n');
+    }
+    contents.into_bytes()
+}
 
 fn module_load_request_files_from_specs(modules: &[&DriverModuleSpec]) -> Vec<InitramfsFile> {
     let module_list = module_list_from_specs(modules);
@@ -8774,6 +8861,14 @@ fn module_load_request_files_from_specs(modules: &[&DriverModuleSpec]) -> Vec<In
         // systemd-modules-load consumes modules-load.d(5), one module name per
         // line, so keep it byte-for-byte aligned with the legacy SysV request.
         initramfs_file(SYSTEMD_MODULES_LOAD_CONF_PATH, 0o100644, module_list),
+        // udev coldplug loads by PCI modalias and does honour modprobe.d
+        // blacklists; without this, deferred modules load anyway on the first
+        // `udevadm trigger`.
+        initramfs_file(
+            MODPROBE_DEFER_CONF_PATH,
+            0o100644,
+            modprobe_defer_conf_contents(),
+        ),
     ]
 }
 
@@ -9392,7 +9487,10 @@ const EARLY_ROOT_MODULE_NAMES: &[&str] = &[
     "sd_mod",
     "libata",
     "libahci",
-    "ahci",
+    // "ahci" itself is runtime-deferred (RUNTIME_DEFERRED_MODULE_NAMES): its
+    // probe corrupts ahci_host_priv through the storage glue and panics every
+    // Q35 boot that carries the ISO on the SATA bus.  The VirtualBox AHCI
+    // root path needs the storage ABI fixed before it can work regardless.
 ];
 
 /// The complete module closure exercised by the QEMU virtio-blk root-binding
@@ -13632,6 +13730,40 @@ fn direct_stage_login_root_disk_overlay_files(
                 "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-monitor.socket",
                 "/usr/lib/systemd/system/systemd-resolved-monitor.socket",
             ),
+            // Match the vendor units' [Install] targets for normal distro
+            // boots such as GraphicsX11, whose default is multi-user.target.
+            (
+                "etc/systemd/system/multi-user.target.wants/systemd-networkd.service",
+                "/usr/lib/systemd/system/systemd-networkd.service",
+            ),
+            (
+                "etc/systemd/system/sysinit.target.wants/systemd-resolved.service",
+                "/usr/lib/systemd/system/systemd-resolved.service",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-networkd.socket",
+                "/usr/lib/systemd/system/systemd-networkd.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-networkd-varlink.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-networkd-varlink-metrics.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink-metrics.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-networkd-resolve-hook.socket",
+                "/usr/lib/systemd/system/systemd-networkd-resolve-hook.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-resolved-varlink.socket",
+                "/usr/lib/systemd/system/systemd-resolved-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-resolved-monitor.socket",
+                "/usr/lib/systemd/system/systemd-resolved-monitor.socket",
+            ),
         ] {
             files.push(initramfs_symlink(wants_path, target));
         }
@@ -14726,17 +14858,20 @@ pub fn run_login_stack_tests() -> Result<()> {
         SerialExpectStep {
             label: "terminated job notification",
             wait_for: "Terminated",
-            send: b"\n",
+            send: b"",
         },
         SerialExpectStep {
             label: "login banner",
             wait_for: prompt,
-            send: b"echo login-stack: gate ok\n",
+            // Bash can print PS1 just before it finishes restoring the tty
+            // after a stopped job exits. A sacrificial blank keeps the first
+            // command byte from being consumed during that transition.
+            send: b" echo login-stack: gate ok\n",
         },
         SerialExpectStep {
             label: "logout lupos",
             wait_for: prompt,
-            send: b"exit\n",
+            send: b" exit\n",
         },
         SerialExpectStep {
             label: "shutdown root login",
@@ -14762,17 +14897,19 @@ pub fn run_login_stack_tests() -> Result<()> {
         SerialExpectStep {
             label: "root filesystem marker",
             wait_for: "login-stack: root fs ok",
-            send: b"\n",
+            send: b"",
         },
         SerialExpectStep {
             label: "curl dns probe",
             wait_for: "[root@lupos /]#",
-            send: b"curl -fsSI --max-time 20 http://example.com >/tmp/lupos-curl.log 2>&1 && ok='login-stack: curl dns ' && printf '%s\\n' \"${ok}ok\" || { rc=$?; printf 'login-stack: curl failed rc=%s\\n' \"$rc\"; cat /tmp/lupos-curl.log; exit 1; }\n",
+            // Keep a harmless leading blank in case the freshly repainted PS1
+            // still consumes one byte while restoring canonical input.
+            send: b" curl -fsSI --max-time 20 http://example.com >/tmp/lupos-curl.log 2>&1 && ok='login-stack: curl dns ' && printf '%s\\n' \"${ok}ok\" || { rc=$?; printf 'login-stack: curl failed rc=%s\\n' \"$rc\"; cat /tmp/lupos-curl.log; exit 1; }\n",
         },
         SerialExpectStep {
             label: "curl dns marker",
             wait_for: "login-stack: curl dns ok",
-            send: b"\n",
+            send: b"",
         },
         SerialExpectStep {
             label: "shutdown",
@@ -14917,6 +15054,26 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             send: b"poweroff -f\n",
         },
     ];
+    let hmp_steps = [
+        HmpExpectStep {
+            label: "greeter username prompt",
+            wait_for: "Prompt greeter with 1 message(s)",
+            text: Some("lupos"),
+        },
+        // Advance past the username transition before looking for the second,
+        // byte-identical PAM prompt. This prevents the password from matching
+        // and being typed into the original username field.
+        HmpExpectStep {
+            label: "greeter accepted username",
+            wait_for: "Greeter start authentication for lupos",
+            text: None,
+        },
+        HmpExpectStep {
+            label: "greeter password prompt",
+            wait_for: "Prompt greeter with 1 message(s)",
+            text: Some("lupos"),
+        },
+    ];
 
     let run = build_and_run_iso_with_serial_expect_display(
         BootMode::GraphicsX11,
@@ -14927,6 +15084,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         },
         &steps,
         "none",
+        &hmp_steps,
     )?;
 
     for needle in [
@@ -14936,8 +15094,15 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: lightdm ok",
         "graphics-x11: greeter ok",
         "graphics-x11: greeter-ready ok",
+        "Greeter start authentication for lupos",
+        "Authenticate result for user lupos: Success",
+        "User lupos authorized",
+        "Greeter requests session xfce",
+        "Running command /usr/libexec/lupos-lightdm-session startxfce4",
+        "graphics-x11: user-session ok",
         "graphics-x11: tty-sysctl ok",
         "graphics-x11: timeout-sanity ok",
+        "graphics-x11: curl dns ok",
         "graphics-x11: xclient-roundtrip ok",
         "graphics-x11: pointer ok",
         "graphics-x11: pty-roundtrip ok",
@@ -14970,9 +15135,11 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: lightdm missing",
         "graphics-x11: greeter missing",
         "graphics-x11: greeter-ready missing",
+        "graphics-x11: user-session failed",
         "graphics-x11: tty-sysctl missing",
         "graphics-x11: timeout-sanity unexpected-ok",
         "graphics-x11: timeout-sanity failed",
+        "graphics-x11: curl failed",
         "graphics-x11: xclient-roundtrip failed",
         "graphics-x11: xclient-roundtrip missing-xmodmap",
         "graphics-x11: pty-roundtrip failed",
@@ -14986,6 +15153,8 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: pixbuf failed",
         "graphics-x11: dbus failed",
         "graphics-x11: xfce failed",
+        "Error writing X authority",
+        "-bash: lupos: command not found",
         "Unrecognized image file format",
         "no screens found",
         "Fatal server error",
@@ -15305,6 +15474,9 @@ fn ping_smoke_expected_driver_modules() -> Vec<&'static str> {
             staged_module_specs_from_config_text(&text)
                 .into_iter()
                 .map(|spec| spec.module_name)
+                // Runtime-deferred modules are excluded from every autoload
+                // list, so the boot log legitimately never loads them.
+                .filter(|name| !module_autoload_deferred(name))
                 .collect()
         })
         .unwrap_or_default()
@@ -17530,13 +17702,19 @@ struct SerialExpectStep {
     send: &'static [u8],
 }
 
+struct HmpExpectStep {
+    label: &'static str,
+    wait_for: &'static str,
+    text: Option<&'static str>,
+}
+
 /// Build the GRUB ISO and boot QEMU with expect-style serial interaction.
 fn build_and_run_iso_with_serial_expect(
     mode: BootMode,
     options: RunOptions,
     steps: &[SerialExpectStep],
 ) -> Result<BootRun> {
-    build_and_run_iso_with_serial_expect_display(mode, options, steps, "none")
+    build_and_run_iso_with_serial_expect_display(mode, options, steps, "none", &[])
 }
 
 fn build_and_run_iso_with_serial_expect_display(
@@ -17544,6 +17722,7 @@ fn build_and_run_iso_with_serial_expect_display(
     options: RunOptions,
     steps: &[SerialExpectStep],
     display: &str,
+    hmp_steps: &[HmpExpectStep],
 ) -> Result<BootRun> {
     let _root_disk_guard = default_qemu_root_disk_guard_for_mode(mode)?;
     let artifacts = build_iso_artifacts(mode, options.exit_after_boot)?;
@@ -17552,8 +17731,14 @@ fn build_and_run_iso_with_serial_expect_display(
         .as_ref()
         .expect("iso path must be present in ISO artifacts");
     let timeout = options.qemu_timeout.unwrap_or_else(default_qemu_timeout);
-    let status =
-        run_qemu_iso_with_serial_expect(iso, &artifacts.serial_log, steps, timeout, display)?;
+    let status = run_qemu_iso_with_serial_expect(
+        iso,
+        &artifacts.serial_log,
+        steps,
+        timeout,
+        display,
+        hmp_steps,
+    )?;
     let serial_output = read_serial_log(&artifacts.serial_log)?;
     Ok(BootRun {
         artifacts,
@@ -20376,12 +20561,85 @@ pub fn run_qemu_iso_with_serial_script(
     }
 }
 
+struct HmpMonitor {
+    #[cfg(unix)]
+    stream: UnixStream,
+}
+
+struct RemoveFileOnDrop(PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+impl HmpMonitor {
+    #[cfg(unix)]
+    fn connect(socket: &Path) -> Result<Self> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match UnixStream::connect(socket) {
+                Ok(stream) => {
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .context("failed to set QEMU HMP write timeout")?;
+                    return Ok(Self { stream });
+                }
+                Err(err) if Instant::now() < deadline => {
+                    let _ = err;
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to connect to QEMU HMP socket {}", socket.display())
+                    });
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn connect(socket: &Path) -> Result<Self> {
+        bail!(
+            "graphical login input requires a Unix QEMU monitor socket: {}",
+            socket.display()
+        )
+    }
+
+    #[cfg(unix)]
+    fn type_text(&mut self, text: &str) -> Result<()> {
+        for byte in text.bytes().chain(core::iter::once(b'\n')) {
+            let key = match byte {
+                b'a'..=b'z' | b'0'..=b'9' => (byte as char).to_string(),
+                b'\n' => String::from("ret"),
+                _ => bail!("unsupported HMP text-input byte 0x{byte:02x}"),
+            };
+            writeln!(self.stream, "sendkey {key} 50")
+                .context("failed to send key through QEMU HMP")?;
+            self.stream
+                .flush()
+                .context("failed to flush QEMU HMP command")?;
+            // HMP sendkey is asynchronous. Keep successive key-up/key-down
+            // events distinct so GTK never interprets them as a chord.
+            thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn type_text(&mut self, _text: &str) -> Result<()> {
+        bail!("graphical login input requires a Unix QEMU monitor socket")
+    }
+}
+
 fn run_qemu_iso_with_serial_expect(
     iso_path: &Path,
     serial_log_path: &Path,
     steps: &[SerialExpectStep],
     timeout: Duration,
     display: &str,
+    hmp_steps: &[HmpExpectStep],
 ) -> Result<ExitStatus> {
     let serial_log = fs::File::create(serial_log_path)
         .with_context(|| format!("failed to create {}", serial_log_path.display()))?;
@@ -20391,6 +20649,16 @@ fn run_qemu_iso_with_serial_expect(
         .stdout(Stdio::from(serial_log))
         .stderr(Stdio::null());
     add_qemu_iso_base_args(&mut command, iso_path, display, "stdio");
+    let hmp_socket = env::temp_dir().join(format!("lupos-hmp-{}.sock", artifact_run_id()));
+    let _hmp_socket_cleanup = if hmp_steps.is_empty() {
+        None
+    } else {
+        let _ = fs::remove_file(&hmp_socket);
+        command
+            .arg("-monitor")
+            .arg(format!("unix:{},server=on,wait=off", hmp_socket.display()));
+        Some(RemoveFileOnDrop(hmp_socket.clone()))
+    };
     command.current_dir(repo_root().context("failed to resolve repo root")?);
 
     let qemu_lock = QemuRunLock::acquire()?;
@@ -20405,6 +20673,9 @@ fn run_qemu_iso_with_serial_expect(
     progress.serial_log_opened();
 
     let deadline = Instant::now() + timeout;
+    let mut hmp_monitor = None;
+    let mut hmp_index = 0usize;
+    let mut hmp_cursor = 0usize;
     let mut cursor = 0usize;
     for step in steps {
         loop {
@@ -20421,6 +20692,34 @@ fn run_qemu_iso_with_serial_expect(
             }
             let log = read_serial_log_if_present(serial_log_path);
             progress.observe_log(&log);
+            if let Some(hmp_step) = hmp_steps.get(hmp_index) {
+                let visible = log.get(hmp_cursor..).unwrap_or(&log);
+                let visible_stripped = strip_ansi_escapes(visible);
+                let raw_match_end = visible
+                    .find(hmp_step.wait_for)
+                    .map(|idx| hmp_cursor + idx + hmp_step.wait_for.len());
+                if raw_match_end.is_some() || visible_stripped.contains(hmp_step.wait_for) {
+                    progress.note_expect_match(hmp_step.label);
+                    if let Some(text) = hmp_step.text {
+                        // LightDM logs the PAM prompt before the GTK entry has
+                        // acquired keyboard focus. Typing immediately can drop
+                        // the leading characters and authenticate the suffix.
+                        thread::sleep(Duration::from_secs(2));
+                        let monitor = match hmp_monitor.as_mut() {
+                            Some(monitor) => monitor,
+                            None => {
+                                hmp_monitor = Some(HmpMonitor::connect(&hmp_socket)?);
+                                hmp_monitor.as_mut().expect("HMP monitor initialized")
+                            }
+                        };
+                        monitor.type_text(text)?;
+                        hmp_cursor = log.len();
+                    } else {
+                        hmp_cursor = raw_match_end.unwrap_or(log.len());
+                    }
+                    hmp_index += 1;
+                }
+            }
             let visible = log.get(cursor..).unwrap_or(&log);
             // The login PS1 paints user@host / \w with ANSI CSI escapes
             // (`\x1b[01;32m…\x1b[00m`); a plain `visible.contains("root@lupos:~#")`
@@ -22835,6 +23134,50 @@ failed command output\n";
             b"/usr/lib/systemd/system/multi-user.target",
             "graphics-x11 must boot the normal multi-user graph before starting Xorg"
         );
+        // Match systemd-networkd/resolved's vendor [Install] sections. The
+        // graphical image boots this standard graph rather than the custom
+        // lupos-terminal.target, so terminal-only links make curl fail from
+        // every XFCE terminal despite a working virtio device.
+        for (link, target) in [
+            (
+                "etc/systemd/system/multi-user.target.wants/systemd-networkd.service",
+                "/usr/lib/systemd/system/systemd-networkd.service",
+            ),
+            (
+                "etc/systemd/system/sysinit.target.wants/systemd-resolved.service",
+                "/usr/lib/systemd/system/systemd-resolved.service",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-networkd.socket",
+                "/usr/lib/systemd/system/systemd-networkd.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-networkd-varlink.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-networkd-varlink-metrics.socket",
+                "/usr/lib/systemd/system/systemd-networkd-varlink-metrics.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-networkd-resolve-hook.socket",
+                "/usr/lib/systemd/system/systemd-networkd-resolve-hook.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-resolved-varlink.socket",
+                "/usr/lib/systemd/system/systemd-resolved-varlink.socket",
+            ),
+            (
+                "etc/systemd/system/sockets.target.wants/systemd-resolved-monitor.socket",
+                "/usr/lib/systemd/system/systemd-resolved-monitor.socket",
+            ),
+        ] {
+            assert_eq!(
+                initramfs_file_bytes(&files, link),
+                Some(target.as_bytes()),
+                "graphics boot graph must enable {link}"
+            );
+        }
 
         let xorg_conf = core::str::from_utf8(
             initramfs_file_bytes(&files, "etc/X11/xorg.conf.d/10-lupos-fbdev.conf")
@@ -22978,8 +23321,16 @@ failed command output\n";
         assert!(probe.contains("graphics-x11: xorg-log using-direct"));
         assert!(probe.contains("graphics-x11: lightdm ok"));
         assert!(probe.contains("graphics-x11: greeter ok"));
-        assert!(probe.contains("xfce_desktop_ready"));
+        assert!(probe.contains("process_named_uid xfce4-session 1000"));
+        assert!(probe.contains("graphics-x11: user-session ok"));
+        assert!(probe.contains("curl -fsSI"));
+        assert!(probe.contains("http://example.com"));
+        assert!(probe.contains("graphics-x11: curl dns ok"));
+        assert!(probe.contains("user_xfce_desktop_ready"));
         assert!(probe.contains("xfce4-panel xfdesktop"));
+        assert!(probe.contains("process_named_uid \"$wanted\" 1000"));
+        assert!(!probe.contains("dbus-run-session -- startxfce4"));
+        assert!(!probe.contains("HOME=/root"));
         assert!(!probe.contains("systemctl "));
         assert!(!probe.contains("journalctl "));
         assert!(probe.contains("/tmp/.X11-unix/X0"));
@@ -25031,7 +25382,10 @@ CONFIG_I2C_I801=m
         );
         assert_eq!(
             etc_modules_from_config_text(config),
-            b"i2c_core\ni2c_smbus\ni2c_i801\n"
+            // i2c_i801 stays staged but autoload-deferred
+            // (RUNTIME_DEFERRED_MODULE_NAMES): its Q35 probe failure path
+            // wedges boot while the IRQ-domain ABI is incomplete.
+            b"i2c_core\ni2c_smbus\n"
         );
         assert_eq!(
             modules_order_from_specs(&specs),
@@ -25216,7 +25570,10 @@ CONFIG_DRM_VIRTIO_GPU=m
 
         assert_eq!(
             etc_modules_from_config_text(config),
-            b"zlib_deflate\ni2c_core\ni2c_algo_bit\nagpgart\namd64_agp\nintel_gtt\nintel_agp\niosf_mbi\ndrm_panel_orientation_quirks\ndrm\ndrm_buddy\nttm\ndrm_kms_helper\ndrm_display_helper\ndrm_shmem_helper\nvirtio_dma_buf\nbochs\ni915\nvirtio_gpu\n"
+            // bochs/i915/virtio_gpu are staged but autoload-deferred
+            // (RUNTIME_DEFERRED_MODULE_NAMES): DRM display binding still
+            // crash-loops the Lupos Xorg synthetic-fb path.
+            b"zlib_deflate\ni2c_core\ni2c_algo_bit\nagpgart\namd64_agp\nintel_gtt\nintel_agp\niosf_mbi\ndrm_panel_orientation_quirks\ndrm\ndrm_buddy\nttm\ndrm_kms_helper\ndrm_display_helper\ndrm_shmem_helper\nvirtio_dma_buf\n"
         );
         assert_eq!(
             modules_order_from_specs(&specs),
@@ -25547,7 +25904,10 @@ CONFIG_VIRTIO_PCI=m
 ";
         assert_eq!(
             etc_modules_from_config_text(config),
-            b"bsg\nscsi_common\nscsi_mod\nsd_mod\ncdrom\nsr_mod\nsg\nscsi_transport_spi\nlibata\nlibahci\nahci\nata_piix\npata_amd\npata_oldpiix\npata_sch\nvirtio_pci_modern_dev\nvirtio_pci_legacy_dev\nvirtio_pci\nvirtio_scsi\nusb_storage\n"
+            // "ahci" is absent: RUNTIME_DEFERRED_MODULE_NAMES keeps the .ko
+            // staged but out of every autoload list until the storage ABI
+            // stops corrupting ahci_host_priv during probe.
+            b"bsg\nscsi_common\nscsi_mod\nsd_mod\ncdrom\nsr_mod\nsg\nscsi_transport_spi\nlibata\nlibahci\nata_piix\npata_amd\npata_oldpiix\npata_sch\nvirtio_pci_modern_dev\nvirtio_pci_legacy_dev\nvirtio_pci\nvirtio_scsi\nusb_storage\n"
         );
         let specs = staged_module_specs_from_config_text(config);
         assert_eq!(
@@ -25906,6 +26266,9 @@ CONFIG_SND_HDA_GENERIC=m
             module_list_from_specs(&modules),
             names
                 .iter()
+                // Autoload lists exclude RUNTIME_DEFERRED_MODULE_NAMES; the
+                // .ko artifacts above stay staged for explicit modprobe.
+                .filter(|name| !module_autoload_deferred(name))
                 .flat_map(|name| name.bytes().chain(core::iter::once(b'\n')))
                 .collect::<Vec<_>>()
         );

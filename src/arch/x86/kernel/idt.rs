@@ -944,7 +944,12 @@ fn on_generic(frame: &mut ExceptionFrame, vector: u8) {
         }
         match bug_trap {
             crate::kernel::bug::BugTrapType::Warn => {
-                frame.rip = frame.rip.wrapping_add(2);
+                // Linux handle_bug() resumes at ip + the decoded insn length:
+                // 2 for a plain UD2 WARN, 5 for the __WARN_trap WARNINSN
+                // (vendor/linux/arch/x86/kernel/traps.c::decode_bug).
+                frame.rip = frame
+                    .rip
+                    .wrapping_add(crate::kernel::bug::bug_insn_len(frame.rip as usize) as u64);
                 return;
             }
             crate::kernel::bug::BugTrapType::Bug | crate::kernel::bug::BugTrapType::None => {}

@@ -66,6 +66,10 @@ pub fn read_inode(sbi: &Ext4Sbi, ino: u32, sb: &SuperBlockRef) -> Result<InodeRe
     let i_blocks = u32::from_le(on_disk.i_blocks_lo) as u64;
     let i_flags = u32::from_le(on_disk.i_flags);
     let i_links = u16::from_le(on_disk.i_links_count) as u32;
+    let i_uid = u16::from_le(on_disk.i_uid) as u32
+        | (u16::from_le_bytes([on_disk._osd2[4], on_disk._osd2[5]]) as u32) << 16;
+    let i_gid = u16::from_le(on_disk.i_gid) as u32
+        | (u16::from_le_bytes([on_disk._osd2[6], on_disk._osd2[7]]) as u32) << 16;
 
     let kind = match (i_mode as u32) & S_IFMT {
         S_IFREG => InodeKind::Regular,
@@ -107,10 +111,8 @@ pub fn read_inode(sbi: &Ext4Sbi, ino: u32, sb: &SuperBlockRef) -> Result<InodeRe
     *i.sb.lock() = Some(sb.clone());
     i.size.store(i_size, Ordering::Release);
     i.nlink.store(i_links, Ordering::Release);
-    i.uid
-        .store(u16::from_le(on_disk.i_uid) as u32, Ordering::Release);
-    i.gid
-        .store(u16::from_le(on_disk.i_gid) as u32, Ordering::Release);
+    i.uid.store(i_uid, Ordering::Release);
+    i.gid.store(i_gid, Ordering::Release);
     let _ = (EXT4_EXTENTS_FL, i_flags);
     Ok(i)
 }

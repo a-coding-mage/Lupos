@@ -1549,10 +1549,15 @@ fn send_signal_info_to_process_for_target(
                 || state == crate::kernel::task::task_state::TASK_STOPPED
             {
                 (*target).m26.ptrace_stop_signal = 0;
-                (*target).__state.store(
-                    crate::kernel::task::task_state::TASK_RUNNING,
-                    core::sync::atomic::Ordering::Release,
-                );
+                // Linux prepare_signal(SIGCONT) resumes the stopped task via
+                // wake_up_state(t, __TASK_STOPPED) at generation time
+                // (vendor/linux/kernel/signal.c): try_to_wake_up() both
+                // stores TASK_RUNNING and re-enqueues.  Storing the state
+                // alone leaves the task parked at its stop point, and the
+                // fatal signal bash queues before SIGCONT on a stopped job
+                // (`kill %1`) is never delivered — the job stays "Stopped".
+                set_tif_sigpending(target);
+                let _ = crate::kernel::sched::wake_task(target);
             }
         }
     }
@@ -1701,10 +1706,11 @@ unsafe fn send_signal_to_task_scoped(
                 || state == crate::kernel::task::task_state::TASK_STOPPED
             {
                 (*target).m26.ptrace_stop_signal = 0;
-                (*target).__state.store(
-                    crate::kernel::task::task_state::TASK_RUNNING,
-                    core::sync::atomic::Ordering::Release,
-                );
+                // prepare_signal(SIGCONT) parity: resume through
+                // try_to_wake_up() so the task is re-enqueued and rechecks
+                // its pending set (see send_signal_info_to_process_for_target).
+                set_tif_sigpending(target);
+                let _ = crate::kernel::sched::wake_task(target);
             }
         }
     }
@@ -3197,6 +3203,68 @@ mod tests {
             linux_recalc_sigpending();
             assert!(current.thread_info.flags & crate::kernel::task::TIF_SIGPENDING != 0);
 
+            sched::set_current(previous);
+        }
+        reset_for_tests();
+    }
+
+    /// bash's `kill` builtin sends the fatal signal and then SIGCONT to a
+    /// stopped job.  Linux `prepare_signal(SIGCONT)` resumes the stopped
+    /// task with `wake_up_state(t, __TASK_STOPPED)` at generation time
+    /// (vendor/linux/kernel/signal.c), after which the queued fatal signal
+    /// is delivered and the shell reports "Terminated".  Storing
+    /// TASK_RUNNING without re-enqueueing leaves the job parked at its stop
+    /// point forever (login-stack gate: "terminated job notification").
+    #[test]
+    fn sigcont_wakes_stopped_task_for_pending_fatal_signal() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut shell = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        shell.pid = 190;
+        shell.tgid = 190;
+        let mut target = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        target.pid = 189;
+        target.tgid = 189;
+        let target_ptr = &mut *target as *mut TaskStruct;
+        unsafe {
+            sched::set_current(&mut *shell as *mut TaskStruct);
+        }
+        {
+            let mut table = SIGNAL_TABLE.lock();
+            table.get_or_create_task_index(189, 189, target_ptr);
+        }
+        target.__state.store(
+            crate::kernel::task::task_state::__TASK_STOPPED,
+            core::sync::atomic::Ordering::Release,
+        );
+
+        assert_eq!(
+            send_signal_info_to_process_for_target(target_ptr, SIGTERM, SigInfo::new(SIGTERM, 0)),
+            0
+        );
+        assert_eq!(
+            target.__state.load(core::sync::atomic::Ordering::Acquire),
+            crate::kernel::task::task_state::__TASK_STOPPED,
+            "a catchable fatal signal must not resume a stopped job"
+        );
+        assert!(has_pending_signal_for_pid(189, SIGTERM));
+
+        assert_eq!(
+            send_signal_info_to_process_for_target(target_ptr, SIGCONT, SigInfo::new(SIGCONT, 0)),
+            0
+        );
+        assert_eq!(
+            target.__state.load(core::sync::atomic::Ordering::Acquire),
+            crate::kernel::task::task_state::TASK_RUNNING,
+            "SIGCONT must resume the stopped job"
+        );
+        assert!(
+            target.thread_info.flags & crate::kernel::task::TIF_SIGPENDING != 0,
+            "the resumed job must recheck signals so the pending SIGTERM is delivered"
+        );
+
+        unsafe {
             sched::set_current(previous);
         }
         reset_for_tests();
