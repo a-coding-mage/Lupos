@@ -27,6 +27,12 @@ pub use tree::{
 pub use types::{RcuHead, rcu_head_init};
 
 use crate::kernel::module::{export_symbol, find_symbol};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+// Configured x86-64 `struct srcu_struct` is 32 bytes. Tasks Trace RCU uses
+// the fast reader flavor, whose first two fields both address the per-CPU
+// lock/unlock counter pair consumed by the unchanged inline guard.
+static RCU_TASKS_TRACE_SRCU_STRUCT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
@@ -37,6 +43,15 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 /// Register the out-of-line PREEMPT_RCU entry points referenced by modules
 /// built with the vendor configuration.
 pub fn register_module_exports() {
+    let counters = crate::arch::x86::kernel::setup_percpu::tracepoint_srcu_counters_symbol();
+    RCU_TASKS_TRACE_SRCU_STRUCT[0].store(counters, Ordering::Release);
+    RCU_TASKS_TRACE_SRCU_STRUCT[1].store(counters, Ordering::Release);
+    RCU_TASKS_TRACE_SRCU_STRUCT[2].store(4, Ordering::Release); // SRCU_READ_FLAVOR_FAST
+    export_symbol_once(
+        "rcu_tasks_trace_srcu_struct",
+        RCU_TASKS_TRACE_SRCU_STRUCT.as_ptr() as usize,
+        true,
+    );
     export_symbol_once("__rcu_read_lock", linux___rcu_read_lock as usize, true);
     export_symbol_once("__rcu_read_unlock", linux___rcu_read_unlock as usize, true);
     export_symbol_once(

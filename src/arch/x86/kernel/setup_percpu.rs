@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+use core::mem::offset_of;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::include::uapi::errno::EINVAL;
@@ -42,7 +43,19 @@ pub struct LinuxPerCpuArea {
     _cpu_number_pad: u32,
     this_cpu_off: AtomicU64,
     preempt_count: AtomicU32,
-    _header_pad: [u8; 44],
+    /// x86 `__stack_chk_guard`, addressed by C as
+    /// `%gs:__ref_stack_chk_guard` when SMP stack protection is enabled.
+    stack_chk_guard: AtomicU64,
+    /// Software call-depth state used by the Skylake RSB-underflow
+    /// mitigation.  Linux initializes an empty call stack to the high bit and
+    /// shifts it right on every thunked call / left on every return.
+    x86_call_depth: AtomicU64,
+    /// Fast-SRCU counters used by tracepoint-generated module code.  Keeping
+    /// the pair in every Linux per-CPU unit makes the vendor sequence
+    /// `mov tracepoint_srcu(%rip), %reg; incq %gs:(%reg)` valid.
+    tracepoint_srcu_locks: AtomicU64,
+    tracepoint_srcu_unlocks: AtomicU64,
+    _header_pad: [u8; 16],
     softnet_data: [u8; LINUX_SOFTNET_DATA_SIZE],
     cpu_info: [u8; crate::arch::x86::kernel::cpu::common::LINUX_CPUINFO_X86_SIZE],
     initialized: AtomicBool,
@@ -56,7 +69,11 @@ impl LinuxPerCpuArea {
             _cpu_number_pad: 0,
             this_cpu_off: AtomicU64::new(0),
             preempt_count: AtomicU32::new(0),
-            _header_pad: [0; 44],
+            stack_chk_guard: AtomicU64::new(0),
+            x86_call_depth: AtomicU64::new(crate::arch::x86::kernel::callthunks::RET_DEPTH_INIT),
+            tracepoint_srcu_locks: AtomicU64::new(0),
+            tracepoint_srcu_unlocks: AtomicU64::new(0),
+            _header_pad: [0; 16],
             softnet_data: [0; LINUX_SOFTNET_DATA_SIZE],
             cpu_info: [0; crate::arch::x86::kernel::cpu::common::LINUX_CPUINFO_X86_SIZE],
             initialized: AtomicBool::new(false),
@@ -65,8 +82,14 @@ impl LinuxPerCpuArea {
     }
 }
 
-static LINUX_PER_CPU_AREAS: [LinuxPerCpuArea; MAX_CPUS] =
+pub(crate) static LINUX_PER_CPU_AREAS: [LinuxPerCpuArea; MAX_CPUS] =
     [const { LinuxPerCpuArea::new() }; MAX_CPUS];
+
+/// Displacement of Linux's per-CPU stack guard from the unit-zero template.
+/// `__switch_to_asm` combines this with the template symbol under `%gs`,
+/// exactly like `PER_CPU_VAR(__stack_chk_guard)` in entry_64.S.
+pub const STACK_CHK_GUARD_OFFSET: usize = offset_of!(LinuxPerCpuArea, stack_chk_guard);
+pub const X86_CALL_DEPTH_OFFSET: usize = offset_of!(LinuxPerCpuArea, x86_call_depth);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PerCpuLayout {
@@ -117,6 +140,21 @@ pub fn setup_percpu_segment(cpu: usize) {
     LINUX_PER_CPU_AREAS[cpu]
         .preempt_count
         .store(0, Ordering::Release);
+    LINUX_PER_CPU_AREAS[cpu]
+        .x86_call_depth
+        .store(crate::arch::x86::kernel::callthunks::RET_DEPTH_INIT, Ordering::Release);
+    if LINUX_PER_CPU_AREAS[cpu]
+        .stack_chk_guard
+        .load(Ordering::Acquire)
+        == 0
+    {
+        // Linux masks the low byte so unterminated C-string overwrites hit a
+        // zero before disclosing the rest of the canary.
+        let canary = crate::kernel::syscalls::next_random_u64() & 0xffff_ffff_ffff_ff00;
+        LINUX_PER_CPU_AREAS[cpu]
+            .stack_chk_guard
+            .store(canary, Ordering::Release);
+    }
     crate::arch::x86::kernel::cpu::common::write_linux_cpuinfo_x86(core::ptr::addr_of!(
         LINUX_PER_CPU_AREAS[cpu].cpu_info
     ) as *mut u8);
@@ -125,6 +163,10 @@ pub fn setup_percpu_segment(cpu: usize) {
     #[cfg(not(test))]
     unsafe {
         crate::arch::x86::kernel::msr::write(crate::arch::x86::kernel::msr::MSR_GS_BASE, offset);
+    }
+    #[cfg(not(test))]
+    if let Err(error) = crate::arch::x86::kernel::cet::setup_cet_cpu(cpu) {
+        panic!("CET/IBT setup failed on CPU {cpu}: errno {error}");
     }
 }
 
@@ -154,6 +196,40 @@ pub fn this_cpu_off_symbol() -> usize {
 
 pub fn preempt_count_symbol() -> usize {
     core::ptr::addr_of!(LINUX_PER_CPU_AREAS[0].preempt_count) as usize
+}
+
+pub fn stack_chk_guard_symbol() -> usize {
+    core::ptr::addr_of!(LINUX_PER_CPU_AREAS[0].stack_chk_guard) as usize
+}
+
+pub fn x86_call_depth_symbol() -> usize {
+    core::ptr::addr_of!(LINUX_PER_CPU_AREAS[0].x86_call_depth) as usize
+}
+
+pub fn x86_call_depth(cpu: usize) -> u64 {
+    LINUX_PER_CPU_AREAS[cpu.min(MAX_CPUS - 1)]
+        .x86_call_depth
+        .load(Ordering::Acquire)
+}
+
+pub fn stack_chk_guard(cpu: usize) -> u64 {
+    LINUX_PER_CPU_AREAS[cpu.min(MAX_CPUS - 1)]
+        .stack_chk_guard
+        .load(Ordering::Acquire)
+}
+
+pub fn tracepoint_srcu_counters_symbol() -> usize {
+    core::ptr::addr_of!(LINUX_PER_CPU_AREAS[0].tracepoint_srcu_locks) as usize
+}
+
+/// Install the incoming task's canary during `__switch_to()`.
+///
+/// This is the Rust equivalent of x86 Linux's
+/// `this_cpu_write(__stack_chk_guard, next->stack_canary)`.
+pub fn set_stack_chk_guard(cpu: usize, canary: u64) {
+    LINUX_PER_CPU_AREAS[cpu.min(MAX_CPUS - 1)]
+        .stack_chk_guard
+        .store(canary & 0xffff_ffff_ffff_ff00, Ordering::Release);
 }
 
 pub fn softnet_data_symbol() -> usize {

@@ -269,6 +269,7 @@ pub fn register_module_exports() {
         false,
     );
     export_symbol_once("napi_consume_skb", napi_consume_skb as usize, false);
+    export_symbol_once("consume_skb", consume_skb as usize, false);
     export_symbol_once(
         "skb_copy_and_csum_dev",
         skb_copy_and_csum_dev as usize,
@@ -1220,6 +1221,14 @@ unsafe extern "C" fn dev_kfree_skb_irq_reason(skb: *mut u8, _reason: u32) {
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn napi_consume_skb(skb: *mut u8, _budget: i32) {
+    unsafe { free_raw_skb(skb) };
+}
+
+/// `consume_skb()` drops the skb users reference and releases the complete
+/// buffer when it reaches zero. `free_raw_skb()` owns the same Linux-layout
+/// reference and fragment teardown used by the receive/NAPI entry points.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn consume_skb(skb: *mut u8) {
     unsafe { free_raw_skb(skb) };
 }
 

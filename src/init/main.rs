@@ -349,6 +349,12 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         arch::x86::entry::syscall::init();
     }
 
+    if arch::x86::kernel::cet::kernel_ibt_enabled() {
+        log_info!("ibt", "x86: kernel IBT enforcement active");
+    } else {
+        log_info!("ibt", "x86: kernel IBT unavailable on this CPU");
+    }
+
     // ── TDD: Milestone 4 smoke test ────────────────────────────────────────
     //
     // When the `test-page-fault` feature is active (set by `cargo xtask` for
@@ -5013,16 +5019,61 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
 
     // ── M56: .ko module loader acceptance ────────────────────────────────────
     //
-    // Tests the symbol table, relocation engine, and the bad-ELF rejection
-    // path of the loader.  A real init_module execution requires a properly
-    // linked .ko binary (built by xtask); here we verify the infrastructure
-    // that surrounds it.
+    // Tests the loader's rejection paths and then forms, executes, traces,
+    // probes, and unloads an unchanged Kbuild-produced 9pnet.ko.  That module
+    // deliberately carries every major x86 metadata class exercised here:
+    // IBT seals, ORC, ftrace, stack protector, jump labels, static calls,
+    // retpolines, return sites, call sites, trace events, and modversions.
     #[cfg(feature = "test-module-loader")]
     {
+        use alloc::boxed::Box;
+        use core::ffi::c_void;
+        use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
         use kernel::module::relocate::{RelocType, apply_rela};
         use kernel::module::{
-            delete_module, export_symbol, find_symbol, inserted_modules, load_module,
+            delete_module, export_symbol, find_module, find_symbol, inserted_modules, load_module,
         };
+        use kernel::trace::ftrace;
+        use kernel::trace::kprobe::{Kprobe, register_kprobe, unregister_kprobe};
+        use kernel::trace::ring_buffer::{TRACE_FN, TRACE_RB, TraceEvent};
+
+        static VENDOR_MODULE: &[u8] = include_bytes!(env!("LUPOS_TEST_VENDOR_MODULE"));
+
+        #[repr(C)]
+        struct P9Fcall {
+            size: u32,
+            id: u8,
+            tag: u16,
+            offset: usize,
+            capacity: usize,
+            cache: *mut c_void,
+            sdata: *mut u8,
+            zc: bool,
+        }
+
+        type P9ParseHeader =
+            unsafe extern "C" fn(*mut P9Fcall, *mut i32, *mut i8, *mut i16, i32) -> i32;
+
+        fn invoke_p9_parse_header(parse: P9ParseHeader) {
+            let mut payload = [7u8, 0, 0, 0, 100, 0x34, 0x12];
+            let mut pdu = P9Fcall {
+                size: payload.len() as u32,
+                id: 0,
+                tag: 0,
+                offset: 0,
+                capacity: payload.len(),
+                cache: core::ptr::null_mut(),
+                sdata: payload.as_mut_ptr(),
+                zc: false,
+            };
+            let (mut size, mut kind, mut tag) = (0i32, 0i8, 0i16);
+            let result = unsafe { parse(&mut pdu, &mut size, &mut kind, &mut tag, 1) };
+            assert_eq!(result, 0, "protected vendor function returned success");
+            assert_eq!(size, 7);
+            assert_eq!(kind, 100);
+            assert_eq!(tag, 0x1234);
+            assert_eq!(pdu.offset, 0, "rewind restored the packet cursor");
+        }
 
         // 1. Export a symbol and look it up.
         static CANARY: u64 = 0xDEAD_C0DE;
@@ -5053,7 +5104,234 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         // 6. Module list is accessible.
         let _ = inserted_modules();
 
-        log_info!("m56", "module: hello.ko load+init+exit ok");
+        // 7. Load the original vendor artifact without rewriting it.  The
+        // non-zero counts prove each architecture finalizer consumed the
+        // corresponding real section rather than accepting and ignoring it.
+        // Select the software call-depth mitigation for this loader test so
+        // its normally CPU-dependent path is exercised: direct calls target
+        // compiler padding, indirect calls use accounting retpolines, and
+        // return sites use call_depth_return_thunk.
+        use arch::x86::kernel::cpu::common::{
+            X86_FEATURE_CALL_DEPTH, X86_FEATURE_RETHUNK, X86_FEATURE_RETPOLINE, set_cpu_cap,
+            setup_clear_cpu_cap,
+        };
+        set_cpu_cap(X86_FEATURE_RETPOLINE);
+        set_cpu_cap(X86_FEATURE_RETHUNK);
+        set_cpu_cap(X86_FEATURE_CALL_DEPTH);
+        let module = load_module(VENDOR_MODULE).expect("load unchanged vendor 9pnet.ko");
+        assert_eq!(module.name, "9pnet");
+        let arch = module.arch_metadata();
+        assert!(arch.num_orcs > 0, "ORC entries registered");
+        assert!(arch.num_jump_entries > 0, "jump labels registered");
+        assert!(arch.num_static_call_sites > 0, "static calls registered");
+        assert!(arch.num_ibt_endbr_seals > 0, "IBT seals applied");
+        assert!(arch.num_retpoline_sites > 0, "retpoline sites consumed");
+        assert!(arch.num_return_sites > 0, "return sites consumed");
+        assert!(arch.num_call_sites > 0, "call-depth metadata validated");
+        assert!(arch.num_call_thunks > 0, "call-depth thunks installed");
+
+        let owner = module.this_module_addr();
+        let parse_addr = find_symbol("p9_parse_header").expect("vendor p9_parse_header export");
+        let parse: P9ParseHeader = unsafe { core::mem::transmute(parse_addr) };
+        let records = ftrace::module_records(owner);
+        assert!(!records.is_empty(), "vendor ftrace records registered");
+        assert!(records.iter().all(|record| record.enabled));
+        let parse_record = records
+            .iter()
+            .find(|record| record.ip >= parse_addr && record.ip < parse_addr + 16)
+            .expect("p9_parse_header fentry callsite");
+        assert!(
+            arch::x86::kernel::unwind_orc::orc_module_find(parse_record.ip).is_some(),
+            "ORC lookup resolves vendor text"
+        );
+
+        // 8. Toggle a real module-owned static key.  The key is the second
+        // field of struct tracepoint on this x86-64 vendor ABI.
+        let tracepoint = find_symbol("__tracepoint_9p_fid_ref").expect("9p tracepoint export");
+        let static_key = (tracepoint + core::mem::size_of::<usize>()) as *mut c_void;
+        assert_eq!(
+            unsafe { arch::x86::kernel::jump_label::linux_static_key_count(static_key) },
+            0
+        );
+        assert!(unsafe { arch::x86::kernel::jump_label::linux_static_key_slow_inc(static_key) });
+        assert_eq!(
+            unsafe { arch::x86::kernel::jump_label::linux_static_key_count(static_key) },
+            1
+        );
+        unsafe { arch::x86::kernel::jump_label::linux_static_key_slow_dec(static_key) };
+
+        // 9. Exercise live static-call transforms on the module's genuine
+        // tracepoint key/trampoline, then restore the vendor-selected target.
+        let static_call_key = find_symbol("__SCK__tp_func_9p_fid_ref")
+            .expect("9p static-call key export") as *mut usize;
+        let static_call_tramp = find_symbol("__SCT__tp_func_9p_fid_ref")
+            .expect("9p static-call trampoline export")
+            as *mut c_void;
+        let original_static_target = unsafe { static_call_key.read_volatile() };
+        assert_ne!(original_static_target, 0);
+        unsafe {
+            arch::x86::kernel::static_call::linux_static_call_update(
+                static_call_key.cast(),
+                static_call_tramp,
+                core::ptr::null_mut(),
+            );
+        }
+        assert_eq!(unsafe { static_call_key.read_volatile() }, 0);
+        unsafe {
+            arch::x86::kernel::static_call::linux_static_call_update(
+                static_call_key.cast(),
+                static_call_tramp,
+                original_static_target as *mut c_void,
+            );
+        }
+        assert_eq!(
+            unsafe { static_call_key.read_volatile() },
+            original_static_target
+        );
+
+        // 10. Enable one genuine generated TRACE_EVENT, then enter it through
+        // the vendor wrapper so the real jump label, static call, tracepoint
+        // callback array, reserve, generated field writes, and commit all run.
+        let fid_event = kernel::trace::trace_events::module_events(owner)
+            .into_iter()
+            .find(|event| unsafe {
+                *((event.call + kernel::trace::trace_events::TRACE_EVENT_CALL_TP_OFFSET)
+                    as *const usize)
+                    == tracepoint
+            })
+            .expect("9p_fid_ref generated event");
+        kernel::trace::trace_events::set_module_event_enabled(fid_event.call, true)
+            .expect("enable generated module trace event");
+        let generated_before =
+            kernel::trace::trace_events::generated_event_count(fid_event.event_type);
+        let do_trace_fid_get: unsafe extern "C" fn(*mut c_void) = unsafe {
+            core::mem::transmute(
+                find_symbol("do_trace_9p_fid_get").expect("vendor trace wrapper export"),
+            )
+        };
+        let mut fake_fid = [0u8; 16];
+        fake_fid[8..12].copy_from_slice(&37i32.to_le_bytes());
+        fake_fid[12..16].copy_from_slice(&4i32.to_le_bytes());
+        unsafe { do_trace_fid_get(fake_fid.as_mut_ptr().cast()) };
+        assert_eq!(
+            kernel::trace::trace_events::generated_event_count(fid_event.event_type),
+            generated_before + 1
+        );
+        let mut generated_payload = [0u8; 32];
+        assert_eq!(
+            kernel::trace::trace_events::latest_generated_payload(
+                fid_event.event_type,
+                &mut generated_payload,
+            ),
+            Some(20)
+        );
+        assert_eq!(
+            u16::from_le_bytes(generated_payload[0..2].try_into().unwrap()),
+            fid_event.event_type as u16
+        );
+        assert_eq!(
+            i32::from_le_bytes(generated_payload[8..12].try_into().unwrap()),
+            37
+        );
+        assert_eq!(
+            i32::from_le_bytes(generated_payload[12..16].try_into().unwrap()),
+            4
+        );
+        assert_eq!(generated_payload[16], 1); // P9_FID_REF_GET
+        kernel::trace::trace_events::set_module_event_enabled(fid_event.call, false)
+            .expect("disable generated module trace event");
+
+        // 11. Turn on dynamic ftrace and call an indirectly-dispatched vendor
+        // function.  p9_parse_header is stack-protected, so the same call also
+        // executes the module's %gs guard load/check and passes through ENDBR.
+        // A SAVE_REGS-style callback starts from the genuine fentry stack and
+        // proves the registered ORC table can unwind that live module frame.
+        static ORC_EXPECTED_IP: AtomicUsize = AtomicUsize::new(0);
+        static ORC_LIVE_UNWIND_OK: AtomicBool = AtomicBool::new(false);
+        fn module_orc_probe(ip: u64, parent_ip: u64, sp: u64, bp: u64) {
+            if ip as usize != ORC_EXPECTED_IP.load(Ordering::Acquire) {
+                return;
+            }
+            let mut state = arch::x86::kernel::unwind_orc::ModuleOrcUnwindState {
+                ip: ip as usize,
+                sp: sp as usize,
+                bp: bp as usize,
+                ..arch::x86::kernel::unwind_orc::ModuleOrcUnwindState::default()
+            };
+            if arch::x86::kernel::unwind_orc::orc_module_unwind_next(&mut state) == Ok(true)
+                && state.ip == parent_ip as usize
+                && state.sp > sp as usize
+            {
+                ORC_LIVE_UNWIND_OK.store(true, Ordering::Release);
+            }
+        }
+        TRACE_RB.set_enabled(true);
+        let mut discarded = [TraceEvent::empty(); 64];
+        while TRACE_RB.drain(&mut discarded) != 0 {}
+        ftrace::register_ftrace_function(ftrace::function_trace_call)
+            .expect("enable vendor ftrace callsites");
+        ORC_EXPECTED_IP.store(parse_record.ip, Ordering::Release);
+        ORC_LIVE_UNWIND_OK.store(false, Ordering::Release);
+        ftrace::register_ftrace_regs_function(module_orc_probe)
+            .expect("enable register-aware vendor ftrace callback");
+        invoke_p9_parse_header(parse);
+        ftrace::unregister_ftrace_function();
+        ftrace::unregister_ftrace_regs_function();
+        let mut traced = [TraceEvent::empty(); 64];
+        let traced_count = TRACE_RB.drain(&mut traced);
+        assert!(
+            traced[..traced_count]
+                .iter()
+                .any(|event| event.ev_type == TRACE_FN && event.arg0 == parse_record.ip as u64),
+            "the real vendor fentry callsite reached the ftrace trampoline"
+        );
+        assert!(
+            ORC_LIVE_UNWIND_OK.load(Ordering::Acquire),
+            "ORC unwound the live vendor frame to its real caller"
+        );
+
+        // 12. Probe the same ENDBR function.  x86 kprobes preserves the IBT
+        // landing pad, executes the displaced fentry NOP, and invokes both
+        // handlers.  Leave it registered across delete_module() to verify the
+        // GOING notifier disarms module-owned probes before freeing text.
+        static PRE_HITS: AtomicU32 = AtomicU32::new(0);
+        static POST_HITS: AtomicU32 = AtomicU32::new(0);
+        fn module_kprobe_pre(_addr: u64, _data: usize) {
+            PRE_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        fn module_kprobe_post(_addr: u64, _data: usize) {
+            POST_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        let probe = Box::leak(Box::new(Kprobe {
+            addr: parse_addr as u64,
+            data: 0,
+            pre: Some(module_kprobe_pre),
+            post: Some(module_kprobe_post),
+            enabled: AtomicBool::new(false),
+        }));
+        register_kprobe(&*probe).expect("register probe in vendor module text");
+        invoke_p9_parse_header(parse);
+        assert_eq!(PRE_HITS.load(Ordering::Acquire), 1);
+        assert_eq!(POST_HITS.load(Ordering::Acquire), 1);
+
+        delete_module("9pnet").expect("unload unchanged vendor 9pnet.ko");
+        assert!(find_module("9pnet").is_none());
+        assert!(ftrace::module_records(owner).is_empty());
+        assert!(
+            arch::x86::kernel::unwind_orc::orc_module_find(parse_record.ip).is_none(),
+            "module ORC table unregistered before memory release"
+        );
+        assert!(!probe.enabled.load(Ordering::Acquire));
+        unregister_kprobe(parse_addr as u64).expect("release killed module probe");
+        drop(module);
+        setup_clear_cpu_cap(X86_FEATURE_CALL_DEPTH);
+        setup_clear_cpu_cap(X86_FEATURE_RETHUNK);
+        setup_clear_cpu_cap(X86_FEATURE_RETPOLINE);
+
+        log_info!(
+            "m56",
+            "module: unchanged 9pnet.ko metadata+trace-event+ftrace+kprobe+init+exit ok"
+        );
         #[cfg(feature = "qemu-test")]
         qemu::exit_success();
     }
@@ -5555,9 +5833,10 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     // ── M62: ftrace + tracepoints + kprobes ─────────────────────────────────
     #[cfg(feature = "test-ftrace-kprobes")]
     {
+        use alloc::boxed::Box;
         use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         use kernel::trace::ftrace;
-        use kernel::trace::kprobe::{Kprobe, fire_kprobe, register_kprobe, unregister_kprobe};
+        use kernel::trace::kprobe::{Kprobe, register_kprobe, unregister_kprobe};
         use kernel::trace::ring_buffer::{TRACE_RB, TraceEvent};
         use kernel::trace::tracepoint::{Tracepoint, TracepointProbe};
 
@@ -5615,24 +5894,29 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         fn kp_post(_addr: u64, _data: usize) {
             POST_HITS.fetch_add(1, Ordering::Relaxed);
         }
-        static TEST_KP: Kprobe = Kprobe {
-            addr: 0xfeed_face,
+        #[inline(never)]
+        extern "C" fn kprobe_live_target(value: u64) -> u64 {
+            core::hint::black_box(value.wrapping_add(1))
+        }
+        let target: extern "C" fn(u64) -> u64 = kprobe_live_target;
+        let test_kp = Box::leak(Box::new(Kprobe {
+            addr: target as usize as u64,
             data: 0,
             pre: Some(kp_pre),
             post: Some(kp_post),
             enabled: AtomicBool::new(false),
-        };
-        register_kprobe(&TEST_KP).expect("kprobe register");
-        assert!(fire_kprobe(TEST_KP.addr));
-        assert!(fire_kprobe(TEST_KP.addr));
-        assert!(fire_kprobe(TEST_KP.addr));
+        }));
+        let test_kp_addr = test_kp.addr;
+        register_kprobe(&*test_kp).expect("live kprobe register");
+        assert_eq!(target(10), 11);
+        assert_eq!(target(20), 21);
+        assert_eq!(target(30), 31);
         assert_eq!(PRE_HITS.load(Ordering::Relaxed), 3);
         assert_eq!(POST_HITS.load(Ordering::Relaxed), 3);
-        // Wrong address → no fire.
-        assert!(!fire_kprobe(0xbad));
-        unregister_kprobe(TEST_KP.addr).expect("kprobe unregister");
-        // After unregister, fire returns false.
-        assert!(!fire_kprobe(TEST_KP.addr));
+        unregister_kprobe(test_kp_addr).expect("live kprobe unregister");
+        assert_eq!(target(40), 41);
+        assert_eq!(PRE_HITS.load(Ordering::Relaxed), 3);
+        assert_eq!(POST_HITS.load(Ordering::Relaxed), 3);
         log_info!("m62", "ftrace-kprobes: kprobe pre+post fired 3x ok");
 
         log_info!(

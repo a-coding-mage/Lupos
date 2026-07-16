@@ -46,6 +46,12 @@ pub const X86_FEATURE_SMAP: u32 = 9 * 32 + 20;
 pub const X86_FEATURE_DTHERM: u32 = 14 * 32;
 pub const X86_FEATURE_PTS: u32 = 14 * 32 + 6;
 pub const X86_FEATURE_LFENCE_RDTSC: u32 = 20 * 32 + 2;
+// Software mitigation bits consumed by alternative.c. They are deliberately
+// not inferred from CPUID; Linux sets them only after mitigation selection.
+pub const X86_FEATURE_RETPOLINE: u32 = 11 * 32 + 12;
+pub const X86_FEATURE_RETPOLINE_LFENCE: u32 = 11 * 32 + 13;
+pub const X86_FEATURE_RETHUNK: u32 = 11 * 32 + 14;
+pub const X86_FEATURE_CALL_DEPTH: u32 = 11 * 32 + 19;
 
 pub const LINUX_CPUINFO_X86_SIZE: usize = 512;
 
@@ -320,6 +326,11 @@ pub fn register_module_exports() {
         "__preempt_count",
         crate::arch::x86::kernel::setup_percpu::preempt_count_symbol(),
         true,
+    );
+    export_symbol_once(
+        "__x86_call_depth",
+        crate::arch::x86::kernel::setup_percpu::x86_call_depth_symbol(),
+        false,
     );
     export_symbol_once(
         "const_current_task",

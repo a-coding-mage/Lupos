@@ -270,12 +270,12 @@ pub fn ext4_link(dir: &InodeRef, name: &str, inode: &InodeRef) -> Result<(), i32
     Ok(())
 }
 
-fn ext4_unlink(dir: &InodeRef, name: &str) -> Result<(), i32> {
-    ext4_remove_entry(dir, name, false)
+fn ext4_unlink(dir: &InodeRef, name: &str, target: &InodeRef) -> Result<(), i32> {
+    ext4_remove_entry(dir, name, false, Some(target))
 }
 
 fn ext4_rmdir(dir: &InodeRef, name: &str) -> Result<(), i32> {
-    ext4_remove_entry(dir, name, true)
+    ext4_remove_entry(dir, name, true, None)
 }
 
 fn ext4_rename(
@@ -705,7 +705,12 @@ fn ext4_add_entry(dir: &InodeRef, name: &str, inode: &InodeRef, file_type: u8) -
     Ok(())
 }
 
-fn ext4_remove_entry(dir: &InodeRef, name: &str, remove_dir: bool) -> Result<(), i32> {
+fn ext4_remove_entry(
+    dir: &InodeRef,
+    name: &str,
+    remove_dir: bool,
+    resolved_target: Option<&InodeRef>,
+) -> Result<(), i32> {
     if name.is_empty() || name == "." || name == ".." || name.len() > EXT4_NAME_LEN {
         return Err(EINVAL);
     }
@@ -730,7 +735,14 @@ fn ext4_remove_entry(dir: &InodeRef, name: &str, remove_dir: bool) -> Result<(),
         let mut block = read_sectors(&sbi.bdev, lba, sbi.block_size as u64 / 512)?;
         match ext4_remove_dirent_from_block(&mut block, name)? {
             Some(removed_ino) => {
-                let removed = read_inode(&sbi, removed_ino, &sb)?;
+                let removed = if let Some(target) = resolved_target {
+                    if target.ino != removed_ino as u64 {
+                        return Err(ENOENT);
+                    }
+                    target.clone()
+                } else {
+                    read_inode(&sbi, removed_ino, &sb)?
+                };
                 if remove_dir {
                     if removed.kind != InodeKind::Directory {
                         return Err(ENOTDIR);
@@ -3531,6 +3543,17 @@ mod tests {
         assert_eq!(tmp.kind, InodeKind::Directory);
         let state = ext4_create(&parent, "state", 0o644).expect("create regular file");
         assert_eq!(state.kind, InodeKind::Regular);
+        // GnuPG's dotlock protocol repeatedly links one temporary inode to a
+        // lock name, stats the source for nlink == 2, then unlinks the lock.
+        // Unlink must update that same resolved inode object, not a freshly
+        // decoded ext4 inode whose link count would diverge from the source.
+        for _ in 0..4 {
+            assert_eq!(ext4_link(&parent, "state.lock", &state), Ok(()));
+            assert_eq!(state.nlink.load(Ordering::Acquire), 2);
+            assert_eq!(ext4_unlink(&parent, "state.lock", &state), Ok(()));
+            assert_eq!(state.nlink.load(Ordering::Acquire), 1);
+            assert!(matches!(ext4_lookup(&parent, "state.lock"), Err(ENOENT)));
+        }
         let long_target = "/devices/platform/serial8250/tty/ttyS0/subsystem/virtual/tty";
         assert!(long_target.len() >= 60);
         let long_link = ext4_symlink(&parent, "long-dev-link", long_target, 0o777)
@@ -3584,7 +3607,7 @@ mod tests {
         let stale_raw = ialloc::read_raw_inode(&sbi, stale.ino as u32).unwrap();
         assert_eq!(le_u16(&stale_raw, 0).unwrap(), 0);
 
-        assert_eq!(ext4_unlink(&parent, "core.db"), Ok(()));
+        assert_eq!(ext4_unlink(&parent, "core.db", &current), Ok(()));
         let entries_after_unlink = dir_read_all(&sbi, &parent_ext).unwrap();
         assert!(
             !entries_after_unlink

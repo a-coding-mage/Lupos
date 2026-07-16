@@ -20,8 +20,11 @@
 //!   - `include/linux/module.h:397` — `struct module`
 //!   - `include/linux/export.h:89`  — `EXPORT_SYMBOL`
 
+pub mod btf;
+pub mod constructors;
 pub mod debug_kmemleak;
 pub mod kdb;
+pub mod kallsyms;
 pub mod linux_sources;
 pub mod livepatch;
 pub mod loader;
@@ -31,13 +34,18 @@ pub mod symbols;
 pub mod syscalls;
 pub mod tracking;
 pub mod tree_lookup;
+pub mod version;
 
 pub use loader::{
     KernelModule, LoadModuleError, ModuleState, delete_module, find_module, inserted_modules,
     load_module, with_module_address,
 };
-pub use symbols::{ExportedSymbol, export_symbol, find_symbol, find_symbol_gpl_only};
+pub use symbols::{
+    ExportedSymbol, export_module_symbol_with_crc, export_symbol, export_symbol_with_crc,
+    find_symbol, find_symbol_crc, find_symbol_gpl_only,
+};
 
 pub fn register_module_exports() {
     loader::register_module_exports();
+    crate::kernel::stackprotector::register_module_exports();
 }

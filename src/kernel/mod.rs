@@ -41,7 +41,9 @@ pub mod clone; // M23
 pub mod cpuhotplug;
 pub mod cred; // M27
 pub mod dma; // M55
+pub mod dynamic_debug;
 pub mod entry;
+pub mod error_injection;
 pub mod events; // M63
 pub mod exec; // M24
 pub mod exec_domain;
@@ -63,6 +65,7 @@ pub mod liveupdate;
 pub mod locking; // M33
 pub mod module; // M56
 pub mod module_signature;
+pub mod stackprotector;
 pub mod notifier;
 pub mod nsproxy; // M28
 pub mod params;

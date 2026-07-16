@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/trace
 //! test-origin: linux:vendor/linux/kernel/trace
 //! Static tracepoints — Linux's `TRACE_EVENT` mechanism.
@@ -19,11 +19,709 @@
 //! - `vendor/linux/kernel/tracepoint.c::tracepoint_probe_register`
 //! - `vendor/linux/include/linux/tracepoint.h::DEFINE_TRACE`
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use spin::Mutex;
 
 pub const MAX_PROBES_PER_TRACEPOINT: usize = 8;
+
+/// A tracepoint object emitted by an original Linux module.  This is kept as
+/// an opaque address because calls into it use the vendor C ABI, not Lupos's
+/// Rust-native `Tracepoint` helper below.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModuleTracepoint {
+    pub owner: usize,
+    pub address: usize,
+}
+
+static MODULE_TRACEPOINTS: Mutex<Vec<ModuleTracepoint>> = Mutex::new(Vec::new());
+
+const LINUX_TRACEPOINT_KEY_OFFSET: usize = 8;
+const LINUX_TRACEPOINT_STATIC_CALL_KEY_OFFSET: usize = 24;
+const LINUX_TRACEPOINT_STATIC_CALL_TRAMP_OFFSET: usize = 32;
+const LINUX_TRACEPOINT_ITERATOR_OFFSET: usize = 40;
+const LINUX_TRACEPOINT_FUNCS_OFFSET: usize = 56;
+const LINUX_TRACEPOINT_EXT_OFFSET: usize = 64;
+
+#[repr(C)]
+struct LinuxStaticKeyFalse {
+    enabled: AtomicI32,
+    _pad: u32,
+    entries: AtomicUsize,
+}
+
+#[repr(C)]
+struct LinuxStaticCallKey {
+    func: AtomicUsize,
+    type_: AtomicUsize,
+}
+
+#[repr(C)]
+struct LinuxBuiltinTracepointObject {
+    name: AtomicUsize,
+    key: LinuxStaticKeyFalse,
+    static_call_key: AtomicUsize,
+    static_call_tramp: AtomicUsize,
+    iterator: AtomicUsize,
+    probestub: AtomicUsize,
+    funcs: AtomicUsize,
+    ext: AtomicUsize,
+}
+
+struct LinuxBuiltinTracepoint {
+    static_call_key: LinuxStaticCallKey,
+    object: LinuxBuiltinTracepointObject,
+}
+
+impl LinuxBuiltinTracepoint {
+    const fn new() -> Self {
+        Self {
+            static_call_key: LinuxStaticCallKey {
+                func: AtomicUsize::new(0),
+                type_: AtomicUsize::new(1),
+            },
+            object: LinuxBuiltinTracepointObject {
+                name: AtomicUsize::new(0),
+                key: LinuxStaticKeyFalse {
+                    enabled: AtomicI32::new(0),
+                    _pad: 0,
+                    entries: AtomicUsize::new(0),
+                },
+                static_call_key: AtomicUsize::new(0),
+                static_call_tramp: AtomicUsize::new(0),
+                iterator: AtomicUsize::new(0),
+                probestub: AtomicUsize::new(0),
+                funcs: AtomicUsize::new(0),
+                ext: AtomicUsize::new(0),
+            },
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<LinuxStaticKeyFalse>() == 16);
+const _: () = assert!(core::mem::size_of::<LinuxStaticCallKey>() == 16);
+const _: () = assert!(core::mem::size_of::<LinuxBuiltinTracepointObject>() == 72);
+const _: () = assert!(core::mem::offset_of!(LinuxBuiltinTracepointObject, key) == 8);
+const _: () = assert!(core::mem::offset_of!(LinuxBuiltinTracepointObject, static_call_key) == 24);
+const _: () = assert!(core::mem::offset_of!(LinuxBuiltinTracepointObject, static_call_tramp) == 32);
+const _: () = assert!(core::mem::offset_of!(LinuxBuiltinTracepointObject, iterator) == 40);
+const _: () = assert!(core::mem::offset_of!(LinuxBuiltinTracepointObject, funcs) == 56);
+const _: () = assert!(core::mem::offset_of!(LinuxBuiltinTracepointObject, ext) == 64);
+
+const BUILTIN_SCHED_SET_STATE: usize = 0;
+const BUILTIN_XDP_EXCEPTION: usize = 1;
+const BUILTIN_READ_MSR: usize = 2;
+const BUILTIN_WRITE_MSR: usize = 3;
+const BUILTIN_MMAP_START: usize = 4;
+const BUILTIN_MMAP_ACQUIRED: usize = 5;
+const BUILTIN_MMAP_RELEASED: usize = 6;
+const BUILTIN_DMA_FENCE_EMIT: usize = 7;
+const BUILTIN_DMA_FENCE_SIGNALED: usize = 8;
+const NUM_BUILTIN_TRACEPOINTS: usize = 9;
+
+static BUILTIN_TRACEPOINTS: [LinuxBuiltinTracepoint; NUM_BUILTIN_TRACEPOINTS] =
+    [const { LinuxBuiltinTracepoint::new() }; NUM_BUILTIN_TRACEPOINTS];
+
+// Each exported static-call trampoline is a distinct, patchable Linux x86
+// trampoline (`jmp rel32` plus the three-byte UD signature).  Module callsites
+// are registered against the corresponding key, so probe registration can
+// update both the trampoline and every already-loaded unchanged module site.
+core::arch::global_asm!(
+    ".pushsection .text.lupos.builtin_tracepoints, \"ax\"",
+    ".balign 16",
+    ".global lupos_builtin_trace_noop",
+    "lupos_builtin_trace_noop:",
+    "xor eax, eax",
+    "ret",
+    ".macro LUPOS_TRACE_TRAMP name",
+    ".balign 4",
+    ".global \\name",
+    "\\name:",
+    "jmp lupos_builtin_trace_noop",
+    ".byte 0x0f, 0xb9, 0xcc",
+    ".endm",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_sched_set_state_tp",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_xdp_exception",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_read_msr",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_write_msr",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_mmap_lock_start_locking",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_mmap_lock_acquire_returned",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_mmap_lock_released",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_dma_fence_emit",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_dma_fence_signaled",
+    ".popsection",
+);
+
+unsafe extern "C" {
+    fn lupos_builtin_trace_noop() -> i32;
+    fn __SCT__tp_func_sched_set_state_tp();
+    fn __SCT__tp_func_xdp_exception();
+    fn __SCT__tp_func_read_msr();
+    fn __SCT__tp_func_write_msr();
+    fn __SCT__tp_func_mmap_lock_start_locking();
+    fn __SCT__tp_func_mmap_lock_acquire_returned();
+    fn __SCT__tp_func_mmap_lock_released();
+    fn __SCT__tp_func_dma_fence_emit();
+    fn __SCT__tp_func_dma_fence_signaled();
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxTracepointFunc {
+    func: usize,
+    data: usize,
+    prio: i32,
+    _pad: i32,
+}
+
+fn builtin_object(index: usize) -> &'static LinuxBuiltinTracepointObject {
+    &BUILTIN_TRACEPOINTS[index].object
+}
+
+unsafe fn builtin_funcs(index: usize) -> *const LinuxTracepointFunc {
+    builtin_object(index).funcs.load(Ordering::Acquire) as *const LinuxTracepointFunc
+}
+
+macro_rules! define_builtin_iterator {
+    ($function:ident, $index:expr $(, $arg:ident : $argument:ty)*) => {
+        unsafe extern "C" fn $function(_data: usize $(, $arg: $argument)*) -> i32 {
+            let mut cursor = unsafe { builtin_funcs($index) };
+            while !cursor.is_null() {
+                let entry = unsafe { &*cursor };
+                if entry.func == 0 {
+                    break;
+                }
+                let callback: unsafe extern "C" fn(usize $(, $argument)*) =
+                    unsafe { core::mem::transmute(entry.func) };
+                unsafe { callback(entry.data $(, $arg)*) };
+                cursor = unsafe { cursor.add(1) };
+            }
+            0
+        }
+    };
+}
+
+define_builtin_iterator!(
+    builtin_iter_sched_set_state,
+    BUILTIN_SCHED_SET_STATE,
+    task: usize,
+    state: u32
+);
+define_builtin_iterator!(
+    builtin_iter_xdp_exception,
+    BUILTIN_XDP_EXCEPTION,
+    device: usize,
+    program: usize,
+    action: u32
+);
+define_builtin_iterator!(
+    builtin_iter_read_msr,
+    BUILTIN_READ_MSR,
+    msr: u32,
+    value: u64,
+    failed: i32
+);
+define_builtin_iterator!(
+    builtin_iter_write_msr,
+    BUILTIN_WRITE_MSR,
+    msr: u32,
+    value: u64,
+    failed: i32
+);
+define_builtin_iterator!(
+    builtin_iter_mmap_start,
+    BUILTIN_MMAP_START,
+    mm: usize,
+    write: bool
+);
+define_builtin_iterator!(
+    builtin_iter_mmap_acquired,
+    BUILTIN_MMAP_ACQUIRED,
+    mm: usize,
+    write: bool,
+    success: bool
+);
+define_builtin_iterator!(
+    builtin_iter_mmap_released,
+    BUILTIN_MMAP_RELEASED,
+    mm: usize,
+    write: bool
+);
+define_builtin_iterator!(
+    builtin_iter_dma_fence_emit,
+    BUILTIN_DMA_FENCE_EMIT,
+    fence: usize
+);
+define_builtin_iterator!(
+    builtin_iter_dma_fence_signaled,
+    BUILTIN_DMA_FENCE_SIGNALED,
+    fence: usize
+);
+
+struct BuiltinTracepointSpec {
+    index: usize,
+    name: &'static [u8],
+    object_symbol: &'static str,
+    iterator_symbol: &'static str,
+    key_symbol: &'static str,
+    trampoline_symbol: &'static str,
+    iterator: usize,
+    trampoline: usize,
+    gpl_only: bool,
+}
+
+fn export_symbol_once(name: &'static str, address: usize, gpl_only: bool) {
+    if crate::kernel::module::find_symbol(name).is_none() {
+        crate::kernel::module::export_symbol(name, address, gpl_only);
+    }
+}
+
+fn initialize_builtin(spec: &BuiltinTracepointSpec) {
+    let builtin = &BUILTIN_TRACEPOINTS[spec.index];
+    let object = &builtin.object;
+    builtin
+        .static_call_key
+        .func
+        .store(spec.iterator, Ordering::Release);
+    builtin.static_call_key.type_.store(1, Ordering::Release);
+    object
+        .name
+        .store(spec.name.as_ptr() as usize, Ordering::Release);
+    object.key.enabled.store(0, Ordering::Release);
+    object.key.entries.store(0, Ordering::Release);
+    object.static_call_key.store(
+        &builtin.static_call_key as *const LinuxStaticCallKey as usize,
+        Ordering::Release,
+    );
+    object
+        .static_call_tramp
+        .store(spec.trampoline, Ordering::Release);
+    object.iterator.store(spec.iterator, Ordering::Release);
+    object
+        .probestub
+        .store(lupos_builtin_trace_noop as usize, Ordering::Release);
+    object.funcs.store(0, Ordering::Release);
+    object.ext.store(0, Ordering::Release);
+
+    let object_address = object as *const LinuxBuiltinTracepointObject as usize;
+    if !registered_module_tracepoint(object_address) {
+        MODULE_TRACEPOINTS.lock().push(ModuleTracepoint {
+            owner: 0,
+            address: object_address,
+        });
+    }
+    export_symbol_once(spec.object_symbol, object_address, spec.gpl_only);
+    export_symbol_once(spec.iterator_symbol, spec.iterator, spec.gpl_only);
+    export_symbol_once(
+        spec.key_symbol,
+        &builtin.static_call_key as *const LinuxStaticCallKey as usize,
+        spec.gpl_only,
+    );
+    export_symbol_once(spec.trampoline_symbol, spec.trampoline, spec.gpl_only);
+}
+
+/// Define the tracepoints that belong to Lupos's built-in kernel subsystems,
+/// using the exact vendor object/key/trampoline ABI. Tracepoints supplied by a
+/// vendor module (for example libata's ATA tracepoints) are deliberately not
+/// synthesized here; their original module exports remain authoritative.
+pub fn register_builtin_module_exports() {
+    let specs = [
+        BuiltinTracepointSpec {
+            index: BUILTIN_SCHED_SET_STATE,
+            name: b"sched_set_state_tp\0",
+            object_symbol: "__tracepoint_sched_set_state_tp",
+            iterator_symbol: "__traceiter_sched_set_state_tp",
+            key_symbol: "__SCK__tp_func_sched_set_state_tp",
+            trampoline_symbol: "__SCT__tp_func_sched_set_state_tp",
+            iterator: builtin_iter_sched_set_state as usize,
+            trampoline: __SCT__tp_func_sched_set_state_tp as usize,
+            gpl_only: false,
+        },
+        BuiltinTracepointSpec {
+            index: BUILTIN_XDP_EXCEPTION,
+            name: b"xdp_exception\0",
+            object_symbol: "__tracepoint_xdp_exception",
+            iterator_symbol: "__traceiter_xdp_exception",
+            key_symbol: "__SCK__tp_func_xdp_exception",
+            trampoline_symbol: "__SCT__tp_func_xdp_exception",
+            iterator: builtin_iter_xdp_exception as usize,
+            trampoline: __SCT__tp_func_xdp_exception as usize,
+            gpl_only: true,
+        },
+        BuiltinTracepointSpec {
+            index: BUILTIN_READ_MSR,
+            name: b"read_msr\0",
+            object_symbol: "__tracepoint_read_msr",
+            iterator_symbol: "__traceiter_read_msr",
+            key_symbol: "__SCK__tp_func_read_msr",
+            trampoline_symbol: "__SCT__tp_func_read_msr",
+            iterator: builtin_iter_read_msr as usize,
+            trampoline: __SCT__tp_func_read_msr as usize,
+            gpl_only: false,
+        },
+        BuiltinTracepointSpec {
+            index: BUILTIN_WRITE_MSR,
+            name: b"write_msr\0",
+            object_symbol: "__tracepoint_write_msr",
+            iterator_symbol: "__traceiter_write_msr",
+            key_symbol: "__SCK__tp_func_write_msr",
+            trampoline_symbol: "__SCT__tp_func_write_msr",
+            iterator: builtin_iter_write_msr as usize,
+            trampoline: __SCT__tp_func_write_msr as usize,
+            gpl_only: false,
+        },
+        BuiltinTracepointSpec {
+            index: BUILTIN_MMAP_START,
+            name: b"mmap_lock_start_locking\0",
+            object_symbol: "__tracepoint_mmap_lock_start_locking",
+            iterator_symbol: "__traceiter_mmap_lock_start_locking",
+            key_symbol: "__SCK__tp_func_mmap_lock_start_locking",
+            trampoline_symbol: "__SCT__tp_func_mmap_lock_start_locking",
+            iterator: builtin_iter_mmap_start as usize,
+            trampoline: __SCT__tp_func_mmap_lock_start_locking as usize,
+            gpl_only: false,
+        },
+        BuiltinTracepointSpec {
+            index: BUILTIN_MMAP_ACQUIRED,
+            name: b"mmap_lock_acquire_returned\0",
+            object_symbol: "__tracepoint_mmap_lock_acquire_returned",
+            iterator_symbol: "__traceiter_mmap_lock_acquire_returned",
+            key_symbol: "__SCK__tp_func_mmap_lock_acquire_returned",
+            trampoline_symbol: "__SCT__tp_func_mmap_lock_acquire_returned",
+            iterator: builtin_iter_mmap_acquired as usize,
+            trampoline: __SCT__tp_func_mmap_lock_acquire_returned as usize,
+            gpl_only: false,
+        },
+        BuiltinTracepointSpec {
+            index: BUILTIN_MMAP_RELEASED,
+            name: b"mmap_lock_released\0",
+            object_symbol: "__tracepoint_mmap_lock_released",
+            iterator_symbol: "__traceiter_mmap_lock_released",
+            key_symbol: "__SCK__tp_func_mmap_lock_released",
+            trampoline_symbol: "__SCT__tp_func_mmap_lock_released",
+            iterator: builtin_iter_mmap_released as usize,
+            trampoline: __SCT__tp_func_mmap_lock_released as usize,
+            gpl_only: false,
+        },
+        BuiltinTracepointSpec {
+            index: BUILTIN_DMA_FENCE_EMIT,
+            name: b"dma_fence_emit\0",
+            object_symbol: "__tracepoint_dma_fence_emit",
+            iterator_symbol: "__traceiter_dma_fence_emit",
+            key_symbol: "__SCK__tp_func_dma_fence_emit",
+            trampoline_symbol: "__SCT__tp_func_dma_fence_emit",
+            iterator: builtin_iter_dma_fence_emit as usize,
+            trampoline: __SCT__tp_func_dma_fence_emit as usize,
+            gpl_only: false,
+        },
+        BuiltinTracepointSpec {
+            index: BUILTIN_DMA_FENCE_SIGNALED,
+            name: b"dma_fence_signaled\0",
+            object_symbol: "__tracepoint_dma_fence_signaled",
+            iterator_symbol: "__traceiter_dma_fence_signaled",
+            key_symbol: "__SCK__tp_func_dma_fence_signaled",
+            trampoline_symbol: "__SCT__tp_func_dma_fence_signaled",
+            iterator: builtin_iter_dma_fence_signaled as usize,
+            trampoline: __SCT__tp_func_dma_fence_signaled as usize,
+            gpl_only: false,
+        },
+    ];
+    for spec in &specs {
+        initialize_builtin(spec);
+    }
+    export_symbol_once("do_trace_read_msr", linux_do_trace_read_msr as usize, false);
+    export_symbol_once(
+        "do_trace_write_msr",
+        linux_do_trace_write_msr as usize,
+        false,
+    );
+    export_symbol_once(
+        "__trace_set_current_state",
+        linux_trace_set_current_state as usize,
+        false,
+    );
+}
+
+unsafe extern "C" fn linux_trace_set_current_state(state: i32) {
+    if builtin_object(BUILTIN_SCHED_SET_STATE)
+        .key
+        .enabled
+        .load(Ordering::Acquire)
+        > 0
+    {
+        let task = crate::arch::x86::kernel::cpu::common::linux_current_task() as usize;
+        unsafe { builtin_iter_sched_set_state(0, task, state as u32) };
+    }
+}
+
+unsafe extern "C" fn linux_do_trace_read_msr(msr: u32, value: u64, failed: i32) {
+    if builtin_object(BUILTIN_READ_MSR)
+        .key
+        .enabled
+        .load(Ordering::Acquire)
+        > 0
+    {
+        unsafe { builtin_iter_read_msr(0, msr, value, failed) };
+    }
+}
+
+unsafe extern "C" fn linux_do_trace_write_msr(msr: u32, value: u64, failed: i32) {
+    if builtin_object(BUILTIN_WRITE_MSR)
+        .key
+        .enabled
+        .load(Ordering::Acquire)
+        > 0
+    {
+        unsafe { builtin_iter_write_msr(0, msr, value, failed) };
+    }
+}
+
+pub fn trace_mmap_lock_start_locking(mm: usize, write: bool) {
+    if builtin_object(BUILTIN_MMAP_START)
+        .key
+        .enabled
+        .load(Ordering::Acquire)
+        > 0
+    {
+        unsafe { builtin_iter_mmap_start(0, mm, write) };
+    }
+}
+
+pub fn trace_mmap_lock_acquire_returned(mm: usize, write: bool, success: bool) {
+    if builtin_object(BUILTIN_MMAP_ACQUIRED)
+        .key
+        .enabled
+        .load(Ordering::Acquire)
+        > 0
+    {
+        unsafe { builtin_iter_mmap_acquired(0, mm, write, success) };
+    }
+}
+
+pub fn trace_mmap_lock_released(mm: usize, write: bool) {
+    if builtin_object(BUILTIN_MMAP_RELEASED)
+        .key
+        .enabled
+        .load(Ordering::Acquire)
+        > 0
+    {
+        unsafe { builtin_iter_mmap_released(0, mm, write) };
+    }
+}
+
+struct LiveModuleTracepoint {
+    address: usize,
+    funcs: Box<[LinuxTracepointFunc]>,
+}
+
+static LIVE_MODULE_TRACEPOINTS: Mutex<Vec<LiveModuleTracepoint>> = Mutex::new(Vec::new());
+
+unsafe fn read_tp_word(tracepoint: usize, offset: usize) -> usize {
+    unsafe { ((tracepoint + offset) as *const usize).read_volatile() }
+}
+
+unsafe fn write_tp_word(tracepoint: usize, offset: usize, value: usize) {
+    unsafe { ((tracepoint + offset) as *mut usize).write_volatile(value) };
+}
+
+fn registered_module_tracepoint(address: usize) -> bool {
+    MODULE_TRACEPOINTS
+        .lock()
+        .iter()
+        .any(|tracepoint| tracepoint.address == address)
+}
+
+fn terminated_funcs(mut funcs: Vec<LinuxTracepointFunc>) -> Box<[LinuxTracepointFunc]> {
+    funcs.push(LinuxTracepointFunc {
+        func: 0,
+        data: 0,
+        prio: 0,
+        _pad: 0,
+    });
+    funcs.into_boxed_slice()
+}
+
+unsafe fn update_tracepoint_call(
+    tracepoint: usize,
+    funcs: &[LinuxTracepointFunc],
+) -> Result<(), i32> {
+    let key = unsafe { read_tp_word(tracepoint, LINUX_TRACEPOINT_STATIC_CALL_KEY_OFFSET) };
+    if key == 0 {
+        return Ok(());
+    }
+    let trampoline = unsafe { read_tp_word(tracepoint, LINUX_TRACEPOINT_STATIC_CALL_TRAMP_OFFSET) };
+    let iterator = unsafe { read_tp_word(tracepoint, LINUX_TRACEPOINT_ITERATOR_OFFSET) };
+    let target = if funcs.len() == 2 {
+        funcs[0].func
+    } else {
+        iterator
+    };
+    unsafe {
+        crate::arch::x86::kernel::static_call::static_call_update_result(
+            key as *mut c_void,
+            trampoline as *mut c_void,
+            target as *mut c_void,
+        )
+    }
+}
+
+/// Linux `tracepoint_probe_register()` for tracepoints whose backing object
+/// lives in an unchanged module.  The published callback array has Linux's
+/// exact 24-byte element layout and remains RCU protected during replacement.
+pub unsafe fn register_module_probe(
+    tracepoint: usize,
+    probe: usize,
+    data: usize,
+) -> Result<(), i32> {
+    if tracepoint == 0 || probe == 0 || !registered_module_tracepoint(tracepoint) {
+        return Err(-22); // EINVAL
+    }
+
+    let mut live = LIVE_MODULE_TRACEPOINTS.lock();
+    let existing = live.iter().position(|entry| entry.address == tracepoint);
+    let mut funcs = existing
+        .map(|index| live[index].funcs[..live[index].funcs.len() - 1].to_vec())
+        .unwrap_or_default();
+    if funcs
+        .iter()
+        .any(|entry| entry.func == probe && entry.data == data)
+    {
+        return Err(-17); // EEXIST
+    }
+
+    let first = funcs.is_empty();
+    if first {
+        let ext = unsafe { read_tp_word(tracepoint, LINUX_TRACEPOINT_EXT_OFFSET) };
+        if ext != 0 {
+            let reg = unsafe { (ext as *const usize).read_volatile() };
+            if reg != 0 {
+                let reg: unsafe extern "C" fn() -> i32 = unsafe { core::mem::transmute(reg) };
+                let result = unsafe { reg() };
+                if result < 0 {
+                    return Err(result);
+                }
+            }
+        }
+    }
+
+    funcs.push(LinuxTracepointFunc {
+        func: probe,
+        data,
+        prio: 10,
+        _pad: 0,
+    });
+    funcs.sort_by_key(|entry| entry.prio);
+    let replacement = terminated_funcs(funcs);
+    unsafe { update_tracepoint_call(tracepoint, &replacement) }?;
+    unsafe {
+        write_tp_word(
+            tracepoint,
+            LINUX_TRACEPOINT_FUNCS_OFFSET,
+            replacement.as_ptr() as usize,
+        );
+    }
+    if first
+        && !unsafe {
+            crate::arch::x86::kernel::jump_label::linux_static_key_slow_inc(
+                (tracepoint + LINUX_TRACEPOINT_KEY_OFFSET) as *mut c_void,
+            )
+        }
+    {
+        unsafe { write_tp_word(tracepoint, LINUX_TRACEPOINT_FUNCS_OFFSET, 0) };
+        let empty = terminated_funcs(Vec::new());
+        let _ = unsafe { update_tracepoint_call(tracepoint, &empty) };
+        let ext = unsafe { read_tp_word(tracepoint, LINUX_TRACEPOINT_EXT_OFFSET) };
+        if ext != 0 {
+            let unreg = unsafe { ((ext + 8) as *const usize).read_volatile() };
+            if unreg != 0 {
+                let unreg: unsafe extern "C" fn() = unsafe { core::mem::transmute(unreg) };
+                unsafe { unreg() };
+            }
+        }
+        return Err(-22);
+    }
+
+    if let Some(index) = existing {
+        let old = core::mem::replace(&mut live[index].funcs, replacement);
+        drop(live);
+        crate::kernel::rcu::synchronize_rcu();
+        drop(old);
+    } else {
+        live.push(LiveModuleTracepoint {
+            address: tracepoint,
+            funcs: replacement,
+        });
+    }
+    Ok(())
+}
+
+/// Linux `tracepoint_probe_unregister()` for a module tracepoint.
+pub unsafe fn unregister_module_probe(
+    tracepoint: usize,
+    probe: usize,
+    data: usize,
+) -> Result<(), i32> {
+    let mut live = LIVE_MODULE_TRACEPOINTS.lock();
+    let index = live
+        .iter()
+        .position(|entry| entry.address == tracepoint)
+        .ok_or(-2)?; // ENOENT
+    let mut funcs = live[index].funcs[..live[index].funcs.len() - 1].to_vec();
+    let remove = funcs
+        .iter()
+        .position(|entry| entry.func == probe && entry.data == data)
+        .ok_or(-2)?;
+    funcs.remove(remove);
+
+    let old;
+    if funcs.is_empty() {
+        let empty = terminated_funcs(Vec::new());
+        unsafe { update_tracepoint_call(tracepoint, &empty) }?;
+        unsafe {
+            crate::arch::x86::kernel::jump_label::linux_static_key_slow_dec(
+                (tracepoint + LINUX_TRACEPOINT_KEY_OFFSET) as *mut c_void,
+            );
+        }
+        unsafe { write_tp_word(tracepoint, LINUX_TRACEPOINT_FUNCS_OFFSET, 0) };
+        let removed = live.remove(index);
+        old = removed.funcs;
+
+        let ext = unsafe { read_tp_word(tracepoint, LINUX_TRACEPOINT_EXT_OFFSET) };
+        if ext != 0 {
+            let unreg = unsafe { ((ext + 8) as *const usize).read_volatile() };
+            if unreg != 0 {
+                let unreg: unsafe extern "C" fn() = unsafe { core::mem::transmute(unreg) };
+                unsafe { unreg() };
+            }
+        }
+    } else {
+        let replacement = terminated_funcs(funcs);
+        let old_pointer = live[index].funcs.as_ptr() as usize;
+        unsafe {
+            write_tp_word(
+                tracepoint,
+                LINUX_TRACEPOINT_FUNCS_OFFSET,
+                replacement.as_ptr() as usize,
+            )
+        };
+        if let Err(error) = unsafe { update_tracepoint_call(tracepoint, &replacement) } {
+            unsafe { write_tp_word(tracepoint, LINUX_TRACEPOINT_FUNCS_OFFSET, old_pointer) };
+            drop(live);
+            crate::kernel::rcu::synchronize_rcu();
+            return Err(error);
+        }
+        old = core::mem::replace(&mut live[index].funcs, replacement);
+    }
+    drop(live);
+    crate::kernel::rcu::synchronize_rcu();
+    drop(old);
+    Ok(())
+}
 
 /// A single registered probe.  Untyped — the macro casts to the typed
 /// signature at fire() time.
@@ -114,6 +812,77 @@ impl Tracepoint {
     }
 }
 
+/// `tracepoint_module_coming()` for x86-64's PREL32
+/// `__tracepoints_ptrs` section.
+///
+/// Each entry is relative to its own address, matching
+/// `tracepoint_ptr_deref()` and `CONFIG_HAVE_ARCH_PREL32_RELOCATIONS` in the
+/// pinned vendor kernel.
+pub fn module_coming(owner: usize, section_address: usize, section: &[u8]) -> Result<(), i32> {
+    if section.len() % core::mem::size_of::<i32>() != 0 {
+        return Err(-8); // ENOEXEC
+    }
+
+    let mut resolved = Vec::with_capacity(section.len() / 4);
+    for (index, bytes) in section.chunks_exact(4).enumerate() {
+        let displacement = i32::from_le_bytes(bytes.try_into().map_err(|_| -8)?);
+        let entry = section_address
+            .checked_add(index.checked_mul(4).ok_or(-8)?)
+            .ok_or(-8)?;
+        let address = entry.checked_add_signed(displacement as isize).ok_or(-8)?;
+        if address == 0 {
+            return Err(-8);
+        }
+        resolved.push(ModuleTracepoint { owner, address });
+    }
+
+    let mut tracepoints = MODULE_TRACEPOINTS.lock();
+    if tracepoints
+        .iter()
+        .any(|tracepoint| tracepoint.owner == owner)
+    {
+        return Err(-17); // EEXIST
+    }
+    tracepoints.extend(resolved);
+    Ok(())
+}
+
+/// `tracepoint_module_going()` removes every published pointer before the
+/// section containing `struct tracepoint` can be freed.
+pub fn module_going(owner: usize) {
+    let addresses = MODULE_TRACEPOINTS
+        .lock()
+        .iter()
+        .filter(|tracepoint| tracepoint.owner == owner)
+        .map(|tracepoint| tracepoint.address)
+        .collect::<Vec<_>>();
+    debug_assert!(
+        !LIVE_MODULE_TRACEPOINTS
+            .lock()
+            .iter()
+            .any(|entry| addresses.contains(&entry.address)),
+        "module tracepoint still has live probes at GOING"
+    );
+    MODULE_TRACEPOINTS
+        .lock()
+        .retain(|tracepoint| tracepoint.owner != owner);
+}
+
+pub fn for_each_module_tracepoint(mut visit: impl FnMut(ModuleTracepoint)) {
+    for tracepoint in MODULE_TRACEPOINTS.lock().iter().copied() {
+        visit(tracepoint);
+    }
+}
+
+pub fn module_tracepoints(owner: usize) -> Vec<ModuleTracepoint> {
+    MODULE_TRACEPOINTS
+        .lock()
+        .iter()
+        .filter(|tracepoint| tracepoint.owner == owner)
+        .copied()
+        .collect()
+}
+
 // Tracepoints are declared explicitly: `static FOO: Tracepoint = Tracepoint::new("foo");`
 // and fired via a typed `fn trace_foo(...)` wrapper that calls `FOO.fire_with(...)`.
 // A `tracepoint!()` macro for typed-signature codegen is deferred — manual
@@ -173,5 +942,34 @@ mod tests {
             .unwrap();
         }
         assert_eq!(tp.register(TracepointProbe { func: 1, data: 0 }), Err(-28));
+    }
+
+    #[test]
+    fn builtin_tracepoint_exports_have_vendor_layout_and_distinct_keys() {
+        register_builtin_module_exports();
+        let sched = crate::kernel::module::find_symbol("__tracepoint_sched_set_state_tp")
+            .expect("scheduler tracepoint");
+        let xdp = crate::kernel::module::find_symbol("__tracepoint_xdp_exception")
+            .expect("XDP tracepoint");
+        let xdp_key = crate::kernel::module::find_symbol("__SCK__tp_func_xdp_exception")
+            .expect("XDP static-call key");
+        let dma_key = crate::kernel::module::find_symbol("__SCK__tp_func_dma_fence_emit")
+            .expect("DMA-fence static-call key");
+        assert_ne!(sched, xdp);
+        assert_ne!(xdp_key, dma_key);
+        assert_eq!(
+            unsafe { read_tp_word(xdp, LINUX_TRACEPOINT_STATIC_CALL_KEY_OFFSET) },
+            xdp_key
+        );
+        assert_eq!(
+            unsafe { read_tp_word(xdp, LINUX_TRACEPOINT_FUNCS_OFFSET) },
+            0
+        );
+        assert!(
+            module_tracepoints(0)
+                .iter()
+                .any(|tracepoint| tracepoint.address == xdp)
+        );
+        assert_eq!(core::mem::size_of::<LinuxBuiltinTracepointObject>(), 72);
     }
 }

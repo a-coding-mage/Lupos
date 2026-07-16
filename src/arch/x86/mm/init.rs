@@ -8,10 +8,8 @@
 //! in the existing x86 paging code; this module exposes the decisions that are
 //! safe to test outside early boot.
 
-#[cfg(not(test))]
 extern crate alloc;
 
-#[cfg(not(test))]
 use alloc::vec::Vec;
 #[cfg(not(test))]
 use lazy_static::lazy_static;
@@ -22,7 +20,7 @@ use crate::arch::x86::mm::paging::{__pgprot, PAGE_MASK, PAGE_SIZE, PMD_SIZE, PUD
 #[cfg(not(test))]
 use crate::arch::x86::mm::paging::{
     _PAGE_ACCESSED, _PAGE_DIRTY, _PAGE_GLOBAL, _PAGE_NX, _PAGE_PRESENT, _PAGE_RW, map_kernel_page,
-    unmap_kernel_page, virt_to_phys,
+    phys_to_virt, unmap_kernel_page, virt_to_phys,
 };
 use crate::arch::x86::mm::pat::{PageCacheMode, cachemode_to_pte_flags};
 use crate::include::uapi::errno::EINVAL;
@@ -389,6 +387,67 @@ pub fn execmem_set_final_permissions(
         unsafe { map_kernel_page(virt, phys, prot) };
     }
     Ok(())
+}
+
+/// Write kernel/module text through the direct-map alias of its backing
+/// physical pages.
+///
+/// The executable mapping remains read-only throughout the operation and the
+/// direct map is non-executable, preserving strict W^X.  Instruction-stream
+/// synchronization and the breakpoint protocol for multi-byte live patches
+/// are owned by `alternative::text_poke_live()`; this function only performs
+/// the physical writes after validating every addressed byte is mapped.
+#[cfg(not(test))]
+pub(crate) fn text_poke_write_alias(address: usize, bytes: &[u8]) -> Result<(), i32> {
+    if bytes.is_empty() || address.checked_add(bytes.len()).is_none() {
+        return Err(EINVAL);
+    }
+    for (offset, byte) in bytes.iter().copied().enumerate() {
+        let virt = address.checked_add(offset).ok_or(EINVAL)? as u64;
+        let phys = virt_to_phys(virt).ok_or(EINVAL)?;
+        unsafe {
+            phys_to_virt(phys).write_volatile(byte);
+        }
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn text_poke_write_alias(address: usize, bytes: &[u8]) -> Result<(), i32> {
+    if address == 0 || bytes.is_empty() || address.checked_add(bytes.len()).is_none() {
+        return Err(EINVAL);
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len());
+    }
+    Ok(())
+}
+
+/// Fault-checked read used by live patchers before comparing expected bytes.
+#[cfg(not(test))]
+pub(crate) fn text_poke_read(address: usize, len: usize) -> Result<Vec<u8>, i32> {
+    if len == 0 || address.checked_add(len).is_none() {
+        return Err(EINVAL);
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|_| EINVAL)?;
+    for offset in 0..len {
+        let virt = address.checked_add(offset).ok_or(EINVAL)? as u64;
+        if virt_to_phys(virt).is_none() {
+            return Err(EINVAL);
+        }
+        bytes.push(unsafe { (virt as *const u8).read_volatile() });
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn text_poke_read(address: usize, len: usize) -> Result<Vec<u8>, i32> {
+    if address == 0 || len == 0 || address.checked_add(len).is_none() {
+        return Err(EINVAL);
+    }
+    Ok(unsafe { core::slice::from_raw_parts(address as *const u8, len) }.to_vec())
 }
 
 #[cfg(test)]

@@ -2,4 +2,10 @@
 xtask = "run -p xtask --"
 
 [build]
-rustflags = ["-Awarnings"]
+rustflags = [
+    "-Awarnings",
+    # Kernel IBT requires every Rust indirect target to begin with ENDBR64.
+    "-Zcf-protection=branch",
+    # Match the strong stack-protector policy used for unchanged vendor modules.
+    "-Zstack-protector=strong",
+]

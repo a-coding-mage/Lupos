@@ -1,20 +1,13 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/trace
 //! test-origin: linux:vendor/linux/kernel/trace
 //! kprobes — `int3` based instruction-level instrumentation.
 //!
 //! Mirrors `vendor/linux/kernel/kprobes.c::register_kprobe`.
 //!
-//! Lupos M62 model:
-//! - A `Kprobe` records the target instruction pointer, an `enabled` flag,
-//!   the saved original byte, and pre/post handler function pointers.
-//! - `register_kprobe` does **not** modify text in M62 — instead, the IDT
-//!   `on_breakpoint` handler consults the registered probe table by RIP and
-//!   invokes the matching handler if found.  This avoids needing a writable
-//!   text path and the single-step trampoline machinery from
-//!   `arch/x86/kernel/kprobes/core.c`, both of which are major sub-projects.
-//!
-//! Real `int3` text patching is deferred (see ROADMAP M62 Deferred).
+//! Registration prepares a displaced-instruction slot, atomically arms the
+//! target with INT3 through the x86 text-poke backend, and keeps the slot alive
+//! until every in-flight #DB completion has returned to the original stream.
 
 extern crate alloc;
 
@@ -22,6 +15,12 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use spin::Mutex;
+
+use crate::arch::x86::kernel::kprobes::core::{
+    KprobeExecution, KprobeExecutionBehavior, LiveKprobe, arm_live_kprobe, disarm_live_kprobe,
+    free_live_kprobe, prepare_live_kprobe,
+};
+use crate::arch::x86::lib::insn::MAX_INSN_SIZE;
 
 use super::ring_buffer::{TRACE_KPROBE, TRACE_RB, TraceEvent};
 
@@ -49,8 +48,17 @@ impl Kprobe {
 }
 
 struct KprobeRegistry {
-    probes: Vec<&'static Kprobe>,
+    probes: Vec<RegisteredKprobe>,
 }
+
+struct RegisteredKprobe {
+    probe: &'static Kprobe,
+    actual_addr: u64,
+    #[cfg(not(test))]
+    live: LiveKprobe,
+}
+
+unsafe impl Send for RegisteredKprobe {}
 
 impl KprobeRegistry {
     const fn new() -> Self {
@@ -59,64 +67,323 @@ impl KprobeRegistry {
 }
 
 static KPROBE_REGISTRY: Mutex<KprobeRegistry> = Mutex::new(KprobeRegistry::new());
+static KPROBE_UPDATE_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AddressRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl AddressRange {
+    pub fn from_start_size(start: usize, size: usize) -> Option<Self> {
+        if start == 0 || size == 0 {
+            return None;
+        }
+        Some(Self {
+            start,
+            end: start.checked_add(size)?,
+        })
+    }
+
+    const fn contains(self, address: usize) -> bool {
+        address >= self.start && address < self.end
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ModuleBlacklistEntry {
+    owner: usize,
+    range: AddressRange,
+}
+
+static KPROBE_BLACKLIST: Mutex<Vec<ModuleBlacklistEntry>> = Mutex::new(Vec::new());
 
 pub fn register_kprobe(kp: &'static Kprobe) -> Result<(), i32> {
+    let _update = KPROBE_UPDATE_LOCK.lock();
+    if within_kprobe_blacklist(kp.addr as usize) {
+        return Err(-22); // EINVAL
+    }
     let mut g = KPROBE_REGISTRY.lock();
-    if g.probes.iter().any(|p| p.addr == kp.addr) {
+    if g.probes.iter().any(|record| record.probe.addr == kp.addr) {
         return Err(-17); // EEXIST
     }
-    g.probes.push(kp);
+
+    #[cfg(not(test))]
+    {
+        let live = prepare_live_kprobe(kp.addr).map_err(|error| -error.abs())?;
+        let actual_addr = live.arch.addr;
+        if g.probes
+            .iter()
+            .any(|record| record.actual_addr == actual_addr)
+        {
+            free_live_kprobe(live);
+            return Err(-17);
+        }
+        g.probes.push(RegisteredKprobe {
+            probe: kp,
+            actual_addr,
+            live,
+        });
+        let index = g.probes.len() - 1;
+        // Publish the registry record before INT3 so every possible trap can
+        // resolve it. No trap is possible before arm_live_kprobe writes INT3.
+        kp.enabled.store(true, Ordering::Release);
+        let live = core::ptr::addr_of_mut!(g.probes[index].live);
+        drop(g);
+        let arm_result = unsafe { arm_live_kprobe(&mut *live) };
+        g = KPROBE_REGISTRY.lock();
+        if let Err(error) = arm_result {
+            kp.enabled.store(false, Ordering::Release);
+            let Some(index) = g
+                .probes
+                .iter()
+                .position(|record| record.probe.addr == kp.addr)
+            else {
+                return Err(-error.abs());
+            };
+            let record = g.probes.swap_remove(index);
+            free_live_kprobe(record.live);
+            return Err(-error.abs());
+        }
+    }
+    #[cfg(test)]
+    g.probes.push(RegisteredKprobe {
+        probe: kp,
+        actual_addr: kp.addr,
+    });
     kp.enabled.store(true, Ordering::Release);
     Ok(())
 }
 
 pub fn unregister_kprobe(addr: u64) -> Result<(), i32> {
+    let _update = KPROBE_UPDATE_LOCK.lock();
     let mut g = KPROBE_REGISTRY.lock();
-    let len_before = g.probes.len();
-    g.probes.retain(|p| {
-        if p.addr == addr {
-            p.enabled.store(false, Ordering::Release);
-            false
-        } else {
-            true
+    let Some(index) = g.probes.iter().position(|record| record.probe.addr == addr) else {
+        return Err(-2); // ENOENT
+    };
+
+    #[cfg(not(test))]
+    {
+        let live = core::ptr::addr_of_mut!(g.probes[index].live);
+        drop(g);
+        unsafe { disarm_live_kprobe(&mut *live) }.map_err(|error| -error.abs())?;
+        while crate::arch::x86::kernel::kprobes::core::kprobe_handlers_active() {
+            core::hint::spin_loop();
         }
-    });
-    if g.probes.len() == len_before {
-        Err(-2) // ENOENT
-    } else {
-        Ok(())
+        g = KPROBE_REGISTRY.lock();
+        let Some(index) = g.probes.iter().position(|record| record.probe.addr == addr) else {
+            return Err(-2);
+        };
+        g.probes[index]
+            .probe
+            .enabled
+            .store(false, Ordering::Release);
+        let record = g.probes.swap_remove(index);
+        free_live_kprobe(record.live);
     }
+    #[cfg(test)]
+    {
+        g.probes[index]
+            .probe
+            .enabled
+            .store(false, Ordering::Release);
+        g.probes.swap_remove(index);
+    }
+    Ok(())
 }
 
 /// Manually invoke a kprobe by address.  Used by both the IDT `on_breakpoint`
 /// hook (deferred until text patching lands) and by direct test/instrumentation
 /// call sites.  Returns true if a probe fired.
 pub fn fire_kprobe(addr: u64) -> bool {
-    let g = KPROBE_REGISTRY.lock();
-    for p in g.probes.iter() {
-        if p.addr == addr && p.enabled.load(Ordering::Acquire) {
-            if let Some(f) = p.pre {
-                f(p.addr, p.data);
-            }
-            TRACE_RB.push(TraceEvent {
-                ts_nsec: crate::kernel::time::jiffies::jiffies() as u64 * 1_000_000,
-                ev_type: TRACE_KPROBE,
-                cpu: 0,
-                pid: 0,
-                arg0: p.addr,
-                arg1: 0,
-            });
-            if let Some(f) = p.post {
-                f(p.addr, p.data);
-            }
-            return true;
-        }
+    if begin_kprobe(addr).is_none() {
+        return false;
     }
-    false
+    finish_kprobe(addr);
+    true
+}
+
+/// Resolve one armed probe and run its pre-handler without retaining the
+/// registry lock across callback code.
+pub(crate) fn begin_kprobe(addr: u64) -> Option<KprobeExecution> {
+    let (probe, execution) = {
+        let registry = KPROBE_REGISTRY.lock();
+        let record = registry.probes.iter().find(|record| {
+            record.actual_addr == addr && record.probe.enabled.load(Ordering::Acquire)
+        })?;
+        #[cfg(not(test))]
+        let execution = record.live.execution();
+        #[cfg(test)]
+        let execution = KprobeExecution {
+            original_ip: record.actual_addr,
+            slot_ip: record.actual_addr,
+            instruction_len: 1,
+            bytes: [0u8; MAX_INSN_SIZE],
+            behavior: KprobeExecutionBehavior::default(),
+        };
+        (record.probe, execution)
+    };
+    if let Some(handler) = probe.pre {
+        handler(probe.addr, probe.data);
+    }
+    TRACE_RB.push(TraceEvent {
+        ts_nsec: crate::kernel::time::jiffies::jiffies() as u64 * 1_000_000,
+        ev_type: TRACE_KPROBE,
+        cpu: crate::kernel::sched::current_cpu() as u16,
+        pid: 0,
+        arg0: probe.addr,
+        arg1: 0,
+    });
+    Some(execution)
+}
+
+pub(crate) fn finish_kprobe(addr: u64) {
+    let probe = {
+        let registry = KPROBE_REGISTRY.lock();
+        registry
+            .probes
+            .iter()
+            .find(|record| record.actual_addr == addr)
+            .map(|record| record.probe)
+    };
+    if let Some(probe) = probe
+        && let Some(handler) = probe.post
+    {
+        handler(probe.addr, probe.data);
+    }
 }
 
 pub fn registered_count() -> usize {
     KPROBE_REGISTRY.lock().probes.len()
+}
+
+/// Match `kernel/kprobes.c::__within_kprobe_blacklist()` for module-owned
+/// `_kprobe_blacklist`, `.kprobes.text`, and `.noinstr.text` entries.
+pub fn within_kprobe_blacklist(address: usize) -> bool {
+    KPROBE_BLACKLIST
+        .lock()
+        .iter()
+        .any(|entry| entry.range.contains(address))
+}
+
+/// Module `COMING` callback from `kprobes_module_callback()`.
+pub fn module_coming(
+    owner: usize,
+    symbol_blacklist: &[usize],
+    kprobes_text: Option<AddressRange>,
+    noinstr_text: Option<AddressRange>,
+) -> Result<(), i32> {
+    let mut blacklist = KPROBE_BLACKLIST.lock();
+    if blacklist.iter().any(|entry| entry.owner == owner) {
+        return Err(-17); // EEXIST
+    }
+
+    blacklist.extend(
+        symbol_blacklist
+            .iter()
+            .copied()
+            .filter(|address| *address != 0)
+            .map(|address| ModuleBlacklistEntry {
+                owner,
+                range: AddressRange {
+                    start: address,
+                    end: address.saturating_add(1),
+                },
+            }),
+    );
+    for range in [kprobes_text, noinstr_text].into_iter().flatten() {
+        blacklist.push(ModuleBlacklistEntry { owner, range });
+    }
+    Ok(())
+}
+
+fn kill_probes_in_ranges(ranges: &[AddressRange]) -> Result<(), i32> {
+    if ranges.is_empty() {
+        return Ok(());
+    }
+
+    let _update = KPROBE_UPDATE_LOCK.lock();
+    #[cfg(not(test))]
+    {
+        let mut probes = KPROBE_REGISTRY.lock();
+        let mut matches = Vec::new();
+        for record in probes.probes.iter_mut() {
+            if record.probe.enabled.load(Ordering::Acquire)
+                && ranges
+                    .iter()
+                    .any(|range| range.contains(record.actual_addr as usize))
+            {
+                matches.push((record.actual_addr, core::ptr::addr_of_mut!(record.live)));
+            }
+        }
+        drop(probes);
+
+        // Keep every record published and enabled until its INT3 is gone;
+        // a CPU which raced with the text poke must still be able to resolve
+        // and finish the probe. KPROBE_UPDATE_LOCK keeps the Vec stable while
+        // the registry lock is deliberately released around cross-CPU sync.
+        let mut disarmed = 0usize;
+        for (_, live) in matches.iter().copied() {
+            if let Err(error) = unsafe { disarm_live_kprobe(&mut *live) } {
+                // Preserve the all-armed state on a partial text-poke failure;
+                // leaving an enabled registry record with restored text would
+                // make its lifecycle indistinguishable from a live probe.
+                for (_, previous) in matches[..disarmed].iter().copied() {
+                    let _ = unsafe { arm_live_kprobe(&mut *previous) };
+                }
+                return Err(-error.abs());
+            }
+            disarmed += 1;
+        }
+        while crate::arch::x86::kernel::kprobes::core::kprobe_handlers_active() {
+            core::hint::spin_loop();
+        }
+        let probes = KPROBE_REGISTRY.lock();
+        for (address, _) in matches {
+            if let Some(record) = probes
+                .probes
+                .iter()
+                .find(|record| record.actual_addr == address)
+            {
+                // Linux's kill_kprobe() leaves the registration present but
+                // marks it gone/disarmed so later unregister is well-defined.
+                record.probe.enabled.store(false, Ordering::Release);
+            }
+        }
+    }
+    #[cfg(test)]
+    {
+        let probes = KPROBE_REGISTRY.lock();
+        for record in probes.probes.iter() {
+            if ranges
+                .iter()
+                .any(|range| range.contains(record.actual_addr as usize))
+            {
+                record.probe.enabled.store(false, Ordering::Release);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Module `LIVE` callback.  At this transition Linux is about to free only
+/// the module init layout, so probes into init text must be killed.
+pub fn module_live(_owner: usize, init_text: &[AddressRange]) -> Result<(), i32> {
+    kill_probes_in_ranges(init_text)
+}
+
+/// Module `GOING` callback.  Kill probes into both layouts before releasing
+/// the blacklist entries whose backing addresses belong to the module.
+pub fn module_going(
+    owner: usize,
+    core_text: &[AddressRange],
+    init_text: &[AddressRange],
+) -> Result<(), i32> {
+    kill_probes_in_ranges(init_text)?;
+    kill_probes_in_ranges(core_text)?;
+    KPROBE_BLACKLIST.lock().retain(|entry| entry.owner != owner);
+    Ok(())
 }
 
 #[cfg(test)]

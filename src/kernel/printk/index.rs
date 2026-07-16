@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/printk/index.c
 //! test-origin: linux:vendor/linux/kernel/printk/index.c
 //! `/sys/kernel/debug/printk/index/*` indexed printk symbol table.
@@ -26,6 +26,16 @@ pub struct PiEntry {
 
 static INDEX: Mutex<Vec<PiEntry>> = Mutex::new(Vec::new());
 
+/// Opaque address of vendor Linux's packed `struct pi_entry`, referenced by
+/// one pointer in a module `.printk_index` section.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModulePiEntry {
+    pub owner: usize,
+    pub address: usize,
+}
+
+static MODULE_INDEX: Mutex<Vec<ModulePiEntry>> = Mutex::new(Vec::new());
+
 pub fn register(entry: PiEntry) {
     INDEX.lock().push(entry);
 }
@@ -36,6 +46,46 @@ pub fn lookup_by_fmt(fmt: &str) -> Option<PiEntry> {
 
 pub fn entries() -> Vec<PiEntry> {
     INDEX.lock().clone()
+}
+
+/// `pi_module_notify(MODULE_STATE_COMING)`.  Linux exposes these entries via
+/// `/sys/kernel/debug/printk/index/<module>` without copying the packed
+/// objects, so their lifetime is exactly the module lifetime.
+pub fn module_coming(owner: usize, section: &[u8]) -> Result<(), i32> {
+    if section.len() % core::mem::size_of::<usize>() != 0 {
+        return Err(-8); // ENOEXEC
+    }
+
+    let mut entries = Vec::with_capacity(section.len() / core::mem::size_of::<usize>());
+    for bytes in section.chunks_exact(core::mem::size_of::<usize>()) {
+        let address = usize::from_le_bytes(bytes.try_into().map_err(|_| -8)?);
+        if address == 0 {
+            return Err(-8);
+        }
+        entries.push(ModulePiEntry { owner, address });
+    }
+
+    let mut index = MODULE_INDEX.lock();
+    if index.iter().any(|entry| entry.owner == owner) {
+        return Err(-17); // EEXIST
+    }
+    index.extend(entries);
+    Ok(())
+}
+
+/// `pi_module_notify(MODULE_STATE_GOING)` removes the debugfs view before its
+/// `pi_entry` pointers become invalid.
+pub fn module_going(owner: usize) {
+    MODULE_INDEX.lock().retain(|entry| entry.owner != owner);
+}
+
+pub fn module_entries(owner: usize) -> Vec<ModulePiEntry> {
+    MODULE_INDEX
+        .lock()
+        .iter()
+        .filter(|entry| entry.owner == owner)
+        .copied()
+        .collect()
 }
 
 #[cfg(test)]

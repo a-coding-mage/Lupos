@@ -7,10 +7,9 @@
 //! - vendor/linux/arch/x86/kernel/module.c
 //!
 //! The relocation writer delegates to the runtime loader's bounded x86_64
-//! implementation. `module_finalize()` mirrors the vendor section scan and
-//! finalizes `.smp_locks` for Lupos' current SMP text state. The runtime loader
-//! still rejects ITS/FineIBT, return thunk, call thunk, alternatives, IBT
-//! sealing, and ORC metadata which need unimplemented patching or registration.
+//! implementation. `module_finalize()` mirrors the ordering in
+//! `vendor/linux/arch/x86/kernel/module.c`: retpoline and return sites, call
+//! sites, alternatives, IBT sealing, SMP locks, and paired ORC tables.
 
 #![allow(dead_code)]
 
@@ -18,23 +17,36 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::x86::kernel::alternative::{
     ALT_FLAG_DIRECT_CALL, ALT_FLAGS_SHIFT, AltInstr, CALL_INSN_OPCODE, JMP32_INSN_OPCODE,
-    MAX_PATCH_LEN, add_nops, alternatives_smp_module_add, alternatives_smp_module_del,
+    MAX_PATCH_LEN, RetpolinePatchPolicy, add_nops, alternatives_smp_module_add,
+    alternatives_smp_module_del, decode_retpoline_site, patch_retpoline, patch_return, seal_endbr,
     text_poke_copy,
 };
-use crate::arch::x86::kernel::cpu::common::{boot_cpu_has, x86_feature_limit};
-use crate::arch::x86::kernel::jump_label::JMP8_INSN_OPCODE;
+use crate::arch::x86::kernel::callthunks::{
+    CALL_INSN_SIZE as CALLTHUNK_CALL_SIZE, SKL_CALL_THUNK_SIZE, call_get_dest, emit_call,
+    install_call_thunk_padding, skl_call_thunk_template,
+};
+use crate::arch::x86::kernel::cpu::common::{
+    X86_FEATURE_CALL_DEPTH, X86_FEATURE_RETHUNK, X86_FEATURE_RETPOLINE,
+    X86_FEATURE_RETPOLINE_LFENCE, boot_cpu_has, x86_feature_limit,
+};
+use crate::arch::x86::kernel::jump_label::{JMP8_INSN_OPCODE, JumpLabelRegistration};
+use crate::arch::x86::kernel::retpoline::{
+    compiler_return_thunk_addr, retpoline_register, return_thunk_addr,
+};
 use crate::arch::x86::kernel::static_call::{
-    STATIC_CALL_SITE_FLAGS, STATIC_CALL_SITE_SIZE, STATIC_CALL_SITE_TAIL,
+    RETINSN, STATIC_CALL_SITE_FLAGS, STATIC_CALL_SITE_SIZE, StaticCallRegistration, TRAMP_UD,
     static_call_fixup_warn_site, warn_trap_addr, warn_trap_trampoline_addr,
 };
+use crate::arch::x86::kernel::unwind_orc::OrcModuleRegistration;
 use crate::arch::x86::lib::insn::Insn;
 use crate::kernel::module::loader::{LoadedSection, NameMap};
 use crate::kernel::module::relocate::{Rela, RelocType, apply_rela};
 
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default)]
 pub struct X86ModuleMetadata {
     pub has_jump_entries: bool,
     pub has_orc_unwind: bool,
@@ -49,10 +61,56 @@ pub struct X86ModuleMetadata {
     smp_locks_registered: bool,
     pub num_static_call_sites: usize,
     pub num_extable_entries: usize,
+    pub num_retpoline_sites: usize,
+    pub num_return_sites: usize,
+    pub num_call_sites: usize,
+    pub num_call_thunks: usize,
+    pub num_cfi_sites: usize,
+    pub num_ibt_endbr_seals: usize,
+    pub num_orcs: usize,
+    pub num_jump_entries: usize,
+    orc_registration: Option<OrcModuleRegistration>,
+    jump_label_registration: Option<JumpLabelRegistration>,
+    static_call_registration: Option<StaticCallRegistration>,
+    released: AtomicBool,
 }
 
 impl Drop for X86ModuleMetadata {
     fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl X86ModuleMetadata {
+    pub fn orc_unwind_ip(&self) -> Option<usize> {
+        self.orc_registration
+            .as_ref()
+            .map(|registration| registration.orc_unwind_ip)
+    }
+
+    pub fn orc_unwind(&self) -> Option<usize> {
+        self.orc_registration
+            .as_ref()
+            .map(|registration| registration.orc_unwind)
+    }
+
+    /// Linux `module_arch_cleanup()`: withdraw every architecture-owned
+    /// registry before the module's section allocations can be freed.  The
+    /// module descriptor itself may remain referenced after `delete_module`,
+    /// so cleanup cannot be deferred to this object's destructor.
+    pub fn release(&self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(registration) = &self.orc_registration {
+            registration.unregister();
+        }
+        if let Some(registration) = &self.jump_label_registration {
+            registration.unregister();
+        }
+        if let Some(registration) = &self.static_call_registration {
+            registration.unregister();
+        }
         alternatives_smp_module_del(self.smp_locks_registered);
     }
 }
@@ -66,7 +124,6 @@ pub struct ResolvedRela {
 #[derive(Debug, Eq, PartialEq)]
 pub enum X86ModuleFinalizeError {
     BadSection(&'static str),
-    Unsupported(&'static str),
 }
 
 pub fn apply_relocate_add(
@@ -108,9 +165,20 @@ pub fn module_finalize(
     sections: &mut NameMap<LoadedSection>,
 ) -> Result<X86ModuleMetadata, X86ModuleFinalizeError> {
     let has_smp_locks = sections.contains_key(".smp_locks");
+    let num_cfi_sites = apply_module_cfi_policy(sections)?;
+    let num_retpoline_sites = apply_module_retpolines(sections)?;
+    let num_return_sites = apply_module_returns(sections)?;
+    let (num_call_sites, num_call_thunks) = finalize_module_call_sites(sections)?;
     let alternatives_applied = apply_module_alternatives(sections)?;
-    let num_static_call_sites = finalize_static_call_sites(sections)?;
+    let num_ibt_endbr_seals = apply_module_ibt_seals(sections)?;
+    let (num_static_call_sites, static_call_registration) = finalize_static_call_sites(sections)?;
+    let (num_jump_entries, jump_label_registration) = finalize_jump_entries(sections)?;
     let num_extable_entries = sort_module_extable(sections)?;
+    let orc_registration = finalize_module_orc(sections)?;
+    let num_orcs = orc_registration
+        .as_ref()
+        .map(|registration| registration.num_orcs)
+        .unwrap_or(0);
     Ok(X86ModuleMetadata {
         has_jump_entries: sections.contains_key("__jump_table"),
         has_orc_unwind: sections.contains_key(".orc_unwind"),
@@ -120,11 +188,23 @@ pub fn module_finalize(
         smp_locks_registered: has_smp_locks && alternatives_smp_module_add(),
         num_static_call_sites,
         num_extable_entries,
+        num_retpoline_sites,
+        num_return_sites,
+        num_call_sites,
+        num_call_thunks,
+        num_cfi_sites,
+        num_ibt_endbr_seals,
+        num_orcs,
+        num_jump_entries,
+        orc_registration,
+        jump_label_registration,
+        static_call_registration,
+        released: AtomicBool::new(false),
     })
 }
 
-pub fn module_arch_cleanup(metadata: &mut X86ModuleMetadata) {
-    *metadata = X86ModuleMetadata::default();
+pub fn module_arch_cleanup(metadata: &X86ModuleMetadata) {
+    metadata.release();
 }
 
 pub fn decode_rela_entries(data: &[u8]) -> Vec<Rela> {
@@ -187,6 +267,327 @@ fn loaded_mut_at(
         }
     }
     None
+}
+
+fn loaded_tail_at(
+    sections: &NameMap<LoadedSection>,
+    addr: usize,
+    max_size: usize,
+) -> Option<Vec<u8>> {
+    for section in sections.values() {
+        let base = section.as_ptr() as usize;
+        let Some(offset) = addr.checked_sub(base) else {
+            continue;
+        };
+        if offset < section.len() {
+            let end = section.len().min(offset.saturating_add(max_size));
+            return Some(section.as_slice()[offset..end].to_vec());
+        }
+    }
+    None
+}
+
+fn parse_prel32_sites(
+    sections: &NameMap<LoadedSection>,
+    name: &'static str,
+) -> Result<Vec<usize>, X86ModuleFinalizeError> {
+    let Some(section) = sections.get(name) else {
+        return Ok(Vec::new());
+    };
+    if section.len() % core::mem::size_of::<i32>() != 0 {
+        return Err(X86ModuleFinalizeError::BadSection(name));
+    }
+    let base = section.as_ptr() as usize;
+    let mut sites = Vec::with_capacity(section.len() / 4);
+    for offset in (0..section.len()).step_by(4) {
+        let displacement =
+            read_i32(section.as_slice(), offset).ok_or(X86ModuleFinalizeError::BadSection(name))?;
+        sites.push(relative_addr(base + offset, displacement));
+    }
+    Ok(sites)
+}
+
+/// `apply_retpolines()` from vendor/linux/arch/x86/kernel/alternative.c.
+fn apply_module_retpolines(
+    sections: &mut NameMap<LoadedSection>,
+) -> Result<usize, X86ModuleFinalizeError> {
+    let sites = parse_prel32_sites(sections, ".retpoline_sites")?;
+    let policy = RetpolinePatchPolicy {
+        retpoline: boot_cpu_has(X86_FEATURE_RETPOLINE),
+        retpoline_lfence: boot_cpu_has(X86_FEATURE_RETPOLINE_LFENCE),
+        call_depth: boot_cpu_has(X86_FEATURE_CALL_DEPTH),
+    };
+    for site_addr in sites.iter().copied() {
+        let bytes = loaded_tail_at(sections, site_addr, 15)
+            .ok_or(X86ModuleFinalizeError::BadSection(".retpoline_sites"))?;
+        let site = decode_retpoline_site(site_addr, &bytes, retpoline_register)
+            .map_err(|_| X86ModuleFinalizeError::BadSection(".retpoline_sites"))?;
+        let Some(patch) = patch_retpoline(site_addr, site, policy)
+            .map_err(|_| X86ModuleFinalizeError::BadSection(".retpoline_sites"))?
+        else {
+            continue;
+        };
+        let destination = loaded_mut_at(sections, site_addr, patch.len())
+            .ok_or(X86ModuleFinalizeError::BadSection(".retpoline_sites"))?;
+        text_poke_copy(destination, &patch)
+            .map_err(|_| X86ModuleFinalizeError::BadSection(".retpoline_sites"))?;
+    }
+    Ok(sites.len())
+}
+
+/// `apply_returns()` from vendor/linux/arch/x86/kernel/alternative.c.
+fn apply_module_returns(
+    sections: &mut NameMap<LoadedSection>,
+) -> Result<usize, X86ModuleFinalizeError> {
+    let sites = parse_prel32_sites(sections, ".return_sites")?;
+    let compiler_return_thunk = compiler_return_thunk_addr();
+    let selected_return_thunk = return_thunk_addr();
+    let wants_rethunk = boot_cpu_has(X86_FEATURE_RETHUNK);
+    for site_addr in sites.iter().copied() {
+        let bytes = loaded_tail_at(sections, site_addr, 8)
+            .ok_or(X86ModuleFinalizeError::BadSection(".return_sites"))?;
+        if bytes.len() >= 8
+            && bytes[5..8] == TRAMP_UD
+            && (bytes[0] == crate::arch::x86::kernel::alternative::RET_INSN_OPCODE
+                || (bytes[0] == JMP32_INSN_OPCODE
+                    && patch_return(
+                        site_addr,
+                        &bytes,
+                        compiler_return_thunk,
+                        selected_return_thunk,
+                        true,
+                    )
+                    .is_ok()))
+        {
+            // __static_call_fixup(): a NULL static-call return trampoline is
+            // normalized to RETINSN before ordinary return-site handling.
+            let destination = loaded_mut_at(sections, site_addr, RETINSN.len())
+                .ok_or(X86ModuleFinalizeError::BadSection(".return_sites"))?;
+            text_poke_copy(destination, &RETINSN)
+                .map_err(|_| X86ModuleFinalizeError::BadSection(".return_sites"))?;
+            continue;
+        }
+        let patch = patch_return(
+            site_addr,
+            &bytes,
+            compiler_return_thunk,
+            selected_return_thunk,
+            wants_rethunk,
+        )
+        .map_err(|_| X86ModuleFinalizeError::BadSection(".return_sites"))?;
+        let destination = loaded_mut_at(sections, site_addr, patch.len())
+            .ok_or(X86ModuleFinalizeError::BadSection(".return_sites"))?;
+        text_poke_copy(destination, &patch)
+            .map_err(|_| X86ModuleFinalizeError::BadSection(".return_sites"))?;
+    }
+    Ok(sites.len())
+}
+
+fn is_core_text_name(name: &str) -> bool {
+    !name.starts_with(".init")
+        && !name.starts_with(".exit")
+        && (name == ".text" || name.starts_with(".text.") || name.ends_with(".text"))
+}
+
+fn is_module_core_text(sections: &NameMap<LoadedSection>, address: usize, size: usize) -> bool {
+    sections.iter().any(|(name, section)| {
+        if !is_core_text_name(name) {
+            return false;
+        }
+        let base = section.as_ptr() as usize;
+        address
+            .checked_sub(base)
+            .and_then(|offset| offset.checked_add(size))
+            .is_some_and(|end| end <= section.len())
+    })
+}
+
+/// `callthunks_patch_module_calls()`. The metadata is always consumed; Linux
+/// deliberately performs no mutation until its software CALL_DEPTH feature
+/// bit is selected for an affected CPU.
+fn finalize_module_call_sites(
+    sections: &mut NameMap<LoadedSection>,
+) -> Result<(usize, usize), X86ModuleFinalizeError> {
+    finalize_module_call_sites_with_policy(
+        sections,
+        boot_cpu_has(X86_FEATURE_CALL_DEPTH),
+        crate::arch::x86::kernel::setup_percpu::x86_call_depth_symbol() as u64,
+    )
+}
+
+fn finalize_module_call_sites_with_policy(
+    sections: &mut NameMap<LoadedSection>,
+    call_depth_enabled: bool,
+    percpu_symbol: u64,
+) -> Result<(usize, usize), X86ModuleFinalizeError> {
+    let sites = parse_prel32_sites(sections, ".call_sites")?;
+    if !call_depth_enabled {
+        return Ok((sites.len(), 0));
+    }
+
+    let template = skl_call_thunk_template(percpu_symbol)
+        .map_err(|_| X86ModuleFinalizeError::BadSection(".call_sites"))?;
+    let mut patched = 0usize;
+    for site in sites.iter().copied() {
+        // Linux ignores metadata outside MOD_TEXT (notably init text).
+        if !is_module_core_text(sections, site, CALLTHUNK_CALL_SIZE) {
+            continue;
+        }
+        let instruction = loaded_bytes_at(sections, site, CALLTHUNK_CALL_SIZE)
+            .ok_or(X86ModuleFinalizeError::BadSection(".call_sites"))?;
+        let Some(destination) = call_get_dest(site as u64, &instruction)
+            .map_err(|_| X86ModuleFinalizeError::BadSection(".call_sites"))?
+        else {
+            // An earlier alternative may have removed this call.
+            continue;
+        };
+        let destination = destination as usize;
+        if !is_module_core_text(sections, destination, 1) {
+            // Lupos core text is not compiled with Linux function padding.
+            // As Linux does for non-core destinations, retain the direct call.
+            continue;
+        }
+        let padding_addr = destination
+            .checked_sub(SKL_CALL_THUNK_SIZE)
+            .ok_or(X86ModuleFinalizeError::BadSection(".call_sites"))?;
+        if !is_module_core_text(sections, padding_addr, SKL_CALL_THUNK_SIZE) {
+            continue;
+        }
+        let padding = loaded_mut_at(sections, padding_addr, SKL_CALL_THUNK_SIZE)
+            .ok_or(X86ModuleFinalizeError::BadSection(".call_sites"))?;
+        if install_call_thunk_padding(padding, &template).is_err() {
+            // `patch_dest()` warns and leaves this call unchanged when a
+            // function lacks the compiler-reserved NOP prefix.
+            continue;
+        }
+        let call = emit_call(site as u64, padding_addr as u64)
+            .map_err(|_| X86ModuleFinalizeError::BadSection(".call_sites"))?;
+        let destination_bytes = loaded_mut_at(sections, site, CALLTHUNK_CALL_SIZE)
+            .ok_or(X86ModuleFinalizeError::BadSection(".call_sites"))?;
+        text_poke_copy(destination_bytes, &call)
+            .map_err(|_| X86ModuleFinalizeError::BadSection(".call_sites"))?;
+        patched += 1;
+    }
+    Ok((sites.len(), patched))
+}
+
+const FINEIBT_CALLER_SIZE: usize = 14;
+const FINEIBT_CALLER_JUMP: u8 = 12;
+
+/// Apply the vendor kernel's `cfi=off` module policy. Lupos is not compiled
+/// with Clang KCFI, so accepting `.cfi_sites` while leaving caller-side type
+/// checks active would route failures into an ABI which does not exist here.
+/// Linux first converts each typed caller prefix into `jmp +12`, preserving
+/// the hash bytes for a later mode change, then leaves the callee preambles
+/// untouched. This is still full metadata consumption, not silent ignoring.
+fn apply_module_cfi_policy(
+    sections: &mut NameMap<LoadedSection>,
+) -> Result<usize, X86ModuleFinalizeError> {
+    let cfi_sites = parse_prel32_sites(sections, ".cfi_sites")?;
+    if cfi_sites.is_empty() {
+        return Ok(0);
+    }
+    for address in cfi_sites.iter().copied() {
+        let preamble = loaded_bytes_at(sections, address, 5)
+            .ok_or(X86ModuleFinalizeError::BadSection(".cfi_sites"))?;
+        if !(0xb8..=0xbf).contains(&preamble[0]) {
+            return Err(X86ModuleFinalizeError::BadSection(".cfi_sites"));
+        }
+    }
+    let retpolines = parse_prel32_sites(sections, ".retpoline_sites")?;
+    for site in retpolines {
+        let Some(prefix_addr) = site.checked_sub(FINEIBT_CALLER_SIZE) else {
+            return Err(X86ModuleFinalizeError::BadSection(".retpoline_sites"));
+        };
+        let Some(prefix) = loaded_bytes_at(sections, prefix_addr, 6) else {
+            continue;
+        };
+        let typed = prefix[0..2] == [0x41, 0xba];
+        let already_disabled = prefix[0..2] == [JMP8_INSN_OPCODE, FINEIBT_CALLER_JUMP];
+        if !typed && !already_disabled {
+            // `nocfi` callers do not carry a decodable hash prefix.
+            continue;
+        }
+        if typed {
+            let destination = loaded_mut_at(sections, prefix_addr, 2)
+                .ok_or(X86ModuleFinalizeError::BadSection(".retpoline_sites"))?;
+            text_poke_copy(destination, &[JMP8_INSN_OPCODE, FINEIBT_CALLER_JUMP])
+                .map_err(|_| X86ModuleFinalizeError::BadSection(".retpoline_sites"))?;
+        }
+    }
+    Ok(cfi_sites.len())
+}
+
+/// `apply_seal_endbr()` from vendor/linux/arch/x86/kernel/alternative.c.
+fn apply_module_ibt_seals(
+    sections: &mut NameMap<LoadedSection>,
+) -> Result<usize, X86ModuleFinalizeError> {
+    let sites = parse_prel32_sites(sections, ".ibt_endbr_seal")?;
+    for site_addr in sites.iter().copied() {
+        let site = loaded_mut_at(
+            sections,
+            site_addr,
+            crate::arch::x86::kernel::alternative::ENDBR_INSN_SIZE,
+        )
+        .ok_or(X86ModuleFinalizeError::BadSection(".ibt_endbr_seal"))?;
+        seal_endbr(site).map_err(|_| X86ModuleFinalizeError::BadSection(".ibt_endbr_seal"))?;
+    }
+    Ok(sites.len())
+}
+
+fn finalize_module_orc(
+    sections: &mut NameMap<LoadedSection>,
+) -> Result<Option<OrcModuleRegistration>, X86ModuleFinalizeError> {
+    if let Some(header) = sections.get(".orc_header")
+        && header.as_slice() != crate::arch::x86::kernel::unwind_orc::VENDOR_ORC_HASH
+    {
+        return Err(X86ModuleFinalizeError::BadSection(".orc_header"));
+    }
+    let (Some(ip_section), Some(orc_section)) =
+        (sections.get(".orc_unwind_ip"), sections.get(".orc_unwind"))
+    else {
+        // This is the exact `if (orc && orc_ip)` condition in module.c.
+        return Ok(None);
+    };
+    let ip_base = ip_section.as_ptr() as usize;
+    let orc_base = orc_section.as_ptr() as usize;
+    let mut text_ranges = Vec::new();
+    for (name, section) in sections.iter() {
+        if name == ".text" || name.starts_with(".text.") || name.ends_with(".text") {
+            let start = section.as_ptr() as usize;
+            let end = start.saturating_add(section.len());
+            if start < end {
+                text_ranges.push((start, end));
+            }
+        }
+    }
+    let mut ip_bytes = ip_section.as_slice().to_vec();
+    let mut orc_bytes = orc_section.as_slice().to_vec();
+    let num_entries = crate::arch::x86::kernel::unwind_orc::sort_module_orc_tables(
+        ip_base,
+        &mut ip_bytes,
+        &mut orc_bytes,
+    )
+    .map_err(|_| X86ModuleFinalizeError::BadSection(".orc_unwind"))?;
+    sections
+        .get_mut(".orc_unwind_ip")
+        .ok_or(X86ModuleFinalizeError::BadSection(".orc_unwind_ip"))?
+        .as_mut_slice()
+        .copy_from_slice(&ip_bytes);
+    sections
+        .get_mut(".orc_unwind")
+        .ok_or(X86ModuleFinalizeError::BadSection(".orc_unwind"))?
+        .as_mut_slice()
+        .copy_from_slice(&orc_bytes);
+    crate::arch::x86::kernel::unwind_orc::register_sorted_module_orc_tables_for_ranges(
+        ip_base,
+        &ip_bytes,
+        orc_base,
+        &orc_bytes,
+        num_entries,
+        &text_ranges,
+    )
+    .map_err(|_| X86ModuleFinalizeError::BadSection(".orc_unwind"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,11 +666,6 @@ fn apply_module_alternatives(
         let Some(entry) = selected else {
             continue;
         };
-        if entry.flags & ALT_FLAG_DIRECT_CALL != 0 {
-            return Err(X86ModuleFinalizeError::Unsupported(
-                ".altinstructions ALT_FLAG_DIRECT_CALL",
-            ));
-        }
         let repl_len = entry.replacementlen as usize;
         if repl_len > patch_len {
             return Err(X86ModuleFinalizeError::BadSection(".altinstructions"));
@@ -277,9 +673,71 @@ fn apply_module_alternatives(
         let replacement = loaded_bytes_at(sections, entry.repl_addr, repl_len)
             .ok_or(X86ModuleFinalizeError::BadSection(".altinstructions"))?;
         let mut patch = alloc::vec![0x90u8; patch_len];
-        patch[..repl_len].copy_from_slice(&replacement);
-        add_nops(&mut patch[repl_len..]);
-        apply_alt_relocation(&mut patch, instr_addr, entry.repl_addr, repl_len)?;
+        if entry.flags & ALT_FLAG_DIRECT_CALL != 0 {
+            // alt_replace_call(): vendor/linux/arch/x86/kernel/alternative.c.
+            // A five-byte `call BUG_func` replacement inherits the target of
+            // the original six-byte `call *disp32(%rip)` pv_ops instruction.
+            if repl_len != 5
+                || replacement.first().copied() != Some(CALL_INSN_OPCODE)
+                || entry.instrlen != 6
+            {
+                return Err(X86ModuleFinalizeError::BadSection(
+                    ".altinstructions ALT_FLAG_DIRECT_CALL",
+                ));
+            }
+            let original = loaded_bytes_at(sections, instr_addr, 6).ok_or(
+                X86ModuleFinalizeError::BadSection(".altinstructions ALT_FLAG_DIRECT_CALL"),
+            )?;
+            if original[..2] != [0xff, 0x15] {
+                return Err(X86ModuleFinalizeError::BadSection(
+                    ".altinstructions ALT_FLAG_DIRECT_CALL",
+                ));
+            }
+            let pointer_disp = i32::from_le_bytes(original[2..6].try_into().map_err(|_| {
+                X86ModuleFinalizeError::BadSection(".altinstructions ALT_FLAG_DIRECT_CALL")
+            })?);
+            let pointer_addr = instr_addr
+                .wrapping_add(6)
+                .wrapping_add_signed(pointer_disp as isize);
+            let mut target_bytes = [0u8; core::mem::size_of::<usize>()];
+            unsafe {
+                crate::arch::x86::mm::maccess::copy_from_kernel_nofault(
+                    target_bytes.as_mut_ptr(),
+                    pointer_addr as *const u8,
+                    target_bytes.len(),
+                )
+            }
+            .map_err(|_| {
+                X86ModuleFinalizeError::BadSection(".altinstructions ALT_FLAG_DIRECT_CALL")
+            })?;
+            let target = match usize::from_le_bytes(target_bytes) {
+                0 => crate::arch::x86::kernel::alternative::BUG_func as usize,
+                target => target,
+            };
+            if target == crate::arch::x86::kernel::alternative::nop_func as usize {
+                add_nops(&mut patch);
+                let dst = loaded_mut_at(sections, instr_addr, patch_len)
+                    .ok_or(X86ModuleFinalizeError::BadSection(".altinstructions"))?;
+                text_poke_copy(dst, &patch)
+                    .map_err(|_| X86ModuleFinalizeError::BadSection(".altinstructions"))?;
+                applied = true;
+                continue;
+            }
+            let next = instr_addr.wrapping_add(5);
+            let relative = target as i128 - next as i128;
+            if !(i32::MIN as i128..=i32::MAX as i128).contains(&relative) {
+                return Err(X86ModuleFinalizeError::BadSection(
+                    ".altinstructions ALT_FLAG_DIRECT_CALL",
+                ));
+            }
+            patch[0] = CALL_INSN_OPCODE;
+            patch[1..5].copy_from_slice(&(relative as i32).to_le_bytes());
+            add_nops(&mut patch[5..]);
+        } else {
+            patch[..repl_len].copy_from_slice(&replacement);
+            add_nops(&mut patch[repl_len..]);
+            apply_alt_relocation(&mut patch, instr_addr, entry.repl_addr, repl_len)?;
+        }
         let dst = loaded_mut_at(sections, instr_addr, patch_len)
             .ok_or(X86ModuleFinalizeError::BadSection(".altinstructions"))?;
         text_poke_copy(dst, &patch)
@@ -392,58 +850,49 @@ fn apply_alt_relocation(
 
 fn finalize_static_call_sites(
     sections: &mut NameMap<LoadedSection>,
-) -> Result<usize, X86ModuleFinalizeError> {
+) -> Result<(usize, Option<StaticCallRegistration>), X86ModuleFinalizeError> {
+    if let Some(section) = sections.get_mut(".static_call_sites") {
+        let base = section.as_ptr() as usize;
+        crate::arch::x86::kernel::static_call::sort_module_static_call_sites(
+            base,
+            section.as_mut_slice(),
+        )
+        .map_err(|_| X86ModuleFinalizeError::BadSection(".static_call_sites"))?;
+    }
     let Some(section) = sections.get(".static_call_sites") else {
-        return Ok(0);
+        return Ok((0, None));
     };
     if section.len() % STATIC_CALL_SITE_SIZE != 0 {
         return Err(X86ModuleFinalizeError::BadSection(".static_call_sites"));
     }
     let base = section.as_ptr() as usize;
-    let data = section.as_slice().to_vec();
-    let mut sites = Vec::with_capacity(data.len() / STATIC_CALL_SITE_SIZE);
-    for offset in (0..data.len()).step_by(STATIC_CALL_SITE_SIZE) {
-        let site_disp = read_i32(&data, offset)
-            .ok_or(X86ModuleFinalizeError::BadSection(".static_call_sites"))?;
-        let key_disp = read_i32(&data, offset + 4)
-            .ok_or(X86ModuleFinalizeError::BadSection(".static_call_sites"))?;
-        let site_addr = relative_addr(base + offset, site_disp);
-        let key_value = relative_addr(base + offset + 4, key_disp);
-        sites.push((site_addr, key_value));
-    }
-
-    for (site_addr, key_value) in sites.iter().copied() {
-        classify_warn_static_call_key(key_value)?;
-        let site = loaded_mut_at(
-            sections,
-            site_addr,
-            crate::arch::x86::kernel::static_call::CALL_INSN_SIZE,
-        )
-        .ok_or(X86ModuleFinalizeError::BadSection(".static_call_sites"))?;
-        static_call_fixup_warn_site(site)
-            .map_err(|_| X86ModuleFinalizeError::BadSection(".static_call_sites"))?;
-    }
-    Ok(sites.len())
+    let count = section.len() / STATIC_CALL_SITE_SIZE;
+    let registration = crate::arch::x86::kernel::static_call::register_module_static_call_sites(
+        base,
+        section.as_slice(),
+    )
+    .map_err(|_| X86ModuleFinalizeError::BadSection(".static_call_sites"))?;
+    Ok((count, registration))
 }
 
-/// Accept a relocated `.static_call_sites` key that resolves to the exported
-/// WARN_trap trampoline or function, after stripping the INIT flag bit that
-/// `static_call_add_module()` masks with STATIC_CALL_SITE_FLAGS
-/// (vendor/linux/kernel/static_call_inline.c).  The staged vendor artifacts
-/// only ever reference `__SCT__WARN_trap + 0` (no TAIL/INIT addend), and both
-/// exported symbols are 16-byte-aligned asm labels, so a set flag bit can only
-/// come from a genuine site flag, never from symbol placement.
-fn classify_warn_static_call_key(key_value: usize) -> Result<(), X86ModuleFinalizeError> {
-    if key_value & STATIC_CALL_SITE_TAIL != 0 {
-        return Err(X86ModuleFinalizeError::Unsupported(
-            ".static_call_sites tail",
-        ));
-    }
-    let key_addr = key_value & !STATIC_CALL_SITE_FLAGS;
-    if key_addr != warn_trap_trampoline_addr() && key_addr != warn_trap_addr() {
-        return Err(X86ModuleFinalizeError::Unsupported(".static_call_sites"));
-    }
-    Ok(())
+fn finalize_jump_entries(
+    sections: &mut NameMap<LoadedSection>,
+) -> Result<(usize, Option<JumpLabelRegistration>), X86ModuleFinalizeError> {
+    let Some(section) = sections.get_mut("__jump_table") else {
+        return Ok((0, None));
+    };
+    let base = section.as_ptr() as usize;
+    let count = crate::arch::x86::kernel::jump_label::sort_module_jump_entries(
+        base,
+        section.as_mut_slice(),
+    )
+    .map_err(|_| X86ModuleFinalizeError::BadSection("__jump_table"))?;
+    let registration = crate::arch::x86::kernel::jump_label::register_module_jump_entries(
+        base,
+        section.as_slice(),
+    )
+    .map_err(|_| X86ModuleFinalizeError::BadSection("__jump_table"))?;
+    Ok((count, registration))
 }
 
 fn sort_module_extable(
@@ -461,6 +910,17 @@ fn sort_module_extable(
 mod tests {
     use super::*;
     use alloc::string::String;
+
+    fn one_borrowed_prel32_section(bytes: &mut [u8], target: usize) -> LoadedSection {
+        let mut section = LoadedSection::borrowed_for_prel32_test(bytes);
+        let base = section.as_ptr() as usize;
+        let displacement = target as i128 - base as i128;
+        assert!((i32::MIN as i128..=i32::MAX as i128).contains(&displacement));
+        section
+            .as_mut_slice()
+            .copy_from_slice(&(displacement as i32).to_le_bytes());
+        section
+    }
 
     #[test]
     fn apply_and_clear_relocation_batch() {
@@ -510,29 +970,6 @@ mod tests {
         );
     }
 
-    /// The relocated key decision of `finalize_static_call_sites()`:
-    /// WARN_trap keys pass (with the INIT flag masked like
-    /// static_call_add_module()), TAIL sites and foreign keys are rejected.
-    /// The staged artifacts only emit `__SCT__WARN_trap + 0` addends.
-    #[test]
-    fn warn_static_call_key_classification_follows_vendor_masking() {
-        let tramp = warn_trap_trampoline_addr();
-        assert_eq!(classify_warn_static_call_key(tramp), Ok(()));
-        assert_eq!(classify_warn_static_call_key(warn_trap_addr()), Ok(()));
-        // STATIC_CALL_SITE_INIT (bit 1) is masked off before comparison.
-        assert_eq!(classify_warn_static_call_key(tramp | 2), Ok(()));
-        assert_eq!(
-            classify_warn_static_call_key(tramp | STATIC_CALL_SITE_TAIL),
-            Err(X86ModuleFinalizeError::Unsupported(
-                ".static_call_sites tail"
-            ))
-        );
-        assert_eq!(
-            classify_warn_static_call_key(tramp + 16),
-            Err(X86ModuleFinalizeError::Unsupported(".static_call_sites"))
-        );
-    }
-
     /// A relocated `static_call_mod(WARN_trap)` site is `call __SCT__WARN_trap`;
     /// the inline transform rewrites it to the vendor WARNINSN
     /// (`ud1 (%edx), %rdi`, vendor/linux/arch/x86/entry/entry.S::__WARN_trap)
@@ -563,5 +1000,74 @@ mod tests {
         assert!(meta.has_jump_entries);
         assert!(meta.has_orc_unwind);
         assert!(!meta.alternatives_applied);
+    }
+
+    #[test]
+    fn enabled_call_depth_patches_padding_and_direct_call() {
+        let mut backing = [0x90; 68];
+        backing[64..].fill(0);
+        let mut text = LoadedSection::borrowed_for_prel32_test(&mut backing[..64]);
+        let text_base = text.as_ptr() as usize;
+        let function = text_base + 16;
+        let callsite = text_base + 32;
+        let original = emit_call(callsite as u64, function as u64).unwrap();
+        text.as_mut_slice()[32..37].copy_from_slice(&original);
+
+        let mut sections = NameMap::new();
+        sections.insert(String::from(".text"), text);
+        sections.insert(
+            String::from(".call_sites"),
+            one_borrowed_prel32_section(&mut backing[64..68], callsite),
+        );
+        assert_eq!(
+            finalize_module_call_sites_with_policy(&mut sections, true, 0x1234),
+            Ok((1, 1))
+        );
+
+        let text = sections.get(".text").unwrap().as_slice();
+        let expected = skl_call_thunk_template(0x1234).unwrap();
+        assert_eq!(&text[6..16], &expected);
+        assert_eq!(
+            call_get_dest(callsite as u64, &text[32..37]),
+            Ok(Some((text_base + 6) as u64))
+        );
+    }
+
+    #[test]
+    fn cfi_off_policy_disables_typed_callers_and_consumes_sites() {
+        let mut backing = [0x90; 72];
+        backing[64..].fill(0);
+        let mut text = LoadedSection::borrowed_for_prel32_test(&mut backing[..64]);
+        let text_base = text.as_ptr() as usize;
+        text.as_mut_slice()[0..6].copy_from_slice(&[0x41, 0xba, 0x78, 0x56, 0x34, 0x12]);
+        text.as_mut_slice()[32..37].copy_from_slice(&[0xb8, 0x78, 0x56, 0x34, 0x12]);
+        let mut sections = NameMap::new();
+        sections.insert(String::from(".text"), text);
+        sections.insert(
+            String::from(".retpoline_sites"),
+            one_borrowed_prel32_section(&mut backing[64..68], text_base + FINEIBT_CALLER_SIZE),
+        );
+        sections.insert(
+            String::from(".cfi_sites"),
+            one_borrowed_prel32_section(&mut backing[68..72], text_base + 32),
+        );
+        assert_eq!(apply_module_cfi_policy(&mut sections), Ok(1));
+        assert_eq!(
+            &sections.get(".text").unwrap().as_slice()[0..2],
+            &[JMP8_INSN_OPCODE, FINEIBT_CALLER_JUMP]
+        );
+    }
+
+    #[test]
+    fn orc_header_rejects_a_different_packed_entry_abi() {
+        let mut sections = NameMap::new();
+        sections.insert(
+            String::from(".orc_header"),
+            LoadedSection::from_bytes(&[0u8; 20]).unwrap(),
+        );
+        assert!(matches!(
+            finalize_module_orc(&mut sections),
+            Err(X86ModuleFinalizeError::BadSection(".orc_header"))
+        ));
     }
 }

@@ -37,12 +37,14 @@ ARCH_OFFLINE_REPO_REL="var/lib/lupos/pacman-repo"
 ARCH_PACMAN_SERVER='Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch'
 ARCH_PACMAN_XFER_HELPER="usr/lib/lupos/pacman-xfer"
 ARCH_PACMAN_XFER_COMMAND="XferCommand = /usr/lib/lupos/pacman-xfer %u %o"
+ARCH_PACMAN_GPG_DIR="etc/pacman.d/gnupg"
 ARCH_SYSTEMD_HOOK_SCRIPT="usr/share/libalpm/scripts/systemd-hook"
 ARCH_OFFLINE_REPO_ARTIFACTS=(
-    "core/os/x86_64/core.db:798ab7b65aea244fb3cbfeab13fcf6a9642dfbcbc3dcfcda6c8071aeeb2e19ee"
+    "core/os/x86_64/core.db:45037c1a6abb70a08cd225f1f2e98f6f1a0140117eba54a24843b581bf884a56"
     "core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst:95b97f61aacc075e85465a7d5e1c99d1b249b4eba63081a170482cdc8791f799"
     "core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst:2b52fdaafc70e63511f3b85d98c34f26151b0498fa6f0e61fcb4be4b0d754edf"
-    "extra/os/x86_64/extra.db:1298f235b84b0ad6f48dceb29908a3862d31d22b31fb5ffec0ddaef0f08cbcb3"
+    "extra/os/x86_64/extra.db:2c4b923190d67f414ee981a020ca00a9f46c0e4ac44efa33fc067e2369e0387d"
+    "extra/os/x86_64/fastfetch-2.63.1-1-x86_64.pkg.tar.zst:d36690ae3a1c342da660ac499655eba532b0ceab58c976b92d943892c1ed232e"
     "extra/os/x86_64/fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst:64dcc7ccaa5460b93ce1c76a9e104bcbb373d3d15fb5abc01a1192f4607e9d2e"
     "extra/os/x86_64/freetype2-2.14.3-1-x86_64.pkg.tar.zst:fcaa410420dea42779d02aa76f1cc95d8430bdc52071ac6219d33306899b8655"
     "extra/os/x86_64/libice-1.1.2-1-x86_64.pkg.tar.zst:bb613be39e5bc1707a39f895c178674bbda52f022da51612e7a10a386608e107"
@@ -69,10 +71,12 @@ ARCH_OFFLINE_REPO_ARTIFACTS=(
     "extra/os/x86_64/xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst:e916cb35a6a3031ddd6c6d49d795bcd702dcc532debb911dc97cec715a235c30"
     "extra/os/x86_64/xorgproto-2025.1-1-any.pkg.tar.zst:f7bf3eed570618511fb53cc1bd32c2f1ee82e02662075436a59e6e50436f30de"
     "extra/os/x86_64/xterm-410-1-x86_64.pkg.tar.zst:85b31fbadc47676215007d2fb08115a237e30c385e382d98f7cf6c59a77d9fa9"
+    "extra/os/x86_64/yyjson-0.12.0-1-x86_64.pkg.tar.zst:a25b2c4be6039c36ef9a7f440ac984772e5052aacac24f6046757053c7d77b58"
 )
 ARCH_OFFLINE_REPO_PACKAGES=(
     "core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst:95b97f61aacc075e85465a7d5e1c99d1b249b4eba63081a170482cdc8791f799"
     "core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst:2b52fdaafc70e63511f3b85d98c34f26151b0498fa6f0e61fcb4be4b0d754edf"
+    "extra/os/x86_64/fastfetch-2.63.1-1-x86_64.pkg.tar.zst:d36690ae3a1c342da660ac499655eba532b0ceab58c976b92d943892c1ed232e"
     "extra/os/x86_64/fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst:64dcc7ccaa5460b93ce1c76a9e104bcbb373d3d15fb5abc01a1192f4607e9d2e"
     "extra/os/x86_64/freetype2-2.14.3-1-x86_64.pkg.tar.zst:fcaa410420dea42779d02aa76f1cc95d8430bdc52071ac6219d33306899b8655"
     "extra/os/x86_64/libice-1.1.2-1-x86_64.pkg.tar.zst:bb613be39e5bc1707a39f895c178674bbda52f022da51612e7a10a386608e107"
@@ -99,8 +103,42 @@ ARCH_OFFLINE_REPO_PACKAGES=(
     "extra/os/x86_64/xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst:e916cb35a6a3031ddd6c6d49d795bcd702dcc532debb911dc97cec715a235c30"
     "extra/os/x86_64/xorgproto-2025.1-1-any.pkg.tar.zst:f7bf3eed570618511fb53cc1bd32c2f1ee82e02662075436a59e6e50436f30de"
     "extra/os/x86_64/xterm-410-1-x86_64.pkg.tar.zst:85b31fbadc47676215007d2fb08115a237e30c385e382d98f7cf6c59a77d9fa9"
+    "extra/os/x86_64/yyjson-0.12.0-1-x86_64.pkg.tar.zst:a25b2c4be6039c36ef9a7f440ac984772e5052aacac24f6046757053c7d77b58"
+)
+ARCH_OFFLINE_REPO_SIGNATURES=(
+    "core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst.sig:70214ba008476ed6457ff52c61e3a9750780a2967012680dc822d139521d7868"
+    "core/os/x86_64/nano-9.0-1-x86_64.pkg.tar.zst.sig:da26270e9831bf5495dd697b219aac57cabfe2c70b2a439605021c6f1032a30c"
+    "extra/os/x86_64/fastfetch-2.63.1-1-x86_64.pkg.tar.zst.sig:2e9e193b614553463e4ea7fdcef8423cbf627f3a5c99b8b14812c775c3742f54"
+    "extra/os/x86_64/fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst.sig:a4846d9d359bb0fc07339dca4441fa77c3d45f2ff411dd21b2c382a63daddd28"
+    "extra/os/x86_64/freetype2-2.14.3-1-x86_64.pkg.tar.zst.sig:ba2b4c9291b8187e9c077bac0df7253c6d34e0330d75bf0bf164dd0ddbdd9732"
+    "extra/os/x86_64/libice-1.1.2-1-x86_64.pkg.tar.zst.sig:61bc66967145883780a56a1eb8c726e9cdf8b9c74ee984efd9a5d4d6e1682c62"
+    "extra/os/x86_64/libpng-1.6.58-1-x86_64.pkg.tar.zst.sig:ee04d806dfd4a506b685059f2dfc92faad3f60886dcbf9b18e0f092109dbbd18"
+    "extra/os/x86_64/libsm-1.2.6-1-x86_64.pkg.tar.zst.sig:51b51bfb204de1202336b1b901da4a9d33b6ef57d3dc458bc408a6154d32c01a"
+    "extra/os/x86_64/libutempter-1.2.3-1-x86_64.pkg.tar.zst.sig:fba77cbdcffc70408f3d825949116160a27b454ca4ad7295b15019c121bee735"
+    "extra/os/x86_64/libx11-1.8.13-1-x86_64.pkg.tar.zst.sig:2797bf6bba9b3cdc09026790ab349e4b6930ef31c0cdde87306dea3b48f1794c"
+    "extra/os/x86_64/libxau-1.0.12-1-x86_64.pkg.tar.zst.sig:d0fc4f60d3a25addaf7ce78b5d7eb5fe5d46b6c6a3086e6946dbf98b0ecead77"
+    "extra/os/x86_64/libxaw-1.0.16-2-x86_64.pkg.tar.zst.sig:ffa32389e3a415f9c5b83d2ad979e263d201317b03c7b7cad6736238ad95baa3"
+    "extra/os/x86_64/libxcb-1.17.0-1-x86_64.pkg.tar.zst.sig:e6a8cef99027f32595301710a49d9e3a1fb0ed7284ba1e1da0150d98c9e6889a"
+    "extra/os/x86_64/libxdmcp-1.1.5-2-x86_64.pkg.tar.zst.sig:cf2b3f2bd0f4c0329c3fa929304bf9566bb7d935f994baa0fda6b2aba507b328"
+    "extra/os/x86_64/libxext-1.3.7-1-x86_64.pkg.tar.zst.sig:1a834468210368faff1b121a45f51f14bb37d6ed92a34737f238a909cdb3d840"
+    "extra/os/x86_64/libxft-2.3.9-1-x86_64.pkg.tar.zst.sig:dc6d742b26b5a34718c15981967cda7af61f233a7565b96dbad2d3cfd75f8786"
+    "extra/os/x86_64/libxmu-1.3.1-1-x86_64.pkg.tar.zst.sig:b0939e8d418055df91895aebfdf5fdbc6df1b93cea0283b4750e3f836c371699"
+    "extra/os/x86_64/libxpm-3.5.19-1-x86_64.pkg.tar.zst.sig:d5294ade5d79ec4b24989181ee3308f2299f6a4a1e2b9be84aad00bf000d91ae"
+    "extra/os/x86_64/libxrender-0.9.12-1-x86_64.pkg.tar.zst.sig:0bba31c86ddc3ec7ac336e52e3dbe94b8cb6779837b6ecf1fa9adb54613ff2e7"
+    "extra/os/x86_64/libxt-1.3.1-1-x86_64.pkg.tar.zst.sig:dea7f540d148afbe390608d147f2e568b75a19d8c1b4c5bce70d0bda0db1b1b5"
+    "extra/os/x86_64/vim-9.2.0573-1-x86_64.pkg.tar.zst.sig:2a137c9157af719429b1f704e39a3137b1bc1a4b698831ae6994e69602745868"
+    "extra/os/x86_64/vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst.sig:25e823c22875673041b1fc8c45b0bd0434a45bbd9702085f87f472f491d1138d"
+    "extra/os/x86_64/xcb-proto-1.17.0-4-any.pkg.tar.zst.sig:b0e77b6b0b4c4fa602ae0ad378b87ffbc4dd82a2d3e1d3686a19b041cf113200"
+    "extra/os/x86_64/xorg-xauth-1.1.5-1-x86_64.pkg.tar.zst.sig:6643971afb233adb4e2bc84309fe4b58c7b3b0d6282db4f2852f440696119868"
+    "extra/os/x86_64/xorg-xinit-1.4.4-1-x86_64.pkg.tar.zst.sig:34101d8ddef1aadf437e3f8bc82a9e5680414bcb25df6f87a13968a987540662"
+    "extra/os/x86_64/xorg-xmodmap-1.0.11-2-x86_64.pkg.tar.zst.sig:b84ce8172bd3404f600066796cc96e43bfa335ab77bfd60529df05ea70872df4"
+    "extra/os/x86_64/xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst.sig:7a68065ce7852ca9377164e2132453f1435315fe423dcd3a5d418ab62f5b00b2"
+    "extra/os/x86_64/xorgproto-2025.1-1-any.pkg.tar.zst.sig:1c084076fcdbac01a098e9d1639a0d20eb0561e655a3d06f46a6a74e04ec0223"
+    "extra/os/x86_64/xterm-410-1-x86_64.pkg.tar.zst.sig:3a5d6d0c2fcc9550e20e62fdf273b7ecf0f1995e0d1296ca7c12fdd1a6295249"
+    "extra/os/x86_64/yyjson-0.12.0-1-x86_64.pkg.tar.zst.sig:3308dd111fac8765ae9bec75a82aa18e6efe108a600962cca46b82a61a375bb2"
 )
 ARCH_OFFLINE_REPO_PACKAGE_ALIASES=(
+    "p/fastfetch:/var/lib/lupos/pacman-repo/extra/os/x86_64/fastfetch-2.63.1-1-x86_64.pkg.tar.zst"
     "p/fontconfig:/var/lib/lupos/pacman-repo/extra/os/x86_64/fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst"
     "p/freetype2:/var/lib/lupos/pacman-repo/extra/os/x86_64/freetype2-2.14.3-1-x86_64.pkg.tar.zst"
     "p/g:/var/lib/lupos/pacman-repo/core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst"
@@ -129,8 +167,12 @@ ARCH_OFFLINE_REPO_PACKAGE_ALIASES=(
     "p/xorg-xrdb:/var/lib/lupos/pacman-repo/extra/os/x86_64/xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst"
     "p/xorgproto:/var/lib/lupos/pacman-repo/extra/os/x86_64/xorgproto-2025.1-1-any.pkg.tar.zst"
     "p/xterm:/var/lib/lupos/pacman-repo/extra/os/x86_64/xterm-410-1-x86_64.pkg.tar.zst"
+    "p/yyjson:/var/lib/lupos/pacman-repo/extra/os/x86_64/yyjson-0.12.0-1-x86_64.pkg.tar.zst"
 )
 ARCH_GRAPHICS_PACKAGES=(
+    # The desktop exposes a normal multi-user shell, so ship the standard
+    # privilege boundary instead of leaving `sudo` absent from PATH.
+    sudo
     xorg-server
     xf86-video-fbdev
     xf86-input-evdev
@@ -250,15 +292,25 @@ pacman_mirrorlist_ready() {
     grep -Fxq "$ARCH_PACMAN_SERVER" "$r/etc/pacman.d/mirrorlist"
 }
 
-pacman_repo_siglevel_ready() {
+pacman_repo_uses_default_siglevel() {
     local conf="$1"
     local repo="$2"
     awk -v repo="$repo" '
         $0 == "[" repo "]" { in_repo = 1; next }
         /^\[/ { in_repo = 0 }
-        in_repo && $0 == "SigLevel = Optional TrustAll" { found = 1 }
-        END { exit found ? 0 : 1 }
+        in_repo && /^[[:space:]]*SigLevel[[:space:]]*=/ { overridden = 1 }
+        END { exit overridden ? 1 : 0 }
     ' "$conf"
+}
+
+pacman_keyring_ready() {
+    local r="$1"
+    local gpgdir="$r/$ARCH_PACMAN_GPG_DIR"
+    [ -f "$gpgdir/pubring.gpg" ] \
+        && [ -s "$gpgdir/pubring.kbx" ] \
+        && [ -s "$gpgdir/trustdb.gpg" ] \
+        && gpg --batch --no-permission-warning --homedir "$gpgdir" \
+            --list-keys 2>/dev/null | grep -q '^pub'
 }
 
 pacman_repo_server_ready() {
@@ -278,8 +330,10 @@ pacman_config_ready() {
         && ! grep -Eq '^[[:space:]]*DownloadUser[[:space:]]*=' "$r/etc/pacman.conf" \
         && grep -Fxq "$ARCH_PACMAN_XFER_COMMAND" "$r/etc/pacman.conf" \
         && [ -x "$r/$ARCH_PACMAN_XFER_HELPER" ] \
-        && pacman_repo_siglevel_ready "$r/etc/pacman.conf" core \
-        && pacman_repo_siglevel_ready "$r/etc/pacman.conf" extra \
+        && grep -Eq '^[[:space:]]*SigLevel[[:space:]]*=[[:space:]]*Required[[:space:]]+DatabaseOptional[[:space:]]*$' "$r/etc/pacman.conf" \
+        && pacman_repo_uses_default_siglevel "$r/etc/pacman.conf" core \
+        && pacman_repo_uses_default_siglevel "$r/etc/pacman.conf" extra \
+        && pacman_keyring_ready "$r" \
         && pacman_repo_server_ready "$r/etc/pacman.conf" core \
         && pacman_repo_server_ready "$r/etc/pacman.conf" extra
 }
@@ -287,7 +341,7 @@ pacman_config_ready() {
 pacman_offline_repo_ready() {
     local r="$1"
     local entry rel sha path actual target repo_db sync_db
-    for entry in "${ARCH_OFFLINE_REPO_ARTIFACTS[@]}"; do
+    for entry in "${ARCH_OFFLINE_REPO_ARTIFACTS[@]}" "${ARCH_OFFLINE_REPO_SIGNATURES[@]}"; do
         rel="${entry%:*}"
         sha="${entry##*:}"
         path="$r/$ARCH_OFFLINE_REPO_REL/$rel"
@@ -318,7 +372,8 @@ graphics_stage_ready() {
     if ! graphics_enabled; then
         return 0
     fi
-    [ -x "$1/usr/bin/Xorg" ] \
+    [ -x "$1/usr/bin/sudo" ] \
+        && [ -x "$1/usr/bin/Xorg" ] \
         && [ -x "$1/usr/bin/startx" ] \
         && [ -x "$1/usr/bin/twm" ] \
         && [ -x "$1/usr/bin/xterm" ] \
@@ -334,6 +389,7 @@ graphics_stage_ready() {
         && [ -e "$1/usr/lib/xorg/modules/drivers/fbdev_drv.so" ] \
         && [ -e "$1/usr/lib/xorg/modules/input/libinput_drv.so" ] \
         && [ -e "$1/usr/lib/xorg/modules/input/evdev_drv.so" ] \
+        && [ -d "$1/var/lib/pacman/local/sudo-1.9.17.p2-2" ] \
         && [ -d "$1/var/lib/pacman/local/xorg-server-21.1.22-2" ] \
         && [ -d "$1/var/lib/pacman/local/xf86-video-fbdev-0.5.1-1" ] \
         && [ -d "$1/var/lib/pacman/local/xf86-input-evdev-2.11.0-1" ] \
@@ -433,7 +489,16 @@ download_arch_offline_repo_artifact() {
     local rel="$1"
     local expected="$2"
     local dst="$ARCH_ROOTFS/$ARCH_OFFLINE_REPO_REL/$rel"
+    local cached_repo="$CACHE/arch-repo/$ARCH_REPO_SNAPSHOT/$rel"
     local cached_pkg="$CACHE/pacman-graphics/$(basename "$rel")"
+    if [ -f "$cached_repo" ]; then
+        local repo_actual
+        repo_actual="$(sha256_of "$cached_repo")"
+        [ "$repo_actual" = "$expected" ] || die "SHA-256 mismatch for cached $cached_repo: expected $expected, got $repo_actual"
+        mkdir -p "$(dirname "$dst")"
+        cp "$cached_repo" "$dst"
+        return
+    fi
     if [[ "$rel" == *.pkg.tar.zst ]] && [ -f "$cached_pkg" ]; then
         local cached_actual
         cached_actual="$(sha256_of "$cached_pkg")"
@@ -443,65 +508,6 @@ download_arch_offline_repo_artifact() {
         return
     fi
     download_arch_repo_file "$rel" "$expected" "$dst"
-}
-
-strip_arch_repo_desc_for_guest() {
-    awk '
-        /^%SHA256SUM%$/ || /^%PGPSIG%$/ { skip = 1; next }
-        /^%[A-Z0-9_]+%$/ { skip = 0 }
-        !skip { print }
-    '
-}
-
-stage_arch_minimal_repo_db() {
-    local rel="$1"
-    local upstream_sha="$2"
-    local final_sha="$3"
-    shift 3
-    local dst="$ARCH_ROOTFS/$ARCH_OFFLINE_REPO_REL/$rel"
-    if [ -f "$dst" ]; then
-        local actual
-        actual="$(sha256_of "$dst")"
-        if [ "$actual" = "$final_sha" ]; then
-            return
-        fi
-        rm -f "$dst"
-    fi
-
-    require_command tar
-    require_command gzip
-    local upstream="$CACHE/arch-repo/$ARCH_REPO_SNAPSHOT/$rel"
-    download_arch_repo_file "$rel" "$upstream_sha" "$upstream"
-
-    local work="$TARGET/.pacman-db-${rel//\//_}-$$"
-    safe_clean_dir "$work"
-    mkdir -p "$work"
-    local pkg
-    local paths=()
-    for pkg in "$@"; do
-        mkdir -p "$work/$pkg"
-        tar -xOf "$upstream" "$pkg/desc" | strip_arch_repo_desc_for_guest > "$work/$pkg/desc" \
-            || die "failed to extract $pkg/desc from $upstream"
-        chmod 755 "$work/$pkg"
-        chmod 644 "$work/$pkg/desc"
-        paths+=("$pkg")
-    done
-
-    mkdir -p "$(dirname "$dst")"
-    local tmp="$dst.tmp.$$"
-    rm -f "$tmp"
-    LC_ALL=C tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
-        --mtime='1970-01-01 00:00Z' -C "$work" -cf - "${paths[@]}" \
-        | gzip -n > "$tmp"
-    local actual
-    actual="$(sha256_of "$tmp")"
-    [ "$actual" = "$final_sha" ] || {
-        rm -f "$tmp"
-        safe_clean_dir "$work"
-        die "SHA-256 mismatch for generated $rel: expected $final_sha, got $actual"
-    }
-    mv "$tmp" "$dst"
-    safe_clean_dir "$work"
 }
 
 stage_arch_pacman_package_cache() {
@@ -526,6 +532,17 @@ stage_arch_pacman_package_aliases() {
 }
 
 stage_arch_offline_pacman_repo() {
+    # Import the pinned Arch repository databases byte-for-byte. They are
+    # vendor artifacts: never filter their metadata or rebuild their tarballs.
+    download_arch_offline_repo_artifact \
+        "core/os/x86_64/core.db" \
+        "45037c1a6abb70a08cd225f1f2e98f6f1a0140117eba54a24843b581bf884a56"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/extra.db" \
+        "2c4b923190d67f414ee981a020ca00a9f46c0e4ac44efa33fc067e2369e0387d"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/fastfetch-2.63.1-1-x86_64.pkg.tar.zst" \
+        "d36690ae3a1c342da660ac499655eba532b0ceab58c976b92d943892c1ed232e"
     download_arch_offline_repo_artifact \
         "core/os/x86_64/gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst" \
         "95b97f61aacc075e85465a7d5e1c99d1b249b4eba63081a170482cdc8791f799"
@@ -610,45 +627,61 @@ stage_arch_offline_pacman_repo() {
     download_arch_offline_repo_artifact \
         "extra/os/x86_64/xterm-410-1-x86_64.pkg.tar.zst" \
         "85b31fbadc47676215007d2fb08115a237e30c385e382d98f7cf6c59a77d9fa9"
-    stage_arch_minimal_repo_db \
-        "core/os/x86_64/core.db" \
-        "45037c1a6abb70a08cd225f1f2e98f6f1a0140117eba54a24843b581bf884a56" \
-        "798ab7b65aea244fb3cbfeab13fcf6a9642dfbcbc3dcfcda6c8071aeeb2e19ee" \
-        "gpm-1.20.7.r38.ge82d1a6-6" \
-        "nano-9.0-1"
-    stage_arch_minimal_repo_db \
-        "extra/os/x86_64/extra.db" \
-        "2c4b923190d67f414ee981a020ca00a9f46c0e4ac44efa33fc067e2369e0387d" \
-        "1298f235b84b0ad6f48dceb29908a3862d31d22b31fb5ffec0ddaef0f08cbcb3" \
-        "fontconfig-2:2.17.1-1" \
-        "freetype2-2.14.3-1" \
-        "libice-1.1.2-1" \
-        "libpng-1.6.58-1" \
-        "libsm-1.2.6-1" \
-        "libutempter-1.2.3-1" \
-        "libx11-1.8.13-1" \
-        "libxau-1.0.12-1" \
-        "libxaw-1.0.16-2" \
-        "libxcb-1.17.0-1" \
-        "libxdmcp-1.1.5-2" \
-        "libxext-1.3.7-1" \
-        "libxft-2.3.9-1" \
-        "libxmu-1.3.1-1" \
-        "libxpm-3.5.19-1" \
-        "libxrender-0.9.12-1" \
-        "libxt-1.3.1-1" \
-        "vim-9.2.0573-1" \
-        "vim-runtime-9.2.0573-1" \
-        "xcb-proto-1.17.0-4" \
-        "xorg-xauth-1.1.5-1" \
-        "xorg-xinit-1.4.4-1" \
-        "xorg-xmodmap-1.0.11-2" \
-        "xorg-xrdb-1.2.2-2" \
-        "xorgproto-2025.1-1" \
-        "xterm-410-1"
+    download_arch_offline_repo_artifact \
+        "extra/os/x86_64/yyjson-0.12.0-1-x86_64.pkg.tar.zst" \
+        "a25b2c4be6039c36ef9a7f440ac984772e5052aacac24f6046757053c7d77b58"
+    local signature rel sha
+    for signature in "${ARCH_OFFLINE_REPO_SIGNATURES[@]}"; do
+        rel="${signature%:*}"
+        sha="${signature##*:}"
+        download_arch_offline_repo_artifact "$rel" "$sha"
+    done
     stage_arch_pacman_sync_dbs
     stage_arch_pacman_package_cache
     stage_arch_pacman_package_aliases
+}
+
+stage_arch_pacman_keyring() {
+    local source_dir="$ARCH_ROOTFS/usr/share/pacman/keyrings"
+    local source_keyring="$source_dir/archlinux.gpg"
+    local source_trust="$source_dir/archlinux-trusted"
+    local gpgdir="$ARCH_ROOTFS/$ARCH_PACMAN_GPG_DIR"
+    [ -s "$source_keyring" ] || die "missing Arch package keyring: $source_keyring"
+    [ -s "$source_trust" ] || die "missing Arch package ownertrust: $source_trust"
+
+    # The bootstrap archive deliberately ships the vendor keyring under
+    # /usr/share but leaves pacman's local GPG database uninitialized. Build
+    # that local state without editing the vendor keyring or pacman policy.
+    # Trust the five snapshot-pinned Arch master keys as roots; their
+    # signatures establish validity for the individual package-signing keys.
+    require_command gpg
+    local work="$TARGET/.arch-keyring-$$"
+    safe_clean_dir "$work"
+    mkdir -m 700 -p "$work"
+    gpg --batch --quiet --no-permission-warning --homedir "$work" \
+        --import "$source_keyring" \
+        || die "failed to import the Arch package keyring"
+    gpg --batch --no-permission-warning --homedir "$work" \
+        --with-colons --fingerprint \
+        | awk -F: '$1 == "fpr" { print $10 ":1:" }' > "$work/all-ownertrust"
+    gpg --batch --quiet --no-permission-warning --homedir "$work" \
+        --import-ownertrust "$work/all-ownertrust" \
+        || die "failed to initialize Arch package-key ownertrust"
+    awk -F: 'NF >= 2 { print $1 ":6:" }' "$source_trust" > "$work/archlinux-ultimate"
+    gpg --batch --quiet --no-permission-warning --homedir "$work" \
+        --import-ownertrust "$work/archlinux-ultimate" \
+        || die "failed to establish trust in the Arch master keys"
+    gpg --batch --quiet --no-permission-warning --homedir "$work" \
+        --update-trustdb </dev/null \
+        || die "failed to build the Arch package trust database"
+
+    # libalpm checks for this legacy marker while modern GnuPG reads the kbx.
+    : > "$work/pubring.gpg"
+    chmod 644 "$work/pubring.gpg" "$work/pubring.kbx" "$work/trustdb.gpg"
+    safe_clean_dir "$gpgdir"
+    mkdir -p "$gpgdir"
+    cp "$work/pubring.gpg" "$work/pubring.kbx" "$work/trustdb.gpg" "$gpgdir/"
+    safe_clean_dir "$work"
 }
 
 stage_arch_pacman_sync_dbs() {
@@ -828,10 +861,10 @@ normalize_arch_pacman() {
         sed -i '/^[#[:space:]]*DisableSandboxSyscalls/a DisableSandbox' "$conf"
     fi
     for repo in core extra; do
-        sed -i "/^\\[$repo\\]$/,/^\\[/ { /^${ARCH_PACMAN_SERVER//\//\\/}$/d; }" "$conf"
-        if ! pacman_repo_siglevel_ready "$conf" "$repo"; then
-            sed -i "/^\\[$repo\\]$/a SigLevel = Optional TrustAll" "$conf"
-        fi
+        sed -i "/^\\[$repo\\]$/,/^\\[/ { \
+            /^${ARCH_PACMAN_SERVER//\//\\/}$/d; \
+            /^[[:space:]]*SigLevel[[:space:]]*=/d; \
+        }" "$conf"
         if ! pacman_repo_server_ready "$conf" "$repo"; then
             sed -i "/^\\[$repo\\]$/a $ARCH_PACMAN_SERVER" "$conf"
         fi
@@ -887,6 +920,7 @@ fi
 
 alias=
 case "$base" in
+    fastfetch-2.63.1-1-x86_64.pkg.tar.zst) alias=/p/fastfetch ;;
     fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst) alias=/p/fontconfig ;;
     freetype2-2.14.3-1-x86_64.pkg.tar.zst) alias=/p/freetype2 ;;
     gpm-1.20.7.r38.ge82d1a6-6-x86_64.pkg.tar.zst) alias=/p/g ;;
@@ -915,6 +949,7 @@ case "$base" in
     xorg-xrdb-1.2.2-2-x86_64.pkg.tar.zst) alias=/p/xorg-xrdb ;;
     xorgproto-2025.1-1-any.pkg.tar.zst) alias=/p/xorgproto ;;
     xterm-410-1-x86_64.pkg.tar.zst) alias=/p/xterm ;;
+    yyjson-0.12.0-1-x86_64.pkg.tar.zst) alias=/p/yyjson ;;
 esac
 
 if [ -n "$alias" ]; then
@@ -1067,6 +1102,7 @@ EOF
     done
 
     normalize_arch_pam
+    stage_arch_pacman_keyring
     normalize_arch_pacman
 }
 
@@ -1209,6 +1245,9 @@ validate_stage() {
         usr/bin/pacman \
         etc/os-release \
         etc/pacman.conf \
+        "$ARCH_PACMAN_GPG_DIR/pubring.gpg" \
+        "$ARCH_PACMAN_GPG_DIR/pubring.kbx" \
+        "$ARCH_PACMAN_GPG_DIR/trustdb.gpg" \
         "$ARCH_PACMAN_XFER_HELPER" \
         etc/systemd/network/10-lupos-qemu.network \
         var/lib/pacman/local/ALPM_DB_VERSION \
@@ -1221,7 +1260,7 @@ validate_stage() {
     done
     [ "$bad" = "0" ] || exit 1
     pacman_mirrorlist_ready "$STAGE" || die "staged pacman mirrorlist has no active Server entries"
-    pacman_config_ready "$STAGE" || die "staged pacman config must disable sandboxing, define direct offline repo servers, use the Lupos transfer helper, and avoid DownloadUser"
+    pacman_config_ready "$STAGE" || die "staged pacman integration must retain Arch signature policy and initialize its keyring while defining the Lupos offline transport"
     pacman_offline_repo_ready "$STAGE" || die "staged offline pacman repo is missing pinned database/package files or preseeded sync databases"
     pam_systemd_ready "$STAGE" || die "staged PAM systemd session hook is missing"
     systemd_hook_ready "$STAGE" || die "staged systemd package hook wrapper is stale"

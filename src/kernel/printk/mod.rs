@@ -28,6 +28,25 @@ use alloc::string::String;
 use core::ffi::{c_char, c_void};
 use core::fmt::Write;
 
+core::arch::global_asm!(
+    ".pushsection .text.lupos.dump_stack, \"ax\"",
+    ".balign 16",
+    ".global lupos_dump_stack_entry",
+    ".type lupos_dump_stack_entry,@function",
+    "lupos_dump_stack_entry:",
+    "endbr64",
+    "mov rdi, [rsp]",
+    "lea rsi, [rsp + 8]",
+    "mov rdx, rbp",
+    "jmp lupos_dump_stack_from_module",
+    ".size lupos_dump_stack_entry,.-lupos_dump_stack_entry",
+    ".popsection",
+);
+
+unsafe extern "C" {
+    fn lupos_dump_stack_entry();
+}
+
 pub use crate::{log_debug, log_error, log_info, log_trace, log_warn};
 pub use levels::{
     KERN_ALERT, KERN_CRIT, KERN_DEBUG, KERN_DEFAULT, KERN_EMERG, KERN_ERR, KERN_INFO, KERN_NOTICE,
@@ -53,6 +72,7 @@ pub fn init() {
 
 /// Register printk entry points used by vendor-built modules.
 pub fn register_module_exports() {
+    crate::kernel::dynamic_debug::register_module_exports();
     if crate::kernel::module::find_symbol("_printk").is_none() {
         crate::kernel::module::export_symbol("_printk", linux_printk as usize, false);
     }
@@ -60,7 +80,7 @@ pub fn register_module_exports() {
         crate::kernel::module::export_symbol("vprintk", linux_vprintk as usize, false);
     }
     if crate::kernel::module::find_symbol("dump_stack").is_none() {
-        crate::kernel::module::export_symbol("dump_stack", linux_dump_stack as usize, false);
+        crate::kernel::module::export_symbol("dump_stack", lupos_dump_stack_entry as usize, false);
     }
     if crate::kernel::module::find_symbol("oops_in_progress").is_none() {
         crate::kernel::module::export_symbol(
@@ -126,6 +146,44 @@ pub unsafe extern "C" fn linux_nbcon_exit_unsafe(_wctxt: *mut c_void) -> bool {
 /// `dump_stack` - `vendor/linux/lib/dump_stack.c`.
 pub unsafe extern "C" fn linux_dump_stack() {
     log_warn!("dump_stack", "Linux module requested stack dump");
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn lupos_dump_stack_from_module(ip: usize, sp: usize, bp: usize) {
+    log_warn!("dump_stack", "Linux module requested stack dump");
+    let mut state = crate::arch::x86::kernel::unwind_orc::ModuleOrcUnwindState {
+        ip,
+        sp,
+        bp,
+        ..Default::default()
+    };
+    for depth in 0..32usize {
+        let mut identified = false;
+        let _ = crate::kernel::module::with_module_address(state.ip, |module, section, offset| {
+            identified = true;
+            log_warn!(
+                "dump_stack",
+                "  #{:02} {}:{}+{:#x} ({:#018x})",
+                depth,
+                module,
+                section,
+                offset,
+                state.ip
+            );
+        });
+        if !identified {
+            log_warn!(
+                "dump_stack",
+                "  #{:02} kernel address {:#018x}",
+                depth,
+                state.ip
+            );
+        }
+        match crate::arch::x86::kernel::unwind_orc::orc_module_unwind_next(&mut state) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => break,
+        }
+    }
 }
 
 /// `panic` - `vendor/linux/kernel/panic.c`.

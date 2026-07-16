@@ -54,8 +54,10 @@ pub struct InodeOps {
     pub create: Option<fn(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32>>,
     /// Create a directory `name` under `dir` with `mode`.
     pub mkdir: Option<fn(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32>>,
-    /// Remove a regular-file entry.
-    pub unlink: Option<fn(dir: &InodeRef, name: &str) -> Result<(), i32>>,
+    /// Remove a regular-file entry. Linux passes the resolved target dentry
+    /// into ->unlink(); keeping the target inode here is essential for
+    /// coherent in-memory link counts on disk-backed filesystems.
+    pub unlink: Option<fn(dir: &InodeRef, name: &str, target: &InodeRef) -> Result<(), i32>>,
     /// Remove an empty directory.
     pub rmdir: Option<fn(dir: &InodeRef, name: &str) -> Result<(), i32>>,
     /// Rename an existing directory entry, replacing the destination when the

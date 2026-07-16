@@ -63,6 +63,21 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
 
 pub fn register_module_exports() {
     export_symbol_once("__vma_start_write", linux___vma_start_write as usize, true);
+    export_symbol_once(
+        "__mmap_lock_do_trace_start_locking",
+        linux_mmap_lock_do_trace_start_locking as usize,
+        false,
+    );
+    export_symbol_once(
+        "__mmap_lock_do_trace_acquire_returned",
+        linux_mmap_lock_do_trace_acquire_returned as usize,
+        false,
+    );
+    export_symbol_once(
+        "__mmap_lock_do_trace_released",
+        linux_mmap_lock_do_trace_released as usize,
+        false,
+    );
 }
 
 fn with_mm_state<R>(mm: *mut u8, f: impl FnOnce(&mut MmapLockState) -> R) -> R {
@@ -319,22 +334,41 @@ pub fn lock_vma_under_rcu(mm: *mut u8, addr: u64) -> *mut u8 {
 
 pub fn rcuwait_wake_up(_w: *mut u8) {}
 
-pub fn __mmap_lock_do_trace_start_locking(mm: *mut u8, _write: bool) {
+pub fn __mmap_lock_do_trace_start_locking(mm: *mut u8, write: bool) {
     with_mm_state(mm, |state| {
         state.trace_start = state.trace_start.saturating_add(1);
     });
+    crate::kernel::trace::tracepoint::trace_mmap_lock_start_locking(mm as usize, write);
 }
 
-pub fn __mmap_lock_do_trace_acquire_returned(mm: *mut u8, _write: bool, _success: bool) {
+pub fn __mmap_lock_do_trace_acquire_returned(mm: *mut u8, write: bool, success: bool) {
     with_mm_state(mm, |state| {
         state.trace_acquire = state.trace_acquire.saturating_add(1);
     });
+    crate::kernel::trace::tracepoint::trace_mmap_lock_acquire_returned(mm as usize, write, success);
 }
 
-pub fn __mmap_lock_do_trace_released(mm: *mut u8, _write: bool) {
+pub fn __mmap_lock_do_trace_released(mm: *mut u8, write: bool) {
     with_mm_state(mm, |state| {
         state.trace_release = state.trace_release.saturating_add(1);
     });
+    crate::kernel::trace::tracepoint::trace_mmap_lock_released(mm as usize, write);
+}
+
+unsafe extern "C" fn linux_mmap_lock_do_trace_start_locking(mm: *mut u8, write: bool) {
+    __mmap_lock_do_trace_start_locking(mm, write);
+}
+
+unsafe extern "C" fn linux_mmap_lock_do_trace_acquire_returned(
+    mm: *mut u8,
+    write: bool,
+    success: bool,
+) {
+    __mmap_lock_do_trace_acquire_returned(mm, write, success);
+}
+
+unsafe extern "C" fn linux_mmap_lock_do_trace_released(mm: *mut u8, write: bool) {
+    __mmap_lock_do_trace_released(mm, write);
 }
 
 pub fn __mmap_lock_trace_start_locking(mm: *mut u8, write: bool) {

@@ -234,8 +234,9 @@ const PAD_FILES_TO_SIGNAL: usize =
 // M27 places `Seccomp` (16 bytes) at the head of this block — Linux puts the
 // `seccomp` field inside the same span — and leaves the rest as padding.
 const PAD_SIGNAL_TO_THREAD_TOTAL: usize = LINUX_OFFSET_THREAD - (LINUX_OFFSET_SIGNAL + 8);
-const PAD_SIGNAL_TO_THREAD: usize =
-    PAD_SIGNAL_TO_THREAD_TOTAL - core::mem::size_of::<crate::kernel::seccomp::Seccomp>();
+const PAD_SIGNAL_TO_THREAD: usize = PAD_SIGNAL_TO_THREAD_TOTAL
+    - core::mem::size_of::<crate::kernel::seccomp::Seccomp>()
+    - core::mem::size_of::<u64>();
 
 // ── M26 fields (parent / children / exit / ptrace) ───────────────────────────
 //
@@ -747,6 +748,9 @@ pub struct TaskStruct {
     /// M27 seccomp state (mode + filter chain head).  Placed at the start of
     /// the signal → thread block; Linux places `seccomp` in the same span.
     pub m27_seccomp: crate::kernel::seccomp::Seccomp,
+    /// Per-task x86 stack canary installed into the current CPU's
+    /// `__stack_chk_guard` by `__switch_to_asm`.
+    pub stack_canary: u64,
     _pad_signal_to_thread: [u8; PAD_SIGNAL_TO_THREAD],
 
     // ── Architecture-specific thread context (LAST FIELD) ───────────────────
@@ -810,6 +814,7 @@ const _: () = {
     assert!(offset_of!(TaskStruct, m28_nsproxy) < offset_of!(TaskStruct, signal));
     assert!(offset_of!(TaskStruct, m27_seccomp) > offset_of!(TaskStruct, signal));
     assert!(offset_of!(TaskStruct, m27_seccomp) < offset_of!(TaskStruct, thread));
+    assert!(offset_of!(TaskStruct, stack_canary) < offset_of!(TaskStruct, thread));
 
     // M29 invariants:
     //   - The scheduler substruct lives at the start of the stack → mm span,

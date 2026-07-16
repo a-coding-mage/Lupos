@@ -28,7 +28,7 @@ pub static ISO_DIR_INODE_OPS: InodeOps = InodeOps {
     lookup: Some(iso_lookup),
     create: Some(|_, _, _| Err(EROFS)),
     mkdir: Some(|_, _, _| Err(EROFS)),
-    unlink: Some(|_, _| Err(EROFS)),
+    unlink: Some(|_, _, _| Err(EROFS)),
     rmdir: Some(|_, _| Err(EROFS)),
     rename: Some(|_, _, _, _| Err(EROFS)),
     symlink: Some(|_, _, _, _| Err(EROFS)),
