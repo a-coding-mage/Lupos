@@ -333,8 +333,8 @@ mod tests {
             "/vendor/linux/include/net/9p/9p.h"
         ));
 
-        assert!(v9fs.contains("V9FS_PROTO_2000U    = 0x01"));
-        assert!(v9fs.contains("V9FS_ACCESS_CLIENT  = 0x10"));
+        assert!(v9fs.contains("V9FS_PROTO_2000U         = 0x01"));
+        assert!(v9fs.contains("V9FS_ACCESS_CLIENT       = 0x10"));
         assert!(v9fs.contains("CACHE_SC_FSCACHE    = 0b10001111"));
         assert!(v9fs.contains("CACHE_FSCACHE       = 0b10000000"));
         assert!(v9fs.contains("struct v9fs_session_info"));

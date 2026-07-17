@@ -204,7 +204,7 @@ mod tests {
         ));
         assert!(source.contains("#include <linux/raid/pq.h>"));
         assert!(source.contains("static void raid6_2data_recov_intx1"));
-        assert!(source.contains("ptrs[faila] = raid6_get_zero_page();"));
+        assert!(source.contains("ptrs[faila] = (void *)raid6_empty_zero_page;"));
         assert!(source.contains("raid6_call.gen_syndrome(disks, bytes, ptrs);"));
         assert!(source.contains("pbmul = raid6_gfmul[raid6_gfexi[failb-faila]];"));
         assert!(

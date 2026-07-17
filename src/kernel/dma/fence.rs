@@ -1482,7 +1482,8 @@ mod tests {
         assert_eq!(unsafe { dma_fence_array_first(base) }, f0);
         assert_eq!(unsafe { dma_fence_array_next(base, 1) }, f1);
         assert!(unsafe { dma_fence_array_next(base, 2).is_null() });
-        assert!(unsafe { dma_fence_match_context(base, 55) });
+        assert!(!unsafe { dma_fence_match_context(base, 55) });
+        assert!(unsafe { dma_fence_match_context(base, 0) });
         assert!(unsafe { dma_fence_is_signaled(base) });
         unsafe { fence_ref_put(base) };
     }

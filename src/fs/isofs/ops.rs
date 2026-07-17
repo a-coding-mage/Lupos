@@ -89,7 +89,7 @@ fn iso_readdir(file: &FileRef) -> Result<Option<(alloc::string::String, u64, Ino
     let sbi = super::get_sbi(&sb).ok_or(EINVAL)?;
     let ino = iso_of(&inode).ok_or(EINVAL)?;
     let entries = dir_read_all(&sbi, ino.extent, ino.size)?;
-    let mut idx = file.private.lock();
+    let mut idx = file.pos.lock();
     if (*idx as usize) >= entries.len() {
         return Ok(None);
     }

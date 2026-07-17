@@ -63,9 +63,8 @@ impl ModuleConstructors {
     /// The table must remain mapped and executable targets must have passed
     /// the module loader's relocation and executable-range validation.
     pub unsafe fn run(&self) -> Result<(), ConstructorError> {
-        let entries = unsafe {
-            core::slice::from_raw_parts(self.address as *const usize, self.count)
-        };
+        let entries =
+            unsafe { core::slice::from_raw_parts(self.address as *const usize, self.count) };
         for address in entries {
             if *address == 0 {
                 return Err(ConstructorError::NullEntry);

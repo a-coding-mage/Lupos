@@ -118,8 +118,8 @@ mod tests {
             "/vendor/linux/fs/9p/vfs_dentry.c"
         ));
         assert!(source.contains("static int v9fs_cached_dentry_delete"));
-        assert!(source.contains("if (d_really_is_negative(dentry))"));
-        assert!(source.contains("return 1;"));
+        assert!(source.contains("if (!d_really_is_negative(dentry))"));
+        assert!(source.contains("return v9fs_ndentry_is_expired(dentry);"));
         assert!(source.contains("static void v9fs_dentry_release"));
         assert!(source.contains("hlist_move_list"));
         assert!(source.contains("p9_fid_put(hlist_entry"));

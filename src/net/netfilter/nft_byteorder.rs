@@ -3,7 +3,7 @@
 //! test-origin: linux:vendor/linux/net/netfilter/nft_byteorder.c
 //! nftables byteorder expression.
 
-use crate::include::uapi::errno::{EINVAL, ERANGE};
+use crate::include::uapi::errno::{EINVAL, EOPNOTSUPP, ERANGE};
 
 pub const NFT_BYTEORDER_NTOH: u8 = 0;
 pub const NFT_BYTEORDER_HTON: u8 = 1;
@@ -21,7 +21,6 @@ pub struct NftByteorder {
     pub sreg: u8,
     pub dreg: u8,
     pub op: u8,
-    pub len: u8,
     pub size: u8,
 }
 
@@ -91,46 +90,34 @@ pub fn nft_byteorder_eval(expr: &NftByteorder, regs: &mut NftRegs) {
     let dreg = expr.dreg as usize;
     match expr.size {
         8 => {
-            let mut i = 0usize;
-            while i < expr.len as usize / 8 {
-                let src64 = nft_reg_load64(&regs.data, sreg + i);
-                let converted = match expr.op {
-                    NFT_BYTEORDER_NTOH => u64::from_be(src64),
-                    NFT_BYTEORDER_HTON => src64.to_be(),
-                    _ => src64,
-                };
-                nft_reg_store64(&mut regs.data, dreg + i * 2, converted);
-                i += 1;
-            }
+            let src64 = nft_reg_load64(&regs.data, sreg);
+            let converted = match expr.op {
+                NFT_BYTEORDER_NTOH => u64::from_be(src64),
+                NFT_BYTEORDER_HTON => src64.to_be(),
+                _ => src64,
+            };
+            nft_reg_store64(&mut regs.data, dreg, converted);
         }
         4 => {
-            let mut i = 0usize;
-            while i < expr.len as usize / 4 {
-                regs.data[dreg + i] = match expr.op {
-                    NFT_BYTEORDER_NTOH => u32::from_be(regs.data[sreg + i]),
-                    NFT_BYTEORDER_HTON => regs.data[sreg + i].to_be(),
-                    _ => regs.data[sreg + i],
-                };
-                i += 1;
-            }
+            regs.data[dreg] = match expr.op {
+                NFT_BYTEORDER_NTOH => u32::from_be(regs.data[sreg]),
+                NFT_BYTEORDER_HTON => regs.data[sreg].to_be(),
+                _ => regs.data[sreg],
+            };
         }
         2 => {
             let mut bytes = regs_as_bytes(regs);
-            let mut i = 0usize;
-            while i < expr.len as usize / 2 {
-                let s = (sreg * 4) + (i * 2);
-                let d = (dreg * 4) + (i * 2);
-                let src16 = u16::from_ne_bytes([bytes[s], bytes[s + 1]]);
-                let converted = match expr.op {
-                    NFT_BYTEORDER_NTOH => u16::from_be(src16),
-                    NFT_BYTEORDER_HTON => src16.to_be(),
-                    _ => src16,
-                };
-                let out = converted.to_ne_bytes();
-                bytes[d] = out[0];
-                bytes[d + 1] = out[1];
-                i += 1;
-            }
+            let s = sreg * 4;
+            let d = dreg * 4;
+            let src16 = u16::from_ne_bytes([bytes[s], bytes[s + 1]]);
+            let converted = match expr.op {
+                NFT_BYTEORDER_NTOH => u16::from_be(src16),
+                NFT_BYTEORDER_HTON => src16.to_be(),
+                _ => src16,
+            };
+            let out = converted.to_ne_bytes();
+            bytes[d] = out[0];
+            bytes[d + 1] = out[1];
             regs_from_bytes(regs, bytes);
         }
         _ => {}
@@ -172,6 +159,9 @@ pub const fn nft_byteorder_init(attrs: NftByteorderAttrs) -> Result<NftByteorder
         return Err(-ERANGE);
     }
     let len = len_value as u8;
+    if len != size {
+        return Err(-EOPNOTSUPP);
+    }
 
     let sreg = match attrs.sreg.unwrap() {
         Ok(sreg) => sreg,
@@ -181,7 +171,7 @@ pub const fn nft_byteorder_init(attrs: NftByteorderAttrs) -> Result<NftByteorder
         Ok(dreg) => dreg,
         Err(err) => return Err(err),
     };
-    if nft_reg_overlap(sreg, dreg, len) {
+    if nft_reg_overlap(sreg, dreg, size) {
         return Err(-EINVAL);
     }
 
@@ -189,7 +179,6 @@ pub const fn nft_byteorder_init(attrs: NftByteorderAttrs) -> Result<NftByteorder
         sreg,
         dreg,
         op,
-        len,
         size,
     })
 }
@@ -199,7 +188,7 @@ pub const fn nft_byteorder_dump(expr: &NftByteorder) -> NftByteorderDump {
         sreg: expr.sreg,
         dreg: expr.dreg,
         op: expr.op,
-        len: expr.len,
+        len: expr.size,
         size: expr.size,
     }
 }
@@ -280,12 +269,12 @@ mod tests {
         assert!(source.contains("enum nft_byteorder_ops\top:8;"));
         assert!(source.contains("void nft_byteorder_eval"));
         assert!(source.contains("case 8:"));
-        assert!(source.contains("be64_to_cpu((__force __be64)src64)"));
-        assert!(source.contains("cpu_to_be64(nft_reg_load64(&src[i]))"));
+        assert!(source.contains("nft_reg_store64(dst64, be64_to_cpu((__force __be64)src64))"));
+        assert!(source.contains("src64 = (__force __u64)cpu_to_be64(nft_reg_load64(src));"));
         assert!(source.contains("case 4:"));
-        assert!(source.contains("dst[i] = ntohl((__force __be32)src[i]);"));
+        assert!(source.contains("*dst = ntohl((__force __be32)*src);"));
         assert!(source.contains("case 2:"));
-        assert!(source.contains("d16[i] = ntohs((__force __be16)s16[i]);"));
+        assert!(source.contains("nft_reg_store16(dst, ntohs(nft_reg_load_be16(src)));"));
         assert!(
             source.contains("[NFTA_BYTEORDER_SREG]\t= NLA_POLICY_MAX(NLA_BE32, NFT_REG32_MAX)")
         );
@@ -295,7 +284,9 @@ mod tests {
         );
         assert!(source.contains("case NFT_BYTEORDER_NTOH:"));
         assert!(source.contains("case NFT_BYTEORDER_HTON:"));
-        assert!(source.contains("if (nft_reg_overlap(priv->sreg, priv->dreg, priv->len))"));
+        assert!(source.contains("/* no longer support multi-reg conversions */"));
+        assert!(source.contains("if (len != size)"));
+        assert!(source.contains("if (nft_reg_overlap(priv->sreg, priv->dreg, len))"));
         assert!(source.contains("nft_dump_register(skb, NFTA_BYTEORDER_SREG, priv->sreg)"));
         assert!(source.contains(".name\t\t= \"byteorder\""));
         assert!(header.contains("NFT_BYTEORDER_NTOH"));
@@ -344,6 +335,7 @@ mod tests {
         assert_eq!(nft_byteorder_init(attrs(2, 4, 4)), Err(-EINVAL));
         assert_eq!(nft_byteorder_init(attrs(0, 3, 4)), Err(-EINVAL));
         assert_eq!(nft_byteorder_init(attrs(0, 4, 256)), Err(-ERANGE));
+        assert_eq!(nft_byteorder_init(attrs(0, 4, 8)), Err(-EOPNOTSUPP));
         assert_eq!(
             nft_byteorder_init(NftByteorderAttrs {
                 dreg: Some(Ok(1)),

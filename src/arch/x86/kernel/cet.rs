@@ -36,6 +36,38 @@ pub const X86_FEATURE_IBT: u32 = 18 * 32 + 20;
 static KERNEL_IBT_ACTIVE: [AtomicBool; crate::kernel::sched::MAX_CPUS] =
     [const { AtomicBool::new(false) }; crate::kernel::sched::MAX_CPUS];
 
+// Mirrors arch/x86/kernel/ibt_selftest.S. If hardware enforcement is active,
+// the indirect jump raises #CP at `lupos_ibt_selftest_noendbr`; the handler
+// clears RAX and resumes at the target RET. Without enforcement it returns 1.
+core::arch::global_asm!(
+    ".pushsection .text.lupos.ibt_selftest, \"ax\"",
+    ".balign 16",
+    ".global lupos_ibt_selftest_noendbr",
+    ".type lupos_ibt_selftest_noendbr,@function",
+    "lupos_ibt_selftest_noendbr:",
+    "ret",
+    ".size lupos_ibt_selftest_noendbr,.-lupos_ibt_selftest_noendbr",
+    ".balign 16",
+    ".global lupos_ibt_selftest",
+    ".type lupos_ibt_selftest,@function",
+    "lupos_ibt_selftest:",
+    "endbr64",
+    "lea rdx, [rip + lupos_ibt_selftest_noendbr]",
+    "mov eax, 1",
+    "jmp rdx",
+    ".size lupos_ibt_selftest,.-lupos_ibt_selftest",
+    ".popsection",
+);
+
+unsafe extern "C" {
+    fn lupos_ibt_selftest() -> i32;
+    fn lupos_ibt_selftest_noendbr();
+}
+
+pub fn ibt_selftest_noendbr_addr() -> usize {
+    lupos_ibt_selftest_noendbr as usize
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CetEnablePlan {
     pub write_s_cet: bool,
@@ -99,7 +131,18 @@ pub fn setup_cet_cpu(cpu: usize) -> Result<bool, i32> {
         setup_clear_cpu_cap(X86_FEATURE_IBT);
         return Err(EINVAL);
     }
-    KERNEL_IBT_ACTIVE[cpu.min(KERNEL_IBT_ACTIVE.len() - 1)].store(true, Ordering::Release);
+    let cpu = cpu.min(KERNEL_IBT_ACTIVE.len() - 1);
+    // Publish enforcement before the deliberate fault so the #CP handler can
+    // distinguish this kernel-mode check from an unexpected exception.
+    KERNEL_IBT_ACTIVE[cpu].store(true, Ordering::Release);
+    if unsafe { lupos_ibt_selftest() } != 0 {
+        KERNEL_IBT_ACTIVE[cpu].store(false, Ordering::Release);
+        unsafe {
+            let _ = crate::arch::x86::kernel::msr::wrmsr_safe(MSR_IA32_S_CET, 0);
+        }
+        setup_clear_cpu_cap(X86_FEATURE_IBT);
+        return Err(EINVAL);
+    }
     Ok(true)
 }
 

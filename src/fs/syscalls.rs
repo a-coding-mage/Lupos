@@ -483,15 +483,21 @@ fn trace_run_fd(op: &str, fd: i32, name: &str, flags: u32, ret: i64) {
     if !crate::kernel::debug_trace::fs_enabled() {
         return;
     }
-    if !matches!(name, "journal" | "netif" | "resolve" | "credentials") {
-        return;
-    }
     let task = unsafe { sched::get_current() };
     let pid = if task.is_null() {
         -1
     } else {
         unsafe { (*task).pid }
     };
+    let logind_getdents = if task.is_null() || op != "getdents64" {
+        false
+    } else {
+        let comm = unsafe { &(*task).comm };
+        comm.starts_with(b"systemd-logind")
+    };
+    if !logind_getdents && !matches!(name, "journal" | "netif" | "resolve" | "credentials") {
+        return;
+    }
     crate::linux_driver_abi::tty::serial_println!(
         "trace-run-{} pid={} fd={} flags={:#x} name={} ret={}",
         op,
@@ -1928,7 +1934,7 @@ fn getdents_reclen_legacy(name_len: usize) -> usize {
 }
 
 fn restore_readdir_pos(file: &FileRef, pos: usize) {
-    *file.private.lock() = pos;
+    *file.pos.lock() = pos as u64;
 }
 
 unsafe fn getdents_common(
@@ -1950,7 +1956,7 @@ unsafe fn getdents_common(
     let ret = (|| {
         let mut written = 0usize;
         loop {
-            let pos_before = *file.private.lock();
+            let pos_before = *file.pos.lock() as usize;
             let next = match readdir(&file) {
                 Ok(Some(entry)) => entry,
                 Ok(None) => break,
@@ -1970,7 +1976,7 @@ unsafe fn getdents_common(
                     written as i64
                 };
             }
-            let pos_after = *file.private.lock() as i64;
+            let pos_after = *file.pos.lock() as i64;
             let reclen_u16 = reclen as u16;
             let mut entry = alloc::vec![0u8; reclen];
             entry[0..8].copy_from_slice(&next.1.to_ne_bytes());
@@ -2005,10 +2011,11 @@ pub unsafe fn sys_getdents64(fd: i32, dirent: *mut u8, count: usize) -> i64 {
     let Some(file) = file else {
         return ret;
     };
+    let trace_path = super::file::path_hint(&file);
     trace_run_fd(
         "getdents64",
         fd,
-        &file.dentry.name,
+        trace_path.as_deref().unwrap_or(&file.dentry.name),
         file.flags.load(Ordering::Acquire),
         ret,
     );
@@ -3348,7 +3355,53 @@ pub fn sys_pivot_root(new_root: *const u8, put_old: *const u8) -> i64 {
     if new_root.is_null() || put_old.is_null() {
         return -(EFAULT as i64);
     }
-    -(EPERM as i64)
+    if !capable(CAP_SYS_ADMIN) {
+        return -(EPERM as i64);
+    }
+    let new_root_name = match unsafe { user_path(new_root) } {
+        Ok(path) if !path.is_empty() => path,
+        Ok(_) => return -(ENOENT as i64),
+        Err(errno) => return -(errno as i64),
+    };
+    let put_old_name = match unsafe { user_path(put_old) } {
+        Ok(path) if !path.is_empty() => path,
+        Ok(_) => return -(ENOENT as i64),
+        Err(errno) => return -(errno as i64),
+    };
+    let new_root_path = match lookup_path_str_with_follow(AT_FDCWD, &new_root_name, true) {
+        Ok(path) => mount::VfsPath::new(path.mount, path.dentry),
+        Err(errno) => return -(errno as i64),
+    };
+    let put_old_path = match lookup_path_str_with_follow(AT_FDCWD, &put_old_name, true) {
+        Ok(path) => mount::VfsPath::new(path.mount, path.dentry),
+        Err(errno) => return -(errno as i64),
+    };
+    if new_root_path
+        .dentry
+        .inode()
+        .is_none_or(|inode| inode.kind != InodeKind::Directory)
+        || put_old_path
+            .dentry
+            .inode()
+            .is_none_or(|inode| inode.kind != InodeKind::Directory)
+    {
+        return -(ENOTDIR as i64);
+    }
+    match mount::pivot_root_paths(&new_root_path, &put_old_path) {
+        Ok((old_root, new_root)) => {
+            super::fs_struct::chroot_fs_refs(&old_root, &new_root);
+            let fs = super::fs_struct::current_fs();
+            if !fs.is_null() {
+                let pwd = unsafe { &*fs }.pwd.lock().clone();
+                let cwd = pwd
+                    .map(|pwd| super::fs_struct::visible_path_for_current_root(&pwd))
+                    .unwrap_or_else(|| String::from("/"));
+                super::fs_struct::set_current_cwd_path(&cwd);
+            }
+            0
+        }
+        Err(errno) => -(errno as i64),
+    }
 }
 
 pub unsafe fn sys_chroot(pathname: *const u8) -> i64 {
@@ -5043,6 +5096,42 @@ mod tests {
             mount::do_mount("tmpfs", "tmpfs", "/tmp", 0, "").expect("tmpfs /tmp");
             assert_empty_dir_dot_entries(b"/tmp\0");
 
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn getdents64_directory_cursor_is_shared_with_lseek() {
+        let _guard = mount::TEST_MOUNT_LOCK.lock();
+        let (mut current, previous) = setup_current_with_rootfs(194);
+        unsafe {
+            assert_eq!(sys_mkdir(b"/rewind\0".as_ptr(), 0o755), 0);
+            assert_eq!(sys_mkdir(b"/rewind/child\0".as_ptr(), 0o755), 0);
+            let fd = open_dir(b"/rewind\0");
+            assert!(fd >= 0);
+
+            let mut dirents = [0u8; 256];
+            let len = sys_getdents64(fd as i32, dirents.as_mut_ptr(), dirents.len());
+            assert!(len > 0);
+            assert_eq!(
+                dirent64_names(&dirents, len as usize),
+                [String::from("."), String::from(".."), String::from("child")]
+            );
+            assert_eq!(
+                sys_getdents64(fd as i32, dirents.as_mut_ptr(), dirents.len()),
+                0
+            );
+
+            assert_eq!(sys_lseek(fd as i32, 0, SEEK_SET), 0);
+            let len = sys_getdents64(fd as i32, dirents.as_mut_ptr(), dirents.len());
+            assert!(len > 0);
+            assert_eq!(
+                dirent64_names(&dirents, len as usize),
+                [String::from("."), String::from(".."), String::from("child")]
+            );
+
+            assert_eq!(crate::fs::fdtable::sys_close(fd as i32), 0);
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
@@ -7042,7 +7131,7 @@ mod tests {
                     core::ptr::null_mut(),
                     core::ptr::null_mut(),
                     core::ptr::null_mut(),
-                    core::ptr::null(),
+                    &crate::kernel::time::Timespec64::new(0, 0),
                     core::ptr::null()
                 ),
                 0
@@ -7131,7 +7220,7 @@ mod tests {
                 sys_ppoll(
                     core::ptr::null_mut(),
                     0,
-                    core::ptr::null(),
+                    &zero_timeout,
                     core::ptr::null(),
                     0
                 ),

@@ -10,6 +10,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::fs::kernfs::{KernfsNode, add_child};
+use crate::fs::ops::FileOps;
+use crate::fs::types::{FileRef, InodeKind};
 use crate::include::uapi::errno::{EACCES, ECHILD, ENOENT};
 use crate::include::uapi::stat::{S_IFLNK, S_IRWXG, S_IRWXO, S_IRWXU};
 
@@ -306,6 +308,71 @@ pub fn new_ns_dir() -> Arc<KernfsNode> {
     dir
 }
 
+static PROC_USER_NS_FILE_OPS: FileOps = FileOps {
+    name: "nsfs-user",
+    read: None,
+    write: None,
+    llseek: None,
+    fsync: None,
+    poll: None,
+    ioctl: None,
+    mmap: None,
+    release: Some(proc_user_ns_release),
+    readdir: None,
+};
+
+fn proc_user_ns_release(file: FileRef) {
+    let ns = *file.private.lock() as *mut crate::kernel::user_namespace::UserNamespace;
+    if ns.is_null() {
+        return;
+    }
+    let ops = unsafe { (*ns).ns.ops };
+    if !ops.is_null() {
+        unsafe { ((*ops).put)(ns.cast()) };
+    }
+}
+
+fn proc_user_ns_path_pid(path: &str) -> Option<i32> {
+    let pid = path.strip_prefix("/proc/")?.strip_suffix("/ns/user")?;
+    if pid == "self" {
+        let task = unsafe { crate::kernel::sched::get_current() };
+        return (!task.is_null()).then(|| unsafe { (*task).pid });
+    }
+    pid.parse::<i32>().ok().filter(|pid| *pid > 0)
+}
+
+/// Open `/proc/<pid>/ns/user` as a namespace handle rather than following
+/// its displayed `user:[inum]` text as an ordinary symlink.
+pub fn user_namespace_file_from_proc_path(path: &str, flags: u32) -> Option<Result<FileRef, i32>> {
+    let pid = proc_user_ns_path_pid(path)?;
+    let task = super::base::task_by_pid(pid);
+    if task.is_null() {
+        return Some(Err(ENOENT));
+    }
+    let cred = unsafe { (*task).cred };
+    let ns = if cred.is_null() || unsafe { (*cred).user_ns.is_null() } {
+        &raw const crate::kernel::user_namespace::INIT_USER_NS as *mut _
+    } else {
+        unsafe { (*cred).user_ns as *mut crate::kernel::user_namespace::UserNamespace }
+    };
+    let ops = unsafe { (*ns).ns.ops };
+    if ops.is_null() {
+        return Some(Err(ENOENT));
+    }
+    unsafe { ((*ops).get)(ns.cast()) };
+    let file = crate::fs::anon_inode::alloc_anon_file_with_ino_and_kind(
+        "nsfs:user",
+        &PROC_USER_NS_FILE_OPS,
+        ns as usize,
+        unsafe { (*ns).ns.inum as u64 },
+        InodeKind::Regular,
+        0o444,
+    );
+    file.flags
+        .store(flags, core::sync::atomic::Ordering::Release);
+    Some(Ok(file))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,5 +609,12 @@ mod tests {
                 _ => panic!("namespace entry is not a symlink"),
             }
         }
+    }
+
+    #[test]
+    fn proc_user_namespace_magic_link_path_parses_live_pid_form() {
+        assert_eq!(proc_user_ns_path_pid("/proc/339/ns/user"), Some(339));
+        assert_eq!(proc_user_ns_path_pid("/proc/0/ns/user"), None);
+        assert_eq!(proc_user_ns_path_pid("/proc/339/ns/mnt"), None);
     }
 }

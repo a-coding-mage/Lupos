@@ -339,7 +339,7 @@ mod tests {
         assert!(source.contains("rettype = DT_DIR;"));
         assert!(source.contains("if (perm & P9_DMSYMLINK)"));
         assert!(source.contains("static struct p9_rdir *v9fs_alloc_rdir_buf"));
-        assert!(source.contains("kzalloc(sizeof(struct p9_rdir) + buflen, GFP_KERNEL)"));
+        assert!(source.contains("kvzalloc(sizeof(struct p9_rdir) + buflen, GFP_KERNEL)"));
         assert!(source.contains("static int v9fs_dir_readdir"));
         assert!(source.contains("if (!rdir)"));
         assert!(source.contains("return -ENOMEM;"));

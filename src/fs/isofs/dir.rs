@@ -413,8 +413,9 @@ mod tests {
         assert!(source.contains("get_acorn_filename(de, tmpname, inode)"));
         assert!(source.contains("isofs_name_translate(de, tmpname, inode)"));
         assert!(source.contains("if (!dir_emit(ctx, p, len, inode_number, DT_UNKNOWN))"));
-        assert!(source.contains("tmpname = (char *)__get_free_page(GFP_KERNEL);"));
+        assert!(source.contains("tmpname = kmalloc(PAGE_SIZE, GFP_KERNEL);"));
         assert!(source.contains("tmpde = (struct iso_directory_record *) (tmpname+1024);"));
+        assert!(source.contains("kfree(tmpname);"));
         assert!(source.contains(".iterate_shared = isofs_readdir"));
         assert!(source.contains(".lookup = isofs_lookup"));
         assert!(header.contains("static inline unsigned long isofs_get_ino"));

@@ -47,7 +47,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/vendor/linux/rust/helpers/uaccess.c"
         ));
-        assert!(source.contains("#ifdef INLINE_COPY_FROM_USER"));
+        assert!(source.contains("#ifdef INLINE_COPY_USER"));
         for contract in SOURCES {
             super::super::assert_helper_source(source, *contract);
         }

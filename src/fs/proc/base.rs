@@ -11,7 +11,7 @@ use crate::fs::anon_inode::alloc_anon_file_with_kind;
 use crate::fs::kernfs::{KernfsNode, add_child};
 use crate::fs::ops::FileOps;
 use crate::fs::types::{FileRef, InodeKind};
-use crate::include::uapi::errno::{EINVAL, ENOENT};
+use crate::include::uapi::errno::{EFAULT, EINVAL, ENOENT};
 use crate::kernel::task::TaskStruct;
 use crate::kernel::task::task_state::{EXIT_DEAD, EXIT_ZOMBIE};
 
@@ -209,12 +209,7 @@ pub fn add_task_common(dir: &Arc<KernfsNode>) {
     // vendor/linux/fs/proc/base.c::proc_pid_environ_read
     add_child(
         dir,
-        KernfsNode::new_file(
-            "environ",
-            0o400,
-            Some(super::array::self_environ_show),
-            None,
-        ),
+        KernfsNode::new_file("environ", 0o400, Some(proc_pid_environ_show), None),
     );
     add_child(
         dir,
@@ -224,6 +219,34 @@ pub fn add_task_common(dir: &Arc<KernfsNode>) {
         dir,
         KernfsNode::new_file("cgroup", 0o444, Some(proc_pid_cgroup_show), None),
     );
+    add_child(
+        dir,
+        KernfsNode::new_file(
+            "uid_map",
+            0o644,
+            Some(proc_pid_uid_map_show),
+            Some(proc_pid_uid_map_store),
+        ),
+    );
+    add_child(
+        dir,
+        KernfsNode::new_file(
+            "gid_map",
+            0o644,
+            Some(proc_pid_gid_map_show),
+            Some(proc_pid_gid_map_store),
+        ),
+    );
+    add_child(
+        dir,
+        KernfsNode::new_file(
+            "setgroups",
+            0o644,
+            Some(proc_pid_setgroups_show),
+            Some(proc_pid_setgroups_store),
+        ),
+    );
+    add_child(dir, super::namespaces::new_ns_dir());
     add_child(
         dir,
         KernfsNode::new_file(
@@ -317,15 +340,52 @@ fn proc_pid_cmdline_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize
     if task == current {
         return super::array::self_cmdline_show(node, buf);
     }
+    let mm = unsafe { (*task).mm };
+    if mm.is_null() {
+        return Ok(0);
+    }
+    unsafe { read_task_mm_range(task, buf, (*mm).arg_start, (*mm).arg_end) }
+}
 
-    // Linux proc_pid_cmdline_read() reads the target task's mm via
-    // get_task_cmdline()/access_process_vm(). Lupos does not yet have remote
-    // argv copying, so avoid the old /proc/<pid>/cmdline bug where a reader
-    // saw its own argv; expose the target comm as a stable NUL-terminated
-    // fallback until remote mm reads are wired up.
-    let mut text = super::util::task_comm(task);
-    text.push('\0');
-    super::util::copy_into(buf, &text)
+fn proc_pid_environ_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    let pid = proc_pid_from_node(node)?;
+    let task = task_by_pid(pid);
+    if task.is_null() {
+        return Err(ENOENT);
+    }
+    let current = unsafe { crate::kernel::sched::get_current() };
+    if task == current {
+        return super::array::self_environ_show(node, buf);
+    }
+    let mm = unsafe { (*task).mm };
+    if mm.is_null() {
+        return Ok(0);
+    }
+    unsafe { read_task_mm_range(task, buf, (*mm).env_start, (*mm).env_end) }
+}
+
+unsafe fn read_task_mm_range(
+    task: *mut TaskStruct,
+    buf: &mut [u8],
+    start: u64,
+    end: u64,
+) -> Result<usize, i32> {
+    if task.is_null() || unsafe { (*task).mm.is_null() } || start == 0 || end <= start {
+        return Ok(0);
+    }
+    let len = (end - start).min(buf.len() as u64) as usize;
+    let copied = crate::mm::mm_public::access_process_vm(
+        unsafe { (*task).mm },
+        start,
+        buf.as_mut_ptr(),
+        len,
+        false,
+    );
+    if copied < 0 {
+        Err(EFAULT)
+    } else {
+        Ok(copied as usize)
+    }
 }
 
 fn proc_pid_cgroup_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
@@ -336,8 +396,68 @@ fn proc_pid_cgroup_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize,
     super::util::copy_into(buf, &crate::kernel::cgroup::proc_cgroup_text_for_pid(pid))
 }
 
+fn task_user_namespace(
+    node: &Arc<KernfsNode>,
+) -> Result<*mut crate::kernel::user_namespace::UserNamespace, i32> {
+    let task = task_by_pid(proc_pid_from_node(node)?);
+    if task.is_null() {
+        return Err(ENOENT);
+    }
+    let cred = unsafe { (*task).cred };
+    if cred.is_null() || unsafe { (*cred).user_ns.is_null() } {
+        return Ok(&raw const crate::kernel::user_namespace::INIT_USER_NS as *mut _);
+    }
+    Ok(unsafe { (*cred).user_ns as *mut crate::kernel::user_namespace::UserNamespace })
+}
+
+fn proc_pid_uid_map_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    let ns = task_user_namespace(node)?;
+    super::util::copy_into(buf, &unsafe { (*ns).uid_map.render() })
+}
+
+fn proc_pid_gid_map_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    let ns = task_user_namespace(node)?;
+    super::util::copy_into(buf, &unsafe { (*ns).gid_map.render() })
+}
+
+fn proc_pid_uid_map_store(node: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize, i32> {
+    let ns = task_user_namespace(node)?;
+    let text = core::str::from_utf8(buf).map_err(|_| EINVAL)?;
+    let map = crate::kernel::user_namespace::UidGidMap::parse(text).map_err(i32::abs)?;
+    if unsafe { (*ns).uid_map.nr_extents } != 0 {
+        return Err(crate::include::uapi::errno::EPERM);
+    }
+    unsafe { (*ns).uid_map = map };
+    Ok(buf.len())
+}
+
+fn proc_pid_gid_map_store(node: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize, i32> {
+    let ns = task_user_namespace(node)?;
+    let text = core::str::from_utf8(buf).map_err(|_| EINVAL)?;
+    let map = crate::kernel::user_namespace::UidGidMap::parse(text).map_err(i32::abs)?;
+    if unsafe { (*ns).gid_map.nr_extents } != 0 {
+        return Err(crate::include::uapi::errno::EPERM);
+    }
+    unsafe { (*ns).gid_map = map };
+    Ok(buf.len())
+}
+
+fn proc_pid_setgroups_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    super::util::copy_into(buf, "allow\n")
+}
+
+fn proc_pid_setgroups_store(_node: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize, i32> {
+    if buf == b"deny\n" || buf == b"deny" {
+        Ok(buf.len())
+    } else {
+        Err(EINVAL)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::fs::kernfs::lookup;
+
     #[test]
     fn proc_pid_cmdline_uses_pid_specific_show_handler() {
         let source = include_str!("base.rs");
@@ -349,5 +469,13 @@ mod tests {
             cmdline_entry.contains("Some(proc_pid_cmdline_show)"),
             "/proc/<pid>/cmdline must not alias /proc/self/cmdline"
         );
+    }
+
+    #[test]
+    fn task_common_exposes_namespace_directory() {
+        let dir = crate::fs::kernfs::KernfsNode::new_dir("123", 0o555);
+        super::add_task_common(&dir);
+        let ns = lookup(&dir, "ns").expect("/proc/<pid>/ns");
+        assert!(lookup(&ns, "user").is_some());
     }
 }

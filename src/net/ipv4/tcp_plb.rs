@@ -24,7 +24,7 @@ pub struct TcpPlbState {
 pub struct TcpSockState {
     pub packets_out: u32,
     pub plb_rehash: u32,
-    pub rethink_txhash_count: u32,
+    pub rethink_txhash_reset_dst_count: u32,
     pub mib_tcp_plb_rehash: u64,
 }
 
@@ -77,7 +77,7 @@ pub fn tcp_plb_check_rehash(
         return;
     }
 
-    sock.rethink_txhash_count += 1;
+    sock.rethink_txhash_reset_dst_count += 1;
     plb.consec_cong_rounds = 0;
     sock.plb_rehash = sock.plb_rehash.wrapping_add(1);
     sock.mib_tcp_plb_rehash += 1;
@@ -135,7 +135,7 @@ mod tests {
         assert!(source.contains(
             "max_suspend = 2 * READ_ONCE(net->ipv4.sysctl_tcp_plb_suspend_rto_sec) * HZ;"
         ));
-        assert!(source.contains("sk_rethink_txhash(sk);"));
+        assert!(source.contains("__sk_rethink_txhash_reset_dst(sk);"));
         assert!(source.contains("WRITE_ONCE(tcp_sk(sk)->plb_rehash, tcp_sk(sk)->plb_rehash + 1);"));
         assert!(source.contains("pause += get_random_u32_below(pause);"));
     }
@@ -172,11 +172,11 @@ mod tests {
         };
 
         tcp_plb_check_rehash(&sysctl, &mut sock, &mut plb, 100);
-        assert_eq!(sock.rethink_txhash_count, 0);
+        assert_eq!(sock.rethink_txhash_reset_dst_count, 0);
 
         sock.packets_out = 0;
         tcp_plb_check_rehash(&sysctl, &mut sock, &mut plb, 100);
-        assert_eq!(sock.rethink_txhash_count, 1);
+        assert_eq!(sock.rethink_txhash_reset_dst_count, 1);
         assert_eq!(sock.plb_rehash, 1);
         assert_eq!(sock.mib_tcp_plb_rehash, 1);
         assert_eq!(plb.consec_cong_rounds, 0);
@@ -184,18 +184,18 @@ mod tests {
         plb.consec_cong_rounds = 3;
         plb.pause_until = 500;
         tcp_plb_check_rehash(&sysctl, &mut sock, &mut plb, 100);
-        assert_eq!(sock.rethink_txhash_count, 1);
+        assert_eq!(sock.rethink_txhash_reset_dst_count, 1);
         assert_eq!(plb.pause_until, 500);
 
         plb.pause_until = 50;
         tcp_plb_check_rehash(&sysctl, &mut sock, &mut plb, 100);
-        assert_eq!(sock.rethink_txhash_count, 2);
+        assert_eq!(sock.rethink_txhash_reset_dst_count, 2);
         assert_eq!(plb.pause_until, 0);
 
         plb.consec_cong_rounds = 3;
         plb.pause_until = 10_000;
         tcp_plb_check_rehash(&sysctl, &mut sock, &mut plb, 100);
-        assert_eq!(sock.rethink_txhash_count, 3);
+        assert_eq!(sock.rethink_txhash_reset_dst_count, 3);
         assert_eq!(plb.pause_until, 0);
     }
 

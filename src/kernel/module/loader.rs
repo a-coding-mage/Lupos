@@ -26,7 +26,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::arch::x86::kernel::module::{
-    X86ModuleFinalizeError, X86ModuleMetadata, module_finalize,
+    X86ModuleFinalizeError, X86ModuleMetadata, module_finalize_with_static_call_tramp_keys,
 };
 use crate::include::uapi::errno::{EBUSY, EEXIST, EINVAL, ENOENT, ENOEXEC};
 use crate::kernel::bug::{
@@ -34,6 +34,7 @@ use crate::kernel::bug::{
     BUG_ENTRY_FORMAT_OFFSET, BUG_ENTRY_SIZE, BUGFLAG_ARGS, MAX_BUG_STRING_LEN,
     ModuleBugFinalizeError, ModuleBugRegistration, module_bug_finalize,
 };
+use crate::kernel::locking::Mutex as SleepingMutex;
 use crate::kernel::module::btf::ModuleBtf;
 use crate::kernel::module::constructors::{ConstructorError, ModuleConstructors};
 use crate::kernel::module::kallsyms::{
@@ -424,7 +425,34 @@ struct ModuleRuntimeMetadata {
     init_text: Vec<AddressRange>,
     _btf: Option<ModuleBtf>,
     kallsyms_registered: AtomicBool,
+    teardown_progress: ModuleTeardownProgress,
     released: AtomicBool,
+}
+
+const TEARDOWN_RAW_TRACEPOINTS: u32 = 1 << 0;
+const TEARDOWN_KPROBES: u32 = 1 << 1;
+const TEARDOWN_TRACE_EVENTS: u32 = 1 << 2;
+const TEARDOWN_TRACEPOINTS: u32 = 1 << 3;
+const TEARDOWN_FTRACE: u32 = 1 << 4;
+
+/// Records successful notifier phases so a failed module teardown retries
+/// only the failed and not-yet-run work.  Individual subsystems remain
+/// idempotent for partial failure inside a phase, but completed phases no
+/// longer need to be invoked again on every userspace retry.
+#[derive(Default)]
+struct ModuleTeardownProgress {
+    completed: AtomicU32,
+}
+
+impl ModuleTeardownProgress {
+    fn run(&self, phase: u32, action: impl FnOnce() -> Result<(), i32>) -> Result<(), i32> {
+        if self.completed.load(Ordering::Acquire) & phase != 0 {
+            return Ok(());
+        }
+        action()?;
+        self.completed.fetch_or(phase, Ordering::Release);
+        Ok(())
+    }
 }
 
 impl ModuleRuntimeMetadata {
@@ -442,6 +470,7 @@ impl ModuleRuntimeMetadata {
             init_text,
             _btf: btf,
             kallsyms_registered: AtomicBool::new(false),
+            teardown_progress: ModuleTeardownProgress::default(),
             released: AtomicBool::new(false),
         }
     }
@@ -456,6 +485,7 @@ impl ModuleRuntimeMetadata {
 
     fn begin_going(&self) -> Result<(), i32> {
         crate::kernel::bpf::module_raw_tracepoints::module_begin_going(self.owner)
+            .map_err(normalize_errno)
     }
 
     fn release(&self) -> Result<(), i32> {
@@ -466,20 +496,35 @@ impl ModuleRuntimeMetadata {
         // Raw tracepoint users hold the same unload-preventing reference as
         // Linux.  Do not dismantle any other registry until that pin check
         // succeeds.
-        crate::kernel::bpf::module_raw_tracepoints::module_going(self.owner)?;
+        self.teardown_progress.run(TEARDOWN_RAW_TRACEPOINTS, || {
+            crate::kernel::bpf::module_raw_tracepoints::module_going(self.owner)
+                .map_err(normalize_errno)
+        })?;
         // Restore every probed instruction and wait for displaced execution
         // before any registry or executable module allocation is released.
-        crate::kernel::trace::kprobe::module_going(self.owner, &self.core_text, &self.init_text)?;
+        self.teardown_progress.run(TEARDOWN_KPROBES, || {
+            crate::kernel::trace::kprobe::module_going(self.owner, &self.core_text, &self.init_text)
+                .map_err(normalize_errno)
+        })?;
+        self.teardown_progress.run(TEARDOWN_TRACE_EVENTS, || {
+            crate::kernel::trace::trace_events::module_going(self.owner).map_err(normalize_errno)
+        })?;
+        self.teardown_progress.run(TEARDOWN_TRACEPOINTS, || {
+            crate::kernel::trace::tracepoint::module_going(self.owner).map_err(normalize_errno)
+        })?;
+        // Keep ftrace records and module allocations owned until every
+        // instrumented callsite has been restored. A failed text poke leaves
+        // the descriptor in GOING so delete_module() can retry this step.
+        self.teardown_progress.run(TEARDOWN_FTRACE, || {
+            crate::kernel::trace::ftrace::release_module(self.owner).map_err(normalize_errno)
+        })?;
         if self.released.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
 
-        crate::kernel::trace::trace_events::module_going(self.owner);
-        crate::kernel::trace::tracepoint::module_going(self.owner);
         crate::kernel::dynamic_debug::module_going(self.owner);
         crate::kernel::printk::index::module_going(self.owner);
         crate::kernel::error_injection::module_going(self.owner);
-        crate::kernel::trace::ftrace::release_module(self.owner);
         if self.kallsyms_registered.swap(false, Ordering::AcqRel) {
             crate::kernel::module::kallsyms::unregister(&self.module_name);
         }
@@ -487,9 +532,53 @@ impl ModuleRuntimeMetadata {
     }
 }
 
+/// The public module-loader API follows the kernel syscall convention and
+/// returns a positive errno. Trace/notifier internals follow Linux helpers and
+/// commonly return `-errno`; normalize the boundary so sys_delete_module()
+/// never turns a teardown failure into a positive syscall result.
+fn normalize_errno(error: i32) -> i32 {
+    error.checked_abs().unwrap_or(EINVAL)
+}
+
 impl Drop for ModuleRuntimeMetadata {
     fn drop(&mut self) {
         let _ = self.release();
+    }
+}
+
+/// Finish a failed COMING/init transition without ever freeing metadata which
+/// a failed notifier teardown still references.  A retained GOING module is
+/// intentionally visible to `delete_module()` so userspace can retry the
+/// idempotent teardown after the transient failure clears.
+fn release_failed_formation(
+    module: &Arc<KernelModule>,
+    module_name: &str,
+    identity: &mut ModuleIdentityReservation,
+) {
+    let _teardown = module.teardown_lock.lock();
+    unexport_module_symbols(module_name);
+    match module.runtime_metadata.release() {
+        Ok(()) => {
+            // As in the normal delete path, architecture registries must be
+            // withdrawn explicitly before unlinking. `find_module()` can
+            // have handed another caller an Arc while the descriptor was in
+            // COMING; relying on the last Arc drop would keep ORC, jump-label,
+            // and static-call addresses published for a failed module.
+            crate::arch::x86::kernel::module::module_arch_cleanup(&module._arch_metadata);
+            MODULES.lock().remove(module_name);
+            module.srcu_registration.cleanup();
+            module.bug_registration.cleanup();
+            identity.release_before_descriptor();
+        }
+        Err(error) => {
+            identity.keep_until_unload();
+            crate::log_error!(
+                "module",
+                "{}: teardown after failed formation returned {}; retaining GOING module for retry",
+                module_name,
+                error
+            );
+        }
     }
 }
 
@@ -511,6 +600,10 @@ pub struct KernelModule {
     /// precedes `sections` so all global registries are unlinked before their
     /// relocated pointers become invalid.
     runtime_metadata: ModuleRuntimeMetadata,
+    /// Serializes cleanup_module(), notifier teardown, retry, and final
+    /// descriptor removal.  MODULES protects lookup/publication only; it
+    /// cannot be held while callbacks run.
+    teardown_lock: SleepingMutex<()>,
     /// Linux module SRCU notifier state. This precedes `sections` so module
     /// static SRCU allocations are released before their owning C objects.
     srcu_registration: ModuleSrcuRegistration,
@@ -1477,6 +1570,49 @@ fn module_exports_from_sections(
     Ok(exports)
 }
 
+/// Correlate Linux `EXPORT_STATIC_CALL(name)` exports without knowing any
+/// concrete static-call name. That macro exports both `__SCT__name`
+/// (trampoline) and `__SCK__name` (key), whereas the built-in kernel can also
+/// record hidden-key relations in its linker table. An unmatched trampoline
+/// is valid for `EXPORT_STATIC_CALL_TRAMP(name)` and is ignored; ambiguous
+/// duplicate matches are malformed.
+fn module_static_call_tramp_keys(
+    exports: &[ModuleExport],
+) -> Result<Vec<(usize, usize)>, LoadModuleError> {
+    let mut pairs = Vec::new();
+    for trampoline in exports
+        .iter()
+        .filter(|export| export.name.starts_with("__SCT__"))
+    {
+        let suffix = &trampoline.name["__SCT__".len()..];
+        if suffix.is_empty() {
+            return Err(LoadModuleError::BadElf);
+        }
+        if exports
+            .iter()
+            .filter(|export| export.name.strip_prefix("__SCT__") == Some(suffix))
+            .count()
+            != 1
+        {
+            return Err(LoadModuleError::BadElf);
+        }
+        let mut keys = exports.iter().filter(|export| {
+            export
+                .name
+                .strip_prefix("__SCK__")
+                .is_some_and(|key_suffix| key_suffix == suffix)
+        });
+        let Some(key) = keys.next() else {
+            continue;
+        };
+        if keys.next().is_some() {
+            return Err(LoadModuleError::BadElf);
+        }
+        pairs.push((trampoline.addr, key.addr));
+    }
+    Ok(pairs)
+}
+
 fn pointer_section_values(section: Option<&LoadedSection>) -> Result<Vec<usize>, LoadModuleError> {
     let Some(section) = section else {
         return Ok(Vec::new());
@@ -2326,17 +2462,26 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
     }
     touch_module_load_watchdog();
 
+    // Module-owned static-call trampolines are represented by paired exports,
+    // not by the built-in kernel's linker table. Discover them only after all
+    // PREL32 ksymtab fields have been relocated, but before the architecture
+    // hook decodes `.static_call_sites`.
+    let module_exports = module_exports_from_sections(&sections)?;
+    let static_call_tramp_keys = module_static_call_tramp_keys(&module_exports)?;
+
     // `post_relocation()` invokes the x86 `module_finalize()` hook after all
     // RELA records have reached their runtime addresses. In particular,
     // `.smp_locks` is a table of relocated PREL32 offsets. Linux's
     // `alternatives_smp_module_add()` leaves those entries and their existing
     // SMP-safe lock prefixes untouched unless the whole kernel was previously
     // patched for UP execution; Lupos never enters that UP-patched state.
-    let arch_metadata = module_finalize(&mut sections).map_err(|error| match error {
-        X86ModuleFinalizeError::BadSection(name) => {
-            LoadModuleError::UnsupportedSection(String::from(name))
-        }
-    })?;
+    let arch_metadata =
+        module_finalize_with_static_call_tramp_keys(&mut sections, &static_call_tramp_keys)
+            .map_err(|error| match error {
+                X86ModuleFinalizeError::BadSection(name) => {
+                    LoadModuleError::UnsupportedSection(String::from(name))
+                }
+            })?;
     let num_orcs = u32::try_from(arch_metadata.num_orcs).map_err(|_| LoadModuleError::BadElf)?;
     unsafe {
         write_module_u32(
@@ -2447,7 +2592,6 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
     })?;
 
     // ── 8. Generic finalization, permissions, construct, and insert ─────────
-    let module_exports = module_exports_from_sections(&sections)?;
     let exported_symbols = module_exports
         .iter()
         .map(|export| export.name.clone())
@@ -2516,13 +2660,12 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
     // any relocated metadata.  ftrace activation is the first prepare-coming
     // hook, followed by tracepoint/kprobe/debug/BPF registrations.
     unsafe { write_module_state(this_module_addr, ModuleState::Coming) };
-    runtime_metadata.coming(&sections, &mod_name)?;
-
     let module = Arc::new(KernelModule {
         name: mod_name.clone(),
         this_module_addr,
         _arch_metadata: arch_metadata,
         runtime_metadata,
+        teardown_lock: SleepingMutex::new(()),
         srcu_registration,
         bug_registration,
         sections,
@@ -2531,6 +2674,15 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
         exit_field_offset,
         constructors,
     });
+    // Link the descriptor before the notifier chain starts.  A partial
+    // COMING failure can then retain this Arc and all backing sections if a
+    // compensating teardown text poke also fails.
+    MODULES.lock().insert(mod_name.clone(), module.clone());
+    if let Err(error) = module.runtime_metadata.coming(&module.sections, &mod_name) {
+        module.set_state(ModuleState::Going);
+        release_failed_formation(&module, &mod_name, &mut identity);
+        return Err(error);
+    }
 
     for export in module_exports.iter() {
         export_module_symbol_with_crc(
@@ -2541,18 +2693,12 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
             export.crc,
         );
     }
-    MODULES.lock().insert(mod_name.clone(), module.clone());
 
     // ── 9. Call init_module() ─────────────────────────────────────────────────
     if let Some(constructors) = module.constructors {
         if unsafe { constructors.run() }.is_err() {
             module.set_state(ModuleState::Going);
-            MODULES.lock().remove(&mod_name);
-            unexport_module_symbols(&mod_name);
-            let _ = module.runtime_metadata.release();
-            module.srcu_registration.cleanup();
-            module.bug_registration.cleanup();
-            identity.release_before_descriptor();
+            release_failed_formation(&module, &mod_name, &mut identity);
             return Err(LoadModuleError::BadElf);
         }
     }
@@ -2562,12 +2708,7 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
         touch_module_load_watchdog();
         if rc < 0 {
             module.set_state(ModuleState::Going);
-            MODULES.lock().remove(&mod_name);
-            unexport_module_symbols(&mod_name);
-            let _ = module.runtime_metadata.release();
-            module.srcu_registration.cleanup();
-            module.bug_registration.cleanup();
-            identity.release_before_descriptor();
+            release_failed_formation(&module, &mod_name, &mut identity);
             // `-EEXIST` is reserved by [f]init_module for an already-loaded
             // module; Linux remaps that value when it comes from module init.
             let rc = if rc == -EEXIST { -EBUSY } else { rc };
@@ -2597,12 +2738,7 @@ pub fn load_module(elf: &[u8]) -> Result<Arc<KernelModule>, LoadModuleError> {
         if let Some(exit_fn) = module.exit() {
             unsafe { exit_fn() };
         }
-        MODULES.lock().remove(&mod_name);
-        unexport_module_symbols(&mod_name);
-        let _ = module.runtime_metadata.release();
-        module.srcu_registration.cleanup();
-        module.bug_registration.cleanup();
-        identity.release_before_descriptor();
+        release_failed_formation(&module, &mod_name, &mut identity);
         return Err(LoadModuleError::InitFailed(-error.abs()));
     }
     module.set_state(ModuleState::Live);
@@ -2620,19 +2756,34 @@ pub fn delete_module(name: &str) -> Result<(), i32> {
     // deletion fail.
     let module = {
         let modules = MODULES.lock();
-        let module = modules.get(name).cloned().ok_or(ENOENT)?;
-        if module.state() != ModuleState::Live {
-            return Err(EBUSY);
+        modules.get(name).cloned().ok_or(ENOENT)?
+    };
+    let _teardown = module.teardown_lock.lock();
+    let first_attempt = {
+        let modules = MODULES.lock();
+        if !modules
+            .get(name)
+            .is_some_and(|loaded| Arc::ptr_eq(loaded, &module))
+        {
+            return Err(ENOENT);
         }
-        // Freeze new unload-pinning raw-tracepoint references before making
-        // the state transition visible.  All notifier-backed metadata stays
-        // registered through cleanup_module(), matching Linux delete_module.
-        module.runtime_metadata.begin_going()?;
-        module.set_state(ModuleState::Going);
-        module
+        match module.state() {
+            ModuleState::Live => {
+                // Freeze new unload-pinning raw-tracepoint references before
+                // making the state transition visible.
+                module.runtime_metadata.begin_going()?;
+                module.set_state(ModuleState::Going);
+                true
+            }
+            // A prior safety-critical notifier failure deliberately retains
+            // the descriptor in GOING.  Retry only the idempotent teardown;
+            // cleanup_module() must never execute twice.
+            ModuleState::Going => false,
+            ModuleState::Coming | ModuleState::Unformed => return Err(EBUSY),
+        }
     };
 
-    if let Some(exit_fn) = module.exit() {
+    if first_attempt && let Some(exit_fn) = module.exit() {
         unsafe {
             exit_fn();
         }
@@ -2667,6 +2818,49 @@ pub fn delete_module(name: &str) -> Result<(), i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn teardown_errno_boundary_accepts_either_internal_sign() {
+        assert_eq!(normalize_errno(EBUSY), EBUSY);
+        assert_eq!(normalize_errno(-EBUSY), EBUSY);
+        assert_eq!(normalize_errno(i32::MIN), EINVAL);
+    }
+
+    #[test]
+    fn teardown_progress_retries_only_failed_and_later_phases() {
+        let progress = ModuleTeardownProgress::default();
+        let first_hits = AtomicU32::new(0);
+        let retry_hits = AtomicU32::new(0);
+
+        progress
+            .run(TEARDOWN_RAW_TRACEPOINTS, || {
+                first_hits.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            progress.run(TEARDOWN_KPROBES, || {
+                retry_hits.fetch_add(1, Ordering::Relaxed);
+                Err(EBUSY)
+            }),
+            Err(EBUSY)
+        );
+
+        progress
+            .run(TEARDOWN_RAW_TRACEPOINTS, || {
+                first_hits.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .unwrap();
+        progress
+            .run(TEARDOWN_KPROBES, || {
+                retry_hits.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(retry_hits.load(Ordering::Relaxed), 2);
+    }
 
     fn write_i32(data: &mut [u8], offset: usize, value: i32) {
         data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -2879,6 +3073,70 @@ mod tests {
                 crc: None,
             }]
         );
+    }
+
+    #[test]
+    fn pairs_module_static_call_exports_generically() {
+        let exports = alloc::vec![
+            ModuleExport {
+                name: String::from("__SCT__tp_func_9p_fid_ref"),
+                addr: 0x1000,
+                gpl_only: false,
+                crc: None,
+            },
+            ModuleExport {
+                name: String::from("unrelated"),
+                addr: 0x2000,
+                gpl_only: false,
+                crc: None,
+            },
+            ModuleExport {
+                name: String::from("__SCK__tp_func_9p_fid_ref"),
+                addr: 0x3000,
+                gpl_only: false,
+                crc: None,
+            },
+            ModuleExport {
+                name: String::from("__SCT__unpaired"),
+                addr: 0x4000,
+                gpl_only: false,
+                crc: None,
+            },
+        ];
+
+        assert_eq!(
+            module_static_call_tramp_keys(&exports).expect("unambiguous static-call exports"),
+            alloc::vec![(0x1000, 0x3000)]
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_module_static_call_exports() {
+        let exports = alloc::vec![
+            ModuleExport {
+                name: String::from("__SCT__duplicate"),
+                addr: 0x1000,
+                gpl_only: false,
+                crc: None,
+            },
+            ModuleExport {
+                name: String::from("__SCT__duplicate"),
+                addr: 0x2000,
+                gpl_only: false,
+                crc: None,
+            },
+            ModuleExport {
+                name: String::from("__SCK__duplicate"),
+                addr: 0x3000,
+                gpl_only: false,
+                crc: None,
+            },
+        ];
+
+        assert!(matches!(
+            module_static_call_tramp_keys(&exports),
+            Err(LoadModuleError::BadElf)
+        ));
     }
 
     #[test]

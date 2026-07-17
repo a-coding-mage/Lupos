@@ -140,9 +140,10 @@ pub fn setup_percpu_segment(cpu: usize) {
     LINUX_PER_CPU_AREAS[cpu]
         .preempt_count
         .store(0, Ordering::Release);
-    LINUX_PER_CPU_AREAS[cpu]
-        .x86_call_depth
-        .store(crate::arch::x86::kernel::callthunks::RET_DEPTH_INIT, Ordering::Release);
+    LINUX_PER_CPU_AREAS[cpu].x86_call_depth.store(
+        crate::arch::x86::kernel::callthunks::RET_DEPTH_INIT,
+        Ordering::Release,
+    );
     if LINUX_PER_CPU_AREAS[cpu]
         .stack_chk_guard
         .load(Ordering::Acquire)

@@ -464,6 +464,7 @@ unsafe fn syscall_dispatch_ptregs_inner(
     let nr = unsafe { (*regs).orig_rax } as usize;
     let task = current_task_for_syscall();
     let hook_state = syscall_enter(unsafe { &*regs }, task);
+    trace_udev_syscall_enter(unsafe { &*regs }, task);
     // Draining the console here delivers terminal signals (Ctrl-C) promptly, but
     // `try_console_input` probes the i8042 status port (`inb 0x64`) when its
     // queue is empty — a port-I/O access that is a VM-exit under VirtualBox/KVM
@@ -536,7 +537,75 @@ unsafe fn syscall_dispatch_ptregs_inner(
     }
     syscall_exit(unsafe { &*regs }, ret, task, hook_state);
     trace_systemd_service_syscall(unsafe { &*regs }, ret, task);
+    trace_udev_syscall_exit(unsafe { &*regs }, ret, task);
     ret
+}
+
+#[cfg(not(test))]
+fn trace_udev_syscall_enter(
+    regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    task: *mut crate::kernel::task::TaskStruct,
+) {
+    if task.is_null()
+        || !crate::kernel::debug_trace::udev_enabled()
+        || !crate::kernel::debug_trace::syscall_enabled()
+    {
+        return;
+    }
+    let comm = unsafe { &(*task).comm };
+    if !comm_starts_with(comm, b"systemd-udevd") {
+        return;
+    }
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-udev-enter pid={} nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+        unsafe { (*task).pid },
+        regs.orig_rax,
+        regs.arg0(),
+        regs.arg1(),
+        regs.arg2(),
+        regs.arg3(),
+        regs.arg4(),
+        regs.arg5()
+    );
+}
+
+#[cfg(test)]
+fn trace_udev_syscall_enter(
+    _regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    _task: *mut crate::kernel::task::TaskStruct,
+) {
+}
+
+#[cfg(not(test))]
+fn trace_udev_syscall_exit(
+    regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    ret: i64,
+    task: *mut crate::kernel::task::TaskStruct,
+) {
+    if task.is_null()
+        || !crate::kernel::debug_trace::udev_enabled()
+        || !crate::kernel::debug_trace::syscall_enabled()
+    {
+        return;
+    }
+    let comm = unsafe { &(*task).comm };
+    if !comm_starts_with(comm, b"systemd-udevd") {
+        return;
+    }
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-udev-exit pid={} nr={} ret={}",
+        unsafe { (*task).pid },
+        regs.orig_rax,
+        ret
+    );
+}
+
+#[cfg(test)]
+fn trace_udev_syscall_exit(
+    _regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    _ret: i64,
+    _task: *mut crate::kernel::task::TaskStruct,
+) {
 }
 
 /// Helper function to get the current CPU's ID.
@@ -896,6 +965,8 @@ fn syscall_enter(
     }
     trace_ping_syscall_enter(regs, task);
     trace_executor_syscall_enter(regs, task);
+    trace_bwrap_syscall_enter(regs, task);
+    trace_xfce_syscall_enter(regs, task);
     trace_syscall(TRACE_SYSCALL_ENTER, regs, 0, pid);
     SyscallHookState { audit_matched }
 }
@@ -1021,6 +1092,165 @@ fn trace_executor_syscall_enter(
 }
 
 #[cfg(not(test))]
+static TRACE_BWRAP_SYSCALL_ENTER_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(not(test))]
+fn trace_bwrap_syscall_enter(
+    regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    task: *mut crate::kernel::task::TaskStruct,
+) {
+    if task.is_null() || !crate::kernel::debug_trace::glycin_enabled() {
+        return;
+    }
+    let comm = unsafe { &(*task).comm };
+    if !comm_starts_with(comm, b"bwrap") {
+        return;
+    }
+    let count = TRACE_BWRAP_SYSCALL_ENTER_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    if count >= 800 {
+        return;
+    }
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-bwrap-sys-enter seq={} pid={} nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+        count,
+        unsafe { (*task).pid },
+        regs.orig_rax,
+        regs.arg0(),
+        regs.arg1(),
+        regs.arg2(),
+        regs.arg3(),
+        regs.arg4(),
+        regs.arg5()
+    );
+}
+
+#[cfg(test)]
+fn trace_bwrap_syscall_enter(
+    _regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    _task: *mut crate::kernel::task::TaskStruct,
+) {
+}
+
+#[cfg(not(test))]
+static TRACE_XFCE_SYSCALL_ENTER_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Trace the blocking/IPC/process syscalls involved in the stock Xfce
+/// session's private D-Bus bootstrap.  This is deliberately behind the same
+/// opt-in image-loader diagnostic flag used by the graphical gate: normal
+/// boots pay only the flag/comm checks, and vendor programs/configuration are
+/// never wrapped or changed to obtain the trace.
+#[cfg(not(test))]
+fn trace_xfce_syscall_enter(
+    regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    task: *mut crate::kernel::task::TaskStruct,
+) {
+    if task.is_null() || !crate::kernel::debug_trace::glycin_enabled() {
+        return;
+    }
+    // Keep this diagnostic scoped to the authenticated desktop session.  A
+    // root-owned standalone D-Bus probe uses the same executable names and
+    // otherwise consumes the trace budget before the real session reaches
+    // its daemonisation path.
+    if task_euid_for_trace(task) != Some(1000) {
+        return;
+    }
+    let comm = unsafe { &(*task).comm };
+    if !comm_starts_with(comm, b"xfce4-session")
+        && !comm_starts_with(comm, b"dbus-launch")
+        && !comm_starts_with(comm, b"dbus-daemon")
+    {
+        return;
+    }
+    let nr = regs.orig_rax;
+    if !matches!(
+        nr,
+        0 | 1 | 3 | 7 | 13 | 14 | 16 | 21 | 23 | 32 | 33 | 41..=62 | 72 | 109..=126
+            | 202 | 217 | 231..=234 | 247 | 257 | 262 | 270 | 271 | 281 | 288
+            | 290..=293 | 302 | 318 | 322 | 435 | 441
+    ) {
+        return;
+    }
+    let count = TRACE_XFCE_SYSCALL_ENTER_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    if count >= 8_000 {
+        return;
+    }
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-xfce-sys-enter seq={} pid={} tgid={} comm={} nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+        count,
+        unsafe { (*task).pid },
+        unsafe { (*task).tgid },
+        comm_for_trace(comm),
+        nr,
+        regs.arg0(),
+        regs.arg1(),
+        regs.arg2(),
+        regs.arg3(),
+        regs.arg4(),
+        regs.arg5()
+    );
+
+    let path_ptr = match nr {
+        21 => regs.arg0(),        // access(2)
+        257 | 262 => regs.arg1(), // openat/newfstatat
+        _ => 0,
+    };
+    if path_ptr != 0 {
+        trace_xfce_user_path(unsafe { (*task).pid }, nr, path_ptr);
+    }
+}
+
+#[cfg(not(test))]
+fn task_euid_for_trace(task: *mut crate::kernel::task::TaskStruct) -> Option<u32> {
+    if task.is_null() {
+        return None;
+    }
+    let cred = unsafe { (*task).cred };
+    if cred.is_null() {
+        None
+    } else {
+        Some(unsafe { (*cred).euid.0 })
+    }
+}
+
+#[cfg(not(test))]
+fn trace_xfce_user_path(pid: i32, nr: u64, ptr: u64) {
+    let mut bytes = [0u8; 192];
+    let copied = unsafe {
+        crate::arch::x86::kernel::uaccess::strncpy_from_user(
+            bytes.as_mut_ptr(),
+            ptr as *const u8,
+            bytes.len(),
+        )
+    };
+    if copied < 0 {
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-xfce-path pid={} nr={} path=<fault:{}>",
+            pid,
+            nr,
+            copied
+        );
+        return;
+    }
+    let len = (copied as usize).min(bytes.len());
+    let path = core::str::from_utf8(&bytes[..len]).unwrap_or("<non-utf8>");
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-xfce-path pid={} nr={} path={}",
+        pid,
+        nr,
+        path
+    );
+}
+
+#[cfg(test)]
+fn trace_xfce_syscall_enter(
+    _regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    _task: *mut crate::kernel::task::TaskStruct,
+) {
+}
+
+#[cfg(not(test))]
 fn trace_systemd_service_syscall(
     regs: &crate::arch::x86::kernel::ptrace::PtRegs,
     ret: i64,
@@ -1034,17 +1264,39 @@ fn trace_systemd_service_syscall(
     let syscall_trace = crate::kernel::debug_trace::syscall_enabled();
     let ping_trace = crate::kernel::debug_trace::ping_enabled();
     let systemctl_trace = crate::kernel::debug_trace::systemctl_enabled();
-    if !syscall_trace && !ping_trace && !systemctl_trace {
+    let glycin_trace = crate::kernel::debug_trace::glycin_enabled();
+    if !syscall_trace && !ping_trace && !systemctl_trace && !glycin_trace {
         return;
     }
     let trace_pid1 = syscall_trace && pid == 1;
     let trace_systemd_service = syscall_trace && comm_starts_with(comm, b"systemd-");
+    let trace_dbus_broker = syscall_trace && comm_starts_with(comm, b"dbus-broker");
     let trace_systemctl =
         (syscall_trace || systemctl_trace) && comm_starts_with(comm, b"systemctl");
     let trace_dbus = systemctl_trace && comm_starts_with(comm, b"dbus-daemon");
     let trace_ping = ping_trace
         && (comm_starts_with(comm, b"ping") || crate::kernel::debug_trace::ping_pid_matches(pid));
-    if !trace_pid1 && !trace_systemd_service && !trace_systemctl && !trace_dbus && !trace_ping {
+    let trace_desktop_session = task_euid_for_trace(task) == Some(1000)
+        && (comm_starts_with(comm, b"xfce4-session")
+            || comm_starts_with(comm, b"dbus-launch")
+            || comm_starts_with(comm, b"dbus-daemon"));
+    let trace_user_manager = task_euid_for_trace(task) == Some(1000)
+        && (comm_starts_with(comm, b"systemd") || comm_starts_with(comm, b"dbus-broker"));
+    let trace_glycin = glycin_trace
+        && (comm_starts_with(comm, b"glycin")
+            || comm_starts_with(comm, b"bwrap")
+            || comm_starts_with(comm, b"glycin-image")
+            || comm_starts_with(comm, b"lightdm-gtk-gre")
+            || trace_desktop_session
+            || trace_user_manager);
+    if !trace_pid1
+        && !trace_systemd_service
+        && !trace_dbus_broker
+        && !trace_systemctl
+        && !trace_dbus
+        && !trace_ping
+        && !trace_glycin
+    {
         return;
     }
     let nr = regs.orig_rax;
@@ -1055,7 +1307,7 @@ fn trace_systemd_service_syscall(
         trace_ping,
         trace_systemctl || trace_dbus,
     );
-    if !interesting {
+    if !interesting && !(trace_glycin && (ret < 0 || comm_starts_with(comm, b"bwrap"))) {
         return;
     }
     crate::linux_driver_abi::tty::serial_println!(
@@ -1090,11 +1342,15 @@ fn trace_service_syscall_is_interesting(
                 | 157
                 | 165
                 | 166
+                | 232
+                | 233
                 | 259
                 | 272
+                | 281
                 | 288
                 | 291
                 | 321
+                | 441
         )
         || (trace_ping
             && matches!(

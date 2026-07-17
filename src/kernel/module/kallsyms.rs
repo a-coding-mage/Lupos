@@ -77,9 +77,11 @@ pub fn register(mut table: ModuleKallsyms) -> Result<(), KallsymsError> {
     }
     // Linux's lookup walks values; sorting here makes nearest-symbol lookup
     // deterministic while retaining duplicate aliases at the same address.
-    table
-        .symbols
-        .sort_by(|left, right| left.address.cmp(&right.address).then(left.name.cmp(&right.name)));
+    table.symbols.sort_by(|left, right| {
+        left.address
+            .cmp(&right.address)
+            .then(left.name.cmp(&right.name))
+    });
 
     let mut modules = MODULE_KALLSYMS.lock();
     if modules.iter().any(|entry| entry.module == table.module) {

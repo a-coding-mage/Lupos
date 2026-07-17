@@ -3935,7 +3935,8 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         init::rootfs::bootstrap_initramfs_rootfs_with_options(&initramfs_boot_options)
             .expect("initramfs rootfs bootstrap");
         assert!(init::rootfs::path_exists("/dev/console"));
-        assert!(init::rootfs::path_exists("/dev/tty6"));
+        assert!(init::rootfs::path_exists("/dev/tty7"));
+        assert!(init::rootfs::path_exists("/dev/tty63"));
         assert!(init::rootfs::path_exists("/dev/vda1"));
         assert!(init::rootfs::path_exists("/proc/self/stat"));
         assert!(init::rootfs::path_exists("/sys/kernel"));
@@ -5033,8 +5034,13 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         use kernel::module::{
             delete_module, export_symbol, find_module, find_symbol, inserted_modules, load_module,
         };
+        use kernel::trace::fgraph::{
+            FgraphEntry, FgraphOps, FgraphReturn, register_ftrace_graph, unregister_ftrace_graph,
+        };
         use kernel::trace::ftrace;
-        use kernel::trace::kprobe::{Kprobe, register_kprobe, unregister_kprobe};
+        use kernel::trace::kprobe::{
+            Kprobe, kprobe_is_optimized, register_kprobe, unregister_kprobe,
+        };
         use kernel::trace::ring_buffer::{TRACE_FN, TRACE_RB, TraceEvent};
 
         static VENDOR_MODULE: &[u8] = include_bytes!(env!("LUPOS_TEST_VENDOR_MODULE"));
@@ -5118,6 +5124,37 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         set_cpu_cap(X86_FEATURE_RETPOLINE);
         set_cpu_cap(X86_FEATURE_RETHUNK);
         set_cpu_cap(X86_FEATURE_CALL_DEPTH);
+        let require_hardware_ibt = fs::proc::cmdline::saved_command_line()
+            .split_ascii_whitespace()
+            .any(|arg| arg == "lupos.require_ibt=1");
+        let hardware_ibt = arch::x86::kernel::cet::kernel_ibt_enabled();
+        if require_hardware_ibt {
+            assert!(hardware_ibt, "hardware supervisor IBT was required");
+        }
+        if hardware_ibt {
+            assert!(
+                arch::x86::kernel::cet::kernel_ibt_enabled(),
+                "hardware missing-ENDBR #CP selftest passed"
+            );
+            let supervisor_cet = unsafe {
+                arch::x86::kernel::msr::rdmsr_safe(arch::x86::kernel::cet::MSR_IA32_S_CET)
+                    .expect("read IA32_S_CET")
+            };
+            let cr4: u64;
+            unsafe {
+                core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+            }
+            assert_ne!(
+                supervisor_cet & arch::x86::kernel::cet::CET_ENDBR_EN,
+                0,
+                "IA32_S_CET.ENDBR_EN active"
+            );
+            assert_ne!(
+                cr4 & arch::x86::kernel::cet::X86_CR4_CET,
+                0,
+                "CR4.CET active"
+            );
+        }
         let module = load_module(VENDOR_MODULE).expect("load unchanged vendor 9pnet.ko");
         assert_eq!(module.name, "9pnet");
         let arch = module.arch_metadata();
@@ -5162,11 +5199,14 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
 
         // 9. Exercise live static-call transforms on the module's genuine
         // tracepoint key/trampoline, then restore the vendor-selected target.
-        let static_call_key = find_symbol("__SCK__tp_func_9p_fid_ref")
-            .expect("9p static-call key export") as *mut usize;
         let static_call_tramp = find_symbol("__SCT__tp_func_9p_fid_ref")
             .expect("9p static-call trampoline export")
             as *mut c_void;
+        let static_call_key = arch::x86::kernel::static_call::static_call_key_for_trampoline(
+            static_call_tramp as usize,
+        )
+        .expect("discover 9p static-call key from generic module export relation")
+            as *mut usize;
         let original_static_target = unsafe { static_call_key.read_volatile() };
         assert_ne!(original_static_target, 0);
         unsafe {
@@ -5248,6 +5288,9 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         // proves the registered ORC table can unwind that live module frame.
         static ORC_EXPECTED_IP: AtomicUsize = AtomicUsize::new(0);
         static ORC_LIVE_UNWIND_OK: AtomicBool = AtomicBool::new(false);
+        static MULTI_OP_HITS: AtomicU32 = AtomicU32::new(0);
+        static GRAPH_ENTRY_OK: AtomicBool = AtomicBool::new(false);
+        static GRAPH_RETURN_OK: AtomicBool = AtomicBool::new(false);
         fn module_orc_probe(ip: u64, parent_ip: u64, sp: u64, bp: u64) {
             if ip as usize != ORC_EXPECTED_IP.load(Ordering::Acquire) {
                 return;
@@ -5265,6 +5308,33 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
                 ORC_LIVE_UNWIND_OK.store(true, Ordering::Release);
             }
         }
+        fn module_multi_probe(ip: u64, _parent: u64, _sp: u64, _bp: u64, expected: usize) {
+            if ip as usize == expected {
+                MULTI_OP_HITS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn module_graph_entry(entry: &FgraphEntry, expected: usize) -> bool {
+            let selected = entry.func as usize == expected;
+            if selected {
+                GRAPH_ENTRY_OK.store(true, Ordering::Release);
+            }
+            selected
+        }
+        fn module_graph_return(ret: &FgraphReturn, expected: usize) {
+            if ret.func as usize == expected && ret.retval == 0 {
+                GRAPH_RETURN_OK.store(true, Ordering::Release);
+            }
+        }
+        let multi_ops = Box::leak(Box::new(ftrace::FtraceOps {
+            func: module_multi_probe,
+            filter: None,
+            data: parse_record.ip,
+        }));
+        let graph_ops = Box::leak(Box::new(FgraphOps {
+            entry: module_graph_entry,
+            return_: module_graph_return,
+            data: parse_record.ip,
+        }));
         TRACE_RB.set_enabled(true);
         let mut discarded = [TraceEvent::empty(); 64];
         while TRACE_RB.drain(&mut discarded) != 0 {}
@@ -5274,7 +5344,11 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         ORC_LIVE_UNWIND_OK.store(false, Ordering::Release);
         ftrace::register_ftrace_regs_function(module_orc_probe)
             .expect("enable register-aware vendor ftrace callback");
+        ftrace::register_ftrace_ops(&*multi_ops).expect("enable independent ftrace_ops callback");
+        register_ftrace_graph(&*graph_ops).expect("enable function-graph return hook");
         invoke_p9_parse_header(parse);
+        unregister_ftrace_graph(&*graph_ops).expect("disable function-graph return hook");
+        ftrace::unregister_ftrace_ops(&*multi_ops).expect("disable ftrace_ops callback");
         ftrace::unregister_ftrace_function();
         ftrace::unregister_ftrace_regs_function();
         let mut traced = [TraceEvent::empty(); 64];
@@ -5289,34 +5363,43 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             ORC_LIVE_UNWIND_OK.load(Ordering::Acquire),
             "ORC unwound the live vendor frame to its real caller"
         );
+        assert_eq!(MULTI_OP_HITS.load(Ordering::Acquire), 1);
+        assert!(GRAPH_ENTRY_OK.load(Ordering::Acquire));
+        assert!(GRAPH_RETURN_OK.load(Ordering::Acquire));
 
-        // 12. Probe the same ENDBR function.  x86 kprobes preserves the IBT
-        // landing pad, executes the displaced fentry NOP, and invokes both
-        // handlers.  Leave it registered across delete_module() to verify the
-        // GOING notifier disarms module-owned probes before freeing text.
+        // 12. Optimize a probe in the same real vendor function. x86 kprobes
+        // preserves the IBT landing pad, executes its detour plus relocated
+        // fentry NOP, and leaves it registered across delete_module() to prove
+        // GOING disarms optimized module probes before freeing text.
         static PRE_HITS: AtomicU32 = AtomicU32::new(0);
-        static POST_HITS: AtomicU32 = AtomicU32::new(0);
         fn module_kprobe_pre(_addr: u64, _data: usize) {
             PRE_HITS.fetch_add(1, Ordering::Relaxed);
-        }
-        fn module_kprobe_post(_addr: u64, _data: usize) {
-            POST_HITS.fetch_add(1, Ordering::Relaxed);
         }
         let probe = Box::leak(Box::new(Kprobe {
             addr: parse_addr as u64,
             data: 0,
             pre: Some(module_kprobe_pre),
-            post: Some(module_kprobe_post),
+            post: None,
             enabled: AtomicBool::new(false),
         }));
         register_kprobe(&*probe).expect("register probe in vendor module text");
+        assert!(
+            kprobe_is_optimized(probe.addr),
+            "vendor module probe uses optimized detour"
+        );
         invoke_p9_parse_header(parse);
         assert_eq!(PRE_HITS.load(Ordering::Acquire), 1);
-        assert_eq!(POST_HITS.load(Ordering::Acquire), 1);
 
         delete_module("9pnet").expect("unload unchanged vendor 9pnet.ko");
         assert!(find_module("9pnet").is_none());
         assert!(ftrace::module_records(owner).is_empty());
+        assert_eq!(
+            arch::x86::kernel::static_call::static_call_key_for_trampoline(
+                static_call_tramp as usize
+            ),
+            None,
+            "module static-call relation withdrawn while an external Arc still retains memory"
+        );
         assert!(
             arch::x86::kernel::unwind_orc::orc_module_find(parse_record.ip).is_none(),
             "module ORC table unregistered before memory release"
@@ -5836,7 +5919,9 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         use alloc::boxed::Box;
         use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         use kernel::trace::ftrace;
-        use kernel::trace::kprobe::{Kprobe, register_kprobe, unregister_kprobe};
+        use kernel::trace::kprobe::{
+            Kprobe, kprobe_is_optimized, register_kprobe, unregister_kprobe,
+        };
         use kernel::trace::ring_buffer::{TRACE_RB, TraceEvent};
         use kernel::trace::tracepoint::{Tracepoint, TracepointProbe};
 
@@ -5918,6 +6003,38 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         assert_eq!(PRE_HITS.load(Ordering::Relaxed), 3);
         assert_eq!(POST_HITS.load(Ordering::Relaxed), 3);
         log_info!("m62", "ftrace-kprobes: kprobe pre+post fired 3x ok");
+
+        // 4. A pre-only probe is eligible for the x86 optprobe detour.  This
+        // executes the generated save/callback/relocated-insn/jump-back path,
+        // not the INT3 single-step fallback used above for post-handlers.
+        static OPT_HITS: AtomicU32 = AtomicU32::new(0);
+        fn opt_pre(_addr: u64, _data: usize) {
+            OPT_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        #[inline(never)]
+        extern "C" fn optprobe_live_target(value: u64) -> u64 {
+            core::hint::black_box(value.wrapping_mul(3).wrapping_add(2))
+        }
+        let opt_target: extern "C" fn(u64) -> u64 = optprobe_live_target;
+        let optprobe = Box::leak(Box::new(Kprobe {
+            addr: opt_target as usize as u64,
+            data: 0,
+            pre: Some(opt_pre),
+            post: None,
+            enabled: AtomicBool::new(false),
+        }));
+        register_kprobe(&*optprobe).expect("optimized kprobe register");
+        assert!(
+            kprobe_is_optimized(optprobe.addr),
+            "pre-only probe optimized"
+        );
+        assert_eq!(opt_target(5), 17);
+        assert_eq!(opt_target(9), 29);
+        assert_eq!(OPT_HITS.load(Ordering::Acquire), 2);
+        unregister_kprobe(optprobe.addr).expect("optimized kprobe unregister");
+        assert_eq!(opt_target(11), 35);
+        assert_eq!(OPT_HITS.load(Ordering::Acquire), 2);
+        log_info!("m62", "ftrace-kprobes: optimized detour fired 2x ok");
 
         log_info!(
             "m62",
@@ -6308,6 +6425,35 @@ fn panic(info: &PanicInfo<'_>) -> ! {
             );
         }
     }
+    let (duplicate_frees, duplicate_pfn, duplicate_order) = mm::buddy::duplicate_free_snapshot();
+    serial_println!(
+        "  buddy: duplicate_frees={} last_pfn={:#x} last_order={}",
+        duplicate_frees,
+        duplicate_pfn,
+        duplicate_order
+    );
+    if let Some((file, line)) = mm::buddy::duplicate_free_caller() {
+        serial_println!("  buddy: last duplicate caller {}:{}", file, line);
+    }
+    let (slab_rejections, slab_ptr, slab_head_pfn, slab_reason) =
+        mm::slab::slab_free_rejection_snapshot();
+    serial_println!(
+        "  slab: free_rejections={} last_ptr={:#x} last_head_pfn={:#x} last_reason={}",
+        slab_rejections,
+        slab_ptr,
+        slab_head_pfn,
+        slab_reason
+    );
+    let (slab_cache, slab_object_size, slab_slot_size, slab_inuse, slab_cursor) =
+        mm::slab::slab_free_rejection_detail();
+    serial_println!(
+        "  slab: cache={:#x} object_size={} slot_size={} inuse={} bad_cursor={:#x}",
+        slab_cache,
+        slab_object_size,
+        slab_slot_size,
+        slab_inuse,
+        slab_cursor
+    );
     dump_panic_stack();
     serial_println!("====================");
     serial_print!("\x1b[0m");

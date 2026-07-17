@@ -1,6 +1,6 @@
 //! linux-parity: complete
-//! linux-source: vendor/linux/lib/crc/arm64/crc64-neon-inner.c
-//! test-origin: linux:vendor/linux/lib/crc/arm64/crc64-neon-inner.c
+//! linux-source: vendor/linux/lib/crc/crc64-neon.c
+//! test-origin: linux:vendor/linux/lib/crc/crc64-neon.c
 //! CRC64-NVME ARM64 PMULL inner routine, represented by an equivalent scalar path.
 
 pub const CRC64_NVME_POLY_REFLECTED: u64 = 0x9A6C_9329_AC4B_C9B5;

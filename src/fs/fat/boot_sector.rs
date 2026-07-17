@@ -6,11 +6,7 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-
-use lazy_static::lazy_static;
-use spin::Mutex;
 
 use crate::block::block_device::BlockDeviceRef;
 use crate::block::partitions::read_sectors;
@@ -95,17 +91,11 @@ pub fn sbi_from_bpb(bdev: BlockDeviceRef, bpb: &Bpb) -> FatSbi {
     }
 }
 
-lazy_static! {
-    static ref FAT_SBI_REGISTRY: Mutex<BTreeMap<u64, Arc<FatSbi>>> = Mutex::new(BTreeMap::new());
-}
-
 pub fn stash_sbi(sb: &SuperBlockRef, sbi: Arc<FatSbi>) -> Result<(), i32> {
-    let key = Arc::as_ptr(sb) as u64;
-    FAT_SBI_REGISTRY.lock().insert(key, sbi);
+    sb.set_fs_private(sbi);
     Ok(())
 }
 
 pub fn get_sbi(sb: &SuperBlockRef) -> Option<Arc<FatSbi>> {
-    let key = Arc::as_ptr(sb) as u64;
-    FAT_SBI_REGISTRY.lock().get(&key).cloned()
+    sb.fs_private::<FatSbi>()
 }

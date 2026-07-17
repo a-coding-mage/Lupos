@@ -108,10 +108,14 @@ struct LinuxDevicePrivate {
     name: [u8; 64],
 }
 
-const LINUX_DEVICE_RELEASE_OFFSET: usize = 712;
+/// Size and release-field offset of `struct device` in the configured vendor
+/// x86_64 ABI. Raw module-owned objects contain the full structure even though
+/// [`LinuxDevice`] models only the prefix consumed directly by this layer.
+pub const LINUX_STRUCT_DEVICE_SIZE: usize = 760;
+pub const LINUX_DEVICE_RELEASE_OFFSET: usize = 712;
 const KOBJ_STATE_INITIALIZED: u32 = 1 << 0;
 const KOBJ_STATE_IN_SYSFS: u32 = 1 << 1;
-type LinuxDeviceReleaseFn = unsafe extern "C" fn(*mut LinuxDevice);
+pub type LinuxDeviceReleaseFn = unsafe extern "C" fn(*mut LinuxDevice);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceState {
@@ -623,6 +627,29 @@ unsafe fn linux_device_release_fn(dev: *mut LinuxDevice) -> Option<LinuxDeviceRe
     }
 }
 
+/// Install `dev->release` in a full vendor-layout `struct device`.
+///
+/// # Safety
+///
+/// `dev` must point to at least [`LINUX_STRUCT_DEVICE_SIZE`] writable bytes,
+/// as it does for module-owned devices and Lupos allocations that embed one.
+pub unsafe fn linux_device_set_release(
+    dev: *mut LinuxDevice,
+    release: Option<LinuxDeviceReleaseFn>,
+) {
+    if dev.is_null() {
+        return;
+    }
+    unsafe {
+        core::ptr::write(
+            dev.cast::<u8>()
+                .add(LINUX_DEVICE_RELEASE_OFFSET)
+                .cast::<Option<LinuxDeviceReleaseFn>>(),
+            release,
+        );
+    }
+}
+
 unsafe fn linux_device_release_at_zero(dev: *mut LinuxDevice) {
     let private = unsafe { (*dev).p };
     let release = unsafe { linux_device_release_fn(dev) };
@@ -1073,6 +1100,7 @@ mod tests {
         assert_eq!(offset_of!(LinuxDevice, platform_data), 112);
         assert_eq!(offset_of!(LinuxDevice, driver_data), 120);
         assert_eq!(size_of::<LinuxDevice>(), 128);
+        assert_eq!(LINUX_STRUCT_DEVICE_SIZE, 760);
         assert_eq!(LINUX_DEVICE_RELEASE_OFFSET, 712);
     }
 

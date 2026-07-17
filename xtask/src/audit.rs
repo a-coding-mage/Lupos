@@ -1,11 +1,9 @@
 //! test-origin: lupos-specific:xtask audit tooling and report regression tests
 //! Linux layout and parity audits.
 //!
-//! Walks [src/docs/linux-layout-map.tsv] and [src/docs/linux-layout-exceptions.tsv]
-//! and verifies that the Rust runtime under `src/` is fully accounted for: every
-//! mapped `.rs` file exists on disk, every claimed `vendor/linux/` counterpart
-//! exists under `vendor/linux/`, and every `.rs` file under `src/` is either
-//! mapped or registered as an explicit Rust-only exception.
+//! Uses the checked-in layout TSVs when present. Repositories that have
+//! migrated those generated files away derive the same mapping from each Rust
+//! file's `linux-source` header and classify untagged files as Rust-only.
 //!
 //! Drift triggers a non-zero exit, mirroring the no-regression policy in
 //! `CLAUDE.md` (rule 4).  Output report at `target/xtask/audit-layout.tsv`.
@@ -202,14 +200,51 @@ fn walk_collect_rs(dir: &Path, repo: &Path, out: &mut Vec<PathBuf>) -> Result<()
 /// caller decides how to surface it.  Splitting "compute" from "side effects"
 /// lets the unit tests assert findings without writing to `target/`.
 pub(crate) fn run_audit(repo: &Path) -> Result<AuditReport> {
-    let map_text = fs::read_to_string(repo.join(LAYOUT_MAP_PATH))
-        .with_context(|| format!("failed to read {LAYOUT_MAP_PATH}"))?;
-    let map = parse_layout_map(&map_text)?;
-    let exc_text = fs::read_to_string(repo.join(LAYOUT_EXCEPTIONS_PATH))
-        .with_context(|| format!("failed to read {LAYOUT_EXCEPTIONS_PATH}"))?;
-    let exceptions = parse_layout_exceptions(&exc_text)?;
     let rs_files = collect_rs_files(repo)?;
+    let (map, exceptions) = load_or_derive_layout(repo, &rs_files)?;
     Ok(audit_against_data(repo, &map, &exceptions, &rs_files))
+}
+
+fn load_or_derive_layout(
+    repo: &Path,
+    rs_files: &[PathBuf],
+) -> Result<(Vec<LayoutMapRow>, Vec<LayoutExceptionRow>)> {
+    let map_path = repo.join(LAYOUT_MAP_PATH);
+    let exceptions_path = repo.join(LAYOUT_EXCEPTIONS_PATH);
+    if map_path.is_file() {
+        let map_text = fs::read_to_string(&map_path)
+            .with_context(|| format!("failed to read {LAYOUT_MAP_PATH}"))?;
+        let exceptions = if exceptions_path.is_file() {
+            let exceptions_text = fs::read_to_string(&exceptions_path)
+                .with_context(|| format!("failed to read {LAYOUT_EXCEPTIONS_PATH}"))?;
+            parse_layout_exceptions(&exceptions_text)?
+        } else {
+            Vec::new()
+        };
+        return Ok((parse_layout_map(&map_text)?, exceptions));
+    }
+
+    let mut map = Vec::new();
+    let mut exceptions = Vec::new();
+    for path in rs_files {
+        let lupos_path = path.to_string_lossy().replace('\\', "/");
+        let text = fs::read_to_string(repo.join(path))
+            .with_context(|| format!("failed to read {lupos_path}"))?;
+        let sources = scan_linux_source_tags(&text);
+        if sources.is_empty() {
+            exceptions.push(LayoutExceptionRow {
+                lupos_path,
+                reason: "Rust-only source (no linux-source header)".to_owned(),
+            });
+        } else {
+            map.extend(sources.into_iter().map(|linux_path| LayoutMapRow {
+                lupos_path: lupos_path.clone(),
+                linux_path,
+                note: "derived-from-linux-source-header".to_owned(),
+            }));
+        }
+    }
+    Ok((map, exceptions))
 }
 
 /// Pure audit logic — no I/O.  All filesystem checks consult `repo` via
@@ -655,12 +690,35 @@ pub(crate) fn scan_linux_source_tags(text: &str) -> BTreeSet<String> {
             if let Some(value) = rest.strip_prefix("linux-source:") {
                 let value = value.trim();
                 if !value.is_empty() {
-                    sources.insert(value.to_owned());
+                    sources.extend(expand_linux_source_value(value));
                 }
             }
         }
     }
     sources
+}
+
+fn expand_linux_source_value(value: &str) -> BTreeSet<String> {
+    let mut expanded = BTreeSet::new();
+    if let (Some(open), Some(close)) = (value.find('{'), value.find('}')) {
+        if open < close {
+            let prefix = &value[..open];
+            let suffix = &value[close + 1..];
+            for alternative in value[open + 1..close].split(',') {
+                expanded.insert(format!("{prefix}{}{suffix}", alternative.trim()));
+            }
+            return expanded;
+        }
+    }
+
+    expanded.extend(
+        value
+            .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned),
+    );
+    expanded
 }
 
 // ===========================================================================
@@ -1040,9 +1098,8 @@ impl ParityReport {
 }
 
 pub(crate) fn run_parity_audit(repo: &Path) -> Result<ParityReport> {
-    let map_text = fs::read_to_string(repo.join(LAYOUT_MAP_PATH))
-        .with_context(|| format!("failed to read {LAYOUT_MAP_PATH}"))?;
-    let map = parse_layout_map(&map_text)?;
+    let rs_files = collect_rs_files(repo)?;
+    let (map, _) = load_or_derive_layout(repo, &rs_files)?;
 
     let mut report = ParityReport::default();
     for row in &map {
@@ -2425,9 +2482,8 @@ fn tag_parity_fallback(tag: ParityTag) -> u32 {
 }
 
 pub(crate) fn run_parity_table(repo: &Path) -> Result<Vec<ParityRow>> {
-    let map_text = fs::read_to_string(repo.join(LAYOUT_MAP_PATH))
-        .with_context(|| format!("failed to read {LAYOUT_MAP_PATH}"))?;
-    let map = parse_layout_map(&map_text)?;
+    let rs_files = collect_rs_files(repo)?;
+    let (map, _) = load_or_derive_layout(repo, &rs_files)?;
 
     let mut rows = Vec::new();
     for row in &map {

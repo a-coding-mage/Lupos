@@ -40,6 +40,8 @@ unsafe fn net_put(ns: *mut core::ffi::c_void) {
             return;
         }
         unsafe {
+            crate::net::device::unregister_net_namespace(ns as usize);
+            crate::net::socket::unregister_net_namespace(ns as usize);
             drop(alloc::boxed::Box::from_raw(ns));
         }
     }
@@ -65,6 +67,26 @@ pub static INIT_NET: Net = Net {
     ns: NsCommon::sticky(&NET_OPS as *const _, PROC_DYNAMIC_FIRST + 5),
     user_ns: &INIT_USER_NS,
 };
+
+/// Stable key for the calling task's network namespace.  The init namespace
+/// uses zero so global driver registration remains independent of the static
+/// object's link address; dynamically allocated namespaces use their pointer.
+pub fn current_net_namespace_key() -> usize {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return 0;
+    }
+    let nsproxy = unsafe { (*task).m28_nsproxy.nsproxy };
+    if nsproxy.is_null() {
+        return 0;
+    }
+    let net = unsafe { (*nsproxy).net_ns };
+    if net.is_null() || core::ptr::eq(net, &raw const INIT_NET as *mut Net) {
+        0
+    } else {
+        net as usize
+    }
+}
 
 pub fn copy_net_ns(_old: *const Net, user_ns: *const UserNamespace) -> Result<*mut Net, i32> {
     let b = alloc::boxed::Box::new(Net {

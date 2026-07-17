@@ -19,13 +19,13 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/vendor/linux/lib/raid/xor/arm/xor-neon.c"
         ));
-        assert!(source.contains("#include \"xor_impl.h\""));
-        assert!(source.contains("#include \"xor_arch.h\""));
+        assert!(source.contains("#include <linux/raid/xor.h>"));
+        assert!(source.contains("#include <linux/module.h>"));
         assert!(source.contains("#ifndef __ARM_NEON__"));
         assert!(source.contains(REQUIRED_CC_FLAG_ERROR));
         assert!(source.contains("#pragma GCC optimize \"tree-vectorize\""));
-        assert!(source.contains("#define NO_TEMPLATE"));
-        assert!(source.contains(TEMPLATE_INCLUDE));
-        assert!(source.contains(BLOCKS_MACRO));
+        assert!(source.contains("#include <asm-generic/xor.h>"));
+        assert!(source.contains("struct xor_block_template const xor_block_neon_inner"));
+        assert!(source.contains("EXPORT_SYMBOL(xor_block_neon_inner);"));
     }
 }

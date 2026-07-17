@@ -31,7 +31,7 @@ pub fn x509_load_certificate_list(cert_list: &[u8], keyring_id: i32) -> X509Load
 
     while offset < cert_list.len() {
         let remaining = cert_list.len() - offset;
-        if remaining < 4 || (cert_list[offset] != 0x30 && cert_list[offset + 1] != 0x82) {
+        if remaining < 4 || cert_list[offset] != 0x30 || cert_list[offset + 1] != 0x82 {
             report.dodgy_cert = true;
             break;
         }
@@ -107,7 +107,7 @@ mod tests {
         ));
         assert!(source.contains("int x509_load_certificate_list"));
         assert!(source.contains("if (end - p < 4)"));
-        assert!(source.contains("if (p[0] != 0x30 &&"));
+        assert!(source.contains("if (p[0] != 0x30 ||"));
         assert!(source.contains("key_create_or_update(make_key_ref(keyring, 1)"));
         assert!(source.contains("KEY_ALLOC_BYPASS_RESTRICTION"));
         assert!(source.contains("EXPORT_SYMBOL_GPL(x509_load_certificate_list);"));
@@ -139,5 +139,18 @@ mod tests {
         assert_eq!(report.linux_return_code(), 0);
         assert_eq!(report.loaded, 0);
         assert!(report.dodgy_cert);
+    }
+
+    #[test]
+    fn x509_loader_rejects_either_invalid_der_prefix_byte() {
+        let _lsm_guard = crate::security::lsm_list::TEST_LSM_LOCK.lock();
+        let _guard = TEST_LOCK.lock();
+        let keyring = reset_all();
+
+        for prefix in [[0x31, 0x82, 0x00, 0x00], [0x30, 0x81, 0x00, 0x00]] {
+            let report = x509_load_certificate_list(&prefix, keyring);
+            assert_eq!(report.loaded, 0);
+            assert!(report.dodgy_cert);
+        }
     }
 }

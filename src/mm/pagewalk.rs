@@ -999,7 +999,7 @@ mod tests {
 
     #[test]
     fn walk_empty_pml4_reports_pte_hole_at_depth_0() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         setup();
 
         let pgd = init_pgd_for_test();
@@ -1015,7 +1015,7 @@ mod tests {
 
     #[test]
     fn walk_over_mapped_range_visits_each_pte_once() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         setup();
 
         let phys: u64 = 0x0000_0000_0020_0000;
@@ -1068,7 +1068,7 @@ mod tests {
 
     #[test]
     fn walk_short_circuits_on_err() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         setup();
 
         let phys: u64 = 0x0000_0000_0010_0000;
@@ -1132,7 +1132,7 @@ mod tests {
 
     #[test]
     fn action_continue_skips_subtree() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         setup();
 
         let phys: u64 = 0x0000_0000_0010_0000;
@@ -1194,7 +1194,7 @@ mod tests {
 
     #[test]
     fn action_again_re_invokes_handler_then_descends() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         setup();
 
         let phys: u64 = 0x0000_0000_0010_0000;
@@ -1218,7 +1218,7 @@ mod tests {
 
     #[test]
     fn walk_respects_start_and_end_bounds() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         setup();
 
         let phys: u64 = 0x0000_0000_0010_0000;
@@ -1246,7 +1246,7 @@ mod tests {
 
     #[test]
     fn walker_oracle_matches_virt_to_phys() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         setup();
 
         use crate::arch::x86::mm::paging::virt_to_phys;
@@ -1335,7 +1335,7 @@ mod tests {
     fn walk_page_range_empty_mm() {
         use crate::mm::mm_types::MmStruct;
 
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         setup();
 
         struct HoleCounter {
@@ -1379,7 +1379,7 @@ mod tests {
         use crate::mm::list::ListHead;
         use crate::mm::mm_types::{MmStruct, VmAreaStruct};
 
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         setup();
 
         struct MappingCounter {

@@ -53,9 +53,10 @@ mod tests {
             "/vendor/linux/lib/raid6/neon.c"
         ));
         assert!(source.contains("#include <linux/raid/pq.h>"));
-        assert!(source.contains("#include <asm/simd.h>"));
+        assert!(source.contains("#include <asm/neon.h>"));
         assert!(source.contains("#define RAID6_NEON_WRAPPER(_n)"));
-        assert!(source.contains("scoped_ksimd()"));
+        assert!(source.contains("kernel_neon_begin();"));
+        assert!(source.contains("kernel_neon_end();"));
         assert!(source.contains("raid6_have_neon"));
         assert!(source.contains("return cpu_has_neon();"));
         assert!(source.contains("RAID6_NEON_WRAPPER(1);"));

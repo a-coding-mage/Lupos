@@ -701,9 +701,6 @@ mod tests {
         original[1..].copy_from_slice(&original_disp.to_le_bytes());
         let patched = patch_return(site, &original, compiler, selected, true).unwrap();
         let patched_disp = i32::from_le_bytes(patched[1..5].try_into().unwrap());
-        assert_eq!(
-            next.wrapping_add_signed(patched_disp as isize),
-            selected
-        );
+        assert_eq!(next.wrapping_add_signed(patched_disp as isize), selected);
     }
 }

@@ -266,6 +266,14 @@ mod tests {
 
     #[test]
     fn register_partition_devices_exposes_dev_path_lookup() {
+        struct RegistryCleanup(alloc::string::String);
+        impl Drop for RegistryCleanup {
+            fn drop(&mut self) {
+                let _ = crate::block::block_device::unregister_block_device(&self.0);
+                let _ = crate::block::gendisk::unregister_gendisk(&self.0);
+            }
+        }
+
         let mem = MemBlockDevice::new("partscan", 4096 * 512);
         {
             let mut data = mem.data.lock();
@@ -273,12 +281,15 @@ mod tests {
             data[8 * 512..9 * 512].fill(0x7b);
         }
         let parent = BlockDevice::wrap(mem, mem_block_device_ops());
-        let registered = register_partition_devices("partscan", &parent).expect("scan");
+        let disk_name = format!("partscan{}", parent.id);
+        let partition_name = partition_device_name(&disk_name, 1);
+        let _cleanup = RegistryCleanup(partition_name.clone());
+        let registered = register_partition_devices(&disk_name, &parent).expect("scan");
 
         assert_eq!(registered.len(), 1);
-        assert_eq!(registered[0].name, "partscan1");
-        assert!(lookup_block_device("partscan1").is_some());
-        assert!(lookup_block_device("/dev/partscan1").is_some());
+        assert_eq!(registered[0].name, partition_name);
+        assert!(lookup_block_device(&partition_name).is_some());
+        assert!(lookup_block_device(&format!("/dev/{partition_name}")).is_some());
         let read = bio_alloc(registered[0].bdev.clone(), BioOp(BIO_OP_READ), 0);
         read.add_vec(BioVec::new(alloc::vec![0u8; 512]));
         submit_bio(read.clone()).expect("read registered partition");

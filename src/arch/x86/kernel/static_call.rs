@@ -44,11 +44,69 @@ struct RegisteredStaticCallSite {
 }
 
 static MODULE_STATIC_CALL_SITES: Mutex<Vec<RegisteredStaticCallSite>> = Mutex::new(Vec::new());
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StaticCallTrampKey {
+    owner: usize,
+    trampoline: usize,
+    key: usize,
+}
+
+/// Exact `struct static_call_tramp_key` emitted by Linux on x86. Each field
+/// is relative to its own address, not to the beginning of the record.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StaticCallTrampKeyOffset {
+    trampoline: i32,
+    key: i32,
+}
+
+const _: () = assert!(core::mem::size_of::<StaticCallTrampKeyOffset>() == 8);
+
+/// Supplemental runtime relations for dynamically created native objects and
+/// host tests. Built-in kernel pairs come from the linker-collected Linux
+/// `.static_call_tramp_key` table below.
+static STATIC_CALL_TRAMP_KEYS: Mutex<Vec<StaticCallTrampKey>> = Mutex::new(Vec::new());
 static STATIC_CALL_UPDATE_LOCK: Mutex<()> = Mutex::new(());
+
+#[repr(C, align(16))]
+struct StaticCallKeyStorage {
+    func: AtomicUsize,
+    type_: AtomicUsize,
+}
+
+#[unsafe(no_mangle)]
+static LUPOS_WARN_TRAP_KEY: StaticCallKeyStorage = StaticCallKeyStorage {
+    func: AtomicUsize::new(0),
+    type_: AtomicUsize::new(0),
+};
 
 #[derive(Debug)]
 pub struct StaticCallRegistration {
     owner: usize,
+}
+
+#[derive(Debug)]
+pub struct StaticCallTrampKeyRegistration {
+    owner: usize,
+}
+
+impl Drop for StaticCallTrampKeyRegistration {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
+
+impl StaticCallTrampKeyRegistration {
+    /// Withdraw module-owned trampoline/key relations before the addresses
+    /// backing either side can be freed. Like the site registration, this is
+    /// deliberately idempotent so explicit module teardown and `Drop` can
+    /// safely overlap.
+    pub fn unregister(&self) {
+        let _update = STATIC_CALL_UPDATE_LOCK.lock();
+        STATIC_CALL_TRAMP_KEYS
+            .lock()
+            .retain(|pair| pair.owner != self.owner);
+    }
 }
 
 impl Drop for StaticCallRegistration {
@@ -62,6 +120,10 @@ impl StaticCallRegistration {
     /// The operation is idempotent because the registration object can
     /// outlive `delete_module()` while another caller holds the descriptor.
     pub fn unregister(&self) {
+        // update_registered_key() operates on a copied list so it can release
+        // the registry lock across text pokes.  Exclude that whole operation
+        // before allowing the owning module text to be freed.
+        let _update = STATIC_CALL_UPDATE_LOCK.lock();
         MODULE_STATIC_CALL_SITES
             .lock()
             .retain(|site| site.owner != self.owner);
@@ -152,6 +214,10 @@ core::arch::global_asm!(
     ".global __SCT__WARN_trap",
     "__SCT__WARN_trap:",
     "jmp __WARN_trap",
+    ".pushsection .static_call_tramp_key, \"a\"",
+    ".long __SCT__WARN_trap - .",
+    ".long LUPOS_WARN_TRAP_KEY - .",
+    ".popsection",
     ".popsection",
 );
 
@@ -238,7 +304,169 @@ pub fn warn_trap_trampoline_addr() -> usize {
     __SCT__WARN_trap as usize
 }
 
+pub fn warn_trap_key_addr() -> usize {
+    &LUPOS_WARN_TRAP_KEY as *const StaticCallKeyStorage as usize
+}
+
+fn decode_trampoline_key(entry: &StaticCallTrampKeyOffset) -> StaticCallTrampKey {
+    let trampoline_field = core::ptr::addr_of!(entry.trampoline) as usize;
+    let key_field = core::ptr::addr_of!(entry.key) as usize;
+    StaticCallTrampKey {
+        owner: 0,
+        trampoline: trampoline_field.wrapping_add_signed(entry.trampoline as isize),
+        key: key_field.wrapping_add_signed(entry.key as isize),
+    }
+}
+
+#[cfg(not(test))]
+fn resolve_linker_trampoline_key(address: usize) -> Option<usize> {
+    unsafe extern "C" {
+        static __start_static_call_tramp_key: StaticCallTrampKeyOffset;
+        static __stop_static_call_tramp_key: StaticCallTrampKeyOffset;
+    }
+
+    let start = core::ptr::addr_of!(__start_static_call_tramp_key) as usize;
+    let stop = core::ptr::addr_of!(__stop_static_call_tramp_key) as usize;
+    let bytes = stop.checked_sub(start)?;
+    if bytes % core::mem::size_of::<StaticCallTrampKeyOffset>() != 0 {
+        return None;
+    }
+    let count = bytes / core::mem::size_of::<StaticCallTrampKeyOffset>();
+    let entries =
+        unsafe { core::slice::from_raw_parts(start as *const StaticCallTrampKeyOffset, count) };
+    entries
+        .iter()
+        .map(decode_trampoline_key)
+        .find(|pair| pair.trampoline == address)
+        .map(|pair| pair.key)
+}
+
+#[cfg(test)]
+fn resolve_linker_trampoline_key(_address: usize) -> Option<usize> {
+    None
+}
+
+/// Register one built-in trampoline/key relation, matching an entry in
+/// Linux's `__start_static_call_tramp_key` table.
+pub fn register_trampoline_key(trampoline: usize, key: usize) -> Result<(), i32> {
+    if trampoline == 0
+        || key == 0
+        || trampoline & STATIC_CALL_SITE_FLAGS != 0
+        || key & STATIC_CALL_SITE_FLAGS != 0
+    {
+        return Err(EINVAL);
+    }
+    let _update = STATIC_CALL_UPDATE_LOCK.lock();
+    let mut pairs = STATIC_CALL_TRAMP_KEYS.lock();
+    if let Some(pair) = pairs
+        .iter()
+        .find(|pair| pair.trampoline == trampoline || pair.key == key)
+    {
+        return if pair.trampoline == trampoline && pair.key == key {
+            Ok(())
+        } else {
+            Err(EINVAL)
+        };
+    }
+    pairs.push(StaticCallTrampKey {
+        owner: 0,
+        trampoline,
+        key,
+    });
+    Ok(())
+}
+
+/// Register the trampoline/key pairs exported by one loadable module.
+///
+/// Linux modules do not contribute to the built-in kernel's linker-collected
+/// `.static_call_tramp_key` table. A module using `EXPORT_STATIC_CALL(name)`
+/// instead exposes the matching `__SCT__name` and `__SCK__name` objects. The
+/// generic module loader correlates those names and passes only addresses
+/// here. (`EXPORT_STATIC_CALL_TRAMP(name)` intentionally leaves the key
+/// unexported and therefore cannot be inferred this way.)
+/// The returned owner is kept in the architecture metadata so no relation can
+/// outlive the module allocation.
+pub fn register_module_trampoline_keys(
+    module_pairs: &[(usize, usize)],
+) -> Result<Option<StaticCallTrampKeyRegistration>, i32> {
+    if module_pairs.is_empty() {
+        return Ok(None);
+    }
+
+    let _update = STATIC_CALL_UPDATE_LOCK.lock();
+    let mut pairs = STATIC_CALL_TRAMP_KEYS.lock();
+    let mut additions: Vec<StaticCallTrampKey> = Vec::with_capacity(module_pairs.len());
+
+    for &(trampoline, key) in module_pairs {
+        if trampoline == 0
+            || key == 0
+            || trampoline & STATIC_CALL_SITE_FLAGS != 0
+            || key & STATIC_CALL_SITE_FLAGS != 0
+        {
+            return Err(EINVAL);
+        }
+
+        // Never share an owner with a pre-existing module relation: if the
+        // first module unloaded, the second registration would otherwise
+        // retain a relation into freed memory. Exact duplicates inside this
+        // one registration are harmless and are collapsed below.
+        if pairs
+            .iter()
+            .find(|pair| pair.trampoline == trampoline || pair.key == key)
+            .is_some()
+        {
+            return Err(EINVAL);
+        }
+        if let Some(pair) = additions
+            .iter()
+            .find(|pair| pair.trampoline == trampoline || pair.key == key)
+        {
+            if pair.trampoline == trampoline && pair.key == key {
+                continue;
+            }
+            return Err(EINVAL);
+        }
+
+        additions.push(StaticCallTrampKey {
+            owner: 0,
+            trampoline,
+            key,
+        });
+    }
+
+    if additions.is_empty() {
+        return Ok(None);
+    }
+    let owner = NEXT_STATIC_CALL_OWNER.fetch_add(1, Ordering::Relaxed);
+    for pair in &mut additions {
+        pair.owner = owner;
+    }
+    pairs.extend(additions);
+    Ok(Some(StaticCallTrampKeyRegistration { owner }))
+}
+
+fn resolve_trampoline_key(address: usize) -> Option<usize> {
+    resolve_linker_trampoline_key(address).or_else(|| {
+        STATIC_CALL_TRAMP_KEYS
+            .lock()
+            .iter()
+            .find(|pair| pair.trampoline == address)
+            .map(|pair| pair.key)
+    })
+}
+
+/// Discover the backing key for any registered static-call trampoline. This
+/// is deliberately table-driven: consumers must not infer a `__SCK__*` name
+/// or add symbol-specific mappings.
+pub fn static_call_key_for_trampoline(trampoline: usize) -> Option<usize> {
+    resolve_trampoline_key(trampoline)
+}
+
 pub fn register_module_exports() {
+    LUPOS_WARN_TRAP_KEY
+        .func
+        .store(warn_trap_addr(), Ordering::Release);
+    LUPOS_WARN_TRAP_KEY.type_.store(0, Ordering::Release);
     if find_symbol("__WARN_trap").is_none() {
         export_symbol("__WARN_trap", warn_trap_addr(), false);
     }
@@ -316,11 +544,7 @@ fn read_pointer(address: usize) -> Result<usize, i32> {
 }
 
 fn key_function(key: usize) -> Result<usize, i32> {
-    if key == warn_trap_trampoline_addr() || key == warn_trap_addr() {
-        Ok(warn_trap_addr())
-    } else {
-        read_pointer(key)
-    }
+    read_pointer(resolve_trampoline_key(key).unwrap_or(key))
 }
 
 fn transform_site(
@@ -369,10 +593,11 @@ fn decode_registered_sites(
                 .map_err(|_| EINVAL)?,
         );
         let raw_key = slot.wrapping_add(4).wrapping_add_signed(key_disp as isize);
+        let key = raw_key & !STATIC_CALL_SITE_FLAGS;
         sites.push(RegisteredStaticCallSite {
             owner,
             addr: slot.wrapping_add_signed(addr_disp as isize),
-            key: raw_key & !STATIC_CALL_SITE_FLAGS,
+            key: resolve_trampoline_key(key).unwrap_or(key),
             tail: raw_key & STATIC_CALL_SITE_TAIL != 0,
         });
     }
@@ -385,6 +610,10 @@ pub fn register_module_static_call_sites(
     base: usize,
     bytes: &[u8],
 ) -> Result<Option<StaticCallRegistration>, i32> {
+    // Do not let __static_call_update() change a key after its target was read
+    // but before these sites become visible.  Linux serializes module COMING
+    // with static_call_lock() for the same reason.
+    let _update = STATIC_CALL_UPDATE_LOCK.lock();
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -482,6 +711,17 @@ pub unsafe extern "C" fn linux_static_call_update(
 mod tests {
     use super::*;
 
+    #[repr(align(16))]
+    struct AlignedWords([usize; 2]);
+
+    static TEST_TRAMPOLINE: AlignedWords = AlignedWords([0; 2]);
+    static TEST_KEY: AlignedWords = AlignedWords([0x1234_5678, 0]);
+    static TEST_MODULE_TRAMPOLINE: AlignedWords = AlignedWords([0; 2]);
+    static TEST_MODULE_KEY: AlignedWords = AlignedWords([0x8765_4321, 0]);
+    static TEST_BAD_TRAMPOLINE_A: AlignedWords = AlignedWords([0; 2]);
+    static TEST_BAD_TRAMPOLINE_B: AlignedWords = AlignedWords([0; 2]);
+    static TEST_BAD_KEY: AlignedWords = AlignedWords([0xfeed_beef, 0]);
+
     fn write_prel32(bytes: &mut [u8], offset: usize, from: usize, to: usize) {
         bytes[offset..offset + 4].copy_from_slice(&encode_prel32(from, to).unwrap().to_le_bytes());
     }
@@ -499,6 +739,68 @@ mod tests {
         let decoded = decode_registered_sites(1, base, &metadata).unwrap();
         assert_eq!(decoded[0].addr, site);
         assert_eq!(decoded[0].key, key);
+    }
+
+    #[test]
+    fn generic_trampoline_table_resolves_a_non_exported_key() {
+        let trampoline = &TEST_TRAMPOLINE as *const AlignedWords as usize;
+        let key = &TEST_KEY as *const AlignedWords as usize;
+        register_trampoline_key(trampoline, key).unwrap();
+        assert_eq!(static_call_key_for_trampoline(trampoline), Some(key));
+        assert_eq!(key_function(trampoline), Ok(0x1234_5678));
+    }
+
+    #[test]
+    fn linux_prel32_trampoline_key_record_decodes_each_field_relative_to_itself() {
+        let mut entry = StaticCallTrampKeyOffset {
+            trampoline: 0,
+            key: 0,
+        };
+        let trampoline = core::ptr::addr_of!(entry).wrapping_byte_add(0x100) as usize;
+        let key = core::ptr::addr_of!(entry).wrapping_byte_add(0x180) as usize;
+        entry.trampoline =
+            trampoline.wrapping_sub(core::ptr::addr_of!(entry.trampoline) as usize) as i32;
+        entry.key = key.wrapping_sub(core::ptr::addr_of!(entry.key) as usize) as i32;
+        assert_eq!(
+            decode_trampoline_key(&entry),
+            StaticCallTrampKey {
+                owner: 0,
+                trampoline,
+                key
+            }
+        );
+    }
+
+    #[test]
+    fn module_trampoline_key_relation_is_removed_with_its_owner() {
+        let trampoline = &TEST_MODULE_TRAMPOLINE as *const AlignedWords as usize;
+        let key = &TEST_MODULE_KEY as *const AlignedWords as usize;
+        let registration = register_module_trampoline_keys(&[(trampoline, key)])
+            .unwrap()
+            .expect("module relation registration");
+
+        assert_eq!(static_call_key_for_trampoline(trampoline), Some(key));
+        assert_eq!(key_function(trampoline), Ok(0x8765_4321));
+
+        registration.unregister();
+        assert_eq!(static_call_key_for_trampoline(trampoline), None);
+        drop(registration);
+        assert_eq!(static_call_key_for_trampoline(trampoline), None);
+    }
+
+    #[test]
+    fn conflicting_module_relations_roll_back_as_one_transaction() {
+        let trampoline_a = &TEST_BAD_TRAMPOLINE_A as *const AlignedWords as usize;
+        let trampoline_b = &TEST_BAD_TRAMPOLINE_B as *const AlignedWords as usize;
+        let key = &TEST_BAD_KEY as *const AlignedWords as usize;
+
+        assert_eq!(
+            register_module_trampoline_keys(&[(trampoline_a, key), (trampoline_b, key)])
+                .map(|registration| registration.is_some()),
+            Err(EINVAL)
+        );
+        assert_eq!(static_call_key_for_trampoline(trampoline_a), None);
+        assert_eq!(static_call_key_for_trampoline(trampoline_b), None);
     }
 
     #[test]

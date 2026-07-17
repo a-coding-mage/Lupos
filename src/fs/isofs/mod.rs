@@ -15,11 +15,7 @@ pub mod volume;
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-
-use lazy_static::lazy_static;
-use spin::Mutex;
 
 use crate::block::{block_device::BlockDeviceRef, lookup_block_device};
 use crate::fs::dcache::d_alloc;
@@ -53,18 +49,12 @@ pub fn mount(source: &str, _flags: u64, _data: &str) -> Result<SuperBlockRef, i3
     Ok(sb)
 }
 
-lazy_static! {
-    static ref ISO_SBI_REGISTRY: Mutex<BTreeMap<u64, Arc<IsoSbi>>> = Mutex::new(BTreeMap::new());
-}
-
 pub fn stash_sbi(sb: &SuperBlockRef, sbi: Arc<IsoSbi>) -> Result<(), i32> {
-    let key = Arc::as_ptr(sb) as u64;
-    ISO_SBI_REGISTRY.lock().insert(key, sbi);
+    sb.set_fs_private(sbi);
     Ok(())
 }
 pub fn get_sbi(sb: &SuperBlockRef) -> Option<Arc<IsoSbi>> {
-    let key = Arc::as_ptr(sb) as u64;
-    ISO_SBI_REGISTRY.lock().get(&key).cloned()
+    sb.fs_private::<IsoSbi>()
 }
 
 pub fn register() {

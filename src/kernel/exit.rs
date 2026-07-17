@@ -22,7 +22,7 @@ use core::sync::atomic::Ordering;
 extern crate alloc;
 
 use crate::arch::x86::kernel::uaccess;
-use crate::kernel::fork::heap_task_release;
+use crate::kernel::fork::{begin_heap_task_release, finish_heap_task_release};
 use crate::kernel::locking::SpinLock;
 use crate::kernel::pid;
 use crate::kernel::sched;
@@ -81,6 +81,11 @@ pub unsafe fn do_exit(code: i64) -> ! {
 
     unsafe {
         (*tsk).m26.exit_code = code as i32;
+
+        // A task which exits does not return through any rewritten fgraph
+        // return addresses. Drop those frame-held callback references before
+        // the task becomes permanently non-runnable.
+        crate::kernel::trace::fgraph::ftrace_graph_exit_task(tsk);
 
         crate::kernel::futex::robust::exit_robust_list((*tsk).pid);
         crate::kernel::futex::core_ops::futex_exit_release(tsk);
@@ -368,6 +373,18 @@ pub unsafe fn release_task(p: *mut TaskStruct) {
     if p.is_null() {
         return;
     }
+    // Claim release ownership before touching `p`.  wait/pidfd and
+    // finish_task_switch() can converge on the same terminal task; after the
+    // first claimant frees it, even reading exit_state in a second path is a
+    // use-after-free.  The heap tracker is the allocation authority and can
+    // reject a duplicate using only the pointer value.
+    let Some(kernel_stack) = begin_heap_task_release(p) else {
+        return;
+    };
+
+    // Idempotent final backstop for tasks transitioned to EXIT_DEAD by a
+    // group-exit/reap path which did not run on their own stack.
+    crate::kernel::trace::fgraph::ftrace_graph_exit_task(p);
 
     let mut leader_waiters = [core::ptr::null_mut(); crate::kernel::task::MAX_WAITERS];
     let mut leader_waiter_count = 0;
@@ -458,7 +475,7 @@ pub unsafe fn release_task(p: *mut TaskStruct) {
 
         // 6. Drop the heap allocations (TaskStruct + kernel stack).  After
         //    this returns, `p` is dangling.
-        heap_task_release(p);
+        finish_heap_task_release(p, kernel_stack);
     }
 }
 
@@ -725,6 +742,10 @@ mod tests {
             unsafe { copy_process(&mut *parent as *mut TaskStruct, &args) }.expect("copy_process");
         assert_eq!(parent.m26.children_count, 1);
 
+        unsafe { release_task(child) };
+        // A converging scheduler/wait reaper may retain only the pointer
+        // value.  Duplicate release must be rejected before dereferencing the
+        // now-freed allocation.
         unsafe { release_task(child) };
 
         assert_eq!(TASK_FREE_COUNT.load(AtomicOrdering::SeqCst), 1);

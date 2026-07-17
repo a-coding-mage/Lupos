@@ -657,7 +657,7 @@ pub fn module_coming(owner: usize, events: &[u8], eval_maps: &[u8]) -> Result<()
 
 /// `trace_module_remove_events()` / `trace_module_remove_evals()` at
 /// `MODULE_STATE_GOING`.
-pub fn module_going(owner: usize) {
+pub fn module_going(owner: usize) -> Result<(), i32> {
     let mut events = MODULE_EVENTS.lock();
     for event in events
         .iter_mut()
@@ -674,11 +674,20 @@ pub fn module_going(owner: usize) {
                 (&mut *event.file) as *mut LinuxTraceEventFile as *mut c_void,
             )
         };
-        debug_assert_eq!(result, 0);
+        if result != 0 {
+            // The module and this registration must remain owned until the
+            // tracepoint/static-call/jump-label teardown can complete.
+            event
+                .file
+                .flags
+                .fetch_or(EVENT_FILE_FL_ENABLED, Ordering::Release);
+            return Err(result);
+        }
         event.enabled = false;
     }
     events.retain(|event| event.owner != owner);
     MODULE_EVAL_MAPS.lock().retain(|map| map.owner != owner);
+    Ok(())
 }
 
 pub fn module_events(owner: usize) -> Vec<ModuleTraceEvent> {

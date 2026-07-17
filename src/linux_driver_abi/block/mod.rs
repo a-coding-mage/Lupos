@@ -1466,6 +1466,32 @@ pub unsafe extern "C" fn blk_mq_map_hw_queues(
 }
 
 /// `__blk_rq_map_sg` - `vendor/linux/block/blk-merge.c`.
+#[cfg(not(test))]
+unsafe fn init_request_sg_one(
+    sg: *mut crate::lib::scatterlist::LinuxScatterList,
+    buf: *const c_void,
+    len: u32,
+) {
+    unsafe { crate::lib::scatterlist::linux_sg_init_one(sg, buf, len) };
+}
+
+/// Host tests use ordinary Rust allocations, which intentionally are not
+/// installed in the kernel page tables consulted by `virt_to_phys`.
+#[cfg(test)]
+unsafe fn init_request_sg_one(
+    sg: *mut crate::lib::scatterlist::LinuxScatterList,
+    buf: *const c_void,
+    len: u32,
+) {
+    unsafe {
+        crate::lib::scatterlist::linux_sg_init_table(sg, 1);
+        (*sg).page_link = (buf as usize & !crate::lib::scatterlist::SG_PAGE_LINK_MASK)
+            | crate::lib::scatterlist::SG_END;
+        (*sg).offset = buf as usize as u32 & 0xfff;
+        (*sg).length = len;
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __blk_rq_map_sg(
     rq: *mut LinuxRequest,
@@ -1482,7 +1508,7 @@ pub unsafe extern "C" fn __blk_rq_map_sg(
             return 0;
         }
         unsafe {
-            crate::lib::scatterlist::linux_sg_init_one(sglist, ptr, len);
+            init_request_sg_one(sglist, ptr, len);
             if !last_sg.is_null() {
                 *last_sg = sglist;
             }
@@ -1502,7 +1528,7 @@ pub unsafe extern "C" fn __blk_rq_map_sg(
         let sg = unsafe { sglist.add(idx) };
         let ptr = unsafe { data.as_mut_ptr().add(vec.off).cast::<c_void>() };
         unsafe {
-            crate::lib::scatterlist::linux_sg_init_one(sg, ptr, vec.len as u32);
+            init_request_sg_one(sg, ptr, vec.len as u32);
             if idx + 1 != vecs.len() {
                 (*sg).page_link &= !crate::lib::scatterlist::SG_END;
             }

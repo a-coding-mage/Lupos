@@ -370,6 +370,17 @@ pub fn vmalloc_init() {
 ///
 /// Ref: Linux `__vmalloc_node_range()` — `mm/vmalloc.c`
 pub fn vmalloc(size: usize) -> *mut u8 {
+    vmalloc_with_leading_guard(size, 0)
+}
+
+/// Allocate vmalloc memory with `leading_guard_pages` intentionally unmapped
+/// pages immediately below the returned address.
+///
+/// The complete VA reservation (guard plus payload) is recorded as one vmalloc
+/// allocation.  Only payload pages receive physical backing, so an x86 stack
+/// growing below its bottom faults before it can overwrite an adjacent kernel
+/// object.  This is the allocation property provided by Linux `VMAP_STACK`.
+fn vmalloc_with_leading_guard(size: usize, leading_guard_pages: usize) -> *mut u8 {
     assert!(
         VMALLOC_READY.load(Ordering::Acquire),
         "vmalloc: called before vmalloc_init"
@@ -380,9 +391,14 @@ pub fn vmalloc(size: usize) -> *mut u8 {
 
     // Round up to page boundary.
     let n_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    let alloc_size = n_pages * PAGE_SIZE;
+    let Some(total_pages) = n_pages.checked_add(leading_guard_pages) else {
+        return core::ptr::null_mut();
+    };
+    let Some(alloc_size) = total_pages.checked_mul(PAGE_SIZE) else {
+        return core::ptr::null_mut();
+    };
 
-    if n_pages > u16::MAX as usize {
+    if total_pages > u16::MAX as usize {
         return core::ptr::null_mut(); // too large for metadata encoding
     }
 
@@ -398,7 +414,8 @@ pub fn vmalloc(size: usize) -> *mut u8 {
     let mut mapped = 0usize;
     let mut ok = true;
     for i in 0..n_pages {
-        let va = va_start + (i * PAGE_SIZE) as u64;
+        let mapping_index = i + leading_guard_pages;
+        let va = va_start + (mapping_index * PAGE_SIZE) as u64;
         let page_opt = with_global_buddy(|b| b.alloc_pages(0, GFP_KERNEL));
         match page_opt {
             None => {
@@ -418,7 +435,8 @@ pub fn vmalloc(size: usize) -> *mut u8 {
     if !ok {
         // Roll back partial mapping.
         for i in 0..mapped {
-            let va = va_start + (i * PAGE_SIZE) as u64;
+            let mapping_index = i + leading_guard_pages;
+            let va = va_start + (mapping_index * PAGE_SIZE) as u64;
             if let Some(phys) = virt_to_phys(va) {
                 let pfn = phys as usize / PAGE_SIZE;
                 // Free the physical frame back to buddy.
@@ -434,7 +452,7 @@ pub fn vmalloc(size: usize) -> *mut u8 {
 
     // 3. Record the allocation size in the metadata array.
     let window_offset = (va_start - VMALLOC_START) as usize / PAGE_SIZE;
-    state.nr_pages[window_offset] = n_pages as u16;
+    state.nr_pages[window_offset] = total_pages as u16;
     state.free_backing[window_offset] = true;
     drop(state);
 
@@ -442,7 +460,23 @@ pub fn vmalloc(size: usize) -> *mut u8 {
         sync_vmalloc_pgd_slot_to_current_mm(va_start, alloc_size);
     }
 
-    va_start as *mut u8
+    (va_start + (leading_guard_pages * PAGE_SIZE) as u64) as *mut u8
+}
+
+/// Allocate a virtually contiguous kernel stack with an unmapped leading guard
+/// page.  Stacks grow downward on x86, so the guard is immediately below the
+/// usable `size` bytes returned to the scheduler.
+pub fn vmalloc_stack(size: usize) -> *mut u8 {
+    vmalloc_with_leading_guard(size, 1)
+}
+
+/// Release a stack returned by [`vmalloc_stack`].
+pub fn vfree_stack(stack_bottom: *mut u8) {
+    if stack_bottom.is_null() {
+        return;
+    }
+    let allocation = stack_bottom.wrapping_sub(PAGE_SIZE);
+    vfree(allocation);
 }
 
 /// Free a vmalloc allocation returned by `vmalloc(ptr)`.
@@ -1011,7 +1045,7 @@ mod tests {
 
     #[test]
     fn va_alloc_first_range_starts_at_vmalloc_start() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         unsafe { setup() };
         let mut state = VMALLOC_LOCK.lock();
         let va = va_alloc(&mut state, PAGE_SIZE).unwrap();
@@ -1020,7 +1054,7 @@ mod tests {
 
     #[test]
     fn two_va_allocs_do_not_overlap() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         unsafe { setup() };
         let mut state = VMALLOC_LOCK.lock();
         let va_a = va_alloc(&mut state, PAGE_SIZE).unwrap();
@@ -1034,7 +1068,7 @@ mod tests {
 
     #[test]
     fn va_free_reuse_same_address() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         unsafe { setup() };
         let mut state = VMALLOC_LOCK.lock();
 
@@ -1048,7 +1082,7 @@ mod tests {
 
     #[test]
     fn va_free_coalesces_adjacent_ranges() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         unsafe { setup() };
         let mut state = VMALLOC_LOCK.lock();
 
@@ -1071,7 +1105,7 @@ mod tests {
 
     #[test]
     fn pte_write_read_via_map_kernel_page() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         unsafe { test_pool::reset() };
         // Pick a virtual address in the vmalloc window and a dummy physical
         // address (page-aligned).
@@ -1086,7 +1120,7 @@ mod tests {
 
     #[test]
     fn vmap_pfn_maps_caller_owned_pfns() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         unsafe { setup() };
 
         let pfns = [0x1000_0000usize / PAGE_SIZE, 0x1001_0000usize / PAGE_SIZE];

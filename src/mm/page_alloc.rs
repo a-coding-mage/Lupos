@@ -462,8 +462,7 @@ fn free_reserved_phys_page(phys: u64) -> bool {
     if !page_in_mem_map(page) {
         return false;
     }
-    with_global_buddy(|buddy| buddy.free_reserved_page(page));
-    true
+    with_global_buddy(|buddy| buddy.free_reserved_page(page))
 }
 
 #[cfg(not(test))]
@@ -769,13 +768,16 @@ mod tests {
             crate::mm::buddy::install_test_buddy(16, TEST_PAGES);
         }
 
-        let (initial_free, start_pfn) = crate::mm::buddy::with_global_buddy(|buddy| {
+        let (initial_free, start_pfn, image_pages) = crate::mm::buddy::with_global_buddy(|buddy| {
             let initial_free = buddy.free_count();
             let page = buddy
                 .alloc_pages(1, GFP_KERNEL)
                 .expect("allocate image pages");
-            (initial_free, page_to_pfn(page))
+            (initial_free, page_to_pfn(page), page)
         });
+        for index in 0..2 {
+            unsafe { (*image_pages.add(index)).set_reserved() };
+        }
         let start = (start_pfn << PAGE_SHIFT) as u64;
         unsafe {
             crate::arch::x86::mm::paging::map_kernel_page(

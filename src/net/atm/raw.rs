@@ -12,7 +12,6 @@ pub const ATM_HDR_VCI_SHIFT: u32 = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtmSend {
     Aal0,
-    DeviceSendBh,
     DeviceSend,
 }
 
@@ -20,10 +19,8 @@ pub enum AtmSend {
 pub struct AtmVcc {
     pub vpi: u32,
     pub vci: u32,
-    pub has_send_bh: bool,
     pub push_raw: bool,
     pub pop_raw: bool,
-    pub push_oam_none: bool,
     pub send: AtmSend,
 }
 
@@ -41,35 +38,21 @@ pub const fn atm_send_aal0(
     if !cap_net_admin && (skb_header & (ATM_HDR_VPI_MASK | ATM_HDR_VCI_MASK)) != expected {
         return Err(-EADDRNOTAVAIL);
     }
-    if vcc.has_send_bh {
-        Ok(AtmSend::DeviceSendBh)
-    } else {
-        Ok(AtmSend::DeviceSend)
-    }
+    Ok(AtmSend::DeviceSend)
 }
 
 pub const fn atm_init_aal0(mut vcc: AtmVcc) -> AtmVcc {
     vcc.push_raw = true;
     vcc.pop_raw = true;
-    vcc.push_oam_none = true;
     vcc.send = AtmSend::Aal0;
     vcc
 }
 
-pub const fn atm_init_aal34(mut vcc: AtmVcc) -> AtmVcc {
+pub const fn atm_init_aal5(mut vcc: AtmVcc) -> AtmVcc {
     vcc.push_raw = true;
     vcc.pop_raw = true;
-    vcc.push_oam_none = true;
-    vcc.send = if vcc.has_send_bh {
-        AtmSend::DeviceSendBh
-    } else {
-        AtmSend::DeviceSend
-    };
+    vcc.send = AtmSend::DeviceSend;
     vcc
-}
-
-pub const fn atm_init_aal5(vcc: AtmVcc) -> AtmVcc {
-    atm_init_aal34(vcc)
 }
 
 #[cfg(test)]
@@ -94,13 +77,11 @@ mod tests {
         assert!(source.contains("if (!capable(CAP_NET_ADMIN)"));
         assert!(source.contains("ATM_HDR_VPI_MASK | ATM_HDR_VCI_MASK"));
         assert!(source.contains("return -EADDRNOTAVAIL;"));
-        assert!(source.contains("if (vcc->dev->ops->send_bh)"));
+        assert!(source.contains("vcc->send = vcc->dev->ops->send;"));
         assert!(source.contains("int atm_init_aal0"));
         assert!(source.contains("vcc->push = atm_push_raw;"));
         assert!(source.contains("vcc->pop = atm_pop_raw;"));
-        assert!(source.contains("vcc->push_oam = NULL;"));
         assert!(source.contains("vcc->send = atm_send_aal0;"));
-        assert!(source.contains("int atm_init_aal34"));
         assert!(source.contains("int atm_init_aal5"));
         assert!(source.contains("EXPORT_SYMBOL(atm_init_aal5);"));
     }
@@ -110,18 +91,16 @@ mod tests {
         let vcc = AtmVcc {
             vpi: 1,
             vci: 32,
-            has_send_bh: true,
             push_raw: false,
             pop_raw: false,
-            push_oam_none: false,
             send: AtmSend::DeviceSend,
         };
         let aal0 = atm_init_aal0(vcc);
         assert_eq!(aal0.send, AtmSend::Aal0);
-        assert!(aal0.push_raw && aal0.pop_raw && aal0.push_oam_none);
+        assert!(aal0.push_raw && aal0.pop_raw);
         assert_eq!(
             atm_send_aal0(false, aal0, atm_header(1, 32)),
-            Ok(AtmSend::DeviceSendBh)
+            Ok(AtmSend::DeviceSend)
         );
         assert_eq!(
             atm_send_aal0(false, aal0, atm_header(1, 33)),
@@ -129,16 +108,8 @@ mod tests {
         );
         assert_eq!(
             atm_send_aal0(true, aal0, atm_header(1, 33)),
-            Ok(AtmSend::DeviceSendBh)
+            Ok(AtmSend::DeviceSend)
         );
-        assert_eq!(atm_init_aal5(vcc).send, AtmSend::DeviceSendBh);
-        assert_eq!(
-            atm_init_aal34(AtmVcc {
-                has_send_bh: false,
-                ..vcc
-            })
-            .send,
-            AtmSend::DeviceSend
-        );
+        assert_eq!(atm_init_aal5(vcc).send, AtmSend::DeviceSend);
     }
 }

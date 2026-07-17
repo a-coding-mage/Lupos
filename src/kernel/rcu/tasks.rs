@@ -8,10 +8,10 @@
 //! at least once.  Used by tracing trampolines (M62) where preempt-RCU
 //! quiescent states are insufficient.
 //!
-//! Lupos M34 ships the cooperative variant: each `schedule()` call records a
-//! "tasks_rcu_qs" pass for the current task; `synchronize_rcu_tasks` waits
-//! until the global pass counter has incremented at least once for the calling
-//! task.
+//! Lupos uses a cooperative, non-preemptible tracing model. Each context
+//! switch and idle-loop pass publishes the current tasks-RCU generation for
+//! that CPU; `synchronize_rcu_tasks()` requests remote reschedules and waits
+//! until every participating CPU has crossed a post-request quiescent state.
 
 extern crate alloc;
 
@@ -24,6 +24,10 @@ use super::types::RcuHead;
 
 /// Global pass counter — every voluntary `schedule()` bumps it.
 static TASKS_PASS: AtomicU64 = AtomicU64::new(0);
+static TASKS_GP_SEQ: AtomicU64 = AtomicU64::new(0);
+static TASKS_ONLINE_MASK: AtomicU64 = AtomicU64::new(0);
+static TASKS_QS_AT_GP: [AtomicU64; crate::kernel::sched::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::kernel::sched::MAX_CPUS];
 
 /// Send-wrapped pair so the static can be a `Mutex` of a `VecDeque`.
 struct CbEntry {
@@ -38,24 +42,47 @@ static PENDING: Mutex<VecDeque<CbEntry>> = Mutex::new(VecDeque::new());
 /// Record a quiescent state.  Called from `schedule()` when the task yields.
 #[inline]
 pub fn tasks_rcu_qs() {
+    let cpu =
+        (crate::kernel::sched::current_cpu() as usize).min(crate::kernel::sched::MAX_CPUS - 1);
+    TASKS_ONLINE_MASK.fetch_or(1u64 << (cpu & 63), Ordering::AcqRel);
+    TASKS_QS_AT_GP[cpu].store(TASKS_GP_SEQ.load(Ordering::Acquire), Ordering::Release);
     TASKS_PASS.fetch_add(1, Ordering::AcqRel);
 }
 
-/// `synchronize_rcu_tasks()` — block until at least one global pass has
-/// elapsed (all tasks have voluntarily scheduled at least once).
-///
-/// Cooperative-mode shortcut: the calling task counts as one pass, then we
-/// yield once to give every other runnable task its slot.  Real Linux walks
-/// the task list and verifies each non-idle task has scheduled.
+fn all_online_cpus_passed(generation: u64) -> bool {
+    let online = TASKS_ONLINE_MASK.load(Ordering::Acquire);
+    (0..crate::kernel::sched::MAX_CPUS).all(|cpu| {
+        online & (1u64 << (cpu & 63)) == 0
+            || TASKS_QS_AT_GP[cpu].load(Ordering::Acquire) >= generation
+    })
+}
+
+/// `synchronize_rcu_tasks()` — wait until every participating CPU has crossed
+/// a context-switch/idle quiescent state after this grace period began.
 pub fn synchronize_rcu_tasks() {
-    // Record our own pass first so we don't wait for ourselves.
+    let generation = TASKS_GP_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+    // The caller cannot concurrently be executing a retired trampoline, so
+    // it may report its own CPU before requesting progress elsewhere.
     tasks_rcu_qs();
     #[cfg(not(test))]
-    unsafe {
-        crate::kernel::sched::schedule_with_irqs_enabled();
+    {
+        let me =
+            (crate::kernel::sched::current_cpu() as usize).min(crate::kernel::sched::MAX_CPUS - 1);
+        let online = TASKS_ONLINE_MASK.load(Ordering::Acquire);
+        for cpu in 0..crate::kernel::sched::MAX_CPUS {
+            if cpu != me && online & (1u64 << (cpu & 63)) != 0 {
+                crate::kernel::sched::request_reschedule(cpu as u32);
+            }
+        }
+        while !all_online_cpus_passed(generation) {
+            unsafe {
+                crate::kernel::sched::schedule_with_irqs_enabled();
+            }
+            core::hint::spin_loop();
+        }
     }
-    // Final QS bump confirms the grace period closed.
-    tasks_rcu_qs();
+    #[cfg(test)]
+    assert!(all_online_cpus_passed(generation));
 }
 
 /// `call_rcu_tasks(head, func)` — queue a tasks-RCU callback.
@@ -85,8 +112,11 @@ mod tests {
     #[test]
     fn synchronize_advances_pass_counter() {
         let before = TASKS_PASS.load(Ordering::Acquire);
+        let generation = TASKS_GP_SEQ.load(Ordering::Acquire);
         synchronize_rcu_tasks();
         assert!(TASKS_PASS.load(Ordering::Acquire) > before);
+        assert!(TASKS_GP_SEQ.load(Ordering::Acquire) > generation);
+        assert!(all_online_cpus_passed(TASKS_GP_SEQ.load(Ordering::Acquire)));
     }
 
     #[test]

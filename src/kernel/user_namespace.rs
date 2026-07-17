@@ -100,6 +100,61 @@ impl UidGidMap {
         }
         u32::MAX
     }
+
+    pub fn parse(text: &str) -> Result<Self, i32> {
+        let mut map = Self::default();
+        for (index, line) in text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+        {
+            if index >= UID_GID_MAP_MAX_EXTENTS {
+                return Err(-7); // E2BIG
+            }
+            let mut fields = line.split_ascii_whitespace();
+            let first = fields.next().ok_or(-22)?.parse::<u32>().map_err(|_| -22)?;
+            let lower_first = fields.next().ok_or(-22)?.parse::<u32>().map_err(|_| -22)?;
+            let count = fields.next().ok_or(-22)?.parse::<u32>().map_err(|_| -22)?;
+            if count == 0 || fields.next().is_some() {
+                return Err(-22); // EINVAL
+            }
+            let end = first.checked_add(count).ok_or(-22)?;
+            let lower_end = lower_first.checked_add(count).ok_or(-22)?;
+            for existing in &map.extent[..index] {
+                let existing_end = existing.first.saturating_add(existing.count);
+                let existing_lower_end = existing.lower_first.saturating_add(existing.count);
+                if first < existing_end && existing.first < end {
+                    return Err(-22);
+                }
+                if lower_first < existing_lower_end && existing.lower_first < lower_end {
+                    return Err(-22);
+                }
+            }
+            map.extent[index] = UidGidExtent {
+                first,
+                lower_first,
+                count,
+            };
+            map.nr_extents += 1;
+        }
+        if map.nr_extents == 0 {
+            return Err(-22);
+        }
+        Ok(map)
+    }
+
+    pub fn render(&self) -> alloc::string::String {
+        let mut output = alloc::string::String::new();
+        for extent in &self.extent[..(self.nr_extents as usize).min(UID_GID_MAP_MAX_EXTENTS)] {
+            use core::fmt::Write;
+            let _ = writeln!(
+                output,
+                "{} {} {}",
+                extent.first, extent.lower_first, extent.count
+            );
+        }
+        output
+    }
 }
 
 /// `struct user_namespace`.

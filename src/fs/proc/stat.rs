@@ -226,10 +226,8 @@ mod tests {
             "/vendor/linux/kernel/time/time.c"
         ));
 
-        assert!(source.contains("u64 get_idle_time(struct kernel_cpustat *kcs, int cpu)"));
-        assert!(source.contains("static u64 get_iowait_time(struct kernel_cpustat *kcs, int cpu)"));
-        assert!(source.contains("idle_usecs = get_cpu_idle_time_us(cpu, NULL);"));
-        assert!(source.contains("iowait_usecs = get_cpu_iowait_time_us(cpu, NULL);"));
+        assert!(source.contains("struct kernel_cpustat kcpustat;"));
+        assert!(source.contains("kcpustat_cpu_fetch(&kcpustat, i);"));
         assert!(source.contains("show_irq_gap(p, i - next);"));
         assert!(source.contains("static int show_stat(struct seq_file *p, void *v)"));
         assert!(source.contains("for_each_possible_cpu(i)"));

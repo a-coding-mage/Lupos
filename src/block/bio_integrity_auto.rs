@@ -185,7 +185,7 @@ mod tests {
         assert!(source.contains("bio_endio(bio);"));
         assert!(source.contains("bio_integrity_prep(struct bio *bio"));
         assert!(source.contains("bid = mempool_alloc(&bid_pool, GFP_NOIO);"));
-        assert!(source.contains("bio_integrity_alloc_buf(bio, action & BI_ACT_ZERO);"));
+        assert!(source.contains("bio_integrity_alloc_buf(bio, GFP_NOIO, action & BI_ACT_ZERO);"));
         assert!(source.contains("bio_integrity_generate(bio);"));
         assert!(source.contains("bid->saved_bio_iter = bio->bi_iter;"));
         assert!(source.contains("kmem_cache_create(\"bio_integrity_data\""));

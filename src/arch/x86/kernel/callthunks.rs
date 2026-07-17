@@ -252,16 +252,28 @@ mod tests {
     fn padding_install_is_validated_and_idempotent() {
         let template = skl_call_thunk_template(0x1234).unwrap();
         let mut padding = [0x90; SKL_CALL_THUNK_SIZE];
-        assert_eq!(install_call_thunk_padding(&mut padding, &template), Ok(true));
-        assert_eq!(install_call_thunk_padding(&mut padding, &template), Ok(false));
+        assert_eq!(
+            install_call_thunk_padding(&mut padding, &template),
+            Ok(true)
+        );
+        assert_eq!(
+            install_call_thunk_padding(&mut padding, &template),
+            Ok(false)
+        );
         padding[0] = 0xcc;
-        assert_eq!(install_call_thunk_padding(&mut padding, &template), Err(EINVAL));
+        assert_eq!(
+            install_call_thunk_padding(&mut padding, &template),
+            Err(EINVAL)
+        );
     }
 
     #[test]
     fn call_depth_arithmetic_matches_linux_saturation_scheme() {
         assert_eq!(account_call(RET_DEPTH_INIT), 0xfc00_0000_0000_0000);
-        assert_eq!(account_return(0xfc00_0000_0000_0000), (RET_DEPTH_INIT, false));
+        assert_eq!(
+            account_return(0xfc00_0000_0000_0000),
+            (RET_DEPTH_INIT, false)
+        );
         assert_eq!(account_return(0), (RET_DEPTH_CREDIT, true));
     }
 }

@@ -95,7 +95,8 @@ pub struct FileOps {
     pub mmap: Option<MmapFn>,
     pub release: Option<fn(FileRef)>,
     /// Iterate one directory entry — returns `Ok(Some((name, ino, kind)))` per
-    /// call, `Ok(None)` at end-of-stream.  Cursor lives in `file.private`.
+    /// call, `Ok(None)` at end-of-stream. The directory cursor lives in
+    /// `file.pos`, matching Linux `file->f_pos` and lseek(2).
     pub readdir: Option<
         fn(&FileRef) -> Result<Option<(alloc::string::String, u64, super::types::InodeKind)>, i32>,
     >,

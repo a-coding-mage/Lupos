@@ -22,13 +22,14 @@
 //!   * The cache lock is held only for the brief lookup / insert / invalidate;
 //!     never across the device I/O itself.
 //!
-//! The cache is keyed by the `Arc<BlockDevice>` identity, so distinct devices
-//! (and distinct partitions) never alias.
+//! The cache is keyed by `BlockDevice::id`, which is monotonic for the lifetime
+//! of the kernel. A raw `Arc` address is insufficient because the cache does
+//! not retain the `Arc`, allowing the allocator to reuse that address for a
+//! later device and expose stale sectors from the earlier device.
 
 extern crate alloc;
 
 use alloc::collections::{BTreeMap, VecDeque};
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
@@ -51,8 +52,8 @@ struct Entry {
 }
 
 struct BlockCache {
-    map: BTreeMap<(usize, u64), Entry>,
-    fifo: VecDeque<(usize, u64)>,
+    map: BTreeMap<(u64, u64), Entry>,
+    fifo: VecDeque<(u64, u64)>,
     bytes: usize,
 }
 
@@ -65,7 +66,7 @@ impl BlockCache {
         }
     }
 
-    fn remove_key(&mut self, key: (usize, u64)) {
+    fn remove_key(&mut self, key: (u64, u64)) {
         if let Some(e) = self.map.remove(&key) {
             self.bytes = self.bytes.saturating_sub(e.data.len());
         }
@@ -73,10 +74,10 @@ impl BlockCache {
 
     /// Invalidate every entry on `dev_id` whose range overlaps
     /// `[sector, sector + nr_sectors)`.
-    fn invalidate_overlap(&mut self, dev_id: usize, sector: u64, nr_sectors: u64) {
+    fn invalidate_overlap(&mut self, dev_id: u64, sector: u64, nr_sectors: u64) {
         let end = sector.saturating_add(nr_sectors);
         let lo = sector.saturating_sub(MAX_ENTRY_SECTORS);
-        let doomed: Vec<(usize, u64)> = self
+        let doomed: Vec<(u64, u64)> = self
             .map
             .range((dev_id, lo)..(dev_id, end))
             .filter(|((_, start), e)| *start < end && start.saturating_add(e.nr_sectors) > sector)
@@ -87,7 +88,7 @@ impl BlockCache {
         }
     }
 
-    fn insert(&mut self, key: (usize, u64), entry: Entry) {
+    fn insert(&mut self, key: (u64, u64), entry: Entry) {
         // Replace any existing entry at this exact key first.
         self.remove_key(key);
         while self.bytes + entry.data.len() > CAPACITY_BYTES {
@@ -105,8 +106,8 @@ impl BlockCache {
 static CACHE: Mutex<BlockCache> = Mutex::new(BlockCache::new());
 
 #[inline]
-fn dev_id(bdev: &BlockDeviceRef) -> usize {
-    Arc::as_ptr(bdev) as usize
+fn dev_id(bdev: &BlockDeviceRef) -> u64 {
+    bdev.id
 }
 
 /// Look up a cached read of exactly `nr_sectors` starting at `sector`.
@@ -155,7 +156,7 @@ pub fn invalidate_device(bdev: &BlockDeviceRef) {
     }
     let id = dev_id(bdev);
     let mut cache = CACHE.lock();
-    let doomed: Vec<(usize, u64)> = cache
+    let doomed: Vec<(u64, u64)> = cache
         .map
         .range((id, 0)..(id, u64::MAX))
         .map(|(k, _)| *k)

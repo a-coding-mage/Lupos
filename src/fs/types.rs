@@ -14,6 +14,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use spin::{Mutex, RwLock};
@@ -329,6 +330,8 @@ pub struct SuperBlock {
     pub uuid: Mutex<[u8; 16]>,
     pub root: Mutex<Option<DentryRef>>,
     pub ops: &'static SuperOps,
+    /// Filesystem-owned superblock state, equivalent to Linux `s_fs_info`.
+    fs_private: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
     /// FS-private next-ino allocator (shared by ramfs/tmpfs/procfs).
     pub next_ino: AtomicU64,
 }
@@ -342,6 +345,7 @@ impl SuperBlock {
             uuid: Mutex::new([0; 16]),
             root: Mutex::new(None),
             ops,
+            fs_private: Mutex::new(None),
             next_ino: AtomicU64::new(1),
         })
     }
@@ -350,6 +354,12 @@ impl SuperBlock {
     }
     pub fn uuid(&self) -> [u8; 16] {
         *self.uuid.lock()
+    }
+    pub fn set_fs_private<T: Any + Send + Sync>(&self, private: Arc<T>) {
+        *self.fs_private.lock() = Some(private);
+    }
+    pub fn fs_private<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.fs_private.lock().clone()?.downcast::<T>().ok()
     }
     pub fn alloc_ino(&self) -> Ino {
         self.next_ino.fetch_add(1, Ordering::AcqRel)

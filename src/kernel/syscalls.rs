@@ -2362,7 +2362,7 @@ pub fn sys_rseq(rseq: *mut u8, rseq_len: u32, flags: i32, sig: u32) -> i64 {
     rseq_register(key, rseq, rseq_len, sig)
 }
 
-pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: *const u8, flags: u32) -> i64 {
+pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: *const u8, flags: u32) -> i64 {
     if !(0..=64).contains(&sig) || flags != 0 {
         return -(EINVAL as i64);
     }
@@ -2373,7 +2373,42 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: *const u8, flags: u32)
     if sig == 0 {
         return 0;
     }
-    unsafe { crate::kernel::signal::send_signal_to_task(target, sig) as i64 }
+
+    let info = if info.is_null() {
+        let current = unsafe { sched::get_current() };
+        let sender_pid = if current.is_null() {
+            0
+        } else {
+            unsafe { (*current).tgid }
+        };
+        let cred = crate::kernel::cred::current_cred();
+        let sender_uid = if cred.is_null() {
+            0
+        } else {
+            unsafe { (*cred).uid.0 }
+        };
+        crate::kernel::signal::SigInfo::with_sender(
+            sig,
+            crate::kernel::signal::SI_USER,
+            sender_pid,
+            sender_uid,
+        )
+    } else {
+        let info =
+            match unsafe { copy_struct_from_user(info.cast::<crate::kernel::signal::SigInfo>()) } {
+                Ok(info) => info,
+                Err(errno) => return -(errno as i64),
+            };
+        if info.signo != sig {
+            return -(EINVAL as i64);
+        }
+        if info.code >= 0 {
+            return -(EPERM as i64);
+        }
+        info
+    };
+
+    unsafe { crate::kernel::signal::send_signal_info_to_task(target, info) as i64 }
 }
 
 pub fn sys_process_madvise(
@@ -4084,6 +4119,34 @@ mod tests {
             let fd = crate::fs::pidfd::install_pidfd(&mut *target as *mut TaskStruct, false)
                 .expect("pidfd");
             assert_eq!(sys_pidfd_send_signal(fd, 0, core::ptr::null(), 0), 0);
+
+            let wrong_signo = crate::kernel::signal::SigInfo::with_sender_value(
+                10,
+                crate::kernel::signal::SI_QUEUE,
+                current.tgid,
+                0,
+                0,
+            );
+            assert_eq!(
+                sys_pidfd_send_signal(fd, 18, (&raw const wrong_signo).cast::<u8>(), 0),
+                -(EINVAL as i64)
+            );
+            let forbidden_code = crate::kernel::signal::SigInfo::with_sender(18, 0, 64, 0);
+            assert_eq!(
+                sys_pidfd_send_signal(fd, 18, (&raw const forbidden_code).cast::<u8>(), 0),
+                -(EPERM as i64)
+            );
+            let queued = crate::kernel::signal::SigInfo::with_sender_value(
+                18,
+                crate::kernel::signal::SI_QUEUE,
+                current.tgid,
+                0,
+                0x55aa,
+            );
+            assert_eq!(
+                sys_pidfd_send_signal(fd, 18, (&raw const queued).cast::<u8>(), 0),
+                0
+            );
             assert_eq!(sys_pidfd_send_signal(fd, 18, core::ptr::null(), 0), 0);
 
             crate::fs::pidfd::notify_task_exit(&mut *target as *mut TaskStruct);

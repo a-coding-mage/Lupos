@@ -105,8 +105,8 @@ fn proc_root_readdir(file: &FileRef) -> Result<Option<(String, u64, InodeKind)>,
     let static_entries = crate::fs::kernfs::list(&node);
     let pids = live_pids();
 
-    let mut idx = file.private.lock();
-    let entry_idx = idx.saturating_sub(2);
+    let mut idx = file.pos.lock();
+    let entry_idx = idx.saturating_sub(2) as usize;
     if entry_idx < static_entries.len() {
         let entry = static_entries[entry_idx].clone();
         *idx += 1;
@@ -159,7 +159,15 @@ fn push_live_pid(pids: &mut Vec<i32>, task: *mut TaskStruct) {
         return;
     }
     unsafe {
-        if (*task).pid <= 0 || ((*task).m26.exit_state & EXIT_DEAD) != 0 {
+        // Linux exposes only thread-group leaders while iterating `/proc`.
+        // A non-leader TID remains addressable explicitly as `/proc/<tid>`
+        // (and under `/proc/<tgid>/task/<tid>`), but it must not appear in
+        // getdents(2).  Process managers rely on this distinction and would
+        // otherwise treat every pthread as a separate process.
+        if (*task).pid <= 0
+            || (*task).pid != (*task).tgid
+            || ((*task).m26.exit_state & EXIT_DEAD) != 0
+        {
             return;
         }
         pids.push((*task).pid);
@@ -253,5 +261,26 @@ mod tests {
             assert!(names.iter().any(|name| name == "version"));
             assert!(names.iter().any(|name| name == "32002"));
         });
+    }
+
+    #[test]
+    fn proc_root_readdir_only_lists_thread_group_leaders() {
+        let mut leader = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        leader.pid = 32_003;
+        leader.tgid = 32_003;
+
+        let mut thread = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        thread.pid = 32_004;
+        thread.tgid = 32_003;
+
+        let mut pids = Vec::new();
+        push_live_pid(&mut pids, &mut *leader);
+        push_live_pid(&mut pids, &mut *thread);
+
+        assert_eq!(pids.as_slice(), &[32_003]);
+        // Direct lookup of a TID is intentionally still supported by
+        // `proc_root_lookup`, matching Linux's invisible-but-addressable
+        // `/proc/<tid>` directories.
+        assert_eq!(parse_pid_name("32004"), Ok(32_004));
     }
 }

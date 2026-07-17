@@ -177,21 +177,13 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/vendor/linux/crypto/pcbc.c"
         ));
-        let testmgr = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/vendor/linux/crypto/testmgr.h"
-        ));
-        let testmgr_c = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/vendor/linux/crypto/testmgr.c"
-        ));
         assert!(source.contains("crypto_pcbc_encrypt_segment"));
         assert!(source.contains("crypto_xor(iv, src, bsize);"));
         assert!(source.contains("crypto_xor_cpy(iv, dst, src, bsize);"));
         assert!(source.contains("crypto_pcbc_decrypt_inplace"));
         assert!(source.contains("skcipher_alloc_instance_simple(tmpl, tb);"));
-        assert!(testmgr.contains("static const struct cipher_testvec fcrypt_pcbc_tv_template[]"));
-        assert!(testmgr_c.contains("\"pcbc(fcrypt)\""));
+        assert!(source.contains("crypto_register_template(&crypto_pcbc_tmpl)"));
+        assert!(source.contains("MODULE_ALIAS_CRYPTO(\"pcbc\")"));
 
         let cipher = AesCipher::new(&[
             0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,

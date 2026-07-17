@@ -15,7 +15,6 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
-use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
@@ -155,16 +154,36 @@ pub fn test_lock() -> spin::MutexGuard<'static, ()> {
 /// Convenience wrapper for the common "device added to /sys/class/<class>/"
 /// case used during rootfs bootstrap.
 pub fn announce_class_device(class: &str, name: &str, subsystem: &str, devname: &str) {
-    let devpath = devpath_for(class, name);
-    let major_minor = ("0", "0");
+    announce_virtual_device(UeventAction::Add, class, name, subsystem, devname, 0, 0);
+}
+
+/// Announce a character device represented below
+/// `/sys/devices/virtual/<class>/<name>`.
+///
+/// Linux class entries are links to the canonical device node; `DEVPATH` in
+/// the uevent must name that canonical node rather than the convenience path
+/// below `/sys/class`.  libudev also uses MAJOR/MINOR to associate the event
+/// with `/sys/dev/char/<major>:<minor>` and `/dev/<devname>`.
+pub fn announce_virtual_device(
+    action: UeventAction,
+    class: &str,
+    name: &str,
+    subsystem: &str,
+    devname: &str,
+    major: u32,
+    minor: u32,
+) {
+    let devpath = alloc::format!("/devices/virtual/{class}/{name}");
+    let major = alloc::format!("{major}");
+    let minor = alloc::format!("{minor}");
     let msg = UeventMessage::build(
-        UeventAction::Add,
+        action,
         &devpath,
         &[
             ("SUBSYSTEM", subsystem),
             ("DEVNAME", devname),
-            ("MAJOR", major_minor.0),
-            ("MINOR", major_minor.1),
+            ("MAJOR", &major),
+            ("MINOR", &minor),
         ],
     );
     broadcast_uevent(msg);
@@ -183,14 +202,6 @@ pub fn announce_netdevice(action: UeventAction, ifname: &str, ifindex: u32) {
         ],
     );
     broadcast_uevent(msg);
-}
-
-fn devpath_for(class: &str, name: &str) -> String {
-    let mut s = String::from("/class/");
-    s.push_str(class);
-    s.push('/');
-    s.push_str(name);
-    s
 }
 
 #[cfg(test)]
@@ -221,8 +232,36 @@ mod tests {
 
         let drained = drain_pending();
         assert_eq!(drained.len(), 2);
-        assert!(drained[0].payload.starts_with(b"add@/class/input/event0"));
-        assert!(drained[1].payload.starts_with(b"add@/class/graphics/fb0"));
+        assert!(
+            drained[0]
+                .payload
+                .starts_with(b"add@/devices/virtual/input/event0")
+        );
+        assert!(
+            drained[1]
+                .payload
+                .starts_with(b"add@/devices/virtual/graphics/fb0")
+        );
+    }
+
+    #[test]
+    fn virtual_character_device_event_carries_real_device_number() {
+        let _guard = test_lock();
+        let _ = drain_pending();
+        announce_virtual_device(
+            UeventAction::Add,
+            "graphics",
+            "fb0",
+            "graphics",
+            "fb0",
+            29,
+            0,
+        );
+        let drained = drain_pending();
+        let payload = &drained[0].payload;
+        assert!(payload.starts_with(b"add@/devices/virtual/graphics/fb0\0"));
+        assert!(payload.windows(9).any(|w| w == b"MAJOR=29\0"));
+        assert!(payload.windows(8).any(|w| w == b"MINOR=0\0"));
     }
 
     #[test]

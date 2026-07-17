@@ -102,7 +102,6 @@ pub fn new_self_dir() -> Arc<KernfsNode> {
     let dir = KernfsNode::new_dir("self", 0o555);
     super::base::add_task_common(&dir);
     add_child(&dir, super::fd::new_fd_dir());
-    add_child(&dir, super::namespaces::new_ns_dir());
     add_child(
         &dir,
         KernfsNode::new_file("mounts", 0o444, Some(super::root::mounts_show), None),

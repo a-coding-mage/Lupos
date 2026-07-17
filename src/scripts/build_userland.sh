@@ -20,21 +20,9 @@ BOOTSTRAP_SHA256="${LUPOS_ARCH_BOOTSTRAP_SHA256:-e68ba918c9f7deede8eccd2cd8ce259
 BOOTSTRAP_URL="${LUPOS_ARCH_BOOTSTRAP_URL:-https://archive.archlinux.org/iso/2026.06.01/${BOOTSTRAP_NAME}.tar.zst}"
 ARCH_REPO_SNAPSHOT="2026/06/01"
 ARCH_REPO_BASE_URL="${LUPOS_ARCH_REPO_BASE_URL:-https://archive.archlinux.org/repos/$ARCH_REPO_SNAPSHOT}"
-# gdk-pixbuf 2.44 delegates all image decoding to `glycin`, which spawns a
-# sandboxed out-of-process `glycin-image-rs` loader and talks to it over peer
-# D-Bus + memfd.  That subprocess model does not work under the Lupos kernel
-# (the loader fails to decode — GTK aborts with "Unrecognized image file
-# format" — and orphaned loaders busy-loop the cooperative scheduler).  Pin the
-# last pre-glycin release (2.42.12), which compiles PNG/JPEG/TIFF loaders
-# directly into libgdk_pixbuf-2.0.so (no subprocess), and overlay it over the
-# staged 2.44 build so every GTK icon load works in-process.  See
-# `downgrade_gdk_pixbuf_no_glycin`.
-GDK_PIXBUF_NOGLYCIN_PKG="gdk-pixbuf2-2.42.12-1-x86_64.pkg.tar.zst"
-GDK_PIXBUF_NOGLYCIN_URL="${LUPOS_GDK_PIXBUF_NOGLYCIN_URL:-https://archive.archlinux.org/packages/g/gdk-pixbuf2/${GDK_PIXBUF_NOGLYCIN_PKG}}"
-GDK_PIXBUF_NOGLYCIN_SHA256="1b1c6495a2439222760f535ddd2da9b56e0c70fa43c90e93cb1b640f86debb47"
-GDK_PIXBUF_NOGLYCIN_SOFILE="libgdk_pixbuf-2.0.so.0.4200.12"
 ARCH_OFFLINE_REPO_REL="var/lib/lupos/pacman-repo"
 ARCH_PACMAN_SERVER='Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch'
+ARCH_PACMAN_CONFIG="etc/pacman-lupos.conf"
 ARCH_PACMAN_XFER_HELPER="usr/lib/lupos/pacman-xfer"
 ARCH_PACMAN_XFER_COMMAND="XferCommand = /usr/lib/lupos/pacman-xfer %u %o"
 ARCH_PACMAN_GPG_DIR="etc/pacman.d/gnupg"
@@ -190,6 +178,11 @@ ARCH_GRAPHICS_PACKAGES=(
     xfce4-session
     xfwm4
     xfce4-panel
+    # The unmodified stock panel's lower dock references
+    # xfce4-appfinder.desktop, but xfce4-panel does not depend on the appfinder
+    # package.  Install the referenced application instead of rewriting the
+    # vendor panel configuration.
+    xfce4-appfinder
     xfdesktop
     xfce4-settings
     thunar
@@ -213,6 +206,8 @@ if [ -z "${LUPOS_ARCH_ROOTFS:-}" ]; then
 fi
 LUPOS_ARCH_BOOTSTRAP_ROOTFS="${LUPOS_ARCH_BOOTSTRAP_ROOTFS:-}"
 ARCH_ROOTFS="${LUPOS_ARCH_BOOTSTRAP_ROOTFS:-$LUPOS_ARCH_ROOTFS}"
+VENDOR_POLICY_STAMP="$ARCH_ROOTFS/.lupos-vendor-policy-v4"
+VENDOR_MANIFEST_REL=".lupos-vendor-files-v1"
 if [ -z "${STAGE:-}" ]; then
     case "${LUPOS_USERLAND_GRAPHICS,,}" in
         1|true|yes|on) STAGE="$TARGET/graphics-stage" ;;
@@ -266,7 +261,9 @@ rootfs_ready() {
         && [ -e "$ARCH_ROOTFS/usr/bin/bash" ] \
         && [ -e "$ARCH_ROOTFS/usr/bin/pacman" ] \
         && [ -e "$ARCH_ROOTFS/etc/pacman.conf" ] \
-        && [ -e "$ARCH_ROOTFS/var/lib/pacman/local/ALPM_DB_VERSION" ]
+        && [ -e "$ARCH_ROOTFS/var/lib/pacman/local/ALPM_DB_VERSION" ] \
+        && [ -e "$VENDOR_POLICY_STAMP" ] \
+        && [ -s "$ARCH_ROOTFS/$VENDOR_MANIFEST_REL" ]
 }
 
 make_rootfs_user_writable() {
@@ -275,21 +272,8 @@ make_rootfs_user_writable() {
 
 pam_systemd_ready() {
     local r="$1"
-    grep -q '^session optional pam_systemd\.so$' "$r/etc/pam.d/system-login" \
+    grep -Eq '^-session[[:space:]]+optional[[:space:]]+pam_systemd\.so$' "$r/etc/pam.d/system-login" \
         && grep -q 'pam_systemd\.so' "$r/usr/lib/pam.d/systemd-user"
-}
-
-systemd_hook_ready() {
-    local r="$1"
-    local hook="$r/$ARCH_SYSTEMD_HOOK_SCRIPT"
-    [ -x "$hook" ] \
-        && grep -Fq 'skip_live_service_hook()' "$hook" \
-        && grep -Fq 'live systemd service-manager package hook is disabled on Lupos' "$hook"
-}
-
-pacman_mirrorlist_ready() {
-    local r="$1"
-    grep -Fxq "$ARCH_PACMAN_SERVER" "$r/etc/pacman.d/mirrorlist"
 }
 
 pacman_repo_uses_default_siglevel() {
@@ -326,16 +310,104 @@ pacman_repo_server_ready() {
 
 pacman_config_ready() {
     local r="$1"
-    grep -Eq '^[[:space:]]*DisableSandbox[[:space:]]*$' "$r/etc/pacman.conf" \
-        && ! grep -Eq '^[[:space:]]*DownloadUser[[:space:]]*=' "$r/etc/pacman.conf" \
-        && grep -Fxq "$ARCH_PACMAN_XFER_COMMAND" "$r/etc/pacman.conf" \
+    local conf="$r/$ARCH_PACMAN_CONFIG"
+    grep -Eq '^[[:space:]]*DisableSandbox[[:space:]]*$' "$conf" \
+        && ! grep -Eq '^[[:space:]]*DownloadUser[[:space:]]*=' "$conf" \
+        && grep -Fxq "$ARCH_PACMAN_XFER_COMMAND" "$conf" \
         && [ -x "$r/$ARCH_PACMAN_XFER_HELPER" ] \
-        && grep -Eq '^[[:space:]]*SigLevel[[:space:]]*=[[:space:]]*Required[[:space:]]+DatabaseOptional[[:space:]]*$' "$r/etc/pacman.conf" \
-        && pacman_repo_uses_default_siglevel "$r/etc/pacman.conf" core \
-        && pacman_repo_uses_default_siglevel "$r/etc/pacman.conf" extra \
+        && grep -Eq '^[[:space:]]*SigLevel[[:space:]]*=[[:space:]]*Required[[:space:]]+DatabaseOptional[[:space:]]*$' "$conf" \
+        && pacman_repo_uses_default_siglevel "$conf" core \
+        && pacman_repo_uses_default_siglevel "$conf" extra \
         && pacman_keyring_ready "$r" \
-        && pacman_repo_server_ready "$r/etc/pacman.conf" core \
-        && pacman_repo_server_ready "$r/etc/pacman.conf" extra
+        && pacman_repo_server_ready "$conf" core \
+        && pacman_repo_server_ready "$conf" extra
+}
+
+vendor_package_configs_pristine() {
+    local r="$1"
+    # pacman's stock configuration documents DisableSandbox and XferCommand in
+    # comments.  Only active directives can indicate that the package-owned
+    # file was repurposed for Lupos; the separate pacman-lupos.conf carries our
+    # offline transport policy.
+    ! grep -Eq '^[[:space:]]*DisableSandbox([[:alpha:]]+)?[[:space:]]*$|^[[:space:]]*XferCommand[[:space:]]*=[[:space:]]*/usr/lib/lupos' "$r/etc/pacman.conf" \
+        && ! grep -Eq '^[[:space:]]*[^#[:space:]].*(lupos|/var/lib/lupos)' "$r/etc/pacman.conf" \
+        && ! grep -Fq 'file:///var/lib/lupos/pacman-repo' "$r/etc/pacman.d/mirrorlist" \
+        && ! grep -Fq 'disabled on Lupos' "$r/$ARCH_SYSTEMD_HOOK_SCRIPT"
+}
+
+write_vendor_files_manifest() {
+    local r="$1"
+    local out="$2"
+    local rel path target
+    local list="$TARGET/.vendor-files-list-$$"
+    local rows="$TARGET/.vendor-files-rows-$$"
+    local regulars="$TARGET/.vendor-files-regulars-$$"
+
+    : > "$list"
+    : > "$rows"
+    : > "$regulars"
+    awk '
+        $0 == "%FILES%" { in_files = 1; next }
+        in_files && /^%.*%$/ { in_files = 0 }
+        in_files && length($0) { print }
+    ' "$r"/var/lib/pacman/local/*/files | LC_ALL=C sort -u > "$list"
+
+    while IFS= read -r rel; do
+        path="$r/$rel"
+        if [ -L "$path" ]; then
+            target="$(readlink "$path")"
+            printf 'link\t%s\t%s\n' "$rel" "$target" >> "$rows"
+        elif [ -f "$path" ]; then
+            printf '%s\0' "$path" >> "$regulars"
+        elif [ -d "$path" ]; then
+            printf 'dir\t%s\n' "$rel" >> "$rows"
+        elif [ -e "$path" ]; then
+            printf 'other\t%s\n' "$rel" >> "$rows"
+        else
+            printf 'missing\t%s\n' "$rel" >> "$rows"
+        fi
+    done < "$list"
+
+    # Hash regular files in batches; spawning sha256sum once per package file
+    # makes a full XFCE stage needlessly expensive.
+    if [ -s "$regulars" ]; then
+        xargs -0 -r sha256sum < "$regulars" | awk -v prefix="$r/" '
+            {
+                digest = $1
+                path = substr($0, length($1) + 3)
+                if (index(path, prefix) == 1)
+                    path = substr(path, length(prefix) + 1)
+                print "file\t" path "\t" digest
+            }
+        ' >> "$rows"
+    fi
+
+    LC_ALL=C sort -u "$rows" > "$out"
+    rm -f "$list" "$rows" "$regulars"
+}
+
+capture_vendor_files_manifest() {
+    local r="$1"
+    local manifest="$r/$VENDOR_MANIFEST_REL"
+    local tmp="$TARGET/.vendor-manifest-$$"
+    write_vendor_files_manifest "$r" "$tmp"
+    mv "$tmp" "$manifest"
+}
+
+vendor_package_files_pristine() {
+    local r="$1"
+    local expected="$r/$VENDOR_MANIFEST_REL"
+    local actual="$TARGET/.vendor-check-$$"
+    [ -s "$expected" ] || return 1
+    write_vendor_files_manifest "$r" "$actual"
+    if cmp -s "$expected" "$actual"; then
+        rm -f "$actual"
+        return 0
+    fi
+    echo "error: package-owned files differ from the imported Arch packages:" >&2
+    diff -u "$expected" "$actual" | sed -n '1,200p' >&2 || true
+    rm -f "$actual"
+    return 1
 }
 
 pacman_offline_repo_ready() {
@@ -382,8 +454,10 @@ graphics_stage_ready() {
         && [ -x "$1/usr/bin/startxfce4" ] \
         && [ -x "$1/usr/bin/xfwm4" ] \
         && [ -x "$1/usr/bin/xfce4-panel" ] \
+        && [ -x "$1/usr/bin/xfce4-appfinder" ] \
         && [ -x "$1/usr/bin/xfdesktop" ] \
         && [ -x "$1/usr/bin/xfsettingsd" ] \
+        && [ -x "$1/usr/bin/xfce4-settings-manager" ] \
         && [ -x "$1/usr/bin/xfce4-terminal" ] \
         && [ -x "$1/usr/bin/dbus-launch" ] \
         && [ -e "$1/usr/lib/xorg/modules/drivers/fbdev_drv.so" ] \
@@ -404,9 +478,11 @@ graphics_runtime_cache_ready() {
     if ! graphics_enabled; then
         return 0
     fi
-    [ -x "$1/usr/bin/gdk-pixbuf-thumbnailer" ] \
-        && [ -s "$1/usr/lib/$GDK_PIXBUF_NOGLYCIN_SOFILE" ] \
-        && [ "$(readlink "$1/usr/lib/libgdk_pixbuf-2.0.so.0" 2>/dev/null || true)" = "$GDK_PIXBUF_NOGLYCIN_SOFILE" ] \
+    [ -x "$1/usr/bin/glycin-thumbnailer" ] \
+        && [ -s "$1/usr/lib/libgdk_pixbuf-2.0.so.0.4400.6" ] \
+        && [ "$(readlink "$1/usr/lib/libgdk_pixbuf-2.0.so.0" 2>/dev/null || true)" = "libgdk_pixbuf-2.0.so.0.4400.6" ] \
+        && [ -x "$1/usr/lib/glycin-loaders/2+/glycin-image-rs" ] \
+        && [ -x "$1/usr/lib/glycin-loaders/2+/glycin-svg" ] \
         && [ -s "$1/usr/share/glib-2.0/schemas/gschemas.compiled" ] \
         && [ -s "$1/usr/share/icons/hicolor/icon-theme.cache" ] \
         && [ -s "$1/usr/share/icons/AdwaitaLegacy/icon-theme.cache" ] \
@@ -416,17 +492,18 @@ graphics_runtime_cache_ready() {
 
 stage_ready() {
     [ -e "$STAGE_STAMP" ] \
+        && [ -e "$STAGE/$(basename "$VENDOR_POLICY_STAMP")" ] \
         && [ -e "$STAGE/.lupos-profile" ] \
         && [ -e "$STAGE/usr/lib/systemd/systemd" ] \
         && [ -e "$STAGE/usr/bin/bash" ] \
         && [ -e "$STAGE/usr/bin/pacman" ] \
         && [ -e "$STAGE/etc/systemd/network/10-lupos-qemu.network" ] \
         && grep -q '^DNSDefaultRoute=yes$' "$STAGE/etc/systemd/network/10-lupos-qemu.network" \
-        && pacman_mirrorlist_ready "$STAGE" \
         && pacman_config_ready "$STAGE" \
+        && vendor_package_configs_pristine "$STAGE" \
+        && vendor_package_files_pristine "$STAGE" \
         && pacman_offline_repo_ready "$STAGE" \
         && pam_systemd_ready "$STAGE" \
-        && systemd_hook_ready "$STAGE" \
         && graphics_stage_ready "$STAGE" \
         && graphics_runtime_cache_ready "$STAGE"
 }
@@ -835,40 +912,22 @@ write_file() {
     cat > "$path"
 }
 
-normalize_arch_pam() {
-    local system_login="$ARCH_ROOTFS/etc/pam.d/system-login"
-    [ -f "$system_login" ] || return
-    sed -i 's/^-*session[[:space:]]\+optional[[:space:]]\+pam_systemd\.so/session optional pam_systemd.so/' "$system_login"
-}
+write_lupos_pacman_config() {
+    write_file "$ARCH_ROOTFS/$ARCH_PACMAN_CONFIG" <<EOF
+[options]
+Architecture = auto
+CheckSpace
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Optional
+DisableSandbox
+$ARCH_PACMAN_XFER_COMMAND
 
-normalize_arch_pacman() {
-    local conf="$ARCH_ROOTFS/etc/pacman.conf"
-    [ -f "$conf" ] || return
-    sed -i \
-        -e 's/^[[:space:]]*DownloadUser[[:space:]]*=.*/#DownloadUser = alpm/' \
-        -e 's/^[#[:space:]]*DisableSandboxFilesystem.*/#DisableSandboxFilesystem/' \
-        -e 's/^[#[:space:]]*DisableSandboxSyscalls.*/#DisableSandboxSyscalls/' \
-        -e '/^[[:space:]]*XferCommand[[:space:]]*=/d' \
-        "$conf"
-    if ! grep -Fxq "$ARCH_PACMAN_XFER_COMMAND" "$conf"; then
-        if grep -Eq '^[#[:space:]]*Architecture[[:space:]]*=' "$conf"; then
-            sed -i "/^[#[:space:]]*Architecture[[:space:]]*=/a $ARCH_PACMAN_XFER_COMMAND" "$conf"
-        else
-            sed -i "/^\\[options\\]$/a $ARCH_PACMAN_XFER_COMMAND" "$conf"
-        fi
-    fi
-    if ! grep -Eq '^[[:space:]]*DisableSandbox[[:space:]]*$' "$conf"; then
-        sed -i '/^[#[:space:]]*DisableSandboxSyscalls/a DisableSandbox' "$conf"
-    fi
-    for repo in core extra; do
-        sed -i "/^\\[$repo\\]$/,/^\\[/ { \
-            /^${ARCH_PACMAN_SERVER//\//\\/}$/d; \
-            /^[[:space:]]*SigLevel[[:space:]]*=/d; \
-        }" "$conf"
-        if ! pacman_repo_server_ready "$conf" "$repo"; then
-            sed -i "/^\\[$repo\\]$/a $ARCH_PACMAN_SERVER" "$conf"
-        fi
-    done
+[core]
+$ARCH_PACMAN_SERVER
+
+[extra]
+$ARCH_PACMAN_SERVER
+EOF
 }
 
 apply_lupos_overlay() {
@@ -876,19 +935,7 @@ apply_lupos_overlay() {
     log "Applying Lupos overlay"
 
     write_file "$S/etc/hostname" <<< "lupos"
-    write_file "$S/etc/hosts" <<'EOF'
-127.0.0.1 localhost lupos
-::1 localhost
-EOF
-    rm -f "$S/etc/resolv.conf"
-    ln -sfn /run/systemd/resolve/resolv.conf "$S/etc/resolv.conf"
 
-    mkdir -p "$S/etc/pacman.d"
-    write_file "$S/etc/pacman.d/mirrorlist" <<'EOF'
-## Lupos stages a pinned Arch Archive subset locally because the guest does
-## not yet provide TCP networking for libalpm downloads.
-Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch
-EOF
     write_file "$S/$ARCH_PACMAN_XFER_HELPER" <<'EOF'
 #!/bin/sh
 set -eu
@@ -961,103 +1008,11 @@ fi
 EOF
     chmod 755 "$S/$ARCH_PACMAN_XFER_HELPER"
 
-    write_file "$S/$ARCH_SYSTEMD_HOOK_SCRIPT" <<'EOF'
-#!/bin/sh -e
-
-skip_chrooted() {
-  if systemd-detect-virt --chroot >/dev/null 2>/dev/null; then
-    echo >&2 "  Skipped: Running in chroot."
-    exit 0
-  fi
-}
-
-systemd_live() {
-  skip_chrooted
-
-  if ! systemd-notify --booted; then
-    echo >&2 "  Skipped: Current root is not booted."
-    exit 0
-  fi
-}
-
-skip_live_service_hook() {
-  skip_chrooted
-  echo >&2 "  Skipped: live systemd service-manager package hook is disabled on Lupos."
-}
-
-udevd_live() {
-  systemd_live
-
-  if [ ! -S /run/udev/control ]; then
-    echo >&2 "  Skipped: Device manager is not running."
-    exit 0
-  fi
-}
-
-op="$1"; shift
-
-case "$op" in
-  binfmt)
-    systemd_live
-    /usr/lib/systemd/systemd-binfmt
-    ;;
-  catalog)
-    /usr/bin/journalctl --update-catalog
-    ;;
-  daemon-reload-system)
-    skip_live_service_hook
-    ;;
-  daemon-reload-user)
-    skip_live_service_hook
-    ;;
-  hwdb)
-    /usr/bin/systemd-hwdb --usr update
-    ;;
-  sysctl)
-    systemd_live
-    /usr/lib/systemd/systemd-sysctl
-    ;;
-  sysusers)
-    /usr/bin/systemd-sysusers
-    ;;
-  tmpfiles)
-    /usr/bin/systemd-tmpfiles --create
-    ;;
-  update)
-    touch -c /usr
-    ;;
-  udev-reload)
-    skip_live_service_hook
-    ;;
-  enqueue-marked)
-    skip_live_service_hook
-    ;;
-  reload)
-    skip_live_service_hook
-    ;;
-  restart)
-    skip_live_service_hook
-    ;;
-  *)
-    echo >&2 "  Invalid operation '$op'"
-    exit 1
-    ;;
-esac
-
-exit 0
-EOF
-    chmod 755 "$S/$ARCH_SYSTEMD_HOOK_SCRIPT"
     stage_arch_offline_pacman_repo
     install_arch_graphics_packages
-
-    write_file "$S/etc/fstab" <<'EOF'
-proc      /proc     proc      defaults 0 0
-sysfs     /sys      sysfs     defaults 0 0
-devtmpfs  /dev      devtmpfs  defaults 0 0
-tmpfs     /tmp      tmpfs     defaults 0 0
-tmpfs     /run      tmpfs     defaults 0 0
-/swapfile none      swap      sw       0 0
-EOF
+    # Package contents are immutable input. Capture every path recorded by
+    # pacman's local database before adding any Lupos-owned files.
+    capture_vendor_files_manifest "$S"
 
     write_file "$S/.lupos-profile" <<'EOF'
 distro=arch
@@ -1081,8 +1036,6 @@ EOF
         "$S/etc/systemd/system/getty@tty1.service.d" \
         "$S/etc/systemd/system/multi-user.target.wants"
 
-    ln -sfn /usr/lib/systemd/system/multi-user.target \
-        "$S/etc/systemd/system/default.target"
     ln -sfn /usr/lib/systemd/system/getty@.service \
         "$S/etc/systemd/system/getty.target.wants/getty@tty1.service"
 
@@ -1101,9 +1054,9 @@ EOF
             "$S/etc/systemd/system/multi-user.target.wants/${svc}.service"
     done
 
-    normalize_arch_pam
     stage_arch_pacman_keyring
-    normalize_arch_pacman
+    write_lupos_pacman_config
+    : > "$VENDOR_POLICY_STAMP"
 }
 
 copy_to_stage() {
@@ -1112,62 +1065,8 @@ copy_to_stage() {
     safe_clean_dir "$STAGE"
     mkdir -p "$STAGE"
     cp -a "$ARCH_ROOTFS/." "$STAGE/"
-    downgrade_gdk_pixbuf_no_glycin "$STAGE"
     generate_arch_font_indexes "$STAGE"
     generate_arch_gtk_caches "$STAGE"
-}
-
-# Replace the staged glycin-based gdk-pixbuf (2.44) with the last pre-glycin
-# release (2.42.12), whose PNG/JPEG/TIFF loaders are compiled directly into
-# libgdk_pixbuf-2.0.so.  The soname (.so.0) is unchanged, and gtk3 depends on
-# `gdk-pixbuf2` with no version bound, so swapping the library file is ABI-safe
-# and makes GTK icon loading work fully in-process.  Idempotent.
-downgrade_gdk_pixbuf_no_glycin() {
-    if ! graphics_enabled; then
-        return 0
-    fi
-    local root="$1"
-    local libdir="$root/usr/lib"
-    # Nothing to do if the pre-glycin library is already in place.
-    if [ -f "$libdir/$GDK_PIXBUF_NOGLYCIN_SOFILE" ] \
-        && [ -x "$root/usr/bin/gdk-pixbuf-thumbnailer" ]; then
-        return 0
-    fi
-    # Only act when a glycin-linked gdk-pixbuf is actually staged.
-    [ -e "$libdir/libgdk_pixbuf-2.0.so.0" ] || return 0
-
-    local pkg="$CACHE/pacman-graphics/$GDK_PIXBUF_NOGLYCIN_PKG"
-    if [ ! -f "$pkg" ]; then
-        require_command curl
-        mkdir -p "$CACHE/pacman-graphics"
-        log "Downloading pre-glycin gdk-pixbuf ($GDK_PIXBUF_NOGLYCIN_PKG)"
-        curl -L --fail --progress-bar "$GDK_PIXBUF_NOGLYCIN_URL" -o "$pkg.tmp.$$"
-        mv "$pkg.tmp.$$" "$pkg"
-    fi
-    local actual
-    actual="$(sha256_of "$pkg")"
-    [ "$actual" = "$GDK_PIXBUF_NOGLYCIN_SHA256" ] || \
-        die "SHA-256 mismatch for $pkg: expected $GDK_PIXBUF_NOGLYCIN_SHA256, got $actual"
-
-    log "Overlaying pre-glycin gdk-pixbuf 2.42.12 over $root (drops glycin subprocess loaders)"
-    # Extract the library and its matching query/thumbnail tools over the stage.
-    tar --zstd -xf "$pkg" -C "$root" \
-        usr/lib/"$GDK_PIXBUF_NOGLYCIN_SOFILE" \
-        usr/bin/gdk-pixbuf-query-loaders \
-        usr/bin/gdk-pixbuf-thumbnailer 2>/dev/null \
-        || die "failed to extract $pkg"
-    # Drop every other libgdk_pixbuf-2.0.so.0.* (the 2.44 glycin build) so only
-    # the pre-glycin library remains, then repoint the sonames at it.
-    local f
-    for f in "$libdir"/libgdk_pixbuf-2.0.so.0.*; do
-        [ -e "$f" ] || continue
-        case "$(basename "$f")" in
-            "$GDK_PIXBUF_NOGLYCIN_SOFILE") ;;
-            *) rm -f "$f" ;;
-        esac
-    done
-    ln -sfn "$GDK_PIXBUF_NOGLYCIN_SOFILE" "$libdir/libgdk_pixbuf-2.0.so.0"
-    ln -sfn "libgdk_pixbuf-2.0.so.0" "$libdir/libgdk_pixbuf-2.0.so"
 }
 
 # pacman runs with `--noscriptlet`, so the GTK/GLib post-install hooks never
@@ -1245,6 +1144,7 @@ validate_stage() {
         usr/bin/pacman \
         etc/os-release \
         etc/pacman.conf \
+        "$ARCH_PACMAN_CONFIG" \
         "$ARCH_PACMAN_GPG_DIR/pubring.gpg" \
         "$ARCH_PACMAN_GPG_DIR/pubring.kbx" \
         "$ARCH_PACMAN_GPG_DIR/trustdb.gpg" \
@@ -1259,11 +1159,11 @@ validate_stage() {
         bad=1
     done
     [ "$bad" = "0" ] || exit 1
-    pacman_mirrorlist_ready "$STAGE" || die "staged pacman mirrorlist has no active Server entries"
     pacman_config_ready "$STAGE" || die "staged pacman integration must retain Arch signature policy and initialize its keyring while defining the Lupos offline transport"
+    vendor_package_configs_pristine "$STAGE" || die "package-owned pacman.conf or mirrorlist was modified"
+    vendor_package_files_pristine "$STAGE" || die "a package-owned Arch file was modified after import"
     pacman_offline_repo_ready "$STAGE" || die "staged offline pacman repo is missing pinned database/package files or preseeded sync databases"
     pam_systemd_ready "$STAGE" || die "staged PAM systemd session hook is missing"
-    systemd_hook_ready "$STAGE" || die "staged systemd package hook wrapper is stale"
     graphics_stage_ready "$STAGE" || die "staged graphics profile is missing X11 packages"
     graphics_runtime_cache_ready "$STAGE" || die "staged graphics profile is missing generated runtime caches"
     : > "$STAGE_STAMP"

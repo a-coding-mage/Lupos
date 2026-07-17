@@ -77,7 +77,7 @@ mod tests {
         assert!(source.contains("page_ref_inc(page);"));
         assert!(source.contains("enum bootmem_type type = bootmem_type(page);"));
         assert!(source.contains("MEMORY_HOTPLUG_MIN_BOOTMEM_TYPE"));
-        assert!(source.contains("ClearPagePrivate(page);"));
+        assert!(source.contains("set_page_private(page, 0);"));
         assert!(source.contains("free_reserved_page(page);"));
         assert!(source.contains("register_page_bootmem_info_section"));
         assert!(source.contains("for (; pfn < end_pfn; pfn += PAGES_PER_SECTION)"));

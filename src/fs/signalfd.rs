@@ -121,10 +121,25 @@ fn signalfd_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize
         let Some(info) = crate::kernel::signal::dequeue_current_pending_signal_mask(mask) else {
             break;
         };
+        let sender_fields = matches!(
+            info.code,
+            crate::kernel::signal::SI_USER
+                | crate::kernel::signal::SI_QUEUE
+                | crate::kernel::signal::SI_TKILL
+        );
+        let queued_value = if info.code == crate::kernel::signal::SI_QUEUE {
+            info.sigval()
+        } else {
+            0
+        };
         let record = SignalfdSiginfo {
             ssi_signo: info.signo as u32,
             ssi_errno: info.errno,
             ssi_code: info.code,
+            ssi_pid: sender_fields.then(|| info.sender_pid() as u32).unwrap_or(0),
+            ssi_uid: sender_fields.then(|| info.sender_uid()).unwrap_or(0),
+            ssi_int: queued_value as i32,
+            ssi_ptr: queued_value,
             ..SignalfdSiginfo::default()
         };
         let bytes = unsafe {
@@ -246,7 +261,7 @@ mod tests {
     use crate::kernel::{
         cred::INIT_CRED,
         files, sched,
-        signal::{SIGCHLD, SIGKILL, SIGSTOP},
+        signal::{SI_QUEUE, SIG_BLOCK, SIGCHLD, SIGKILL, SIGSTOP, SIGUSR1, SigInfo, SigSet},
         task::TaskStruct,
     };
     use alloc::boxed::Box;
@@ -265,6 +280,8 @@ mod tests {
 
     #[test]
     fn syscall_m76_signalfd_parity() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
         let previous = unsafe { sched::get_current() };
         let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         current.pid = 82;
@@ -295,10 +312,13 @@ mod tests {
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
+        crate::kernel::signal::reset_for_tests();
     }
 
     #[test]
     fn signalfd_does_not_consume_sigkill() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
         let previous = unsafe { sched::get_current() };
         let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         current.pid = 183;
@@ -336,10 +356,13 @@ mod tests {
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
+        crate::kernel::signal::reset_for_tests();
     }
 
     #[test]
     fn signalfd_poll_and_read_consume_masked_signal() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
         let previous = unsafe { sched::get_current() };
         let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         current.pid = 182;
@@ -351,6 +374,16 @@ mod tests {
             sched::set_current(&mut *current as *mut TaskStruct);
 
             let mask = 1u64 << (SIGCHLD - 1);
+            let blocked = SigSet { bits: mask };
+            assert_eq!(
+                crate::kernel::signal::sys_rt_sigprocmask(
+                    SIG_BLOCK,
+                    &blocked,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<SigSet>(),
+                ),
+                0
+            );
             let fd = sys_signalfd4(-1, &mask as *const u64 as *const u8, 8, SFD_CLOEXEC);
             assert!(fd >= 0);
             let ft = files::get_task_files(&mut *current as *mut TaskStruct).unwrap();
@@ -379,5 +412,56 @@ mod tests {
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
+        crate::kernel::signal::reset_for_tests();
+    }
+
+    #[test]
+    fn signalfd_preserves_queued_signal_sender_and_value() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 184;
+        current.tgid = 184;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let mask = 1u64 << (SIGUSR1 - 1);
+            let fd = sys_signalfd4(-1, &mask as *const u64 as *const u8, 8, SFD_CLOEXEC);
+            assert!(fd >= 0);
+            let ft = files::get_task_files(&mut *current as *mut TaskStruct).unwrap();
+            let file = ft.get(fd as i32).unwrap();
+
+            let value = 0x1122_3344_5566_7788;
+            let info = SigInfo::with_sender_value(SIGUSR1, SI_QUEUE, 357, 42, value);
+            assert_eq!(
+                crate::kernel::signal::send_signal_info_to_task(
+                    &mut *current as *mut TaskStruct,
+                    info,
+                ),
+                0
+            );
+
+            let mut buf = [0u8; core::mem::size_of::<SignalfdSiginfo>()];
+            let mut pos = 0;
+            assert_eq!(
+                signalfd_read(&file, &mut buf, &mut pos).unwrap(),
+                core::mem::size_of::<SignalfdSiginfo>()
+            );
+            let record = core::ptr::read_unaligned(buf.as_ptr() as *const SignalfdSiginfo);
+            assert_eq!(record.ssi_signo, SIGUSR1 as u32);
+            assert_eq!(record.ssi_code, SI_QUEUE);
+            assert_eq!(record.ssi_pid, 357);
+            assert_eq!(record.ssi_uid, 42);
+            assert_eq!(record.ssi_int, value as i32);
+            assert_eq!(record.ssi_ptr, value);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+        crate::kernel::signal::reset_for_tests();
     }
 }

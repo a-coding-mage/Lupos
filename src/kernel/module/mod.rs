@@ -23,8 +23,8 @@
 pub mod btf;
 pub mod constructors;
 pub mod debug_kmemleak;
-pub mod kdb;
 pub mod kallsyms;
+pub mod kdb;
 pub mod linux_sources;
 pub mod livepatch;
 pub mod loader;

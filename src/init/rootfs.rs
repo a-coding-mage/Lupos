@@ -1523,22 +1523,12 @@ fn populate_devtmpfs() -> Result<(), i32> {
     set_node_rdev("/dev/console", 5, 1);
     create_special_node("/dev/tty", InodeKind::Chardev, 0o666, &CONSOLE_FILE_OPS)?;
     set_node_rdev("/dev/tty", 5, 0);
-    for (minor, tty) in [
-        "/dev/tty0",
-        "/dev/tty1",
-        "/dev/tty2",
-        "/dev/tty3",
-        "/dev/tty4",
-        "/dev/tty5",
-        "/dev/tty6",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        create_special_node(tty, InodeKind::Chardev, 0o620, &CONSOLE_FILE_OPS)?;
+    for minor in 0..=crate::linux_driver_abi::tty::VT_MAX_CONSOLES {
+        let tty = format!("/dev/tty{minor}");
+        create_special_node(&tty, InodeKind::Chardev, 0o620, &CONSOLE_FILE_OPS)?;
         // Virtual consoles live on TTY_MAJOR (4): tty0 is the current-VT alias,
-        // tty1..tty6 the individual consoles.
-        set_node_rdev(tty, 4, minor as u32);
+        // tty1..tty63 are the individual consoles (`MAX_NR_CONSOLES`).
+        set_node_rdev(&tty, 4, minor);
     }
     create_special_node("/dev/ttyS0", InodeKind::Chardev, 0o620, &CONSOLE_FILE_OPS)?;
     // Serial console: TTY_MAJOR (4), minor 64 == ttyS0.
@@ -1551,10 +1541,18 @@ fn populate_devtmpfs() -> Result<(), i32> {
         &crate::block::dm::DM_CONTROL_FILE_OPS,
     )?;
     create_special_node("/dev/kmsg", InodeKind::Chardev, 0o666, &DEV_KMSG_FILE_OPS)?;
-    for node in ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"] {
+    set_node_rdev("/dev/kmsg", 1, 11);
+    for (node, minor) in [
+        ("/dev/null", 3),
+        ("/dev/zero", 5),
+        ("/dev/random", 8),
+        ("/dev/urandom", 9),
+    ] {
         create_special_node(node, InodeKind::Chardev, 0o666, &RAMFS_FILE_OPS)?;
+        set_node_rdev(node, 1, minor);
     }
     create_special_node("/dev/full", InodeKind::Chardev, 0o666, &DEV_FULL_FILE_OPS)?;
+    set_node_rdev("/dev/full", 1, 7);
     // UNIX98 pty master multiplexor.  `/dev/ptmx` is char major 5 minor 2;
     // opening it allocates a pty pair and its `/dev/pts/N` slave node.
     replace_special_node(
@@ -1651,7 +1649,7 @@ fn prepare_devtmpfs_mount() -> Result<(), i32> {
         .map(|root| root.sb.fs_name != "ramfs")
         .unwrap_or(false)
     {
-        let _ = do_mount("ramfs", "devtmpfs", "/dev", 0, "")?;
+        let _ = do_mount("devtmpfs", "devtmpfs", "/dev", 0, "")?;
     }
     Ok(())
 }
@@ -1662,7 +1660,7 @@ fn populate_graphics_nodes() -> Result<(), i32> {
     use crate::linux_driver_abi::input::evdev_chardev::EVDEV_FILE_OPS;
     use crate::linux_driver_abi::input::register_default_evdev_devices;
     use crate::linux_driver_abi::video::fbdev::{FBDEV_FILE_OPS, fbdev_init};
-    use crate::net::uevent::announce_class_device;
+    use crate::net::uevent::{UeventAction, announce_virtual_device};
 
     register_default_evdev_devices();
     ensure_dir("/dev/input", 0o755)?;
@@ -1678,8 +1676,24 @@ fn populate_graphics_nodes() -> Result<(), i32> {
         0o660,
         &EVDEV_FILE_OPS,
     )?;
-    announce_class_device("input", "event0", "input", "input/event0");
-    announce_class_device("input", "event1", "input", "input/event1");
+    announce_virtual_device(
+        UeventAction::Add,
+        "input",
+        "event0",
+        "input",
+        "input/event0",
+        13,
+        64,
+    );
+    announce_virtual_device(
+        UeventAction::Add,
+        "input",
+        "event1",
+        "input",
+        "input/event1",
+        13,
+        65,
+    );
 
     // evdev input nodes live on major 13 (INPUT_MAJOR): event0/event1 are
     // minors 64/65.
@@ -1688,7 +1702,15 @@ fn populate_graphics_nodes() -> Result<(), i32> {
     if fbdev_init() {
         create_special_node("/dev/fb0", InodeKind::Chardev, 0o660, &FBDEV_FILE_OPS)?;
         set_node_rdev("/dev/fb0", 29, 0);
-        announce_class_device("graphics", "fb0", "graphics", "fb0");
+        announce_virtual_device(
+            UeventAction::Add,
+            "graphics",
+            "fb0",
+            "graphics",
+            "fb0",
+            29,
+            0,
+        );
     }
     Ok(())
 }
@@ -3013,7 +3035,8 @@ mod tests {
         bootstrap_initramfs_rootfs().expect("initramfs rootfs bootstrap");
 
         assert!(path_exists("/dev/console"));
-        assert!(path_exists("/dev/tty6"));
+        assert!(path_exists("/dev/tty7"));
+        assert!(path_exists("/dev/tty63"));
         assert!(path_exists("/dev/hugepages"));
         assert!(path_exists("/dev/mqueue"));
         assert!(path_exists("/dev/vda1"));
@@ -3462,6 +3485,8 @@ mod tests {
             "/dev/tty4",
             "/dev/tty5",
             "/dev/tty6",
+            "/dev/tty7",
+            "/dev/tty63",
             "/dev/ttyS0",
         ] {
             assert!(path_exists(node), "{node} must exist for getty/login chain");
@@ -3470,18 +3495,24 @@ mod tests {
         // Standard data nodes (devices.txt §"1 mem").  /dev/full was missing
         // — GNU coreutils' `df`/`stat` tests + bash's `printf` write-error
         // exercise it.
-        for node in [
-            "/dev/null",
-            "/dev/zero",
-            "/dev/full",
-            "/dev/random",
-            "/dev/urandom",
-            "/dev/kmsg",
+        for (node, minor) in [
+            ("/dev/null", 3),
+            ("/dev/zero", 5),
+            ("/dev/full", 7),
+            ("/dev/random", 8),
+            ("/dev/urandom", 9),
+            ("/dev/kmsg", 11),
         ] {
             let inode = path_walk(node)
                 .and_then(|d| d.inode())
                 .unwrap_or_else(|| panic!("{node} must exist"));
             assert_eq!(inode.kind, InodeKind::Chardev, "{node} must be a chardev");
+            assert_eq!(
+                inode.rdev.load(Ordering::Acquire),
+                crate::init::noinitramfs::new_encode_dev(crate::init::noinitramfs::mkdev(1, minor))
+                    as u64,
+                "{node} must use the Linux memory-device number"
+            );
             if node == "/dev/kmsg" {
                 assert_eq!(inode.fops.name, "dev_kmsg");
                 assert!(
@@ -3915,7 +3946,7 @@ mod tests {
             assert_eq!(
                 crate::kernel::signal::send_signal_to_task(
                     &mut *task as *mut crate::kernel::task::TaskStruct,
-                    crate::kernel::signal::SIGCHLD
+                    crate::kernel::signal::SIGUSR1
                 ),
                 0
             );
@@ -3952,7 +3983,7 @@ mod tests {
             assert_eq!(
                 crate::kernel::signal::send_signal_to_task(
                     &mut *task as *mut crate::kernel::task::TaskStruct,
-                    crate::kernel::signal::SIGCHLD
+                    crate::kernel::signal::SIGUSR1
                 ),
                 0
             );

@@ -1175,36 +1175,39 @@ pub mod tmpfs_vfs {
         for (name, mode, rdev) in [
             ("console", 0o600, dev(5, 1)),
             ("tty", 0o666, dev(5, 0)),
-            ("tty0", 0o620, dev(4, 0)),
-            ("tty1", 0o620, dev(4, 1)),
-            ("tty2", 0o620, dev(4, 2)),
-            ("tty3", 0o620, dev(4, 3)),
-            ("tty4", 0o620, dev(4, 4)),
-            ("tty5", 0o620, dev(4, 5)),
-            ("tty6", 0o620, dev(4, 6)),
             ("ttyS0", 0o620, dev(4, 64)),
         ] {
             let node = make_special(sb, InodeKind::Chardev, mode, console);
             node.rdev.store(rdev, Ordering::Release);
             insert_child(&root, name, node)?;
         }
-        insert_child(
-            &root,
-            "kmsg",
-            make_special(
-                sb,
-                InodeKind::Chardev,
-                0o666,
-                &crate::init::rootfs::DEV_KMSG_FILE_OPS,
-            ),
-        )?;
-        for name in ["null", "zero", "random", "urandom"] {
-            insert_child(
-                &root,
-                name,
-                make_special(sb, InodeKind::Chardev, 0o666, &TMPFS_FILE_OPS),
-            )?;
+        for minor in 0..=crate::linux_driver_abi::tty::VT_MAX_CONSOLES {
+            let name = alloc::format!("tty{minor}");
+            let node = make_special(sb, InodeKind::Chardev, 0o620, console);
+            node.rdev.store(dev(4, minor), Ordering::Release);
+            insert_child(&root, &name, node)?;
         }
+        let kmsg = make_special(
+            sb,
+            InodeKind::Chardev,
+            0o666,
+            &crate::init::rootfs::DEV_KMSG_FILE_OPS,
+        );
+        kmsg.rdev.store(dev(1, 11), Ordering::Release);
+        insert_child(&root, "kmsg", kmsg)?;
+        for (name, minor) in [("null", 3), ("zero", 5), ("random", 8), ("urandom", 9)] {
+            let node = make_special(sb, InodeKind::Chardev, 0o666, &TMPFS_FILE_OPS);
+            node.rdev.store(dev(1, minor), Ordering::Release);
+            insert_child(&root, name, node)?;
+        }
+        let full = make_special(
+            sb,
+            InodeKind::Chardev,
+            0o666,
+            &crate::init::rootfs::DEV_FULL_FILE_OPS,
+        );
+        full.rdev.store(dev(1, 7), Ordering::Release);
+        insert_child(&root, "full", full)?;
         insert_child(&root, "ptmx", make_ptmx(sb))?;
         let root_inode = root.inode().ok_or(EINVAL)?;
         let pts = insert_child(&root, "pts", make_dir(sb, Some(&root_inode), 0o755))?;
@@ -1358,17 +1361,67 @@ pub mod tmpfs_vfs {
         let _ = remove_devtmpfs_block_node(name);
     }
 
-    fn mount_named(fs_name: &'static str) -> Result<SuperBlockRef, i32> {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct TmpfsRootOptions {
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    }
+
+    impl Default for TmpfsRootOptions {
+        fn default() -> Self {
+            Self {
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+            }
+        }
+    }
+
+    fn parse_tmpfs_root_options(data: &str) -> Result<TmpfsRootOptions, i32> {
+        let mut options = TmpfsRootOptions::default();
+        for option in data.split(',').filter(|option| !option.is_empty()) {
+            let Some((name, value)) = option.split_once('=') else {
+                continue;
+            };
+            match name {
+                "mode" => {
+                    if value.is_empty() {
+                        return Err(EINVAL);
+                    }
+                    options.mode = u32::from_str_radix(value, 8).map_err(|_| EINVAL)?;
+                    if options.mode & !0o7777 != 0 {
+                        return Err(EINVAL);
+                    }
+                }
+                "uid" => options.uid = value.parse::<u32>().map_err(|_| EINVAL)?,
+                "gid" => options.gid = value.parse::<u32>().map_err(|_| EINVAL)?,
+                _ => {}
+            }
+        }
+        Ok(options)
+    }
+
+    fn mount_named_with_root_options(
+        fs_name: &'static str,
+        options: TmpfsRootOptions,
+    ) -> Result<SuperBlockRef, i32> {
         let sb = SuperBlock::alloc(fs_name, TMPFS_MAGIC, &TMPFS_SUPER_OPS);
-        let root_inode = make_dir(&sb, None, 0o755);
+        let root_inode = make_dir(&sb, None, options.mode);
+        root_inode.uid.store(options.uid, Ordering::Release);
+        root_inode.gid.store(options.gid, Ordering::Release);
         let root = d_alloc("/");
         root.instantiate(root_inode);
         *sb.root.lock() = Some(root);
         Ok(sb)
     }
 
-    pub fn mount(_source: &str, _flags: u64, _data: &str) -> Result<SuperBlockRef, i32> {
-        mount_named("tmpfs")
+    fn mount_named(fs_name: &'static str) -> Result<SuperBlockRef, i32> {
+        mount_named_with_root_options(fs_name, TmpfsRootOptions::default())
+    }
+
+    pub fn mount(_source: &str, _flags: u64, data: &str) -> Result<SuperBlockRef, i32> {
+        mount_named_with_root_options("tmpfs", parse_tmpfs_root_options(data)?)
     }
 
     pub fn mount_devtmpfs(_source: &str, _flags: u64, _data: &str) -> Result<SuperBlockRef, i32> {
@@ -1470,7 +1523,10 @@ pub mod tmpfs_vfs {
         #[test]
         fn mounted_devtmpfs_contains_core_device_nodes() {
             let sb = mount_devtmpfs("devtmpfs", 0, "").expect("mount devtmpfs");
-            for name in ["console", "tty", "tty1", "ttyS0", "kmsg", "null", "ptmx"] {
+            for name in [
+                "console", "tty", "tty1", "ttyS0", "kmsg", "null", "zero", "full", "random",
+                "urandom", "ptmx",
+            ] {
                 assert_eq!(child_kind(&sb, name), InodeKind::Chardev, "{name}");
             }
             let root = sb.root().expect("root");
@@ -1480,6 +1536,15 @@ pub mod tmpfs_vfs {
             assert!(
                 kmsg_inode.fops.poll.is_some(),
                 "/dev/kmsg must be pollable for systemd-journald"
+            );
+            let full = d_lookup(&root, "full")
+                .and_then(|dentry| dentry.inode())
+                .expect("full inode");
+            assert_eq!(full.fops.name, "dev_full");
+            assert_eq!(
+                full.rdev.load(Ordering::Acquire),
+                crate::init::noinitramfs::new_encode_dev(crate::init::noinitramfs::mkdev(1, 7))
+                    as u64
             );
             let input = d_lookup(&root, "input").expect("input dentry");
             assert_eq!(
@@ -1505,6 +1570,25 @@ pub mod tmpfs_vfs {
         fn mounted_devpts_contains_ptmx() {
             let sb = mount_devpts("devpts", 0, "").expect("mount devpts");
             assert_eq!(child_kind(&sb, "ptmx"), InodeKind::Chardev);
+        }
+
+        #[test]
+        fn tmpfs_mount_applies_root_mode_uid_and_gid_options() {
+            let sb = mount("tmpfs", 0, "size=10M,mode=0700,uid=1000,gid=1001")
+                .expect("tmpfs mount options");
+            let root = sb.root().expect("tmpfs root");
+            let inode = root.inode().expect("tmpfs root inode");
+
+            assert_eq!(inode.mode.load(Ordering::Acquire) & 0o7777, 0o700);
+            assert_eq!(inode.uid.load(Ordering::Acquire), 1000);
+            assert_eq!(inode.gid.load(Ordering::Acquire), 1001);
+        }
+
+        #[test]
+        fn tmpfs_mount_rejects_malformed_root_identity_options() {
+            assert!(matches!(mount("tmpfs", 0, "mode=not-octal"), Err(EINVAL)));
+            assert!(matches!(mount("tmpfs", 0, "uid=not-a-number"), Err(EINVAL)));
+            assert!(matches!(mount("tmpfs", 0, "gid="), Err(EINVAL)));
         }
 
         #[test]

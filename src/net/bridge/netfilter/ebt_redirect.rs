@@ -30,7 +30,7 @@ pub struct RedirectPacket {
     pub writable: bool,
     pub hooknum: u8,
     pub h_dest: [u8; 6],
-    pub bridge_dev_addr: [u8; 6],
+    pub master_dev_addr: Option<[u8; 6]>,
     pub in_dev_addr: [u8; 6],
     pub pkt_type: u8,
 }
@@ -57,7 +57,10 @@ pub fn ebt_redirect_tg(packet: &mut RedirectPacket, info: EbtRedirectInfo) -> i3
         return EBT_DROP;
     }
     packet.h_dest = if packet.hooknum != NF_BR_BROUTING {
-        packet.bridge_dev_addr
+        let Some(master_dev_addr) = packet.master_dev_addr else {
+            return EBT_DROP;
+        };
+        master_dev_addr
     } else {
         packet.in_dev_addr
     };
@@ -107,7 +110,9 @@ mod tests {
         assert!(source.contains("if (skb_ensure_writable(skb, 0))"));
         assert!(source.contains("return EBT_DROP;"));
         assert!(source.contains("if (xt_hooknum(par) != NF_BR_BROUTING)"));
-        assert!(source.contains("br_port_get_rcu(xt_in(par))->br->dev->dev_addr"));
+        assert!(source.contains("dev = netdev_master_upper_dev_get_rcu(xt_in(par));"));
+        assert!(source.contains("if (!dev)"));
+        assert!(source.contains("ether_addr_copy(eth_hdr(skb)->h_dest, dev->dev_addr);"));
         assert!(source.contains("xt_in(par)->dev_addr"));
         assert!(source.contains("skb->pkt_type = PACKET_HOST;"));
         assert!(source.contains("return info->target;"));
@@ -123,7 +128,7 @@ mod tests {
             writable: true,
             hooknum: NF_BR_PRE_ROUTING,
             h_dest: [0; 6],
-            bridge_dev_addr: [0x02, 0, 0, 0, 0, 1],
+            master_dev_addr: Some([0x02, 0, 0, 0, 0, 1]),
             in_dev_addr: [0x02, 0, 0, 0, 0, 2],
             pkt_type: 9,
         };
@@ -139,6 +144,12 @@ mod tests {
             EBT_DROP
         );
         assert_eq!(packet.h_dest, [0x02, 0, 0, 0, 0, 2]);
+        packet.hooknum = NF_BR_PRE_ROUTING;
+        packet.master_dev_addr = None;
+        assert_eq!(
+            ebt_redirect_tg(&mut packet, EbtRedirectInfo { target: EBT_ACCEPT }),
+            EBT_DROP
+        );
         packet.writable = false;
         assert_eq!(
             ebt_redirect_tg(&mut packet, EbtRedirectInfo { target: EBT_ACCEPT }),

@@ -88,6 +88,10 @@ const NETLINK_LIST_MEMBERSHIPS: i32 = 9;
 const RTNLGRP_MAX: usize = 39;
 const IFNAMSIZ: usize = 16;
 const IFREQ_DATA_LEN: usize = 24;
+// Linux `TIOCOUTQ`/`SIOCOUTQ`: bytes queued in the socket send buffer.
+// Lupos' local sockets deliver into the peer receive queue synchronously, so
+// they have no residual sender-side queue after sendmsg(2) returns.
+const TIOCOUTQ: u32 = 0x5411;
 const SIOCGIFNAME: u32 = 0x8910;
 const SIOCGIFFLAGS: u32 = 0x8913;
 const SIOCSIFFLAGS: u32 = 0x8914;
@@ -258,14 +262,27 @@ fn trace_unix_interesting_path(path: &str) -> bool {
 }
 
 #[cfg(not(test))]
+fn trace_current_is_udev() -> bool {
+    if !crate::kernel::debug_trace::udev_enabled() {
+        return false;
+    }
+    let task = unsafe { sched::get_current() };
+    if task.is_null() {
+        return false;
+    }
+    let comm = unsafe { &(*task).comm };
+    comm.starts_with(b"systemd-udevd")
+}
+
+#[cfg(not(test))]
 fn trace_unix_socket_paths(sock: &SocketRef) -> (Option<String>, Option<String>) {
     let socket = sock.lock();
     let local = match socket.local.as_ref() {
-        Some(SockAddr::Unix(path)) if trace_unix_interesting_path(path) => Some(path.clone()),
+        Some(SockAddr::Unix(path)) => Some(path.clone()),
         _ => None,
     };
     let peer = match socket.peer.as_ref() {
-        Some(SockAddr::Unix(path)) if trace_unix_interesting_path(path) => Some(path.clone()),
+        Some(SockAddr::Unix(path)) => Some(path.clone()),
         _ => None,
     };
     (local, peer)
@@ -293,13 +310,17 @@ fn trace_unix_sendmsg(
     bytes: &[u8],
     result: &Result<usize, i32>,
 ) {
-    if !crate::kernel::debug_trace::proc_enabled() {
+    let trace_udev = trace_current_is_udev();
+    if !crate::kernel::debug_trace::proc_enabled() && !trace_udev {
         return;
     }
     let (local, peer) = trace_unix_socket_paths(sock);
     let local = local.as_deref().or(path);
     let peer = peer.as_deref().or(path);
-    if local.is_none() && peer.is_none() {
+    if !trace_udev
+        && !local.is_some_and(trace_unix_interesting_path)
+        && !peer.is_some_and(trace_unix_interesting_path)
+    {
         return;
     }
     let cred = trace_current_ucred();
@@ -368,13 +389,15 @@ fn trace_unix_recvmsg(
     controllen: usize,
     flags: i32,
 ) {
-    if !crate::kernel::debug_trace::proc_enabled() {
+    let trace_udev = trace_current_is_udev();
+    if !crate::kernel::debug_trace::proc_enabled() && !trace_udev {
         return;
     }
     let (local, peer) = trace_unix_socket_paths(sock);
     let payload = trace_payload_prefix(bytes);
-    if local.is_none()
-        && peer.is_none()
+    if !trace_udev
+        && !local.as_deref().is_some_and(trace_unix_interesting_path)
+        && !peer.as_deref().is_some_and(trace_unix_interesting_path)
         && !payload.contains("READY=")
         && !payload.contains("STOPPING=")
     {
@@ -1096,6 +1119,10 @@ fn socket_ioctl_ethtool(
 
 fn socket_file_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
     let _sock = socket_from_file(file)?;
+    if cmd == TIOCOUTQ {
+        write_user_struct(arg as *mut i32, &0i32)?;
+        return Ok(0);
+    }
     if cmd == SIOCGIFNAME {
         let mut ifr = read_user_struct::<LinuxIfreq>(arg as *const LinuxIfreq)?;
         let ifindex = ifr.ifindex() as u32;
@@ -2183,7 +2210,7 @@ pub unsafe fn sys_setsockopt(fd: i32, level: i32, opt: i32, val: *const u8, len:
         Err(errno) => -(errno as i64),
     };
     #[cfg(not(test))]
-    if crate::kernel::debug_trace::proc_enabled()
+    if (crate::kernel::debug_trace::proc_enabled() || crate::kernel::debug_trace::netlink_enabled())
         && level == SOL_SOCKET
         && opt as u32 == socket::SO_PASSCRED
     {
@@ -2824,7 +2851,7 @@ pub unsafe fn sys_sendmsg(fd: i32, msg: *const LinuxMsghdr, flags: i32) -> i64 {
             Ok(peer) => {
                 #[cfg(not(test))]
                 if let SockAddr::Unix(path) = &peer
-                    && trace_unix_interesting_path(path)
+                    && (trace_unix_interesting_path(path) || trace_current_is_udev())
                 {
                     trace_dest_path = Some(path.clone());
                 }
@@ -2942,7 +2969,7 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
                 _ => 0,
             };
             crate::linux_driver_abi::tty::serial_println!(
-                "trace-netlink-recv pid={} fd={} nlmsg_type={} seq={} hdr_pid={} peer_pid={} peer_groups=0x{:x} pktinfo_group={} recv_pktinfo={} flags=0x{:x} real_len={} copied={}",
+                "trace-netlink-recv pid={} fd={} nlmsg_type={} seq={} hdr_pid={} peer_pid={} peer_groups=0x{:x} pktinfo_group={} recv_pktinfo={} passcred={} packet_pid={} packet_uid={} packet_gid={} controllen={} flags=0x{:x} real_len={} copied={}",
                 pid,
                 fd,
                 msg_type,
@@ -2952,6 +2979,11 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
                 peer_groups,
                 packet_meta.netlink_group,
                 recv_pktinfo,
+                passcred,
+                packet_cred.pid,
+                packet_cred.uid,
+                packet_cred.gid,
+                msgval.controllen,
                 flags,
                 real_len,
                 n,
@@ -3476,6 +3508,49 @@ mod tests {
             sched::set_current(core::ptr::null_mut());
         }
         crate::net::device::unregister_netdevice(name).expect("unregister netdev");
+    }
+
+    #[test]
+    fn unix_socket_tiocoutq_reports_empty_synchronous_send_queue() {
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 278;
+        current.tgid = 278;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let mut sv = [-1i32; 2];
+            assert_eq!(
+                sys_socketpair(
+                    AF_UNIX as i32,
+                    socket::SOCK_STREAM as i32,
+                    0,
+                    sv.as_mut_ptr()
+                ),
+                0
+            );
+            assert_eq!(
+                sys_sendto(sv[0], b"queued".as_ptr(), 6, 0, core::ptr::null(), 0),
+                6
+            );
+
+            let mut pending = -1i32;
+            assert_eq!(
+                crate::fs::ioctl::sys_ioctl(sv[0], TIOCOUTQ, (&mut pending as *mut i32) as u64),
+                0
+            );
+            assert_eq!(pending, 0);
+            assert_eq!(
+                crate::fs::ioctl::sys_ioctl(sv[0], TIOCOUTQ, 0),
+                -(EFAULT as i64)
+            );
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
     }
 
     #[test]
@@ -5369,7 +5444,7 @@ mod tests {
             );
             assert!(n > 0);
             let payload = &out[..n as usize];
-            assert!(payload.starts_with(b"add@/class/input/event-syscall0\0"));
+            assert!(payload.starts_with(b"add@/devices/virtual/input/event-syscall0\0"));
 
             let _ = crate::net::uevent::drain_pending();
             files::drop_task_files(&mut *current as *mut TaskStruct);
