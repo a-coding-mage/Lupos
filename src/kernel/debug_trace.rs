@@ -16,13 +16,17 @@ pub const TRACE_CGROUP: u32 = 1 << 3;
 pub const TRACE_PING: u32 = 1 << 4;
 pub const TRACE_SYSTEMCTL: u32 = 1 << 5;
 pub const TRACE_PROC: u32 = 1 << 6;
+pub const TRACE_GLYCIN: u32 = 1 << 7;
+pub const TRACE_UDEV: u32 = 1 << 8;
 pub const TRACE_ALL: u32 = TRACE_SYSCALL
     | TRACE_FS
     | TRACE_NETLINK
     | TRACE_CGROUP
     | TRACE_PING
     | TRACE_SYSTEMCTL
-    | TRACE_PROC;
+    | TRACE_PROC
+    | TRACE_GLYCIN
+    | TRACE_UDEV;
 
 static TRACE_FLAGS: AtomicU32 = AtomicU32::new(0);
 static PING_TRACE_PID: AtomicI32 = AtomicI32::new(-1);
@@ -54,6 +58,8 @@ fn parse_trace_value(value: &str, mut flags: u32) -> u32 {
             "ping" => flags |= TRACE_PING,
             "systemctl" => flags |= TRACE_SYSTEMCTL,
             "proc" | "process" => flags |= TRACE_PROC,
+            "glycin" | "image-loader" => flags |= TRACE_GLYCIN,
+            "udev" => flags |= TRACE_UDEV,
             _ => {}
         }
     }
@@ -86,6 +92,14 @@ pub fn systemctl_enabled() -> bool {
 
 pub fn proc_enabled() -> bool {
     flags() & TRACE_PROC != 0
+}
+
+pub fn glycin_enabled() -> bool {
+    flags() & TRACE_GLYCIN != 0
+}
+
+pub fn udev_enabled() -> bool {
+    flags() & TRACE_UDEV != 0
 }
 
 pub fn remember_ping_pid_for_exec(pid: i32, path: &str, exec_path: &str) -> bool {
@@ -141,8 +155,9 @@ mod tests {
     #[test]
     fn parses_lupos_trace_cmdline_as_comma_list() {
         let _guard = reset_trace_state();
-        let flags =
-            parse_cmdline("quiet lupos.trace=syscall,fs,cgroup,ping,systemctl,proc root=/dev/vda1");
+        let flags = parse_cmdline(
+            "quiet lupos.trace=syscall,fs,cgroup,ping,systemctl,proc,glycin,udev root=/dev/vda1",
+        );
 
         assert_ne!(flags & TRACE_SYSCALL, 0);
         assert_ne!(flags & TRACE_FS, 0);
@@ -151,6 +166,8 @@ mod tests {
         assert_ne!(flags & TRACE_PING, 0);
         assert_ne!(flags & TRACE_SYSTEMCTL, 0);
         assert_ne!(flags & TRACE_PROC, 0);
+        assert_ne!(flags & TRACE_GLYCIN, 0);
+        assert_ne!(flags & TRACE_UDEV, 0);
     }
 
     #[test]

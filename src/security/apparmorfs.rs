@@ -731,7 +731,7 @@ mod tests {
         let data = b"data\0data.demo\0os-release\0";
         assert_eq!(vfs_write(&access_file, data), Ok(data.len()));
         let mut expected = Vec::new();
-        expected.extend_from_slice(&18u32.to_le_bytes());
+        expected.extend_from_slice(&16u32.to_le_bytes());
         expected.extend_from_slice(&1u32.to_le_bytes());
         expected.extend_from_slice(&8u32.to_le_bytes());
         expected.extend_from_slice(b"ID=arch\n");

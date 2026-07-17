@@ -281,8 +281,21 @@ fn do_openat2_with_path_hint(
     }
 
     let ctx = LookupCtx::from_paths(root, dir.clone(), how.resolve);
+    let proc_fd_target = if flags & O_NOFOLLOW == 0 {
+        match crate::fs::proc::fd::current_fd_file_from_proc_path(path) {
+            Some(Ok(file)) => Some(file.dentry.clone()),
+            Some(Err(errno)) => return Err(errno),
+            None => None,
+        }
+    } else {
+        None
+    };
 
-    if let Some(dentry) = resolve_existing_open_path(&ctx, path, flags & O_NOFOLLOW == 0)? {
+    let existing = match proc_fd_target {
+        Some(dentry) => Some(dentry),
+        None => resolve_existing_open_path(&ctx, path, flags & O_NOFOLLOW == 0)?,
+    };
+    if let Some(dentry) = existing {
         if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
             return Err(EEXIST);
         }
@@ -519,6 +532,11 @@ fn proc_file_open_result(result: Result<FileRef, i32>, flags: u32) -> Result<Ope
 }
 
 fn proc_special_open_result(path: &str, flags: u32, mode: u32) -> Option<Result<OpenResult, i32>> {
+    if let Some(result) =
+        crate::fs::proc::namespaces::user_namespace_file_from_proc_path(path, flags)
+    {
+        return Some(proc_file_open_result(result, flags));
+    }
     if let Some(result) = crate::fs::proc::fd::current_fdinfo_file_from_proc_path(path, flags, mode)
     {
         return Some(read_only_proc_open_result(result, flags));

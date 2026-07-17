@@ -62,7 +62,7 @@ mod tests {
         assert!(source.contains("boot_cpu_has(X86_FEATURE_X2APIC)"));
         assert!(source.contains("DEFINE_IDTENTRY_SYSVEC(sysvec_acrn_hv_callback)"));
         assert!(source.contains("apic_eoi();"));
-        assert!(source.contains("inc_irq_stat(irq_hv_callback_count);"));
+        assert!(source.contains("inc_irq_stat(HYPERVISOR_CALLBACK);"));
         assert!(source.contains("acrn_setup_intr_handler"));
         assert!(source.contains("acrn_remove_intr_handler"));
         assert!(source.contains(".name                   = \"ACRN\""));

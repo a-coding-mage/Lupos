@@ -574,10 +574,12 @@ static COMPAT_KD_MODE: AtomicU32 = AtomicU32::new(KD_TEXT);
 static COMPAT_KB_MODE: AtomicU32 = AtomicU32::new(K_XLATE);
 static COMPAT_VT_ACTIVE: AtomicU32 = AtomicU32::new(1);
 
-/// Number of synthetic VTs we report to userspace.  Mirrors the default
-/// configuration of Linux's `CONFIG_VT_CONSOLE` build (`MAX_NR_CONSOLES=63`
-/// in upstream, but we only own `tty1..tty6`).
-pub const VT_MAX_CONSOLES: u32 = 6;
+/// Number of virtual consoles exposed by Linux's `CONFIG_VT_CONSOLE` build.
+///
+/// `MAX_NR_CONSOLES` is 63 upstream.  Keeping that complete range matters to
+/// unmodified display managers: LightDM conventionally starts Xorg on VT7,
+/// after the six text consoles reserved by the distribution.
+pub const VT_MAX_CONSOLES: u32 = 63;
 
 /// Snapshot used by callers that need to check whether the framebuffer text
 /// console should keep rendering — fbcon equivalents go silent in
@@ -949,8 +951,10 @@ pub fn tty_ioctl_compat(cmd: u32, arg: u64) -> Result<i64, i32> {
             let st = VtStat {
                 v_active: COMPAT_VT_ACTIVE.load(Ordering::Acquire) as u16,
                 v_signal: 0,
-                // Bitmask of opened VTs — we always report tty1..tty6 open.
-                v_state: ((1u16 << (VT_MAX_CONSOLES + 1)) - 1) & !1,
+                // `struct vt_stat::v_state` is only a 16-bit legacy bitmap,
+                // even though Linux supports tty1..tty63.  Report every VT
+                // representable by that ABI field as open.
+                v_state: u16::MAX & !1,
             };
             let not_copied = unsafe {
                 crate::arch::x86::kernel::uaccess::copy_to_user(

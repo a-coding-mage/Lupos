@@ -19,13 +19,14 @@ use spin::Mutex;
 use crate::include::uapi::errno::{EBUSY, EINVAL, ELOOP, ENOENT, EPERM, EROFS, EXDEV};
 use crate::include::uapi::mount::{
     MS_BIND, MS_MOVE, MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW,
-    MS_PRIVATE, MS_RDONLY, MS_REC, MS_RELATIME, MS_REMOUNT, MS_SHARED, MS_SLAVE, MS_STRICTATIME,
-    MS_UNBINDABLE,
+    MS_PRIVATE, MS_RDONLY, MS_REC, MS_RELATIME, MS_REMOUNT, MS_SHARED, MS_SILENT, MS_SLAVE,
+    MS_STRICTATIME, MS_UNBINDABLE,
 };
 use crate::include::uapi::openat2::{
     RESOLVE_BENEATH, RESOLVE_IN_ROOT, RESOLVE_NO_MAGICLINKS, RESOLVE_NO_SYMLINKS, RESOLVE_NO_XDEV,
 };
 use crate::kernel::capability::{CAP_SYS_ADMIN, capable};
+use crate::kernel::nsproxy::INIT_NSPROXY;
 
 use super::namei::LookupCtx;
 use super::types::DCACHE_MOUNTED;
@@ -37,7 +38,9 @@ const MAX_SYMLINK_FOLLOWS: usize = 40;
 #[cfg(not(test))]
 macro_rules! trace_mount {
     ($($arg:tt)*) => {
-        if crate::kernel::debug_trace::fs_enabled() {
+        if crate::kernel::debug_trace::fs_enabled()
+            || crate::kernel::debug_trace::glycin_enabled()
+        {
             crate::linux_driver_abi::tty::serial_println!($($arg)*);
         }
     };
@@ -139,19 +142,128 @@ pub struct MountTable {
 }
 
 lazy_static::lazy_static! {
-    pub static ref MOUNTS: MountTable = MountTable {
+    pub static ref MOUNTS: Arc<MountTable> = Arc::new(MountTable {
         root: Mutex::new(None),
         by_path: Mutex::new(BTreeMap::new()),
-    };
+    });
+    static ref MOUNT_NAMESPACES: Mutex<BTreeMap<usize, Arc<MountTable>>> =
+        Mutex::new(BTreeMap::new());
 }
 
 #[cfg(test)]
 pub static TEST_MOUNT_LOCK: Mutex<()> = Mutex::new(());
 
+fn table_for_namespace(ns: *const crate::fs::namespace::MntNamespace) -> Arc<MountTable> {
+    if ns.is_null() || core::ptr::eq(ns, &raw const crate::fs::namespace::INIT_MNT_NS as *const _) {
+        return MOUNTS.clone();
+    }
+    MOUNT_NAMESPACES
+        .lock()
+        .get(&(ns as usize))
+        .cloned()
+        .unwrap_or_else(|| MOUNTS.clone())
+}
+
+fn current_mount_table() -> Arc<MountTable> {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return MOUNTS.clone();
+    }
+    let nsproxy = unsafe { (*task).m28_nsproxy.nsproxy };
+    let nsproxy = if nsproxy.is_null() {
+        &raw const INIT_NSPROXY as *mut crate::kernel::nsproxy::Nsproxy
+    } else {
+        nsproxy
+    };
+    table_for_namespace(unsafe { (*nsproxy).mnt_ns })
+}
+
+pub fn current_mount_entries() -> Vec<(String, Arc<Mount>)> {
+    current_mount_table()
+        .by_path
+        .lock()
+        .iter()
+        .map(|(path, mount)| (path.clone(), mount.clone()))
+        .collect()
+}
+
+pub fn namespace_root_for(ns: *const crate::fs::namespace::MntNamespace) -> Option<VfsPath> {
+    let mount = table_for_namespace(ns).root.lock().clone()?;
+    Some(VfsPath::new(mount.clone(), mount.root.clone()))
+}
+
+pub fn resolve_from_namespace_root(root: &VfsPath, path: &str) -> Result<VfsPath, i32> {
+    walk_path(root, root.clone(), path, true, 0)
+}
+
+fn clone_mount_subtree(
+    source: &Arc<Mount>,
+    parent: Option<Arc<Mount>>,
+    by_id: &mut BTreeMap<MountId, Arc<Mount>>,
+) -> Arc<Mount> {
+    let cloned = Mount::alloc(
+        source.sb.clone(),
+        source.root.clone(),
+        source.flags.load(Ordering::Acquire),
+    );
+    *cloned.mountpoint.lock() = source.mountpoint.lock().clone();
+    *cloned.parent.lock() = parent;
+    by_id.insert(source.id, cloned.clone());
+    for source_child in source.children.lock().clone() {
+        let child = clone_mount_subtree(&source_child, Some(cloned.clone()), by_id);
+        cloned.children.lock().push(child);
+    }
+    cloned
+}
+
+/// Clone the complete mount tree for a new mount namespace and publish it
+/// before the child can run. Superblocks and dentries remain shared, while
+/// mount topology, flags, and later attach/detach operations are private.
+pub fn register_mount_namespace(
+    ns: *mut crate::fs::namespace::MntNamespace,
+    old: *const crate::fs::namespace::MntNamespace,
+) -> *mut Mount {
+    let source = table_for_namespace(old);
+    let Some(source_root) = source.root.lock().clone() else {
+        MOUNT_NAMESPACES.lock().insert(
+            ns as usize,
+            Arc::new(MountTable {
+                root: Mutex::new(None),
+                by_path: Mutex::new(BTreeMap::new()),
+            }),
+        );
+        return core::ptr::null_mut();
+    };
+    let mut by_id = BTreeMap::new();
+    let root = clone_mount_subtree(&source_root, None, &mut by_id);
+    let mut by_path = BTreeMap::new();
+    for (path, source_mount) in source.by_path.lock().iter() {
+        if let Some(cloned) = by_id.get(&source_mount.id) {
+            by_path.insert(path.clone(), cloned.clone());
+        }
+    }
+    let root_ptr = Arc::as_ptr(&root) as *mut Mount;
+    MOUNT_NAMESPACES.lock().insert(
+        ns as usize,
+        Arc::new(MountTable {
+            root: Mutex::new(Some(root)),
+            by_path: Mutex::new(by_path),
+        }),
+    );
+    root_ptr
+}
+
+pub fn unregister_mount_namespace(ns: *const crate::fs::namespace::MntNamespace) {
+    if !ns.is_null() {
+        MOUNT_NAMESPACES.lock().remove(&(ns as usize));
+    }
+}
+
 /// Set the rootfs mount (init time).
 pub fn set_rootfs(m: Arc<Mount>) {
-    *MOUNTS.root.lock() = Some(m.clone());
-    MOUNTS
+    let table = current_mount_table();
+    *table.root.lock() = Some(m.clone());
+    table
         .by_path
         .lock()
         .insert(alloc::string::String::from("/"), m);
@@ -159,7 +271,7 @@ pub fn set_rootfs(m: Arc<Mount>) {
 }
 
 pub fn rootfs() -> Option<Arc<Mount>> {
-    MOUNTS.root.lock().clone()
+    current_mount_table().root.lock().clone()
 }
 
 pub fn namespace_root_path() -> Option<VfsPath> {
@@ -195,7 +307,18 @@ fn do_bind_mount(source_path: &str, mountpoint_path: &str, flags: u64) -> Result
     if source_path.is_empty() {
         return Err(ENOENT);
     }
-    let (source_mount, source_root) = resolve_path_follow(source_path)?;
+    let (source_mount, source_root) = match resolve_path_follow(source_path) {
+        Ok(source) => source,
+        Err(errno) => {
+            trace_mount!(
+                "trace-bind-resolve source={} target={} failed=source errno={}",
+                source_path,
+                mountpoint_path,
+                errno
+            );
+            return Err(errno);
+        }
+    };
     if bind_source_is_target_mount_root(&source_mount, &source_root, mountpoint_path) {
         return Ok(source_mount);
     }
@@ -208,11 +331,22 @@ fn do_bind_mount(source_path: &str, mountpoint_path: &str, flags: u64) -> Result
         .or_else(|| stable_path_for_dentry(&source_root_for_walk))
         .unwrap_or_else(|| normalize_mount_path(source_path));
     let m = Mount::alloc(source_mount.sb.clone(), source_root, flags as u32);
-    attach_mount(m.clone(), mountpoint_path)?;
+    if let Err(errno) = attach_mount(m.clone(), mountpoint_path) {
+        trace_mount!(
+            "trace-bind-resolve source={} target={} failed=target errno={}",
+            source_path,
+            mountpoint_path,
+            errno
+        );
+        return Err(errno);
+    }
     if flags & MS_REC != 0 {
-        let bind_root_path = m
-            .mountpoint
-            .lock()
+        // Drop the mountpoint guard before canonicalization.  Relative bind
+        // targets fall through to path_for_dentry(), which walks every mount
+        // and locks this same mountpoint field.  Keeping the guard alive
+        // across the closure self-deadlocks bubblewrap's recursive self-bind.
+        let bind_mountpoint = m.mountpoint.lock().clone();
+        let bind_root_path = bind_mountpoint
             .as_ref()
             .map(|mp| canonical_mountpoint_path(mountpoint_path, mp))
             .or_else(|| path_for_dentry(&m.root))
@@ -391,7 +525,7 @@ fn collect_mount_tree_ids(mount: &Arc<Mount>, ids: &mut Vec<MountId>) {
 fn unregister_mount_tree(mount: &Arc<Mount>) {
     let mut ids = Vec::new();
     collect_mount_tree_ids(mount, &mut ids);
-    MOUNTS
+    current_mount_table()
         .by_path
         .lock()
         .retain(|_, candidate| !ids.contains(&candidate.id));
@@ -420,7 +554,8 @@ fn attach_mount_at(mount: Arc<Mount>, target: &VfsPath) -> Result<(), i32> {
         .flags
         .fetch_or(DCACHE_MOUNTED, Ordering::AcqRel);
     target.mount.children.lock().push(mount.clone());
-    let mut table = MOUNTS.by_path.lock();
+    let mount_table = current_mount_table();
+    let mut table = mount_table.by_path.lock();
     register_mount_tree(&mount, &canonical_path, &mut table);
     drop(table);
     notify_mount_change();
@@ -434,7 +569,10 @@ pub fn attach_mount(m: Arc<Mount>, mountpoint_path: &str) -> Result<(), i32> {
     *m.parent.lock() = Some(parent.clone());
     mp.flags.fetch_or(DCACHE_MOUNTED, Ordering::AcqRel);
     parent.children.lock().push(m.clone());
-    MOUNTS.by_path.lock().insert(canonical_path, m.clone());
+    current_mount_table()
+        .by_path
+        .lock()
+        .insert(canonical_path, m.clone());
     notify_mount_change();
     Ok(())
 }
@@ -577,7 +715,8 @@ fn containing_mount_for_dentry_by_path(
     dentry: &DentryRef,
     prefer_longest_path_on_tie: bool,
 ) -> Option<Arc<Mount>> {
-    let mounts = MOUNTS.by_path.lock();
+    let table = current_mount_table();
+    let mounts = table.by_path.lock();
     let mut best: Option<(usize, usize, Arc<Mount>)> = None;
     for (path, mount) in mounts.iter() {
         if let Some(depth) = dentry_depth_below_root(dentry, &mount.root) {
@@ -703,7 +842,9 @@ pub unsafe fn sys_mount(
         let propagation_flags = MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE;
         let propagation = flags & propagation_flags;
         if propagation != 0 && (propagation & (propagation - 1)) == 0 {
-            if flags & !(propagation_flags | MS_REC) != 0 {
+            // MS_SILENT is an accepted no-op request modifier. bubblewrap
+            // combines it with MS_SLAVE|MS_REC for its namespace root.
+            if flags & !(propagation_flags | MS_REC | MS_SILENT) != 0 {
                 trace_mount!("trace-mount-ret errno={}", EINVAL);
                 return -(EINVAL as i64);
             }
@@ -763,8 +904,28 @@ pub unsafe fn sys_mount(
 }
 
 pub fn do_umount(mountpoint_path: &str, _flags: u32) -> Result<(), i32> {
-    let mut tbl = MOUNTS.by_path.lock();
-    let m = tbl.remove(mountpoint_path).ok_or(EINVAL)?;
+    let table = current_mount_table();
+    let keyed_mount = table.by_path.lock().get(mountpoint_path).cloned();
+    let m = keyed_mount
+        .or_else(|| {
+            let (mount, dentry) = resolve_path_follow(mountpoint_path).ok()?;
+            if Arc::ptr_eq(&dentry, &mount.root) && mount.parent.lock().is_some() {
+                return Some(mount);
+            }
+            mount.children.lock().iter().rev().find_map(|child| {
+                child
+                    .mountpoint
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|mp| Arc::ptr_eq(mp, &dentry))
+                    .then(|| child.clone())
+            })
+        })
+        .ok_or(EINVAL)?;
+    if m.parent.lock().is_none() {
+        return Err(EBUSY);
+    }
+    unregister_mount_tree(&m);
     let mountpoint = m.mountpoint.lock().clone();
     if let Some(parent) = m.parent.lock().clone() {
         parent.children.lock().retain(|c| !Arc::ptr_eq(c, &m));
@@ -783,7 +944,10 @@ pub fn do_umount(mountpoint_path: &str, _flags: u32) -> Result<(), i32> {
                 })
                 .cloned();
             if let Some(replacement) = replacement {
-                tbl.insert(String::from(mountpoint_path), replacement);
+                table
+                    .by_path
+                    .lock()
+                    .insert(String::from(mountpoint_path), replacement);
             } else {
                 mp.flags.fetch_and(!DCACHE_MOUNTED, Ordering::AcqRel);
             }
@@ -794,7 +958,7 @@ pub fn do_umount(mountpoint_path: &str, _flags: u32) -> Result<(), i32> {
 }
 
 pub fn lookup_mount(path: &str) -> Option<Arc<Mount>> {
-    MOUNTS.by_path.lock().get(path).cloned()
+    current_mount_table().by_path.lock().get(path).cloned()
 }
 
 pub fn mounted_root_for_dentry(dentry: &DentryRef) -> Option<Arc<Mount>> {
@@ -802,7 +966,8 @@ pub fn mounted_root_for_dentry(dentry: &DentryRef) -> Option<Arc<Mount>> {
 }
 
 fn mounted_root_for_dentry_by_path(dentry: &DentryRef, prefer_longest: bool) -> Option<Arc<Mount>> {
-    let mounts = MOUNTS.by_path.lock();
+    let table = current_mount_table();
+    let mounts = table.by_path.lock();
     let mut best: Option<(usize, Arc<Mount>)> = None;
     for (path, mount) in mounts.iter() {
         if Arc::ptr_eq(&mount.root, dentry) {
@@ -841,7 +1006,8 @@ pub fn stable_path_for_dentry(dentry: &DentryRef) -> Option<String> {
 }
 
 fn path_for_dentry_by_mount_path(dentry: &DentryRef, prefer_longest: bool) -> Option<String> {
-    let mounts = MOUNTS.by_path.lock();
+    let table = current_mount_table();
+    let mounts = table.by_path.lock();
     let mut best: Option<(usize, String)> = None;
     for (path, mount) in mounts.iter() {
         if let Some(components) = dentry_components_below_root(dentry, &mount.root) {
@@ -1215,13 +1381,67 @@ pub fn path_walk(path: &str) -> Option<DentryRef> {
     resolve_path_follow(path).ok().map(|(_, dentry)| dentry)
 }
 
-pub fn pivot_root(new_root: &str, _put_old: &str) -> Result<(), i32> {
-    let m = lookup_mount(new_root).ok_or(EINVAL)?;
-    if Arc::strong_count(&m) == 0 {
-        return Err(EBUSY);
+pub fn pivot_root_paths(new_root: &VfsPath, put_old: &VfsPath) -> Result<(VfsPath, VfsPath), i32> {
+    let table = current_mount_table();
+    let old_mount = table.root.lock().clone().ok_or(EINVAL)?;
+    if Arc::ptr_eq(&old_mount, &new_root.mount)
+        || !Arc::ptr_eq(&new_root.dentry, &new_root.mount.root)
+        || !Arc::ptr_eq(&put_old.mount, &new_root.mount)
+        || new_root.mount.parent.lock().is_none()
+    {
+        return Err(EINVAL);
     }
-    *MOUNTS.root.lock() = Some(m);
-    Ok(())
+    let old_root = VfsPath::new(old_mount.clone(), old_mount.root.clone());
+    let new_root = VfsPath::new(new_root.mount.clone(), new_root.mount.root.clone());
+
+    let old_parent = new_root.mount.parent.lock().clone().ok_or(EINVAL)?;
+    let old_mountpoint = new_root.mount.mountpoint.lock().clone().ok_or(EINVAL)?;
+    old_parent
+        .children
+        .lock()
+        .retain(|mount| !Arc::ptr_eq(mount, &new_root.mount));
+    if !old_parent.children.lock().iter().any(|mount| {
+        mount
+            .mountpoint
+            .lock()
+            .as_ref()
+            .is_some_and(|mountpoint| Arc::ptr_eq(mountpoint, &old_mountpoint))
+    }) {
+        old_mountpoint
+            .flags
+            .fetch_and(!DCACHE_MOUNTED, Ordering::AcqRel);
+    }
+
+    *new_root.mount.parent.lock() = None;
+    *new_root.mount.mountpoint.lock() = None;
+    *old_mount.parent.lock() = Some(new_root.mount.clone());
+    *old_mount.mountpoint.lock() = Some(put_old.dentry.clone());
+    put_old
+        .dentry
+        .flags
+        .fetch_or(DCACHE_MOUNTED, Ordering::AcqRel);
+
+    // The pivot_root(".", ".") container-runtime idiom keeps the old root
+    // reachable through an open fd/current path until MNT_DETACH, but it must
+    // not cover the new namespace root during ordinary absolute lookup.
+    let dot_pivot = put_old.equal(&new_root);
+    if !dot_pivot {
+        new_root.mount.children.lock().push(old_mount.clone());
+    }
+
+    let mut by_path = BTreeMap::new();
+    register_mount_tree(&new_root.mount, "/", &mut by_path);
+    if dot_pivot {
+        // Keep the detached tree discoverable by dentry-only open file
+        // descriptions until fchdir()+MNT_DETACH drops it.  The synthetic key
+        // is internal to the mount registry and is never pathname-resolved.
+        let hidden_path = alloc::format!("/.lupos-pivot-old-{}", old_mount.id);
+        register_mount_tree(&old_mount, &hidden_path, &mut by_path);
+    }
+    *table.root.lock() = Some(new_root.mount.clone());
+    *table.by_path.lock() = by_path;
+    notify_mount_change();
+    Ok((old_root, new_root))
 }
 
 #[cfg(test)]
@@ -1258,6 +1478,30 @@ mod tests {
         assert!(rootfs().expect("rootfs").is_readonly());
         remount_mountpoint("/", MS_REMOUNT).expect("remount root");
         assert!(!rootfs().expect("rootfs").is_readonly());
+    }
+
+    #[test]
+    fn recursive_slave_propagation_accepts_silent_modifier() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", 0, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        set_rootfs(Mount::alloc(sb, root, 0));
+
+        assert_eq!(
+            unsafe {
+                sys_mount(
+                    core::ptr::null(),
+                    b"/\0".as_ptr(),
+                    core::ptr::null(),
+                    MS_SLAVE | MS_REC | MS_SILENT,
+                    core::ptr::null(),
+                )
+            },
+            0
+        );
     }
 
     #[test]
@@ -1494,6 +1738,97 @@ mod tests {
         let sb = inode.sb.lock().clone().expect("cgroup sb");
         assert_eq!(sb.fs_name, "cgroup2");
         assert!(inode.ops.mkdir.expect("cgroup mkdir")(&inode, "systemd", 0o755).is_ok());
+    }
+
+    #[test]
+    fn relative_recursive_self_bind_does_not_relock_mountpoint() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", 0, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        set_rootfs(Mount::alloc(sb, root.clone(), 0));
+        mkdir_dentry(&root, "sandbox-root");
+
+        let mount = do_bind_mount("sandbox-root", "sandbox-root", MS_BIND | MS_REC)
+            .expect("recursive self-bind");
+        assert_eq!(
+            stable_path_for_dentry(&mount.root).as_deref(),
+            Some("/sandbox-root")
+        );
+    }
+
+    #[test]
+    fn pivot_root_reparents_old_tree_below_new_root() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", 0, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        let old_mount = Mount::alloc(sb, root.clone(), 0);
+        set_rootfs(old_mount.clone());
+        mkdir_dentry(&root, "tmp");
+        mkdir_dentry(&root, "dev");
+        do_mount("tmpfs", "tmpfs", "/dev", 0, "").expect("old devtmpfs");
+        let (_, dev_root) = resolve_path_follow("/dev").expect("devtmpfs root");
+        mkdir_dentry(&dev_root, "full");
+        do_mount("tmpfs", "tmpfs", "/tmp", 0, "").expect("sandbox tmpfs");
+        let (_, tmp_root) = resolve_path_follow("/tmp").expect("tmpfs root");
+        mkdir_dentry(&tmp_root, "newroot");
+        mkdir_dentry(&tmp_root, "oldroot");
+
+        let (new_mount, new_dentry) = resolve_path_follow("/tmp").expect("new root");
+        let (put_mount, put_dentry) = resolve_path_follow("/tmp/oldroot").expect("put_old");
+        let (old_path, new_path) = pivot_root_paths(
+            &VfsPath::new(new_mount, new_dentry),
+            &VfsPath::new(put_mount, put_dentry),
+        )
+        .expect("pivot root");
+
+        assert!(Arc::ptr_eq(&old_path.mount, &old_mount));
+        assert!(Arc::ptr_eq(
+            &rootfs().expect("namespace root"),
+            &new_path.mount
+        ));
+        let (mounted_old, _) = resolve_path_follow("/oldroot").expect("old root visible");
+        assert!(Arc::ptr_eq(&mounted_old, &old_mount));
+        assert!(
+            resolve_path_follow("/oldroot/dev/full").is_ok(),
+            "old-root submounts remain reachable after pivot"
+        );
+    }
+
+    #[test]
+    fn dot_dot_pivot_keeps_old_root_fd_reachable_but_not_path_covering() {
+        let _guard = TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        reset_mount_state();
+
+        let sb = mount_fs("ramfs", "", 0, "").expect("ramfs");
+        let root = sb.root().expect("root");
+        let old_mount = Mount::alloc(sb, root.clone(), 0);
+        set_rootfs(old_mount.clone());
+        let newroot = mkdir_dentry(&root, "newroot");
+        let new_mount =
+            do_bind_mount("/newroot", "/newroot", MS_BIND | MS_REC).expect("newroot bind");
+        let pivot = VfsPath::new(new_mount.clone(), newroot);
+
+        let (old_path, new_path) = pivot_root_paths(&pivot, &pivot).expect("dot pivot");
+        assert!(Arc::ptr_eq(&old_path.mount, &old_mount));
+        assert!(Arc::ptr_eq(
+            &rootfs().expect("namespace root"),
+            &new_path.mount
+        ));
+        assert!(new_path.mount.children.lock().is_empty());
+        assert!(old_path.mount.parent.lock().is_some());
+        assert!(Arc::ptr_eq(
+            &VfsPath::for_dentry(root)
+                .expect("open old-root dentry remains mount-qualified")
+                .mount,
+            &old_mount
+        ));
     }
 
     #[test]

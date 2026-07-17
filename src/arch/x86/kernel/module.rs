@@ -38,7 +38,8 @@ use crate::arch::x86::kernel::retpoline::{
     compiler_return_thunk_addr, retpoline_register, return_thunk_addr,
 };
 use crate::arch::x86::kernel::static_call::{
-    RETINSN, STATIC_CALL_SITE_FLAGS, STATIC_CALL_SITE_SIZE, StaticCallRegistration, TRAMP_UD,
+    RETINSN, STATIC_CALL_SITE_FLAGS, STATIC_CALL_SITE_SIZE, StaticCallRegistration,
+    StaticCallTrampKeyRegistration, TRAMP_UD, register_module_trampoline_keys,
     static_call_fixup_warn_site, warn_trap_addr, warn_trap_trampoline_addr,
 };
 use crate::arch::x86::kernel::unwind_orc::OrcModuleRegistration;
@@ -72,6 +73,7 @@ pub struct X86ModuleMetadata {
     orc_registration: Option<OrcModuleRegistration>,
     jump_label_registration: Option<JumpLabelRegistration>,
     static_call_registration: Option<StaticCallRegistration>,
+    static_call_tramp_key_registration: Option<StaticCallTrampKeyRegistration>,
     released: AtomicBool,
 }
 
@@ -109,6 +111,9 @@ impl X86ModuleMetadata {
             registration.unregister();
         }
         if let Some(registration) = &self.static_call_registration {
+            registration.unregister();
+        }
+        if let Some(registration) = &self.static_call_tramp_key_registration {
             registration.unregister();
         }
         alternatives_smp_module_del(self.smp_locks_registered);
@@ -164,6 +169,20 @@ pub fn clear_relocate_add(mem: &mut [u8], relocs: &[ResolvedRela]) {
 pub fn module_finalize(
     sections: &mut NameMap<LoadedSection>,
 ) -> Result<X86ModuleMetadata, X86ModuleFinalizeError> {
+    module_finalize_with_static_call_tramp_keys(sections, &[])
+}
+
+pub fn module_finalize_with_static_call_tramp_keys(
+    sections: &mut NameMap<LoadedSection>,
+    static_call_tramp_keys: &[(usize, usize)],
+) -> Result<X86ModuleMetadata, X86ModuleFinalizeError> {
+    // This owner must exist before `.static_call_sites` is decoded: a module
+    // site can encode an exported `__SCT__*` address where Linux expects the
+    // corresponding `__SCK__*` key. Any later finalization error drops the
+    // local owner and rolls the relation back.
+    let static_call_tramp_key_registration =
+        register_module_trampoline_keys(static_call_tramp_keys)
+            .map_err(|_| X86ModuleFinalizeError::BadSection(".static_call_tramp_key"))?;
     let has_smp_locks = sections.contains_key(".smp_locks");
     let num_cfi_sites = apply_module_cfi_policy(sections)?;
     let num_retpoline_sites = apply_module_retpolines(sections)?;
@@ -199,6 +218,7 @@ pub fn module_finalize(
         orc_registration,
         jump_label_registration,
         static_call_registration,
+        static_call_tramp_key_registration,
         released: AtomicBool::new(false),
     })
 }
@@ -231,6 +251,17 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
 
 fn relative_addr(field_addr: usize, displacement: i32) -> usize {
     (field_addr as isize).wrapping_add(displacement as isize) as usize
+}
+
+fn encode_rel32(from_next_ip: usize, target: usize) -> Result<i32, X86ModuleFinalizeError> {
+    let displacement = target.wrapping_sub(from_next_ip) as u32 as i32;
+    if from_next_ip.wrapping_add_signed(displacement as isize) == target {
+        Ok(displacement)
+    } else {
+        Err(X86ModuleFinalizeError::BadSection(
+            ".altinstructions ALT_FLAG_DIRECT_CALL",
+        ))
+    }
 }
 
 fn loaded_bytes_at(sections: &NameMap<LoadedSection>, addr: usize, size: usize) -> Option<Vec<u8>> {
@@ -724,14 +755,9 @@ fn apply_module_alternatives(
                 continue;
             }
             let next = instr_addr.wrapping_add(5);
-            let relative = target as i128 - next as i128;
-            if !(i32::MIN as i128..=i32::MAX as i128).contains(&relative) {
-                return Err(X86ModuleFinalizeError::BadSection(
-                    ".altinstructions ALT_FLAG_DIRECT_CALL",
-                ));
-            }
+            let relative = encode_rel32(next, target)?;
             patch[0] = CALL_INSN_OPCODE;
-            patch[1..5].copy_from_slice(&(relative as i32).to_le_bytes());
+            patch[1..5].copy_from_slice(&relative.to_le_bytes());
             add_nops(&mut patch[5..]);
         } else {
             patch[..repl_len].copy_from_slice(&replacement);
@@ -785,7 +811,9 @@ fn is_rip_relative(insn: &Insn) -> bool {
     let modrm = insn.modrm.value as u8;
     let mode = (modrm >> 6) & 0x3;
     let rm = modrm & 0x7;
-    mode == 0 && (rm == 5 || (rm == 4 && insn.sib.got != 0 && (insn.sib.value as u8 & 0x7) == 5))
+    // A SIB with mod=00/base=5 is an absolute disp32 with no base, not
+    // RIP-relative.  Match Linux insn_rip_relative(): only mod=00/rm=5.
+    mode == 0 && rm == 5
 }
 
 fn apply_alt_relocation(
@@ -938,6 +966,25 @@ mod tests {
         assert_eq!(i32::from_le_bytes(mem[0..4].try_into().unwrap()), 0xc);
         clear_relocate_add(&mut mem, &[rel]);
         assert_eq!(&mem[0..4], &[0; 4]);
+    }
+
+    #[test]
+    fn direct_alternative_call_accepts_canonical_alias_rel32() {
+        let next = 0xffff_ffff_c100_0005usize;
+        let target = 0x0000_0000_0050_0000usize;
+        let displacement = encode_rel32(next, target).unwrap();
+        assert_eq!(next.wrapping_add_signed(displacement as isize), target);
+    }
+
+    #[test]
+    fn alternative_relocation_does_not_treat_sib_no_base_as_rip_relative() {
+        let mut rip_relative = Insn::init(&[0x8b, 0x05, 0, 0, 0, 0], true);
+        rip_relative.get_length();
+        assert!(is_rip_relative(&rip_relative));
+
+        let mut sib_no_base = Insn::init(&[0x8b, 0x04, 0x25, 0, 0, 0, 0], true);
+        sib_no_base.get_length();
+        assert!(!is_rip_relative(&sib_no_base));
     }
 
     /// Every staged vendor module with WARN static calls (scsi_mod, libata,

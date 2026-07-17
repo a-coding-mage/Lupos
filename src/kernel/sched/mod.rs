@@ -145,9 +145,11 @@ pub const MAX_KTHREADS: usize = 30;
 
 /// Kernel stack size per thread.
 ///
-/// Lupos runs a Rust debug-profile kernel in boot gates; deeper syscall,
-/// scheduler, and module callbacks can exceed Linux's 16 KiB x86 default.
-pub const KTHREAD_STACK_SIZE: usize = 32 * 1024;
+/// Lupos runs a Rust debug-profile kernel in boot gates.  The module loader's
+/// debug frame plus nested finalizers exceeds 32 KiB even though an optimized
+/// Linux build normally fits its architecture default.  Heap-created task
+/// stacks also carry an unmapped leading guard page (see `vmalloc_stack`).
+pub const KTHREAD_STACK_SIZE: usize = 64 * 1024;
 
 /// Maximum tasks in the legacy cooperative run queue.
 ///
@@ -895,6 +897,7 @@ pub unsafe fn legacy_schedule() -> bool {
     unsafe {
         clear_need_resched(next);
     }
+    crate::kernel::rcu::tasks_rcu_qs();
     crate::kernel::rcu::rcu_qs();
 
     // Perform the context switch.  This call will not return until `prev` is
@@ -975,6 +978,7 @@ pub unsafe fn __schedule() {
         return;
     }
 
+    crate::kernel::rcu::tasks_rcu_qs();
     crate::kernel::rcu::rcu_qs();
     unsafe {
         seed_current_task_stack(prev);
@@ -1718,28 +1722,28 @@ mod tests {
     }
 
     #[test]
-    fn kthread_stack_is_32k() {
-        assert_eq!(KTHREAD_STACK_SIZE, 32 * 1024);
+    fn kthread_stack_is_64k() {
+        assert_eq!(KTHREAD_STACK_SIZE, 64 * 1024);
     }
 
     #[test]
     fn stack_top_for_sp_uses_kernel_thread_size_window() {
         assert_eq!(stack_top_for_sp(0), 0);
-        assert_eq!(stack_top_for_sp(0x7fff), 0x8000);
-        assert_eq!(stack_top_for_sp(0x8000), 0x8000);
-        assert_eq!(stack_top_for_sp(0x8001), 0x10000);
+        assert_eq!(stack_top_for_sp(0xffff), 0x10000);
+        assert_eq!(stack_top_for_sp(0x10000), 0x10000);
+        assert_eq!(stack_top_for_sp(0x10001), 0x20000);
 
         let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         let task_ptr = &mut *task as *mut TaskStruct;
         unsafe {
-            seed_current_task_stack_from_sp(task_ptr, 0x7ff0);
+            seed_current_task_stack_from_sp(task_ptr, 0xfff0);
         }
-        assert_eq!(task.stack as usize, 0x8000);
+        assert_eq!(task.stack as usize, 0x10000);
         unsafe {
-            seed_current_task_stack_from_sp(task_ptr, 0xbff0);
+            seed_current_task_stack_from_sp(task_ptr, 0x1fff0);
         }
         assert_eq!(
-            task.stack as usize, 0x8000,
+            task.stack as usize, 0x10000,
             "once seeded, the saved task stack top must be owned by switch code"
         );
     }

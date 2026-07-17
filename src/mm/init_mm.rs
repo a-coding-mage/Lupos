@@ -57,7 +57,7 @@ mod tests {
         assert!(source.contains("struct mm_struct init_mm = {"));
         assert!(source.contains(".mm_users\t= ATOMIC_INIT(2),"));
         assert!(source.contains(".mm_count\t= ATOMIC_INIT(1),"));
-        assert!(source.contains(".user_ns\t= &init_user_ns,"));
+        assert!(source.contains(".flexible_array\t= MM_STRUCT_FLEXIBLE_ARRAY_INIT,"));
         assert!(source.contains("void setup_initial_init_mm"));
         assert!(source.contains("init_mm.start_code = (unsigned long)start_code;"));
         assert!(source.contains("init_mm.brk = (unsigned long)brk;"));

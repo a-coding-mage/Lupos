@@ -41,6 +41,11 @@ use crate::mm::zone::{MAX_PAGE_ORDER, NR_PAGE_ORDERS, ZONE_DMA_MAX_PFN, Zone};
 const BOOT_DIRECT_MAP_BYTES: usize = 64 * 1024 * 1024 * 1024;
 const BOOT_DIRECT_MAP_BYTES_U64: u64 = BOOT_DIRECT_MAP_BYTES as u64;
 
+// Allocator-private ownership bit. PageBuddy only marks the head of a free
+// block; this bit marks every page so a duplicate free of a coalesced tail
+// cannot insert an overlapping block into the free lists.
+const PG_BUDDY_FREE_TRACK: u64 = 1 << 63;
+
 // ---------------------------------------------------------------------------
 // Global mem_map — a flat array of Page structs for all physical frames.
 //
@@ -54,6 +59,32 @@ static MEM_MAP_PTR: AtomicPtr<Page> = AtomicPtr::new(core::ptr::null_mut());
 static MEM_MAP_BASE_PFN: AtomicUsize = AtomicUsize::new(0);
 /// Number of Page entries in the mem_map array.
 static MEM_MAP_COUNT: AtomicUsize = AtomicUsize::new(0);
+static DUPLICATE_FREE_REJECTIONS: AtomicUsize = AtomicUsize::new(0);
+static LAST_DUPLICATE_FREE_PFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static LAST_DUPLICATE_FREE_ORDER: AtomicUsize = AtomicUsize::new(usize::MAX);
+static LAST_DUPLICATE_FREE_FILE: AtomicUsize = AtomicUsize::new(0);
+static LAST_DUPLICATE_FREE_FILE_LEN: AtomicUsize = AtomicUsize::new(0);
+static LAST_DUPLICATE_FREE_LINE: AtomicUsize = AtomicUsize::new(0);
+
+pub fn duplicate_free_snapshot() -> (usize, usize, usize) {
+    (
+        DUPLICATE_FREE_REJECTIONS.load(Ordering::Acquire),
+        LAST_DUPLICATE_FREE_PFN.load(Ordering::Acquire),
+        LAST_DUPLICATE_FREE_ORDER.load(Ordering::Acquire),
+    )
+}
+
+pub fn duplicate_free_caller() -> Option<(&'static str, usize)> {
+    let ptr = LAST_DUPLICATE_FREE_FILE.load(Ordering::Acquire);
+    let len = LAST_DUPLICATE_FREE_FILE_LEN.load(Ordering::Acquire);
+    if ptr == 0 || len == 0 {
+        return None;
+    }
+    let file = unsafe {
+        core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr as *const u8, len))
+    };
+    Some((file, LAST_DUPLICATE_FREE_LINE.load(Ordering::Acquire)))
+}
 
 /// Convert a page frame number to a pointer into the mem_map array.
 ///
@@ -312,6 +343,9 @@ impl BuddyAllocator {
 
                 unsafe {
                     let page = pfn_to_page(pfn);
+                    for idx in 0..(1usize << max_order_for_pfn) {
+                        (*page.add(idx)).set_flag(PG_BUDDY_FREE_TRACK);
+                    }
                     (*page).set_buddy_order(max_order_for_pfn);
                     self.zones[zone_idx].add_to_free_list(
                         page,
@@ -504,7 +538,34 @@ impl BuddyAllocator {
     /// until the buddy is not free or MAX_PAGE_ORDER is reached.
     ///
     /// Ref: Linux mm/page_alloc.c:978-1064 — `__free_one_page()`
+    #[track_caller]
     pub fn free_pages(&mut self, page: *mut Page, order: usize) {
+        if page.is_null() || order > MAX_PAGE_ORDER {
+            return;
+        }
+        // PageBuddy marks only a free block's head. Check every requested
+        // page against the allocator-private ownership bit so a duplicate
+        // free of a coalesced tail is rejected too.
+        let nr_pages = 1usize << order;
+        let already_free = (0..nr_pages).any(|idx| unsafe {
+            (*page.add(idx)).flags.load(Ordering::Relaxed) & PG_BUDDY_FREE_TRACK != 0
+        });
+        if already_free {
+            // Do not printk while the global buddy lock is held: printk may
+            // allocate and recurse into this allocator. Keep lock-free
+            // diagnostics for a caller outside the allocation critical path.
+            LAST_DUPLICATE_FREE_PFN.store(page_to_pfn(page), Ordering::Release);
+            LAST_DUPLICATE_FREE_ORDER.store(order, Ordering::Release);
+            let caller = core::panic::Location::caller();
+            LAST_DUPLICATE_FREE_FILE.store(caller.file().as_ptr() as usize, Ordering::Release);
+            LAST_DUPLICATE_FREE_FILE_LEN.store(caller.file().len(), Ordering::Release);
+            LAST_DUPLICATE_FREE_LINE.store(caller.line() as usize, Ordering::Release);
+            DUPLICATE_FREE_REJECTIONS.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        for idx in 0..nr_pages {
+            unsafe { (*page.add(idx)).set_flag(PG_BUDDY_FREE_TRACK) };
+        }
         let pfn = page_to_pfn(page);
         let zone_idx = self.pfn_to_zone_idx(pfn);
 
@@ -517,24 +578,27 @@ impl BuddyAllocator {
     /// Linux's `free_reserved_area()` clears PG_reserved, accounts the page as
     /// managed memory, then frees it. The ordinary `free_pages()` path is kept
     /// for pages that were already managed and allocated from the buddy.
-    pub fn free_reserved_page(&mut self, page: *mut Page) {
+    pub fn free_reserved_page(&mut self, page: *mut Page) -> bool {
         if page.is_null() {
-            return;
+            return false;
         }
         unsafe {
-            if (*page).is_buddy() {
-                return;
+            // This interface is only for boot-time PG_reserved pages.  An
+            // unreserved non-buddy page is allocated and must never be
+            // silently released by a repeated free_reserved_area() call.
+            if (*page).is_buddy() || !(*page).is_reserved() {
+                return false;
             }
             let pfn = page_to_pfn(page);
             let zone_idx = self.pfn_to_zone_idx(pfn);
-            if (*page).is_reserved() {
-                (*page).clear_flag(crate::mm::page_flags::PG_RESERVED);
-                self.zones[zone_idx].managed_pages += 1;
-                self.zones[zone_idx].present_pages += 1;
-            }
+            (*page).clear_flag(crate::mm::page_flags::PG_RESERVED);
+            (*page).set_flag(PG_BUDDY_FREE_TRACK);
+            self.zones[zone_idx].managed_pages += 1;
+            self.zones[zone_idx].present_pages += 1;
             (*page)._refcount.store(0, Ordering::Relaxed);
             self.free_one_page(page, pfn, zone_idx, 0);
             self.total_free_pages += 1;
+            true
         }
     }
 
@@ -1146,12 +1210,41 @@ pub mod tests {
             let page = pfn_to_page(4);
             (*page).set_reserved();
 
-            alloc.free_reserved_page(page);
+            assert!(alloc.free_reserved_page(page));
 
             assert!(!(*page).is_reserved());
             assert!((*page).is_buddy());
             assert_eq!(alloc.free_count(), 1);
             assert_eq!(alloc.total_managed(), 1);
+
+            assert!(!alloc.free_reserved_page(page));
+            assert_eq!(alloc.free_count(), 1);
+            assert_eq!(alloc.total_managed(), 1);
+        }
+    }
+
+    #[test]
+    fn duplicate_free_does_not_reinsert_buddy_list_node() {
+        let _g = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let (mut alloc, _pages) = make_test_env();
+            let page = pfn_to_page(6);
+            let tail = pfn_to_page(7);
+
+            alloc.free_pages(page, 0);
+            alloc.free_pages(tail, 0);
+            let free = alloc.free_count();
+            // PFN 7 is now a tail inside the coalesced order-1 block whose
+            // PageBuddy head is PFN 6.
+            assert!(!(*tail).is_buddy());
+            let rejected_before = duplicate_free_snapshot().0;
+            alloc.free_pages(tail, 0);
+
+            assert_eq!(alloc.free_count(), free);
+            assert!((*page).is_buddy());
+            assert!(duplicate_free_snapshot().0 > rejected_before);
         }
     }
 

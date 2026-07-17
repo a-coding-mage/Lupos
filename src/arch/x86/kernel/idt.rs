@@ -850,20 +850,27 @@ fn on_general_protection(frame: &ExceptionFrame) {
     panic!("General Protection Fault");
 }
 
-fn on_control_protection(frame: &ExceptionFrame) {
+fn on_control_protection(frame: &mut ExceptionFrame) {
     use crate::arch::x86::kernel::cet::{
-        CP_ENDBR, ControlProtectionAction, exc_control_protection_action, kernel_ibt_enabled,
+        CP_ENDBR, ControlProtectionAction, exc_control_protection_action,
+        ibt_selftest_noendbr_addr, kernel_ibt_enabled,
     };
 
+    let hit_ibt_selftest = frame.rip as usize == ibt_selftest_noendbr_addr();
     let action = exc_control_protection_action(
         is_user_exception(frame),
         false,
         kernel_ibt_enabled(),
         true,
-        false,
+        hit_ibt_selftest,
         frame.error_code,
     );
     match action {
+        ControlProtectionAction::ClearSelftestAndResume => {
+            // Linux's handler clears AX and resumes at the target RET. A
+            // non-faulting indirect jump returns the sentinel value 1.
+            frame.rax = 0;
+        }
         ControlProtectionAction::ForceSigsegv { code } => panic!(
             "user control-protection fault at rip={:#018x}, error={:#x}, si_code={code}",
             frame.rip, frame.error_code

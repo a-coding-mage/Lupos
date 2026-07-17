@@ -648,11 +648,12 @@ fn names_eq(a: &str, b: &str) -> bool {
 }
 
 /// Emit Linux's synthetic `.` / `..` directory entries for in-memory
-/// filesystem iterators.  `file.private` mirrors `dir_context::pos`.
+/// filesystem iterators. `file.pos` is Linux `file->f_pos` and therefore must
+/// be shared with lseek(2), telldir(3), seekdir(3), and rewinddir(3).
 pub fn synthetic_readdir_dot_entry(
     file: &FileRef,
 ) -> Result<Option<(String, u64, InodeKind)>, i32> {
-    let mut pos = file.private.lock();
+    let mut pos = file.pos.lock();
     let name = match *pos {
         0 => ".",
         1 => "..",
@@ -673,7 +674,7 @@ pub fn synthetic_readdir_dot_entry(
     Ok(Some((String::from(name), ino, InodeKind::Directory)))
 }
 
-/// Generic readdir cursor — `file.private` holds a Linux-style directory
+/// Generic readdir cursor — `file.pos` holds a Linux-style directory
 /// position: 0/1 for dot entries, 2+ for entries in the BTreeMap.
 pub fn simple_readdir(file: &FileRef) -> Result<Option<(String, u64, InodeKind)>, i32> {
     if let Some(dot) = synthetic_readdir_dot_entry(file)? {
@@ -684,9 +685,9 @@ pub fn simple_readdir(file: &FileRef) -> Result<Option<(String, u64, InodeKind)>
         InodePrivate::RamDir(m) => m,
         _ => return Err(EINVAL),
     };
-    let mut idx = file.private.lock();
+    let mut idx = file.pos.lock();
     let g = map.lock();
-    let child_idx = idx.saturating_sub(2);
+    let child_idx = idx.saturating_sub(2) as usize;
     if child_idx >= g.len() {
         return Ok(None);
     }

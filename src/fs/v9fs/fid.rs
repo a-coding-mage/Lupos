@@ -353,7 +353,8 @@ mod tests {
         assert!(source.contains("struct p9_fid *v9fs_fid_find_inode"));
         assert!(source.contains("if (want_writeable && !v9fs_is_writeable(fid->mode))"));
         assert!(source.contains("static struct p9_fid *v9fs_fid_find"));
-        assert!(source.contains("if (dentry->d_fsdata)"));
+        assert!(source.contains("struct v9fs_dentry *v9fs_dentry = to_v9fs_dentry(dentry);"));
+        assert!(source.contains("if (!hlist_empty(&v9fs_dentry->head))"));
         assert!(source.contains("if (!ret && dentry->d_inode)"));
         assert!(source.contains("static int build_path_from_dentry"));
         assert!(source.contains("for (ds = dentry, i = (n-1); i >= 0; i--"));

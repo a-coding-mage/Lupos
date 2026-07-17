@@ -250,9 +250,21 @@ pub unsafe fn copy_namespaces(
         return Ok(());
     }
 
-    // Allocate a fresh nsproxy with the requested namespaces unshared.
-    let user_ns: *const UserNamespace = &INIT_USER_NS;
+    // Allocate a fresh nsproxy with the requested namespaces unshared. A
+    // CLONE_NEWUSER child already owns its freshly-created user namespace in
+    // its credentials, and every other new namespace must be owned by it.
+    let child_cred = unsafe { (*child).cred };
+    let user_ns = if child_cred.is_null() || unsafe { (*child_cred).user_ns.is_null() } {
+        &raw const INIT_USER_NS
+    } else {
+        unsafe { (*child_cred).user_ns as *const UserNamespace }
+    };
     let new = create_new_namespaces(flags, parent_nsproxy, user_ns)?;
+    if flags & CLONE_NEWNS != 0 {
+        unsafe {
+            rebase_task_fs_for_mount_namespace(child, (*parent_nsproxy).mnt_ns, (*new).mnt_ns);
+        }
+    }
     unsafe {
         (*child).m28_nsproxy.nsproxy = new;
         (*child).m28_nsproxy.thread_pid_ns_for_children =
@@ -292,34 +304,87 @@ pub unsafe fn sys_unshare(flags: u64) -> i64 {
         // duplication that lands with M39 / M52.  Reject them for now.
         return -22;
     }
-    if flags & CLONE_NEWUSER != 0 {
+    if flags & CLONE_NEWNS != 0 && flags & CLONE_NEWUSER == 0 {
+        // The mount tree itself is private, but systemd's bare root mount-
+        // namespace path also relies on the full shared/slave propagation
+        // graph. Keep that capability probe fail-closed until propagation is
+        // complete. Rootless sandboxes create the owning user namespace and
+        // mount namespace atomically and use the isolated path below.
         return -1;
     }
-    if flags & CLONE_NEWNS != 0 {
-        // Mount namespaces are identity-only today: copy_mnt_ns clones no
-        // mount tree, so an unshared task's mount/umount calls would mutate
-        // the GLOBAL mount table — systemd's per-service sandbox
-        // (PrivateTmp/ProtectSystem, vendor/systemd src/core/namespace.c)
-        // MS_MOVEs / away and freezes every process.  Refuse with EPERM
-        // like CLONE_NEWUSER above: observably a Linux container without
-        // CAP_SYS_ADMIN, which systemd answers by logging "assuming
-        // containerized execution" and starting the unit unsandboxed.
-        // Lifted when per-namespace mount trees land (ROADMAP Distro
-        // Parity: "Per-namespace mount trees").
-        return -1; // EPERM
-    }
-    if flags & NSPROXY_FLAGS == 0 {
-        return 0;
+    // Creating namespaces owned by the current user namespace requires
+    // CAP_SYS_ADMIN there.  CLONE_NEWUSER is the rootless Linux path: the
+    // caller receives capabilities in the new user namespace and can create
+    // the remaining namespaces atomically inside it.
+    if flags & NSPROXY_FLAGS != 0
+        && flags & CLONE_NEWUSER == 0
+        && !crate::kernel::capability::capable(crate::kernel::capability::CAP_SYS_ADMIN)
+    {
+        return -1;
     }
 
+    let parent_cred = crate::kernel::cred::current_cred();
+    let parent_user_ns = if parent_cred.is_null() || unsafe { (*parent_cred).user_ns.is_null() } {
+        &raw const INIT_USER_NS
+    } else {
+        unsafe { (*parent_cred).user_ns as *const UserNamespace }
+    };
+    let new_user_ns = if flags & CLONE_NEWUSER != 0 {
+        match crate::kernel::user_namespace::create_user_ns(parent_user_ns) {
+            Ok(ns) => Some(ns),
+            Err(e) => return e as i64,
+        }
+    } else {
+        None
+    };
+    let namespace_owner = new_user_ns
+        .map(|ns| ns as *const UserNamespace)
+        .unwrap_or(parent_user_ns);
+
     let parent_nsproxy = unsafe { (*task).m28_nsproxy.nsproxy };
-    let user_ns: *const UserNamespace = &INIT_USER_NS;
-    let new = match create_new_namespaces(flags, parent_nsproxy, user_ns) {
-        Ok(p) => p,
-        Err(e) => return e as i64,
+    let new = if flags & NSPROXY_FLAGS != 0 {
+        match create_new_namespaces(flags, parent_nsproxy, namespace_owner) {
+            Ok(p) => Some(p),
+            Err(e) => return e as i64,
+        }
+    } else {
+        None
+    };
+
+    if let Some(user_ns) = new_user_ns {
+        let Some(new_cred) = crate::kernel::cred::prepare_creds() else {
+            if let Some(new_nsproxy) = new {
+                unsafe { put_nsproxy(new_nsproxy) };
+            }
+            return -12;
+        };
+        unsafe {
+            (*new_cred).user_ns = user_ns as *const core::ffi::c_void;
+            // Linux grants the creator all capabilities in the namespace it
+            // owns; uid/gid maps remain empty until procfs accepts the writes.
+            (*new_cred).cap_permitted = crate::kernel::capability::KernelCapT::full();
+            (*new_cred).cap_effective = crate::kernel::capability::KernelCapT::full();
+            (*new_cred).cap_bset = crate::kernel::capability::KernelCapT::full();
+            (*new_cred).cap_ambient = crate::kernel::capability::KernelCapT::empty();
+        }
+        crate::kernel::cred::commit_creds(new_cred);
+    }
+
+    let Some(new) = new else {
+        return 0;
     };
 
     let old = unsafe { (*task).m28_nsproxy.nsproxy };
+    if flags & CLONE_NEWNS != 0 {
+        let old_mnt_ns = if old.is_null() {
+            INIT_NSPROXY.mnt_ns
+        } else {
+            unsafe { (*old).mnt_ns }
+        };
+        unsafe {
+            rebase_task_fs_for_mount_namespace(task, old_mnt_ns, (*new).mnt_ns);
+        }
+    }
     unsafe {
         (*task).m28_nsproxy.nsproxy = new;
         (*task).m28_nsproxy.thread_pid_ns_for_children =
@@ -327,6 +392,40 @@ pub unsafe fn sys_unshare(flags: u64) -> i64 {
         put_nsproxy(old);
     }
     0
+}
+
+unsafe fn rebase_task_fs_for_mount_namespace(
+    task: *mut crate::kernel::task::TaskStruct,
+    old_ns: *const MntNamespace,
+    new_ns: *const MntNamespace,
+) {
+    let fs = unsafe { crate::fs::fs_struct::task_fs(task) };
+    if fs.is_null() {
+        return;
+    }
+    let Some(old_namespace_root) = crate::fs::mount::namespace_root_for(old_ns) else {
+        return;
+    };
+    let Some(new_namespace_root) = crate::fs::mount::namespace_root_for(new_ns) else {
+        return;
+    };
+    let fs = unsafe { &*fs };
+    let old_root = fs
+        .root
+        .lock()
+        .clone()
+        .unwrap_or_else(|| old_namespace_root.clone());
+    let old_pwd = fs.pwd.lock().clone().unwrap_or_else(|| old_root.clone());
+    let root_name = crate::fs::mount::path_between(&old_namespace_root, &old_root)
+        .unwrap_or_else(|| alloc::string::String::from("/"));
+    let pwd_name = crate::fs::mount::path_between(&old_namespace_root, &old_pwd)
+        .unwrap_or_else(|| root_name.clone());
+    let new_root = crate::fs::mount::resolve_from_namespace_root(&new_namespace_root, &root_name)
+        .unwrap_or_else(|_| new_namespace_root.clone());
+    let new_pwd = crate::fs::mount::resolve_from_namespace_root(&new_namespace_root, &pwd_name)
+        .unwrap_or_else(|_| new_root.clone());
+    crate::fs::fs_struct::set_fs_root_path(fs, new_root);
+    crate::fs::fs_struct::set_fs_pwd_path(fs, new_pwd);
 }
 
 /// `sys_setns(fd, nstype)` — join an existing namespace identified by `fd`.
@@ -352,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn unshare_mount_namespace_is_refused_like_unprivileged_container() {
+    fn bare_unshare_mount_namespace_stays_fail_closed() {
         use crate::kernel::sched;
         use crate::kernel::task::TaskStruct;
         use alloc::boxed::Box;
@@ -362,23 +461,19 @@ mod tests {
         task.m28_nsproxy.nsproxy = &raw const INIT_NSPROXY as *mut Nsproxy;
         unsafe { sched::set_current(&mut *task as *mut TaskStruct) };
 
-        // Lupos mount namespaces are identity-only (copy_mnt_ns clones no
-        // mount tree), so an unshared task's mounts would mutate the GLOBAL
-        // tree: systemd's sandbox setup (vendor/systemd src/core/namespace.c)
-        // MS_MOVEs / away and freezes every process.  Until per-namespace
-        // mount trees land, refuse with EPERM exactly like CLONE_NEWUSER —
-        // systemd logs "assuming containerized execution" and starts the
-        // service without its sandbox.
         assert_eq!(unsafe { sys_unshare(CLONE_NEWNS) }, -1);
 
-        // The other M28 namespaces keep working.
+        // Other namespace families remain available independently.
         assert_eq!(unsafe { sys_unshare(CLONE_NEWUTS) }, 0);
+        let final_nsproxy = task.m28_nsproxy.nsproxy;
+        assert_eq!(unsafe { (*final_nsproxy).mnt_ns }, INIT_NSPROXY.mnt_ns);
 
         unsafe { sched::set_current(previous) };
+        unsafe { put_nsproxy(final_nsproxy) };
     }
 
     #[test]
-    fn clone_with_mount_namespace_flag_is_refused() {
+    fn clone_mount_namespace_without_owning_user_namespace_is_refused() {
         let source = include_str!("fork.rs");
         let gate = source
             .split("pub unsafe fn kernel_clone")
@@ -389,8 +484,8 @@ mod tests {
             .expect("kernel_clone preamble");
         assert!(
             gate.contains("CLONE_NEWNS") && gate.contains("EPERM"),
-            "kernel_clone must refuse CLONE_NEWNS before copy_process \
-             until per-namespace mount trees land"
+            "kernel_clone must keep a bare CLONE_NEWNS capability probe \
+             fail-closed while allowing atomic CLONE_NEWUSER|CLONE_NEWNS"
         );
     }
 

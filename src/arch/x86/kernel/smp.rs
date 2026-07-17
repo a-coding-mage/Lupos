@@ -538,6 +538,7 @@ pub extern "C" fn ap_main(apic_id: u64) -> ! {
         crate::kernel::sched::sched_init_ap(cpu);
         crate::arch::x86::kernel::apic_timer::init_ap();
     }
+    crate::kernel::rcu::tasks_rcu_qs();
     crate::kernel::rcu::rcu_qs();
 
     // Signal the BSP that this AP is ready.
@@ -552,6 +553,7 @@ pub extern "C" fn ap_main(apic_id: u64) -> ! {
     loop {
         crate::kernel::watchdog::touch_softlockup_watchdog_sched();
         crate::kernel::softirq::do_softirq();
+        crate::kernel::rcu::tasks_rcu_qs();
         crate::kernel::rcu::rcu_qs();
         unsafe {
             core::arch::asm!("sti; hlt", options(nomem, nostack));

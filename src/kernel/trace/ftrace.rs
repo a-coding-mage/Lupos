@@ -17,12 +17,41 @@ use spin::Mutex;
 
 use super::ring_buffer::{TRACE_FN, TRACE_RB, TraceEvent};
 
-/// Active function probe (0 = no tracer attached).
-/// Stored as `usize` because we want a single atomic store.
-static ACTIVE_PROBE: AtomicUsize = AtomicUsize::new(0);
-/// Register-aware callback selected by `FTRACE_OPS_FL_SAVE_REGS`-style users.
-static ACTIVE_REGS_PROBE: AtomicUsize = AtomicUsize::new(0);
 static FTRACE_UPDATE_LOCK: Mutex<()> = Mutex::new(());
+static GRAPH_USERS: AtomicUsize = AtomicUsize::new(0);
+// Readers increment this before loading any published callback. Removal
+// clears the callback first and then waits for all pre-existing readers, so a
+// module may free callback text as soon as unregister returns.
+static FTRACE_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+pub const MAX_FTRACE_OPS: usize = 16;
+const FTRACE_KIND_SIMPLE: usize = 1;
+const FTRACE_KIND_REGS: usize = 2;
+const FTRACE_KIND_OPS: usize = 3;
+
+struct FtraceSlot {
+    key: AtomicUsize,
+    callback: AtomicUsize,
+    data: AtomicUsize,
+    filter: AtomicUsize,
+    kind: AtomicUsize,
+}
+
+impl FtraceSlot {
+    const fn new() -> Self {
+        Self {
+            key: AtomicUsize::new(0),
+            callback: AtomicUsize::new(0),
+            data: AtomicUsize::new(0),
+            filter: AtomicUsize::new(0),
+            kind: AtomicUsize::new(0),
+        }
+    }
+}
+
+static FTRACE_SLOTS: [FtraceSlot; MAX_FTRACE_OPS] = [const { FtraceSlot::new() }; MAX_FTRACE_OPS];
+static FTRACE_RECURSION: [AtomicUsize; crate::kernel::sched::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; crate::kernel::sched::MAX_CPUS];
 
 /// One relocated `__mcount_loc`/`__patchable_function_entries` callsite.
 ///
@@ -45,10 +74,32 @@ static MODULE_RECORDS: Mutex<Vec<ModuleFtraceRecord>> = Mutex::new(Vec::new());
 
 pub type FtraceFn = fn(ip: u64, parent_ip: u64);
 pub type FtraceRegsFn = fn(ip: u64, parent_ip: u64, sp: u64, bp: u64);
+pub type FtraceFilterFn = fn(ip: u64, parent_ip: u64) -> bool;
+pub type FtraceOpsFn = fn(ip: u64, parent_ip: u64, sp: u64, bp: u64, data: usize);
+
+pub struct FtraceOps {
+    pub func: FtraceOpsFn,
+    pub filter: Option<FtraceFilterFn>,
+    pub data: usize,
+}
+
+impl FtraceOps {
+    pub const fn new(func: FtraceOpsFn) -> Self {
+        Self {
+            func,
+            filter: None,
+            data: 0,
+        }
+    }
+}
+
+unsafe impl Sync for FtraceOps {}
 
 fn tracing_active() -> bool {
-    ACTIVE_PROBE.load(Ordering::Acquire) != 0
-        || ACTIVE_REGS_PROBE.load(Ordering::Acquire) != 0
+    GRAPH_USERS.load(Ordering::Acquire) != 0
+        || FTRACE_SLOTS
+            .iter()
+            .any(|slot| slot.callback.load(Ordering::Acquire) != 0)
 }
 
 fn patch_enabled_records(records: &mut [ModuleFtraceRecord]) -> Result<(), i32> {
@@ -93,68 +144,160 @@ fn unpatch_enabled_records(records: &mut [ModuleFtraceRecord]) {
     }
 }
 
-pub fn register_ftrace_function(probe: FtraceFn) -> Result<(), i32> {
+fn register_slot(
+    key: usize,
+    callback: usize,
+    kind: usize,
+    data: usize,
+    filter: usize,
+) -> Result<(), i32> {
     let _update = FTRACE_UPDATE_LOCK.lock();
-    if ACTIVE_PROBE.load(Ordering::Acquire) != 0 {
-        return Err(-16); // EBUSY: only one tracer at a time in M62
+    if FTRACE_SLOTS.iter().any(|slot| {
+        slot.key.load(Ordering::Acquire) == key && slot.kind.load(Ordering::Acquire) == kind
+    }) {
+        return Err(-17); // EEXIST
     }
-
+    let slot = FTRACE_SLOTS
+        .iter()
+        .find(|slot| slot.callback.load(Ordering::Acquire) == 0)
+        .ok_or(-12)?; // ENOMEM
     let mut records = MODULE_RECORDS.lock();
     if !tracing_active() {
         patch_enabled_records(&mut records)?;
     }
-    ACTIVE_PROBE.store(probe as usize, Ordering::Release);
+    slot.key.store(key, Ordering::Relaxed);
+    slot.data.store(data, Ordering::Relaxed);
+    slot.filter.store(filter, Ordering::Relaxed);
+    slot.kind.store(kind, Ordering::Relaxed);
+    slot.callback.store(callback, Ordering::Release);
     Ok(())
+}
+
+fn unregister_slots(mut matches: impl FnMut(usize, usize) -> bool) -> bool {
+    let _update = FTRACE_UPDATE_LOCK.lock();
+    let mut removed = false;
+    for slot in &FTRACE_SLOTS {
+        let callback = slot.callback.load(Ordering::Acquire);
+        let kind = slot.kind.load(Ordering::Relaxed);
+        let key = slot.key.load(Ordering::Relaxed);
+        if callback != 0 && matches(key, kind) {
+            slot.callback.store(0, Ordering::Release);
+            slot.kind.store(0, Ordering::Relaxed);
+            slot.key.store(0, Ordering::Relaxed);
+            removed = true;
+        }
+    }
+    if !tracing_active() {
+        unpatch_enabled_records(&mut MODULE_RECORDS.lock());
+    }
+    if removed {
+        while FTRACE_IN_FLIGHT.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+    removed
+}
+
+pub fn register_ftrace_function(probe: FtraceFn) -> Result<(), i32> {
+    register_slot(probe as usize, probe as usize, FTRACE_KIND_SIMPLE, 0, 0)
 }
 
 pub fn unregister_ftrace_function() {
-    let _update = FTRACE_UPDATE_LOCK.lock();
-    ACTIVE_PROBE.store(0, Ordering::Release);
-    if !tracing_active() {
-        unpatch_enabled_records(&mut MODULE_RECORDS.lock());
-    }
+    unregister_slots(|_, kind| kind == FTRACE_KIND_SIMPLE);
 }
 
 pub fn register_ftrace_regs_function(probe: FtraceRegsFn) -> Result<(), i32> {
-    let _update = FTRACE_UPDATE_LOCK.lock();
-    if ACTIVE_REGS_PROBE.load(Ordering::Acquire) != 0 {
-        return Err(-16);
-    }
-    let mut records = MODULE_RECORDS.lock();
-    if !tracing_active() {
-        patch_enabled_records(&mut records)?;
-    }
-    ACTIVE_REGS_PROBE.store(probe as usize, Ordering::Release);
-    Ok(())
+    register_slot(probe as usize, probe as usize, FTRACE_KIND_REGS, 0, 0)
 }
 
 pub fn unregister_ftrace_regs_function() {
-    let _update = FTRACE_UPDATE_LOCK.lock();
-    ACTIVE_REGS_PROBE.store(0, Ordering::Release);
-    if !tracing_active() {
-        unpatch_enabled_records(&mut MODULE_RECORDS.lock());
+    unregister_slots(|_, kind| kind == FTRACE_KIND_REGS);
+}
+
+pub fn register_ftrace_ops(ops: &'static FtraceOps) -> Result<(), i32> {
+    register_slot(
+        ops as *const FtraceOps as usize,
+        ops.func as usize,
+        FTRACE_KIND_OPS,
+        ops.data,
+        ops.filter.map_or(0, |filter| filter as usize),
+    )
+}
+
+pub fn unregister_ftrace_ops(ops: &'static FtraceOps) -> Result<(), i32> {
+    if unregister_slots(|key, kind| {
+        kind == FTRACE_KIND_OPS && key == ops as *const FtraceOps as usize
+    }) {
+        Ok(())
+    } else {
+        Err(-2) // ENOENT
     }
+}
+
+pub(crate) fn set_graph_tracing(enable: bool) -> Result<(), i32> {
+    let _update = FTRACE_UPDATE_LOCK.lock();
+    let old = GRAPH_USERS.load(Ordering::Acquire);
+    if enable {
+        if old == 0 && !tracing_active() {
+            patch_enabled_records(&mut MODULE_RECORDS.lock())?;
+        }
+        GRAPH_USERS.store(old.saturating_add(1), Ordering::Release);
+    } else if old != 0 {
+        GRAPH_USERS.store(old - 1, Ordering::Release);
+        if !tracing_active() {
+            unpatch_enabled_records(&mut MODULE_RECORDS.lock());
+        }
+    }
+    Ok(())
 }
 
 /// Call site placed at the entry of any instrumented function.
 /// Cheap when no tracer is attached.
 #[inline]
 pub fn ftrace_function_trace_call(ip: u64, parent_ip: u64) {
-    let probe = ACTIVE_PROBE.load(Ordering::Relaxed);
-    if probe == 0 {
-        return;
-    }
-    let f: FtraceFn = unsafe { core::mem::transmute(probe) };
-    f(ip, parent_ip);
+    ftrace_function_trace_call_with_regs(ip, parent_ip, 0, 0);
 }
 
 pub fn ftrace_function_trace_call_with_regs(ip: u64, parent_ip: u64, sp: u64, bp: u64) {
-    ftrace_function_trace_call(ip, parent_ip);
-    let probe = ACTIVE_REGS_PROBE.load(Ordering::Relaxed);
-    if probe != 0 {
-        let f: FtraceRegsFn = unsafe { core::mem::transmute(probe) };
-        f(ip, parent_ip, sp, bp);
+    let cpu =
+        (crate::kernel::sched::current_cpu() as usize).min(crate::kernel::sched::MAX_CPUS - 1);
+    if FTRACE_RECURSION[cpu]
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
     }
+    FTRACE_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+    for slot in &FTRACE_SLOTS {
+        let callback = slot.callback.load(Ordering::Acquire);
+        if callback == 0 {
+            continue;
+        }
+        let filter = slot.filter.load(Ordering::Relaxed);
+        if filter != 0 {
+            let filter: FtraceFilterFn = unsafe { core::mem::transmute(filter) };
+            if !filter(ip, parent_ip) {
+                continue;
+            }
+        }
+        match slot.kind.load(Ordering::Relaxed) {
+            FTRACE_KIND_SIMPLE => {
+                let f: FtraceFn = unsafe { core::mem::transmute(callback) };
+                f(ip, parent_ip);
+            }
+            FTRACE_KIND_REGS => {
+                let f: FtraceRegsFn = unsafe { core::mem::transmute(callback) };
+                f(ip, parent_ip, sp, bp);
+            }
+            FTRACE_KIND_OPS => {
+                let f: FtraceOpsFn = unsafe { core::mem::transmute(callback) };
+                f(ip, parent_ip, sp, bp, slot.data.load(Ordering::Relaxed));
+            }
+            _ => {}
+        }
+    }
+    FTRACE_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    FTRACE_RECURSION[cpu].store(0, Ordering::Release);
 }
 
 /// Default function tracer probe: push a TraceEvent into the global ring.
@@ -212,20 +355,32 @@ pub fn module_enable(owner: usize) -> Result<(), i32> {
     Ok(())
 }
 
-/// `ftrace_release_mod()` — unconditionally discard all addresses backed by
-/// module memory.  Linux invokes this on formation failure as well as unload.
-pub fn release_module(owner: usize) {
+/// `ftrace_release_mod()` — discard all addresses backed by module memory
+/// only after every live callsite has been restored.
+///
+/// Text-poke failure is retryable: successfully restored records remain
+/// disabled, while the complete owner set stays registered so module memory
+/// cannot be released with a callsite still targeting the ftrace trampoline.
+/// Linux invokes this on formation failure as well as unload.
+fn release_module_with(
+    owner: usize,
+    mut set_callsite: impl FnMut(usize, bool) -> Result<(), i32>,
+) -> Result<(), i32> {
     let _update = FTRACE_UPDATE_LOCK.lock();
     let mut records = MODULE_RECORDS.lock();
     for record in records
         .iter_mut()
         .filter(|record| record.owner == owner && record.enabled && record.traced)
     {
-        if crate::arch::x86::kernel::ftrace::set_module_callsite(record.ip, false).is_ok() {
-            record.traced = false;
-        }
+        set_callsite(record.ip, false).map_err(|error| -error.abs())?;
+        record.traced = false;
     }
     records.retain(|record| record.owner != owner);
+    Ok(())
+}
+
+pub fn release_module(owner: usize) -> Result<(), i32> {
+    release_module_with(owner, crate::arch::x86::kernel::ftrace::set_module_callsite)
 }
 
 pub fn module_records(owner: usize) -> Vec<ModuleFtraceRecord> {
@@ -250,6 +405,8 @@ mod tests {
 
     static TEST_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     static TEST_REGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static TEST_OPS_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_probe(_ip: u64, _parent: u64) {
         TEST_HITS.fetch_add(1, Ordering::Relaxed);
@@ -259,8 +416,29 @@ mod tests {
         TEST_REGS.store(ip ^ parent ^ sp ^ bp, Ordering::Relaxed);
     }
 
+    fn second_probe(_ip: u64, _parent: u64) {
+        TEST_HITS.fetch_add(10, Ordering::Relaxed);
+    }
+
+    fn ops_probe(ip: u64, _parent: u64, _sp: u64, _bp: u64, data: usize) {
+        TEST_OPS_HITS.store(ip + data as u64, Ordering::Relaxed);
+    }
+
+    fn only_1000(ip: u64, _parent: u64) -> bool {
+        ip == 0x1000
+    }
+
+    static TEST_OPS: FtraceOps = FtraceOps {
+        func: ops_probe,
+        filter: Some(only_1000),
+        data: 7,
+    };
+
     #[test]
     fn register_then_call_records_hit() {
+        let _guard = TEST_LOCK.lock();
+        unregister_ftrace_function();
+        unregister_ftrace_regs_function();
         TEST_HITS.store(0, Ordering::Relaxed);
         register_ftrace_function(test_probe).unwrap();
         ftrace_function_trace_call(0x1000, 0x2000);
@@ -271,19 +449,28 @@ mod tests {
 
     #[test]
     fn no_probe_is_zero_overhead() {
+        let _guard = TEST_LOCK.lock();
         unregister_ftrace_function();
+        unregister_ftrace_regs_function();
         ftrace_function_trace_call(0x1000, 0x2000); // no-op
     }
 
     #[test]
-    fn second_register_returns_ebusy() {
+    fn multiple_callbacks_run_and_duplicate_registration_is_rejected() {
+        let _guard = TEST_LOCK.lock();
+        unregister_ftrace_function();
+        TEST_HITS.store(0, Ordering::Relaxed);
         register_ftrace_function(test_probe).unwrap();
-        assert_eq!(register_ftrace_function(test_probe), Err(-16));
+        register_ftrace_function(second_probe).unwrap();
+        assert_eq!(register_ftrace_function(test_probe), Err(-17));
+        ftrace_function_trace_call(0x1000, 0x2000);
+        assert_eq!(TEST_HITS.load(Ordering::Relaxed), 11);
         unregister_ftrace_function();
     }
 
     #[test]
     fn register_aware_callback_receives_live_state() {
+        let _guard = TEST_LOCK.lock();
         unregister_ftrace_function();
         unregister_ftrace_regs_function();
         TEST_REGS.store(0, Ordering::Relaxed);
@@ -291,5 +478,66 @@ mod tests {
         ftrace_function_trace_call_with_regs(1, 2, 4, 8);
         assert_eq!(TEST_REGS.load(Ordering::Relaxed), 15);
         unregister_ftrace_regs_function();
+    }
+
+    #[test]
+    fn ftrace_ops_filter_and_private_data_are_applied() {
+        let _guard = TEST_LOCK.lock();
+        TEST_OPS_HITS.store(0, Ordering::Relaxed);
+        register_ftrace_ops(&TEST_OPS).unwrap();
+        ftrace_function_trace_call_with_regs(0x999, 0, 1, 2);
+        assert_eq!(TEST_OPS_HITS.load(Ordering::Relaxed), 0);
+        ftrace_function_trace_call_with_regs(0x1000, 0, 1, 2);
+        assert_eq!(TEST_OPS_HITS.load(Ordering::Relaxed), 0x1007);
+        unregister_ftrace_ops(&TEST_OPS).unwrap();
+        assert_eq!(unregister_ftrace_ops(&TEST_OPS), Err(-2));
+    }
+
+    #[test]
+    fn failed_module_release_retains_records_and_retries_only_live_sites() {
+        let _guard = TEST_LOCK.lock();
+        const OWNER: usize = usize::MAX - 1;
+        MODULE_RECORDS.lock().extend([
+            ModuleFtraceRecord {
+                owner: OWNER,
+                ip: 0x1000,
+                enabled: true,
+                traced: true,
+            },
+            ModuleFtraceRecord {
+                owner: OWNER,
+                ip: 0x2000,
+                enabled: true,
+                traced: true,
+            },
+        ]);
+
+        let mut first_attempt = Vec::new();
+        assert_eq!(
+            release_module_with(OWNER, |ip, enabled| {
+                assert!(!enabled);
+                first_attempt.push(ip);
+                if ip == 0x2000 { Err(-5) } else { Ok(()) }
+            }),
+            Err(-5)
+        );
+        assert_eq!(first_attempt, [0x1000, 0x2000]);
+        assert_eq!(
+            module_records(OWNER)
+                .iter()
+                .map(|record| (record.ip, record.traced))
+                .collect::<Vec<_>>(),
+            [(0x1000, false), (0x2000, true)]
+        );
+
+        let mut retry = Vec::new();
+        release_module_with(OWNER, |ip, enabled| {
+            assert!(!enabled);
+            retry.push(ip);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(retry, [0x2000]);
+        assert!(module_records(OWNER).is_empty());
     }
 }

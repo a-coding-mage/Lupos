@@ -57,8 +57,7 @@ mod tests {
         assert!(source.contains("static int uptime_proc_show(struct seq_file *m, void *v)"));
         assert!(source.contains("idle_nsec = 0;"));
         assert!(source.contains("for_each_possible_cpu(i)"));
-        assert!(source.contains("kcpustat_cpu_fetch(&kcs, i);"));
-        assert!(source.contains("idle_nsec += get_idle_time(&kcs, i);"));
+        assert!(source.contains("idle_nsec += kcpustat_field(CPUTIME_IDLE, i);"));
         assert!(source.contains("ktime_get_boottime_ts64(&uptime);"));
         assert!(source.contains("timens_add_boottime(&uptime);"));
         assert!(source.contains("idle.tv_sec = div_u64_rem(idle_nsec, NSEC_PER_SEC, &rem);"));

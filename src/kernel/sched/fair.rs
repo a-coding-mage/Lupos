@@ -398,17 +398,25 @@ mod tests {
             (*ptr).m29.se.load.weight = NICE_0_LOAD;
         }
 
-        crate::arch::x86::kernel::apic_timer::TIMER_TICKS.store(1, Ordering::Release);
+        crate::kernel::sched::entity::SCHED_CLOCK_NS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |clock| {
+                Some(clock.max(1))
+            })
+            .unwrap();
         unsafe {
             task_tick_fair(&mut rq, ptr, true);
         }
         assert_eq!(rq.cfs.current, ptr);
         let first_runtime = task.m29.se.sum_exec_runtime;
 
-        // With the configured Linux HZ=250 clock, two additional ticks provide
-        // 8 ms of runtime and exceed the default CFS slice.  The former 2 here
-        // depended on the removed, incorrect 25 ms-per-tick scheduler clock.
-        crate::arch::x86::kernel::apic_timer::TIMER_TICKS.store(3, Ordering::Release);
+        // Advance the shared monotonic scheduler clock by 8 ms. Using an
+        // absolute LAPIC tick value made this fixture depend on tests that had
+        // already advanced the process-wide scheduler clock.
+        crate::kernel::sched::entity::SCHED_CLOCK_NS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |clock| {
+                Some(clock.saturating_add(8_000_000))
+            })
+            .unwrap();
         unsafe {
             task_tick_fair(&mut rq, ptr, true);
         }
@@ -419,7 +427,6 @@ mod tests {
             0,
             "timer tick must request a cooperative reschedule for legacy fair tasks"
         );
-        crate::arch::x86::kernel::apic_timer::TIMER_TICKS.store(0, Ordering::Release);
     }
 
     #[test]
@@ -434,16 +441,18 @@ mod tests {
             crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
             Ordering::Release,
         );
-        sleeper.stack = 0x8000usize as *mut core::ffi::c_void;
-        sleeper.thread.sp = 0x8000 - 64;
+        let sleeper_stack_top = crate::kernel::sched::KTHREAD_STACK_SIZE * 2;
+        sleeper.stack = sleeper_stack_top as *mut core::ffi::c_void;
+        sleeper.thread.sp = sleeper_stack_top as u64 - 64;
         sleeper.m29.se.vruntime = 1;
 
         runnable.__state.store(
             crate::kernel::task::task_state::TASK_RUNNING,
             Ordering::Release,
         );
-        runnable.stack = 0x9000usize as *mut core::ffi::c_void;
-        runnable.thread.sp = 0x9000 - 64;
+        let runnable_stack_top = crate::kernel::sched::KTHREAD_STACK_SIZE * 3;
+        runnable.stack = runnable_stack_top as *mut core::ffi::c_void;
+        runnable.thread.sp = runnable_stack_top as u64 - 64;
         runnable.m29.se.vruntime = 2;
 
         rq.cfs.insert(sleeper_ptr, sleeper.m29.se.vruntime);

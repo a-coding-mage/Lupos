@@ -49,7 +49,7 @@ mod tests {
         assert!(source.contains("return XFS_DADDR_TO_FSB(cur->bc_mp,"));
         assert!(source.contains("if (level == cur->bc_nlevels - 1 &&"));
         assert!(source.contains("cur->bc_ops->type == XFS_BTREE_TYPE_INODE"));
-        assert!(source.contains("return XFS_INO_TO_FSB(cur->bc_mp, cur->bc_ino.ip->i_ino);"));
+        assert!(source.contains("return XFS_INODE_TO_FSB(cur->bc_ino.ip);"));
         assert!(source.contains("return NULLFSBLOCK;"));
         assert!(source.contains("#define CREATE_TRACE_POINTS"));
         assert!(source.contains("#include \"scrub/trace.h\""));

@@ -118,8 +118,9 @@ mod tests {
             "/vendor/linux/net/netfilter/nf_dup_netdev.c"
         ));
         assert!(source.contains("static void nf_do_netdev_egress"));
-        assert!(source.contains("nf_get_nf_dup_skb_recursion()"));
-        assert!(source.contains("if (*nf_dup_skb_recursion > NF_RECURSION_LIMIT)"));
+        assert!(source.contains("if (nf_dev_xmit_recursion())"));
+        assert!(source.contains("nf_dev_xmit_recursion_inc();"));
+        assert!(source.contains("nf_dev_xmit_recursion_dec();"));
         assert!(source.contains("if (hook == NF_NETDEV_INGRESS && skb_mac_header_was_set(skb))"));
         assert!(source.contains("if (skb_cow_head(skb, skb->mac_len))"));
         assert!(source.contains("skb_push(skb, skb->mac_len);"));

@@ -37,10 +37,10 @@ mod tests {
             "/vendor/linux/lib/raid6/recov_neon.c"
         ));
         assert!(source.contains("#include <linux/raid/pq.h>"));
-        assert!(source.contains("#include <asm/simd.h>"));
+        assert!(source.contains("#include <asm/neon.h>"));
         assert!(source.contains("static int raid6_has_neon(void)"));
         assert!(source.contains("return cpu_has_neon();"));
-        assert!(source.contains("ptrs[faila] = raid6_get_zero_page();"));
+        assert!(source.contains("ptrs[faila] = (void *)raid6_empty_zero_page;"));
         assert!(source.contains("ptrs[disks - 2] = dp;"));
         assert!(source.contains("raid6_call.gen_syndrome(disks, bytes, ptrs);"));
         assert!(source.contains("pbmul = raid6_vgfmul[raid6_gfexi[failb-faila]];"));

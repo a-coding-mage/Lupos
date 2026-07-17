@@ -8,13 +8,9 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-
-use lazy_static::lazy_static;
-use spin::Mutex;
 
 use crate::block::block_device::BlockDeviceRef;
 use crate::block::partitions::read_sectors;
@@ -217,24 +213,13 @@ pub fn read_super(bdev: &BlockDeviceRef) -> Result<Ext4Sbi, i32> {
     })
 }
 
-// ── sb → sbi side-table ──────────────────────────────────────────────────
-//
-// `SuperBlock` doesn't have a generic private-data slot, so we keep an
-// id-keyed registry.  Robust enough for the M45 acceptance test.
-
-lazy_static! {
-    static ref SBI_REGISTRY: Mutex<BTreeMap<u64, Arc<Ext4Sbi>>> = Mutex::new(BTreeMap::new());
-}
-
 pub fn stash_sbi(sb: &SuperBlockRef, sbi: Arc<Ext4Sbi>) -> Result<(), i32> {
-    let key = Arc::as_ptr(sb) as u64;
-    SBI_REGISTRY.lock().insert(key, sbi);
+    sb.set_fs_private(sbi);
     Ok(())
 }
 
 pub fn get_sbi(sb: &SuperBlockRef) -> Option<Arc<Ext4Sbi>> {
-    let key = Arc::as_ptr(sb) as u64;
-    SBI_REGISTRY.lock().get(&key).cloned()
+    sb.fs_private::<Ext4Sbi>()
 }
 
 #[cfg(test)]

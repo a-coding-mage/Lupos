@@ -156,13 +156,11 @@ mod tests {
         assert!(source.contains("rwstat->cnt[BLKG_RWSTAT_READ] +"));
         assert!(source.contains("rwstat->cnt[BLKG_RWSTAT_DISCARD]"));
         assert!(source.contains("blkg_rwstat_recursive_sum"));
-        assert!(source.contains("lockdep_assert_held(&blkg->q->queue_lock);"));
+        assert!(source.contains("WARN_ON_ONCE(!rcu_read_lock_held());"));
         assert!(source.contains("memset(sum, 0, sizeof(*sum));"));
-        assert!(source.contains("rcu_read_lock();"));
         assert!(source.contains("blkg_for_each_descendant_pre(pos_blkg, pos_css, blkg)"));
         assert!(source.contains("if (!pos_blkg->online)"));
         assert!(source.contains("blkg_to_pd(pos_blkg, pol)"));
-        assert!(source.contains("rcu_read_unlock();"));
         assert!(header.contains("enum blkg_rwstat_type"));
         assert!(header.contains("static inline void blkg_rwstat_add"));
         assert!(header.contains("blkg_rwstat_total"));

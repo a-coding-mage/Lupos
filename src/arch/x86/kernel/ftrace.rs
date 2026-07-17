@@ -78,6 +78,9 @@ core::arch::global_asm!(
     // initial state expected by the module ORC unwinder.
     "lea rdx, [rsp + 144]",
     "mov rcx, [rsp + 88]",
+    // Address of the instrumented function's real caller return slot.  The
+    // function-graph entry hook may replace it with return_to_handler.
+    "lea r8, [rsp + 144]",
     "call lupos_ftrace_dispatch",
     "add rsp, 8",
     "pop r15",
@@ -98,19 +101,42 @@ core::arch::global_asm!(
     "popfq",
     "ret",
     ".size lupos_ftrace_caller,.-lupos_ftrace_caller",
+    ".balign 16",
+    ".global return_to_handler",
+    ".type return_to_handler,@function",
+    "return_to_handler:",
+    "endbr64",
+    // A traced function returned here with the caller's ABI-visible result
+    // registers live. Preserve integer and scalar/vector return values while
+    // Rust resolves the original return address and runs graph callbacks.
+    "sub rsp, 48",
+    "mov [rsp], rax",
+    "mov [rsp + 8], rdx",
+    "movdqu [rsp + 16], xmm0",
+    "movdqu [rsp + 32], xmm1",
+    "mov rdi, rax",
+    "call lupos_fgraph_return_dispatch",
+    "mov r11, rax",
+    "mov rax, [rsp]",
+    "mov rdx, [rsp + 8]",
+    "movdqu xmm0, [rsp + 16]",
+    "movdqu xmm1, [rsp + 32]",
+    "add rsp, 48",
+    "jmp r11",
+    ".size return_to_handler,.-return_to_handler",
     ".popsection",
 );
 
 unsafe extern "C" {
     pub fn __fentry__();
     pub fn lupos_ftrace_caller();
+    pub fn return_to_handler();
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn lupos_ftrace_dispatch(ip: u64, parent_ip: u64, sp: u64, bp: u64) {
-    crate::kernel::trace::ftrace::ftrace_function_trace_call_with_regs(
-        ip, parent_ip, sp, bp,
-    );
+extern "C" fn lupos_ftrace_dispatch(ip: u64, parent_ip: u64, sp: u64, bp: u64, parent: *mut u64) {
+    crate::kernel::trace::ftrace::ftrace_function_trace_call_with_regs(ip, parent_ip, sp, bp);
+    crate::kernel::trace::fgraph::function_graph_enter(ip, parent);
 }
 
 pub fn mcount_addr() -> u64 {
@@ -119,6 +145,10 @@ pub fn mcount_addr() -> u64 {
 
 pub fn ftrace_caller_addr() -> u64 {
     lupos_ftrace_caller as usize as u64
+}
+
+pub fn return_to_handler_addr() -> usize {
+    return_to_handler as usize
 }
 
 pub fn register_module_exports() {

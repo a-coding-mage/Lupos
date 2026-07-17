@@ -23,7 +23,9 @@ pub fn new_fd_dir() -> Arc<KernfsNode> {
 
 pub fn current_fd_path(fd: i32) -> Result<String, i32> {
     let file = current_fd_file(fd)?;
-    Ok(crate::fs::mount::stable_path_for_dentry(&file.dentry).unwrap_or_else(|| file_path(&file)))
+    Ok(crate::fs::file::path_hint(&file)
+        .or_else(|| crate::fs::mount::stable_path_for_dentry(&file.dentry))
+        .unwrap_or_else(|| file_path(&file)))
 }
 
 pub fn current_fd_file(fd: i32) -> Result<FileRef, i32> {
@@ -77,8 +79,8 @@ fn fd_dir_readdir(file: &FileRef) -> Result<Option<(String, u64, InodeKind)>, i3
         return Ok(Some(dot));
     }
     let fds = current_open_fds();
-    let mut idx = file.private.lock();
-    let fd_idx = idx.saturating_sub(2);
+    let mut idx = file.pos.lock();
+    let fd_idx = idx.saturating_sub(2) as usize;
     if fd_idx >= fds.len() {
         return Ok(None);
     }
@@ -326,7 +328,7 @@ mod tests {
     use crate::fs::anon_inode::alloc_anon_file;
     use crate::fs::dcache::d_alloc;
     use crate::fs::fdtable::FilesStruct;
-    use crate::fs::file::alloc_file;
+    use crate::fs::file::{alloc_file, set_path_hint};
     use crate::fs::ops::NOOP_FILE_OPS;
     use crate::fs::read_write::vfs_read;
     use crate::fs::types::SuperBlock;
@@ -390,6 +392,7 @@ mod tests {
         unsafe {
             let fdt = FilesStruct::new();
             let held = alloc_anon_file("held", &NOOP_FILE_OPS, 0);
+            set_path_hint(&held, String::from("/newroot/usr"));
             assert_eq!(fdt.install_at_or_above(held, 5, false), Ok(5));
             files::set_task_files(&mut *current as *mut TaskStruct, fdt);
             sched::set_current(&mut *current as *mut TaskStruct);
@@ -421,7 +424,7 @@ mod tests {
             let link = fd_dir_lookup(&dir_inode, "5").expect("fd link");
             let mut buf = [0u8; 64];
             let n = proc_fd_readlink(&link, &mut buf).expect("readlink");
-            assert!(n > 0);
+            assert_eq!(&buf[..n], b"/newroot/usr");
             assert_eq!(fd_dir_lookup(&dir_inode, "6").err(), Some(ENOENT));
 
             files::drop_task_files(&mut *current as *mut TaskStruct);

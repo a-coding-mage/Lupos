@@ -207,7 +207,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/vendor/linux/arch/x86/virt/vmx/tdx/tdx_global_metadata.c"
         ));
-        assert!(source.contains("static __init int get_tdx_sys_info_version"));
+        assert!(source.contains("static int get_tdx_sys_info_version"));
         assert!(source.contains("read_sys_metadata_field(0x0800000100000003, &val)"));
         assert!(source.contains("sysinfo_version->minor_version = val;"));
         assert!(source.contains("read_sys_metadata_field(0x0A00000300000008, &val)"));
@@ -217,7 +217,7 @@ mod tests {
         assert!(source.contains("if (sysinfo_td_conf->num_cpuid_config > ARRAY_SIZE(sysinfo_td_conf->cpuid_config_leaves))"));
         assert!(source.contains("read_sys_metadata_field(0x9900000300000400 + i, &val)"));
         assert!(source.contains("read_sys_metadata_field(0x9900000300000500 + i * 2 + j, &val)"));
-        assert!(source.contains("pr_info(\"Module version: %u.%u.%02u\\n\""));
+        assert!(source.contains("pr_info(\"Module version: \" TDX_VERSION_FMT \"\\n\""));
         assert!(source.contains("ret = ret ?: get_tdx_sys_info_td_conf(&sysinfo->td_conf);"));
 
         let entries = [

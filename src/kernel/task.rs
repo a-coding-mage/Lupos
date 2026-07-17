@@ -370,6 +370,12 @@ pub struct M27Fields {
 
 pub const TASK_CTRL_CHILD_SUBREAPER: u32 = 1 << 16;
 pub const TASK_CTRL_HAS_CHILD_SUBREAPER: u32 = 1 << 17;
+/// `task_exec_state.dumpable`, packed into the process-control word.  Linux's
+/// stable prctl ABI accepts only OFF (0) and OWNER (1); the VALID bit keeps a
+/// zero-initialized task distinguishable from an explicit OFF transition.
+pub const TASK_CTRL_DUMPABLE_SHIFT: u32 = 2;
+pub const TASK_CTRL_DUMPABLE_MASK: u32 = 0b11 << TASK_CTRL_DUMPABLE_SHIFT;
+pub const TASK_CTRL_DUMPABLE_VALID: u32 = 1 << 4;
 
 unsafe impl Send for M27Fields {}
 unsafe impl Sync for M27Fields {}

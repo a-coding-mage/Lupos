@@ -158,6 +158,9 @@ pub struct KernelSocket {
     pub family: u16,
     pub sock_type: u16,
     pub protocol: u16,
+    /// Owning network namespace. AF_INET/AF_INET6/AF_NETLINK lookup and
+    /// notifications never cross this boundary.
+    pub net_ns: usize,
     pub state: SocketState,
     /// Linux `sk_shutdown` (`RCV_SHUTDOWN` / `SEND_SHUTDOWN`).
     pub shutdown: u8,
@@ -215,7 +218,94 @@ lazy_static! {
     static ref BOUND: Mutex<BTreeMap<SockAddr, Vec<SocketRef>>> = Mutex::new(BTreeMap::new());
     static ref IFADDRS: Mutex<Vec<IfAddrRecord>> = Mutex::new(Vec::new());
     static ref ROUTE4S: Mutex<Vec<Route4Record>> = Mutex::new(Vec::new());
+    static ref IFADDRS_BY_NAMESPACE: Mutex<BTreeMap<usize, Vec<IfAddrRecord>>> =
+        Mutex::new(BTreeMap::new());
+    static ref ROUTE4S_BY_NAMESPACE: Mutex<BTreeMap<usize, Vec<Route4Record>>> =
+        Mutex::new(BTreeMap::new());
     static ref INET_SOCKETS: Mutex<Vec<Weak<Mutex<KernelSocket>>>> = Mutex::new(Vec::new());
+}
+
+fn current_net_namespace_key() -> usize {
+    crate::net::core::net_namespace::current_net_namespace_key()
+}
+
+fn namespace_scoped_family(family: u16) -> bool {
+    matches!(family, AF_INET | AF_INET6 | AF_NETLINK | AF_PACKET)
+}
+
+fn socket_in_net_namespace(sock: &SocketRef, namespace_key: usize, family: u16) -> bool {
+    !namespace_scoped_family(family) || sock.lock().net_ns == namespace_key
+}
+
+fn first_bound_in_namespace(
+    sockets: &[SocketRef],
+    namespace_key: usize,
+    family: u16,
+) -> Option<SocketRef> {
+    sockets
+        .iter()
+        .find(|socket| socket_in_net_namespace(socket, namespace_key, family))
+        .cloned()
+}
+
+fn current_ifaddrs_snapshot() -> Vec<IfAddrRecord> {
+    let key = current_net_namespace_key();
+    if key == 0 {
+        IFADDRS.lock().clone()
+    } else {
+        IFADDRS_BY_NAMESPACE
+            .lock()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn with_current_ifaddrs<R>(f: impl FnOnce(&mut Vec<IfAddrRecord>) -> R) -> R {
+    let key = current_net_namespace_key();
+    if key == 0 {
+        f(&mut IFADDRS.lock())
+    } else {
+        let mut namespaces = IFADDRS_BY_NAMESPACE.lock();
+        f(namespaces.entry(key).or_default())
+    }
+}
+
+fn current_routes_snapshot() -> Vec<Route4Record> {
+    let key = current_net_namespace_key();
+    if key == 0 {
+        ROUTE4S.lock().clone()
+    } else {
+        ROUTE4S_BY_NAMESPACE
+            .lock()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn with_current_routes<R>(f: impl FnOnce(&mut Vec<Route4Record>) -> R) -> R {
+    let key = current_net_namespace_key();
+    if key == 0 {
+        f(&mut ROUTE4S.lock())
+    } else {
+        let mut namespaces = ROUTE4S_BY_NAMESPACE.lock();
+        f(namespaces.entry(key).or_default())
+    }
+}
+
+pub fn unregister_net_namespace(namespace_key: usize) {
+    IFADDRS_BY_NAMESPACE.lock().remove(&namespace_key);
+    ROUTE4S_BY_NAMESPACE.lock().remove(&namespace_key);
+    INET_SOCKETS.lock().retain(|entry| {
+        entry
+            .upgrade()
+            .is_some_and(|socket| socket.lock().net_ns != namespace_key)
+    });
+    BOUND.lock().retain(|_, sockets| {
+        sockets.retain(|socket| socket.lock().net_ns != namespace_key);
+        !sockets.is_empty()
+    });
 }
 
 static NEXT_EPHEMERAL_PORT: AtomicU32 = AtomicU32::new(0);
@@ -404,6 +494,7 @@ pub fn socket(family: u16, sock_type: u16, protocol: u16) -> Result<SocketRef, i
         family,
         sock_type,
         protocol,
+        net_ns: current_net_namespace_key(),
         state: SocketState::Created,
         shutdown: 0,
         pending_error: 0,
@@ -439,8 +530,13 @@ pub fn socket(family: u16, sock_type: u16, protocol: u16) -> Result<SocketRef, i
 }
 
 pub(crate) fn inet_socket_snapshot() -> Vec<SocketRef> {
+    let namespace_key = current_net_namespace_key();
     let mut sockets = INET_SOCKETS.lock();
-    let live = sockets.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+    let live = sockets
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|socket| socket.lock().net_ns == namespace_key)
+        .collect::<Vec<_>>();
     sockets.retain(|entry| entry.strong_count() != 0);
     live
 }
@@ -625,13 +721,14 @@ pub fn bind(sock: &SocketRef, addr: SockAddr) -> Result<(), i32> {
         return Err(EPERM);
     }
 
-    let (reuseaddr, family, sock_type, protocol) = {
+    let (reuseaddr, family, sock_type, protocol, namespace_key) = {
         let socket = sock.lock();
         (
             socket.reuseaddr,
             socket.family,
             socket.sock_type,
             socket.protocol,
+            socket.net_ns,
         )
     };
     {
@@ -639,6 +736,9 @@ pub fn bind(sock: &SocketRef, addr: SockAddr) -> Result<(), i32> {
         if let Some(existing) = bound.get(&addr) {
             for entry in existing.iter().filter(|entry| !Arc::ptr_eq(entry, sock)) {
                 let entry = entry.lock();
+                if namespace_scoped_family(family) && entry.net_ns != namespace_key {
+                    continue;
+                }
                 if !reuseaddr
                     || !entry.reuseaddr
                     || entry.family != family
@@ -670,16 +770,21 @@ fn netlink_autobind_addr(sock: &SocketRef, addr: SockAddr) -> SockAddr {
     let SockAddr::Netlink { pid: 0, groups } = addr else {
         return addr;
     };
+    let namespace_key = sock.lock().net_ns;
     if sock.lock().family != AF_NETLINK {
         return SockAddr::Netlink { pid: 0, groups };
     }
     let preferred = current_netlink_portid();
-    if preferred != 0
-        && !BOUND.lock().contains_key(&SockAddr::Netlink {
+    let preferred_in_use = BOUND
+        .lock()
+        .get(&SockAddr::Netlink {
             pid: preferred,
             groups,
         })
-    {
+        .is_some_and(|sockets| {
+            first_bound_in_namespace(sockets, namespace_key, AF_NETLINK).is_some()
+        });
+    if preferred != 0 && !preferred_in_use {
         return SockAddr::Netlink {
             pid: preferred,
             groups,
@@ -742,9 +847,9 @@ fn inet6_unscoped_link_local(peer: &SockAddr) -> bool {
 }
 
 pub fn connect(sock: &SocketRef, peer: SockAddr) -> Result<(), i32> {
-    let (family, sock_type) = {
+    let (family, sock_type, namespace_key) = {
         let socket = sock.lock();
-        (socket.family, socket.sock_type)
+        (socket.family, socket.sock_type, socket.net_ns)
     };
     // connect() to the IPv6 any-address means loopback: the BSD'ism kept by
     // vendor/linux/net/ipv6/tcp_ipv6.c::tcp_v6_connect() and
@@ -767,7 +872,7 @@ pub fn connect(sock: &SocketRef, peer: SockAddr) -> Result<(), i32> {
     let mut listener = BOUND
         .lock()
         .get(&peer)
-        .and_then(|sockets| sockets.first().cloned());
+        .and_then(|sockets| first_bound_in_namespace(sockets, namespace_key, family));
     // Linux __inet_lookup_listener(): when no exact-address listener matches,
     // a stream connect still reaches the INADDR_ANY listener on that port.
     if listener.is_none()
@@ -778,7 +883,7 @@ pub fn connect(sock: &SocketRef, peer: SockAddr) -> Result<(), i32> {
         listener = BOUND
             .lock()
             .get(&SockAddr::Inet { addr: 0, port })
-            .and_then(|sockets| sockets.first().cloned());
+            .and_then(|sockets| first_bound_in_namespace(sockets, namespace_key, family));
     }
     if matches!(peer, SockAddr::Unix(_)) && listener.is_none() {
         return Err(ECONNREFUSED);
@@ -1108,7 +1213,7 @@ pub fn sendmsg_with_fds_meta_cred(
     send_cred: Option<SocketCred>,
 ) -> Result<usize, i32> {
     let cred = send_cred.unwrap_or_else(current_scm_cred);
-    let (peer_socket, peer_addr, local_addr, family, sock_type, state, shutdown) = {
+    let (peer_socket, peer_addr, local_addr, family, sock_type, state, shutdown, namespace_key) = {
         let socket = sock.lock();
         (
             socket.peer_socket.clone(),
@@ -1118,6 +1223,7 @@ pub fn sendmsg_with_fds_meta_cred(
             socket.sock_type,
             socket.state,
             socket.shutdown,
+            socket.net_ns,
         )
     };
     if family != AF_UNIX && !fds.is_empty() {
@@ -1160,14 +1266,14 @@ pub fn sendmsg_with_fds_meta_cred(
     }
 
     let Some(peer) = peer_addr else {
-        if let Some(n) = synthesize_netlink_send(sock, bytes, None) {
+        if let Some(n) = synthesize_netlink_send(sock, bytes, None, &cred) {
             drop_file_refs(fds);
             return Ok(n);
         }
         drop_file_refs(fds);
         return Err(ENOTCONN);
     };
-    if let Some(n) = synthesize_netlink_send(sock, bytes, Some(&peer)) {
+    if let Some(n) = synthesize_netlink_send(sock, bytes, Some(&peer), &cred) {
         drop_file_refs(fds);
         return Ok(n);
     }
@@ -1196,7 +1302,7 @@ pub fn sendmsg_with_fds_meta_cred(
     let target = match BOUND
         .lock()
         .get(&peer)
-        .and_then(|sockets| sockets.first().cloned())
+        .and_then(|sockets| first_bound_in_namespace(sockets, namespace_key, family))
     {
         Some(target) => target,
         None => {
@@ -1255,9 +1361,9 @@ pub fn sendto_with_fds_meta_cred(
     send_cred: Option<SocketCred>,
 ) -> Result<usize, i32> {
     let cred = send_cred.unwrap_or_else(current_scm_cred);
-    let (family, state, shutdown) = {
+    let (family, state, shutdown, namespace_key) = {
         let socket = sock.lock();
-        (socket.family, socket.state, socket.shutdown)
+        (socket.family, socket.state, socket.shutdown, socket.net_ns)
     };
     if state == SocketState::Closed || shutdown & SEND_SHUTDOWN != 0 {
         drop_file_refs(fds);
@@ -1285,7 +1391,7 @@ pub fn sendto_with_fds_meta_cred(
         }
         (_, dest) => dest,
     };
-    if let Some(n) = synthesize_netlink_send(sock, bytes, Some(&dest)) {
+    if let Some(n) = synthesize_netlink_send(sock, bytes, Some(&dest), &cred) {
         drop_file_refs(fds);
         return Ok(n);
     }
@@ -1311,7 +1417,7 @@ pub fn sendto_with_fds_meta_cred(
     let target = match BOUND
         .lock()
         .get(&dest)
-        .and_then(|sockets| sockets.first().cloned())
+        .and_then(|sockets| first_bound_in_namespace(sockets, namespace_key, family))
     {
         Some(target) => target,
         None => {
@@ -1356,20 +1462,82 @@ fn synthesize_netlink_send(
     sock: &SocketRef,
     bytes: &[u8],
     dest: Option<&SockAddr>,
+    cred: &SocketCred,
 ) -> Option<usize> {
-    let (family, protocol, accepts_kernel_dest) = {
+    let (family, protocol, namespace_key, sender_pid, accepts_kernel_dest) = {
         let socket = sock.lock();
         (
             socket.family,
             socket.protocol,
+            socket.net_ns,
+            match socket.local {
+                Some(SockAddr::Netlink { pid, .. }) => pid,
+                _ => 0,
+            },
             dest.is_none_or(|addr| matches!(addr, SockAddr::Netlink { pid: 0, .. })),
         )
     };
-    if family != AF_NETLINK || !accepts_kernel_dest {
+    if family != AF_NETLINK {
+        return None;
+    }
+
+    // A netlink sender's multicast subscriptions are not part of the source
+    // address reported for a unicast datagram. Linux netlink_recvmsg() reports
+    // nl_pid=NETLINK_CB(skb).portid and nl_groups=0 here. In particular,
+    // systemd-udevd's manager socket subscribes to the kernel uevent group,
+    // then unicasts processed devices to idle worker sockets. Propagating the
+    // manager's subscription mask as the packet source makes libsystemd reject
+    // the otherwise valid worker message and leaves the event running until
+    // udev's three-minute timeout.
+    if let Some(SockAddr::Netlink { pid, .. }) = dest
+        && *pid != 0
+    {
+        let target = {
+            let bound = BOUND.lock();
+            bound
+                .values()
+                .flat_map(|sockets| sockets.iter())
+                .find(|candidate| {
+                    let socket = candidate.lock();
+                    socket.net_ns == namespace_key
+                        && socket.family == AF_NETLINK
+                        && socket.protocol == protocol
+                        && matches!(socket.local, Some(SockAddr::Netlink { pid: local, .. }) if local == *pid)
+                })
+                .cloned()
+        }?;
+        {
+            target.lock().recvq.push_back(QueuedPacket {
+                bytes: bytes.to_vec(),
+                peer: Some(SockAddr::Netlink {
+                    pid: sender_pid,
+                    groups: 0,
+                }),
+                fds: Vec::new(),
+                cred: cred.clone(),
+                meta: PacketMeta::default(),
+            });
+        }
+        wake_socket_recv(&target);
+        return Some(bytes.len());
+    }
+
+    if !accepts_kernel_dest {
         return None;
     }
 
     match protocol {
+        NETLINK_KOBJECT_UEVENT => {
+            let groups = match dest {
+                Some(SockAddr::Netlink { pid: 0, groups }) if *groups != 0 => *groups,
+                _ => {
+                    queue_netlink_error(sock, bytes, -(EOPNOTSUPP as i32));
+                    return Some(bytes.len());
+                }
+            };
+            broadcast_userspace_kobject_uevent(sock, bytes, groups, cred);
+            Some(bytes.len())
+        }
         NETLINK_AUDIT => {
             synthesize_audit_netlink(sock, bytes);
             Some(bytes.len())
@@ -2121,16 +2289,25 @@ fn ensure_default_ifaddrs() {
     let Some(lo) = crate::net::device::lookup_netdevice("lo") else {
         return;
     };
-    let mut ifaddrs = IFADDRS.lock();
-    if ifaddrs.iter().any(|ifa| {
-        ifa.family == AF_INET as u8 && ifa.ifindex == lo.ifindex && ifa.local == ipv4(127, 0, 0, 1)
-    }) {
+    // Linux creates a bare, down `lo` in a new network namespace.  The
+    // namespace creator (bubblewrap here) adds 127.0.0.1 and raises the link;
+    // pre-seeding it would make NLM_F_EXCL RTM_NEWADDR incorrectly fail.
+    if current_net_namespace_key() != 0 {
         return;
     }
-    let mut loopback = ifaddr_ipv4(8, [127, 0, 0, 1]);
-    loopback.ifindex = lo.ifindex;
-    loopback.label = String::from("lo");
-    ifaddrs.push(loopback);
+    with_current_ifaddrs(|ifaddrs| {
+        if ifaddrs.iter().any(|ifa| {
+            ifa.family == AF_INET as u8
+                && ifa.ifindex == lo.ifindex
+                && ifa.local == ipv4(127, 0, 0, 1)
+        }) {
+            return;
+        }
+        let mut loopback = ifaddr_ipv4(8, [127, 0, 0, 1]);
+        loopback.ifindex = lo.ifindex;
+        loopback.label = String::from("lo");
+        ifaddrs.push(loopback);
+    });
 }
 
 fn rtattr_payload(packet: &[u8], offset: usize, attr_type: u16) -> Option<&[u8]> {
@@ -2280,7 +2457,7 @@ fn queue_rtnl_getaddr_dump(sock: &SocketRef, bytes: &[u8], req: &NetlinkHeader) 
         0
     };
     let reply_portid = netlink_reply_portid(sock);
-    let mut ifaddrs = IFADDRS.lock().clone();
+    let mut ifaddrs = current_ifaddrs_snapshot();
     ifaddrs.sort_by_key(|ifa| (ifa.ifindex, ifa.local));
     for ifaddr in ifaddrs {
         if family != AF_UNSPEC && family != ifaddr.family {
@@ -2389,8 +2566,7 @@ fn apply_rtnl_newaddr(sock: &SocketRef, bytes: &[u8], header: &NetlinkHeader) ->
             ifaddr.flags,
         );
     }
-    {
-        let mut ifaddrs = IFADDRS.lock();
+    let duplicate = with_current_ifaddrs(|ifaddrs| {
         if ifaddrs.iter().any(|current| {
             current.family == ifaddr.family
                 && current.ifindex == ifaddr.ifindex
@@ -2398,17 +2574,22 @@ fn apply_rtnl_newaddr(sock: &SocketRef, bytes: &[u8], header: &NetlinkHeader) ->
                 && current.local == ifaddr.local
                 && current.address == ifaddr.address
         }) {
-            #[cfg(not(test))]
-            if crate::kernel::debug_trace::netlink_enabled() {
-                crate::linux_driver_abi::tty::serial_println!(
-                    "trace-netlink-addr action=newaddr-result seq={} err={}",
-                    header.seq,
-                    -EEXIST
-                );
-            }
-            return Err(EEXIST);
+            true
+        } else {
+            ifaddrs.push(ifaddr.clone());
+            false
         }
-        ifaddrs.push(ifaddr.clone());
+    });
+    if duplicate {
+        #[cfg(not(test))]
+        if crate::kernel::debug_trace::netlink_enabled() {
+            crate::linux_driver_abi::tty::serial_println!(
+                "trace-netlink-addr action=newaddr-result seq={} err={}",
+                header.seq,
+                -EEXIST
+            );
+        }
+        return Err(EEXIST);
     }
     if rtnl_report_requested(header) {
         enqueue_rtnl_ifaddr_requester(sock, header, RTM_NEWADDR, &ifaddr);
@@ -2434,18 +2615,18 @@ fn apply_rtnl_newaddr(sock: &SocketRef, bytes: &[u8], header: &NetlinkHeader) ->
 fn apply_rtnl_deladdr(sock: &SocketRef, bytes: &[u8], header: &NetlinkHeader) -> Result<(), i32> {
     ensure_default_ifaddrs();
     let needle = parse_ifaddr_request(bytes, header)?;
-    let removed = {
-        let mut ifaddrs = IFADDRS.lock();
+    let removed = with_current_ifaddrs(|ifaddrs| {
         let Some(index) = ifaddrs.iter().position(|current| {
             current.family == needle.family
                 && current.ifindex == needle.ifindex
                 && current.local == needle.local
                 && current.address == needle.address
         }) else {
-            return Err(EADDRNOTAVAIL);
+            return None;
         };
-        ifaddrs.remove(index)
-    };
+        Some(ifaddrs.remove(index))
+    })
+    .ok_or(EADDRNOTAVAIL)?;
     if rtnl_report_requested(header) {
         enqueue_rtnl_ifaddr_requester(sock, header, RTM_DELADDR, &removed);
     }
@@ -2493,17 +2674,21 @@ fn route_ifaddr_subscribed(socket: &KernelSocket) -> bool {
 }
 
 fn broadcast_rtnl_ifaddr(
-    _sock: &SocketRef,
+    sock: &SocketRef,
     _header: &NetlinkHeader,
     msg_type: u16,
     ifaddr: &IfAddrRecord,
 ) {
+    let namespace_key = sock.lock().net_ns;
     let listeners = {
         let bound = BOUND.lock();
         bound
             .values()
             .flat_map(|sockets| sockets.iter())
-            .filter(|sock| route_ifaddr_subscribed(&sock.lock()))
+            .filter(|listener| {
+                let socket = listener.lock();
+                socket.net_ns == namespace_key && route_ifaddr_subscribed(&socket)
+            })
             .cloned()
             .collect::<Vec<_>>()
     };
@@ -2518,8 +2703,9 @@ fn broadcast_rtnl_ifaddr(
 }
 
 pub fn drop_rtnl_ifaddrs_for_device(ifindex: u32) {
-    let mut ifaddrs = IFADDRS.lock();
-    ifaddrs.retain(|ifa| ifa.ifindex != ifindex || ifa.local == ipv4(127, 0, 0, 1));
+    with_current_ifaddrs(|ifaddrs| {
+        ifaddrs.retain(|ifa| ifa.ifindex != ifindex || ifa.local == ipv4(127, 0, 0, 1));
+    });
 }
 
 fn ipv4_prefix(local: u32, prefixlen: u8) -> u32 {
@@ -2666,8 +2852,7 @@ fn derived_route4s_for_ifaddr(ifaddr: &IfAddrRecord) -> Vec<Route4Record> {
 
 fn derived_route4s() -> Vec<Route4Record> {
     ensure_default_ifaddrs();
-    IFADDRS
-        .lock()
+    current_ifaddrs_snapshot()
         .iter()
         .flat_map(derived_route4s_for_ifaddr)
         .collect()
@@ -2675,7 +2860,7 @@ fn derived_route4s() -> Vec<Route4Record> {
 
 fn current_route4s() -> Vec<Route4Record> {
     let mut routes = derived_route4s();
-    routes.extend(ROUTE4S.lock().iter().cloned());
+    routes.extend(current_routes_snapshot());
     routes.sort_by_key(|route| {
         (
             route.table,
@@ -2700,8 +2885,7 @@ fn route4_matches(route: &Route4Record, needle: &Route4Record) -> bool {
 
 fn infer_route4_oif(gateway: Option<u32>, dst: u32, dst_len: u8) -> Option<u32> {
     let probe = gateway.unwrap_or(dst);
-    IFADDRS
-        .lock()
+    current_ifaddrs_snapshot()
         .iter()
         .filter(|ifa| ifa.family == AF_INET as u8)
         .find(|ifa| {
@@ -2716,8 +2900,7 @@ fn infer_route4_oif(gateway: Option<u32>, dst: u32, dst_len: u8) -> Option<u32> 
 }
 
 fn route4_prefsrc_for_oif(oif: u32) -> Option<u32> {
-    IFADDRS
-        .lock()
+    current_ifaddrs_snapshot()
         .iter()
         .find(|ifa| ifa.family == AF_INET as u8 && ifa.ifindex == oif)
         .map(|ifa| ifa.local)
@@ -2861,21 +3044,24 @@ fn apply_rtnl_newroute(sock: &SocketRef, bytes: &[u8], header: &NetlinkHeader) -
     let excl = header.flags & NLM_F_EXCL != 0;
     #[cfg(not(test))]
     trace_rtnl_route("newroute-request", header, Some(&route), 0);
-    {
-        let mut routes = ROUTE4S.lock();
+    let result = with_current_routes(|routes| {
         if let Some(existing) = routes
             .iter_mut()
             .find(|current| route4_matches(current, &route))
         {
             if excl || (!replace && !create) {
-                #[cfg(not(test))]
-                trace_rtnl_route("newroute-result", header, Some(&route), -EEXIST);
                 return Err(EEXIST);
             }
             *existing = route.clone();
         } else {
             routes.push(route.clone());
         }
+        Ok(())
+    });
+    if let Err(errno) = result {
+        #[cfg(not(test))]
+        trace_rtnl_route("newroute-result", header, Some(&route), -errno);
+        return Err(errno);
     }
     if rtnl_report_requested(header) {
         enqueue_rtnl_route_requester(sock, header, RTM_NEWROUTE, &route);
@@ -2888,16 +3074,16 @@ fn apply_rtnl_newroute(sock: &SocketRef, bytes: &[u8], header: &NetlinkHeader) -
 
 fn apply_rtnl_delroute(sock: &SocketRef, bytes: &[u8], header: &NetlinkHeader) -> Result<(), i32> {
     let route = parse_route4_request(bytes, header)?;
-    let removed = {
-        let mut routes = ROUTE4S.lock();
+    let removed = with_current_routes(|routes| {
         let Some(index) = routes
             .iter()
             .position(|current| route4_matches(current, &route))
         else {
-            return Err(EADDRNOTAVAIL);
+            return None;
         };
-        routes.remove(index)
-    };
+        Some(routes.remove(index))
+    })
+    .ok_or(EADDRNOTAVAIL)?;
     if rtnl_report_requested(header) {
         enqueue_rtnl_route_requester(sock, header, RTM_DELROUTE, &removed);
     }
@@ -2941,17 +3127,22 @@ fn enqueue_rtnl_route_requester(
 }
 
 fn broadcast_rtnl_route(
-    _sock: &SocketRef,
+    sock: &SocketRef,
     _header: &NetlinkHeader,
     msg_type: u16,
     route: &Route4Record,
 ) {
+    let namespace_key = sock.lock().net_ns;
     let listeners = {
         let bound = BOUND.lock();
         bound
             .values()
             .flat_map(|sockets| sockets.iter())
-            .filter(|sock| route_multicast_subscribed(&sock.lock(), RTNLGRP_IPV4_ROUTE))
+            .filter(|listener| {
+                let socket = listener.lock();
+                socket.net_ns == namespace_key
+                    && route_multicast_subscribed(&socket, RTNLGRP_IPV4_ROUTE)
+            })
             .cloned()
             .collect::<Vec<_>>()
     };
@@ -2966,12 +3157,17 @@ fn broadcast_rtnl_route(
 }
 
 fn broadcast_rtnl_route_kernel(msg_type: u16, route: &Route4Record) {
+    let namespace_key = current_net_namespace_key();
     let listeners = {
         let bound = BOUND.lock();
         bound
             .values()
             .flat_map(|sockets| sockets.iter())
-            .filter(|sock| route_multicast_subscribed(&sock.lock(), RTNLGRP_IPV4_ROUTE))
+            .filter(|listener| {
+                let socket = listener.lock();
+                socket.net_ns == namespace_key
+                    && route_multicast_subscribed(&socket, RTNLGRP_IPV4_ROUTE)
+            })
             .cloned()
             .collect::<Vec<_>>()
     };
@@ -3002,11 +3198,11 @@ fn broadcast_rtnl_route_kernel(msg_type: u16, route: &Route4Record) {
 }
 
 pub fn drop_rtnl_routes_for_device(ifindex: u32) {
-    let mut routes = ROUTE4S.lock();
-    routes.retain(|route| route.oif != ifindex);
+    with_current_routes(|routes| routes.retain(|route| route.oif != ifindex));
 }
 
 pub fn broadcast_rtnl_newlink(dev: &crate::net::device::NetDeviceRef) {
+    let namespace_key = current_net_namespace_key();
     let listeners = {
         let bound = BOUND.lock();
         bound
@@ -3014,7 +3210,8 @@ pub fn broadcast_rtnl_newlink(dev: &crate::net::device::NetDeviceRef) {
             .flat_map(|sockets| sockets.iter())
             .filter(|sock| {
                 let socket = sock.lock();
-                socket.family == AF_NETLINK
+                socket.net_ns == namespace_key
+                    && socket.family == AF_NETLINK
                     && socket.protocol == NETLINK_ROUTE
                     && matches!(
                         socket.local,
@@ -3059,12 +3256,16 @@ fn broadcast_rtnl_newlink_for_request(
     header: &NetlinkHeader,
     dev: &crate::net::device::NetDeviceRef,
 ) {
+    let namespace_key = sock.lock().net_ns;
     let listeners = {
         let bound = BOUND.lock();
         bound
             .values()
             .flat_map(|sockets| sockets.iter())
-            .filter(|sock| link_multicast_subscribed(&sock.lock()))
+            .filter(|listener| {
+                let socket = listener.lock();
+                socket.net_ns == namespace_key && link_multicast_subscribed(&socket)
+            })
             .filter(|listener| !Arc::ptr_eq(listener, sock))
             .cloned()
             .collect::<Vec<_>>()
@@ -3150,7 +3351,63 @@ fn kobject_uevent_subscribed(socket: &KernelSocket) -> bool {
     if socket.family != AF_NETLINK || socket.protocol != NETLINK_KOBJECT_UEVENT {
         return false;
     }
-    matches!(socket.local, Some(SockAddr::Netlink { groups, .. }) if groups != 0)
+    matches!(socket.local, Some(SockAddr::Netlink { groups, .. }) if groups & 1 != 0)
+}
+
+fn broadcast_userspace_kobject_uevent(
+    sender: &SocketRef,
+    payload: &[u8],
+    groups: u32,
+    cred: &SocketCred,
+) {
+    let (namespace_key, sender_pid) = {
+        let socket = sender.lock();
+        let pid = match socket.local {
+            Some(SockAddr::Netlink { pid, .. }) => pid,
+            _ => 0,
+        };
+        (socket.net_ns, pid)
+    };
+    let listeners = {
+        let bound = BOUND.lock();
+        bound
+            .values()
+            .flat_map(|sockets| sockets.iter())
+            .filter(|listener| !Arc::ptr_eq(listener, sender))
+            .filter(|listener| {
+                let socket = listener.lock();
+                socket.net_ns == namespace_key
+                    && socket.family == AF_NETLINK
+                    && socket.protocol == NETLINK_KOBJECT_UEVENT
+                    && matches!(
+                        socket.local,
+                        Some(SockAddr::Netlink {
+                            groups: subscribed,
+                            ..
+                        }) if subscribed & groups != 0
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    for listener in listeners {
+        {
+            listener.lock().recvq.push_back(QueuedPacket {
+                bytes: payload.to_vec(),
+                peer: Some(SockAddr::Netlink {
+                    pid: sender_pid,
+                    groups,
+                }),
+                fds: Vec::new(),
+                cred: cred.clone(),
+                meta: PacketMeta {
+                    netlink_group: netlink_dst_group(groups),
+                    ..PacketMeta::default()
+                },
+            });
+        }
+        wake_socket_recv(&listener);
+    }
 }
 
 fn audit_netlink_required_cap(msg_type: u16) -> Option<u32> {
@@ -3204,7 +3461,15 @@ fn enqueue_kobject_uevent(sock: &SocketRef, payload: &[u8]) {
             groups: GroupInfo::default(),
             pid_ref: None,
         },
-        meta: PacketMeta::default(),
+        // NETLINK_KOBJECT_UEVENT's kernel multicast channel is group 1.
+        // systemd-udevd enables NETLINK_PKTINFO and rejects datagrams whose
+        // ancillary nl_pktinfo group does not identify that channel, even
+        // when sockaddr_nl.nl_groups is correct. `udevadm monitor --kernel`
+        // is less strict, which can otherwise hide this mismatch.
+        meta: PacketMeta {
+            netlink_group: 1,
+            ..PacketMeta::default()
+        },
     });
     drop(socket);
     wake_socket_recv(sock);
@@ -4421,7 +4686,7 @@ mod tests {
         assert_eq!(nl_seq(&out[..n]), 9);
         assert_eq!(i32::from_ne_bytes(out[16..20].try_into().unwrap()), 0);
         let n = recvmsg(&auditd, &mut out).expect("AUDIT_LIST_RULES done");
-        assert_eq!(n, NLMSG_HDRLEN);
+        assert_eq!(n, NLMSG_HDRLEN + core::mem::size_of::<i32>());
         assert_eq!(nl_type(&out[..n]), NLMSG_DONE);
         assert_eq!(nl_flags(&out[..n]), NLM_F_MULTI);
         assert_eq!(nl_seq(&out[..n]), 9);
@@ -4557,10 +4822,146 @@ mod tests {
 
         let mut out = [0u8; 256];
         let n = recvmsg(&sock, &mut out).expect("uevent payload");
-        assert!(out[..n].starts_with(b"add@/class/input/event-test0\0"));
+        assert!(out[..n].starts_with(b"add@/devices/virtual/input/event-test0\0"));
         assert!(out[..n].windows(16).any(|w| w == b"SUBSYSTEM=input\0"));
         release_bound_socket(&sock);
         let _ = crate::net::uevent::drain_pending();
+    }
+
+    #[test]
+    fn kernel_kobject_uevent_does_not_reach_udev_userspace_group() {
+        let _guard = crate::net::uevent::test_lock();
+        let _ = crate::net::uevent::drain_pending();
+        let udev_listener = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT).unwrap();
+        bind(
+            &udev_listener,
+            SockAddr::Netlink {
+                pid: 0x5545_0011,
+                groups: 2,
+            },
+        )
+        .unwrap();
+
+        crate::net::uevent::announce_class_device(
+            "graphics",
+            "fb-group-test0",
+            "graphics",
+            "fb-group-test0",
+        );
+
+        let mut out = [0u8; 256];
+        assert_eq!(recvmsg(&udev_listener, &mut out), Err(EAGAIN));
+        release_bound_socket(&udev_listener);
+        let _ = crate::net::uevent::drain_pending();
+    }
+
+    #[test]
+    fn userspace_kobject_multicast_reaches_only_requested_group() {
+        let _guard = crate::net::uevent::test_lock();
+        let _ = crate::net::uevent::drain_pending();
+        let sender = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT).unwrap();
+        bind(
+            &sender,
+            SockAddr::Netlink {
+                pid: 0x5545_0020,
+                groups: 0,
+            },
+        )
+        .unwrap();
+        let udev_listener = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT).unwrap();
+        bind(
+            &udev_listener,
+            SockAddr::Netlink {
+                pid: 0x5545_0021,
+                groups: 2,
+            },
+        )
+        .unwrap();
+        let kernel_listener = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT).unwrap();
+        bind(
+            &kernel_listener,
+            SockAddr::Netlink {
+                pid: 0x5545_0022,
+                groups: 1,
+            },
+        )
+        .unwrap();
+
+        let payload = b"libudev\0processed-device";
+        assert_eq!(
+            sendto(&sender, payload, SockAddr::Netlink { pid: 0, groups: 2 },),
+            Ok(payload.len())
+        );
+
+        let mut out = [0u8; 64];
+        let (n, peer) = recvfrom(&udev_listener, &mut out).expect("userspace multicast");
+        assert_eq!(&out[..n], payload);
+        assert_eq!(
+            peer,
+            Some(SockAddr::Netlink {
+                pid: 0x5545_0020,
+                groups: 2,
+            })
+        );
+        assert_eq!(last_rx_meta(&udev_listener).netlink_group, 2);
+        assert_eq!(recvmsg(&kernel_listener, &mut out), Err(EAGAIN));
+
+        release_bound_socket(&sender);
+        release_bound_socket(&udev_listener);
+        release_bound_socket(&kernel_listener);
+        let _ = crate::net::uevent::drain_pending();
+    }
+
+    #[test]
+    fn userspace_kobject_unicast_reports_sender_portid_with_zero_groups() {
+        let manager = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT).unwrap();
+        bind(
+            &manager,
+            SockAddr::Netlink {
+                pid: 0x5545_0030,
+                // The udev manager listens to kernel multicast while using
+                // this same socket for unicast messages to its workers.
+                groups: 1,
+            },
+        )
+        .unwrap();
+        let worker = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT).unwrap();
+        bind(
+            &worker,
+            SockAddr::Netlink {
+                pid: 0x5545_0031,
+                groups: 0,
+            },
+        )
+        .unwrap();
+
+        let payload = b"libudev\0worker-device";
+        assert_eq!(
+            sendto(
+                &manager,
+                payload,
+                SockAddr::Netlink {
+                    pid: 0x5545_0031,
+                    groups: 0,
+                },
+            ),
+            Ok(payload.len())
+        );
+
+        let mut out = [0u8; 64];
+        let (n, peer) = recvfrom(&worker, &mut out).expect("userspace unicast");
+        assert_eq!(&out[..n], payload);
+        assert_eq!(
+            peer,
+            Some(SockAddr::Netlink {
+                pid: 0x5545_0030,
+                groups: 0,
+            })
+        );
+        assert_eq!(last_rx_meta(&worker).netlink_group, 0);
+
+        release_bound_socket(&manager);
+        release_bound_socket(&worker);
     }
 
     #[test]
@@ -4582,7 +4983,7 @@ mod tests {
 
         let mut out = [0u8; 256];
         let n = recvmsg(&sock, &mut out).expect("replayed uevent payload");
-        assert!(out[..n].starts_with(b"add@/class/graphics/fb-test0\0"));
+        assert!(out[..n].starts_with(b"add@/devices/virtual/graphics/fb-test0\0"));
         assert!(out[..n].windows(19).any(|w| w == b"SUBSYSTEM=graphics\0"));
         release_bound_socket(&sock);
         let _ = crate::net::uevent::drain_pending();
@@ -4618,7 +5019,7 @@ mod tests {
 
         let mut out = [0u8; 256];
         let n = recvmsg(&sock, &mut out).expect("replayed uevent payload");
-        assert!(out[..n].starts_with(b"add@/class/net/eth-autobind0\0"));
+        assert!(out[..n].starts_with(b"add@/devices/virtual/net/eth-autobind0\0"));
         assert!(out[..n].windows(14).any(|w| w == b"SUBSYSTEM=net\0"));
         release_bound_socket(&sock);
         let _ = crate::net::uevent::drain_pending();
@@ -4647,8 +5048,9 @@ mod tests {
 
         let mut out = [0u8; 256];
         let (n, peer) = recvfrom(&sock, &mut out).expect("uevent payload");
-        assert!(out[..n].starts_with(b"add@/class/input/event-test1\0"));
+        assert!(out[..n].starts_with(b"add@/devices/virtual/input/event-test1\0"));
         assert_eq!(peer, Some(SockAddr::Netlink { pid: 0, groups: 1 }));
+        assert_eq!(last_rx_meta(&sock).netlink_group, 1);
         release_bound_socket(&sock);
         let _ = crate::net::uevent::drain_pending();
     }
@@ -5061,6 +5463,7 @@ mod tests {
         );
 
         drop_rtnl_ifaddrs_for_device(dev.ifindex);
+        release_bound_socket(&sock);
         crate::net::device::unregister_netdevice(name).expect("cleanup");
     }
 
@@ -5122,6 +5525,7 @@ mod tests {
         );
 
         drop_rtnl_ifaddrs_for_device(dev.ifindex);
+        release_bound_socket(&sock);
         crate::net::device::unregister_netdevice(name).expect("cleanup");
     }
 
@@ -5193,6 +5597,8 @@ mod tests {
         }
 
         drop_rtnl_ifaddrs_for_device(dev.ifindex);
+        release_bound_socket(&requester);
+        release_bound_socket(&subscriber);
         crate::net::device::unregister_netdevice(name).expect("cleanup");
     }
 

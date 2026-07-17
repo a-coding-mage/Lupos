@@ -112,7 +112,7 @@ mod tests {
         assert!(source.contains("struct fs_bio_integrity_buf"));
         assert!(source.contains("action = bio_integrity_action(bio);"));
         assert!(source.contains("bio_integrity_init(bio, &iib->bip, &iib->bvec, 1);"));
-        assert!(source.contains("bio_integrity_alloc_buf(bio, action & BI_ACT_ZERO);"));
+        assert!(source.contains("bio_integrity_alloc_buf(bio, GFP_NOFS, action & BI_ACT_ZERO);"));
         assert!(source.contains("if (action & BI_ACT_CHECK)"));
         assert!(source.contains("bio_integrity_setup_default(bio);"));
         assert!(source.contains("bio->bi_integrity = NULL;"));

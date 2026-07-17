@@ -328,7 +328,7 @@ pub unsafe fn copy_creds(
     parent: *mut crate::kernel::task::TaskStruct,
     clone_flags: u64,
 ) -> Result<(), i32> {
-    use crate::kernel::clone::CLONE_THREAD;
+    use crate::kernel::clone::{CLONE_NEWUSER, CLONE_THREAD};
 
     let parent_cred = unsafe { (*parent).cred };
     let cred_to_use: *const Cred = if parent_cred.is_null() {
@@ -346,6 +346,20 @@ pub unsafe fn copy_creds(
         }
     } else {
         // COW — allocate a private copy.
+        let new_user_ns = if clone_flags & CLONE_NEWUSER != 0 {
+            let parent_user_ns = unsafe { (*cred_to_use).user_ns }
+                as *const crate::kernel::user_namespace::UserNamespace;
+            let parent_user_ns = if parent_user_ns.is_null() {
+                &raw const crate::kernel::user_namespace::INIT_USER_NS
+            } else {
+                parent_user_ns
+            };
+            Some(crate::kernel::user_namespace::create_user_ns(
+                parent_user_ns,
+            )?)
+        } else {
+            None
+        };
         let new = unsafe {
             let mut c: Box<Cred> = Box::new(core::mem::zeroed());
             *c = Cred {
@@ -365,8 +379,19 @@ pub unsafe fn copy_creds(
                 cap_ambient: (*cred_to_use).cap_ambient,
                 securebits: (*cred_to_use).securebits,
                 group_info: (*cred_to_use).group_info,
-                user_ns: (*cred_to_use).user_ns,
+                user_ns: new_user_ns
+                    .map(|ns| ns as *const core::ffi::c_void)
+                    .unwrap_or((*cred_to_use).user_ns),
             };
+            if new_user_ns.is_some() {
+                // Linux grants a process creating a user namespace every
+                // capability in that new namespace. The UID/GID maps remain
+                // empty until procfs accepts the caller's mapping writes.
+                c.cap_permitted = KernelCapT::full();
+                c.cap_effective = KernelCapT::full();
+                c.cap_bset = KernelCapT::full();
+                c.cap_ambient = KernelCapT::empty();
+            }
             Box::into_raw(c)
         };
         unsafe {

@@ -106,6 +106,15 @@ const KMALLOC_NAMES: [&str; NR_KMALLOC_SIZES] = [
 
 /// True after `slab_init()` has completed; guards GlobalAlloc bootstrap.
 static SLAB_READY: AtomicBool = AtomicBool::new(false);
+static SLAB_FREE_REJECTIONS: AtomicUsize = AtomicUsize::new(0);
+static LAST_REJECTED_FREE_PTR: AtomicUsize = AtomicUsize::new(0);
+static LAST_REJECTED_FREE_HEAD_PFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static LAST_REJECTED_FREE_REASON: AtomicUsize = AtomicUsize::new(0);
+static LAST_REJECTED_FREE_CACHE: AtomicUsize = AtomicUsize::new(0);
+static LAST_REJECTED_FREE_OBJECT_SIZE: AtomicUsize = AtomicUsize::new(0);
+static LAST_REJECTED_FREE_SLOT_SIZE: AtomicUsize = AtomicUsize::new(0);
+static LAST_REJECTED_FREE_INUSE: AtomicUsize = AtomicUsize::new(0);
+static LAST_REJECTED_FREE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
 /// Coarse per-slab-subsystem lock.  Held during every `kmalloc` / `kfree`
 /// call.  Per-CPU cache magazines can be layered on this lock without changing
@@ -113,6 +122,99 @@ static SLAB_READY: AtomicBool = AtomicBool::new(false);
 ///
 /// Ref: Linux `struct kmem_cache::lock` (per-cache in SLUB)
 static SLAB_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+/// Kernel ABI unit tests execute exported allocation entry points before the
+/// boot-time buddy/slab setup exists. Track those pre-init allocations in the
+/// host allocator so the ABI paths remain testable without weakening the
+/// production pre-slab guard.
+#[cfg(test)]
+static TEST_HOST_ALLOCATIONS: spin::Mutex<Vec<(usize, usize, usize)>> =
+    spin::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn test_host_kmalloc(size: usize, gfp: GfpFlags) -> *mut u8 {
+    let size = size.max(1);
+    let align = core::mem::align_of::<usize>();
+    let layout = Layout::from_size_align(size, align).expect("valid host kmalloc layout");
+    let ptr = unsafe {
+        if gfp & __GFP_ZERO != 0 {
+            alloc::alloc::alloc_zeroed(layout)
+        } else {
+            alloc::alloc::alloc(layout)
+        }
+    };
+    if !ptr.is_null() {
+        TEST_HOST_ALLOCATIONS
+            .lock()
+            .push((ptr as usize, size, align));
+    }
+    ptr
+}
+
+#[cfg(test)]
+unsafe fn test_host_kfree(ptr: *mut u8) -> bool {
+    let mut allocations = TEST_HOST_ALLOCATIONS.lock();
+    let Some(index) = allocations
+        .iter()
+        .position(|(address, _, _)| *address == ptr as usize)
+    else {
+        return false;
+    };
+    let (_, size, align) = allocations.swap_remove(index);
+    drop(allocations);
+    let layout = Layout::from_size_align(size, align).expect("valid host kfree layout");
+    unsafe { alloc::alloc::dealloc(ptr, layout) };
+    true
+}
+
+#[cfg(test)]
+fn test_host_ksize(ptr: *const u8) -> Option<usize> {
+    TEST_HOST_ALLOCATIONS
+        .lock()
+        .iter()
+        .find(|(address, _, _)| *address == ptr as usize)
+        .map(|(_, size, _)| *size)
+}
+
+/// Lock-free diagnostics for frees rejected before they can corrupt a slab.
+/// Reason values are: 1 = foreign/misaligned pointer, 2 = invalid in-use
+/// count, 3 = duplicate free, 4 = corrupt freelist.
+pub fn slab_free_rejection_snapshot() -> (usize, usize, usize, usize) {
+    (
+        SLAB_FREE_REJECTIONS.load(Ordering::Acquire),
+        LAST_REJECTED_FREE_PTR.load(Ordering::Acquire),
+        LAST_REJECTED_FREE_HEAD_PFN.load(Ordering::Acquire),
+        LAST_REJECTED_FREE_REASON.load(Ordering::Acquire),
+    )
+}
+
+pub fn slab_free_rejection_detail() -> (usize, usize, usize, usize, usize) {
+    (
+        LAST_REJECTED_FREE_CACHE.load(Ordering::Acquire),
+        LAST_REJECTED_FREE_OBJECT_SIZE.load(Ordering::Acquire),
+        LAST_REJECTED_FREE_SLOT_SIZE.load(Ordering::Acquire),
+        LAST_REJECTED_FREE_INUSE.load(Ordering::Acquire),
+        LAST_REJECTED_FREE_CURSOR.load(Ordering::Acquire),
+    )
+}
+
+fn record_slab_free_rejection(
+    cache: &KmemCache,
+    ptr: *mut u8,
+    head_page: *mut Page,
+    reason: usize,
+    cursor: usize,
+) {
+    LAST_REJECTED_FREE_PTR.store(ptr as usize, Ordering::Release);
+    LAST_REJECTED_FREE_HEAD_PFN.store(page_to_pfn(head_page), Ordering::Release);
+    LAST_REJECTED_FREE_REASON.store(reason, Ordering::Release);
+    LAST_REJECTED_FREE_CACHE.store(cache as *const KmemCache as usize, Ordering::Release);
+    LAST_REJECTED_FREE_OBJECT_SIZE.store(cache.object_size, Ordering::Release);
+    LAST_REJECTED_FREE_SLOT_SIZE.store(cache.size, Ordering::Release);
+    LAST_REJECTED_FREE_INUSE.store(unsafe { (*head_page).index }, Ordering::Release);
+    LAST_REJECTED_FREE_CURSOR.store(cursor, Ordering::Release);
+    SLAB_FREE_REJECTIONS.fetch_add(1, Ordering::AcqRel);
+}
 
 /// Restores the saved interrupt state when dropped.  Paired with the spin guard
 /// in [`lock_slab`]; tuple fields drop left-to-right, so the spin lock is
@@ -355,7 +457,53 @@ impl KmemCache {
     /// - `ptr` must be a valid object from this cache.
     ///
     /// Ref: Linux `mm/slub.c` — `slab_free()`
-    pub unsafe fn free_object(&mut self, head_page: *mut Page, ptr: *mut u8) {
+    pub unsafe fn free_object(&mut self, head_page: *mut Page, ptr: *mut u8) -> bool {
+        let slab_start = page_to_pfn(head_page).saturating_mul(PAGE_SIZE);
+        #[cfg(not(test))]
+        let slab_start = phys_to_virt(slab_start as u64) as usize;
+        let object_bytes = self.objects_per_slab.saturating_mul(self.size);
+        let ptr_addr = ptr as usize;
+        let valid_object = ptr_addr >= slab_start
+            && ptr_addr < slab_start.saturating_add(object_bytes)
+            && ptr_addr.wrapping_sub(slab_start) % self.size == 0;
+        if !valid_object {
+            record_slab_free_rejection(self, ptr, head_page, 1, 0);
+            return false;
+        }
+
+        let inuse = unsafe { (*head_page).index };
+        if inuse == 0 || inuse > self.objects_per_slab {
+            record_slab_free_rejection(self, ptr, head_page, 2, 0);
+            return false;
+        }
+
+        // A free object contains the next freelist pointer in its first word.
+        // Walk at most one slab's capacity, validating every pointer before
+        // dereferencing it. Finding `ptr` proves a duplicate free; rejecting it
+        // keeps `index` from reaching zero while other objects are still live.
+        let mut free = unsafe { (*head_page).mapping } as *mut u8;
+        let mut walked = 0usize;
+        while !free.is_null() && walked < self.objects_per_slab {
+            let free_addr = free as usize;
+            if free_addr < slab_start
+                || free_addr >= slab_start.saturating_add(object_bytes)
+                || free_addr.wrapping_sub(slab_start) % self.size != 0
+            {
+                record_slab_free_rejection(self, ptr, head_page, 4, free_addr);
+                return false;
+            }
+            if free == ptr {
+                record_slab_free_rejection(self, ptr, head_page, 3, free_addr);
+                return false;
+            }
+            free = unsafe { *(free as *const usize) as *mut u8 };
+            walked += 1;
+        }
+        if !free.is_null() {
+            record_slab_free_rejection(self, ptr, head_page, 4, free as usize);
+            return false;
+        }
+
         let was_full = unsafe { (*head_page).mapping } == 0;
 
         // Push onto freelist.
@@ -385,6 +533,7 @@ impl KmemCache {
             self.nr_partial.fetch_sub(1, Ordering::Relaxed);
             unsafe { free_slab_page(head_page, self.order) };
         }
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -455,9 +604,12 @@ static TEST_PAGE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static TEST_FREE_PAGES: spin::Mutex<Vec<(usize, usize)>> = spin::Mutex::new(Vec::new());
 
-/// Test-only physical memory pool (128 × 4 KiB = 512 KiB, page-aligned).
+/// Test-only physical memory pool (128 × 4 KiB = 512 KiB).
+///
+/// The maximum order exercised by this pool is one, so its base must be
+/// aligned to the corresponding 8 KiB slab boundary.
 #[cfg(test)]
-#[repr(align(4096))]
+#[repr(align(8192))]
 struct TestPhysMem([u8; PAGE_SIZE * TEST_N_PAGES]);
 
 #[cfg(test)]
@@ -486,10 +638,12 @@ unsafe fn alloc_slab_page(order: usize, _gfp: GfpFlags) -> Option<(*mut Page, *m
         if let Some(pos) = free.iter().position(|&(_, free_order)| free_order == order) {
             free.swap_remove(pos).0
         } else {
-            let idx = TEST_PAGE_CURSOR.fetch_add(n, Ordering::SeqCst);
+            let cursor = TEST_PAGE_CURSOR.load(Ordering::SeqCst);
+            let idx = cursor.checked_add(n - 1).map(|value| value & !(n - 1))?;
             if idx + n > TEST_N_PAGES {
                 return None;
             }
+            TEST_PAGE_CURSOR.store(idx + n, Ordering::SeqCst);
             idx
         }
     };
@@ -575,7 +729,7 @@ pub unsafe fn kmalloc(size: usize, gfp: GfpFlags) -> *mut u8 {
             }
         }
         #[cfg(test)]
-        panic!("kmalloc before slab_init");
+        return test_host_kmalloc(size, gfp);
     }
 
     if size == 0 {
@@ -625,6 +779,11 @@ pub unsafe fn kfree(ptr: *mut u8) {
     }
     // ZERO_SIZE_PTR sentinel — no backing allocation.
     if ptr == core::ptr::NonNull::<u8>::dangling().as_ptr() {
+        return;
+    }
+
+    #[cfg(test)]
+    if unsafe { test_host_kfree(ptr) } {
         return;
     }
 
@@ -717,6 +876,10 @@ pub fn kmalloc_size_roundup(size: usize) -> usize {
 pub fn ksize(ptr: *const u8) -> usize {
     if ptr.is_null() || ptr == core::ptr::NonNull::<u8>::dangling().as_ptr() {
         return 0;
+    }
+    #[cfg(test)]
+    if let Some(size) = test_host_ksize(ptr) {
+        return size;
     }
     if crate::mm::vmalloc::is_vmalloc_addr(ptr) {
         return crate::mm::vmalloc::vmalloc_usable_size(ptr);
@@ -1509,6 +1672,32 @@ mod tests {
             // Next alloc must return same address (LIFO freelist).
             let p2 = cache.alloc(GFP_KERNEL);
             assert_eq!(p1, p2, "freed object should be reused");
+        }
+    }
+
+    #[test]
+    fn duplicate_object_free_is_rejected_without_releasing_live_slab() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            setup();
+
+            let mut cache = make_cache("test-double-free", 64);
+            let first = cache.alloc(GFP_KERNEL);
+            let second = cache.alloc(GFP_KERNEL);
+            assert!(!first.is_null() && !second.is_null());
+            let head = pfn_to_page(first as usize / PAGE_SIZE);
+
+            assert!(cache.free_object(head, first));
+            let inuse_after_first = (*head).index;
+            let rejected_before = slab_free_rejection_snapshot().0;
+            assert!(!cache.free_object(head, first));
+            assert_eq!((*head).index, inuse_after_first);
+            assert!(slab_free_rejection_snapshot().0 > rejected_before);
+            assert_eq!(slab_free_rejection_snapshot().3, 3);
+
+            // The other live object can still be freed normally; the rejected
+            // duplicate did not release or recycle its backing page.
+            assert!(cache.free_object(head, second));
         }
     }
 

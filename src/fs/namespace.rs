@@ -50,6 +50,10 @@ unsafe fn mnt_put(ns: *mut core::ffi::c_void) {
             return;
         }
         unsafe {
+            crate::fs::mount::unregister_mount_namespace(ns);
+            if !(*ns).user_ns.is_null() {
+                (*(*ns).user_ns).ns.put();
+            }
             drop(alloc::boxed::Box::from_raw(ns));
         }
     }
@@ -78,7 +82,7 @@ pub static INIT_MNT_NS: MntNamespace = MntNamespace {
 };
 
 pub fn copy_mnt_ns(
-    _old: *const MntNamespace,
+    old: *const MntNamespace,
     user_ns: *const UserNamespace,
 ) -> Result<*mut MntNamespace, i32> {
     let b = alloc::boxed::Box::new(MntNamespace {
@@ -97,5 +101,10 @@ pub fn copy_mnt_ns(
             (*user_ns).ns.get();
         }
     }
-    Ok(alloc::boxed::Box::into_raw(b))
+    let ns = alloc::boxed::Box::into_raw(b);
+    let root = crate::fs::mount::register_mount_namespace(ns, old);
+    unsafe {
+        (*ns).root = root;
+    }
+    Ok(ns)
 }

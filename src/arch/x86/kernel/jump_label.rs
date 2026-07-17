@@ -68,6 +68,11 @@ impl JumpLabelRegistration {
     /// This is deliberately idempotent so explicit module teardown and Drop
     /// can share the same cleanup path.
     pub fn unregister(&self) {
+        // Serialize with update_key().  That function deliberately copies the
+        // matching entries out of MODULE_JUMP_ENTRIES before doing text pokes;
+        // without this lock an unload could remove the registry entries and
+        // free module text while an updater still held copied addresses.
+        let _update = JUMP_LABEL_UPDATE_LOCK.lock();
         MODULE_JUMP_ENTRIES
             .lock()
             .retain(|entry| entry.owner != self.owner);
@@ -401,6 +406,10 @@ pub fn register_module_jump_entries(
     base: usize,
     bytes: &[u8],
 ) -> Result<Option<JumpLabelRegistration>, i32> {
+    // A static-key transition must not fall between reading the key counter
+    // and publishing the module sites.  Linux provides the same exclusion
+    // with jump_label_lock() around jump_label_add_module().
+    let _update = JUMP_LABEL_UPDATE_LOCK.lock();
     let decoded = decode_module_entries(base, bytes)?;
     if decoded.is_empty() {
         return Ok(None);
@@ -433,8 +442,16 @@ fn update_key(key: usize, enabled: bool) -> Result<(), i32> {
         .filter(|entry| entry.key == key)
         .copied()
         .collect::<Vec<_>>();
-    for entry in &entries {
-        transform_registered(entry, enabled, false)?;
+    for (index, entry) in entries.iter().enumerate() {
+        if let Err(error) = transform_registered(entry, enabled, false) {
+            // Keep the text and counter transition atomic from callers'
+            // perspective.  A failed later poke must not leave earlier sites
+            // in the new state while slow_inc/slow_dec restores the counter.
+            for previous in entries[..index].iter().rev() {
+                let _ = transform_registered(previous, !enabled, false);
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -500,7 +517,15 @@ pub unsafe extern "C" fn linux_static_key_slow_dec(key: *mut c_void) {
         counter.store(value - 1, Ordering::Release);
     } else if value == 1 {
         counter.store(0, Ordering::Release);
-        let _ = update_key(key as usize, false);
+        if let Err(error) = update_key(key as usize, false) {
+            counter.store(1, Ordering::Release);
+            crate::log_error!(
+                "jump_label",
+                "static-key disable rejected: key={:#x} errno={}",
+                key as usize,
+                error
+            );
+        }
     }
 }
 

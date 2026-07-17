@@ -312,6 +312,36 @@ fn fb0_dev_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
     copy_text(buf, "29:0\n")
 }
 
+fn fb0_uevent_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    copy_text(buf, "MAJOR=29\nMINOR=0\nDEVNAME=fb0\n")
+}
+
+fn fb0_uevent_store(_node: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize, i32> {
+    use crate::include::uapi::errno::EINVAL;
+    use crate::net::uevent::{UeventAction, announce_virtual_device};
+
+    let end = buf
+        .iter()
+        .position(|byte| matches!(*byte, 0 | b'\n'))
+        .unwrap_or(buf.len());
+    let request = core::str::from_utf8(&buf[..end])
+        .map_err(|_| EINVAL)?
+        .trim();
+    let action = match request.split_ascii_whitespace().next().ok_or(EINVAL)? {
+        "add" => UeventAction::Add,
+        "remove" => UeventAction::Remove,
+        "change" => UeventAction::Change,
+        "online" => UeventAction::Online,
+        "offline" => UeventAction::Offline,
+        "move" => UeventAction::Move,
+        "bind" => UeventAction::Bind,
+        "unbind" => UeventAction::Unbind,
+        _ => return Err(EINVAL),
+    };
+    announce_virtual_device(action, "graphics", "fb0", "graphics", "fb0", 29, 0);
+    Ok(buf.len())
+}
+
 /// Populate `/sys/class/graphics`, exposing `fb0` when a framebuffer is
 /// registered.  `xf86-video-fbdev`'s probe `readlink`s
 /// `/sys/class/graphics/fb0/device/subsystem` to confirm the framebuffer is not
@@ -320,29 +350,66 @@ fn fb0_dev_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
 ///
 /// Ref: `xf86-video-fbdev` `FBDevProbe`/`fbdevHWProbe`; Linux registers the
 /// class in `drivers/video/fbdev/core/fbsysfs.c`.
-fn add_graphics_class(class: &Arc<KernfsNode>) {
+fn add_graphics_class(class: &Arc<KernfsNode>, devices: &Arc<KernfsNode>, dev: &Arc<KernfsNode>) {
     let graphics = KernfsNode::new_dir("graphics", 0o555);
     if crate::linux_driver_abi::video::fbdev::core::fb_info().is_some() {
-        let fb0 = KernfsNode::new_dir("fb0", 0o555);
-        add_child(
-            &fb0,
-            KernfsNode::new_file("name", 0o444, Some(fb0_name_show), None),
-        );
-        add_child(
-            &fb0,
-            KernfsNode::new_file("dev", 0o444, Some(fb0_dev_show), None),
-        );
-        let device = KernfsNode::new_dir("device", 0o555);
-        // The link target's basename must not contain "pci", so the driver
-        // treats fb0 as a platform (non-PCI) framebuffer and claims it directly.
-        add_child(
-            &device,
-            KernfsNode::new_symlink("subsystem", "../../../../bus/platform"),
-        );
-        add_child(&fb0, device);
-        add_child(&graphics, fb0);
+        add_fb0_device(&graphics, devices, dev);
     }
     add_child(class, graphics);
+}
+
+fn add_fb0_device(graphics: &Arc<KernfsNode>, devices: &Arc<KernfsNode>, dev: &Arc<KernfsNode>) {
+    let virtual_root = lookup_or_add_dir(devices, "virtual");
+    let virtual_graphics = lookup_or_add_dir(&virtual_root, "graphics");
+    let fb0 = KernfsNode::new_dir("fb0", 0o555);
+    add_child(
+        &fb0,
+        KernfsNode::new_file("name", 0o444, Some(fb0_name_show), None),
+    );
+    add_child(
+        &fb0,
+        KernfsNode::new_file("dev", 0o444, Some(fb0_dev_show), None),
+    );
+    add_child(
+        &fb0,
+        KernfsNode::new_file(
+            "uevent",
+            0o644,
+            Some(fb0_uevent_show),
+            Some(fb0_uevent_store),
+        ),
+    );
+    add_child(
+        &fb0,
+        KernfsNode::new_symlink("subsystem", "../../../../class/graphics"),
+    );
+    let device = KernfsNode::new_dir("device", 0o555);
+    // The link target's basename must not contain "pci", so the driver treats
+    // fb0 as a platform (non-PCI) framebuffer and claims it directly.
+    add_child(
+        &device,
+        KernfsNode::new_symlink("subsystem", "../../../../bus/platform"),
+    );
+    add_child(&fb0, device);
+    add_child(&virtual_graphics, fb0);
+    add_child(
+        graphics,
+        KernfsNode::new_symlink("fb0", "../../devices/virtual/graphics/fb0"),
+    );
+
+    let char_root = lookup_or_add_dir(dev, "char");
+    add_child(
+        &char_root,
+        KernfsNode::new_symlink("29:0", "../../devices/virtual/graphics/fb0"),
+    );
+}
+
+fn lookup_or_add_dir(parent: &Arc<KernfsNode>, name: &str) -> Arc<KernfsNode> {
+    crate::fs::kernfs::lookup(parent, name).unwrap_or_else(|| {
+        let node = KernfsNode::new_dir(name, 0o555);
+        add_child(parent, node.clone());
+        node
+    })
 }
 
 fn add_tty_class(class: &Arc<KernfsNode>) {
@@ -416,10 +483,10 @@ pub fn build_root() -> (Arc<KernfsNode>, Arc<KernfsNode>) {
 
     let class = KernfsNode::new_dir("class", 0o555);
     add_tty_class(&class);
-    add_graphics_class(&class);
 
     let devices = KernfsNode::new_dir("devices", 0o555);
     crate::fs::sysfs::net::attach_roots(&class, &devices);
+    add_graphics_class(&class, &devices, &dev);
 
     for child in [
         kernel.clone(),
@@ -559,5 +626,71 @@ mod tests {
         );
         let pmd = lookup(&thp, "hugepages-2048kB").expect("THP PMD size dir");
         assert!(show(&lookup(&pmd, "enabled").expect("enabled")).contains("[inherit]"));
+    }
+
+    #[test]
+    fn framebuffer_sysfs_uses_linux_canonical_device_layout() {
+        let graphics = KernfsNode::new_dir("graphics", 0o555);
+        let devices = KernfsNode::new_dir("devices", 0o555);
+        let dev = KernfsNode::new_dir("dev", 0o555);
+        add_child(&dev, KernfsNode::new_dir("char", 0o555));
+        add_fb0_device(&graphics, &devices, &dev);
+
+        let class_link = lookup(&graphics, "fb0").expect("/sys/class/graphics/fb0");
+        assert!(matches!(
+            &class_link.kind,
+            KernfsKind::Symlink { target }
+                if target == "../../devices/virtual/graphics/fb0"
+        ));
+
+        let virtual_root = lookup(&devices, "virtual").expect("/sys/devices/virtual");
+        let virtual_graphics =
+            lookup(&virtual_root, "graphics").expect("/sys/devices/virtual/graphics");
+        let fb0 = lookup(&virtual_graphics, "fb0").expect("canonical fb0 device");
+        let subsystem = lookup(&fb0, "subsystem").expect("fb0 subsystem link");
+        assert!(matches!(
+            &subsystem.kind,
+            KernfsKind::Symlink { target }
+                if target == "../../../../class/graphics"
+        ));
+        assert_eq!(
+            show(&lookup(&fb0, "uevent").expect("fb0 uevent")),
+            "MAJOR=29\nMINOR=0\nDEVNAME=fb0\n"
+        );
+        assert_eq!(show(&lookup(&fb0, "dev").expect("fb0 dev")), "29:0\n");
+
+        let char_root = lookup(&dev, "char").expect("/sys/dev/char");
+        let devnum_link = lookup(&char_root, "29:0").expect("fb0 devnum link");
+        assert!(matches!(
+            &devnum_link.kind,
+            KernfsKind::Symlink { target }
+                if target == "../../devices/virtual/graphics/fb0"
+        ));
+    }
+
+    #[test]
+    fn framebuffer_uevent_replay_is_usable_by_udev_coldplug() {
+        let _guard = crate::net::uevent::test_lock();
+        let _ = crate::net::uevent::drain_pending();
+        let node = KernfsNode::new_file(
+            "uevent",
+            0o644,
+            Some(fb0_uevent_show),
+            Some(fb0_uevent_store),
+        );
+        assert_eq!(store(&node, b"add\n"), Ok(4));
+        let events = crate::net::uevent::drain_pending();
+        let payload = &events.last().expect("fb0 add event").payload;
+        assert!(payload.starts_with(b"add@/devices/virtual/graphics/fb0\0"));
+        assert!(
+            payload
+                .windows(b"SUBSYSTEM=graphics\0".len())
+                .any(|window| window == b"SUBSYSTEM=graphics\0")
+        );
+        assert!(
+            payload
+                .windows(b"MAJOR=29\0".len())
+                .any(|window| window == b"MAJOR=29\0")
+        );
     }
 }

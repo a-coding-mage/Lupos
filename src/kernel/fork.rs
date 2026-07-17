@@ -38,7 +38,9 @@
 
 extern crate alloc;
 
-use alloc::alloc::{Layout, alloc_zeroed, dealloc};
+#[cfg(test)]
+use alloc::alloc::dealloc;
+use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -175,7 +177,13 @@ pub fn heap_task_count() -> usize {
     HEAP_TASKS.lock().len
 }
 
-fn untrack_heap_task(task: *mut TaskStruct) -> Option<*mut u8> {
+/// Claim the sole release ownership for a heap task.
+///
+/// The pointer comparison deliberately happens before any `TaskStruct`
+/// dereference.  A second waiter/scheduler reaping path can therefore pass a
+/// stale pointer here safely: only the first claimant removes the tracker
+/// entry and may continue with `release_task()` cleanup.
+pub(crate) fn begin_heap_task_release(task: *mut TaskStruct) -> Option<*mut u8> {
     let mut tracker = HEAP_TASKS.lock();
     for i in 0..MAX_HEAP_TASKS {
         if let Some(entry) = &tracker.entries[i] {
@@ -251,42 +259,53 @@ pub fn for_each_heap_task(mut f: impl FnMut(*mut TaskStruct)) {
     }
 }
 
-/// Locate `task` in the heap-task tracker, remove it, and free both the
-/// `Box<TaskStruct>` and the `Box<[u8; KTHREAD_STACK_SIZE]>` it owns.
+/// Free the allocations whose unique ownership was returned by
+/// `begin_heap_task_release()`.
 ///
 /// Called by `crate::kernel::exit::release_task` once the parent has reaped a
 /// zombie child.  After this call returns, `task` is dangling and must not be
 /// dereferenced.
 ///
 /// # Safety
-/// `task` must be a pointer previously returned by `copy_process` and not
-/// yet released.  No other CPU may hold a reference to the task; the caller
-/// (`release_task`) ensures this by removing the task from its parent's
-/// children list and from the run queue first.
-pub unsafe fn heap_task_release(task: *mut TaskStruct) {
-    if let Some(stack) = untrack_heap_task(task) {
-        unsafe {
-            free_kernel_stack(stack);
-            // Reclaim the TaskStruct allocation last — `task` becomes invalid.
-            drop(Box::from_raw(task));
-        }
+/// `task` and `stack` must be the pair claimed by
+/// `begin_heap_task_release()`. No other CPU may hold a reference to the task;
+/// the caller removes it from its indexes and run queue before finishing.
+pub(crate) unsafe fn finish_heap_task_release(task: *mut TaskStruct, stack: *mut u8) {
+    unsafe {
+        free_kernel_stack(stack);
+        // Reclaim the TaskStruct allocation last — `task` becomes invalid.
+        drop(Box::from_raw(task));
     }
 }
 
 // ── kernel_fork_child_entry ───────────────────────────────────────────────────
 
+#[cfg(test)]
 fn kernel_stack_layout() -> Layout {
-    Layout::from_size_align(KTHREAD_STACK_SIZE, 16).expect("valid kernel stack layout")
+    Layout::from_size_align(KTHREAD_STACK_SIZE, KTHREAD_STACK_SIZE)
+        .expect("valid kernel stack layout")
 }
 
+#[cfg(test)]
 fn alloc_kernel_stack() -> *mut u8 {
     unsafe { alloc_zeroed(kernel_stack_layout()) }
 }
 
+#[cfg(not(test))]
+fn alloc_kernel_stack() -> *mut u8 {
+    crate::mm::vmalloc::vmalloc_stack(KTHREAD_STACK_SIZE)
+}
+
+#[cfg(test)]
 unsafe fn free_kernel_stack(stack: *mut u8) {
     if !stack.is_null() {
         unsafe { dealloc(stack, kernel_stack_layout()) };
     }
+}
+
+#[cfg(not(test))]
+unsafe fn free_kernel_stack(stack: *mut u8) {
+    crate::mm::vmalloc::vfree_stack(stack);
 }
 
 fn alloc_task_struct_zeroed() -> *mut TaskStruct {
@@ -708,6 +727,9 @@ pub unsafe fn copy_process(
             .filter
             .store(parent_filter, core::sync::atomic::Ordering::Release);
         (*child).m27.no_new_privs = (*parent).m27.no_new_privs;
+        (*child).m27.mdwe_flags |= (*parent).m27.mdwe_flags
+            & (crate::kernel::task::TASK_CTRL_DUMPABLE_MASK
+                | crate::kernel::task::TASK_CTRL_DUMPABLE_VALID);
         // ── 11c. copy_namespaces (M28) ───────────────────────────────────────
         if let Err(e) = crate::kernel::nsproxy::copy_namespaces(args.flags, parent, child) {
             cleanup_failed_child(parent, child, stack_ptr, task_allocated);
@@ -831,7 +853,7 @@ unsafe fn cleanup_failed_child(
             crate::kernel::pid::put_pid(thread_pid);
         }
 
-        let tracked_stack = untrack_heap_task(child);
+        let tracked_stack = begin_heap_task_release(child);
         let stack_to_free = tracked_stack.unwrap_or(stack_ptr);
         drop(Box::from_raw(child));
         free_kernel_stack(stack_to_free);
@@ -871,22 +893,14 @@ pub unsafe fn kernel_clone(args: &KernelCloneArgs) -> i64 {
     if effective_args.flags & CLONE_EMPTY_MNTNS != 0 {
         effective_args.flags |= CLONE_NEWNS;
     }
-    if effective_args.flags & CLONE_NEWUSER != 0 {
-        // User namespaces are only modeled as static init credentials today.
-        // Failing the clone keeps callers such as systemd's ID-mapping probe on
-        // their non-userns fallback instead of exposing incomplete proc/ns state.
+    if effective_args.flags & CLONE_NEWNS != 0 && effective_args.flags & CLONE_NEWUSER == 0 {
+        // Keep the privileged systemd mount-namespace capability probe on
+        // its established container fallback until every service-manager
+        // propagation operation is modeled. Rootless sandboxes create the
+        // owning user namespace and private mount namespace atomically; that
+        // is the safe path supported below.
         return -1; // EPERM
     }
-    if effective_args.flags & CLONE_NEWNS != 0 {
-        // Mount namespaces are identity-only (copy_mnt_ns clones no mount
-        // tree); a child mutating its "private" tree would corrupt the
-        // global one and freeze the system under systemd's per-service
-        // sandboxing.  EPERM keeps systemd on its containerized fallback.
-        // See kernel::nsproxy::sys_unshare and the ROADMAP "Per-namespace
-        // mount trees" prerequisite.
-        return -1; // EPERM
-    }
-
     let child = match unsafe { copy_process(parent, &effective_args) } {
         Ok(c) => c,
         Err(e) => return e as i64,

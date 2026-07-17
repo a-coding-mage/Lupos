@@ -457,8 +457,9 @@ mod tests {
     #[test]
     fn linux_pci_dev_present_matches_registered_raw_device() {
         unsafe {
+            register_module_exports();
             let pdev = PciDev::new_with_subsystem(
-                0, 0, 30, 0, 0xfefe, 0xcafe, 0x03, 0x00, 0x00, 1, 0x1111, 0x2222,
+                0x7ffd, 0, 30, 0, 0xfefe, 0xcafe, 0x03, 0x00, 0x00, 1, 0x1111, 0x2222,
             );
             let raw = crate::linux_driver_abi::pci::device::register_linux_pci_device(
                 &pdev,

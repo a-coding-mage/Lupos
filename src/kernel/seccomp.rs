@@ -90,6 +90,8 @@ pub const PR_SET_CHILD_SUBREAPER: i32 = 36;
 pub const PR_GET_CHILD_SUBREAPER: i32 = 37;
 pub const PR_SET_PDEATHSIG: i32 = 1;
 pub const PR_GET_PDEATHSIG: i32 = 2;
+pub const PR_GET_DUMPABLE: i32 = 3;
+pub const PR_SET_DUMPABLE: i32 = 4;
 pub const PR_CAPBSET_READ: i32 = 23;
 pub const PR_CAPBSET_DROP: i32 = 24;
 pub const PR_CAP_AMBIENT: i32 = 47;
@@ -449,6 +451,30 @@ pub unsafe fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
                 .is_err()
             {
                 return -14;
+            }
+            0
+        }
+        PR_GET_DUMPABLE => unsafe {
+            let control = (*task).m27.mdwe_flags;
+            if control & crate::kernel::task::TASK_CTRL_DUMPABLE_VALID == 0 {
+                // Linux initializes a normal task as TASK_DUMPABLE_OWNER.
+                1
+            } else {
+                ((control & crate::kernel::task::TASK_CTRL_DUMPABLE_MASK)
+                    >> crate::kernel::task::TASK_CTRL_DUMPABLE_SHIFT) as i64
+            }
+        },
+        PR_SET_DUMPABLE => {
+            // TASK_DUMPABLE_ROOT (2) is a sysctl-selected internal mode, not
+            // accepted by PR_SET_DUMPABLE.  Match vendor/linux/kernel/sys.c.
+            if arg2 > 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return -22;
+            }
+            unsafe {
+                (*task).m27.mdwe_flags = ((*task).m27.mdwe_flags
+                    & !crate::kernel::task::TASK_CTRL_DUMPABLE_MASK)
+                    | ((arg2 as u32) << crate::kernel::task::TASK_CTRL_DUMPABLE_SHIFT)
+                    | crate::kernel::task::TASK_CTRL_DUMPABLE_VALID;
             }
             0
         }
@@ -818,6 +844,13 @@ mod tests {
             assert_eq!(sys_prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0), 1);
             assert_eq!(sys_prctl(PR_SET_NO_NEW_PRIVS, 2, 0, 0, 0), -22);
             assert_eq!(sys_prctl(PR_GET_SECCOMP, 0, 0, 0, 0), 0);
+            assert_eq!(sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0), 1);
+            assert_eq!(sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0), 0);
+            assert_eq!(sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0), 0);
+            assert_eq!(sys_prctl(PR_SET_DUMPABLE, 1, 0, 0, 0), 0);
+            assert_eq!(sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0), 1);
+            assert_eq!(sys_prctl(PR_SET_DUMPABLE, 2, 0, 0, 0), -22);
+            assert_eq!(sys_prctl(PR_SET_DUMPABLE, 1, 1, 0, 0), -22);
             assert_eq!(sys_prctl(PR_GET_SECUREBITS, 0, 0, 0, 0), 0);
             assert_eq!(sys_prctl(PR_GET_KEEPCAPS, 0, 0, 0, 0), 0);
             let mut subreaper = 99u32;

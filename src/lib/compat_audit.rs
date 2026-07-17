@@ -190,12 +190,12 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/vendor/linux/lib/compat_audit.c"
         ));
-        assert!(source.contains("unsigned compat_dir_class[]"));
+        assert!(source.contains("unsigned int compat_dir_class[]"));
         assert!(source.contains("#include <asm-generic/audit_dir_write.h>"));
-        assert!(source.contains("unsigned compat_read_class[]"));
-        assert!(source.contains("unsigned compat_write_class[]"));
-        assert!(source.contains("unsigned compat_chattr_class[]"));
-        assert!(source.contains("unsigned compat_signal_class[]"));
+        assert!(source.contains("unsigned int compat_read_class[]"));
+        assert!(source.contains("unsigned int compat_write_class[]"));
+        assert!(source.contains("unsigned int compat_chattr_class[]"));
+        assert!(source.contains("unsigned int compat_signal_class[]"));
         assert!(source.contains("~0U"));
         assert!(source.contains("case __NR_open:"));
         assert!(source.contains("case __NR_openat:"));

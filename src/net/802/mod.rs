@@ -107,11 +107,6 @@ pub const NET_802_BUILD_RULES: &[Net802BuildRule] = &[
         rust_module: "fddi",
     },
     Net802BuildRule {
-        config: "CONFIG_ATALK",
-        object: "psnap.o",
-        rust_module: "psnap",
-    },
-    Net802BuildRule {
         config: "CONFIG_STP",
         object: "stp.o",
         rust_module: "stp",
@@ -147,7 +142,6 @@ pub const NET_802_METADATA: &[Net802File] = &[
             "obj-$(CONFIG_LLC)\t+= psnap.o",
             "obj-$(CONFIG_NET_FC)\t+=",
             "obj-$(CONFIG_FDDI)\t+=",
-            "obj-$(CONFIG_ATALK)\t+= psnap.o",
             "obj-$(CONFIG_STP)\t+= stp.o",
             "obj-$(CONFIG_GARP)\t+= garp.o",
             "obj-$(CONFIG_MRP)\t+= mrp.o",
@@ -284,7 +278,7 @@ mod tests {
     fn build_rules_match_linux_makefile_objects() {
         let makefile = linux_source("vendor/linux/net/802/Makefile");
 
-        assert_eq!(NET_802_BUILD_RULES.len(), 7);
+        assert_eq!(NET_802_BUILD_RULES.len(), 6);
         for rule in NET_802_BUILD_RULES {
             let needle = alloc::format!("obj-$({})", rule.config);
             assert!(makefile.contains(&needle), "missing build rule {needle}");

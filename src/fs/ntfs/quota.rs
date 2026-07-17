@@ -68,12 +68,12 @@ mod tests {
         assert!(source.contains("#include \"index.h\""));
         assert!(source.contains("#include \"quota.h\""));
         assert!(source.contains("bool ntfs_mark_quotas_out_of_date"));
-        assert!(source.contains("const __le32 qid = QUOTA_DEFAULTS_ID;"));
+        assert!(source.contains("const le32 qid = QUOTA_DEFAULTS_ID;"));
         assert!(source.contains("if (NVolQuotaOutOfDate(vol))"));
         assert!(source.contains("if (!vol->quota_ino || !vol->quota_q_ino)"));
-        assert!(source.contains("ntfs_index_ctx_get(NTFS_I(vol->quota_q_ino), I30, 4);"));
+        assert!(source.contains("ntfs_index_ctx_get(NTFS_I(vol->quota_q_ino));"));
         assert!(source.contains("ntfs_index_lookup(&qid, sizeof(qid), ictx);"));
-        assert!(source.contains("if (ictx->data_len < offsetof(struct quota_control_entry, sid))"));
+        assert!(source.contains("if (ictx->data_len < offsetof(QUOTA_CONTROL_ENTRY, sid))"));
         assert!(source.contains("le32_to_cpu(qce->version) != QUOTA_VERSION"));
         assert!(source.contains("if (qce->flags & QUOTA_FLAG_OUT_OF_DATE)"));
         assert!(source.contains("QUOTA_FLAG_TRACKING_ENABLED"));

@@ -106,10 +106,10 @@ mod tests {
         assert!(source.contains("nf_conntrack_broadcast_help(skb, ct, ctinfo, timeout);"));
         assert!(source.contains("if (nf_nat_snmp && ct->status & IPS_NAT_MASK)"));
         assert!(source.contains("return NF_ACCEPT;"));
-        assert!(source.contains(".name\t\t\t= \"snmp\""));
-        assert!(source.contains(".tuple.src.u.udp.port\t= cpu_to_be16(SNMP_PORT)"));
+        assert!(source.contains("nf_ct_helper_init(&helper, AF_INET, IPPROTO_UDP,"));
+        assert!(source.contains("\"snmp\", SNMP_PORT, SNMP_PORT, SNMP_PORT,"));
         assert!(source.contains("exp_policy.timeout = timeout;"));
-        assert!(source.contains("nf_conntrack_helper_register(&helper);"));
+        assert!(source.contains("nf_conntrack_helper_register(&helper, &helper_ptr);"));
 
         set_timeout(DEFAULT_TIMEOUT_SECS);
         let helper = nf_conntrack_snmp_init();

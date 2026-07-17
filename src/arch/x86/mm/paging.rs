@@ -1532,7 +1532,10 @@ unsafe fn alloc_pt_page(ctx: PtPageTraceContext) -> Option<u64> {
     }
     let kernel_phys_start = unsafe { &_kernel_phys_start as *const u8 as u64 };
     let kernel_phys_end = unsafe { &_kernel_phys_end as *const u8 as u64 };
-    if phys >= kernel_phys_start && phys < kernel_phys_end {
+    if phys >= kernel_phys_start
+        && phys < kernel_phys_end
+        && !kernel_image_page_was_released(phys as usize)
+    {
         crate::kernel::printk::log_error!(
             "mm",
             "alloc_pt_page: buddy returned kernel image page phys={:#x} kernel={:#x}..{:#x}",
@@ -1552,6 +1555,36 @@ unsafe fn alloc_pt_page(ctx: PtPageTraceContext) -> Option<u64> {
         record_pt_page_alloc(phys, page_ptr, page_type, ctx);
     }
     Some(phys)
+}
+
+#[cfg(not(test))]
+fn kernel_image_page_was_released(phys: usize) -> bool {
+    unsafe extern "C" {
+        static __text_end: u8;
+        static __start_rodata: u8;
+        static __end_rodata: u8;
+        static __data_start: u8;
+        static __init_begin: u8;
+        static __init_end: u8;
+    }
+    const PAGE_SIZE: usize = crate::mm::frame::PAGE_SIZE;
+    let align_up = |addr: usize| (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let align_down = |addr: usize| addr & !(PAGE_SIZE - 1);
+    let in_released_range = |begin: usize, end: usize| {
+        let begin = align_up(begin);
+        let end = align_down(end);
+        phys >= begin && phys < end
+    };
+    in_released_range(
+        &raw const __text_end as usize,
+        &raw const __start_rodata as usize,
+    ) || in_released_range(
+        &raw const __end_rodata as usize,
+        &raw const __data_start as usize,
+    ) || in_released_range(
+        &raw const __init_begin as usize,
+        &raw const __init_end as usize,
+    )
 }
 
 #[cfg(test)]

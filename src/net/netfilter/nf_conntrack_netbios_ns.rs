@@ -86,11 +86,10 @@ mod tests {
         assert!(source.contains("static unsigned int timeout __read_mostly = 3;"));
         assert!(source.contains(".max_expected\t= 1"));
         assert!(source.contains("return nf_conntrack_broadcast_help(skb, ct, ctinfo, timeout);"));
-        assert!(source.contains(".tuple.src.l3num\t= NFPROTO_IPV4"));
-        assert!(source.contains(".tuple.src.u.udp.port\t= cpu_to_be16(NMBD_PORT)"));
-        assert!(source.contains(".tuple.dst.protonum\t= IPPROTO_UDP"));
+        assert!(source.contains("nf_ct_helper_init(&helper, AF_INET, IPPROTO_UDP, HELPER_NAME,"));
+        assert!(source.contains("NMBD_PORT, NMBD_PORT, NMBD_PORT,"));
         assert!(source.contains("exp_policy.timeout = timeout;"));
-        assert!(source.contains("nf_conntrack_helper_register(&helper);"));
+        assert!(source.contains("nf_conntrack_helper_register(&helper, &helper_ptr);"));
 
         set_timeout(DEFAULT_TIMEOUT_SECS);
         let helper = nf_conntrack_netbios_ns_init();

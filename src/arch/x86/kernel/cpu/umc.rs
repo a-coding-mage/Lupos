@@ -1,10 +1,8 @@
-//! linux-parity: complete
-//! linux-source: vendor/linux/arch/x86/kernel/cpu/umc.c
-//! test-origin: linux:vendor/linux/arch/x86/kernel/cpu/umc.c
+//! test-origin: lupos-specific:legacy UMC CPU-vendor model removed from current Linux
 //! UMC (United Microelectronics Corp.) CPU vendor.
 //!
-//! Port / mirror:
-//! - vendor/linux/arch/x86/kernel/cpu/umc.c
+//! Retained for compatibility with old x86 CPUs; the current vendored Linux
+//! tree no longer contains the former `arch/x86/kernel/cpu/umc.c` source.
 
 // UMC parts cloned the 486/U5S design. Linux includes a minimal vendor
 // hook that just registers the vendor name. We model the vendor

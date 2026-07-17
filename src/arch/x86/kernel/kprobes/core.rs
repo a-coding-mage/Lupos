@@ -103,7 +103,7 @@ impl LiveKprobe {
     }
 }
 
-struct ProductionText;
+pub(super) struct ProductionText;
 
 impl KernelText for ProductionText {
     fn read(&self, ip: u64, len: usize) -> Result<Vec<u8>, i32> {
@@ -205,6 +205,15 @@ pub fn is_jcc(bytes: &[u8]) -> bool {
                 .is_some_and(|b| (0x80..=0x8f).contains(b)))
 }
 
+fn encode_rel32(from_next_ip: u64, target: u64) -> Result<i32, i32> {
+    let displacement = target.wrapping_sub(from_next_ip) as u32 as i32;
+    if from_next_ip.wrapping_add_signed(displacement as i64) == target {
+        Ok(displacement)
+    } else {
+        Err(EINVAL)
+    }
+}
+
 pub fn copy_instruction(
     original_ip: u64,
     slot_ip: u64,
@@ -230,12 +239,9 @@ pub fn copy_instruction(
             let target = original_ip
                 .wrapping_add(len as u64)
                 .wrapping_add(old_disp as i64 as u64);
-            let new_disp = target as i64 - (slot_ip + len as u64) as i64;
-            if new_disp < i32::MIN as i64 || new_disp > i32::MAX as i64 {
-                return Err(EINVAL);
-            }
+            let new_disp = encode_rel32(slot_ip.wrapping_add(len as u64), target)?;
             bytes[disp_off..disp_off + 4].copy_from_slice(&(new_disp as i32).to_le_bytes());
-            rip_relative_fixup = Some(new_disp as i32);
+            rip_relative_fixup = Some(new_disp);
         }
     }
 
@@ -256,12 +262,8 @@ pub fn copy_instruction(
         let target = original_ip
             .wrapping_add(len as u64)
             .wrapping_add(old as i64 as u64);
-        let replacement = target as i128 - (slot_ip + len as u64) as i128;
-        if !(i32::MIN as i128..=i32::MAX as i128).contains(&replacement) {
-            return Err(EINVAL);
-        }
-        bytes[immediate_offset..immediate_offset + 4]
-            .copy_from_slice(&(replacement as i32).to_le_bytes());
+        let replacement = encode_rel32(slot_ip.wrapping_add(len as u64), target)?;
+        bytes[immediate_offset..immediate_offset + 4].copy_from_slice(&replacement.to_le_bytes());
     }
 
     Ok(CopiedInsn {
@@ -316,7 +318,7 @@ pub fn arch_remove_kprobe<P: KprobeTextPoke>(poker: &P, kp: &mut ArchKprobe) -> 
 /// entry starts after ENDBR so CET continues to recognize the function as a
 /// valid indirect target while the probe is armed.
 #[cfg(not(test))]
-fn adjust_live_kprobe_addr(addr: u64) -> Result<u64, i32> {
+pub(super) fn adjust_live_kprobe_addr(addr: u64) -> Result<u64, i32> {
     let prefix = ProductionText.read(addr, super::super::alternative::ENDBR_INSN_SIZE)?;
     if prefix == super::super::alternative::ENDBR64 || prefix == super::super::alternative::ENDBR32
     {
@@ -353,9 +355,25 @@ fn classify_execution_behavior(bytes: &[u8; MAX_INSN_SIZE], len: usize) -> Kprob
 fn validate_live_instruction(bytes: &[u8]) -> Result<(), i32> {
     let insn = decode_instruction(bytes)?;
     let opcode = first_opcode(bytes);
-    // Match Linux's explicit exclusions: nested INT3, IRET, and far absolute
-    // control transfers cannot be made safe by the ordinary kprobe path.
-    if matches!(opcode, 0x9a | 0xcc | 0xcf | 0xea) {
+    let offset = opcode_offset(bytes);
+    let second_opcode = bytes.get(offset + 1).copied();
+    // Match Linux is_exception_insn(): probing an instruction which raises
+    // its own INT/UD exception would attribute that exception to the displaced
+    // slot and strand the active probe state.
+    let exception_insn = matches!(opcode, 0xcc | 0xcd | 0xce | 0xf1)
+        || (opcode == 0x0f && matches!(second_opcode, Some(0xff | 0xb9 | 0x0b)));
+    // IRET and far control transfers likewise cannot use the ordinary
+    // displaced-instruction completion path.  POPF may clear TF, suppressing
+    // the #DB on which this implementation relies, so fail closed rather than
+    // leaving a permanently active probe.
+    if exception_insn || matches!(opcode, 0x9a | 0x9d | 0xcf | 0xea) {
+        return Err(EOPNOTSUPP);
+    }
+    // Intel suppresses the single-step trap after POP SS and MOV SS.  Linux's
+    // __copy_instruction() rejects both via insn_masking_exception().
+    if opcode == 0x1f
+        || (opcode == 0x8e && insn.modrm.got != 0 && ((insn.modrm.value as u8 >> 3) & 7) == 2)
+    {
         return Err(EOPNOTSUPP);
     }
     if opcode == 0xff && insn.modrm.got != 0 {
@@ -370,7 +388,6 @@ fn validate_live_instruction(bytes: &[u8]) -> Result<(), i32> {
             return Err(EOPNOTSUPP);
         }
     }
-    let offset = opcode_offset(bytes);
     if opcode == 0x0f
         && bytes.get(offset + 1).copied() == Some(0x01)
         && insn.modrm.got != 0
@@ -425,10 +442,16 @@ pub fn prepare_live_kprobe(_addr: u64) -> Result<LiveKprobe, i32> {
 }
 
 pub fn arm_live_kprobe(kprobe: &mut LiveKprobe) -> Result<(), i32> {
+    if kprobe.arch.armed {
+        return Ok(());
+    }
     arch_arm_kprobe(&ProductionText, &mut kprobe.arch)
 }
 
 pub fn disarm_live_kprobe(kprobe: &mut LiveKprobe) -> Result<(), i32> {
+    if !kprobe.arch.armed {
+        return Ok(());
+    }
     arch_disarm_kprobe(&ProductionText, &mut kprobe.arch)
 }
 
@@ -860,6 +883,23 @@ mod tests {
     }
 
     #[test]
+    fn relative_call_copy_accepts_canonical_alias_wrap() {
+        let original = 0xffff_ffff_c100_0000;
+        let slot = 0xffff_ffff_c100_1000;
+        let target = 0x0000_0000_0050_0000;
+        let original_disp = encode_rel32(original + 5, target).unwrap();
+        let mut instruction = [RELATIVECALL_OPCODE, 0, 0, 0, 0];
+        instruction[1..].copy_from_slice(&original_disp.to_le_bytes());
+
+        let copied = copy_instruction(original, slot, &instruction).unwrap();
+        let copied_disp = i32::from_le_bytes(copied.bytes[1..5].try_into().unwrap());
+        assert_eq!(
+            slot.wrapping_add(5).wrapping_add_signed(copied_disp as i64),
+            target
+        );
+    }
+
+    #[test]
     fn boost_rejects_control_flow_and_if_modifiers() {
         assert!(can_boost(&[0x90]));
         assert!(!can_boost(&[0xe8, 0, 0, 0, 0]));
@@ -914,5 +954,23 @@ mod tests {
         assert_eq!(validate_live_instruction(&[0xff, 0x20]), Ok(())); // jmp *(%rax)
         assert_eq!(validate_live_instruction(&[0xff, 0x18]), Err(EOPNOTSUPP)); // lcall
         assert_eq!(validate_live_instruction(&[0xff, 0x28]), Err(EOPNOTSUPP)); // ljmp
+    }
+
+    #[test]
+    fn exception_and_single_step_masking_instructions_are_rejected() {
+        for instruction in [
+            &[0xcc][..],
+            &[0xcd, 0x80],
+            &[0xce],
+            &[0xf1],
+            &[0x0f, 0x0b],
+            &[0x0f, 0xb9, 0xc0],
+            &[0x0f, 0xff, 0xc0],
+            &[0x9d],
+            &[0x1f],
+            &[0x8e, 0xd0],
+        ] {
+            assert_eq!(validate_live_instruction(instruction), Err(EOPNOTSUPP));
+        }
     }
 }

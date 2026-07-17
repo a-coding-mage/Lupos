@@ -242,7 +242,7 @@ pub fn register_module_exports() {
 fn raw_current_task() -> u64 {
     #[cfg(test)]
     {
-        1
+        8
     }
     #[cfg(not(test))]
     unsafe {

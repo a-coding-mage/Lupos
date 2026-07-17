@@ -28,7 +28,9 @@ use spin::Mutex;
 use crate::include::uapi::errno::{EBUSY, EEXIST, EINVAL, ENOENT, ENOSYS, ENOTDIR, EROFS};
 use crate::include::uapi::stat::{S_IFDIR, S_IFLNK, S_IFREG};
 
-use super::types::{FileRef, Inode, InodeKind, InodePrivate, InodeRef, SuperBlockRef};
+use super::types::{
+    FileRef, Inode, InodeKind, InodePrivate, InodeRef, SuperBlockRef, init_inode_owner,
+};
 
 pub mod dir;
 pub mod file;
@@ -367,7 +369,20 @@ fn kernfs_lookup(dir: &InodeRef, name: &str) -> Result<InodeRef, i32> {
     let node = node_from_inode(dir);
     if let Some(child) = lookup(&node, name) {
         let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
-        return Ok(inode_for_node(&sb, child));
+        let inode = inode_for_node(&sb, child);
+        if sb.fs_name == "cgroup2" {
+            // A delegated cgroup subtree must remain writable by its owner.
+            // Kernfs creates every interface inode lazily, so inherit the
+            // containing cgroup's ownership instead of recreating control
+            // files as root:root on each lookup.
+            inode
+                .uid
+                .store(dir.uid.load(Ordering::Acquire), Ordering::Release);
+            inode
+                .gid
+                .store(dir.gid.load(Ordering::Acquire), Ordering::Release);
+        }
+        return Ok(inode);
     }
     if let Some(lookup) = node.dynamic_lookup {
         return lookup(dir, name);
@@ -386,7 +401,12 @@ fn kernfs_mkdir(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> 
     }
     let child = crate::kernel::cgroup::new_cgroup_dir(name, mode);
     add_child(&parent, child.clone());
-    Ok(inode_for_node(&sb, child))
+    let inode = inode_for_node(&sb, child);
+    // cgroup mkdir follows normal VFS ownership rules.  This is essential
+    // for systemd's user-manager delegation: descendants created by uid 1000
+    // and their cgroup.procs files must be writable by uid 1000.
+    init_inode_owner(&inode, Some(dir), mode | S_IFDIR);
+    Ok(inode)
 }
 
 fn kernfs_rmdir(dir: &InodeRef, name: &str) -> Result<(), i32> {
@@ -427,8 +447,8 @@ fn kernfs_readdir(file: &super::types::FileRef) -> Result<Option<(String, u64, I
         return Ok(Some(dot));
     }
     let snapshot = list(&node);
-    let mut idx = file.private.lock();
-    let child_idx = idx.saturating_sub(2);
+    let mut idx = file.pos.lock();
+    let child_idx = idx.saturating_sub(2) as usize;
     if child_idx >= snapshot.len() {
         return Ok(None);
     }
@@ -636,5 +656,23 @@ mod tests {
 
         assert_eq!(kernfs_rmdir(&inode, "system.slice"), Err(EBUSY));
         assert!(lookup(&root, "system.slice").is_some());
+    }
+
+    #[test]
+    fn delegated_cgroup_control_files_inherit_directory_owner() {
+        let service = crate::kernel::cgroup::new_cgroup_dir("user-at-1000.service", 0o755);
+        let sb = super::super::types::SuperBlock::alloc(
+            "cgroup2",
+            0x63677270,
+            &super::super::ops::NOOP_SUPER_OPS,
+        );
+        let service_inode = inode_for_node(&sb, service);
+        service_inode.uid.store(1000, Ordering::Release);
+        service_inode.gid.store(1000, Ordering::Release);
+
+        let procs = kernfs_lookup(&service_inode, "cgroup.procs").expect("cgroup.procs");
+        assert_eq!(procs.uid.load(Ordering::Acquire), 1000);
+        assert_eq!(procs.gid.load(Ordering::Acquire), 1000);
+        assert_eq!(procs.mode.load(Ordering::Acquire) & 0o777, 0o644);
     }
 }

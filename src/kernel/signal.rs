@@ -37,6 +37,7 @@ pub const NSIG: usize = 64;
 pub const SIGRTMIN: i32 = 32;
 pub const SIGRTMAX: i32 = NSIG as i32;
 pub const SI_USER: i32 = 0;
+pub const SI_QUEUE: i32 = -1;
 pub const SI_TIMER: i32 = -2;
 pub const SI_KERNEL: i32 = 0x80;
 pub const SI_TKILL: i32 = -6;
@@ -186,6 +187,24 @@ impl SigInfo {
         info._sifields[0..4].copy_from_slice(&pid.to_ne_bytes());
         info._sifields[4..8].copy_from_slice(&uid.to_ne_bytes());
         info
+    }
+
+    pub fn with_sender_value(signo: i32, code: i32, pid: i32, uid: u32, value: u64) -> Self {
+        let mut info = Self::with_sender(signo, code, pid, uid);
+        info._sifields[8..16].copy_from_slice(&value.to_ne_bytes());
+        info
+    }
+
+    pub fn sender_pid(&self) -> i32 {
+        i32::from_ne_bytes(self._sifields[0..4].try_into().unwrap())
+    }
+
+    pub fn sender_uid(&self) -> u32 {
+        u32::from_ne_bytes(self._sifields[4..8].try_into().unwrap())
+    }
+
+    pub fn sigval(&self) -> u64 {
+        u64::from_ne_bytes(self._sifields[8..16].try_into().unwrap())
     }
 
     pub fn with_sigfault(signo: i32, code: i32, addr: u64, addr_lsb: i16) -> Self {

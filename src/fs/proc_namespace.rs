@@ -10,7 +10,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 
-use super::mount::MOUNTS;
+use super::mount::current_mount_entries;
 use super::types::FileRef;
 use crate::fs::eventpoll::{EPOLLERR, EPOLLIN, EPOLLPRI};
 
@@ -20,7 +20,7 @@ fn mount_options(readonly: bool) -> &'static str {
 
 pub fn render_mounts() -> String {
     let mut out = String::new();
-    for (path, mount) in MOUNTS.by_path.lock().iter() {
+    for (path, mount) in current_mount_entries() {
         out.push_str(&format!(
             "{} {} {} {} 0 0\n",
             mount.sb.fs_name,
@@ -34,7 +34,7 @@ pub fn render_mounts() -> String {
 
 pub fn render_mountinfo() -> String {
     let mut out = String::new();
-    for (path, mount) in MOUNTS.by_path.lock().iter() {
+    for (path, mount) in current_mount_entries() {
         let parent_id = mount
             .parent
             .lock()
@@ -57,7 +57,7 @@ pub fn render_mountinfo() -> String {
 
 pub fn render_mountstats() -> String {
     let mut out = String::new();
-    for (path, mount) in MOUNTS.by_path.lock().iter() {
+    for (path, mount) in current_mount_entries() {
         out.push_str(&format!(
             "device {} mounted on {} with fstype {}\n",
             mount.sb.fs_name, path, mount.sb.fs_name

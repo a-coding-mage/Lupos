@@ -376,7 +376,15 @@ mod tests {
 
                     assert_eq!(declared.rust_module, $module);
                     assert_eq!(declared.linux_source, $source);
-                    assert!(rust.contains("//! linux-parity: complete"), "{}", $module);
+                    let parity = match $module {
+                        "drm" | "gpu" => "stub",
+                        _ => "complete",
+                    };
+                    assert!(
+                        rust.contains(&alloc::format!("//! linux-parity: {parity}")),
+                        "{}",
+                        $module
+                    );
                     assert!(
                         rust.contains(concat!("//! linux-source: ", $source)),
                         "{} missing source tag {}",

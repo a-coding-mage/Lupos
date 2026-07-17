@@ -210,7 +210,7 @@ mod tests {
         assert!(source.contains("fn = symbol_get(vfio_file_enforced_coherent);"));
         assert!(source.contains("fn = symbol_get(vfio_file_is_valid);"));
         assert!(source.contains("if (!kvm_vfio_file_is_valid(filp))"));
-        assert!(source.contains("ret = -EEXIST;"));
+        assert!(source.contains("return -EEXIST;"));
         assert!(source.contains("kvm_vfio_update_coherency(dev);"));
         assert!(source.contains("case KVM_DEV_VFIO_FILE_ADD:"));
         assert!(source.contains("case KVM_DEV_VFIO_FILE_DEL:"));

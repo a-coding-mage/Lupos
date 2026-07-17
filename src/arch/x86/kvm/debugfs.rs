@@ -212,7 +212,7 @@ mod tests {
         assert!(source.contains("log[i] = kcalloc(RMAP_LOG_SIZE"));
         assert!(source.contains("mutex_lock(&kvm->slots_lock);"));
         assert!(source.contains("write_lock(&kvm->mmu_lock);"));
-        assert!(source.contains("index = ffs(pte_list_count(&rmap[l]));"));
+        assert!(source.contains("index = fls(pte_list_count(&rmap[l]));"));
         assert!(source.contains("if (WARN_ON_ONCE(index >= RMAP_LOG_SIZE))"));
         assert!(source.contains("seq_printf(m, \"Rmap_Count:\\t0\\t1\\t\");"));
         assert!(source.contains("seq_printf(m, \"Level=%s:\\t\", kvm_lpage_str[i]);"));

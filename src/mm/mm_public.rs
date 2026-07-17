@@ -1211,13 +1211,62 @@ pub unsafe fn mm_populate(addr: u64, len: u64) -> i32 {
 }
 
 pub unsafe fn access_remote_vm(
-    _mm: *mut MmStruct,
-    _addr: u64,
-    _buf: *mut u8,
+    mm: *mut MmStruct,
+    addr: u64,
+    buf: *mut u8,
     len: usize,
-    _write: bool,
+    write: bool,
 ) -> isize {
-    if len == 0 { 0 } else { -(EFAULT as isize) }
+    if len == 0 {
+        return 0;
+    }
+    if mm.is_null() || buf.is_null() {
+        return -(EFAULT as isize);
+    }
+
+    // `mm.pgd` is a kernel-direct-map pointer in production and an identity
+    // pointer in host tests.  The explicit-PGD walker consumes the physical
+    // table address in both cases.
+    let pgd_virt = unsafe { (*mm).pgd as u64 };
+    let pgd_phys = if pgd_virt >= crate::arch::x86::mm::paging::PAGE_OFFSET {
+        pgd_virt - crate::arch::x86::mm::paging::PAGE_OFFSET
+    } else {
+        pgd_virt
+    };
+    if pgd_phys == 0 {
+        return -(EFAULT as isize);
+    }
+
+    let mut copied = 0usize;
+    while copied < len {
+        let remote = match addr.checked_add(copied as u64) {
+            Some(remote) => remote,
+            None => break,
+        };
+        let Some(phys) = crate::arch::x86::mm::paging::virt_to_phys_in_pgd(pgd_phys, remote) else {
+            break;
+        };
+        let page_offset = (phys & (PAGE_SIZE as u64 - 1)) as usize;
+        let chunk = (PAGE_SIZE - page_offset).min(len - copied);
+        let remote_kernel = unsafe {
+            crate::arch::x86::mm::paging::pfn_to_virt((phys >> PAGE_SHIFT) as usize)
+                .add(page_offset)
+        };
+        unsafe {
+            if write {
+                core::ptr::copy_nonoverlapping(buf.add(copied), remote_kernel, chunk);
+            } else {
+                core::ptr::copy_nonoverlapping(remote_kernel, buf.add(copied), chunk);
+            }
+        }
+        copied += chunk;
+    }
+
+    if copied == 0 {
+        -(EFAULT as isize)
+    } else {
+        copied as isize
+    }
 }
 
 pub unsafe fn get_cmdline(_task: *mut u8, _buffer: *mut u8, _buflen: usize) -> i32 {

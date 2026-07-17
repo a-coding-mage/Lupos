@@ -15,7 +15,7 @@
 extern crate alloc;
 
 use core::ffi::{c_char, c_uint, c_void};
-use core::mem::size_of;
+use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicI32, Ordering};
 
 use alloc::string::String;
@@ -31,8 +31,9 @@ use crate::linux_driver_abi::base::bus::{
     BusType, LinuxBusType, bus_register, register_linux_bus_type,
 };
 use crate::linux_driver_abi::base::device::{
-    Device, LinuxDevice, device_register, linux_device_add, linux_device_initialize,
-    linux_device_set_name_bytes, linux_device_unregister, put_device,
+    Device, LINUX_STRUCT_DEVICE_SIZE, LinuxDevice, device_register, linux_device_add,
+    linux_device_initialize, linux_device_set_name_bytes, linux_device_set_release,
+    linux_device_unregister, put_device,
 };
 use crate::linux_driver_abi::base::driver::{DeviceDriver, ProbeFn, RemoveFn, driver_register};
 
@@ -107,7 +108,25 @@ pub struct LinuxPlatformDevice {
     pub id_auto: bool,
     _pad: [u8; 3],
     pub dev: LinuxDevice,
+    _dev_tail: [u8; LINUX_STRUCT_DEVICE_SIZE - size_of::<LinuxDevice>()],
+    pub platform_dma_mask: u64,
+    pub dma_parms: LinuxDeviceDmaParameters,
+    pub num_resources: u32,
+    _resource_pad: u32,
+    pub resource: *mut c_void,
+    pub id_entry: *const c_void,
+    pub mfd_cell: *mut c_void,
 }
+
+/// `struct device_dma_parameters` from `include/linux/device.h`.
+#[repr(C)]
+pub struct LinuxDeviceDmaParameters {
+    pub max_segment_size: u32,
+    pub min_align_mask: u32,
+    pub segment_boundary_mask: usize,
+}
+
+const LINUX_PLATFORM_DEVICE_SIZE: usize = 832;
 
 /// `struct platform_device_info` - `vendor/linux/include/linux/platform_device.h`.
 #[repr(C)]
@@ -249,6 +268,15 @@ unsafe fn free_tracked_platform_device(pdev: *mut LinuxPlatformDevice) {
     }
 }
 
+unsafe extern "C" fn linux_platform_device_release(dev: *mut LinuxDevice) {
+    let pdev = unsafe {
+        dev.cast::<u8>()
+            .sub(offset_of!(LinuxPlatformDevice, dev))
+            .cast::<LinuxPlatformDevice>()
+    };
+    unsafe { free_tracked_platform_device(pdev) };
+}
+
 /// `platform_device_register_full` — `drivers/base/platform.c`.
 pub unsafe extern "C" fn linux_platform_device_register_full(
     pdevinfo: *const LinuxPlatformDeviceInfo,
@@ -262,13 +290,13 @@ pub unsafe extern "C" fn linux_platform_device_register_full(
     }
 
     let pdev = unsafe {
-        crate::mm::slab::linux___kmalloc_noprof(size_of::<LinuxPlatformDevice>(), 0)
+        crate::mm::slab::linux___kmalloc_noprof(LINUX_PLATFORM_DEVICE_SIZE, 0)
             .cast::<LinuxPlatformDevice>()
     };
     if pdev.is_null() {
         return err_ptr(ENOMEM);
     }
-    unsafe { core::ptr::write_bytes(pdev.cast::<u8>(), 0, size_of::<LinuxPlatformDevice>()) };
+    unsafe { core::ptr::write_bytes(pdev.cast::<u8>(), 0, LINUX_PLATFORM_DEVICE_SIZE) };
 
     let id_auto = info.id == PLATFORM_DEVID_AUTO;
     let id = if id_auto {
@@ -293,6 +321,10 @@ pub unsafe extern "C" fn linux_platform_device_register_full(
         (*pdev).id = id;
         (*pdev).id_auto = id_auto;
         linux_device_initialize(core::ptr::addr_of_mut!((*pdev).dev));
+        linux_device_set_release(
+            core::ptr::addr_of_mut!((*pdev).dev),
+            Some(linux_platform_device_release),
+        );
         (*pdev).dev.parent = info.parent;
         (*pdev).dev.bus = linux_platform_bus_ptr();
         (*pdev).dev.platform_data = platform_data;
@@ -315,7 +347,7 @@ pub unsafe extern "C" fn linux_platform_device_register_full(
     if ret != 0 {
         unsafe {
             linux_device_unregister(core::ptr::addr_of_mut!((*pdev).dev));
-            free_tracked_platform_device(pdev);
+            put_device(core::ptr::addr_of_mut!((*pdev).dev));
         }
         return err_ptr(ret);
     }
@@ -333,7 +365,6 @@ pub unsafe extern "C" fn linux_platform_device_unregister(pdev: *mut LinuxPlatfo
     unsafe {
         linux_device_unregister(dev);
         put_device(dev);
-        free_tracked_platform_device(pdev);
     }
 }
 
@@ -408,6 +439,13 @@ mod tests {
         assert_eq!(offset_of!(LinuxPlatformDevice, id), 8);
         assert_eq!(offset_of!(LinuxPlatformDevice, id_auto), 12);
         assert_eq!(offset_of!(LinuxPlatformDevice, dev), 16);
+        assert_eq!(offset_of!(LinuxPlatformDevice, platform_dma_mask), 776);
+        assert_eq!(offset_of!(LinuxPlatformDevice, dma_parms), 784);
+        assert_eq!(offset_of!(LinuxPlatformDevice, num_resources), 800);
+        assert_eq!(offset_of!(LinuxPlatformDevice, resource), 808);
+        assert_eq!(offset_of!(LinuxPlatformDevice, id_entry), 816);
+        assert_eq!(offset_of!(LinuxPlatformDevice, mfd_cell), 824);
+        assert_eq!(size_of::<LinuxPlatformDevice>(), LINUX_PLATFORM_DEVICE_SIZE);
     }
 
     #[test]

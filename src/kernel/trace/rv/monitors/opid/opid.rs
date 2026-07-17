@@ -109,7 +109,7 @@ pub const fn ha_get_env(
         OpidEnv::IrqOff => irq_disabled as u64,
         OpidEnv::PreemptOff => {
             if config_preemption {
-                ((preempt_count & PREEMPT_MASK) > 1) as u64
+                ((preempt_count & PREEMPT_MASK) > 0) as u64
             } else {
                 1
             }
@@ -232,19 +232,19 @@ mod tests {
         assert!(source.contains("#define MODULE_NAME \"opid\""));
         assert!(source.contains("if (env == irq_off_opid)"));
         assert!(source.contains("return irqs_disabled();"));
-        assert!(source.contains("(preempt_count() & PREEMPT_MASK) > 1"));
+        assert!(source.contains("(preempt_count() & PREEMPT_MASK) > 0"));
         assert!(source.contains("return ENV_INVALID_VALUE;"));
         assert!(source.contains("event == sched_need_resched_opid"));
         assert!(source.contains("event == sched_waking_opid"));
         assert!(source.contains("da_handle_start_run_event(sched_need_resched_opid);"));
         assert!(source.contains("da_handle_start_run_event(sched_waking_opid);"));
-        assert!(source.contains("retval = da_monitor_init();"));
+        assert!(source.contains("retval = ha_monitor_init();"));
         assert!(source.contains("rv_attach_trace_probe(\"opid\", sched_set_need_resched_tp"));
         assert!(source.contains("rv_attach_trace_probe(\"opid\", sched_waking"));
         assert!(source.contains("rv_this.enabled = 0;"));
         assert!(source.contains("rv_detach_trace_probe(\"opid\", sched_set_need_resched_tp"));
         assert!(source.contains("rv_detach_trace_probe(\"opid\", sched_waking"));
-        assert!(source.contains("da_monitor_destroy();"));
+        assert!(source.contains("ha_monitor_destroy();"));
         assert!(source.contains(".description = \"operations with preemption and irq disabled.\""));
         assert!(source.contains(".reset = da_monitor_reset_all"));
         assert!(source.contains("return rv_register_monitor(&rv_this, &rv_sched);"));
@@ -267,7 +267,7 @@ mod tests {
         assert_eq!(RV_MON_TYPE, "RV_MON_PER_CPU");
         assert_eq!(OPID_LICENSE, "GPL");
         assert_eq!(ha_get_env(OpidEnv::IrqOff, true, 0, true), 1);
-        assert_eq!(ha_get_env(OpidEnv::PreemptOff, true, 1, true), 0);
+        assert_eq!(ha_get_env(OpidEnv::PreemptOff, true, 1, true), 1);
         assert_eq!(ha_get_env(OpidEnv::PreemptOff, true, 2, true), 1);
         assert_eq!(ha_get_env(OpidEnv::PreemptOff, false, 0, false), 1);
         assert!(ha_verify_constraint(
@@ -278,7 +278,7 @@ mod tests {
             0,
             true
         ));
-        assert!(!ha_verify_constraint(
+        assert!(ha_verify_constraint(
             OpidState::Any,
             OpidEvent::SchedWaking,
             OpidState::Any,

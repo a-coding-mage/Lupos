@@ -46,6 +46,15 @@ SECTIONS
     {
         *(.rodata .rodata.*)
         *(.eh_frame_hdr)
+
+        /* Trampoline-to-key relations emitted by ARCH_ADD_TRAMP_KEY().
+         * Keep the Linux PREL32 layout so static-call module metadata can
+         * discover non-exported keys without symbol-specific registration.
+         */
+        . = ALIGN(8);
+        __start_static_call_tramp_key = .;
+        KEEP(*(.static_call_tramp_key))
+        __stop_static_call_tramp_key = .;
     }
 
     /* Exception table — pairs of (fault_ip_off, fixup_ip_off) i32 PC-relative

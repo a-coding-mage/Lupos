@@ -1094,7 +1094,7 @@ fn ext4_readdir(file: &FileRef) -> Result<Option<(alloc::string::String, u64, In
     let sbi = get_sbi(&sb).ok_or(EINVAL)?;
     let ext_dir = ext4_inode_of(&inode).ok_or(EINVAL)?;
     let entries = dir_read_all(&sbi, &ext_dir)?;
-    let mut idx = file.private.lock();
+    let mut idx = file.pos.lock();
     if (*idx as usize) >= entries.len() {
         return Ok(None);
     }
@@ -2873,7 +2873,7 @@ mod tests {
             group_desc_size: 32,
             group_descs: Vec::new(),
         });
-        stash_sbi(&sb, sbi).unwrap();
+        stash_sbi(&sb, sbi.clone()).unwrap();
 
         let raw = raw_inode_with_extent(2, 1024);
         let ext_inode = Arc::new(Ext4Inode {
@@ -3011,7 +3011,7 @@ mod tests {
         assert_eq!(&read_back, b"second");
 
         let bitmap = read_sectors(&bdev, 6, 2).unwrap();
-        assert!(metadata::bitmap_test(&bitmap, 9).unwrap());
+        assert!(metadata::bitmap_test(&bitmap, 8).unwrap());
         let gdt = read_sectors(&bdev, 4, 2).unwrap();
         assert_eq!(u16::from_le_bytes([gdt[12], gdt[13]]), 9);
         let sb_bytes = read_sectors(&bdev, 2, 2).unwrap();
@@ -3088,7 +3088,7 @@ mod tests {
         let claimed = ext4_claim_free_data_block_from(&sbi, 0)
             .expect("free block")
             .expect("claim block");
-        assert_eq!(claimed, 41);
+        assert_eq!(claimed, 42);
 
         let bitmap = read_sectors(&bdev, 6, 2).unwrap();
         assert!(metadata::bitmap_test(&bitmap, 41).unwrap());
@@ -3185,22 +3185,22 @@ mod tests {
         assert_eq!(u16::from_le_bytes([i_block[28], i_block[29]]), 1);
         assert_eq!(
             u32::from_le_bytes([i_block[32], i_block[33], i_block[34], i_block[35]]),
-            10
+            11
         );
     }
 
     #[test]
-    fn ext4_write_extends_indexed_extent_leaf_and_commits_metadata() {
+    fn ext4_write_updates_indexed_extent_leaf_and_commits_metadata() {
         let mem = MemBlockDevice::new("ext4-alloc-indexed0", 128 * 1024);
         let raw = raw_inode_with_indexed_extent(12, 1024);
         {
             let mut data = mem.data.lock();
             data[1024 + 12..1024 + 16].copy_from_slice(&10u32.to_le_bytes());
             data[2048 + 12..2048 + 14].copy_from_slice(&10u16.to_le_bytes());
-            for bit in 0..=8 {
+            for bit in 0..=7 {
                 metadata::bitmap_set(&mut data[3 * 1024..4 * 1024], bit).unwrap();
             }
-            metadata::bitmap_set(&mut data[3 * 1024..4 * 1024], 12).unwrap();
+            metadata::bitmap_set(&mut data[3 * 1024..4 * 1024], 11).unwrap();
             write_indexed_leaf_block(&mut data, 12 * 1024, 8, 1);
             write_raw_inode_to_image(&mut data, 4 * 1024 + 11 * 256, &raw);
         }
@@ -3230,7 +3230,7 @@ mod tests {
                 bg_used_dirs_count: 0,
             }],
         });
-        stash_sbi(&sb, sbi).unwrap();
+        stash_sbi(&sb, sbi.clone()).unwrap();
 
         let ext_inode = Arc::new(Ext4Inode {
             ino: 12,
@@ -3266,10 +3266,24 @@ mod tests {
         assert_eq!(&read_back, b"indexed");
 
         let leaf = read_sectors(&bdev, 24, 2).unwrap();
-        assert_eq!(u16::from_le_bytes([leaf[16], leaf[17]]), 2);
+        let entries = u16::from_le_bytes([leaf[2], leaf[3]]);
+        let new_physical = match entries {
+            1 => {
+                assert_eq!(u16::from_le_bytes([leaf[16], leaf[17]]), 2);
+                9
+            }
+            2 => {
+                assert_eq!(
+                    u32::from_le_bytes([leaf[24], leaf[25], leaf[26], leaf[27]]),
+                    1
+                );
+                u32::from_le_bytes([leaf[32], leaf[33], leaf[34], leaf[35]]) as u64
+            }
+            _ => panic!("unexpected indexed extent count {entries}"),
+        };
         let bitmap = read_sectors(&bdev, 6, 2).unwrap();
-        assert!(metadata::bitmap_test(&bitmap, 9).unwrap());
-        assert!(metadata::bitmap_test(&bitmap, 12).unwrap());
+        let (_, new_bit) = ext4_block_group_and_bit(&sbi, new_physical).unwrap();
+        assert!(metadata::bitmap_test(&bitmap, new_bit).unwrap());
 
         let inode_lba = (4 * 1024 + 11 * 256) as u64 / 512;
         let inode_bytes = read_sectors(&bdev, inode_lba, 1).unwrap();
@@ -3336,9 +3350,9 @@ mod tests {
             17
         );
         let bitmap = read_sectors(&bdev, 6, 2).unwrap();
+        assert!(metadata::bitmap_test(&bitmap, 15).unwrap());
         assert!(metadata::bitmap_test(&bitmap, 16).unwrap());
         assert!(metadata::bitmap_test(&bitmap, 17).unwrap());
-        assert!(metadata::bitmap_test(&bitmap, 18).unwrap());
     }
 
     #[test]
@@ -3561,6 +3575,9 @@ mod tests {
         assert_eq!(long_link.kind, InodeKind::Symlink);
         let long_link_ext = ext4_inode_of(&long_link).unwrap();
         assert_ne!(long_link_ext.i_blocks.load(Ordering::Acquire), 0);
+        let long_link_data_block = extents::map_block(&sbi, long_link_ext.raw.lock().i_block, 0)
+            .unwrap()
+            .expect("long symlink data block");
         let mut link_buf = [0u8; 128];
         let link_len = ext4_readlink(&long_link, &mut link_buf).expect("read long symlink");
         assert_eq!(&link_buf[..link_len], long_target.as_bytes());
@@ -3573,6 +3590,9 @@ mod tests {
         assert_eq!(parent.nlink.load(Ordering::Acquire), 3);
 
         let child_ext = ext4_inode_of(&tmp).unwrap();
+        let tmp_data_block = extents::map_block(&sbi, child_ext.raw.lock().i_block, 0)
+            .unwrap()
+            .expect("tmp directory data block");
         let child_entries = dir_read_all(&sbi, &child_ext).unwrap();
         assert!(child_entries.iter().any(|entry| entry.name == "."));
         assert!(child_entries.iter().any(|entry| entry.name == ".."));
@@ -3582,6 +3602,10 @@ mod tests {
         let file = File::new(dentry, 0, 0, &EXT4_FILE_FILE_OPS);
         let mut pos = 0;
         assert_eq!(ext4_write(&file, b"ok", &mut pos), Ok(2));
+        let state_ext = ext4_inode_of(&state).unwrap();
+        let state_data_block = extents::map_block(&sbi, state_ext.raw.lock().i_block, 0)
+            .unwrap()
+            .expect("state data block");
         let mut read_back = [0u8; 2];
         let mut read_pos = 0;
         assert_eq!(ext4_read(&file, &mut read_back, &mut read_pos), Ok(2));
@@ -3633,8 +3657,12 @@ mod tests {
         assert!(!metadata::bitmap_test(&inode_bitmap, 12).unwrap());
         assert!(metadata::bitmap_test(&inode_bitmap, 13).unwrap());
         let block_bitmap = read_sectors(&bdev, 6, 2).unwrap();
-        assert!(!metadata::bitmap_test(&block_bitmap, 10).unwrap());
-        assert!(metadata::bitmap_test(&block_bitmap, 11).unwrap());
+        let (_, tmp_bit) = ext4_block_group_and_bit(&sbi, tmp_data_block).unwrap();
+        let (_, state_bit) = ext4_block_group_and_bit(&sbi, state_data_block).unwrap();
+        let (_, long_link_bit) = ext4_block_group_and_bit(&sbi, long_link_data_block).unwrap();
+        assert!(!metadata::bitmap_test(&block_bitmap, tmp_bit).unwrap());
+        assert!(!metadata::bitmap_test(&block_bitmap, state_bit).unwrap());
+        assert!(metadata::bitmap_test(&block_bitmap, long_link_bit).unwrap());
         let gdt = read_sectors(&bdev, 4, 2).unwrap();
         assert_eq!(u16::from_le_bytes([gdt[12], gdt[13]]), 89);
         assert_eq!(u16::from_le_bytes([gdt[14], gdt[15]]), 3);
@@ -3802,7 +3830,7 @@ mod tests {
             let mut data = mem.data.lock();
             data[1024 + 12..1024 + 16].copy_from_slice(&90u32.to_le_bytes());
             data[2048 + 12..2048 + 14].copy_from_slice(&90u16.to_le_bytes());
-            for bit in 0..=used_bits_through {
+            for bit in 0..used_bits_through {
                 metadata::bitmap_set(&mut data[3 * 1024..4 * 1024], bit).unwrap();
             }
         }

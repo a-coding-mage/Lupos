@@ -65,7 +65,6 @@ pub mod liveupdate;
 pub mod locking; // M33
 pub mod module; // M56
 pub mod module_signature;
-pub mod stackprotector;
 pub mod notifier;
 pub mod nsproxy; // M28
 pub mod params;
@@ -82,6 +81,7 @@ pub mod sched;
 pub mod seccomp; // M27
 pub mod session; // M68/M69
 pub mod signal; // M25
+pub mod stackprotector;
 pub mod task;
 pub mod task_work; // M28a
 pub mod taskstats;

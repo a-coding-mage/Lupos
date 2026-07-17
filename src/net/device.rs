@@ -166,6 +166,11 @@ static NETDEV_INIT_DONE: AtomicBool = AtomicBool::new(false);
 
 lazy_static! {
     static ref NETDEV_BY_NAME: Mutex<BTreeMap<String, NetDeviceRef>> = Mutex::new(BTreeMap::new());
+    /// Device registries for non-init network namespaces.  Physical/vendor
+    /// devices stay exclusively in `NETDEV_BY_NAME`; each child namespace is
+    /// lazily populated with its own down loopback device.
+    static ref NETDEV_BY_NAMESPACE: Mutex<BTreeMap<usize, BTreeMap<String, NetDeviceRef>>> =
+        Mutex::new(BTreeMap::new());
 }
 
 static RTNL: QSpinLock = QSpinLock::new();
@@ -199,7 +204,7 @@ pub fn init() {
     // drivers/net/loopback.c::loopback_net_init().  systemd uses the rtnetlink
     // dump of this device as its baseline network inventory.
     if lookup_netdevice("lo").is_none()
-        && let Ok(dev) = register_loopback_netdevice()
+        && let Ok(dev) = register_loopback_netdevice(0)
     {
         dev.flags.store(
             IFF_LOOPBACK | IFF_UP | IFF_RUNNING | IFF_LOWER_UP,
@@ -210,13 +215,8 @@ pub fn init() {
     }
 }
 
-fn register_loopback_netdevice() -> Result<NetDeviceRef, i32> {
+fn register_loopback_netdevice(namespace_key: usize) -> Result<NetDeviceRef, i32> {
     rtnl_lock(|| {
-        let mut registry = NETDEV_BY_NAME.lock();
-        if registry.contains_key("lo") {
-            return Err(EBUSY);
-        }
-
         let dev = Arc::new(NetDevice {
             ifindex: NEXT_IFINDEX.fetch_add(1, Ordering::AcqRel),
             name: String::from("lo"),
@@ -231,15 +231,47 @@ fn register_loopback_netdevice() -> Result<NetDeviceRef, i32> {
             rx_packets: AtomicU64::new(0),
             linux_dev: None,
         });
-        registry.insert(String::from("lo"), dev.clone());
-        crate::fs::sysfs::net::register_netdevice(&dev);
-        crate::net::uevent::announce_netdevice(
-            crate::net::uevent::UeventAction::Add,
-            "lo",
-            dev.ifindex,
-        );
+        if namespace_key == 0 {
+            let mut registry = NETDEV_BY_NAME.lock();
+            if registry.contains_key("lo") {
+                return Err(EBUSY);
+            }
+            registry.insert(String::from("lo"), dev.clone());
+            crate::fs::sysfs::net::register_netdevice(&dev);
+            crate::net::uevent::announce_netdevice(
+                crate::net::uevent::UeventAction::Add,
+                "lo",
+                dev.ifindex,
+            );
+        } else {
+            let mut namespaces = NETDEV_BY_NAMESPACE.lock();
+            let registry = namespaces.entry(namespace_key).or_default();
+            if registry.contains_key("lo") {
+                return Err(EBUSY);
+            }
+            registry.insert(String::from("lo"), dev.clone());
+        }
         Ok(dev)
     })
+}
+
+fn ensure_current_namespace_loopback(namespace_key: usize) {
+    if namespace_key == 0 {
+        return;
+    }
+    let present = NETDEV_BY_NAMESPACE
+        .lock()
+        .get(&namespace_key)
+        .is_some_and(|registry| registry.contains_key("lo"));
+    if !present {
+        let _ = register_loopback_netdevice(namespace_key);
+    }
+}
+
+pub fn unregister_net_namespace(namespace_key: usize) {
+    if namespace_key != 0 {
+        NETDEV_BY_NAMESPACE.lock().remove(&namespace_key);
+    }
 }
 
 pub fn register_netdevice(
@@ -382,11 +414,30 @@ pub fn unregister_netdevice(name: &str) -> Result<(), i32> {
 }
 
 pub fn lookup_netdevice(name: &str) -> Option<NetDeviceRef> {
-    NETDEV_BY_NAME.lock().get(name).cloned()
+    let namespace_key = crate::net::core::net_namespace::current_net_namespace_key();
+    if namespace_key == 0 {
+        NETDEV_BY_NAME.lock().get(name).cloned()
+    } else {
+        ensure_current_namespace_loopback(namespace_key);
+        NETDEV_BY_NAMESPACE
+            .lock()
+            .get(&namespace_key)
+            .and_then(|registry| registry.get(name).cloned())
+    }
 }
 
 pub fn list_netdevices() -> alloc::vec::Vec<NetDeviceRef> {
-    NETDEV_BY_NAME.lock().values().cloned().collect()
+    let namespace_key = crate::net::core::net_namespace::current_net_namespace_key();
+    if namespace_key == 0 {
+        NETDEV_BY_NAME.lock().values().cloned().collect()
+    } else {
+        ensure_current_namespace_loopback(namespace_key);
+        NETDEV_BY_NAMESPACE
+            .lock()
+            .get(&namespace_key)
+            .map(|registry| registry.values().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 pub fn set_device_up(dev: &NetDeviceRef) -> Result<(), i32> {

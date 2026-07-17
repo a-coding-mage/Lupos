@@ -626,7 +626,7 @@ unsafe fn acpi_copy_name_to_buffer(buffer: *mut LinuxAcpiBuffer, name: &[u8]) ->
     match input_len {
         ACPI_NO_BUFFER => return AE_BUFFER_OVERFLOW,
         ACPI_ALLOCATE_BUFFER | ACPI_ALLOCATE_LOCAL_BUFFER => {
-            let ptr = unsafe { crate::mm::slab::linux___kmalloc_noprof(name.len(), GFP_KERNEL) };
+            let ptr = unsafe { acpi_allocate_name_buffer(name.len()) };
             if ptr.is_null() {
                 return AE_NO_MEMORY;
             }
@@ -647,6 +647,25 @@ unsafe fn acpi_copy_name_to_buffer(buffer: *mut LinuxAcpiBuffer, name: &[u8]) ->
         core::ptr::copy_nonoverlapping(name.as_ptr(), (*buffer).pointer.cast::<u8>(), name.len());
     }
     AE_OK
+}
+
+#[cfg(not(test))]
+unsafe fn acpi_allocate_name_buffer(size: usize) -> *mut u8 {
+    unsafe { crate::mm::slab::linux___kmalloc_noprof(size, GFP_KERNEL) }
+}
+
+/// Host tests do not initialize the kernel slab allocator. Keep the ACPICA
+/// allocation contract under test while using the test binary's allocator.
+#[cfg(test)]
+unsafe fn acpi_allocate_name_buffer(size: usize) -> *mut u8 {
+    let layout = core::alloc::Layout::from_size_align(size, 1).expect("valid ACPI name layout");
+    unsafe { alloc::alloc::alloc(layout) }
+}
+
+#[cfg(test)]
+unsafe fn acpi_free_name_buffer(ptr: *mut u8, size: usize) {
+    let layout = core::alloc::Layout::from_size_align(size, 1).expect("valid ACPI name layout");
+    unsafe { alloc::alloc::dealloc(ptr, layout) };
 }
 
 /// `acpi_get_name` - `vendor/linux/drivers/acpi/acpica/nsxfname.c`.
@@ -1476,7 +1495,7 @@ mod tests {
                 ),
                 ACPI_LUPOS_FULL_PATH
             );
-            crate::mm::slab::linux_kfree(allocated.pointer.cast());
+            acpi_free_name_buffer(allocated.pointer.cast(), allocated.length);
         }
 
         assert_eq!(

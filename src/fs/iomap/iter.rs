@@ -74,10 +74,8 @@ pub fn iomap_iter_advance_full(iter: &mut IomapIter) -> i32 {
     iomap_iter_advance(iter, iomap_length(iter))
 }
 
-pub fn iomap_iter_reset_iomap(iter: &mut IomapIter) {
+pub fn iomap_iter_clean_fbatch(iter: &mut IomapIter) {
     iter.status = 0;
-    iter.iomap = Iomap::hole();
-    iter.srcmap = Iomap::hole();
 }
 
 pub fn iomap_iter_finish(iter: &mut IomapIter, iomap_end_ret: Option<i32>) -> i32 {
@@ -101,7 +99,12 @@ pub fn iomap_iter_finish(iter: &mut IomapIter, iomap_end_ret: Option<i32>) -> i3
     } else {
         1
     };
-    iomap_iter_reset_iomap(iter);
+    iomap_iter_clean_fbatch(iter);
+    if ret <= 0 {
+        return ret;
+    }
+    iter.iomap = Iomap::hole();
+    iter.srcmap = Iomap::hole();
     ret
 }
 
@@ -122,7 +125,7 @@ mod tests {
         assert!(source.contains("#include <linux/iomap.h>"));
         assert!(source.contains("#include \"trace.h\""));
         assert!(
-            source.contains("static inline void iomap_iter_reset_iomap(struct iomap_iter *iter)")
+            source.contains("static inline void iomap_iter_clean_fbatch(struct iomap_iter *iter)")
         );
         assert!(source.contains("if (iter->iomap.flags & IOMAP_F_FOLIO_BATCH)"));
         assert!(source.contains("folio_batch_release(iter->fbatch);"));
@@ -188,6 +191,7 @@ mod tests {
         no_advance.iter_start_pos = 0;
         no_advance.len = 1;
         assert_eq!(iomap_iter_finish(&mut no_advance, None), 0);
+        assert_eq!(no_advance.iomap.iomap_type, IOMAP_MAPPED);
 
         let mut stale = no_advance;
         stale.iomap.flags = IOMAP_F_STALE;

@@ -124,7 +124,10 @@ const BUILTIN_DMA_FENCE_EMIT: usize = 7;
 const BUILTIN_DMA_FENCE_SIGNALED: usize = 8;
 const NUM_BUILTIN_TRACEPOINTS: usize = 9;
 
-static BUILTIN_TRACEPOINTS: [LinuxBuiltinTracepoint; NUM_BUILTIN_TRACEPOINTS] =
+const _: () = assert!(core::mem::size_of::<LinuxBuiltinTracepoint>() == 88);
+
+#[unsafe(no_mangle)]
+static LUPOS_BUILTIN_TRACEPOINTS: [LinuxBuiltinTracepoint; NUM_BUILTIN_TRACEPOINTS] =
     [const { LinuxBuiltinTracepoint::new() }; NUM_BUILTIN_TRACEPOINTS];
 
 // Each exported static-call trampoline is a distinct, patchable Linux x86
@@ -136,24 +139,32 @@ core::arch::global_asm!(
     ".balign 16",
     ".global lupos_builtin_trace_noop",
     "lupos_builtin_trace_noop:",
+    // `probestub` is an indirect function pointer in struct tracepoint.  It
+    // therefore needs a valid landing pad when supervisor IBT is active even
+    // though the static-call trampolines reach it with direct JMPs.
+    "endbr64",
     "xor eax, eax",
     "ret",
-    ".macro LUPOS_TRACE_TRAMP name",
+    ".macro LUPOS_TRACE_TRAMP name, key_offset",
     ".balign 4",
     ".global \\name",
     "\\name:",
     "jmp lupos_builtin_trace_noop",
     ".byte 0x0f, 0xb9, 0xcc",
+    ".pushsection .static_call_tramp_key, \"a\"",
+    ".long \\name - .",
+    ".long LUPOS_BUILTIN_TRACEPOINTS + \\key_offset - .",
+    ".popsection",
     ".endm",
-    "LUPOS_TRACE_TRAMP __SCT__tp_func_sched_set_state_tp",
-    "LUPOS_TRACE_TRAMP __SCT__tp_func_xdp_exception",
-    "LUPOS_TRACE_TRAMP __SCT__tp_func_read_msr",
-    "LUPOS_TRACE_TRAMP __SCT__tp_func_write_msr",
-    "LUPOS_TRACE_TRAMP __SCT__tp_func_mmap_lock_start_locking",
-    "LUPOS_TRACE_TRAMP __SCT__tp_func_mmap_lock_acquire_returned",
-    "LUPOS_TRACE_TRAMP __SCT__tp_func_mmap_lock_released",
-    "LUPOS_TRACE_TRAMP __SCT__tp_func_dma_fence_emit",
-    "LUPOS_TRACE_TRAMP __SCT__tp_func_dma_fence_signaled",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_sched_set_state_tp, 0",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_xdp_exception, 88",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_read_msr, 176",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_write_msr, 264",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_mmap_lock_start_locking, 352",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_mmap_lock_acquire_returned, 440",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_mmap_lock_released, 528",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_dma_fence_emit, 616",
+    "LUPOS_TRACE_TRAMP __SCT__tp_func_dma_fence_signaled, 704",
     ".popsection",
 );
 
@@ -180,7 +191,7 @@ struct LinuxTracepointFunc {
 }
 
 fn builtin_object(index: usize) -> &'static LinuxBuiltinTracepointObject {
-    &BUILTIN_TRACEPOINTS[index].object
+    &LUPOS_BUILTIN_TRACEPOINTS[index].object
 }
 
 unsafe fn builtin_funcs(index: usize) -> *const LinuxTracepointFunc {
@@ -282,7 +293,7 @@ fn export_symbol_once(name: &'static str, address: usize, gpl_only: bool) {
 }
 
 fn initialize_builtin(spec: &BuiltinTracepointSpec) {
-    let builtin = &BUILTIN_TRACEPOINTS[spec.index];
+    let builtin = &LUPOS_BUILTIN_TRACEPOINTS[spec.index];
     let object = &builtin.object;
     builtin
         .static_call_key
@@ -520,6 +531,11 @@ struct LiveModuleTracepoint {
 }
 
 static LIVE_MODULE_TRACEPOINTS: Mutex<Vec<LiveModuleTracepoint>> = Mutex::new(Vec::new());
+/// Serializes probe publication/removal with module COMING/GOING.  Merely
+/// checking MODULE_TRACEPOINTS before taking LIVE_MODULE_TRACEPOINTS leaves a
+/// check-to-unload race in which a probe can be published after GOING removed
+/// the owning object.
+static TRACEPOINT_UPDATE_LOCK: Mutex<()> = Mutex::new(());
 
 unsafe fn read_tp_word(tracepoint: usize, offset: usize) -> usize {
     unsafe { ((tracepoint + offset) as *const usize).read_volatile() }
@@ -578,6 +594,7 @@ pub unsafe fn register_module_probe(
     probe: usize,
     data: usize,
 ) -> Result<(), i32> {
+    let _update = TRACEPOINT_UPDATE_LOCK.lock();
     if tracepoint == 0 || probe == 0 || !registered_module_tracepoint(tracepoint) {
         return Err(-22); // EINVAL
     }
@@ -666,6 +683,7 @@ pub unsafe fn unregister_module_probe(
     probe: usize,
     data: usize,
 ) -> Result<(), i32> {
+    let _update = TRACEPOINT_UPDATE_LOCK.lock();
     let mut live = LIVE_MODULE_TRACEPOINTS.lock();
     let index = live
         .iter()
@@ -849,23 +867,28 @@ pub fn module_coming(owner: usize, section_address: usize, section: &[u8]) -> Re
 
 /// `tracepoint_module_going()` removes every published pointer before the
 /// section containing `struct tracepoint` can be freed.
-pub fn module_going(owner: usize) {
+pub fn module_going(owner: usize) -> Result<(), i32> {
+    let _update = TRACEPOINT_UPDATE_LOCK.lock();
     let addresses = MODULE_TRACEPOINTS
         .lock()
         .iter()
         .filter(|tracepoint| tracepoint.owner == owner)
         .map(|tracepoint| tracepoint.address)
         .collect::<Vec<_>>();
-    debug_assert!(
-        !LIVE_MODULE_TRACEPOINTS
-            .lock()
-            .iter()
-            .any(|entry| addresses.contains(&entry.address)),
-        "module tracepoint still has live probes at GOING"
-    );
+    if LIVE_MODULE_TRACEPOINTS
+        .lock()
+        .iter()
+        .any(|entry| addresses.contains(&entry.address))
+    {
+        // Linux expects tracer notifiers to unregister these before GOING.
+        // Lupos has no equivalent external notifier chain, so retain the
+        // module instead of freeing tracepoint objects still in use.
+        return Err(-16); // EBUSY
+    }
     MODULE_TRACEPOINTS
         .lock()
         .retain(|tracepoint| tracepoint.owner != owner);
+    Ok(())
 }
 
 pub fn for_each_module_tracepoint(mut visit: impl FnMut(ModuleTracepoint)) {

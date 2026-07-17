@@ -115,12 +115,7 @@ pub fn export_symbol(name: &str, addr: usize, gpl_only: bool) {
 ///
 /// Mirrors the pairing of `__ksymtab` with `__kcrctab` in
 /// `vendor/linux/kernel/module/main.c::find_symbol`.
-pub fn export_symbol_with_crc(
-    name: &str,
-    addr: usize,
-    gpl_only: bool,
-    crc: Option<u32>,
-) {
+pub fn export_symbol_with_crc(name: &str, addr: usize, gpl_only: bool, crc: Option<u32>) {
     KSYMTAB.lock().push(ExportedSymbol {
         name: name.to_string(),
         addr,

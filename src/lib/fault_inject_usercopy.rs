@@ -62,5 +62,6 @@ mod tests {
             crate::kernel::module::find_symbol("should_fail_usercopy"),
             Some(should_fail_usercopy as usize)
         );
+        reset_for_test();
     }
 }

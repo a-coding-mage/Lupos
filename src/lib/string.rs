@@ -14,7 +14,6 @@ const EXPORTED_STRING_SYMBOLS: &[&str] = &[
     "strncasecmp",
     "strcasecmp",
     "strcpy",
-    "strncpy",
     "sized_strscpy",
     "stpcpy",
     "strcat",
@@ -649,7 +648,7 @@ mod tests {
             register_module_exports();
             assert_eq!(crate::kernel::module::find_symbol(name), symbol_addr(name));
         }
-        assert_eq!(EXPORTED_STRING_SYMBOLS.len(), 34);
+        assert_eq!(EXPORTED_STRING_SYMBOLS.len(), 33);
     }
 
     #[test]

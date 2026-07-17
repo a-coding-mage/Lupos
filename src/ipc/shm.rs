@@ -243,7 +243,7 @@ mod tests {
             hugepage_selftest
                 .contains("shmget(2, LENGTH, SHM_HUGETLB | IPC_CREAT | SHM_R | SHM_W)")
         );
-        assert!(hugepage_selftest.contains("shmat(shmid, NULL, 0)"));
+        assert!(hugepage_selftest.contains("shmat(shmid, ADDR, SHMAT_FLAGS)"));
         assert!(hugepage_selftest.contains("shmctl(shmid, IPC_RMID, NULL);"));
         assert!(ipc_h.contains("DO_TEST(shmat, __NR_shmat)"));
         assert!(ipc_h.contains("DO_TEST(shmdt, __NR_shmdt)"));
