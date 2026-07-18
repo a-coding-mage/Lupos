@@ -25,7 +25,16 @@ use crate::arch::x86::mm::paging::{
     p4d_offset, pgd_none, pgd_offset_pgd, pgd_t, pmd_huge, pmd_none, pmd_offset, pte_offset_kernel,
     pte_phys, pte_present, pte_t, pte_write, pud_huge, pud_none, pud_offset,
 };
-use crate::kernel::{sched, task::TaskStruct};
+use crate::include::uapi::{
+    mount::MS_NOSUID,
+    stat::{S_ISGID, S_ISUID},
+};
+use crate::kernel::{
+    capability::KernelCapT,
+    cred::{self, Cred, KGid, KUid},
+    sched,
+    task::TaskStruct,
+};
 use crate::mm::{
     buddy::{is_buddy_ready, page_to_pfn, with_global_buddy},
     fault::{FAULT_FLAG_USER, FAULT_FLAG_WRITE, VM_FAULT_ERROR, handle_mm_fault},
@@ -126,21 +135,28 @@ pub struct ElfImage {
     pub load_segments: Vec<ElfLoadSegment>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct ExecResolution {
     pub requested_path: String,
     pub resolved_path: String,
     pub elf: ElfImage,
+    pub inode: crate::fs::types::InodeRef,
+    pub dentry: crate::fs::types::DentryRef,
+    pub mount: alloc::sync::Arc<crate::fs::mount::Mount>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct LoadedImage {
     path: String,
     elf: ElfImage,
     bytes: Vec<u8>,
+    inode: crate::fs::types::InodeRef,
+    dentry: crate::fs::types::DentryRef,
+    mount: alloc::sync::Arc<crate::fs::mount::Mount>,
+    from_script: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct LoadedProgram {
     main: LoadedImage,
     interp: Option<LoadedImage>,
@@ -184,6 +200,136 @@ struct ElfLoadWindow {
 struct ShebangSpec {
     interpreter: String,
     arg: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecSecurityContext {
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub secure_exec: bool,
+}
+
+struct ProposedExecCreds {
+    cred: *mut Cred,
+    security: ExecSecurityContext,
+}
+
+impl Drop for ProposedExecCreds {
+    fn drop(&mut self) {
+        if !self.cred.is_null() {
+            unsafe { Cred::put(self.cred) };
+        }
+    }
+}
+
+impl ProposedExecCreds {
+    fn security(&self) -> ExecSecurityContext {
+        self.security
+    }
+
+    fn commit(mut self) {
+        let cred = self.cred;
+        self.cred = core::ptr::null_mut();
+        cred::commit_creds(cred);
+    }
+}
+
+fn securebit_mask(bit: u32) -> u32 {
+    1u32 << bit
+}
+
+fn exec_creds_privileged_before(old: &Cred, new: &Cred) -> bool {
+    old.uid != new.uid
+        || old.euid != new.euid
+        || old.gid != new.gid
+        || old.egid != new.egid
+        || old.suid != new.suid
+        || old.sgid != new.sgid
+        || old.fsuid != new.fsuid
+        || old.fsgid != new.fsgid
+        || old.cap_permitted != new.cap_permitted
+        || old.cap_effective != new.cap_effective
+}
+
+fn final_exec_nosuid(program: &LoadedProgram) -> bool {
+    (program.main.mount.flags.load(Ordering::Acquire) & MS_NOSUID as u32) != 0
+}
+
+fn final_exec_has_file_caps(image: &LoadedImage) -> bool {
+    image
+        .inode
+        .xattrs
+        .lock()
+        .contains_key("security.capability")
+}
+
+fn prepare_exec_creds(program: &LoadedProgram) -> Result<ProposedExecCreds, i32> {
+    let task = unsafe { sched::get_current() };
+    let old_ptr = cred::current_cred();
+    if old_ptr.is_null() {
+        return Err(-3);
+    }
+    let Some(new_ptr) = cred::prepare_creds() else {
+        return Err(-12);
+    };
+
+    let new = unsafe { &mut *new_ptr };
+    let old = unsafe { &*old_ptr };
+    let mode = program.main.inode.mode.load(Ordering::Acquire);
+    let file_uid = KUid(program.main.inode.uid.load(Ordering::Acquire));
+    let file_gid = KGid(program.main.inode.gid.load(Ordering::Acquire));
+    let no_new_privs = !task.is_null() && unsafe { (*task).m27.no_new_privs != 0 };
+    let nosuid = final_exec_nosuid(program);
+    let script = program.main.from_script;
+    let has_file_caps = final_exec_has_file_caps(&program.main);
+    let setid_or_caps = (mode & (S_ISUID | S_ISGID)) != 0 || has_file_caps;
+    let allow_privilege = !nosuid && !no_new_privs && !script;
+
+    if allow_privilege {
+        if mode & S_ISUID != 0 {
+            new.euid = file_uid;
+            new.suid = file_uid;
+            new.fsuid = file_uid;
+        }
+        if mode & S_ISGID != 0 {
+            new.egid = file_gid;
+            new.sgid = file_gid;
+            new.fsgid = file_gid;
+        }
+    }
+
+    if has_file_caps || (!allow_privilege && setid_or_caps) {
+        new.cap_ambient = KernelCapT::empty();
+    }
+    if new.euid.0 == 0
+        && old.euid.0 != 0
+        && new.securebits & securebit_mask(cred::securebits::SECURE_NOROOT) == 0
+        && new.securebits & securebit_mask(cred::securebits::SECURE_NO_SETUID_FIXUP) == 0
+    {
+        new.cap_permitted = new.cap_bset;
+        new.cap_effective = new.cap_permitted;
+    }
+    if new.euid.0 != 0
+        && new.securebits & securebit_mask(cred::securebits::SECURE_NO_SETUID_FIXUP) == 0
+    {
+        new.cap_effective = KernelCapT::empty();
+    }
+
+    let changed_privilege = exec_creds_privileged_before(old, new);
+    let secure_exec = changed_privilege || (!allow_privilege && setid_or_caps);
+    let security = ExecSecurityContext {
+        uid: new.uid.0,
+        euid: new.euid.0,
+        gid: new.gid.0,
+        egid: new.egid.0,
+        secure_exec,
+    };
+    Ok(ProposedExecCreds {
+        cred: new_ptr,
+        security,
+    })
 }
 
 static EXEC_STARTS: Mutex<Vec<(i32, UserStartContext)>> = Mutex::new(Vec::new());
@@ -299,6 +445,9 @@ pub fn resolve_exec_image(path: &str) -> Result<ExecResolution, i32> {
         requested_path: path.to_string(),
         resolved_path: loaded.path,
         elf: loaded.elf,
+        inode: loaded.inode,
+        dentry: loaded.dentry,
+        mount: loaded.mount,
     })
 }
 
@@ -316,15 +465,21 @@ fn load_image_with_shebang(path: &str, depth: usize) -> Result<LoadedImage, i32>
     if depth > MAX_INTERP_RECURSION {
         return Err(-40); // ELOOP
     }
-    let bytes = read_exec_file(path)?;
-    if let Some(next) = parse_shebang_interpreter(&bytes)? {
-        return load_image_with_shebang(&next.interpreter, depth + 1);
+    let meta = read_exec_file_meta(path)?;
+    if let Some(next) = parse_shebang_interpreter(&meta.bytes)? {
+        let mut image = load_image_with_shebang(&next.interpreter, depth + 1)?;
+        image.from_script = true;
+        return Ok(image);
     }
-    let elf = parse_elf_image(&bytes)?;
+    let elf = parse_elf_image(&meta.bytes)?;
     Ok(LoadedImage {
         path: normalize_exec_path(path),
         elf,
-        bytes,
+        bytes: meta.bytes,
+        inode: meta.inode,
+        dentry: meta.dentry,
+        mount: meta.mount,
+        from_script: false,
     })
 }
 
@@ -333,14 +488,25 @@ fn read_shebang_spec(path: &str) -> Result<Option<ShebangSpec>, i32> {
     parse_shebang_interpreter(&bytes)
 }
 
+struct ExecFileMeta {
+    bytes: Vec<u8>,
+    inode: crate::fs::types::InodeRef,
+    dentry: crate::fs::types::DentryRef,
+    mount: alloc::sync::Arc<crate::fs::mount::Mount>,
+}
+
 fn read_exec_file(path: &str) -> Result<Vec<u8>, i32> {
-    let (_, dentry) =
+    read_exec_file_meta(path).map(|meta| meta.bytes)
+}
+
+fn read_exec_file_meta(path: &str) -> Result<ExecFileMeta, i32> {
+    let (mount, dentry) =
         crate::fs::mount::resolve_path_follow(path).map_err(|errno| -(errno as i32))?;
     let inode = dentry.inode().ok_or(-2)?;
     if inode.kind != crate::fs::types::InodeKind::Regular {
         return Err(-13);
     }
-    match &inode.private {
+    let bytes = match &inode.private {
         crate::fs::types::InodePrivate::StaticBytes(bytes) => Ok(bytes.to_vec()),
         crate::fs::types::InodePrivate::StaticCowBytes { base, overlay } => {
             if let Some(bytes) = overlay.lock().as_ref() {
@@ -350,8 +516,14 @@ fn read_exec_file(path: &str) -> Result<Vec<u8>, i32> {
             }
         }
         crate::fs::types::InodePrivate::RamBytes(bytes) => Ok(bytes.lock().clone()),
-        _ => read_regular_inode_bytes(path, dentry, inode),
-    }
+        _ => read_regular_inode_bytes(path, dentry.clone(), inode.clone()),
+    }?;
+    Ok(ExecFileMeta {
+        bytes,
+        inode,
+        dentry,
+        mount,
+    })
 }
 
 fn read_regular_inode_bytes(
@@ -944,6 +1116,7 @@ fn build_auxv(
     random_ptr: u64,
     execfn_ptr: u64,
     vdso_ehdr: u64,
+    security: ExecSecurityContext,
 ) -> Vec<(u64, u64)> {
     let mut auxv = vec![
         (AT_PAGESZ, PAGE_SIZE as u64),
@@ -952,12 +1125,12 @@ fn build_auxv(
         (AT_PHNUM, main.phnum as u64),
         (AT_BASE, at_base),
         (AT_ENTRY, entry_ip),
-        (AT_UID, 0),
-        (AT_EUID, 0),
-        (AT_GID, 0),
-        (AT_EGID, 0),
+        (AT_UID, security.uid as u64),
+        (AT_EUID, security.euid as u64),
+        (AT_GID, security.gid as u64),
+        (AT_EGID, security.egid as u64),
         (AT_HWCAP, 0),
-        (AT_SECURE, 0),
+        (AT_SECURE, security.secure_exec as u64),
         (AT_RANDOM, random_ptr),
         (AT_EXECFN, execfn_ptr),
     ];
@@ -995,6 +1168,7 @@ unsafe fn build_initial_stack(
     at_base: u64,
     at_entry: u64,
     vdso_ehdr: u64,
+    security: ExecSecurityContext,
 ) -> Result<(u64, u64, u64), i32> {
     let mut sp = stack_top;
 
@@ -1036,7 +1210,7 @@ unsafe fn build_initial_stack(
     argv_ptrs.reverse();
 
     let auxv = build_auxv(
-        main, main_bias, at_base, at_entry, random_ptr, execfn_ptr, vdso_ehdr,
+        main, main_bias, at_base, at_entry, random_ptr, execfn_ptr, vdso_ehdr, security,
     );
     let mut words = Vec::new();
     words.push(argv_ptrs.len() as u64);
@@ -1079,6 +1253,7 @@ unsafe fn commit_exec_for_current(
     argv: &[String],
     envp: &[String],
     program: &LoadedProgram,
+    proposed_creds: ProposedExecCreds,
 ) -> Result<UserStartContext, i32> {
     let task = unsafe { sched::get_current() };
     if task.is_null() {
@@ -1124,6 +1299,7 @@ unsafe fn commit_exec_for_current(
             layout.at_base,
             layout.at_entry,
             vdso_ehdr,
+            proposed_creds.security(),
         )?
     };
 
@@ -1146,6 +1322,7 @@ unsafe fn commit_exec_for_current(
 
     unsafe {
         security::security_bprm_committing_creds(path.as_bytes());
+        proposed_creds.commit();
         (*task).mm = mm;
         (*task).active_mm = mm;
         (*task).thread.fsbase = 0;
@@ -1355,7 +1532,11 @@ pub unsafe fn sys_execve(
             exec_path
         );
     }
-    match unsafe { commit_exec_for_current(&path, &argv_vec, &env_vec, &program) } {
+    let proposed_creds = match prepare_exec_creds(&program) {
+        Ok(creds) => creds,
+        Err(e) => return e as i64,
+    };
+    match unsafe { commit_exec_for_current(&path, &argv_vec, &env_vec, &program, proposed_creds) } {
         Ok(_) => {
             #[cfg(not(test))]
             trace_ping_exec_commit(&path, &exec_path);
@@ -1445,7 +1626,9 @@ pub fn execve_from_kernel(
     let program = load_program(&exec_path)?;
     prepare_exec_security(path)?;
     measure_exec_program(&program);
-    let ctx = unsafe { commit_exec_for_current(path, &argv_vec, &env_vec, &program) }?;
+    let proposed_creds = prepare_exec_creds(&program)?;
+    let ctx =
+        unsafe { commit_exec_for_current(path, &argv_vec, &env_vec, &program, proposed_creds) }?;
     // Kernel callers enter userspace directly with the returned context, not
     // through the syscall exit path.  Drop the pending syscall-return handoff
     // so a later successful user syscall cannot restart the new image.
@@ -1719,6 +1902,147 @@ mod tests {
         out
     }
 
+    fn test_loaded_image(path: &str, elf: ElfImage, bytes: Vec<u8>) -> LoadedImage {
+        let dentry = crate::fs::dcache::d_alloc(path.rsplit('/').next().unwrap_or(path));
+        let inode = crate::fs::types::Inode::new(
+            1,
+            crate::fs::types::InodeKind::Regular,
+            0o755,
+            &crate::fs::ops::NOOP_INODE_OPS,
+            &crate::fs::ops::NOOP_FILE_OPS,
+            crate::fs::types::InodePrivate::RamBytes(spin::Mutex::new(bytes.clone())),
+        );
+        dentry.instantiate(inode.clone());
+        let root = crate::fs::dcache::d_alloc("/");
+        let sb =
+            crate::fs::types::SuperBlock::alloc("exec-test", 0, &crate::fs::ops::NOOP_SUPER_OPS);
+        let mount = crate::fs::mount::Mount::alloc(sb, root, 0);
+        LoadedImage {
+            path: path.to_string(),
+            elf,
+            bytes,
+            inode,
+            dentry,
+            mount,
+            from_script: false,
+        }
+    }
+
+    fn test_security(
+        uid: u32,
+        euid: u32,
+        gid: u32,
+        egid: u32,
+        secure_exec: bool,
+    ) -> ExecSecurityContext {
+        ExecSecurityContext {
+            uid,
+            euid,
+            gid,
+            egid,
+            secure_exec,
+        }
+    }
+
+    fn test_setid_program(
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        mount_flags: u32,
+        from_script: bool,
+    ) -> LoadedProgram {
+        let bytes = tiny_elf(None);
+        let elf = parse_elf_image(&bytes).expect("parse");
+        let mut image = test_loaded_image("/usr/bin/sudo", elf, bytes);
+        image.inode.mode.store(mode, Ordering::Release);
+        image.inode.uid.store(uid, Ordering::Release);
+        image.inode.gid.store(gid, Ordering::Release);
+        image.mount.flags.store(mount_flags, Ordering::Release);
+        image.from_script = from_script;
+        LoadedProgram {
+            main: image,
+            interp: None,
+        }
+    }
+
+    fn test_nonroot_cred(uid: u32, gid: u32) -> Box<Cred> {
+        Box::new(Cred {
+            usage: core::sync::atomic::AtomicUsize::new(1),
+            uid: KUid(uid),
+            gid: KGid(gid),
+            suid: KUid(uid),
+            sgid: KGid(gid),
+            euid: KUid(uid),
+            egid: KGid(gid),
+            fsuid: KUid(uid),
+            fsgid: KGid(gid),
+            cap_inheritable: KernelCapT::empty(),
+            cap_permitted: KernelCapT::empty(),
+            cap_effective: KernelCapT::empty(),
+            cap_bset: KernelCapT::full(),
+            cap_ambient: KernelCapT::empty(),
+            securebits: 0,
+            group_info: crate::kernel::cred::GroupInfo::default(),
+            user_ns: core::ptr::null(),
+        })
+    }
+
+    fn install_test_task<'a>(
+        cred: &'a Cred,
+        no_new_privs: u8,
+    ) -> (Box<TaskStruct>, *mut TaskStruct) {
+        let mut task: Box<TaskStruct> = unsafe { Box::new(core::mem::zeroed()) };
+        task.cred = cred as *const Cred;
+        task.m27.real_cred = cred as *const Cred;
+        task.m27.no_new_privs = no_new_privs;
+        let previous = unsafe { sched::get_current() };
+        unsafe { sched::set_current(&mut *task) };
+        (task, previous)
+    }
+
+    #[test]
+    fn exec_creds_apply_root_owned_04755_sudo() {
+        let old = test_nonroot_cred(1000, 1000);
+        let (_task, previous) = install_test_task(&old, 0);
+        let program = test_setid_program(0o4755, 0, 0, 0, false);
+        let proposed = prepare_exec_creds(&program).expect("prepare exec creds");
+
+        assert_eq!(
+            proposed.security(),
+            test_security(1000, 0, 1000, 1000, true)
+        );
+        unsafe {
+            assert_eq!((*proposed.cred).euid, KUid(0));
+            assert_eq!((*proposed.cred).suid, KUid(0));
+        }
+        unsafe { sched::set_current(previous) };
+    }
+
+    #[test]
+    fn exec_creds_ignore_setuid_on_nosuid_mount_and_enable_secure_mode() {
+        let old = test_nonroot_cred(1000, 1000);
+        let (_task, previous) = install_test_task(&old, 0);
+        let program = test_setid_program(0o4755, 123, 0, MS_NOSUID as u32, false);
+        let proposed = prepare_exec_creds(&program).expect("prepare exec creds");
+
+        assert_eq!(proposed.security().euid, 1000);
+        assert!(proposed.security().secure_exec);
+        unsafe { sched::set_current(previous) };
+    }
+
+    #[test]
+    fn exec_creds_ignore_setuid_when_no_new_privs_is_set() {
+        let old = test_nonroot_cred(1000, 1000);
+        let (_task, previous) = install_test_task(&old, 1);
+
+        let program = test_setid_program(0o4755, 123, 0, 0, false);
+        let proposed = prepare_exec_creds(&program).expect("prepare exec creds");
+
+        assert_eq!(proposed.security().euid, 1000);
+        assert!(proposed.security().secure_exec);
+        unsafe { sched::set_current(previous) };
+    }
+
     #[test]
     fn parse_elf_extracts_loads_and_interp() {
         let elf = tiny_elf(Some("/lib/ld-musl-x86_64.so.1"));
@@ -1827,7 +2151,16 @@ mod tests {
     fn build_auxv_omits_sysinfo_ehdr_when_vdso_is_not_published() {
         let elf = tiny_elf(None);
         let parsed = parse_elf_image(&elf).expect("parse");
-        let aux = build_auxv(&parsed, 0x400000, 0, 0x401000, 0x7fff_1000, 0x7fff_2000, 0);
+        let aux = build_auxv(
+            &parsed,
+            0x400000,
+            0,
+            0x401000,
+            0x7fff_1000,
+            0x7fff_2000,
+            0,
+            test_security(1000, 1000, 100, 100, false),
+        );
         let mut keys = aux.iter().map(|(k, _)| *k).collect::<Vec<_>>();
         keys.sort_unstable();
         assert!(keys.contains(&AT_PHDR));
@@ -1851,6 +2184,7 @@ mod tests {
             0x7fff_1000,
             0x7fff_2000,
             0x7fff_f000,
+            test_security(1000, 1000, 100, 100, true),
         );
         assert!(aux.contains(&(AT_SYSINFO_EHDR, 0x7fff_f000)));
     }
@@ -1862,16 +2196,12 @@ mod tests {
         let interp_bytes = tiny_elf(None);
         let interp_elf = parse_elf_image(&interp_bytes).expect("interp parse");
         let program = LoadedProgram {
-            main: LoadedImage {
-                path: "/sbin/init".to_string(),
-                elf: main_elf.clone(),
-                bytes: main_bytes,
-            },
-            interp: Some(LoadedImage {
-                path: "/lib64/ld-linux-x86-64.so.2".to_string(),
-                elf: interp_elf.clone(),
-                bytes: interp_bytes,
-            }),
+            main: test_loaded_image("/sbin/init", main_elf.clone(), main_bytes),
+            interp: Some(test_loaded_image(
+                "/lib64/ld-linux-x86-64.so.2",
+                interp_elf.clone(),
+                interp_bytes,
+            )),
         };
 
         let layout = exec_load_layout(&program).expect("layout");
@@ -1890,16 +2220,12 @@ mod tests {
         let interp_bytes = tiny_elf(None);
         let interp_elf = parse_elf_image(&interp_bytes).expect("interp parse");
         let program = LoadedProgram {
-            main: LoadedImage {
-                path: "/sbin/init".to_string(),
-                elf: main_elf,
-                bytes: main_bytes,
-            },
-            interp: Some(LoadedImage {
-                path: "/lib64/ld-linux-x86-64.so.2".to_string(),
-                elf: interp_elf,
-                bytes: interp_bytes,
-            }),
+            main: test_loaded_image("/sbin/init", main_elf, main_bytes),
+            interp: Some(test_loaded_image(
+                "/lib64/ld-linux-x86-64.so.2",
+                interp_elf,
+                interp_bytes,
+            )),
         };
 
         let plan = exec_relocation_plan(&program);
@@ -1912,11 +2238,7 @@ mod tests {
         let main_bytes = tiny_elf(None);
         let main_elf = parse_elf_image(&main_bytes).expect("main parse");
         let program = LoadedProgram {
-            main: LoadedImage {
-                path: "/sbin/init".to_string(),
-                elf: main_elf,
-                bytes: main_bytes,
-            },
+            main: test_loaded_image("/sbin/init", main_elf, main_bytes),
             interp: None,
         };
 
@@ -2112,16 +2434,12 @@ mod tests {
         let interp_bytes = tiny_elf(None);
         let interp_elf = parse_elf_image(&interp_bytes).expect("interp parse");
         let program = LoadedProgram {
-            main: LoadedImage {
-                path: "/bin/app".to_string(),
-                elf: main_elf,
-                bytes: main_bytes,
-            },
-            interp: Some(LoadedImage {
-                path: "/lib64/ld-linux-x86-64.so.2".to_string(),
-                elf: interp_elf,
-                bytes: interp_bytes,
-            }),
+            main: test_loaded_image("/bin/app", main_elf, main_bytes),
+            interp: Some(test_loaded_image(
+                "/lib64/ld-linux-x86-64.so.2",
+                interp_elf,
+                interp_bytes,
+            )),
         };
 
         assert_eq!(measure_exec_program(&program), 2);
