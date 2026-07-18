@@ -721,7 +721,7 @@ pub fn bind(sock: &SocketRef, addr: SockAddr) -> Result<(), i32> {
         return Err(EPERM);
     }
 
-    let (reuseaddr, family, sock_type, protocol, namespace_key) = {
+    let (reuseaddr, family, sock_type, protocol, namespace_key, bound_ifindex) = {
         let socket = sock.lock();
         (
             socket.reuseaddr,
@@ -729,8 +729,15 @@ pub fn bind(sock: &SocketRef, addr: SockAddr) -> Result<(), i32> {
             socket.sock_type,
             socket.protocol,
             socket.net_ns,
+            socket.bound_ifindex,
         )
     };
+    if let SockAddr::Inet { addr, .. } = &addr
+        && *addr != 0
+        && !inet_addr_is_local(*addr, Some(bound_ifindex))
+    {
+        return Err(EADDRNOTAVAIL);
+    }
     {
         let mut bound = BOUND.lock();
         if let Some(existing) = bound.get(&addr) {
@@ -2897,6 +2904,17 @@ fn infer_route4_oif(gateway: Option<u32>, dst: u32, dst_len: u8) -> Option<u32> 
                     && ipv4_prefix(dst, ifa.prefixlen) == ipv4_prefix(ifa.local, ifa.prefixlen))
         })
         .map(|ifa| ifa.ifindex)
+}
+
+pub(crate) fn inet_addr_is_local(addr: u32, ifindex: Option<u32>) -> bool {
+    ensure_default_ifaddrs();
+    addr == 0
+        || addr == ipv4(10, 0, 2, 15)
+        || current_ifaddrs_snapshot().iter().any(|ifa| {
+            ifa.family == AF_INET as u8
+                && ifa.local == addr
+                && ifindex.is_none_or(|ifindex| ifindex == 0 || ifa.ifindex == ifindex)
+        })
 }
 
 fn route4_prefsrc_for_oif(oif: u32) -> Option<u32> {
@@ -6833,6 +6851,21 @@ mod tests {
         assert_eq!(
             connect(&sock, SockAddr::Unix(String::from("\0plymouth"))),
             Err(crate::include::uapi::errno::ECONNREFUSED)
+        );
+    }
+
+    #[test]
+    fn inet_bind_rejects_nonlocal_source_address() {
+        let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP as u16).unwrap();
+        assert_eq!(
+            bind(
+                &sock,
+                SockAddr::Inet {
+                    addr: ipv4(203, 0, 113, 66),
+                    port: 12345,
+                },
+            ),
+            Err(EADDRNOTAVAIL)
         );
     }
 
