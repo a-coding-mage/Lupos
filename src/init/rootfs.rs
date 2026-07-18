@@ -618,9 +618,11 @@ fn console_read(
         // readline) hit its ESC keyseq timeout and mis-parse the rest as
         // literal input, corrupting in-line editing. Keep a modest burst in one
         // read() without letting a serial flood keep us in kernel context or
-        // grow the console buffers without bound.
-        let drain_limit = core::cmp::max(buf.len(), CONSOLE_INPUT_DRAIN_BUDGET);
-        let drained = drain_console_available_input(drain_limit);
+        // grow the console buffers without bound. Linux's n_tty read path
+        // consumes bytes already delivered by the asynchronous flip-buffer
+        // worker; its requested read size does not control synchronous
+        // hardware polling. Keep this hardware-ingest budget absolute too.
+        let drained = drain_console_available_input(CONSOLE_INPUT_DRAIN_BUDGET);
         if drained {
             if let Some(n) = console_read_ready_or_signal(buf, pos)? {
                 return Ok(n);
@@ -3975,6 +3977,45 @@ mod tests {
         assert_eq!(
             console_hardware_input_len_for_tests(),
             100 - CONSOLE_INPUT_DRAIN_BUDGET
+        );
+
+        reset_console_buffers();
+    }
+
+    #[test]
+    fn console_read_large_buffer_does_not_expand_hardware_input_drain() {
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        reset_console_buffers();
+
+        let file = alloc_file(
+            crate::fs::dcache::d_alloc("tty"),
+            O_RDONLY,
+            0,
+            &CONSOLE_FILE_OPS,
+        );
+        let mut termios = crate::linux_driver_abi::tty::KernelTermios::default();
+        termios.c_lflag &= !(crate::linux_driver_abi::tty::LFLAG_ICANON
+            | crate::linux_driver_abi::tty::LFLAG_ECHO);
+        crate::linux_driver_abi::tty::set_compat_termios(termios);
+
+        const INPUT_LEN: usize = CONSOLE_INPUT_DRAIN_BUDGET * 3;
+        push_hardware_input_for_tests(&[b'x'; INPUT_LEN]);
+        let mut buf = [0u8; CONSOLE_INPUT_DRAIN_BUDGET * 2];
+        let mut pos = 0u64;
+        assert_eq!(
+            console_read(&file, &mut buf, &mut pos),
+            Ok(CONSOLE_INPUT_DRAIN_BUDGET)
+        );
+        assert!(
+            buf[..CONSOLE_INPUT_DRAIN_BUDGET]
+                .iter()
+                .all(|&byte| byte == b'x')
+        );
+        assert_eq!(pos, CONSOLE_INPUT_DRAIN_BUDGET as u64);
+        assert_eq!(console_ready_len_for_tests(), 0);
+        assert_eq!(
+            console_hardware_input_len_for_tests(),
+            INPUT_LEN - CONSOLE_INPUT_DRAIN_BUDGET
         );
 
         reset_console_buffers();

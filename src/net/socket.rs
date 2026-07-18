@@ -735,8 +735,7 @@ pub fn bind(sock: &SocketRef, addr: SockAddr) -> Result<(), i32> {
         )
     };
     if let SockAddr::Inet { addr, .. } = &addr
-        && *addr != 0
-        && !inet_addr_is_local(*addr, Some(bound_ifindex))
+        && !inet_addr_is_bindable(*addr, bound_ifindex)
     {
         return Err(EADDRNOTAVAIL);
     }
@@ -1908,6 +1907,7 @@ const RT_SCOPE_HOST: u8 = 254;
 const RTN_UNICAST: u8 = 1;
 const RTN_LOCAL: u8 = 2;
 const RTN_BROADCAST: u8 = 3;
+const RTN_MULTICAST: u8 = 5;
 const RT_TABLE_UNSPEC: u8 = 0;
 const RT_TABLE_MAIN: u8 = 254;
 const RT_TABLE_LOCAL: u8 = 255;
@@ -2925,15 +2925,62 @@ fn infer_route4_oif(gateway: Option<u32>, dst: u32, dst_len: u8) -> Option<u32> 
         .map(|ifa| ifa.ifindex)
 }
 
-pub(crate) fn inet_addr_is_local(addr: u32, ifindex: Option<u32>) -> bool {
-    ensure_default_ifaddrs();
-    addr == 0
-        || addr == ipv4(10, 0, 2, 15)
-        || current_ifaddrs_snapshot().iter().any(|ifa| {
-            ifa.family == AF_INET as u8
-                && ifa.local == addr
-                && ifindex.is_none_or(|ifindex| ifindex == 0 || ifa.ifindex == ifindex)
+fn qemu_guest_addr_is_builtin_local(addr: u32, namespace_key: usize) -> bool {
+    namespace_key == 0 && addr == qemu_guest_ipv4()
+}
+
+fn inet_addr_type_local_table(addr: u32) -> u8 {
+    // Match vendor/linux/net/ipv4/fib_frontend.c::__inet_dev_addr_type().
+    // INADDR_ANY and limited broadcast are broadcast-class addresses, while
+    // multicast does not require a FIB entry.
+    if addr == 0 || addr == u32::MAX {
+        return RTN_BROADCAST;
+    }
+    if addr & 0xf000_0000 == 0xe000_0000 {
+        return RTN_MULTICAST;
+    }
+
+    // The slirp address is Lupos's built-in IPv4 assignment in the init
+    // network namespace even before userspace has materialized it through
+    // rtnetlink. It must not leak into a newly-created namespace whose local
+    // FIB and interface-address set start empty.
+    if qemu_guest_addr_is_builtin_local(addr, current_net_namespace_key()) {
+        return RTN_LOCAL;
+    }
+
+    // fib_table_lookup() performs a longest-prefix lookup. This matters for
+    // loopback: fib_add_ifaddr() installs both 127.0.0.0/8 as RTN_LOCAL and
+    // 127.255.255.255/32 as RTN_BROADCAST. An `any(RTN_LOCAL)` check would
+    // incorrectly permit the latter as a packet source.
+    current_route4s()
+        .into_iter()
+        .filter(|route| {
+            route.table == RT_TABLE_LOCAL
+                && route.dst_len <= 32
+                && ipv4_prefix(route.dst, route.dst_len) == ipv4_prefix(addr, route.dst_len)
         })
+        .max_by_key(|route| route.dst_len)
+        .map_or(RTN_UNICAST, |route| route.route_type)
+}
+
+fn inet_addr_is_bindable(addr: u32, _bound_ifindex: u32) -> bool {
+    // vendor/linux/include/net/inet_sock.h::inet_addr_valid_or_nonlocal().
+    // Lupos does not model l3mdev-specific FIB tables, so an ordinary
+    // SO_BINDTODEVICE does not narrow the local table used for this check.
+    addr == 0
+        || matches!(
+            inet_addr_type_local_table(addr),
+            RTN_LOCAL | RTN_MULTICAST | RTN_BROADCAST
+        )
+}
+
+pub(crate) fn inet_addr_is_local(addr: u32, _ifindex: Option<u32>) -> bool {
+    // vendor/linux/net/ipv4/route.c::ip_route_output_key_hash_rcu() validates
+    // a nonzero source through __ip_dev_find(), whose fallback is an
+    // RTN_LOCAL lookup in the local FIB. Linux deliberately permits a source
+    // owned by another interface, so the selected output interface does not
+    // narrow this lookup.
+    inet_addr_type_local_table(addr) == RTN_LOCAL
 }
 
 fn route4_prefsrc_for_oif(oif: u32) -> Option<u32> {
@@ -6992,6 +7039,46 @@ mod tests {
             ),
             Err(EADDRNOTAVAIL)
         );
+    }
+
+    #[test]
+    fn inet_bind_accepts_address_covered_by_loopback_local_route() {
+        let addr = SockAddr::Inet {
+            addr: ipv4(127, 0, 0, 53),
+            port: 45680,
+        };
+        let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP as u16).unwrap();
+
+        assert_eq!(bind(&sock, addr), Ok(()));
+        assert!(inet_addr_is_local(ipv4(127, 0, 0, 53), None));
+
+        // Keep the global bind table independent of this regression test.
+        release_bound_socket(&sock);
+    }
+
+    #[test]
+    fn inet_bind_and_transmit_source_use_distinct_linux_address_rules() {
+        let multicast = ipv4(239, 1, 2, 3);
+        let limited_broadcast = u32::MAX;
+
+        // inet_addr_valid_or_nonlocal() permits these receive addresses.
+        assert!(inet_addr_is_bindable(multicast, 0));
+        assert!(inet_addr_is_bindable(limited_broadcast, 0));
+
+        // ip_route_output_key_hash_rcu() rejects them as packet sources.
+        assert!(!inet_addr_is_local(multicast, None));
+        assert!(!inet_addr_is_local(limited_broadcast, None));
+        assert!(!inet_addr_is_local(ipv4(203, 0, 113, 66), None));
+
+        // This vendor tree's ipv4_is_zeronet() is `addr == 0`, not 0/8.
+        assert!(!inet_addr_is_bindable(ipv4(0, 1, 2, 3), 0));
+
+        // Lupos's synthetic slirp assignment belongs only to init_net.
+        assert!(qemu_guest_addr_is_builtin_local(qemu_guest_ipv4(), 0));
+        assert!(!qemu_guest_addr_is_builtin_local(
+            qemu_guest_ipv4(),
+            usize::MAX
+        ));
     }
 
     #[test]

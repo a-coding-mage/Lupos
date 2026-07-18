@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/net/ethernet, vendor/linux/net/ipv4
+//! test-origin: linux:vendor/linux/net/ipv4/af_inet.c
 //! Ethernet/ARP/IPv4 transport path used by module-backed net devices.
 
 extern crate alloc;
@@ -77,6 +78,20 @@ fn active_device_by_ifindex(ifindex: u32) -> Option<crate::net::device::NetDevic
     crate::net::device::list_netdevices()
         .into_iter()
         .find(|dev| dev.ifindex == ifindex && dev.linux_dev.is_some() && dev.is_up())
+}
+
+fn select_ipv4_source_addr(explicit_source: Option<u32>, bound_source: u32) -> u32 {
+    explicit_source
+        .filter(|addr| *addr != 0)
+        // __inet_bind() retains multicast/broadcast in inet_rcv_saddr but
+        // clears inet_saddr so output selects a device address. KernelSocket
+        // has one local address, so reproduce that split while selecting the
+        // wire source rather than weakening bind semantics.
+        .or_else(|| {
+            (bound_source != 0 && crate::net::socket::inet_addr_is_local(bound_source, None))
+                .then_some(bound_source)
+        })
+        .unwrap_or(GUEST_IPV4)
 }
 
 fn transmit(dev: &crate::net::device::NetDeviceRef, frame: &[u8]) -> Result<(), i32> {
@@ -358,11 +373,10 @@ pub(crate) fn send_inet(
             Some(SockAddr::Inet { addr, port }) => (addr, port),
             _ => (0, 0),
         };
-        let source_addr = send_meta
-            .and_then(|meta| meta.local_inet_addr)
-            .filter(|addr| *addr != 0)
-            .or((source_port.0 != 0).then_some(source_port.0))
-            .unwrap_or(GUEST_IPV4);
+        let source_addr = select_ipv4_source_addr(
+            send_meta.and_then(|meta| meta.local_inet_addr),
+            source_port.0,
+        );
         let ttl = send_meta
             .and_then(|meta| meta.ttl)
             .filter(|ttl| *ttl != 0)
@@ -752,5 +766,30 @@ pub(crate) fn receive_frame(linux_dev: *mut u8, frame: &[u8]) {
         ETH_P_ARP => handle_arp(linux_dev, frame),
         ETH_P_IP => handle_ipv4(linux_dev, frame),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::fib::ipv4;
+
+    #[test]
+    fn bound_receive_only_ipv4_addresses_do_not_become_wire_sources() {
+        assert_eq!(
+            select_ipv4_source_addr(None, ipv4(239, 1, 2, 3)),
+            GUEST_IPV4
+        );
+        assert_eq!(select_ipv4_source_addr(None, u32::MAX), GUEST_IPV4);
+        assert_eq!(
+            select_ipv4_source_addr(None, ipv4(127, 255, 255, 255)),
+            GUEST_IPV4
+        );
+
+        // A source covered by an RTN_LOCAL prefix remains usable.
+        assert_eq!(
+            select_ipv4_source_addr(None, ipv4(127, 0, 0, 53)),
+            ipv4(127, 0, 0, 53)
+        );
     }
 }
