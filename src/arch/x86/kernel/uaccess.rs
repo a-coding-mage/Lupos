@@ -152,8 +152,7 @@ unsafe extern "C" fn linux_copy_to_nontemporal(dst: *mut u8, src: *const u8, siz
     if dst.is_null() || src.is_null() {
         return size;
     }
-    unsafe { core::ptr::copy_nonoverlapping(src, dst, size) };
-    0
+    unsafe { copy_to_user(dst, src, size) }
 }
 
 #[unsafe(naked)]
