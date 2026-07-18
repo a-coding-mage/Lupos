@@ -9,12 +9,12 @@ use alloc::sync::Arc;
 
 use crate::arch::x86::kernel::uaccess;
 
-use crate::include::uapi::errno::{EBADF, EFAULT, EINVAL};
-use crate::include::uapi::fcntl::O_PATH;
+use crate::include::uapi::errno::{EACCES, EBADF, EFAULT, EINVAL};
+use crate::include::uapi::fcntl::{O_ACCMODE, O_PATH, O_RDWR, O_WRONLY};
 use crate::kernel::{files, sched};
 
 use super::madvise::do_madvise;
-use super::mmap::{MAP_ANONYMOUS, do_mmap, do_munmap};
+use super::mmap::{MAP_ANONYMOUS, MAP_SHARED, PROT_WRITE, do_mmap, do_munmap};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -47,8 +47,12 @@ pub unsafe fn sys_mmap(addr: u64, len: u64, prot: u32, flags: u32, fd: i32, off:
         };
         match ft.get(fd) {
             Ok(file) => {
-                if file.flags.load(core::sync::atomic::Ordering::Acquire) & O_PATH != 0 {
+                let file_flags = file.flags.load(core::sync::atomic::Ordering::Acquire);
+                if file_flags & O_PATH != 0 {
                     return -(EBADF as i64);
+                }
+                if let Err(errno) = mmap_validate_file_access(prot, flags, file_flags) {
+                    return -(errno as i64);
                 }
                 crate::fs::file::note_file_mmap_for_integrity(None, &file);
                 Arc::into_raw(file) as usize
@@ -74,6 +78,53 @@ pub unsafe fn sys_mmap(addr: u64, len: u64, prot: u32, flags: u32, fd: i32, off:
 #[inline]
 fn mmap_uses_file(flags: u32) -> bool {
     flags & MAP_ANONYMOUS == 0
+}
+
+#[inline]
+fn mmap_validate_file_access(prot: u32, flags: u32, file_flags: u32) -> Result<(), i32> {
+    if flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 {
+        let access_mode = file_flags & O_ACCMODE;
+        if access_mode != O_WRONLY && access_mode != O_RDWR {
+            return Err(EACCES);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::include::uapi::fcntl::O_RDONLY;
+    use crate::mm::mmap::MAP_PRIVATE;
+
+    #[test]
+    fn shared_writable_mmap_rejects_read_only_fd() {
+        assert_eq!(
+            mmap_validate_file_access(PROT_WRITE, MAP_SHARED, O_RDONLY),
+            Err(EACCES)
+        );
+    }
+
+    #[test]
+    fn shared_writable_mmap_accepts_write_capable_fd() {
+        assert_eq!(
+            mmap_validate_file_access(PROT_WRITE, MAP_SHARED, O_WRONLY),
+            Ok(())
+        );
+        assert_eq!(
+            mmap_validate_file_access(PROT_WRITE, MAP_SHARED, O_RDWR),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn non_shared_writable_mmap_does_not_require_writable_fd() {
+        assert_eq!(
+            mmap_validate_file_access(PROT_WRITE, MAP_PRIVATE, O_RDONLY),
+            Ok(())
+        );
+        assert_eq!(mmap_validate_file_access(0, MAP_SHARED, O_RDONLY), Ok(()));
+    }
 }
 
 /// Linux-visible `mmap_pgoff()` wrapper.
