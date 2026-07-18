@@ -16,8 +16,8 @@ use spin::Mutex;
 
 use crate::arch::x86::kernel::uaccess;
 use crate::include::uapi::errno::{
-    E2BIG, EBADF, EBUSY, EEXIST, EFAULT, EINTR, EINVAL, EIO, EISDIR, ENODATA, ENODEV, ENOENT,
-    ENOSYS, ENOTDIR, ENOTEMPTY, ENOTTY, EPERM, ERANGE, EXDEV,
+    E2BIG, EACCES, EBADF, EBUSY, EEXIST, EFAULT, EINTR, EINVAL, EIO, EISDIR, ENODATA, ENODEV,
+    ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, ENOTTY, EPERM, ERANGE, EXDEV,
 };
 use crate::include::uapi::fcntl::{
     AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_RECURSIVE, AT_REMOVEDIR, AT_SYMLINK_FOLLOW,
@@ -35,13 +35,14 @@ use crate::include::uapi::mount::{
 };
 use crate::include::uapi::openat2::OpenHow;
 use crate::include::uapi::stat::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK};
-use crate::kernel::capability::{CAP_SYS_ADMIN, CAP_SYS_CHROOT, capable};
+use crate::kernel::capability::{CAP_DAC_READ_SEARCH, CAP_SYS_ADMIN, CAP_SYS_CHROOT, capable};
 use crate::kernel::{files, sched};
 
 use super::mount;
 use super::namei::{LookupCtx, path_lookupat};
 use super::openat::{do_openat2, do_openat2_with_hint, sys_openat};
 use super::ops::{NOOP_FILE_OPS, NOOP_INODE_OPS};
+use super::permission::check_file_write_permission;
 use super::read_write::{vfs_fsync, vfs_lseek, vfs_read, vfs_write};
 use super::select;
 pub use super::select::PollFd;
@@ -3009,6 +3010,9 @@ fn linkat_path(
         if flags & AT_EMPTY_PATH as i32 == 0 {
             return Err(ENOENT);
         }
+        if !capable(CAP_DAC_READ_SEARCH) {
+            return Err(ENOENT);
+        }
         lookup_empty_stat_target(olddfd)?
     } else {
         lookup_path_str_with_follow(olddfd, old_path, flags & AT_SYMLINK_FOLLOW as i32 != 0)?
@@ -3028,6 +3032,7 @@ fn linkat_path(
     if lookup_child_optional(&new_parent, &new_dir, &new_name)?.is_some() {
         return Err(EEXIST);
     }
+    check_file_write_permission(&new_parent, &new_dir)?;
 
     match &new_dir.private {
         InodePrivate::RamDir(children) => {
@@ -5461,6 +5466,91 @@ mod tests {
             assert!(len > 0);
             assert!(dirents_contain(&dirents, len as usize, b"ghost"));
             assert_eq!(crate::fs::fdtable::sys_close(fd as i32), 0);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn linkat_requires_destination_directory_write_permission() {
+        let _guard = mount::TEST_MOUNT_LOCK.lock();
+        let (mut current, previous) = setup_current_with_rootfs(861);
+        unsafe {
+            assert!(sys_creat(b"/src\0".as_ptr(), 0o644) >= 0);
+            assert_eq!(sys_mkdirat(AT_FDCWD, b"/protected\0".as_ptr(), 0o755), 0);
+
+            drop_current_to_unprivileged(1000);
+
+            assert_eq!(
+                sys_link(b"/src\0".as_ptr(), b"/protected/hard\0".as_ptr()),
+                -(EACCES as i64)
+            );
+            let mut stat_buf = LinuxStat::default();
+            assert_eq!(
+                sys_lstat(b"/protected/hard\0".as_ptr(), &mut stat_buf),
+                -(ENOENT as i64)
+            );
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn linkat_rejects_readonly_destination_mount() {
+        let _guard = mount::TEST_MOUNT_LOCK.lock();
+        let (mut current, previous) = setup_current_with_rootfs(862);
+        unsafe {
+            assert!(sys_creat(b"/src\0".as_ptr(), 0o644) >= 0);
+            assert_eq!(sys_mkdirat(AT_FDCWD, b"/ro\0".as_ptr(), 0o755), 0);
+            mount::do_mount("tmpfs", "tmpfs", "/ro", MS_RDONLY, "").expect("readonly tmpfs");
+
+            assert_eq!(
+                sys_link(b"/src\0".as_ptr(), b"/ro/hard\0".as_ptr()),
+                -(crate::include::uapi::errno::EROFS as i64)
+            );
+            let mut stat_buf = LinuxStat::default();
+            assert_eq!(
+                sys_lstat(b"/ro/hard\0".as_ptr(), &mut stat_buf),
+                -(ENOENT as i64)
+            );
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn linkat_empty_path_requires_cap_dac_read_search() {
+        let _guard = mount::TEST_MOUNT_LOCK.lock();
+        let (mut current, previous) = setup_current_with_rootfs(863);
+        unsafe {
+            let fd = sys_openat(
+                AT_FDCWD,
+                b"/src\0".as_ptr(),
+                (O_RDWR | O_CREAT) as i32,
+                0o644,
+            );
+            assert!(fd >= 0);
+
+            drop_current_to_unprivileged(1000);
+
+            assert_eq!(
+                sys_linkat(
+                    fd as i32,
+                    b"\0".as_ptr(),
+                    AT_FDCWD,
+                    b"/hard\0".as_ptr(),
+                    AT_EMPTY_PATH as i32
+                ),
+                -(ENOENT as i64)
+            );
+            let mut stat_buf = LinuxStat::default();
+            assert_eq!(
+                sys_lstat(b"/hard\0".as_ptr(), &mut stat_buf),
+                -(ENOENT as i64)
+            );
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
