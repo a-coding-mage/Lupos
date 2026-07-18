@@ -1703,6 +1703,9 @@ fn rtnl_link_ifindex(bytes: &[u8], header: &NetlinkHeader) -> Result<u32, i32> {
 }
 
 fn apply_rtnl_setlink(sock: &SocketRef, bytes: &[u8], header: &NetlinkHeader) -> Result<(), i32> {
+    if !capable(CAP_NET_ADMIN) {
+        return Err(EPERM);
+    }
     let ifindex = rtnl_link_ifindex(bytes, header)?;
     if ifindex == 0 {
         return Err(ENODEV);
@@ -4467,6 +4470,66 @@ mod tests {
         assert_eq!(err, 0, "RTM_SETLINK must ACK with success");
         // The original 16-byte nlmsghdr is mirrored into the trailing payload.
         assert_eq!(&out[20..36], &req[..16]);
+    }
+
+    #[test]
+    fn unprivileged_rtnetlink_setlink_requires_net_admin() {
+        let name = "rtnl-setlink-unpriv0";
+        let _ = crate::net::device::unregister_netdevice(name);
+        let dev = crate::net::device::register_netdevice(
+            name,
+            1500,
+            [2, 0, 0, 0, 0, 7],
+            &crate::net::device::DUMMY_NETDEV_OPS,
+        )
+        .expect("device");
+        assert!(!dev.is_up(), "fresh dummy device should start down");
+
+        let previous = unsafe { sched::get_current() };
+        let cred = unprivileged_cred();
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 0x4e45_5441;
+        current.tgid = 0x4e45_5441;
+        current.cred = &*cred as *const Cred;
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+        }
+
+        let sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE).unwrap();
+        let mut req = alloc::vec![0u8; 32];
+        req[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        req[4..6].copy_from_slice(&RTM_SETLINK.to_ne_bytes());
+        req[6..8].copy_from_slice(&0x0005u16.to_ne_bytes());
+        req[8..12].copy_from_slice(&0x4eadu32.to_ne_bytes());
+        req[20..24].copy_from_slice(&(dev.ifindex as i32).to_ne_bytes());
+        req[24..28].copy_from_slice(&crate::net::device::IFF_UP.to_ne_bytes());
+        req[28..32].copy_from_slice(&crate::net::device::IFF_UP.to_ne_bytes());
+
+        assert_eq!(
+            sendto(&sock, &req, SockAddr::Netlink { pid: 0, groups: 0 }).unwrap(),
+            req.len()
+        );
+
+        let mut out = [0u8; 64];
+        let (n, _, _, _, _, _) = recvmsg_full(&sock, &mut out, 0).expect("ack");
+        assert_eq!(n, 36, "NLMSG_ERROR ACK must be 36 bytes");
+        assert_eq!(
+            u16::from_ne_bytes(out[4..6].try_into().unwrap()),
+            NLMSG_ERROR
+        );
+        assert_eq!(
+            i32::from_ne_bytes(out[16..20].try_into().unwrap()),
+            -(EPERM as i32)
+        );
+        assert!(
+            !dev.is_up(),
+            "unprivileged RTM_SETLINK must not raise IFF_UP"
+        );
+
+        unsafe {
+            sched::set_current(previous);
+        }
+        crate::net::device::unregister_netdevice(name).expect("cleanup");
     }
 
     #[test]
