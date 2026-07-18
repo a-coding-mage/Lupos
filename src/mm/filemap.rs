@@ -209,8 +209,10 @@ pub unsafe fn filemap_add_folio(
             (*page).index = 0;
             return -17; // -EEXIST
         }
-        (*mapping).nrpages.fetch_add(1, Ordering::Relaxed);
-        track_mapping(mapping);
+        let old_nrpages = (*mapping).nrpages.fetch_add(1, Ordering::Relaxed);
+        if old_nrpages == 0 {
+            track_mapping(mapping);
+        }
         lru_cache_add(page);
         0
     }
@@ -413,8 +415,13 @@ pub unsafe fn set_page_dirty(page: *mut Page) -> bool {
     if page.is_null() {
         return false;
     }
-    let mapping = unsafe { (*page).mapping as *mut AddressSpace };
     let was_dirty = unsafe { (&*page).flags.load(Ordering::Acquire) & PG_DIRTY != 0 };
+    if was_dirty {
+        unsafe { (&*page).flags.fetch_and(!super::page_flags::PG_RECLAIM, Ordering::Relaxed) };
+        return false;
+    }
+
+    let mapping = unsafe { (*page).mapping as *mut AddressSpace };
     let mut callback_dirty = false;
 
     unsafe {
@@ -2117,6 +2124,32 @@ mod tests {
     // ── filemap_add_increments_nrpages ────────────────────────────────────────
 
     #[test]
+    fn many_pages_register_mapping_once() {
+        let _guard = test_guard();
+        let mut mapping = make_mapping();
+        let mptr = mapping.as_mut() as *mut AddressSpace;
+        let mut pages = Vec::new();
+
+        for index in 0..128u64 {
+            let page = alloc_test_page(index as u8);
+            assert_eq!(unsafe { filemap_add_folio(mptr, page, index, GFP_KERNEL) }, 0);
+            assert_eq!(
+                crate::mm::writeback::snapshot_mappings(),
+                alloc::vec![mptr],
+                "mapping registration must not duplicate for page {index}"
+            );
+            pages.push(page);
+        }
+
+        assert_eq!(mapping.nrpages.load(Ordering::Relaxed), pages.len());
+        for page in pages {
+            unsafe { filemap_remove_folio(page) };
+            unsafe { free_test_page(page) };
+        }
+        assert!(crate::mm::writeback::snapshot_mappings().is_empty());
+    }
+
+    #[test]
     fn filemap_add_increments_nrpages() {
         let _guard = test_guard();
         let mut mapping = make_mapping();
@@ -2330,6 +2363,55 @@ mod tests {
         unsafe { filemap_remove_folio(p1) };
         unsafe { free_test_page(p0) };
         unsafe { free_test_page(p1) };
+    }
+
+    static DIRTY_CALLBACK_CALLS: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn counting_dirty_folio(_mapping: *mut AddressSpace, page: *mut Page) -> bool {
+        DIRTY_CALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe { (*page).flags.fetch_or(PG_DIRTY, Ordering::AcqRel) };
+        true
+    }
+
+    static COUNTING_DIRTY_OPS: AddressSpaceOperations = AddressSpaceOperations {
+        read_folio: None,
+        readahead: None,
+        writepages: None,
+        dirty_folio: Some(counting_dirty_folio),
+        write_begin: None,
+        write_end: None,
+        invalidate_folio: None,
+        release_folio: None,
+        free_folio: None,
+        is_partially_uptodate: None,
+        error_remove_folio: None,
+    };
+
+    #[test]
+    fn repeated_shared_writes_to_dirty_page_skip_dirty_bookkeeping() {
+        let _guard = test_guard();
+        DIRTY_CALLBACK_CALLS.store(0, Ordering::Relaxed);
+        let mut mapping = make_mapping();
+        mapping.set_ops(&raw const COUNTING_DIRTY_OPS);
+        let mptr = mapping.as_mut() as *mut AddressSpace;
+        let page = alloc_test_page(0);
+        unsafe { filemap_add_folio(mptr, page, 0, GFP_KERNEL) };
+
+        assert!(unsafe { set_page_dirty(page) });
+        assert_eq!(DIRTY_CALLBACK_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(crate::mm::writeback::stats().dirty_pages, 1);
+
+        for _ in 0..64 {
+            assert!(!unsafe { set_page_dirty(page) });
+        }
+
+        assert_eq!(DIRTY_CALLBACK_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(crate::mm::writeback::stats().dirty_pages, 1);
+        assert_eq!(crate::mm::writeback::snapshot_mappings(), alloc::vec![mptr]);
+
+        unsafe { filemap_remove_folio(page) };
+        unsafe { free_test_page(page) };
     }
 
     // ── generic_perform_write_marks_page_dirty ────────────────────────────────

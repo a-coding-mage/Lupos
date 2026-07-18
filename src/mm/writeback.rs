@@ -242,7 +242,11 @@ pub unsafe fn mark_page_dirty(page: *mut Page) -> bool {
 
     let old = unsafe { (&*page).flags.fetch_or(PG_DIRTY, Ordering::AcqRel) };
     let newly_dirty = (old & PG_DIRTY) == 0;
-    unsafe { note_page_dirty(page, newly_dirty) };
+    if newly_dirty {
+        unsafe { note_page_dirty(page, true) };
+    } else {
+        unsafe { (&*page).flags.fetch_and(!PG_RECLAIM, Ordering::Relaxed) };
+    }
     newly_dirty
 }
 
