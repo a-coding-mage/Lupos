@@ -183,6 +183,7 @@ const LUPOS_OVMF_VARS_ENV: &str = "LUPOS_OVMF_VARS";
 /// Override the GRUB module directory passed to `grub-mkrescue -d`, so hosts
 /// lacking the i386-pc GRUB platform can still produce a BIOS-bootable ISO.
 const LUPOS_GRUB_LIBDIR_ENV: &str = "LUPOS_GRUB_LIBDIR";
+const LUPOS_TIMEZONE_ENV: &str = "LUPOS_TIMEZONE";
 const TMPDIR_ENV: &str = "TMPDIR";
 const DEFAULT_QEMU_MEMORY: &str = "1024M";
 const GUI_SHELL_QEMU_MEMORY: &str = "4096M";
@@ -4058,6 +4059,96 @@ fn initramfs_symlink(path: &str, target: &str) -> InitramfsFile {
     initramfs_file(path, INITRAMFS_S_IFLNK | 0o777, target.as_bytes())
 }
 
+fn valid_timezone_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'+'))
+}
+
+fn timezone_name_from_localtime_symlink(localtime: &Path) -> Option<String> {
+    let target = fs::read_link(localtime).ok()?;
+    let zoneinfo = Path::new("/usr/share/zoneinfo");
+    let relative = if target.is_absolute() {
+        target.strip_prefix(zoneinfo).ok()?.to_path_buf()
+    } else {
+        let parent = localtime.parent().unwrap_or_else(|| Path::new("/"));
+        let joined = parent.join(target);
+        joined.strip_prefix(zoneinfo).ok()?.to_path_buf()
+    };
+    let zone = relative
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .to_owned();
+    valid_timezone_name(&zone).then_some(zone)
+}
+
+fn timezone_name_from_config_file(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    contents.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let value = trimmed
+            .strip_prefix("TIMEZONE=")
+            .or_else(|| trimmed.strip_prefix("ZONE="))
+            .unwrap_or(trimmed)
+            .trim_matches(|c| c == '"' || c == '\'');
+        valid_timezone_name(value).then(|| value.to_owned())
+    })
+}
+
+fn timezone_name_from_zoneinfo_bytes(localtime: &Path) -> Option<String> {
+    // Preserve common named zones even on hosts where /etc/localtime was copied
+    // instead of symlinked. This keeps GLib/XFCE on a zone identity rather than
+    // an anonymous TZif blob when the identity can be recovered cheaply.
+    let localtime = fs::read(localtime).ok()?;
+    for zone in ["Asia/Tokyo"] {
+        if fs::read(Path::new("/usr/share/zoneinfo").join(zone))
+            .ok()
+            .as_deref()
+            == Some(localtime.as_slice())
+        {
+            return Some(zone.to_owned());
+        }
+    }
+    None
+}
+
+fn resolve_timezone_name(explicit_override: Option<&str>) -> Option<String> {
+    if let Some(zone) = explicit_override
+        .map(str::trim)
+        .filter(|zone| valid_timezone_name(zone))
+    {
+        return Some(zone.to_owned());
+    }
+    timezone_name_from_localtime_symlink(Path::new("/etc/localtime"))
+        .or_else(|| timezone_name_from_zoneinfo_bytes(Path::new("/etc/localtime")))
+        .or_else(|| timezone_name_from_config_file(Path::new("/etc/timezone")))
+        .or_else(|| timezone_name_from_config_file(Path::new("/etc/conf.d/clock")))
+}
+
+fn stage_timezone_files(files: &mut Vec<InitramfsFile>) {
+    if let Some(zone) = resolve_timezone_name(env::var(LUPOS_TIMEZONE_ENV).ok().as_deref()) {
+        files.push(initramfs_symlink(
+            "etc/localtime",
+            &format!("/usr/share/zoneinfo/{zone}"),
+        ));
+        files.push(initramfs_file(
+            "etc/timezone",
+            0o100644,
+            format!("{zone}\n").into_bytes(),
+        ));
+        return;
+    }
+
+    // Fallback for hosts without a recoverable zoneinfo identity: keep the old
+    // self-contained TZif staging so libc still renders local wall clock time.
+    if let Ok(tzdata) = fs::read("/etc/localtime") {
+        files.push(initramfs_file("etc/localtime", 0o100644, tzdata));
+    }
+}
+
 fn lupos_swapfile_bytes() -> Vec<u8> {
     const PAGE_SIZE: usize = 4096;
     let mut bytes = vec![0u8; LUPOS_SWAPFILE_PAGES * PAGE_SIZE];
@@ -5079,6 +5170,11 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "echo 'graphics-x11: fd-readlink-probe end'\n",
         "printf 'graphics-x11: guest-date %s\\n' \"$(date '+%F %T %Z' 2>/dev/null)\"\n",
         "ls -l /etc/localtime 2>&1 | sed 's/^/graphics-x11: localtime /'\n",
+        "cat /etc/timezone 2>/dev/null | sed 's/^/graphics-x11: timezone /' || true\n",
+        "echo 'graphics-x11: glib-timezone-probe begin'\n",
+        "if [ -x /usr/bin/gio ]; then /usr/bin/gio info -a time::modified /etc/timezone 2>&1 | sed 's/^/graphics-x11: glib-timezone /'; echo 'graphics-x11: glib-timezone ok'; else echo 'graphics-x11: glib-timezone no-gio'; fi\n",
+        "if [ -x /usr/bin/xfconf-query ]; then /usr/bin/xfconf-query --version 2>&1 | head -1 | sed 's/^/graphics-x11: xfce-glib /'; echo 'graphics-x11: xfce-glib ok'; else echo 'graphics-x11: xfce-glib no-xfconf-query'; fi\n",
+        "echo 'graphics-x11: glib-timezone-probe end'\n",
         // D-Bus session-bus probe: xfconf/xfce4-panel/xfsettingsd need a working
         // per-session bus.  dbus-launch was failing ("Connection refused"), so
         // start dbus-daemon directly and prove a client can round-trip a call.
@@ -14084,13 +14180,10 @@ fn direct_stage_login_root_disk_overlay_files(
         );
     }
 
-    // The guest wall clock is correct UTC (RTC-seeded at boot), but the Arch
-    // rootfs ships no tzdata, so every userland clock renders raw UTC.
-    // Mirror the build host's zone; /etc/localtime is a self-contained TZif
-    // blob, so no zoneinfo database is needed. Skip when the host has none.
-    if let Ok(tzdata) = fs::read("/etc/localtime") {
-        files.push(initramfs_file("etc/localtime", 0o100644, tzdata));
-    }
+    // Prefer a named zone over anonymous TZif bytes so libc, GLib, and XFCE all
+    // see the same zone identity; fall back to the copied host TZif only when
+    // the host exposes no recoverable zoneinfo name.
+    stage_timezone_files(&mut files);
 
     if graphics_x11 {
         files.push(initramfs_file(
@@ -15311,6 +15404,8 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: pixbuf ok",
         "graphics-x11: pixbuf-bridge ok",
         "graphics-x11: pixbuf-bridge-pixels ok",
+        "graphics-x11: glib-timezone ok",
+        "graphics-x11: xfce-glib ok",
         "graphics-x11: dbus ok",
         "graphics-x11: xfce ok",
         "graphics-x11: xfce-proc xfce4-session",
@@ -23486,6 +23581,7 @@ failed command output\n";
 
     #[test]
     fn graphics_x11_direct_stage_overlay_starts_fbdev_xorg_on_tty1() {
+        let _timezone_guard = EnvVarGuard::set(LUPOS_TIMEZONE_ENV, "Asia/Tokyo");
         let files = direct_stage_login_root_disk_overlay_files(
             BootMode::GraphicsX11,
             SYSTEMD_DISK_ROOT_FSTAB,
@@ -23669,6 +23765,9 @@ failed command output\n";
         assert!(probe.contains("/usr/bin/xfce4-appfinder"));
         assert!(probe.contains("graphics-x11: appfinder ok"));
         assert!(probe.contains("graphics-x11: pixbuf-bridge-pixels ok"));
+        assert!(probe.contains("graphics-x11: glib-timezone-probe begin"));
+        assert!(probe.contains("/usr/bin/gio info -a time::modified /etc/timezone"));
+        assert!(probe.contains("/usr/bin/xfconf-query --version"));
         assert!(probe.contains("tail -c +25 /tmp/lupos-pixbuf-bridge.bin"));
         assert!(probe.contains("/usr/share/backgrounds/xfce/xfce-x.svg"));
         assert!(probe.contains("graphics-x11: wallpaper-decode ok"));
@@ -23685,6 +23784,16 @@ failed command output\n";
         assert!(probe.contains("/tmp/.X11-unix/X0"));
         assert!(probe.contains("/var/log/Xorg.0.log"));
 
+        assert_eq!(
+            find_initramfs_symlink_target(&files, "etc/localtime"),
+            Some(&b"/usr/share/zoneinfo/Asia/Tokyo"[..]),
+            "graphics-x11 must stage /etc/localtime as a named zoneinfo symlink"
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/timezone"),
+            Some(&b"Asia/Tokyo\n"[..]),
+            "graphics-x11 must stage /etc/timezone for GLib/XFCE consumers"
+        );
         assert!(
             find_initramfs_entry(&files, "etc/systemd/system/display-manager.service").is_some(),
             "graphics-x11 must enable the LightDM display manager"
