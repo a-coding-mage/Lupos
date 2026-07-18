@@ -21,7 +21,9 @@ use crate::include::uapi::errno::{
     EINVAL, ENETDOWN, ENETUNREACH, ENODEV, ENOPROTOOPT, ENOTCONN, EOPNOTSUPP, EPERM, EPIPE,
     EPROTONOSUPPORT, ESRCH,
 };
-use crate::kernel::capability::{CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE, capable};
+use crate::kernel::capability::{
+    CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE, CAP_NET_ADMIN, capable,
+};
 use crate::kernel::cred::GroupInfo;
 use crate::kernel::pid::{KPid, get_pid, put_pid};
 use crate::kernel::sched;
@@ -1584,21 +1586,27 @@ fn synthesize_route_netlink(sock: &SocketRef, bytes: &[u8]) {
             queue_netlink_error(sock, bytes, error);
         }
         RTM_NEWADDR => {
-            let error = apply_rtnl_newaddr(sock, bytes, &header).map_or_else(|errno| -errno, |_| 0);
+            let error = require_rtnl_net_admin()
+                .and_then(|_| apply_rtnl_newaddr(sock, bytes, &header))
+                .map_or_else(|errno| -errno, |_| 0);
             queue_netlink_error(sock, bytes, error);
         }
         RTM_DELADDR => {
-            let error = apply_rtnl_deladdr(sock, bytes, &header).map_or_else(|errno| -errno, |_| 0);
+            let error = require_rtnl_net_admin()
+                .and_then(|_| apply_rtnl_deladdr(sock, bytes, &header))
+                .map_or_else(|errno| -errno, |_| 0);
             queue_netlink_error(sock, bytes, error);
         }
         RTM_NEWROUTE => {
-            let error =
-                apply_rtnl_newroute(sock, bytes, &header).map_or_else(|errno| -errno, |_| 0);
+            let error = require_rtnl_net_admin()
+                .and_then(|_| apply_rtnl_newroute(sock, bytes, &header))
+                .map_or_else(|errno| -errno, |_| 0);
             queue_netlink_error(sock, bytes, error);
         }
         RTM_DELROUTE => {
-            let error =
-                apply_rtnl_delroute(sock, bytes, &header).map_or_else(|errno| -errno, |_| 0);
+            let error = require_rtnl_net_admin()
+                .and_then(|_| apply_rtnl_delroute(sock, bytes, &header))
+                .map_or_else(|errno| -errno, |_| 0);
             queue_netlink_error(sock, bytes, error);
         }
         RTM_DELLINK => queue_netlink_error(sock, bytes, 0),
@@ -1607,6 +1615,14 @@ fn synthesize_route_netlink(sock: &SocketRef, bytes: &[u8]) {
         // unavailable.
         RTM_GETQDISC | RTM_GETRULE => queue_netlink_error(sock, bytes, -(EOPNOTSUPP as i32)),
         _ => queue_netlink_error(sock, bytes, -(EOPNOTSUPP as i32)),
+    }
+}
+
+fn require_rtnl_net_admin() -> Result<(), i32> {
+    if capable(CAP_NET_ADMIN) {
+        Ok(())
+    } else {
+        Err(EPERM)
     }
 }
 
@@ -4797,6 +4813,51 @@ mod tests {
             sched::set_current(previous);
         }
         crate::kernel::audit::reset_for_test();
+    }
+
+    #[test]
+    fn unprivileged_route_netlink_mutations_require_net_admin() {
+        let previous = unsafe { sched::get_current() };
+        let cred = unprivileged_cred();
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 0x0bad_8000;
+        current.tgid = 0x0bad_8000;
+        current.cred = &*cred as *const Cred;
+        current.m27.real_cred = &*cred as *const Cred;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+        }
+
+        let sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE).unwrap();
+        let mut req = [0u8; NLMSG_HDRLEN + 8];
+        req[0..4].copy_from_slice(&(req.len() as u32).to_ne_bytes());
+        req[4..6].copy_from_slice(&RTM_NEWADDR.to_ne_bytes());
+        req[6..8].copy_from_slice(&1u16.to_ne_bytes());
+        req[8..12].copy_from_slice(&0xaced_u32.to_ne_bytes());
+
+        assert_eq!(
+            sendto(&sock, &req, SockAddr::Netlink { pid: 0, groups: 0 }).unwrap(),
+            req.len()
+        );
+
+        let mut out = [0u8; 128];
+        let n = recvmsg(&sock, &mut out).expect("RTM_NEWADDR denial ACK");
+        assert_eq!(
+            u16::from_ne_bytes(out[4..6].try_into().unwrap()),
+            NLMSG_ERROR
+        );
+        assert_eq!(u32::from_ne_bytes(out[8..12].try_into().unwrap()), 0xaced);
+        assert_eq!(
+            i32::from_ne_bytes(out[16..20].try_into().unwrap()),
+            -(EPERM as i32)
+        );
+        assert_eq!(n, 36);
+
+        release_bound_socket(&sock);
+        unsafe {
+            sched::set_current(previous);
+        }
     }
 
     #[test]
