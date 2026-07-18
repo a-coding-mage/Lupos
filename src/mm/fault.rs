@@ -38,7 +38,7 @@ use crate::arch::x86::mm::paging::{
     pte_present, pte_special, pte_t, pte_write, pte_wrprotect, ptep_get, ptep_get_and_clear,
     pud_alloc, pud_huge, pud_none, pud_offset, pud_t, set_pte_at,
 };
-use crate::mm::address_space::{AS_SHARED_ANON, AddressSpace};
+use crate::mm::address_space::{AS_SHARED_ANON, AddressSpace, wait_on_page_writeback};
 use crate::mm::buddy::{page_to_pfn, pfn_to_page, pfn_valid, with_global_buddy};
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
 use crate::mm::page::Page;
@@ -1131,8 +1131,16 @@ unsafe fn lupos_cached_file_fault(
         let mut entry = pte_mkyoung(pfn_pte(page_to_pfn(page) as u64, prot));
         let shared_write = (*vma).vm_flags & (VM_SHARED | VM_WRITE) == (VM_SHARED | VM_WRITE);
         if shared_write && (*vmf).flags & FAULT_FLAG_WRITE != 0 {
-            // Linux's shared-file write-fault path dirties the page-cache
-            // folio and reuses it instead of creating a private copy.
+            // Linux page_mkwrite semantics: with the folio locked, revalidate
+            // the cache identity after any read/truncate race, wait for
+            // conflicting writeback, then dirty the cache folio once before
+            // installing the writable PTE.
+            wait_on_page_writeback(page);
+            if (*page).mapping != mapping as usize || (*page).index != index as usize {
+                unlock_page(page);
+                (*page).put_page();
+                return VM_FAULT_SIGBUS;
+            }
             crate::mm::filemap::set_page_dirty(page);
             entry = pte_mkwrite(pte_mkdirty(entry));
         } else {
