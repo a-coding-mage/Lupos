@@ -487,7 +487,9 @@ graphics_runtime_cache_ready() {
         && [ -s "$1/usr/share/icons/hicolor/icon-theme.cache" ] \
         && [ -s "$1/usr/share/icons/AdwaitaLegacy/icon-theme.cache" ] \
         && [ -s "$1/usr/share/fonts/misc/fonts.dir" ] \
-        && [ -s "$1/usr/share/mime/mime.cache" ]
+        && [ -s "$1/usr/share/mime/mime.cache" ] \
+        && { [ ! -d "$1/usr/lib/gio/modules" ] \
+            || [ -s "$1/usr/lib/gio/modules/giomodule.cache" ]; }
 }
 
 stage_ready() {
@@ -1122,6 +1124,17 @@ generate_arch_gtk_caches() {
                 > "${loaders_conf:-$(dirname "$loaders_dir")/loaders.cache}" 2>/dev/null \
                 || die "failed to build staged gdk-pixbuf loader cache"
         fi
+    fi
+
+    # GIO extension modules (the dconf/xfconf GSettings backends, GnuTLS…)
+    # are normally indexed by each package's gio-querymodules hook, which
+    # --noscriptlet suppressed. Without giomodule.cache GIO must dlopen every
+    # module to discover extension points; regenerate the cache host-side.
+    if [ -x "$root/usr/bin/gio-querymodules" ] \
+        && [ -d "$root/usr/lib/gio/modules" ]; then
+        log "Building GIO module cache"
+        run_staged usr/bin/gio-querymodules "$root/usr/lib/gio/modules" \
+            || die "failed to build staged GIO module cache"
     fi
 
     # Per-theme icon caches so GTK finds icons quickly and correctly.
