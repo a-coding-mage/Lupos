@@ -20,10 +20,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::arch::x86::kernel::idt::ExceptionFrame;
 use crate::kernel::printk::log_error;
 use crate::kernel::sched;
-use crate::kernel::task::{TaskStruct, TIF_NEED_RESCHED};
+use crate::kernel::task::{TIF_NEED_RESCHED, TaskStruct};
 use crate::mm::fault::{
-    handle_mm_fault, FaultFlags, VmFaultFlags, FAULT_FLAG_DEFAULT, FAULT_FLAG_INSTRUCTION,
-    FAULT_FLAG_USER, FAULT_FLAG_WRITE, VM_FAULT_ERROR,
+    FAULT_FLAG_DEFAULT, FAULT_FLAG_INSTRUCTION, FAULT_FLAG_USER, FAULT_FLAG_WRITE, FaultFlags,
+    VM_FAULT_ERROR, VmFaultFlags, handle_mm_fault,
 };
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
 use crate::mm::vm_flags::{VM_EXEC, VM_GROWSDOWN, VM_READ, VM_WRITE};
@@ -605,7 +605,7 @@ mod tests {
     #[test]
     fn access_error_read_denied_on_no_read_vma() {
         let vma = VmAreaStruct::new(0x1000, 0x2000, 0); // no VM_READ
-                                                        // No INSTR, no WRITE → read fault.
+        // No INSTR, no WRITE → read fault.
         assert!(access_error(0, &vma));
     }
 

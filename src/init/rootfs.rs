@@ -557,6 +557,7 @@ fn reset_console_buffers() {
     crate::linux_driver_abi::tty::reset_compat_tty_state();
     #[cfg(test)]
     {
+        TEST_HW_INPUT_QUEUE.lock().clear();
         CONSOLE_WAIT_TEST_INJECT_NEWLINE.store(false, Ordering::SeqCst);
         CONSOLE_WAIT_TEST_COUNT.store(0, Ordering::SeqCst);
     }
