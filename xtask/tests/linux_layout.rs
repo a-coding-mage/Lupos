@@ -69,13 +69,16 @@ fn required_linux_roots_exist() {
 #[test]
 fn root_contains_only_allowed_visible_entries() {
     let root = repo_root();
-    let allowed_dirs = ["branding", "configs", "src", "target", "vendor", "xtask"];
+    let allowed_dirs = [
+        "branding", "configs", "scripts", "src", "target", "vendor", "xtask",
+    ];
     let allowed_files = [
         ".config",
         ".config.old",
         ".editorconfig",
         ".gitattributes",
         ".gitignore",
+        "AGENTS.MD",
         "build.rs",
         "Cargo.lock",
         "Cargo.toml",
@@ -144,11 +147,20 @@ fn old_flattened_paths_are_absent() {
     }
 }
 
+/// The generated layout TSVs were retired; `xtask/src/audit.rs` now derives
+/// the same mapping from each file's `//! linux-source:` header and
+/// `cargo xtask test` enforces it via `audit-layout`.  The TSV shape checks
+/// below only apply to checkouts that still carry the generated files.
+fn layout_map_tsv(root: &Path) -> Option<String> {
+    fs::read_to_string(root.join("src/docs/linux-layout-map.tsv")).ok()
+}
+
 #[test]
 fn linux_layout_map_paths_exist() {
     let root = repo_root();
-    let map_path = root.join("src/docs/linux-layout-map.tsv");
-    let map = fs::read_to_string(&map_path).expect("read linux layout map");
+    let Some(map) = layout_map_tsv(&root) else {
+        return;
+    };
     for (idx, line) in map.lines().enumerate() {
         let line = line.trim_start_matches('\u{feff}');
         if idx == 0 || line.trim().is_empty() {
@@ -215,8 +227,9 @@ fn linux_layout_map_paths_exist() {
 #[test]
 fn linux_layout_c_mappings_are_complete_translations() {
     let root = repo_root();
-    let map_path = root.join("src/docs/linux-layout-map.tsv");
-    let map = fs::read_to_string(&map_path).expect("read linux layout map");
+    let Some(map) = layout_map_tsv(&root) else {
+        return;
+    };
     let mut bad = Vec::new();
 
     for (idx, line) in map.lines().enumerate() {
@@ -264,6 +277,9 @@ fn syscall_64_tbl_matches_vendor_linux() {
 fn every_source_file_is_categorized() {
     use std::collections::HashSet;
     let root = repo_root();
+    if layout_map_tsv(&root).is_none() {
+        return;
+    }
     let mut files = Vec::new();
     walk_files(&root.join("src"), &mut files);
     files.push(root.join("build.rs"));

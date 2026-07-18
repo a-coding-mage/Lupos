@@ -364,6 +364,9 @@ fn handle_pte_fault(vmf: &mut VmFault) -> VmFaultFlags {
             if pte_special(vmf.orig_pte) {
                 return wp_pfn_shared(vmf);
             }
+            if (*vmf.vma).vm_file != 0 {
+                crate::mm::filemap::set_page_dirty(pfn_to_page(pfn));
+            }
             let entry = pte_mkwrite(pte_mkdirty(pte_mkyoung(vmf.orig_pte)));
             set_pte_at((*vmf.vma).vm_mm as *mut (), vmf.address, vmf.pte, entry);
             flush_tlb_page(vmf.address);
@@ -1022,9 +1025,8 @@ unsafe extern "C" fn lupos_file_fault(vmf: *mut VmFault) -> VmFaultFlags {
         let file_ptr = (*vma).vm_file as *const crate::fs::types::File;
         Arc::increment_strong_count(file_ptr);
         let file = Arc::from_raw(file_ptr);
-        let cacheable = (*vma).vm_flags & VM_SHARED == 0
-            && file.fops.read.is_some()
-            && file.inode().is_some_and(|inode| inode.is_reg());
+        let cacheable =
+            file.fops.read.is_some() && file.inode().is_some_and(|inode| inode.is_reg());
         let ret = if cacheable {
             lupos_cached_file_fault(vmf, &file)
         } else {
@@ -1036,7 +1038,7 @@ unsafe extern "C" fn lupos_file_fault(vmf: *mut VmFault) -> VmFaultFlags {
 }
 
 /// Current Rust-VFS equivalent of Linux's `filemap_fault()` plus
-/// `finish_fault()` for a private regular-file mapping.
+/// `finish_fault()` for a regular-file mapping.
 ///
 /// Lupos installs PTEs inside the VMA fault callback, so this consumes the
 /// lookup reference as the PTE reference and unlocks the cache page before
@@ -1126,9 +1128,19 @@ unsafe fn lupos_cached_file_fault(
         } else {
             pgprot_t(_PAGE_PRESENT | _PAGE_USER | _PAGE_ACCESSED | _PAGE_NX)
         };
-        // A private file mapping always starts read-only.  A write fault must
-        // COW away from the mapping reference rather than modify the cache.
-        let entry = pte_wrprotect(pte_mkyoung(pfn_pte(page_to_pfn(page) as u64, prot)));
+        let mut entry = pte_mkyoung(pfn_pte(page_to_pfn(page) as u64, prot));
+        let shared_write = (*vma).vm_flags & (VM_SHARED | VM_WRITE) == (VM_SHARED | VM_WRITE);
+        if shared_write && (*vmf).flags & FAULT_FLAG_WRITE != 0 {
+            // Linux's shared-file write-fault path dirties the page-cache
+            // folio and reuses it instead of creating a private copy.
+            crate::mm::filemap::set_page_dirty(page);
+            entry = pte_mkwrite(pte_mkdirty(entry));
+        } else {
+            // Private mappings must COW on a later write. Writable shared
+            // mappings also start read-only after a read fault so their first
+            // write passes through the dirty-page bookkeeping above.
+            entry = pte_wrprotect(entry);
+        }
         set_pte_at((*vma).vm_mm as *mut (), (*vmf).address, ptep, entry);
         (*page)._mapcount().fetch_add(1, Ordering::Relaxed);
         (*vmf).page = page;

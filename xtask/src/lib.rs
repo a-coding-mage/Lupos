@@ -4449,13 +4449,14 @@ fn lightdm_session_wrapper() -> Vec<u8> {
     format!("#!/bin/sh\n{X11_SESSION_BODY}").into_bytes()
 }
 
-/// System GTK3 defaults.  Modern Arch `librsvg` (2.62) no longer ships the
-/// gdk-pixbuf SVG loader, and `gdk-pixbuf2` builds its loaders in, so GTK3 apps
-/// cannot rasterise the SVG `Adwaita` icon theme — a missing icon then fatally
-/// aborts (`Gtk:ERROR ensure_surface_for_gicon ... Bail out!`).  Point the icon
-/// theme at the **PNG** `AdwaitaLegacy` theme (from `adwaita-icon-theme-legacy`)
-/// so no icon load ever needs an SVG loader.  The Adwaita *GTK* theme itself is
-/// built into libgtk-3 as a GResource, so it needs no external loader.
+/// System GTK3 defaults.  Staged `gdk-pixbuf2` (2.44) compiles in only the
+/// ani/bmp/icns/qtif/xpm loaders — both PNG and SVG decode are delegated to
+/// the out-of-process glycin loaders (`usr/lib/glycin-loaders/`), and Arch
+/// `librsvg` (2.62) no longer ships a gdk-pixbuf SVG module at all.  Point the
+/// icon theme at the **PNG** `AdwaitaLegacy` theme (from
+/// `adwaita-icon-theme-legacy`) so icon loads only ever need glycin's
+/// `glycin-image-rs` loader, never the SVG one.  The Adwaita *GTK* theme
+/// itself is built into libgtk-3 as a GResource, so it needs no loader.
 fn gtk3_settings_ini() -> Vec<u8> {
     concat!(
         "[Settings]\n",
@@ -4468,10 +4469,12 @@ fn gtk3_settings_ini() -> Vec<u8> {
     .to_vec()
 }
 
-/// XFCE `xsettings` channel defaults.  Once `xfsettingsd` starts it owns the
-/// XSETTINGS manager selection and overrides `gtk-3.0/settings.ini`, so pin the
-/// same PNG icon theme here to keep GTK apps off the SVG path for the whole
-/// session.
+/// XFCE `xsettings` channel seed.  Once `xfsettingsd` starts it owns the
+/// XSETTINGS manager selection and overrides `gtk-3.0/settings.ini`, so pin
+/// the same PNG icon theme here to keep GTK apps off the SVG path for the
+/// whole session.  Staged into the per-user xfconf layer (`root/` and
+/// `home/lupos/`) because the package-owned system default under `/etc/xdg`
+/// must remain untouched and the user layer overrides it regardless.
 fn xfce_xsettings_xml() -> Vec<u8> {
     concat!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
@@ -4523,6 +4526,9 @@ fn lightdm_config() -> Vec<u8> {
         // the greeter and authenticated session; do not disable access control.
         "xserver-command=/usr/lib/xorg/lupos-xserver -retro -configdir /etc/X11/xorg.conf.d\n",
         "xserver-allow-tcp=false\n",
+        // The greeter and session MUST share one X server: lupos drives a
+        // single system framebuffer (nomodeset), so a second per-session Xorg
+        // cannot start (the session then dies with "Can't open display :0").
         "xserver-share=true\n",
         "greeter-session=lightdm-gtk-greeter\n",
         "greeter-hide-users=true\n",
@@ -5034,6 +5040,45 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "else\n",
         "    echo 'graphics-x11: pixbuf no-tool'\n",
         "fi\n",
+        // Decode the same PNG through gdk-pixbuf itself: gdk-pixbuf-pixdata
+        // drives gdk_pixbuf_new_from_file, i.e. the in-process
+        // gdk-pixbuf→glycin bridge every GTK icon render uses.  The
+        // standalone glycin-thumbnailer probe above cannot see bridge-only
+        // failures, and a broken bridge means an icon-less desktop.
+        "echo 'graphics-x11: pixbuf-bridge-probe begin'\n",
+        "if [ -x /usr/bin/gdk-pixbuf-pixdata ] && [ -f \"$pixbuf_source\" ]; then\n",
+        "    G_MESSAGES_DEBUG=all timeout -k 5 30 /usr/bin/gdk-pixbuf-pixdata \"$pixbuf_source\" /tmp/lupos-pixbuf-bridge.bin >/tmp/pixbuf-bridge.log 2>&1\n",
+        "    brc=$?\n",
+        "    printf 'graphics-x11: pixbuf-bridge rc=%s\\n' \"$brc\"\n",
+        // A serialized GdkPixdata header occupies 24 bytes. Checking only the
+        // output size missed the MAP_SHARED regression where Glycin returned
+        // correct dimensions followed by an entirely zero pixel payload.
+        "    if [ \"$brc\" = 0 ] && [ -s /tmp/lupos-pixbuf-bridge.bin ] && tail -c +25 /tmp/lupos-pixbuf-bridge.bin | od -An -v -tu1 | grep -Eq '[1-9]'; then\n",
+        "        echo 'graphics-x11: pixbuf-bridge ok'\n",
+        "        echo 'graphics-x11: pixbuf-bridge-pixels ok'\n",
+        "    else\n",
+        "        echo 'graphics-x11: pixbuf-bridge failed'\n",
+        "        echo 'graphics-x11: pixbuf-bridge-pixels failed'\n",
+        "    fi\n",
+        "    if [ -s /tmp/pixbuf-bridge.log ]; then echo 'graphics-x11: pixbuf-bridge-log begin'; tail -40 /tmp/pixbuf-bridge.log; echo 'graphics-x11: pixbuf-bridge-log end'; fi\n",
+        "else\n",
+        "    echo 'graphics-x11: pixbuf-bridge no-tool'\n",
+        "fi\n",
+        // Minimal reproduction of the bridge's g_file_from_file mechanism:
+        // recover a plain regular-file fd's path via readlink(/proc/self/fd/N)
+        // from the shell, capturing the errno text when it fails.  Also report
+        // the guest-visible local time so the /etc/localtime staging is
+        // verifiable from serial without a display.
+        "echo 'graphics-x11: fd-readlink-probe begin'\n",
+        "( exec 9<\"$pixbuf_source\"\n",
+        "  target=\"$(readlink -v /proc/self/fd/9 2>/tmp/lupos-fd-readlink.err)\"\n",
+        "  printf 'graphics-x11: fd-readlink rc=%s target=%s\\n' \"$?\" \"$target\"\n",
+        ")\n",
+        "if [ -s /tmp/lupos-fd-readlink.err ]; then sed 's/^/graphics-x11: fd-readlink-err /' /tmp/lupos-fd-readlink.err; fi\n",
+        "ls -l /proc/self/fd/ 2>&1 | sed 's/^/graphics-x11: self-fd /'\n",
+        "echo 'graphics-x11: fd-readlink-probe end'\n",
+        "printf 'graphics-x11: guest-date %s\\n' \"$(date '+%F %T %Z' 2>/dev/null)\"\n",
+        "ls -l /etc/localtime 2>&1 | sed 's/^/graphics-x11: localtime /'\n",
         // D-Bus session-bus probe: xfconf/xfce4-panel/xfsettingsd need a working
         // per-session bus.  dbus-launch was failing ("Connection refused"), so
         // start dbus-daemon directly and prove a client can round-trip a call.
@@ -5191,7 +5236,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "echo 'graphics-x11: wallpaper-probe begin'\n",
         "stock_wallpaper=/usr/share/backgrounds/xfce/xfce-x.svg\n",
         "printf 'graphics-x11: wallpaper-default %s\\n' \"$stock_wallpaper\"\n",
-        "rm -f /tmp/lupos-wallpaper.png /tmp/lupos-wallpaper.log /tmp/lupos-xfdesktop-xfconf.log\n",
+        "rm -f /tmp/lupos-wallpaper.png /tmp/lupos-wallpaper-pixdata.bin /tmp/lupos-wallpaper.log /tmp/lupos-xfdesktop-xfconf.log\n",
         "if [ -n \"${settings_session_pid:-}\" ] && [ -x /usr/bin/xfconf-query ]; then\n",
         "    sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" /usr/bin/xfconf-query -c xfce4-desktop -lv >/tmp/lupos-xfdesktop-xfconf.log 2>&1 || true\n",
         "fi\n",
@@ -5199,6 +5244,17 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    timeout -k 5 30 /usr/bin/glycin-thumbnailer --input \"file://$stock_wallpaper\" --output /tmp/lupos-wallpaper.png --size 128 >/tmp/lupos-wallpaper.log 2>&1\n",
         "    wallpaper_rc=$?\n",
         "    if [ \"$wallpaper_rc\" -eq 0 ] && [ -s /tmp/lupos-wallpaper.png ]; then echo 'graphics-x11: wallpaper-decode ok'; else printf 'graphics-x11: wallpaper-decode failed rc=%s\\n' \"$wallpaper_rc\"; fi\n",
+        "    wallpaper_pixels=1\n",
+        "    if [ \"$wallpaper_rc\" -eq 0 ] && [ -x /usr/bin/gdk-pixbuf-pixdata ]; then\n",
+        "        timeout -k 5 30 /usr/bin/gdk-pixbuf-pixdata /tmp/lupos-wallpaper.png /tmp/lupos-wallpaper-pixdata.bin >>/tmp/lupos-wallpaper.log 2>&1 || wallpaper_pixels=0\n",
+        "        if [ \"$wallpaper_pixels\" -eq 1 ] && [ -s /tmp/lupos-wallpaper-pixdata.bin ] && tail -c +25 /tmp/lupos-wallpaper-pixdata.bin | od -An -v -tu1 | grep -Eq '[1-9]'; then\n",
+        "            echo 'graphics-x11: wallpaper-pixels ok'\n",
+        "        else\n",
+        "            echo 'graphics-x11: wallpaper-pixels failed'\n",
+        "        fi\n",
+        "    else\n",
+        "        echo 'graphics-x11: wallpaper-pixels failed'\n",
+        "    fi\n",
         "else\n",
         "    echo 'graphics-x11: wallpaper-decode missing-input'\n",
         "fi\n",
@@ -14028,12 +14084,54 @@ fn direct_stage_login_root_disk_overlay_files(
         );
     }
 
+    // The guest wall clock is correct UTC (RTC-seeded at boot), but the Arch
+    // rootfs ships no tzdata, so every userland clock renders raw UTC.
+    // Mirror the build host's zone; /etc/localtime is a self-contained TZif
+    // blob, so no zoneinfo database is needed. Skip when the host has none.
+    if let Ok(tzdata) = fs::read("/etc/localtime") {
+        files.push(initramfs_file("etc/localtime", 0o100644, tzdata));
+    }
+
     if graphics_x11 {
         files.push(initramfs_file(
             "etc/X11/xorg.conf.d/10-lupos-fbdev.conf",
             0o100644,
             x11_fbdev_config(),
         ));
+        // Pin the PNG AdwaitaLegacy icon theme for plain GTK apps
+        // (settings.ini) and for the XSETTINGS owner xfsettingsd — the stock
+        // xfce4-settings default pins the SVG-only `elementary` theme.  The
+        // xfconf seed lives in the per-user layer for both login accounts:
+        // the package-owned /etc/xdg/.../xsettings.xml must stay untouched
+        // (see graphics_x11_direct_stage_overlay_starts_fbdev_xorg_on_tty1),
+        // and xfconf's user layer overrides the system default anyway.  The
+        // directory chain is staged explicitly so home/lupos/** picks up
+        // uid/gid 1000 from emit_overlay_owner; mkdir'd parents would stay
+        // root-owned and xfconfd (uid 1000) could not persist changes.
+        files.push(initramfs_file(
+            "etc/gtk-3.0/settings.ini",
+            0o100644,
+            gtk3_settings_ini(),
+        ));
+        for account in ["root", "home/lupos"] {
+            for dir in [
+                ".config",
+                ".config/xfce4",
+                ".config/xfce4/xfconf",
+                ".config/xfce4/xfconf/xfce-perchannel-xml",
+            ] {
+                files.push(initramfs_file(
+                    &format!("{account}/{dir}"),
+                    0o40755,
+                    Vec::new(),
+                ));
+            }
+            files.push(initramfs_file(
+                &format!("{account}/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml"),
+                0o100644,
+                xfce_xsettings_xml(),
+            ));
+        }
         files.push(initramfs_file(
             "root/.xinitrc",
             0o100755,
@@ -15211,6 +15309,8 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         // subprocess, a private D-Bus session bus round-trips, and the XFCE
         // complete desktop process set actually comes up.
         "graphics-x11: pixbuf ok",
+        "graphics-x11: pixbuf-bridge ok",
+        "graphics-x11: pixbuf-bridge-pixels ok",
         "graphics-x11: dbus ok",
         "graphics-x11: xfce ok",
         "graphics-x11: xfce-proc xfce4-session",
@@ -15222,6 +15322,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: appfinder ok",
         "graphics-x11: wallpaper-default /usr/share/backgrounds/xfce/xfce-x.svg",
         "graphics-x11: wallpaper-decode ok",
+        "graphics-x11: wallpaper-pixels ok",
     ] {
         if !serial_log_contains(&run.serial_output, needle) {
             bail!(
@@ -15259,6 +15360,9 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: xterm-shell missing-xserver",
         "graphics-x11: pointer not-detected",
         "graphics-x11: pixbuf failed",
+        "graphics-x11: pixbuf-bridge failed",
+        "graphics-x11: pixbuf-bridge-pixels failed",
+        "graphics-x11: pixbuf-bridge no-tool",
         "graphics-x11: dbus failed",
         "graphics-x11: xfce failed",
         "graphics-x11: settings-manager missing-binary",
@@ -15269,6 +15373,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: appfinder failed",
         "graphics-x11: wallpaper-decode missing-input",
         "graphics-x11: wallpaper-decode failed",
+        "graphics-x11: wallpaper-pixels failed",
         "Error writing X authority",
         "-bash: lupos: command not found",
         "Unrecognized image file format",
@@ -16473,9 +16578,21 @@ pub fn run_module_loader_tests() -> Result<()> {
 /// This is deliberately separate from the generic loader gate: TCG and QEMU
 /// builds without CET virtualization can still test every loader mechanism,
 /// but they cannot claim that IA32_S_CET and CR4.CET were active at runtime.
+///
+/// Passing needs the whole host stack to virtualize CET, fail-closed on each
+/// link: an IBT-capable host CPU (`ibt`/`user_shstk` in /proc/cpuinfo), a
+/// host kernel whose KVM exposes guest CET (6.12 predates it), and a QEMU
+/// that models the `ibt`/`shstk` CPU properties (QEMU 10.0 reports
+/// `Property 'host-x86_64-cpu.ibt' not found`).  Until the host kernel and
+/// QEMU both gain guest-CET support this gate stays externally blocked; do
+/// not weaken it to pass without the hardware claim.
 pub fn run_module_loader_cet_tests() -> Result<()> {
     if !Path::new("/dev/kvm").exists() {
-        bail!("module-loader CET runtime gate requires /dev/kvm and an IBT-capable host CPU");
+        bail!(
+            "module-loader CET runtime gate requires /dev/kvm, an IBT-capable host CPU, \
+             a KVM with guest-CET virtualization, and a QEMU exposing the ibt/shstk CPU \
+             properties (QEMU <= 10.0 has neither)"
+        );
     }
     let _accel_guard = EnvVarGuard::set(LUPOS_QEMU_ACCEL_ENV, "kvm");
     let _cpu_guard = EnvVarGuard::set(LUPOS_QEMU_CPU_ENV, "host");
@@ -18462,6 +18579,15 @@ fn add_qemu_iso_base_args(command: &mut Command, iso_path: &Path, display: &str,
         .arg("none")
         .arg("-serial")
         .arg(serial);
+    // Opt-in QMP control socket (diagnostics only): when LUPOS_QEMU_QMP_SOCKET
+    // is set, expose a QMP server so the host can `screendump` the actual VGA
+    // framebuffer — ground truth for whether the desktop is on screen. Off by
+    // default, so normal gate/run behavior is unchanged.
+    if let Ok(qmp) = env::var("LUPOS_QEMU_QMP_SOCKET") {
+        if !qmp.trim().is_empty() {
+            command.arg("-qmp").arg(format!("unix:{qmp},server,nowait"));
+        }
+    }
     add_qemu_default_devices(command);
     add_qemu_cpu_if_requested(command);
     add_qemu_root_disk_if_requested(command);
@@ -23486,6 +23612,30 @@ failed command output\n";
         assert!(find_initramfs_entry(&files, "usr/lib/xorg/lupos-xserver").is_none());
         assert!(find_initramfs_entry(&files, "usr/share/backgrounds/lupos-login.png").is_none());
 
+        // Icon-theme pinning: staged gdk-pixbuf cannot rasterise SVG-only
+        // themes, so both login accounts seed the PNG AdwaitaLegacy theme in
+        // the per-user xfconf layer (never the package-owned /etc/xdg file),
+        // and plain GTK apps get the same default via settings.ini.
+        let settings_ini = core::str::from_utf8(
+            initramfs_file_bytes(&files, "etc/gtk-3.0/settings.ini")
+                .expect("gtk3 settings.ini staged"),
+        )
+        .expect("settings.ini utf-8");
+        assert!(settings_ini.contains("gtk-icon-theme-name=AdwaitaLegacy"));
+        for account in ["root", "home/lupos"] {
+            let seed = core::str::from_utf8(
+                initramfs_file_bytes(
+                    &files,
+                    &format!("{account}/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml"),
+                )
+                .expect("per-user xsettings seed staged"),
+            )
+            .expect("xsettings seed utf-8");
+            assert!(
+                seed.contains("name=\"IconThemeName\" type=\"string\" value=\"AdwaitaLegacy\"")
+            );
+        }
+
         let probe = core::str::from_utf8(
             initramfs_file_bytes(&files, GRAPHICS_X11_PROBE_SCRIPT_PATH)
                 .expect("graphics X11 probe script staged"),
@@ -23518,8 +23668,12 @@ failed command output\n";
         assert!(probe.contains("graphics-x11: appfinder-probe begin"));
         assert!(probe.contains("/usr/bin/xfce4-appfinder"));
         assert!(probe.contains("graphics-x11: appfinder ok"));
+        assert!(probe.contains("graphics-x11: pixbuf-bridge-pixels ok"));
+        assert!(probe.contains("tail -c +25 /tmp/lupos-pixbuf-bridge.bin"));
         assert!(probe.contains("/usr/share/backgrounds/xfce/xfce-x.svg"));
         assert!(probe.contains("graphics-x11: wallpaper-decode ok"));
+        assert!(probe.contains("graphics-x11: wallpaper-pixels ok"));
+        assert!(probe.contains("tail -c +25 /tmp/lupos-wallpaper-pixdata.bin"));
         assert!(probe.contains("graphics-x11: login1-seats"));
         assert!(probe.contains("graphics-x11: seat-graphical ok"));
         assert!(probe.contains("timeout 15 journalctl"));

@@ -18,6 +18,10 @@ pub const TRACE_SYSTEMCTL: u32 = 1 << 5;
 pub const TRACE_PROC: u32 = 1 << 6;
 pub const TRACE_GLYCIN: u32 = 1 << 7;
 pub const TRACE_UDEV: u32 = 1 << 8;
+/// Narrow diagnostic for the gdk-pixbuf→glycin bridge: traces only
+/// `gdk-pixbuf-*` tool syscalls (failures and readlink*), unlike the very
+/// verbose `glycin` flag which also floods the desktop-session comms.
+pub const TRACE_PIXBUF: u32 = 1 << 9;
 pub const TRACE_ALL: u32 = TRACE_SYSCALL
     | TRACE_FS
     | TRACE_NETLINK
@@ -26,6 +30,7 @@ pub const TRACE_ALL: u32 = TRACE_SYSCALL
     | TRACE_SYSTEMCTL
     | TRACE_PROC
     | TRACE_GLYCIN
+    | TRACE_PIXBUF
     | TRACE_UDEV;
 
 static TRACE_FLAGS: AtomicU32 = AtomicU32::new(0);
@@ -59,6 +64,7 @@ fn parse_trace_value(value: &str, mut flags: u32) -> u32 {
             "systemctl" => flags |= TRACE_SYSTEMCTL,
             "proc" | "process" => flags |= TRACE_PROC,
             "glycin" | "image-loader" => flags |= TRACE_GLYCIN,
+            "pixbuf" => flags |= TRACE_PIXBUF,
             "udev" => flags |= TRACE_UDEV,
             _ => {}
         }
@@ -96,6 +102,10 @@ pub fn proc_enabled() -> bool {
 
 pub fn glycin_enabled() -> bool {
     flags() & TRACE_GLYCIN != 0
+}
+
+pub fn pixbuf_enabled() -> bool {
+    flags() & TRACE_PIXBUF != 0
 }
 
 pub fn udev_enabled() -> bool {
@@ -156,7 +166,7 @@ mod tests {
     fn parses_lupos_trace_cmdline_as_comma_list() {
         let _guard = reset_trace_state();
         let flags = parse_cmdline(
-            "quiet lupos.trace=syscall,fs,cgroup,ping,systemctl,proc,glycin,udev root=/dev/vda1",
+            "quiet lupos.trace=syscall,fs,cgroup,ping,systemctl,proc,glycin,pixbuf,udev root=/dev/vda1",
         );
 
         assert_ne!(flags & TRACE_SYSCALL, 0);
@@ -167,6 +177,7 @@ mod tests {
         assert_ne!(flags & TRACE_SYSTEMCTL, 0);
         assert_ne!(flags & TRACE_PROC, 0);
         assert_ne!(flags & TRACE_GLYCIN, 0);
+        assert_ne!(flags & TRACE_PIXBUF, 0);
         assert_ne!(flags & TRACE_UDEV, 0);
     }
 

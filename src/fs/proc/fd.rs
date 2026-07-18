@@ -176,10 +176,38 @@ pub fn current_fdinfo_file_from_proc_path(
     Some(current_fdinfo_file(fd, flags, mode))
 }
 
+/// Accept `/proc/<pid>/fd/` for the calling process itself, exactly like
+/// `/proc/self/fd/`.  Staged gdk-pixbuf 2.44 recovers an fd's filename with
+/// `readlink("/proc/%u/fd/%d")` (io-glycin-utils.c), i.e. the numeric-pid
+/// spelling of its own fd — without this the gdk-pixbuf→glycin bridge fails
+/// and every GTK icon decode silently yields nothing.  Foreign pids are not
+/// resolved here: that requires another task's fd table, which the dynamic
+/// shortcut deliberately does not reach for.
+fn strip_current_pid_fd_prefix(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/proc/")?;
+    let digit_len = rest
+        .as_bytes()
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digit_len == 0 {
+        return None;
+    }
+    let pid = rest[..digit_len].parse::<i32>().ok()?;
+    let rest = rest[digit_len..].strip_prefix("/fd/")?;
+    let task = unsafe { sched::get_current() };
+    if task.is_null() {
+        return None;
+    }
+    let (cur_pid, cur_tgid) = unsafe { ((*task).pid, (*task).tgid) };
+    (pid == cur_pid || pid == cur_tgid).then_some(rest)
+}
+
 fn parse_proc_fd_path(path: &str) -> Option<Result<(i32, &str), i32>> {
     let rest = path
         .strip_prefix("/proc/self/fd/")
-        .or_else(|| path.strip_prefix("/dev/fd/"))?;
+        .or_else(|| path.strip_prefix("/dev/fd/"))
+        .or_else(|| strip_current_pid_fd_prefix(path))?;
     if rest.is_empty() {
         return Some(Err(ENOENT));
     }
@@ -377,6 +405,47 @@ mod tests {
             sched::set_current(previous);
             put_pid(target.m26.thread_pid);
             target.m26.thread_pid = core::ptr::null_mut();
+        }
+    }
+
+    #[test]
+    fn proc_numeric_pid_fd_path_resolves_for_current_task_only() {
+        let previous = unsafe { sched::get_current() };
+
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 434;
+        current.tgid = 434;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            let fdt = FilesStruct::new();
+            let held = alloc_anon_file("held", &NOOP_FILE_OPS, 0);
+            set_path_hint(&held, String::from("/newroot/usr"));
+            assert_eq!(fdt.install_at_or_above(held, 5, false), Ok(5));
+            files::set_task_files(&mut *current as *mut TaskStruct, fdt);
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            // The numeric-pid spelling of the caller's own fd resolves like
+            // /proc/self/fd (gdk-pixbuf 2.44 readlinks "/proc/%u/fd/%d").
+            assert_eq!(
+                current_fd_path_from_proc_path("/proc/434/fd/5"),
+                Some(Ok(String::from("/newroot/usr")))
+            );
+            assert_eq!(
+                current_fd_path_from_proc_path("/proc/self/fd/5"),
+                Some(Ok(String::from("/newroot/usr")))
+            );
+            // Foreign pids are not served by the dynamic shortcut.
+            assert_eq!(current_fd_path_from_proc_path("/proc/435/fd/5"), None);
+            // Unknown fds under the caller's own pid report EBADF, matching
+            // the existing /proc/self/fd shortcut behaviour.
+            assert_eq!(
+                current_fd_path_from_proc_path("/proc/434/fd/6"),
+                Some(Err(EBADF))
+            );
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
         }
     }
 

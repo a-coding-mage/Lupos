@@ -1265,7 +1265,8 @@ fn trace_systemd_service_syscall(
     let ping_trace = crate::kernel::debug_trace::ping_enabled();
     let systemctl_trace = crate::kernel::debug_trace::systemctl_enabled();
     let glycin_trace = crate::kernel::debug_trace::glycin_enabled();
-    if !syscall_trace && !ping_trace && !systemctl_trace && !glycin_trace {
+    let pixbuf_trace = crate::kernel::debug_trace::pixbuf_enabled();
+    if !syscall_trace && !ping_trace && !systemctl_trace && !glycin_trace && !pixbuf_trace {
         return;
     }
     let trace_pid1 = syscall_trace && pid == 1;
@@ -1289,6 +1290,13 @@ fn trace_systemd_service_syscall(
             || comm_starts_with(comm, b"lightdm-gtk-gre")
             || trace_desktop_session
             || trace_user_manager);
+    // Narrow bridge diagnostic: gdk-pixbuf-pixdata/csource drive the
+    // in-process gdk-pixbuf→glycin bridge in the graphics probe.  Trace only
+    // their failing syscalls plus readlink/readlinkat so the serial console
+    // is not flooded the way the full `glycin` flag floods it.
+    let trace_pixbuf = pixbuf_trace
+        && comm_starts_with(comm, b"gdk-pixbuf")
+        && (ret < 0 || matches!(regs.orig_rax, 89 | 267));
     if !trace_pid1
         && !trace_systemd_service
         && !trace_dbus_broker
@@ -1296,6 +1304,7 @@ fn trace_systemd_service_syscall(
         && !trace_dbus
         && !trace_ping
         && !trace_glycin
+        && !trace_pixbuf
     {
         return;
     }
@@ -1307,7 +1316,10 @@ fn trace_systemd_service_syscall(
         trace_ping,
         trace_systemctl || trace_dbus,
     );
-    if !interesting && !(trace_glycin && (ret < 0 || comm_starts_with(comm, b"bwrap"))) {
+    if !interesting
+        && !(trace_glycin && (ret < 0 || comm_starts_with(comm, b"bwrap")))
+        && !trace_pixbuf
+    {
         return;
     }
     crate::linux_driver_abi::tty::serial_println!(
