@@ -336,7 +336,6 @@ const LOGIN_PAM_SU: &str = concat!(
 );
 const LOGIN_PAM_PASSWD: &str = "password required pam_unix.so\n";
 const LOGIN_PAM_COMMON_SESSION: &str = "session required pam_unix.so\n";
-const LOGIN_SUDOERS_WHEEL: &str = "%wheel ALL=(ALL:ALL) ALL\n";
 const LOGIN_DEFS: &str = concat!(
     "MAIL_DIR        /var/mail\n",
     "PASS_MAX_DAYS   99999\n",
@@ -7087,7 +7086,6 @@ fn sysv_login_userland_files_with_stage_and_options(
         initramfs_file("etc/shadow", 0o100600, LOGIN_SHADOW.as_bytes()),
         initramfs_file("etc/group", 0o100644, LOGIN_GROUP.as_bytes()),
         initramfs_file("etc/gshadow", 0o100600, LOGIN_GSHADOW.as_bytes()),
-        initramfs_file("etc/sudoers.d/10-lupos-wheel", 0o100440, LOGIN_SUDOERS_WHEEL.as_bytes()),
         initramfs_file("etc/pam.d/login", 0o100644, LOGIN_PAM_LOGIN.as_bytes()),
         initramfs_file("etc/pam.d/passwd", 0o100644, LOGIN_PAM_PASSWD.as_bytes()),
         initramfs_file("etc/pam.d/su", 0o100644, LOGIN_PAM_SU.as_bytes()),
@@ -7324,7 +7322,6 @@ fn systemd_login_userland_files_with_stage_and_options(
         initramfs_file("etc/shadow", 0o100600, staged_auth_config(stage, "etc/shadow", LOGIN_SHADOW)),
         initramfs_file("etc/group", 0o100644, staged_auth_config(stage, "etc/group", LOGIN_GROUP)),
         initramfs_file("etc/gshadow", 0o100600, staged_auth_config(stage, "etc/gshadow", LOGIN_GSHADOW)),
-        initramfs_file("etc/sudoers.d/10-lupos-wheel", 0o100440, LOGIN_SUDOERS_WHEEL.as_bytes()),
         initramfs_file("etc/pam.d/login", 0o100644, LOGIN_PAM_LOGIN.as_bytes().to_vec()),
         initramfs_file("etc/pam.d/passwd", 0o100644, LOGIN_PAM_PASSWD.as_bytes().to_vec()),
         initramfs_file("etc/pam.d/su", 0o100644, LOGIN_PAM_SU.as_bytes().to_vec()),
@@ -15113,16 +15110,6 @@ pub fn run_login_stack_tests() -> Result<()> {
             send: b"id\n",
         },
         SerialExpectStep {
-            label: "sudo root uid",
-            wait_for: prompt,
-            send: b"sudo_uid=$(printf 'lupos\n' | sudo -S -k id -u) && [ \"$sudo_uid\" = 0 ] && printf 'login-stack: sudo-wheel uid=%s\n' \"$sudo_uid\"\n",
-        },
-        SerialExpectStep {
-            label: "sudo marker",
-            wait_for: "login-stack: sudo-wheel uid=0",
-            send: b"",
-        },
-        SerialExpectStep {
             label: "shell",
             wait_for: prompt,
             send: b"echo $SHELL\n",
@@ -15275,7 +15262,6 @@ pub fn run_login_stack_tests() -> Result<()> {
     for marker in [
         "login-stack: prompt recovered",
         "login-stack: ls-li metadata ok",
-        "login-stack: sudo-wheel uid=0",
         "login-stack: root fs ok",
         "login-stack: curl dns ok",
     ] {
@@ -28890,55 +28876,12 @@ CONFIG_MODULES=y
     }
 
     #[test]
-    fn initramfs_stages_wheel_sudoers_dropin() {
+    fn initramfs_does_not_stage_wheel_sudoers_dropin() {
         let files = sysv_login_userland_files_with_stage(None);
-        let sudoers = find_initramfs_entry(&files, "etc/sudoers.d/10-lupos-wheel")
-            .expect("wheel sudoers drop-in must be staged");
         assert!(
-            initramfs_file_is_regular(sudoers),
-            "wheel sudoers drop-in must be a regular file"
+            find_initramfs_entry(&files, "etc/sudoers.d/10-lupos-wheel").is_none(),
+            "default login images must not grant wheel password-authenticated sudo"
         );
-        assert_eq!(
-            initramfs_mode_perms(sudoers.1),
-            0o440,
-            "wheel sudoers drop-in must be readable only by root/group"
-        );
-        let body = core::str::from_utf8(&sudoers.2).expect("sudoers drop-in utf-8");
-        assert!(
-            body.lines()
-                .any(|line| line.trim() == "%wheel ALL=(ALL:ALL) ALL"),
-            "wheel sudoers drop-in must enable password-authenticated wheel sudo"
-        );
-
-        let group = core::str::from_utf8(
-            &find_initramfs_entry(&files, "etc/group")
-                .expect("/etc/group must be staged")
-                .2,
-        )
-        .expect("group utf-8");
-        assert!(
-            group.lines().any(|line| line == "wheel:x:10:root,lupos"),
-            "lupos must remain a member of wheel in /etc/group"
-        );
-        let gshadow = core::str::from_utf8(
-            &find_initramfs_entry(&files, "etc/gshadow")
-                .expect("/etc/gshadow must be staged")
-                .2,
-        )
-        .expect("gshadow utf-8");
-        assert!(
-            gshadow.lines().any(|line| line == "wheel:*::root,lupos"),
-            "lupos must remain a member of wheel in /etc/gshadow"
-        );
-
-        let cpio = build_cpio_newc(&[(
-            "etc/sudoers.d/10-lupos-wheel",
-            sudoers.1,
-            sudoers.2.as_slice(),
-        )]);
-        let header = core::str::from_utf8(&cpio[..110]).expect("newc header utf-8");
-        assert_eq!(&header[22..30], "00000000", "newc uid must be root");
-        assert_eq!(&header[30..38], "00000000", "newc gid must be root");
     }
 
     /// Public Boot acceptance gate: `poweroff` / `reboot` from userspace must
