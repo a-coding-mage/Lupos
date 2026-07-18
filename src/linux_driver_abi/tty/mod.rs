@@ -1125,10 +1125,13 @@ mod tests {
     fn tcgets_layout_matches_x86_64_glibc_termios() {
         let termios = KernelTermios::default();
         let base = &termios as *const KernelTermios as usize;
+        let padding = &termios.__padding as *const [u8; 3] as usize - base;
         let ispeed = &termios.c_ispeed as *const u32 as usize - base;
         let ospeed = &termios.c_ospeed as *const u32 as usize - base;
 
         assert_eq!(core::mem::size_of::<KernelTermios>(), 60);
+        assert_eq!(padding, 49);
+        assert_eq!(termios.__padding, [0; 3]);
         assert_eq!(ispeed, 52);
         assert_eq!(ospeed, 56);
         assert_eq!(core::mem::size_of::<KernelTermios2>(), 44);

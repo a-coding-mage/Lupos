@@ -993,7 +993,8 @@ fn pty_common_ioctl(pty: &Arc<Pty>, cmd: u32, arg: u64, is_master: bool) -> Resu
             Ok(0)
         }
         TCSETS | TCSETSW | TCSETSF => {
-            let t: KernelTermios = copy_struct_from_user(arg)?;
+            let mut t: KernelTermios = copy_struct_from_user(arg)?;
+            t.__padding = [0; 3];
             *pty.termios.lock() = t;
             Ok(0)
         }
@@ -1212,6 +1213,7 @@ fn kernel_termios_from2(t2: KernelTermios2) -> KernelTermios {
         c_lflag: t2.c_lflag,
         c_line: t2.c_line,
         c_cc,
+        __padding: [0; 3],
         c_ispeed: t2.c_ispeed,
         c_ospeed: t2.c_ospeed,
     }
@@ -1377,5 +1379,30 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = pty.slave_read(&mut buf);
         assert_eq!(&buf[..n], b"cmd\n");
+    }
+
+    #[test]
+    fn termios_conversions_zero_userspace_padding() {
+        let pty = Pty::new(6);
+        let mut termios = KernelTermios::default();
+        termios.__padding = [0xa5; 3];
+
+        assert_eq!(
+            pty_common_ioctl(&pty, TCSETS, &termios as *const _ as u64, false),
+            Ok(0)
+        );
+        assert_eq!(pty.termios.lock().__padding, [0; 3]);
+
+        let mut roundtrip = KernelTermios::default();
+        roundtrip.__padding = [0xff; 3];
+        assert_eq!(
+            pty_common_ioctl(&pty, TCGETS, &mut roundtrip as *mut _ as u64, false),
+            Ok(0)
+        );
+        assert_eq!(roundtrip.__padding, [0; 3]);
+        assert_eq!(roundtrip.c_lflag, termios.c_lflag);
+
+        let termios2 = KernelTermios2::from(termios);
+        assert_eq!(kernel_termios_from2(termios2).__padding, [0; 3]);
     }
 }

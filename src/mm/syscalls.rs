@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 use crate::arch::x86::kernel::uaccess;
 
 use crate::include::uapi::errno::{EACCES, EBADF, EFAULT, EINVAL};
-use crate::include::uapi::fcntl::{O_ACCMODE, O_PATH, O_RDWR, O_WRONLY};
+use crate::include::uapi::fcntl::{O_ACCMODE, O_PATH, O_RDONLY, O_RDWR};
 use crate::kernel::{files, sched};
 
 use super::madvise::do_madvise;
@@ -82,49 +82,18 @@ fn mmap_uses_file(flags: u32) -> bool {
 
 #[inline]
 fn mmap_validate_file_access(prot: u32, flags: u32, file_flags: u32) -> Result<(), i32> {
-    if flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 {
-        let access_mode = file_flags & O_ACCMODE;
-        if access_mode != O_WRONLY && access_mode != O_RDWR {
-            return Err(EACCES);
-        }
+    let access_mode = file_flags & O_ACCMODE;
+
+    // Linux requires FMODE_READ for every file-backed mmap, including a
+    // writable shared mapping. O_RDONLY and O_RDWR are the open modes that
+    // provide it.
+    if access_mode != O_RDONLY && access_mode != O_RDWR {
+        return Err(EACCES);
+    }
+    if flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 && access_mode != O_RDWR {
+        return Err(EACCES);
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::include::uapi::fcntl::O_RDONLY;
-    use crate::mm::mmap::MAP_PRIVATE;
-
-    #[test]
-    fn shared_writable_mmap_rejects_read_only_fd() {
-        assert_eq!(
-            mmap_validate_file_access(PROT_WRITE, MAP_SHARED, O_RDONLY),
-            Err(EACCES)
-        );
-    }
-
-    #[test]
-    fn shared_writable_mmap_accepts_write_capable_fd() {
-        assert_eq!(
-            mmap_validate_file_access(PROT_WRITE, MAP_SHARED, O_WRONLY),
-            Ok(())
-        );
-        assert_eq!(
-            mmap_validate_file_access(PROT_WRITE, MAP_SHARED, O_RDWR),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn non_shared_writable_mmap_does_not_require_writable_fd() {
-        assert_eq!(
-            mmap_validate_file_access(PROT_WRITE, MAP_PRIVATE, O_RDONLY),
-            Ok(())
-        );
-        assert_eq!(mmap_validate_file_access(0, MAP_SHARED, O_RDONLY), Ok(()));
-    }
 }
 
 /// Linux-visible `mmap_pgoff()` wrapper.
@@ -561,7 +530,9 @@ pub fn process_vm_writev(
 #[cfg(test)]
 mod tests {
     use crate::include::uapi::errno::EBADF;
+    use crate::include::uapi::fcntl::{O_RDONLY, O_RDWR, O_WRONLY};
     use crate::kernel::sched;
+    use crate::mm::mmap::{MAP_PRIVATE, MAP_SHARED, PROT_WRITE};
 
     #[test]
     fn syscall_glue_exports_mm_closure_entrypoints() {
@@ -603,6 +574,46 @@ mod tests {
             crate::mm::mmap::MAP_PRIVATE | crate::mm::mmap::MAP_ANONYMOUS
         ));
         assert!(super::mmap_uses_file(crate::mm::mmap::MAP_PRIVATE));
+    }
+
+    #[test]
+    fn file_mmap_rejects_write_only_fd() {
+        assert_eq!(
+            super::mmap_validate_file_access(0, MAP_PRIVATE, O_WRONLY),
+            Err(super::EACCES)
+        );
+        assert_eq!(
+            super::mmap_validate_file_access(PROT_WRITE, MAP_SHARED, O_WRONLY),
+            Err(super::EACCES)
+        );
+    }
+
+    #[test]
+    fn shared_writable_mmap_rejects_read_only_fd() {
+        assert_eq!(
+            super::mmap_validate_file_access(PROT_WRITE, MAP_SHARED, O_RDONLY),
+            Err(super::EACCES)
+        );
+    }
+
+    #[test]
+    fn shared_writable_mmap_accepts_read_write_fd() {
+        assert_eq!(
+            super::mmap_validate_file_access(PROT_WRITE, MAP_SHARED, O_RDWR),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn read_only_fd_accepts_nonshared_or_nonwritable_mmap() {
+        assert_eq!(
+            super::mmap_validate_file_access(PROT_WRITE, MAP_PRIVATE, O_RDONLY),
+            Ok(())
+        );
+        assert_eq!(
+            super::mmap_validate_file_access(0, MAP_SHARED, O_RDONLY),
+            Ok(())
+        );
     }
 
     #[test]

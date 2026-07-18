@@ -44,8 +44,8 @@ use super::page_flags::{
 };
 use super::writeback::{
     balance_dirty_pages, clear_page_dirty_for_io, end_page_writeback,
-    mark_page_dirty as writeback_mark_page_dirty, note_page_dirty, page_cache_remove,
-    start_page_writeback, track_mapping, untrack_mapping,
+    mark_page_dirty as writeback_mark_page_dirty, page_cache_remove, start_page_writeback,
+    track_mapping, untrack_mapping,
 };
 use super::xarray::XaMark;
 use crate::arch::x86::mm::paging::PAGE_SIZE;
@@ -412,41 +412,7 @@ pub unsafe fn filemap_grab_folio(mapping: *mut AddressSpace, index: u64) -> *mut
 ///
 /// Ref: Linux `set_page_dirty()` — `mm/page-writeback.c`
 pub unsafe fn set_page_dirty(page: *mut Page) -> bool {
-    if page.is_null() {
-        return false;
-    }
-    let was_dirty = unsafe { (&*page).flags.load(Ordering::Acquire) & PG_DIRTY != 0 };
-    if was_dirty {
-        unsafe { (&*page).flags.fetch_and(!super::page_flags::PG_RECLAIM, Ordering::Relaxed) };
-        return false;
-    }
-
-    let mapping = unsafe { (*page).mapping as *mut AddressSpace };
-    let mut callback_dirty = false;
-
-    unsafe {
-        if !mapping.is_null() {
-            let a_ops = (*mapping).a_ops;
-            if !a_ops.is_null() {
-                if let Some(dirty_fn) = (*a_ops).dirty_folio {
-                    callback_dirty = dirty_fn(mapping, page);
-                }
-            }
-        }
-    }
-
-    let is_dirty = unsafe { (&*page).flags.load(Ordering::Acquire) & PG_DIRTY != 0 };
-    if !was_dirty && is_dirty {
-        unsafe { note_page_dirty(page, true) };
-    } else if !was_dirty {
-        unsafe {
-            writeback_mark_page_dirty(page);
-        }
-    } else if is_dirty {
-        unsafe { note_page_dirty(page, false) };
-    }
-
-    (!was_dirty && is_dirty) || callback_dirty
+    unsafe { folio_mark_dirty(page) }
 }
 
 extern "C" fn linux_set_page_dirty(page: *mut Page) -> bool {
@@ -1804,7 +1770,36 @@ pub unsafe fn folio_wait_stable(folio: *mut Page) {
 }
 
 pub unsafe fn folio_mark_dirty(folio: *mut Page) -> bool {
-    unsafe { writeback_mark_page_dirty(folio) }
+    if folio.is_null() {
+        return false;
+    }
+
+    let mapping = unsafe { (*folio).mapping as *mut AddressSpace };
+    if mapping.is_null() {
+        return unsafe { noop_dirty_folio(mapping, folio) };
+    }
+
+    // Linux clears PG_reclaim in folio_mark_dirty() before dispatching to
+    // the filesystem.  The callback must still run for an already-dirty
+    // folio because filesystem-specific implementations can have additional
+    // work beyond setting the generic dirty bit.
+    unsafe {
+        (&*folio)
+            .flags
+            .fetch_and(!super::page_flags::PG_RECLAIM, Ordering::Relaxed);
+    }
+
+    let a_ops = unsafe { (*mapping).a_ops };
+    if !a_ops.is_null() {
+        if let Some(dirty_folio) = unsafe { (*a_ops).dirty_folio } {
+            return unsafe { dirty_folio(mapping, folio) };
+        }
+    }
+
+    // AddressSpace::new() permits an unset operations table while synthetic
+    // mappings are being assembled.  Use Linux's generic filemap callback as
+    // the compatibility fallback for those mappings.
+    unsafe { filemap_dirty_folio(mapping, folio) }
 }
 
 extern "C" fn linux_folio_mark_dirty(folio: *mut Page) -> bool {
@@ -1812,7 +1807,7 @@ extern "C" fn linux_folio_mark_dirty(folio: *mut Page) -> bool {
 }
 
 pub unsafe fn __folio_mark_dirty(folio: *mut Page, _mapping: *mut AddressSpace) -> bool {
-    unsafe { folio_mark_dirty(folio) }
+    unsafe { writeback_mark_page_dirty(folio) }
 }
 
 pub unsafe fn folio_mark_dirty_lock(folio: *mut Page) -> bool {
@@ -1823,11 +1818,18 @@ pub unsafe fn folio_mark_dirty_lock(folio: *mut Page) -> bool {
 }
 
 pub unsafe fn filemap_dirty_folio(_mapping: *mut AddressSpace, folio: *mut Page) -> bool {
-    unsafe { folio_mark_dirty(folio) }
+    // The generic implementation owns the already-dirty fast path.  It
+    // atomically sets PG_DIRTY and updates XArray/writeback accounting only
+    // on the clean-to-dirty transition.
+    unsafe { writeback_mark_page_dirty(folio) }
 }
 
-pub unsafe fn noop_dirty_folio(mapping: *mut AddressSpace, folio: *mut Page) -> bool {
-    unsafe { filemap_dirty_folio(mapping, folio) }
+pub unsafe fn noop_dirty_folio(_mapping: *mut AddressSpace, folio: *mut Page) -> bool {
+    if folio.is_null() {
+        return false;
+    }
+    let old = unsafe { (&*folio).flags.fetch_or(PG_DIRTY, Ordering::AcqRel) };
+    old & PG_DIRTY == 0
 }
 
 pub unsafe fn folio_clear_dirty_for_io(folio: *mut Page) -> bool {
@@ -1847,7 +1849,8 @@ pub unsafe fn folio_cancel_dirty(folio: *mut Page) -> bool {
 }
 
 pub unsafe fn folio_redirty_for_writepage(_wbc: *mut u8, folio: *mut Page) -> bool {
-    unsafe { folio_mark_dirty(folio) }
+    let mapping = unsafe { folio_mapping(folio) };
+    unsafe { filemap_dirty_folio(mapping, folio) }
 }
 
 extern "C" fn linux_folio_redirty_for_writepage(wbc: *mut u8, folio: *mut Page) -> bool {
@@ -2051,7 +2054,9 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
-    use crate::mm::address_space::{AddressSpace, set_page_uptodate, unlock_page};
+    use crate::mm::address_space::{
+        AddressSpace, AddressSpaceOperations, set_page_uptodate, unlock_page,
+    };
     use crate::mm::buddy::{page_in_mem_map, reset_buddy_state_for_test};
     use crate::mm::lru::reset_lru_state_for_test;
     use crate::mm::page::Page;
@@ -2132,7 +2137,10 @@ mod tests {
 
         for index in 0..128u64 {
             let page = alloc_test_page(index as u8);
-            assert_eq!(unsafe { filemap_add_folio(mptr, page, index, GFP_KERNEL) }, 0);
+            assert_eq!(
+                unsafe { filemap_add_folio(mptr, page, index, GFP_KERNEL) },
+                0
+            );
             assert_eq!(
                 crate::mm::writeback::snapshot_mappings(),
                 alloc::vec![mptr],
@@ -2367,11 +2375,16 @@ mod tests {
 
     static DIRTY_CALLBACK_CALLS: core::sync::atomic::AtomicUsize =
         core::sync::atomic::AtomicUsize::new(0);
+    static DIRTY_CALLBACK_SAW_RECLAIM: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
 
-    unsafe extern "C" fn counting_dirty_folio(_mapping: *mut AddressSpace, page: *mut Page) -> bool {
+    unsafe extern "C" fn counting_dirty_folio(mapping: *mut AddressSpace, page: *mut Page) -> bool {
         DIRTY_CALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
-        unsafe { (*page).flags.fetch_or(PG_DIRTY, Ordering::AcqRel) };
-        true
+        if unsafe { (*page).flags.load(Ordering::Acquire) & crate::mm::page_flags::PG_RECLAIM != 0 }
+        {
+            DIRTY_CALLBACK_SAW_RECLAIM.store(true, Ordering::Relaxed);
+        }
+        unsafe { filemap_dirty_folio(mapping, page) }
     }
 
     static COUNTING_DIRTY_OPS: AddressSpaceOperations = AddressSpaceOperations {
@@ -2389,9 +2402,10 @@ mod tests {
     };
 
     #[test]
-    fn repeated_shared_writes_to_dirty_page_skip_dirty_bookkeeping() {
+    fn mapped_dirty_dispatches_callback_but_accounts_once() {
         let _guard = test_guard();
         DIRTY_CALLBACK_CALLS.store(0, Ordering::Relaxed);
+        DIRTY_CALLBACK_SAW_RECLAIM.store(false, Ordering::Relaxed);
         let mut mapping = make_mapping();
         mapping.set_ops(&raw const COUNTING_DIRTY_OPS);
         let mptr = mapping.as_mut() as *mut AddressSpace;
@@ -2403,10 +2417,16 @@ mod tests {
         assert_eq!(crate::mm::writeback::stats().dirty_pages, 1);
 
         for _ in 0..64 {
+            unsafe {
+                (*page)
+                    .flags
+                    .fetch_or(crate::mm::page_flags::PG_RECLAIM, Ordering::Relaxed);
+            }
             assert!(!unsafe { set_page_dirty(page) });
         }
 
-        assert_eq!(DIRTY_CALLBACK_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(DIRTY_CALLBACK_CALLS.load(Ordering::Relaxed), 65);
+        assert!(!DIRTY_CALLBACK_SAW_RECLAIM.load(Ordering::Relaxed));
         assert_eq!(crate::mm::writeback::stats().dirty_pages, 1);
         assert_eq!(crate::mm::writeback::snapshot_mappings(), alloc::vec![mptr]);
 

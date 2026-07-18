@@ -4912,7 +4912,8 @@ mod tests {
 
         let sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE).unwrap();
         let mut req = [0u8; NLMSG_HDRLEN + 8];
-        req[0..4].copy_from_slice(&(req.len() as u32).to_ne_bytes());
+        let req_len = req.len() as u32;
+        req[0..4].copy_from_slice(&req_len.to_ne_bytes());
         req[4..6].copy_from_slice(&RTM_NEWADDR.to_ne_bytes());
         req[6..8].copy_from_slice(&1u16.to_ne_bytes());
         req[8..12].copy_from_slice(&0xaced_u32.to_ne_bytes());

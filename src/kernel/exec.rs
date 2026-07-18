@@ -1992,7 +1992,7 @@ mod tests {
 
     fn install_test_task<'a>(
         cred: &'a Cred,
-        no_new_privs: u8,
+        no_new_privs: u32,
     ) -> (Box<TaskStruct>, *mut TaskStruct) {
         let mut task: Box<TaskStruct> = unsafe { Box::new(core::mem::zeroed()) };
         task.cred = cred as *const Cred;
