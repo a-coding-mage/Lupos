@@ -152,6 +152,7 @@ pub const SHIPPED_COMMANDS_MARKERS: &[&str] = &[
     "shipped-commands: networking ok",
 ];
 const SPLASH_ART_BYTES: &[u8] = include_bytes!("../../branding/splashart.png");
+const LOGIN_WALLPAPER_BYTES: &[u8] = include_bytes!("../../branding/wallpaper.jpg");
 const GRUB_INTERACTIVE_TIMEOUT_SECS: u8 = 2;
 const GRUB_TEST_BOOT_TIMEOUT_SECS: u8 = 3;
 const LUPOS_QEMU_ACCEL_ENV: &str = "LUPOS_QEMU_ACCEL";
@@ -4532,11 +4533,11 @@ fn x11_root_xinitrc() -> Vec<u8> {
     format!("#!/bin/sh\n{X11_SESSION_BODY}").into_bytes()
 }
 
-/// LightDM's per-login session wrapper. The selected desktop is deliberately
-/// pinned to the same XFCE-first session that `startx` uses: Lupos currently
-/// offers one desktop, and avoiding distro shell-hook fan-out keeps login
-/// deterministic on the single-vCPU guest.
-fn lightdm_session_wrapper() -> Vec<u8> {
+/// Per-user LightDM session hook. Arch's stock `/etc/lightdm/Xsession` sources
+/// an executable `$HOME/.xsession` before its final `exec "$@"`; keeping this
+/// hook in the package-unowned home directory lets Lupos establish the
+/// per-session D-Bus required by XFCE without replacing LightDM's wrapper.
+fn lightdm_user_xsession() -> Vec<u8> {
     format!("#!/bin/sh\n{X11_SESSION_BODY}").into_bytes()
 }
 
@@ -4642,7 +4643,7 @@ fn lightdm_config() -> Vec<u8> {
 fn lightdm_gtk_greeter_config() -> Vec<u8> {
     concat!(
         "[greeter]\n",
-        "background=/usr/share/backgrounds/lupos-login.png\n",
+        "background=/usr/share/backgrounds/lupos-login.jpg\n",
         "user-background=false\n",
         "theme-name=LuposLogin\n",
         "icon-theme-name=AdwaitaLegacy\n",
@@ -14191,6 +14192,25 @@ fn direct_stage_login_root_disk_overlay_files(
             0o100644,
             x11_fbdev_config(),
         ));
+        // Keep Arch's package-owned greeter configuration intact.  The GTK
+        // greeter merges administrator fragments from this directory and its
+        // stock file leaves `background` unset, which otherwise renders the
+        // login screen as a flat black canvas.
+        files.push(initramfs_file(
+            "etc/lightdm/lightdm-gtk-greeter.conf.d/50-lupos.conf",
+            0o100644,
+            lightdm_gtk_greeter_config(),
+        ));
+        files.push(initramfs_file(
+            "usr/share/backgrounds/lupos-login.jpg",
+            0o100644,
+            LOGIN_WALLPAPER_BYTES,
+        ));
+        files.push(initramfs_file(
+            "usr/share/themes/LuposLogin/gtk-3.0/gtk.css",
+            0o100644,
+            lightdm_gtk_theme_css(),
+        ));
         // Pin the PNG AdwaitaLegacy icon theme for plain GTK apps
         // (settings.ini) and for the XSETTINGS owner xfsettingsd — the stock
         // xfce4-settings default pins the SVG-only `elementary` theme.  The
@@ -14229,6 +14249,11 @@ fn direct_stage_login_root_disk_overlay_files(
             "root/.xinitrc",
             0o100755,
             x11_root_xinitrc(),
+        ));
+        files.push(initramfs_file(
+            "home/lupos/.xsession",
+            0o100755,
+            lightdm_user_xsession(),
         ));
         files.push(initramfs_file(
             "etc/systemd/system/lightdm.service.d/50-lupos-debug.conf",
@@ -15347,15 +15372,29 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             send: b"poweroff -f\n",
         },
     ];
-    let hmp_steps = [HmpExpectStep {
-        // The stock greeter selects the first discovered account and
-        // starts PAM itself.  Inject only the password after LightDM has
-        // logged the real prompt, so keystrokes cannot race GTK startup
-        // or alter the package's normal user-selection behavior.
-        label: "greeter password prompt",
-        wait_for: "Prompt greeter with 1 message(s)",
-        text: Some("lupos"),
-    }];
+    let hmp_steps = [
+        HmpExpectStep {
+            // Exercise the real PAM rejection path before the successful
+            // login. LightDM must keep the greeter/X server alive and start a
+            // fresh authentication conversation after PAM_AUTH_ERR.
+            label: "greeter first password prompt",
+            wait_for: "Prompt greeter with 1 message(s)",
+            text: Some("wrong"),
+        },
+        HmpExpectStep {
+            label: "greeter rejects wrong password",
+            wait_for: "Authenticate result for user lupos: Authentication failure",
+            text: None,
+        },
+        HmpExpectStep {
+            // This match is cursor-scoped after the failure marker above, so
+            // it proves the same greeter reached a new prompt before typing
+            // the valid password.
+            label: "greeter retry password prompt",
+            wait_for: "Prompt greeter with 1 message(s)",
+            text: Some("lupos"),
+        },
+    ];
 
     let run = build_and_run_iso_with_serial_expect_display(
         BootMode::GraphicsX11,
@@ -15379,7 +15418,10 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: greeter ok",
         "graphics-x11: greeter-ready ok",
         "graphics-x11: service-xorg ready",
+        "[Configuration] Reading file: /etc/lightdm/lightdm-gtk-greeter.conf.d/50-lupos.conf",
         "Greeter start authentication for lupos",
+        "Authentication complete with return value 7: Authentication failure",
+        "Authenticate result for user lupos: Authentication failure",
         "Authenticate result for user lupos: Success",
         "User lupos authorized",
         "Greeter requests session xfce",
@@ -15472,6 +15514,8 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "Error writing X authority",
         "-bash: lupos: command not found",
         "Unrecognized image file format",
+        "Failed to load background",
+        "Failed to read wallpaper",
         "no screens found",
         "Fatal server error",
     ] {
@@ -23662,6 +23706,37 @@ failed command output\n";
         assert!(xorg_conf.contains("Option \"Device\" \"/dev/input/event0\""));
         assert!(xorg_conf.contains("InputDevice \"LuposKeyboard\" \"CoreKeyboard\""));
 
+        let greeter_config = core::str::from_utf8(
+            initramfs_file_bytes(
+                &files,
+                "etc/lightdm/lightdm-gtk-greeter.conf.d/50-lupos.conf",
+            )
+            .expect("Lupos greeter configuration fragment staged"),
+        )
+        .expect("greeter configuration UTF-8");
+        assert!(
+            greeter_config.contains("background=/usr/share/backgrounds/lupos-login.jpg"),
+            "greeter fragment must select the staged wallpaper"
+        );
+        assert!(
+            greeter_config.contains("theme-name=LuposLogin"),
+            "greeter fragment must select the staged GTK theme"
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/share/backgrounds/lupos-login.jpg"),
+            Some(LOGIN_WALLPAPER_BYTES),
+            "greeter wallpaper bytes must match the branded source asset"
+        );
+        let greeter_css = core::str::from_utf8(
+            initramfs_file_bytes(&files, "usr/share/themes/LuposLogin/gtk-3.0/gtk.css")
+                .expect("Lupos greeter GTK theme staged"),
+        )
+        .expect("greeter GTK theme UTF-8");
+        assert!(
+            greeter_css.contains("#login_window"),
+            "greeter GTK theme must style the login surface"
+        );
+
         let xinitrc = core::str::from_utf8(
             initramfs_file_bytes(&files, "root/.xinitrc").expect("root xinitrc staged"),
         )
@@ -23670,6 +23745,24 @@ failed command output\n";
         assert!(xinitrc.contains("startxfce4"));
         assert!(xinitrc.contains("xterm"));
         assert!(xinitrc.contains("exec twm"));
+
+        let user_xsession = find_initramfs_entry(&files, "home/lupos/.xsession")
+            .expect("package-unowned LightDM user xsession staged");
+        assert_eq!(
+            user_xsession.1 & 0o777,
+            0o755,
+            "stock Xsession only sources executable ~/.xsession files"
+        );
+        let user_xsession_body =
+            core::str::from_utf8(&user_xsession.2).expect("user xsession utf-8");
+        assert!(
+            user_xsession_body.contains("exec dbus-run-session -- startxfce4"),
+            "LightDM user session must start XFCE with a live session bus"
+        );
+        assert!(
+            user_xsession_body.contains("exec twm"),
+            "LightDM user session keeps the non-XFCE fallback"
+        );
 
         assert_eq!(
             find_initramfs_symlink_target(&files, "etc/systemd/system/display-manager.service"),
@@ -23689,6 +23782,7 @@ failed command output\n";
             "usr/lib/systemd/system/lightdm.service",
             "etc/lightdm/lightdm.conf",
             "etc/lightdm/lightdm-gtk-greeter.conf",
+            "etc/lightdm/Xsession",
             "etc/pam.d/lightdm",
             "etc/pam.d/lightdm-greeter",
             "etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml",
