@@ -304,20 +304,23 @@ pub unsafe fn sys_unshare(flags: u64) -> i64 {
         // duplication that lands with M39 / M52.  Reject them for now.
         return -22;
     }
-    if flags & CLONE_NEWNS != 0 && flags & CLONE_NEWUSER == 0 {
+    if flags & CLONE_NEWUSER != 0 {
+        // User namespaces grant capabilities that must be scoped to the new
+        // namespace. Keep unshare(CLONE_NEWUSER) fail-closed until capability
+        // checks are namespace-aware; otherwise the new effective bits pass
+        // global capable() checks such as CAP_SYS_ADMIN.
+        return -1;
+    }
+    if flags & CLONE_NEWNS != 0 {
         // The mount tree itself is private, but systemd's bare root mount-
         // namespace path also relies on the full shared/slave propagation
         // graph. Keep that capability probe fail-closed until propagation is
-        // complete. Rootless sandboxes create the owning user namespace and
-        // mount namespace atomically and use the isolated path below.
+        // complete.
         return -1;
     }
     // Creating namespaces owned by the current user namespace requires
-    // CAP_SYS_ADMIN there.  CLONE_NEWUSER is the rootless Linux path: the
-    // caller receives capabilities in the new user namespace and can create
-    // the remaining namespaces atomically inside it.
+    // CAP_SYS_ADMIN there.
     if flags & NSPROXY_FLAGS != 0
-        && flags & CLONE_NEWUSER == 0
         && !crate::kernel::capability::capable(crate::kernel::capability::CAP_SYS_ADMIN)
     {
         return -1;
@@ -462,6 +465,8 @@ mod tests {
         unsafe { sched::set_current(&mut *task as *mut TaskStruct) };
 
         assert_eq!(unsafe { sys_unshare(CLONE_NEWNS) }, -1);
+        assert_eq!(unsafe { sys_unshare(CLONE_NEWUSER) }, -1);
+        assert_eq!(unsafe { sys_unshare(CLONE_NEWUSER | CLONE_NEWNS) }, -1);
 
         // Other namespace families remain available independently.
         assert_eq!(unsafe { sys_unshare(CLONE_NEWUTS) }, 0);
@@ -483,9 +488,10 @@ mod tests {
             .next()
             .expect("kernel_clone preamble");
         assert!(
-            gate.contains("CLONE_NEWNS") && gate.contains("EPERM"),
-            "kernel_clone must keep a bare CLONE_NEWNS capability probe \
-             fail-closed while allowing atomic CLONE_NEWUSER|CLONE_NEWNS"
+            gate.contains("CLONE_NEWUSER")
+                && gate.contains("CLONE_NEWNS")
+                && gate.contains("EPERM"),
+            "kernel_clone must keep CLONE_NEWNS and CLONE_NEWUSER fail-closed"
         );
     }
 
