@@ -19,7 +19,8 @@ use spin::Mutex;
 use super::list::ListHead;
 use super::page::Page;
 use super::page_flags::{
-    PG_ACTIVE, PG_LRU, PG_RECLAIM, PG_REFERENCED, PG_SWAPBACKED, PG_UNEVICTABLE, PG_WORKINGSET,
+    PG_ACTIVE, PG_LRU, PG_LRU_PENDING, PG_RECLAIM, PG_REFERENCED, PG_SWAPBACKED, PG_UNEVICTABLE,
+    PG_WORKINGSET,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +39,8 @@ pub struct LruStats {
     pub inactive_file: usize,
     pub active_file: usize,
 }
+
+const LRU_ADD_BATCH: usize = 31;
 
 struct LruState {
     initialized: bool,
@@ -77,16 +80,32 @@ impl LruState {
         self.initialized = true;
     }
 
-    fn pending_contains(&self, page: *mut Page) -> bool {
-        self.pending.iter().copied().any(|queued| queued == page)
-    }
-
     fn remove_pending(&mut self, page: *mut Page) -> bool {
         if let Some(idx) = self.pending.iter().position(|&queued| queued == page) {
             self.pending.swap_remove(idx);
+            unsafe { (&*page).flags.fetch_and(!PG_LRU_PENDING, Ordering::Release) };
             true
         } else {
             false
+        }
+    }
+
+    unsafe fn drain_pending(&mut self) {
+        let pending = core::mem::take(&mut self.pending);
+        for page in pending {
+            if page.is_null() {
+                continue;
+            }
+            let flags = unsafe { (&*page).flags.fetch_and(!PG_LRU_PENDING, Ordering::AcqRel) };
+            if (flags & PG_LRU) != 0 {
+                continue;
+            }
+            let has_mapping = unsafe { (*page).mapping != 0 };
+            let swapbacked = (flags & PG_SWAPBACKED) != 0;
+            if !has_mapping && !swapbacked {
+                continue;
+            }
+            unsafe { self.attach(page, classify_page(page)) };
         }
     }
 
@@ -168,31 +187,20 @@ pub unsafe fn lru_cache_add(page: *mut Page) {
     let mut state = LRU_STATE.lock();
     unsafe { state.ensure_init() };
     let flags = unsafe { (&*page).flags.load(Ordering::Acquire) };
-    if (flags & PG_LRU) != 0 || state.pending_contains(page) {
+    if (flags & (PG_LRU | PG_LRU_PENDING)) != 0 {
         return;
     }
+    unsafe { (&*page).flags.fetch_or(PG_LRU_PENDING, Ordering::Release) };
     state.pending.push(page);
+    if state.pending.len() >= LRU_ADD_BATCH {
+        unsafe { state.drain_pending() };
+    }
 }
 
 pub fn lru_add_drain() {
     let mut state = LRU_STATE.lock();
     unsafe { state.ensure_init() };
-    let pending = core::mem::take(&mut state.pending);
-    for page in pending {
-        if page.is_null() {
-            continue;
-        }
-        let flags = unsafe { (&*page).flags.load(Ordering::Acquire) };
-        if (flags & PG_LRU) != 0 {
-            continue;
-        }
-        let has_mapping = unsafe { (*page).mapping != 0 };
-        let swapbacked = (flags & PG_SWAPBACKED) != 0;
-        if !has_mapping && !swapbacked {
-            continue;
-        }
-        unsafe { state.attach(page, classify_page(page)) };
-    }
+    unsafe { state.drain_pending() };
 }
 
 pub unsafe fn mark_page_accessed(page: *mut Page) {
@@ -228,7 +236,7 @@ pub unsafe fn mark_page_accessed(page: *mut Page) {
         (&*page).flags.fetch_and(!PG_REFERENCED, Ordering::Relaxed);
     }
 
-    if !state.pending_contains(page) {
+    if (unsafe { (&*page).flags.load(Ordering::Acquire) } & PG_LRU_PENDING) == 0 {
         unsafe {
             state.attach(page, classify_page(page));
         }
@@ -245,10 +253,13 @@ pub unsafe fn remove_lru_page(page: *mut Page) {
     unsafe {
         state.detach(page);
     }
-    state.remove_pending(page);
+    let flags = unsafe { (&*page).flags.load(Ordering::Acquire) };
+    if (flags & PG_LRU_PENDING) != 0 {
+        state.remove_pending(page);
+    }
     unsafe {
         (&*page).flags.fetch_and(
-            !(PG_LRU | PG_ACTIVE | PG_REFERENCED | PG_WORKINGSET | PG_RECLAIM),
+            !(PG_LRU | PG_LRU_PENDING | PG_ACTIVE | PG_REFERENCED | PG_WORKINGSET | PG_RECLAIM),
             Ordering::Relaxed,
         );
     }
@@ -298,7 +309,7 @@ pub unsafe fn putback_page(page: *mut Page) {
     let mut state = LRU_STATE.lock();
     unsafe { state.ensure_init() };
     let flags = unsafe { (&*page).flags.load(Ordering::Acquire) };
-    if state.pending_contains(page) || (flags & PG_LRU) != 0 {
+    if (flags & (PG_LRU_PENDING | PG_LRU)) != 0 {
         return;
     }
     unsafe {
@@ -328,6 +339,11 @@ pub fn lru_stats() -> LruStats {
 #[cfg(test)]
 pub fn reset_lru_state_for_test() {
     *LRU_STATE.lock() = LruState::new();
+}
+
+#[cfg(test)]
+fn pending_lru_pages_for_test() -> usize {
+    LRU_STATE.lock().pending.len()
 }
 
 #[cfg(test)]
@@ -420,5 +436,44 @@ mod tests {
 
         unsafe { filemap_remove_folio(page) };
         unsafe { free_test_page(page) };
+    }
+    #[test]
+    fn lru_cache_add_drains_at_batch_limit() {
+        let _guard = test_guard();
+
+        let mut mapping = Box::new(AddressSpace::new());
+        let mptr = mapping.as_mut() as *mut AddressSpace;
+        let mut pages = Vec::new();
+
+        for index in 0..(LRU_ADD_BATCH + 1) {
+            let page = alloc_test_page();
+            assert_eq!(
+                unsafe { filemap_add_folio(mptr, page, index as u64, GFP_KERNEL) },
+                0
+            );
+            assert!(
+                pending_lru_pages_for_test() < LRU_ADD_BATCH,
+                "pending LRU add batch grew to the configured drain limit"
+            );
+            pages.push(page);
+        }
+
+        assert_eq!(pending_lru_pages_for_test(), 1);
+        assert_eq!(lru_len(LruList::InactiveFile), LRU_ADD_BATCH);
+
+        lru_add_drain();
+        assert_eq!(pending_lru_pages_for_test(), 0);
+        assert_eq!(lru_len(LruList::InactiveFile), LRU_ADD_BATCH + 1);
+        for &page in &pages {
+            assert_eq!(
+                unsafe { (&*page).flags.load(Ordering::Relaxed) } & PG_LRU_PENDING,
+                0
+            );
+        }
+
+        for page in pages {
+            unsafe { filemap_remove_folio(page) };
+            unsafe { free_test_page(page) };
+        }
     }
 }
