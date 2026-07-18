@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 use spin::Mutex;
 
-use crate::include::uapi::errno::{EHOSTUNREACH, EINVAL, ENETDOWN, ENOTCONN};
+use crate::include::uapi::errno::{EADDRNOTAVAIL, EHOSTUNREACH, EINVAL, ENETDOWN, ENOTCONN};
 use crate::net::ip::{IPPROTO_ICMP, IPPROTO_TCP, IPPROTO_UDP, checksum};
 use crate::net::socket::{
     AF_INET, KernelSocket, QueuedPacket, RCV_SHUTDOWN, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, SockAddr,
@@ -373,6 +373,9 @@ pub(crate) fn send_inet(
             .or((socket.bound_ifindex != 0).then_some(socket.bound_ifindex))
             .or((socket.unicast_ifindex != 0).then_some(socket.unicast_ifindex))
             .unwrap_or(0);
+        if !crate::net::socket::inet_addr_is_local(source_addr, Some(preferred_ifindex)) {
+            return Some(Err(EADDRNOTAVAIL));
+        }
         (
             socket.sock_type,
             socket.protocol,
