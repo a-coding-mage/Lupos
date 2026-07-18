@@ -290,15 +290,18 @@ fn prepare_exec_creds(program: &LoadedProgram) -> Result<ProposedExecCreds, i32>
     if allow_privilege {
         if mode & S_ISUID != 0 {
             new.euid = file_uid;
-            new.suid = file_uid;
             new.fsuid = file_uid;
         }
         if mode & S_ISGID != 0 {
             new.egid = file_gid;
-            new.sgid = file_gid;
             new.fsgid = file_gid;
         }
     }
+
+    // POSIX exec semantics reset the saved IDs to the post-exec effective IDs
+    // for every successful exec, not only when setuid/setgid bits are honored.
+    new.suid = new.euid;
+    new.sgid = new.egid;
 
     if has_file_caps || (!allow_privilege && setid_or_caps) {
         new.cap_ambient = KernelCapT::empty();
@@ -2014,6 +2017,28 @@ mod tests {
         unsafe {
             assert_eq!((*proposed.cred).euid, KUid(0));
             assert_eq!((*proposed.cred).suid, KUid(0));
+        }
+        unsafe { sched::set_current(previous) };
+    }
+
+    #[test]
+    fn exec_creds_reset_saved_ids_on_plain_exec() {
+        let mut old = test_nonroot_cred(1000, 1000);
+        old.suid = KUid(0);
+        old.sgid = KGid(0);
+        let (_task, previous) = install_test_task(&old, 0);
+        let program = test_setid_program(0o0755, 2000, 2000, 0, false);
+        let proposed = prepare_exec_creds(&program).expect("prepare exec creds");
+
+        assert_eq!(
+            proposed.security(),
+            test_security(1000, 1000, 1000, 1000, true)
+        );
+        unsafe {
+            assert_eq!((*proposed.cred).euid, KUid(1000));
+            assert_eq!((*proposed.cred).suid, KUid(1000));
+            assert_eq!((*proposed.cred).egid, KGid(1000));
+            assert_eq!((*proposed.cred).sgid, KGid(1000));
         }
         unsafe { sched::set_current(previous) };
     }
