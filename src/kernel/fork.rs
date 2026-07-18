@@ -893,12 +893,17 @@ pub unsafe fn kernel_clone(args: &KernelCloneArgs) -> i64 {
     if effective_args.flags & CLONE_EMPTY_MNTNS != 0 {
         effective_args.flags |= CLONE_NEWNS;
     }
-    if effective_args.flags & CLONE_NEWNS != 0 && effective_args.flags & CLONE_NEWUSER == 0 {
+    if effective_args.flags & CLONE_NEWUSER != 0 {
+        // User namespaces grant capabilities that are meant to be scoped to
+        // the new namespace. Keep CLONE_NEWUSER fail-closed until capability
+        // checks are namespace-aware; otherwise those bits satisfy global
+        // capable() gates.
+        return -1; // EPERM
+    }
+    if effective_args.flags & CLONE_NEWNS != 0 {
         // Keep the privileged systemd mount-namespace capability probe on
         // its established container fallback until every service-manager
-        // propagation operation is modeled. Rootless sandboxes create the
-        // owning user namespace and private mount namespace atomically; that
-        // is the safe path supported below.
+        // propagation operation is modeled.
         return -1; // EPERM
     }
     let child = match unsafe { copy_process(parent, &effective_args) } {
