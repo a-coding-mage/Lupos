@@ -20,10 +20,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::arch::x86::kernel::idt::ExceptionFrame;
 use crate::kernel::printk::log_error;
 use crate::kernel::sched;
-use crate::kernel::task::{TIF_NEED_RESCHED, TaskStruct};
+use crate::kernel::task::{TaskStruct, TIF_NEED_RESCHED};
 use crate::mm::fault::{
-    FAULT_FLAG_DEFAULT, FAULT_FLAG_INSTRUCTION, FAULT_FLAG_USER, FAULT_FLAG_WRITE, FaultFlags,
-    VM_FAULT_ERROR, VmFaultFlags, handle_mm_fault,
+    handle_mm_fault, FaultFlags, VmFaultFlags, FAULT_FLAG_DEFAULT, FAULT_FLAG_INSTRUCTION,
+    FAULT_FLAG_USER, FAULT_FLAG_WRITE, VM_FAULT_ERROR,
 };
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
 use crate::mm::vm_flags::{VM_EXEC, VM_GROWSDOWN, VM_READ, VM_WRITE};
@@ -338,25 +338,19 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
                     let end = comm.iter().position(|&c| c == 0).unwrap_or(comm.len());
                     core::str::from_utf8(&comm[..end]).unwrap_or("<?>")
                 };
-                // Dump the faulting instruction bytes — but only for data faults,
-                // where rip is guaranteed present (it was fetched).  On an
-                // instruction-fetch fault rip itself may be unmapped, so reading
-                // it from the kernel would double-fault.
-                let mut insn = [0u8; 16];
-                if ec & X86_PF_INSTR == 0 {
-                    for (i, b) in insn.iter_mut().enumerate() {
-                        *b = unsafe { core::ptr::read_volatile((frame.rip as *const u8).add(i)) };
-                    }
-                }
+                // Do not dereference the user RIP here.  Even when the
+                // fault was caused by data access after a successful instruction
+                // fetch, only the bytes actually fetched by the CPU are known to
+                // be readable; probing a fixed instruction window can cross into
+                // an unmapped page and turn a user SIGSEGV into a kernel fault.
                 crate::linux_driver_abi::tty::serial_println!(
-                    "trace-user-pf pid={} comm={} fs_msr={:#x} task_fs={:#x} cr2={:#x} rip={:#x} insn={:02x?}",
+                    "trace-user-pf pid={} comm={} fs_msr={:#x} task_fs={:#x} cr2={:#x} rip={:#x}",
                     pid,
                     comm_str,
                     fs_msr,
                     task_fs,
                     addr,
-                    frame.rip,
-                    insn
+                    frame.rip
                 );
             }
             if pid == 1 {
@@ -611,7 +605,7 @@ mod tests {
     #[test]
     fn access_error_read_denied_on_no_read_vma() {
         let vma = VmAreaStruct::new(0x1000, 0x2000, 0); // no VM_READ
-        // No INSTR, no WRITE → read fault.
+                                                        // No INSTR, no WRITE → read fault.
         assert!(access_error(0, &vma));
     }
 
