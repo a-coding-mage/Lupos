@@ -539,10 +539,11 @@ static COMPAT_SPAWNSIG: AtomicI32 = AtomicI32::new(0);
 static COMPAT_SPAWNPID: AtomicI32 = AtomicI32::new(0);
 
 // `tty_legacy_tiocsti` — `drivers/tty/tty_io.c`. Gate for unprivileged
-// `TIOCSTI`; the build config sets `CONFIG_LEGACY_TIOCSTI=y`, so it starts
-// enabled. Toggled at runtime via `/proc/sys/dev/tty/legacy_tiocsti`.
+// `TIOCSTI`; default disabled so same-session processes cannot synthesize
+// terminal input unless explicitly re-enabled by the sysctl. Toggled at
+// runtime via `/proc/sys/dev/tty/legacy_tiocsti`.
 static TTY_LEGACY_TIOCSTI: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
+    core::sync::atomic::AtomicBool::new(false);
 // `tty_ldisc_autoload` — `drivers/tty/tty_ldisc.c`, `CONFIG_LDISC_AUTOLOAD=y`.
 // Only surfaced through `/proc/sys/dev/tty/ldisc_autoload` for now; Lupos has
 // no modular line disciplines to gate yet.
