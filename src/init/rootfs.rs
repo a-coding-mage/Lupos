@@ -185,6 +185,8 @@ fn dev_kmsg_poll(
     }
 }
 
+const CONSOLE_INPUT_DRAIN_BUDGET: usize = 32;
+
 lazy_static! {
     static ref CONSOLE_CANON_BUFFER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
     static ref CONSOLE_READY_BUFFER: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
@@ -216,6 +218,16 @@ pub(crate) fn clear_console_input_for_tests() {
     CONSOLE_CANON_BUFFER.lock().clear();
     CONSOLE_READY_BUFFER.lock().clear();
     TEST_HW_INPUT_QUEUE.lock().clear();
+}
+
+#[cfg(test)]
+fn console_ready_len_for_tests() -> usize {
+    CONSOLE_READY_BUFFER.lock().len()
+}
+
+#[cfg(test)]
+fn console_hardware_input_len_for_tests() -> usize {
+    TEST_HW_INPUT_QUEUE.lock().len()
 }
 
 #[cfg(test)]
@@ -253,9 +265,7 @@ pub enum LegacyInitrdLoad {
 }
 
 pub fn drain_console_control_bytes() {
-    while let Some(input) = try_console_input() {
-        process_console_input(input);
-    }
+    let _ = drain_console_available_input(CONSOLE_INPUT_DRAIN_BUDGET);
 }
 
 fn deliver_console_signal(sig: i32) {
@@ -509,6 +519,18 @@ fn current_has_pending_signal() -> bool {
     crate::kernel::signal::has_pending_signals(current)
 }
 
+fn drain_console_available_input(limit: usize) -> bool {
+    let mut drained = false;
+    for _ in 0..limit {
+        let Some(input) = try_console_input() else {
+            break;
+        };
+        process_console_input(input);
+        drained = true;
+    }
+    drained
+}
+
 fn console_read_ready_or_signal(buf: &mut [u8], pos: &mut u64) -> Result<Option<usize>, i32> {
     let n = drain_console_ready(buf);
     if n > 0 {
@@ -588,18 +610,16 @@ fn console_read(
             return Ok(n);
         }
 
-        // Drain every input byte that is already available before returning.
-        // Multi-byte key sequences (arrow/Home/End/Delete keys decode to
-        // `ESC [ ...`) arrive in the input queue together, but the source
-        // hands them back one byte per call. Returning a lone `ESC` makes a
-        // raw-mode reader (bash readline) hit its ESC keyseq timeout and
-        // mis-parse the rest as literal input, corrupting in-line editing.
-        // Draining to exhaustion keeps the whole sequence in a single read().
-        let mut drained = false;
-        while let Some(input) = try_console_input() {
-            process_console_input(input);
-            drained = true;
-        }
+        // Drain a bounded burst of input before returning. Multi-byte key
+        // sequences (arrow/Home/End/Delete keys decode to `ESC [ ...`) arrive
+        // in the input queue together, but the source hands them back one byte
+        // per call. Returning a lone `ESC` makes a raw-mode reader (bash
+        // readline) hit its ESC keyseq timeout and mis-parse the rest as
+        // literal input, corrupting in-line editing. Keep a modest burst in one
+        // read() without letting a serial flood keep us in kernel context or
+        // grow the console buffers without bound.
+        let drain_limit = core::cmp::max(buf.len(), CONSOLE_INPUT_DRAIN_BUDGET);
+        let drained = drain_console_available_input(drain_limit);
         if drained {
             if let Some(n) = console_read_ready_or_signal(buf, pos)? {
                 return Ok(n);
@@ -3921,6 +3941,40 @@ mod tests {
         assert_eq!(&buf[..1], b"\n");
         assert_eq!(pos, 1);
         assert_eq!(CONSOLE_WAIT_TEST_COUNT.load(Ordering::SeqCst), 1);
+
+        reset_console_buffers();
+    }
+
+    #[test]
+    fn console_read_limits_raw_hardware_input_drain() {
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        reset_console_buffers();
+
+        let file = alloc_file(
+            crate::fs::dcache::d_alloc("tty"),
+            O_RDONLY,
+            0,
+            &CONSOLE_FILE_OPS,
+        );
+        let mut termios = crate::linux_driver_abi::tty::KernelTermios::default();
+        termios.c_lflag &= !(crate::linux_driver_abi::tty::LFLAG_ICANON
+            | crate::linux_driver_abi::tty::LFLAG_ECHO);
+        crate::linux_driver_abi::tty::set_compat_termios(termios);
+
+        push_hardware_input_for_tests(&[b'x'; 100]);
+        let mut buf = [0u8; 1];
+        let mut pos = 0u64;
+        assert_eq!(console_read(&file, &mut buf, &mut pos), Ok(1));
+        assert_eq!(buf[0], b'x');
+        assert_eq!(pos, 1);
+        assert_eq!(
+            console_ready_len_for_tests(),
+            CONSOLE_INPUT_DRAIN_BUDGET - 1
+        );
+        assert_eq!(
+            console_hardware_input_len_for_tests(),
+            100 - CONSOLE_INPUT_DRAIN_BUDGET
+        );
 
         reset_console_buffers();
     }
