@@ -42,7 +42,7 @@ use super::mount;
 use super::namei::{LookupCtx, path_lookupat};
 use super::openat::{do_openat2, do_openat2_with_hint, sys_openat};
 use super::ops::{NOOP_FILE_OPS, NOOP_INODE_OPS};
-use super::permission::check_file_write_permission;
+use super::permission::check_inode_write_permission;
 use super::read_write::{vfs_fsync, vfs_lseek, vfs_read, vfs_write};
 use super::select;
 pub use super::select::PollFd;
@@ -3025,14 +3025,17 @@ fn linkat_path(
     if new_path.is_empty() {
         return Err(ENOENT);
     }
-    let (new_parent, new_dir, new_name) = rename_parent(newdfd, new_path)?;
-    if !same_superblock(&old_inode, &new_dir)? {
-        return Err(EXDEV);
-    }
-    if lookup_child_optional(&new_parent, &new_dir, &new_name)?.is_some() {
+    let (new_parent, new_dir, new_name) = linkat_parent(newdfd, new_path)?;
+    if lookup_child_optional(&new_parent.dentry, &new_dir, &new_name)?.is_some() {
         return Err(EEXIST);
     }
-    check_file_write_permission(&new_parent, &new_dir)?;
+    if new_parent.mount.is_readonly() {
+        return Err(crate::include::uapi::errno::EROFS);
+    }
+    if !Arc::ptr_eq(&old_target.mount, &new_parent.mount) {
+        return Err(EXDEV);
+    }
+    check_inode_write_permission(&new_dir)?;
 
     match &new_dir.private {
         InodePrivate::RamDir(children) => {
@@ -3051,11 +3054,24 @@ fn linkat_path(
         _ => return Err(ENOSYS),
     }
 
-    super::dcache::d_drop(&new_parent, &new_name);
-    let linked = super::dcache::d_alloc_child(&new_parent, &new_name);
+    super::dcache::d_drop(&new_parent.dentry, &new_name);
+    let linked = super::dcache::d_alloc_child(&new_parent.dentry, &new_name);
     linked.instantiate(old_inode);
-    super::inotify::notify_create(&new_parent, &new_name, false);
+    super::inotify::notify_create(&new_parent.dentry, &new_name, false);
     Ok(())
+}
+
+fn linkat_parent(dirfd: i32, path: &str) -> Result<(StatTarget, InodeRef, String), i32> {
+    let (parent_path, last) = split_last(path);
+    if last.is_empty() || last == "." || last == ".." {
+        return Err(ENOENT);
+    }
+    let parent = lookup_path_str_with_follow(dirfd, parent_path, true)?;
+    let parent_inode = parent.dentry.inode().ok_or(ENOENT)?;
+    if parent_inode.kind != InodeKind::Directory {
+        return Err(ENOTDIR);
+    }
+    Ok((parent, parent_inode, String::from(last)))
 }
 
 pub unsafe fn sys_symlinkat(oldname: *const u8, newdfd: i32, newname: *const u8) -> i64 {
@@ -5513,6 +5529,40 @@ mod tests {
             let mut stat_buf = LinuxStat::default();
             assert_eq!(
                 sys_lstat(b"/ro/hard\0".as_ptr(), &mut stat_buf),
+                -(ENOENT as i64)
+            );
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn linkat_rejects_distinct_bind_mount_of_same_filesystem() {
+        let _guard = mount::TEST_MOUNT_LOCK.lock();
+        let (mut current, previous) = setup_current_with_rootfs(864);
+        unsafe {
+            assert_eq!(sys_mkdirat(AT_FDCWD, b"/source\0".as_ptr(), 0o755), 0);
+            assert_eq!(sys_mkdirat(AT_FDCWD, b"/alias\0".as_ptr(), 0o755), 0);
+            assert!(sys_creat(b"/source/file\0".as_ptr(), 0o644) >= 0);
+            assert_eq!(
+                mount::sys_mount(
+                    b"/source\0".as_ptr(),
+                    b"/alias\0".as_ptr(),
+                    core::ptr::null(),
+                    crate::include::uapi::mount::MS_BIND as u64,
+                    core::ptr::null(),
+                ),
+                0
+            );
+
+            assert_eq!(
+                sys_link(b"/source/file\0".as_ptr(), b"/alias/hard\0".as_ptr()),
+                -(EXDEV as i64)
+            );
+            let mut stat_buf = LinuxStat::default();
+            assert_eq!(
+                sys_lstat(b"/alias/hard\0".as_ptr(), &mut stat_buf),
                 -(ENOENT as i64)
             );
 
