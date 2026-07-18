@@ -171,6 +171,9 @@ pub struct KernelTermios {
     pub c_lflag: u32,
     pub c_line: u8,
     pub c_cc: [u8; USER_NCCS],
+    // Explicitly model the x86-64 userspace ABI padding so raw ioctl copies
+    // never expose Rust struct padding bytes to userspace.
+    pub __padding: [u8; 3],
     pub c_ispeed: u32,
     pub c_ospeed: u32,
 }
@@ -187,6 +190,7 @@ impl Default for KernelTermios {
                 3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
             ],
+            __padding: [0; 3],
             c_ispeed: DEFAULT_TTY_SPEED,
             c_ospeed: DEFAULT_TTY_SPEED,
         }
@@ -794,6 +798,7 @@ pub fn tty_ioctl_compat(cmd: u32, arg: u64) -> Result<i64, i32> {
                 )
             };
             if not_copied == 0 {
+                termios.__padding = [0; 3];
                 set_compat_termios(termios);
                 Ok(0)
             } else {
@@ -842,6 +847,7 @@ pub fn tty_ioctl_compat(cmd: u32, arg: u64) -> Result<i64, i32> {
                     c_lflag: termios2.c_lflag,
                     c_line: termios2.c_line,
                     c_cc,
+                    __padding: [0; 3],
                     c_ispeed: termios2.c_ispeed,
                     c_ospeed: termios2.c_ospeed,
                 };
