@@ -72,11 +72,13 @@ pub const PG_DROPBEHIND: u64 = 1 << 19;
 pub const PG_MLOCKED: u64 = 1 << 20;
 /// Hardware-poisoned page — do not touch (CONFIG_MEMORY_FAILURE).
 pub const PG_HWPOISON: u64 = 1 << 21;
+/// Page is queued on the deferred LRU add batch.
+pub const PG_LRU_PENDING: u64 = 1 << 22;
 
-/// Total number of defined page flags (matches Linux __NR_PAGEFLAGS).
+/// Total number of defined page flags (matches Linux __NR_PAGEFLAGS plus local LRU queue state).
 /// Conditional flags (PG_young, PG_idle, PG_arch_2, PG_arch_3) are omitted
 /// for now — they depend on CONFIG options not yet relevant.
-pub const NR_PAGEFLAGS: u32 = 22;
+pub const NR_PAGEFLAGS: u32 = 23;
 
 // Aliases matching Linux (page-flags.h:132-137)
 pub const PG_READAHEAD: u64 = PG_RECLAIM;
