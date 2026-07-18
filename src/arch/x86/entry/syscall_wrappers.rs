@@ -3523,22 +3523,104 @@ pub unsafe extern "C" fn __x64_sys_getsid(regs: *mut PtRegs) -> i64 {
 
 pub unsafe extern "C" fn __x64_sys_capget(regs: *mut PtRegs) -> i64 {
     let r = unsafe { &*regs };
-    unsafe {
-        crate::kernel::capability::sys_capget(
-            r.arg0() as *mut crate::kernel::capability::UserCapHeader,
-            r.arg1() as *mut crate::kernel::capability::UserCapData,
-        )
+    let header_user = r.arg0() as *mut crate::kernel::capability::UserCapHeader;
+    let datap_user = r.arg1() as *mut crate::kernel::capability::UserCapData;
+    if header_user.is_null() {
+        return -14;
     }
+
+    let mut header = crate::kernel::capability::UserCapHeader::default();
+    let header_size = core::mem::size_of::<crate::kernel::capability::UserCapHeader>();
+    let header_left = unsafe {
+        crate::arch::x86::kernel::uaccess::copy_from_user(
+            &mut header as *mut _ as *mut u8,
+            header_user as *const u8,
+            header_size,
+        )
+    };
+    if header_left != 0 {
+        return -14;
+    }
+
+    let requested_version = header.version;
+    let mut data = [crate::kernel::capability::UserCapData::default();
+        crate::kernel::capability::KERNEL_CAPABILITY_U32S];
+    let ret = unsafe {
+        crate::kernel::capability::sys_capget(
+            &mut header,
+            if datap_user.is_null() {
+                core::ptr::null_mut()
+            } else {
+                data.as_mut_ptr()
+            },
+        )
+    };
+
+    let header_left = unsafe {
+        crate::arch::x86::kernel::uaccess::copy_to_user(
+            header_user as *mut u8,
+            &header as *const _ as *const u8,
+            header_size,
+        )
+    };
+    if header_left != 0 {
+        return -14;
+    }
+    if ret == 0 && !datap_user.is_null() {
+        let words = if requested_version == crate::kernel::capability::LINUX_CAPABILITY_VERSION_1 {
+            1
+        } else {
+            2
+        };
+        let data_size = words * core::mem::size_of::<crate::kernel::capability::UserCapData>();
+        let data_left = unsafe {
+            crate::arch::x86::kernel::uaccess::copy_to_user(
+                datap_user as *mut u8,
+                data.as_ptr() as *const u8,
+                data_size,
+            )
+        };
+        if data_left != 0 {
+            return -14;
+        }
+    }
+    ret
 }
 
 pub unsafe extern "C" fn __x64_sys_capset(regs: *mut PtRegs) -> i64 {
     let r = unsafe { &*regs };
-    unsafe {
-        crate::kernel::capability::sys_capset(
-            r.arg0() as *const crate::kernel::capability::UserCapHeader,
-            r.arg1() as *const crate::kernel::capability::UserCapData,
-        )
+    let header_user = r.arg0() as *const crate::kernel::capability::UserCapHeader;
+    let datap_user = r.arg1() as *const crate::kernel::capability::UserCapData;
+    if header_user.is_null() || datap_user.is_null() {
+        return -14;
     }
+
+    let mut header = crate::kernel::capability::UserCapHeader::default();
+    let header_left = unsafe {
+        crate::arch::x86::kernel::uaccess::copy_from_user(
+            &mut header as *mut _ as *mut u8,
+            header_user as *const u8,
+            core::mem::size_of::<crate::kernel::capability::UserCapHeader>(),
+        )
+    };
+    if header_left != 0 {
+        return -14;
+    }
+
+    let mut data = [crate::kernel::capability::UserCapData::default();
+        crate::kernel::capability::KERNEL_CAPABILITY_U32S];
+    let data_left = unsafe {
+        crate::arch::x86::kernel::uaccess::copy_from_user(
+            data.as_mut_ptr() as *mut u8,
+            datap_user as *const u8,
+            core::mem::size_of_val(&data),
+        )
+    };
+    if data_left != 0 {
+        return -14;
+    }
+
+    unsafe { crate::kernel::capability::sys_capset(&header, data.as_ptr()) }
 }
 
 #[cfg(test)]
