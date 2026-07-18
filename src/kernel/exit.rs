@@ -467,6 +467,7 @@ pub unsafe fn release_task(p: *mut TaskStruct) {
         crate::security::security_task_free((*p).pid as u32);
 
         // 5. Drop task-owned shared state that is not released during do_exit.
+        crate::kernel::session::release_task_session_state((*p).pid);
         crate::kernel::syscalls::release_process_rlimits(p);
         crate::kernel::syscalls::release_task_rseq_registration(p);
         crate::kernel::time::posix_timers::release_task_posix_timers((*p).pid);

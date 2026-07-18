@@ -141,6 +141,31 @@ pub fn clear_controlling_tty(tty: ControllingTty) {
     CONTROLLING_TTYS.lock().retain(|entry| entry.tty != tty);
 }
 
+/// Remove the exiting/reaped task from the session side tables.
+///
+/// The controlling-TTY table is keyed only by the numeric session ID, so it
+/// must not outlive the last task in that session. Otherwise a later task that
+/// reuses the same PID as a session leader could inherit stale `/dev/tty`
+/// access or block a fresh TTY claim.
+pub fn release_task_session_state(pid: i32) {
+    let sid = {
+        let mut sessions = SESSIONS.lock();
+        let sid = sessions
+            .iter()
+            .find(|entry| entry.pid == pid)
+            .map(|entry| entry.sid)
+            .unwrap_or(pid);
+        sessions.retain(|entry| entry.pid != pid);
+        let session_has_tasks = sessions.iter().any(|entry| entry.sid == sid);
+        if session_has_tasks {
+            return;
+        }
+        sid
+    };
+
+    CONTROLLING_TTYS.lock().retain(|entry| entry.sid != sid);
+}
+
 /// Linux `is_current_pgrp_orphaned()` (`kernel/pid.c`, called from
 /// `__tty_check_change()`). A process group is orphaned unless some member
 /// has a parent that is in the same session but a *different* group — i.e. a
@@ -289,5 +314,40 @@ mod tests {
 
         assert_eq!(session_id(22), Some(20));
         assert_eq!(process_group(22), Some(21));
+    }
+
+    #[test]
+    fn releasing_last_session_task_clears_controlling_tty() {
+        reset_for_tests();
+        update_entry(30, |entry| {
+            entry.sid = 30;
+            entry.pgid = 30;
+        })
+        .unwrap();
+        claim_controlling_tty(30, ControllingTty::Console(0x500)).unwrap();
+
+        release_task_session_state(30);
+
+        assert_eq!(controlling_tty(30), None);
+        assert_eq!(
+            claim_controlling_tty(40, ControllingTty::Console(0x500)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn releasing_one_member_preserves_live_session_tty() {
+        reset_for_tests();
+        update_entry(50, |entry| {
+            entry.sid = 50;
+            entry.pgid = 50;
+        })
+        .unwrap();
+        inherit_from_parent(50, 51);
+        claim_controlling_tty(50, ControllingTty::Unix98Pty(1, 99)).unwrap();
+
+        release_task_session_state(51);
+
+        assert_eq!(controlling_tty(50), Some(ControllingTty::Unix98Pty(1, 99)));
     }
 }
