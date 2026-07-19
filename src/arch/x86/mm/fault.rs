@@ -315,10 +315,16 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
     }
     log_error!(
         "cpu",
-        "cpu: bad area addr={:#018x} error={:#010x} rip={:#018x} r12={:#018x} r13={:#018x} rbp={:#018x} rbx={:#018x}",
+        "cpu: bad area addr={:#018x} error={:#010x} rip={:#018x} rsp={:#018x} rax={:#018x} rcx={:#018x} rdx={:#018x} rsi={:#018x} rdi={:#018x} r12={:#018x} r13={:#018x} rbp={:#018x} rbx={:#018x}",
         addr,
         ec,
         frame.rip,
+        frame.user_rsp,
+        frame.rax,
+        frame.rcx,
+        frame.rdx,
+        frame.rsi,
+        frame.rdi,
         frame.r12,
         frame.r13,
         frame.rbp,
