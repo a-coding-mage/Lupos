@@ -64,6 +64,8 @@ pub const X86_PF_SHSTK: u64 = 1 << 6;
 // Addresses >= TASK_SIZE_MAX are in kernel space.
 // Ref: arch/x86/include/asm/processor.h — TASK_SIZE_MAX
 const TASK_SIZE_MAX: u64 = 0x0000_8000_0000_0000;
+const SEGV_MAPERR: i32 = 1;
+const SEGV_ACCERR: i32 = 2;
 
 // ---------------------------------------------------------------------------
 // M12 placeholder: current mm_struct pointer.
@@ -365,7 +367,8 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
                     addr, ec, frame.rip
                 );
             }
-            if deliver_user_sigsegv(frame, task) {
+            let si_code = user_sigsegv_code(task, addr);
+            if deliver_user_sigsegv(frame, task, addr, si_code) {
                 return;
             }
             unsafe {
@@ -374,6 +377,20 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
         }
     }
     panic!("Segmentation fault");
+}
+
+fn user_sigsegv_code(task: *mut TaskStruct, addr: u64) -> i32 {
+    if task.is_null() {
+        return SEGV_MAPERR;
+    }
+    let mm = unsafe { (*task).mm };
+    if mm.is_null() {
+        return SEGV_MAPERR;
+    }
+    match find_vma(unsafe { &*mm }, addr) {
+        Some(vma) if addr >= unsafe { (*vma).vm_start } => SEGV_ACCERR,
+        _ => SEGV_MAPERR,
+    }
 }
 
 /// Diagnostic: dump the VMAs surrounding a faulting user address so we can tell
@@ -500,10 +517,18 @@ unsafe fn write_ptregs_to_exception_frame(
 fn deliver_user_sigsegv(
     frame: &ExceptionFrame,
     task: *mut crate::kernel::task::TaskStruct,
+    addr: u64,
+    si_code: i32,
 ) -> bool {
     let mut regs = exception_frame_to_ptregs(frame);
+    let info = crate::kernel::signal::SigInfo::with_sigfault(
+        crate::kernel::signal::SIGSEGV,
+        si_code,
+        addr,
+        0,
+    );
     unsafe {
-        let _ = crate::kernel::signal::send_signal_to_task(task, crate::kernel::signal::SIGSEGV);
+        let _ = crate::kernel::signal::send_signal_info_to_task(task, info);
         if crate::kernel::signal::do_signal(&mut regs as *mut crate::kernel::task::PtRegs) {
             let frame_mut = frame as *const ExceptionFrame as *mut ExceptionFrame;
             write_ptregs_to_exception_frame(frame_mut, &regs);

@@ -441,6 +441,22 @@ unsafe fn save_fsgs(task: *mut TaskStruct) {
 #[cfg(test)]
 unsafe fn save_fsgs(_task: *mut TaskStruct) {}
 
+/// Snapshot the current task's live user FS/GS bases before copying thread
+/// state.  With FSGSBASE enabled userspace may change either base directly, so
+/// `task.thread` is not necessarily current until Linux's `current_save_fsgs()`
+/// equivalent runs.
+///
+/// Ref: Linux `arch/x86/kernel/process_64.c::current_save_fsgs()`.
+pub(crate) unsafe fn current_save_fsgs() {
+    let task = crate::kernel::sched::get_current();
+    if task.is_null() {
+        return;
+    }
+    unsafe {
+        save_fsgs(task);
+    }
+}
+
 #[cfg(not(test))]
 unsafe fn load_fsgs(task: *mut TaskStruct) {
     if task.is_null() {

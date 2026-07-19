@@ -631,6 +631,11 @@ pub unsafe fn copy_process(
             sp.sub(7) as u64
         };
 
+        // Userspace can change FS/GS directly with FSGSBASE instructions.
+        // Match Linux copy_thread() by snapshotting the live bases before
+        // copying the parent's thread_struct.
+        crate::arch::x86::kernel::switch::current_save_fsgs();
+
         let mut child_thread = ThreadStruct {
             tls_array: (*parent).thread.tls_array,
             sp: initial_sp,

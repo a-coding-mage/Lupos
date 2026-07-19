@@ -221,6 +221,10 @@ pub fn add_task_common(dir: &Arc<KernfsNode>) {
     );
     add_child(
         dir,
+        KernfsNode::new_dynamic_symlink("exe", proc_pid_exe_readlink),
+    );
+    add_child(
+        dir,
         KernfsNode::new_file(
             "uid_map",
             0o644,
@@ -265,6 +269,23 @@ pub fn add_task_common(dir: &Arc<KernfsNode>) {
             Some(super::array::self_oom_score_adj_store),
         ),
     );
+}
+
+fn proc_pid_exe_readlink(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    let pid = proc_pid_from_node(node)?;
+    let task = task_by_pid(pid);
+    if task.is_null() {
+        return Err(ENOENT);
+    }
+    let mm = unsafe { (*task).mm };
+    let file = unsafe { crate::mm::mm_public::get_mm_exe_file_ref(mm) }.ok_or(ENOENT)?;
+    let target = crate::fs::file::path_hint(&file)
+        .or_else(|| crate::fs::mount::stable_path_for_dentry(&file.dentry))
+        .unwrap_or_else(|| crate::fs::file::file_path(&file));
+    let n = target.len().min(buf.len());
+    buf[..n].copy_from_slice(&target.as_bytes()[..n]);
+    crate::fs::file::fput(file);
+    Ok(n)
 }
 
 fn proc_pid_from_node(node: &Arc<KernfsNode>) -> Result<i32, i32> {

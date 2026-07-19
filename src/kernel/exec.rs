@@ -1326,6 +1326,16 @@ unsafe fn commit_exec_for_current(
     unsafe {
         security::security_bprm_committing_creds(path.as_bytes());
         proposed_creds.commit();
+        let exe_file = crate::fs::file::alloc_file(
+            program.main.dentry.clone(),
+            crate::include::uapi::fcntl::O_RDONLY,
+            program.main.inode.mode.load(Ordering::Acquire),
+            program.main.inode.fops,
+        );
+        let exe_path = crate::fs::mount::stable_path_for_dentry(&program.main.dentry)
+            .unwrap_or_else(|| program.main.path.clone());
+        crate::fs::file::set_path_hint(&exe_file, exe_path);
+        crate::mm::mm_public::set_mm_exe_file_ref(mm, exe_file);
         (*task).mm = mm;
         (*task).active_mm = mm;
         (*task).thread.fsbase = 0;

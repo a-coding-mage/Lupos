@@ -97,6 +97,9 @@ pub unsafe fn dup_mm(old_mm: *mut MmStruct) -> Option<*mut MmStruct> {
         (*new_mm).arg_end = (*old_mm).arg_end;
         (*new_mm).env_start = (*old_mm).env_start;
         (*new_mm).env_end = (*old_mm).env_end;
+        if let Some(exe_file) = crate::mm::mm_public::get_mm_exe_file_ref(old_mm) {
+            crate::mm::mm_public::set_mm_exe_file_ref(new_mm, exe_file);
+        }
 
         // Allocate a fresh PGD (page table root) from the buddy allocator.
         // The PGD must be page-aligned and zeroed.
@@ -279,6 +282,7 @@ pub unsafe fn destroy_mm(mm: *mut MmStruct) {
 
     unsafe {
         crate::kernel::futex::futex_private_hash_mm_destroy(mm as u64);
+        crate::mm::mm_public::clear_mm_exe_file_ref(mm);
         exit_mmap(mm);
         free_user_page_tables(mm);
         free_mm_pgd(mm);

@@ -53,6 +53,7 @@ pub type OpenWriteFn =
 pub type OpenReleaseFn = fn(file: FileRef, node: &Arc<KernfsNode>);
 pub type DynamicLookupFn = fn(dir: &InodeRef, name: &str) -> Result<InodeRef, i32>;
 pub type DynamicReaddirFn = fn(file: &FileRef) -> Result<Option<(String, u64, InodeKind)>, i32>;
+pub type DynamicReadlinkFn = fn(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32>;
 
 pub enum KernfsKind {
     Dir,
@@ -65,6 +66,9 @@ pub enum KernfsKind {
     },
     Symlink {
         target: String,
+    },
+    DynamicSymlink {
+        readlink: DynamicReadlinkFn,
     },
 }
 
@@ -181,6 +185,20 @@ impl KernfsNode {
             dynamic_readdir: None,
         })
     }
+
+    pub fn new_dynamic_symlink(name: &str, readlink: DynamicReadlinkFn) -> Arc<Self> {
+        Arc::new(Self {
+            name: String::from(name),
+            kind: KernfsKind::DynamicSymlink { readlink },
+            parent: Mutex::new(Weak::new()),
+            children: Mutex::new(BTreeMap::new()),
+            mode: mode_for_symlink(),
+            ino: alloc_kn_ino(),
+            priv_ptr: AtomicU64::new(0),
+            dynamic_lookup: None,
+            dynamic_readdir: None,
+        })
+    }
 }
 
 fn mode_for_symlink() -> u32 {
@@ -232,7 +250,9 @@ pub fn list(parent: &Arc<KernfsNode>) -> Vec<(String, u64, InodeKind)> {
             let kind = match &v.kind {
                 KernfsKind::Dir => InodeKind::Directory,
                 KernfsKind::File { .. } => InodeKind::Regular,
-                KernfsKind::Symlink { .. } => InodeKind::Symlink,
+                KernfsKind::Symlink { .. } | KernfsKind::DynamicSymlink { .. } => {
+                    InodeKind::Symlink
+                }
             };
             (k.clone(), v.ino, kind)
         })
@@ -252,7 +272,7 @@ pub fn inode_for_node(sb: &SuperBlockRef, node: Arc<KernfsNode>) -> InodeRef {
     let kind = match &node.kind {
         KernfsKind::Dir => InodeKind::Directory,
         KernfsKind::File { .. } => InodeKind::Regular,
-        KernfsKind::Symlink { .. } => InodeKind::Symlink,
+        KernfsKind::Symlink { .. } | KernfsKind::DynamicSymlink { .. } => InodeKind::Symlink,
     };
     let raw = Arc::into_raw(node);
     let inode = Inode::new(
@@ -553,13 +573,15 @@ fn kernfs_release(file: super::types::FileRef) {
 
 fn kernfs_readlink(inode: &InodeRef, buf: &mut [u8]) -> Result<usize, i32> {
     let node = node_from_inode(inode);
-    let target = match &node.kind {
-        KernfsKind::Symlink { target } => target,
-        _ => return Err(EINVAL),
-    };
-    let n = target.len().min(buf.len());
-    buf[..n].copy_from_slice(&target.as_bytes()[..n]);
-    Ok(n)
+    match &node.kind {
+        KernfsKind::Symlink { target } => {
+            let n = target.len().min(buf.len());
+            buf[..n].copy_from_slice(&target.as_bytes()[..n]);
+            Ok(n)
+        }
+        KernfsKind::DynamicSymlink { readlink } => readlink(&node, buf),
+        _ => Err(EINVAL),
+    }
 }
 
 #[cfg(test)]
