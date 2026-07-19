@@ -339,6 +339,15 @@ unsafe fn exit_notify_locked(tsk: *mut TaskStruct, notify_parent: bool) {
                 (*c).m26.real_parent = new_parent;
                 (*c).m26.parent = new_parent;
                 add_child_link(new_parent, c);
+                // Linux forget_original_parent() delivers the signal selected
+                // with PR_SET_PDEATHSIG while reparenting each orphan.  Merely
+                // storing pdeath_signal lets supervised helpers (display
+                // greeters and `bwrap --die-with-parent`, for example) outlive
+                // their supervisor and retain privileged/session resources.
+                let pdeath_signal = (*c).m26.pdeath_signal;
+                if pdeath_signal > 0 {
+                    let _ = signal::send_signal_to_process_for_target(c, pdeath_signal);
+                }
             }
         }
 
@@ -581,6 +590,33 @@ mod tests {
             exit_notify(&mut *parent as *mut TaskStruct);
             assert_eq!(child.m26.real_parent, &mut *grand as *mut TaskStruct);
             assert_eq!(child.m26.parent, &mut *grand as *mut TaskStruct);
+        }
+    }
+
+    #[test]
+    fn exit_notify_delivers_parent_death_signal_to_reparented_child() {
+        signal::reset_for_tests();
+
+        let mut grand = make_task(10, 10);
+        let mut parent = make_task(11, 11);
+        let mut child = make_task(12, 12);
+
+        unsafe {
+            parent.m26.real_parent = &mut *grand as *mut TaskStruct;
+            parent.m26.parent = parent.m26.real_parent;
+            parent.m26.children[0] = &mut *child as *mut TaskStruct;
+            parent.m26.children_count = 1;
+            child.m26.real_parent = &mut *parent as *mut TaskStruct;
+            child.m26.parent = child.m26.real_parent;
+            child.m26.pdeath_signal = crate::kernel::signal::SIGTERM;
+
+            exit_notify(&mut *parent as *mut TaskStruct);
+
+            assert_eq!(child.m26.real_parent, &mut *grand as *mut TaskStruct);
+            assert!(
+                signal::has_pending_signal_for_pid(12, crate::kernel::signal::SIGTERM),
+                "PR_SET_PDEATHSIG must become pending when the parent exits"
+            );
         }
     }
 

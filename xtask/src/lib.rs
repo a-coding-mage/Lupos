@@ -264,6 +264,8 @@ const USERSPACE_SMOKE_PACMAN_HOOKDIR_PATH: &str = "usr/share/lupos/empty-hooks";
 const RUNTIME_STRESS_SCRIPT_PATH: &str = "usr/libexec/lupos-runtime-stress.sh";
 const SHIPPED_COMMANDS_SCRIPT_PATH: &str = "usr/libexec/lupos-shipped-commands.sh";
 const GRAPHICS_X11_PROBE_SCRIPT_PATH: &str = "usr/libexec/lupos-graphics-x11-probe.sh";
+const GRAPHICS_X11_SUDOERS_PATH: &str = "etc/sudoers.d/10-lupos-wheel";
+const GRAPHICS_X11_SUDOERS: &str = "%wheel ALL=(ALL:ALL) ALL\n";
 const PID1_HANDOFF_TRANSCRIPT: &str = concat!(
     "pid1-handoff: init: PID 1 entering runlevel 3\n",
     "pid1-handoff: rcS using kernel-prepared proc sys dev tmp run; hostname=lupos; modules loaded\n",
@@ -4401,6 +4403,118 @@ fn systemd_lupos_user_provision_unit() -> Vec<u8> {
     .to_vec()
 }
 
+/// Materialize polkit's packaged sysusers declaration before D-Bus parses
+/// policies that name `polkitd`.
+///
+/// The stock `systemd-sysusers` path commits account databases through an
+/// anonymous temporary file. Lupos does not yet reliably persist that commit,
+/// so a successful-looking sysusers run can leave the package declaration
+/// unapplied. This early, idempotent fallback only appends the exact account
+/// declared by the installed polkit package. It never overlays the
+/// package-owned account databases in the root-disk image.
+fn polkitd_account_provision_script() -> Vec<u8> {
+    br#"#!/bin/sh
+set -eu
+export LC_ALL=C
+
+die() {
+    printf 'lupos-provision-polkitd: %s\n' "$*" >&2
+    exit 1
+}
+
+config=/usr/lib/sysusers.d/polkit.conf
+[ -r "$config" ] || die "missing packaged sysusers declaration"
+/usr/bin/grep -Fqx 'g polkitd 102' "$config" ||
+    die "packaged polkitd group declaration changed"
+/usr/bin/grep -Fqx 'u polkitd 102:102 "User for polkitd"' "$config" ||
+    die "packaged polkitd user declaration changed"
+
+group_count="$(/usr/bin/awk -F: '$1 == "polkitd" { n++ } END { print n + 0 }' /etc/group)"
+[ "$group_count" -le 1 ] || die "duplicate polkitd group entries"
+gid_collision="$(/usr/bin/awk -F: '$3 == "102" && $1 != "polkitd" { print $1; exit }' /etc/group)"
+[ -z "$gid_collision" ] || die "gid 102 belongs to $gid_collision"
+if [ "$group_count" -eq 0 ]; then
+    printf '%s\n' 'polkitd:x:102:' >>/etc/group
+else
+    polkit_group_password="$(/usr/bin/awk -F: '$1 == "polkitd" { print $2; exit }' /etc/group)"
+    polkit_gid="$(/usr/bin/awk -F: '$1 == "polkitd" { print $3; exit }' /etc/group)"
+    [ "$polkit_group_password" = x ] || die "polkitd group has an unexpected password field"
+    [ "$polkit_gid" = 102 ] || die "polkitd group has gid $polkit_gid, expected 102"
+fi
+
+gshadow_count="$(/usr/bin/awk -F: '$1 == "polkitd" { n++ } END { print n + 0 }' /etc/gshadow)"
+[ "$gshadow_count" -le 1 ] || die "duplicate polkitd gshadow entries"
+if [ "$gshadow_count" -eq 0 ]; then
+    printf '%s\n' 'polkitd:!*::' >>/etc/gshadow
+else
+    gshadow_password="$(/usr/bin/awk -F: '$1 == "polkitd" { print $2; exit }' /etc/gshadow)"
+    case "$gshadow_password" in
+        '!'*|'*'*) ;;
+        *) die "polkitd group password is not locked" ;;
+    esac
+fi
+
+passwd_count="$(/usr/bin/awk -F: '$1 == "polkitd" { n++ } END { print n + 0 }' /etc/passwd)"
+[ "$passwd_count" -le 1 ] || die "duplicate polkitd passwd entries"
+uid_collision="$(/usr/bin/awk -F: '$3 == "102" && $1 != "polkitd" { print $1; exit }' /etc/passwd)"
+[ -z "$uid_collision" ] || die "uid 102 belongs to $uid_collision"
+if [ "$passwd_count" -eq 0 ]; then
+    printf '%s\n' 'polkitd:x:102:102:User for polkitd:/:/usr/bin/nologin' >>/etc/passwd
+else
+    polkit_password="$(/usr/bin/awk -F: '$1 == "polkitd" { print $2; exit }' /etc/passwd)"
+    polkit_uid="$(/usr/bin/awk -F: '$1 == "polkitd" { print $3; exit }' /etc/passwd)"
+    polkit_primary_gid="$(/usr/bin/awk -F: '$1 == "polkitd" { print $4; exit }' /etc/passwd)"
+    polkit_home="$(/usr/bin/awk -F: '$1 == "polkitd" { print $6; exit }' /etc/passwd)"
+    polkit_shell="$(/usr/bin/awk -F: '$1 == "polkitd" { print $7; exit }' /etc/passwd)"
+    [ "$polkit_password" = x ] || die "polkitd user has an unexpected password field"
+    [ "$polkit_uid" = 102 ] || die "polkitd user has uid $polkit_uid, expected 102"
+    [ "$polkit_primary_gid" = 102 ] ||
+        die "polkitd user has primary gid $polkit_primary_gid, expected 102"
+    [ "$polkit_home" = / ] || die "polkitd user has unexpected home $polkit_home"
+    case "$polkit_shell" in
+        */nologin) ;;
+        *) die "polkitd user has login shell $polkit_shell" ;;
+    esac
+fi
+
+shadow_count="$(/usr/bin/awk -F: '$1 == "polkitd" { n++ } END { print n + 0 }' /etc/shadow)"
+[ "$shadow_count" -le 1 ] || die "duplicate polkitd shadow entries"
+if [ "$shadow_count" -eq 0 ]; then
+    printf '%s\n' 'polkitd:!*:::::::' >>/etc/shadow
+else
+    shadow_password="$(/usr/bin/awk -F: '$1 == "polkitd" { print $2; exit }' /etc/shadow)"
+    case "$shadow_password" in
+        '!'*|'*'*) ;;
+        *) die "polkitd password is not locked" ;;
+    esac
+fi
+
+[ "$(/usr/bin/id -u polkitd)" = 102 ] || die "NSS did not resolve polkitd uid 102"
+[ "$(/usr/bin/id -g polkitd)" = 102 ] || die "NSS did not resolve polkitd gid 102"
+"#
+    .to_vec()
+}
+
+fn systemd_lupos_polkitd_account_unit() -> Vec<u8> {
+    concat!(
+        "[Unit]\n",
+        "Description=Materialize the packaged polkitd system account\n",
+        "Documentation=man:sysusers.d(5) man:polkit(8)\n",
+        "DefaultDependencies=no\n",
+        "Wants=systemd-remount-fs.service\n",
+        "After=systemd-remount-fs.service\n",
+        "Before=systemd-sysusers.service lupos-provision-users.service dbus.service dbus-broker.service polkit.service sysinit.target\n",
+        "ConditionPathExists=/usr/lib/sysusers.d/polkit.conf\n",
+        "\n",
+        "[Service]\n",
+        "Type=oneshot\n",
+        "ExecStart=/usr/libexec/lupos-provision-polkitd\n",
+        "RemainAfterExit=yes\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
 fn systemd_lightdm_debug_dropin() -> Vec<u8> {
     concat!(
         "[Unit]\n",
@@ -4538,7 +4652,84 @@ fn x11_root_xinitrc() -> Vec<u8> {
 /// hook in the package-unowned home directory lets Lupos establish the
 /// per-session D-Bus required by XFCE without replacing LightDM's wrapper.
 fn lightdm_user_xsession() -> Vec<u8> {
-    format!("#!/bin/sh\n{X11_SESSION_BODY}").into_bytes()
+    format!(
+        concat!(
+            "#!/bin/sh\n",
+            // Publish readiness from the authenticated uid-1000 session
+            // itself.  This monitor only reads /proc; it never connects to X,
+            // maps a helper window, or produces damage that could hide an
+            // initially black desktop.  A root oneshot relays the tmpfs file
+            // to the serial console for the host harness.
+            "lupos_session_uid=\"$(id -u)\"\n",
+            "lupos_desktop_processes_ready() {{\n",
+            "    for wanted in xfce4-session xfwm4 xfsettingsd xfce4-panel xfdesktop; do\n",
+            "        found=0\n",
+            "        for proc in /proc/[0-9]*; do\n",
+            "            [ -r \"$proc/comm\" ] && [ -r \"$proc/status\" ] || continue\n",
+            "            comm=; IFS= read -r comm < \"$proc/comm\" 2>/dev/null || true\n",
+            "            [ \"$comm\" = \"$wanted\" ] || continue\n",
+            "            uid=\"$(awk '/^Uid:/ {{ print $2; exit }}' \"$proc/status\" 2>/dev/null)\"\n",
+            "            if [ \"$uid\" = \"$lupos_session_uid\" ]; then found=1; break; fi\n",
+            "        done\n",
+            "        [ \"$found\" -eq 1 ] || return 1\n",
+            "    done\n",
+            "    return 0\n",
+            "}}\n",
+            "(\n",
+            "    i=0\n",
+            "    while [ \"$i\" -lt 300 ]; do\n",
+            "        if lupos_desktop_processes_ready; then\n",
+            "            sleep 5\n",
+            "            if lupos_desktop_processes_ready; then\n",
+            "                : > /tmp/lupos-desktop-initial-ready\n",
+            "                exit 0\n",
+            "            fi\n",
+            "        fi\n",
+            "        i=$((i + 1)); sleep 1\n",
+            "    done\n",
+            "    : > /tmp/lupos-desktop-initial-failed\n",
+            ") &\n",
+            "{X11_SESSION_BODY}",
+        ),
+        X11_SESSION_BODY = X11_SESSION_BODY,
+    )
+    .into_bytes()
+}
+
+fn graphics_x11_desktop_ready_relay_script() -> Vec<u8> {
+    concat!(
+        "#!/bin/sh\n",
+        "i=0\n",
+        "while [ \"$i\" -lt 360 ] && [ ! -e /tmp/lupos-desktop-initial-ready ] && [ ! -e /tmp/lupos-desktop-initial-failed ]; do\n",
+        "    i=$((i + 1)); sleep 1\n",
+        "done\n",
+        "if [ -e /tmp/lupos-desktop-initial-ready ]; then\n",
+        "    echo 'graphics-x11: desktop-initial-ready'\n",
+        "    exit 0\n",
+        "fi\n",
+        "echo 'graphics-x11: desktop-initial-failed'\n",
+        "exit 1\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+fn systemd_graphics_x11_desktop_ready_relay_unit() -> Vec<u8> {
+    concat!(
+        "[Unit]\n",
+        "Description=Relay the untouched XFCE desktop-ready boundary to the graphics gate\n",
+        "After=display-manager.service\n",
+        "ConditionKernelCommandLine=lupos.graphics_probe=1\n",
+        "\n",
+        "[Service]\n",
+        "Type=oneshot\n",
+        "ExecStart=/usr/libexec/lupos-desktop-ready-relay\n",
+        "TimeoutStartSec=600s\n",
+        "StandardOutput=journal+console\n",
+        "StandardError=journal+console\n",
+    )
+    .as_bytes()
+    .to_vec()
 }
 
 /// System GTK3 defaults.  Staged `gdk-pixbuf2` (2.44) compiles in only the
@@ -4760,6 +4951,40 @@ fn lightdm_greeter_pam() -> Vec<u8> {
     .to_vec()
 }
 
+/// Authorize the installed desktop user for only the logind operations exposed
+/// by XFCE's restart and power-off buttons.
+///
+/// On Lupos, polkit can reliably derive a system-bus caller's Unix user, while
+/// its optional logind-session lookup is not yet reliable for every descendant
+/// of the LightDM session.  Requiring `subject.active` would therefore hide the
+/// buttons even though logind has an active local session.  Matching the exact
+/// account and exact power actions keeps the exception narrow.  The rule lives
+/// in `/usr/local/share`, an administrator rules directory documented by
+/// polkit(8), so no Arch package-owned policy is replaced.
+fn polkit_lupos_power_rules() -> Vec<u8> {
+    concat!(
+        "polkit.addRule(function(action, subject) {\n",
+        "    if (subject.user != \"lupos\") {\n",
+        "        return polkit.Result.NOT_HANDLED;\n",
+        "    }\n",
+        "\n",
+        "    var permitted = [\n",
+        "        \"org.freedesktop.login1.power-off\",\n",
+        "        \"org.freedesktop.login1.power-off-multiple-sessions\",\n",
+        "        \"org.freedesktop.login1.reboot\",\n",
+        "        \"org.freedesktop.login1.reboot-multiple-sessions\"\n",
+        "    ];\n",
+        "\n",
+        "    if (permitted.indexOf(action.id) >= 0) {\n",
+        "        return polkit.Result.YES;\n",
+        "    }\n",
+        "    return polkit.Result.NOT_HANDLED;\n",
+        "});\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
 fn systemd_lupos_lightdm_unit() -> Vec<u8> {
     // Keep the display manager independent from the full default dependency
     // chain, but do not race Xorg against the system bus.  Xorg's logind path
@@ -4798,14 +5023,11 @@ fn graphics_x11_probe_script() -> Vec<u8> {
     concat!(
         "#!/bin/sh\n",
         "export PATH=/usr/bin:/bin:/usr/sbin:/sbin\n",
-        // The probe starts before LightDM creates the authority file.  Export
-        // its stable path now so later X clients read the cookie once it exists.
+        // The harness starts this probe only after the authenticated desktop
+        // boundary, so LightDM's root authority is already populated.  Keep
+        // the stable path explicit for later read-only and application probes.
         "export XAUTHORITY=/run/lightdm/root/:0\n",
         "echo 'graphics-x11: probe begin'\n",
-        // Root used this exact shape in the reported terminal failure. `-n`
-        // keeps the gate deterministic while proving sudo can resolve and
-        // execute pacman from its configured secure path.
-        "if sudo -n pacman --config /etc/pacman-lupos.conf --version >/dev/null 2>&1; then echo 'graphics-x11: sudo-pacman ok'; else echo 'graphics-x11: sudo-pacman failed'; fi\n",
         // This is the stock udev -> logind -> LightDM admission boundary.  It
         // must settle before Xorg can exist, so report it before the longer X
         // and greeter waits instead of hiding the root cause at probe teardown.
@@ -4947,9 +5169,11 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "if [ -s \"$direct_xorg_log\" ]; then echo 'graphics-x11: direct-xorg-server-log present'; tail -80 \"$direct_xorg_log\"; fi\n",
         "if [ -s \"$xorg_log\" ]; then echo 'graphics-x11: xorg-log present'; tail -80 \"$xorg_log\"; elif [ -s \"$direct_xorg_log\" ]; then echo 'graphics-x11: xorg-log present'; echo 'graphics-x11: xorg-log using-direct'; tail -80 \"$direct_xorg_log\"; else echo 'graphics-x11: xorg-log missing'; fi\n",
         "if process_named lightdm; then echo 'graphics-x11: lightdm ok'; else echo 'graphics-x11: lightdm missing'; for f in /var/log/lightdm/*.log; do [ -s \"$f\" ] && printf 'graphics-x11: lightdm-log %s begin\\n' \"$f\" && tail -80 \"$f\" && printf 'graphics-x11: lightdm-log %s end\\n' \"$f\"; done; fi\n",
-        // Lupos currently exposes TASK_COMM_LEN-sized cmdlines through procfs,
-        // so match the observable 15-byte prefix of lightdm-gtk-greeter.
-        "if wait_for_process 'lightdm-gtk-gre' 30; then echo 'graphics-x11: greeter ok'; else echo 'graphics-x11: greeter missing'; for f in /var/log/lightdm/*.log; do [ -s \"$f\" ] && printf 'graphics-x11: greeter-log %s begin\\n' \"$f\" && tail -80 \"$f\" && printf 'graphics-x11: greeter-log %s end\\n' \"$f\"; done; fi\n",
+        // The untouched-frame boundary is after successful login, when the
+        // greeter must already be gone.  Prove that the stock greeter reached
+        // readiness from LightDM's durable log rather than incorrectly
+        // requiring its process to remain alive.
+        "if [ -s /var/log/lightdm/seat0-greeter.log ] && grep -q 'Greeter connected' /var/log/lightdm/lightdm.log 2>/dev/null; then echo 'graphics-x11: greeter ok'; else echo 'graphics-x11: greeter missing'; for f in /var/log/lightdm/*.log; do [ -s \"$f\" ] && printf 'graphics-x11: greeter-log %s begin\\n' \"$f\" && tail -80 \"$f\" && printf 'graphics-x11: greeter-log %s end\\n' \"$f\"; done; fi\n",
         // A greeter process exists long before it finishes its cold GTK/font
         // initialization under TCG.  Starting xterm in that interval makes a
         // short host-style deadline measure X-server contention, so wait for
@@ -4966,14 +5190,100 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "sudo -n -u lightdm timeout -k 5 45 /usr/bin/bwrap --unshare-all --die-with-parent --chdir / --ro-bind /usr /usr --dev /dev --tmpfs /tmp-home --tmpfs /tmp-run --clearenv --setenv HOME /tmp-home --setenv XDG_RUNTIME_DIR /tmp-run --symlink /usr/lib /lib --symlink /usr/lib /lib64 /usr/bin/true >/tmp/lupos-bwrap.log 2>&1\n",
         "bwrap_rc=$?\n",
         "printf 'graphics-x11: bwrap-sandbox rc=%s\\n' \"$bwrap_rc\"\n",
+        "if [ \"$bwrap_rc\" -eq 1 ] && grep -q 'No permissions to create a new namespace' /tmp/lupos-bwrap.log 2>/dev/null; then echo 'graphics-x11: bwrap-sandbox secure-fail-closed'; else echo 'graphics-x11: bwrap-sandbox unexpected-result'; fi\n",
         "if [ -s /tmp/lupos-bwrap.log ]; then echo 'graphics-x11: bwrap-sandbox-log begin'; tail -60 /tmp/lupos-bwrap.log; echo 'graphics-x11: bwrap-sandbox-log end'; fi\n",
         "timeout 15 journalctl --no-pager -b -u dbus-broker.service -n 160 2>&1 | sed 's/^/graphics-x11: dbus-journal /' || true\n",
         // The HMP-driven regression login uses the real uid-1000 account.
         // Requiring its live session manager catches both failed PAM/session
         // dispatch and the historical root-owned ~/.Xauthority teardown.
         "echo 'graphics-x11: user-session-probe begin'\n",
-        "i=0; while [ \"$i\" -lt 60 ] && ! process_named_uid xfce4-session 1000; do i=$((i + 1)); sleep 1; done\n",
+        // The HMP login and this serial probe are concurrent under one slow
+        // TCG vCPU.  Use a distro-scale deadline rather than failing a valid
+        // login merely because XFCE was cold-starting.
+        "i=0; while [ \"$i\" -lt 240 ] && ! process_named_uid xfce4-session 1000; do i=$((i + 1)); sleep 1; done\n",
         "if process_named_uid xfce4-session 1000; then echo 'graphics-x11: user-session ok'; else echo 'graphics-x11: user-session failed'; fi\n",
+        // Record the guest's framebuffer backing-store readback before xterm,
+        // settings-manager, appfinder, or any synthetic pointer/keyboard
+        // action can generate X damage.  The HMP PPM already captured by the
+        // host at `desktop-initial-ready` is the authoritative scanout; this
+        // read remains useful diagnostics for fbdev implementations whose
+        // read(2) and mmap views are coherent.  Take only one sample so a later
+        // repaint can never turn an initial failure into success.
+        "echo 'graphics-x11: initial-framebuffer-probe begin'\n",
+        "initial_desktop_wait=0\n",
+        "while [ \"$initial_desktop_wait\" -lt 240 ] && ! user_xfce_desktop_ready; do initial_desktop_wait=$((initial_desktop_wait + 1)); sleep 1; done\n",
+        "if user_xfce_desktop_ready; then echo 'graphics-x11: initial-desktop-ready ok'; initial_desktop_ok=1; else echo 'graphics-x11: initial-desktop-ready failed'; initial_desktop_ok=0; fi\n",
+        "root_pixmap_wait=0; root_pixmap_ready=0\n",
+        "while [ \"$initial_desktop_ok\" -eq 1 ] && [ \"$root_pixmap_wait\" -lt 30 ]; do\n",
+        "    if DISPLAY=:0 timeout 5 /usr/bin/xprop -root _XROOTPMAP_ID ESETROOT_PMAP_ID > /tmp/lupos-initial-root-pixmap.log 2>/dev/null && grep -Eq 'PIXMAP|0x[1-9a-fA-F][0-9a-fA-F]*' /tmp/lupos-initial-root-pixmap.log; then root_pixmap_ready=1; break; fi\n",
+        "    root_pixmap_wait=$((root_pixmap_wait + 1)); sleep 1\n",
+        "done\n",
+        "if [ \"$root_pixmap_ready\" -eq 1 ]; then echo 'graphics-x11: initial-root-pixmap ready'; else echo 'graphics-x11: initial-root-pixmap missing'; fi\n",
+        "sleep 2\n",
+        "frame_size=\"$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null || true)\"\n",
+        "frame_width=${frame_size%,*}; frame_height=${frame_size#*,}\n",
+        "case \"$frame_width\" in ''|*[!0-9]*) frame_width=1280 ;; esac\n",
+        "case \"$frame_height\" in ''|*[!0-9]*) frame_height=800 ;; esac\n",
+        "frame_bpp=\"$(cat /sys/class/graphics/fb0/bits_per_pixel 2>/dev/null || true)\"\n",
+        "case \"$frame_bpp\" in ''|*[!0-9]*) frame_bpp=32 ;; esac\n",
+        "frame_stride=\"$(cat /sys/class/graphics/fb0/stride 2>/dev/null || true)\"\n",
+        "case \"$frame_stride\" in ''|*[!0-9]*) frame_stride=$((frame_width * ((frame_bpp + 7) / 8))) ;; esac\n",
+        "frame_y=$((frame_height / 4)); frame_rows=$((frame_height / 4)); [ \"$frame_rows\" -gt 0 ] || frame_rows=1\n",
+        "frame_nonzero=0; frame_total=0; initial_frame_ok=0\n",
+        "if [ \"$initial_desktop_ok\" -eq 1 ]; then\n",
+        "    frame_stats=\"$(dd if=/dev/fb0 bs=\"$frame_stride\" skip=\"$frame_y\" count=\"$frame_rows\" status=none 2>/dev/null | od -An -v -tu4 | awk '{ for (i = 1; i <= NF; i++) { total++; if ($i != 0) nonzero++ } } END { printf \"%d %d\", nonzero, total }')\"\n",
+        "    set -- $frame_stats; frame_nonzero=${1:-0}; frame_total=${2:-0}\n",
+        "    if [ \"$frame_total\" -gt 0 ] && [ $((frame_nonzero * 100)) -ge $((frame_total * 25)) ]; then initial_frame_ok=1; fi\n",
+        "fi\n",
+        "frame_percent=0; [ \"$frame_total\" -eq 0 ] || frame_percent=$((frame_nonzero * 100 / frame_total))\n",
+        "printf 'graphics-x11: initial-framebuffer size=%sx%s stride=%s band-y=%s rows=%s nonzero=%s/%s percent=%s pixmap-wait=%s\\n' \"$frame_width\" \"$frame_height\" \"$frame_stride\" \"$frame_y\" \"$frame_rows\" \"$frame_nonzero\" \"$frame_total\" \"$frame_percent\" \"$root_pixmap_wait\"\n",
+        // With ShadowFB=false, Xorg updates the scanout through its mmap and a
+        // later read(2) of /dev/fb0 can legitimately return the backing file's
+        // untouched zero pages.  Keep this guest value diagnostic; the HMP PPM
+        // captured before this script starts is the authoritative displayed
+        // framebuffer gate.
+        "if [ \"$initial_frame_ok\" -eq 1 ]; then echo 'graphics-x11: guest-framebuffer-readback painted'; elif [ \"$frame_total\" -eq 0 ]; then echo 'graphics-x11: guest-framebuffer-readback unreadable'; else echo 'graphics-x11: guest-framebuffer-readback zero'; fi\n",
+        "echo 'graphics-x11: initial-framebuffer-probe end'\n",
+        // The stale resource itself was an unmapped InputOnly child, which
+        // neither EWMH nor the staged userland tools can enumerate reliably.
+        // The untouched host PPM is authoritative; this companion process
+        // check confirms the greeter executable is gone.
+        "echo 'graphics-x11: greeter-lifetime-probe begin'\n",
+        "if process_cmdline_contains 'lightdm-gtk-greeter'; then echo 'graphics-x11: greeter-process present-after-login'; else echo 'graphics-x11: greeter-process absent-after-login'; fi\n",
+        "echo 'graphics-x11: greeter-lifetime-probe end'\n",
+        // Validate elevation only after the untouched-frame boundary.  The
+        // negative check uses the exact pacman argv exercised positively, so
+        // a command-specific NOPASSWD rule cannot hide behind a denied `true`.
+        "echo 'graphics-x11: sudo-probe begin'\n",
+        "if [ \"$(/usr/bin/id -u lupos 2>/dev/null)\" = 1000 ]; then echo 'graphics-x11: lupos-uid ok'; else echo 'graphics-x11: lupos-uid failed'; fi\n",
+        "if /usr/bin/visudo -cf /etc/sudoers >/tmp/lupos-visudo.log 2>&1; then echo 'graphics-x11: sudoers-syntax ok'; else echo 'graphics-x11: sudoers-syntax failed'; sed 's/^/graphics-x11: sudoers-diagnostic /' /tmp/lupos-visudo.log; fi\n",
+        "rm -f /tmp/lupos-visudo.log\n",
+        "if /usr/bin/sudo -n -u lupos /bin/sh -c '/usr/bin/sudo -K; ! /usr/bin/sudo -n /usr/bin/pacman --config /etc/pacman-lupos.conf --version >/dev/null 2>&1'; then echo 'graphics-x11: sudo-password-required ok'; else echo 'graphics-x11: sudo-password-required failed'; fi\n",
+        "if /usr/bin/sudo -n -u lupos /bin/sh -c \"printf '%s\\n' lupos | /usr/bin/sudo -S -k -p '' /usr/bin/pacman --config /etc/pacman-lupos.conf --version >/dev/null 2>&1; rc=\\$?; /usr/bin/sudo -k; exit \\$rc\"; then echo 'graphics-x11: sudo-pacman ok'; else echo 'graphics-x11: sudo-pacman failed'; fi\n",
+        "echo 'graphics-x11: sudo-probe end'\n",
+        // D-Bus parses PolicyKit's packaged user=polkitd rules at startup, so
+        // prove the early account provisioner ran and that the unmodified
+        // packaged daemon can become active before checking its decisions.
+        "echo 'graphics-x11: polkit-service-probe begin'\n",
+        "if /usr/bin/id polkitd >/tmp/lupos-polkitd-id.log 2>&1 && [ \"$(/usr/bin/id -u polkitd 2>/dev/null)\" = 102 ] && [ \"$(/usr/bin/id -g polkitd 2>/dev/null)\" = 102 ]; then sed 's/^/graphics-x11: polkitd-id /' /tmp/lupos-polkitd-id.log; echo 'graphics-x11: polkitd-account ok'; else echo 'graphics-x11: polkitd-account failed'; sed 's/^/graphics-x11: polkitd-id /' /tmp/lupos-polkitd-id.log; fi\n",
+        "rm -f /tmp/lupos-polkitd-id.log\n",
+        "if /usr/bin/systemctl is-active --quiet lupos-provision-polkitd.service; then echo 'graphics-x11: polkitd-provision-service active'; else echo 'graphics-x11: polkitd-provision-service failed'; /usr/bin/systemctl --no-pager --full status lupos-provision-polkitd.service 2>&1 | sed 's/^/graphics-x11: polkitd-provision-status /' || true; fi\n",
+        "if timeout -k 2 15 /usr/bin/systemctl start polkit.service && /usr/bin/systemctl is-active --quiet polkit.service; then echo 'graphics-x11: polkit-service active'; else echo 'graphics-x11: polkit-service failed'; /usr/bin/systemctl --no-pager --full status polkit.service 2>&1 | sed 's/^/graphics-x11: polkit-status /' || true; timeout 15 /usr/bin/journalctl --no-pager -b -u polkit.service -n 120 2>&1 | sed 's/^/graphics-x11: polkit-journal /' || true; fi\n",
+        "echo 'graphics-x11: polkit-service-probe end'\n",
+        // XFCE asks logind whether restart and power-off are authorized before
+        // enabling those buttons.  Test both the underlying polkit rule and
+        // the exact logind Can* methods as uid 1000.  `exec` keeps the shell
+        // PID alive as pkcheck's subject, avoiding a PID-reuse race.
+        "echo 'graphics-x11: power-actions-probe begin'\n",
+        "if sudo -n -u lupos timeout -k 2 15 /bin/sh -c 'exec /usr/bin/pkcheck --action-id org.freedesktop.login1.power-off --process \"$$\"'; then echo 'graphics-x11: polkit-power-off ok'; else echo 'graphics-x11: polkit-power-off failed'; fi\n",
+        "if sudo -n -u lupos timeout -k 2 15 /bin/sh -c 'exec /usr/bin/pkcheck --action-id org.freedesktop.login1.reboot --process \"$$\"'; then echo 'graphics-x11: polkit-reboot ok'; else echo 'graphics-x11: polkit-reboot failed'; fi\n",
+        "poweroff_state=\"$(sudo -n -u lupos timeout -k 2 15 /usr/bin/busctl --system --no-pager call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanPowerOff 2>&1 || true)\"\n",
+        "reboot_state=\"$(sudo -n -u lupos timeout -k 2 15 /usr/bin/busctl --system --no-pager call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanReboot 2>&1 || true)\"\n",
+        "printf 'graphics-x11: login1-can-power-off %s\\n' \"$poweroff_state\"\n",
+        "printf 'graphics-x11: login1-can-reboot %s\\n' \"$reboot_state\"\n",
+        "case \"$poweroff_state\" in *'s \"yes\"'*) echo 'graphics-x11: power-off-button ok' ;; *) echo 'graphics-x11: power-off-button failed' ;; esac\n",
+        "case \"$reboot_state\" in *'s \"yes\"'*) echo 'graphics-x11: reboot-button ok' ;; *) echo 'graphics-x11: reboot-button failed' ;; esac\n",
+        "echo 'graphics-x11: power-actions-probe end'\n",
         // Stock Arch creates the per-user runtime directory and user bus via
         // pam_systemd/logind.  Capture that boundary before XFCE's fallback
         // dbus-launch path can obscure the original registration failure.
@@ -4997,7 +5307,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "for proc in /proc/[0-9]*; do [ -r \"$proc/status\" ] || continue; [ \"$(awk '/^Uid:/ { print $2; exit }' \"$proc/status\" 2>/dev/null)\" = 1000 ] || continue; [ \"$(cat \"$proc/comm\" 2>/dev/null)\" = systemd ] || continue; printf 'graphics-x11: early-user-manager pid=%s wchan=' \"${proc##*/}\"; cat \"$proc/wchan\" 2>/dev/null || true; for fd in \"$proc\"/fd/*; do target=; target=\"$(readlink \"$fd\" 2>/dev/null || true)\"; [ -n \"$target\" ] && printf 'graphics-x11: early-user-manager-fd %s -> %s\\n' \"${fd##*/}\" \"$target\"; done; done\n",
         "sudo -n -u lupos env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus timeout -k 2 10 systemctl --user --no-pager --full status dbus.socket dbus.service 2>&1 | sed 's/^/graphics-x11: early-user-unit /' || true\n",
         "early_bus=; early_bus_ok=0; early_desktop_ok=0; i=0\n",
-        "while [ \"$i\" -lt 10 ]; do\n",
+        "while [ \"$i\" -lt 240 ]; do\n",
         "    [ -n \"$early_session_pid\" ] || early_session_pid=\"$(process_pid_named_uid_with_bus xfce4-session 1000 2>/dev/null || true)\"\n",
         "    if [ -n \"$early_session_pid\" ] && [ -r \"/proc/$early_session_pid/environ\" ]; then early_bus=\"$(tr '\\000' '\\n' < \"/proc/$early_session_pid/environ\" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' | head -1)\"; fi\n",
         "    if [ \"$early_bus_ok\" -eq 0 ] && [ -n \"$early_bus\" ]; then sudo -n -u lupos env DBUS_SESSION_BUS_ADDRESS=\"$early_bus\" timeout 2 /usr/bin/dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/tmp/lupos-early-user-bus.log 2>&1 && early_bus_ok=1; fi\n",
@@ -5015,10 +5325,11 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "if [ -n \"$greeter_pid\" ]; then printf 'graphics-x11: greeter-runtime pid=%s wchan=' \"$greeter_pid\"; cat \"/proc/$greeter_pid/wchan\" 2>/dev/null || true; grep -E '^(State|Uid|Gid|Threads|Sig)' \"/proc/$greeter_pid/status\" 2>/dev/null || true; fi\n",
         // The tty sysctls Linux registers from `tty_init()` (drivers/tty/
         // tty_io.c::tty_table).  The vendor kselftest tty_tiocsti_test.c
-        // skips entirely when this file is absent, so its presence (and the
-        // CONFIG_LEGACY_TIOCSTI=y default of 1) is the observable contract.
+        // skips entirely when this file is absent.  Lupos intentionally
+        // hardens the legacy injection switch to 0 while retaining the
+        // separate ldisc autoload default.
         "echo 'graphics-x11: tty-sysctl-probe begin'\n",
-        "if [ \"$(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null)\" = '1' ] && [ \"$(cat /proc/sys/dev/tty/ldisc_autoload 2>/dev/null)\" = '1' ]; then\n",
+        "if [ \"$(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null)\" = '0' ] && [ \"$(cat /proc/sys/dev/tty/ldisc_autoload 2>/dev/null)\" = '1' ]; then\n",
         "    echo 'graphics-x11: tty-sysctl ok'\n",
         "else\n",
         "    printf 'graphics-x11: tty-sysctl missing legacy_tiocsti=%s ldisc_autoload=%s\\n' \"$(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null || echo ENOENT)\" \"$(cat /proc/sys/dev/tty/ldisc_autoload 2>/dev/null || echo ENOENT)\"\n",
@@ -14187,6 +14498,33 @@ fn direct_stage_login_root_disk_overlay_files(
     stage_timezone_files(&mut files);
 
     if graphics_x11 {
+        // Arch owns /etc/sudoers and already includes /etc/sudoers.d.  Grant
+        // the provisioned wheel member normal password-authenticated sudo via
+        // a package-unowned administrator fragment; never weaken this to
+        // NOPASSWD.
+        files.push(initramfs_file(
+            GRAPHICS_X11_SUDOERS_PATH,
+            0o100440,
+            GRAPHICS_X11_SUDOERS.as_bytes(),
+        ));
+        // polkit's packaged sysusers declaration must be materialized before
+        // dbus-broker resolves user=polkitd in the packaged bus policy. Keep
+        // the fallback package-unowned and order it ahead of both the stock
+        // sysusers pass and every system-bus service.
+        files.push(initramfs_file(
+            "usr/libexec/lupos-provision-polkitd",
+            0o100755,
+            polkitd_account_provision_script(),
+        ));
+        files.push(initramfs_file(
+            "usr/lib/systemd/system/lupos-provision-polkitd.service",
+            0o100644,
+            systemd_lupos_polkitd_account_unit(),
+        ));
+        files.push(initramfs_symlink(
+            "etc/systemd/system/sysinit.target.wants/lupos-provision-polkitd.service",
+            "/usr/lib/systemd/system/lupos-provision-polkitd.service",
+        ));
         files.push(initramfs_file(
             "etc/X11/xorg.conf.d/10-lupos-fbdev.conf",
             0o100644,
@@ -14210,6 +14548,11 @@ fn direct_stage_login_root_disk_overlay_files(
             "usr/share/themes/LuposLogin/gtk-3.0/gtk.css",
             0o100644,
             lightdm_gtk_theme_css(),
+        ));
+        files.push(initramfs_file(
+            "usr/local/share/polkit-1/rules.d/49-lupos-power.rules",
+            0o100644,
+            polkit_lupos_power_rules(),
         ));
         // Pin the PNG AdwaitaLegacy icon theme for plain GTK apps
         // (settings.ini) and for the XSETTINGS owner xfsettingsd — the stock
@@ -14254,6 +14597,20 @@ fn direct_stage_login_root_disk_overlay_files(
             "home/lupos/.xsession",
             0o100755,
             lightdm_user_xsession(),
+        ));
+        files.push(initramfs_file(
+            "usr/libexec/lupos-desktop-ready-relay",
+            0o100755,
+            graphics_x11_desktop_ready_relay_script(),
+        ));
+        files.push(initramfs_file(
+            "usr/lib/systemd/system/lupos-desktop-ready-relay.service",
+            0o100644,
+            systemd_graphics_x11_desktop_ready_relay_unit(),
+        ));
+        files.push(initramfs_symlink(
+            "etc/systemd/system/multi-user.target.wants/lupos-desktop-ready-relay.service",
+            "/usr/lib/systemd/system/lupos-desktop-ready-relay.service",
         ));
         files.push(initramfs_file(
             "etc/systemd/system/lightdm.service.d/50-lupos-debug.conf",
@@ -15362,8 +15719,13 @@ pub fn run_graphics_x11_tests() -> Result<()> {
     let prompt = "[root@lupos /]#";
     let steps = [
         SerialExpectStep {
-            label: "root shell",
-            wait_for: prompt,
+            // The root shell is already idle on ttyS0.  Do not start the
+            // guest probe while the greeter owns the display: even a
+            // read-only root X client can perturb the exact handoff this
+            // regression is meant to observe.  Wait until the successful
+            // HMP-driven login has crossed into the stock XFCE session.
+            label: "untouched xfce desktop",
+            wait_for: "graphics-x11: desktop-initial-ready",
             send: b"sh /usr/libexec/lupos-graphics-x11-probe.sh\n",
         },
         SerialExpectStep {
@@ -15380,11 +15742,13 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             label: "greeter first password prompt",
             wait_for: "Prompt greeter with 1 message(s)",
             text: Some("wrong"),
+            capture_initial_desktop: false,
         },
         HmpExpectStep {
             label: "greeter rejects wrong password",
             wait_for: "Authenticate result for user lupos: Authentication failure",
             text: None,
+            capture_initial_desktop: false,
         },
         HmpExpectStep {
             // This match is cursor-scoped after the failure marker above, so
@@ -15393,6 +15757,17 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             label: "greeter retry password prompt",
             wait_for: "Prompt greeter with 1 message(s)",
             text: Some("lupos"),
+            capture_initial_desktop: false,
+        },
+        HmpExpectStep {
+            // This marker is emitted only after the authenticated session has
+            // observed the complete XFCE process set stable for five seconds.
+            // Capture synchronously before the serial expect loop sends the
+            // guest probe command for the same marker.
+            label: "untouched initial desktop capture",
+            wait_for: "graphics-x11: desktop-initial-ready",
+            text: None,
+            capture_initial_desktop: true,
         },
     ];
 
@@ -15426,8 +15801,25 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "User lupos authorized",
         "Greeter requests session xfce",
         "Running command /etc/lightdm/Xsession startxfce4",
+        "graphics-x11: desktop-initial-ready",
         "graphics-x11: user-session ok",
-        "graphics-x11: bwrap-sandbox rc=0",
+        "graphics-x11: initial-desktop-ready ok",
+        "graphics-x11: initial-root-pixmap ready",
+        "graphics-x11: greeter-process absent-after-login",
+        "graphics-x11: lupos-uid ok",
+        "graphics-x11: polkitd-account ok",
+        "graphics-x11: polkitd-provision-service active",
+        "graphics-x11: polkit-service active",
+        "graphics-x11: polkit-power-off ok",
+        "graphics-x11: polkit-reboot ok",
+        "graphics-x11: login1-can-power-off s \"yes\"",
+        "graphics-x11: login1-can-reboot s \"yes\"",
+        "graphics-x11: power-off-button ok",
+        "graphics-x11: reboot-button ok",
+        "graphics-x11: bwrap-sandbox rc=1",
+        "graphics-x11: bwrap-sandbox secure-fail-closed",
+        "graphics-x11: sudoers-syntax ok",
+        "graphics-x11: sudo-password-required ok",
         "graphics-x11: sudo-pacman ok",
         "graphics-x11: tty-sysctl ok",
         "graphics-x11: timeout-sanity ok",
@@ -15478,9 +15870,24 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: greeter missing",
         "graphics-x11: greeter-ready missing",
         "graphics-x11: service-xorg missing",
+        "graphics-x11: desktop-initial-failed",
         "graphics-x11: user-session failed",
+        "graphics-x11: initial-desktop-ready failed",
+        "graphics-x11: initial-root-pixmap missing",
+        "graphics-x11: greeter-process present-after-login",
+        "graphics-x11: lupos-uid failed",
+        "graphics-x11: polkitd-account failed",
+        "graphics-x11: polkitd-provision-service failed",
+        "graphics-x11: polkit-service failed",
+        "graphics-x11: polkit-power-off failed",
+        "graphics-x11: polkit-reboot failed",
+        "graphics-x11: power-off-button failed",
+        "graphics-x11: reboot-button failed",
         "graphics-x11: bwrap-sandbox rc=124",
         "graphics-x11: bwrap-sandbox rc=125",
+        "graphics-x11: bwrap-sandbox unexpected-result",
+        "graphics-x11: sudoers-syntax failed",
+        "graphics-x11: sudo-password-required failed",
         "graphics-x11: sudo-pacman failed",
         "graphics-x11: tty-sysctl missing",
         "graphics-x11: timeout-sanity unexpected-ok",
@@ -18163,6 +18570,7 @@ struct HmpExpectStep {
     label: &'static str,
     wait_for: &'static str,
     text: Option<&'static str>,
+    capture_initial_desktop: bool,
 }
 
 /// Build the GRUB ISO and boot QEMU with expect-style serial interaction.
@@ -21063,6 +21471,29 @@ struct HmpMonitor {
     stream: UnixStream,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DesktopFrameStats {
+    width: usize,
+    height: usize,
+    interior_pixels: usize,
+    painted_pixels: usize,
+}
+
+impl DesktopFrameStats {
+    fn painted_percent(self) -> usize {
+        if self.interior_pixels == 0 {
+            0
+        } else {
+            self.painted_pixels.saturating_mul(100) / self.interior_pixels
+        }
+    }
+
+    fn wallpaper_is_visible(self) -> bool {
+        self.interior_pixels != 0
+            && self.painted_pixels.saturating_mul(100) >= self.interior_pixels.saturating_mul(20)
+    }
+}
+
 struct RemoveFileOnDrop(PathBuf);
 
 impl Drop for RemoveFileOnDrop {
@@ -21128,6 +21559,190 @@ impl HmpMonitor {
     fn type_text(&mut self, _text: &str) -> Result<()> {
         bail!("graphical login input requires a Unix QEMU monitor socket")
     }
+
+    #[cfg(unix)]
+    fn capture_initial_desktop(&mut self, path: &Path) -> Result<DesktopFrameStats> {
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| anyhow!("initial desktop screendump path is not UTF-8"))?;
+        if path_text.chars().any(char::is_whitespace) {
+            bail!(
+                "initial desktop screendump path contains HMP-unsafe whitespace: {}",
+                path.display()
+            );
+        }
+        let _ = fs::remove_file(path);
+        writeln!(self.stream, "screendump {path_text}")
+            .context("failed to request the initial desktop HMP screendump")?;
+        self.stream
+            .flush()
+            .context("failed to flush the initial desktop HMP screendump command")?;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut previous_len = 0u64;
+        let mut stable_observations = 0usize;
+        loop {
+            let len = fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if len != 0 && len == previous_len {
+                stable_observations += 1;
+                if stable_observations >= 2 {
+                    break;
+                }
+            } else {
+                stable_observations = 0;
+                previous_len = len;
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "QEMU did not finish the initial desktop screendump {}",
+                    path.display()
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let ppm = fs::read(path)
+            .with_context(|| format!("failed to read initial desktop {}", path.display()))?;
+        let stats = analyze_initial_desktop_ppm(&ppm)
+            .with_context(|| format!("invalid initial desktop {}", path.display()))?;
+        println!(
+            "graphics-x11: host-initial-framebuffer artifact={} size={}x{} painted={}/{} percent={}",
+            path.display(),
+            stats.width,
+            stats.height,
+            stats.painted_pixels,
+            stats.interior_pixels,
+            stats.painted_percent(),
+        );
+        if !stats.wallpaper_is_visible() {
+            bail!(
+                "initial XFCE desktop is black before interaction: painted {}/{} interior pixels ({}%); screendump retained at {}",
+                stats.painted_pixels,
+                stats.interior_pixels,
+                stats.painted_percent(),
+                path.display()
+            );
+        }
+        Ok(stats)
+    }
+
+    #[cfg(not(unix))]
+    fn capture_initial_desktop(&mut self, _path: &Path) -> Result<DesktopFrameStats> {
+        bail!("initial desktop capture requires a Unix QEMU monitor socket")
+    }
+}
+
+fn initial_desktop_screendump_path(serial_log_path: &Path) -> PathBuf {
+    let stem = serial_log_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("graphics-x11");
+    serial_log_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{stem}-initial-desktop.ppm"))
+}
+
+fn ppm_header_token<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8]> {
+    loop {
+        while bytes
+            .get(*cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            *cursor += 1;
+        }
+        if bytes.get(*cursor) != Some(&b'#') {
+            break;
+        }
+        while bytes.get(*cursor).is_some_and(|byte| *byte != b'\n') {
+            *cursor += 1;
+        }
+    }
+    let start = *cursor;
+    while bytes
+        .get(*cursor)
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'#')
+    {
+        *cursor += 1;
+    }
+    if *cursor == start {
+        bail!("missing PPM header token");
+    }
+    Ok(&bytes[start..*cursor])
+}
+
+fn parse_ppm_usize(token: &[u8], label: &str) -> Result<usize> {
+    core::str::from_utf8(token)
+        .with_context(|| format!("PPM {label} is not UTF-8"))?
+        .parse::<usize>()
+        .with_context(|| format!("invalid PPM {label}"))
+}
+
+fn analyze_initial_desktop_ppm(ppm: &[u8]) -> Result<DesktopFrameStats> {
+    let mut cursor = 0usize;
+    if ppm_header_token(ppm, &mut cursor)? != b"P6" {
+        bail!("QEMU screendump is not a binary P6 PPM");
+    }
+    let width = parse_ppm_usize(ppm_header_token(ppm, &mut cursor)?, "width")?;
+    let height = parse_ppm_usize(ppm_header_token(ppm, &mut cursor)?, "height")?;
+    let max_value = parse_ppm_usize(ppm_header_token(ppm, &mut cursor)?, "max value")?;
+    if width == 0 || height == 0 || max_value != 255 {
+        bail!("unsupported PPM dimensions/max value {width}x{height}/{max_value}");
+    }
+    let Some(separator) = ppm.get(cursor) else {
+        bail!("PPM header has no pixel-data separator");
+    };
+    if !separator.is_ascii_whitespace() {
+        bail!("PPM header has an invalid pixel-data separator");
+    }
+    cursor += 1;
+    if *separator == b'\r' && ppm.get(cursor) == Some(&b'\n') {
+        cursor += 1;
+    }
+
+    let pixel_bytes = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| anyhow!("PPM dimensions overflow"))?;
+    if ppm.len().saturating_sub(cursor) < pixel_bytes {
+        bail!(
+            "truncated PPM pixels: need {pixel_bytes}, have {}",
+            ppm.len().saturating_sub(cursor)
+        );
+    }
+    let pixels = &ppm[cursor..cursor + pixel_bytes];
+
+    // Exclude desktop icons at the left edge, the top panel, and the bottom
+    // launcher.  The remaining center is wallpaper-only in the stock XFCE
+    // layout and was completely zero-filled in the reported regression.
+    let x_start = width / 8;
+    let x_end = width.saturating_sub(width / 8);
+    let y_start = height / 5;
+    let y_end = height.saturating_mul(3) / 4;
+    if x_start >= x_end || y_start >= y_end {
+        bail!("PPM is too small for an interior desktop sample");
+    }
+    let mut painted_pixels = 0usize;
+    let mut interior_pixels = 0usize;
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            let offset = (y * width + x) * 3;
+            let pixel = &pixels[offset..offset + 3];
+            interior_pixels += 1;
+            if pixel.iter().any(|channel| *channel > 16) {
+                painted_pixels += 1;
+            }
+        }
+    }
+
+    Ok(DesktopFrameStats {
+        width,
+        height,
+        interior_pixels,
+        painted_pixels,
+    })
 }
 
 fn run_qemu_iso_with_serial_expect(
@@ -21197,7 +21812,18 @@ fn run_qemu_iso_with_serial_expect(
                     .map(|idx| hmp_cursor + idx + hmp_step.wait_for.len());
                 if raw_match_end.is_some() || visible_stripped.contains(hmp_step.wait_for) {
                     progress.note_expect_match(hmp_step.label);
-                    if let Some(text) = hmp_step.text {
+                    if hmp_step.capture_initial_desktop {
+                        let monitor = match hmp_monitor.as_mut() {
+                            Some(monitor) => monitor,
+                            None => {
+                                hmp_monitor = Some(HmpMonitor::connect(&hmp_socket)?);
+                                hmp_monitor.as_mut().expect("HMP monitor initialized")
+                            }
+                        };
+                        let capture_path = initial_desktop_screendump_path(serial_log_path);
+                        monitor.capture_initial_desktop(&capture_path)?;
+                        hmp_cursor = raw_match_end.unwrap_or(log.len());
+                    } else if let Some(text) = hmp_step.text {
                         // LightDM logs the PAM prompt before the GTK entry has
                         // acquired keyboard focus. Typing immediately can drop
                         // the leading characters and authenticate the suffix.
@@ -22440,6 +23066,76 @@ mod tests {
         assert!(!serial_log_contains(log, "missing"));
     }
 
+    fn test_ppm(width: usize, height: usize, pixel: [u8; 3]) -> Vec<u8> {
+        let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+        for _ in 0..width * height {
+            ppm.extend_from_slice(&pixel);
+        }
+        ppm
+    }
+
+    #[test]
+    fn initial_desktop_ppm_rejects_black_interior() {
+        let stats =
+            analyze_initial_desktop_ppm(&test_ppm(80, 60, [0, 0, 0])).expect("valid black PPM");
+
+        assert_eq!(stats.painted_pixels, 0);
+        assert_eq!(stats.painted_percent(), 0);
+        assert!(!stats.wallpaper_is_visible());
+    }
+
+    #[test]
+    fn initial_desktop_ppm_accepts_painted_wallpaper() {
+        let stats = analyze_initial_desktop_ppm(&test_ppm(80, 60, [24, 48, 96]))
+            .expect("valid painted PPM");
+
+        assert_eq!(stats.painted_pixels, stats.interior_pixels);
+        assert_eq!(stats.painted_percent(), 100);
+        assert!(stats.wallpaper_is_visible());
+    }
+
+    #[test]
+    fn initial_desktop_screendump_stays_next_to_serial_artifact() {
+        assert_eq!(
+            initial_desktop_screendump_path(Path::new("/tmp/serial-graphics-x11-123.log")),
+            PathBuf::from("/tmp/serial-graphics-x11-123-initial-desktop.ppm")
+        );
+    }
+
+    #[test]
+    fn graphics_x11_generated_shell_scripts_parse() {
+        for (label, script) in [
+            ("user xsession", lightdm_user_xsession()),
+            (
+                "desktop-ready relay",
+                graphics_x11_desktop_ready_relay_script(),
+            ),
+            ("graphics probe", graphics_x11_probe_script()),
+        ] {
+            let mut child = Command::new("/bin/sh")
+                .arg("-n")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap_or_else(|err| panic!("failed to start sh -n for {label}: {err}"));
+            child
+                .stdin
+                .take()
+                .expect("sh stdin")
+                .write_all(&script)
+                .unwrap_or_else(|err| panic!("failed to feed {label} to sh -n: {err}"));
+            let output = child
+                .wait_with_output()
+                .unwrap_or_else(|err| panic!("failed to wait for sh -n on {label}: {err}"));
+            assert!(
+                output.status.success(),
+                "{label} failed sh -n: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     #[test]
     fn qemu_run_lock_blocks_concurrent_owner() {
         let nonce = SystemTime::now()
@@ -23624,6 +24320,84 @@ failed command output\n";
     }
 
     #[test]
+    fn graphics_x11_materializes_packaged_polkitd_account_before_dbus() {
+        let files = direct_stage_login_root_disk_overlay_files(
+            BootMode::GraphicsX11,
+            SYSTEMD_DISK_ROOT_FSTAB,
+            &[],
+            Path::new("/nonexistent-graphics-stage"),
+        );
+
+        for package_owned in ["etc/passwd", "etc/group", "etc/shadow", "etc/gshadow"] {
+            assert!(
+                find_initramfs_entry(&files, package_owned).is_none(),
+                "polkitd provisioning must not overlay package-owned {package_owned}"
+            );
+        }
+
+        let provision_entry = find_initramfs_entry(&files, "usr/libexec/lupos-provision-polkitd")
+            .expect("package-unowned polkitd provisioner staged");
+        assert_eq!(provision_entry.1 & 0o777, 0o755);
+        let provision =
+            core::str::from_utf8(&provision_entry.2).expect("polkitd provisioner UTF-8");
+        for declaration in [
+            "g polkitd 102",
+            "u polkitd 102:102 \"User for polkitd\"",
+            "polkitd:x:102:",
+            "polkitd:x:102:102:User for polkitd:/:/usr/bin/nologin",
+            "polkitd:!*::",
+            "polkitd:!*:::::::",
+            "/usr/bin/id -u polkitd",
+            "/usr/bin/id -g polkitd",
+        ] {
+            assert!(
+                provision.contains(declaration),
+                "polkitd provisioner must contain {declaration:?}"
+            );
+        }
+        assert!(provision.contains("gid 102 belongs to"));
+        assert!(provision.contains("uid 102 belongs to"));
+
+        let unit = core::str::from_utf8(
+            initramfs_file_bytes(
+                &files,
+                "usr/lib/systemd/system/lupos-provision-polkitd.service",
+            )
+            .expect("polkitd provisioning unit staged"),
+        )
+        .expect("polkitd provisioning unit UTF-8");
+        assert!(unit.contains("After=systemd-remount-fs.service"));
+        let before = unit
+            .lines()
+            .find(|line| line.starts_with("Before="))
+            .expect("polkitd provisioning unit has explicit early ordering");
+        for predecessor in [
+            "systemd-sysusers.service",
+            "lupos-provision-users.service",
+            "dbus.service",
+            "dbus-broker.service",
+            "polkit.service",
+            "sysinit.target",
+        ] {
+            assert!(
+                before
+                    .split_whitespace()
+                    .any(|word| { word.trim_start_matches("Before=") == predecessor }),
+                "polkitd provisioning must run before {predecessor}"
+            );
+        }
+        assert!(!unit.contains("users-provisioned"));
+        assert_eq!(
+            find_initramfs_symlink_target(
+                &files,
+                "etc/systemd/system/sysinit.target.wants/lupos-provision-polkitd.service",
+            ),
+            Some(&b"/usr/lib/systemd/system/lupos-provision-polkitd.service"[..]),
+            "sysinit must pull in the polkitd provisioner"
+        );
+    }
+
+    #[test]
     fn graphics_x11_direct_stage_overlay_starts_fbdev_xorg_on_tty1() {
         let _timezone_guard = EnvVarGuard::set(LUPOS_TIMEZONE_ENV, "Asia/Tokyo");
         let files = direct_stage_login_root_disk_overlay_files(
@@ -23737,6 +24511,40 @@ failed command output\n";
             "greeter GTK theme must style the login surface"
         );
 
+        let power_rules = core::str::from_utf8(
+            initramfs_file_bytes(
+                &files,
+                "usr/local/share/polkit-1/rules.d/49-lupos-power.rules",
+            )
+            .expect("package-unowned Lupos power policy staged"),
+        )
+        .expect("Lupos power policy UTF-8");
+        assert!(power_rules.contains("subject.user != \"lupos\""));
+        for action in [
+            "org.freedesktop.login1.power-off",
+            "org.freedesktop.login1.power-off-multiple-sessions",
+            "org.freedesktop.login1.reboot",
+            "org.freedesktop.login1.reboot-multiple-sessions",
+        ] {
+            assert!(
+                power_rules.contains(action),
+                "Lupos power policy must authorize {action}"
+            );
+        }
+        for forbidden in [
+            "org.freedesktop.login1.suspend",
+            "org.freedesktop.login1.hibernate",
+            "org.freedesktop.login1.power-off-ignore-inhibit",
+            "org.freedesktop.login1.reboot-ignore-inhibit",
+            "action.id.indexOf(\"org.freedesktop.login1.\")",
+            "subject.isInGroup",
+        ] {
+            assert!(
+                !power_rules.contains(forbidden),
+                "Lupos power policy must not broaden into {forbidden}"
+            );
+        }
+
         let xinitrc = core::str::from_utf8(
             initramfs_file_bytes(&files, "root/.xinitrc").expect("root xinitrc staged"),
         )
@@ -23763,6 +24571,27 @@ failed command output\n";
             user_xsession_body.contains("exec twm"),
             "LightDM user session keeps the non-XFCE fallback"
         );
+        assert!(
+            user_xsession_body.contains("/tmp/lupos-desktop-initial-ready"),
+            "authenticated session must publish the untouched desktop boundary"
+        );
+        assert!(
+            user_xsession_body.contains("xfce4-session xfwm4 xfsettingsd xfce4-panel xfdesktop"),
+            "desktop boundary must require the complete XFCE process set"
+        );
+        let desktop_relay = core::str::from_utf8(
+            initramfs_file_bytes(&files, "usr/libexec/lupos-desktop-ready-relay")
+                .expect("desktop-ready serial relay staged"),
+        )
+        .expect("desktop-ready relay UTF-8");
+        assert!(desktop_relay.contains("graphics-x11: desktop-initial-ready"));
+        assert_eq!(
+            find_initramfs_symlink_target(
+                &files,
+                "etc/systemd/system/multi-user.target.wants/lupos-desktop-ready-relay.service"
+            ),
+            Some(&b"/usr/lib/systemd/system/lupos-desktop-ready-relay.service"[..])
+        );
 
         assert_eq!(
             find_initramfs_symlink_target(&files, "etc/systemd/system/display-manager.service"),
@@ -23778,6 +24607,23 @@ failed command output\n";
         )
         .expect("LightDM drop-in UTF-8");
         assert!(lightdm_dropin.contains("ExecStart=/usr/bin/lightdm --debug"));
+
+        let sudoers = find_initramfs_entry(&files, GRAPHICS_X11_SUDOERS_PATH)
+            .expect("graphics image must stage its package-unowned sudoers fragment");
+        assert_eq!(
+            sudoers.1 & 0o7777,
+            0o440,
+            "sudoers fragments must not be writable or executable"
+        );
+        assert_eq!(
+            sudoers.2.as_slice(),
+            GRAPHICS_X11_SUDOERS.as_bytes(),
+            "wheel must receive the standard password-authenticated sudo grant"
+        );
+        assert!(
+            !GRAPHICS_X11_SUDOERS.contains("NOPASSWD"),
+            "desktop sudo must preserve the password authentication boundary"
+        );
         for package_owned in [
             "usr/lib/systemd/system/lightdm.service",
             "etc/lightdm/lightdm.conf",
@@ -23792,6 +24638,9 @@ failed command output\n";
             "etc/shadow",
             "etc/group",
             "etc/gshadow",
+            "etc/sudoers",
+            "usr/bin/sudo",
+            "usr/bin/visudo",
         ] {
             assert!(
                 find_initramfs_entry(&files, package_owned).is_none(),
@@ -23843,6 +24692,45 @@ failed command output\n";
         assert!(probe.contains("graphics-x11: greeter ok"));
         assert!(probe.contains("process_named_uid xfce4-session 1000"));
         assert!(probe.contains("graphics-x11: user-session ok"));
+        assert!(probe.contains("graphics-x11: initial-desktop-ready ok"));
+        assert!(probe.contains("graphics-x11: initial-root-pixmap ready"));
+        assert!(probe.contains("dd if=/dev/fb0"));
+        assert!(probe.contains("graphics-x11: guest-framebuffer-readback zero"));
+        assert!(!probe.contains("graphics-x11: initial-wallpaper failed"));
+        assert!(probe.contains("graphics-x11: greeter-process absent-after-login"));
+        assert!(!probe.contains("greeter-x-resources absent"));
+        assert!(!probe.contains("/usr/bin/xwininfo"));
+        let initial_frame = probe
+            .find("graphics-x11: initial-framebuffer-probe begin")
+            .expect("initial framebuffer boundary");
+        let initial_frame_end = probe
+            .find("graphics-x11: initial-framebuffer-probe end")
+            .expect("initial framebuffer completion");
+        let sudo_probe = probe
+            .find("graphics-x11: sudo-probe begin")
+            .expect("sudo probe boundary");
+        let first_mapped_client = probe
+            .find("graphics-x11: xterm-shell-probe begin")
+            .expect("mapped X client boundary");
+        assert!(initial_frame < initial_frame_end);
+        assert!(initial_frame_end < sudo_probe);
+        assert!(initial_frame_end < first_mapped_client);
+        assert!(
+            !probe[..initial_frame_end].contains("/usr/bin/xterm"),
+            "no mapped helper client may run before the authoritative frame sample"
+        );
+        assert!(probe.contains("graphics-x11: lupos-uid ok"));
+        assert!(probe.contains("/usr/bin/id polkitd"));
+        assert!(probe.contains("graphics-x11: polkitd-account ok"));
+        assert!(probe.contains("graphics-x11: polkitd-provision-service active"));
+        assert!(probe.contains("/usr/bin/systemctl start polkit.service"));
+        assert!(probe.contains("graphics-x11: polkit-service active"));
+        assert!(probe.contains("graphics-x11: polkit-power-off ok"));
+        assert!(probe.contains("graphics-x11: polkit-reboot ok"));
+        assert!(probe.contains("org.freedesktop.login1.Manager CanPowerOff"));
+        assert!(probe.contains("org.freedesktop.login1.Manager CanReboot"));
+        assert!(probe.contains("graphics-x11: power-off-button ok"));
+        assert!(probe.contains("graphics-x11: reboot-button ok"));
         assert!(probe.contains("curl -fsSI"));
         assert!(probe.contains("http://example.com"));
         assert!(probe.contains("graphics-x11: curl dns ok"));
@@ -23869,6 +24757,19 @@ failed command output\n";
         assert!(probe.contains("tail -c +25 /tmp/lupos-wallpaper-pixdata.bin"));
         assert!(probe.contains("graphics-x11: login1-seats"));
         assert!(probe.contains("graphics-x11: seat-graphical ok"));
+        assert!(probe.contains("/usr/bin/visudo -cf /etc/sudoers"));
+        assert!(probe.contains("graphics-x11: sudoers-syntax ok"));
+        assert!(probe.contains("/usr/bin/sudo -n -u lupos"));
+        assert!(probe.contains("graphics-x11: sudo-password-required ok"));
+        assert!(probe.contains(
+            "! /usr/bin/sudo -n /usr/bin/pacman --config /etc/pacman-lupos.conf --version"
+        ));
+        assert!(probe.contains("/usr/bin/sudo -S -k -p '' /usr/bin/pacman"));
+        assert!(probe.contains("graphics-x11: sudo-pacman ok"));
+        assert!(probe.contains("graphics-x11: bwrap-sandbox secure-fail-closed"));
+        assert!(probe.contains("No permissions to create a new namespace"));
+        assert!(probe.contains("legacy_tiocsti 2>/dev/null)\" = '0'"));
+        assert!(!probe.contains("NOPASSWD"));
         assert!(probe.contains("timeout 15 journalctl"));
         assert!(probe.contains("timeout 10 /usr/bin/busctl"));
         assert!(!probe.contains("dbus-run-session -- startxfce4"));

@@ -1085,9 +1085,6 @@ pub unsafe fn sys_epoll_wait(
     loop {
         #[cfg(not(test))]
         let _ = crate::linux_driver_abi::poll_driver_abi_events_for_wait();
-        unsafe {
-            crate::kernel::signal::exit_if_fatal_signal_pending_current();
-        }
         match ep.wait_ready_user(events, maxevents as usize) {
             Ok(n) if n != 0 => {
                 return n as i64;
@@ -1098,8 +1095,10 @@ pub unsafe fn sys_epoll_wait(
             Ok(_) => {}
             Err(errno) => return -(errno as i64),
         }
-        #[cfg(not(test))]
         if crate::kernel::signal::current_has_unblocked_pending_signals() {
+            // epoll_wait is not restartable. Return through the syscall frame
+            // so the EventPoll Arc is dropped before syscall-exit delivers a
+            // default-fatal signal.
             return -(EINTR as i64);
         }
         if let Some(deadline_ns) = deadline_ns {
@@ -1293,6 +1292,70 @@ mod tests {
     #[test]
     fn epoll_event_size_is_12() {
         assert_eq!(core::mem::size_of::<EpollEvent>(), 12);
+    }
+
+    #[test]
+    fn fatal_signal_interrupts_epoll_without_consuming_signal_or_leaking_arcs() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 31_102;
+        current.tgid = 31_102;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            let ft = FilesStruct::new();
+            let ft_weak = Arc::downgrade(&ft);
+            files::set_task_files(&mut *current as *mut TaskStruct, ft.clone());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let epfd = sys_epoll_create1(0);
+            assert!(epfd >= 0);
+            let ep = epoll_from_fd(epfd as i32).expect("created epoll");
+            let ep_weak = Arc::downgrade(&ep);
+            assert!(ep.wait_queue.is_empty());
+            drop(ep);
+            drop(ft);
+
+            assert_eq!(
+                crate::kernel::signal::send_signal_to_task(
+                    &mut *current as *mut TaskStruct,
+                    crate::kernel::signal::SIGTERM,
+                ),
+                0
+            );
+
+            let mut out = [EpollEvent { events: 0, data: 0 }; 1];
+            assert_eq!(
+                sys_epoll_wait(epfd as i32, out.as_mut_ptr(), 1, -1),
+                -(EINTR as i64)
+            );
+            assert_ne!(
+                crate::kernel::signal::current_pending_signal_bits()
+                    & (1u64 << (crate::kernel::signal::SIGTERM - 1)),
+                0,
+                "epoll_wait must leave the fatal signal queued for syscall-exit"
+            );
+            let ep = epoll_from_fd(epfd as i32).expect("epoll survives interrupted wait");
+            assert!(
+                ep.wait_queue.is_empty(),
+                "interrupted epoll_wait left a task wait entry"
+            );
+            drop(ep);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            assert!(
+                ft_weak.upgrade().is_none(),
+                "epoll_wait syscall-local files_struct Arc leaked"
+            );
+            assert!(
+                ep_weak.upgrade().is_none(),
+                "epoll_wait syscall-local EventPoll Arc leaked"
+            );
+            sched::set_current(previous);
+        }
+        crate::kernel::signal::reset_for_tests();
     }
 
     #[test]
