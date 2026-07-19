@@ -162,11 +162,9 @@ fn legacy_timed_futex_restart_result(result: i64, has_timeout: bool) -> i64 {
     const ERESTART_RESTARTBLOCK: i64 = 516;
 
     if has_timeout && result == -ERESTARTSYS {
-        // Linux installs futex_wait_restart and returns this code.  Lupos has
-        // the signal-side restart-syscall routing but no materialized per-task
-        // restart_block (sys_restart_syscall currently returns EINTR).  Using
-        // the existing routing preserves Linux's handler-visible EINTR and,
-        // critically, never restarts a relative wait with its full duration.
+        // Linux installs futex_wait_restart and returns this code.  The caller
+        // has populated the current task's restart_block with the absolute
+        // timeout so restart_syscall cannot reset a relative wait's duration.
         return -ERESTART_RESTARTBLOCK;
     }
     result
@@ -1829,6 +1827,9 @@ pub unsafe extern "C" fn __x64_sys_pause(_regs: *mut PtRegs) -> i64 {
 }
 
 pub unsafe extern "C" fn __x64_sys_restart_syscall(_regs: *mut PtRegs) -> i64 {
+    if let Some(result) = unsafe { crate::kernel::futex::restart_futex_wait_current() } {
+        return result;
+    }
     crate::kernel::syscalls::sys_restart_syscall()
 }
 
@@ -2198,6 +2199,55 @@ pub unsafe extern "C" fn __x64_sys_sched_getattr(regs: *mut PtRegs) -> i64 {
     0
 }
 
+#[cfg(not(test))]
+static FUTEX_UNEXPECTED_TRACE_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+fn trace_unexpected_futex_result(regs: &PtRegs, result: i64) {
+    const EAGAIN: i64 = 11;
+    const ETIMEDOUT: i64 = 110;
+    if result >= 0 || result == -EAGAIN {
+        return;
+    }
+    let cmd = regs.arg1() as u32 & crate::kernel::futex::FUTEX_CMD_MASK;
+    if result == -ETIMEDOUT
+        && regs.arg3() != 0
+        && matches!(
+            cmd,
+            crate::kernel::futex::FUTEX_WAIT | crate::kernel::futex::FUTEX_WAIT_BITSET
+        )
+    {
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        let task = unsafe { crate::kernel::sched::get_current() };
+        if task.is_null() || !unsafe { (*task).comm.starts_with(b"firefox") } {
+            return;
+        }
+        let count = FUTEX_UNEXPECTED_TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        if count >= 128 {
+            return;
+        }
+        let pid = if task.is_null() {
+            -1
+        } else {
+            unsafe { (*task).pid }
+        };
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-futex-unexpected pid={} op={:#x} uaddr={:#x} val={} timeout={:#x} uaddr2={:#x} val3={:#x} ret={}",
+            pid,
+            regs.arg1(),
+            regs.arg0(),
+            regs.arg2(),
+            regs.arg3(),
+            regs.arg4(),
+            regs.arg5(),
+            result
+        );
+    }
+}
+
 pub unsafe extern "C" fn __x64_sys_futex(regs: *mut PtRegs) -> i64 {
     let r = unsafe { &*regs };
     let op = r.arg1() as u32;
@@ -2247,7 +2297,22 @@ pub unsafe extern "C" fn __x64_sys_futex(regs: *mut PtRegs) -> i64 {
                 op & crate::kernel::futex::FUTEX_PRIVATE_FLAG != 0,
             )
         };
-        return legacy_timed_futex_restart_result(result, deadline.is_some());
+        if result == -512 {
+            if let Some(deadline) = deadline {
+                unsafe {
+                    crate::kernel::futex::prepare_futex_wait_restart(
+                        r.arg0(),
+                        r.arg2() as u32,
+                        bitset,
+                        deadline,
+                        op & crate::kernel::futex::FUTEX_PRIVATE_FLAG != 0,
+                    );
+                }
+            }
+        }
+        let result = legacy_timed_futex_restart_result(result, deadline.is_some());
+        trace_unexpected_futex_result(r, result);
+        return result;
     }
     let timeout_clockid = if cmd == crate::kernel::futex::FUTEX_LOCK_PI {
         crate::kernel::time::CLOCK_REALTIME
@@ -2270,7 +2335,7 @@ pub unsafe extern "C" fn __x64_sys_futex(regs: *mut PtRegs) -> i64 {
         }
         _ => raw_timeout,
     };
-    unsafe {
+    let result = unsafe {
         crate::kernel::futex::sys_futex(
             r.arg0(),
             op,
@@ -2279,7 +2344,9 @@ pub unsafe extern "C" fn __x64_sys_futex(regs: *mut PtRegs) -> i64 {
             r.arg4(),
             r.arg5() as u32,
         )
-    }
+    };
+    trace_unexpected_futex_result(r, result);
+    result
 }
 
 pub unsafe extern "C" fn __x64_sys_set_robust_list(regs: *mut PtRegs) -> i64 {

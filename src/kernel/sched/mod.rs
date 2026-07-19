@@ -894,8 +894,12 @@ pub unsafe fn legacy_schedule() -> bool {
         return true; // round-robin landed back on ourselves; idle
     }
 
+    // Match Linux __schedule(): the reschedule request belongs to the task
+    // that entered the scheduler.  Clearing it on `next` leaves `prev` with a
+    // stale TIF_NEED_RESCHED, so it schedules again at every return-to-user
+    // boundary after it next runs.
     unsafe {
-        clear_need_resched(next);
+        clear_need_resched(prev);
     }
     crate::kernel::rcu::tasks_rcu_qs();
     crate::kernel::rcu::rcu_qs();
@@ -958,12 +962,12 @@ pub unsafe fn __schedule() {
         } else {
             prev
         };
+        clear_need_resched(prev);
         if !next.is_null() && next != prev {
             (*next).m29.on_cpu = 1;
             (*next).thread_info.cpu = cpu;
             (*next).m29.recent_used_cpu = cpu as i32;
             (*next).m29.wake_cpu = cpu as i32;
-            clear_need_resched(next);
         }
         this_rq.current = next;
         (prev, next)

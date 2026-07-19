@@ -1,5 +1,4 @@
 //! linux-parity: partial
-//! linux-deviation: timed legacy futex waits use Linux absolute hrtimer-sleeper deadlines, but Lupos does not yet materialize the per-task restart_block needed for a handler-free restart_syscall continuation.
 //! linux-source: vendor/linux/kernel/futex
 //! test-origin: linux:vendor/linux/kernel/futex
 //! Core futex operations — `futex_wait`, `futex_wake`, `futex_requeue`,
@@ -27,6 +26,10 @@ use super::{
 
 // Kernel-internal restart pseudo-errno from vendor/linux/include/linux/errno.h.
 const ERESTARTSYS: i32 = 512;
+const ERESTART_RESTARTBLOCK: i32 = 516;
+const FLAGS_SHARED: u32 = 0x0010;
+const FLAGS_CLOCKRT: u32 = 0x0020;
+const FLAGS_HAS_TIMEOUT: u32 = 0x0040;
 
 /// An absolute futex timeout and the clock against which it expires.
 ///
@@ -808,6 +811,91 @@ pub unsafe fn futex_wait_deadline(
     private: bool,
 ) -> i64 {
     unsafe { futex_wait_impl(uaddr, val, bitset, deadline, private, false) }
+}
+
+/// Populate the current task's Linux `restart_block.futex` after an
+/// interrupted timed wait.
+pub unsafe fn prepare_futex_wait_restart(
+    uaddr: u64,
+    val: u32,
+    bitset: u32,
+    deadline: FutexDeadline,
+    private: bool,
+) {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return;
+    }
+    let mut flags = FLAGS_HAS_TIMEOUT;
+    if !private {
+        flags |= FLAGS_SHARED;
+    }
+    if matches!(
+        deadline.clock,
+        crate::kernel::time::hrtimer::ClockBase::Realtime
+            | crate::kernel::time::hrtimer::ClockBase::Tai
+    ) {
+        flags |= FLAGS_CLOCKRT;
+    }
+    unsafe {
+        (*task).restart_block.arch_data = 0;
+        (*task).restart_block.fn_marker = crate::kernel::task::RESTART_BLOCK_FN_FUTEX;
+        (*task).restart_block.data.futex = crate::kernel::task::FutexRestartBlock {
+            uaddr,
+            val,
+            flags,
+            bitset,
+            _pad: 0,
+            time: deadline.expires_ns.min(i64::MAX as u64) as i64,
+            uaddr2: 0,
+        };
+    }
+}
+
+/// Linux `futex_wait_restart()`, dispatched by `restart_syscall(2)`.
+///
+/// Returns `None` when the current task has no futex restart pending.
+pub unsafe fn restart_futex_wait_current() -> Option<i64> {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null()
+        || unsafe { (*task).restart_block.fn_marker } != crate::kernel::task::RESTART_BLOCK_FN_FUTEX
+    {
+        return None;
+    }
+    let restart = unsafe { (*task).restart_block.data.futex };
+    unsafe {
+        (*task).restart_block.fn_marker = crate::kernel::task::RESTART_BLOCK_FN_NONE;
+    }
+    let deadline = if restart.flags & FLAGS_CLOCKRT != 0 {
+        FutexDeadline::realtime(restart.time.max(0) as u64)
+    } else {
+        FutexDeadline::monotonic(restart.time.max(0) as u64)
+    };
+    let private = restart.flags & FLAGS_SHARED == 0;
+    let result = unsafe {
+        futex_wait_impl(
+            restart.uaddr,
+            restart.val,
+            restart.bitset,
+            (restart.flags & FLAGS_HAS_TIMEOUT != 0).then_some(deadline),
+            private,
+            false,
+        )
+    };
+    if result == -(ERESTARTSYS as i64) {
+        unsafe {
+            prepare_futex_wait_restart(
+                restart.uaddr,
+                restart.val,
+                restart.bitset,
+                deadline,
+                private,
+            );
+        }
+        Some(-(ERESTART_RESTARTBLOCK as i64))
+    } else {
+        Some(result)
+    }
 }
 
 pub unsafe fn futex_wait_requeue_pi_prepare(
