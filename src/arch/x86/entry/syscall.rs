@@ -526,12 +526,7 @@ unsafe fn syscall_dispatch_ptregs_inner(
                 if ctx.old_mm != 0 {
                     crate::mm::fork::mmput(ctx.old_mm as *mut crate::mm::mm_types::MmStruct);
                 }
-                (*regs).rip = ctx.ip;
-                (*regs).rcx = ctx.ip;
-                (*regs).rsp = ctx.sp;
-                (*regs).eflags = ctx.rflags;
-                (*regs).r11 = ctx.rflags;
-                (*regs).rax = 0;
+                initialize_exec_registers(&mut *regs, &ctx);
             }
         }
     }
@@ -539,6 +534,44 @@ unsafe fn syscall_dispatch_ptregs_inner(
     trace_systemd_service_syscall(unsafe { &*regs }, ret, task);
     trace_udev_syscall_exit(unsafe { &*regs }, ret, task);
     ret
+}
+
+/// Initialize the x86-64 user register image for a newly executed ELF.
+///
+/// Linux's `ELF_PLAT_INIT()` calls `elf_common_init()` before
+/// `start_thread()`: all general-purpose registers except `%rax` are cleared,
+/// `%rax` carries execve's zero return value, and the new instruction/stack
+/// pointers and user segments are installed. In particular, `%rdx` must be
+/// zero. The System V startup ABI treats a nonzero `%rdx` as the dynamic
+/// loader's finalizer callback; leaking execve's old `envp` there makes static
+/// PIE startup register a data pointer with `atexit()`.
+///
+/// Ref: Linux `arch/x86/include/asm/elf.h::elf_common_init()` and
+/// `arch/x86/kernel/process_64.c::start_thread_common()`.
+fn initialize_exec_registers(
+    regs: &mut crate::arch::x86::kernel::ptrace::PtRegs,
+    ctx: &UserStartContext,
+) {
+    regs.r15 = 0;
+    regs.r14 = 0;
+    regs.r13 = 0;
+    regs.r12 = 0;
+    regs.rbp = 0;
+    regs.rbx = 0;
+    regs.r11 = 0;
+    regs.r10 = 0;
+    regs.r9 = 0;
+    regs.r8 = 0;
+    regs.rax = 0;
+    regs.rcx = 0;
+    regs.rdx = 0;
+    regs.rsi = 0;
+    regs.rdi = 0;
+    regs.rip = ctx.ip;
+    regs.cs = sel::USER_CS as u64;
+    regs.eflags = ctx.rflags;
+    regs.rsp = ctx.sp;
+    regs.ss = sel::USER_DS as u64;
 }
 
 #[cfg(not(test))]
@@ -1476,6 +1509,56 @@ mod tests {
             rsp: 0,
             ss: 0,
         }
+    }
+
+    #[test]
+    fn exec_register_image_matches_x86_64_elf_common_init() {
+        let mut regs = PtRegs {
+            r15: 15,
+            r14: 14,
+            r13: 13,
+            r12: 12,
+            rbp: 6,
+            rbx: 3,
+            r11: 11,
+            r10: 10,
+            r9: 9,
+            r8: 8,
+            rax: 59,
+            rcx: 4,
+            rdx: 0xdead_beef,
+            rsi: 2,
+            rdi: 1,
+            orig_rax: 59,
+            rip: 0x400000,
+            cs: 0,
+            eflags: 0,
+            rsp: 0x7000,
+            ss: 0,
+        };
+        let ctx = UserStartContext {
+            ip: 0x5555_5555_7bc0,
+            sp: 0x7fff_ffff_f000,
+            rflags: 0x202,
+            old_mm: 0,
+        };
+
+        initialize_exec_registers(&mut regs, &ctx);
+
+        assert_eq!(
+            [
+                regs.r15, regs.r14, regs.r13, regs.r12, regs.rbp, regs.rbx, regs.r11, regs.r10,
+                regs.r9, regs.r8, regs.rax, regs.rcx, regs.rdx, regs.rsi, regs.rdi,
+            ],
+            [0; 15]
+        );
+        assert_eq!(regs.orig_rax, 59);
+        assert_eq!(regs.rip, ctx.ip);
+        assert_eq!(regs.rsp, ctx.sp);
+        assert_eq!(regs.eflags, ctx.rflags);
+        assert_eq!(regs.cs, sel::USER_CS as u64);
+        assert_eq!(regs.ss, sel::USER_DS as u64);
+        assert!(!syscall_frame_allows_sysret(&regs));
     }
 
     #[test]
