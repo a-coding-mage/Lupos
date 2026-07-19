@@ -2789,6 +2789,7 @@ pub(crate) struct LinuxDriverModuleOverride {
     pub symbol: String,
     pub expected_ko: String,
     pub kbuild_path: String,
+    pub kconfig_path: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2990,16 +2991,16 @@ fn config_parity_detail(
     if let Some(module) = module_overrides.get(symbol) {
         return match (kind, staged_modules.get(symbol)) {
             (ConfigParityKind::ModuleOverride, Some(path)) => format!(
-                "driver demotion covered by staged vendor module {path}; kbuild={}",
-                module.kbuild_path
+                "driver demotion covered by staged vendor module {path}; kconfig={}; kbuild={}",
+                module.kconfig_path, module.kbuild_path
             ),
             (_, Some(path)) => format!(
-                "staged vendor module mismatch: expected {}; manifest has {path}; kbuild={}",
-                module.expected_ko, module.kbuild_path
+                "staged vendor module mismatch: expected {}; manifest has {path}; kconfig={}; kbuild={}",
+                module.expected_ko, module.kconfig_path, module.kbuild_path
             ),
             _ => format!(
-                "driver demotion missing staged vendor module {}; kbuild={}",
-                module.expected_ko, module.kbuild_path
+                "driver demotion missing staged vendor module {}; kconfig={}; kbuild={}",
+                module.expected_ko, module.kconfig_path, module.kbuild_path
             ),
         };
     }
@@ -3070,7 +3071,15 @@ fn generated_linux_driver_module_overrides(
         })
         .map(|(symbol, _)| symbol.clone())
         .collect::<BTreeSet<_>>();
-    let kbuild_modules = scan_vendor_kbuild_modules(&repo.join("vendor/linux"))?;
+    let linux_root = repo.join("vendor/linux");
+    let kconfig_symbols = scan_vendor_kconfig_symbols(&linux_root)?;
+    let mut kbuild_modules = scan_vendor_kbuild_modules(&linux_root)?;
+    for module in kbuild_modules.values_mut() {
+        module.kconfig_path = kconfig_symbols
+            .get(&module.symbol)
+            .cloned()
+            .unwrap_or_else(|| "<missing-kconfig-declaration>".to_owned());
+    }
     Ok(demoted
         .into_iter()
         .filter_map(|symbol| {
@@ -3080,6 +3089,57 @@ fn generated_linux_driver_module_overrides(
                 .map(|module| (symbol, module))
         })
         .collect())
+}
+
+fn scan_vendor_kconfig_symbols(linux: &Path) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    scan_vendor_kconfig_dir(linux, linux, &mut out)?;
+    Ok(out)
+}
+
+fn scan_vendor_kconfig_dir(
+    root: &Path,
+    dir: &Path,
+    out: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            scan_vendor_kconfig_dir(root, &path, out)?;
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("Kconfig") {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        for line in text.lines() {
+            let line = line.trim();
+            let Some(name) = line
+                .strip_prefix("config ")
+                .or_else(|| line.strip_prefix("menuconfig "))
+            else {
+                continue;
+            };
+            if let Some(symbol) = name.split_whitespace().next() {
+                out.entry(format!("CONFIG_{symbol}"))
+                    .or_insert_with(|| rel.clone());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn scan_vendor_kbuild_modules(linux: &Path) -> Result<BTreeMap<String, LinuxDriverModuleOverride>> {
@@ -3155,6 +3215,7 @@ fn scan_vendor_kbuild_dir(
                         } else {
                             format!("{rel_dir}/{name}")
                         },
+                        kconfig_path: String::new(),
                     });
             }
         }
@@ -4203,6 +4264,7 @@ mod tests {
                         symbol: (*symbol).to_owned(),
                         expected_ko: (*ko).to_owned(),
                         kbuild_path: "drivers/test/Makefile".to_owned(),
+                        kconfig_path: "drivers/test/Kconfig".to_owned(),
                     },
                 )
             })
@@ -4410,24 +4472,40 @@ mod tests {
     }
 
     #[test]
-    fn vendor_kbuild_scanner_derives_expected_modules_from_config_symbols() {
+    fn vendor_metadata_derives_expected_modules_from_config_symbols() {
         let root = tmp_repo();
         let linux = root.join("vendor/linux/drivers/net");
         fs::create_dir_all(&linux).expect("create vendor kbuild dir");
         fs::write(
             linux.join("Makefile"),
-            "obj-$(CONFIG_VIRTIO_NET) += virtio_net.o
-             obj-$(CONFIG_DUAL) += first.o second.o
-",
+            "obj-$(CONFIG_VIRTIO_NET) += virtio_net.o\nobj-$(CONFIG_DUAL) += first.o second.o\n",
         )
         .expect("write makefile");
+        fs::write(
+            linux.join("Kconfig"),
+            r#"config VIRTIO_NET
+	tristate "Virtio network driver"
+config DUAL
+	tristate "dual module fixture"
+"#,
+        )
+        .expect("write kconfig");
 
-        let modules = scan_vendor_kbuild_modules(&root.join("vendor/linux")).expect("scan kbuild");
+        let lupos = "CONFIG_VIRTIO_NET=m\nCONFIG_DUAL=m\n";
+        let upstream = "CONFIG_VIRTIO_NET=y\nCONFIG_DUAL=y\n";
+        let modules = generated_linux_driver_module_overrides(&root, lupos, upstream)
+            .expect("scan vendor metadata");
         assert_eq!(
             modules
                 .get("CONFIG_VIRTIO_NET")
                 .map(|module| module.expected_ko.as_str()),
             Some("kernel/drivers/net/virtio_net.ko")
+        );
+        assert_eq!(
+            modules
+                .get("CONFIG_VIRTIO_NET")
+                .map(|module| module.kconfig_path.as_str()),
+            Some("drivers/net/Kconfig")
         );
         assert_eq!(
             split_module_list(
