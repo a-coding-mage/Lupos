@@ -9148,86 +9148,40 @@ fn module_strong_undefined_symbols(spec: &DriverModuleSpec) -> Result<HashSet<St
         .collect())
 }
 
-/// Cross-check hand-authored modules.dep metadata against the actual ELF
-/// import/export graph. Undefined kernel symbols with no selected module
-/// provider remain a separate Lupos ABI obligation and are reported by the
-/// runtime-loadability warning; this audit rejects missing/interverted staged
-/// module providers.
-fn audit_linux_driver_module_dependencies(modules: &[&DriverModuleSpec]) -> Result<()> {
-    let positions = modules
+/// Cross-check generated load metadata against the actual staged ELF import/export graph.
+/// Undefined kernel symbols with no selected module provider remain a separate
+/// Lupos ABI obligation and are reported by the runtime-loadability warning;
+/// this audit rejects missing/interverted staged module providers.
+fn audit_linux_driver_module_dependencies(modules: &[&'static DriverModuleSpec]) -> Result<()> {
+    let (ordered, dependencies) = generated_module_load_metadata(modules)?;
+    let positions = ordered
         .iter()
         .enumerate()
         .map(|(index, spec)| (spec.module_path, index))
         .collect::<HashMap<_, _>>();
-    for (index, spec) in modules.iter().enumerate() {
-        for dependency in spec.module_deps {
+    for spec in modules {
+        let Some(index) = positions.get(spec.module_path) else {
+            bail!(
+                "staged module {} is missing from generated load metadata",
+                spec.module_path
+            );
+        };
+        for dependency in dependencies.get(spec.module_path).into_iter().flatten() {
             let Some(dependency_index) = positions.get(dependency) else {
                 bail!(
-                    "{} declares unstaged module dependency {}",
+                    "{} generated unstaged module dependency {}",
                     spec.module_name,
                     dependency
                 );
             };
-            if *dependency_index >= index {
+            if *dependency_index >= *index {
                 bail!(
-                    "{} must follow module dependency {} in /etc/modules",
+                    "{} appears before dependency {} in generated load metadata",
                     spec.module_name,
                     dependency
                 );
             }
         }
-    }
-
-    let mut providers = HashMap::<String, Vec<&DriverModuleSpec>>::new();
-    for spec in modules {
-        for symbol in module_exported_symbols(spec)? {
-            providers.entry(symbol).or_default().push(spec);
-        }
-    }
-
-    let mut metadata_errors = Vec::new();
-    for consumer in modules {
-        let declared = consumer.module_deps.iter().copied().collect::<HashSet<_>>();
-        let mut missing = Vec::new();
-        for symbol in module_strong_undefined_symbols(consumer)? {
-            let Some(symbol_providers) = providers.get(&symbol) else {
-                continue;
-            };
-            let external_providers = symbol_providers
-                .iter()
-                .copied()
-                .filter(|provider| provider.module_path != consumer.module_path)
-                .collect::<Vec<_>>();
-            if !external_providers.is_empty()
-                && !external_providers
-                    .iter()
-                    .any(|provider| declared.contains(provider.module_path))
-            {
-                missing.push(format!(
-                    "{symbol} from {}",
-                    external_providers
-                        .iter()
-                        .map(|provider| provider.module_path)
-                        .collect::<Vec<_>>()
-                        .join(" or ")
-                ));
-            }
-        }
-        missing.sort();
-        missing.dedup();
-        if !missing.is_empty() {
-            metadata_errors.push(format!(
-                "{} omits {}",
-                consumer.module_name,
-                missing.join(", ")
-            ));
-        }
-    }
-    if !metadata_errors.is_empty() {
-        bail!(
-            "modules.dep metadata omits actual ELF provider(s): {}",
-            metadata_errors.join("; ")
-        );
     }
     Ok(())
 }
@@ -9432,7 +9386,7 @@ fn build_linux_driver_module_artifacts(modules: &[&DriverModuleSpec]) -> Result<
     Ok(())
 }
 
-fn ensure_linux_driver_module_artifacts(modules: &[&DriverModuleSpec]) -> Result<()> {
+fn ensure_linux_driver_module_artifacts(modules: &[&'static DriverModuleSpec]) -> Result<()> {
     let _guard = LINUX_DRIVER_MODULE_BUILD_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -9559,7 +9513,147 @@ fn module_autoload_deferred(name: &str) -> bool {
     RUNTIME_DEFERRED_MODULE_NAMES.contains(&name)
 }
 
-fn module_list_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
+fn vendor_module_order_index(name: &str) -> usize {
+    VENDOR_KBUILD_MODULE_ORDER
+        .iter()
+        .position(|candidate| *candidate == name)
+        .unwrap_or(usize::MAX)
+}
+
+fn module_dependency_paths_from_symbols(
+    modules: &[&DriverModuleSpec],
+) -> Result<HashMap<&'static str, Vec<&'static str>>> {
+    #[cfg(test)]
+    if modules
+        .iter()
+        .any(|spec| !linux_driver_module_artifact(spec).is_ok_and(|path| path.is_file()))
+    {
+        return Ok(modules
+            .iter()
+            .map(|spec| (spec.module_path, spec.module_deps.to_vec()))
+            .collect());
+    }
+
+    let mut providers = HashMap::<String, Vec<&DriverModuleSpec>>::new();
+    for spec in modules {
+        for symbol in module_exported_symbols(spec)? {
+            providers.entry(symbol).or_default().push(spec);
+        }
+    }
+
+    let selected_paths = modules
+        .iter()
+        .map(|spec| spec.module_path)
+        .collect::<HashSet<_>>();
+    let mut dependencies = HashMap::new();
+    for consumer in modules {
+        let mut deps = HashSet::new();
+        for symbol in module_strong_undefined_symbols(consumer)? {
+            let Some(symbol_providers) = providers.get(&symbol) else {
+                continue;
+            };
+            for provider in symbol_providers {
+                if provider.module_path != consumer.module_path
+                    && selected_paths.contains(provider.module_path)
+                {
+                    deps.insert(provider.module_path);
+                }
+            }
+        }
+        let mut deps = deps.into_iter().collect::<Vec<_>>();
+        deps.sort_by_key(|path| {
+            modules
+                .iter()
+                .find(|spec| spec.module_path == *path)
+                .map(|spec| vendor_module_order_index(spec.module_name))
+                .unwrap_or(usize::MAX)
+        });
+        dependencies.insert(consumer.module_path, deps);
+    }
+    Ok(dependencies)
+}
+
+fn module_load_order_from_dependency_paths(
+    modules: &[&'static DriverModuleSpec],
+    dependencies: &HashMap<&'static str, Vec<&'static str>>,
+) -> Result<Vec<&'static DriverModuleSpec>> {
+    let by_path = modules
+        .iter()
+        .copied()
+        .map(|spec| (spec.module_path, spec))
+        .collect::<HashMap<_, _>>();
+    let mut ordered_roots = modules.to_vec();
+    ordered_roots.sort_by_key(|spec| vendor_module_order_index(spec.module_name));
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut ordered = Vec::new();
+
+    fn visit(
+        path: &'static str,
+        by_path: &HashMap<&'static str, &'static DriverModuleSpec>,
+        dependencies: &HashMap<&'static str, Vec<&'static str>>,
+        visiting: &mut HashSet<&'static str>,
+        visited: &mut HashSet<&'static str>,
+        ordered: &mut Vec<&'static DriverModuleSpec>,
+    ) -> Result<()> {
+        if visited.contains(path) {
+            return Ok(());
+        }
+        if !visiting.insert(path) {
+            bail!("cycle in generated module dependency metadata at {path}");
+        }
+        for dep in dependencies.get(path).into_iter().flatten() {
+            visit(dep, by_path, dependencies, visiting, visited, ordered)?;
+        }
+        visiting.remove(path);
+        visited.insert(path);
+        ordered.push(
+            *by_path
+                .get(path)
+                .with_context(|| format!("dependency {path} was not staged"))?,
+        );
+        Ok(())
+    }
+
+    for spec in ordered_roots {
+        visit(
+            spec.module_path,
+            &by_path,
+            dependencies,
+            &mut visiting,
+            &mut visited,
+            &mut ordered,
+        )?;
+    }
+    Ok(ordered)
+}
+
+fn generated_module_load_metadata(
+    modules: &[&'static DriverModuleSpec],
+) -> Result<(
+    Vec<&'static DriverModuleSpec>,
+    HashMap<&'static str, Vec<&'static str>>,
+)> {
+    #[cfg(test)]
+    if modules
+        .iter()
+        .any(|spec| !linux_driver_module_artifact(spec).is_ok_and(|path| path.is_file()))
+    {
+        return Ok((
+            modules.to_vec(),
+            modules
+                .iter()
+                .map(|spec| (spec.module_path, spec.module_deps.to_vec()))
+                .collect(),
+        ));
+    }
+
+    let dependencies = module_dependency_paths_from_symbols(modules)?;
+    let ordered = module_load_order_from_dependency_paths(modules, &dependencies)?;
+    Ok((ordered, dependencies))
+}
+
+fn module_list_from_ordered_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
     let mut list = String::new();
     for spec in modules {
         if module_autoload_deferred(spec.module_name) {
@@ -9569,6 +9663,12 @@ fn module_list_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
         list.push('\n');
     }
     list.into_bytes()
+}
+
+fn module_list_from_specs(modules: &[&'static DriverModuleSpec]) -> Vec<u8> {
+    let (ordered, _) = generated_module_load_metadata(modules)
+        .expect("vendor-built module dependency metadata must generate /etc/modules");
+    module_list_from_ordered_specs(&ordered)
 }
 
 const SYSTEMD_MODULES_LOAD_CONF_PATH: &str = "usr/lib/modules-load.d/lupos.conf";
@@ -9587,7 +9687,9 @@ fn modprobe_defer_conf_contents() -> Vec<u8> {
     contents.into_bytes()
 }
 
-fn module_load_request_files_from_specs(modules: &[&DriverModuleSpec]) -> Vec<InitramfsFile> {
+fn module_load_request_files_from_specs(
+    modules: &[&'static DriverModuleSpec],
+) -> Vec<InitramfsFile> {
     let module_list = module_list_from_specs(modules);
     vec![
         initramfs_file("etc/modules", 0o100644, module_list.clone()),
@@ -9709,7 +9811,16 @@ const VENDOR_KBUILD_MODULE_ORDER: &[&str] = &[
     "pata_sch",
 ];
 
-fn modules_order_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
+fn modules_order_from_ordered_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
+    let mut order = String::new();
+    for spec in modules {
+        order.push_str(spec.module_path);
+        order.push('\n');
+    }
+    order.into_bytes()
+}
+
+fn modules_order_from_specs(modules: &[&'static DriverModuleSpec]) -> Vec<u8> {
     let by_name = modules
         .iter()
         .map(|spec| (spec.module_name, *spec))
@@ -9731,31 +9842,27 @@ fn modules_order_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
     order.into_bytes()
 }
 
-fn modules_dep_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
-    let by_name = modules
-        .iter()
-        .map(|spec| (spec.module_name, *spec))
-        .collect::<HashMap<_, _>>();
+fn modules_dep_from_metadata(
+    ordered: &[&DriverModuleSpec],
+    dependencies: &HashMap<&'static str, Vec<&'static str>>,
+) -> Vec<u8> {
     let mut deps = String::new();
-    let mut emitted = HashSet::new();
-    for name in VENDOR_KBUILD_MODULE_ORDER {
-        if let Some(spec) = by_name.get(name) {
-            deps.push_str(spec.module_path);
-            deps.push(':');
-            for dep in spec.module_deps {
-                deps.push(' ');
-                deps.push_str(dep);
-            }
-            deps.push('\n');
-            emitted.insert(*name);
+    for spec in ordered {
+        deps.push_str(spec.module_path);
+        deps.push(':');
+        for dep in dependencies.get(spec.module_path).into_iter().flatten() {
+            deps.push(' ');
+            deps.push_str(dep);
         }
+        deps.push('\n');
     }
-    assert_eq!(
-        emitted.len(),
-        modules.len(),
-        "selected module lacks an audited depmod modules.dep position"
-    );
     deps.into_bytes()
+}
+
+fn modules_dep_from_specs(modules: &[&'static DriverModuleSpec]) -> Vec<u8> {
+    let (ordered, dependencies) = generated_module_load_metadata(modules)
+        .expect("vendor-built module dependency metadata must generate modules.dep");
+    modules_dep_from_metadata(&ordered, &dependencies)
 }
 
 fn modules_dep_equivalent(left: &[u8], right: &[u8]) -> bool {
@@ -9901,8 +10008,9 @@ fn staged_module_files_from_specs(
     }
 
     let mut files = Vec::new();
-    let modules_order = modules_order_from_specs(modules);
-    let modules_dep = modules_dep_from_specs(modules);
+    let (ordered, dependencies) = generated_module_load_metadata(modules)?;
+    let modules_order = modules_order_from_ordered_specs(&ordered);
+    let modules_dep = modules_dep_from_metadata(&ordered, &dependencies);
     for spec in modules {
         files.push(initramfs_file(
             &format!("lib/modules/{MODULE_VERSION_DIR}/{}", spec.module_path),
@@ -10265,6 +10373,50 @@ const INITRAMFS_ROOTFS_TEST_MODULE_NAMES: &[&str] = &[
     "virtio_blk",
 ];
 
+fn module_dependency_closed_specs(
+    selected: &[&'static DriverModuleSpec],
+    roots: &[&str],
+) -> Result<Vec<&'static DriverModuleSpec>> {
+    let (ordered, dependencies) = generated_module_load_metadata(selected)?;
+    let by_name = selected
+        .iter()
+        .copied()
+        .map(|spec| (spec.module_name, spec))
+        .collect::<HashMap<_, _>>();
+    let by_path = selected
+        .iter()
+        .copied()
+        .map(|spec| (spec.module_path, spec))
+        .collect::<HashMap<_, _>>();
+    let mut wanted_paths = HashSet::new();
+
+    fn add_closure(
+        path: &'static str,
+        dependencies: &HashMap<&'static str, Vec<&'static str>>,
+        wanted_paths: &mut HashSet<&'static str>,
+    ) {
+        if !wanted_paths.insert(path) {
+            return;
+        }
+        for dep in dependencies.get(path).into_iter().flatten() {
+            add_closure(dep, dependencies, wanted_paths);
+        }
+    }
+
+    for root in roots {
+        let Some(spec) = by_name.get(root) else {
+            bail!("required early boot module {root}.ko is not selected in .config");
+        };
+        add_closure(spec.module_path, &dependencies, &mut wanted_paths);
+    }
+
+    Ok(ordered
+        .into_iter()
+        .filter(|spec| wanted_paths.contains(spec.module_path))
+        .map(|spec| by_path[spec.module_path])
+        .collect())
+}
+
 fn initramfs_rootfs_test_module_specs_from_repo_config() -> Vec<&'static DriverModuleSpec> {
     let text = repo_config_text().expect("initramfs-rootfs test requires a synchronized .config");
     let selected = staged_module_specs_from_config_text(&text);
@@ -10272,20 +10424,8 @@ fn initramfs_rootfs_test_module_specs_from_repo_config() -> Vec<&'static DriverM
     // configured Kbuild invocation.  Only the boot-test CPIO is filtered.
     ensure_linux_driver_module_artifacts(&selected)
         .expect("configured Linux driver module artifacts must be built");
-    INITRAMFS_ROOTFS_TEST_MODULE_NAMES
-        .iter()
-        .map(|name| {
-            selected
-                .iter()
-                .copied()
-                .find(|spec| spec.module_name == *name)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "initramfs-rootfs QEMU gate requires Linux-built {name}.ko selected as a module in .config"
-                    )
-                })
-        })
-        .collect()
+    module_dependency_closed_specs(&selected, INITRAMFS_ROOTFS_TEST_MODULE_NAMES)
+        .expect("initramfs-rootfs module dependency closure must be generated")
 }
 
 fn early_root_module_specs_from_repo_config() -> Vec<&'static DriverModuleSpec> {
@@ -10298,15 +10438,8 @@ fn early_root_module_specs_from_repo_config() -> Vec<&'static DriverModuleSpec> 
     // shared cache between early-root and full-root manifests.
     ensure_linux_driver_module_artifacts(&selected)
         .expect("configured Linux driver module artifacts must be built");
-    EARLY_ROOT_MODULE_NAMES
-        .iter()
-        .filter_map(|name| {
-            selected
-                .iter()
-                .copied()
-                .find(|spec| spec.module_name == *name)
-        })
-        .collect()
+    module_dependency_closed_specs(&selected, EARLY_ROOT_MODULE_NAMES)
+        .expect("early-root module dependency closure must be generated")
 }
 
 fn early_root_module_paths(modules: &[&DriverModuleSpec]) -> Vec<u8> {
