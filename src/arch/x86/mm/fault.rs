@@ -309,58 +309,15 @@ fn access_error(ec: u64, vma: &VmAreaStruct) -> bool {
 ///
 /// Ref: arch/x86/mm/fault.c — `bad_area_nosemaphore()`
 fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
-    log_page_fault(frame, ec, addr);
     let task = unsafe { sched::get_current() };
-    #[cfg(not(test))]
-    if is_user_mode_fault(frame, ec) && !task.is_null() {
-        dump_vmas_near(task, addr);
-    }
-    log_error!(
-        "cpu",
-        "cpu: bad area addr={:#018x} error={:#010x} rip={:#018x} rsp={:#018x} rax={:#018x} rcx={:#018x} rdx={:#018x} rsi={:#018x} rdi={:#018x} r12={:#018x} r13={:#018x} rbp={:#018x} rbx={:#018x}",
-        addr,
-        ec,
-        frame.rip,
-        frame.user_rsp,
-        frame.rax,
-        frame.rcx,
-        frame.rdx,
-        frame.rsi,
-        frame.rdi,
-        frame.r12,
-        frame.r13,
-        frame.rbp,
-        frame.rbx,
-    );
     if is_user_mode_fault(frame, ec) {
+        // Match __bad_area_nosemaphore(): a userspace fault may run signal
+        // delivery with interrupts enabled.  Firefox intentionally recovers
+        // from many SIGSEGVs; keeping IF clear across that work starves timer
+        // ticks and makes the whole desktop appear frozen.
+        crate::kernel::locking::local_irq_enable();
         if !task.is_null() {
             let pid = unsafe { (*task).pid };
-            #[cfg(not(test))]
-            {
-                let fs_msr = unsafe {
-                    crate::arch::x86::kernel::msr::read(crate::arch::x86::kernel::msr::MSR_FS_BASE)
-                };
-                let task_fs = unsafe { (*task).thread.fsbase };
-                let comm = unsafe { (*task).comm };
-                let comm_str = {
-                    let end = comm.iter().position(|&c| c == 0).unwrap_or(comm.len());
-                    core::str::from_utf8(&comm[..end]).unwrap_or("<?>")
-                };
-                // Do not dereference the user RIP here.  Even when the
-                // fault was caused by data access after a successful instruction
-                // fetch, only the bytes actually fetched by the CPU are known to
-                // be readable; probing a fixed instruction window can cross into
-                // an unmapped page and turn a user SIGSEGV into a kernel fault.
-                crate::linux_driver_abi::tty::serial_println!(
-                    "trace-user-pf pid={} comm={} fs_msr={:#x} task_fs={:#x} cr2={:#x} rip={:#x}",
-                    pid,
-                    comm_str,
-                    fs_msr,
-                    task_fs,
-                    addr,
-                    frame.rip
-                );
-            }
             if pid == 1 {
                 panic!(
                     "init died from SIGSEGV: addr={:#018x} error={:#010x} rip={:#018x}",
@@ -376,6 +333,16 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
             }
         }
     }
+
+    log_page_fault(frame, ec, addr);
+    log_error!(
+        "cpu",
+        "cpu: bad area addr={:#018x} error={:#010x} rip={:#018x} rsp={:#018x}",
+        addr,
+        ec,
+        frame.rip,
+        frame.user_rsp,
+    );
     panic!("Segmentation fault");
 }
 
@@ -390,73 +357,6 @@ fn user_sigsegv_code(task: *mut TaskStruct, addr: u64) -> i32 {
     match find_vma(unsafe { &*mm }, addr) {
         Some(vma) if addr >= unsafe { (*vma).vm_start } => SEGV_ACCERR,
         _ => SEGV_MAPERR,
-    }
-}
-
-/// Diagnostic: dump the VMAs surrounding a faulting user address so we can tell
-/// whether the fault is a missing VMA, a permission mismatch (e.g. a leftover
-/// PROT_NONE ld.so reservation), or a file-backed mapping. Removable.
-#[cfg(not(test))]
-fn dump_vmas_near(task: *mut TaskStruct, addr: u64) {
-    let mm = unsafe { (*task).mm };
-    if mm.is_null() {
-        return;
-    }
-    let mm_ref = unsafe { &*mm };
-    let lo = addr.saturating_sub(0x40_0000);
-    let hi = addr.saturating_add(0x40_0000);
-    crate::linux_driver_abi::tty::serial_println!(
-        "bad-area-vma-dump pid={} cr2={:#x} window=[{:#x},{:#x})",
-        unsafe { (*task).pid },
-        addr,
-        lo,
-        hi
-    );
-    let mut idx = lo;
-    let mut printed = 0;
-    while printed < 24 {
-        let next = mm_ref.mm_mt.find_first_gte(idx);
-        let (start, end, value) = match next {
-            Some(t) => t,
-            None => break,
-        };
-        if start > hi {
-            break;
-        }
-        // mm_mt stores [vm_start, vm_end-1]; recover vm_end.
-        let vm_end = end.saturating_add(1);
-        let vma = value as *const VmAreaStruct;
-        let (flags, file, ops, pgoff) = if vma.is_null() {
-            (0, 0, 0, 0)
-        } else {
-            unsafe {
-                (
-                    (*vma).vm_flags,
-                    (*vma).vm_file,
-                    (*vma).vm_ops,
-                    (*vma).vm_pgoff,
-                )
-            }
-        };
-        let covers = addr >= start && addr < vm_end;
-        crate::linux_driver_abi::tty::serial_println!(
-            "  vma [{:#x},{:#x}) flags={:#x} file={:#x} ops={:#x} pgoff={:#x}{}",
-            start,
-            vm_end,
-            flags,
-            file,
-            ops,
-            pgoff,
-            if covers { "  <== COVERS cr2" } else { "" }
-        );
-        printed += 1;
-        if vm_end <= idx {
-            break;
-        }
-        idx = vm_end;
-    }
-    if printed == 0 {
-        crate::linux_driver_abi::tty::serial_println!("  (no VMAs in window)");
     }
 }
 
