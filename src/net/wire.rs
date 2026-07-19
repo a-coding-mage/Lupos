@@ -681,7 +681,8 @@ fn handle_udp(source: u32, destination: u32, datagram: &[u8], ifindex: u32, ttl:
             udp_checksum
         );
     }
-    if let Some(sock) = matching_socket(IPPROTO_UDP, destination_port, source, source_port) {
+    let matched = matching_socket(IPPROTO_UDP, destination_port, source, source_port);
+    if let Some(sock) = matched {
         sock.lock().recvq.push_back(QueuedPacket {
             bytes: datagram[8..length].to_vec(),
             peer: Some(SockAddr::Inet {

@@ -22,6 +22,7 @@ ARCH_REPO_SNAPSHOT="2026/06/01"
 ARCH_REPO_BASE_URL="${LUPOS_ARCH_REPO_BASE_URL:-https://archive.archlinux.org/repos/$ARCH_REPO_SNAPSHOT}"
 ARCH_OFFLINE_REPO_REL="var/lib/lupos/pacman-repo"
 ARCH_PACMAN_SERVER='Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch'
+ARCH_PACMAN_ARCHIVE_SERVER='Server = https://archive.archlinux.org/repos/2026/06/01/$repo/os/$arch'
 ARCH_PACMAN_CONFIG="etc/pacman-lupos.conf"
 ARCH_PACMAN_XFER_HELPER="usr/lib/lupos/pacman-xfer"
 ARCH_PACMAN_XFER_COMMAND="XferCommand = /usr/lib/lupos/pacman-xfer %u %o"
@@ -297,30 +298,38 @@ pacman_keyring_ready() {
             --list-keys 2>/dev/null | grep -q '^pub'
 }
 
-pacman_repo_server_ready() {
+pacman_repo_servers_ready() {
     local conf="$1"
     local repo="$2"
-    awk -v repo="$repo" -v server="$ARCH_PACMAN_SERVER" '
+    awk \
+        -v repo="$repo" \
+        -v local_server="$ARCH_PACMAN_SERVER" \
+        -v archive_server="$ARCH_PACMAN_ARCHIVE_SERVER" '
         $0 == "[" repo "]" { in_repo = 1; next }
         /^\[/ { in_repo = 0 }
-        in_repo && $0 == server { found = 1 }
-        END { exit found ? 0 : 1 }
+        in_repo && $0 == local_server { local_found = 1; next }
+        in_repo && local_found && $0 == archive_server { archive_after_local = 1 }
+        END { exit local_found && archive_after_local ? 0 : 1 }
     ' "$conf"
 }
 
 pacman_config_ready() {
     local r="$1"
     local conf="$r/$ARCH_PACMAN_CONFIG"
+    local helper="$r/$ARCH_PACMAN_XFER_HELPER"
     grep -Eq '^[[:space:]]*DisableSandbox[[:space:]]*$' "$conf" \
         && ! grep -Eq '^[[:space:]]*DownloadUser[[:space:]]*=' "$conf" \
         && grep -Fxq "$ARCH_PACMAN_XFER_COMMAND" "$conf" \
-        && [ -x "$r/$ARCH_PACMAN_XFER_HELPER" ] \
+        && [ -x "$helper" ] \
+        && [ -x "$r/usr/bin/curl" ] \
+        && grep -Fq 'http://*|https://*)' "$helper" \
+        && grep -Fq "exec /usr/bin/curl --disable --fail --location --proto '=http,https' --proto-redir '=http,https' --continue-at - --output \"\$dst\" \"\$src\"" "$helper" \
         && grep -Eq '^[[:space:]]*SigLevel[[:space:]]*=[[:space:]]*Required[[:space:]]+DatabaseOptional[[:space:]]*$' "$conf" \
         && pacman_repo_uses_default_siglevel "$conf" core \
         && pacman_repo_uses_default_siglevel "$conf" extra \
         && pacman_keyring_ready "$r" \
-        && pacman_repo_server_ready "$conf" core \
-        && pacman_repo_server_ready "$conf" extra
+        && pacman_repo_servers_ready "$conf" core \
+        && pacman_repo_servers_ready "$conf" extra
 }
 
 vendor_package_configs_pristine() {
@@ -500,7 +509,11 @@ stage_ready() {
         && [ -e "$STAGE/usr/bin/bash" ] \
         && [ -e "$STAGE/usr/bin/pacman" ] \
         && [ -e "$STAGE/etc/systemd/network/10-lupos-qemu.network" ] \
+        && grep -q '^ConfigureWithoutCarrier=yes$' "$STAGE/etc/systemd/network/10-lupos-qemu.network" \
         && grep -q '^DNSDefaultRoute=yes$' "$STAGE/etc/systemd/network/10-lupos-qemu.network" \
+        && [ -e "$STAGE/usr/lib/systemd/system/lupos-qemu-link-up.service" ] \
+        && grep -q '^ExecStart=/usr/bin/ip link set dev eth0 up$' "$STAGE/usr/lib/systemd/system/lupos-qemu-link-up.service" \
+        && [ "$(readlink "$STAGE/etc/systemd/system/multi-user.target.wants/lupos-qemu-link-up.service" 2>/dev/null || true)" = "/usr/lib/systemd/system/lupos-qemu-link-up.service" ] \
         && pacman_config_ready "$STAGE" \
         && vendor_package_configs_pristine "$STAGE" \
         && vendor_package_files_pristine "$STAGE" \
@@ -926,9 +939,11 @@ $ARCH_PACMAN_XFER_COMMAND
 
 [core]
 $ARCH_PACMAN_SERVER
+$ARCH_PACMAN_ARCHIVE_SERVER
 
 [extra]
 $ARCH_PACMAN_SERVER
+$ARCH_PACMAN_ARCHIVE_SERVER
 EOF
 }
 
@@ -952,6 +967,9 @@ dst=$2
 
 case "$src" in
     file://*) src=${src#file://} ;;
+    http://*|https://*)
+        exec /usr/bin/curl --disable --fail --location --proto '=http,https' --proto-redir '=http,https' --continue-at - --output "$dst" "$src"
+        ;;
     *)
         echo "unsupported pacman transfer URL: $src" >&2
         exit 2
@@ -1027,10 +1045,25 @@ EOF
 Name=e* eth* en*
 
 [Network]
+ConfigureWithoutCarrier=yes
 Address=10.0.2.15/24
 Gateway=10.0.2.2
 DNS=10.0.2.3
 DNSDefaultRoute=yes
+EOF
+
+    mkdir -p "$S/usr/lib/systemd/system"
+    write_file "$S/usr/lib/systemd/system/lupos-qemu-link-up.service" <<'EOF'
+[Unit]
+Description=Activate the Lupos QEMU network interface
+After=systemd-modules-load.service
+Before=systemd-networkd.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ip link set dev eth0 up
+RemainAfterExit=yes
 EOF
 
     mkdir -p \
@@ -1040,6 +1073,8 @@ EOF
 
     ln -sfn /usr/lib/systemd/system/getty@.service \
         "$S/etc/systemd/system/getty.target.wants/getty@tty1.service"
+    ln -sfn /usr/lib/systemd/system/lupos-qemu-link-up.service \
+        "$S/etc/systemd/system/multi-user.target.wants/lupos-qemu-link-up.service"
 
     write_file "$S/etc/systemd/system/getty@tty1.service.d/lupos.conf" <<'EOF'
 [Service]

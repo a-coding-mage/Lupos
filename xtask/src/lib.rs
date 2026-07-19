@@ -716,13 +716,33 @@ const SYSTEMD_DISK_ROOT_FSTAB: &str = concat!(
 );
 // The login image stages the Arch/systemd static account databases. Keep auth
 // lookups file-only so early boot services do not block on DynamicUser userdb
-// traffic before the login stack is fully up.
+// traffic before the login stack is fully up. Resolve hostnames through
+// glibc's DNS backend and resolved's generated uplink resolv.conf: the
+// nss-resolve D-Bus backend can return a terminal NOTFOUND before NSS reaches
+// `dns` on kernels that do not yet implement its complete query path.
 const SYSTEMD_NSSWITCH: &str = concat!(
     "passwd: files\n",
     "group: files\n",
     "shadow: files\n",
     "gshadow: files\n",
-    "hosts: mymachines resolve [!UNAVAIL=return] files myhostname dns\n",
+    "hosts: files dns myhostname\n",
+);
+// QEMU user networking exposes its DNS proxy at 10.0.2.3. Keep lookup retries
+// bounded so a failed proxy cannot stall package operations indefinitely.
+const LUPOS_QEMU_RESOLV_CONF: &str = "nameserver 10.0.2.3\noptions timeout:2 attempts:1\n";
+// The vendor virtio-net module may register before its carrier state settles.
+// Configure the fixed QEMU user-network address without waiting for carrier so
+// networkd still raises the interface and installs the route used by pacman.
+const LUPOS_QEMU_NETWORKD_PROFILE: &str = concat!(
+    "[Match]\n",
+    "Name=e* eth* en*\n",
+    "\n",
+    "[Network]\n",
+    "ConfigureWithoutCarrier=yes\n",
+    "Address=10.0.2.15/24\n",
+    "Gateway=10.0.2.2\n",
+    "DNS=10.0.2.3\n",
+    "DNSDefaultRoute=yes\n",
 );
 const SYSTEMD_SYSTEM_CONF: &str = concat!(
     "[Manager]\n",
@@ -2625,8 +2645,35 @@ const LUPOS_PING_ICMP_ADDR_ENV: &str = "LUPOS_PING_ICMP_ADDR";
 const DEFAULT_PING_ICMP_ADDR: [u8; 4] = [10, 0, 2, 2];
 const ARCH_PACMAN_CONFIG: &str = "etc/pacman-lupos.conf";
 const ARCH_PACMAN_SERVER: &str = "Server = file:///var/lib/lupos/pacman-repo/$repo/os/$arch";
+const ARCH_PACMAN_ARCHIVE_SERVER: &str =
+    "Server = https://archive.archlinux.org/repos/2026/06/01/$repo/os/$arch";
+const ARCH_PACMAN_WRAPPER: &str = "usr/local/bin/pacman";
+const ARCH_PACMAN_WRAPPER_SCRIPT: &str =
+    "#!/bin/sh\nexec /usr/bin/pacman --config /etc/pacman-lupos.conf \"$@\"\n";
 const ARCH_PACMAN_XFER_HELPER: &str = "usr/lib/lupos/pacman-xfer";
 const ARCH_PACMAN_XFER_COMMAND: &str = "XferCommand = /usr/lib/lupos/pacman-xfer %u %o";
+
+fn arch_pacman_runtime_config() -> Vec<u8> {
+    format!(
+        "[options]\n\
+         Architecture = auto\n\
+         CheckSpace\n\
+         SigLevel = Required DatabaseOptional\n\
+         LocalFileSigLevel = Optional\n\
+         DisableSandbox\n\
+         {ARCH_PACMAN_XFER_COMMAND}\n\
+         \n\
+         [core]\n\
+         {ARCH_PACMAN_SERVER}\n\
+         {ARCH_PACMAN_ARCHIVE_SERVER}\n\
+         \n\
+         [extra]\n\
+         {ARCH_PACMAN_SERVER}\n\
+         {ARCH_PACMAN_ARCHIVE_SERVER}\n"
+    )
+    .into_bytes()
+}
+
 const ARCH_PACMAN_XFER_HELPER_SCRIPT: &str = concat!(
     "#!/bin/sh\n",
     "set -eu\n",
@@ -2641,6 +2688,9 @@ const ARCH_PACMAN_XFER_HELPER_SCRIPT: &str = concat!(
     "\n",
     "case \"$src\" in\n",
     "    file://*) src=${src#file://} ;;\n",
+    "    http://*|https://*)\n",
+    "        exec /usr/bin/curl --disable --fail --location --proto '=http,https' --proto-redir '=http,https' --continue-at - --output \"$dst\" \"$src\"\n",
+    "        ;;\n",
     "    *)\n",
     "        echo \"unsupported pacman transfer URL: $src\" >&2\n",
     "        exit 2\n",
@@ -4327,6 +4377,23 @@ fn systemd_lupos_terminal_target_unit() -> Vec<u8> {
     .to_vec()
 }
 
+fn systemd_lupos_qemu_link_up_unit() -> Vec<u8> {
+    concat!(
+        "[Unit]\n",
+        "Description=Activate the Lupos QEMU network interface\n",
+        "After=systemd-modules-load.service\n",
+        "Before=systemd-networkd.service\n",
+        "Wants=systemd-modules-load.service\n",
+        "\n",
+        "[Service]\n",
+        "Type=oneshot\n",
+        "ExecStart=/usr/bin/ip link set dev eth0 up\n",
+        "RemainAfterExit=yes\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
 fn systemd_lupos_serial_getty_unit() -> Vec<u8> {
     concat!(
         "[Unit]\n",
@@ -4606,7 +4673,7 @@ fn x11_fbdev_config() -> Vec<u8> {
 /// are not staged. Reused by both `startx`'s `~/.xinitrc` and LightDM's session
 /// wrapper so the two entry points never drift.
 const X11_SESSION_BODY: &str = concat!(
-    "export PATH=/usr/bin:/bin:/usr/sbin:/sbin\n",
+    "export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\n",
     "export XDG_CONFIG_DIRS=/etc/xdg\n",
     "export XDG_DATA_DIRS=/usr/local/share:/usr/share\n",
     "export XDG_CACHE_HOME=\"$HOME/.cache\"\n",
@@ -5022,7 +5089,7 @@ fn systemd_lupos_lightdm_unit() -> Vec<u8> {
 fn graphics_x11_probe_script() -> Vec<u8> {
     concat!(
         "#!/bin/sh\n",
-        "export PATH=/usr/bin:/bin:/usr/sbin:/sbin\n",
+        "export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\n",
         // The harness starts this probe only after the authenticated desktop
         // boundary, so LightDM's root authority is already populated.  Keep
         // the stable path explicit for later read-only and application probes.
@@ -5316,6 +5383,10 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    i=$((i + 1)); sleep 1\n",
         "done\n",
         "printf 'graphics-x11: early-session-bus pid=%s address=%s usable=%s desktop=%s wait=%s\\n' \"$early_session_pid\" \"$early_bus\" \"$early_bus_ok\" \"$early_desktop_ok\" \"$i\"\n",
+        "session_path=\n",
+        "if [ -n \"$early_session_pid\" ] && [ -r \"/proc/$early_session_pid/environ\" ]; then session_path=\"$(tr '\\000' '\\n' < \"/proc/$early_session_pid/environ\" | sed -n 's/^PATH=//p' | head -1)\"; fi\n",
+        "printf 'graphics-x11: session-path %s\\n' \"$session_path\"\n",
+        "case \"$session_path\" in /usr/local/sbin:/usr/local/bin:/usr/bin:*) echo 'graphics-x11: session-path ok' ;; *) echo 'graphics-x11: session-path failed' ;; esac\n",
         "if [ -s /tmp/lupos-early-user-bus.log ]; then echo 'graphics-x11: early-session-bus-log begin'; tail -30 /tmp/lupos-early-user-bus.log; echo 'graphics-x11: early-session-bus-log end'; fi\n",
         "echo 'graphics-x11: early-session-processes begin'\n",
         "for proc in /proc/[0-9]*; do [ -r \"$proc/status\" ] || continue; uid=; uid=\"$(awk '/^Uid:/ { print $2; exit }' \"$proc/status\" 2>/dev/null)\"; [ \"$uid\" = 1000 ] || continue; comm=; comm=\"$(cat \"$proc/comm\" 2>/dev/null || true)\"; case \"$comm\" in xfce4-*|xfwm4|xfsettingsd|xfconfd|xfdesktop|dbus-*) state=\"$(grep -E '^(State|Tgid|Pid|PPid|Threads):' \"$proc/status\" 2>/dev/null | tr '\\n' ';')\"; printf 'graphics-x11: early-session-proc pid=%s comm=%s status=[%s]\\n' \"${proc##*/}\" \"$comm\" \"$state\" ;; esac; done\n",
@@ -5346,6 +5417,13 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // response proves this graphical multi-user boot actually enabled the
         // network services rather than merely staging their unit files.
         "echo 'graphics-x11: curl-probe begin'\n",
+        "if grep -Eq '^[[:space:]]*nameserver[[:space:]]+10\\.0\\.2\\.3([[:space:]]|$)' /etc/resolv.conf 2>/dev/null && grep -Eq '^[[:space:]]*options[[:space:]].*\\btimeout:2\\b.*\\battempts:1\\b' /etc/resolv.conf 2>/dev/null; then echo 'graphics-x11: resolver-config ok'; else echo 'graphics-x11: resolver-config failed'; ls -l /etc/resolv.conf 2>&1 || true; cat /etc/resolv.conf /run/systemd/resolve/resolv.conf 2>/dev/null || true; timeout 15 /usr/bin/resolvectl status 2>&1 || true; fi\n",
+        "rm -f /tmp/lupos-direct-dns.log\n",
+        // Lupos has a fixed QEMU IPv4 address in the kernel transport, while
+        // RTM_GETADDR remains empty until userspace explicitly publishes it.
+        // Disable getent's AI_ADDRCONFIG filtering so this probe exercises the
+        // DNS NSS backend instead of stopping at the address inventory.
+        "if timeout 20 /usr/bin/getent -A -s dns ahostsv4 example.com >/tmp/lupos-direct-dns.log 2>&1; then echo 'graphics-x11: direct-dns ok'; else echo 'graphics-x11: direct-dns failed'; sed 's/^/graphics-x11: direct-dns-log /' /tmp/lupos-direct-dns.log 2>/dev/null || true; cat /etc/nsswitch.conf /run/systemd/resolve/resolv.conf 2>/dev/null || true; timeout 15 /usr/bin/resolvectl status 2>&1 || true; fi\n",
         "rm -f /tmp/lupos-curl.log\n",
         "if curl -fsSI --connect-timeout 5 --max-time 10 --retry 12 --retry-all-errors --retry-delay 1 --retry-max-time 60 http://example.com >/tmp/lupos-curl.log 2>&1; then\n",
         "    echo 'graphics-x11: curl dns ok'\n",
@@ -5354,6 +5432,23 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    printf 'graphics-x11: curl failed rc=%s\\n' \"$rc\"\n",
         "    cat /tmp/lupos-curl.log 2>/dev/null || true\n",
         "fi\n",
+        // Reproduce the terminal command exactly: command lookup must select
+        // the /usr/local wrapper, and no test-only --config argument is
+        // allowed. fastfetch exercises the signed local repository from the
+        // report; tree is deliberately absent locally and proves the pinned
+        // HTTPS archive fallback plus DNS/TLS/download/signature path.
+        "echo 'graphics-x11: pacman-probe begin'\n",
+        "pacman_test_path=\"${session_path:-/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}\"\n",
+        "resolved_pacman=\"$(env PATH=\"$pacman_test_path\" /bin/sh -c 'command -v pacman' 2>/dev/null || true)\"\n",
+        "printf 'graphics-x11: pacman-command %s\\n' \"$resolved_pacman\"\n",
+        "if [ \"$resolved_pacman\" = /usr/local/bin/pacman ]; then echo 'graphics-x11: pacman-wrapper ok'; else echo 'graphics-x11: pacman-wrapper failed'; fi\n",
+        "rm -f /var/lib/pacman/db.lck /tmp/lupos-pacman-fastfetch.log\n",
+        "if env PATH=\"$pacman_test_path\" timeout -k 5 180 pacman -S --noconfirm fastfetch >/tmp/lupos-pacman-fastfetch.log 2>&1; then echo 'graphics-x11: pacman-fastfetch-install ok'; else rc=\"$?\"; printf 'graphics-x11: pacman-fastfetch-install failed rc=%s\\n' \"$rc\"; sed 's/^/graphics-x11: pacman-fastfetch-log /' /tmp/lupos-pacman-fastfetch.log 2>/dev/null || true; fi\n",
+        "if env PATH=\"$pacman_test_path\" pacman -Q fastfetch yyjson >/tmp/lupos-pacman-fastfetch-query.log 2>&1 && env PATH=\"$pacman_test_path\" fastfetch --version >>/tmp/lupos-pacman-fastfetch-query.log 2>&1; then echo 'graphics-x11: pacman-fastfetch-query ok'; else echo 'graphics-x11: pacman-fastfetch-query failed'; sed 's/^/graphics-x11: pacman-fastfetch-query-log /' /tmp/lupos-pacman-fastfetch-query.log 2>/dev/null || true; fi\n",
+        "rm -f /var/cache/pacman/pkg/tree-*.pkg.tar.* /var/lib/pacman/db.lck /tmp/lupos-pacman-tree.log\n",
+        "if env PATH=\"$pacman_test_path\" timeout -k 5 300 pacman -S --noconfirm tree >/tmp/lupos-pacman-tree.log 2>&1; then echo 'graphics-x11: pacman-remote-tree-install ok'; else rc=\"$?\"; printf 'graphics-x11: pacman-remote-tree-install failed rc=%s\\n' \"$rc\"; sed 's/^/graphics-x11: pacman-tree-log /' /tmp/lupos-pacman-tree.log 2>/dev/null || true; fi\n",
+        "if env PATH=\"$pacman_test_path\" pacman -Q tree >/tmp/lupos-pacman-tree-query.log 2>&1 && env PATH=\"$pacman_test_path\" tree --version >>/tmp/lupos-pacman-tree-query.log 2>&1 && ls /var/cache/pacman/pkg/tree-*.pkg.tar.zst >>/tmp/lupos-pacman-tree-query.log 2>&1; then echo 'graphics-x11: pacman-remote-tree-query ok'; else echo 'graphics-x11: pacman-remote-tree-query failed'; sed 's/^/graphics-x11: pacman-tree-query-log /' /tmp/lupos-pacman-tree-query.log 2>/dev/null || true; fi\n",
+        "echo 'graphics-x11: pacman-probe end'\n",
         "echo 'graphics-x11: xclient-probe begin'\n",
         "if [ -x /usr/bin/xmodmap ]; then\n",
         "    if DISPLAY=:0 timeout 20 /usr/bin/xmodmap -query > /tmp/lupos-xclient.log 2>&1; then\n",
@@ -7622,6 +7717,16 @@ fn systemd_login_userland_files_with_stage_and_options(
         initramfs_file("usr/sbin/e2fsck", 0o100755, e2fsck),
         initramfs_file("usr/sbin/fsck.ext4", 0o100755, fsck_ext4),
         initramfs_file(
+            ARCH_PACMAN_CONFIG,
+            0o100644,
+            arch_pacman_runtime_config(),
+        ),
+        initramfs_file(
+            ARCH_PACMAN_WRAPPER,
+            0o100755,
+            ARCH_PACMAN_WRAPPER_SCRIPT.as_bytes(),
+        ),
+        initramfs_file(
             ARCH_PACMAN_XFER_HELPER,
             0o100755,
             ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes(),
@@ -7650,9 +7755,10 @@ fn systemd_login_userland_files_with_stage_and_options(
         initramfs_file("etc/securetty", 0o100644, staged_config("etc/securetty", LOGIN_SECURETTY.as_bytes())),
         initramfs_file("etc/shells", 0o100644, staged_config("etc/shells", LOGIN_SHELLS.as_bytes())),
         initramfs_file("etc/hosts", 0o100644, staged_config("etc/hosts", b"127.0.0.1 localhost lupos\n::1 localhost\n")),
-        initramfs_symlink(
+        initramfs_file(
             "etc/resolv.conf",
-            "/run/systemd/resolve/resolv.conf",
+            0o100644,
+            LUPOS_QEMU_RESOLV_CONF.as_bytes(),
         ),
         initramfs_file(
             "etc/fstab",
@@ -7699,6 +7805,11 @@ fn systemd_login_userland_files_with_stage_and_options(
             "usr/lib/systemd/system/lupos-terminal.target",
             0o100644,
             systemd_lupos_terminal_target_unit(),
+        ),
+        initramfs_file(
+            "usr/lib/systemd/system/lupos-qemu-link-up.service",
+            0o100644,
+            systemd_lupos_qemu_link_up_unit(),
         ),
         initramfs_file(
             "usr/lib/systemd/system/lupos-serial-getty.service",
@@ -7853,6 +7964,14 @@ fn systemd_login_userland_files_with_stage_and_options(
     ];
 
     if options.start_network_daemons {
+        files.push(initramfs_symlink(
+            "etc/systemd/system/multi-user.target.wants/lupos-qemu-link-up.service",
+            "/usr/lib/systemd/system/lupos-qemu-link-up.service",
+        ));
+        files.push(initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/lupos-qemu-link-up.service",
+            "/usr/lib/systemd/system/lupos-qemu-link-up.service",
+        ));
         files.push(initramfs_symlink(
             "etc/systemd/system/lupos-terminal.target.wants/dbus.socket",
             "/usr/lib/systemd/system/dbus.socket",
@@ -8192,6 +8311,7 @@ fn apply_systemd_login_payload_overrides(files: &mut Vec<InitramfsFile>) {
     for path in [
         "var/run",
         "etc/resolv.conf",
+        "etc/systemd/network/10-lupos-qemu.network",
         "sbin/poweroff",
         "usr/sbin/poweroff",
         "etc/machine-id",
@@ -8202,9 +8322,15 @@ fn apply_systemd_login_payload_overrides(files: &mut Vec<InitramfsFile>) {
         files.retain(|(entry_path, _, _)| entry_path != path);
     }
     files.push(initramfs_symlink("var/run", "/run"));
-    files.push(initramfs_symlink(
+    files.push(initramfs_file(
         "etc/resolv.conf",
-        "/run/systemd/resolve/resolv.conf",
+        0o100644,
+        LUPOS_QEMU_RESOLV_CONF.as_bytes(),
+    ));
+    files.push(initramfs_file(
+        "etc/systemd/network/10-lupos-qemu.network",
+        0o100644,
+        LUPOS_QEMU_NETWORKD_PROFILE.as_bytes(),
     ));
     files.push(initramfs_file("sbin/poweroff", 0o100755, poweroff.clone()));
     files.push(initramfs_file("usr/sbin/poweroff", 0o100755, poweroff));
@@ -14019,6 +14145,8 @@ fn direct_stage_delete_list_contents(delete_paths: &[&str]) -> String {
 
 fn direct_stage_login_root_disk_delete_paths(mode: BootMode) -> Vec<&'static str> {
     let mut paths = vec![
+        "etc/nsswitch.conf",
+        "etc/resolv.conf",
         "etc/systemd/system/default.target",
         "etc/systemd/system/dbus-org.freedesktop.network1.service",
         "etc/systemd/system/dbus-org.freedesktop.resolve1.service",
@@ -14075,9 +14203,37 @@ fn direct_stage_login_root_disk_overlay_files(
 
     let mut files = vec![
         initramfs_file(
+            ARCH_PACMAN_CONFIG,
+            0o100644,
+            arch_pacman_runtime_config(),
+        ),
+        initramfs_file(
+            ARCH_PACMAN_WRAPPER,
+            0o100755,
+            ARCH_PACMAN_WRAPPER_SCRIPT.as_bytes(),
+        ),
+        initramfs_file(
             ARCH_PACMAN_XFER_HELPER,
             0o100755,
             ARCH_PACMAN_XFER_HELPER_SCRIPT.as_bytes(),
+        ),
+        initramfs_file(
+            "etc/nsswitch.conf",
+            0o100644,
+            SYSTEMD_NSSWITCH.as_bytes(),
+        ),
+        // Arch ships a documentation-only regular resolv.conf. The QEMU
+        // Runtime clients use QEMU's DNS proxy directly instead of depending
+        // on systemd-resolved's dynamically generated uplink file.
+        initramfs_file(
+            "etc/resolv.conf",
+            0o100644,
+            LUPOS_QEMU_RESOLV_CONF.as_bytes(),
+        ),
+        initramfs_file(
+            "etc/systemd/network/10-lupos-qemu.network",
+            0o100644,
+            LUPOS_QEMU_NETWORKD_PROFILE.as_bytes(),
         ),
         initramfs_file("etc/machine-id", 0o100444, SYSTEMD_MACHINE_ID.as_bytes()),
         initramfs_file("root/.bashrc", 0o100644, ROOT_LOGIN_BASHRC.as_bytes()),
@@ -14134,6 +14290,11 @@ fn direct_stage_login_root_disk_overlay_files(
             "usr/lib/systemd/system/lupos-terminal.target",
             0o100644,
             systemd_lupos_terminal_target_unit(),
+        ),
+        initramfs_file(
+            "usr/lib/systemd/system/lupos-qemu-link-up.service",
+            0o100644,
+            systemd_lupos_qemu_link_up_unit(),
         ),
         initramfs_file(
             "usr/lib/systemd/system/lupos-serial-getty.service",
@@ -14301,6 +14462,14 @@ fn direct_stage_login_root_disk_overlay_files(
     }
 
     if include_network_daemons {
+        files.push(initramfs_symlink(
+            "etc/systemd/system/multi-user.target.wants/lupos-qemu-link-up.service",
+            "/usr/lib/systemd/system/lupos-qemu-link-up.service",
+        ));
+        files.push(initramfs_symlink(
+            "etc/systemd/system/lupos-terminal.target.wants/lupos-qemu-link-up.service",
+            "/usr/lib/systemd/system/lupos-qemu-link-up.service",
+        ));
         files.push(initramfs_symlink(
             "etc/systemd/system/lupos-terminal.target.wants/dbus.socket",
             "/usr/lib/systemd/system/dbus.socket",
@@ -14716,12 +14885,20 @@ fn stage_package_owned_paths(stage: &Path) -> Result<HashSet<String>> {
     Ok(owned)
 }
 
+fn direct_stage_package_override_is_allowed(path: &str) -> bool {
+    // Runtime /etc is administrator policy. Keep the package-collision guard
+    // fail-closed around the two intentional network-name-service overrides:
+    // Arch's documentation-only resolv.conf placeholder and its nss-resolve
+    // first host lookup order.
+    matches!(path, "etc/resolv.conf" | "etc/nsswitch.conf")
+}
+
 fn validate_overlay_preserves_package_files(stage: &Path, files: &[InitramfsFile]) -> Result<()> {
     let owned = stage_package_owned_paths(stage)?;
     let mut collisions = files
         .iter()
         .map(|(path, _, _)| path.as_str())
-        .filter(|path| owned.contains(*path))
+        .filter(|path| owned.contains(*path) && !direct_stage_package_override_is_allowed(path))
         .collect::<Vec<_>>();
     collisions.sort_unstable();
     collisions.dedup();
@@ -15821,9 +15998,17 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: sudoers-syntax ok",
         "graphics-x11: sudo-password-required ok",
         "graphics-x11: sudo-pacman ok",
+        "graphics-x11: session-path ok",
         "graphics-x11: tty-sysctl ok",
         "graphics-x11: timeout-sanity ok",
+        "graphics-x11: resolver-config ok",
+        "graphics-x11: direct-dns ok",
         "graphics-x11: curl dns ok",
+        "graphics-x11: pacman-wrapper ok",
+        "graphics-x11: pacman-fastfetch-install ok",
+        "graphics-x11: pacman-fastfetch-query ok",
+        "graphics-x11: pacman-remote-tree-install ok",
+        "graphics-x11: pacman-remote-tree-query ok",
         "graphics-x11: xclient-roundtrip ok",
         "graphics-x11: pointer ok",
         "graphics-x11: pty-roundtrip ok",
@@ -15889,10 +16074,19 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: sudoers-syntax failed",
         "graphics-x11: sudo-password-required failed",
         "graphics-x11: sudo-pacman failed",
+        "graphics-x11: session-path failed",
         "graphics-x11: tty-sysctl missing",
         "graphics-x11: timeout-sanity unexpected-ok",
         "graphics-x11: timeout-sanity failed",
+        "graphics-x11: resolver-config failed",
+        "graphics-x11: direct-dns failed",
         "graphics-x11: curl failed",
+        "graphics-x11: pacman-wrapper failed",
+        "graphics-x11: pacman-fastfetch-install failed",
+        "graphics-x11: pacman-fastfetch-query failed",
+        "graphics-x11: pacman-remote-tree-install failed",
+        "graphics-x11: pacman-remote-tree-query failed",
+        "error: no servers configured for repository",
         "graphics-x11: xclient-roundtrip failed",
         "graphics-x11: xclient-roundtrip missing-xmodmap",
         "graphics-x11: pty-roundtrip failed",
@@ -24043,12 +24237,65 @@ failed command output\n";
             Path::new("/nonexistent-login-stage"),
         );
 
-        for package_owned in ["sbin/init", "etc/fstab", "etc/resolv.conf"] {
+        for package_owned in ["sbin/init", "etc/fstab"] {
             assert!(
                 find_initramfs_entry(&files, package_owned).is_none(),
                 "direct-stage overlays must preserve package-owned {package_owned}"
             );
         }
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/resolv.conf"),
+            Some(LUPOS_QEMU_RESOLV_CONF.as_bytes()),
+            "runtime resolv.conf must use QEMU's DNS proxy"
+        );
+        assert!(
+            direct_stage_login_root_disk_delete_paths(BootMode::LoginDisplay)
+                .contains(&"etc/resolv.conf"),
+            "the package placeholder must be removed before installing the runtime symlink"
+        );
+        assert!(
+            direct_stage_login_root_disk_delete_paths(BootMode::LoginDisplay)
+                .contains(&"etc/nsswitch.conf"),
+            "the package host lookup order must be removed before installing runtime NSS policy"
+        );
+        assert!(direct_stage_package_override_is_allowed("etc/resolv.conf"));
+        assert!(direct_stage_package_override_is_allowed(
+            "etc/nsswitch.conf"
+        ));
+        for still_protected in ["etc/pacman.conf", "usr/bin/pacman", "etc/passwd"] {
+            assert!(
+                !direct_stage_package_override_is_allowed(still_protected),
+                "package collision allowlist unexpectedly admits {still_protected}"
+            );
+        }
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/nsswitch.conf"),
+            Some(SYSTEMD_NSSWITCH.as_bytes()),
+            "direct-stage DNS must bypass nss-resolve's terminal NOTFOUND result"
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/systemd/network/10-lupos-qemu.network"),
+            Some(LUPOS_QEMU_NETWORKD_PROFILE.as_bytes()),
+            "networkd must configure the fixed QEMU uplink even without carrier"
+        );
+        assert!(LUPOS_QEMU_NETWORKD_PROFILE.contains("ConfigureWithoutCarrier=yes"));
+        assert_eq!(
+            initramfs_file_bytes(&files, "usr/lib/systemd/system/lupos-qemu-link-up.service"),
+            Some(systemd_lupos_qemu_link_up_unit().as_slice()),
+            "QEMU guests must raise eth0 before networkd starts"
+        );
+        for wants in [
+            "etc/systemd/system/multi-user.target.wants/lupos-qemu-link-up.service",
+            "etc/systemd/system/lupos-terminal.target.wants/lupos-qemu-link-up.service",
+        ] {
+            assert_eq!(
+                find_initramfs_symlink_target(&files, wants),
+                Some(b"/usr/lib/systemd/system/lupos-qemu-link-up.service".as_slice()),
+                "{wants} must enable the QEMU link activation service"
+            );
+        }
+        assert!(SYSTEMD_NSSWITCH.contains("hosts: files dns myhostname"));
+        assert!(!SYSTEMD_NSSWITCH.contains("[!UNAVAIL=return]"));
         assert_eq!(
             initramfs_file_bytes(&files, "etc/modules"),
             Some(etc_modules_from_repo_config().as_slice())
@@ -24152,6 +24399,14 @@ failed command output\n";
         }
         let pacman_xfer = find_initramfs_entry(&files, ARCH_PACMAN_XFER_HELPER)
             .expect("direct-stage root disks must include the pacman transfer helper");
+        let pacman_config = find_initramfs_entry(&files, ARCH_PACMAN_CONFIG)
+            .expect("direct-stage root disks must include the Lupos pacman config");
+        assert_eq!(pacman_config.1 & 0o777, 0o644);
+        assert_eq!(pacman_config.2, arch_pacman_runtime_config());
+        let pacman_wrapper = find_initramfs_entry(&files, ARCH_PACMAN_WRAPPER)
+            .expect("direct-stage root disks must make plain pacman select Lupos policy");
+        assert_eq!(pacman_wrapper.1 & 0o777, 0o755);
+        assert_eq!(pacman_wrapper.2, ARCH_PACMAN_WRAPPER_SCRIPT.as_bytes());
         assert_eq!(pacman_xfer.1 & 0o777, 0o755);
         assert_eq!(
             initramfs_file_bytes(&files, ARCH_PACMAN_XFER_HELPER),
@@ -24731,6 +24986,24 @@ failed command output\n";
         assert!(probe.contains("org.freedesktop.login1.Manager CanReboot"));
         assert!(probe.contains("graphics-x11: power-off-button ok"));
         assert!(probe.contains("graphics-x11: reboot-button ok"));
+        assert!(X11_SESSION_BODY.starts_with(
+            "export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\n"
+        ));
+        assert!(probe.contains("graphics-x11: session-path ok"));
+        assert!(probe.contains("command -v pacman"));
+        assert!(probe.contains("graphics-x11: pacman-wrapper ok"));
+        assert!(probe.contains("pacman -S --noconfirm fastfetch"));
+        assert!(!probe.contains("pacman -S --noconfirm --config"));
+        assert!(probe.contains("pacman -Q fastfetch yyjson"));
+        assert!(probe.contains("graphics-x11: pacman-fastfetch-install ok"));
+        assert!(probe.contains("graphics-x11: pacman-fastfetch-query ok"));
+        assert!(probe.contains("pacman -S --noconfirm tree"));
+        assert!(probe.contains("graphics-x11: pacman-remote-tree-install ok"));
+        assert!(probe.contains("graphics-x11: pacman-remote-tree-query ok"));
+        assert!(probe.contains("options[[:space:]].*\\btimeout:2\\b.*\\battempts:1\\b"));
+        assert!(probe.contains("graphics-x11: resolver-config ok"));
+        assert!(probe.contains("/usr/bin/getent -A -s dns ahostsv4 example.com"));
+        assert!(probe.contains("graphics-x11: direct-dns ok"));
         assert!(probe.contains("curl -fsSI"));
         assert!(probe.contains("http://example.com"));
         assert!(probe.contains("graphics-x11: curl dns ok"));
@@ -29400,6 +29673,8 @@ CONFIG_MODULES=y
             "alias=/p/xterm",
             "cached_pkg=\"$CACHE/pacman-graphics/$(basename \"$rel\")\"",
             "file:///var/lib/lupos/pacman-repo/$repo/os/$arch",
+            "https://archive.archlinux.org/repos/2026/06/01/$repo/os/$arch",
+            "exec /usr/bin/curl --disable --fail --location --proto '=http,https' --proto-redir '=http,https' --continue-at -",
             "var/cache/pacman/pkg",
             "vim-runtime-9.2.0573-1-x86_64.pkg.tar.zst",
             "xterm-410-1-x86_64.pkg.tar.zst",
@@ -30526,9 +30801,11 @@ CONFIG_MODULES=y
                 "/etc/nsswitch.conf must keep `{database}` lookups file-only"
             );
         }
-        let resolv_conf = find_initramfs_symlink_target(&files, "etc/resolv.conf")
-            .expect("/etc/resolv.conf must be managed by systemd-resolved");
-        assert_eq!(resolv_conf, b"/run/systemd/resolve/resolv.conf");
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/resolv.conf"),
+            Some(LUPOS_QEMU_RESOLV_CONF.as_bytes()),
+            "/etc/resolv.conf must use QEMU's DNS proxy with bounded retries"
+        );
         assert!(
             nsswitch.contains("files"),
             "/etc/nsswitch.conf must use the `files` NSS module"
@@ -30602,15 +30879,27 @@ CONFIG_MODULES=y
     /// config, local database, and direct shared-library chain.
     #[test]
     fn pacman_package_manager_runtime_is_staged() {
-        let Some(stage) = systemd_login_stage_or_skip() else {
+        let Some(mut stage) = systemd_login_stage_or_skip() else {
             return;
         };
+        // The reported failure is in the graphics image. Cargo tests do not
+        // set LUPOS_USERLAND_GRAPHICS, so prefer that independently cached
+        // package stage when it exists instead of inspecting an unrelated
+        // older terminal-only cache.
+        let graphics_stage = repo_root()
+            .expect("repo root")
+            .join("target/userland/graphics-stage");
+        if graphics_stage.join("usr/lib/systemd/systemd").is_file() {
+            stage = graphics_stage;
+        }
         let files = systemd_login_userland_files_with_stage(&stage);
 
         for rel in [
             "usr/bin/pacman",
             "etc/pacman.conf",
+            ARCH_PACMAN_CONFIG,
             "etc/pacman.d/mirrorlist",
+            ARCH_PACMAN_WRAPPER,
             ARCH_PACMAN_XFER_HELPER,
             "var/lib/pacman/local/ALPM_DB_VERSION",
         ] {
@@ -30628,25 +30917,33 @@ CONFIG_MODULES=y
         )
         .expect("pacman mirrorlist must be UTF-8");
         assert!(
-            mirrorlist.lines().any(|line| {
-                let line = line.trim_start();
-                line.starts_with("Server = ") || line.starts_with("Server=")
-            }),
-            "pacman mirrorlist must include at least one uncommented Server entry"
+            !mirrorlist.contains("/var/lib/lupos"),
+            "the package-owned mirrorlist must remain vendor input"
         );
-        assert!(
-            mirrorlist.contains("file:///var/lib/lupos/pacman-repo/$repo/os/$arch"),
-            "pacman mirrorlist must use the generated offline repo"
-        );
-        let pacman_conf = core::str::from_utf8(
+        let vendor_pacman_conf = core::str::from_utf8(
             initramfs_file_bytes(&files, "etc/pacman.conf").expect("pacman config must be staged"),
         )
         .expect("pacman config must be UTF-8");
         assert!(
+            !vendor_pacman_conf.lines().any(|line| {
+                let line = line.trim_start();
+                !line.starts_with('#')
+                    && (line.starts_with("DisableSandbox")
+                        || line.contains("/usr/lib/lupos")
+                        || line.contains("/var/lib/lupos"))
+            }),
+            "the package-owned pacman.conf must remain vendor input"
+        );
+        let pacman_conf = core::str::from_utf8(
+            initramfs_file_bytes(&files, ARCH_PACMAN_CONFIG)
+                .expect("Lupos pacman config must be staged"),
+        )
+        .expect("Lupos pacman config must be UTF-8");
+        assert_eq!(pacman_conf.as_bytes(), arch_pacman_runtime_config());
+        assert!(
             pacman_conf
                 .lines()
-                .any(|line| line.trim() == "DisableSandbox"),
-            "pacman config must disable libalpm's Linux sandbox"
+                .any(|line| line.trim() == "DisableSandbox")
         );
         assert!(
             !pacman_conf.lines().any(|line| {
@@ -30656,9 +30953,10 @@ CONFIG_MODULES=y
             "pacman config must not enable DownloadUser until uid switching works in the guest"
         );
         assert!(
-            pacman_conf
-                .lines()
-                .any(|line| line.trim() == "SigLevel    = Required DatabaseOptional"),
+            pacman_conf.lines().any(|line| {
+                line.split_ascii_whitespace().collect::<Vec<_>>()
+                    == ["SigLevel", "=", "Required", "DatabaseOptional"]
+            }),
             "pacman config must retain Arch's package-signature policy"
         );
         assert!(
@@ -30666,6 +30964,40 @@ CONFIG_MODULES=y
                 .iter()
                 .any(|repo| pacman_repo_section_has_directive(pacman_conf, repo, "SigLevel")),
             "offline repositories must not override Arch's package-signature policy"
+        );
+        for repo in ["core", "extra"] {
+            let section = pacman_conf
+                .split_once(&format!("[{repo}]\n"))
+                .unwrap_or_else(|| panic!("missing [{repo}] section"))
+                .1
+                .split_once("\n[")
+                .map_or_else(
+                    || {
+                        pacman_conf
+                            .split_once(&format!("[{repo}]\n"))
+                            .expect("section checked")
+                            .1
+                    },
+                    |(body, _)| body,
+                );
+            let local = section
+                .find(ARCH_PACMAN_SERVER)
+                .unwrap_or_else(|| panic!("[{repo}] must prefer the local signed repository"));
+            let archive = section.find(ARCH_PACMAN_ARCHIVE_SERVER).unwrap_or_else(|| {
+                panic!("[{repo}] must include the pinned signed Arch Archive fallback")
+            });
+            assert!(
+                local < archive,
+                "[{repo}] must try the local repository before the archive"
+            );
+        }
+        let wrapper = find_initramfs_entry(&files, ARCH_PACMAN_WRAPPER)
+            .expect("plain pacman wrapper must be staged");
+        assert_eq!(wrapper.1 & 0o777, 0o755);
+        assert_eq!(wrapper.2, ARCH_PACMAN_WRAPPER_SCRIPT.as_bytes());
+        assert!(
+            ARCH_PACMAN_WRAPPER_SCRIPT
+                .contains("exec /usr/bin/pacman --config /etc/pacman-lupos.conf \"$@\"")
         );
         for rel in [
             "etc/pacman.d/gnupg/pubring.kbx",
@@ -30690,6 +31022,17 @@ CONFIG_MODULES=y
         assert!(
             ARCH_PACMAN_XFER_HELPER_SCRIPT.contains("*.sig) exit 1 ;;"),
             "transfer helper must quietly miss optional package signatures"
+        );
+        assert!(ARCH_PACMAN_XFER_HELPER_SCRIPT.contains("http://*|https://*)"));
+        assert!(
+            ARCH_PACMAN_XFER_HELPER_SCRIPT
+                .contains("exec /usr/bin/curl --disable --fail --location --proto '=http,https'")
+        );
+        assert!(
+            !ARCH_OFFLINE_PACMAN_REPO_ARTIFACTS
+                .iter()
+                .any(|rel| rel.contains("/tree-")),
+            "tree must remain a remote-only package for the runtime fallback regression"
         );
         if let Some(ldconfig) = initramfs_file_bytes(&files, "usr/bin/ldconfig") {
             assert!(
@@ -31374,6 +31717,19 @@ CONFIG_MODULES=y
         assert!(
             net_body.contains("DNSDefaultRoute=yes"),
             "10-lupos-qemu.network must mark the QEMU uplink DNS as the default route for resolved"
+        );
+        assert!(
+            net_body.contains("ConfigureWithoutCarrier=yes"),
+            "10-lupos-qemu.network must configure the fixed QEMU uplink before carrier is reported"
+        );
+        let link_up =
+            find_initramfs_entry(&files, "usr/lib/systemd/system/lupos-qemu-link-up.service")
+                .expect("QEMU link activation unit must be staged");
+        assert!(
+            core::str::from_utf8(&link_up.2)
+                .unwrap()
+                .contains("ExecStart=/usr/bin/ip link set dev eth0 up"),
+            "QEMU link activation unit must administratively raise eth0"
         );
 
         // (9) systemctl status cleanliness: the initramfs must NOT ship
@@ -32296,6 +32652,8 @@ CONFIG_MODULES=y
             "2c4b923190d67f414ee981a020ca00a9f46c0e4ac44efa33fc067e2369e0387d",
             "vendor artifacts: never filter their metadata or rebuild their tarballs",
             "file:///var/lib/lupos/pacman-repo/$repo/os/$arch",
+            "https://archive.archlinux.org/repos/2026/06/01/$repo/os/$arch",
+            "exec /usr/bin/curl --disable --fail --location --proto '=http,https' --proto-redir '=http,https' --continue-at -",
             "var/cache/pacman/pkg",
             "vim-9.2.0573-1-x86_64.pkg.tar.zst",
             "fontconfig-2:2.17.1-1-x86_64.pkg.tar.zst",
