@@ -27,8 +27,9 @@ use core::sync::atomic::Ordering;
 
 use crate::arch::x86::mm::paging::{
     PAGE_OFFSET, PAGE_SHIFT, PAGE_SIZE as X86_PAGE_SIZE, PMD_SIZE, PTE_PFN_MASK, PTRS_PER_PGD,
-    PTRS_PER_PMD, PTRS_PER_PUD, PUD_SIZE, dump_pt_page_life_trace, pgd_none, pgd_t, pmd_huge,
-    pmd_none, pmd_t, pte_present, pte_t, pud_huge, pud_none, pud_t, record_pt_page_free,
+    PTRS_PER_PMD, PTRS_PER_PUD, PUD_SIZE, dump_pt_page_life_trace, pgd_none_or_clear_bad, pgd_t,
+    pmd_huge, pmd_none_or_clear_bad, pmd_t, pte_present, pte_t, pud_huge, pud_none_or_clear_bad,
+    pud_t, record_pt_page_free,
 };
 use crate::mm::buddy::{pfn_to_page, pfn_valid, with_global_buddy};
 use crate::mm::fault::copy_page_range;
@@ -305,8 +306,8 @@ unsafe fn free_user_page_tables(mm: *mut MmStruct) {
         let mut pgd_idx = 0usize;
         while pgd_idx < user_limit {
             let pgdp = pgd.add(pgd_idx);
-            let pgd_entry = *pgdp;
-            if !pgd_none(pgd_entry) {
+            if !pgd_none_or_clear_bad(&mut *pgdp) {
+                let pgd_entry = *pgdp;
                 if let Some(pud_ptr) =
                     owned_table_ptr_from_entry(pgd_entry.0, pgdp as usize, "pgd", pgd_idx, 0, 0)
                 {
@@ -314,8 +315,8 @@ unsafe fn free_user_page_tables(mm: *mut MmStruct) {
                     let mut pud_idx = 0usize;
                     while pud_idx < PTRS_PER_PUD {
                         let pudp = pud_base.add(pud_idx);
-                        let pud_entry = *pudp;
-                        if !pud_none(pud_entry) && !pud_huge(pud_entry) {
+                        if !pud_huge(*pudp) && !pud_none_or_clear_bad(&mut *pudp) {
+                            let pud_entry = *pudp;
                             if let Some(pmd_ptr) = owned_table_ptr_from_entry(
                                 pud_entry.0,
                                 pudp as usize,
@@ -328,8 +329,8 @@ unsafe fn free_user_page_tables(mm: *mut MmStruct) {
                                 let mut pmd_idx = 0usize;
                                 while pmd_idx < PTRS_PER_PMD {
                                     let pmdp = pmd_base.add(pmd_idx);
-                                    let pmd_entry = *pmdp;
-                                    if !pmd_none(pmd_entry) && !pmd_huge(pmd_entry) {
+                                    if !pmd_huge(*pmdp) && !pmd_none_or_clear_bad(&mut *pmdp) {
+                                        let pmd_entry = *pmdp;
                                         if owned_table_ptr_from_entry(
                                             pmd_entry.0,
                                             pmdp as usize,
@@ -340,6 +341,7 @@ unsafe fn free_user_page_tables(mm: *mut MmStruct) {
                                         )
                                         .is_some()
                                         {
+                                            *pmdp = pmd_t(0);
                                             free_table_page_from_entry(
                                                 pmd_entry.0,
                                                 "pte",
@@ -347,20 +349,25 @@ unsafe fn free_user_page_tables(mm: *mut MmStruct) {
                                                 pud_idx,
                                                 pmd_idx,
                                             );
+                                        } else {
+                                            *pmdp = pmd_t(0);
                                         }
-                                        *pmdp = pmd_t(0);
                                     }
                                     pmd_idx += 1;
                                 }
+                                *pudp = pud_t(0);
                                 free_table_page_from_entry(pud_entry.0, "pmd", pgd_idx, pud_idx, 0);
+                            } else {
+                                *pudp = pud_t(0);
                             }
-                            *pudp = pud_t(0);
                         }
                         pud_idx += 1;
                     }
+                    *pgdp = pgd_t(0);
                     free_table_page_from_entry(pgd_entry.0, "pud", pgd_idx, 0, 0);
+                } else {
+                    *pgdp = pgd_t(0);
                 }
-                *pgdp = pgd_t(0);
             }
             pgd_idx += 1;
         }

@@ -6,7 +6,7 @@ use std::{
     env,
     ffi::OsStr,
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -179,6 +179,9 @@ const LUPOS_QEMU_GDB_ENV: &str = "LUPOS_QEMU_GDB";
 /// graphics/GUI runners set this so the desktop cursor works; other boots keep
 /// the tablet (e.g. the input-hid-usb xHCI probe).
 const LUPOS_QEMU_USB_TABLET_ENV: &str = "LUPOS_QEMU_USB_TABLET";
+/// Benchmark-only switch for comparing the historical syscall-driven i8042
+/// polling path with the default interrupt/deferred-publication path.
+const LUPOS_I8042_POLL_BASELINE_ENV: &str = "LUPOS_I8042_POLL_BASELINE";
 const LUPOS_OVMF_CODE_ENV: &str = "LUPOS_OVMF_CODE";
 const LUPOS_OVMF_VARS_ENV: &str = "LUPOS_OVMF_VARS";
 /// Override the GRUB module directory passed to `grub-mkrescue -d`, so hosts
@@ -5750,7 +5753,10 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "echo 'graphics-x11: desktop-rpc-probe begin'\n",
         "desktop_rpc_ok=1; desktop_rpc_i=0; desktop_rpc_start=\"$(date +%s%N 2>/dev/null || true)\"\n",
         "while [ \"$desktop_rpc_i\" -lt 10 ]; do\n",
+        "    desktop_rpc_sample_start=\"${EPOCHREALTIME/./}\"\n",
         "    sudo -n -u lupos env DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout 2 /usr/bin/dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1 || desktop_rpc_ok=0\n",
+        "    desktop_rpc_sample_end=\"${EPOCHREALTIME/./}\"\n",
+        "    printf 'graphics-x11: desktop-rpc-sample iteration=%s elapsed-us=%s\\n' \"$desktop_rpc_i\" \"$((desktop_rpc_sample_end - desktop_rpc_sample_start))\"\n",
         "    desktop_rpc_i=$((desktop_rpc_i + 1))\n",
         "done\n",
         "desktop_rpc_end=\"$(date +%s%N 2>/dev/null || true)\"; desktop_rpc_ms=999999\n",
@@ -5762,9 +5768,12 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // scalable font before starting Firefox.  Package presence alone does
         // not catch a skipped fontconfig post-install configuration/cache.
         "fontconfig_match=\"$(sudo -n -u lupos env HOME=\"$session_home\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout 20 /usr/bin/fc-match -f '%{family} %{file}\\n' sans-serif 2>/tmp/lupos-fontconfig.err | head -1 || true)\"\n",
+        "fontconfig_cjk_match=\"$(sudo -n -u lupos env HOME=\"$session_home\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout 20 /usr/bin/fc-match -f '%{family} %{file}\\n' ':charset=3042' 2>>/tmp/lupos-fontconfig.err | head -1 || true)\"\n",
         "fontconfig_count=\"$(sudo -n -u lupos env HOME=\"$session_home\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout 20 /usr/bin/fc-list 2>>/tmp/lupos-fontconfig.err | wc -l)\"\n",
         "printf 'graphics-x11: fontconfig count=%s match=%s\\n' \"$fontconfig_count\" \"$fontconfig_match\"\n",
         "if [ \"${fontconfig_count:-0}\" -gt 0 ] && printf '%s' \"$fontconfig_match\" | grep -q '/usr/share/fonts/'; then echo 'graphics-x11: fontconfig ok'; else echo 'graphics-x11: fontconfig failed'; fi\n",
+        "printf 'graphics-x11: fontconfig-cjk match=%s\\n' \"$fontconfig_cjk_match\"\n",
+        "if printf '%s' \"$fontconfig_cjk_match\" | grep -q '/usr/share/fonts/' && ! printf '%s' \"$fontconfig_cjk_match\" | grep -q '\\.pcf'; then echo 'graphics-x11: fontconfig-cjk ok'; else echo 'graphics-x11: fontconfig-cjk failed'; fi\n",
         "if [ -s /tmp/lupos-fontconfig.err ]; then echo 'graphics-x11: fontconfig-log begin'; tail -40 /tmp/lupos-fontconfig.err; echo 'graphics-x11: fontconfig-log end'; fi\n",
         // Firefox discovers its installation directory from
         // readlink("/proc/self/exe") before it loads XPCOM. Verify the PATH
@@ -5786,12 +5795,28 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "else\n",
         "    rm -rf /tmp/lupos-firefox-profile\n",
         "    install -d -m 700 -o lupos -g lupos /tmp/lupos-firefox-profile\n",
+        "    cat > /tmp/lupos-firefox-profile/user.js <<'EOF'\n",
+        "user_pref(\"browser.urlbar.suggest.history\", true);\n",
+        "user_pref(\"browser.urlbar.suggest.searches\", false);\n",
+        "user_pref(\"browser.urlbar.suggest.bookmark\", false);\n",
+        "user_pref(\"browser.urlbar.suggest.topsites\", false);\n",
+        "user_pref(\"browser.urlbar.quicksuggest.enabled\", false);\n",
+        "user_pref(\"browser.urlbar.openViewOnFocus\", false);\n",
+        "user_pref(\"keyword.enabled\", false);\n",
+        "EOF\n",
+        "    chown lupos:lupos /tmp/lupos-firefox-profile/user.js\n",
+        "    cat > /tmp/zzzzlupossuggestion.html <<'EOF'\n",
+        "<!doctype html><meta charset=\"utf-8\"><title>LUPOS Firefox suggestion probe</title><style>body{font:24px sans-serif;padding:80px;background:#eef0f4}input{font:28px sans-serif;width:720px;padding:12px}#menu{box-sizing:border-box;margin:0 0 0 225px;width:748px;padding:8px;background:white;border:1px solid #8992a3;box-shadow:0 4px 12px #788090;list-style:none}#item{padding:12px}.selected{background:#cfe3ff}</style><main><label>Firefox suggestion <input id=\"query\" autofocus autocomplete=\"off\"></label><ul id=\"menu\" hidden><li id=\"item\">z — 日本語候補 かなカナ</li></ul></main><script>query.oninput=()=>{menu.hidden=query.value!=='z';item.classList.remove('selected')};query.onkeydown=e=>{if(e.key==='ArrowDown'&&!menu.hidden){item.classList.add('selected');e.preventDefault()}else if(e.key==='Enter'&&item.classList.contains('selected')){query.value=item.textContent;menu.hidden=true;document.title='LUPOS 日本語候補 かなカナ';e.preventDefault()}else if(e.key==='Escape'){menu.hidden=true;item.classList.remove('selected')}}</script>\n",
+        "EOF\n",
+        "    chmod 644 /tmp/zzzzlupossuggestion.html\n",
+        "    /usr/bin/python -m http.server 8765 --bind 127.0.0.1 --directory /tmp >/tmp/lupos-firefox-http.log 2>&1 &\n",
+        "    firefox_http_pid=$!\n",
         "    rm -f /tmp/lupos-firefox.log /tmp/lupos-firefox-windows.log /tmp/lupos-firefox-maps.log /tmp/lupos-firefox-status.log\n",
         "    firefox_fb_before=\"$(cksum </dev/fb0 2>/dev/null || true)\"\n",
-        "    sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none /usr/bin/firefox --no-remote --profile /tmp/lupos-firefox-profile 'https://www.google.com/?hl=en' >/tmp/lupos-firefox.log 2>&1 &\n",
+        "    sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none /usr/bin/firefox --no-remote --profile /tmp/lupos-firefox-profile 'http://127.0.0.1:8765/zzzzlupossuggestion.html' >/tmp/lupos-firefox.log 2>&1 &\n",
         "    firefox_launcher_pid=$!\n",
-        "    firefox_pid=; firefox_window=0; i=0\n",
-        "    while [ \"$i\" -lt 90 ] && [ \"$firefox_window\" -eq 0 ]; do\n",
+        "    firefox_pid=; firefox_history_seeded=0; i=0\n",
+        "    while [ \"$i\" -lt 90 ] && [ \"$firefox_history_seeded\" -eq 0 ]; do\n",
         "        [ -n \"$firefox_pid\" ] || firefox_pid=\"$(process_pid_named_uid firefox 1000 2>/dev/null || true)\"\n",
         "        if [ -n \"$firefox_pid\" ] && [ ! -s /tmp/lupos-firefox-maps.log ]; then\n",
         "            cat \"/proc/$firefox_pid/maps\" > /tmp/lupos-firefox-maps.log 2>&1 || true\n",
@@ -5802,12 +5827,35 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "            for wid in $(sed 's/.*# //' /tmp/lupos-firefox-clients.log | tr ',' ' '); do\n",
         "                DISPLAY=:0 timeout 1 /usr/bin/xprop -id \"$wid\" WM_CLASS _NET_WM_NAME 2>/dev/null >> /tmp/lupos-firefox-windows.log || true\n",
         "            done\n",
+        "            if grep -qiE 'WM_CLASS.*(Navigator|firefox)' /tmp/lupos-firefox-windows.log 2>/dev/null && grep -Fq 'LUPOS Firefox suggestion probe' /tmp/lupos-firefox-windows.log 2>/dev/null; then firefox_history_seeded=1; break; fi\n",
+        "        fi\n",
+        "        kill -0 \"$firefox_launcher_pid\" 2>/dev/null || break\n",
+        "        i=$((i + 1)); sleep 1\n",
+        "    done\n",
+        "    if [ \"$firefox_history_seeded\" -eq 1 ] && [ -n \"$firefox_pid\" ]; then\n",
+        "        sleep 2; echo 'graphics-x11: firefox-window-ready'\n",
+        "        cjk_suggestion_selected=0; cjk_i=0\n",
+        "        while [ \"$cjk_i\" -lt 30 ] && [ \"$cjk_suggestion_selected\" -eq 0 ]; do\n",
+        "            : > /tmp/lupos-firefox-cjk-windows.log\n",
+        "            if DISPLAY=:0 timeout 1 /usr/bin/xprop -root _NET_CLIENT_LIST > /tmp/lupos-firefox-clients.log 2>/dev/null; then\n",
+        "                for wid in $(sed 's/.*# //' /tmp/lupos-firefox-clients.log | tr ',' ' '); do DISPLAY=:0 timeout 1 /usr/bin/xprop -id \"$wid\" _NET_WM_NAME 2>/dev/null >> /tmp/lupos-firefox-cjk-windows.log || true; done\n",
+        "                if grep -Fq 'LUPOS 日本語候補 かなカナ' /tmp/lupos-firefox-cjk-windows.log 2>/dev/null; then cjk_suggestion_selected=1; break; fi\n",
+        "            fi\n",
+        "            cjk_i=$((cjk_i + 1)); sleep 1\n",
+        "        done\n",
+        "        if [ \"$cjk_suggestion_selected\" -eq 1 ]; then echo 'graphics-x11: firefox-cjk-suggestion-selected ok'; else echo 'graphics-x11: firefox-cjk-suggestion-selected failed'; fi\n",
+        "        sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none timeout 30 /usr/bin/firefox --profile /tmp/lupos-firefox-profile --new-tab 'https://www.google.com/?hl=en' >>/tmp/lupos-firefox.log 2>&1 || true\n",
+        "    fi\n",
+        "    firefox_window=0; i=0\n",
+        "    while [ \"$i\" -lt 90 ] && [ \"$firefox_window\" -eq 0 ]; do\n",
+        "        : > /tmp/lupos-firefox-windows.log\n",
+        "        if DISPLAY=:0 timeout 1 /usr/bin/xprop -root _NET_CLIENT_LIST > /tmp/lupos-firefox-clients.log 2>/dev/null; then\n",
+        "            for wid in $(sed 's/.*# //' /tmp/lupos-firefox-clients.log | tr ',' ' '); do DISPLAY=:0 timeout 1 /usr/bin/xprop -id \"$wid\" WM_CLASS _NET_WM_NAME 2>/dev/null >> /tmp/lupos-firefox-windows.log || true; done\n",
         "            if grep -qiE 'WM_CLASS.*(Navigator|firefox)' /tmp/lupos-firefox-windows.log 2>/dev/null && grep -q 'Google' /tmp/lupos-firefox-windows.log 2>/dev/null && ! grep -qiE 'Profile Missing|Crash Reporter|Firefox is already running|Problem loading page|Security Risk' /tmp/lupos-firefox-windows.log 2>/dev/null; then firefox_window=1; break; fi\n",
         "        fi\n",
         "        kill -0 \"$firefox_launcher_pid\" 2>/dev/null || break\n",
         "        i=$((i + 1)); sleep 1\n",
         "    done\n",
-        "    if [ \"$firefox_window\" -eq 1 ] && [ -n \"$firefox_pid\" ]; then sleep 3; echo 'graphics-x11: firefox-window-ready'; sleep 10; fi\n",
         "    firefox_exe=; firefox_alive=0\n",
         "    if [ -n \"$firefox_pid\" ]; then firefox_exe=\"$(readlink \"/proc/$firefox_pid/exe\" 2>/dev/null || true)\"; kill -0 \"$firefox_pid\" 2>/dev/null && firefox_alive=1; fi\n",
         "    firefox_fb_after=\"$(cksum </dev/fb0 2>/dev/null || true)\"\n",
@@ -5817,6 +5865,20 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    firefox_responsive=1; responsive_i=0\n",
         "    while [ \"$responsive_i\" -lt 5 ]; do DISPLAY=:0 timeout 2 /usr/bin/xprop -root _NET_CLIENT_LIST >/dev/null 2>&1 || firefox_responsive=0; responsive_i=$((responsive_i + 1)); done\n",
         "    if [ \"$firefox_responsive\" -eq 1 ]; then echo 'graphics-x11: firefox-desktop-responsive ok'; else echo 'graphics-x11: firefox-desktop-responsive failed'; fi\n",
+        "    firefox_rpc_ok=1; firefox_rpc_i=0; firefox_rpc_start=\"$(date +%s%N 2>/dev/null || true)\"\n",
+        "    while [ \"$firefox_rpc_i\" -lt 10 ]; do\n",
+        "        firefox_rpc_sample_start=\"${EPOCHREALTIME/./}\"\n",
+        "        sudo -n -u lupos env DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout 2 /usr/bin/dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1 || firefox_rpc_ok=0\n",
+        "        firefox_rpc_sample_end=\"${EPOCHREALTIME/./}\"\n",
+        "        printf 'graphics-x11: firefox-desktop-rpc-sample iteration=%s elapsed-us=%s\\n' \"$firefox_rpc_i\" \"$((firefox_rpc_sample_end - firefox_rpc_sample_start))\"\n",
+        "        firefox_rpc_i=$((firefox_rpc_i + 1))\n",
+        "    done\n",
+        "    firefox_rpc_end=\"$(date +%s%N 2>/dev/null || true)\"; firefox_rpc_ms=999999\n",
+        "    if [ -n \"$firefox_rpc_start\" ] && [ -n \"$firefox_rpc_end\" ]; then firefox_rpc_ms=$(((firefox_rpc_end - firefox_rpc_start) / 1000000)); fi\n",
+        "    printf 'graphics-x11: firefox-desktop-rpc iterations=%s elapsed-ms=%s\\n' \"$firefox_rpc_i\" \"$firefox_rpc_ms\"\n",
+        // Keep the runtime assertion a profile-independent liveness budget;
+        // release performance is evaluated from the emitted per-call samples.
+        "    if [ \"$firefox_rpc_ok\" -eq 1 ] && [ \"$firefox_rpc_ms\" -le 10000 ]; then echo 'graphics-x11: firefox-desktop-rpc ok'; else echo 'graphics-x11: firefox-desktop-rpc failed'; fi\n",
         "    sleep 2; wall_epoch=\"$(date +%s 2>/dev/null || true)\"\n",
         "    clock_elapsed=-1; if [ -n \"$clock_before\" ] && [ -n \"$wall_epoch\" ]; then clock_elapsed=$((wall_epoch - clock_before)); fi\n",
         "    printf 'graphics-x11: firefox-clock wall=%s elapsed=%s\\n' \"$wall_epoch\" \"$clock_elapsed\"\n",
@@ -5832,6 +5894,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    timeout 5 sh -c 'wait \"$1\" 2>/dev/null' sh \"$firefox_launcher_pid\" 2>/dev/null || true\n",
         "    if [ -s /tmp/lupos-firefox.log ]; then echo 'graphics-x11: firefox-log begin'; tail -80 /tmp/lupos-firefox.log; echo 'graphics-x11: firefox-log end'; fi\n",
         "    if [ -s /tmp/lupos-firefox-windows.log ]; then echo 'graphics-x11: firefox-windows begin'; tail -40 /tmp/lupos-firefox-windows.log; echo 'graphics-x11: firefox-windows end'; fi\n",
+        "    kill \"$firefox_http_pid\" 2>/dev/null || true\n",
         "fi\n",
         "if [ -s /tmp/lupos-self-exe.err ]; then sed 's/^/graphics-x11: self-exe-err /' /tmp/lupos-self-exe.err; fi\n",
         "echo 'graphics-x11: firefox-probe end'\n",
@@ -16087,14 +16150,16 @@ pub fn run_graphics_x11_tests() -> Result<()> {
     // VBE linear framebuffer (`gfxpayload=keep`, 1280x800 preferred) so
     // `/dev/fb0` is the displayed framebuffer — the same path the interactive
     // `--gui` boot uses.
-    let serial_cmdline = append_kernel_args(
-        &current_cmdline,
-        &[
-            "systemd.show_status=yes",
-            "lupos.serial_getty=1",
-            "lupos.graphics_probe=1",
-        ],
-    );
+    let polling_baseline = env::var_os(LUPOS_I8042_POLL_BASELINE_ENV).is_some();
+    let mut graphics_args = vec![
+        "systemd.show_status=yes",
+        "lupos.serial_getty=1",
+        "lupos.graphics_probe=1",
+    ];
+    if polling_baseline {
+        graphics_args.push("lupos.i8042_poll=1");
+    }
+    let serial_cmdline = append_kernel_args(&current_cmdline, &graphics_args);
     let _cmdline_guard = EnvVarGuard::set(LUPOS_KERNEL_CMDLINE_ENV, &serial_cmdline);
 
     let prompt = "[root@lupos /]#";
@@ -16122,14 +16187,12 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             // fresh authentication conversation after PAM_AUTH_ERR.
             label: "greeter first password prompt",
             wait_for: "Prompt greeter with 1 message(s)",
-            text: Some("wrong"),
-            capture_frame: None,
+            action: HmpExpectAction::TypeText("wrong"),
         },
         HmpExpectStep {
             label: "greeter rejects wrong password",
             wait_for: "Authenticate result for user lupos: Authentication failure",
-            text: None,
-            capture_frame: None,
+            action: HmpExpectAction::None,
         },
         HmpExpectStep {
             // This match is cursor-scoped after the failure marker above, so
@@ -16137,8 +16200,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             // the valid password.
             label: "greeter retry password prompt",
             wait_for: "Prompt greeter with 1 message(s)",
-            text: Some("lupos"),
-            capture_frame: None,
+            action: HmpExpectAction::TypeText("lupos"),
         },
         HmpExpectStep {
             // This marker is emitted only after the authenticated session has
@@ -16147,17 +16209,15 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             // guest probe command for the same marker.
             label: "untouched initial desktop capture",
             wait_for: "graphics-x11: desktop-initial-ready",
-            text: None,
-            capture_frame: Some("initial-desktop"),
+            action: HmpExpectAction::CaptureFrame("initial-desktop"),
         },
         HmpExpectStep {
             // Capture the visible VGA output while Firefox is still alive.
             // The guest marker follows the remote HTTPS page-title check and
             // a three-second paint interval.
-            label: "rendered firefox capture",
+            label: "firefox CJK suggestion input",
             wait_for: "graphics-x11: firefox-window-ready",
-            text: None,
-            capture_frame: Some("firefox-rendered"),
+            action: HmpExpectAction::FirefoxSuggestionProbe,
         },
     ];
 
@@ -16172,6 +16232,19 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "none",
         &hmp_steps,
     )?;
+
+    let input_marker = if polling_baseline {
+        "i8042: polling fallback selected by lupos.i8042_poll=1"
+    } else {
+        "i8042: IRQ-driven input online: keyboard=1"
+    };
+    if !serial_log_contains(&run.serial_output, input_marker) {
+        bail!(
+            "graphics-x11 serial log did not contain input marker {:?}\nserial log:\n{}",
+            input_marker,
+            run.serial_output
+        );
+    }
 
     for needle in [
         "graphics-x11: seat-graphical ok",
@@ -16251,12 +16324,15 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: appfinder ok",
         "graphics-x11: desktop-rpc ok",
         "graphics-x11: fontconfig ok",
+        "graphics-x11: fontconfig-cjk ok",
         "graphics-x11: firefox-path /usr/bin/firefox",
         "graphics-x11: firefox-proc-exe ok",
         "graphics-x11: firefox-window ok",
         "graphics-x11: firefox-google-https ok",
+        "graphics-x11: firefox-cjk-suggestion-selected ok",
         "graphics-x11: firefox-render-pixels ok",
         "graphics-x11: firefox-desktop-responsive ok",
+        "graphics-x11: firefox-desktop-rpc ok",
         "graphics-x11: firefox-clock-advancing ok",
         "graphics-x11: wallpaper-default /usr/share/backgrounds/xfce/xfce-x.svg",
         "graphics-x11: wallpaper-decode ok",
@@ -16271,6 +16347,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         }
     }
     for forbidden in [
+        "i8042: IRQ1 registration failed",
         "graphics-x11: seat-graphical missing",
         "graphics-x11: xorg-proc missing",
         "graphics-x11: x-socket missing",
@@ -16337,17 +16414,23 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: appfinder failed",
         "graphics-x11: desktop-rpc failed",
         "graphics-x11: fontconfig failed",
+        "graphics-x11: fontconfig-cjk failed",
         "graphics-x11: firefox-path failed",
         "graphics-x11: self-exe failed",
         "graphics-x11: firefox missing-user-session",
         "graphics-x11: firefox-proc-exe failed",
         "graphics-x11: firefox-window failed",
         "graphics-x11: firefox-google-https failed",
+        "graphics-x11: firefox-cjk-suggestion-selected failed",
         "graphics-x11: firefox-render-pixels failed",
         "graphics-x11: firefox-desktop-responsive failed",
+        "graphics-x11: firefox-desktop-rpc failed",
         "graphics-x11: firefox-clock-advancing failed",
         "Couldn't find the application directory.",
         "The futex facility returned an unexpected error code.",
+        "pt_page_life dump",
+        "free_user_page_tables: skip",
+        "BUG: soft lockup",
         "bad-area-vma-dump",
         "trace-user-pf",
         "graphics-x11: wallpaper-decode missing-input",
@@ -19028,8 +19111,15 @@ struct SerialExpectStep {
 struct HmpExpectStep {
     label: &'static str,
     wait_for: &'static str,
-    text: Option<&'static str>,
-    capture_frame: Option<&'static str>,
+    action: HmpExpectAction,
+}
+
+#[derive(Clone, Copy)]
+enum HmpExpectAction {
+    None,
+    TypeText(&'static str),
+    CaptureFrame(&'static str),
+    FirefoxSuggestionProbe,
 }
 
 /// Build the GRUB ISO and boot QEMU with expect-style serial interaction.
@@ -21971,7 +22061,14 @@ impl HmpMonitor {
                     stream
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .context("failed to set QEMU HMP write timeout")?;
-                    return Ok(Self { stream });
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .context("failed to set QEMU HMP read timeout")?;
+                    let mut monitor = Self { stream };
+                    monitor
+                        .read_prompt("HMP greeting")
+                        .context("QEMU HMP did not send its initial prompt")?;
+                    return Ok(monitor);
                 }
                 Err(err) if Instant::now() < deadline => {
                     let _ = err;
@@ -21995,6 +22092,41 @@ impl HmpMonitor {
     }
 
     #[cfg(unix)]
+    fn read_prompt(&mut self, label: &str) -> Result<()> {
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let read = self
+                .stream
+                .read(&mut chunk)
+                .with_context(|| format!("failed to read {label} HMP response"))?;
+            if read == 0 {
+                bail!("QEMU HMP disconnected while reading {label}");
+            }
+            response.extend_from_slice(&chunk[..read]);
+            if response
+                .windows(b"(qemu)".len())
+                .any(|part| part == b"(qemu)")
+            {
+                return Ok(());
+            }
+            if response.len() > 64 * 1024 {
+                bail!("QEMU HMP response for {label} exceeded 64 KiB");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn command(&mut self, command: &str, label: &str) -> Result<()> {
+        writeln!(self.stream, "{command}")
+            .with_context(|| format!("failed to write {label} HMP command"))?;
+        self.stream
+            .flush()
+            .with_context(|| format!("failed to flush {label} HMP command"))?;
+        self.read_prompt(label)
+    }
+
+    #[cfg(unix)]
     fn type_text(&mut self, text: &str) -> Result<()> {
         for byte in text.bytes().chain(core::iter::once(b'\n')) {
             let key = match byte {
@@ -22002,15 +22134,198 @@ impl HmpMonitor {
                 b'\n' => String::from("ret"),
                 _ => bail!("unsupported HMP text-input byte 0x{byte:02x}"),
             };
-            writeln!(self.stream, "sendkey {key} 50")
-                .context("failed to send key through QEMU HMP")?;
-            self.stream
-                .flush()
-                .context("failed to flush QEMU HMP command")?;
+            self.command(&format!("sendkey {key} 50"), "text input")?;
             // HMP sendkey is asynchronous. Keep successive key-up/key-down
             // events distinct so GTK never interprets them as a chord.
             thread::sleep(Duration::from_millis(100));
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn send_key(&mut self, key: &str, hold_ms: u64, settle: Duration) -> Result<()> {
+        if key.chars().any(char::is_whitespace) {
+            bail!("HMP key name contains whitespace: {key:?}");
+        }
+        self.command(&format!("sendkey {key} {hold_ms}"), key)?;
+        if !settle.is_zero() {
+            thread::sleep(settle);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn capture_frame_fast(&mut self, path: &Path, label: &str) -> Result<Vec<u8>> {
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| anyhow!("{label} screendump path is not UTF-8"))?;
+        if path_text.chars().any(char::is_whitespace) {
+            bail!(
+                "{label} screendump path contains HMP-unsafe whitespace: {}",
+                path.display()
+            );
+        }
+        let _ = fs::remove_file(path);
+        self.command(&format!("screendump {path_text}"), label)?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(ppm) = fs::read(path)
+                && ppm_pixels(&ppm).is_ok()
+            {
+                return Ok(ppm);
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "QEMU did not finish the {label} screendump {}",
+                    path.display()
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    fn capture_png(&mut self, path: &Path, label: &str) -> Result<()> {
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| anyhow!("{label} PNG path is not UTF-8"))?;
+        if path_text.chars().any(char::is_whitespace) {
+            bail!("{label} PNG path contains HMP-unsafe whitespace");
+        }
+        let _ = fs::remove_file(path);
+        self.command(&format!("screendump {path_text} -f png"), label)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut previous_len = 0;
+        loop {
+            let len = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+            if len != 0 && len == previous_len {
+                return Ok(());
+            }
+            previous_len = len;
+            if Instant::now() >= deadline {
+                bail!("QEMU did not finish the {label} PNG {}", path.display());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn firefox_suggestion_probe(&mut self, serial_log_path: &Path) -> Result<()> {
+        const ITERATIONS: usize = 10;
+        const MIN_CHANGED_PIXELS: usize = 10_000;
+        let artifact = frame_screendump_path(serial_log_path, "firefox-cjk-suggestion");
+        let parent = artifact.parent().unwrap_or_else(|| Path::new("."));
+        let stem = artifact
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("firefox-cjk-suggestion");
+        let input_mode = if env::var_os(LUPOS_I8042_POLL_BASELINE_ENV).is_some() {
+            "polling"
+        } else {
+            "irq"
+        };
+        let mut samples = Vec::with_capacity(ITERATIONS);
+
+        // The earlier XFCE window probes can leave the virtual pointer over a
+        // launcher and produce a delayed tooltip inside the suggestion ROI.
+        // Move it to the quiet bottom-right corner before taking baselines.
+        self.command("mouse_move 10000 10000", "pointer movement")?;
+        thread::sleep(Duration::from_millis(500));
+
+        for iteration in 0..ITERATIONS {
+            // The deterministic local page autofocuses its suggestion input.
+            // Escape any prior suggestion, clear the previous query, then
+            // let Firefox settle before timing key delivery through DOM
+            // input handling and the rendered website suggestion.
+            self.send_key("esc", 20, Duration::from_millis(20))?;
+            self.send_key("ctrl-a", 20, Duration::from_millis(20))?;
+            self.send_key("backspace", 50, Duration::from_millis(300))?;
+
+            let baseline_path = parent.join(format!("{stem}-baseline-{iteration}.ppm"));
+            let baseline =
+                self.capture_frame_fast(&baseline_path, "Firefox suggestion baseline")?;
+            let started = Instant::now();
+            self.send_key("z", 20, Duration::ZERO)?;
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut changed = 0usize;
+            let mut observed = None;
+            let mut sample = 0usize;
+            while Instant::now() < deadline {
+                let sample_path = parent.join(format!("{stem}-sample-{iteration}-{sample}.ppm"));
+                let frame = self.capture_frame_fast(&sample_path, "Firefox suggestion sample")?;
+                changed = ppm_changed_pixels_in_suggestion_roi(&baseline, &frame)?;
+                if changed >= MIN_CHANGED_PIXELS {
+                    observed = Some((sample_path, frame));
+                    break;
+                }
+                let _ = fs::remove_file(sample_path);
+                sample += 1;
+            }
+            let elapsed = started.elapsed();
+            let Some((sample_path, frame)) = observed else {
+                let failure_artifact = parent.join(format!("{stem}-failure-{iteration}.ppm"));
+                let failure_png = failure_artifact.with_extension("png");
+                let last_sample =
+                    self.capture_frame_fast(&failure_artifact, "Firefox suggestion failure")?;
+                fs::write(&failure_artifact, last_sample).with_context(|| {
+                    format!(
+                        "failed to retain Firefox suggestion failure {}",
+                        failure_artifact.display()
+                    )
+                })?;
+                self.capture_png(&failure_png, "Firefox suggestion failure")?;
+                bail!(
+                    "Firefox suggestion popup did not become visible in iteration {iteration}; changed-pixels={changed}; artifact={}",
+                    failure_png.display()
+                );
+            };
+            println!(
+                "graphics-x11: firefox-key-to-suggestion-sample iteration={iteration} elapsed-us={} changed-pixels={changed}",
+                elapsed.as_micros()
+            );
+            samples.push((elapsed.as_micros(), changed));
+            if iteration + 1 == ITERATIONS {
+                fs::write(&artifact, &frame).with_context(|| {
+                    format!("failed to retain Firefox suggestion {}", artifact.display())
+                })?;
+                let png_artifact = artifact.with_extension("png");
+                self.capture_png(&png_artifact, "Firefox CJK suggestion")?;
+                println!(
+                    "graphics-x11: host-firefox-cjk-suggestion artifact={} png={}",
+                    artifact.display(),
+                    png_artifact.display()
+                );
+                self.send_key("down", 20, Duration::from_millis(40))?;
+                self.send_key("ret", 20, Duration::from_millis(100))?;
+            }
+            let _ = fs::remove_file(baseline_path);
+            let _ = fs::remove_file(sample_path);
+        }
+        let samples_artifact = artifact.with_extension("samples");
+        let mut sorted_us: Vec<u128> = samples.iter().map(|(elapsed, _)| *elapsed).collect();
+        sorted_us.sort_unstable();
+        let median_us = (sorted_us[ITERATIONS / 2 - 1] + sorted_us[ITERATIONS / 2]) / 2;
+        let p95_us = sorted_us[(ITERATIONS * 95).div_ceil(100) - 1];
+        let mut body = format!(
+            "input-mode={input_mode}\niterations={ITERATIONS}\nmedian-us={median_us}\np95-us={p95_us}\n"
+        );
+        for (iteration, (elapsed_us, changed_pixels)) in samples.iter().enumerate() {
+            body.push_str(&format!(
+                "sample={iteration} elapsed-us={elapsed_us} changed-pixels={changed_pixels}\n"
+            ));
+        }
+        fs::write(&samples_artifact, body).with_context(|| {
+            format!(
+                "failed to retain Firefox suggestion samples {}",
+                samples_artifact.display()
+            )
+        })?;
+        println!(
+            "graphics-x11: firefox-key-to-suggestion-summary input-mode={input_mode} median-us={median_us} p95-us={p95_us} artifact={}",
+            samples_artifact.display()
+        );
         Ok(())
     }
 
@@ -22031,11 +22346,7 @@ impl HmpMonitor {
             );
         }
         let _ = fs::remove_file(path);
-        writeln!(self.stream, "screendump {path_text}")
-            .with_context(|| format!("failed to request the {label} HMP screendump"))?;
-        self.stream
-            .flush()
-            .with_context(|| format!("failed to flush the {label} HMP screendump command"))?;
+        self.command(&format!("screendump {path_text}"), label)?;
 
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut previous_len = 0u64;
@@ -22143,7 +22454,7 @@ fn parse_ppm_usize(token: &[u8], label: &str) -> Result<usize> {
         .with_context(|| format!("invalid PPM {label}"))
 }
 
-fn analyze_initial_desktop_ppm(ppm: &[u8]) -> Result<DesktopFrameStats> {
+fn ppm_pixels(ppm: &[u8]) -> Result<(usize, usize, &[u8])> {
     let mut cursor = 0usize;
     if ppm_header_token(ppm, &mut cursor)? != b"P6" {
         bail!("QEMU screendump is not a binary P6 PPM");
@@ -22175,7 +22486,42 @@ fn analyze_initial_desktop_ppm(ppm: &[u8]) -> Result<DesktopFrameStats> {
             ppm.len().saturating_sub(cursor)
         );
     }
-    let pixels = &ppm[cursor..cursor + pixel_bytes];
+    Ok((width, height, &ppm[cursor..cursor + pixel_bytes]))
+}
+
+fn ppm_changed_pixels_in_suggestion_roi(baseline: &[u8], candidate: &[u8]) -> Result<usize> {
+    let (width, height, baseline_pixels) = ppm_pixels(baseline)?;
+    let (candidate_width, candidate_height, candidate_pixels) = ppm_pixels(candidate)?;
+    if (width, height) != (candidate_width, candidate_height) {
+        bail!(
+            "Firefox suggestion frames changed dimensions from {width}x{height} to {candidate_width}x{candidate_height}"
+        );
+    }
+    // The deterministic page places its datalist input and popup below the
+    // browser chrome. Exclude the tab/address bars so the typed glyph alone
+    // cannot satisfy the popup gate.
+    let y_start = core::cmp::min(120, height);
+    let y_end = core::cmp::min(420, height);
+    let mut changed = 0usize;
+    for y in y_start..y_end {
+        for x in 0..width {
+            let offset = (y * width + x) * 3;
+            let before = &baseline_pixels[offset..offset + 3];
+            let after = &candidate_pixels[offset..offset + 3];
+            if before
+                .iter()
+                .zip(after)
+                .any(|(left, right)| left.abs_diff(*right) >= 8)
+            {
+                changed += 1;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn analyze_initial_desktop_ppm(ppm: &[u8]) -> Result<DesktopFrameStats> {
+    let (width, height, pixels) = ppm_pixels(ppm)?;
 
     // Exclude desktop icons at the left edge, the top panel, and the bottom
     // launcher.  The remaining center is wallpaper-only in the stock XFCE
@@ -22275,33 +22621,47 @@ fn run_qemu_iso_with_serial_expect(
                     .map(|idx| hmp_cursor + idx + hmp_step.wait_for.len());
                 if raw_match_end.is_some() || visible_stripped.contains(hmp_step.wait_for) {
                     progress.note_expect_match(hmp_step.label);
-                    if let Some(frame_label) = hmp_step.capture_frame {
-                        let monitor = match hmp_monitor.as_mut() {
-                            Some(monitor) => monitor,
-                            None => {
-                                hmp_monitor = Some(HmpMonitor::connect(&hmp_socket)?);
-                                hmp_monitor.as_mut().expect("HMP monitor initialized")
-                            }
-                        };
-                        let capture_path = frame_screendump_path(serial_log_path, frame_label);
-                        monitor.capture_frame(&capture_path, frame_label)?;
-                        hmp_cursor = raw_match_end.unwrap_or(log.len());
-                    } else if let Some(text) = hmp_step.text {
-                        // LightDM logs the PAM prompt before the GTK entry has
-                        // acquired keyboard focus. Typing immediately can drop
-                        // the leading characters and authenticate the suffix.
-                        thread::sleep(Duration::from_secs(2));
-                        let monitor = match hmp_monitor.as_mut() {
-                            Some(monitor) => monitor,
-                            None => {
-                                hmp_monitor = Some(HmpMonitor::connect(&hmp_socket)?);
-                                hmp_monitor.as_mut().expect("HMP monitor initialized")
-                            }
-                        };
-                        monitor.type_text(text)?;
-                        hmp_cursor = log.len();
-                    } else {
-                        hmp_cursor = raw_match_end.unwrap_or(log.len());
+                    match hmp_step.action {
+                        HmpExpectAction::None => {
+                            hmp_cursor = raw_match_end.unwrap_or(log.len());
+                        }
+                        HmpExpectAction::TypeText(text) => {
+                            // LightDM logs the PAM prompt before the GTK entry
+                            // has acquired keyboard focus.
+                            thread::sleep(Duration::from_secs(2));
+                            let monitor = match hmp_monitor.as_mut() {
+                                Some(monitor) => monitor,
+                                None => {
+                                    hmp_monitor = Some(HmpMonitor::connect(&hmp_socket)?);
+                                    hmp_monitor.as_mut().expect("HMP monitor initialized")
+                                }
+                            };
+                            monitor.type_text(text)?;
+                            hmp_cursor = log.len();
+                        }
+                        HmpExpectAction::CaptureFrame(frame_label) => {
+                            let monitor = match hmp_monitor.as_mut() {
+                                Some(monitor) => monitor,
+                                None => {
+                                    hmp_monitor = Some(HmpMonitor::connect(&hmp_socket)?);
+                                    hmp_monitor.as_mut().expect("HMP monitor initialized")
+                                }
+                            };
+                            let capture_path = frame_screendump_path(serial_log_path, frame_label);
+                            monitor.capture_frame(&capture_path, frame_label)?;
+                            hmp_cursor = raw_match_end.unwrap_or(log.len());
+                        }
+                        HmpExpectAction::FirefoxSuggestionProbe => {
+                            let monitor = match hmp_monitor.as_mut() {
+                                Some(monitor) => monitor,
+                                None => {
+                                    hmp_monitor = Some(HmpMonitor::connect(&hmp_socket)?);
+                                    hmp_monitor.as_mut().expect("HMP monitor initialized")
+                                }
+                            };
+                            monitor.firefox_suggestion_probe(serial_log_path)?;
+                            hmp_cursor = raw_match_end.unwrap_or(log.len());
+                        }
                     }
                     hmp_index += 1;
                     // HMP accepts one client at a time. Reconnect for each
@@ -23559,6 +23919,37 @@ mod tests {
         assert_eq!(stats.painted_pixels, stats.interior_pixels);
         assert_eq!(stats.painted_percent(), 100);
         assert!(stats.wallpaper_is_visible());
+    }
+
+    #[test]
+    fn firefox_suggestion_diff_excludes_address_bar_and_counts_popup() {
+        let baseline = test_ppm(640, 480, [24, 48, 96]);
+        let mut address_only = baseline.clone();
+        let (_, _, pixels) = ppm_pixels(&address_only).expect("valid PPM");
+        let pixel_offset = pixels.as_ptr() as usize - address_only.as_ptr() as usize;
+        for y in 20..70 {
+            for x in 20..620 {
+                let offset = pixel_offset + (y * 640 + x) * 3;
+                address_only[offset..offset + 3].copy_from_slice(&[220, 220, 220]);
+            }
+        }
+        assert_eq!(
+            ppm_changed_pixels_in_suggestion_roi(&baseline, &address_only)
+                .expect("same dimensions"),
+            0
+        );
+
+        let mut popup = baseline.clone();
+        for y in 100..300 {
+            for x in 20..620 {
+                let offset = pixel_offset + (y * 640 + x) * 3;
+                popup[offset..offset + 3].copy_from_slice(&[220, 220, 220]);
+            }
+        }
+        assert_eq!(
+            ppm_changed_pixels_in_suggestion_roi(&baseline, &popup).expect("same dimensions"),
+            108_000
+        );
     }
 
     #[test]
@@ -25294,9 +25685,11 @@ failed command output\n";
         assert!(probe.contains("graphics-x11: curl dns ok"));
         assert!(probe.contains("/usr/bin/firefox --no-remote"));
         assert!(probe.contains("https://www.google.com/?hl=en"));
+        assert!(probe.contains("LUPOS 日本語候補 かなカナ"));
+        assert!(probe.contains("graphics-x11: firefox-cjk-suggestion-selected ok"));
         assert!(probe.contains("grep -q 'Google'"));
         assert!(probe.contains("graphics-x11: firefox-google-https ok"));
-        assert!(!probe.contains("file:///tmp/lupos-firefox-proof.html"));
+        assert!(probe.contains("http://127.0.0.1:8765/zzzzlupossuggestion.html"));
         assert!(probe.contains("user_xfce_desktop_ready"));
         assert!(probe.contains("xfce4-panel xfdesktop"));
         assert!(probe.contains("process_named_uid \"$wanted\" 1000"));
@@ -28584,6 +28977,26 @@ CONFIG_MODULES=y
                 && sched < softirq
                 && softirq < irq_enable,
             "Linux start_kernel initializes sched_init/timekeeping before watchdog and timer work can run, and only enables IRQs after softirq is ready"
+        );
+    }
+
+    #[test]
+    fn kernel_main_registers_i8042_after_softirq_before_irq_enable() {
+        let source = fs::read_to_string(repo_root().expect("repo root").join("src/init/main.rs"))
+            .expect("read kernel init source");
+        let softirq = source
+            .find("kernel::softirq::init();")
+            .expect("kernel init should initialise softirq");
+        let i8042 = source
+            .find("linux_driver_abi::input::i8042::init(")
+            .expect("kernel init should initialise i8042");
+        let irq_enable = source
+            .find("core::arch::asm!(\"sti\",")
+            .expect("kernel init should enable interrupts");
+
+        assert!(
+            softirq < i8042 && i8042 < irq_enable,
+            "Linux-style i8042 setup must register its deferred consumer and IRQ handlers after softirq setup but before sti"
         );
     }
 
@@ -33153,6 +33566,10 @@ CONFIG_MODULES=y
             packages.contains("firefox"),
             "the XFCE image must preinstall Firefox"
         );
+        assert!(
+            packages.contains("noto-fonts-cjk"),
+            "Firefox search suggestions must have scalable CJK glyph coverage"
+        );
 
         let installer = script
             .split_once("install_arch_graphics_packages() {")
@@ -33166,7 +33583,7 @@ CONFIG_MODULES=y
             "--database",
             "--check",
             "--query",
-            "nano firefox",
+            "nano firefox noto-fonts-cjk",
         ] {
             assert!(
                 installer.contains(needle),
