@@ -213,6 +213,40 @@ impl SigInfo {
         info._sifields[8..10].copy_from_slice(&addr_lsb.to_ne_bytes());
         info
     }
+
+    /// Build the `SIGSYS/SYS_SECCOMP` record used by `SECCOMP_RET_TRAP`.
+    ///
+    /// Linux's `_sigsys` union layout is:
+    /// `si_call_addr` at byte 0, `si_syscall` at byte 8, and `si_arch` at
+    /// byte 12. The filter-provided 16-bit data is exposed through
+    /// `si_errno`, outside the union.
+    pub fn with_sigsys(
+        signo: i32,
+        code: i32,
+        call_addr: u64,
+        syscall: i32,
+        arch: u32,
+        errno: i32,
+    ) -> Self {
+        let mut info = Self::new(signo, code);
+        info.errno = errno;
+        info._sifields[0..8].copy_from_slice(&call_addr.to_ne_bytes());
+        info._sifields[8..12].copy_from_slice(&syscall.to_ne_bytes());
+        info._sifields[12..16].copy_from_slice(&arch.to_ne_bytes());
+        info
+    }
+
+    pub fn sigsys_call_addr(&self) -> u64 {
+        u64::from_ne_bytes(self._sifields[0..8].try_into().unwrap())
+    }
+
+    pub fn sigsys_syscall(&self) -> i32 {
+        i32::from_ne_bytes(self._sifields[8..12].try_into().unwrap())
+    }
+
+    pub fn sigsys_arch(&self) -> u32 {
+        u32::from_ne_bytes(self._sifields[12..16].try_into().unwrap())
+    }
 }
 
 impl Default for SigInfo {
@@ -2681,7 +2715,6 @@ pub unsafe fn do_signal(regs: *mut crate::kernel::task::PtRegs) -> bool {
                 RtSigAction::default()
             }
         };
-
         // Linux: signals fatal-by-design (SIGKILL) bypass the handler lookup —
         // they always terminate via the default-action path.
         let kind = if info.signo == SIGKILL {
@@ -3145,6 +3178,18 @@ mod tests {
     use crate::kernel::{cred::INIT_CRED, sched, task::TaskStruct};
 
     use super::SIGNAL_TEST_LOCK as TEST_LOCK;
+
+    #[test]
+    fn seccomp_sigsys_info_matches_linux_union_layout() {
+        let info = SigInfo::with_sigsys(SIGSYS, 1, 0x7fff_1234_5678, 204, 0xc000_003e, 0x1234);
+
+        assert_eq!(info.signo, SIGSYS);
+        assert_eq!(info.code, 1);
+        assert_eq!(info.errno, 0x1234);
+        assert_eq!(info.sigsys_call_addr(), 0x7fff_1234_5678);
+        assert_eq!(info.sigsys_syscall(), 204);
+        assert_eq!(info.sigsys_arch(), 0xc000_003e);
+    }
 
     fn syscall_restart_regs(errno: i32) -> crate::kernel::task::PtRegs {
         crate::kernel::task::PtRegs {

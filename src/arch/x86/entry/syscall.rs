@@ -332,7 +332,7 @@ pub(crate) unsafe extern "C" fn load_current_user_tls_base() {
     unsafe { wrmsr(MSR_FS_BASE, fsbase) };
 }
 
-pub(crate) unsafe extern "C" fn syscall_exit_slowpath(
+pub unsafe extern "C" fn syscall_exit_slowpath(
     regs: *mut crate::arch::x86::kernel::ptrace::PtRegs,
 ) {
     let task = sched::get_current();
@@ -500,8 +500,8 @@ unsafe fn syscall_dispatch_ptregs_inner(
     }
 
     let ret = match syscall_seccomp_check(unsafe { &*regs }, task) {
-        Ok(()) if nr < NR_syscalls => unsafe { SYS_CALL_TABLE[nr](regs) },
-        Ok(()) => {
+        SeccompCheck::Allow if nr < NR_syscalls => unsafe { SYS_CALL_TABLE[nr](regs) },
+        SeccompCheck::Allow => {
             #[cfg(not(test))]
             {
                 let pid = if task.is_null() {
@@ -519,7 +519,15 @@ unsafe fn syscall_dispatch_ptregs_inner(
             }
             -ENOSYS
         }
-        Err(errno) => errno,
+        SeccompCheck::Errno(errno) => errno,
+        SeccompCheck::Trap(data) => {
+            // Linux `SECCOMP_RET_TRAP` rolls the syscall registers back,
+            // skips dispatch, and forces SIGSYS/SYS_SECCOMP.  The userspace
+            // handler sees the original syscall number in both RAX and
+            // siginfo, and may replace RAX in its ucontext to emulate it.
+            unsafe { queue_seccomp_trap(&mut *regs, task, data) };
+            unsafe { (*regs).orig_rax as i64 }
+        }
     };
 
     #[cfg(not(test))]
@@ -533,7 +541,6 @@ unsafe fn syscall_dispatch_ptregs_inner(
             crate::linux_driver_abi::tty::serial_println!("enosys pid={} nr={}", pid, nr);
         }
     }
-
     unsafe {
         (*regs).rax = ret as u64;
     }
@@ -1446,12 +1453,41 @@ fn comm_for_trace(comm: &[u8; 16]) -> &str {
     core::str::from_utf8(&comm[..len]).unwrap_or("?")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SeccompCheck {
+    Allow,
+    Errno(i64),
+    Trap(u16),
+}
+
+const SYS_SECCOMP: i32 = 1;
+
+pub(crate) unsafe fn queue_seccomp_trap(
+    regs: &mut crate::arch::x86::kernel::ptrace::PtRegs,
+    task: *mut crate::kernel::task::TaskStruct,
+    data: u16,
+) {
+    regs.rax = regs.orig_rax;
+    if task.is_null() {
+        return;
+    }
+    let info = crate::kernel::signal::SigInfo::with_sigsys(
+        crate::kernel::signal::SIGSYS,
+        SYS_SECCOMP,
+        regs.rip,
+        regs.orig_rax as i32,
+        AUDIT_ARCH_X86_64,
+        data as i32,
+    );
+    let _ = unsafe { crate::kernel::signal::send_signal_info_to_task(task, info) };
+}
+
 fn syscall_seccomp_check(
     regs: &crate::arch::x86::kernel::ptrace::PtRegs,
     task: *mut crate::kernel::task::TaskStruct,
-) -> Result<(), i64> {
+) -> SeccompCheck {
     if task.is_null() {
-        return Ok(());
+        return SeccompCheck::Allow;
     }
 
     let seccomp = unsafe { &(*task).m27_seccomp };
@@ -1461,11 +1497,11 @@ fn syscall_seccomp_check(
 pub(crate) fn syscall_seccomp_check_state(
     regs: &crate::arch::x86::kernel::ptrace::PtRegs,
     seccomp: &Seccomp,
-) -> Result<(), i64> {
+) -> SeccompCheck {
     if seccomp.mode.load(core::sync::atomic::Ordering::Acquire) == SECCOMP_MODE_STRICT
         && !strict_seccomp_allows(regs.orig_rax)
     {
-        return Err(-EPERM);
+        return SeccompCheck::Errno(-EPERM);
     }
 
     let data = SeccompData {
@@ -1481,13 +1517,14 @@ fn strict_seccomp_allows(nr: u64) -> bool {
     matches!(nr, 0 | 1 | SYS_EXIT | SYS_RT_SIGRETURN)
 }
 
-fn seccomp_action_to_result(action: u32) -> Result<(), i64> {
+fn seccomp_action_to_result(action: u32) -> SeccompCheck {
     match action & SECCOMP_RET_ACTION_FULL {
-        SECCOMP_RET_ALLOW | SECCOMP_RET_LOG => Ok(()),
-        SECCOMP_RET_ERRNO => Err(-((action & SECCOMP_RET_DATA) as i64)),
-        SECCOMP_RET_TRACE | SECCOMP_RET_USER_NOTIF => Err(-ENOSYS),
-        SECCOMP_RET_TRAP | SECCOMP_RET_KILL_THREAD | SECCOMP_RET_KILL_PROCESS => Err(-EPERM),
-        _ => Err(-EPERM),
+        SECCOMP_RET_ALLOW | SECCOMP_RET_LOG => SeccompCheck::Allow,
+        SECCOMP_RET_ERRNO => SeccompCheck::Errno(-((action & SECCOMP_RET_DATA) as i64)),
+        SECCOMP_RET_TRAP => SeccompCheck::Trap((action & SECCOMP_RET_DATA) as u16),
+        SECCOMP_RET_TRACE | SECCOMP_RET_USER_NOTIF => SeccompCheck::Errno(-ENOSYS),
+        SECCOMP_RET_KILL_THREAD | SECCOMP_RET_KILL_PROCESS => SeccompCheck::Errno(-EPERM),
+        _ => SeccompCheck::Errno(-EPERM),
     }
 }
 
@@ -1845,7 +1882,10 @@ mod tests {
         }
 
         let regs = regs_for_syscall(39);
-        assert_eq!(syscall_seccomp_check_state(&regs, &seccomp), Err(-13));
+        assert_eq!(
+            syscall_seccomp_check_state(&regs, &seccomp),
+            SeccompCheck::Errno(-13)
+        );
 
         unsafe {
             SeccompFilter::put(seccomp.filter.load(Ordering::Acquire));
@@ -1861,11 +1901,33 @@ mod tests {
 
         assert_eq!(
             syscall_seccomp_check_state(&regs_for_syscall(39), &seccomp),
-            Err(-EPERM)
+            SeccompCheck::Errno(-EPERM)
         );
         assert_eq!(
             syscall_seccomp_check_state(&regs_for_syscall(SYS_EXIT), &seccomp),
-            Ok(())
+            SeccompCheck::Allow
         );
+    }
+
+    #[test]
+    fn seccomp_trap_preserves_filter_data_for_sigsys() {
+        let seccomp = Seccomp::default();
+        let filter = seccomp_prepare_filter(alloc::vec![SockFilter::stmt(
+            BPF_RET | BPF_K,
+            SECCOMP_RET_TRAP | 0x1234,
+        )])
+        .unwrap();
+        unsafe {
+            seccomp_attach_filter(&seccomp, filter);
+        }
+
+        assert_eq!(
+            syscall_seccomp_check_state(&regs_for_syscall(204), &seccomp),
+            SeccompCheck::Trap(0x1234)
+        );
+
+        unsafe {
+            SeccompFilter::put(seccomp.filter.load(Ordering::Acquire));
+        }
     }
 }

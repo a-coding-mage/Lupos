@@ -389,9 +389,15 @@ impl VsyscallEnv for KernelVsyscallEnv {
 
         let seccomp = unsafe { &(*task).m27_seccomp };
         match crate::arch::x86::entry::syscall::syscall_seccomp_check_state(regs, seccomp) {
-            Ok(()) => 0,
-            Err(errno) => {
+            crate::arch::x86::entry::syscall::SeccompCheck::Allow => 0,
+            crate::arch::x86::entry::syscall::SeccompCheck::Errno(errno) => {
                 regs.rax = errno as u64;
+                1
+            }
+            crate::arch::x86::entry::syscall::SeccompCheck::Trap(data) => {
+                unsafe {
+                    crate::arch::x86::entry::syscall::queue_seccomp_trap(regs, task, data);
+                }
                 1
             }
         }
