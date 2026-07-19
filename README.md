@@ -16,6 +16,7 @@
 
 **[Watch the technical showcase (MP4)](./branding/lupos-showcase.mp4)** ·
 **[Build it](#build-and-reproduce)** · **[Architecture](#architecture)** ·
+**[Translation progress](./TRANSLATION_PROGRESS.md)** ·
 **[Limitations and security](#known-limitations-and-security-warnings)** ·
 **[AI disclosure](#how-ai-was-used)** ·
 **[Contributing](./CONTRIBUTING.md)** · **[GPL-2.0-only](./LICENSE)**
@@ -43,7 +44,9 @@ The current evidence is narrower than that contract:
 - The source-parity audit currently records 2,454 Rust implementation units:
   1,821 marked `complete`, 567 `partial`, and 66 `stub`. These are
   project-maintained implementation tags, **not** proof of whole-kernel
-  compatibility.
+  compatibility. See the
+  [translation progress dashboard](./TRANSLATION_PROGRESS.md) for the
+  file-level audit, subsystem breakdowns, and review-risk plots.
 - The strongest evidence is the test path: original Linux tests are built and
   run against Lupos, with Linux/Lupos result comparison where supported.
 
