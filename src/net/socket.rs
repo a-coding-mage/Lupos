@@ -311,6 +311,8 @@ pub fn unregister_net_namespace(namespace_key: usize) {
 }
 
 static NEXT_EPHEMERAL_PORT: AtomicU32 = AtomicU32::new(0);
+const EPHEMERAL_PORT_FIRST: u16 = 32768;
+const EPHEMERAL_PORT_COUNT: u32 = 28232;
 
 static NEXT_NETLINK_AUTOBIND_PORTID: AtomicU32 = AtomicU32::new(u32::MAX);
 /// Ethernet receive handoff from a vendor-built Linux net driver after its
@@ -523,7 +525,7 @@ pub fn socket(family: u16, sock_type: u16, protocol: u16) -> Result<SocketRef, i
         last_rx_meta: PacketMeta::default(),
         wire_tcp: None,
     }));
-    if family == AF_INET {
+    if matches!(family, AF_INET | AF_INET6) {
         let mut sockets = INET_SOCKETS.lock();
         sockets.retain(|entry| entry.strong_count() != 0);
         sockets.push(Arc::downgrade(&socket));
@@ -566,7 +568,95 @@ pub(crate) fn qemu_dns_ipv4() -> u32 {
 
 fn next_ephemeral_port() -> u16 {
     let next = NEXT_EPHEMERAL_PORT.fetch_add(1, Ordering::AcqRel);
-    32768u16 + (next % 28232) as u16
+    EPHEMERAL_PORT_FIRST + (next % EPHEMERAL_PORT_COUNT) as u16
+}
+
+fn inet_bind_addresses_conflict(candidate: &SockAddr, existing: &SockAddr) -> bool {
+    match (candidate, existing) {
+        (
+            SockAddr::Inet {
+                addr: candidate_addr,
+                port: candidate_port,
+            },
+            SockAddr::Inet {
+                addr: existing_addr,
+                port: existing_port,
+            },
+        ) => {
+            candidate_port == existing_port
+                && (*candidate_addr == 0 || *existing_addr == 0 || candidate_addr == existing_addr)
+        }
+        (
+            SockAddr::Inet6 {
+                addr: candidate_addr,
+                port: candidate_port,
+            },
+            SockAddr::Inet6 {
+                addr: existing_addr,
+                port: existing_port,
+            },
+        ) => {
+            candidate_port == existing_port
+                && (*candidate_addr == [0; 16]
+                    || *existing_addr == [0; 16]
+                    || candidate_addr == existing_addr)
+        }
+        _ => false,
+    }
+}
+
+/// Resolve an explicit inet `bind(..., port 0)` before inserting the socket
+/// into the bind table.
+///
+/// Linux `__inet_bind()` calls the protocol's `get_port(sk, 0)` unless
+/// `IP_BIND_ADDRESS_NO_PORT` was requested.  The selected port is immediately
+/// visible through `getsockname()` and is retained for later sends.  In
+/// particular, Firefox's HTTP/3 transport binds `0.0.0.0:0`, reads the chosen
+/// address back, and then hands the descriptor to Neqo.
+fn resolve_inet_ephemeral_bind(sock: &SocketRef, addr: SockAddr) -> Result<SockAddr, i32> {
+    let needs_port = matches!(
+        &addr,
+        SockAddr::Inet { port: 0, .. } | SockAddr::Inet6 { port: 0, .. }
+    );
+    if !needs_port {
+        return Ok(addr);
+    }
+
+    let (family, sock_type, namespace_key) = {
+        let socket = sock.lock();
+        (socket.family, socket.sock_type, socket.net_ns)
+    };
+    for _ in 0..EPHEMERAL_PORT_COUNT {
+        let port = next_ephemeral_port();
+        let candidate = match &addr {
+            SockAddr::Inet { addr, .. } => SockAddr::Inet { addr: *addr, port },
+            SockAddr::Inet6 { addr, .. } => SockAddr::Inet6 { addr: *addr, port },
+            _ => unreachable!(),
+        };
+        let conflict = {
+            let mut sockets = INET_SOCKETS.lock();
+            let live = sockets.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+            sockets.retain(|entry| entry.strong_count() != 0);
+            drop(sockets);
+            live.into_iter().any(|entry| {
+                if Arc::ptr_eq(&entry, sock) {
+                    return false;
+                }
+                let entry = entry.lock();
+                entry.net_ns == namespace_key
+                    && entry.family == family
+                    && entry.sock_type == sock_type
+                    && entry
+                        .local
+                        .as_ref()
+                        .is_some_and(|local| inet_bind_addresses_conflict(&candidate, local))
+            })
+        };
+        if !conflict {
+            return Ok(candidate);
+        }
+    }
+    Err(EADDRINUSE)
 }
 
 pub(crate) fn autobind_inet(socket: &mut KernelSocket) {
@@ -718,7 +808,7 @@ fn validate_unix_socket(sock_type: u16, protocol: u16) -> Result<(), i32> {
 }
 
 pub fn bind(sock: &SocketRef, addr: SockAddr) -> Result<(), i32> {
-    let addr = netlink_autobind_addr(sock, addr);
+    let addr = resolve_inet_ephemeral_bind(sock, netlink_autobind_addr(sock, addr))?;
     if audit_netlink_readlog_addr_requires_cap(sock, &addr) && !capable(CAP_AUDIT_READ) {
         return Err(EPERM);
     }
@@ -1837,6 +1927,7 @@ const NLMSG_DONE: u16 = 3;
 const NLM_F_MULTI: u16 = 0x2;
 const NLM_F_ACK: u16 = 0x4;
 const NLM_F_ECHO: u16 = 0x8;
+const NLM_F_DUMP: u16 = 0x300;
 const NLM_F_REPLACE: u16 = 0x100;
 const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
@@ -3085,7 +3176,60 @@ fn build_rtnl_route_message(
     msg
 }
 
+fn queue_rtnl_getroute_lookup(sock: &SocketRef, bytes: &[u8], req: &NetlinkHeader) {
+    // Linux dispatches RTM_GETROUTE without NLM_F_DUMP to
+    // net/ipv4/route.c::inet_rtm_getroute(), which parses RTA_DST, performs an
+    // output-route lookup, and unicasts one RTM_NEWROUTE carrying RTA_OIF.
+    // Mozilla's QUIC PMTU discovery uses exactly this form and blocks in
+    // read(2) until that reply arrives.
+    if req.len < NLMSG_HDRLEN + 12 {
+        queue_netlink_error(sock, bytes, -(EINVAL as i32));
+        return;
+    }
+    if bytes[16] != AF_INET as u8 {
+        queue_netlink_error(sock, bytes, -(EAFNOSUPPORT as i32));
+        return;
+    }
+    let Some(dst) = rtattr_ipv4(&bytes[..req.len], NLMSG_HDRLEN + 12, RTA_DST) else {
+        queue_netlink_error(sock, bytes, -(EINVAL as i32));
+        return;
+    };
+    let requested_table = if bytes[20] == RT_TABLE_UNSPEC {
+        RT_TABLE_MAIN
+    } else {
+        bytes[20]
+    };
+    let requested_oif = rtattr_u32(&bytes[..req.len], NLMSG_HDRLEN + 12, RTA_OIF);
+    let route = current_route4s()
+        .into_iter()
+        .filter(|route| route.table == requested_table)
+        .filter(|route| requested_oif.is_none_or(|oif| route.oif == oif))
+        .filter(|route| {
+            route.dst_len <= 32
+                && ipv4_prefix(dst, route.dst_len) == ipv4_prefix(route.dst, route.dst_len)
+        })
+        .max_by_key(|route| route.dst_len);
+
+    let Some(route) = route else {
+        queue_netlink_error(sock, bytes, -(ENETUNREACH as i32));
+        return;
+    };
+    enqueue_netlink_packet(
+        sock,
+        build_rtnl_route_message(RTM_NEWROUTE, req.seq, netlink_reply_portid(sock), 0, &route),
+    );
+    if req.flags & NLM_F_ACK != 0 {
+        queue_netlink_error(sock, bytes, 0);
+    }
+}
+
 fn queue_rtnl_getroute_dump(sock: &SocketRef, bytes: &[u8], req: &NetlinkHeader) {
+    // vendor/linux/net/core/rtnetlink.c::rtnetlink_rcv_msg selects dumpit
+    // only for requests carrying NLM_F_DUMP; all other GET requests use doit.
+    if req.flags & NLM_F_DUMP == 0 {
+        queue_rtnl_getroute_lookup(sock, bytes, req);
+        return;
+    }
     let family = if req.len >= NLMSG_HDRLEN + 12 {
         bytes[16]
     } else {
