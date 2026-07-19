@@ -5743,6 +5743,29 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    if [ -s /tmp/lupos-appfinder.log ]; then echo 'graphics-x11: appfinder-log begin'; tail -40 /tmp/lupos-appfinder.log; echo 'graphics-x11: appfinder-log end'; fi\n",
         "    if [ -s /tmp/lupos-appfinder-windows.log ]; then echo 'graphics-x11: appfinder-windows begin'; tail -40 /tmp/lupos-appfinder-windows.log; echo 'graphics-x11: appfinder-windows end'; fi\n",
         "fi\n",
+        // Exercise repeated cross-process RPCs on the authenticated desktop
+        // session before Firefox adds load.  This catches scheduler/futex/IPC
+        // regressions that still function eventually but make the desktop
+        // unusably slow.
+        "echo 'graphics-x11: desktop-rpc-probe begin'\n",
+        "desktop_rpc_ok=1; desktop_rpc_i=0; desktop_rpc_start=\"$(date +%s%N 2>/dev/null || true)\"\n",
+        "while [ \"$desktop_rpc_i\" -lt 10 ]; do\n",
+        "    sudo -n -u lupos env DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout 2 /usr/bin/dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1 || desktop_rpc_ok=0\n",
+        "    desktop_rpc_i=$((desktop_rpc_i + 1))\n",
+        "done\n",
+        "desktop_rpc_end=\"$(date +%s%N 2>/dev/null || true)\"; desktop_rpc_ms=999999\n",
+        "if [ -n \"$desktop_rpc_start\" ] && [ -n \"$desktop_rpc_end\" ]; then desktop_rpc_ms=$(((desktop_rpc_end - desktop_rpc_start) / 1000000)); fi\n",
+        "printf 'graphics-x11: desktop-rpc iterations=%s elapsed-ms=%s\\n' \"$desktop_rpc_i\" \"$desktop_rpc_ms\"\n",
+        "if [ \"$desktop_rpc_ok\" -eq 1 ] && [ \"$desktop_rpc_ms\" -le 10000 ]; then echo 'graphics-x11: desktop-rpc ok'; else echo 'graphics-x11: desktop-rpc failed'; fi\n",
+        "echo 'graphics-x11: desktop-rpc-probe end'\n",
+        // Prove that the unprivileged desktop session can resolve a real
+        // scalable font before starting Firefox.  Package presence alone does
+        // not catch a skipped fontconfig post-install configuration/cache.
+        "fontconfig_match=\"$(sudo -n -u lupos env HOME=\"$session_home\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout 20 /usr/bin/fc-match -f '%{family} %{file}\\n' sans-serif 2>/tmp/lupos-fontconfig.err | head -1 || true)\"\n",
+        "fontconfig_count=\"$(sudo -n -u lupos env HOME=\"$session_home\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout 20 /usr/bin/fc-list 2>>/tmp/lupos-fontconfig.err | wc -l)\"\n",
+        "printf 'graphics-x11: fontconfig count=%s match=%s\\n' \"$fontconfig_count\" \"$fontconfig_match\"\n",
+        "if [ \"${fontconfig_count:-0}\" -gt 0 ] && printf '%s' \"$fontconfig_match\" | grep -q '/usr/share/fonts/'; then echo 'graphics-x11: fontconfig ok'; else echo 'graphics-x11: fontconfig failed'; fi\n",
+        "if [ -s /tmp/lupos-fontconfig.err ]; then echo 'graphics-x11: fontconfig-log begin'; tail -40 /tmp/lupos-fontconfig.err; echo 'graphics-x11: fontconfig-log end'; fi\n",
         // Firefox discovers its installation directory from
         // readlink("/proc/self/exe") before it loads XPCOM. Verify the PATH
         // launcher, that procfs ABI, the retained executable path, and a real
@@ -5790,13 +5813,14 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    firefox_fb_after=\"$(cksum </dev/fb0 2>/dev/null || true)\"\n",
         "    printf 'graphics-x11: firefox-framebuffer before=%s after=%s\\n' \"$firefox_fb_before\" \"$firefox_fb_after\"\n",
         "    if [ -n \"$firefox_fb_before\" ] && [ -n \"$firefox_fb_after\" ] && [ \"$firefox_fb_before\" != \"$firefox_fb_after\" ]; then echo 'graphics-x11: firefox-render-pixels ok'; else echo 'graphics-x11: firefox-render-pixels failed'; fi\n",
+        "    clock_before=\"$(date +%s 2>/dev/null || true)\"\n",
         "    firefox_responsive=1; responsive_i=0\n",
         "    while [ \"$responsive_i\" -lt 5 ]; do DISPLAY=:0 timeout 2 /usr/bin/xprop -root _NET_CLIENT_LIST >/dev/null 2>&1 || firefox_responsive=0; responsive_i=$((responsive_i + 1)); done\n",
         "    if [ \"$firefox_responsive\" -eq 1 ]; then echo 'graphics-x11: firefox-desktop-responsive ok'; else echo 'graphics-x11: firefox-desktop-responsive failed'; fi\n",
-        "    wall_epoch=\"$(date +%s 2>/dev/null || true)\"; rtc_text=\"$(hwclock --show --utc --noadjfile 2>/dev/null || true)\"; rtc_epoch=\"$(date -u -d \"$rtc_text\" +%s 2>/dev/null || true)\"\n",
-        "    clock_skew=999999; if [ -n \"$wall_epoch\" ] && [ -n \"$rtc_epoch\" ]; then if [ \"$wall_epoch\" -ge \"$rtc_epoch\" ]; then clock_skew=$((wall_epoch - rtc_epoch)); else clock_skew=$((rtc_epoch - wall_epoch)); fi; fi\n",
-        "    printf 'graphics-x11: firefox-clock wall=%s rtc=%s skew=%s\\n' \"$wall_epoch\" \"$rtc_epoch\" \"$clock_skew\"\n",
-        "    if [ \"$clock_skew\" -le 5 ]; then echo 'graphics-x11: firefox-clock-sync ok'; else echo 'graphics-x11: firefox-clock-sync failed'; fi\n",
+        "    sleep 2; wall_epoch=\"$(date +%s 2>/dev/null || true)\"\n",
+        "    clock_elapsed=-1; if [ -n \"$clock_before\" ] && [ -n \"$wall_epoch\" ]; then clock_elapsed=$((wall_epoch - clock_before)); fi\n",
+        "    printf 'graphics-x11: firefox-clock wall=%s elapsed=%s\\n' \"$wall_epoch\" \"$clock_elapsed\"\n",
+        "    if [ \"$clock_elapsed\" -ge 1 ] && [ \"$clock_elapsed\" -le 20 ]; then echo 'graphics-x11: firefox-clock-advancing ok'; else echo 'graphics-x11: firefox-clock-advancing failed'; fi\n",
         "    printf 'graphics-x11: firefox-exe %s\\n' \"$firefox_exe\"\n",
         "    if [ \"$firefox_alive\" -eq 1 ] && [ \"$firefox_exe\" = /usr/lib/firefox/firefox ]; then echo 'graphics-x11: firefox-proc-exe ok'; else echo 'graphics-x11: firefox-proc-exe failed'; fi\n",
         "    if [ \"$firefox_window\" -eq 1 ]; then echo 'graphics-x11: firefox-window ok'; else echo 'graphics-x11: firefox-window failed'; fi\n",
@@ -13888,7 +13912,7 @@ const SHIPPED_COMMANDS_ROOT_DISK_BYTES: u64 = 768 * 1024 * 1024;
 const LOGIN_ROOT_DISK_MANIFEST_VERSION: &str = "2";
 // v17: restore the pinned Arch bootstrap's numeric ownership in the ext4
 // image instead of inheriting the unprivileged host user's uid/gid.
-const DIRECT_STAGE_ROOT_DISK_MANIFEST_VERSION: &str = "18";
+const DIRECT_STAGE_ROOT_DISK_MANIFEST_VERSION: &str = "19";
 
 fn ensure_disk_root_remount_disk() -> Result<PathBuf> {
     let target = xtask_target_dir()?;
@@ -16041,6 +16065,11 @@ pub fn run_gui_shell_tests() -> Result<()> {
 /// full XFCE session and requires its core desktop components.
 pub fn run_graphics_x11_tests() -> Result<()> {
     let _graphics_guard = EnvVarGuard::set("LUPOS_USERLAND_GRAPHICS", "1");
+    // Exercise Firefox under the same memory contract as the interactive GUI
+    // boot.  A modern multi-process browser is not a meaningful desktop
+    // responsiveness test in the generic 1 GiB boot-test default.
+    let _memory_guard = default_gui_shell_memory_guard();
+    let _release_guard = default_login_boot_release_guard();
     // Keep the cached graphics image immutable. This makes every automated
     // run start with the original staged packages/configuration/databases and
     // confines logs, swap activation, and other runtime writes to QEMU's
@@ -16219,12 +16248,14 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: xfce-proc xfdesktop",
         "graphics-x11: settings-manager ok",
         "graphics-x11: appfinder ok",
+        "graphics-x11: desktop-rpc ok",
+        "graphics-x11: fontconfig ok",
         "graphics-x11: firefox-path /usr/bin/firefox",
         "graphics-x11: firefox-proc-exe ok",
         "graphics-x11: firefox-window ok",
         "graphics-x11: firefox-render-pixels ok",
         "graphics-x11: firefox-desktop-responsive ok",
-        "graphics-x11: firefox-clock-sync ok",
+        "graphics-x11: firefox-clock-advancing ok",
         "graphics-x11: wallpaper-default /usr/share/backgrounds/xfce/xfce-x.svg",
         "graphics-x11: wallpaper-decode ok",
         "graphics-x11: wallpaper-pixels ok",
@@ -16302,6 +16333,8 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: appfinder missing-binary",
         "graphics-x11: appfinder missing-user-session",
         "graphics-x11: appfinder failed",
+        "graphics-x11: desktop-rpc failed",
+        "graphics-x11: fontconfig failed",
         "graphics-x11: firefox-path failed",
         "graphics-x11: self-exe failed",
         "graphics-x11: firefox missing-user-session",
@@ -16309,7 +16342,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: firefox-window failed",
         "graphics-x11: firefox-render-pixels failed",
         "graphics-x11: firefox-desktop-responsive failed",
-        "graphics-x11: firefox-clock-sync failed",
+        "graphics-x11: firefox-clock-advancing failed",
         "Couldn't find the application directory.",
         "The futex facility returned an unexpected error code.",
         "bad-area-vma-dump",
@@ -16333,6 +16366,27 @@ pub fn run_graphics_x11_tests() -> Result<()> {
                 run.serial_output
             );
         }
+    }
+
+    let wall_epoch = run
+        .serial_output
+        .lines()
+        .rev()
+        .find_map(|line| {
+            line.split_once("graphics-x11: firefox-clock wall=")
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .context("graphics-x11 serial log did not contain a valid Firefox wall-clock sample")?;
+    let host_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("host wall clock is before the Unix epoch")?
+        .as_secs();
+    let clock_skew = host_epoch.abs_diff(wall_epoch);
+    if clock_skew > 60 {
+        bail!(
+            "graphics-x11 Firefox wall clock is not synchronized with the host: guest={wall_epoch} host={host_epoch} skew={clock_skew}s"
+        );
     }
 
     Ok(())

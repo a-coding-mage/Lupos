@@ -851,7 +851,12 @@ static SOCKET_FILE_OPS: FileOps = FileOps {
 fn socket_release(file: FileRef) {
     let token = *file.private.lock();
     if token != 0 {
-        if let Some(sock) = SOCKETS.lock().remove(&token) {
+        // Drop the global descriptor-to-socket table lock before releasing
+        // queued SCM_RIGHTS files. A queued file may itself be a socket, whose
+        // fput() re-enters socket_release(); retaining SOCKETS here deadlocks
+        // that recursive close path.
+        let sock = { SOCKETS.lock().remove(&token) };
+        if let Some(sock) = sock {
             socket::release_socket(&sock);
         }
     }
@@ -1215,7 +1220,8 @@ fn install_socket_with(sock: SocketRef, file_flags: u32, cloexec: bool) -> Resul
     match files.install(file, cloexec) {
         Ok(fd) => Ok(fd),
         Err(errno) => {
-            if let Some(sock) = SOCKETS.lock().remove(&token) {
+            let sock = { SOCKETS.lock().remove(&token) };
+            if let Some(sock) = sock {
                 socket::release_socket(&sock);
             }
             Err(errno)
@@ -5747,6 +5753,72 @@ mod tests {
                 ft.get_fd_flags(received_fd).unwrap() & FD_CLOEXEC,
                 FD_CLOEXEC
             );
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn closing_socket_drops_queued_socket_rights_without_global_lock_recursion() {
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 282;
+        current.tgid = 282;
+        current.cred = &raw const INIT_CRED;
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let mut transport = [0i32; 2];
+            let mut passed_pair = [0i32; 2];
+            assert_eq!(
+                sys_socketpair(
+                    AF_UNIX as i32,
+                    socket::SOCK_STREAM as i32,
+                    0,
+                    transport.as_mut_ptr(),
+                ),
+                0
+            );
+            assert_eq!(
+                sys_socketpair(
+                    AF_UNIX as i32,
+                    socket::SOCK_STREAM as i32,
+                    0,
+                    passed_pair.as_mut_ptr(),
+                ),
+                0
+            );
+
+            let mut control = [0u8; 32];
+            let (control_len, truncated) =
+                write_scm_rights(control.as_mut_ptr(), control.len(), &[passed_pair[0]]).unwrap();
+            assert!(!truncated);
+            let body = b"F";
+            let mut iov = LinuxIovec {
+                base: body.as_ptr() as *mut u8,
+                len: body.len(),
+            };
+            let message = LinuxMsghdr {
+                name: core::ptr::null_mut(),
+                namelen: 0,
+                iov: &mut iov,
+                iovlen: 1,
+                control: control.as_mut_ptr(),
+                controllen: control_len,
+                flags: 0,
+            };
+            assert_eq!(sys_sendmsg(transport[0], &message, 0), 1);
+
+            let ft = current_files().unwrap();
+            ft.close(passed_pair[0]).unwrap();
+            ft.close(passed_pair[1]).unwrap();
+            // Releasing transport[1] drops its unread packet. The SCM_RIGHTS
+            // FileRef is now the final reference to passed_pair[0], so fput()
+            // recursively enters socket_release().
+            ft.close(transport[1]).unwrap();
+            ft.close(transport[0]).unwrap();
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);

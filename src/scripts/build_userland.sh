@@ -532,6 +532,10 @@ graphics_runtime_cache_ready() {
         && [ -s "$1/usr/share/icons/hicolor/icon-theme.cache" ] \
         && [ -s "$1/usr/share/icons/AdwaitaLegacy/icon-theme.cache" ] \
         && [ -s "$1/usr/share/fonts/misc/fonts.dir" ] \
+        && [ -L "$1/etc/fonts/conf.d/45-generic.conf" ] \
+        && [ -L "$1/etc/fonts/conf.d/60-generic.conf" ] \
+        && find "$1/var/cache/fontconfig" -type f -size +0c -print -quit 2>/dev/null \
+            | grep -q . \
         && [ -s "$1/usr/share/mime/mime.cache" ] \
         && { [ ! -d "$1/usr/lib/gio/modules" ] \
             || [ -s "$1/usr/lib/gio/modules/giomodule.cache" ]; }
@@ -1163,8 +1167,42 @@ copy_to_stage() {
     safe_clean_dir "$STAGE"
     mkdir -p "$STAGE"
     cp -a "$ARCH_ROOTFS/." "$STAGE/"
+    generate_arch_fontconfig "$STAGE"
     generate_arch_font_indexes "$STAGE"
     generate_arch_gtk_caches "$STAGE"
+}
+
+# pacman runs with `--noscriptlet`, so fontconfig's packaged post_install does
+# not populate /etc/fonts/conf.d from the vendor conf.default selection and
+# does not build the system font cache.  Reproduce those two vendor operations
+# against the staged root.  Merely shipping the TTF files is insufficient:
+# modern applications resolve generic families through these configuration
+# links, and Firefox aborts during graphics initialization if no usable default
+# font can be selected.
+generate_arch_fontconfig() {
+    if ! graphics_enabled; then
+        return 0
+    fi
+    local root="$1"
+    local defaults="$root/usr/share/fontconfig/conf.default"
+    local conf_d="$root/etc/fonts/conf.d"
+    [ -d "$defaults" ] || return 0
+
+    mkdir -p "$conf_d"
+    local default name
+    while IFS= read -r -d '' default; do
+        name="${default##*/}"
+        ln -sfn "/usr/share/fontconfig/conf.default/$name" "$conf_d/$name"
+    done < <(find "$defaults" -mindepth 1 -maxdepth 1 -type l -print0)
+
+    local ld="$root/usr/lib/ld-linux-x86-64.so.2"
+    local fc_cache="$root/usr/bin/fc-cache"
+    if [ -x "$ld" ] && [ -x "$fc_cache" ]; then
+        log "Rebuilding staged fontconfig cache"
+        "$ld" --library-path "$root/usr/lib" "$fc_cache" \
+            --really-force --system-only --sysroot "$root" \
+            || die "failed to rebuild staged fontconfig cache"
+    fi
 }
 
 # pacman runs with `--noscriptlet`, so the GTK/GLib post-install hooks never

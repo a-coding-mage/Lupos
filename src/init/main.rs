@@ -3255,7 +3255,6 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     {
         use alloc::boxed::Box;
         use arch::x86::mm::paging::{PAGE_SIZE, phys_to_virt, read_cr3};
-        use core::sync::atomic::{AtomicU32, Ordering};
         use kernel::task::{M26Fields, TaskStruct};
         use mm::mm_types::MmStruct;
         use mm::mmap::{
@@ -3281,10 +3280,38 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         }
 
         _flush_for_tests();
-        let cond = AtomicU32::new(1);
-        let pi = AtomicU32::new(0);
-        let cond_addr = &cond as *const AtomicU32 as u64;
-        let pi_addr = &pi as *const AtomicU32 as u64;
+        let pgd_virt = phys_to_virt(read_cr3()) as usize;
+        let mut mm = Box::new(MmStruct::new(pgd_virt));
+        mm.start_brk = 0x80_0000;
+        mm.brk = 0x80_0000;
+        let mm_ptr = &mut *mm as *mut MmStruct;
+        let user_futex_addr = DEFAULT_MMAP_BASE + 0x1f_0000;
+        let cond_addr = user_futex_addr;
+        let pi_addr = user_futex_addr + 8;
+        let user_tid_addr = DEFAULT_MMAP_BASE + 0x20_0000;
+        unsafe {
+            (*current).mm = mm_ptr;
+            (*current).active_mm = mm_ptr;
+            arch::x86::mm::tlb::set_active_mm(kernel::sched::current_cpu(), mm_ptr);
+            do_mmap(
+                &mut *mm_ptr,
+                user_futex_addr,
+                PAGE_SIZE as u64,
+                PROT_READ | PROT_WRITE,
+                MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE,
+                0,
+                0,
+            )
+            .expect("pthread-smoke: mmap futex page");
+        }
+        assert_eq!(
+            unsafe { arch::x86::kernel::uaccess::put_user_u32(cond_addr as *mut u32, 1) },
+            Ok(())
+        );
+        assert_eq!(
+            unsafe { arch::x86::kernel::uaccess::put_user_u32(pi_addr as *mut u32, 0) },
+            Ok(())
+        );
 
         assert_eq!(
             unsafe { futex_wait(cond_addr, 0, FUTEX_BITSET_MATCH_ANY, 0, true) },
@@ -3302,21 +3329,18 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         assert_eq!(unsafe { futex_lock_pi(pi_addr, 0, true) }, 0);
         assert_eq!(unsafe { futex_unlock_pi(pi_addr, true) }, 0);
 
-        pi.store(FUTEX_OWNER_DIED | FUTEX_WAITERS, Ordering::Release);
+        assert_eq!(
+            unsafe {
+                arch::x86::kernel::uaccess::put_user_u32(
+                    pi_addr as *mut u32,
+                    FUTEX_OWNER_DIED | FUTEX_WAITERS,
+                )
+            },
+            Ok(())
+        );
         assert_eq!(unsafe { futex_lock_pi(pi_addr, 0, true) }, 0);
         assert_eq!(unsafe { futex_unlock_pi(pi_addr, true) }, 0);
 
-        let pgd_virt = phys_to_virt(read_cr3()) as usize;
-        let mut mm = Box::new(MmStruct::new(pgd_virt));
-        mm.start_brk = 0x80_0000;
-        mm.brk = 0x80_0000;
-        let mm_ptr = &mut *mm as *mut MmStruct;
-        let user_tid_addr = DEFAULT_MMAP_BASE + 0x20_0000;
-        unsafe {
-            (*current).mm = mm_ptr;
-            (*current).active_mm = mm_ptr;
-            arch::x86::mm::tlb::set_active_mm(kernel::sched::current_cpu(), mm_ptr);
-        }
         unsafe {
             do_mmap(
                 &mut *mm_ptr,
