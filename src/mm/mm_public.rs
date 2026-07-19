@@ -635,6 +635,61 @@ pub unsafe fn get_task_exe_file(task: *const MmStruct) -> usize {
     unsafe { get_mm_exe_file(task) }
 }
 
+/// Take a reference to the executable file retained by `mm`.
+///
+/// Linux's `get_mm_exe_file()` returns a refcounted `struct file *`. Lupos
+/// stores the owning `Arc<File>` as a raw pointer in the corresponding private
+/// field and promotes it back to a `FileRef` for callers.
+pub unsafe fn get_mm_exe_file_ref(mm: *const MmStruct) -> Option<crate::fs::types::FileRef> {
+    let raw = unsafe { get_mm_exe_file(mm) };
+    if raw == 0 {
+        return None;
+    }
+    let ptr = raw as *const crate::fs::types::File;
+    unsafe {
+        alloc::sync::Arc::increment_strong_count(ptr);
+    }
+    let file = unsafe { alloc::sync::Arc::from_raw(ptr) };
+    file.f_count
+        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    Some(file)
+}
+
+/// Replace the executable file owned by `mm`.
+///
+/// This is the `Arc<File>` equivalent of Linux's `set_mm_exe_file()`: `mm`
+/// owns the supplied reference until another exec or final mm teardown.
+pub unsafe fn set_mm_exe_file_ref(mm: *mut MmStruct, file: crate::fs::types::FileRef) {
+    if mm.is_null() {
+        crate::fs::file::fput(file);
+        return;
+    }
+    let new = alloc::sync::Arc::into_raw(file) as usize;
+    let old = unsafe { (*mm).exe_file };
+    unsafe {
+        (*mm).exe_file = new;
+    }
+    if old != 0 {
+        let old = unsafe { alloc::sync::Arc::from_raw(old as *const crate::fs::types::File) };
+        crate::fs::file::fput(old);
+    }
+}
+
+/// Release the executable file reference owned by `mm`.
+pub unsafe fn clear_mm_exe_file_ref(mm: *mut MmStruct) {
+    if mm.is_null() {
+        return;
+    }
+    let raw = unsafe { (*mm).exe_file };
+    unsafe {
+        (*mm).exe_file = 0;
+    }
+    if raw != 0 {
+        let file = unsafe { alloc::sync::Arc::from_raw(raw as *const crate::fs::types::File) };
+        crate::fs::file::fput(file);
+    }
+}
+
 pub unsafe fn set_mm_exe_file(mm: *mut MmStruct, file: usize) {
     if !mm.is_null() {
         unsafe { (*mm).exe_file = file };

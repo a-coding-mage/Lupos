@@ -41,10 +41,19 @@ pub unsafe fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
             ARCH_SET_GS => {
                 (*task).thread.gsbase = addr;
                 (*task).thread.gsindex = 0;
+                write_user_gs_base(addr);
                 0
             }
-            ARCH_GET_FS => copy_tls_base_to_user(addr, (*task).thread.fsbase),
-            ARCH_GET_GS => copy_tls_base_to_user(addr, (*task).thread.gsbase),
+            ARCH_GET_FS => {
+                let base = read_fs_base((*task).thread.fsbase);
+                (*task).thread.fsbase = base;
+                copy_tls_base_to_user(addr, base)
+            }
+            ARCH_GET_GS => {
+                let base = read_user_gs_base((*task).thread.gsbase);
+                (*task).thread.gsbase = base;
+                copy_tls_base_to_user(addr, base)
+            }
             _ => EINVAL,
         }
     }
@@ -69,6 +78,8 @@ unsafe fn copy_tls_base_to_user(addr: u64, value: u64) -> i64 {
 
 #[cfg(not(test))]
 const MSR_FS_BASE: u32 = 0xC000_0100;
+#[cfg(not(test))]
+const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 #[cfg(not(test))]
 #[inline]
@@ -82,6 +93,43 @@ unsafe fn write_fs_base(_value: u64) {}
 
 #[cfg(not(test))]
 #[inline]
+unsafe fn write_user_gs_base(value: u64) {
+    // SYSCALL entry has already executed SWAPGS, so the inactive user GS base
+    // resides in IA32_KERNEL_GS_BASE until the return-to-user SWAPGS.
+    unsafe { wrmsr_raw(MSR_KERNEL_GS_BASE, value) };
+}
+
+#[cfg(test)]
+#[inline]
+unsafe fn write_user_gs_base(_value: u64) {}
+
+#[cfg(not(test))]
+#[inline]
+unsafe fn read_fs_base(_fallback: u64) -> u64 {
+    unsafe { rdmsr_raw(MSR_FS_BASE) }
+}
+
+#[cfg(test)]
+#[inline]
+unsafe fn read_fs_base(fallback: u64) -> u64 {
+    fallback
+}
+
+#[cfg(not(test))]
+#[inline]
+unsafe fn read_user_gs_base(_fallback: u64) -> u64 {
+    // See write_user_gs_base(): user GS is inactive while this syscall runs.
+    unsafe { rdmsr_raw(MSR_KERNEL_GS_BASE) }
+}
+
+#[cfg(test)]
+#[inline]
+unsafe fn read_user_gs_base(fallback: u64) -> u64 {
+    fallback
+}
+
+#[cfg(not(test))]
+#[inline]
 unsafe fn wrmsr_raw(msr: u32, value: u64) {
     unsafe {
         core::arch::asm!(
@@ -92,6 +140,23 @@ unsafe fn wrmsr_raw(msr: u32, value: u64) {
             options(nostack, nomem, preserves_flags),
         );
     }
+}
+
+#[cfg(not(test))]
+#[inline]
+unsafe fn rdmsr_raw(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nostack, nomem, preserves_flags),
+        );
+    }
+    ((high as u64) << 32) | low as u64
 }
 
 #[cfg(test)]
@@ -122,6 +187,10 @@ mod tests {
             let mut fs = 0u64;
             assert_eq!(sys_arch_prctl(ARCH_GET_FS, &mut fs as *mut u64 as u64), 0);
             assert_eq!(fs, 0x7000);
+            assert_eq!(sys_arch_prctl(ARCH_SET_GS, 0x8000), 0);
+            let mut gs = 0u64;
+            assert_eq!(sys_arch_prctl(ARCH_GET_GS, &mut gs as *mut u64 as u64), 0);
+            assert_eq!(gs, 0x8000);
             assert_eq!(sys_arch_prctl(ARCH_GET_FS, 0), EFAULT);
             assert_eq!(sys_arch_prctl(ARCH_GET_FS, uaccess::TASK_SIZE_MAX), EFAULT);
             assert_eq!(sys_arch_prctl(0, 0), EINVAL);

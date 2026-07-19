@@ -11,6 +11,7 @@ name = "lupos"
 version.workspace = true
 edition = "2024"
 publish = false
+license = "GPL-2.0-only"
 
 [lib]
 path = "src/lib.rs"
