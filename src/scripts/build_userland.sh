@@ -198,6 +198,10 @@ ARCH_GRAPHICS_PACKAGES=(
     adwaita-icon-theme
     hicolor-icon-theme
     ttf-dejavu
+    # Firefox suggestions follow the remote page/search locale and routinely
+    # contain CJK text.  Bitmap xorg-fonts-misc fallback renders as missing or
+    # garbled glyphs in modern Firefox, so ship a scalable CJK family.
+    noto-fonts-cjk
 )
 
 TARGET="$ROOT/target/userland"
@@ -488,7 +492,9 @@ graphics_stage_ready() {
         && [ -d "$1/var/lib/pacman/local/nano-9.0-1" ] \
         && [ -d "$1/var/lib/pacman/local/firefox-151.0.2-1" ] \
         && [ -e "$1/usr/share/fonts/misc/6x13-ISO8859-1.pcf.gz" ] \
-        && [ -d "$1/var/lib/pacman/local/xorg-fonts-misc-1.0.4-2" ]
+        && [ -d "$1/var/lib/pacman/local/xorg-fonts-misc-1.0.4-2" ] \
+        && find "$1/var/lib/pacman/local" -maxdepth 1 -type d -name 'noto-fonts-cjk-*' -print -quit \
+            | grep -q .
 }
 
 graphics_pacman_database_ready() {
@@ -515,7 +521,7 @@ graphics_pacman_database_ready() {
             --root "$r" \
             --dbpath "$r/var/lib/pacman" \
             --disable-sandbox \
-            nano firefox \
+            nano firefox noto-fonts-cjk \
             >/dev/null 2>&1
 }
 
@@ -925,7 +931,7 @@ install_arch_graphics_packages() {
         --root "$ARCH_ROOTFS" \
         --dbpath "$ARCH_ROOTFS/var/lib/pacman" \
         --disable-sandbox \
-        nano firefox
+        nano firefox noto-fonts-cjk
 
     stage_arch_pacman_sync_dbs
     safe_clean_dir "$work"

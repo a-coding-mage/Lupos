@@ -118,6 +118,20 @@ pub unsafe fn route_pci_intx_for_legacy_irq(irq: u8) {
     }
     let vector = crate::arch::x86::kernel::idt::LEGACY_IRQ_VECTOR_BASE + irq;
     let dest = unsafe { crate::arch::x86::kernel::apic::id() };
+    // In APIC mode the IMCR disconnects the 8259 from the processor. ISA
+    // sources (timer/keyboard/cascade/aux) therefore need their own fixed
+    // IO-APIC route, just as Linux installs legacy GSI routes before device
+    // startup. PC-compatible ISA lines are edge-triggered, active-high.
+    if let Ok(isa_raw) = route_entry(IoApicRouteEntry {
+        vector,
+        dest,
+        trigger: TriggerMode::Edge,
+        polarity: Polarity::High,
+        masked: false,
+    }) {
+        let _ = unsafe { write_redirection_entry(irq, isa_raw) };
+    }
+
     let Ok(raw) = route_entry(IoApicRouteEntry {
         vector,
         dest,

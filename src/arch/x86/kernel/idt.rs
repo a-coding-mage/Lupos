@@ -774,17 +774,20 @@ fn on_breakpoint(frame: &ExceptionFrame) {
 ///
 /// Reference: Intel SDM Vol. 3A §6.15 "Interrupt 14 — Page-Fault Exception"
 fn on_page_fault(frame: &ExceptionFrame) {
-    // M59: extable fixup.  If the faulting RIP is registered in __ex_table
-    // (via the .pushsection __ex_table directives in arch/x86/uaccess.rs),
-    // redirect execution to the fixup label instead of taking the fault.
-    // RCX holds the bytes-not-copied count at the fixup site, so user-copy
-    // routines return cleanly with that value.
+    // M59: extable fixup for a kernel-mode fault.  Linux reaches
+    // fixup_exception() through kernelmode_fixup_or_oops(); user faults go
+    // directly through do_user_addr_fault().  Searching module exception
+    // tables for every userspace demand fault both violates that contract and
+    // turns normal Firefox paging into a global MODULES-lock/string-scan hot
+    // path.
     //
     // SAFETY: `frame` is the iretq frame on the kernel stack — writing
     // through a *mut alias mutates the saved RIP that iretq will pop.
     //
-    // Ref: vendor/linux/arch/x86/mm/extable.c::fixup_exception
-    if let Some(fixup) = super::extable::search_extable(frame.rip) {
+    // Ref: vendor/linux/arch/x86/mm/fault.c::kernelmode_fixup_or_oops
+    if page_fault_needs_extable_lookup(frame)
+        && let Some(fixup) = super::extable::search_extable(frame.rip)
+    {
         unsafe {
             let frame_mut = frame as *const ExceptionFrame as *mut ExceptionFrame;
             (*frame_mut).rip = fixup;
@@ -793,6 +796,11 @@ fn on_page_fault(frame: &ExceptionFrame) {
     }
 
     crate::arch::x86::mm::fault::do_page_fault(frame);
+}
+
+#[inline]
+fn page_fault_needs_extable_lookup(frame: &ExceptionFrame) -> bool {
+    !is_user_exception(frame)
 }
 
 /// #GP — General Protection Fault.
@@ -1493,6 +1501,19 @@ mod tests {
         assert!(!is_user_exception(&test_exception_frame(
             sel::KERNEL_CS as u64
         )));
+    }
+
+    /// Linux reaches `fixup_exception()` from `kernelmode_fixup_or_oops()`,
+    /// whose `WARN_ON_ONCE(user_mode(regs))` contract excludes user faults.
+    ///
+    /// test-origin: linux:vendor/linux/arch/x86/mm/fault.c
+    #[test]
+    fn user_page_fault_skips_kernel_exception_table_lookup() {
+        let user = test_exception_frame(sel::USER_CS as u64);
+        let kernel = test_exception_frame(sel::KERNEL_CS as u64);
+
+        assert!(!page_fault_needs_extable_lookup(&user));
+        assert!(page_fault_needs_extable_lookup(&kernel));
     }
 
     #[test]

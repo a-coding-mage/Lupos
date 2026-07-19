@@ -326,8 +326,6 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             );
         }
     }
-    linux_driver_abi::input::i8042::init();
-
     // ── Milestone 4: CPU exception foundations ─────────────────────────────
     //
     // Initialisation order matters:
@@ -508,6 +506,16 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     // userspace tools that parse dmesg find the expected token.
     log_info!("", "Calibrating delay loop... 0.00 BogoMIPS (lpj=0)");
     kernel::softirq::init();
+    // Linux's i8042 platform init runs only after IRQ descriptors and the
+    // deferred-input path exist. request_irq() must precede enabling the
+    // controller ports; the old early call was subsequently erased by
+    // pic::init_and_mask_all() and left input dependent on syscall polling.
+    let i8042_polling_baseline = early_cmdline.is_some_and(|cmdline| {
+        cmdline
+            .split_ascii_whitespace()
+            .any(|arg| arg == "lupos.i8042_poll=1")
+    });
+    linux_driver_abi::input::i8042::init(!i8042_polling_baseline);
 
     kernel::sched::clock::sched_clock_init_late();
 

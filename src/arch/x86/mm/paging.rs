@@ -510,6 +510,68 @@ pub fn pte_none(pte: pte_t) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Bad-entry predicates used before upper-level page-table descent.
+//
+// Ref: Linux `pmd_bad`, `pud_bad`, and `*_none_or_clear_bad`
+//      arch/x86/include/asm/pgtable.h and include/linux/pgtable.h.
+// ---------------------------------------------------------------------------
+
+#[inline]
+pub fn pmd_bad(pmd: pmd_t) -> bool {
+    let flags = pmd.0 & PTE_FLAGS_MASK;
+    (flags & !(_PAGE_USER | _PAGE_ACCESSED)) != (_KERNPG_TABLE & !_PAGE_ACCESSED)
+}
+
+#[inline]
+pub fn pud_bad(pud: pud_t) -> bool {
+    let flags = pud.0 & PTE_FLAGS_MASK;
+    (flags & !(_KERNPG_TABLE | _PAGE_USER)) != 0
+}
+
+#[inline]
+pub fn pgd_bad(pgd: pgd_t) -> bool {
+    // Lupos's four-level layout folds p4d and has PGD entries point directly
+    // to PUD tables, so apply the x86 PUD-table flag contract here.
+    pud_bad(pud_t(pgd.0))
+}
+
+#[inline]
+pub fn pmd_none_or_clear_bad(pmd: &mut pmd_t) -> bool {
+    if pmd_none(*pmd) {
+        return true;
+    }
+    if pmd_bad(*pmd) {
+        *pmd = pmd_t(0);
+        return true;
+    }
+    false
+}
+
+#[inline]
+pub fn pud_none_or_clear_bad(pud: &mut pud_t) -> bool {
+    if pud_none(*pud) {
+        return true;
+    }
+    if pud_bad(*pud) {
+        *pud = pud_t(0);
+        return true;
+    }
+    false
+}
+
+#[inline]
+pub fn pgd_none_or_clear_bad(pgd: &mut pgd_t) -> bool {
+    if pgd_none(*pgd) {
+        return true;
+    }
+    if pgd_bad(*pgd) {
+        *pgd = pgd_t(0);
+        return true;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Presence predicates — `pte_present` accepts either a hardware-present
 // entry or one that has been marked PROTNONE (PRESENT clear, GLOBAL set).
 //
@@ -1462,8 +1524,48 @@ pub fn dump_pt_page_life_trace(reason: &'static str, target_phys: u64) {
         return;
     }
 
-    let trace = PT_PAGE_LIFE_TRACE.lock();
-    let total = trace.next_seq;
+    // Snapshot under the trace lock, then release it before touching printk.
+    // Linux spinlock critical sections never contain an unbounded console
+    // drain; on a single-vCPU guest, retaining this lock across serial output
+    // can turn a diagnostic into a system-wide soft lockup.
+    let mut matching = [PtPageLifeEvent::empty(); PT_PAGE_LIFE_DUMP_MATCH_LIMIT];
+    let mut matching_len = 0usize;
+    let mut recent_events = [PtPageLifeEvent::empty(); PT_PAGE_LIFE_DUMP_RECENT as usize];
+    let mut recent_len = 0usize;
+    let total = {
+        let trace = PT_PAGE_LIFE_TRACE.lock();
+        let total = trace.next_seq;
+        if total != 0 {
+            let earliest = total
+                .saturating_sub(PT_PAGE_LIFE_TRACE_LEN as u64)
+                .saturating_add(1);
+            let mut seq = earliest;
+            while seq <= total && matching_len < PT_PAGE_LIFE_DUMP_MATCH_LIMIT {
+                if let Some(event) = trace.event_for_seq(seq)
+                    && pt_page_life_target_match(event.phys, target_phys)
+                {
+                    matching[matching_len] = event;
+                    matching_len += 1;
+                }
+                seq += 1;
+            }
+
+            let recent = core::cmp::min(
+                PT_PAGE_LIFE_DUMP_RECENT,
+                core::cmp::min(total, PT_PAGE_LIFE_TRACE_LEN as u64),
+            );
+            let mut seq = total.saturating_sub(recent).saturating_add(1);
+            while seq <= total && recent_len < recent_events.len() {
+                if let Some(event) = trace.event_for_seq(seq) {
+                    recent_events[recent_len] = event;
+                    recent_len += 1;
+                }
+                seq += 1;
+            }
+        }
+        total
+    };
+
     crate::kernel::printk::log_error!(
         "mm",
         "pt_page_life dump reason={} target_phys={:#018x} dump={} total_seq={}",
@@ -1477,21 +1579,10 @@ pub fn dump_pt_page_life_trace(reason: &'static str, target_phys: u64) {
         return;
     }
 
-    let earliest = total
-        .saturating_sub(PT_PAGE_LIFE_TRACE_LEN as u64)
-        .saturating_add(1);
-    let mut matches = 0usize;
-    let mut seq = earliest;
-    while seq <= total && matches < PT_PAGE_LIFE_DUMP_MATCH_LIMIT {
-        if let Some(event) = trace.event_for_seq(seq)
-            && pt_page_life_target_match(event.phys, target_phys)
-        {
-            log_pt_page_life_event("match", target_phys, event);
-            matches += 1;
-        }
-        seq += 1;
+    for event in matching[..matching_len].iter().copied() {
+        log_pt_page_life_event("match", target_phys, event);
     }
-    if matches == 0 {
+    if matching_len == 0 {
         crate::kernel::printk::log_error!(
             "mm",
             "pt_page_life no matching phys records for target={:#018x}",
@@ -1499,16 +1590,8 @@ pub fn dump_pt_page_life_trace(reason: &'static str, target_phys: u64) {
         );
     }
 
-    let recent = core::cmp::min(
-        PT_PAGE_LIFE_DUMP_RECENT,
-        core::cmp::min(total, PT_PAGE_LIFE_TRACE_LEN as u64),
-    );
-    let mut seq = total.saturating_sub(recent).saturating_add(1);
-    while seq <= total {
-        if let Some(event) = trace.event_for_seq(seq) {
-            log_pt_page_life_event("recent", target_phys, event);
-        }
-        seq += 1;
+    for event in recent_events[..recent_len].iter().copied() {
+        log_pt_page_life_event("recent", target_phys, event);
     }
 }
 
@@ -2741,6 +2824,25 @@ mod tests {
             _KERNPG_TABLE,
             _PAGE_PRESENT | _PAGE_RW | _PAGE_ACCESSED | _PAGE_DIRTY
         );
+    }
+
+    /// Linux's free-page-table walkers clear malformed upper-level entries
+    /// instead of interpreting their address bits as a child table.
+    ///
+    /// test-origin: linux:vendor/linux/include/linux/pgtable.h
+    #[test]
+    fn upper_level_bad_entries_are_cleared_before_page_table_descent() {
+        let mut self_pointer = pmd_t(0xffff_8880_37d8_fe78);
+        assert!(pmd_none_or_clear_bad(&mut self_pointer));
+        assert_eq!(self_pointer.0, 0);
+
+        let mut invalid_flags = pmd_t(0x8000_000f_0000_0000);
+        assert!(pmd_none_or_clear_bad(&mut invalid_flags));
+        assert_eq!(invalid_flags.0, 0);
+
+        let mut user_table = pmd_t(0x0000_0000_1234_5000 | _PAGE_TABLE);
+        assert!(!pmd_none_or_clear_bad(&mut user_table));
+        assert_ne!(user_table.0, 0);
     }
 
     // ── Index functions ──────────────────────────────────────────────────

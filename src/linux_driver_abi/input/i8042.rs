@@ -1,15 +1,17 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/drivers/input
 //! test-origin: linux:vendor/linux/drivers/input
-//! Minimal i8042/AT keyboard polling path for the QEMU VGA console.
+//! Minimal i8042/AT keyboard and mouse path for the QEMU VGA console.
 //!
-//! This is intentionally small: it decodes set-1 scancodes from the legacy
-//! PS/2 keyboard controller and returns cooked ASCII bytes for tty1.
+//! The hard-IRQ path mirrors Linux's interrupt-driven controller ownership but
+//! defers allocation and compatibility event publication through a fixed
+//! lock-free byte ring. The remaining global evdev/cooked-console bridge is
+//! Lupos-specific and is therefore not complete Linux input-core parity.
 
 extern crate alloc;
 
 use alloc::collections::VecDeque;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -49,6 +51,7 @@ const MOUSE_SET_DEFAULTS: u8 = 0xF6;
 const MOUSE_ENABLE_REPORTING: u8 = 0xF4;
 /// Standard PS/2 device acknowledge byte.
 const MOUSE_ACK: u8 = 0xFA;
+const I8042_QUEUE_CAPACITY: usize = 256;
 
 /// evdev id of `/dev/input/event1` (the PS/2 mouse) — see
 /// `input::register_default_evdev_devices`.
@@ -61,6 +64,9 @@ static EXTENDED: AtomicBool = AtomicBool::new(false);
 /// Linux evdev LED bitmap: bit 0 Num Lock, bit 1 Caps Lock, bit 2 Scroll Lock.
 /// [`evdev_leds_to_ps2`] translates it to the PS/2 wire ordering.
 static KEYBOARD_LEDS: AtomicU8 = AtomicU8::new(0);
+static IRQ_DRIVEN: AtomicBool = AtomicBool::new(false);
+static IRQ_DROPPED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static mut I8042_IRQ_COOKIE: u8 = 0;
 
 /// Separate extended-prefix latch for the evdev bridge.  The console decoder
 /// consumes its own [`EXTENDED`] latch inside `decode_scancode_input`, so the
@@ -71,8 +77,56 @@ static EVDEV_EXTENDED: AtomicBool = AtomicBool::new(false);
 /// `input::register_default_evdev_devices`.
 const EVDEV_KEYBOARD_ID: u32 = 0xE001;
 
+struct IrqByteQueue {
+    slots: [AtomicU16; I8042_QUEUE_CAPACITY],
+    head: AtomicUsize,
+    tail: AtomicUsize,
+}
+
+impl IrqByteQueue {
+    const fn new() -> Self {
+        Self {
+            slots: [const { AtomicU16::new(0) }; I8042_QUEUE_CAPACITY],
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
+    fn push(&self, byte: u8, aux: bool) -> bool {
+        let head = self.head.load(Ordering::Relaxed);
+        let next = (head + 1) % I8042_QUEUE_CAPACITY;
+        if next == self.tail.load(Ordering::Acquire) {
+            return false;
+        }
+        self.slots[head].store(
+            u16::from(byte) | if aux { 1 << 8 } else { 0 },
+            Ordering::Relaxed,
+        );
+        self.head.store(next, Ordering::Release);
+        true
+    }
+
+    fn pop(&self) -> Option<(u8, bool)> {
+        let tail = self.tail.load(Ordering::Relaxed);
+        if tail == self.head.load(Ordering::Acquire) {
+            return None;
+        }
+        let value = self.slots[tail].load(Ordering::Relaxed);
+        self.tail
+            .store((tail + 1) % I8042_QUEUE_CAPACITY, Ordering::Release);
+        Some((value as u8, value & (1 << 8) != 0))
+    }
+
+    fn clear(&self) {
+        self.tail
+            .store(self.head.load(Ordering::Acquire), Ordering::Release);
+    }
+}
+
+static IRQ_BYTE_QUEUE: IrqByteQueue = IrqByteQueue::new();
+
 lazy_static! {
-    static ref BYTE_QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
+    static ref BYTE_QUEUE: Mutex<VecDeque<ConsoleInput>> = Mutex::new(VecDeque::new());
     /// Scancodes observed while synchronously waiting for a keyboard-command
     /// ACK. They must re-enter the normal decoder instead of being discarded.
     static ref PENDING_KEYBOARD_SCANCODES: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
@@ -122,7 +176,7 @@ pub enum ConsoleInput {
     Restart,
 }
 
-pub fn init() {
+pub fn init(use_irqs: bool) {
     BYTE_QUEUE.lock().clear();
     PENDING_KEYBOARD_SCANCODES.lock().clear();
     *MOUSE_STATE.lock() = MousePacket::new();
@@ -133,23 +187,121 @@ pub fn init() {
     EVDEV_EXTENDED.store(false, Ordering::Release);
     KEYBOARD_LEDS.store(0, Ordering::Release);
     MOUSE_PRESENT.store(false, Ordering::Release);
+    IRQ_DRIVEN.store(false, Ordering::Release);
+    IRQ_DROPPED_BYTES.store(0, Ordering::Release);
+    IRQ_BYTE_QUEUE.clear();
     drain_pending();
+
+    // Linux requests both i8042 IRQs before enabling the corresponding port.
+    // Keep the controller's interrupt bits clear while commands and ACKs are
+    // exchanged, then enable only after the handlers and deferred consumer
+    // are installed.
+    let mut config = read_config().unwrap_or(CONFIG_TRANSLATION);
+    config &= !(CONFIG_IRQ1 | CONFIG_IRQ12);
+    write_config(config);
+
+    let (keyboard_irq, aux_irq) = if use_irqs {
+        crate::kernel::softirq::open_softirq(
+            crate::kernel::softirq::SoftIrqVec::IrqPoll,
+            drain_irq_bytes,
+        );
+        let dev_id = core::ptr::addr_of_mut!(I8042_IRQ_COOKIE).cast();
+        let aux_irq = crate::kernel::irq::request_irq(
+            12,
+            i8042_interrupt,
+            crate::kernel::irq::IRQF_SHARED,
+            "i8042",
+            dev_id,
+        )
+        .is_ok();
+        let keyboard_irq = crate::kernel::irq::request_irq(
+            1,
+            i8042_interrupt,
+            crate::kernel::irq::IRQF_SHARED,
+            "i8042",
+            dev_id,
+        )
+        .is_ok();
+        (keyboard_irq, aux_irq)
+    } else {
+        (false, false)
+    };
 
     // Enable the aux (mouse) port before touching the config byte so the
     // controller accepts the mouse-directed writes below.
     let _ = write_command(COMMAND_ENABLE_AUX);
-
-    if let Some(mut config) = read_config() {
-        config &= !(CONFIG_DISABLE_KEYBOARD | CONFIG_DISABLE_MOUSE);
-        config |= CONFIG_IRQ1 | CONFIG_IRQ12 | CONFIG_TRANSLATION;
-        write_config(config);
-    }
-
     let _ = write_command(COMMAND_ENABLE_KEYBOARD);
     let _ = write_data(KEYBOARD_ENABLE_SCANNING);
 
     init_mouse();
     drain_pending();
+
+    config &= !(CONFIG_DISABLE_KEYBOARD | CONFIG_DISABLE_MOUSE);
+    config |= CONFIG_TRANSLATION;
+    if keyboard_irq {
+        config |= CONFIG_IRQ1;
+    }
+    if aux_irq {
+        config |= CONFIG_IRQ12;
+    }
+    write_config(config);
+    IRQ_DRIVEN.store(keyboard_irq, Ordering::Release);
+    if !use_irqs {
+        crate::log_info!("i8042", "polling fallback selected by lupos.i8042_poll=1");
+    } else if keyboard_irq {
+        crate::log_info!(
+            "i8042",
+            "IRQ-driven input online: keyboard=1 aux={}",
+            usize::from(aux_irq)
+        );
+    } else {
+        crate::log_warn!(
+            "i8042",
+            "IRQ1 registration failed; retaining polling fallback"
+        );
+    }
+}
+
+unsafe extern "C" fn i8042_interrupt(_irq: u32, _dev_id: *mut core::ffi::c_void) -> i32 {
+    let mut handled = 0usize;
+    // QEMU may coalesce a short make/break burst while the edge-triggered ISA
+    // line is asserted. Drain the controller output buffer completely so a
+    // byte left behind cannot wait forever for an edge that never re-arms.
+    // The fixed bound prevents a broken controller from trapping the CPU in
+    // hard-IRQ context.
+    for _ in 0..32 {
+        let status = unsafe { crate::arch::x86::include::asm::io::inb(STATUS_PORT) };
+        if status & STATUS_OUTPUT_FULL == 0 {
+            break;
+        }
+        let byte = unsafe { crate::arch::x86::include::asm::io::inb(DATA_PORT) };
+        if !IRQ_BYTE_QUEUE.push(byte, status & STATUS_AUX_DATA != 0) {
+            IRQ_DROPPED_BYTES.fetch_add(1, Ordering::Relaxed);
+        }
+        handled += 1;
+    }
+    if handled == 0 {
+        return crate::kernel::irq::IRQ_NONE;
+    }
+    crate::kernel::softirq::raise_softirq(crate::kernel::softirq::SoftIrqVec::IrqPoll);
+    crate::kernel::irq::IRQ_HANDLED
+}
+
+fn drain_irq_bytes() {
+    while let Some((byte, aux)) = IRQ_BYTE_QUEUE.pop() {
+        if aux {
+            feed_mouse_byte(byte);
+            continue;
+        }
+        feed_evdev_scancode(byte);
+        if crate::linux_driver_abi::tty::compat_cooked_keyboard_input_enabled() {
+            queue_decoded(byte);
+        }
+    }
+    let dropped = IRQ_DROPPED_BYTES.swap(0, Ordering::AcqRel);
+    if dropped != 0 {
+        crate::log_warn!("i8042", "deferred input ring dropped {} bytes", dropped);
+    }
 }
 
 /// Initialise the PS/2 mouse: restore defaults, then enable stream-mode data
@@ -359,11 +511,17 @@ pub fn try_read_byte() -> Option<u8> {
 
 pub fn try_read_input() -> Option<ConsoleInput> {
     if crate::linux_driver_abi::tty::compat_cooked_keyboard_input_enabled() {
-        if let Some(byte) = BYTE_QUEUE.lock().pop_front() {
-            return Some(ConsoleInput::Byte(byte));
+        if let Some(input) = BYTE_QUEUE.lock().pop_front() {
+            return Some(input);
         }
     } else {
         BYTE_QUEUE.lock().clear();
+    }
+    // Once IRQ1 is registered, the hard handler is the sole reader of port
+    // 0x60. Keeping the old syscall/epoll poller active would race it and can
+    // consume bytes before the IRQ path publishes the evdev frame.
+    if IRQ_DRIVEN.load(Ordering::Acquire) {
+        return None;
     }
     // Port 0x60 is shared by the keyboard and the aux (mouse) channel; the
     // status byte's AUX bit says which produced the pending byte.  This polled
@@ -548,8 +706,8 @@ fn enqueue_decoded(scancode: u8) -> Option<ConsoleInput> {
         Some(DecodedInput::Byte(byte)) => Some(ConsoleInput::Byte(byte)),
         Some(DecodedInput::Sequence(bytes)) => {
             let mut queue = BYTE_QUEUE.lock();
-            queue.extend(bytes.iter().copied());
-            queue.pop_front().map(ConsoleInput::Byte)
+            queue.extend(bytes.iter().copied().map(ConsoleInput::Byte));
+            queue.pop_front()
         }
         Some(DecodedInput::Action(ConsoleAction::Shutdown)) => Some(ConsoleInput::Shutdown),
         Some(DecodedInput::Action(ConsoleAction::Restart)) => {
@@ -557,6 +715,21 @@ fn enqueue_decoded(scancode: u8) -> Option<ConsoleInput> {
             Some(ConsoleInput::Restart)
         }
         None => None,
+    }
+}
+
+fn queue_decoded(scancode: u8) {
+    let Some(decoded) = decode_scancode_input(scancode) else {
+        return;
+    };
+    let mut queue = BYTE_QUEUE.lock();
+    match decoded {
+        DecodedInput::Byte(byte) => queue.push_back(ConsoleInput::Byte(byte)),
+        DecodedInput::Sequence(bytes) => {
+            queue.extend(bytes.iter().copied().map(ConsoleInput::Byte))
+        }
+        DecodedInput::Action(ConsoleAction::Shutdown) => queue.push_back(ConsoleInput::Shutdown),
+        DecodedInput::Action(ConsoleAction::Restart) => queue.push_back(ConsoleInput::Restart),
     }
 }
 
@@ -1035,6 +1208,21 @@ mod tests {
             enqueue_decoded_if_cooked(0x1E, true),
             Some(ConsoleInput::Byte(b'a'))
         );
+    }
+
+    #[test]
+    fn hardirq_byte_ring_preserves_channel_and_order_without_allocating() {
+        let queue = IrqByteQueue::new();
+        assert!(queue.push(0x1e, false));
+        assert!(queue.push(0x08, true));
+        assert_eq!(queue.pop(), Some((0x1e, false)));
+        assert_eq!(queue.pop(), Some((0x08, true)));
+        assert_eq!(queue.pop(), None);
+
+        for byte in 0..I8042_QUEUE_CAPACITY - 1 {
+            assert!(queue.push(byte as u8, byte & 1 != 0));
+        }
+        assert!(!queue.push(0xff, false), "bounded IRQ ring must not grow");
     }
 
     #[test]
