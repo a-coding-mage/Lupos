@@ -3841,6 +3841,7 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         linux_make_target: "snd-hda-intel.ko",
         module_deps: &[
             "kernel/sound/hda/core/snd-intel-dspcfg.ko",
+            "kernel/sound/hda/core/snd-intel-sdw-acpi.ko",
             "kernel/sound/hda/common/snd-hda-codec.ko",
             "kernel/sound/core/snd-hwdep.ko",
             "kernel/sound/hda/core/snd-hda-core.ko",
@@ -27913,6 +27914,21 @@ CONFIG_SND_HDA_GENERIC=m
         assert_eq!(etc_modules_from_config_text(config), expected);
 
         let specs = staged_module_specs_from_config_text(config);
+        let hda_intel = specs
+            .iter()
+            .find(|spec| spec.module_name == "snd_hda_intel")
+            .expect("snd_hda_intel staged");
+        // `vendor/linux/sound/hda/controllers/Kconfig` selects
+        // SND_INTEL_DSP_CONFIG, and `vendor/linux/sound/hda/core/Kconfig`
+        // selects SND_INTEL_SOUNDWIRE_ACPI from that on ACPI systems.  Keep
+        // modules.dep aligned so dynamic `modprobe snd_hda_intel` pulls the
+        // complete Linux-built helper closure without a Lupos-side driver.
+        assert!(
+            hda_intel
+                .module_deps
+                .contains(&"kernel/sound/hda/core/snd-intel-sdw-acpi.ko")
+        );
+
         let positions = specs
             .iter()
             .enumerate()
