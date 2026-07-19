@@ -2778,59 +2778,18 @@ pub(crate) const REQUIRED_X86_64_GENERIC_VIDEO_SYMBOLS: &[&str] = &[
     "CONFIG_DRM_VIRTIO_GPU",
 ];
 
-const LINUX_DRIVER_MODULE_OVERRIDE_SYMBOLS: &[&str] = &[
-    "CONFIG_AGP",
-    "CONFIG_AGP_AMD64",
-    "CONFIG_AGP_INTEL",
-    "CONFIG_ATA",
-    "CONFIG_ATA_PIIX",
-    "CONFIG_BLK_DEV_SD",
-    "CONFIG_BLK_DEV_SR",
-    "CONFIG_CHR_DEV_SG",
-    "CONFIG_8139TOO",
-    "CONFIG_DRM_I915",
-    "CONFIG_DRM_VIRTIO_GPU",
-    "CONFIG_E100",
-    "CONFIG_E1000",
-    "CONFIG_E1000E",
-    "CONFIG_FORCEDETH",
-    "CONFIG_I2C_I801",
-    "CONFIG_PHYLIB",
-    "CONFIG_MII",
-    "CONFIG_NET_9P",
-    "CONFIG_NET_9P_VIRTIO",
-    "CONFIG_NETCONSOLE",
-    "CONFIG_PATA_AMD",
-    "CONFIG_PATA_OLDPIIX",
-    "CONFIG_PATA_SCH",
-    "CONFIG_R8169",
-    "CONFIG_REALTEK_PHY",
-    "CONFIG_SATA_AHCI",
-    "CONFIG_SCSI_SPI_ATTRS",
-    "CONFIG_SCSI_VIRTIO",
-    "CONFIG_SKY2",
-    "CONFIG_TIGON3",
-    "CONFIG_SND",
-    "CONFIG_SND_HRTIMER",
-    "CONFIG_SND_HDA_INTEL",
-    "CONFIG_SND_SEQUENCER",
-    "CONFIG_SND_SEQ_DUMMY",
-    "CONFIG_SOUND",
-    "CONFIG_USB_EHCI_HCD",
-    "CONFIG_USB_EHCI_PCI",
-    "CONFIG_USB_MON",
-    "CONFIG_USB_OHCI_HCD",
-    "CONFIG_USB_OHCI_HCD_PCI",
-    "CONFIG_USB_STORAGE",
-    "CONFIG_USB_PRINTER",
-    "CONFIG_USB_UHCI_HCD",
-    "CONFIG_VIRTIO_BLK",
-    "CONFIG_VIRTIO_CONSOLE",
-    "CONFIG_VIRTIO_INPUT",
-    "CONFIG_VIRTIO_NET",
-    "CONFIG_VIRTIO_PCI",
-    "CONFIG_X86_PKG_TEMP_THERMAL",
+const BUILTIN_NON_DRIVER_MODULE_EXCEPTIONS: &[(&str, &str)] = &[
+    // Keep this list intentionally tiny and auditable: entries here are not
+    // accepted as driver demotions.  They only document support/core symbols
+    // whose objects are satisfied by Lupos built-ins or another audited module.
 ];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LinuxDriverModuleOverride {
+    pub symbol: String,
+    pub expected_ko: String,
+    pub kbuild_path: String,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ConfigParityKind {
@@ -2858,6 +2817,8 @@ pub(crate) struct ConfigParityEntry {
     pub lupos_value: String,
     pub linux_value: String,
     pub kind: ConfigParityKind,
+    pub expected_ko: String,
+    pub detail: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2880,7 +2841,7 @@ impl ConfigParityReport {
     }
 
     pub(crate) fn to_tsv(&self) -> String {
-        let mut out = String::from("kind\tsymbol\tlupos_value\tlinux_value\n");
+        let mut out = String::from("kind\tsymbol\tlupos_value\tlinux_value\texpected_ko\tdetail\n");
         for entry in &self.entries {
             out.push_str(entry.kind.as_str());
             out.push('\t');
@@ -2889,6 +2850,10 @@ impl ConfigParityReport {
             out.push_str(&entry.lupos_value);
             out.push('\t');
             out.push_str(&entry.linux_value);
+            out.push('\t');
+            out.push_str(&entry.expected_ko);
+            out.push('\t');
+            out.push_str(&entry.detail);
             out.push('\n');
         }
         out
@@ -2937,7 +2902,14 @@ pub(crate) fn run_config_parity_audit(repo: &Path) -> Result<ConfigParityReport>
             "failed to read {LINUX_X86_64_DEFCONFIG_PATH} (is vendor/linux/ populated? run vendor/setup_linux.sh)"
         )
     })?;
-    let mut report = audit_config_parity(&lupos_text, &linux_text);
+    let module_overrides = generated_linux_driver_module_overrides(repo, &lupos_text, &linux_text)?;
+    let staged_modules = staged_linux_driver_module_manifest(repo)?;
+    let mut report = audit_config_parity_with_driver_modules(
+        &lupos_text,
+        &linux_text,
+        &module_overrides,
+        &staged_modules,
+    );
     audit_required_video_kconfig_symbols(&mut report, &kconfig_text, &linux_text);
     Ok(report)
 }
@@ -2975,6 +2947,9 @@ fn audit_required_video_kconfig_symbols(
             .find(|entry| entry.symbol == symbol)
         {
             if entry.kind == ConfigParityKind::Divergence {
+                entry.lupos_value = "<missing-kconfig>".to_owned();
+                entry.detail =
+                    "required x86_64 video symbol is missing from Lupos Kconfig".to_owned();
                 continue;
             }
             match entry.kind {
@@ -2991,6 +2966,8 @@ fn audit_required_video_kconfig_symbols(
                 lupos_value: "<missing-kconfig>".to_owned(),
                 linux_value: linux_value.clone(),
                 kind: ConfigParityKind::Divergence,
+                expected_ko: String::new(),
+                detail: "symbol is required upstream but absent from Lupos defconfig".to_owned(),
             });
             report.divergences += 1;
         }
@@ -3000,7 +2977,206 @@ fn audit_required_video_kconfig_symbols(
         .sort_by(|a, b| (a.kind, &a.symbol).cmp(&(b.kind, &b.symbol)));
 }
 
+fn split_module_list(paths: &str) -> BTreeSet<&str> {
+    paths.split(';').filter(|path| !path.is_empty()).collect()
+}
+
+fn config_parity_detail(
+    symbol: &str,
+    kind: ConfigParityKind,
+    module_overrides: &BTreeMap<String, LinuxDriverModuleOverride>,
+    staged_modules: &BTreeMap<String, String>,
+) -> String {
+    if let Some(module) = module_overrides.get(symbol) {
+        return match (kind, staged_modules.get(symbol)) {
+            (ConfigParityKind::ModuleOverride, Some(path)) => format!(
+                "driver demotion covered by staged vendor module {path}; kbuild={}",
+                module.kbuild_path
+            ),
+            (_, Some(path)) => format!(
+                "staged vendor module mismatch: expected {}; manifest has {path}; kbuild={}",
+                module.expected_ko, module.kbuild_path
+            ),
+            _ => format!(
+                "driver demotion missing staged vendor module {}; kbuild={}",
+                module.expected_ko, module.kbuild_path
+            ),
+        };
+    }
+    if let Some((_, reason)) = BUILTIN_NON_DRIVER_MODULE_EXCEPTIONS
+        .iter()
+        .find(|(exception, _)| *exception == symbol)
+    {
+        return format!("built-in non-driver/core exception: {reason}");
+    }
+    match kind {
+        ConfigParityKind::Match => String::new(),
+        ConfigParityKind::ModuleOverride => "documented non-driver/core exception".to_owned(),
+        ConfigParityKind::Divergence => {
+            "not covered by generated vendor Kbuild module map or staged manifest".to_owned()
+        }
+    }
+}
+
+fn staged_linux_driver_module_manifest(repo: &Path) -> Result<BTreeMap<String, String>> {
+    let manifest = repo
+        .join(AUDIT_CONFIG_REPORT_PATH)
+        .parent()
+        .expect("report path has parent")
+        .join("vendor-linux-modules/.lupos-build-manifest");
+    if !manifest.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let text = fs::read_to_string(&manifest).with_context(|| {
+        format!(
+            "failed to read staged module manifest {}",
+            manifest.display()
+        )
+    })?;
+    let mut modules = BTreeMap::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("module=") else {
+            continue;
+        };
+        let fields = rest.split('|').collect::<Vec<_>>();
+        if fields.len() < 3 {
+            bail!(
+                "invalid staged module manifest row in {}: {line}",
+                manifest.display()
+            );
+        }
+        modules
+            .entry(fields[1].to_owned())
+            .and_modify(|paths: &mut String| {
+                paths.push(';');
+                paths.push_str(fields[2]);
+            })
+            .or_insert_with(|| fields[2].to_owned());
+    }
+    Ok(modules)
+}
+
+fn generated_linux_driver_module_overrides(
+    repo: &Path,
+    lupos_text: &str,
+    linux_text: &str,
+) -> Result<BTreeMap<String, LinuxDriverModuleOverride>> {
+    let lupos = parse_defconfig(lupos_text);
+    let linux = parse_defconfig(linux_text);
+    let demoted = lupos
+        .iter()
+        .filter(|(symbol, value)| {
+            value.as_str() == "m" && linux.get(*symbol).is_some_and(|v| v == "y")
+        })
+        .map(|(symbol, _)| symbol.clone())
+        .collect::<BTreeSet<_>>();
+    let kbuild_modules = scan_vendor_kbuild_modules(&repo.join("vendor/linux"))?;
+    Ok(demoted
+        .into_iter()
+        .filter_map(|symbol| {
+            kbuild_modules
+                .get(&symbol)
+                .cloned()
+                .map(|module| (symbol, module))
+        })
+        .collect())
+}
+
+fn scan_vendor_kbuild_modules(linux: &Path) -> Result<BTreeMap<String, LinuxDriverModuleOverride>> {
+    let mut out = BTreeMap::new();
+    scan_vendor_kbuild_dir(linux, linux, &mut out)?;
+    Ok(out)
+}
+
+fn scan_vendor_kbuild_dir(
+    root: &Path,
+    dir: &Path,
+    out: &mut BTreeMap<String, LinuxDriverModuleOverride>,
+) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            scan_vendor_kbuild_dir(root, &path, out)?;
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name != "Makefile" && name != "Kbuild" {
+            continue;
+        }
+        let rel_dir = path
+            .parent()
+            .unwrap_or(root)
+            .strip_prefix(root)
+            .unwrap_or(Path::new(""));
+        let rel_dir = rel_dir.to_string_lossy().replace('\\', "/");
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            let Some(after) = line.strip_prefix("obj-$(CONFIG_") else {
+                continue;
+            };
+            let Some((symbol_tail, rhs)) = after.split_once(")") else {
+                continue;
+            };
+            let symbol = format!("CONFIG_{symbol_tail}");
+            let Some((_, objects)) = rhs.split_once("+=") else {
+                continue;
+            };
+            for object in objects.split_whitespace() {
+                if !object.ends_with(".o") || object.contains("$(") {
+                    continue;
+                }
+                let stem = object.trim_end_matches(".o");
+                if stem.ends_with('/') || stem.contains('/') {
+                    continue;
+                }
+                let ko = if rel_dir.is_empty() {
+                    format!("kernel/{stem}.ko")
+                } else {
+                    format!("kernel/{rel_dir}/{stem}.ko")
+                };
+                out.entry(symbol.clone())
+                    .and_modify(|module| {
+                        module.expected_ko.push(';');
+                        module.expected_ko.push_str(&ko);
+                    })
+                    .or_insert_with(|| LinuxDriverModuleOverride {
+                        symbol: symbol.clone(),
+                        expected_ko: ko,
+                        kbuild_path: if rel_dir.is_empty() {
+                            name.to_owned()
+                        } else {
+                            format!("{rel_dir}/{name}")
+                        },
+                    });
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn audit_config_parity(lupos_text: &str, linux_text: &str) -> ConfigParityReport {
+    audit_config_parity_with_driver_modules(
+        lupos_text,
+        linux_text,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+}
+
+pub(crate) fn audit_config_parity_with_driver_modules(
+    lupos_text: &str,
+    linux_text: &str,
+    module_overrides: &BTreeMap<String, LinuxDriverModuleOverride>,
+    staged_modules: &BTreeMap<String, String>,
+) -> ConfigParityReport {
     let lupos = parse_defconfig(lupos_text);
     let linux = parse_defconfig(linux_text);
 
@@ -3028,27 +3204,51 @@ pub(crate) fn audit_config_parity(lupos_text: &str, linux_text: &str) -> ConfigP
                 lupos_value: "<missing>".to_owned(),
                 linux_value: linux_value.clone(),
                 kind: ConfigParityKind::Divergence,
+                expected_ko: String::new(),
+                detail: "symbol is required upstream but absent from Lupos defconfig".to_owned(),
             });
             continue;
         };
         let kind = if lupos_value == linux_value {
             report.matched += 1;
             ConfigParityKind::Match
-        } else if lupos_value == "m"
-            && linux_value == "y"
-            && LINUX_DRIVER_MODULE_OVERRIDE_SYMBOLS.contains(&symbol.as_str())
-        {
-            report.module_overrides += 1;
-            ConfigParityKind::ModuleOverride
+        } else if lupos_value == "m" && linux_value == "y" {
+            if let Some(module) = module_overrides.get(&symbol) {
+                if staged_modules.get(&symbol).is_some_and(|path| {
+                    split_module_list(path) == split_module_list(&module.expected_ko)
+                }) {
+                    report.module_overrides += 1;
+                    ConfigParityKind::ModuleOverride
+                } else {
+                    report.divergences += 1;
+                    ConfigParityKind::Divergence
+                }
+            } else if BUILTIN_NON_DRIVER_MODULE_EXCEPTIONS
+                .iter()
+                .any(|(exception, _)| *exception == symbol)
+            {
+                report.module_overrides += 1;
+                ConfigParityKind::ModuleOverride
+            } else {
+                report.divergences += 1;
+                ConfigParityKind::Divergence
+            }
         } else {
             report.divergences += 1;
             ConfigParityKind::Divergence
         };
+        let expected_ko = module_overrides
+            .get(&symbol)
+            .map(|module| module.expected_ko.clone())
+            .unwrap_or_default();
+        let detail = config_parity_detail(&symbol, kind, module_overrides, staged_modules);
         report.entries.push(ConfigParityEntry {
             symbol,
             lupos_value: lupos_value.clone(),
             linux_value: linux_value.clone(),
             kind,
+            expected_ko,
+            detail,
         });
     }
     report
@@ -3991,6 +4191,31 @@ mod tests {
         assert_eq!(map.get("NOT_A_CONFIG"), None);
     }
 
+    fn test_module_overrides(
+        symbols: &[(&str, &str)],
+    ) -> BTreeMap<String, LinuxDriverModuleOverride> {
+        symbols
+            .iter()
+            .map(|(symbol, ko)| {
+                (
+                    (*symbol).to_owned(),
+                    LinuxDriverModuleOverride {
+                        symbol: (*symbol).to_owned(),
+                        expected_ko: (*ko).to_owned(),
+                        kbuild_path: "drivers/test/Makefile".to_owned(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn test_staged_modules(symbols: &[(&str, &str)]) -> BTreeMap<String, String> {
+        symbols
+            .iter()
+            .map(|(symbol, ko)| ((*symbol).to_owned(), (*ko).to_owned()))
+            .collect()
+    }
+
     #[test]
     fn config_parity_passes_on_matches_and_module_overrides() {
         let lupos = "CONFIG_SMP=y\n\
@@ -4000,7 +4225,11 @@ mod tests {
         let linux = "CONFIG_SMP=y\n\
                      CONFIG_NET=y\n\
                      CONFIG_VIRTIO_NET=y\n";
-        let report = audit_config_parity(lupos, linux);
+        let modules =
+            test_module_overrides(&[("CONFIG_VIRTIO_NET", "kernel/drivers/net/virtio_net.ko")]);
+        let staged =
+            test_staged_modules(&[("CONFIG_VIRTIO_NET", "kernel/drivers/net/virtio_net.ko")]);
+        let report = audit_config_parity_with_driver_modules(lupos, linux, &modules, &staged);
         assert!(report.is_clean());
         assert_eq!(report.matched, 2);
         assert_eq!(report.module_overrides, 1);
@@ -4059,7 +4288,21 @@ mod tests {
         let linux = "CONFIG_DRM=y\n\
                      CONFIG_DRM_I915=y\n\
                      CONFIG_DRM_VIRTIO_GPU=y\n";
-        let report = audit_config_parity(lupos, linux);
+        let modules = test_module_overrides(&[
+            ("CONFIG_DRM_I915", "kernel/drivers/gpu/drm/i915/i915.ko"),
+            (
+                "CONFIG_DRM_VIRTIO_GPU",
+                "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko",
+            ),
+        ]);
+        let staged = test_staged_modules(&[
+            ("CONFIG_DRM_I915", "kernel/drivers/gpu/drm/i915/i915.ko"),
+            (
+                "CONFIG_DRM_VIRTIO_GPU",
+                "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko",
+            ),
+        ]);
+        let report = audit_config_parity_with_driver_modules(lupos, linux, &modules, &staged);
 
         assert!(report.is_clean());
         assert_eq!(report.matched, 1);
@@ -4077,7 +4320,21 @@ mod tests {
                      CONFIG_DRM_VIRTIO_GPU=y\n";
         let kconfig = "config DRM\n\
                        bool \"Direct Rendering Manager support\"\n";
-        let mut report = audit_config_parity(lupos, linux);
+        let modules = test_module_overrides(&[
+            ("CONFIG_DRM_I915", "kernel/drivers/gpu/drm/i915/i915.ko"),
+            (
+                "CONFIG_DRM_VIRTIO_GPU",
+                "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko",
+            ),
+        ]);
+        let staged = test_staged_modules(&[
+            ("CONFIG_DRM_I915", "kernel/drivers/gpu/drm/i915/i915.ko"),
+            (
+                "CONFIG_DRM_VIRTIO_GPU",
+                "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko",
+            ),
+        ]);
+        let mut report = audit_config_parity_with_driver_modules(lupos, linux, &modules, &staged);
         audit_required_video_kconfig_symbols(&mut report, kconfig, linux);
 
         assert!(!report.is_clean());
@@ -4103,7 +4360,21 @@ mod tests {
                      CONFIG_DRM_I915=y\n\
                      CONFIG_DRM_VIRTIO_GPU=y\n\
                      CONFIG_UNDECLARED_DRIVER=y\n";
-        let report = audit_config_parity(lupos, linux);
+        let modules = test_module_overrides(&[
+            ("CONFIG_DRM_I915", "kernel/drivers/gpu/drm/i915/i915.ko"),
+            (
+                "CONFIG_DRM_VIRTIO_GPU",
+                "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko",
+            ),
+        ]);
+        let staged = test_staged_modules(&[
+            ("CONFIG_DRM_I915", "kernel/drivers/gpu/drm/i915/i915.ko"),
+            (
+                "CONFIG_DRM_VIRTIO_GPU",
+                "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko",
+            ),
+        ]);
+        let report = audit_config_parity_with_driver_modules(lupos, linux, &modules, &staged);
 
         assert!(!report.is_clean());
         assert_eq!(report.module_overrides, 2);
@@ -4114,6 +4385,59 @@ mod tests {
                 .next()
                 .map(|entry| entry.symbol.as_str()),
             Some("CONFIG_UNDECLARED_DRIVER")
+        );
+    }
+
+    #[test]
+    fn config_parity_rejects_missing_staged_module_manifest_entry() {
+        let lupos = "CONFIG_VIRTIO_NET=m
+";
+        let linux = "CONFIG_VIRTIO_NET=y
+";
+        let modules =
+            test_module_overrides(&[("CONFIG_VIRTIO_NET", "kernel/drivers/net/virtio_net.ko")]);
+        let staged = BTreeMap::new();
+        let report = audit_config_parity_with_driver_modules(lupos, linux, &modules, &staged);
+
+        assert!(!report.is_clean());
+        let entry = report
+            .divergent_entries()
+            .next()
+            .expect("missing divergence");
+        assert_eq!(entry.symbol, "CONFIG_VIRTIO_NET");
+        assert_eq!(entry.expected_ko, "kernel/drivers/net/virtio_net.ko");
+        assert!(entry.detail.contains("missing staged vendor module"));
+    }
+
+    #[test]
+    fn vendor_kbuild_scanner_derives_expected_modules_from_config_symbols() {
+        let root = tmp_repo();
+        let linux = root.join("vendor/linux/drivers/net");
+        fs::create_dir_all(&linux).expect("create vendor kbuild dir");
+        fs::write(
+            linux.join("Makefile"),
+            "obj-$(CONFIG_VIRTIO_NET) += virtio_net.o
+             obj-$(CONFIG_DUAL) += first.o second.o
+",
+        )
+        .expect("write makefile");
+
+        let modules = scan_vendor_kbuild_modules(&root.join("vendor/linux")).expect("scan kbuild");
+        assert_eq!(
+            modules
+                .get("CONFIG_VIRTIO_NET")
+                .map(|module| module.expected_ko.as_str()),
+            Some("kernel/drivers/net/virtio_net.ko")
+        );
+        assert_eq!(
+            split_module_list(
+                modules
+                    .get("CONFIG_DUAL")
+                    .expect("CONFIG_DUAL module map")
+                    .expected_ko
+                    .as_str()
+            ),
+            split_module_list("kernel/drivers/net/first.ko;kernel/drivers/net/second.ko")
         );
     }
 
