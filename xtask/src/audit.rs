@@ -1614,6 +1614,22 @@ fn collect_mm_rust_symbols(repo: &Path) -> Result<BTreeMap<String, Vec<MmRustSym
     Ok(symbols)
 }
 
+fn collect_files_named(dir: &Path, repo: &Path, name: &str, out: &mut Vec<PathBuf>) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("error reading entry in {}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_named(&path, repo, name, out)?;
+        } else if path.file_name().and_then(|s| s.to_str()) == Some(name) {
+            out.push(rel_path(repo, &path)?);
+        }
+    }
+    Ok(())
+}
+
 fn collect_files_with_extensions(
     dir: &Path,
     repo: &Path,
@@ -2861,6 +2877,9 @@ pub(crate) struct ConfigParityEntry {
     pub lupos_value: String,
     pub linux_value: String,
     pub kind: ConfigParityKind,
+    pub vendor_path: String,
+    pub expected_value: String,
+    pub allowlist_reason: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2883,15 +2902,23 @@ impl ConfigParityReport {
     }
 
     pub(crate) fn to_tsv(&self) -> String {
-        let mut out = String::from("kind\tsymbol\tlupos_value\tlinux_value\n");
+        let mut out = String::from(
+            "kind\tsymbol\tvendor_path\tlupos_value\texpected_value\tlinux_value\tallowlist_reason\n",
+        );
         for entry in &self.entries {
             out.push_str(entry.kind.as_str());
             out.push('\t');
             out.push_str(&entry.symbol);
             out.push('\t');
+            out.push_str(&entry.vendor_path);
+            out.push('\t');
             out.push_str(&entry.lupos_value);
             out.push('\t');
+            out.push_str(&entry.expected_value);
+            out.push('\t');
             out.push_str(&entry.linux_value);
+            out.push('\t');
+            out.push_str(&entry.allowlist_reason);
             out.push('\n');
         }
         out
@@ -2940,7 +2967,7 @@ pub(crate) fn run_config_parity_audit(repo: &Path) -> Result<ConfigParityReport>
             "failed to read {LINUX_X86_64_DEFCONFIG_PATH} (is vendor/linux/ populated? run vendor/setup_linux.sh)"
         )
     })?;
-    let mut report = audit_config_parity(&lupos_text, &linux_text);
+    let mut report = audit_config_parity_for_repo(repo, &lupos_text, &linux_text)?;
     audit_required_video_kconfig_symbols(&mut report, &kconfig_text, &linux_text);
     audit_resolved_vendor_driver_modules_staged(repo, &mut report)?;
     Ok(report)
@@ -3052,6 +3079,9 @@ fn audit_required_video_kconfig_symbols(
                 lupos_value: "<missing-kconfig>".to_owned(),
                 linux_value: linux_value.clone(),
                 kind: ConfigParityKind::Divergence,
+                vendor_path: String::new(),
+                expected_value: linux_value.clone(),
+                allowlist_reason: String::new(),
             });
             report.divergences += 1;
         }
@@ -3059,6 +3089,222 @@ fn audit_required_video_kconfig_symbols(
     report
         .entries
         .sort_by(|a, b| (a.kind, &a.symbol).cmp(&(b.kind, &b.symbol)));
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DriverConfigAuditInfo {
+    pub vendor_path: String,
+    pub allowlist_reason: String,
+}
+
+const BUILTIN_DRIVER_CONFIG_ALLOWLIST: &[(&str, &str)] = &[
+    (
+        "CONFIG_BLOCK",
+        "core ABI substrate required before module loading",
+    ),
+    (
+        "CONFIG_DRM",
+        "core ABI substrate required before module loading",
+    ),
+    (
+        "CONFIG_HID",
+        "core ABI substrate required before module loading",
+    ),
+    (
+        "CONFIG_INPUT",
+        "core ABI substrate required before module loading",
+    ),
+    (
+        "CONFIG_NET",
+        "core ABI substrate required before module loading",
+    ),
+    (
+        "CONFIG_NETDEVICES",
+        "core ABI substrate required before module loading",
+    ),
+    (
+        "CONFIG_PCI",
+        "core ABI substrate required before module loading",
+    ),
+    (
+        "CONFIG_USB",
+        "core ABI substrate required before module loading",
+    ),
+    (
+        "CONFIG_VIRTIO",
+        "core ABI substrate required before module loading",
+    ),
+];
+
+fn builtin_driver_allowlist_reason(symbol: &str) -> Option<&'static str> {
+    BUILTIN_DRIVER_CONFIG_ALLOWLIST
+        .iter()
+        .find_map(|(allowed, reason)| (*allowed == symbol).then_some(*reason))
+}
+
+pub(crate) fn audit_config_parity_for_repo(
+    repo: &Path,
+    lupos_text: &str,
+    linux_text: &str,
+) -> Result<ConfigParityReport> {
+    let driver_symbols = discover_module_capable_driver_symbols(repo)?;
+    Ok(audit_config_parity_with_driver_symbols(
+        lupos_text,
+        linux_text,
+        &driver_symbols,
+    ))
+}
+
+pub(crate) fn audit_config_parity_with_driver_symbols(
+    lupos_text: &str,
+    linux_text: &str,
+    driver_symbols: &BTreeMap<String, DriverConfigAuditInfo>,
+) -> ConfigParityReport {
+    let mut report = audit_config_parity(lupos_text, linux_text);
+    let lupos = parse_defconfig(lupos_text);
+    let linux = parse_defconfig(linux_text);
+
+    for (symbol, info) in driver_symbols {
+        if linux.get(symbol).map(String::as_str) != Some("y") {
+            continue;
+        }
+        let current = lupos.get(symbol).map(String::as_str).unwrap_or("<missing>");
+        let expected = if let Some(reason) = builtin_driver_allowlist_reason(symbol) {
+            ("y", reason)
+        } else {
+            ("m", "")
+        };
+        if current == expected.0 {
+            if let Some(entry) = report
+                .entries
+                .iter_mut()
+                .find(|entry| entry.symbol == *symbol)
+            {
+                entry.vendor_path = info.vendor_path.clone();
+                entry.expected_value = expected.0.to_owned();
+                entry.allowlist_reason = expected.1.to_owned();
+            }
+            continue;
+        }
+        if let Some(entry) = report
+            .entries
+            .iter_mut()
+            .find(|entry| entry.symbol == *symbol)
+        {
+            if entry.kind != ConfigParityKind::Divergence {
+                match entry.kind {
+                    ConfigParityKind::Match => report.matched -= 1,
+                    ConfigParityKind::ModuleOverride => report.module_overrides -= 1,
+                    ConfigParityKind::Divergence => unreachable!(),
+                }
+                report.divergences += 1;
+            }
+            entry.kind = ConfigParityKind::Divergence;
+            entry.vendor_path = info.vendor_path.clone();
+            entry.expected_value = expected.0.to_owned();
+            entry.allowlist_reason = expected.1.to_owned();
+        } else {
+            report.divergences += 1;
+            report.entries.push(ConfigParityEntry {
+                symbol: symbol.clone(),
+                lupos_value: current.to_owned(),
+                linux_value: "y".to_owned(),
+                kind: ConfigParityKind::Divergence,
+                vendor_path: info.vendor_path.clone(),
+                expected_value: expected.0.to_owned(),
+                allowlist_reason: expected.1.to_owned(),
+            });
+        }
+    }
+    report
+        .entries
+        .sort_by(|a, b| (a.kind, &a.symbol).cmp(&(b.kind, &b.symbol)));
+    report
+}
+
+fn discover_module_capable_driver_symbols(
+    repo: &Path,
+) -> Result<BTreeMap<String, DriverConfigAuditInfo>> {
+    let linux = repo.join("vendor/linux");
+    if !linux.is_dir() {
+        return Ok(BTreeMap::new());
+    }
+    let mut kconfigs = Vec::new();
+    for root in ["drivers", "sound", "net"] {
+        collect_files_named(&linux.join(root), repo, "Kconfig", &mut kconfigs)?;
+    }
+    let mut tristate = BTreeMap::<String, String>::new();
+    for rel in kconfigs {
+        let text = fs::read_to_string(repo.join(&rel))
+            .with_context(|| format!("failed to read {}", path_to_unix(&rel)))?;
+        for sym in parse_tristate_kconfig_symbols(&text) {
+            tristate.entry(sym).or_insert_with(|| path_to_unix(&rel));
+        }
+    }
+    let mut makefiles = Vec::new();
+    for root in ["drivers", "sound", "net"] {
+        collect_files_named(&linux.join(root), repo, "Makefile", &mut makefiles)?;
+    }
+    let mut out = BTreeMap::new();
+    for rel in makefiles {
+        let rel_s = path_to_unix(&rel);
+        let text = fs::read_to_string(repo.join(&rel))
+            .with_context(|| format!("failed to read {rel_s}"))?;
+        for sym in extract_kbuild_config_refs(&text) {
+            let symbol = format!("CONFIG_{sym}");
+            if tristate.contains_key(&symbol) {
+                out.insert(
+                    symbol,
+                    DriverConfigAuditInfo {
+                        vendor_path: rel_s.clone(),
+                        allowlist_reason: String::new(),
+                    },
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn parse_tristate_kconfig_symbols(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(name) = t
+            .strip_prefix("config ")
+            .or_else(|| t.strip_prefix("menuconfig "))
+        {
+            current = Some(format!(
+                "CONFIG_{}",
+                name.split_whitespace().next().unwrap_or("")
+            ));
+        } else if t.starts_with("tristate") {
+            if let Some(sym) = current.take() {
+                out.push(sym);
+            }
+        }
+    }
+    out
+}
+
+fn extract_kbuild_config_refs(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for line in text.lines() {
+        let mut rest = line;
+        while let Some(idx) = rest.find("$(CONFIG_") {
+            let after = &rest[idx + "$(CONFIG_".len()..];
+            let name: String = after
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .collect();
+            if !name.is_empty() {
+                out.insert(name);
+            }
+            rest = after;
+        }
+    }
+    out
 }
 
 pub(crate) fn audit_config_parity(lupos_text: &str, linux_text: &str) -> ConfigParityReport {
@@ -3089,6 +3335,9 @@ pub(crate) fn audit_config_parity(lupos_text: &str, linux_text: &str) -> ConfigP
                 lupos_value: "<missing>".to_owned(),
                 linux_value: linux_value.clone(),
                 kind: ConfigParityKind::Divergence,
+                vendor_path: String::new(),
+                expected_value: linux_value.clone(),
+                allowlist_reason: String::new(),
             });
             continue;
         };
@@ -3110,6 +3359,9 @@ pub(crate) fn audit_config_parity(lupos_text: &str, linux_text: &str) -> ConfigP
             lupos_value: lupos_value.clone(),
             linux_value: linux_value.clone(),
             kind,
+            vendor_path: String::new(),
+            expected_value: linux_value.clone(),
+            allowlist_reason: String::new(),
         });
     }
     report
@@ -4152,6 +4404,56 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing Kconfig-declaration finding for {symbol}"));
             assert_eq!(entry.lupos_value, "<missing-kconfig>");
         }
+    }
+
+    #[test]
+    fn config_parity_audits_module_capable_vendor_driver_symbols() {
+        let lupos = "CONFIG_NET=y
+CONFIG_VENDOR_NET=y
+CONFIG_VENDOR_CORE=y
+";
+        let linux = "CONFIG_NET=y
+CONFIG_VENDOR_NET=y
+CONFIG_VENDOR_CORE=y
+";
+        let mut driver_symbols = BTreeMap::new();
+        driver_symbols.insert(
+            "CONFIG_VENDOR_NET".to_owned(),
+            DriverConfigAuditInfo {
+                vendor_path: "vendor/linux/drivers/net/Makefile".to_owned(),
+                allowlist_reason: String::new(),
+            },
+        );
+        driver_symbols.insert(
+            "CONFIG_NET".to_owned(),
+            DriverConfigAuditInfo {
+                vendor_path: "vendor/linux/net/Makefile".to_owned(),
+                allowlist_reason: String::new(),
+            },
+        );
+
+        let report = audit_config_parity_with_driver_symbols(lupos, linux, &driver_symbols);
+
+        assert!(!report.is_clean());
+        let driver = report
+            .divergent_entries()
+            .find(|entry| entry.symbol == "CONFIG_VENDOR_NET")
+            .expect("module-capable driver should require =m");
+        assert_eq!(driver.vendor_path, "vendor/linux/drivers/net/Makefile");
+        assert_eq!(driver.lupos_value, "y");
+        assert_eq!(driver.expected_value, "m");
+        assert_eq!(driver.allowlist_reason, "");
+        let net = report
+            .entries
+            .iter()
+            .find(|entry| entry.symbol == "CONFIG_NET")
+            .expect("allowlisted core symbol entry");
+        assert_eq!(net.kind, ConfigParityKind::Match);
+        assert_eq!(net.expected_value, "y");
+        assert_eq!(
+            net.allowlist_reason,
+            "core ABI substrate required before module loading"
+        );
     }
 
     #[test]
