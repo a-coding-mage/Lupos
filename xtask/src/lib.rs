@@ -3841,7 +3841,6 @@ const DRIVER_MODULES: &[DriverModuleSpec] = &[
         linux_make_target: "snd-hda-intel.ko",
         module_deps: &[
             "kernel/sound/hda/core/snd-intel-dspcfg.ko",
-            "kernel/sound/hda/core/snd-intel-sdw-acpi.ko",
             "kernel/sound/hda/common/snd-hda-codec.ko",
             "kernel/sound/core/snd-hwdep.ko",
             "kernel/sound/hda/core/snd-hda-core.ko",
@@ -5761,8 +5760,11 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "else\n",
         "    rm -rf /tmp/lupos-firefox-profile\n",
         "    install -d -m 700 -o lupos -g lupos /tmp/lupos-firefox-profile\n",
-        "    rm -f /tmp/lupos-firefox.log /tmp/lupos-firefox-windows.log /tmp/lupos-firefox-maps.log /tmp/lupos-firefox-status.log\n",
-        "    sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none /usr/bin/firefox --no-remote --profile /tmp/lupos-firefox-profile about:blank >/tmp/lupos-firefox.log 2>&1 &\n",
+        "    rm -f /tmp/lupos-firefox.log /tmp/lupos-firefox-windows.log /tmp/lupos-firefox-maps.log /tmp/lupos-firefox-status.log /tmp/lupos-firefox-proof.html\n",
+        "    printf '%s\\n' '<!doctype html><html><head><meta charset=\"utf-8\"><title>Lupos Firefox Render Proof</title><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#11263d;color:#fff;font-family:sans-serif}main{height:100%;display:grid;place-items:center;background:linear-gradient(135deg,#14532d 0 33%,#1d4ed8 33% 66%,#b91c1c 66%)}h1{font-size:64px;text-shadow:0 4px 12px #000}p{font-size:28px}</style></head><body><main><section><h1>Firefox rendered this page</h1><p>Lupos browser responsiveness proof</p></section></main></body></html>' > /tmp/lupos-firefox-proof.html\n",
+        "    chown lupos:lupos /tmp/lupos-firefox-proof.html\n",
+        "    firefox_fb_before=\"$(cksum </dev/fb0 2>/dev/null || true)\"\n",
+        "    sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none /usr/bin/firefox --no-remote --profile /tmp/lupos-firefox-profile file:///tmp/lupos-firefox-proof.html >/tmp/lupos-firefox.log 2>&1 &\n",
         "    firefox_launcher_pid=$!\n",
         "    firefox_pid=; firefox_window=0; i=0\n",
         "    while [ \"$i\" -lt 120 ] && [ \"$firefox_window\" -eq 0 ]; do\n",
@@ -5776,14 +5778,24 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "            for wid in $(sed 's/.*# //' /tmp/lupos-firefox-clients.log | tr ',' ' '); do\n",
         "                DISPLAY=:0 timeout 5 /usr/bin/xprop -id \"$wid\" WM_CLASS _NET_WM_NAME 2>/dev/null >> /tmp/lupos-firefox-windows.log || true\n",
         "            done\n",
-        "            if grep -qiE 'WM_CLASS.*(Navigator|firefox)' /tmp/lupos-firefox-windows.log 2>/dev/null && ! grep -qiE 'Profile Missing|Crash Reporter|Firefox is already running' /tmp/lupos-firefox-windows.log 2>/dev/null; then firefox_window=1; break; fi\n",
+        "            if grep -qiE 'WM_CLASS.*(Navigator|firefox)' /tmp/lupos-firefox-windows.log 2>/dev/null && grep -q 'Lupos Firefox Render Proof' /tmp/lupos-firefox-windows.log 2>/dev/null && ! grep -qiE 'Profile Missing|Crash Reporter|Firefox is already running' /tmp/lupos-firefox-windows.log 2>/dev/null; then firefox_window=1; break; fi\n",
         "        fi\n",
         "        kill -0 \"$firefox_launcher_pid\" 2>/dev/null || break\n",
         "        i=$((i + 1)); sleep 1\n",
         "    done\n",
-        "    if [ \"$firefox_window\" -eq 1 ] && [ -n \"$firefox_pid\" ]; then sleep 10; fi\n",
+        "    if [ \"$firefox_window\" -eq 1 ] && [ -n \"$firefox_pid\" ]; then sleep 3; echo 'graphics-x11: firefox-window-ready'; sleep 10; fi\n",
         "    firefox_exe=; firefox_alive=0\n",
         "    if [ -n \"$firefox_pid\" ]; then firefox_exe=\"$(readlink \"/proc/$firefox_pid/exe\" 2>/dev/null || true)\"; kill -0 \"$firefox_pid\" 2>/dev/null && firefox_alive=1; fi\n",
+        "    firefox_fb_after=\"$(cksum </dev/fb0 2>/dev/null || true)\"\n",
+        "    printf 'graphics-x11: firefox-framebuffer before=%s after=%s\\n' \"$firefox_fb_before\" \"$firefox_fb_after\"\n",
+        "    if [ -n \"$firefox_fb_before\" ] && [ -n \"$firefox_fb_after\" ] && [ \"$firefox_fb_before\" != \"$firefox_fb_after\" ]; then echo 'graphics-x11: firefox-render-pixels ok'; else echo 'graphics-x11: firefox-render-pixels failed'; fi\n",
+        "    firefox_responsive=1; responsive_i=0\n",
+        "    while [ \"$responsive_i\" -lt 5 ]; do DISPLAY=:0 timeout 2 /usr/bin/xprop -root _NET_CLIENT_LIST >/dev/null 2>&1 || firefox_responsive=0; responsive_i=$((responsive_i + 1)); done\n",
+        "    if [ \"$firefox_responsive\" -eq 1 ]; then echo 'graphics-x11: firefox-desktop-responsive ok'; else echo 'graphics-x11: firefox-desktop-responsive failed'; fi\n",
+        "    wall_epoch=\"$(date +%s 2>/dev/null || true)\"; rtc_text=\"$(hwclock --show --utc --noadjfile 2>/dev/null || true)\"; rtc_epoch=\"$(date -u -d \"$rtc_text\" +%s 2>/dev/null || true)\"\n",
+        "    clock_skew=999999; if [ -n \"$wall_epoch\" ] && [ -n \"$rtc_epoch\" ]; then if [ \"$wall_epoch\" -ge \"$rtc_epoch\" ]; then clock_skew=$((wall_epoch - rtc_epoch)); else clock_skew=$((rtc_epoch - wall_epoch)); fi; fi\n",
+        "    printf 'graphics-x11: firefox-clock wall=%s rtc=%s skew=%s\\n' \"$wall_epoch\" \"$rtc_epoch\" \"$clock_skew\"\n",
+        "    if [ \"$clock_skew\" -le 5 ]; then echo 'graphics-x11: firefox-clock-sync ok'; else echo 'graphics-x11: firefox-clock-sync failed'; fi\n",
         "    printf 'graphics-x11: firefox-exe %s\\n' \"$firefox_exe\"\n",
         "    if [ \"$firefox_alive\" -eq 1 ] && [ \"$firefox_exe\" = /usr/lib/firefox/firefox ]; then echo 'graphics-x11: firefox-proc-exe ok'; else echo 'graphics-x11: firefox-proc-exe failed'; fi\n",
         "    if [ \"$firefox_window\" -eq 1 ]; then echo 'graphics-x11: firefox-window ok'; else echo 'graphics-x11: firefox-window failed'; fi\n",
@@ -15984,13 +15996,13 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             label: "greeter first password prompt",
             wait_for: "Prompt greeter with 1 message(s)",
             text: Some("wrong"),
-            capture_initial_desktop: false,
+            capture_frame: None,
         },
         HmpExpectStep {
             label: "greeter rejects wrong password",
             wait_for: "Authenticate result for user lupos: Authentication failure",
             text: None,
-            capture_initial_desktop: false,
+            capture_frame: None,
         },
         HmpExpectStep {
             // This match is cursor-scoped after the failure marker above, so
@@ -15999,7 +16011,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             label: "greeter retry password prompt",
             wait_for: "Prompt greeter with 1 message(s)",
             text: Some("lupos"),
-            capture_initial_desktop: false,
+            capture_frame: None,
         },
         HmpExpectStep {
             // This marker is emitted only after the authenticated session has
@@ -16009,7 +16021,16 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             label: "untouched initial desktop capture",
             wait_for: "graphics-x11: desktop-initial-ready",
             text: None,
-            capture_initial_desktop: true,
+            capture_frame: Some("initial-desktop"),
+        },
+        HmpExpectStep {
+            // Capture the visible VGA output while Firefox is still alive.
+            // The guest marker follows proof-page title detection and a
+            // three-second paint interval.
+            label: "rendered firefox capture",
+            wait_for: "graphics-x11: firefox-window-ready",
+            text: None,
+            capture_frame: Some("firefox-rendered"),
         },
     ];
 
@@ -16104,6 +16125,9 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: firefox-path /usr/bin/firefox",
         "graphics-x11: firefox-proc-exe ok",
         "graphics-x11: firefox-window ok",
+        "graphics-x11: firefox-render-pixels ok",
+        "graphics-x11: firefox-desktop-responsive ok",
+        "graphics-x11: firefox-clock-sync ok",
         "graphics-x11: wallpaper-default /usr/share/backgrounds/xfce/xfce-x.svg",
         "graphics-x11: wallpaper-decode ok",
         "graphics-x11: wallpaper-pixels ok",
@@ -16186,7 +16210,13 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: firefox missing-user-session",
         "graphics-x11: firefox-proc-exe failed",
         "graphics-x11: firefox-window failed",
+        "graphics-x11: firefox-render-pixels failed",
+        "graphics-x11: firefox-desktop-responsive failed",
+        "graphics-x11: firefox-clock-sync failed",
         "Couldn't find the application directory.",
+        "The futex facility returned an unexpected error code.",
+        "bad-area-vma-dump",
+        "trace-user-pf",
         "graphics-x11: wallpaper-decode missing-input",
         "graphics-x11: wallpaper-decode failed",
         "graphics-x11: wallpaper-pixels failed",
@@ -18845,7 +18875,7 @@ struct HmpExpectStep {
     label: &'static str,
     wait_for: &'static str,
     text: Option<&'static str>,
-    capture_initial_desktop: bool,
+    capture_frame: Option<&'static str>,
 }
 
 /// Build the GRUB ISO and boot QEMU with expect-style serial interaction.
@@ -21836,22 +21866,22 @@ impl HmpMonitor {
     }
 
     #[cfg(unix)]
-    fn capture_initial_desktop(&mut self, path: &Path) -> Result<DesktopFrameStats> {
+    fn capture_frame(&mut self, path: &Path, label: &str) -> Result<DesktopFrameStats> {
         let path_text = path
             .to_str()
-            .ok_or_else(|| anyhow!("initial desktop screendump path is not UTF-8"))?;
+            .ok_or_else(|| anyhow!("{label} screendump path is not UTF-8"))?;
         if path_text.chars().any(char::is_whitespace) {
             bail!(
-                "initial desktop screendump path contains HMP-unsafe whitespace: {}",
+                "{label} screendump path contains HMP-unsafe whitespace: {}",
                 path.display()
             );
         }
         let _ = fs::remove_file(path);
         writeln!(self.stream, "screendump {path_text}")
-            .context("failed to request the initial desktop HMP screendump")?;
+            .with_context(|| format!("failed to request the {label} HMP screendump"))?;
         self.stream
             .flush()
-            .context("failed to flush the initial desktop HMP screendump command")?;
+            .with_context(|| format!("failed to flush the {label} HMP screendump command"))?;
 
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut previous_len = 0u64;
@@ -21871,19 +21901,19 @@ impl HmpMonitor {
             }
             if Instant::now() >= deadline {
                 bail!(
-                    "QEMU did not finish the initial desktop screendump {}",
+                    "QEMU did not finish the {label} screendump {}",
                     path.display()
                 );
             }
             thread::sleep(Duration::from_millis(100));
         }
 
-        let ppm = fs::read(path)
-            .with_context(|| format!("failed to read initial desktop {}", path.display()))?;
+        let ppm =
+            fs::read(path).with_context(|| format!("failed to read {label} {}", path.display()))?;
         let stats = analyze_initial_desktop_ppm(&ppm)
-            .with_context(|| format!("invalid initial desktop {}", path.display()))?;
+            .with_context(|| format!("invalid {label} {}", path.display()))?;
         println!(
-            "graphics-x11: host-initial-framebuffer artifact={} size={}x{} painted={}/{} percent={}",
+            "graphics-x11: host-{label}-framebuffer artifact={} size={}x{} painted={}/{} percent={}",
             path.display(),
             stats.width,
             stats.height,
@@ -21893,7 +21923,7 @@ impl HmpMonitor {
         );
         if !stats.wallpaper_is_visible() {
             bail!(
-                "initial XFCE desktop is black before interaction: painted {}/{} interior pixels ({}%); screendump retained at {}",
+                "{label} display is black: painted {}/{} interior pixels ({}%); screendump retained at {}",
                 stats.painted_pixels,
                 stats.interior_pixels,
                 stats.painted_percent(),
@@ -21904,12 +21934,12 @@ impl HmpMonitor {
     }
 
     #[cfg(not(unix))]
-    fn capture_initial_desktop(&mut self, _path: &Path) -> Result<DesktopFrameStats> {
-        bail!("initial desktop capture requires a Unix QEMU monitor socket")
+    fn capture_frame(&mut self, _path: &Path, label: &str) -> Result<DesktopFrameStats> {
+        bail!("{label} capture requires a Unix QEMU monitor socket")
     }
 }
 
-fn initial_desktop_screendump_path(serial_log_path: &Path) -> PathBuf {
+fn frame_screendump_path(serial_log_path: &Path, label: &str) -> PathBuf {
     let stem = serial_log_path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -21917,7 +21947,11 @@ fn initial_desktop_screendump_path(serial_log_path: &Path) -> PathBuf {
     serial_log_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(format!("{stem}-initial-desktop.ppm"))
+        .join(format!("{stem}-{label}.ppm"))
+}
+
+fn initial_desktop_screendump_path(serial_log_path: &Path) -> PathBuf {
+    frame_screendump_path(serial_log_path, "initial-desktop")
 }
 
 fn ppm_header_token<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8]> {
@@ -22087,7 +22121,7 @@ fn run_qemu_iso_with_serial_expect(
                     .map(|idx| hmp_cursor + idx + hmp_step.wait_for.len());
                 if raw_match_end.is_some() || visible_stripped.contains(hmp_step.wait_for) {
                     progress.note_expect_match(hmp_step.label);
-                    if hmp_step.capture_initial_desktop {
+                    if let Some(frame_label) = hmp_step.capture_frame {
                         let monitor = match hmp_monitor.as_mut() {
                             Some(monitor) => monitor,
                             None => {
@@ -22095,8 +22129,8 @@ fn run_qemu_iso_with_serial_expect(
                                 hmp_monitor.as_mut().expect("HMP monitor initialized")
                             }
                         };
-                        let capture_path = initial_desktop_screendump_path(serial_log_path);
-                        monitor.capture_initial_desktop(&capture_path)?;
+                        let capture_path = frame_screendump_path(serial_log_path, frame_label);
+                        monitor.capture_frame(&capture_path, frame_label)?;
                         hmp_cursor = raw_match_end.unwrap_or(log.len());
                     } else if let Some(text) = hmp_step.text {
                         // LightDM logs the PAM prompt before the GTK entry has
@@ -27984,13 +28018,16 @@ CONFIG_SND_HDA_GENERIC=m
             .iter()
             .find(|spec| spec.module_name == "snd_hda_intel")
             .expect("snd_hda_intel staged");
-        // `vendor/linux/sound/hda/controllers/Kconfig` selects
-        // SND_INTEL_DSP_CONFIG, and `vendor/linux/sound/hda/core/Kconfig`
-        // selects SND_INTEL_SOUNDWIRE_ACPI from that on ACPI systems.  Keep
-        // modules.dep aligned so dynamic `modprobe snd_hda_intel` pulls the
-        // complete Linux-built helper closure without a Lupos-side driver.
+        // Kconfig selects both helpers for staging, but dependency metadata
+        // follows the actual ELF references emitted by vendor Kbuild.  The
+        // controller references dspcfg; SoundWire ACPI has no link-time edge.
         assert!(
             hda_intel
+                .module_deps
+                .contains(&"kernel/sound/hda/core/snd-intel-dspcfg.ko")
+        );
+        assert!(
+            !hda_intel
                 .module_deps
                 .contains(&"kernel/sound/hda/core/snd-intel-sdw-acpi.ko")
         );
