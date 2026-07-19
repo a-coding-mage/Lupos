@@ -16,8 +16,8 @@ use spin::Mutex;
 
 use crate::arch::x86::kernel::uaccess;
 use crate::include::uapi::errno::{
-    E2BIG, EACCES, EBADF, EBUSY, EEXIST, EFAULT, EINTR, EINVAL, EIO, EISDIR, ENODATA, ENODEV,
-    ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, ENOTTY, EPERM, ERANGE, EXDEV,
+    E2BIG, EACCES, EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EIO, EISDIR, ENODATA, ENODEV, ENOENT,
+    ENOSYS, ENOTDIR, ENOTEMPTY, ENOTTY, EPERM, ERANGE, EXDEV,
 };
 use crate::include::uapi::fcntl::{
     AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_RECURSIVE, AT_REMOVEDIR, AT_SYMLINK_FOLLOW,
@@ -89,6 +89,7 @@ const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
 const RENAME_NOREPLACE: u32 = 1 << 0;
 const RENAME_EXCHANGE: u32 = 1 << 1;
 const RENAME_WHITEOUT: u32 = 1 << 2;
+const ERESTARTNOHAND: i32 = 514;
 
 fn statx_result_mask(request_mask: u32) -> u32 {
     let mnt_id = if request_mask & STATX_MNT_ID_UNIQUE != 0 {
@@ -1573,9 +1574,6 @@ unsafe fn poll_impl(fds: *mut PollFd, nfds: usize, timeout_ns: Option<u64>) -> i
     loop {
         #[cfg(not(test))]
         let _ = crate::linux_driver_abi::poll_driver_abi_events_for_wait();
-        unsafe {
-            crate::kernel::signal::exit_if_fatal_signal_pending_current();
-        }
         #[cfg(not(test))]
         crate::init::rootfs::drain_console_control_bytes();
 
@@ -1590,14 +1588,21 @@ unsafe fn poll_impl(fds: *mut PollFd, nfds: usize, timeout_ns: Option<u64>) -> i
                 return -(errno as i64);
             }
         };
-        if ready != 0 || timeout_ns == Some(0) {
+        if ready != 0 {
             poll_table.finish();
             return ready;
         }
-        #[cfg(not(test))]
         if crate::kernel::signal::current_has_unblocked_pending_signals() {
             poll_table.finish();
-            return -(EINTR as i64);
+            // Linux do_poll() returns the internal restart code after freeing
+            // poll_wqueues. Syscall-exit signal handling then either restarts
+            // the call or converts it to EINTR. Keeping the signal queued
+            // here also lets every Rust-owned FileRef/Arc unwind normally.
+            return -(ERESTARTNOHAND as i64);
+        }
+        if timeout_ns == Some(0) {
+            poll_table.finish();
+            return 0;
         }
         if let Some(deadline_ns) = deadline_ns {
             if crate::kernel::time::ktime_get() >= deadline_ns {
@@ -1671,9 +1676,6 @@ unsafe fn select_impl(
     let mut wait_state = ConsoleWaitState::default();
 
     loop {
-        unsafe {
-            crate::kernel::signal::exit_if_fatal_signal_pending_current();
-        }
         #[cfg(not(test))]
         crate::init::rootfs::drain_console_control_bytes();
 
@@ -1717,10 +1719,11 @@ unsafe fn select_impl(
             poll_table.finish();
             return ready;
         }
-        #[cfg(not(test))]
         if crate::kernel::signal::current_has_unblocked_pending_signals() {
             poll_table.finish();
-            return -(EINTR as i64);
+            // Match core_sys_select(): free all wait registrations before
+            // returning the internal restart code with the signal untouched.
+            return -(ERESTARTNOHAND as i64);
         }
 
         if let Some(deadline_ns) = deadline_ns {
@@ -5028,6 +5031,30 @@ mod tests {
         (current, previous)
     }
 
+    static INTERRUPTED_POLL_QUEUE: crate::kernel::sched::wait::WaitQueueHead =
+        crate::kernel::sched::wait::WaitQueueHead::new();
+
+    fn interrupted_poll_mask(
+        file: &FileRef,
+        table: Option<&mut crate::fs::select::PollTable>,
+    ) -> u32 {
+        crate::fs::select::poll_wait(file, &INTERRUPTED_POLL_QUEUE, table);
+        0
+    }
+
+    static INTERRUPTED_POLL_OPS: crate::fs::ops::FileOps = crate::fs::ops::FileOps {
+        name: "interrupted-poll",
+        read: None,
+        write: None,
+        llseek: None,
+        fsync: None,
+        poll: Some(interrupted_poll_mask),
+        ioctl: None,
+        mmap: None,
+        release: None,
+        readdir: None,
+    };
+
     fn dirents_contain(dirents: &[u8], len: usize, name: &[u8]) -> bool {
         dirent64_names(dirents, len)
             .iter()
@@ -7433,6 +7460,89 @@ mod tests {
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
+    }
+
+    #[test]
+    fn fatal_signal_interrupts_poll_and_select_after_releasing_wait_resources() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        assert!(INTERRUPTED_POLL_QUEUE.is_empty());
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 31_101;
+        current.tgid = 31_101;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            let ft = FilesStruct::new();
+            let ft_weak = Arc::downgrade(&ft);
+            files::set_task_files(&mut *current as *mut TaskStruct, ft.clone());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let file = crate::fs::file::alloc_file(
+                crate::fs::dcache::d_alloc("interrupted-poll-file"),
+                0,
+                0,
+                &INTERRUPTED_POLL_OPS,
+            );
+            let file_weak = Arc::downgrade(&file);
+            let fd = ft.install(file, false).expect("install poll file");
+            drop(ft);
+
+            assert_eq!(
+                crate::kernel::signal::send_signal_to_task(
+                    &mut *current as *mut TaskStruct,
+                    crate::kernel::signal::SIGTERM,
+                ),
+                0
+            );
+
+            let mut pfd = PollFd {
+                fd,
+                events: POLLIN,
+                revents: 0,
+            };
+            assert_eq!(sys_poll(&mut pfd, 1, -1), -(ERESTARTNOHAND as i64));
+            assert!(INTERRUPTED_POLL_QUEUE.is_empty());
+            assert_ne!(
+                crate::kernel::signal::current_pending_signal_bits()
+                    & (1u64 << (crate::kernel::signal::SIGTERM - 1)),
+                0,
+                "poll must leave the fatal signal queued for syscall-exit"
+            );
+
+            let mut readfds = 1u64 << fd;
+            assert_eq!(
+                sys_select(
+                    fd + 1,
+                    &mut readfds,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                ),
+                -(ERESTARTNOHAND as i64)
+            );
+            assert!(INTERRUPTED_POLL_QUEUE.is_empty());
+            assert_ne!(
+                crate::kernel::signal::current_pending_signal_bits()
+                    & (1u64 << (crate::kernel::signal::SIGTERM - 1)),
+                0,
+                "select must leave the fatal signal queued for syscall-exit"
+            );
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            assert!(
+                ft_weak.upgrade().is_none(),
+                "poll/select syscall-local files_struct Arc leaked"
+            );
+            assert!(
+                file_weak.upgrade().is_none(),
+                "poll/select wait-table FileRef leaked"
+            );
+            sched::set_current(previous);
+        }
+        crate::kernel::signal::reset_for_tests();
     }
 
     fn drop_current_to_unprivileged(uid: u32) {

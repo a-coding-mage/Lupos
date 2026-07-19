@@ -700,16 +700,6 @@ unsafe fn futex_wait_impl(
             }
         }
 
-        if let Some(sig) = crate::kernel::signal::take_current_fatal_signal() {
-            if requeue_pi {
-                remove_waiter_any_bucket(pid, uaddr);
-            } else {
-                remove_waiter(bucket_idx, pid, uaddr);
-            }
-            finish_futex_timeout(&mut timeout, has_timeout, cur);
-            unsafe { crate::kernel::signal::exit_current_for_signal(sig) };
-        }
-
         // Drain check.
         let mut woken = false;
         let mut timed_out = false;
@@ -1499,28 +1489,13 @@ mod tests {
     }
 
     #[test]
-    fn futex_wait_returns_erestartsys_for_unblocked_pending_signal() {
+    fn futex_wait_returns_erestartsys_with_fatal_signal_still_queued_and_waiter_removed() {
         _with_test_lock(|| {
             let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
             crate::kernel::signal::reset_for_tests();
             _flush_for_tests();
             with_test_current(31_001, |task| {
                 let futex_word = AtomicU32::new(0);
-                let action = crate::kernel::signal::RtSigAction {
-                    sa_handler: 0x1234,
-                    ..Default::default()
-                };
-                assert_eq!(
-                    unsafe {
-                        crate::kernel::signal::sys_rt_sigaction(
-                            crate::kernel::signal::SIGTERM,
-                            &action,
-                            core::ptr::null_mut(),
-                            core::mem::size_of::<crate::kernel::signal::SigSet>(),
-                        )
-                    },
-                    0
-                );
                 assert_eq!(
                     unsafe {
                         crate::kernel::signal::send_signal_to_task(
@@ -1542,8 +1517,23 @@ mod tests {
                 };
 
                 assert_eq!(ret, -ERESTARTSYS as i64);
+                assert_ne!(
+                    crate::kernel::signal::current_pending_signal_bits()
+                        & (1u64 << (crate::kernel::signal::SIGTERM - 1)),
+                    0,
+                    "futex_wait consumed the fatal signal"
+                );
+                assert!(
+                    BUCKETS.iter().all(|bucket| bucket
+                        .lock()
+                        .waiters
+                        .iter()
+                        .all(|waiter| waiter.task_pid != 31_001)),
+                    "futex_wait left the interrupted task queued"
+                );
             });
             _flush_for_tests();
+            crate::kernel::signal::reset_for_tests();
         });
     }
 
@@ -1596,28 +1586,13 @@ mod tests {
     }
 
     #[test]
-    fn futex_waitv_returns_erestartsys_for_unblocked_pending_signal() {
+    fn futex_waitv_returns_erestartsys_with_fatal_signal_still_queued() {
         _with_test_lock(|| {
             let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
             crate::kernel::signal::reset_for_tests();
             _flush_for_tests();
             with_test_current(31_003, |task| {
                 let futex_word = AtomicU32::new(0);
-                let action = crate::kernel::signal::RtSigAction {
-                    sa_handler: 0x1234,
-                    ..Default::default()
-                };
-                assert_eq!(
-                    unsafe {
-                        crate::kernel::signal::sys_rt_sigaction(
-                            crate::kernel::signal::SIGTERM,
-                            &action,
-                            core::ptr::null_mut(),
-                            core::mem::size_of::<crate::kernel::signal::SigSet>(),
-                        )
-                    },
-                    0
-                );
                 assert_eq!(
                     unsafe {
                         crate::kernel::signal::send_signal_to_task(
@@ -1637,8 +1612,23 @@ mod tests {
                 let ret = unsafe { futex_waitv(&waiters, 0) };
 
                 assert_eq!(ret, -ERESTARTSYS as i64);
+                assert_ne!(
+                    crate::kernel::signal::current_pending_signal_bits()
+                        & (1u64 << (crate::kernel::signal::SIGTERM - 1)),
+                    0,
+                    "futex_waitv consumed the fatal signal"
+                );
+                assert!(
+                    BUCKETS.iter().all(|bucket| bucket
+                        .lock()
+                        .waiters
+                        .iter()
+                        .all(|waiter| waiter.waitv_id == 0)),
+                    "futex_waitv left interrupted waiters queued"
+                );
             });
             _flush_for_tests();
+            crate::kernel::signal::reset_for_tests();
         });
     }
 

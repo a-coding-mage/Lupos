@@ -37,6 +37,7 @@ use super::socket::{
 
 const MAX_RW: usize = 1 << 20;
 const UIO_MAXIOV: usize = 1024;
+const ERESTARTSYS: i32 = 512;
 
 // ── cmsg / SCM_RIGHTS constants ─────────────────────────────────────────────
 //
@@ -1317,8 +1318,10 @@ fn install_scm_pidfd(cred: &socket::SocketCred) -> Result<Option<i32>, i32> {
     crate::fs::pidfd::install_pidfd(task, false).map(Some)
 }
 
-#[cfg(not(test))]
 fn wait_for_socket_recv(sock: &SocketRef, timeout_ns: u64) -> Result<(), i32> {
+    #[cfg(test)]
+    TEST_SOCKET_RECV_WAIT_CALLS.fetch_add(1, Ordering::AcqRel);
+
     let deadline_ns = if timeout_ns == 0 {
         None
     } else {
@@ -1330,12 +1333,10 @@ fn wait_for_socket_recv(sock: &SocketRef, timeout_ns: u64) -> Result<(), i32> {
     }
 
     loop {
+        #[cfg(not(test))]
         let _ = crate::linux_driver_abi::poll_driver_abi_events_for_wait();
-        unsafe {
-            crate::kernel::signal::exit_if_fatal_signal_pending_current();
-        }
         if crate::kernel::signal::current_has_unblocked_pending_signals() {
-            return Err(EINTR);
+            return Err(socket_wait_signal_errno(timeout_ns));
         }
         if let Some(deadline_ns) = deadline_ns {
             if crate::kernel::time::ktime_get() >= deadline_ns {
@@ -1352,13 +1353,20 @@ fn wait_for_socket_recv(sock: &SocketRef, timeout_ns: u64) -> Result<(), i32> {
             return Ok(());
         }
 
+        #[cfg(test)]
+        if TEST_SOCKET_RECV_SIGNAL_AFTER_PREPARE.swap(false, Ordering::AcqRel) {
+            let _ = unsafe {
+                crate::kernel::signal::send_signal_to_task(task, crate::kernel::signal::SIGTERM)
+            };
+        }
+
         // Signals and absolute receive timeouts may have become visible while
         // the task was being linked. Always unlink before returning.
         if crate::kernel::signal::current_has_unblocked_pending_signals() {
             unsafe {
                 socket::finish_socket_recv_wait(sock, task);
             }
-            return Err(EINTR);
+            return Err(socket_wait_signal_errno(timeout_ns));
         }
         if let Some(deadline_ns) = deadline_ns
             && crate::kernel::time::ktime_get() >= deadline_ns
@@ -1378,33 +1386,50 @@ fn wait_for_socket_recv(sock: &SocketRef, timeout_ns: u64) -> Result<(), i32> {
         // Data/EOF producers provide the normal wakeup. Linux leaves an
         // infinite receive wait untimed; a finite SO_RCVTIMEO arms only its
         // actual remaining deadline, not a 250 Hz re-poll timer.
-        let task_id = task as usize;
-        let timer_armed = deadline_ns.map(|deadline| {
-            let remaining = deadline.saturating_sub(crate::kernel::time::ktime_get());
-            let timeout = crate::kernel::time::timeconv::nsecs_to_jiffies64(remaining).max(1);
-            let wake_at = crate::kernel::time::jiffies::jiffies().saturating_add(timeout);
-            crate::kernel::time::sleep_timeout::arm_wakeup(task_id, wake_at);
-        });
-        unsafe {
-            crate::kernel::sched::schedule_with_irqs_enabled();
+        #[cfg(not(test))]
+        {
+            let task_id = task as usize;
+            let timer_armed = deadline_ns.map(|deadline| {
+                let remaining = deadline.saturating_sub(crate::kernel::time::ktime_get());
+                let timeout = crate::kernel::time::timeconv::nsecs_to_jiffies64(remaining).max(1);
+                let wake_at = crate::kernel::time::jiffies::jiffies().saturating_add(timeout);
+                crate::kernel::time::sleep_timeout::arm_wakeup(task_id, wake_at);
+            });
+            unsafe {
+                crate::kernel::sched::schedule_with_irqs_enabled();
+            }
+            if timer_armed.is_some() {
+                crate::kernel::time::sleep_timeout::cancel_wakeup(task_id);
+            }
+            unsafe {
+                socket::finish_socket_recv_wait(sock, task);
+            }
         }
-        if timer_armed.is_some() {
-            crate::kernel::time::sleep_timeout::cancel_wakeup(task_id);
-        }
-        unsafe {
-            socket::finish_socket_recv_wait(sock, task);
+        #[cfg(test)]
+        {
+            // Unit tests do not run the cooperative scheduler. Preserve the
+            // existing one-pass EAGAIN behavior after exercising the actual
+            // prepare/recheck/finish waiter lifecycle above.
+            unsafe {
+                socket::finish_socket_recv_wait(sock, task);
+            }
+            return Err(EAGAIN);
         }
     }
+}
+
+fn socket_wait_signal_errno(timeout_ns: u64) -> i32 {
+    // vendor/linux/include/net/sock.h::sock_intr_errno(): infinite socket
+    // waits are restartable; SO_RCVTIMEO makes the operation non-restartable.
+    if timeout_ns == 0 { ERESTARTSYS } else { EINTR }
 }
 
 #[cfg(test)]
 static TEST_SOCKET_RECV_WAIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
-fn wait_for_socket_recv(_sock: &SocketRef, _timeout_ns: u64) -> Result<(), i32> {
-    TEST_SOCKET_RECV_WAIT_CALLS.fetch_add(1, Ordering::AcqRel);
-    Err(EAGAIN)
-}
+static TEST_SOCKET_RECV_SIGNAL_AFTER_PREPARE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 fn read_sockaddr(ptr: *const u8, len: u32) -> Result<SockAddr, i32> {
     if ptr.is_null() {
@@ -4120,6 +4145,118 @@ mod tests {
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
+    }
+
+    #[test]
+    fn socket_signal_wait_codes_preserve_signal_and_unlink_waiter() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 31_103;
+        current.tgid = 31_103;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            for (timeout_ns, expected) in [(0, ERESTARTSYS), (1_000_000, EINTR)] {
+                crate::kernel::signal::reset_for_tests();
+                let sock =
+                    socket::socket(AF_UNIX, socket::SOCK_DGRAM, 0).expect("create test socket");
+                let recv_wait = sock.lock().recv_wait.clone();
+                assert!(recv_wait.is_empty());
+
+                TEST_SOCKET_RECV_SIGNAL_AFTER_PREPARE.store(true, Ordering::Release);
+                assert_eq!(
+                    wait_for_socket_recv(&sock, timeout_ns),
+                    Err(expected),
+                    "wrong interruption code for timeout {timeout_ns}"
+                );
+                assert!(
+                    recv_wait.is_empty(),
+                    "socket signal path left the task linked on recv_wait"
+                );
+                assert_ne!(
+                    crate::kernel::signal::current_pending_signal_bits()
+                        & (1u64 << (crate::kernel::signal::SIGTERM - 1)),
+                    0,
+                    "socket wait consumed the fatal signal"
+                );
+                socket::release_socket(&sock);
+            }
+            sched::set_current(previous);
+        }
+        crate::kernel::signal::reset_for_tests();
+    }
+
+    #[test]
+    fn fatal_signal_recvfrom_releases_fdtable_file_and_socket_arcs() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 31_104;
+        current.tgid = 31_104;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            let ft = FilesStruct::new();
+            let ft_weak = Arc::downgrade(&ft);
+            files::set_task_files(&mut *current as *mut TaskStruct, ft.clone());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let fd = sys_socket(AF_UNIX as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(fd >= 0);
+            let file = ft.get(fd as i32).expect("socket file");
+            let file_weak = Arc::downgrade(&file);
+            let sock = socket_from_file(&file).expect("socket registry entry");
+            let sock_weak = Arc::downgrade(&sock);
+            drop(sock);
+            drop(file);
+            drop(ft);
+
+            assert_eq!(
+                crate::kernel::signal::send_signal_to_task(
+                    &mut *current as *mut TaskStruct,
+                    crate::kernel::signal::SIGTERM,
+                ),
+                0
+            );
+            let mut byte = 0u8;
+            assert_eq!(
+                sys_recvfrom(
+                    fd as i32,
+                    &mut byte,
+                    1,
+                    0,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                ),
+                -(ERESTARTSYS as i64)
+            );
+            assert_ne!(
+                crate::kernel::signal::current_pending_signal_bits()
+                    & (1u64 << (crate::kernel::signal::SIGTERM - 1)),
+                0,
+                "recvfrom consumed the fatal signal"
+            );
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            assert!(
+                ft_weak.upgrade().is_none(),
+                "recvfrom syscall-local files_struct Arc leaked"
+            );
+            assert!(
+                file_weak.upgrade().is_none(),
+                "recvfrom syscall-local socket FileRef leaked"
+            );
+            assert!(
+                sock_weak.upgrade().is_none(),
+                "recvfrom syscall-local SocketRef leaked"
+            );
+            sched::set_current(previous);
+        }
+        crate::kernel::signal::reset_for_tests();
     }
 
     #[test]
