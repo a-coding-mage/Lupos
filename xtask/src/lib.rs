@@ -188,8 +188,8 @@ const LUPOS_TIMEZONE_ENV: &str = "LUPOS_TIMEZONE";
 const TMPDIR_ENV: &str = "TMPDIR";
 const DEFAULT_QEMU_MEMORY: &str = "1024M";
 const GUI_SHELL_QEMU_MEMORY: &str = "4096M";
-const GRAPHICS_ROOT_DISK_SIZE: &str = "12G";
-const GRAPHICS_ROOT_DISK_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+const GRAPHICS_ROOT_DISK_SIZE: &str = "40G";
+const GRAPHICS_ROOT_DISK_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const GUI_SHELL_ROOT_DISK_SIZE: &str = GRAPHICS_ROOT_DISK_SIZE;
 const QEMU_GDB_PORT: u16 = 1234;
 const BZIMAGE_SETUP_SECTS: u8 = 4;
@@ -16972,6 +16972,8 @@ fn validate_userland_stage() -> Result<()> {
             "usr/bin/xfsettingsd",
             "usr/bin/xfce4-settings-manager",
             "usr/bin/xfce4-terminal",
+            "usr/bin/nano",
+            "usr/bin/firefox",
             "usr/bin/dbus-launch",
         ] {
             validate_stage_artifact(&stage, required, allow_symlinks)?;
@@ -25319,7 +25321,8 @@ failed command output\n";
         }
         assert_eq!(LOGIN_ROOT_DISK_SIZE, "768M");
         assert_eq!(SHIPPED_COMMANDS_ROOT_DISK_SIZE, "768M");
-        assert_eq!(GRAPHICS_ROOT_DISK_SIZE, "12G");
+        assert_eq!(GRAPHICS_ROOT_DISK_SIZE, "40G");
+        assert_eq!(GRAPHICS_ROOT_DISK_BYTES, 40 * 1024 * 1024 * 1024);
         assert!(LOGIN_ROOT_DISK_BYTES > DISK_ROOT_FSCK_DISK_BYTES);
         assert!(SHIPPED_COMMANDS_ROOT_DISK_BYTES > DISK_ROOT_FSCK_DISK_BYTES);
         assert!(GRAPHICS_ROOT_DISK_BYTES > LOGIN_ROOT_DISK_BYTES);
@@ -32796,6 +32799,7 @@ CONFIG_MODULES=y
             "LUPOS_ARCH_ROOTFS=\"$TARGET/arch-graphics-rootfs\"",
             "STAGE=\"$TARGET/graphics-stage\"",
             "graphics_enabled",
+            "graphics_pacman_database_ready",
             "if ! graphics_enabled; then",
             "return 0",
             "install_arch_graphics_packages",
@@ -32819,6 +32823,8 @@ CONFIG_MODULES=y
             "xfdesktop",
             "xfce4-settings",
             "xfce4-terminal",
+            "nano",
+            "firefox",
             "usr/bin/Xorg",
             "usr/bin/sudo",
             "usr/bin/startx",
@@ -32829,10 +32835,15 @@ CONFIG_MODULES=y
             "usr/bin/xfce4-appfinder",
             "usr/bin/xfdesktop",
             "usr/bin/xfce4-settings-manager",
+            "usr/bin/nano",
+            "usr/bin/firefox",
             "usr/lib/xorg/modules/drivers/fbdev_drv.so",
             "usr/lib/xorg/modules/input/libinput_drv.so",
             "usr/lib/xorg/modules/input/evdev_drv.so",
             "staged graphics profile is missing X11 packages",
+            "--database",
+            "--check",
+            "--query",
         ] {
             assert!(
                 script.contains(needle),
@@ -32850,6 +32861,53 @@ CONFIG_MODULES=y
             assert!(
                 !script.contains(forbidden),
                 "graphics profile must stay on the lean X11/fbdev stack, found {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn xfce_image_preinstalls_editor_and_firefox_with_pacman_checks() {
+        let root = repo_root().expect("repo root");
+        let script = fs::read_to_string(root.join(USERLAND_BUILD_SCRIPT)).expect("build script");
+        let package_array = script
+            .split_once("ARCH_GRAPHICS_PACKAGES=(")
+            .expect("graphics package array")
+            .1
+            .split_once("\n)")
+            .expect("end of graphics package array")
+            .0;
+        let packages = package_array
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect::<HashSet<_>>();
+
+        assert!(
+            packages.contains("nano"),
+            "the XFCE image must preinstall a terminal text editor"
+        );
+        assert!(
+            packages.contains("firefox"),
+            "the XFCE image must preinstall Firefox"
+        );
+
+        let installer = script
+            .split_once("install_arch_graphics_packages() {")
+            .expect("graphics package installer")
+            .1
+            .split_once("\n}")
+            .expect("end of graphics package installer")
+            .0;
+        for needle in [
+            "\"${ARCH_GRAPHICS_PACKAGES[@]}\"",
+            "--database",
+            "--check",
+            "--query",
+            "nano firefox",
+        ] {
+            assert!(
+                installer.contains(needle),
+                "graphics pacman transaction must contain {needle}"
             );
         }
     }

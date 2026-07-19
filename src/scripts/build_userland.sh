@@ -188,6 +188,10 @@ ARCH_GRAPHICS_PACKAGES=(
     xfce4-settings
     thunar
     xfce4-terminal
+    # Ship a usable terminal editor and browser in the image.  Installing them
+    # in this host-side transaction avoids a large, slow first-boot pacman run.
+    nano
+    firefox
     # D-Bus for the per-session bus xfce4-session needs, plus a base icon theme
     # and scalable fonts so the panel/desktop render.
     dbus
@@ -468,6 +472,8 @@ graphics_stage_ready() {
         && [ -x "$1/usr/bin/xfsettingsd" ] \
         && [ -x "$1/usr/bin/xfce4-settings-manager" ] \
         && [ -x "$1/usr/bin/xfce4-terminal" ] \
+        && [ -x "$1/usr/bin/nano" ] \
+        && [ -x "$1/usr/bin/firefox" ] \
         && [ -x "$1/usr/bin/dbus-launch" ] \
         && [ -e "$1/usr/lib/xorg/modules/drivers/fbdev_drv.so" ] \
         && [ -e "$1/usr/lib/xorg/modules/input/libinput_drv.so" ] \
@@ -479,8 +485,38 @@ graphics_stage_ready() {
         && [ -d "$1/var/lib/pacman/local/xorg-xinit-1.4.4-1" ] \
         && [ -d "$1/var/lib/pacman/local/xorg-twm-1.0.13.1-1" ] \
         && [ -d "$1/var/lib/pacman/local/xterm-410-1" ] \
+        && [ -d "$1/var/lib/pacman/local/nano-9.0-1" ] \
+        && [ -d "$1/var/lib/pacman/local/firefox-151.0.2-1" ] \
         && [ -e "$1/usr/share/fonts/misc/6x13-ISO8859-1.pcf.gz" ] \
         && [ -d "$1/var/lib/pacman/local/xorg-fonts-misc-1.0.4-2" ]
+}
+
+graphics_pacman_database_ready() {
+    if ! graphics_enabled; then
+        return 0
+    fi
+    local r="$1"
+    "$r/usr/lib/ld-linux-x86-64.so.2" \
+        --library-path "$r/usr/lib" \
+        "$r/usr/bin/pacman" \
+        --database \
+        --check \
+        --config "$r/$ARCH_PACMAN_CONFIG" \
+        --root "$r" \
+        --dbpath "$r/var/lib/pacman" \
+        --disable-sandbox \
+        >/dev/null 2>&1 \
+        && "$r/usr/lib/ld-linux-x86-64.so.2" \
+            --library-path "$r/usr/lib" \
+            "$r/usr/bin/pacman" \
+            --query \
+            --check \
+            --config "$r/$ARCH_PACMAN_CONFIG" \
+            --root "$r" \
+            --dbpath "$r/var/lib/pacman" \
+            --disable-sandbox \
+            nano firefox \
+            >/dev/null 2>&1
 }
 
 graphics_runtime_cache_ready() {
@@ -520,6 +556,7 @@ stage_ready() {
         && pacman_offline_repo_ready "$STAGE" \
         && pam_systemd_ready "$STAGE" \
         && graphics_stage_ready "$STAGE" \
+        && graphics_pacman_database_ready "$STAGE" \
         && graphics_runtime_cache_ready "$STAGE"
 }
 
@@ -822,45 +859,69 @@ install_arch_graphics_packages() {
     if ! graphics_enabled; then
         return 0
     fi
-    if graphics_stage_ready "$ARCH_ROOTFS"; then
-        log "Graphics packages already present in $ARCH_ROOTFS"
-        return
-    fi
-
-    require_command fakeroot
-    local fakeroot_lib_dir
-    fakeroot_lib_dir="$(find_fakeroot_lib_dir)" || die "fakeroot library directory not found"
-
-    local full_core_db="$CACHE/arch-repo/$ARCH_REPO_SNAPSHOT/core/os/x86_64/core.db"
-    local full_extra_db="$CACHE/arch-repo/$ARCH_REPO_SNAPSHOT/extra/os/x86_64/extra.db"
-    [ -s "$full_core_db" ] || die "missing full Arch core db: $full_core_db"
-    [ -s "$full_extra_db" ] || die "missing full Arch extra db: $full_extra_db"
 
     local work="$TARGET/.graphics-pacman-$$"
     safe_clean_dir "$work"
     mkdir -p "$work/hooks" "$work/gpg" "$CACHE/pacman-graphics"
     write_arch_archive_pacman_conf "$work/pacman.conf" "$work/hooks"
 
-    cp "$full_core_db" "$ARCH_ROOTFS/var/lib/pacman/sync/core.db"
-    cp "$full_extra_db" "$ARCH_ROOTFS/var/lib/pacman/sync/extra.db"
+    if graphics_stage_ready "$ARCH_ROOTFS"; then
+        log "Graphics packages already present in $ARCH_ROOTFS"
+    else
+        require_command fakeroot
+        local fakeroot_lib_dir
+        fakeroot_lib_dir="$(find_fakeroot_lib_dir)" || die "fakeroot library directory not found"
 
-    log "Installing X11 graphics packages into Arch rootfs"
-    fakeroot -- \
-        "$ARCH_ROOTFS/usr/lib/ld-linux-x86-64.so.2" \
-        --library-path "$fakeroot_lib_dir:$ARCH_ROOTFS/usr/lib" \
+        local full_core_db="$CACHE/arch-repo/$ARCH_REPO_SNAPSHOT/core/os/x86_64/core.db"
+        local full_extra_db="$CACHE/arch-repo/$ARCH_REPO_SNAPSHOT/extra/os/x86_64/extra.db"
+        [ -s "$full_core_db" ] || die "missing full Arch core db: $full_core_db"
+        [ -s "$full_extra_db" ] || die "missing full Arch extra db: $full_extra_db"
+
+        cp "$full_core_db" "$ARCH_ROOTFS/var/lib/pacman/sync/core.db"
+        cp "$full_extra_db" "$ARCH_ROOTFS/var/lib/pacman/sync/extra.db"
+
+        log "Installing X11 graphics packages into Arch rootfs"
+        fakeroot -- \
+            "$ARCH_ROOTFS/usr/lib/ld-linux-x86-64.so.2" \
+            --library-path "$fakeroot_lib_dir:$ARCH_ROOTFS/usr/lib" \
+            "$ARCH_ROOTFS/usr/bin/pacman" \
+            -S \
+            --config "$work/pacman.conf" \
+            --root "$ARCH_ROOTFS" \
+            --dbpath "$ARCH_ROOTFS/var/lib/pacman" \
+            --cachedir "$CACHE/pacman-graphics" \
+            --gpgdir "$work/gpg" \
+            --hookdir "$work/hooks" \
+            --noconfirm \
+            --needed \
+            --noscriptlet \
+            --disable-sandbox \
+            "${ARCH_GRAPHICS_PACKAGES[@]}"
+    fi
+
+    # Use pacman's own dependency checker against the completed local package
+    # database.  This makes a broken Firefox dependency closure fail the image
+    # build even if the top-level executable happened to be unpacked.
+    log "Checking installed graphics package dependency closure with pacman"
+    "$ARCH_ROOTFS/usr/lib/ld-linux-x86-64.so.2" \
+        --library-path "$ARCH_ROOTFS/usr/lib" \
         "$ARCH_ROOTFS/usr/bin/pacman" \
-        -S \
+        --database \
+        --check \
         --config "$work/pacman.conf" \
         --root "$ARCH_ROOTFS" \
         --dbpath "$ARCH_ROOTFS/var/lib/pacman" \
-        --cachedir "$CACHE/pacman-graphics" \
-        --gpgdir "$work/gpg" \
-        --hookdir "$work/hooks" \
-        --noconfirm \
-        --needed \
-        --noscriptlet \
+        --disable-sandbox
+    "$ARCH_ROOTFS/usr/lib/ld-linux-x86-64.so.2" \
+        --library-path "$ARCH_ROOTFS/usr/lib" \
+        "$ARCH_ROOTFS/usr/bin/pacman" \
+        --query \
+        --check \
+        --config "$work/pacman.conf" \
+        --root "$ARCH_ROOTFS" \
+        --dbpath "$ARCH_ROOTFS/var/lib/pacman" \
         --disable-sandbox \
-        "${ARCH_GRAPHICS_PACKAGES[@]}"
+        nano firefox
 
     stage_arch_pacman_sync_dbs
     safe_clean_dir "$work"
@@ -1213,6 +1274,7 @@ validate_stage() {
     pacman_offline_repo_ready "$STAGE" || die "staged offline pacman repo is missing pinned database/package files or preseeded sync databases"
     pam_systemd_ready "$STAGE" || die "staged PAM systemd session hook is missing"
     graphics_stage_ready "$STAGE" || die "staged graphics profile is missing X11 packages"
+    graphics_pacman_database_ready "$STAGE" || die "staged graphics profile has an inconsistent pacman dependency database or missing Firefox/nano files"
     graphics_runtime_cache_ready "$STAGE" || die "staged graphics profile is missing generated runtime caches"
     : > "$STAGE_STAMP"
 }
