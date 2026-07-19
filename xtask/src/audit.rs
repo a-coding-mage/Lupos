@@ -2768,6 +2768,8 @@ pub(crate) const LUPOS_KCONFIG_PATH: &str = "src/kernel/Kconfig";
 pub(crate) const LINUX_X86_64_DEFCONFIG_PATH: &str =
     "vendor/linux/arch/x86/configs/x86_64_defconfig";
 pub(crate) const AUDIT_CONFIG_REPORT_PATH: &str = "target/xtask/config-parity.tsv";
+const CONFIG_PARITY_STAGED_MODULE_MANIFEST_PATH: &str =
+    "target/xtask/vendor-linux-modules/.lupos-build-manifest";
 
 pub(crate) const REQUIRED_X86_64_GENERIC_VIDEO_SYMBOLS: &[&str] = &[
     "CONFIG_AGP",
@@ -3020,11 +3022,7 @@ fn config_parity_detail(
 }
 
 fn staged_linux_driver_module_manifest(repo: &Path) -> Result<BTreeMap<String, String>> {
-    let manifest = repo
-        .join(AUDIT_CONFIG_REPORT_PATH)
-        .parent()
-        .expect("report path has parent")
-        .join("vendor-linux-modules/.lupos-build-manifest");
+    let manifest = repo.join(CONFIG_PARITY_STAGED_MODULE_MANIFEST_PATH);
     if !manifest.is_file() {
         return Ok(BTreeMap::new());
     }
