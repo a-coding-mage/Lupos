@@ -2768,6 +2768,9 @@ pub(crate) const LUPOS_KCONFIG_PATH: &str = "src/kernel/Kconfig";
 pub(crate) const LINUX_X86_64_DEFCONFIG_PATH: &str =
     "vendor/linux/arch/x86/configs/x86_64_defconfig";
 pub(crate) const AUDIT_CONFIG_REPORT_PATH: &str = "target/xtask/config-parity.tsv";
+const VENDOR_MODULE_ARTIFACT_DIR: &str = "target/xtask/vendor-linux-modules";
+const VENDOR_EFFECTIVE_CONFIG: &str = ".lupos-effective-config";
+const VENDOR_MODULES_ORDER: &str = "modules.order";
 
 pub(crate) const REQUIRED_X86_64_GENERIC_VIDEO_SYMBOLS: &[&str] = &[
     "CONFIG_AGP",
@@ -2939,7 +2942,65 @@ pub(crate) fn run_config_parity_audit(repo: &Path) -> Result<ConfigParityReport>
     })?;
     let mut report = audit_config_parity(&lupos_text, &linux_text);
     audit_required_video_kconfig_symbols(&mut report, &kconfig_text, &linux_text);
+    audit_resolved_vendor_driver_modules_staged(repo, &mut report)?;
     Ok(report)
+}
+
+fn module_name_from_module_path(module_path: &str) -> String {
+    Path::new(module_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(module_path)
+        .replace('-', "_")
+}
+
+fn audit_resolved_vendor_driver_modules_staged(
+    repo: &Path,
+    report: &mut ConfigParityReport,
+) -> Result<()> {
+    let artifact_dir = repo.join(VENDOR_MODULE_ARTIFACT_DIR);
+    let config_path = artifact_dir.join(VENDOR_EFFECTIVE_CONFIG);
+    let order_path = artifact_dir.join(VENDOR_MODULES_ORDER);
+    if !config_path.is_file() || !order_path.is_file() {
+        return Ok(());
+    }
+
+    let config = parse_defconfig(
+        &fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?,
+    );
+    let order_text = fs::read_to_string(&order_path)
+        .with_context(|| format!("failed to read {}", order_path.display()))?;
+    let staged = order_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.ends_with(".ko"))
+        .map(module_name_from_module_path)
+        .collect::<BTreeSet<_>>();
+
+    for (symbol, value) in config {
+        if value != "m" {
+            continue;
+        }
+        let module_name = symbol
+            .strip_prefix("CONFIG_")
+            .unwrap_or(&symbol)
+            .to_ascii_lowercase();
+        if staged.contains(&module_name) {
+            continue;
+        }
+        report.divergences += 1;
+        report.entries.push(ConfigParityEntry {
+            symbol,
+            lupos_value: "<missing-staged-module>".to_owned(),
+            linux_value: "m".to_owned(),
+            kind: ConfigParityKind::Divergence,
+        });
+    }
+    report
+        .entries
+        .sort_by(|a, b| (a.kind, &a.symbol).cmp(&(b.kind, &b.symbol)));
+    Ok(())
 }
 
 fn parse_kconfig_symbols(text: &str) -> BTreeSet<String> {
