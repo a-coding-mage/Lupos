@@ -525,7 +525,7 @@ pub fn socket(family: u16, sock_type: u16, protocol: u16) -> Result<SocketRef, i
         last_rx_meta: PacketMeta::default(),
         wire_tcp: None,
     }));
-    if matches!(family, AF_INET | AF_INET6) {
+    if family == AF_INET {
         let mut sockets = INET_SOCKETS.lock();
         sockets.retain(|entry| entry.strong_count() != 0);
         sockets.push(Arc::downgrade(&socket));
@@ -605,6 +605,47 @@ fn inet_bind_addresses_conflict(candidate: &SockAddr, existing: &SockAddr) -> bo
     }
 }
 
+fn inet_transport_protocol(sock_type: u16, protocol: u16) -> u16 {
+    match (sock_type, protocol) {
+        (SOCK_STREAM, 0) => IPPROTO_TCP as u16,
+        (SOCK_DGRAM, 0) => IPPROTO_UDP as u16,
+        _ => protocol,
+    }
+}
+
+fn inet_uses_ephemeral_port_allocator(family: u16, sock_type: u16, protocol: u16) -> bool {
+    matches!(family, AF_INET | AF_INET6)
+        && ((sock_type == SOCK_STREAM && (protocol == 0 || protocol == IPPROTO_TCP as u16))
+            || (sock_type == SOCK_DGRAM && (protocol == 0 || protocol == IPPROTO_UDP as u16)))
+}
+
+fn bound_inet_addr_conflicts(
+    bound: &BTreeMap<SockAddr, Vec<SocketRef>>,
+    sock: &SocketRef,
+    candidate: &SockAddr,
+    reuseaddr: bool,
+    family: u16,
+    sock_type: u16,
+    protocol: u16,
+    namespace_key: usize,
+) -> bool {
+    let protocol = inet_transport_protocol(sock_type, protocol);
+    bound.iter().any(|(bound_addr, entries)| {
+        inet_bind_addresses_conflict(candidate, bound_addr)
+            && entries.iter().any(|entry| {
+                if Arc::ptr_eq(entry, sock) {
+                    return false;
+                }
+                let entry = entry.lock();
+                (!namespace_scoped_family(family) || entry.net_ns == namespace_key)
+                    && entry.family == family
+                    && entry.sock_type == sock_type
+                    && inet_transport_protocol(entry.sock_type, entry.protocol) == protocol
+                    && (!reuseaddr || !entry.reuseaddr)
+            })
+    })
+}
+
 /// Resolve an explicit inet `bind(..., port 0)` before inserting the socket
 /// into the bind table.
 ///
@@ -613,19 +654,24 @@ fn inet_bind_addresses_conflict(candidate: &SockAddr, existing: &SockAddr) -> bo
 /// visible through `getsockname()` and is retained for later sends.  In
 /// particular, Firefox's HTTP/3 transport binds `0.0.0.0:0`, reads the chosen
 /// address back, and then hands the descriptor to Neqo.
-fn resolve_inet_ephemeral_bind(sock: &SocketRef, addr: SockAddr) -> Result<SockAddr, i32> {
+fn resolve_inet_ephemeral_bind(
+    bound: &BTreeMap<SockAddr, Vec<SocketRef>>,
+    sock: &SocketRef,
+    addr: SockAddr,
+    reuseaddr: bool,
+    family: u16,
+    sock_type: u16,
+    protocol: u16,
+    namespace_key: usize,
+) -> Result<SockAddr, i32> {
     let needs_port = matches!(
         &addr,
         SockAddr::Inet { port: 0, .. } | SockAddr::Inet6 { port: 0, .. }
-    );
+    ) && inet_uses_ephemeral_port_allocator(family, sock_type, protocol);
     if !needs_port {
         return Ok(addr);
     }
 
-    let (family, sock_type, namespace_key) = {
-        let socket = sock.lock();
-        (socket.family, socket.sock_type, socket.net_ns)
-    };
     for _ in 0..EPHEMERAL_PORT_COUNT {
         let port = next_ephemeral_port();
         let candidate = match &addr {
@@ -633,26 +679,16 @@ fn resolve_inet_ephemeral_bind(sock: &SocketRef, addr: SockAddr) -> Result<SockA
             SockAddr::Inet6 { addr, .. } => SockAddr::Inet6 { addr: *addr, port },
             _ => unreachable!(),
         };
-        let conflict = {
-            let mut sockets = INET_SOCKETS.lock();
-            let live = sockets.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
-            sockets.retain(|entry| entry.strong_count() != 0);
-            drop(sockets);
-            live.into_iter().any(|entry| {
-                if Arc::ptr_eq(&entry, sock) {
-                    return false;
-                }
-                let entry = entry.lock();
-                entry.net_ns == namespace_key
-                    && entry.family == family
-                    && entry.sock_type == sock_type
-                    && entry
-                        .local
-                        .as_ref()
-                        .is_some_and(|local| inet_bind_addresses_conflict(&candidate, local))
-            })
-        };
-        if !conflict {
+        if !bound_inet_addr_conflicts(
+            bound,
+            sock,
+            &candidate,
+            reuseaddr,
+            family,
+            sock_type,
+            protocol,
+            namespace_key,
+        ) {
             return Ok(candidate);
         }
     }
@@ -808,12 +844,12 @@ fn validate_unix_socket(sock_type: u16, protocol: u16) -> Result<(), i32> {
 }
 
 pub fn bind(sock: &SocketRef, addr: SockAddr) -> Result<(), i32> {
-    let addr = resolve_inet_ephemeral_bind(sock, netlink_autobind_addr(sock, addr))?;
+    let addr = netlink_autobind_addr(sock, addr);
     if audit_netlink_readlog_addr_requires_cap(sock, &addr) && !capable(CAP_AUDIT_READ) {
         return Err(EPERM);
     }
 
-    let (reuseaddr, family, sock_type, protocol, namespace_key, bound_ifindex) = {
+    let (reuseaddr, family, sock_type, protocol, namespace_key, bound_ifindex, inet_already_bound) = {
         let socket = sock.lock();
         (
             socket.reuseaddr,
@@ -822,8 +858,12 @@ pub fn bind(sock: &SocketRef, addr: SockAddr) -> Result<(), i32> {
             socket.protocol,
             socket.net_ns,
             socket.bound_ifindex,
+            matches!(socket.family, AF_INET | AF_INET6) && socket.local.is_some(),
         )
     };
+    if inet_already_bound {
+        return Err(EINVAL);
+    }
     if let SockAddr::Inet { addr, .. } = &addr
         && !inet_addr_is_bindable(*addr, bound_ifindex)
     {
@@ -831,7 +871,30 @@ pub fn bind(sock: &SocketRef, addr: SockAddr) -> Result<(), i32> {
     }
     {
         let mut bound = BOUND.lock();
-        if let Some(existing) = bound.get(&addr) {
+        let addr = resolve_inet_ephemeral_bind(
+            &bound,
+            sock,
+            addr,
+            reuseaddr,
+            family,
+            sock_type,
+            protocol,
+            namespace_key,
+        )?;
+        if matches!(addr, SockAddr::Inet { .. } | SockAddr::Inet6 { .. }) {
+            if bound_inet_addr_conflicts(
+                &bound,
+                sock,
+                &addr,
+                reuseaddr,
+                family,
+                sock_type,
+                protocol,
+                namespace_key,
+            ) {
+                return Err(EADDRINUSE);
+            }
+        } else if let Some(existing) = bound.get(&addr) {
             for entry in existing.iter().filter(|entry| !Arc::ptr_eq(entry, sock)) {
                 let entry = entry.lock();
                 if namespace_scoped_family(family) && entry.net_ns != namespace_key {
@@ -1990,6 +2053,7 @@ const IFA_F_PERMANENT: u32 = 0x80;
 const IFA_F_NOPREFIXROUTE: u32 = 0x200;
 const IFA_F_DEPRECATED: u32 = 0x20;
 const IFAPROT_KERNEL_LO: u8 = 1;
+const RTPROT_UNSPEC: u8 = 0;
 const RTPROT_KERNEL: u8 = 2;
 const RTPROT_BOOT: u8 = 3;
 const RT_SCOPE_UNIVERSE: u8 = 0;
@@ -1999,6 +2063,7 @@ const RTN_UNICAST: u8 = 1;
 const RTN_LOCAL: u8 = 2;
 const RTN_BROADCAST: u8 = 3;
 const RTN_MULTICAST: u8 = 5;
+const RTM_F_CLONED: u32 = 0x200;
 const RT_TABLE_UNSPEC: u8 = 0;
 const RT_TABLE_MAIN: u8 = 254;
 const RT_TABLE_LOCAL: u8 = 255;
@@ -3187,22 +3252,13 @@ fn queue_rtnl_getroute_lookup(sock: &SocketRef, bytes: &[u8], req: &NetlinkHeade
         return;
     }
     if bytes[16] != AF_INET as u8 {
-        queue_netlink_error(sock, bytes, -(EAFNOSUPPORT as i32));
+        queue_netlink_error(sock, bytes, -(EOPNOTSUPP as i32));
         return;
     }
-    let Some(dst) = rtattr_ipv4(&bytes[..req.len], NLMSG_HDRLEN + 12, RTA_DST) else {
-        queue_netlink_error(sock, bytes, -(EINVAL as i32));
-        return;
-    };
-    let requested_table = if bytes[20] == RT_TABLE_UNSPEC {
-        RT_TABLE_MAIN
-    } else {
-        bytes[20]
-    };
+    let dst = rtattr_ipv4(&bytes[..req.len], NLMSG_HDRLEN + 12, RTA_DST).unwrap_or(0);
     let requested_oif = rtattr_u32(&bytes[..req.len], NLMSG_HDRLEN + 12, RTA_OIF);
     let route = current_route4s()
         .into_iter()
-        .filter(|route| route.table == requested_table)
         .filter(|route| requested_oif.is_none_or(|oif| route.oif == oif))
         .filter(|route| {
             route.dst_len <= 32
@@ -3214,9 +3270,21 @@ fn queue_rtnl_getroute_lookup(sock: &SocketRef, bytes: &[u8], req: &NetlinkHeade
         queue_netlink_error(sock, bytes, -(ENETUNREACH as i32));
         return;
     };
+    // inet_rtm_getroute() reports the resolved destination rather than
+    // replaying the selected FIB entry. In particular, a default-route match
+    // is returned as a cloned /32 route for the queried address.
+    let reply = Route4Record {
+        dst,
+        dst_len: 32,
+        protocol: RTPROT_UNSPEC,
+        scope: RT_SCOPE_UNIVERSE,
+        flags: RTM_F_CLONED,
+        priority: None,
+        ..route
+    };
     enqueue_netlink_packet(
         sock,
-        build_rtnl_route_message(RTM_NEWROUTE, req.seq, netlink_reply_portid(sock), 0, &route),
+        build_rtnl_route_message(RTM_NEWROUTE, req.seq, netlink_reply_portid(sock), 0, &reply),
     );
     if req.flags & NLM_F_ACK != 0 {
         queue_netlink_error(sock, bytes, 0);
