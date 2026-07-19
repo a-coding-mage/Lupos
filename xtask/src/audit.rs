@@ -3022,6 +3022,9 @@ fn audit_resolved_vendor_driver_modules_staged(
             lupos_value: "<missing-staged-module>".to_owned(),
             linux_value: "m".to_owned(),
             kind: ConfigParityKind::Divergence,
+            vendor_path: String::new(),
+            expected_value: "m".to_owned(),
+            allowlist_reason: String::new(),
         });
     }
     report

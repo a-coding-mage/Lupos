@@ -2199,55 +2199,6 @@ pub unsafe extern "C" fn __x64_sys_sched_getattr(regs: *mut PtRegs) -> i64 {
     0
 }
 
-#[cfg(not(test))]
-static FUTEX_UNEXPECTED_TRACE_COUNT: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-
-fn trace_unexpected_futex_result(regs: &PtRegs, result: i64) {
-    const EAGAIN: i64 = 11;
-    const ETIMEDOUT: i64 = 110;
-    if result >= 0 || result == -EAGAIN {
-        return;
-    }
-    let cmd = regs.arg1() as u32 & crate::kernel::futex::FUTEX_CMD_MASK;
-    if result == -ETIMEDOUT
-        && regs.arg3() != 0
-        && matches!(
-            cmd,
-            crate::kernel::futex::FUTEX_WAIT | crate::kernel::futex::FUTEX_WAIT_BITSET
-        )
-    {
-        return;
-    }
-    #[cfg(not(test))]
-    {
-        let task = unsafe { crate::kernel::sched::get_current() };
-        if task.is_null() || !unsafe { (*task).comm.starts_with(b"firefox") } {
-            return;
-        }
-        let count = FUTEX_UNEXPECTED_TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-        if count >= 128 {
-            return;
-        }
-        let pid = if task.is_null() {
-            -1
-        } else {
-            unsafe { (*task).pid }
-        };
-        crate::linux_driver_abi::tty::serial_println!(
-            "trace-futex-unexpected pid={} op={:#x} uaddr={:#x} val={} timeout={:#x} uaddr2={:#x} val3={:#x} ret={}",
-            pid,
-            regs.arg1(),
-            regs.arg0(),
-            regs.arg2(),
-            regs.arg3(),
-            regs.arg4(),
-            regs.arg5(),
-            result
-        );
-    }
-}
-
 pub unsafe extern "C" fn __x64_sys_futex(regs: *mut PtRegs) -> i64 {
     let r = unsafe { &*regs };
     let op = r.arg1() as u32;
@@ -2311,7 +2262,6 @@ pub unsafe extern "C" fn __x64_sys_futex(regs: *mut PtRegs) -> i64 {
             }
         }
         let result = legacy_timed_futex_restart_result(result, deadline.is_some());
-        trace_unexpected_futex_result(r, result);
         return result;
     }
     let timeout_clockid = if cmd == crate::kernel::futex::FUTEX_LOCK_PI {
@@ -2345,7 +2295,6 @@ pub unsafe extern "C" fn __x64_sys_futex(regs: *mut PtRegs) -> i64 {
             r.arg5() as u32,
         )
     };
-    trace_unexpected_futex_result(r, result);
     result
 }
 
