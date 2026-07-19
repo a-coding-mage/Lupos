@@ -22247,6 +22247,10 @@ fn run_qemu_iso_with_serial_expect(
                         hmp_cursor = raw_match_end.unwrap_or(log.len());
                     }
                     hmp_index += 1;
+                    // HMP accepts one client at a time. Reconnect for each
+                    // scripted action so the socket remains available for
+                    // inspecting a guest that wedges between markers.
+                    hmp_monitor = None;
                 }
             }
             let visible = log.get(cursor..).unwrap_or(&log);

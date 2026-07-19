@@ -456,13 +456,21 @@ fn queue_napi(napi: *mut u8) {
     }
     let address = napi as usize;
     let queued = {
+        // __napi_schedule() runs from hard IRQ context, while NET_RX may
+        // manipulate the same list from task/softirq context.  Linux protects
+        // the per-CPU poll list with IRQs disabled; do the same around this
+        // host-side mutex so an interrupt cannot self-deadlock on CPU 0.
+        let irq_flags = crate::kernel::locking::local_irq_save();
         let mut pending = SCHEDULED_NAPI.lock();
-        if pending.contains(&address) {
+        let queued = if pending.contains(&address) {
             false
         } else {
             pending.push(address);
             true
-        }
+        };
+        drop(pending);
+        crate::kernel::locking::local_irq_restore(irq_flags);
+        queued
     };
     #[cfg(not(test))]
     if queued {
@@ -480,8 +488,12 @@ fn net_rx_action() {
 /// by the existing vendor-driver event pump.
 fn poll_scheduled_napi() -> usize {
     let batch = {
+        let irq_flags = crate::kernel::locking::local_irq_save();
         let mut pending = SCHEDULED_NAPI.lock();
-        core::mem::take(&mut *pending)
+        let batch = core::mem::take(&mut *pending);
+        drop(pending);
+        crate::kernel::locking::local_irq_restore(irq_flags);
+        batch
     };
     let mut handled = 0usize;
     for address in batch.into_iter().take(256) {
