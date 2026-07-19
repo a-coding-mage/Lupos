@@ -10,7 +10,8 @@
 //!
 //! Remaining deviations from `evdev.c` are the pre-existing device-wide event
 //! queue (rather than one `evdev_client` ring per open file), missing revoke /
-//! disconnect state, async notification and the evdev write path.
+//! disconnect state and async notification. The write path accepts supported
+//! input events, including the keyboard LED controls X.Org relies on.
 //!
 //! References:
 //!   - `vendor/linux/drivers/input/evdev.c`               — the upstream handler
@@ -27,7 +28,7 @@ use core::sync::atomic::Ordering;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use super::{EV_ABS, EV_KEY, EV_REL, EV_SYN, InputDev, InputEvent};
+use super::{EV_ABS, EV_KEY, EV_LED, EV_REL, EV_SYN, InputDev, InputEvent};
 use crate::fs::ops::{FileOps, IoctlFn, PollFn};
 use crate::fs::types::FileRef;
 use crate::include::uapi::errno::{EFAULT, EINVAL, ENODEV, ENOTTY};
@@ -217,6 +218,39 @@ fn evdev_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i
     }
 }
 
+fn evdev_write(file: &FileRef, buf: &[u8], _pos: &mut u64) -> Result<usize, i32> {
+    let stride = size_of::<InputEvent>();
+    if !buf.is_empty() && buf.len() < stride {
+        return Err(EINVAL);
+    }
+    let count = core::cmp::min(buf.len(), 4096);
+    let dev = with_slot(file, |slot| Ok(slot.dev.clone()))?;
+    let is_keyboard = slot_for_path(&file.dentry.name) == Some(0);
+    let mut consumed = 0usize;
+    while consumed + stride <= count {
+        let event =
+            unsafe { core::ptr::read_unaligned(buf.as_ptr().add(consumed).cast::<InputEvent>()) };
+        consumed += stride;
+
+        let supported = if is_keyboard {
+            match event.event_type {
+                EV_SYN | EV_KEY => true,
+                EV_LED => crate::linux_driver_abi::input::i8042::set_keyboard_led(
+                    event.code,
+                    event.value != 0,
+                ),
+                _ => false,
+            }
+        } else {
+            matches!(event.event_type, EV_SYN | EV_KEY | EV_REL)
+        };
+        if supported {
+            dev.input_event(event.event_type, event.code, event.value);
+        }
+    }
+    Ok(consumed)
+}
+
 fn finish_evdev_wait(dev: &InputDev, task: *mut TaskStruct) {
     if !task.is_null() {
         unsafe {
@@ -286,9 +320,9 @@ fn evdev_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
             0x07 | 0x08 => evdev_get_string(arg, size, b""),
             // EVIOCGPROP(len) — input properties bitmap. We expose none.
             0x09 => evdev_get_zeroed(arg, size),
-            // EVIOCGKEY / EVIOCGLED / EVIOCGSW — current key/LED/switch state.
-            // All released; report an all-zero bitmap.
-            0x18 | 0x19 | 0x1b => evdev_get_zeroed(arg, size),
+            // EVIOCGKEY / EVIOCGLED / EVIOCGSW — current state bitmaps.
+            0x18 | 0x1b => evdev_get_zeroed(arg, size),
+            0x19 => evdev_get_led(file, arg, size),
             // EVIOCGBIT(ev, len) — capability bitmap for event type `ev`
             // (nr == 0x20 + ev; 0x20 == the supported-event-types bitmap).
             0x20..=0x3f => evdev_get_bit(file, arg, size, (nr - 0x20) as u16),
@@ -336,7 +370,7 @@ fn evdev_get_bit(file: &FileRef, arg: u64, size: usize, ev_type: u16) -> Result<
         return Err(EFAULT);
     }
     // Capabilities are per device: `/dev/input/event0` (minor 0) is the AT
-    // keyboard (EV_SYN | EV_KEY only — advertising EV_REL/EV_ABS would make
+    // keyboard (EV_SYN | EV_KEY | EV_LED — advertising EV_REL/EV_ABS would make
     // X.Org's evdev driver misclassify it as a pointer); other minors are the
     // PS/2 mouse (EV_SYN | EV_KEY | EV_REL — only the BTN_* buttons and the
     // X/Y/wheel relative axes).
@@ -347,10 +381,13 @@ fn evdev_get_bit(file: &FileRef, arg: u64, size: usize, ev_type: u16) -> Result<
     match ev_type {
         0 => {
             // Bitmap of supported event types. Bit 0 = EV_SYN, 1 = EV_KEY, …
-            buf[0] |= 1 << EV_SYN;
-            buf[0] |= 1 << EV_KEY;
+            set_code_bit(&mut buf, n, EV_SYN);
+            set_code_bit(&mut buf, n, EV_KEY);
+            if is_keyboard {
+                set_code_bit(&mut buf, n, EV_LED);
+            }
             if !is_keyboard {
-                buf[0] |= 1 << EV_REL;
+                set_code_bit(&mut buf, n, EV_REL);
             }
         }
         EV_KEY if is_keyboard => {
@@ -376,9 +413,40 @@ fn evdev_get_bit(file: &FileRef, arg: u64, size: usize, ev_type: u16) -> Result<
             set_code_bit(&mut buf, n, 0x01);
             set_code_bit(&mut buf, n, 0x08);
         }
+        EV_LED if is_keyboard => {
+            set_code_bit(&mut buf, n, crate::linux_driver_abi::input::i8042::LED_NUML);
+            set_code_bit(
+                &mut buf,
+                n,
+                crate::linux_driver_abi::input::i8042::LED_CAPSL,
+            );
+            set_code_bit(
+                &mut buf,
+                n,
+                crate::linux_driver_abi::input::i8042::LED_SCROLLL,
+            );
+        }
         _ => {
             // Unsupported event type for this device — all-zero bitmap.
         }
+    }
+    let not_copied =
+        unsafe { crate::arch::x86::kernel::uaccess::copy_to_user(arg as *mut u8, buf.as_ptr(), n) };
+    if not_copied == 0 {
+        Ok(n as i64)
+    } else {
+        Err(EFAULT)
+    }
+}
+
+fn evdev_get_led(file: &FileRef, arg: u64, size: usize) -> Result<i64, i32> {
+    if arg == 0 || size == 0 {
+        return Err(EFAULT);
+    }
+    let mut buf = [0u8; 128];
+    let n = core::cmp::min(size, buf.len());
+    if slot_for_path(&file.dentry.name) == Some(0) {
+        buf[0] = crate::linux_driver_abi::input::i8042::keyboard_leds();
     }
     let not_copied =
         unsafe { crate::arch::x86::kernel::uaccess::copy_to_user(arg as *mut u8, buf.as_ptr(), n) };
@@ -440,7 +508,7 @@ fn evdev_get_abs(arg: u64, size: usize) -> Result<i64, i32> {
 pub const EVDEV_FILE_OPS: FileOps = FileOps {
     name: "evdev",
     read: Some(evdev_read),
-    write: None,
+    write: Some(evdev_write),
     llseek: None,
     fsync: None,
     poll: Some(evdev_poll as PollFn),
@@ -527,5 +595,68 @@ mod tests {
         let (_dev, file) = setup_dev(103, 0xE103);
         let r = evdev_ioctl(&file, 0xDEAD_BEEF, 0);
         assert_eq!(r, Err(ENOTTY));
+    }
+
+    #[test]
+    fn keyboard_evdev_write_updates_and_reports_num_lock_led() {
+        let _guard = crate::linux_driver_abi::input::i8042::I8042_TEST_LOCK.lock();
+        let (dev, file) = setup_dev(0, 0xE104);
+        let _ = crate::linux_driver_abi::input::i8042::set_keyboard_led(
+            crate::linux_driver_abi::input::i8042::LED_NUML,
+            false,
+        );
+        let events = [
+            InputEvent {
+                sec: 0,
+                usec: 0,
+                event_type: EV_LED,
+                code: crate::linux_driver_abi::input::i8042::LED_NUML,
+                value: 1,
+            },
+            InputEvent {
+                sec: 0,
+                usec: 0,
+                event_type: EV_SYN,
+                code: 0,
+                value: 0,
+            },
+        ];
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                events.as_ptr().cast::<u8>(),
+                events.len() * size_of::<InputEvent>(),
+            )
+        };
+        let mut pos = 0;
+        assert_eq!(
+            evdev_write(&file, bytes, &mut pos),
+            Ok(events.len() * size_of::<InputEvent>())
+        );
+        assert_ne!(
+            crate::linux_driver_abi::input::i8042::keyboard_leds()
+                & (1 << crate::linux_driver_abi::input::i8042::LED_NUML),
+            0
+        );
+        assert!(dev.drain_events().iter().any(|event| {
+            event.event_type == EV_LED
+                && event.code == crate::linux_driver_abi::input::i8042::LED_NUML
+                && event.value == 1
+        }));
+
+        let mut state = [0u8; 1];
+        let cmd = ior(EVDEV_IOC_TYPE, 0x19, state.len() as u32);
+        assert_eq!(evdev_ioctl(&file, cmd, state.as_mut_ptr() as u64), Ok(1));
+        assert_ne!(
+            state[0] & (1 << crate::linux_driver_abi::input::i8042::LED_NUML),
+            0
+        );
+
+        let mut event_types = [0u8; 4];
+        let cmd = ior(EVDEV_IOC_TYPE, 0x20, event_types.len() as u32);
+        assert_eq!(
+            evdev_ioctl(&file, cmd, event_types.as_mut_ptr() as u64),
+            Ok(event_types.len() as i64)
+        );
+        assert_ne!(event_types[(EV_LED / 8) as usize] & (1 << (EV_LED % 8)), 0);
     }
 }

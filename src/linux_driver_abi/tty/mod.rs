@@ -593,6 +593,15 @@ pub fn kd_text_console_owned() -> bool {
     COMPAT_KD_MODE.load(Ordering::Acquire) == KD_TEXT
 }
 
+/// Whether the active VT should receive translated/cooked PS/2 input.
+///
+/// Xorg owns its VT in `KD_GRAPHICS` and normally selects `K_RAW`; in either
+/// case the physical keyboard must keep feeding evdev without also injecting
+/// translated text into a console reader.
+pub fn compat_cooked_keyboard_input_enabled() -> bool {
+    kd_text_console_owned() && matches!(COMPAT_KB_MODE.load(Ordering::Acquire), K_XLATE | K_UNICODE)
+}
+
 /// `struct vt_mode` — `include/uapi/linux/vt.h:22`.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -1223,6 +1232,23 @@ mod tests {
             tty_ioctl_compat(KDSKBMODE, 99),
             Err(crate::include::uapi::errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn graphics_and_raw_keyboard_modes_suppress_cooked_console_input() {
+        let _guard = TTY_TEST_LOCK.lock();
+        reset_compat_tty_state();
+        assert!(compat_cooked_keyboard_input_enabled());
+
+        assert_eq!(tty_ioctl_compat(KDSKBMODE, K_RAW as u64), Ok(0));
+        assert!(!compat_cooked_keyboard_input_enabled());
+        assert_eq!(tty_ioctl_compat(KDSKBMODE, K_XLATE as u64), Ok(0));
+        assert!(compat_cooked_keyboard_input_enabled());
+
+        assert_eq!(tty_ioctl_compat(KDSETMODE, KD_GRAPHICS as u64), Ok(0));
+        assert!(!compat_cooked_keyboard_input_enabled());
+        assert_eq!(tty_ioctl_compat(KDSETMODE, KD_TEXT as u64), Ok(0));
+        assert!(compat_cooked_keyboard_input_enabled());
     }
 
     #[test]

@@ -116,6 +116,29 @@ pub fn current_fs() -> *mut FsStruct {
     unsafe { ensure_task_fs(task) }
 }
 
+/// Return `current->fs->umask`.
+///
+/// Linux keeps the creation mask in the (optionally `CLONE_FS`-shared)
+/// `fs_struct`, not in a system-wide variable.  The early-boot fallback is the
+/// same 022 used by `init_fs`.
+pub fn current_umask() -> u32 {
+    let fs = current_fs();
+    if fs.is_null() {
+        0o022
+    } else {
+        (unsafe { (*fs).umask.load(Ordering::Acquire) }) & 0o777
+    }
+}
+
+/// Atomically replace `current->fs->umask`, returning the previous mask.
+pub fn set_current_umask(mask: u32) -> u32 {
+    let fs = current_fs();
+    if fs.is_null() {
+        return 0o022;
+    }
+    unsafe { (*fs).umask.swap(mask & 0o777, Ordering::AcqRel) }
+}
+
 pub fn current_root_and_pwd_paths() -> Option<(VfsPath, VfsPath)> {
     let fs = current_fs();
     if fs.is_null() {
@@ -528,6 +551,13 @@ mod tests {
             assert_eq!((*private).users.load(Ordering::Relaxed), 1);
             assert_eq!((*fs).users.load(Ordering::Relaxed), 2);
 
+            (*fs).umask.store(0o077, Ordering::Release);
+            assert_eq!(
+                (*task_fs(&mut *shared_child)).umask.load(Ordering::Acquire),
+                0o077
+            );
+            assert_eq!((*private).umask.load(Ordering::Acquire), 0o022);
+
             exit_fs(&mut *shared_child);
             exit_fs(&mut *private_child);
             exit_fs(&mut *parent);
@@ -553,6 +583,7 @@ mod tests {
         let previous = unsafe { sched::get_current() };
         let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         let fs = init_fs();
+        unsafe { (*fs).umask.store(0o027, Ordering::Release) };
         get_fs_struct(fs);
         unsafe {
             set_task_fs(&mut *task, fs);
@@ -562,6 +593,9 @@ mod tests {
             assert_ne!(new, fs);
             assert_eq!((*new).users.load(Ordering::Relaxed), 1);
             assert_eq!((*fs).users.load(Ordering::Relaxed), 1);
+            assert_eq!((*new).umask.load(Ordering::Acquire), 0o027);
+            (*new).umask.store(0o077, Ordering::Release);
+            assert_eq!((*fs).umask.load(Ordering::Acquire), 0o027);
             exit_fs(&mut *task);
             put_fs_struct(fs);
             sched::set_current(previous);

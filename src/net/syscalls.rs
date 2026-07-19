@@ -1543,7 +1543,7 @@ fn ensure_unix_socket_node(path: &str) -> Result<(), i32> {
     let inode = Inode::new(
         ino,
         InodeKind::Socket,
-        0o777,
+        0o777 & !crate::fs::fs_struct::current_umask(),
         &NOOP_INODE_OPS,
         &NOOP_FILE_OPS,
         InodePrivate::None,
@@ -6975,14 +6975,15 @@ mod tests {
 
             let fd = sys_socket(AF_UNIX as i32, socket::SOCK_STREAM as i32, 0);
             assert!(fd >= 0);
+            assert_eq!(crate::kernel::syscalls::sys_umask(0o077), 0o022);
             let (addr, addrlen) = unix_sockaddr("/run/systemd/journal/X0");
             assert_eq!(sys_bind(fd as i32, addr.as_ptr(), addrlen), 0);
-            assert_eq!(
-                negative.inode().expect("socket inode").kind,
-                InodeKind::Socket
-            );
+            let inode = negative.inode().expect("socket inode");
+            assert_eq!(inode.kind, InodeKind::Socket);
+            assert_eq!(inode.mode.load(Ordering::Acquire) & 0o777, 0o700);
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
+            crate::fs::fs_struct::exit_fs(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
     }

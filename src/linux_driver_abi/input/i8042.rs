@@ -9,7 +9,7 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -38,6 +38,12 @@ const CONFIG_DISABLE_KEYBOARD: u8 = 0x10;
 const CONFIG_DISABLE_MOUSE: u8 = 0x20;
 const CONFIG_TRANSLATION: u8 = 0x40;
 const KEYBOARD_ENABLE_SCANNING: u8 = 0xF4;
+const KEYBOARD_SET_LEDS: u8 = 0xED;
+const KEYBOARD_ACK: u8 = 0xFA;
+const KEYBOARD_RESEND: u8 = 0xFE;
+pub const LED_NUML: u16 = 0;
+pub const LED_CAPSL: u16 = 1;
+pub const LED_SCROLLL: u16 = 2;
 /// PS/2 mouse commands (`drivers/input/mouse/psmouse-base.c`).
 const MOUSE_SET_DEFAULTS: u8 = 0xF6;
 const MOUSE_ENABLE_REPORTING: u8 = 0xF4;
@@ -52,6 +58,9 @@ static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 static ALT_DOWN: AtomicBool = AtomicBool::new(false);
 static EXTENDED: AtomicBool = AtomicBool::new(false);
+/// Linux evdev LED bitmap: bit 0 Num Lock, bit 1 Caps Lock, bit 2 Scroll Lock.
+/// [`evdev_leds_to_ps2`] translates it to the PS/2 wire ordering.
+static KEYBOARD_LEDS: AtomicU8 = AtomicU8::new(0);
 
 /// Separate extended-prefix latch for the evdev bridge.  The console decoder
 /// consumes its own [`EXTENDED`] latch inside `decode_scancode_input`, so the
@@ -64,6 +73,9 @@ const EVDEV_KEYBOARD_ID: u32 = 0xE001;
 
 lazy_static! {
     static ref BYTE_QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
+    /// Scancodes observed while synchronously waiting for a keyboard-command
+    /// ACK. They must re-enter the normal decoder instead of being discarded.
+    static ref PENDING_KEYBOARD_SCANCODES: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
     static ref MOUSE_STATE: Mutex<MousePacket> = Mutex::new(MousePacket::new());
 }
 
@@ -112,7 +124,14 @@ pub enum ConsoleInput {
 
 pub fn init() {
     BYTE_QUEUE.lock().clear();
+    PENDING_KEYBOARD_SCANCODES.lock().clear();
     *MOUSE_STATE.lock() = MousePacket::new();
+    SHIFT_DOWN.store(false, Ordering::Release);
+    CTRL_DOWN.store(false, Ordering::Release);
+    ALT_DOWN.store(false, Ordering::Release);
+    EXTENDED.store(false, Ordering::Release);
+    EVDEV_EXTENDED.store(false, Ordering::Release);
+    KEYBOARD_LEDS.store(0, Ordering::Release);
     MOUSE_PRESENT.store(false, Ordering::Release);
     drain_pending();
 
@@ -203,6 +222,96 @@ fn write_data(data: u8) -> bool {
     true
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeyboardResponse {
+    Ack,
+    Resend,
+}
+
+/// Wait for a response to a command sent to the keyboard. Mouse packets are
+/// decoded in place and any interleaved keyboard scancodes are retained for
+/// the ordinary input pump.
+#[cfg(not(test))]
+fn wait_keyboard_response() -> Option<KeyboardResponse> {
+    for _ in 0..100_000 {
+        let status = unsafe { crate::arch::x86::include::asm::io::inb(STATUS_PORT) };
+        if status & STATUS_OUTPUT_FULL == 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        let byte = unsafe { crate::arch::x86::include::asm::io::inb(DATA_PORT) };
+        if status & STATUS_AUX_DATA != 0 {
+            feed_mouse_byte(byte);
+            continue;
+        }
+        match byte {
+            KEYBOARD_ACK => return Some(KeyboardResponse::Ack),
+            KEYBOARD_RESEND => return Some(KeyboardResponse::Resend),
+            scancode => PENDING_KEYBOARD_SCANCODES.lock().push_back(scancode),
+        }
+    }
+    None
+}
+
+#[cfg(not(test))]
+fn write_keyboard_byte_with_ack(byte: u8) -> bool {
+    for _ in 0..2 {
+        if !write_data(byte) {
+            return false;
+        }
+        match wait_keyboard_response() {
+            Some(KeyboardResponse::Ack) => return true,
+            Some(KeyboardResponse::Resend) => continue,
+            None => return false,
+        }
+    }
+    false
+}
+
+#[cfg(not(test))]
+fn program_keyboard_leds(leds: u8) {
+    if write_keyboard_byte_with_ack(KEYBOARD_SET_LEDS) {
+        let _ = write_keyboard_byte_with_ack(evdev_leds_to_ps2(leds));
+    }
+}
+
+#[cfg(test)]
+fn program_keyboard_leds(_leds: u8) {}
+
+fn evdev_leds_to_ps2(leds: u8) -> u8 {
+    ((leds & (1 << LED_NUML)) << 1)
+        | ((leds & (1 << LED_CAPSL)) << 1)
+        | ((leds & (1 << LED_SCROLLL)) >> 2)
+}
+
+/// Current evdev-compatible keyboard LED bitmap.
+pub fn keyboard_leds() -> u8 {
+    KEYBOARD_LEDS.load(Ordering::Acquire)
+}
+
+/// Apply one Linux `EV_LED` value and forward the complete bitmap to the PS/2
+/// keyboard. Returns false for an unsupported LED code.
+pub fn set_keyboard_led(code: u16, enabled: bool) -> bool {
+    if !matches!(code, LED_NUML | LED_CAPSL | LED_SCROLLL) {
+        return false;
+    }
+    let mask = 1u8 << code;
+    let previous = if enabled {
+        KEYBOARD_LEDS.fetch_or(mask, Ordering::AcqRel)
+    } else {
+        KEYBOARD_LEDS.fetch_and(!mask, Ordering::AcqRel)
+    };
+    let next = if enabled {
+        previous | mask
+    } else {
+        previous & !mask
+    };
+    if next != previous {
+        program_keyboard_leds(next);
+    }
+    true
+}
+
 fn read_data_timeout() -> Option<u8> {
     for _ in 0..100_000 {
         if controller_has_data() {
@@ -249,8 +358,12 @@ pub fn try_read_byte() -> Option<u8> {
 }
 
 pub fn try_read_input() -> Option<ConsoleInput> {
-    if let Some(byte) = BYTE_QUEUE.lock().pop_front() {
-        return Some(ConsoleInput::Byte(byte));
+    if crate::linux_driver_abi::tty::compat_cooked_keyboard_input_enabled() {
+        if let Some(byte) = BYTE_QUEUE.lock().pop_front() {
+            return Some(ConsoleInput::Byte(byte));
+        }
+    } else {
+        BYTE_QUEUE.lock().clear();
     }
     // Port 0x60 is shared by the keyboard and the aux (mouse) channel; the
     // status byte's AUX bit says which produced the pending byte.  This polled
@@ -259,12 +372,20 @@ pub fn try_read_input() -> Option<ConsoleInput> {
     // bare modifiers must not stop the drain, or a keystroke queued behind a
     // mouse packet would stall.
     loop {
-        let status = unsafe { crate::arch::x86::include::asm::io::inb(STATUS_PORT) };
-        if status & STATUS_OUTPUT_FULL == 0 {
-            return None;
-        }
-        let byte = unsafe { crate::arch::x86::include::asm::io::inb(DATA_PORT) };
-        if status & STATUS_AUX_DATA != 0 {
+        let pending = PENDING_KEYBOARD_SCANCODES.lock().pop_front();
+        let (byte, aux) = if let Some(byte) = pending {
+            (byte, false)
+        } else {
+            let status = unsafe { crate::arch::x86::include::asm::io::inb(STATUS_PORT) };
+            if status & STATUS_OUTPUT_FULL == 0 {
+                return None;
+            }
+            (
+                unsafe { crate::arch::x86::include::asm::io::inb(DATA_PORT) },
+                status & STATUS_AUX_DATA != 0,
+            )
+        };
+        if aux {
             feed_mouse_byte(byte);
             continue;
         }
@@ -272,7 +393,10 @@ pub fn try_read_input() -> Option<ConsoleInput> {
         // so X.Org's evdev driver receives keystrokes, while the cooked ASCII
         // path keeps feeding the console/tty.
         feed_evdev_scancode(byte);
-        if let Some(input) = enqueue_decoded(byte) {
+        if let Some(input) = enqueue_decoded_if_cooked(
+            byte,
+            crate::linux_driver_abi::tty::compat_cooked_keyboard_input_enabled(),
+        ) {
             return Some(input);
         }
     }
@@ -436,6 +560,14 @@ fn enqueue_decoded(scancode: u8) -> Option<ConsoleInput> {
     }
 }
 
+fn enqueue_decoded_if_cooked(scancode: u8, cooked: bool) -> Option<ConsoleInput> {
+    if cooked {
+        enqueue_decoded(scancode)
+    } else {
+        None
+    }
+}
+
 pub fn decode_scancode(scancode: u8) -> Option<u8> {
     match decode_scancode_input(scancode) {
         Some(DecodedInput::Byte(byte)) => Some(byte),
@@ -455,6 +587,11 @@ pub fn decode_scancode_input(scancode: u8) -> Option<DecodedInput> {
     }
 
     match scancode {
+        0x45 => {
+            let enabled = keyboard_leds() & (1 << LED_NUML) == 0;
+            let _ = set_keyboard_led(LED_NUML, enabled);
+            None
+        }
         0x2A | 0x36 => {
             SHIFT_DOWN.store(true, Ordering::Release);
             None
@@ -480,6 +617,13 @@ pub fn decode_scancode_input(scancode: u8) -> Option<DecodedInput> {
             None
         }
         code if (code & 0x80) != 0 => None,
+        0x37 => Some(DecodedInput::Byte(b'*')),
+        0x4A => Some(DecodedInput::Byte(b'-')),
+        0x4E => Some(DecodedInput::Byte(b'+')),
+        code @ (0x47..=0x49 | 0x4B..=0x4D | 0x4F..=0x53) => Some(decode_keypad_scancode(
+            code,
+            keyboard_leds() & (1 << LED_NUML) != 0,
+        )),
         code => translate_scancode(
             code,
             SHIFT_DOWN.load(Ordering::Acquire),
@@ -487,6 +631,40 @@ pub fn decode_scancode_input(scancode: u8) -> Option<DecodedInput> {
         )
         .map(DecodedInput::Byte),
     }
+}
+
+fn decode_keypad_scancode(scancode: u8, num_lock: bool) -> DecodedInput {
+    if num_lock {
+        return DecodedInput::Byte(match scancode {
+            0x47 => b'7',
+            0x48 => b'8',
+            0x49 => b'9',
+            0x4B => b'4',
+            0x4C => b'5',
+            0x4D => b'6',
+            0x4F => b'1',
+            0x50 => b'2',
+            0x51 => b'3',
+            0x52 => b'0',
+            0x53 => b'.',
+            _ => unreachable!(),
+        });
+    }
+
+    DecodedInput::Sequence(match scancode {
+        0x47 => b"\x1b[1~",
+        0x48 => b"\x1b[A",
+        0x49 => b"\x1b[5~",
+        0x4B => b"\x1b[D",
+        0x4C => b"\x1b[G",
+        0x4D => b"\x1b[C",
+        0x4F => b"\x1b[4~",
+        0x50 => b"\x1b[B",
+        0x51 => b"\x1b[6~",
+        0x52 => b"\x1b[2~",
+        0x53 => b"\x1b[3~",
+        _ => unreachable!(),
+    })
 }
 
 fn decode_extended_scancode(scancode: u8) -> Option<DecodedInput> {
@@ -508,12 +686,17 @@ fn decode_extended_scancode(scancode: u8) -> Option<DecodedInput> {
             None
         }
         code if (code & 0x80) != 0 => None,
+        0x1C => Some(DecodedInput::Byte(b'\n')),
+        0x35 => Some(DecodedInput::Byte(b'/')),
         0x47 => Some(DecodedInput::Sequence(b"\x1b[H")),
         0x48 => Some(DecodedInput::Sequence(b"\x1b[A")),
+        0x49 => Some(DecodedInput::Sequence(b"\x1b[5~")),
         0x4B => Some(DecodedInput::Sequence(b"\x1b[D")),
         0x4D => Some(DecodedInput::Sequence(b"\x1b[C")),
         0x4F => Some(DecodedInput::Sequence(b"\x1b[F")),
         0x50 => Some(DecodedInput::Sequence(b"\x1b[B")),
+        0x51 => Some(DecodedInput::Sequence(b"\x1b[6~")),
+        0x52 => Some(DecodedInput::Sequence(b"\x1b[2~")),
         0x53 => decode_delete_key(),
         _ => None,
     }
@@ -739,6 +922,9 @@ fn ctrl_byte(byte: u8) -> Option<u8> {
 }
 
 #[cfg(test)]
+pub(crate) static I8042_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -747,7 +933,10 @@ mod tests {
         CTRL_DOWN.store(false, Ordering::Release);
         ALT_DOWN.store(false, Ordering::Release);
         EXTENDED.store(false, Ordering::Release);
+        EVDEV_EXTENDED.store(false, Ordering::Release);
+        KEYBOARD_LEDS.store(0, Ordering::Release);
         BYTE_QUEUE.lock().clear();
+        PENDING_KEYBOARD_SCANCODES.lock().clear();
     }
 
     #[test]
@@ -766,6 +955,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_scancode_sequence_emits_linux_vintr_byte() {
+        let _guard = I8042_TEST_LOCK.lock();
         reset_decoder_state();
         assert_eq!(decode_scancode_input(0x1D), None);
         assert_eq!(decode_scancode_input(0x2E), Some(DecodedInput::Byte(0x03)));
@@ -781,6 +971,7 @@ mod tests {
 
     #[test]
     fn decodes_extended_arrow_sequences() {
+        let _guard = I8042_TEST_LOCK.lock();
         reset_decoder_state();
         assert_eq!(decode_scancode_input(0xE0), None);
         assert_eq!(
@@ -795,7 +986,97 @@ mod tests {
     }
 
     #[test]
+    fn num_lock_enables_every_keypad_digit_and_decimal() {
+        let _guard = I8042_TEST_LOCK.lock();
+        reset_decoder_state();
+        assert_eq!(decode_scancode_input(0x45), None);
+        assert_ne!(keyboard_leds() & (1 << LED_NUML), 0);
+
+        for (scancode, expected) in [
+            (0x47, b'7'),
+            (0x48, b'8'),
+            (0x49, b'9'),
+            (0x4B, b'4'),
+            (0x4C, b'5'),
+            (0x4D, b'6'),
+            (0x4F, b'1'),
+            (0x50, b'2'),
+            (0x51, b'3'),
+            (0x52, b'0'),
+            (0x53, b'.'),
+        ] {
+            assert_eq!(
+                decode_scancode_input(scancode),
+                Some(DecodedInput::Byte(expected))
+            );
+        }
+
+        // The break code must not toggle the lock; the next make does.
+        assert_eq!(decode_scancode_input(0xC5), None);
+        assert_ne!(keyboard_leds() & (1 << LED_NUML), 0);
+        assert_eq!(decode_scancode_input(0x45), None);
+        assert_eq!(keyboard_leds() & (1 << LED_NUML), 0);
+    }
+
+    #[test]
+    fn evdev_led_bitmap_is_translated_to_ps2_wire_order() {
+        assert_eq!(evdev_leds_to_ps2(1 << LED_NUML), 0b010);
+        assert_eq!(evdev_leds_to_ps2(1 << LED_CAPSL), 0b100);
+        assert_eq!(evdev_leds_to_ps2(1 << LED_SCROLLL), 0b001);
+        assert_eq!(evdev_leds_to_ps2(0b111), 0b111);
+    }
+
+    #[test]
+    fn graphical_raw_keyboard_input_is_not_cooked_into_the_console() {
+        let _guard = I8042_TEST_LOCK.lock();
+        reset_decoder_state();
+        assert_eq!(enqueue_decoded_if_cooked(0x1E, false), None);
+        assert_eq!(
+            enqueue_decoded_if_cooked(0x1E, true),
+            Some(ConsoleInput::Byte(b'a'))
+        );
+    }
+
+    #[test]
+    fn keypad_without_num_lock_emits_linux_console_navigation_and_operators() {
+        let _guard = I8042_TEST_LOCK.lock();
+        reset_decoder_state();
+        for (scancode, expected) in [
+            (0x47, b"\x1b[1~".as_slice()),
+            (0x48, b"\x1b[A".as_slice()),
+            (0x49, b"\x1b[5~".as_slice()),
+            (0x4B, b"\x1b[D".as_slice()),
+            (0x4C, b"\x1b[G".as_slice()),
+            (0x4D, b"\x1b[C".as_slice()),
+            (0x4F, b"\x1b[4~".as_slice()),
+            (0x50, b"\x1b[B".as_slice()),
+            (0x51, b"\x1b[6~".as_slice()),
+            (0x52, b"\x1b[2~".as_slice()),
+            (0x53, b"\x1b[3~".as_slice()),
+        ] {
+            assert_eq!(
+                decode_scancode_input(scancode),
+                Some(DecodedInput::Sequence(expected))
+            );
+        }
+        assert_eq!(decode_scancode_input(0x37), Some(DecodedInput::Byte(b'*')));
+        assert_eq!(decode_scancode_input(0x4A), Some(DecodedInput::Byte(b'-')));
+        assert_eq!(decode_scancode_input(0x4E), Some(DecodedInput::Byte(b'+')));
+    }
+
+    #[test]
+    fn extended_keypad_slash_and_enter_emit_bytes() {
+        let _guard = I8042_TEST_LOCK.lock();
+        reset_decoder_state();
+        assert_eq!(decode_scancode_input(0xE0), None);
+        assert_eq!(decode_scancode_input(0x35), Some(DecodedInput::Byte(b'/')));
+        assert_eq!(decode_scancode_input(0xE0), None);
+        assert_eq!(decode_scancode_input(0x1C), Some(DecodedInput::Byte(b'\n')));
+    }
+
+    #[test]
     fn ctrl_alt_delete_decodes_shutdown_action() {
+        let _guard = I8042_TEST_LOCK.lock();
         reset_decoder_state();
         assert_eq!(decode_scancode_input(0x1D), None);
         assert_eq!(decode_scancode_input(0x38), None);
@@ -808,6 +1089,7 @@ mod tests {
 
     #[test]
     fn ctrl_shift_delete_decodes_restart_action() {
+        let _guard = I8042_TEST_LOCK.lock();
         reset_decoder_state();
         assert_eq!(decode_scancode_input(0x1D), None);
         assert_eq!(decode_scancode_input(0x2A), None);
@@ -826,6 +1108,11 @@ mod tests {
         assert_eq!(evdev_key_event(0x1C, false), Some((28, 1))); // KEY_ENTER
         assert_eq!(evdev_key_event(0x2A, false), Some((42, 1))); // KEY_LEFTSHIFT
         assert_eq!(evdev_key_event(0x39, false), Some((57, 1))); // KEY_SPACE
+        assert_eq!(evdev_key_event(0x45, false), Some((69, 1))); // KEY_NUMLOCK
+        assert_eq!(evdev_key_event(0x47, false), Some((71, 1))); // KEY_KP7
+        assert_eq!(evdev_key_event(0xCF, false), Some((79, 0))); // KEY_KP1 release
+        assert_eq!(evdev_key_event(0x52, false), Some((82, 1))); // KEY_KP0
+        assert_eq!(evdev_key_event(0x53, false), Some((83, 1))); // KEY_KPDOT
     }
 
     #[test]
@@ -839,6 +1126,7 @@ mod tests {
 
     #[test]
     fn ps2_mouse_packet_decodes_to_evdev_rel_and_buttons() {
+        let _guard = I8042_TEST_LOCK.lock();
         use super::super::{
             BTN_LEFT, EV_KEY, EV_REL, EV_SYN, InputDev, REL_X, REL_Y, find_input_dev,
             input_register_device,
@@ -881,6 +1169,7 @@ mod tests {
 
     #[test]
     fn ps2_mouse_resyncs_on_missing_sync_bit() {
+        let _guard = I8042_TEST_LOCK.lock();
         // A first packet byte without bit3 set is dropped (out-of-sync).
         *MOUSE_STATE.lock() = MousePacket::new();
         feed_mouse_byte(0x00); // no sync bit → ignored
@@ -891,6 +1180,7 @@ mod tests {
 
     #[test]
     fn plain_delete_still_decodes_escape_sequence() {
+        let _guard = I8042_TEST_LOCK.lock();
         reset_decoder_state();
         assert_eq!(decode_scancode_input(0xE0), None);
         assert_eq!(

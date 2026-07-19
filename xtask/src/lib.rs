@@ -4440,12 +4440,19 @@ fn lupos_user_provision_script() -> Vec<u8> {
     concat!(
         "#!/bin/sh\n",
         "set -eu\n",
+        "umask 077\n",
         "/usr/bin/systemd-sysusers\n",
         "/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/lupos-home.conf /usr/lib/tmpfiles.d/lightdm.conf\n",
         "password_hash='$6$lupos$kfqTeHWlA.9yNwAV7ku8p6jKF5ULWSzdhP3d/4Cq0ObxXStDoiUHezFLQH0Kh5EIXypcHW4AGgV6gn/KgMxou/'\n",
         "printf 'root:%s\\nlupos:%s\\n' \"$password_hash\" \"$password_hash\" | /usr/bin/chpasswd -e\n",
+        "/usr/bin/chown 0:0 /etc/passwd /etc/group /etc/shadow /etc/gshadow\n",
+        "/usr/bin/chmod 0644 /etc/passwd /etc/group\n",
+        "/usr/bin/chmod 0600 /etc/shadow /etc/gshadow\n",
         "mkdir -p /var/lib/lupos\n",
-        ": > /var/lib/lupos/users-provisioned\n",
+        "/usr/bin/chmod 0700 /var/lib/lupos\n",
+        "/usr/bin/rm -f /var/lib/lupos/users-provisioned\n",
+        ": > /var/lib/lupos/users-provisioned-v2\n",
+        "/usr/bin/chmod 0600 /var/lib/lupos/users-provisioned-v2\n",
     )
     .as_bytes()
     .to_vec()
@@ -4459,7 +4466,7 @@ fn systemd_lupos_user_provision_unit() -> Vec<u8> {
         "Wants=systemd-sysusers.service systemd-tmpfiles-setup.service\n",
         "After=systemd-sysusers.service systemd-tmpfiles-setup.service\n",
         "Before=getty.target display-manager.service lupos-serial-getty.service\n",
-        "ConditionPathExists=!/var/lib/lupos/users-provisioned\n",
+        "ConditionPathExists=!/var/lib/lupos/users-provisioned-v2\n",
         "\n",
         "[Service]\n",
         "Type=oneshot\n",
@@ -5325,8 +5332,11 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "if [ \"$(/usr/bin/id -u lupos 2>/dev/null)\" = 1000 ]; then echo 'graphics-x11: lupos-uid ok'; else echo 'graphics-x11: lupos-uid failed'; fi\n",
         "if /usr/bin/visudo -cf /etc/sudoers >/tmp/lupos-visudo.log 2>&1; then echo 'graphics-x11: sudoers-syntax ok'; else echo 'graphics-x11: sudoers-syntax failed'; sed 's/^/graphics-x11: sudoers-diagnostic /' /tmp/lupos-visudo.log; fi\n",
         "rm -f /tmp/lupos-visudo.log\n",
+        "if [ \"$(/usr/bin/stat -c '%a:%u:%g' /etc/passwd)\" = 644:0:0 ] && [ \"$(/usr/bin/stat -c '%a:%u:%g' /etc/group)\" = 644:0:0 ] && [ \"$(/usr/bin/stat -c '%a:%u:%g' /etc/shadow)\" = 600:0:0 ] && [ \"$(/usr/bin/stat -c '%a:%u:%g' /etc/gshadow)\" = 600:0:0 ]; then echo 'graphics-x11: account-file-modes ok'; else echo 'graphics-x11: account-file-modes failed'; /usr/bin/stat -c 'graphics-x11: account-mode %a:%u:%g %n' /etc/passwd /etc/group /etc/shadow /etc/gshadow; fi\n",
         "if /usr/bin/sudo -n -u lupos /bin/sh -c '/usr/bin/sudo -K; ! /usr/bin/sudo -n /usr/bin/pacman --config /etc/pacman-lupos.conf --version >/dev/null 2>&1'; then echo 'graphics-x11: sudo-password-required ok'; else echo 'graphics-x11: sudo-password-required failed'; fi\n",
         "if /usr/bin/sudo -n -u lupos /bin/sh -c \"printf '%s\\n' lupos | /usr/bin/sudo -S -k -p '' /usr/bin/pacman --config /etc/pacman-lupos.conf --version >/dev/null 2>&1; rc=\\$?; /usr/bin/sudo -k; exit \\$rc\"; then echo 'graphics-x11: sudo-pacman ok'; else echo 'graphics-x11: sudo-pacman failed'; fi\n",
+        "if /usr/bin/sudo -n -u lupos /bin/sh -c \"printf '%s\\n' lupos | /usr/bin/timeout -k 2 15 /usr/bin/script -qfec \\\"/usr/bin/sudo -k -p '' /usr/bin/su -c '/usr/bin/id -u' root\\\" /dev/null; rc=\\$?; /usr/bin/sudo -k; [ \\\"\\$rc\\\" -eq 0 ] || [ \\\"\\$rc\\\" -eq 124 ]\" >/tmp/lupos-sudo-su.log 2>&1 && tr -d '\\r' </tmp/lupos-sudo-su.log | grep -qx 0; then echo 'graphics-x11: sudo-su ok'; else echo 'graphics-x11: sudo-su failed'; sed 's/^/graphics-x11: sudo-su-log /' /tmp/lupos-sudo-su.log 2>/dev/null || true; fi\n",
+        "rm -f /tmp/lupos-sudo-su.log\n",
         "echo 'graphics-x11: sudo-probe end'\n",
         // D-Bus parses PolicyKit's packaged user=polkitd rules at startup, so
         // prove the early account provisioner ran and that the unmodified
@@ -15996,8 +16006,10 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: bwrap-sandbox rc=1",
         "graphics-x11: bwrap-sandbox secure-fail-closed",
         "graphics-x11: sudoers-syntax ok",
+        "graphics-x11: account-file-modes ok",
         "graphics-x11: sudo-password-required ok",
         "graphics-x11: sudo-pacman ok",
+        "graphics-x11: sudo-su ok",
         "graphics-x11: session-path ok",
         "graphics-x11: tty-sysctl ok",
         "graphics-x11: timeout-sanity ok",
@@ -16072,8 +16084,10 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: bwrap-sandbox rc=125",
         "graphics-x11: bwrap-sandbox unexpected-result",
         "graphics-x11: sudoers-syntax failed",
+        "graphics-x11: account-file-modes failed",
         "graphics-x11: sudo-password-required failed",
         "graphics-x11: sudo-pacman failed",
+        "graphics-x11: sudo-su failed",
         "graphics-x11: session-path failed",
         "graphics-x11: tty-sysctl missing",
         "graphics-x11: timeout-sanity unexpected-ok",
@@ -16117,6 +16131,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "Unrecognized image file format",
         "Failed to load background",
         "Failed to read wallpaper",
+        "Failed to set keyboard controls: Function not implemented",
         "no screens found",
         "Fatal server error",
     ] {
@@ -24448,6 +24463,18 @@ failed command output\n";
                 .windows(b"chpasswd -e".len())
                 .any(|w| w == b"chpasswd -e")
         );
+        assert!(
+            provision
+                .windows(b"chmod 0600 /etc/shadow /etc/gshadow".len())
+                .any(|w| w == b"chmod 0600 /etc/shadow /etc/gshadow"),
+            "account provisioner must restore secure shadow database modes"
+        );
+        assert!(
+            provision
+                .windows(b"users-provisioned-v2".len())
+                .any(|w| w == b"users-provisioned-v2"),
+            "versioned marker must repair disks provisioned before secure modes"
+        );
         assert_eq!(
             initramfs_file_bytes(&files, "etc/motd"),
             Some(LOGIN_MOTD.as_bytes())
@@ -25032,6 +25059,8 @@ failed command output\n";
         assert!(probe.contains("graphics-x11: seat-graphical ok"));
         assert!(probe.contains("/usr/bin/visudo -cf /etc/sudoers"));
         assert!(probe.contains("graphics-x11: sudoers-syntax ok"));
+        assert!(probe.contains("graphics-x11: account-file-modes ok"));
+        assert!(probe.contains("600:0:0"));
         assert!(probe.contains("/usr/bin/sudo -n -u lupos"));
         assert!(probe.contains("graphics-x11: sudo-password-required ok"));
         assert!(probe.contains(
@@ -25039,6 +25068,11 @@ failed command output\n";
         ));
         assert!(probe.contains("/usr/bin/sudo -S -k -p '' /usr/bin/pacman"));
         assert!(probe.contains("graphics-x11: sudo-pacman ok"));
+        assert!(probe.contains("/usr/bin/script -qfec"));
+        assert!(probe.contains("/usr/bin/su -c '/usr/bin/id -u' root"));
+        assert!(probe.contains("[ \\\"\\$rc\\\" -eq 0 ] || [ \\\"\\$rc\\\" -eq 124 ]"));
+        assert!(probe.contains("grep -qx 0"));
+        assert!(probe.contains("graphics-x11: sudo-su ok"));
         assert!(probe.contains("graphics-x11: bwrap-sandbox secure-fail-closed"));
         assert!(probe.contains("No permissions to create a new namespace"));
         assert!(probe.contains("legacy_tiocsti 2>/dev/null)\" = '0'"));

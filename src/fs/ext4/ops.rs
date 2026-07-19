@@ -16,6 +16,9 @@ use core::sync::atomic::Ordering;
 
 use crate::block::bio::{BIO_OP_WRITE, BioOp, BioVec, bio_alloc, submit_bio};
 use crate::block::partitions::read_sectors;
+use crate::fs::attr::{
+    ATTR_ATIME, ATTR_CTIME, ATTR_GID, ATTR_MODE, ATTR_MTIME, ATTR_SIZE, ATTR_UID, IAttr,
+};
 use crate::fs::ops::{FileOps, InodeOps, SuperOps};
 use crate::fs::types::{
     FileRef, Inode, InodeKind, InodePrivate, InodeRef, SuperBlockRef, init_inode_owner,
@@ -70,6 +73,7 @@ pub static EXT4_DIR_INODE_OPS: InodeOps = InodeOps {
     rename: Some(ext4_rename),
     symlink: Some(ext4_symlink),
     readlink: None,
+    setattr: Some(ext4_setattr),
 };
 
 pub static EXT4_FILE_INODE_OPS: InodeOps = InodeOps {
@@ -82,6 +86,7 @@ pub static EXT4_FILE_INODE_OPS: InodeOps = InodeOps {
     rename: None,
     symlink: None,
     readlink: None,
+    setattr: Some(ext4_setattr),
 };
 
 pub static EXT4_SYMLINK_INODE_OPS: InodeOps = InodeOps {
@@ -94,6 +99,7 @@ pub static EXT4_SYMLINK_INODE_OPS: InodeOps = InodeOps {
     rename: None,
     symlink: None,
     readlink: Some(ext4_readlink),
+    setattr: Some(ext4_setattr),
 };
 
 pub static EXT4_DIR_FILE_OPS: FileOps = FileOps {
@@ -539,6 +545,44 @@ fn ext4_store_raw_inode_owner(raw: &mut OnDiskInode, inode: &InodeRef) {
     raw.i_gid = (gid as u16).to_le();
     raw._osd2[4..6].copy_from_slice(&((uid >> 16) as u16).to_le_bytes());
     raw._osd2[6..8].copy_from_slice(&((gid >> 16) as u16).to_le_bytes());
+}
+
+fn ext4_setattr(inode: &InodeRef, attr: &IAttr) -> Result<(), i32> {
+    let sb = inode.sb.lock().clone().ok_or(EIO)?;
+    if sb.fs_name != "ext4" {
+        return Err(EINVAL);
+    }
+    let sbi = get_sbi(&sb).ok_or(EIO)?;
+    let ext_inode = ext4_inode_of(inode).ok_or(EINVAL)?;
+    let mut raw_guard = ext_inode.raw.lock();
+    let mut raw = *raw_guard;
+
+    if attr.valid & (ATTR_MODE | ATTR_UID | ATTR_GID) != 0 {
+        ext4_store_raw_inode_owner(&mut raw, inode);
+    }
+    if attr.valid & ATTR_SIZE != 0 {
+        let size = inode.size.load(Ordering::Acquire);
+        raw.i_size_lo = (size as u32).to_le();
+        raw.i_size_hi = ((size >> 32) as u32).to_le();
+    }
+    if attr.valid & ATTR_ATIME != 0 {
+        raw.i_atime = (inode.atime.load(Ordering::Acquire).min(u32::MAX as u64) as u32).to_le();
+    }
+    if attr.valid & ATTR_MTIME != 0 {
+        raw.i_mtime = (inode.mtime.load(Ordering::Acquire).min(u32::MAX as u64) as u32).to_le();
+    }
+    if attr.valid & ATTR_CTIME != 0 {
+        raw.i_ctime = (inode.ctime.load(Ordering::Acquire).min(u32::MAX as u64) as u32).to_le();
+    }
+
+    write_inode_metadata(&sbi, ext_inode.ino, &raw)?;
+    if attr.valid & ATTR_SIZE != 0 {
+        ext_inode
+            .i_size
+            .store(inode.size.load(Ordering::Acquire), Ordering::Release);
+    }
+    *raw_guard = raw;
+    Ok(())
 }
 
 fn ext4_new_raw_inode(sbi: &super::Ext4Sbi, mode: u32, kind: InodeKind) -> OnDiskInode {
@@ -2753,6 +2797,31 @@ mod tests {
         assert_eq!(le_u16(&raw, 122).unwrap(), (gid >> 16) as u16);
 
         let persisted = read_inode(&sbi, inode.ino as u32, &sb).unwrap();
+        assert_eq!(persisted.uid.load(Ordering::Acquire), uid);
+        assert_eq!(persisted.gid.load(Ordering::Acquire), gid);
+    }
+
+    #[test]
+    fn ext4_setattr_persists_mode_and_owner_across_inode_reread() {
+        let (sbi, sb, parent) = new_inode_owner_fixture("ext4-setattr-persistence");
+        let inode = create_inode_with_cred(&sbi, &sb, &parent, 1000, 1001);
+        let uid = 0x1234_5678;
+        let gid = 0x2345_6789;
+        let attr = IAttr {
+            valid: ATTR_MODE | ATTR_UID | ATTR_GID,
+            mode: 0o600,
+            uid,
+            gid,
+            ..IAttr::default()
+        };
+
+        crate::fs::attr::notify_change(&inode, &attr, false).expect("persist setattr");
+        assert_eq!(inode.mode.load(Ordering::Acquire), S_IFREG | 0o600);
+        assert_eq!(inode.uid.load(Ordering::Acquire), uid);
+        assert_eq!(inode.gid.load(Ordering::Acquire), gid);
+
+        let persisted = read_inode(&sbi, inode.ino as u32, &sb).expect("reread inode");
+        assert_eq!(persisted.mode.load(Ordering::Acquire), S_IFREG | 0o600);
         assert_eq!(persisted.uid.load(Ordering::Acquire), uid);
         assert_eq!(persisted.gid.load(Ordering::Acquire), gid);
     }

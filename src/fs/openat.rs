@@ -265,6 +265,14 @@ fn do_openat2_with_path_hint(
     }
     let flags = how.flags as u32;
     let mode = how.mode as u32;
+    // `open(2)` creation modes are filtered by the calling task's umask.
+    // Apply it only to a newly-created inode: the mode argument has no effect
+    // when an existing path is opened.
+    let create_mode = if will_create(flags) {
+        mode & !super::fs_struct::current_umask()
+    } else {
+        mode
+    };
     if flags & O_PATH != 0 && flags & !O_PATH_FLAGS != 0 {
         return Err(EINVAL);
     }
@@ -399,7 +407,7 @@ fn do_openat2_with_path_hint(
                             }
                             Err(ENOENT) if flags & O_CREAT != 0 => {
                                 let create = parent_inode.ops.create.ok_or(EINVAL)?;
-                                let inode = create(&parent_inode, last, mode)?;
+                                let inode = create(&parent_inode, last, create_mode)?;
                                 d.instantiate(inode);
                                 super::inotify::notify_create(&parent_dentry, last, false);
                                 d
@@ -409,7 +417,7 @@ fn do_openat2_with_path_hint(
                         }
                     } else if flags & O_CREAT != 0 {
                         let create = parent_inode.ops.create.ok_or(EINVAL)?;
-                        let inode = create(&parent_inode, last, mode)?;
+                        let inode = create(&parent_inode, last, create_mode)?;
                         d.instantiate(inode);
                         super::inotify::notify_create(&parent_dentry, last, false);
                         d
@@ -432,7 +440,7 @@ fn do_openat2_with_path_hint(
                         }
                         Err(ENOENT) if flags & O_CREAT != 0 => {
                             let create = parent_inode.ops.create.ok_or(EINVAL)?;
-                            let inode = create(&parent_inode, last, mode)?;
+                            let inode = create(&parent_inode, last, create_mode)?;
                             let d = d_alloc_child(&parent_dentry, last);
                             d.instantiate(inode);
                             super::inotify::notify_create(&parent_dentry, last, false);
@@ -446,7 +454,7 @@ fn do_openat2_with_path_hint(
                     }
                 } else if flags & O_CREAT != 0 {
                     let create = parent_inode.ops.create.ok_or(EINVAL)?;
-                    let inode = create(&parent_inode, last, mode)?;
+                    let inode = create(&parent_inode, last, create_mode)?;
                     let d = d_alloc_child(&parent_dentry, last);
                     d.instantiate(inode);
                     super::inotify::notify_create(&parent_dentry, last, false);

@@ -7,6 +7,7 @@
 //! a filesystem doesn't implement get a no-op default so the dispatch path
 //! never has to NULL-check before calling.
 
+use super::attr::IAttr;
 use super::types::{Dentry, DentryRef, File, FileRef, Inode, InodeRef, SuperBlock, SuperBlockRef};
 use crate::mm::mm_types::VmAreaStruct;
 
@@ -22,6 +23,7 @@ pub type RenameFn =
     fn(old_dir: &InodeRef, old_name: &str, new_dir: &InodeRef, new_name: &str) -> Result<(), i32>;
 pub type SymlinkFn =
     fn(dir: &InodeRef, name: &str, target: &str, mode: u32) -> Result<InodeRef, i32>;
+pub type SetattrFn = fn(inode: &InodeRef, attr: &IAttr) -> Result<(), i32>;
 
 /// `struct super_operations`.
 #[repr(C)]
@@ -67,6 +69,8 @@ pub struct InodeOps {
     pub symlink: Option<SymlinkFn>,
     /// Read symlink target into `buf` (returns bytes written).
     pub readlink: Option<fn(inode: &InodeRef, buf: &mut [u8]) -> Result<usize, i32>>,
+    /// Persist generic inode attribute changes in the backing filesystem.
+    pub setattr: Option<SetattrFn>,
 }
 
 pub const NOOP_INODE_OPS: InodeOps = InodeOps {
@@ -79,6 +83,7 @@ pub const NOOP_INODE_OPS: InodeOps = InodeOps {
     rename: None,
     symlink: None,
     readlink: None,
+    setattr: None,
 };
 
 /// `struct file_operations`.  M38 lands the read/write/llseek/fsync/release

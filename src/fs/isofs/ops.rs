@@ -33,6 +33,7 @@ pub static ISO_DIR_INODE_OPS: InodeOps = InodeOps {
     rename: Some(|_, _, _, _| Err(EROFS)),
     symlink: Some(|_, _, _, _| Err(EROFS)),
     readlink: None,
+    setattr: None,
 };
 pub static ISO_FILE_INODE_OPS: InodeOps = InodeOps {
     name: "iso_file",
@@ -44,6 +45,7 @@ pub static ISO_FILE_INODE_OPS: InodeOps = InodeOps {
     rename: None,
     symlink: None,
     readlink: None,
+    setattr: None,
 };
 pub static ISO_DIR_FILE_OPS: FileOps = FileOps {
     name: "iso_dir",
