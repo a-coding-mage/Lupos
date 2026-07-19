@@ -2543,6 +2543,7 @@ static LINUX_DRIVER_MODULE_BUILD_LOCK: Mutex<()> = Mutex::new(());
 static DEPMOD_INDEX_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 const LINUX_DRIVER_MODULE_MANIFEST: &str = ".lupos-build-manifest";
 const LINUX_DRIVER_MODULE_EFFECTIVE_CONFIG: &str = ".lupos-effective-config";
+const LINUX_DRIVER_MODULE_RESOLVED_ORDER: &str = "modules.order";
 const LINUX_DRIVER_MODULE_BUILD_POLICY: &str = concat!(
     "linux-x86_64-lupos-runtime-v4;modules-forced-per-staged-artifact;",
     "vga-arb=y;aperture-helpers=y;video=y;screen-info=y;sysfb=n;",
@@ -8634,15 +8635,96 @@ fn driver_module_activation_description(spec: &DriverModuleSpec) -> String {
     }
 }
 
+fn module_name_from_module_path(module_path: &str) -> String {
+    Path::new(module_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(module_path)
+        .replace('-', "_")
+}
+
+fn linux_make_dir_from_module_path(module_path: &str) -> String {
+    module_path
+        .strip_prefix("kernel/")
+        .unwrap_or(module_path)
+        .rsplit_once('/')
+        .map(|(dir, _)| dir.to_owned())
+        .unwrap_or_default()
+}
+
+fn leak_driver_module_spec(module_path: String) -> &'static DriverModuleSpec {
+    let module_name = module_name_from_module_path(&module_path);
+    let linux_make_dir = linux_make_dir_from_module_path(&module_path);
+    let linux_make_target = Path::new(&module_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&module_path)
+        .to_owned();
+    Box::leak(Box::new(DriverModuleSpec {
+        symbol: Box::leak(
+            format!(
+                "CONFIG_MODULE_FROM_VENDOR_{}",
+                module_name.to_ascii_uppercase()
+            )
+            .into_boxed_str(),
+        ),
+        module_name: Box::leak(module_name.into_boxed_str()),
+        module_path: Box::leak(module_path.clone().into_boxed_str()),
+        vendor_linux_ref: Box::leak(format!("vendor/linux/{linux_make_dir}").into_boxed_str()),
+        linux_make_dir: Box::leak(linux_make_dir.into_boxed_str()),
+        linux_make_target: Box::leak(linux_make_target.into_boxed_str()),
+        module_deps: &[],
+    }))
+}
+
+fn resolved_vendor_modules_order_paths() -> Result<Vec<String>> {
+    let path = xtask_target_dir()?
+        .join("vendor-linux-modules")
+        .join(LINUX_DRIVER_MODULE_RESOLVED_ORDER);
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "failed to read resolved vendor modules.order at {}",
+            path.display()
+        )
+    })?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.ends_with(".ko"))
+        .map(str::to_owned)
+        .collect())
+}
+
 fn staged_module_specs_from_config_text(text: &str) -> Vec<&'static DriverModuleSpec> {
     let values = parse_kconfig_values(text);
     let mut paths = HashSet::new();
     let mut names = HashSet::new();
-    DRIVER_MODULES
+    let mut modules = DRIVER_MODULES
         .iter()
         .filter(|module| driver_module_is_selected(module, &values))
         .filter(|module| paths.insert(module.module_path) && names.insert(module.module_name))
-        .collect()
+        .collect::<Vec<_>>();
+
+    // Once vendor Linux has produced the post-olddefconfig module list, treat
+    // it as the source of truth for staged loadable objects. DRIVER_MODULES
+    // remains only a Lupos metadata overlay for dependencies/early-load policy;
+    // previously unknown vendor modules are staged by their Kbuild install path.
+    if let Ok(resolved_paths) = resolved_vendor_modules_order_paths() {
+        for module_path in resolved_paths {
+            if !paths.insert(Box::leak(module_path.clone().into_boxed_str())) {
+                continue;
+            }
+            let module_name = module_name_from_module_path(&module_path);
+            if !names.insert(Box::leak(module_name.into_boxed_str())) {
+                continue;
+            }
+            modules.push(leak_driver_module_spec(module_path));
+        }
+    }
+    modules
 }
 
 fn linux_driver_module_artifact(spec: &DriverModuleSpec) -> Result<PathBuf> {
@@ -9420,6 +9502,14 @@ fn build_linux_driver_module_artifacts(modules: &[&DriverModuleSpec]) -> Result<
         .with_context(|| format!("failed to read {}", generated_config.display()))?;
     fs::write(&effective_config, &config_bytes)
         .with_context(|| format!("failed to write {}", effective_config.display()))?;
+    let generated_order = build_dir.join("modules.order");
+    if generated_order.is_file() {
+        fs::copy(
+            &generated_order,
+            artifact_root.join(LINUX_DRIVER_MODULE_RESOLVED_ORDER),
+        )
+        .with_context(|| format!("failed to persist {}", generated_order.display()))?;
+    }
 
     // Hash the installed probe copies, not merely the current working-tree
     // files: these are the inputs Kbuild actually compiled in this build.
@@ -9723,11 +9813,12 @@ fn modules_order_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
             emitted.insert(*name);
         }
     }
-    assert_eq!(
-        emitted.len(),
-        modules.len(),
-        "selected module lacks an audited vendor Kbuild modules.order position"
-    );
+    for spec in modules {
+        if emitted.insert(spec.module_name) {
+            order.push_str(spec.module_path);
+            order.push('\n');
+        }
+    }
     order.into_bytes()
 }
 
@@ -9750,11 +9841,17 @@ fn modules_dep_from_specs(modules: &[&DriverModuleSpec]) -> Vec<u8> {
             emitted.insert(*name);
         }
     }
-    assert_eq!(
-        emitted.len(),
-        modules.len(),
-        "selected module lacks an audited depmod modules.dep position"
-    );
+    for spec in modules {
+        if emitted.insert(spec.module_name) {
+            deps.push_str(spec.module_path);
+            deps.push(':');
+            for dep in spec.module_deps {
+                deps.push(' ');
+                deps.push_str(dep);
+            }
+            deps.push('\n');
+        }
+    }
     deps.into_bytes()
 }
 
