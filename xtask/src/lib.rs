@@ -5769,7 +5769,9 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // Firefox discovers its installation directory from
         // readlink("/proc/self/exe") before it loads XPCOM. Verify the PATH
         // launcher, that procfs ABI, the retained executable path, and a real
-        // browser window in the unchanged uid-1000 desktop session.
+        // HTTPS browser navigation/render in the unchanged uid-1000 desktop
+        // session. curl and a local file:// page do not exercise Firefox's
+        // DNS, socket, and TLS path.
         "echo 'graphics-x11: firefox-probe begin'\n",
         "firefox_path=\"$(command -v firefox 2>/dev/null || true)\"\n",
         "printf 'graphics-x11: firefox-path %s\\n' \"$firefox_path\"\n",
@@ -5784,14 +5786,12 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "else\n",
         "    rm -rf /tmp/lupos-firefox-profile\n",
         "    install -d -m 700 -o lupos -g lupos /tmp/lupos-firefox-profile\n",
-        "    rm -f /tmp/lupos-firefox.log /tmp/lupos-firefox-windows.log /tmp/lupos-firefox-maps.log /tmp/lupos-firefox-status.log /tmp/lupos-firefox-proof.html\n",
-        "    printf '%s\\n' '<!doctype html><html><head><meta charset=\"utf-8\"><title>Lupos Firefox Render Proof</title><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#11263d;color:#fff;font-family:sans-serif}main{height:100%;display:grid;place-items:center;background:linear-gradient(135deg,#14532d 0 33%,#1d4ed8 33% 66%,#b91c1c 66%)}h1{font-size:64px;text-shadow:0 4px 12px #000}p{font-size:28px}</style></head><body><main><section><h1>Firefox rendered this page</h1><p>Lupos browser responsiveness proof</p></section></main></body></html>' > /tmp/lupos-firefox-proof.html\n",
-        "    chown lupos:lupos /tmp/lupos-firefox-proof.html\n",
+        "    rm -f /tmp/lupos-firefox.log /tmp/lupos-firefox-windows.log /tmp/lupos-firefox-maps.log /tmp/lupos-firefox-status.log\n",
         "    firefox_fb_before=\"$(cksum </dev/fb0 2>/dev/null || true)\"\n",
-        "    sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none /usr/bin/firefox --no-remote --profile /tmp/lupos-firefox-profile file:///tmp/lupos-firefox-proof.html >/tmp/lupos-firefox.log 2>&1 &\n",
+        "    sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none /usr/bin/firefox --no-remote --profile /tmp/lupos-firefox-profile 'https://www.google.com/?hl=en' >/tmp/lupos-firefox.log 2>&1 &\n",
         "    firefox_launcher_pid=$!\n",
         "    firefox_pid=; firefox_window=0; i=0\n",
-        "    while [ \"$i\" -lt 45 ] && [ \"$firefox_window\" -eq 0 ]; do\n",
+        "    while [ \"$i\" -lt 90 ] && [ \"$firefox_window\" -eq 0 ]; do\n",
         "        [ -n \"$firefox_pid\" ] || firefox_pid=\"$(process_pid_named_uid firefox 1000 2>/dev/null || true)\"\n",
         "        if [ -n \"$firefox_pid\" ] && [ ! -s /tmp/lupos-firefox-maps.log ]; then\n",
         "            cat \"/proc/$firefox_pid/maps\" > /tmp/lupos-firefox-maps.log 2>&1 || true\n",
@@ -5802,7 +5802,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "            for wid in $(sed 's/.*# //' /tmp/lupos-firefox-clients.log | tr ',' ' '); do\n",
         "                DISPLAY=:0 timeout 1 /usr/bin/xprop -id \"$wid\" WM_CLASS _NET_WM_NAME 2>/dev/null >> /tmp/lupos-firefox-windows.log || true\n",
         "            done\n",
-        "            if grep -qiE 'WM_CLASS.*(Navigator|firefox)' /tmp/lupos-firefox-windows.log 2>/dev/null && grep -q 'Lupos Firefox Render Proof' /tmp/lupos-firefox-windows.log 2>/dev/null && ! grep -qiE 'Profile Missing|Crash Reporter|Firefox is already running' /tmp/lupos-firefox-windows.log 2>/dev/null; then firefox_window=1; break; fi\n",
+        "            if grep -qiE 'WM_CLASS.*(Navigator|firefox)' /tmp/lupos-firefox-windows.log 2>/dev/null && grep -q 'Google' /tmp/lupos-firefox-windows.log 2>/dev/null && ! grep -qiE 'Profile Missing|Crash Reporter|Firefox is already running|Problem loading page|Security Risk' /tmp/lupos-firefox-windows.log 2>/dev/null; then firefox_window=1; break; fi\n",
         "        fi\n",
         "        kill -0 \"$firefox_launcher_pid\" 2>/dev/null || break\n",
         "        i=$((i + 1)); sleep 1\n",
@@ -5824,6 +5824,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    printf 'graphics-x11: firefox-exe %s\\n' \"$firefox_exe\"\n",
         "    if [ \"$firefox_alive\" -eq 1 ] && [ \"$firefox_exe\" = /usr/lib/firefox/firefox ]; then echo 'graphics-x11: firefox-proc-exe ok'; else echo 'graphics-x11: firefox-proc-exe failed'; fi\n",
         "    if [ \"$firefox_window\" -eq 1 ]; then echo 'graphics-x11: firefox-window ok'; else echo 'graphics-x11: firefox-window failed'; fi\n",
+        "    if [ \"$firefox_window\" -eq 1 ]; then echo 'graphics-x11: firefox-google-https ok'; else echo 'graphics-x11: firefox-google-https failed'; fi\n",
         "    if [ -s /tmp/lupos-firefox-maps.log ]; then echo 'graphics-x11: firefox-maps begin'; cat /tmp/lupos-firefox-maps.log; echo 'graphics-x11: firefox-maps end'; fi\n",
         "    if [ -s /tmp/lupos-firefox-status.log ]; then echo 'graphics-x11: firefox-status begin'; cat /tmp/lupos-firefox-status.log; echo 'graphics-x11: firefox-status end'; fi\n",
         "    [ -z \"$firefox_pid\" ] || kill \"$firefox_pid\" 2>/dev/null || true\n",
@@ -16151,8 +16152,8 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         },
         HmpExpectStep {
             // Capture the visible VGA output while Firefox is still alive.
-            // The guest marker follows proof-page title detection and a
-            // three-second paint interval.
+            // The guest marker follows the remote HTTPS page-title check and
+            // a three-second paint interval.
             label: "rendered firefox capture",
             wait_for: "graphics-x11: firefox-window-ready",
             text: None,
@@ -16253,6 +16254,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: firefox-path /usr/bin/firefox",
         "graphics-x11: firefox-proc-exe ok",
         "graphics-x11: firefox-window ok",
+        "graphics-x11: firefox-google-https ok",
         "graphics-x11: firefox-render-pixels ok",
         "graphics-x11: firefox-desktop-responsive ok",
         "graphics-x11: firefox-clock-advancing ok",
@@ -16340,6 +16342,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: firefox missing-user-session",
         "graphics-x11: firefox-proc-exe failed",
         "graphics-x11: firefox-window failed",
+        "graphics-x11: firefox-google-https failed",
         "graphics-x11: firefox-render-pixels failed",
         "graphics-x11: firefox-desktop-responsive failed",
         "graphics-x11: firefox-clock-advancing failed",
@@ -25289,6 +25292,11 @@ failed command output\n";
         assert!(probe.contains("curl -fsSI"));
         assert!(probe.contains("http://example.com"));
         assert!(probe.contains("graphics-x11: curl dns ok"));
+        assert!(probe.contains("/usr/bin/firefox --no-remote"));
+        assert!(probe.contains("https://www.google.com/?hl=en"));
+        assert!(probe.contains("grep -q 'Google'"));
+        assert!(probe.contains("graphics-x11: firefox-google-https ok"));
+        assert!(!probe.contains("file:///tmp/lupos-firefox-proof.html"));
         assert!(probe.contains("user_xfce_desktop_ready"));
         assert!(probe.contains("xfce4-panel xfdesktop"));
         assert!(probe.contains("process_named_uid \"$wanted\" 1000"));
