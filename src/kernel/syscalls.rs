@@ -27,7 +27,6 @@ use super::utsname::{INIT_UTS_NS, NEW_UTS_LEN_PLUS_NUL, NewUtsname};
 use cred::{KGid, KUid};
 
 static GETRANDOM_STATE: AtomicU64 = AtomicU64::new(0x6a09_e667_f3bc_c909);
-static PROCESS_UMASK: AtomicU32 = AtomicU32::new(0o022);
 static PROCESS_NICE: AtomicU32 = AtomicU32::new(20);
 const RLIM_INFINITY: u64 = u64::MAX;
 const RLIM_NLIMITS: i32 = 16;
@@ -1364,7 +1363,7 @@ pub unsafe fn sys_getrandom(buf: *mut u8, buflen: usize, flags: u32) -> i64 {
 }
 
 pub fn sys_umask(mask: u32) -> i64 {
-    PROCESS_UMASK.swap(mask & 0o777, Ordering::AcqRel) as i64
+    crate::fs::fs_struct::set_current_umask(mask) as i64
 }
 
 pub unsafe fn sys_getrlimit(resource: i32, rlim: *mut RLimit) -> i64 {
@@ -3397,6 +3396,7 @@ mod tests {
             );
             assert!(bytes.iter().any(|&byte| byte != 0));
 
+            crate::fs::fs_struct::exit_fs(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
     }

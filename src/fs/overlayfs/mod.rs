@@ -26,6 +26,7 @@ pub static OVERLAY_DIR_INODE_OPS: InodeOps = InodeOps {
     rename: Some(|_, _, _, _| Err(EROFS)),
     symlink: Some(|_, _, _, _| Err(EROFS)),
     readlink: None,
+    setattr: None,
 };
 
 pub static OVERLAY_DIR_FILE_OPS: FileOps = FileOps {

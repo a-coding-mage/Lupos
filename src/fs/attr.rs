@@ -84,6 +84,13 @@ pub fn setattr_prepare(inode: &InodeRef, attr: &IAttr, readonly: bool) -> Result
 pub fn notify_change(inode: &InodeRef, attr: &IAttr, readonly: bool) -> Result<(), i32> {
     setattr_prepare(inode, attr, readonly)?;
     let evm_metadata_changed = super::xattr::evm_setattr_prepare(inode, attr)?;
+    let old_mode = inode.mode.load(Ordering::Acquire);
+    let old_uid = inode.uid.load(Ordering::Acquire);
+    let old_gid = inode.gid.load(Ordering::Acquire);
+    let old_size = inode.size.load(Ordering::Acquire);
+    let old_atime = inode.atime.load(Ordering::Acquire);
+    let old_mtime = inode.mtime.load(Ordering::Acquire);
+    let old_ctime = inode.ctime.load(Ordering::Acquire);
 
     if attr.valid & ATTR_MODE != 0 {
         let kind = inode.kind.s_ifmt();
@@ -108,6 +115,19 @@ pub fn notify_change(inode: &InodeRef, attr: &IAttr, readonly: bool) -> Result<(
     }
     if attr.valid & ATTR_CTIME != 0 {
         inode.ctime.store(attr.ctime, Ordering::Release);
+    }
+
+    if let Some(setattr) = inode.ops.setattr {
+        if let Err(errno) = setattr(inode, attr) {
+            inode.mode.store(old_mode, Ordering::Release);
+            inode.uid.store(old_uid, Ordering::Release);
+            inode.gid.store(old_gid, Ordering::Release);
+            inode.size.store(old_size, Ordering::Release);
+            inode.atime.store(old_atime, Ordering::Release);
+            inode.mtime.store(old_mtime, Ordering::Release);
+            inode.ctime.store(old_ctime, Ordering::Release);
+            return Err(errno);
+        }
     }
 
     super::xattr::evm_post_setattr(inode, evm_metadata_changed)?;

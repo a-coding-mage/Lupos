@@ -45,6 +45,7 @@ pub static RAMFS_DIR_INODE_OPS: InodeOps = InodeOps {
     rename: None,
     symlink: Some(ramfs_symlink),
     readlink: None,
+    setattr: None,
 };
 
 pub static RAMFS_FILE_INODE_OPS: InodeOps = InodeOps {
@@ -57,6 +58,7 @@ pub static RAMFS_FILE_INODE_OPS: InodeOps = InodeOps {
     rename: None,
     symlink: None,
     readlink: None,
+    setattr: None,
 };
 
 pub static RAMFS_SYMLINK_INODE_OPS: InodeOps = InodeOps {
@@ -69,6 +71,7 @@ pub static RAMFS_SYMLINK_INODE_OPS: InodeOps = InodeOps {
     rename: None,
     symlink: None,
     readlink: Some(ramfs_readlink),
+    setattr: None,
 };
 
 pub static RAMFS_FILE_OPS: FileOps = FileOps {

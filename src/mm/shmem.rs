@@ -882,6 +882,7 @@ pub mod tmpfs_vfs {
         rename: None,
         symlink: Some(tmpfs_symlink),
         readlink: None,
+        setattr: None,
     };
     pub static TMPFS_FILE_INODE_OPS: InodeOps = InodeOps {
         name: "tmpfs_file",
@@ -893,6 +894,7 @@ pub mod tmpfs_vfs {
         rename: None,
         symlink: None,
         readlink: None,
+        setattr: None,
     };
     pub static TMPFS_SYMLINK_INODE_OPS: InodeOps = InodeOps {
         name: "tmpfs_symlink",
@@ -904,6 +906,7 @@ pub mod tmpfs_vfs {
         rename: None,
         symlink: None,
         readlink: Some(tmpfs_readlink),
+        setattr: None,
     };
 
     pub static TMPFS_FILE_OPS: FileOps = FileOps {

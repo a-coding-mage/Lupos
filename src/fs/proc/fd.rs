@@ -103,6 +103,7 @@ static PROC_FD_SYMLINK_INODE_OPS: InodeOps = InodeOps {
     rename: None,
     symlink: None,
     readlink: Some(proc_fd_readlink),
+    setattr: None,
 };
 
 static PROC_FD_SYMLINK_FILE_OPS: FileOps = FileOps {

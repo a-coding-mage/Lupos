@@ -300,6 +300,7 @@ pub static KERNFS_DIR_INODE_OPS: InodeOps = InodeOps {
     rename: None,
     symlink: None,
     readlink: None,
+    setattr: None,
 };
 
 pub static KERNFS_FILE_INODE_OPS: InodeOps = InodeOps {
@@ -312,6 +313,7 @@ pub static KERNFS_FILE_INODE_OPS: InodeOps = InodeOps {
     rename: None,
     symlink: None,
     readlink: None,
+    setattr: None,
 };
 
 pub static KERNFS_SYMLINK_INODE_OPS: InodeOps = InodeOps {
@@ -324,6 +326,7 @@ pub static KERNFS_SYMLINK_INODE_OPS: InodeOps = InodeOps {
     rename: None,
     symlink: None,
     readlink: Some(kernfs_readlink),
+    setattr: None,
 };
 
 pub static KERNFS_DIR_FILE_OPS: FileOps = FileOps {

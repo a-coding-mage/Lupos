@@ -68,6 +68,7 @@ pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
 pub const EV_ABS: u16 = 0x03;
 pub const EV_SW: u16 = 0x05;
+pub const EV_LED: u16 = 0x11;
 pub const EV_SND: u16 = 0x12;
 pub const EV_REP: u16 = 0x14;
 

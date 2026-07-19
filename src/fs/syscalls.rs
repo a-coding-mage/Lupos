@@ -2133,8 +2133,9 @@ pub unsafe fn sys_mkdirat(dirfd: i32, pathname: *const u8, mode: u32) -> i64 {
                 Err(errno) => return -(errno as i64),
             }
         }
+        let create_mode = (mode & 0o7777) & !super::fs_struct::current_umask();
         match dir.ops.mkdir {
-            Some(mkdir) => match mkdir(&dir, last, mode) {
+            Some(mkdir) => match mkdir(&dir, last, create_mode) {
                 Ok(inode) => {
                     let dentry = super::dcache::d_lookup(&parent, last)
                         .unwrap_or_else(|| super::dcache::d_alloc_child(&parent, last));
@@ -3324,6 +3325,7 @@ pub unsafe fn sys_mknodat(dirfd: i32, pathname: *const u8, mode: u32, dev: u32) 
     };
     let ret = (|| {
         let kind = mknod_kind(mode)?;
+        let create_mode = mode & !super::fs_struct::current_umask();
         let (root, start) = root_and_start(dirfd)?;
         let (parent_path, last) = split_last(&path);
         if last.is_empty() || last == "." || last == ".." {
@@ -3347,14 +3349,14 @@ pub unsafe fn sys_mknodat(dirfd: i32, pathname: *const u8, mode: u32, dev: u32) 
         }
         if kind == InodeKind::Regular {
             let create = dir.ops.create.ok_or(ENOSYS)?;
-            let inode = create(&dir, last, mode & 0o7777)?;
+            let inode = create(&dir, last, create_mode & 0o7777)?;
             let child = super::dcache::d_lookup(&parent, last)
                 .unwrap_or_else(|| super::dcache::d_alloc_child(&parent, last));
             child.instantiate(inode);
             super::inotify::notify_create(&parent, last, false);
             return Ok(());
         }
-        insert_special_node(&parent, &dir, last, mode, kind, dev)?;
+        insert_special_node(&parent, &dir, last, create_mode, kind, dev)?;
         super::inotify::notify_create(&parent, last, kind == InodeKind::Directory);
         Ok(())
     })()
@@ -5407,6 +5409,57 @@ mod tests {
             }
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn per_task_umask_filters_open_mkdir_and_mknod_creation_modes() {
+        let _guard = mount::TEST_MOUNT_LOCK.lock();
+        let (mut current, previous) = setup_current_with_rootfs(84);
+        unsafe {
+            assert_eq!(crate::kernel::syscalls::sys_umask(0o077), 0o022);
+
+            let fd = sys_openat(
+                AT_FDCWD,
+                b"/private-file\0".as_ptr(),
+                (O_CREAT | O_WRONLY) as i32,
+                0o666,
+            );
+            assert!(fd >= 0);
+            assert_eq!(crate::fs::fdtable::sys_close(fd as i32), 0);
+            let how = OpenHow {
+                flags: (O_CREAT | O_WRONLY) as u64,
+                mode: 0o666,
+                resolve: 0,
+            };
+            let openat2_fd = sys_openat2(
+                AT_FDCWD,
+                b"/private-openat2\0".as_ptr(),
+                &how,
+                core::mem::size_of::<OpenHow>(),
+            );
+            assert!(openat2_fd >= 0);
+            assert_eq!(crate::fs::fdtable::sys_close(openat2_fd as i32), 0);
+            assert_eq!(sys_mkdirat(AT_FDCWD, b"/private-dir\0".as_ptr(), 0o777), 0);
+            assert_eq!(
+                sys_mknodat(AT_FDCWD, b"/private-fifo\0".as_ptr(), S_IFIFO | 0o666, 0,),
+                0
+            );
+
+            for (path, expected) in [
+                (b"/private-file\0".as_slice(), S_IFREG | 0o600),
+                (b"/private-openat2\0".as_slice(), S_IFREG | 0o600),
+                (b"/private-dir\0".as_slice(), S_IFDIR | 0o700),
+                (b"/private-fifo\0".as_slice(), S_IFIFO | 0o600),
+            ] {
+                let mut st = LinuxStat::default();
+                assert_eq!(sys_lstat(path.as_ptr(), &mut st), 0);
+                assert_eq!(st.st_mode & (S_IFMT | 0o7777), expected);
+            }
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            crate::fs::fs_struct::exit_fs(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
     }
