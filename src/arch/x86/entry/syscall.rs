@@ -339,14 +339,32 @@ pub(crate) unsafe extern "C" fn syscall_exit_slowpath(
     if task.is_null() {
         return;
     }
-    if unsafe { (*task).thread_info.flags & TIF_SIGPENDING != 0 } {
+    let restart_pending = if regs.is_null() {
+        false
+    } else {
+        matches!(unsafe { (*regs).rax as i64 }, -512 | -513 | -514 | -516)
+    };
+    if unsafe { (*task).thread_info.flags & TIF_SIGPENDING != 0 } || restart_pending {
         if regs.is_null() {
             while unsafe { crate::kernel::signal::do_signal_stop_only() } {}
         } else {
             // `arch::x86::kernel::ptrace::PtRegs` and `kernel::task::PtRegs` both mirror
             // Linux `struct pt_regs` with the same `repr(C)` layout; the latter
             // keeps Linux's short field names used by the signal frame builder.
+            // A process-directed signal can be consumed by a sibling after a
+            // blocking syscall has selected an internal restart result.  Still
+            // run arch_do_signal_or_restart-equivalent processing so no
+            // ERESTART* value can escape to userspace.
             let _ = unsafe { crate::kernel::signal::do_signal(regs.cast()) };
+            // get_signal() consumes default stop/continue actions internally
+            // before arch_do_signal_or_restart() applies restart semantics.
+            // Lupos' combined do_signal() can return after those actions, so
+            // finish any still-pending internal restart here.  This also makes
+            // the exit boundary robust against a process-directed signal being
+            // consumed by a sibling between the wait wakeup and this path.
+            unsafe {
+                crate::kernel::signal::apply_syscall_restart_without_handler(&mut *regs.cast());
+            }
         }
     }
     sanitize_syscall_user_rflags(regs);

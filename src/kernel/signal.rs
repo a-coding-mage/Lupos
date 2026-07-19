@@ -2606,7 +2606,7 @@ fn apply_syscall_restart_for_handler(regs: &mut crate::kernel::task::PtRegs, act
     }
 }
 
-fn apply_syscall_restart_without_handler(regs: &mut crate::kernel::task::PtRegs) {
+pub(crate) fn apply_syscall_restart_without_handler(regs: &mut crate::kernel::task::PtRegs) {
     match syscall_restart_error(regs) {
         Some(ERESTARTNOHAND) | Some(ERESTARTSYS) | Some(ERESTARTNOINTR) => {
             restart_original_syscall(regs);

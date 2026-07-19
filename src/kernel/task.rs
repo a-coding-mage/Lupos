@@ -202,6 +202,46 @@ const PAD_STACK_TO_MM: usize = LINUX_OFFSET_MM - (LINUX_OFFSET_STACK + 8);
 // After `mm` (8 bytes) and `active_mm` (8 bytes), next acceptance field is `pid`.
 const PAD_ACTIVE_MM_TO_PID: usize = LINUX_OFFSET_PID - (LINUX_OFFSET_MM + 16);
 
+/// Linux `struct restart_block::futex`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FutexRestartBlock {
+    pub uaddr: u64,
+    pub val: u32,
+    pub flags: u32,
+    pub bitset: u32,
+    pub _pad: u32,
+    pub time: i64,
+    pub uaddr2: u64,
+}
+
+/// Largest active member of Linux `struct restart_block`'s payload union.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union RestartBlockData {
+    pub futex: FutexRestartBlock,
+    pub raw: [u64; 5],
+}
+
+/// Linux `struct restart_block`.
+///
+/// Function identities are kernel-internal, so Lupos stores a stable marker
+/// in the function-pointer-sized slot and dispatches it from
+/// `sys_restart_syscall`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RestartBlock {
+    pub arch_data: u64,
+    pub fn_marker: usize,
+    pub data: RestartBlockData,
+}
+
+pub const RESTART_BLOCK_FN_NONE: usize = 0;
+pub const RESTART_BLOCK_FN_FUTEX: usize = 1;
+
+const PAD_ACTIVE_MM_TO_RESTART_BLOCK: usize =
+    PAD_ACTIVE_MM_TO_PID - core::mem::size_of::<RestartBlock>();
+
 // After `tgid` (4 bytes), next acceptance field is `cred`.
 // M26 inserts `M26Fields` (`size_of::<M26Fields>()` bytes) at the start of
 // this region; M27 adds `M27Fields` (real_cred + no_new_privs) immediately
@@ -689,7 +729,8 @@ pub struct TaskStruct {
     //
     // Contains: exit_state, exit_code, exit_signal, pdeath_signal, jobctl,
     // personality, scheduler bitfields, atomic_flags, restart_block.
-    _pad_active_mm_to_pid: [u8; PAD_ACTIVE_MM_TO_PID],
+    _pad_active_mm_to_restart_block: [u8; PAD_ACTIVE_MM_TO_RESTART_BLOCK],
+    pub restart_block: RestartBlock,
 
     /// Process ID (unique per-task; equals tgid for the group leader).
     pub pid: i32,
