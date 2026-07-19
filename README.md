@@ -5,6 +5,16 @@ AArch64 planned later. The success condition is binary-level Linux ABI parity:
 binaries built for Linux should observe Linux-compatible syscalls, filesystems,
 device interfaces, and process behavior.
 
+<p align="center">
+  <img src="./branding/lupos-fastfetch.png" alt="fastfetch running in xfce4-terminal on the XFCE desktop under QEMU, reporting an Arch Linux userland on the Lupos 0.1.0 kernel" />
+</p>
+
+*What you're looking at: an unmodified Arch Linux userland — `bash`, `pacman`,
+Xorg, the full XFCE 4.20 desktop, and `fastfetch` in `xfce4-terminal` — booted
+on the Lupos kernel (`Kernel: Lupos 0.1.0-lupos`) in QEMU. No patched binaries:
+the same syscalls, filesystems, and device interfaces Linux provides, served by
+a kernel written in Rust.*
+
 <span style="font-style: italic;">Working on virtualbox</span>
 <img src="./branding/virtualbox_bash.png" />
 
