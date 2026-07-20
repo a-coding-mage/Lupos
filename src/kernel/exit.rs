@@ -588,8 +588,9 @@ mod tests {
             .split("pub unsafe fn exit_clear_child_tid")
             .next()
             .expect("group-exit path end");
-        assert!(group_exit.contains("zap_other_threads(current, code)"));
-        assert!(group_exit.contains("do_exit(code)"));
+        assert!(group_exit.contains("if started"));
+        assert!(group_exit.contains("zap_other_threads(current, code as i64)"));
+        assert!(group_exit.contains("do_exit(code as i64)"));
 
         let signal_source = include_str!("signal.rs");
         let do_signal = signal_source

@@ -509,6 +509,8 @@ mod tests {
         ima::reset_for_test();
         ima::init();
         ima::set_file_hook_measurements_for_test(true);
+        let policy = b"measure func=FILE_CHECK mask=MAY_READ fsname=rootfs\n";
+        assert_eq!(ima::load_policy(policy), Ok(policy.len()));
 
         let inode = Inode::new(
             100,
