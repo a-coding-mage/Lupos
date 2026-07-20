@@ -91,6 +91,15 @@ const RENAME_EXCHANGE: u32 = 1 << 1;
 const RENAME_WHITEOUT: u32 = 1 << 2;
 const ERESTARTNOHAND: i32 = 514;
 
+/// Sixth argument to pselect6(2). Linux packs the sigset pointer and size
+/// because the native syscall ABI only has six argument registers.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PselectSigsetArg {
+    sigmask: *const crate::kernel::signal::SigSet,
+    sigsetsize: usize,
+}
+
 fn statx_result_mask(request_mask: u32) -> u32 {
     let mnt_id = if request_mask & STATX_MNT_ID_UNIQUE != 0 {
         STATX_MNT_ID_UNIQUE
@@ -1894,27 +1903,53 @@ pub unsafe fn sys_pselect6(
     writefds: *mut u64,
     exceptfds: *mut u64,
     timeout: *const crate::kernel::time::Timespec64,
-    _sig: *const u8,
+    sig: *const u8,
 ) -> i64 {
+    let sigset = if sig.is_null() {
+        PselectSigsetArg::default()
+    } else {
+        match unsafe { copy_user_value(sig.cast::<PselectSigsetArg>()) } {
+            Ok(sigset) => sigset,
+            Err(errno) => return -(errno as i64),
+        }
+    };
     let timeout_ns = match unsafe { timespec_timeout_ns(timeout) } {
         Ok(timeout_ns) => timeout_ns,
         Err(errno) => return -(errno as i64),
     };
-    unsafe { select_impl(nfds, readfds, writefds, exceptfds, timeout_ns) }
+    let error =
+        unsafe { crate::kernel::signal::set_user_sigmask(sigset.sigmask, sigset.sigsetsize) };
+    if error != 0 {
+        return error;
+    }
+    let result = unsafe { select_impl(nfds, readfds, writefds, exceptfds, timeout_ns) };
+    crate::kernel::signal::restore_saved_sigmask_unless(result == -(ERESTARTNOHAND as i64));
+    result
 }
 
 pub unsafe fn sys_ppoll(
     fds: *mut PollFd,
     nfds: usize,
     timeout: *const crate::kernel::time::Timespec64,
-    _sigmask: *const u8,
-    _sigsetsize: usize,
+    sigmask: *const u8,
+    sigsetsize: usize,
 ) -> i64 {
     let timeout_ns = match unsafe { timespec_timeout_ns(timeout) } {
         Ok(timeout_ns) => timeout_ns,
         Err(errno) => return -(errno as i64),
     };
-    unsafe { poll_impl(fds, nfds, timeout_ns) }
+    let error = unsafe {
+        crate::kernel::signal::set_user_sigmask(
+            sigmask.cast::<crate::kernel::signal::SigSet>(),
+            sigsetsize,
+        )
+    };
+    if error != 0 {
+        return error;
+    }
+    let result = unsafe { poll_impl(fds, nfds, timeout_ns) };
+    crate::kernel::signal::restore_saved_sigmask_unless(result == -(ERESTARTNOHAND as i64));
+    result
 }
 
 fn dirent_type(kind: InodeKind) -> u8 {
@@ -7593,6 +7628,77 @@ mod tests {
                 file_weak.upgrade().is_none(),
                 "poll/select wait-table FileRef leaked"
             );
+            sched::set_current(previous);
+        }
+        crate::kernel::signal::reset_for_tests();
+    }
+
+    #[test]
+    fn pselect_temporary_mask_unblocks_pending_signal_during_wait() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 31_102;
+        current.tgid = 31_102;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let mut blocked = crate::kernel::signal::SigSet::default();
+            blocked.add(crate::kernel::signal::SIGTERM);
+            assert_eq!(
+                crate::kernel::signal::sys_rt_sigprocmask(
+                    crate::kernel::signal::SIG_SETMASK,
+                    &blocked,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<crate::kernel::signal::SigSet>(),
+                ),
+                0
+            );
+            assert_eq!(
+                crate::kernel::signal::send_signal_to_task(
+                    &mut *current as *mut TaskStruct,
+                    crate::kernel::signal::SIGTERM,
+                ),
+                0
+            );
+            assert!(
+                !crate::kernel::signal::current_has_unblocked_pending_signals(),
+                "the persistent mask must keep SIGTERM blocked"
+            );
+
+            let wait_mask = crate::kernel::signal::SigSet::default();
+            let arg = PselectSigsetArg {
+                sigmask: &wait_mask,
+                sigsetsize: core::mem::size_of::<crate::kernel::signal::SigSet>(),
+            };
+            let zero_timeout = crate::kernel::time::Timespec64::new(0, 0);
+            assert_eq!(
+                sys_pselect6(
+                    0,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    &zero_timeout,
+                    (&raw const arg).cast::<u8>(),
+                ),
+                -(ERESTARTNOHAND as i64)
+            );
+            assert!(
+                crate::kernel::signal::current_has_unblocked_pending_signals(),
+                "pselect's temporary empty mask must expose pending SIGTERM"
+            );
+
+            // Model the no-handler cleanup path and prove pselect retained the
+            // original mask for restoration.
+            crate::kernel::signal::restore_saved_sigmask_unless(false);
+            assert!(!crate::kernel::signal::current_has_unblocked_pending_signals());
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
         crate::kernel::signal::reset_for_tests();

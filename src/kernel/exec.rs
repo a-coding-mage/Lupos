@@ -2482,6 +2482,11 @@ mod tests {
         reset_for_test();
         crate::security::integrity::ima::reset_for_test();
         crate::security::integrity::ima::init();
+        let policy = b"measure func=BPRM_CHECK mask=MAY_EXEC fsname=rootfs\n";
+        assert_eq!(
+            crate::security::integrity::ima::load_policy(policy),
+            Ok(policy.len())
+        );
 
         let main_bytes = tiny_elf(Some("/lib64/ld-linux-x86-64.so.2"));
         let main_elf = parse_elf_image(&main_bytes).expect("main parse");
