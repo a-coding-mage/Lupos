@@ -5,9 +5,38 @@
 //!
 //! Ref: `vendor/linux/fs/sysfs/mount.c`
 
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 
 use crate::fs::kernfs::{KernfsNode, add_child};
+use lazy_static::lazy_static;
+use spin::Mutex;
+
+#[derive(Clone)]
+struct LinuxClassDevice {
+    device: usize,
+    class: String,
+    name: String,
+    devpath: String,
+    devname: Option<String>,
+    major: u32,
+    minor: u32,
+}
+
+#[derive(Clone)]
+struct LinuxClassRoots {
+    class: Arc<KernfsNode>,
+    devices: Arc<KernfsNode>,
+    dev: Arc<KernfsNode>,
+}
+
+lazy_static! {
+    static ref LINUX_CLASS_DEVICES: Mutex<BTreeMap<usize, LinuxClassDevice>> =
+        Mutex::new(BTreeMap::new());
+    static ref LINUX_CLASS_ROOTS: Mutex<Option<LinuxClassRoots>> = Mutex::new(None);
+}
 
 /// Show callback for `/sys/kernel/uevent_seqnum`.
 /// Ref: `vendor/linux/lib/kobject_uevent.c` — the file is wired through
@@ -27,6 +56,198 @@ fn copy_text(buf: &mut [u8], text: &str) -> Result<usize, i32> {
     let n = text.len().min(buf.len());
     buf[..n].copy_from_slice(&text.as_bytes()[..n]);
     Ok(n)
+}
+
+fn linux_class_device_for_attribute(node: &Arc<KernfsNode>) -> Option<LinuxClassDevice> {
+    let device_node = node.parent.lock().upgrade()?;
+    let device = device_node.priv_ptr.load(Ordering::Acquire) as usize;
+    LINUX_CLASS_DEVICES.lock().get(&device).cloned()
+}
+
+fn linux_class_dev_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    let record =
+        linux_class_device_for_attribute(node).ok_or(crate::include::uapi::errno::ENODEV)?;
+    copy_text(buf, &alloc::format!("{}:{}\n", record.major, record.minor))
+}
+
+fn linux_class_uevent_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    let record =
+        linux_class_device_for_attribute(node).ok_or(crate::include::uapi::errno::ENODEV)?;
+    let text = if let Some(devname) = record.devname.as_deref() {
+        alloc::format!(
+            "MAJOR={}\nMINOR={}\nDEVNAME={}\n",
+            record.major,
+            record.minor,
+            devname
+        )
+    } else {
+        String::new()
+    };
+    copy_text(buf, &text)
+}
+
+fn parse_uevent_action(buf: &[u8]) -> Result<crate::net::uevent::UeventAction, i32> {
+    use crate::include::uapi::errno::EINVAL;
+    use crate::net::uevent::UeventAction;
+
+    let end = buf
+        .iter()
+        .position(|byte| matches!(*byte, 0 | b'\n'))
+        .unwrap_or(buf.len());
+    let request = core::str::from_utf8(&buf[..end])
+        .map_err(|_| EINVAL)?
+        .trim();
+    match request.split_ascii_whitespace().next().ok_or(EINVAL)? {
+        "add" => Ok(UeventAction::Add),
+        "remove" => Ok(UeventAction::Remove),
+        "change" => Ok(UeventAction::Change),
+        "online" => Ok(UeventAction::Online),
+        "offline" => Ok(UeventAction::Offline),
+        "move" => Ok(UeventAction::Move),
+        "bind" => Ok(UeventAction::Bind),
+        "unbind" => Ok(UeventAction::Unbind),
+        _ => Err(EINVAL),
+    }
+}
+
+fn linux_class_uevent_store(node: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize, i32> {
+    let record =
+        linux_class_device_for_attribute(node).ok_or(crate::include::uapi::errno::ENODEV)?;
+    let action = parse_uevent_action(buf)?;
+    let devt = record
+        .devname
+        .as_ref()
+        .map(|_| (record.major, record.minor));
+    crate::net::uevent::announce_class_device_at_path(
+        action,
+        &record.devpath,
+        &record.class,
+        record.devname.as_deref(),
+        devt,
+    );
+    Ok(buf.len())
+}
+
+fn lookup_or_add_path(root: &Arc<KernfsNode>, path: &str) -> Arc<KernfsNode> {
+    let mut current = root.clone();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        current = lookup_or_add_dir(&current, component);
+    }
+    current
+}
+
+fn install_linux_class_device(roots: &LinuxClassRoots, record: &LinuxClassDevice) {
+    let class = lookup_or_add_dir(&roots.class, &record.class);
+    let relative = record
+        .devpath
+        .strip_prefix("/devices/")
+        .unwrap_or(record.devpath.as_str());
+    let (parent_path, _) = relative.rsplit_once('/').unwrap_or(("", relative));
+    let parent = lookup_or_add_path(&roots.devices, parent_path);
+    let device_node = lookup_or_add_dir(&parent, &record.name);
+    device_node
+        .priv_ptr
+        .store(record.device as u64, Ordering::Release);
+
+    add_child(
+        &device_node,
+        KernfsNode::new_file(
+            "uevent",
+            0o644,
+            Some(linux_class_uevent_show),
+            Some(linux_class_uevent_store),
+        ),
+    );
+    add_child(
+        &device_node,
+        KernfsNode::new_symlink(
+            "subsystem",
+            &alloc::format!(
+                "{}class/{}",
+                "../".repeat(
+                    record
+                        .devpath
+                        .split('/')
+                        .filter(|component| !component.is_empty())
+                        .count()
+                ),
+                record.class
+            ),
+        ),
+    );
+    if record.devname.is_some() {
+        add_child(
+            &device_node,
+            KernfsNode::new_file("dev", 0o444, Some(linux_class_dev_show), None),
+        );
+        let char_root = lookup_or_add_dir(&roots.dev, "char");
+        add_child(
+            &char_root,
+            KernfsNode::new_symlink(
+                &alloc::format!("{}:{}", record.major, record.minor),
+                &alloc::format!("../..{}", record.devpath),
+            ),
+        );
+    }
+
+    add_child(
+        &class,
+        KernfsNode::new_symlink(&record.name, &alloc::format!("../..{}", record.devpath)),
+    );
+}
+
+/// Publish the sysfs objects that vendor/Linux `device_add()` creates before
+/// its add uevent. `parent` is the raw target task's `struct device *`; when it
+/// is another member of the same class, the canonical kobject is nested below
+/// that parent (for example `sound/card0/controlC0`).
+pub fn publish_linux_class_device(
+    device: usize,
+    parent: usize,
+    class: &str,
+    name: &str,
+    devname: Option<&str>,
+    major: u32,
+    minor: u32,
+) -> String {
+    let mut devices = LINUX_CLASS_DEVICES.lock();
+    let parent_path = devices
+        .get(&parent)
+        .filter(|record| record.class == class)
+        .map(|record| record.devpath.clone());
+    let devpath = parent_path.map_or_else(
+        || alloc::format!("/devices/virtual/{class}/{name}"),
+        |parent_path| alloc::format!("{parent_path}/{name}"),
+    );
+    let record = LinuxClassDevice {
+        device,
+        class: class.to_string(),
+        name: name.to_string(),
+        devpath: devpath.clone(),
+        devname: devname.map(ToString::to_string),
+        major,
+        minor,
+    };
+    devices.insert(device, record.clone());
+    drop(devices);
+
+    if let Some(roots) = LINUX_CLASS_ROOTS.lock().clone() {
+        install_linux_class_device(&roots, &record);
+    }
+    devpath
+}
+
+pub fn unpublish_linux_class_device(
+    device: usize,
+) -> Option<(String, String, Option<String>, u32, u32)> {
+    LINUX_CLASS_DEVICES.lock().remove(&device).map(|record| {
+        (
+            record.devpath,
+            record.class,
+            record.devname,
+            record.major,
+            record.minor,
+        )
+    })
 }
 
 /// `/sys/class/tty/tty0/active` reports the active virtual console.
@@ -487,6 +708,15 @@ pub fn build_root() -> (Arc<KernfsNode>, Arc<KernfsNode>) {
     let devices = KernfsNode::new_dir("devices", 0o555);
     crate::fs::sysfs::net::attach_roots(&class, &devices);
     add_graphics_class(&class, &devices, &dev);
+    let linux_class_roots = LinuxClassRoots {
+        class: class.clone(),
+        devices: devices.clone(),
+        dev: dev.clone(),
+    };
+    *LINUX_CLASS_ROOTS.lock() = Some(linux_class_roots.clone());
+    for record in LINUX_CLASS_DEVICES.lock().values().cloned() {
+        install_linux_class_device(&linux_class_roots, &record);
+    }
 
     for child in [
         kernel.clone(),
@@ -692,5 +922,97 @@ mod tests {
                 .windows(b"MAJOR=29\0".len())
                 .any(|window| window == b"MAJOR=29\0")
         );
+    }
+
+    /// ALSA registers `card0` as a class device without a `dev_t`, then
+    /// registers `controlC0` as its class-device child. Arch's
+    /// `78-sound-card.rules` writes `change` to the parent's `uevent` file and
+    /// assigns `SOUND_INITIALIZED=1`; PipeWire's ALSA udev enumerator rejects
+    /// the card without that exact hierarchy.
+    ///
+    /// Ref: `vendor/linux/sound/core/init.c`,
+    /// `vendor/linux/drivers/base/core.c::device_add`.
+    #[test]
+    fn sound_class_devices_expose_vendor_parent_and_uevent_layout() {
+        let _guard = crate::net::uevent::test_lock();
+        let _ = crate::net::uevent::drain_pending();
+        const CARD_DEVICE: usize = 0x534f_554e_4400;
+        const CONTROL_DEVICE: usize = 0x534f_554e_4401;
+
+        let (root, _) = build_root();
+        assert_eq!(
+            publish_linux_class_device(CARD_DEVICE, 0, "sound", "card0", None, 0, 0,),
+            "/devices/virtual/sound/card0"
+        );
+        assert_eq!(
+            publish_linux_class_device(
+                CONTROL_DEVICE,
+                CARD_DEVICE,
+                "sound",
+                "controlC0",
+                Some("snd/controlC0"),
+                116,
+                0,
+            ),
+            "/devices/virtual/sound/card0/controlC0"
+        );
+
+        let class = lookup(&root, "class").expect("/sys/class");
+        let sound = lookup(&class, "sound").expect("/sys/class/sound");
+        for (name, target) in [
+            ("card0", "../../devices/virtual/sound/card0"),
+            ("controlC0", "../../devices/virtual/sound/card0/controlC0"),
+        ] {
+            let link = lookup(&sound, name).unwrap_or_else(|| panic!("/sys/class/sound/{name}"));
+            assert!(matches!(
+                &link.kind,
+                KernfsKind::Symlink { target: actual } if actual == target
+            ));
+        }
+
+        let devices = lookup(&root, "devices").expect("/sys/devices");
+        let virtual_root = lookup(&devices, "virtual").expect("/sys/devices/virtual");
+        let sound_devices = lookup(&virtual_root, "sound").expect("sound devices");
+        let card = lookup(&sound_devices, "card0").expect("card0");
+        let control = lookup(&card, "controlC0").expect("controlC0 below card0");
+        assert_eq!(show(&lookup(&card, "uevent").expect("card0 uevent")), "");
+        assert_eq!(
+            show(&lookup(&control, "uevent").expect("controlC0 uevent")),
+            "MAJOR=116\nMINOR=0\nDEVNAME=snd/controlC0\n"
+        );
+        assert_eq!(
+            show(&lookup(&control, "dev").expect("controlC0 dev")),
+            "116:0\n"
+        );
+        assert!(matches!(
+            &lookup(&control, "subsystem")
+                .expect("controlC0 subsystem")
+                .kind,
+            KernfsKind::Symlink { target }
+                if target == "../../../../../class/sound"
+        ));
+
+        let char_root =
+            lookup(&lookup(&root, "dev").expect("/sys/dev"), "char").expect("/sys/dev/char");
+        assert!(lookup(&char_root, "116:0").is_some());
+
+        let card_uevent = lookup(&card, "uevent").expect("card0 uevent");
+        assert_eq!(store(&card_uevent, b"change\n"), Ok(7));
+        let events = crate::net::uevent::drain_pending();
+        let payload = &events.last().expect("card0 change event").payload;
+        assert!(payload.starts_with(b"change@/devices/virtual/sound/card0\0"));
+        assert!(
+            payload
+                .windows(b"SUBSYSTEM=sound\0".len())
+                .any(|window| window == b"SUBSYSTEM=sound\0")
+        );
+        assert!(
+            !payload
+                .windows(b"MAJOR=".len())
+                .any(|window| window == b"MAJOR=")
+        );
+
+        let _ = unpublish_linux_class_device(CONTROL_DEVICE);
+        let _ = unpublish_linux_class_device(CARD_DEVICE);
     }
 }

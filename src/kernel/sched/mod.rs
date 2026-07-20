@@ -426,6 +426,19 @@ pub unsafe fn get_current() -> *mut TaskStruct {
     }
 }
 
+/// Return whether the task running on this CPU has been asked to reschedule.
+///
+/// The BSP idle loop uses this with local IRQs disabled for the final
+/// check-before-halt, matching Linux's `do_idle()` contract: a wakeup observed
+/// before `sti; hlt` must cause another scheduler pass instead of entering
+/// idle with runnable work queued.
+#[inline]
+pub fn current_needs_resched() -> bool {
+    let current = unsafe { get_current() };
+    !current.is_null()
+        && unsafe { (*current).thread_info.flags & crate::kernel::task::TIF_NEED_RESCHED != 0 }
+}
+
 /// Set the current task for this CPU.
 ///
 /// Called from `__switch_to` after the stack swap — at that point we are
@@ -1782,6 +1795,38 @@ mod tests {
 
         assert!(enable_before < schedule);
         assert!(schedule < enable_after);
+    }
+
+    #[test]
+    fn bsp_idle_loop_schedules_and_closes_the_check_halt_race() {
+        let source = include_str!("../../init/main.rs");
+        let body = source
+            .split("fn halt_loop_with_softirq() -> !")
+            .nth(1)
+            .expect("BSP idle loop must exist")
+            .split("/// Panic handler")
+            .next()
+            .expect("BSP idle loop must end before panic handler");
+
+        let schedule = body
+            .find("kernel::sched::schedule()")
+            .expect("BSP idle task must run the scheduler");
+        let disable = body[schedule..]
+            .find("kernel::locking::local_irq_disable()")
+            .map(|offset| schedule + offset)
+            .expect("BSP idle task must disable IRQs before its final checks");
+        let need_resched = body[disable..]
+            .find("kernel::sched::current_needs_resched()")
+            .map(|offset| disable + offset)
+            .expect("BSP idle task must recheck need_resched with IRQs disabled");
+        let halt = body[need_resched..]
+            .find("core::arch::asm!(\"sti; hlt\"")
+            .map(|offset| need_resched + offset)
+            .expect("BSP idle task must atomically enable IRQs and halt");
+
+        assert!(schedule < disable);
+        assert!(disable < need_resched);
+        assert!(need_resched < halt);
     }
 
     #[test]

@@ -319,8 +319,26 @@ const LOGIN_SHADOW: &str = concat!(
     "root:$6$lupos$kfqTeHWlA.9yNwAV7ku8p6jKF5ULWSzdhP3d/4Cq0ObxXStDoiUHezFLQH0Kh5EIXypcHW4AGgV6gn/KgMxou/:19000:0:99999:7:::\n",
     "lupos:$6$lupos$kfqTeHWlA.9yNwAV7ku8p6jKF5ULWSzdhP3d/4Cq0ObxXStDoiUHezFLQH0Kh5EIXypcHW4AGgV6gn/KgMxou/:19000:0:99999:7:::\n",
 );
-const LOGIN_GROUP: &str = concat!("root:x:0:\n", "lupos:x:1000:\n", "wheel:x:10:root,lupos\n",);
-const LOGIN_GSHADOW: &str = concat!("root:*::\n", "lupos:*::\n", "wheel:*::root,lupos\n",);
+const LOGIN_GROUP: &str = concat!(
+    "root:x:0:\n",
+    "lupos:x:1000:\n",
+    "wheel:x:10:root,lupos\n",
+    "network:x:90:lupos\n",
+    "audio:x:995:lupos\n",
+    "input:x:992:lupos\n",
+    "render:x:987:lupos\n",
+    "video:x:983:lupos\n",
+);
+const LOGIN_GSHADOW: &str = concat!(
+    "root:*::\n",
+    "lupos:*::\n",
+    "wheel:*::root,lupos\n",
+    "network:*::lupos\n",
+    "audio:*::lupos\n",
+    "input:*::lupos\n",
+    "render:*::lupos\n",
+    "video:*::lupos\n",
+);
 const LIGHTDM_PASSWD: &str =
     "lightdm:x:969:969:Light Display Manager:/var/lib/lightdm:/usr/bin/nologin\n";
 const LIGHTDM_SHADOW: &str = "lightdm:!*:19793::::::\n";
@@ -4431,6 +4449,11 @@ fn lupos_sysusers_config() -> Vec<u8> {
         "g lupos 1000\n",
         "u lupos 1000:lupos \"Lupos User\" /home/lupos /bin/bash\n",
         "m lupos wheel\n",
+        "m lupos network\n",
+        "m lupos audio\n",
+        "m lupos input\n",
+        "m lupos render\n",
+        "m lupos video\n",
     )
     .as_bytes()
     .to_vec()
@@ -5101,6 +5124,16 @@ fn graphics_x11_probe_script() -> Vec<u8> {
     concat!(
         "#!/bin/sh\n",
         "export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\n",
+        // A uid change does not migrate a process between cgroups. Test
+        // applications launched by this root-side probe must explicitly join
+        // the authenticated LightDM session before exec so shutdown exercises
+        // the same ownership and kill path as an application launched by XFCE.
+        "run_in_session_cgroup() {\n",
+        "    target=\"$1\"; shift\n",
+        "    [ -n \"$target\" ] || return 125\n",
+        "    printf '0\\n' > \"/sys/fs/cgroup${target}/cgroup.procs\" || return 125\n",
+        "    exec \"$@\"\n",
+        "}\n",
         // The harness starts this probe only after the authenticated desktop
         // boundary, so LightDM's root authority is already populated.  Keep
         // the stable path explicit for later read-only and application probes.
@@ -5387,6 +5420,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "grep '/run/user/1000' /proc/net/unix 2>/dev/null | sed 's/^/graphics-x11: early-user-unix /' || true\n",
         "for proc in /proc/[0-9]*; do [ -r \"$proc/status\" ] || continue; [ \"$(awk '/^Uid:/ { print $2; exit }' \"$proc/status\" 2>/dev/null)\" = 1000 ] || continue; [ \"$(cat \"$proc/comm\" 2>/dev/null)\" = systemd ] || continue; printf 'graphics-x11: early-user-manager pid=%s wchan=' \"${proc##*/}\"; cat \"$proc/wchan\" 2>/dev/null || true; for fd in \"$proc\"/fd/*; do target=; target=\"$(readlink \"$fd\" 2>/dev/null || true)\"; [ -n \"$target\" ] && printf 'graphics-x11: early-user-manager-fd %s -> %s\\n' \"${fd##*/}\" \"$target\"; done; done\n",
         "sudo -n -u lupos env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus timeout -k 2 10 systemctl --user --no-pager --full status dbus.socket dbus.service 2>&1 | sed 's/^/graphics-x11: early-user-unit /' || true\n",
+        "if /usr/bin/systemctl is-active --quiet user@1000.service; then echo 'graphics-x11: user-manager active'; else echo 'graphics-x11: user-manager failed'; /usr/bin/systemctl --no-pager --full status user@1000.service 2>&1 | sed 's/^/graphics-x11: user-manager-status /' || true; fi\n",
         "early_bus=; early_bus_ok=0; early_desktop_ok=0; i=0\n",
         "while [ \"$i\" -lt 240 ]; do\n",
         "    [ -n \"$early_session_pid\" ] || early_session_pid=\"$(process_pid_named_uid_with_bus xfce4-session 1000 2>/dev/null || true)\"\n",
@@ -5431,6 +5465,10 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // response proves this graphical multi-user boot actually enabled the
         // network services rather than merely staging their unit files.
         "echo 'graphics-x11: curl-probe begin'\n",
+        "timeout 15 /usr/bin/nmcli --terse device status 2>&1 | sed 's/^/graphics-x11: nm-device /' || true\n",
+        "timeout 15 /usr/bin/nmcli --terse connection show --active 2>&1 | sed 's/^/graphics-x11: nm-active /' || true\n",
+        "/usr/bin/ip -details address show dev eth0 2>&1 | sed 's/^/graphics-x11: ip-address /' || true\n",
+        "/usr/bin/ip route show 2>&1 | sed 's/^/graphics-x11: ip-route /' || true\n",
         "if grep -Eq '^[[:space:]]*nameserver[[:space:]]+10\\.0\\.2\\.3([[:space:]]|$)' /etc/resolv.conf 2>/dev/null && grep -Eq '^[[:space:]]*options[[:space:]].*\\btimeout:2\\b.*\\battempts:1\\b' /etc/resolv.conf 2>/dev/null; then echo 'graphics-x11: resolver-config ok'; else echo 'graphics-x11: resolver-config failed'; ls -l /etc/resolv.conf 2>&1 || true; cat /etc/resolv.conf /run/systemd/resolve/resolv.conf 2>/dev/null || true; timeout 15 /usr/bin/resolvectl status 2>&1 || true; fi\n",
         "rm -f /tmp/lupos-direct-dns.log\n",
         // Lupos has a fixed QEMU IPv4 address in the kernel transport, while
@@ -5690,6 +5728,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    session_dbus=\"$(tr '\\000' '\\n' < \"$session_env\" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' | head -1)\"\n",
         "    session_runtime=\"$(tr '\\000' '\\n' < \"$session_env\" | sed -n 's/^XDG_RUNTIME_DIR=//p' | head -1)\"\n",
         "    session_home=\"$(awk -F: '$3 == 1000 { print $6; exit }' /etc/passwd)\"\n",
+        "    session_cgroup=\"$(sed -n 's/^0:://p' \"/proc/$settings_session_pid/cgroup\" | head -1)\"\n",
         "    [ -n \"$session_display\" ] || session_display=:0\n",
         "    [ -n \"$session_home\" ] || session_home=/home/lupos\n",
         "    rm -f /tmp/lupos-settings-manager.log /tmp/lupos-settings-windows.log\n",
@@ -5775,6 +5814,123 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "printf 'graphics-x11: fontconfig-cjk match=%s\\n' \"$fontconfig_cjk_match\"\n",
         "if printf '%s' \"$fontconfig_cjk_match\" | grep -q '/usr/share/fonts/' && ! printf '%s' \"$fontconfig_cjk_match\" | grep -q '\\.pcf'; then echo 'graphics-x11: fontconfig-cjk ok'; else echo 'graphics-x11: fontconfig-cjk failed'; fi\n",
         "if [ -s /tmp/lupos-fontconfig.err ]; then echo 'graphics-x11: fontconfig-log begin'; tail -40 /tmp/lupos-fontconfig.err; echo 'graphics-x11: fontconfig-log end'; fi\n",
+        // Prove the shipped XFCE image exposes concrete audio, display, and
+        // network controls rather than merely carrying package metadata.
+        "echo 'graphics-x11: media-settings-probe begin'\n",
+        "media_settings_ok=1\n",
+        "for tool in /usr/bin/pavucontrol /usr/bin/xfce4-display-settings /usr/bin/nm-connection-editor; do\n",
+        "    if [ -x \"$tool\" ]; then printf 'graphics-x11: media-settings-tool %s\\n' \"$tool\"; else printf 'graphics-x11: media-settings-missing %s\\n' \"$tool\"; media_settings_ok=0; fi\n",
+        "done\n",
+        "if [ \"$media_settings_ok\" -eq 1 ]; then echo 'graphics-x11: media-settings ok'; else echo 'graphics-x11: media-settings failed'; fi\n",
+        "echo 'graphics-x11: media-settings-probe end'\n",
+        // Validate the whole sound path: HDA enumeration, ALSA PCM exposure,
+        // the stock per-user PipeWire/WirePlumber graph, and real-time PCM
+        // consumption by the emulated playback stream.
+        "echo 'graphics-x11: audio-probe begin'\n",
+        "if [ -e /dev/snd/controlC0 ] && [ -e /dev/snd/pcmC0D0p ] && /usr/bin/aplay -l 2>/tmp/lupos-aplay.err | grep -q '^card 0:'; then\n",
+        "    echo 'graphics-x11: alsa-hda-card ok'\n",
+        "else\n",
+        "    echo 'graphics-x11: alsa-hda-card failed'\n",
+        "fi\n",
+        "/usr/bin/aplay -l 2>&1 | sed 's/^/graphics-x11: aplay /'\n",
+        // PAM supplies an unsorted supplementary-gid vector. Linux sorts it
+        // in set_groups() before in_group_p() performs its binary search; this
+        // unprivileged open is the direct regression gate for that contract.
+        "if sudo -n -u lupos /usr/bin/aplay -l >/tmp/lupos-aplay-user.log 2>&1 && grep -q '^card 0:' /tmp/lupos-aplay-user.log; then echo 'graphics-x11: alsa-user-card ok'; else echo 'graphics-x11: alsa-user-card failed'; fi\n",
+        "sed 's/^/graphics-x11: aplay-user /' /tmp/lupos-aplay-user.log 2>/dev/null || true\n",
+        // WirePlumber's `api.alsa.enum.udev` enumerator requires the same
+        // class-device hierarchy and SOUND_INITIALIZED property produced by
+        // vendor/Linux plus Arch's stock 78-sound-card.rules.
+        "alsa_udev_card_ok=0; i=0\n",
+        "while [ \"$i\" -lt 20 ] && [ \"$alsa_udev_card_ok\" -eq 0 ]; do\n",
+        "    if [ -e /sys/class/sound/card0 ] && [ -e /sys/class/sound/controlC0 ] && /usr/bin/udevadm info --query=property --path=/sys/class/sound/card0 >/tmp/lupos-udev-card.log 2>&1 && grep -q '^SOUND_INITIALIZED=1$' /tmp/lupos-udev-card.log; then alsa_udev_card_ok=1; break; fi\n",
+        "    i=$((i + 1)); sleep 1\n",
+        "done\n",
+        "{ ls -la /sys/class/sound; readlink -f /sys/class/sound/card0; readlink -f /sys/class/sound/controlC0; /usr/bin/udevadm info --query=all --path=/sys/class/sound/card0; /usr/bin/udevadm info --query=all --name=/dev/snd/controlC0; } >/tmp/lupos-alsa-udev.log 2>&1 || true\n",
+        "if [ \"$alsa_udev_card_ok\" -eq 1 ]; then echo 'graphics-x11: alsa-udev-card ok'; else echo 'graphics-x11: alsa-udev-card failed'; fi\n",
+        // PipeWire's vendor access module opens this Linux procfs magic link
+        // for every peer before deciding whether it belongs to a sandbox.
+        "proc_pid_root_target=\"$(readlink \"/proc/$$/root\" 2>/tmp/lupos-proc-pid-root.err || true)\"\n",
+        "printf 'graphics-x11: proc-pid-root target=%s\\n' \"$proc_pid_root_target\"\n",
+        "if [ -n \"$proc_pid_root_target\" ] && [ -d \"/proc/$$/root\" ]; then echo 'graphics-x11: proc-pid-root ok'; else echo 'graphics-x11: proc-pid-root failed'; fi\n",
+        "rm -f /tmp/lupos-audio.wav /tmp/lupos-aplay-direct.log /tmp/lupos-pipewire-start.log /tmp/lupos-pw-play.log /tmp/lupos-wpctl.log /tmp/lupos-pactl.log /tmp/lupos-aplay-service-unfiltered.log /tmp/lupos-aplay-service-unfiltered-launcher.log /tmp/lupos-aplay-service-filtered.log /tmp/lupos-aplay-service-filtered-launcher.log\n",
+        "if timeout -k 2 30 /usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i sine=frequency=440:sample_rate=48000 -t 6 -ac 2 -c:a pcm_s16le /tmp/lupos-audio.wav; then echo 'graphics-x11: audio-pcm-generated ok'; else echo 'graphics-x11: audio-pcm-generated failed'; fi\n",
+        "chown lupos:lupos /tmp/lupos-audio.wav 2>/dev/null || true\n",
+        // Exercise the vendor ALSA PCM callbacks as the desktop user without
+        // a sound server first.
+        // Besides proving that `/dev/snd` is more than a set of metadata-only
+        // nodes, this keeps a PipeWire/WirePlumber policy-loop regression from
+        // obscuring the actual HDA DMA result.
+        "aplay_direct_start=\"$(date +%s 2>/dev/null || true)\"\n",
+        "sudo -n -u lupos timeout -k 2 15 /usr/bin/aplay -D hw:0,0 /tmp/lupos-audio.wav >/tmp/lupos-aplay-direct.log 2>&1\n",
+        "aplay_direct_rc=$?; aplay_direct_end=\"$(date +%s 2>/dev/null || true)\"; aplay_direct_elapsed=-1\n",
+        "if [ -n \"$aplay_direct_start\" ] && [ -n \"$aplay_direct_end\" ]; then aplay_direct_elapsed=$((aplay_direct_end - aplay_direct_start)); fi\n",
+        "printf 'graphics-x11: alsa-direct-playback rc=%s elapsed=%s\\n' \"$aplay_direct_rc\" \"$aplay_direct_elapsed\"\n",
+        "if [ \"$aplay_direct_rc\" -eq 0 ] && [ \"$aplay_direct_elapsed\" -ge 4 ] && [ \"$aplay_direct_elapsed\" -le 12 ]; then echo 'graphics-x11: alsa-direct-realtime ok'; else echo 'graphics-x11: alsa-direct-realtime failed'; fi\n",
+        "if [ -s /tmp/lupos-aplay-direct.log ]; then echo 'graphics-x11: audio-log /tmp/lupos-aplay-direct.log begin'; tail -80 /tmp/lupos-aplay-direct.log; echo 'graphics-x11: audio-log /tmp/lupos-aplay-direct.log end'; fi\n",
+        // Linux's systemctl --user start waits for all jobs. Use --no-block so
+        // the acceptance script remains able to print service diagnostics if
+        // a newly-started media process stops yielding.
+        "pipewire_start_rc=125\n",
+        "pipewire_ready=0; i=0\n",
+        "if [ \"$aplay_direct_rc\" -eq 0 ]; then\n",
+        "    sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user set-environment PIPEWIRE_DEBUG=4 WIREPLUMBER_DEBUG=4 >/tmp/lupos-pipewire-env.log 2>&1 || true\n",
+        "    rm -f /tmp/lupos-pipewire-start.rc\n",
+        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 30 /usr/bin/systemctl --user start --no-block pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service >/tmp/lupos-pipewire-start.log 2>&1; printf '%s\\n' \"$?\" > /tmp/lupos-pipewire-start.rc ) &\n",
+        "    pipewire_start_pid=$!\n",
+        "    rm -f /tmp/lupos-pipewire-ready\n",
+        "    ( sleep 5; sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" PIPEWIRE_DEBUG=4 /usr/bin/wpctl status -n >/tmp/lupos-wpctl.log 2>&1 && grep -q 'alsa_output' /tmp/lupos-wpctl.log && sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" /usr/bin/pactl info >/tmp/lupos-pactl.log 2>&1 && touch /tmp/lupos-pipewire-ready ) &\n",
+        "    pipewire_probe_pid=$!\n",
+        "    while [ \"$i\" -lt 30 ] && [ ! -e /tmp/lupos-pipewire-ready ]; do i=$((i + 1)); sleep 1; done\n",
+        "    [ -e /tmp/lupos-pipewire-ready ] && pipewire_ready=1\n",
+        "    if [ -s /tmp/lupos-pipewire-start.rc ]; then pipewire_start_rc=\"$(cat /tmp/lupos-pipewire-start.rc)\"; elif kill -0 \"$pipewire_start_pid\" 2>/dev/null; then pipewire_start_rc=124; else pipewire_start_rc=125; fi\n",
+        "fi\n",
+        "printf 'graphics-x11: pipewire-start rc=%s wait=%s\\n' \"$pipewire_start_rc\" \"$i\"\n",
+        "if [ \"$pipewire_ready\" -eq 1 ] && grep -q 'Audio' /tmp/lupos-wpctl.log && grep -q 'Server Name: PulseAudio (on PipeWire' /tmp/lupos-pactl.log; then echo 'graphics-x11: pipewire-session ok'; else echo 'graphics-x11: pipewire-session failed'; fi\n",
+        "if [ \"$pipewire_ready\" -ne 1 ]; then\n",
+        "    for media_name in pipewire pipewire-pulse wireplumber systemctl wpctl timeout; do for media_proc in /proc/[0-9]*; do [ \"$(cat \"$media_proc/comm\" 2>/dev/null)\" = \"$media_name\" ] || continue; printf 'name=%s pid=%s wchan=' \"$media_name\" \"${media_proc##*/}\" >> /tmp/lupos-pipewire-credentials.log; cat \"$media_proc/wchan\" >> /tmp/lupos-pipewire-credentials.log 2>/dev/null || true; sed -n '/^State:/p;/^Pid:/p;/^PPid:/p;/^Uid:/p;/^Gid:/p;/^Groups:/p;/^NoNewPrivs:/p;/^Seccomp:/p' \"$media_proc/status\" >> /tmp/lupos-pipewire-credentials.log 2>&1 || true; done; done\n",
+        "    echo 'graphics-x11: audio-live-credentials begin'; cat /tmp/lupos-pipewire-credentials.log 2>/dev/null || true; echo 'graphics-x11: audio-live-credentials end'\n",
+        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user --no-pager --full status pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service >/tmp/lupos-pipewire-status.log 2>&1 || true ) &\n",
+        "    : > /tmp/lupos-pipewire-credentials.log\n",
+        "    for unit in pipewire.service wireplumber.service; do\n",
+        "        media_pid=\"$(sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" /usr/bin/systemctl --user show --property=MainPID --value \"$unit\" 2>/dev/null || true)\"\n",
+        "        printf 'unit=%s pid=%s\\n' \"$unit\" \"$media_pid\" >> /tmp/lupos-pipewire-credentials.log\n",
+        "        if [ -n \"$media_pid\" ] && [ \"$media_pid\" != 0 ]; then\n",
+        "            sed -n '/^Name:/p;/^State:/p;/^Pid:/p;/^PPid:/p;/^Uid:/p;/^Gid:/p;/^Groups:/p;/^CapEff:/p;/^NoNewPrivs:/p;/^Seccomp:/p' \"/proc/$media_pid/status\" >> /tmp/lupos-pipewire-credentials.log 2>&1 || true\n",
+        "            ls -ld \"/proc/$media_pid/root/dev\" \"/proc/$media_pid/root/dev/snd\" \"/proc/$media_pid/root/dev/snd/controlC0\" >> /tmp/lupos-pipewire-credentials.log 2>&1 || true\n",
+        "        fi\n",
+        "    done\n",
+        // Reproduce the stock PipeWire unit's execution context with one
+        // controlled variable. Both transient services inherit the desktop
+        // user's manager, credentials, mount namespace and hardening; only
+        // the second installs the exact stock syscall filter. This separates
+        // path/device errors from seccomp cBPF evaluation errors.
+        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 30 /usr/bin/systemd-run --user --wait --collect --unit=lupos-alsa-unfiltered -p Type=exec -p NoNewPrivileges=yes -p LockPersonality=yes -p MemoryDenyWriteExecute=yes -p SystemCallArchitectures=native /bin/sh -c 'exec /usr/bin/aplay -l >/tmp/lupos-aplay-service-unfiltered.log 2>&1' >/tmp/lupos-aplay-service-unfiltered-launcher.log 2>&1 || true ) &\n",
+        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 30 /usr/bin/systemd-run --user --wait --collect --unit=lupos-alsa-filtered -p Type=exec -p NoNewPrivileges=yes -p LockPersonality=yes -p MemoryDenyWriteExecute=yes -p SystemCallArchitectures=native -p 'SystemCallFilter=@system-service mincore' /bin/sh -c 'exec /usr/bin/aplay -l >/tmp/lupos-aplay-service-filtered.log 2>&1' >/tmp/lupos-aplay-service-filtered-launcher.log 2>&1 || true ) &\n",
+        "    timeout -k 2 10 /usr/bin/journalctl --no-pager -b _UID=1000 -n 200 >/tmp/lupos-pipewire-journal.log 2>&1 || true\n",
+        "    timeout -k 2 10 /usr/bin/journalctl --no-pager -b _UID=1000 _SYSTEMD_USER_UNIT=pipewire.service -n 500 >/tmp/lupos-pipewire-service-journal.log 2>&1 || true\n",
+        "    timeout -k 2 10 /usr/bin/journalctl --no-pager -b _UID=1000 _SYSTEMD_USER_UNIT=wireplumber.service -n 200 >/tmp/lupos-wireplumber-journal.log 2>&1 || true\n",
+        "    { ls -la \"$session_runtime\"; /usr/bin/ss -xlpn; } >/tmp/lupos-pipewire-runtime.log 2>&1 || true\n",
+        "fi\n",
+        "audio_pcm_running=0; audio_play_rc=125; audio_elapsed=-1\n",
+        "if [ \"$pipewire_ready\" -eq 1 ] && [ -s /tmp/lupos-audio.wav ]; then\n",
+        "    audio_start=\"$(date +%s 2>/dev/null || true)\"\n",
+        "    sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 15 /usr/bin/pw-play /tmp/lupos-audio.wav >/tmp/lupos-pw-play.log 2>&1 &\n",
+        "    audio_play_pid=$!\n",
+        "    i=0; while [ \"$i\" -lt 150 ] && kill -0 \"$audio_play_pid\" 2>/dev/null; do if grep -q 'alsa_output' /tmp/lupos-wpctl.log 2>/dev/null; then audio_pcm_running=1; fi; i=$((i + 1)); sleep 0.1; done\n",
+        "    if kill -0 \"$audio_play_pid\" 2>/dev/null; then audio_play_rc=124; else wait \"$audio_play_pid\"; audio_play_rc=$?; fi\n",
+        "    audio_end=\"$(date +%s 2>/dev/null || true)\"\n",
+        "    if [ -n \"$audio_start\" ] && [ -n \"$audio_end\" ]; then audio_elapsed=$((audio_end - audio_start)); fi\n",
+        "fi\n",
+        "printf 'graphics-x11: audio-playback rc=%s elapsed=%s pcm-running=%s\\n' \"$audio_play_rc\" \"$audio_elapsed\" \"$audio_pcm_running\"\n",
+        "if [ \"$audio_play_rc\" -eq 0 ] && [ \"$audio_elapsed\" -ge 4 ] && [ \"$audio_elapsed\" -le 12 ] && [ \"$audio_pcm_running\" -eq 1 ]; then echo 'graphics-x11: audio-realtime-playback ok'; else echo 'graphics-x11: audio-realtime-playback failed'; fi\n",
+        "if [ \"$audio_play_rc\" -ne 0 ] || [ \"$audio_pcm_running\" -ne 1 ]; then\n",
+        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user --no-pager --full status pipewire.service wireplumber.service >/tmp/lupos-pipewire-status.log 2>&1 || true ) &\n",
+        "    timeout -k 2 10 /usr/bin/journalctl --no-pager -b _UID=1000 _SYSTEMD_USER_UNIT=pipewire.service -n 500 >/tmp/lupos-pipewire-service-journal.log 2>&1 || true\n",
+        "    timeout -k 2 10 /usr/bin/journalctl --no-pager -b _UID=1000 _SYSTEMD_USER_UNIT=wireplumber.service -n 500 >/tmp/lupos-wireplumber-journal.log 2>&1 || true\n",
+        "fi\n",
+        "for f in /tmp/lupos-alsa-udev.log /tmp/lupos-udev-card.log /tmp/lupos-pipewire-env.log /tmp/lupos-pipewire-start.log /tmp/lupos-wpctl.log /tmp/lupos-wpctl-playing.log /tmp/lupos-pactl.log /tmp/lupos-pw-play.log /tmp/lupos-pipewire-status.log /tmp/lupos-pipewire-credentials.log /tmp/lupos-aplay-service-unfiltered.log /tmp/lupos-aplay-service-unfiltered-launcher.log /tmp/lupos-aplay-service-filtered.log /tmp/lupos-aplay-service-filtered-launcher.log /tmp/lupos-pipewire-journal.log /tmp/lupos-pipewire-service-journal.log /tmp/lupos-wireplumber-journal.log /tmp/lupos-pipewire-runtime.log; do [ -s \"$f\" ] && printf 'graphics-x11: audio-log %s begin\\n' \"$f\" && tail -500 \"$f\" && printf 'graphics-x11: audio-log %s end\\n' \"$f\"; done\n",
+        "echo 'graphics-x11: audio-probe end'\n",
         // Firefox discovers its installation directory from
         // readlink("/proc/self/exe") before it loads XPCOM. Verify the PATH
         // launcher, that procfs ABI, the retained executable path, and a real
@@ -5803,17 +5959,28 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "user_pref(\"browser.urlbar.quicksuggest.enabled\", false);\n",
         "user_pref(\"browser.urlbar.openViewOnFocus\", false);\n",
         "user_pref(\"keyword.enabled\", false);\n",
+        "user_pref(\"media.autoplay.default\", 0);\n",
+        "user_pref(\"media.autoplay.blocking_policy\", 0);\n",
+        "user_pref(\"media.autoplay.allow-muted\", true);\n",
         "EOF\n",
         "    chown lupos:lupos /tmp/lupos-firefox-profile/user.js\n",
         "    cat > /tmp/zzzzlupossuggestion.html <<'EOF'\n",
         "<!doctype html><meta charset=\"utf-8\"><title>LUPOS Firefox suggestion probe</title><style>body{font:24px sans-serif;padding:80px;background:#eef0f4}input{font:28px sans-serif;width:720px;padding:12px}#menu{box-sizing:border-box;margin:0 0 0 225px;width:748px;padding:8px;background:white;border:1px solid #8992a3;box-shadow:0 4px 12px #788090;list-style:none}#item{padding:12px}.selected{background:#cfe3ff}</style><main><label>Firefox suggestion <input id=\"query\" autofocus autocomplete=\"off\"></label><ul id=\"menu\" hidden><li id=\"item\">z — 日本語候補 かなカナ</li></ul></main><script>query.oninput=()=>{menu.hidden=query.value!=='z';item.classList.remove('selected')};query.onkeydown=e=>{if(e.key==='ArrowDown'&&!menu.hidden){item.classList.add('selected');e.preventDefault()}else if(e.key==='Enter'&&item.classList.contains('selected')){query.value=item.textContent;menu.hidden=true;document.title='LUPOS 日本語候補 かなカナ';e.preventDefault()}else if(e.key==='Escape'){menu.hidden=true;item.classList.remove('selected')}}</script>\n",
         "EOF\n",
-        "    chmod 644 /tmp/zzzzlupossuggestion.html\n",
+        "    cat > /tmp/lupos-local-media.html <<'EOF'\n",
+        "<!doctype html><meta charset=\"utf-8\"><title>LUPOS local media loading</title><style>html,body{margin:0;background:#111;color:white;font:20px sans-serif}video{display:block;width:960px;max-width:100%;margin:20px auto}p{text-align:center}</style><video id=\"media\" autoplay controls src=\"/lupos-media.webm\"></video><p id=\"state\">loading VP9 + Opus</p><script>let done=false;media.addEventListener('playing',()=>state.textContent='playing');media.addEventListener('timeupdate',()=>{state.textContent='playing '+media.currentTime.toFixed(1)+'s';if(!done&&media.currentTime>=5){done=true;document.title='LUPOS local media advanced 5s'}});media.addEventListener('error',()=>document.title='LUPOS local media error');media.play().catch(e=>{state.textContent=e.name;document.title='LUPOS local media blocked'})</script>\n",
+        "EOF\n",
+        "    cat > /tmp/lupos-youtube.html <<'EOF'\n",
+        "<!doctype html><meta charset=\"utf-8\"><title>LUPOS YouTube loading</title><style>html,body{margin:0;background:#111;color:white;font:20px sans-serif}#player{width:960px;height:540px;margin:20px auto}p{text-align:center}</style><div id=\"player\"></div><p id=\"state\">loading youtube.com iframe API</p><script>let player,done=false;function onYouTubeIframeAPIReady(){player=new YT.Player('player',{videoId:'M7lc1UVf-VE',playerVars:{autoplay:1,mute:1,playsinline:1},events:{onReady:e=>{e.target.mute();e.target.playVideo();state.textContent='ready'},onStateChange:e=>{state.textContent='state '+e.data},onError:e=>{document.title='LUPOS YouTube error '+e.data}}});setInterval(()=>{try{let t=player.getCurrentTime();state.textContent='youtube playing '+t.toFixed(1)+'s';if(!done&&t>=5){done=true;document.title='LUPOS YouTube advanced 5s'}}catch(e){}},500)}let api=document.createElement('script');api.src='https://www.youtube.com/iframe_api';document.head.appendChild(api)</script>\n",
+        "EOF\n",
+        "    chmod 644 /tmp/zzzzlupossuggestion.html /tmp/lupos-local-media.html /tmp/lupos-youtube.html\n",
+        "    if timeout -k 2 60 /usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=640x360:rate=24 -f lavfi -i sine=frequency=660:sample_rate=48000 -t 12 -ac 2 -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -b:v 500k -c:a libopus -b:a 96k /tmp/lupos-media.webm; then echo 'graphics-x11: browser-media-generated ok'; else echo 'graphics-x11: browser-media-generated failed'; fi\n",
+        "    chmod 644 /tmp/lupos-media.webm 2>/dev/null || true\n",
         "    /usr/bin/python -m http.server 8765 --bind 127.0.0.1 --directory /tmp >/tmp/lupos-firefox-http.log 2>&1 &\n",
         "    firefox_http_pid=$!\n",
         "    rm -f /tmp/lupos-firefox.log /tmp/lupos-firefox-windows.log /tmp/lupos-firefox-maps.log /tmp/lupos-firefox-status.log\n",
         "    firefox_fb_before=\"$(cksum </dev/fb0 2>/dev/null || true)\"\n",
-        "    sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none /usr/bin/firefox --no-remote --profile /tmp/lupos-firefox-profile 'http://127.0.0.1:8765/zzzzlupossuggestion.html' >/tmp/lupos-firefox.log 2>&1 &\n",
+        "    ( run_in_session_cgroup \"$session_cgroup\" sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none /usr/bin/firefox --no-remote --profile /tmp/lupos-firefox-profile 'http://127.0.0.1:8765/zzzzlupossuggestion.html' ) >/tmp/lupos-firefox.log 2>&1 &\n",
         "    firefox_launcher_pid=$!\n",
         "    firefox_pid=; firefox_history_seeded=0; i=0\n",
         "    while [ \"$i\" -lt 90 ] && [ \"$firefox_history_seeded\" -eq 0 ]; do\n",
@@ -5844,7 +6011,29 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "            cjk_i=$((cjk_i + 1)); sleep 1\n",
         "        done\n",
         "        if [ \"$cjk_suggestion_selected\" -eq 1 ]; then echo 'graphics-x11: firefox-cjk-suggestion-selected ok'; else echo 'graphics-x11: firefox-cjk-suggestion-selected failed'; fi\n",
-        "        sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none timeout 30 /usr/bin/firefox --profile /tmp/lupos-firefox-profile --new-tab 'https://www.google.com/?hl=en' >>/tmp/lupos-firefox.log 2>&1 || true\n",
+        "        ( run_in_session_cgroup \"$session_cgroup\" sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none timeout -k 2 30 /usr/bin/firefox --profile /tmp/lupos-firefox-profile --new-tab 'http://127.0.0.1:8765/lupos-local-media.html' ) >>/tmp/lupos-firefox.log 2>&1 || true\n",
+        "        local_media_advanced=0; media_i=0\n",
+        "        while [ \"$media_i\" -lt 90 ] && [ \"$local_media_advanced\" -eq 0 ]; do\n",
+        "            : > /tmp/lupos-firefox-media-windows.log\n",
+        "            if DISPLAY=:0 timeout 1 /usr/bin/xprop -root _NET_CLIENT_LIST > /tmp/lupos-firefox-clients.log 2>/dev/null; then\n",
+        "                for wid in $(sed 's/.*# //' /tmp/lupos-firefox-clients.log | tr ',' ' '); do DISPLAY=:0 timeout 1 /usr/bin/xprop -id \"$wid\" _NET_WM_NAME 2>/dev/null >> /tmp/lupos-firefox-media-windows.log || true; done\n",
+        "                if grep -Fq 'LUPOS local media advanced 5s' /tmp/lupos-firefox-media-windows.log 2>/dev/null; then local_media_advanced=1; break; fi\n",
+        "            fi\n",
+        "            media_i=$((media_i + 1)); sleep 1\n",
+        "        done\n",
+        "        if [ \"$local_media_advanced\" -eq 1 ]; then echo 'graphics-x11: firefox-vp9-opus-playback ok'; else echo 'graphics-x11: firefox-vp9-opus-playback failed'; fi\n",
+        "        ( run_in_session_cgroup \"$session_cgroup\" sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none timeout -k 2 30 /usr/bin/firefox --profile /tmp/lupos-firefox-profile --new-tab 'http://127.0.0.1:8765/lupos-youtube.html' ) >>/tmp/lupos-firefox.log 2>&1 || true\n",
+        "        youtube_advanced=0; youtube_i=0\n",
+        "        while [ \"$youtube_i\" -lt 180 ] && [ \"$youtube_advanced\" -eq 0 ]; do\n",
+        "            : > /tmp/lupos-firefox-youtube-windows.log\n",
+        "            if DISPLAY=:0 timeout 1 /usr/bin/xprop -root _NET_CLIENT_LIST > /tmp/lupos-firefox-clients.log 2>/dev/null; then\n",
+        "                for wid in $(sed 's/.*# //' /tmp/lupos-firefox-clients.log | tr ',' ' '); do DISPLAY=:0 timeout 1 /usr/bin/xprop -id \"$wid\" _NET_WM_NAME 2>/dev/null >> /tmp/lupos-firefox-youtube-windows.log || true; done\n",
+        "                if grep -Fq 'LUPOS YouTube advanced 5s' /tmp/lupos-firefox-youtube-windows.log 2>/dev/null; then youtube_advanced=1; break; fi\n",
+        "            fi\n",
+        "            youtube_i=$((youtube_i + 1)); sleep 1\n",
+        "        done\n",
+        "        if [ \"$youtube_advanced\" -eq 1 ]; then echo 'graphics-x11: firefox-youtube-playback ok'; else echo 'graphics-x11: firefox-youtube-playback failed'; fi\n",
+        "        ( run_in_session_cgroup \"$session_cgroup\" sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none timeout -k 2 30 /usr/bin/firefox --profile /tmp/lupos-firefox-profile --new-tab 'https://www.google.com/?hl=en' ) >>/tmp/lupos-firefox.log 2>&1 || true\n",
         "    fi\n",
         "    firefox_window=0; i=0\n",
         "    while [ \"$i\" -lt 90 ] && [ \"$firefox_window\" -eq 0 ]; do\n",
@@ -5889,6 +6078,8 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    if [ \"$firefox_window\" -eq 1 ]; then echo 'graphics-x11: firefox-google-https ok'; else echo 'graphics-x11: firefox-google-https failed'; fi\n",
         "    if [ -s /tmp/lupos-firefox-maps.log ]; then echo 'graphics-x11: firefox-maps begin'; cat /tmp/lupos-firefox-maps.log; echo 'graphics-x11: firefox-maps end'; fi\n",
         "    if [ -s /tmp/lupos-firefox-status.log ]; then echo 'graphics-x11: firefox-status begin'; cat /tmp/lupos-firefox-status.log; echo 'graphics-x11: firefox-status end'; fi\n",
+        "    if [ -s /tmp/lupos-firefox-media-windows.log ]; then echo 'graphics-x11: firefox-media-windows begin'; tail -40 /tmp/lupos-firefox-media-windows.log; echo 'graphics-x11: firefox-media-windows end'; fi\n",
+        "    if [ -s /tmp/lupos-firefox-youtube-windows.log ]; then echo 'graphics-x11: firefox-youtube-windows begin'; tail -40 /tmp/lupos-firefox-youtube-windows.log; echo 'graphics-x11: firefox-youtube-windows end'; fi\n",
         "    [ -z \"$firefox_pid\" ] || kill \"$firefox_pid\" 2>/dev/null || true\n",
         "    kill \"$firefox_launcher_pid\" 2>/dev/null || true\n",
         "    timeout 5 sh -c 'wait \"$1\" 2>/dev/null' sh \"$firefox_launcher_pid\" 2>/dev/null || true\n",
@@ -5931,8 +6122,43 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "if [ -s /tmp/lupos-wallpaper.log ]; then echo 'graphics-x11: wallpaper-log begin'; tail -40 /tmp/lupos-wallpaper.log; echo 'graphics-x11: wallpaper-log end'; fi\n",
         // QEMU's synthetic keyboard input is also mirrored into the kernel
         // console in this configuration. Consume the two credential lines
-        // before returning to the privileged interactive shell.
+        // before exercising the real desktop shutdown path.
         "timeout 3 sh -c 'IFS= read -r _ || exit 0; IFS= read -r _ || true' || true\n",
+        // This is intentionally the final probe: unlike the historical root
+        // `poweroff -f`, xfce4-session-logout exercises the exact GUI request,
+        // session teardown, logind authorization, systemd shutdown, and QEMU
+        // power-off chain.  A transient root watchdog keeps the regression
+        // bounded without making its forced fallback look like success.
+        "echo 'graphics-x11: gui-poweroff-probe begin'\n",
+        "systemd-run --quiet --unit=lupos-gui-poweroff-watchdog --property=DefaultDependencies=no /bin/sh -c '\n",
+        "i=0; session_reported=0\n",
+        "while [ \"$i\" -lt 15 ]; do\n",
+        "    session_alive=0\n",
+        "    for proc in /proc/[0-9]*; do\n",
+        "        [ -r \"$proc/comm\" ] && [ -r \"$proc/status\" ] || continue\n",
+        "        [ \"$(cat \"$proc/comm\" 2>/dev/null)\" = xfce4-session ] || continue\n",
+        "        [ \"$(awk \"/^Uid:/ { print \\\\$2; exit }\" \"$proc/status\" 2>/dev/null)\" = 1000 ] || continue\n",
+        "        session_alive=1; break\n",
+        "    done\n",
+        "    if [ \"$session_alive\" -eq 0 ] && [ \"$session_reported\" -eq 0 ]; then echo \"graphics-x11: gui-session-exited ok\" >/dev/ttyS0; session_reported=1; fi\n",
+        "    i=$((i + 1)); sleep 1\n",
+        "done\n",
+        "echo \"graphics-x11: gui-poweroff-diagnostics begin\" >/dev/ttyS0\n",
+        "/usr/bin/loginctl --no-pager --full session-status c1 c5 >/dev/ttyS0 2>&1 || true\n",
+        "/usr/bin/systemctl --no-pager --full status session-c1.scope session-c5.scope >/dev/ttyS0 2>&1 || true\n",
+        "/usr/bin/systemctl --no-pager --full status user@1000.service >/dev/ttyS0 2>&1 || true\n",
+        "/usr/bin/sudo -n -u lupos env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/systemctl --user --no-pager --full list-jobs >/dev/ttyS0 2>&1 || true\n",
+        "/usr/bin/sudo -n -u lupos env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/bin/systemctl --user --no-pager --full --state=deactivating,failed,running list-units >/dev/ttyS0 2>&1 || true\n",
+        "for proc in /proc/[0-9]*; do [ -r \"$proc/status\" ] || continue; [ \"$(awk \"/^Uid:/ { print \\\\$2; exit }\" \"$proc/status\" 2>/dev/null)\" = 1000 ] || continue; p=${proc##*/}; echo \"graphics-x11: shutdown-proc $p cgroup=$(tr \"\\\\n\" \";\" <\"$proc/cgroup\")\" >/dev/ttyS0; grep -E \"^(Name|State|Tgid|Pid|PPid|Threads|SigPnd|ShdPnd|SigBlk|SigIgn|SigCgt):\" \"$proc/status\" >/dev/ttyS0 2>&1 || true; done\n",
+        "/usr/bin/ps -eo pid,ppid,sid,stat,wchan:32,comm,args >/dev/ttyS0 2>&1 || true\n",
+        "echo \"graphics-x11: gui-poweroff-diagnostics end\" >/dev/ttyS0\n",
+        "echo \"graphics-x11: gui-poweroff-timeout\" >/dev/ttyS0\n",
+        "/usr/bin/systemctl poweroff --force --force\n",
+        "'\n",
+        "echo 'graphics-x11: gui-poweroff-requested'\n",
+        "sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" /usr/bin/xfce4-session-logout --halt --fast\n",
+        "gui_poweroff_rc=$?\n",
+        "printf 'graphics-x11: gui-poweroff-returned rc=%s\\n' \"$gui_poweroff_rc\"\n",
     )
     .as_bytes()
     .to_vec()
@@ -14740,83 +14966,125 @@ fn direct_stage_login_root_disk_overlay_files(
             "etc/systemd/system/sockets.target.wants/dbus.socket",
             "/usr/lib/systemd/system/dbus.socket",
         ));
-        files.push(initramfs_symlink(
-            "etc/systemd/system/dbus-org.freedesktop.network1.service",
-            "/usr/lib/systemd/system/systemd-networkd.service",
-        ));
-        files.push(initramfs_symlink(
-            "etc/systemd/system/dbus-org.freedesktop.resolve1.service",
-            "/usr/lib/systemd/system/systemd-resolved.service",
-        ));
-        for (wants_path, target) in [
-            (
-                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.service",
+        if graphics_x11 {
+            // The desktop applet must control the service that actually owns
+            // the NIC. Terminal/test images retain their proven networkd
+            // configuration.
+            files.push(initramfs_file(
+                "etc/NetworkManager/conf.d/10-lupos-qemu.conf",
+                0o100644,
+                b"[main]\ndns=none\n",
+            ));
+            files.push(initramfs_file(
+                "etc/NetworkManager/system-connections/lupos-qemu.nmconnection",
+                0o100600,
+                concat!(
+                    "[connection]\n",
+                    "id=Lupos QEMU\n",
+                    "type=ethernet\n",
+                    "interface-name=eth0\n",
+                    "autoconnect=true\n",
+                    "\n",
+                    "[ethernet]\n",
+                    "\n",
+                    "[ipv4]\n",
+                    "method=manual\n",
+                    "address1=10.0.2.15/24,10.0.2.2\n",
+                    "dns=10.0.2.3;\n",
+                    "never-default=false\n",
+                    "\n",
+                    "[ipv6]\n",
+                    "method=disabled\n",
+                )
+                .as_bytes(),
+            ));
+            files.push(initramfs_symlink(
+                "etc/systemd/system/multi-user.target.wants/NetworkManager.service",
+                "/usr/lib/systemd/system/NetworkManager.service",
+            ));
+            files.push(initramfs_symlink(
+                "etc/systemd/system/dbus-org.freedesktop.NetworkManager.service",
+                "/usr/lib/systemd/system/NetworkManager.service",
+            ));
+        } else {
+            files.push(initramfs_symlink(
+                "etc/systemd/system/dbus-org.freedesktop.network1.service",
                 "/usr/lib/systemd/system/systemd-networkd.service",
-            ),
-            (
-                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.socket",
-                "/usr/lib/systemd/system/systemd-networkd.socket",
-            ),
-            (
-                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink.socket",
-                "/usr/lib/systemd/system/systemd-networkd-varlink.socket",
-            ),
-            (
-                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink-metrics.socket",
-                "/usr/lib/systemd/system/systemd-networkd-varlink-metrics.socket",
-            ),
-            (
-                "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-resolve-hook.socket",
-                "/usr/lib/systemd/system/systemd-networkd-resolve-hook.socket",
-            ),
-            (
-                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved.service",
+            ));
+            files.push(initramfs_symlink(
+                "etc/systemd/system/dbus-org.freedesktop.resolve1.service",
                 "/usr/lib/systemd/system/systemd-resolved.service",
-            ),
-            (
-                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-varlink.socket",
-                "/usr/lib/systemd/system/systemd-resolved-varlink.socket",
-            ),
-            (
-                "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-monitor.socket",
-                "/usr/lib/systemd/system/systemd-resolved-monitor.socket",
-            ),
-            // Match the vendor units' [Install] targets for normal distro
-            // boots such as GraphicsX11, whose default is multi-user.target.
-            (
-                "etc/systemd/system/multi-user.target.wants/systemd-networkd.service",
-                "/usr/lib/systemd/system/systemd-networkd.service",
-            ),
-            (
-                "etc/systemd/system/sysinit.target.wants/systemd-resolved.service",
-                "/usr/lib/systemd/system/systemd-resolved.service",
-            ),
-            (
-                "etc/systemd/system/sockets.target.wants/systemd-networkd.socket",
-                "/usr/lib/systemd/system/systemd-networkd.socket",
-            ),
-            (
-                "etc/systemd/system/sockets.target.wants/systemd-networkd-varlink.socket",
-                "/usr/lib/systemd/system/systemd-networkd-varlink.socket",
-            ),
-            (
-                "etc/systemd/system/sockets.target.wants/systemd-networkd-varlink-metrics.socket",
-                "/usr/lib/systemd/system/systemd-networkd-varlink-metrics.socket",
-            ),
-            (
-                "etc/systemd/system/sockets.target.wants/systemd-networkd-resolve-hook.socket",
-                "/usr/lib/systemd/system/systemd-networkd-resolve-hook.socket",
-            ),
-            (
-                "etc/systemd/system/sockets.target.wants/systemd-resolved-varlink.socket",
-                "/usr/lib/systemd/system/systemd-resolved-varlink.socket",
-            ),
-            (
-                "etc/systemd/system/sockets.target.wants/systemd-resolved-monitor.socket",
-                "/usr/lib/systemd/system/systemd-resolved-monitor.socket",
-            ),
-        ] {
-            files.push(initramfs_symlink(wants_path, target));
+            ));
+            for (wants_path, target) in [
+                (
+                    "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.service",
+                    "/usr/lib/systemd/system/systemd-networkd.service",
+                ),
+                (
+                    "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd.socket",
+                    "/usr/lib/systemd/system/systemd-networkd.socket",
+                ),
+                (
+                    "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink.socket",
+                    "/usr/lib/systemd/system/systemd-networkd-varlink.socket",
+                ),
+                (
+                    "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-varlink-metrics.socket",
+                    "/usr/lib/systemd/system/systemd-networkd-varlink-metrics.socket",
+                ),
+                (
+                    "etc/systemd/system/lupos-terminal.target.wants/systemd-networkd-resolve-hook.socket",
+                    "/usr/lib/systemd/system/systemd-networkd-resolve-hook.socket",
+                ),
+                (
+                    "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved.service",
+                    "/usr/lib/systemd/system/systemd-resolved.service",
+                ),
+                (
+                    "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-varlink.socket",
+                    "/usr/lib/systemd/system/systemd-resolved-varlink.socket",
+                ),
+                (
+                    "etc/systemd/system/lupos-terminal.target.wants/systemd-resolved-monitor.socket",
+                    "/usr/lib/systemd/system/systemd-resolved-monitor.socket",
+                ),
+                // Match the vendor units' [Install] targets for normal distro
+                // boots such as GraphicsX11, whose default is multi-user.target.
+                (
+                    "etc/systemd/system/multi-user.target.wants/systemd-networkd.service",
+                    "/usr/lib/systemd/system/systemd-networkd.service",
+                ),
+                (
+                    "etc/systemd/system/sysinit.target.wants/systemd-resolved.service",
+                    "/usr/lib/systemd/system/systemd-resolved.service",
+                ),
+                (
+                    "etc/systemd/system/sockets.target.wants/systemd-networkd.socket",
+                    "/usr/lib/systemd/system/systemd-networkd.socket",
+                ),
+                (
+                    "etc/systemd/system/sockets.target.wants/systemd-networkd-varlink.socket",
+                    "/usr/lib/systemd/system/systemd-networkd-varlink.socket",
+                ),
+                (
+                    "etc/systemd/system/sockets.target.wants/systemd-networkd-varlink-metrics.socket",
+                    "/usr/lib/systemd/system/systemd-networkd-varlink-metrics.socket",
+                ),
+                (
+                    "etc/systemd/system/sockets.target.wants/systemd-networkd-resolve-hook.socket",
+                    "/usr/lib/systemd/system/systemd-networkd-resolve-hook.socket",
+                ),
+                (
+                    "etc/systemd/system/sockets.target.wants/systemd-resolved-varlink.socket",
+                    "/usr/lib/systemd/system/systemd-resolved-varlink.socket",
+                ),
+                (
+                    "etc/systemd/system/sockets.target.wants/systemd-resolved-monitor.socket",
+                    "/usr/lib/systemd/system/systemd-resolved-monitor.socket",
+                ),
+            ] {
+                files.push(initramfs_symlink(wants_path, target));
+            }
         }
     }
 
@@ -14960,6 +15228,39 @@ fn direct_stage_login_root_disk_overlay_files(
             "etc/X11/xorg.conf.d/10-lupos-fbdev.conf",
             0o100644,
             x11_fbdev_config(),
+        ));
+        // The native VM subsystem does not yet expose a vendor-layout VMA to
+        // module callbacks. Keep the original ALSA read/write/ioctl path and
+        // tell WirePlumber not to request PCM mmap until that ABI exists.
+        files.push(initramfs_file(
+            "etc/wireplumber/wireplumber.conf.d/51-lupos-alsa.conf",
+            0o100644,
+            concat!(
+                "monitor.alsa.rules = [\n",
+                "  {\n",
+                "    matches = [\n",
+                "      { device.name = \"~alsa_card.*\" }\n",
+                "    ]\n",
+                "    actions = {\n",
+                "      update-props = {\n",
+                "        api.alsa.use-acp = false\n",
+                "      }\n",
+                "    }\n",
+                "  }\n",
+                "  {\n",
+                "    matches = [\n",
+                "      { node.name = \"~alsa_input.*\" }\n",
+                "      { node.name = \"~alsa_output.*\" }\n",
+                "    ]\n",
+                "    actions = {\n",
+                "      update-props = {\n",
+                "        api.alsa.disable-mmap = true\n",
+                "      }\n",
+                "    }\n",
+                "  }\n",
+                "]\n",
+            )
+            .as_bytes(),
         ));
         // Keep Arch's package-owned greeter configuration intact.  The GTK
         // greeter merges administrator fragments from this directory and its
@@ -16162,22 +16463,24 @@ pub fn run_graphics_x11_tests() -> Result<()> {
     let serial_cmdline = append_kernel_args(&current_cmdline, &graphics_args);
     let _cmdline_guard = EnvVarGuard::set(LUPOS_KERNEL_CMDLINE_ENV, &serial_cmdline);
 
-    let prompt = "[root@lupos /]#";
     let steps = [
         SerialExpectStep {
-            // The root shell is already idle on ttyS0.  Do not start the
-            // guest probe while the greeter owns the display: even a
-            // read-only root X client can perturb the exact handoff this
-            // regression is meant to observe.  Wait until the successful
-            // HMP-driven login has crossed into the stock XFCE session.
+            // The root shell is already idle on ttyS0.  Do not start the guest
+            // probe while the greeter owns the display: even a read-only root
+            // X client can perturb the exact handoff this regression is meant
+            // to observe.
             label: "untouched xfce desktop",
             wait_for: "graphics-x11: desktop-initial-ready",
-            send: b"sh /usr/libexec/lupos-graphics-x11-probe.sh\n",
+            send: b"exec sh /usr/libexec/lupos-graphics-x11-probe.sh\n",
         },
         SerialExpectStep {
-            label: "shutdown",
-            wait_for: prompt,
-            send: b"poweroff -f\n",
+            // Keep the shared serial/HMP expect loop alive until the final
+            // marker so its Firefox keyboard action can run.  Sending nothing
+            // is essential: the guest probe itself requests power-off from
+            // the authenticated XFCE session.
+            label: "xfce requested poweroff",
+            wait_for: "graphics-x11: gui-poweroff-requested",
+            send: b"",
         },
     ];
     let hmp_steps = [
@@ -16226,6 +16529,10 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         RunOptions {
             exit_after_boot: false,
             qemu_timeout: Some(Duration::from_secs(1800)),
+            // Production APs currently stop in the architecture idle loop and
+            // do not execute per-CPU runqueues. Keep the desktop gate on the
+            // one scheduling CPU until that separate scheduler subsystem is
+            // complete; the launcher still honors smp_count for SMP gates.
             smp_count: 1,
         },
         &steps,
@@ -16287,6 +16594,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: sudo-pacman ok",
         "graphics-x11: sudo-su ok",
         "graphics-x11: session-path ok",
+        "graphics-x11: user-manager active",
         "graphics-x11: tty-sysctl ok",
         "graphics-x11: timeout-sanity ok",
         "graphics-x11: resolver-config ok",
@@ -16325,11 +16633,26 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: desktop-rpc ok",
         "graphics-x11: fontconfig ok",
         "graphics-x11: fontconfig-cjk ok",
+        "graphics-x11: media-settings-tool /usr/bin/pavucontrol",
+        "graphics-x11: media-settings-tool /usr/bin/xfce4-display-settings",
+        "graphics-x11: media-settings-tool /usr/bin/nm-connection-editor",
+        "graphics-x11: media-settings ok",
+        "graphics-x11: alsa-hda-card ok",
+        "graphics-x11: alsa-user-card ok",
+        "graphics-x11: alsa-udev-card ok",
+        "graphics-x11: proc-pid-root ok",
+        "graphics-x11: audio-pcm-generated ok",
+        "graphics-x11: alsa-direct-realtime ok",
+        "graphics-x11: pipewire-session ok",
+        "graphics-x11: audio-realtime-playback ok",
         "graphics-x11: firefox-path /usr/bin/firefox",
         "graphics-x11: firefox-proc-exe ok",
         "graphics-x11: firefox-window ok",
         "graphics-x11: firefox-google-https ok",
         "graphics-x11: firefox-cjk-suggestion-selected ok",
+        "graphics-x11: browser-media-generated ok",
+        "graphics-x11: firefox-vp9-opus-playback ok",
+        "graphics-x11: firefox-youtube-playback ok",
         "graphics-x11: firefox-render-pixels ok",
         "graphics-x11: firefox-desktop-responsive ok",
         "graphics-x11: firefox-desktop-rpc ok",
@@ -16337,6 +16660,10 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: wallpaper-default /usr/share/backgrounds/xfce/xfce-x.svg",
         "graphics-x11: wallpaper-decode ok",
         "graphics-x11: wallpaper-pixels ok",
+        "graphics-x11: gui-poweroff-probe begin",
+        "graphics-x11: gui-poweroff-requested",
+        "graphics-x11: gui-session-exited ok",
+        "graphics-x11: gui-poweroff-returned rc=0",
     ] {
         if !serial_log_contains(&run.serial_output, needle) {
             bail!(
@@ -16378,6 +16705,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: sudo-pacman failed",
         "graphics-x11: sudo-su failed",
         "graphics-x11: session-path failed",
+        "graphics-x11: user-manager failed",
         "graphics-x11: tty-sysctl missing",
         "graphics-x11: timeout-sanity unexpected-ok",
         "graphics-x11: timeout-sanity failed",
@@ -16415,6 +16743,15 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: desktop-rpc failed",
         "graphics-x11: fontconfig failed",
         "graphics-x11: fontconfig-cjk failed",
+        "graphics-x11: media-settings-missing",
+        "graphics-x11: media-settings failed",
+        "graphics-x11: alsa-hda-card failed",
+        "graphics-x11: alsa-user-card failed",
+        "graphics-x11: alsa-udev-card failed",
+        "graphics-x11: audio-pcm-generated failed",
+        "graphics-x11: alsa-direct-realtime failed",
+        "graphics-x11: pipewire-session failed",
+        "graphics-x11: audio-realtime-playback failed",
         "graphics-x11: firefox-path failed",
         "graphics-x11: self-exe failed",
         "graphics-x11: firefox missing-user-session",
@@ -16422,6 +16759,9 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: firefox-window failed",
         "graphics-x11: firefox-google-https failed",
         "graphics-x11: firefox-cjk-suggestion-selected failed",
+        "graphics-x11: browser-media-generated failed",
+        "graphics-x11: firefox-vp9-opus-playback failed",
+        "graphics-x11: firefox-youtube-playback failed",
         "graphics-x11: firefox-render-pixels failed",
         "graphics-x11: firefox-desktop-responsive failed",
         "graphics-x11: firefox-desktop-rpc failed",
@@ -16436,6 +16776,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: wallpaper-decode missing-input",
         "graphics-x11: wallpaper-decode failed",
         "graphics-x11: wallpaper-pixels failed",
+        "graphics-x11: gui-poweroff-timeout",
         "Error writing X authority",
         "-bash: lupos: command not found",
         "Unrecognized image file format",
@@ -19152,6 +19493,7 @@ fn build_and_run_iso_with_serial_expect_display(
         timeout,
         display,
         hmp_steps,
+        options.smp_count,
     )?;
     let serial_output = read_serial_log(&artifacts.serial_log)?;
     Ok(BootRun {
@@ -19907,11 +20249,15 @@ pub fn build_qemu_iso_command(
 
     // Add -smp only when more than one CPU is requested.
     // Ref: https://www.qemu.org/docs/master/system/invocation.html#harg-smp
+    add_qemu_smp_args(&mut command, smp_count);
+
+    command
+}
+
+fn add_qemu_smp_args(command: &mut Command, smp_count: usize) {
     if smp_count > 1 {
         command.arg("-smp").arg(smp_count.to_string());
     }
-
-    command
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -20079,6 +20425,10 @@ fn run_qemu_iso_login_display(iso_path: &Path, serial_log_path: &Path) -> Result
         "gtk,zoom-to-fit=on",
         &format!("file:{}", serial_log_path.display()),
     );
+    // The interactive desktop is a workstation profile, not a uniprocessor
+    // kernel test.  Four vCPUs leave Firefox's content/compositor/media
+    // processes independent execution time while XFCE remains responsive.
+    command.arg("-smp").arg("4");
     command.current_dir(repo_root().context("failed to resolve repo root")?);
 
     run_command_with_optional_timeout(&mut command, serial_log_path, None)
@@ -22561,6 +22911,7 @@ fn run_qemu_iso_with_serial_expect(
     timeout: Duration,
     display: &str,
     hmp_steps: &[HmpExpectStep],
+    smp_count: usize,
 ) -> Result<ExitStatus> {
     let serial_log = fs::File::create(serial_log_path)
         .with_context(|| format!("failed to create {}", serial_log_path.display()))?;
@@ -22570,6 +22921,7 @@ fn run_qemu_iso_with_serial_expect(
         .stdout(Stdio::from(serial_log))
         .stderr(Stdio::null());
     add_qemu_iso_base_args(&mut command, iso_path, display, "stdio");
+    add_qemu_smp_args(&mut command, smp_count);
     let hmp_socket = env::temp_dir().join(format!("lupos-hmp-{}.sock", artifact_run_id()));
     let _hmp_socket_cleanup = if hmp_steps.is_empty() {
         None
@@ -24387,6 +24739,12 @@ failed command output\n";
         assert!(rendered.contains("pcspk-audiodev=luposaudio"));
         // smp_count=1 should NOT add -smp flag
         assert!(!rendered.contains("-smp"));
+
+        let smp_command = build_qemu_iso_command(iso, serial_log, 4);
+        assert!(
+            render_command(&smp_command).contains("-smp 4"),
+            "workstation runner topology must reach QEMU"
+        );
     }
 
     #[test]
@@ -25348,42 +25706,16 @@ failed command output\n";
             find_initramfs_entry(&files, "etc/systemd/system/default.target").is_none(),
             "graphics must use Arch's packaged graphical default target"
         );
-        // Match systemd-networkd/resolved's vendor [Install] sections. The
-        // graphical image boots this standard graph rather than the custom
-        // lupos-terminal.target, so terminal-only links make curl fail from
-        // every XFCE terminal despite a working virtio device.
+        // The graphical image must run the same NetworkManager instance its
+        // XFCE applet controls.  Terminal/test images retain networkd.
         for (link, target) in [
             (
-                "etc/systemd/system/multi-user.target.wants/systemd-networkd.service",
-                "/usr/lib/systemd/system/systemd-networkd.service",
+                "etc/systemd/system/multi-user.target.wants/NetworkManager.service",
+                "/usr/lib/systemd/system/NetworkManager.service",
             ),
             (
-                "etc/systemd/system/sysinit.target.wants/systemd-resolved.service",
-                "/usr/lib/systemd/system/systemd-resolved.service",
-            ),
-            (
-                "etc/systemd/system/sockets.target.wants/systemd-networkd.socket",
-                "/usr/lib/systemd/system/systemd-networkd.socket",
-            ),
-            (
-                "etc/systemd/system/sockets.target.wants/systemd-networkd-varlink.socket",
-                "/usr/lib/systemd/system/systemd-networkd-varlink.socket",
-            ),
-            (
-                "etc/systemd/system/sockets.target.wants/systemd-networkd-varlink-metrics.socket",
-                "/usr/lib/systemd/system/systemd-networkd-varlink-metrics.socket",
-            ),
-            (
-                "etc/systemd/system/sockets.target.wants/systemd-networkd-resolve-hook.socket",
-                "/usr/lib/systemd/system/systemd-networkd-resolve-hook.socket",
-            ),
-            (
-                "etc/systemd/system/sockets.target.wants/systemd-resolved-varlink.socket",
-                "/usr/lib/systemd/system/systemd-resolved-varlink.socket",
-            ),
-            (
-                "etc/systemd/system/sockets.target.wants/systemd-resolved-monitor.socket",
-                "/usr/lib/systemd/system/systemd-resolved-monitor.socket",
+                "etc/systemd/system/dbus-org.freedesktop.NetworkManager.service",
+                "/usr/lib/systemd/system/NetworkManager.service",
             ),
         ] {
             assert_eq!(
@@ -25392,6 +25724,39 @@ failed command output\n";
                 "graphics boot graph must enable {link}"
             );
         }
+        assert!(
+            find_initramfs_entry(
+                &files,
+                "etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
+            )
+            .is_none(),
+            "NetworkManager and networkd must not race for the desktop NIC"
+        );
+        assert_eq!(
+            initramfs_file_bytes(&files, "etc/NetworkManager/conf.d/10-lupos-qemu.conf"),
+            Some(&b"[main]\ndns=none\n"[..]),
+            "NetworkManager must preserve QEMU's static DNS proxy configuration"
+        );
+        let nm_profile = core::str::from_utf8(
+            initramfs_file_bytes(
+                &files,
+                "etc/NetworkManager/system-connections/lupos-qemu.nmconnection",
+            )
+            .expect("NetworkManager static profile staged"),
+        )
+        .expect("NetworkManager profile utf-8");
+        assert!(nm_profile.contains("address1=10.0.2.15/24,10.0.2.2"));
+        assert!(nm_profile.contains("dns=10.0.2.3;"));
+        let wireplumber = core::str::from_utf8(
+            initramfs_file_bytes(
+                &files,
+                "etc/wireplumber/wireplumber.conf.d/51-lupos-alsa.conf",
+            )
+            .expect("WirePlumber ALSA override staged"),
+        )
+        .expect("WirePlumber ALSA override utf-8");
+        assert!(wireplumber.contains("api.alsa.use-acp = false"));
+        assert!(wireplumber.contains("api.alsa.disable-mmap = true"));
 
         let xorg_conf = core::str::from_utf8(
             initramfs_file_bytes(&files, "etc/X11/xorg.conf.d/10-lupos-fbdev.conf")
@@ -25666,6 +26031,7 @@ failed command output\n";
             "export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\n"
         ));
         assert!(probe.contains("graphics-x11: session-path ok"));
+        assert!(probe.contains("graphics-x11: user-manager active"));
         assert!(probe.contains("command -v pacman"));
         assert!(probe.contains("graphics-x11: pacman-wrapper ok"));
         assert!(probe.contains("pacman -S --noconfirm fastfetch"));
@@ -25683,6 +26049,25 @@ failed command output\n";
         assert!(probe.contains("curl -fsSI"));
         assert!(probe.contains("http://example.com"));
         assert!(probe.contains("graphics-x11: curl dns ok"));
+        assert!(probe.contains("/usr/bin/pavucontrol"));
+        assert!(probe.contains("/usr/bin/xfce4-display-settings"));
+        assert!(probe.contains("/usr/bin/nm-connection-editor"));
+        assert!(probe.contains("graphics-x11: media-settings ok"));
+        assert!(probe.contains("/dev/snd/controlC0"));
+        assert!(probe.contains("/dev/snd/pcmC0D0p"));
+        assert!(probe.contains("/usr/bin/aplay -l"));
+        assert!(probe.contains("sudo -n -u lupos /usr/bin/aplay -l"));
+        assert!(probe.contains("graphics-x11: alsa-user-card ok"));
+        assert!(probe.contains("/sys/class/sound/card0"));
+        assert!(probe.contains("SOUND_INITIALIZED=1"));
+        assert!(probe.contains("graphics-x11: alsa-udev-card ok"));
+        assert!(probe.contains("readlink \"/proc/$$/root\""));
+        assert!(probe.contains("graphics-x11: proc-pid-root ok"));
+        assert!(probe.contains("/usr/bin/wpctl status"));
+        assert!(probe.contains("/usr/bin/pactl info"));
+        assert!(probe.contains("sine=frequency=440:sample_rate=48000 -t 6 -ac 2 -c:a pcm_s16le"));
+        assert!(probe.contains("/usr/bin/pw-play /tmp/lupos-audio.wav"));
+        assert!(probe.contains("graphics-x11: audio-realtime-playback ok"));
         assert!(probe.contains("/usr/bin/firefox --no-remote"));
         assert!(probe.contains("https://www.google.com/?hl=en"));
         assert!(probe.contains("LUPOS 日本語候補 かなカナ"));
@@ -25690,6 +26075,17 @@ failed command output\n";
         assert!(probe.contains("grep -q 'Google'"));
         assert!(probe.contains("graphics-x11: firefox-google-https ok"));
         assert!(probe.contains("http://127.0.0.1:8765/zzzzlupossuggestion.html"));
+        assert!(probe.contains("lupos-local-media.html"));
+        assert!(probe.contains("libvpx-vp9"));
+        assert!(probe.contains("libopus"));
+        assert!(probe.contains("-t 12 -ac 2 -c:v libvpx-vp9"));
+        assert!(probe.contains("graphics-x11: firefox-vp9-opus-playback ok"));
+        assert!(probe.contains("https://www.youtube.com/iframe_api"));
+        assert!(probe.contains("M7lc1UVf-VE"));
+        assert!(probe.contains("graphics-x11: firefox-youtube-playback ok"));
+        assert!(probe.contains(
+            "timeout -k 2 30 /usr/bin/firefox --profile /tmp/lupos-firefox-profile --new-tab"
+        ));
         assert!(probe.contains("user_xfce_desktop_ready"));
         assert!(probe.contains("xfce4-panel xfdesktop"));
         assert!(probe.contains("process_named_uid \"$wanted\" 1000"));
@@ -29495,6 +29891,15 @@ CONFIG_MODULES=y
         assert!(LOGIN_SHADOW.contains("root:$6$"));
         assert!(LOGIN_SHADOW.contains("lupos:$6$"));
         assert!(LOGIN_GROUP.contains("wheel:x:10:root,lupos"));
+        for group in ["network", "audio", "input", "render", "video"] {
+            assert!(
+                LOGIN_GROUP
+                    .lines()
+                    .find(|line| line.starts_with(&format!("{group}:")))
+                    .is_some_and(|line| line.ends_with(":lupos")),
+                "lupos must be a member of {group}"
+            );
+        }
         assert!(LOGIN_PROFILE.contains("PATH=/bin:/sbin:/usr/bin:/usr/sbin"));
         assert!(LOGIN_PROFILE.contains("TERM=${TERM:-linux}"));
         assert!(!LOGIN_PROFILE.contains("cd \"$HOME\""));
@@ -33499,6 +33904,22 @@ CONFIG_MODULES=y
             "xfdesktop",
             "xfce4-settings",
             "xfce4-terminal",
+            "alsa-utils",
+            "pipewire",
+            "pipewire-audio",
+            "pipewire-alsa",
+            "pipewire-pulse",
+            "wireplumber",
+            "pavucontrol",
+            "xfce4-pulseaudio-plugin",
+            "ffmpeg",
+            "gst-libav",
+            "gst-plugins-good",
+            "gst-plugins-bad",
+            "gst-plugins-ugly",
+            "parole",
+            "networkmanager",
+            "network-manager-applet",
             "nano",
             "firefox",
             "usr/bin/Xorg",
@@ -33570,6 +33991,29 @@ CONFIG_MODULES=y
             packages.contains("noto-fonts-cjk"),
             "Firefox search suggestions must have scalable CJK glyph coverage"
         );
+        for package in [
+            "alsa-utils",
+            "pipewire",
+            "pipewire-audio",
+            "pipewire-alsa",
+            "pipewire-pulse",
+            "wireplumber",
+            "pavucontrol",
+            "xfce4-pulseaudio-plugin",
+            "ffmpeg",
+            "gst-libav",
+            "gst-plugins-good",
+            "gst-plugins-bad",
+            "gst-plugins-ugly",
+            "parole",
+            "networkmanager",
+            "network-manager-applet",
+        ] {
+            assert!(
+                packages.contains(package),
+                "the XFCE image must preinstall desktop media/settings package {package}"
+            );
+        }
 
         let installer = script
             .split_once("install_arch_graphics_packages() {")

@@ -34,7 +34,7 @@ use crate::arch::x86::mm::paging::{
 use crate::mm::buddy::{pfn_to_page, pfn_valid, with_global_buddy};
 use crate::mm::fault::copy_page_range;
 use crate::mm::mm_types::{MmStruct, VmAreaStruct, mmf_init_legacy_flags};
-use crate::mm::mmap::do_munmap;
+use crate::mm::mmap::{TASK_SIZE, do_munmap};
 use crate::mm::page_flags::{GFP_KERNEL, PGTY_TABLE, decode_page_type};
 use crate::mm::pagewalk::{MmWalk, MmWalkOps, walk_page_vma};
 use crate::mm::rmap::anon_vma_fork;
@@ -243,13 +243,13 @@ pub unsafe fn exit_mmap(mm: *mut MmStruct) {
         return;
     }
 
-    let entries = unsafe { (*mm).mm_mt.collect_entries() };
-    for (start, end_inclusive, _) in entries {
-        let end = end_inclusive.saturating_add(1);
-        if end > start {
-            let _ = unsafe { do_munmap(&mut *mm, start, end - start) };
-        }
-    }
+    // Linux's exit_mmap() walks and detaches the whole VMA tree in one pass.
+    // Use the full userspace range here so do_munmap() snapshots the tree once.
+    // Calling do_munmap() separately for every entry repeatedly rebuilt that
+    // snapshot, making teardown O(VMA²); a Firefox process with hundreds of
+    // mappings could therefore keep its final thread alive long after a
+    // session shutdown request.
+    let _ = unsafe { do_munmap(&mut *mm, 0, TASK_SIZE) };
 }
 
 /// Drop a userspace mm reference and destroy the address space on the last user.
@@ -644,6 +644,31 @@ mod tests {
             // Clean up.
             let _ = Box::from_raw(old_mm);
             let _ = Box::from_raw(new_mm);
+        }
+    }
+
+    #[test]
+    fn exit_mmap_detaches_the_complete_vma_tree() {
+        let _g = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mm = Box::into_raw(Box::new(MmStruct::new(0)));
+            for (start, end) in [
+                (0x1000, 0x3000),
+                (0x10_0000, 0x14_0000),
+                (TASK_SIZE - 0x4000, TASK_SIZE),
+            ] {
+                let vma = make_vma(start, end, VM_READ | VM_WRITE);
+                insert_vma(&mut *mm, vma).expect("insert exit VMA");
+            }
+            assert_eq!((*mm).map_count, 3);
+
+            exit_mmap(mm);
+
+            assert_eq!((*mm).map_count, 0);
+            assert!((*mm).mm_mt.collect_entries().is_empty());
+            let _ = Box::from_raw(mm);
         }
     }
 

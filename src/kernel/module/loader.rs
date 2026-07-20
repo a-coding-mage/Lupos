@@ -695,7 +695,7 @@ unsafe extern "C" fn linux___module_get(module: *mut u8) {
     module_refcnt(module as usize).fetch_add(1, Ordering::AcqRel);
 }
 
-unsafe extern "C" fn linux_try_module_get(module: *mut u8) -> bool {
+pub(crate) unsafe extern "C" fn linux_try_module_get(module: *mut u8) -> bool {
     if module.is_null() {
         return true;
     }
@@ -767,7 +767,7 @@ unsafe extern "C" fn linux___request_module(_wait: bool, _fmt: *const c_char) ->
     -ENOENT
 }
 
-unsafe extern "C" fn linux_module_put(module: *mut u8) {
+pub(crate) unsafe extern "C" fn linux_module_put(module: *mut u8) {
     if module.is_null() {
         return;
     }

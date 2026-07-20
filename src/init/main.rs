@@ -6403,25 +6403,34 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     halt_loop_with_softirq()
 }
 
-/// Idle loop that drains pending softirqs between `hlt` instructions.
+/// BSP idle loop that schedules runnable work and drains pending softirqs.
 ///
-/// Replaces the bare `halt_loop()` for the post-Milestone-6 BSP because
-/// `apic_timer::on_tick` raises the Timer softirq from inside the ISR but
-/// does not drain it (see `kernel::softirq` Risk #2).  Without this loop,
-/// raised softirqs would never run.
-///
-/// Note that we keep IF *enabled* here so the LAPIC timer keeps firing.
-/// `hlt` resumes on the next interrupt, then we drain softirqs, then we
-/// halt again — classic Linux idle loop pattern.
+/// Linux's `do_idle()` leaves its halt loop when `need_resched()` becomes true
+/// and calls `schedule_idle()`. The Lupos BSP is also `swapper/0`, so merely
+/// draining softirqs and halting here strands tasks woken by timers: IRQ exit
+/// deliberately does not preempt a kernel-mode frame. Run the scheduler on
+/// every idle-loop iteration, then close the check/halt race with IRQs
+/// disabled exactly as Linux does before entering an idle instruction.
 #[allow(dead_code)]
 fn halt_loop_with_softirq() -> ! {
     loop {
         kernel::watchdog::touch_softlockup_watchdog_sched();
         kernel::softirq::do_softirq();
         unsafe {
-            // sti+hlt as a single sequence — sti has a one-instruction grace
-            // window so the interrupt cannot fire between sti and hlt and
-            // leave us blocked indefinitely.
+            kernel::locking::local_irq_enable();
+            let _ = kernel::sched::schedule();
+            kernel::locking::local_irq_enable();
+        }
+
+        kernel::locking::local_irq_disable();
+        if kernel::sched::current_needs_resched() || kernel::softirq::local_softirq_pending() != 0 {
+            kernel::locking::local_irq_enable();
+            continue;
+        }
+        unsafe {
+            // IF is clear for the final checks above. `sti`'s one-instruction
+            // grace window makes the following `hlt` atomic with respect to a
+            // wakeup interrupt.
             core::arch::asm!("sti; hlt", options(nomem, nostack));
         }
     }

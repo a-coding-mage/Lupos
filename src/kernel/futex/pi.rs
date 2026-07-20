@@ -21,7 +21,7 @@ use super::core_ops::futex_pi_wake_next;
 use super::{EAGAIN, EDEADLK, EFAULT, EPERM, ETIMEDOUT};
 use super::{FUTEX_OWNER_DIED, FUTEX_TID_MASK, FUTEX_WAITERS};
 
-use crate::arch::x86::kernel::uaccess::{access_ok, get_user_u32, put_user_u32};
+use crate::arch::x86::kernel::uaccess::{access_ok, cmpxchg_user_u32, get_user_u32, put_user_u32};
 
 struct PiFutexState {
     uaddr: u64,
@@ -108,11 +108,7 @@ fn user_word_ptr(uaddr: u64) -> Result<*mut u32, ()> {
 
 unsafe fn cmpxchg_word(uaddr: u64, expected: u32, new: u32) -> Result<u32, ()> {
     let p = user_word_ptr(uaddr)?;
-    let prev = unsafe { get_user_u32(p as *const u32) }.map_err(|_| ())?;
-    if prev == expected {
-        unsafe { put_user_u32(p, new) }.map_err(|_| ())?;
-    }
-    Ok(prev)
+    unsafe { cmpxchg_user_u32(p, expected, new) }.map_err(|_| ())
 }
 
 unsafe fn load_word(uaddr: u64) -> Result<u32, ()> {
@@ -181,28 +177,36 @@ pub unsafe fn futex_lock_pi(uaddr: u64, timeout_ns: u64, private: bool) -> i64 {
 
     let mm_id = mm_for(private);
     let state = get_pi_state(mm_id, uaddr);
-    let owner = match unsafe { load_word(uaddr) } {
-        Ok(word) => word & FUTEX_TID_MASK,
+    let owner_word = match unsafe { load_word(uaddr) } {
+        Ok(word) => word,
         Err(_) => return -EFAULT as i64,
     };
+    let owner = owner_word & FUTEX_TID_MASK;
     let owner_task = find_task_by_pid(owner as i32);
+    match unsafe { cmpxchg_word(uaddr, owner_word, owner_word | FUTEX_WAITERS) } {
+        Ok(prev) if prev == owner_word => {}
+        Ok(_) => return -EAGAIN as i64,
+        Err(_) => return -EFAULT as i64,
+    }
     unsafe {
         (*state).lock.adopt_owner(owner_task, true);
-    }
-    if unsafe { store_word(uaddr, owner | FUTEX_WAITERS) }.is_err() {
-        return -EFAULT as i64;
     }
     unsafe {
         (*state).lock.lock();
         (*state).owner_tid = tid;
-        let bits = tid
-            | if (*state).lock.waiter_count() > 0 {
-                FUTEX_WAITERS
-            } else {
-                0
-            };
-        if store_word(uaddr, bits).is_err() {
-            return -EFAULT as i64;
+        // Once a contended futex has PI state, Linux keeps FUTEX_WAITERS
+        // set until the kernel slow-path destroys that state. Clearing it
+        // here lets the new owner unlock entirely in userspace, leaving the
+        // kernel rt-mutex owned by a task which no longer owns the futex.
+        let bits = tid | FUTEX_WAITERS;
+        let observed = match load_word(uaddr) {
+            Ok(word) => word,
+            Err(_) => return -EFAULT as i64,
+        };
+        match cmpxchg_word(uaddr, observed, bits) {
+            Ok(prev) if prev == observed => {}
+            Ok(_) => return -EAGAIN as i64,
+            Err(_) => return -EFAULT as i64,
         }
     }
     0
@@ -249,12 +253,31 @@ pub unsafe fn futex_unlock_pi(uaddr: u64, private: bool) -> i64 {
     let state = get_pi_state(mm_id, uaddr);
     unsafe {
         if (*state).lock.is_locked() {
-            let had_waiters = (*state).lock.waiter_count() > 0;
-            (*state).owner_tid = 0;
-            (*state).lock.unlock();
-            let replacement = if had_waiters { FUTEX_WAITERS } else { 0 };
-            if store_word(uaddr, replacement).is_err() {
-                return -EFAULT as i64;
+            // vendor rt_mutex_futex_unlock() transfers ownership and updates
+            // the user futex word before waking the next task. Waking first
+            // lets the waiter run and then allows the old owner to overwrite
+            // its TID, making the waiter's later FUTEX_UNLOCK_PI fail EPERM.
+            let (next_owner, _more_waiters) = (*state).lock.unlock_handoff();
+            let next_tid = if next_owner.is_null() {
+                0
+            } else {
+                ((*next_owner).pid as u32) & FUTEX_TID_MASK
+            };
+            (*state).owner_tid = next_tid;
+            // Linux keeps FUTEX_WAITERS set for every ownership handoff
+            // while PI state exists, including handoff to the final waiter.
+            let replacement = if next_owner.is_null() {
+                0
+            } else {
+                next_tid | FUTEX_WAITERS
+            };
+            match cmpxchg_word(uaddr, word, replacement) {
+                Ok(prev) if prev == word => {}
+                Ok(_) => return -EAGAIN as i64,
+                Err(_) => return -EFAULT as i64,
+            }
+            if !next_owner.is_null() {
+                crate::kernel::sched::wake_task(next_owner);
             }
             return 0;
         }

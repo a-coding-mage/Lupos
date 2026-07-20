@@ -189,6 +189,34 @@ pub fn announce_virtual_device(
     broadcast_uevent(msg);
 }
 
+/// Announce a class device at its already-published canonical sysfs path.
+///
+/// `device_add()` emits this only after the kobject, class link, `uevent`, and
+/// optional `dev` attribute exist, matching vendor/Linux ordering. Class
+/// devices such as ALSA `card0` legitimately have no device number.
+pub fn announce_class_device_at_path(
+    action: UeventAction,
+    devpath: &str,
+    subsystem: &str,
+    devname: Option<&str>,
+    devt: Option<(u32, u32)>,
+) {
+    let major;
+    let minor;
+    let mut properties = Vec::with_capacity(4);
+    properties.push(("SUBSYSTEM", subsystem));
+    if let Some(devname) = devname {
+        properties.push(("DEVNAME", devname));
+    }
+    if let Some((major_value, minor_value)) = devt {
+        major = alloc::format!("{major_value}");
+        minor = alloc::format!("{minor_value}");
+        properties.push(("MAJOR", major.as_str()));
+        properties.push(("MINOR", minor.as_str()));
+    }
+    broadcast_uevent(UeventMessage::build(action, devpath, &properties));
+}
+
 pub fn announce_netdevice(action: UeventAction, ifname: &str, ifindex: u32) {
     let devpath = alloc::format!("/devices/virtual/net/{ifname}");
     let ifindex = alloc::format!("{ifindex}");

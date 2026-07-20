@@ -75,11 +75,23 @@ pub struct LinuxKObject {
     pub state_flags: u32,
 }
 
-/// Prefix of `struct device` through `driver_data`.
+/// Size and release-field offset of `struct device` in the configured vendor
+/// x86_64 ABI.
+pub const LINUX_STRUCT_DEVICE_SIZE: usize = 760;
+pub const LINUX_DEVICE_RELEASE_OFFSET: usize = 712;
+const LINUX_DEVICE_PREFIX_SIZE: usize = 128;
+const LINUX_DEVICE_TYPE_DEVNODE_OFFSET: usize = 24;
+const LINUX_DEVICE_DEVT_OFFSET: usize = 668;
+const LINUX_DEVICE_CLASS_OFFSET: usize = 696;
+const LINUX_CLASS_NAME_OFFSET: usize = 0;
+const LINUX_CLASS_DEVNODE_OFFSET: usize = 32;
+
+/// `struct device` with its directly consumed prefix and ABI-preserving tail.
 ///
-/// Source: `vendor/linux/include/linux/device.h:628`.  Later fields are not
-/// modeled yet; this prefix is enough for driver-core registration, bus
-/// matching, `dev_name()`, and `dev_{get,set}_drvdata()`.
+/// Source: `vendor/linux/include/linux/device.h:628`. Fields after
+/// `driver_data` remain opaque here, but the allocation has the complete
+/// vendor size so subsystems such as runtime PM can safely access them at
+/// their probed ABI offsets.
 #[repr(C)]
 pub struct LinuxDevice {
     pub kobj: LinuxKObject,
@@ -91,6 +103,7 @@ pub struct LinuxDevice {
     pub driver: *mut LinuxDeviceDriver,
     pub platform_data: *mut c_void,
     pub driver_data: *mut c_void,
+    pub _abi_tail: [u8; LINUX_STRUCT_DEVICE_SIZE - LINUX_DEVICE_PREFIX_SIZE],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,11 +121,6 @@ struct LinuxDevicePrivate {
     name: [u8; 64],
 }
 
-/// Size and release-field offset of `struct device` in the configured vendor
-/// x86_64 ABI. Raw module-owned objects contain the full structure even though
-/// [`LinuxDevice`] models only the prefix consumed directly by this layer.
-pub const LINUX_STRUCT_DEVICE_SIZE: usize = 760;
-pub const LINUX_DEVICE_RELEASE_OFFSET: usize = 712;
 const KOBJ_STATE_INITIALIZED: u32 = 1 << 0;
 const KOBJ_STATE_IN_SYSFS: u32 = 1 << 1;
 pub type LinuxDeviceReleaseFn = unsafe extern "C" fn(*mut LinuxDevice);
@@ -520,6 +528,121 @@ fn linux_dev_name(dev: &LinuxDevice) -> *const c_char {
     }
 }
 
+struct LinuxDevnode {
+    name: String,
+    class_name: String,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    major: u32,
+    minor: u32,
+}
+
+unsafe fn linux_device_class_name(dev: *mut LinuxDevice) -> String {
+    if dev.is_null() {
+        return String::new();
+    }
+    let class = unsafe {
+        dev.cast::<u8>()
+            .add(LINUX_DEVICE_CLASS_OFFSET)
+            .cast::<*const u8>()
+            .read()
+    };
+    if class.is_null() {
+        return String::new();
+    }
+    let name = unsafe {
+        class
+            .add(LINUX_CLASS_NAME_OFFSET)
+            .cast::<*const c_char>()
+            .read()
+    };
+    String::from(unsafe { linux_device_c_str(name) })
+}
+
+/// Exact `device_get_devnode()` selection order from
+/// `vendor/linux/drivers/base/core.c`: device type, class, then `dev_name()`.
+unsafe fn linux_device_get_devnode(dev: *mut LinuxDevice) -> Option<LinuxDevnode> {
+    if dev.is_null() {
+        return None;
+    }
+    let internal_devt = unsafe {
+        dev.cast::<u8>()
+            .add(LINUX_DEVICE_DEVT_OFFSET)
+            .cast::<u32>()
+            .read()
+    };
+    let major = crate::init::noinitramfs::major(internal_devt);
+    let minor = crate::init::noinitramfs::minor(internal_devt);
+    if major == 0 {
+        return None;
+    }
+
+    let class = unsafe {
+        dev.cast::<u8>()
+            .add(LINUX_DEVICE_CLASS_OFFSET)
+            .cast::<*const u8>()
+            .read()
+    };
+    let class_name = unsafe { linux_device_class_name(dev) };
+
+    let mut mode = 0u16;
+    let mut uid = 0u32;
+    let mut gid = 0u32;
+    let mut allocated = core::ptr::null_mut::<c_char>();
+
+    let type_ = unsafe { (*dev).type_.cast::<u8>() };
+    if !type_.is_null() {
+        let callback = unsafe {
+            type_
+                .add(LINUX_DEVICE_TYPE_DEVNODE_OFFSET)
+                .cast::<usize>()
+                .read()
+        };
+        if callback != 0 {
+            let callback: unsafe extern "C" fn(
+                *const LinuxDevice,
+                *mut u16,
+                *mut u32,
+                *mut u32,
+            ) -> *mut c_char = unsafe { core::mem::transmute(callback) };
+            allocated = unsafe { callback(dev, &mut mode, &mut uid, &mut gid) };
+        }
+    }
+    if allocated.is_null() && !class.is_null() {
+        let callback = unsafe { class.add(LINUX_CLASS_DEVNODE_OFFSET).cast::<usize>().read() };
+        if callback != 0 {
+            let callback: unsafe extern "C" fn(*const LinuxDevice, *mut u16) -> *mut c_char =
+                unsafe { core::mem::transmute(callback) };
+            allocated = unsafe { callback(dev, &mut mode) };
+        }
+    }
+
+    let name = if allocated.is_null() {
+        let fallback = unsafe { linux_device_c_str(linux_dev_name(&*dev)) };
+        if fallback.is_empty() {
+            return None;
+        }
+        String::from(fallback).replace('!', "/")
+    } else {
+        let name = String::from(unsafe { linux_device_c_str(allocated) });
+        unsafe { crate::mm::slab::linux_kfree(allocated.cast()) };
+        name
+    };
+    if name.is_empty() {
+        return None;
+    }
+    Some(LinuxDevnode {
+        name,
+        class_name,
+        mode,
+        uid,
+        gid,
+        major,
+        minor,
+    })
+}
+
 unsafe fn ensure_linux_device_private(dev: *mut LinuxDevice) {
     if unsafe { (*dev).p.is_null() } {
         let private = Box::into_raw(Box::new(LinuxDevicePrivate {
@@ -678,6 +801,7 @@ pub unsafe extern "C" fn linux_device_initialize(dev: *mut LinuxDevice) {
             core::ptr::addr_of_mut!((*dev).kobj).cast(),
             core::ptr::null(),
         );
+        crate::kernel::power::runtime_pm_init_device(dev.cast());
     }
 }
 
@@ -766,6 +890,76 @@ pub unsafe extern "C" fn linux_device_add(dev: *mut LinuxDevice) -> i32 {
         driver: bound_driver as usize,
         name: name as usize,
     });
+    drop(devices);
+
+    let node = unsafe { linux_device_get_devnode(dev) };
+    let class_name = unsafe { linux_device_class_name(dev) };
+    let device_name = String::from(unsafe { linux_device_c_str(name) });
+    let class_devpath = if class_name.is_empty() {
+        None
+    } else {
+        Some(crate::fs::sysfs::mount_ops::publish_linux_class_device(
+            dev_addr,
+            unsafe { (*dev).parent as usize },
+            &class_name,
+            &device_name,
+            node.as_ref().map(|node| node.name.as_str()),
+            node.as_ref().map_or(0, |node| node.major),
+            node.as_ref().map_or(0, |node| node.minor),
+        ))
+    };
+
+    if let Some(node) = node.as_ref() {
+        // Like vendor devtmpfs, node creation failure does not fail
+        // `device_add()`: userspace discovery still receives the uevent.
+        let create_result = crate::init::rootfs::devtmpfs_create_linux_char_node(
+            &node.name, node.mode, node.uid, node.gid, node.major, node.minor,
+        );
+        if let Err(errno) = create_result {
+            crate::log_warn!(
+                "device",
+                "devtmpfs create failed name={} dev={}:{} errno={}",
+                node.name,
+                node.major,
+                node.minor,
+                errno
+            );
+        } else {
+            crate::log_info!(
+                "device",
+                "devtmpfs created /dev/{} dev={}:{} mode={:o}",
+                node.name,
+                node.major,
+                node.minor,
+                if node.mode == 0 { 0o600 } else { node.mode }
+            );
+        }
+    }
+
+    if let Some(devpath) = class_devpath {
+        crate::net::uevent::announce_class_device_at_path(
+            crate::net::uevent::UeventAction::Add,
+            &devpath,
+            &class_name,
+            node.as_ref().map(|node| node.name.as_str()),
+            node.as_ref().map(|node| (node.major, node.minor)),
+        );
+    } else if let Some(node) = node.as_ref() {
+        let subsystem = if node.class_name.is_empty() {
+            "char"
+        } else {
+            &node.class_name
+        };
+        crate::net::uevent::announce_virtual_device(
+            crate::net::uevent::UeventAction::Add,
+            subsystem,
+            unsafe { linux_device_c_str(name) },
+            subsystem,
+            &node.name,
+            node.major,
+            node.minor,
+        );
+    }
 
     0
 }
@@ -842,6 +1036,36 @@ pub unsafe extern "C" fn linux_device_unregister(dev: *mut LinuxDevice) {
         return;
     }
 
+    let node = unsafe { linux_device_get_devnode(dev) };
+    if let Some((devpath, class, devname, major, minor)) =
+        crate::fs::sysfs::mount_ops::unpublish_linux_class_device(dev as usize)
+    {
+        crate::net::uevent::announce_class_device_at_path(
+            crate::net::uevent::UeventAction::Remove,
+            &devpath,
+            &class,
+            devname.as_deref(),
+            devname.as_ref().map(|_| (major, minor)),
+        );
+    } else if let Some(node) = node.as_ref() {
+        let subsystem = if node.class_name.is_empty() {
+            "char"
+        } else {
+            &node.class_name
+        };
+        crate::net::uevent::announce_virtual_device(
+            crate::net::uevent::UeventAction::Remove,
+            subsystem,
+            unsafe { linux_device_c_str(linux_dev_name(&*dev)) },
+            subsystem,
+            &node.name,
+            node.major,
+            node.minor,
+        );
+    }
+    if let Some(node) = node {
+        let _ = crate::init::rootfs::devtmpfs_delete_linux_char_node(&node.name);
+    }
     LINUX_DEVICES
         .lock()
         .retain(|registered| registered.device != dev as usize);
@@ -1099,7 +1323,8 @@ mod tests {
         assert_eq!(offset_of!(LinuxDevice, driver), 104);
         assert_eq!(offset_of!(LinuxDevice, platform_data), 112);
         assert_eq!(offset_of!(LinuxDevice, driver_data), 120);
-        assert_eq!(size_of::<LinuxDevice>(), 128);
+        assert_eq!(offset_of!(LinuxDevice, _abi_tail), 128);
+        assert_eq!(size_of::<LinuxDevice>(), 760);
         assert_eq!(LINUX_STRUCT_DEVICE_SIZE, 760);
         assert_eq!(LINUX_DEVICE_RELEASE_OFFSET, 712);
     }

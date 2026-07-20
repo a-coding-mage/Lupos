@@ -753,12 +753,18 @@ pub unsafe fn copy_process(
         if args.flags & crate::kernel::clone::CLONE_CHILD_SETTID != 0 {
             register_child_set_tid(nr, args.child_tid);
         }
-        crate::kernel::signal::inherit_signal_state_for_clone(
+        if !crate::kernel::signal::inherit_signal_state_for_clone(
             (*parent).pid,
             nr,
             (*child).tgid,
             child,
-        );
+        ) {
+            // vendor/linux copy_process() aborts a clone which races a
+            // process-wide fatal exit. Otherwise the new thread can miss
+            // zap_other_threads() and keep a zombie leader unreapable.
+            cleanup_failed_child(parent, child, stack_ptr, task_allocated);
+            return Err(-4); // EINTR
+        }
     }
 
     Ok(child)
@@ -840,6 +846,16 @@ unsafe fn cleanup_failed_child(
             crate::security::security_task_free((*child).pid as u32);
         }
 
+        // copy_process() binds every successfully copied task into Lupos's
+        // SignalTable, which is the local equivalent of Linux linking a task
+        // into signal->thread_head.  kernel_clone() can still fail afterwards
+        // (for example while installing/copying out a pidfd).  Linux unwinds
+        // that partial task before freeing task_struct; retaining the binding
+        // here makes thread_group_empty() see a peer that never became a live
+        // task, so an exiting group leader remains an unreapable zombie.
+        crate::kernel::signal::release_signal_task_binding(child);
+
+        crate::kernel::cgroup::forget_pid_cgroup((*child).pid);
         crate::kernel::syscalls::release_process_rlimits(child);
         crate::kernel::syscalls::release_task_rseq_registration(child);
 
@@ -911,6 +927,11 @@ pub unsafe fn kernel_clone(args: &KernelCloneArgs) -> i64 {
         // propagation operation is modeled.
         return -1; // EPERM
     }
+    let cgroup_fork_state = if effective_args.flags & CLONE_INTO_CGROUP == 0 {
+        crate::kernel::cgroup::prepare_pid_cgroup_fork(unsafe { (*parent).pid })
+    } else {
+        None
+    };
     let child = match unsafe { copy_process(parent, &effective_args) } {
         Ok(c) => c,
         Err(e) => return e as i64,
@@ -924,7 +945,7 @@ pub unsafe fn kernel_clone(args: &KernelCloneArgs) -> i64 {
         }
     }
 
-    if effective_args.flags & CLONE_INTO_CGROUP != 0 {
+    let crossed_cgroup_kill = if effective_args.flags & CLONE_INTO_CGROUP != 0 {
         if let Err(errno) =
             crate::kernel::cgroup::assign_pid_to_cgroup_fd(child_pid as i32, effective_args.cgroup)
         {
@@ -942,7 +963,12 @@ pub unsafe fn kernel_clone(args: &KernelCloneArgs) -> i64 {
             }
             return -(errno as i64);
         }
-    }
+        false
+    } else {
+        cgroup_fork_state.is_some_and(|state| {
+            crate::kernel::cgroup::finish_pid_cgroup_fork(state, child_pid as i32)
+        })
+    };
 
     if effective_args.flags & CLONE_PIDFD != 0 {
         if effective_args.pidfd.is_null() {
@@ -978,6 +1004,16 @@ pub unsafe fn kernel_clone(args: &KernelCloneArgs) -> i64 {
             }
             return errno as i64;
         }
+    }
+
+    if crossed_cgroup_kill {
+        // Linux cgroup_post_fork() prevents a child that raced with
+        // cgroup.kill from escaping the killed group. Queue SIGKILL before
+        // the new task becomes runnable.
+        let _ = crate::kernel::signal::send_signal_to_process_for_target(
+            child,
+            crate::kernel::signal::SIGKILL,
+        );
     }
 
     // Enqueue the child so the scheduler can run it.
@@ -1098,6 +1134,33 @@ mod tests {
         };
         let result = unsafe { copy_process(&mut *parent as *mut TaskStruct, &args) };
         assert_eq!(result, Err(-22));
+    }
+
+    #[test]
+    fn copy_process_rejects_fork_after_group_exit_started() {
+        let _test_guard = TEST_LOCK.lock().unwrap();
+        clean_lsm_hooks!();
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+
+        let baseline = heap_task_count();
+        let mut parent = make_parent();
+        parent.m26.exit_signal = crate::kernel::signal::SIGCHLD;
+        parent.m26.group_leader = &mut *parent as *mut TaskStruct;
+        unsafe {
+            crate::kernel::signal::prepare_timer_signal_target(&mut *parent as *mut TaskStruct);
+            assert_eq!(
+                crate::kernel::signal::synchronize_group_exit(&mut *parent as *mut TaskStruct, 9,),
+                9
+            );
+            assert_eq!(
+                copy_process(&mut *parent as *mut TaskStruct, &KernelCloneArgs::default(),),
+                Err(-4),
+                "vendor copy_process aborts when fatal_signal_pending(current)"
+            );
+        }
+        assert_eq!(heap_task_count(), baseline);
+        crate::kernel::signal::reset_for_tests();
     }
 
     // ── PID assignment ────────────────────────────────────────────────────────
@@ -1246,6 +1309,36 @@ mod tests {
             "CLONE_THREAD child.tgid must equal parent.tgid"
         );
         unsafe { cleanup_child(child) };
+    }
+
+    #[test]
+    fn failed_clone_cleanup_removes_thread_group_signal_binding() {
+        let _test_guard = TEST_LOCK.lock().unwrap();
+        clean_lsm_hooks!();
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+
+        let mut parent = make_parent();
+        parent.m26.exit_signal = crate::kernel::signal::SIGCHLD;
+        parent.m26.group_leader = &mut *parent as *mut TaskStruct;
+        let args = KernelCloneArgs {
+            flags: CLONE_VM | CLONE_SIGHAND | CLONE_THREAD,
+            ..KernelCloneArgs::default()
+        };
+        let child = unsafe { copy_process(&mut *parent as *mut TaskStruct, &args) }
+            .expect("copy_process should bind the partial thread");
+
+        assert!(
+            !unsafe { crate::kernel::signal::thread_group_empty(&mut *parent as *mut TaskStruct) },
+            "the copied thread must be visible before late clone unwind"
+        );
+        unsafe { cleanup_child_fully(child) };
+        assert!(
+            unsafe { crate::kernel::signal::thread_group_empty(&mut *parent as *mut TaskStruct) },
+            "late clone unwind must not leave a phantom signal->thread_head member"
+        );
+
+        crate::kernel::signal::reset_for_tests();
     }
 
     // ── mm handling ───────────────────────────────────────────────────────────

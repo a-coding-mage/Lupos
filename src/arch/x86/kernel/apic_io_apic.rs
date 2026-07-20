@@ -64,6 +64,25 @@ const PCI_INTX_GSI_FIRST: u8 = 16;
 #[cfg(not(test))]
 const PCI_INTX_GSI_LAST: u8 = 23;
 
+/// Temporary x86 PCI INTx domain used until ACPI `_PRT` creates one IRQ
+/// descriptor per q35 GSI.
+///
+/// Every q35 PCI INTx GSI is routed to this Linux IRQ below, so the IRQ stored
+/// in Linux-facing `struct pci_dev` objects must use the same number.  Exposing
+/// the firmware Interrupt Line byte instead can register a module handler on
+/// IRQ 10 while the I/O APIC delivers IRQ 11, permanently stranding level
+/// interrupts after device startup.
+pub const PCI_INTX_SHARED_IRQ: u8 = 11;
+
+/// IRQ exposed to Linux PCI drivers for an INTx-capable device.
+pub const fn linux_pci_intx_irq(interrupt_pin: u8) -> u32 {
+    if interrupt_pin == 0 {
+        0
+    } else {
+        PCI_INTX_SHARED_IRQ as u32
+    }
+}
+
 #[cfg(not(test))]
 static IO_APIC_VIRT: AtomicU64 = AtomicU64::new(0);
 
@@ -142,7 +161,7 @@ pub unsafe fn route_pci_intx_for_legacy_irq(irq: u8) {
         return;
     };
 
-    if irq == 11 {
+    if irq == PCI_INTX_SHARED_IRQ {
         for gsi in PCI_INTX_GSI_FIRST..=PCI_INTX_GSI_LAST {
             if unsafe { write_redirection_entry(gsi, raw) } {
                 crate::log_info!(
@@ -175,5 +194,12 @@ mod tests {
         assert_ne!(raw & (1 << 15), 0);
         assert_ne!(raw & (1 << 13), 0);
         assert_ne!(raw & (1 << 16), 0);
+    }
+
+    #[test]
+    fn linux_pci_intx_irq_matches_shared_q35_route() {
+        assert_eq!(linux_pci_intx_irq(0), 0);
+        assert_eq!(linux_pci_intx_irq(1), PCI_INTX_SHARED_IRQ as u32);
+        assert_eq!(linux_pci_intx_irq(4), PCI_INTX_SHARED_IRQ as u32);
     }
 }

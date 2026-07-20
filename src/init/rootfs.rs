@@ -2062,6 +2062,59 @@ fn create_special_node_with_metadata_and_private(
     Ok(())
 }
 
+/// Materialize the devtmpfs node requested by a vendor `struct device`.
+///
+/// Source of truth: `vendor/linux/drivers/base/devtmpfs.c::devtmpfs_create_node`.
+/// `devname` is the callback-provided path relative to `/dev`; nested names
+/// such as ALSA's `snd/controlC0` create their parent directory on demand.
+pub(crate) fn devtmpfs_create_linux_char_node(
+    devname: &str,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    major: u32,
+    minor: u32,
+) -> Result<(), i32> {
+    if devname.is_empty()
+        || devname.starts_with('/')
+        || devname
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(EINVAL);
+    }
+    let path = alloc::format!("/dev/{devname}");
+    create_special_node_with_metadata_and_private(
+        &path,
+        InodeKind::Chardev,
+        if mode == 0 {
+            0o600
+        } else {
+            u32::from(mode) & 0o7777
+        },
+        uid,
+        gid,
+        1,
+        0,
+        &crate::fs::char_dev::LINUX_CHAR_FILE_OPS,
+        empty_ram_bytes(),
+    )?;
+    set_node_rdev(&path, major, minor);
+    Ok(())
+}
+
+pub(crate) fn devtmpfs_delete_linux_char_node(devname: &str) -> Result<(), i32> {
+    if devname.is_empty()
+        || devname.starts_with('/')
+        || devname
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(EINVAL);
+    }
+    remove_special_node(&alloc::format!("/dev/{devname}"))
+}
+
 /// Remove a special node previously created under a ramfs `/dev` directory.
 /// A no-op if the path (or its parent) does not resolve.  Mirrors the child
 /// teardown `ramfs_unlink` performs: drop the RamDir entry, adjust the parent

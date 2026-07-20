@@ -10,9 +10,10 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use lazy_static::lazy_static;
@@ -42,12 +43,28 @@ lazy_static! {
     pub static ref ROOT_CG: Mutex<TaskGroup> = Mutex::new(TaskGroup::new_root());
     static ref PID_CGROUPS: Mutex<BTreeMap<i32, PidCgroupMembership>> =
         Mutex::new(BTreeMap::new());
+    static ref CGROUP_KILL_SEQUENCES: Mutex<BTreeMap<String, u64>> =
+        Mutex::new(BTreeMap::new());
+    static ref CGROUP_EVENT_TARGETS: Mutex<BTreeMap<String, CgroupEventTarget>> =
+        Mutex::new(BTreeMap::new());
 }
 
 #[derive(Clone)]
 struct PidCgroupMembership {
     path: String,
     live: bool,
+}
+
+struct CgroupEventTarget {
+    node: Weak<KernfsNode>,
+    sb: Weak<SuperBlock>,
+}
+
+/// Snapshot taken before task allocation, matching the cgroup path and
+/// `kill_seq` retained in Linux `kernel_clone_args`.
+pub struct CgroupForkState {
+    path: String,
+    kill_seq: u64,
 }
 
 // ── cpu.* show/store callbacks ────────────────────────────────────────────
@@ -186,23 +203,163 @@ fn current_pid() -> Option<i32> {
 }
 
 pub fn assign_pid_to_cgroup_path(pid: i32, path: &str) {
-    PID_CGROUPS.lock().insert(
+    let mut memberships = PID_CGROUPS.lock();
+    let affected = affected_cgroup_paths(
+        memberships
+            .get(&pid)
+            .map(|membership| membership.path.as_str()),
+        Some(path),
+    );
+    let before = populated_snapshot(&memberships, &affected);
+    memberships.insert(
         pid,
         PidCgroupMembership {
             path: String::from(path),
             live: true,
         },
     );
+    let changed = populated_transitions(&memberships, &before);
+    drop(memberships);
+    notify_cgroup_event_transitions(&changed);
+}
+
+/// Snapshot a normal fork/clone child's inherited cgroup before task
+/// allocation begins.
+///
+/// Linux `cgroup_css_set_fork()` selects the parent's css_set unless
+/// `CLONE_INTO_CGROUP` supplies another target and records that cgroup's
+/// `kill_seq` in `kernel_clone_args`.
+pub fn prepare_pid_cgroup_fork(parent_pid: i32) -> Option<CgroupForkState> {
+    let sequences = CGROUP_KILL_SEQUENCES.lock();
+    let memberships = PID_CGROUPS.lock();
+    let path = memberships.get(&parent_pid)?.path.clone();
+    let kill_seq = sequences.get(&path).copied().unwrap_or(0);
+    Some(CgroupForkState { path, kill_seq })
+}
+
+/// Link a prepared child before it becomes runnable.
+///
+/// Returns true when `cgroup.kill` advanced after the pre-fork snapshot, in
+/// which case Linux takes the child down immediately after post-fork setup.
+pub fn finish_pid_cgroup_fork(state: CgroupForkState, child_pid: i32) -> bool {
+    let sequences = CGROUP_KILL_SEQUENCES.lock();
+    let mut memberships = PID_CGROUPS.lock();
+    let affected = affected_cgroup_paths(None, Some(&state.path));
+    let before = populated_snapshot(&memberships, &affected);
+    let current_kill_seq = sequences.get(&state.path).copied().unwrap_or(0);
+    let crossed_kill = state.kill_seq != current_kill_seq;
+    memberships.insert(
+        child_pid,
+        PidCgroupMembership {
+            path: state.path,
+            live: true,
+        },
+    );
+    let changed = populated_transitions(&memberships, &before);
+    drop(memberships);
+    drop(sequences);
+    notify_cgroup_event_transitions(&changed);
+    crossed_kill
 }
 
 pub fn mark_pid_exited_from_cgroup(pid: i32) {
-    if let Some(membership) = PID_CGROUPS.lock().get_mut(&pid) {
+    let mut memberships = PID_CGROUPS.lock();
+    let Some(path) = memberships
+        .get(&pid)
+        .map(|membership| membership.path.clone())
+    else {
+        return;
+    };
+    let affected = affected_cgroup_paths(Some(&path), None);
+    let before = populated_snapshot(&memberships, &affected);
+    if let Some(membership) = memberships.get_mut(&pid) {
         membership.live = false;
     }
+    let changed = populated_transitions(&memberships, &before);
+    drop(memberships);
+    notify_cgroup_event_transitions(&changed);
 }
 
 pub fn forget_pid_cgroup(pid: i32) {
-    PID_CGROUPS.lock().remove(&pid);
+    let mut memberships = PID_CGROUPS.lock();
+    let Some(path) = memberships
+        .get(&pid)
+        .map(|membership| membership.path.clone())
+    else {
+        return;
+    };
+    let affected = affected_cgroup_paths(Some(&path), None);
+    let before = populated_snapshot(&memberships, &affected);
+    memberships.remove(&pid);
+    let changed = populated_transitions(&memberships, &before);
+    drop(memberships);
+    notify_cgroup_event_transitions(&changed);
+}
+
+fn affected_cgroup_paths(old_path: Option<&str>, new_path: Option<&str>) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for path in [old_path, new_path].into_iter().flatten() {
+        let mut cursor = path;
+        while cursor != "/" && !cursor.is_empty() {
+            paths.insert(String::from(cursor));
+            cursor = cursor
+                .rsplit_once('/')
+                .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+                .unwrap_or("/");
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn cgroup_path_is_populated_in(
+    memberships: &BTreeMap<i32, PidCgroupMembership>,
+    path: &str,
+) -> bool {
+    if path == "/" {
+        return true;
+    }
+    let prefix = alloc::format!("{path}/");
+    memberships.values().any(|membership| {
+        membership.live && (membership.path == path || membership.path.starts_with(&prefix))
+    })
+}
+
+fn populated_snapshot(
+    memberships: &BTreeMap<i32, PidCgroupMembership>,
+    paths: &[String],
+) -> Vec<(String, bool)> {
+    paths
+        .iter()
+        .map(|path| (path.clone(), cgroup_path_is_populated_in(memberships, path)))
+        .collect()
+}
+
+fn populated_transitions(
+    memberships: &BTreeMap<i32, PidCgroupMembership>,
+    before: &[(String, bool)],
+) -> Vec<String> {
+    before
+        .iter()
+        .filter(|(path, was_populated)| {
+            *was_populated != cgroup_path_is_populated_in(memberships, path)
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+fn notify_cgroup_event_transitions(paths: &[String]) {
+    for path in paths {
+        let target = CGROUP_EVENT_TARGETS
+            .lock()
+            .get(path)
+            .and_then(|target| Some((target.node.upgrade()?, target.sb.upgrade()?)));
+        if let Some((node, sb)) = target {
+            // vendor/linux/kernel/cgroup/cgroup.c::cgroup_file_notify() owns
+            // the cgroup_file's kernfs_node and notifies it directly. This
+            // remains valid after the exiting task detached fs/ns state.
+            crate::fs::kernfs::notify_node(&node, &sb);
+        }
+    }
 }
 
 fn cgroup_procs_store(node: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize, i32> {
@@ -279,6 +436,8 @@ pub fn proc_cgroup_text_for_pid(pid: i32) -> String {
 #[cfg(test)]
 fn clear_pid_cgroups_for_test() {
     PID_CGROUPS.lock().clear();
+    CGROUP_KILL_SEQUENCES.lock().clear();
+    CGROUP_EVENT_TARGETS.lock().clear();
 }
 fn cgroup_events_show(n: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
     let path = cgroup_path_for_node(n);
@@ -294,13 +453,7 @@ fn cgroup_events_show(n: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32>
 }
 
 fn cgroup_path_is_populated(path: &str) -> bool {
-    if path == "/" {
-        return true;
-    }
-    let prefix = alloc::format!("{path}/");
-    PID_CGROUPS.lock().values().any(|membership| {
-        membership.live && (membership.path == path || membership.path.starts_with(&prefix))
-    })
+    cgroup_path_is_populated_in(&PID_CGROUPS.lock(), path)
 }
 fn cgroup_max_show(_n: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
     write_const(buf, "max\n")
@@ -359,16 +512,47 @@ fn cgroup_freeze_store(_n: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize, i32> {
     }
 }
 
-/// `cgroup.kill` is `CFTYPE_NOT_ON_ROOT` and write-only.  Writing `1`
-/// kills every member of the cgroup; any other value is rejected with
-/// `-EINVAL` per `cgroup_kill_write`.  Ref: `vendor/linux/kernel/cgroup/
-/// cgroup.c::cgroup_kill_write`.  We do not yet plumb the kill action
-/// into the scheduler, but the ABI must accept the write so systemd's
-/// `cg_kill_kernel_sigkill` path in `cgroup-util.c` resolves.
-fn cgroup_kill_store(_n: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize, i32> {
+/// `cgroup.kill` is `CFTYPE_NOT_ON_ROOT` and write-only. Writing `1`
+/// increments the cgroup kill generation and sends process-directed SIGKILL
+/// to every process in this cgroup and its descendants, matching
+/// `vendor/linux/kernel/cgroup/cgroup.c::{__cgroup_kill,cgroup_kill}`.
+fn cgroup_kill_store(n: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize, i32> {
     let s = core::str::from_utf8(buf).map_err(|_| EINVAL)?;
     if s.trim() != "1" {
         return Err(EINVAL);
+    }
+    let path = cgroup_path_for_node(n);
+    let prefix = alloc::format!("{path}/");
+    let member_pids = {
+        let mut sequences = CGROUP_KILL_SEQUENCES.lock();
+        let sequence = sequences.entry(path.clone()).or_insert(0);
+        *sequence = sequence.wrapping_add(1);
+        PID_CGROUPS
+            .lock()
+            .iter()
+            .filter(|(_, membership)| {
+                membership.live && (membership.path == path || membership.path.starts_with(&prefix))
+            })
+            .map(|(pid, _)| *pid)
+            .collect::<BTreeSet<_>>()
+    };
+
+    // cgroup.kill is process-directed. Collapse thread memberships to TGIDs
+    // before queueing SIGKILL, as Linux's CSS_TASK_ITER_PROCS does.
+    let mut target_tgids = BTreeSet::new();
+    let mut collect = |task: *mut crate::kernel::task::TaskStruct| {
+        if task.is_null() {
+            return;
+        }
+        let pid = unsafe { (*task).pid };
+        if member_pids.contains(&pid) {
+            target_tgids.insert(unsafe { (*task).tgid });
+        }
+    };
+    crate::kernel::fork::for_each_heap_task(&mut collect);
+    crate::kernel::sched::for_each_pool_task(&mut collect);
+    for tgid in target_tgids {
+        let _ = crate::kernel::signal::send_signal_to_process(tgid, crate::kernel::signal::SIGKILL);
     }
     Ok(buf.len())
 }
@@ -390,6 +574,34 @@ pub fn new_cgroup_dir(name: &str, mode: u32) -> Arc<KernfsNode> {
     let dir = KernfsNode::new_dir(name, mode & 0o777);
     populate_cgroup_dir_internal(&dir, /* is_root */ false);
     dir
+}
+
+pub fn register_cgroup_dir(dir: &Arc<KernfsNode>, sb: &SuperBlockRef) {
+    let components = crate::fs::kernfs::symlink::kernfs_node_path_from_root(dir);
+    let path = if components.is_empty() {
+        String::from("/")
+    } else {
+        alloc::format!("/{}", components.join("/"))
+    };
+    if let Some(events) = lookup(dir, "cgroup.events") {
+        CGROUP_EVENT_TARGETS.lock().insert(
+            path,
+            CgroupEventTarget {
+                node: Arc::downgrade(&events),
+                sb: Arc::downgrade(sb),
+            },
+        );
+    }
+}
+
+pub fn unregister_cgroup_dir(dir: &Arc<KernfsNode>) {
+    let components = crate::fs::kernfs::symlink::kernfs_node_path_from_root(dir);
+    let path = if components.is_empty() {
+        String::from("/")
+    } else {
+        alloc::format!("/{}", components.join("/"))
+    };
+    CGROUP_EVENT_TARGETS.lock().remove(&path);
 }
 
 fn populate_cgroup_dir(root: &Arc<KernfsNode>) {
@@ -601,6 +813,7 @@ pub fn mount(_source: &str, _flags: u64, _data: &str) -> Result<SuperBlockRef, i
     let sb = SuperBlock::alloc("cgroup2", CGROUP2_MAGIC, &CGROUP_SUPER_OPS);
     let root = KernfsNode::new_dir("/", 0o755);
     populate_cgroup_dir(&root);
+    register_cgroup_dir(&root, &sb);
 
     let root_inode = inode_for_node(&sb, root);
     let root_dentry = d_alloc("/");
@@ -693,6 +906,79 @@ mod tests {
         let events = lookup(&udev, "cgroup.events").unwrap();
         let n = cgroup_events_show(&events, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"populated 1\nfrozen 0\n");
+    }
+
+    #[test]
+    fn normal_fork_inherits_membership_until_the_last_task_exits() {
+        let _guard = TEST_LOCK.lock();
+        clear_pid_cgroups_for_test();
+        let service_path = "/user.slice/user-1000.slice/session-c1.scope";
+
+        assign_pid_to_cgroup_path(500, service_path);
+        let state = prepare_pid_cgroup_fork(500).expect("parent membership");
+        assert!(!finish_pid_cgroup_fork(state, 501));
+        assert_eq!(path_for_pid(501), service_path);
+        assert!(cgroup_path_is_populated(service_path));
+
+        mark_pid_exited_from_cgroup(500);
+        assert!(
+            cgroup_path_is_populated(service_path),
+            "the live child must keep cgroup.events populated=1"
+        );
+        mark_pid_exited_from_cgroup(501);
+        assert!(
+            !cgroup_path_is_populated(service_path),
+            "the last exiting task must transition cgroup.events to populated=0"
+        );
+    }
+
+    #[test]
+    fn fork_crossing_cgroup_kill_generation_is_rejected() {
+        let _guard = TEST_LOCK.lock();
+        clear_pid_cgroups_for_test();
+        let service_path = "/user.slice/user-1000.slice/session-c5.scope";
+
+        assign_pid_to_cgroup_path(600, service_path);
+        let state = prepare_pid_cgroup_fork(600).expect("pre-kill snapshot");
+        CGROUP_KILL_SEQUENCES
+            .lock()
+            .insert(String::from(service_path), 1);
+
+        assert!(finish_pid_cgroup_fork(state, 601));
+        assert_eq!(path_for_pid(601), service_path);
+    }
+
+    #[test]
+    fn populated_transitions_only_report_visible_value_changes() {
+        let _guard = TEST_LOCK.lock();
+        clear_pid_cgroups_for_test();
+        let service_path = String::from("/system.slice/example.service");
+        let paths = alloc::vec![service_path.clone()];
+
+        let before = populated_snapshot(&PID_CGROUPS.lock(), &paths);
+        assign_pid_to_cgroup_path(700, &service_path);
+        assert_eq!(
+            populated_transitions(&PID_CGROUPS.lock(), &before),
+            paths,
+            "first attachment must notify populated 0 -> 1"
+        );
+
+        let before = populated_snapshot(&PID_CGROUPS.lock(), &paths);
+        assign_pid_to_cgroup_path(701, &service_path);
+        assert!(
+            populated_transitions(&PID_CGROUPS.lock(), &before).is_empty(),
+            "additional members must not emit a spurious populated transition"
+        );
+
+        mark_pid_exited_from_cgroup(700);
+        assert!(cgroup_path_is_populated(&service_path));
+        let before = populated_snapshot(&PID_CGROUPS.lock(), &paths);
+        mark_pid_exited_from_cgroup(701);
+        assert_eq!(
+            populated_transitions(&PID_CGROUPS.lock(), &before),
+            paths,
+            "last exit must notify populated 1 -> 0"
+        );
     }
 
     #[test]

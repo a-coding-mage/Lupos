@@ -34,6 +34,52 @@ use crate::kernel::task::{MAX_CHILDREN, TaskStruct};
 /// last-nonleader leader notification with `tasklist_lock` held for write.
 static TASKLIST_LOCK: SpinLock<()> = SpinLock::new(());
 
+/// Queue SIGKILL for every live peer in the current thread group.
+///
+/// This is Linux `zap_other_threads()`. A peer must unwind and call
+/// `do_exit()` on its own stack; remotely freeing a sleeping task would leave
+/// stack-owned waitqueue and futex entries dangling.
+unsafe fn zap_other_threads(current: *mut TaskStruct, code: i64) {
+    if current.is_null() {
+        return;
+    }
+    let tgid = unsafe { (*current).tgid };
+    let mut visit = |task: *mut TaskStruct| unsafe {
+        if task.is_null() || task == current || (*task).tgid != tgid || (*task).m26.exit_state != 0
+        {
+            return;
+        }
+        (*task).m26.exit_code = code as i32;
+        let _ = signal::send_signal_to_task(task, signal::SIGKILL);
+        sched::request_reschedule((*task).thread_info.cpu);
+    };
+    crate::kernel::fork::for_each_heap_task(&mut visit);
+    sched::for_each_pool_task(&mut visit);
+}
+
+/// Terminate the current task and every other thread in its thread group.
+///
+/// Linux uses this common path for both `exit_group(2)` and default-fatal
+/// signals. Exiting only the signal recipient can publish a zombie leader
+/// while another thread remains asleep forever, preventing waiters and session
+/// teardown from completing.
+///
+/// # Safety
+/// Must be called from a valid task context. Never returns.
+pub unsafe fn do_group_exit(code: i64) -> ! {
+    let current = unsafe { sched::get_current() };
+    unsafe {
+        let (code, started) = signal::begin_group_exit(current, code as i32);
+        // vendor/linux do_group_exit() calls zap_other_threads() only while
+        // publishing SIGNAL_GROUP_EXIT for the first time. Later peers use
+        // the shared code and proceed directly to do_exit().
+        if started {
+            zap_other_threads(current, code as i64);
+        }
+        do_exit(code as i64);
+    }
+}
+
 pub unsafe fn exit_clear_child_tid(tsk: *mut TaskStruct) {
     if tsk.is_null() {
         return;
@@ -273,6 +319,8 @@ pub unsafe fn notify_exit_and_publish_zombie(tsk: *mut TaskStruct) -> bool {
 
     let mut waiters = [core::ptr::null_mut(); crate::kernel::task::MAX_WAITERS];
     let mut waiter_count = 0;
+    let mut leader_waiters = [core::ptr::null_mut(); crate::kernel::task::MAX_WAITERS];
+    let mut leader_waiter_count = 0;
     let (tasklist_guard, irq_flags) = TASKLIST_LOCK.lock_irqsave();
     let autoreap = unsafe {
         // Linux thread_group_leader(p) is exactly p->exit_signal >= 0.
@@ -286,6 +334,16 @@ pub unsafe fn notify_exit_and_publish_zombie(tsk: *mut TaskStruct) -> bool {
         let task_state = if autoreap { TASK_DEAD } else { EXIT_ZOMBIE };
 
         (*tsk).m26.exit_state = exit_state;
+        // Linux exit_notify() immediately calls release_task() for an
+        // untraced subthread. Its task_struct may retain a final scheduler
+        // reference, but __exit_signal() has already removed it from
+        // signal->thread_head. Mirror that membership transition here instead
+        // of delaying it until the outgoing kernel stack is reclaimed.
+        let removed_group_member = if autoreap {
+            signal::release_signal_task_binding(tsk)
+        } else {
+            false
+        };
         if !delay_leader {
             (waiters, waiter_count) = take_exit_waiters(tsk);
         }
@@ -295,10 +353,21 @@ pub unsafe fn notify_exit_and_publish_zombie(tsk: *mut TaskStruct) -> bool {
         if !delay_leader {
             notify_parent_exit(tsk);
         }
+        let leader = (*tsk).m26.group_leader;
+        if removed_group_member
+            && !leader.is_null()
+            && leader != tsk
+            && signal::thread_group_empty(leader)
+            && (*leader).m26.exit_state == EXIT_ZOMBIE
+        {
+            (leader_waiters, leader_waiter_count) = take_exit_waiters(leader);
+            notify_parent_exit(leader);
+        }
         autoreap
     };
     SpinLock::unlock_irqrestore(tasklist_guard, irq_flags);
     wake_exit_waiters(&waiters, waiter_count);
+    wake_exit_waiters(&leader_waiters, leader_waiter_count);
     autoreap
 }
 
@@ -436,7 +505,7 @@ pub unsafe fn release_task(p: *mut TaskStruct) {
         // `__exit_signal()` removes p from signal->thread_head before testing
         // thread_group_empty(leader). The SignalState binding is Lupos's
         // authoritative membership entry, so clear it at exactly that point.
-        crate::kernel::signal::release_signal_task_binding(p);
+        let removed_group_member = crate::kernel::signal::release_signal_task_binding(p);
 
         (*p).__state.store(EXIT_DEAD, Ordering::Release);
         (*p).m26.exit_state = EXIT_DEAD;
@@ -445,6 +514,7 @@ pub unsafe fn release_task(p: *mut TaskStruct) {
         // leader to its parent. Until this point wait/pidfd deliberately hide
         // that EXIT_ZOMBIE leader via delay_group_leader().
         if is_nonleader
+            && removed_group_member
             && signal::thread_group_empty(leader)
             && (*leader).m26.exit_state == EXIT_ZOMBIE
         {
@@ -501,12 +571,52 @@ mod tests {
     use crate::kernel::fork::{KernelCloneArgs, copy_process, heap_task_count};
     use crate::kernel::task::M26Fields;
     use crate::kernel::task::task_state::{
-        EXIT_ZOMBIE, NON_RUNNABLE_MASK, TASK_INTERRUPTIBLE, TASK_RUNNING,
+        EXIT_DEAD, EXIT_ZOMBIE, NON_RUNNABLE_MASK, TASK_DEAD, TASK_INTERRUPTIBLE, TASK_RUNNING,
     };
     use crate::security::hooks::{LsmHooks, NOOP_HOOKS};
     use crate::security::lsm_list::{TEST_LSM_LOCK, reset_for_test};
     use crate::security::register_lsm;
     use alloc::boxed::Box;
+
+    #[test]
+    fn group_exit_zaps_peers_and_is_shared_by_fatal_signals() {
+        let exit_source = include_str!("exit.rs");
+        let group_exit = exit_source
+            .split("pub unsafe fn do_group_exit(code: i64) -> !")
+            .nth(1)
+            .expect("common group-exit path")
+            .split("pub unsafe fn exit_clear_child_tid")
+            .next()
+            .expect("group-exit path end");
+        assert!(group_exit.contains("zap_other_threads(current, code)"));
+        assert!(group_exit.contains("do_exit(code)"));
+
+        let signal_source = include_str!("signal.rs");
+        let do_signal = signal_source
+            .split("pub unsafe fn do_signal(")
+            .nth(1)
+            .expect("signal delivery path")
+            .split("// ── Default action table")
+            .next()
+            .expect("signal delivery path end");
+        assert!(
+            do_signal
+                .matches("crate::kernel::exit::do_group_exit")
+                .count()
+                >= 2,
+            "both terminating and coredumping default actions must terminate the thread group"
+        );
+
+        let wait_source = include_str!("wait.rs");
+        let sys_exit_group = wait_source
+            .split("pub unsafe fn sys_exit_group(code: i32) -> !")
+            .nth(1)
+            .expect("exit_group syscall")
+            .split("// ── Tests")
+            .next()
+            .expect("exit_group syscall end");
+        assert!(sys_exit_group.contains("crate::kernel::exit::do_group_exit(packed)"));
+    }
 
     static TASK_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -738,6 +848,68 @@ mod tests {
                 "exit notification must still signal the real parent before wake"
             );
         }
+    }
+
+    #[test]
+    fn autoreaped_last_subthread_releases_delayed_leader_to_parent() {
+        let _signal_guard = signal::SIGNAL_TEST_LOCK.lock();
+        signal::reset_for_tests();
+
+        let mut parent = make_task(8200, 8200);
+        let mut leader = make_task(8201, 8201);
+        let mut peer = make_task(8202, 8201);
+        unsafe {
+            let previous = sched::get_current();
+            sched::set_current(&mut *parent as *mut TaskStruct);
+            signal::prepare_timer_signal_target(&mut *parent as *mut TaskStruct);
+            let blocked = signal::SigSet {
+                bits: 1u64 << (SIGCHLD - 1),
+            };
+            assert_eq!(
+                signal::sys_rt_sigprocmask(
+                    signal::SIG_BLOCK,
+                    &blocked,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<signal::SigSet>(),
+                ),
+                0
+            );
+            sched::set_current(&mut *leader as *mut TaskStruct);
+            signal::prepare_timer_signal_target(&mut *leader as *mut TaskStruct);
+            assert!(signal::inherit_signal_state_for_clone(
+                leader.pid,
+                peer.pid,
+                leader.tgid,
+                &mut *peer as *mut TaskStruct,
+            ));
+            sched::set_current(previous);
+
+            leader.m26.real_parent = &mut *parent as *mut TaskStruct;
+            leader.m26.group_leader = &mut *leader as *mut TaskStruct;
+            leader.m26.exit_signal = SIGCHLD;
+            leader.m26.exit_state = EXIT_ZOMBIE;
+            leader.__state.store(EXIT_ZOMBIE, Ordering::Release);
+            leader.m26.wait_waiters[0] = &mut *parent as *mut TaskStruct;
+            leader.m26.wait_count = 1;
+
+            peer.m26.real_parent = &mut *parent as *mut TaskStruct;
+            peer.m26.group_leader = &mut *leader as *mut TaskStruct;
+            peer.m26.exit_signal = -1;
+            parent.__state.store(TASK_INTERRUPTIBLE, Ordering::Release);
+
+            assert!(!signal::thread_group_empty(&mut *leader as *mut TaskStruct));
+            assert!(notify_exit_and_publish_zombie(
+                &mut *peer as *mut TaskStruct
+            ));
+
+            assert_eq!(peer.m26.exit_state, EXIT_DEAD);
+            assert_eq!(peer.__state.load(Ordering::Acquire), TASK_DEAD);
+            assert!(signal::thread_group_empty(&mut *leader as *mut TaskStruct));
+            assert_eq!(leader.m26.wait_count, 0);
+            assert_eq!(parent.__state.load(Ordering::Acquire), TASK_RUNNING);
+            assert!(signal::has_pending_signal_for_pid(parent.pid, SIGCHLD));
+        }
+        signal::reset_for_tests();
     }
 
     #[test]

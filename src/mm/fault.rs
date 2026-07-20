@@ -985,6 +985,61 @@ pub struct VmOperationsStruct {
     pub access: Option<unsafe extern "C" fn(*mut VmAreaStruct, u64, *mut u8, i32, u32) -> i32>,
 }
 
+/// Complete a page fault whose page was selected by a Linux-built module.
+///
+/// Vendor callbacks follow Linux's `->fault` contract: they return a
+/// referenced `struct page` in `vmf->page`, while Linux's generic fault layer
+/// installs the PTE afterward. Lupos fault callbacks normally install their
+/// own PTEs, so the char-device ABI bridge calls this adapter to perform that
+/// missing generic step.
+pub unsafe fn finish_linux_module_page_fault(
+    vmf: *mut VmFault,
+    page: *mut Page,
+    result: VmFaultFlags,
+) -> VmFaultFlags {
+    if vmf.is_null() || result & VM_FAULT_ERROR != 0 {
+        return result;
+    }
+    if page.is_null() {
+        return if result != 0 { result } else { VM_FAULT_SIGBUS };
+    }
+
+    unsafe {
+        let vma = (*vmf).vma;
+        if vma.is_null() {
+            (*page).put_page();
+            return VM_FAULT_SIGBUS;
+        }
+        let ptep = match pte_alloc((*vmf).pmd, (*vmf).address, _PAGE_TABLE) {
+            Some(ptep) => ptep,
+            None => {
+                (*page).put_page();
+                return VM_FAULT_OOM;
+            }
+        };
+        if !pte_none(ptep_get(ptep)) {
+            (*page).put_page();
+            return VM_FAULT_NOPAGE;
+        }
+
+        let prot = if (*vma).vm_page_prot != 0 {
+            pgprot_t((*vma).vm_page_prot)
+        } else {
+            pgprot_t(_PAGE_PRESENT | _PAGE_USER | _PAGE_ACCESSED | _PAGE_NX)
+        };
+        let mut entry = pte_mkyoung(pfn_pte(page_to_pfn(page) as u64, prot));
+        if (*vmf).flags & FAULT_FLAG_WRITE != 0 && (*vma).vm_flags & VM_WRITE != 0 {
+            entry = pte_mkwrite(pte_mkdirty(entry));
+        }
+        set_pte_at((*vma).vm_mm as *mut (), (*vmf).address, ptep, entry);
+        (*page)._mapcount().fetch_add(1, Ordering::Relaxed);
+        (*vmf).page = page;
+        (*vmf).pte = ptep;
+        add_mm_rss((*vma).vm_mm, 1);
+        result
+    }
+}
+
 // ---------------------------------------------------------------------------
 // filemap_fault — page-cache backed fault handler
 // ---------------------------------------------------------------------------

@@ -334,6 +334,11 @@ pub unsafe fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
         Ok(f) => f,
         Err(errno) => return -(errno as i64),
     };
+    if let Some(result) =
+        unsafe { crate::fs::char_dev::linux_module_chardev_write(&file, buf, count) }
+    {
+        return result;
+    }
 
     // Chunked copy so we don't try to allocate `count` bytes in one go.
     const CHUNK: usize = 4096;
@@ -416,6 +421,11 @@ pub unsafe fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
         Ok(f) => f,
         Err(errno) => return -(errno as i64),
     };
+    if let Some(result) =
+        unsafe { crate::fs::char_dev::linux_module_chardev_read(&file, buf, count) }
+    {
+        return result;
+    }
 
     const CHUNK: usize = 4096;
     let mut done = 0usize;

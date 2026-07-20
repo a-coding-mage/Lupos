@@ -188,6 +188,29 @@ ARCH_GRAPHICS_PACKAGES=(
     xfce4-settings
     thunar
     xfce4-terminal
+    # A complete desktop media session: PipeWire provides the graph and ALSA /
+    # PulseAudio compatibility endpoints, WirePlumber owns device policy, and
+    # XFCE exposes both a panel volume control and the full pavucontrol mixer.
+    alsa-utils
+    pipewire
+    pipewire-audio
+    pipewire-alsa
+    pipewire-pulse
+    wireplumber
+    pavucontrol
+    xfce4-pulseaudio-plugin
+    # Keep browser and standalone playback codec coverage explicit instead of
+    # relying on Firefox's current transitive dependency closure.
+    ffmpeg
+    gst-libav
+    gst-plugins-good
+    gst-plugins-bad
+    gst-plugins-ugly
+    parole
+    # XFCE's settings manager already supplies display controls.  NetworkManager
+    # and its status applet add the corresponding live network settings UI.
+    networkmanager
+    network-manager-applet
     # Ship a usable terminal editor and browser in the image.  Installing them
     # in this host-side transaction avoids a large, slow first-boot pacman run.
     nano

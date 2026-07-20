@@ -67,6 +67,7 @@ fn ioctl_fionbio(file: &FileRef, arg: u64) -> Result<i64, i32> {
     } else {
         file.flags.fetch_and(!O_NONBLOCK, Ordering::AcqRel);
     }
+    crate::fs::char_dev::sync_linux_module_chardev_flags(file);
     Ok(0)
 }
 

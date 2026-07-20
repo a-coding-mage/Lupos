@@ -73,6 +73,12 @@ fn vma_alloc(start: u64, end: u64, flags: VmFlags) -> *mut VmAreaStruct {
 pub unsafe fn vm_area_free(vma: *mut VmAreaStruct) {
     if !vma.is_null() {
         unsafe {
+            if (*vma).vm_ops != 0 {
+                let ops = &*((*vma).vm_ops as *const crate::mm::fault::VmOperationsStruct);
+                if let Some(close) = ops.close {
+                    close(vma);
+                }
+            }
             crate::mm::rmap::anon_vma_unlink(vma);
             vma_file_put(vma);
             drop(Box::from_raw(vma));
@@ -89,12 +95,17 @@ fn lupos_device_pfn_vm_ops_tag() -> usize {
         as usize
 }
 
+fn linux_char_vm_ops_tag() -> usize {
+    crate::fs::char_dev::linux_char_vm_ops_tag()
+}
+
 fn vma_owns_lupos_file(vma: *const VmAreaStruct) -> bool {
     !vma.is_null()
         && unsafe {
             (*vma).vm_file != 0
                 && ((*vma).vm_ops == lupos_file_vm_ops_tag()
-                    || (*vma).vm_ops == lupos_device_pfn_vm_ops_tag())
+                    || (*vma).vm_ops == lupos_device_pfn_vm_ops_tag()
+                    || (*vma).vm_ops == linux_char_vm_ops_tag())
         }
 }
 
@@ -109,9 +120,24 @@ pub unsafe fn vma_file_get(vma: *const VmAreaStruct) -> bool {
         return false;
     }
     unsafe {
+        (*((*vma).vm_file as *const crate::fs::types::File))
+            .f_count
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         alloc::sync::Arc::increment_strong_count((*vma).vm_file as *const crate::fs::types::File);
     }
     true
+}
+
+/// Transfer an owned native `FileRef` into a VMA-held Linux file reference.
+///
+/// `FilesStruct::get()` returns an implementation `Arc` clone without changing
+/// Linux-visible `f_count`. Installing that clone in `vm_file` corresponds to
+/// vendor `__mmap_new_file_vma()`'s `get_file()`, so account it before turning
+/// the `Arc` into a raw VMA pointer.
+pub fn vma_file_from_ref(file: crate::fs::types::FileRef) -> usize {
+    file.f_count
+        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    alloc::sync::Arc::into_raw(file) as usize
 }
 
 /// Release the file reference owned by a Lupos file-backed VMA.
@@ -137,11 +163,8 @@ pub unsafe fn vma_file_put(vma: *mut VmAreaStruct) {
 /// `crate::fs::types::File`, or zero.
 pub unsafe fn vma_file_put_raw(file: usize) {
     if file != 0 {
-        unsafe {
-            drop(alloc::sync::Arc::from_raw(
-                file as *const crate::fs::types::File,
-            ));
-        }
+        let file = unsafe { alloc::sync::Arc::from_raw(file as *const crate::fs::types::File) };
+        crate::fs::file::fput(file);
     }
 }
 
@@ -178,7 +201,15 @@ pub unsafe fn vm_area_dup(src: *const VmAreaStruct) -> *mut VmAreaStruct {
     });
     let ptr = Box::into_raw(copy);
     // Initialise the fresh chain list-head now that the pointer is stable.
-    unsafe { ListHead::init(&mut (*ptr).anon_vma_chain) };
+    unsafe {
+        ListHead::init(&mut (*ptr).anon_vma_chain);
+        if (*ptr).vm_ops != 0 {
+            let ops = &*((*ptr).vm_ops as *const crate::mm::fault::VmOperationsStruct);
+            if let Some(open) = ops.open {
+                open(ptr);
+            }
+        }
+    }
     ptr
 }
 
@@ -643,7 +674,31 @@ pub fn run_mm_smoke_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::dcache::d_alloc;
+    use crate::fs::file::{alloc_file, fput};
+    use crate::fs::ops::FileOps;
+    use crate::fs::types::FileRef;
     use crate::mm::vm_flags::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static VMA_FILE_RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_vma_file_release(_file: FileRef) {
+        VMA_FILE_RELEASES.fetch_add(1, Ordering::AcqRel);
+    }
+
+    static VMA_FILE_OPS: FileOps = FileOps {
+        name: "vma-file-lifetime-test",
+        read: None,
+        write: None,
+        llseek: None,
+        fsync: None,
+        poll: None,
+        ioctl: None,
+        mmap: None,
+        release: Some(count_vma_file_release),
+        readdir: None,
+    };
 
     /// Helper: create an mm_struct and insert a VMA.
     fn make_mm_with_vma(start: u64, end: u64, flags: VmFlags) -> (MmStruct, *mut VmAreaStruct) {
@@ -823,6 +878,20 @@ mod tests {
         unsafe {
             vm_area_free(core::ptr::null_mut());
         }
+    }
+
+    #[test]
+    fn final_vma_file_put_runs_file_release() {
+        VMA_FILE_RELEASES.store(0, Ordering::Release);
+        let fd_file = alloc_file(d_alloc("mapped"), 0, 0, &VMA_FILE_OPS);
+        let raw_vma_file = vma_file_from_ref(fd_file.clone());
+
+        assert_eq!(fd_file.f_count.load(Ordering::Acquire), 2);
+        fput(fd_file);
+        assert_eq!(VMA_FILE_RELEASES.load(Ordering::Acquire), 0);
+
+        unsafe { vma_file_put_raw(raw_vma_file) };
+        assert_eq!(VMA_FILE_RELEASES.load(Ordering::Acquire), 1);
     }
 
     // -- vma_split --
