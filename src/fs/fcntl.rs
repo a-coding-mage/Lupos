@@ -135,6 +135,13 @@ pub fn sys_fcntl(files: &Arc<FilesStruct>, fd: i32, cmd: i32, arg: u64) -> Resul
             let requested = file_status_flags(arg as u32);
             let next = (requested & SETFL_MASK) | (current & !SETFL_MASK);
             f.flags.store(next, core::sync::atomic::Ordering::Release);
+            // Linux mutates the same `struct file::f_flags` that a character
+            // driver's ->read()/->write() callback subsequently observes.
+            // Lupos keeps a native File plus a configured-vendor `struct file`
+            // adapter for module-backed character devices, so keep both views
+            // coherent. In particular, ALSA sequencer reads use this bit to
+            // return -EAGAIN after fcntl(F_SETFL, O_NONBLOCK).
+            super::char_dev::sync_linux_module_chardev_flags(&f);
             Ok(0)
         }
         F_DUPFD => {
@@ -190,6 +197,7 @@ pub fn sys_fcntl(files: &Arc<FilesStruct>, fd: i32, cmd: i32, arg: u64) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::char_dev::LINUX_CHAR_FILE_OPS;
     use crate::fs::dcache::d_alloc;
     use crate::fs::file::alloc_file;
     use crate::fs::ops::NOOP_FILE_OPS;
@@ -233,6 +241,33 @@ mod tests {
             sys_fcntl(&files, fd, F_GETFL, 0).unwrap() as u32,
             O_WRONLY | O_NONBLOCK
         );
+    }
+
+    #[test]
+    fn setfl_updates_vendor_linux_file_flags_for_module_chardevs() {
+        let files = FilesStruct::new();
+        // Configured vendor `struct file` is 176 bytes with f_flags at byte
+        // 40. Keep the backing aligned exactly as the module adapter does.
+        let mut linux_file = [0u64; 22];
+        let file = alloc_file(d_alloc("snd-seq"), O_RDWR, 0, &LINUX_CHAR_FILE_OPS);
+        *file.private.lock() = linux_file.as_mut_ptr() as usize;
+        let fd = files.install(file.clone(), false).unwrap();
+
+        sys_fcntl(&files, fd, F_SETFL, O_NONBLOCK as u64).unwrap();
+
+        let vendor_flags = unsafe {
+            linux_file
+                .as_ptr()
+                .cast::<u8>()
+                .add(40)
+                .cast::<u32>()
+                .read()
+        };
+        assert_eq!(vendor_flags, O_RDWR | O_NONBLOCK);
+
+        // The test-owned array must not be released through the module
+        // allocator when the final FileRef drops.
+        *file.private.lock() = 0;
     }
 
     #[test]

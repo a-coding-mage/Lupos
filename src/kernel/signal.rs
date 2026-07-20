@@ -27,7 +27,7 @@ use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use core::ffi::c_void;
 
 use crate::arch::x86::kernel::uaccess;
-use crate::include::uapi::errno::EINTR;
+use crate::include::uapi::errno::{EAGAIN, EFAULT, EINTR, EINVAL};
 use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::sched;
 use crate::kernel::sched::wait::WaitQueueHead;
@@ -296,6 +296,11 @@ struct SignalState {
     altstack: SigAltStack,
     pid: i32,
     tgid: i32,
+    /// Linux `signal_struct::flags & SIGNAL_GROUP_EXIT` together with
+    /// `signal_struct::group_exit_code`.  The group leader owns this shared
+    /// value; every thread in the tgid consults it before normal signal
+    /// dequeue, so a peer cannot escape a process-wide fatal exit.
+    group_exit_code: Option<i32>,
     /// Bound task address, protected by SIGNAL_TABLE.  Timer callbacks use
     /// this existing binding instead of taking the process registry lock.
     task_addr: usize,
@@ -319,6 +324,7 @@ impl SignalState {
             altstack: SigAltStack::default(),
             pid,
             tgid,
+            group_exit_code: None,
             task_addr: 0,
         }
     }
@@ -553,7 +559,22 @@ impl SignalTable {
         child_pid: i32,
         child_tgid: i32,
         child_task: *mut crate::kernel::task::TaskStruct,
-    ) {
+    ) -> bool {
+        let parent_tgid = self
+            .states
+            .iter()
+            .find(|state| state.pid == parent_pid)
+            .map_or(child_tgid, |state| state.tgid);
+        if self
+            .states
+            .iter()
+            .find(|state| state.tgid == parent_tgid && state.pid == parent_tgid)
+            .or_else(|| self.states.iter().find(|state| state.tgid == parent_tgid))
+            .is_some_and(|state| state.group_exit_code.is_some())
+        {
+            return false;
+        }
+
         let inherited = self
             .states
             .iter()
@@ -575,6 +596,7 @@ impl SignalTable {
         } else {
             self.states.push(child);
         }
+        true
     }
 }
 
@@ -1262,31 +1284,148 @@ fn enqueue_for_pid(pid: i32, sig: i32, info: SigInfo) -> i64 {
 pub unsafe fn sys_rt_sigtimedwait(
     set: *const SigSet,
     info: *mut SigInfo,
-    _timeout: *const c_void,
+    timeout: *const c_void,
     sigsetsize: usize,
 ) -> i64 {
     if sigsetsize != core::mem::size_of::<SigSet>() {
-        return -22;
+        return -(EINVAL as i64);
     }
     if set.is_null() {
-        return -14;
+        return -(EFAULT as i64);
     }
-    let wait = match unsafe { read_user_value(set) } {
+    let mut wait = match unsafe { read_user_value(set) } {
         Ok(set) => set,
         Err(e) => return e,
     };
+    // Linux do_sigtimedwait() removes the two unblockable signals before
+    // selecting from the requested set.
+    sanitize_blocked_mask(&mut wait);
+
+    let finite_timeout = if timeout.is_null() {
+        None
+    } else {
+        let value =
+            match unsafe { read_user_value(timeout.cast::<crate::kernel::time::Timespec64>()) } {
+                Ok(value) => value,
+                Err(e) => return e,
+            };
+        if !value.is_valid() {
+            return -(EINVAL as i64);
+        }
+        let timeout_ms = value.to_ns().div_ceil(1_000_000);
+        Some(crate::kernel::time::sleep_timeout::msecs_to_schedule_timeout(timeout_ms))
+    };
+
     let task = unsafe { sched::get_current() };
-    let candidate = {
-        let mut table = SIGNAL_TABLE.lock();
-        let idx = match table.get_or_create_current_index() {
-            Ok(idx) => idx,
-            Err(e) => return e as i64,
+    let mut remaining = finite_timeout.unwrap_or(0);
+    let candidate = loop {
+        let candidate = {
+            let mut table = SIGNAL_TABLE.lock();
+            let idx = match table.get_or_create_current_index() {
+                Ok(idx) => idx,
+                Err(e) => return e as i64,
+            };
+            dequeue_masked_signal_for_state_index(&mut table, idx, wait.bits)
         };
-        let Some(candidate) = dequeue_masked_signal_for_state_index(&mut table, idx, wait.bits)
-        else {
-            return -11; // EAGAIN
-        };
-        candidate
+        if let Some(candidate) = candidate {
+            break candidate;
+        }
+
+        // An unrelated unblocked signal interrupts this synchronous wait.
+        // A requested signal is always selected above, even when the caller
+        // normally blocks it as required by sigwait(3).
+        if current_has_unblocked_pending_signals() {
+            return -(EINTR as i64);
+        }
+        if finite_timeout.is_some() && remaining == 0 {
+            return -(EAGAIN as i64);
+        }
+
+        #[cfg(test)]
+        {
+            // Host unit tests have no runnable peer that could wake a
+            // synchronous signal waiter. Runtime coverage exercises the real
+            // blocking/wakeup path through systemd's sd-pam helper.
+            return -(EAGAIN as i64);
+        }
+
+        #[cfg(not(test))]
+        {
+            // Linux do_sigtimedwait() temporarily unblocks the requested set
+            // while sleeping.  This is essential: signal generation only
+            // selects and wakes a task that wants the signal.  Restore the
+            // caller's mask before dequeue/return so the requested signal
+            // cannot escape into ordinary handler delivery.
+            crate::kernel::locking::local_irq_disable();
+            if !task.is_null() {
+                unsafe {
+                    (*task).__state.store(
+                        crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+                        core::sync::atomic::Ordering::Release,
+                    );
+                }
+            }
+            let (ready, saved_blocked) = {
+                let mut table = SIGNAL_TABLE.lock();
+                match table.get_or_create_current_index() {
+                    Ok(idx) => {
+                        let saved = table.states[idx].blocked;
+                        table.states[idx].blocked.bits &= !wait.bits;
+                        let requested = {
+                            let state = &table.states[idx];
+                            let shared = group_shared_pending_bits(&table, state.tgid);
+                            (state.pending.bits | shared) & wait.bits != 0
+                        };
+                        (
+                            requested || state_has_unblocked_pending_signal(&table, idx),
+                            Some(saved),
+                        )
+                    }
+                    Err(_) => (true, None),
+                }
+            };
+            if ready {
+                if let Some(saved) = saved_blocked {
+                    let mut table = SIGNAL_TABLE.lock();
+                    if let Ok(idx) = table.get_or_create_current_index() {
+                        table.states[idx].blocked = saved;
+                    }
+                }
+                if !task.is_null() {
+                    unsafe {
+                        (*task).__state.store(
+                            crate::kernel::task::task_state::TASK_RUNNING,
+                            core::sync::atomic::Ordering::Release,
+                        );
+                    }
+                }
+                crate::kernel::locking::local_irq_enable();
+                continue;
+            }
+
+            if finite_timeout.is_some() {
+                remaining = crate::kernel::time::sleep_timeout::schedule_timeout(remaining);
+            } else {
+                unsafe {
+                    crate::kernel::sched::schedule_with_irqs_enabled();
+                }
+                if !task.is_null() {
+                    unsafe {
+                        (*task).__state.store(
+                            crate::kernel::task::task_state::TASK_RUNNING,
+                            core::sync::atomic::Ordering::Release,
+                        );
+                    }
+                }
+            }
+            if let Some(saved) = saved_blocked {
+                let mut table = SIGNAL_TABLE.lock();
+                if let Ok(idx) = table.get_or_create_current_index() {
+                    table.states[idx].blocked = saved;
+                }
+            }
+            recalc_tif_sigpending(task);
+        }
     };
     rearm_dequeued_timers(task, &candidate);
     recalc_tif_sigpending(task);
@@ -1503,7 +1642,7 @@ pub fn queue_posix_timer_signal_noalloc(pid: i32, tgid: i32, sig: i32, timer_id:
     0
 }
 
-fn send_signal_info_to_process_for_target(
+pub(crate) fn send_signal_info_to_process_for_target(
     target: *mut crate::kernel::task::TaskStruct,
     sig: i32,
     info: SigInfo,
@@ -1967,6 +2106,22 @@ pub fn has_pending_signal_for_pid(pid: i32, sig: i32) -> bool {
         return pending_bits_for_state(&table, &table.states[idx]) & sig_bit(sig) != 0;
     }
     false
+}
+
+#[cfg(test)]
+pub(crate) fn pending_signal_scopes_for_pid(pid: i32, sig: i32) -> (bool, bool) {
+    let table = SIGNAL_TABLE.lock();
+    table
+        .states
+        .iter()
+        .find(|state| state.pid == pid)
+        .map(|state| {
+            (
+                state.pending.contains(sig),
+                state.shared_pending.contains(sig),
+            )
+        })
+        .unwrap_or((false, false))
 }
 
 /// Set the TIF_SIGPENDING flag on a task to indicate pending signals.
@@ -2487,6 +2642,9 @@ pub unsafe fn do_signal_stop_only() -> bool {
     if task.is_null() {
         return false;
     }
+    if let Some(code) = unsafe { task_group_exit_code(task) } {
+        unsafe { crate::kernel::exit::do_group_exit(code as i64) };
+    }
 
     let (signal_info, saved_mask) = {
         let mut table = SIGNAL_TABLE.lock();
@@ -2513,7 +2671,7 @@ pub unsafe fn do_signal_stop_only() -> bool {
 
     match info.signo {
         SIGKILL | SIGINT => unsafe {
-            crate::kernel::exit::do_exit(crate::kernel::wait::w_exitcode(0, info.signo) as i64)
+            crate::kernel::exit::do_group_exit(crate::kernel::wait::w_exitcode(0, info.signo) as i64)
         },
         SIGSTOP | SIGTSTP => unsafe { stop_current_for_signal(task, info.signo) },
         _ => {
@@ -2673,6 +2831,13 @@ pub unsafe fn do_signal(regs: *mut crate::kernel::task::PtRegs) -> bool {
     }
 
     loop {
+        // vendor/linux get_signal() checks SIGNAL_GROUP_EXIT before normal
+        // pending-signal selection. Every peer therefore joins an exit already
+        // started by another thread even if its private SIGKILL instance was
+        // coalesced or raced with clone.
+        if let Some(code) = unsafe { task_group_exit_code(task) } {
+            unsafe { crate::kernel::exit::do_group_exit(code as i64) };
+        }
         let (signal_info, saved_mask, mask_to_save) = {
             let mut table = SIGNAL_TABLE.lock();
             if let Ok(idx) = table.get_or_create_current_index() {
@@ -2734,14 +2899,14 @@ pub unsafe fn do_signal(regs: *mut crate::kernel::task::PtRegs) -> bool {
                     continue;
                 }
                 DefaultAction::Term => unsafe {
-                    crate::kernel::exit::do_exit(
-                        crate::kernel::wait::w_exitcode(0, info.signo) as i64
-                    );
+                    crate::kernel::exit::do_group_exit(crate::kernel::wait::w_exitcode(
+                        0, info.signo,
+                    ) as i64);
                 },
                 DefaultAction::Core => unsafe {
                     // Drive the coredump pipeline before terminating.
                     do_coredump(task, &info);
-                    crate::kernel::exit::do_exit(crate::kernel::wait::w_exitcode(
+                    crate::kernel::exit::do_group_exit(crate::kernel::wait::w_exitcode(
                         0,
                         info.signo | 0x80,
                     ) as i64);
@@ -3089,19 +3254,77 @@ pub(crate) fn inherit_signal_state_for_clone(
     child_pid: i32,
     child_tgid: i32,
     child_task: *mut crate::kernel::task::TaskStruct,
-) {
+) -> bool {
     SIGNAL_TABLE
         .lock()
-        .inherit_for_clone(parent_pid, child_pid, child_tgid, child_task);
+        .inherit_for_clone(parent_pid, child_pid, child_tgid, child_task)
+}
+
+/// Publish or observe Linux's shared `SIGNAL_GROUP_EXIT` state.
+///
+/// The first exiting thread fixes the process exit code. Later peers use that
+/// same code, exactly like `do_group_exit()` under `sighand->siglock`.
+///
+/// # Safety
+/// `task` must remain live while its pid/tgid are sampled.
+pub(crate) unsafe fn begin_group_exit(
+    task: *mut crate::kernel::task::TaskStruct,
+    code: i32,
+) -> (i32, bool) {
+    if task.is_null() {
+        return (code, false);
+    }
+    let (pid, tgid) = unsafe { ((*task).pid, (*task).tgid) };
+    let mut table = SIGNAL_TABLE.lock();
+    let task_idx = table.get_or_create_task_index(pid, tgid, task);
+    let owner_idx = table
+        .states
+        .iter()
+        .position(|state| state.tgid == tgid && state.pid == tgid)
+        .unwrap_or(task_idx);
+    let owner = table.states.get_mut(owner_idx).expect("owner index valid");
+    if let Some(existing) = owner.group_exit_code {
+        (existing, false)
+    } else {
+        owner.group_exit_code = Some(code);
+        (code, true)
+    }
+}
+
+pub(crate) unsafe fn synchronize_group_exit(
+    task: *mut crate::kernel::task::TaskStruct,
+    code: i32,
+) -> i32 {
+    unsafe { begin_group_exit(task, code).0 }
+}
+
+/// Return the process-wide exit code once `SIGNAL_GROUP_EXIT` is published.
+///
+/// # Safety
+/// `task` must remain live while its tgid is sampled.
+pub(crate) unsafe fn task_group_exit_code(
+    task: *mut crate::kernel::task::TaskStruct,
+) -> Option<i32> {
+    if task.is_null() {
+        return None;
+    }
+    let tgid = unsafe { (*task).tgid };
+    let table = SIGNAL_TABLE.lock();
+    table
+        .states
+        .iter()
+        .find(|state| state.tgid == tgid && state.pid == tgid)
+        .or_else(|| table.states.iter().find(|state| state.tgid == tgid))
+        .and_then(|state| state.group_exit_code)
 }
 
 /// Linux `thread_group_empty()` / `delay_group_leader()` membership test.
 ///
 /// Lupos does not yet expose Linux's intrusive `signal->thread_head` list, but
 /// every successfully cloned task has one live `SignalState::task_addr`
-/// binding. `release_task()` clears that binding at the same point where
-/// Linux's `__exit_signal()` removes `p->thread_node`, so the resulting
-/// lifetime and last-thread test are identical.
+/// binding. Exit notification clears an autoreaped subthread binding at the
+/// same point where Linux's `release_task()` runs `__exit_signal()`; traced
+/// tasks clear it when their waiter eventually calls Lupos `release_task()`.
 ///
 /// # Safety
 /// `task` must remain live for the duration of this call.
@@ -3129,23 +3352,33 @@ pub(crate) unsafe fn delay_group_leader(task: *mut crate::kernel::task::TaskStru
         && !unsafe { thread_group_empty(task) }
 }
 
-/// Remove the raw task binding before release_task frees TaskStruct. Pending
-/// process-directed state remains attached to the thread group, as it does in
-/// Linux's signal_struct.
+/// Remove the task's private signal state before release_task frees TaskStruct.
+///
+/// Process-directed pending state is owned by the group leader entry, so
+/// removing an autoreaped subthread mirrors Linux freeing `task_struct.pending`
+/// while retaining `signal_struct.shared_pending`. Removing completed task
+/// entries also prevents the signal table from growing with every short-lived
+/// helper process.
 ///
 /// # Safety
 /// `task` must still point to the live TaskStruct being released.
-pub(crate) unsafe fn release_signal_task_binding(task: *mut crate::kernel::task::TaskStruct) {
+pub(crate) unsafe fn release_signal_task_binding(
+    task: *mut crate::kernel::task::TaskStruct,
+) -> bool {
     if task.is_null() {
-        return;
+        return false;
     }
     let pid = unsafe { (*task).pid };
     let mut table = SIGNAL_TABLE.lock();
-    if let Some(state) = table.states.iter_mut().find(|state| state.pid == pid)
-        && state.task_addr == task as usize
+    if let Some(index) = table
+        .states
+        .iter()
+        .position(|state| state.pid == pid && state.task_addr == task as usize)
     {
-        state.task_addr = 0;
+        table.states.swap_remove(index);
+        return true;
     }
+    false
 }
 
 pub(crate) fn flush_signal_handlers_for_exec(force_default: bool) {
@@ -3373,7 +3606,12 @@ mod tests {
             parent.rt_queue.push_back(SigInfo::new(SIGRTMIN + 1, 0));
         }
 
-        inherit_signal_state_for_clone(100, 101, 100, core::ptr::null_mut());
+        assert!(inherit_signal_state_for_clone(
+            100,
+            101,
+            100,
+            core::ptr::null_mut()
+        ));
 
         let table = SIGNAL_TABLE.lock();
         let child = table
@@ -3394,6 +3632,81 @@ mod tests {
             !signal_is_default_fatal(child, SIGRTMIN + 1),
             "inherited NPTL realtime handler must prevent default termination"
         );
+    }
+
+    #[test]
+    fn group_exit_code_is_shared_and_rejects_a_racing_clone() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+
+        let mut leader = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        leader.pid = 200;
+        leader.tgid = 200;
+        leader.m26.exit_signal = SIGCHLD;
+        let mut peer = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        peer.pid = 201;
+        peer.tgid = 200;
+        peer.m26.exit_signal = -1;
+
+        unsafe {
+            assert_eq!(
+                begin_group_exit(&mut *leader as *mut TaskStruct, 0x0f),
+                (0x0f, true),
+                "only the first thread publishes SIGNAL_GROUP_EXIT"
+            );
+            assert_eq!(
+                task_group_exit_code(&mut *peer as *mut TaskStruct),
+                Some(0x0f)
+            );
+            assert_eq!(
+                begin_group_exit(&mut *peer as *mut TaskStruct, 0x0900),
+                (0x0f, false),
+                "later peers must reuse the first code without re-zapping"
+            );
+        }
+        assert!(
+            !inherit_signal_state_for_clone(200, 202, 200, core::ptr::null_mut()),
+            "a clone racing SIGNAL_GROUP_EXIT must be rejected"
+        );
+        reset_for_tests();
+    }
+
+    #[test]
+    fn released_subthread_signal_state_is_removed_but_group_state_survives() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+
+        let mut leader = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        leader.pid = 210;
+        leader.tgid = 210;
+        leader.m26.exit_signal = SIGCHLD;
+        let mut peer = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        peer.pid = 211;
+        peer.tgid = 210;
+        peer.m26.exit_signal = -1;
+
+        unsafe {
+            prepare_timer_signal_target(&mut *leader as *mut TaskStruct);
+            assert!(inherit_signal_state_for_clone(
+                leader.pid,
+                peer.pid,
+                leader.tgid,
+                &mut *peer as *mut TaskStruct,
+            ));
+            assert_eq!(
+                synchronize_group_exit(&mut *leader as *mut TaskStruct, 9),
+                9
+            );
+        }
+        assert_eq!(SIGNAL_TABLE.lock().states.len(), 2);
+        assert!(unsafe { release_signal_task_binding(&mut *peer as *mut TaskStruct) });
+        {
+            let table = SIGNAL_TABLE.lock();
+            assert_eq!(table.states.len(), 1);
+            assert_eq!(table.states[0].pid, leader.pid);
+            assert_eq!(table.states[0].group_exit_code, Some(9));
+        }
+        reset_for_tests();
     }
 
     #[test]

@@ -8,12 +8,13 @@
 extern crate alloc;
 
 use alloc::{format, string::String, sync::Arc};
+use core::fmt::Write as _;
 use core::sync::atomic::Ordering;
 
 use crate::fs::kernfs::KernfsNode;
 use crate::kernel::{
     capability::KernelCapT,
-    cred::{Cred, INIT_CRED},
+    cred::{Cred, GroupInfo, INIT_CRED},
     task::TaskStruct,
 };
 
@@ -22,6 +23,7 @@ pub type ProcShow = fn(&Arc<KernfsNode>, &mut [u8]) -> Result<usize, i32>;
 pub struct ProcStatusSecurity {
     pub uid: [u32; 4],
     pub gid: [u32; 4],
+    pub groups: GroupInfo,
     pub cap_inheritable: KernelCapT,
     pub cap_permitted: KernelCapT,
     pub cap_effective: KernelCapT,
@@ -145,6 +147,7 @@ pub fn task_status_security(task: *mut TaskStruct) -> ProcStatusSecurity {
                 (*cred).sgid.0,
                 (*cred).fsgid.0,
             ],
+            groups: (*cred).group_info,
             cap_inheritable: (*cred).cap_inheritable,
             cap_permitted: (*cred).cap_permitted,
             cap_effective: (*cred).cap_effective,
@@ -158,8 +161,14 @@ pub fn task_status_security(task: *mut TaskStruct) -> ProcStatusSecurity {
 }
 
 pub fn format_status(view: &ProcStatusView<'_>) -> String {
+    let mut groups = String::new();
+    let group_count =
+        (view.security.groups.ngroups as usize).min(crate::kernel::cred::NGROUPS_MAX_INLINE);
+    for (index, gid) in view.security.groups.gid[..group_count].iter().enumerate() {
+        let _ = write!(groups, "{}{}", if index == 0 { "" } else { " " }, gid.0);
+    }
     format!(
-        "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nVmLck:\t{:8} kB\nRssAnon:\t{:8} kB\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n",
+        "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nGroups:\t{} \nVmLck:\t{:8} kB\nRssAnon:\t{:8} kB\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n",
         view.name,
         view.state,
         view.tgid,
@@ -173,6 +182,7 @@ pub fn format_status(view: &ProcStatusView<'_>) -> String {
         view.security.gid[1],
         view.security.gid[2],
         view.security.gid[3],
+        groups,
         view.locked_kb,
         view.rss_anon_kb,
         cap_mask_hex(view.security.cap_inheritable),
@@ -248,6 +258,17 @@ mod tests {
             security: ProcStatusSecurity {
                 uid: [0, 0, 0, 0],
                 gid: [0, 0, 0, 0],
+                groups: GroupInfo {
+                    ngroups: 2,
+                    gid: {
+                        let mut gids =
+                            [crate::kernel::cred::KGid(0); crate::kernel::cred::NGROUPS_MAX_INLINE];
+                        gids[0] = crate::kernel::cred::KGid(10);
+                        gids[1] = crate::kernel::cred::KGid(995);
+                        gids
+                    },
+                    ..GroupInfo::default()
+                },
                 cap_inheritable: KernelCapT::empty(),
                 cap_permitted: KernelCapT::full(),
                 cap_effective: KernelCapT::full(),
@@ -259,6 +280,7 @@ mod tests {
             },
         });
         assert!(text.contains("CapInh:\t0000000000000000"));
+        assert!(text.contains("Groups:\t10 995 \n"));
         assert!(text.contains("CapPrm:\t000001ffffffffff"));
         assert!(text.contains("CapEff:\t000001ffffffffff"));
         assert!(text.contains("CapBnd:\t000001ffffffffff"));

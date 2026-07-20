@@ -32,6 +32,7 @@ use super::select::{self, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRN
 use super::types::FileRef;
 
 const PIPE_BUF_CAPACITY: usize = 65_536;
+const ERESTARTSYS: i32 = 512;
 
 struct PipeState {
     buf: Mutex<VecDeque<u8>>,
@@ -158,6 +159,9 @@ fn pipe_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i3
         if task.is_null() {
             return Ok(0);
         }
+        if crate::kernel::signal::has_unblocked_pending_signals(task) {
+            return Err(ERESTARTSYS);
+        }
 
         unsafe {
             pipe.read_wait.prepare_to_wait(task, TASK_INTERRUPTIBLE);
@@ -172,6 +176,9 @@ fn pipe_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i3
             sched::schedule_with_irqs_enabled();
             pipe.read_wait.finish_wait(task);
             (*task).__state.store(TASK_RUNNING, AtomicOrdering::Release);
+        }
+        if crate::kernel::signal::has_unblocked_pending_signals(task) {
+            return Err(ERESTARTSYS);
         }
     }
 }
@@ -209,6 +216,9 @@ fn pipe_write(file: &FileRef, buf: &[u8], _pos: &mut u64) -> Result<usize, i32> 
         if task.is_null() {
             return Ok(0);
         }
+        if crate::kernel::signal::has_unblocked_pending_signals(task) {
+            return Err(ERESTARTSYS);
+        }
 
         unsafe {
             pipe.write_wait.prepare_to_wait(task, TASK_INTERRUPTIBLE);
@@ -223,6 +233,9 @@ fn pipe_write(file: &FileRef, buf: &[u8], _pos: &mut u64) -> Result<usize, i32> 
             sched::schedule_with_irqs_enabled();
             pipe.write_wait.finish_wait(task);
             (*task).__state.store(TASK_RUNNING, AtomicOrdering::Release);
+        }
+        if crate::kernel::signal::has_unblocked_pending_signals(task) {
+            return Err(ERESTARTSYS);
         }
     }
 }
@@ -364,6 +377,9 @@ mod tests {
     use super::*;
     use crate::fs::anon_inode::alloc_anon_file;
     use crate::fs::read_write::{vfs_read, vfs_write};
+    use crate::kernel::cred::INIT_CRED;
+    use crate::kernel::task::TaskStruct;
+    use alloc::boxed::Box;
 
     #[test]
     fn pipe_file_ops_round_trip_bytes() {
@@ -389,6 +405,52 @@ mod tests {
         assert_eq!(pipe_read(&reader, &mut out, &mut pos), Ok(3));
         assert_eq!(&out[..3], b"abc");
         PIPES.lock().remove(&token);
+    }
+
+    #[test]
+    fn blocking_pipe_read_returns_erestartsys_for_pending_signal() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 936;
+        current.tgid = 936;
+        current.cred = &raw const INIT_CRED;
+
+        let token = PIPE_TOKEN.fetch_add(1, Ordering::AcqRel);
+        PIPES.lock().insert(
+            token,
+            Arc::new(PipeState {
+                buf: Mutex::new(VecDeque::new()),
+                flags: 0,
+                readers: AtomicUsize::new(1),
+                writers: AtomicUsize::new(1),
+                read_wait: WaitQueueHead::new(),
+                write_wait: WaitQueueHead::new(),
+            }),
+        );
+        let reader = alloc_anon_file("pipe-read-signal-test", &PIPE_READ_OPS, token);
+        reader.flags.store(O_RDONLY, AtomicOrdering::Release);
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            assert_eq!(
+                crate::kernel::signal::send_signal_to_task(
+                    &mut *current as *mut TaskStruct,
+                    crate::kernel::signal::SIGTERM,
+                ),
+                0
+            );
+        }
+        let mut out = [0u8; 1];
+        let mut pos = 0;
+        assert_eq!(pipe_read(&reader, &mut out, &mut pos), Err(ERESTARTSYS));
+
+        PIPES.lock().remove(&token);
+        unsafe {
+            sched::set_current(previous);
+        }
+        crate::kernel::signal::reset_for_tests();
     }
 
     #[test]

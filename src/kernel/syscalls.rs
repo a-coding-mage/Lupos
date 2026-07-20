@@ -832,17 +832,21 @@ pub unsafe fn sys_setgroups(size: i32, list: *const u32) -> i64 {
     if size != 0 && list.is_null() {
         return -(EFAULT as i64);
     }
-    let mut gids = [KGid(0); cred::NGROUPS_MAX_INLINE];
+    let mut group_info = cred::GroupInfo::default();
+    group_info.ngroups = size as u32;
     for i in 0..size as usize {
         let value = match unsafe { uaccess::get_user_u32(list.add(i)) } {
             Ok(value) => value,
             Err(_) => return -(EFAULT as i64),
         };
-        gids[i] = KGid(value);
+        group_info.gid[i] = KGid(value);
     }
+    // vendor/linux/kernel/groups.c::set_groups() sorts before publishing the
+    // credential because in_group_p() performs a binary search. NSS/PAM does
+    // not promise that initgroups(3) supplies gids in sorted order.
+    crate::kernel::groups::groups_sort(&mut group_info);
     mutate_current_cred(|c| {
-        c.group_info.ngroups = size as u32;
-        c.group_info.gid = gids;
+        c.group_info = group_info;
     })
 }
 
@@ -2407,7 +2411,12 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: *const u8, flags: u32) 
         info
     };
 
-    unsafe { crate::kernel::signal::send_signal_info_to_task(target, info) as i64 }
+    // A pidfd opened without PIDFD_THREAD identifies a thread group.  Linux
+    // therefore uses PIDTYPE_TGID here, placing the signal on
+    // signal_struct::shared_pending and waking an eligible interruptible
+    // thread.  A task-private enqueue can leave a service asleep in poll(2)
+    // forever even though TIF_SIGPENDING was set on its leader.
+    crate::kernel::signal::send_signal_info_to_process_for_target(target, sig, info) as i64
 }
 
 pub fn sys_process_madvise(
@@ -3448,13 +3457,17 @@ mod tests {
             assert_eq!(sys_getegid(), 3003);
 
             current.cred = &raw const INIT_CRED;
-            let groups = [44u32, 55u32];
+            let groups = [55u32, 44u32];
             assert_eq!(sys_getgroups(0, core::ptr::null_mut()), 0);
             assert_eq!(sys_setgroups(groups.len() as i32, groups.as_ptr()), 0);
             assert_eq!(sys_getgroups(0, core::ptr::null_mut()), 2);
             let mut out = [0u32; 2];
             assert_eq!(sys_getgroups(out.len() as i32, out.as_mut_ptr()), 2);
-            assert_eq!(out, groups);
+            assert_eq!(out, [44, 55]);
+            assert!(
+                crate::kernel::groups::in_group_p(KGid(44)),
+                "vendor set_groups sorts initgroups input for binary lookup"
+            );
             assert_eq!(sys_getgroups(1, out.as_mut_ptr()), -(EINVAL as i64));
             assert_eq!(sys_setgroups(-1, core::ptr::null()), -(EINVAL as i64));
             assert_eq!(sys_setgroups(1, core::ptr::null()), -(EFAULT as i64));
@@ -4146,6 +4159,10 @@ mod tests {
             assert_eq!(
                 sys_pidfd_send_signal(fd, 18, (&raw const queued).cast::<u8>(), 0),
                 0
+            );
+            assert_eq!(
+                crate::kernel::signal::pending_signal_scopes_for_pid(target.pid, 18),
+                (false, true)
             );
             assert_eq!(sys_pidfd_send_signal(fd, 18, core::ptr::null(), 0), 0);
 

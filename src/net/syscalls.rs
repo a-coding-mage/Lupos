@@ -24,7 +24,7 @@ use crate::fs::ops::{FileOps, NOOP_FILE_OPS, NOOP_INODE_OPS};
 use crate::fs::types::{FileRef, Inode, InodeKind, InodePrivate};
 use crate::include::uapi::errno::{
     EADDRINUSE, EAGAIN, EBADF, EFAULT, EINPROGRESS, EINTR, EINVAL, ENODEV, ENOENT, ENOPROTOOPT,
-    ENOSYS, ENOTCONN, ENOTDIR, ENOTTY, EOPNOTSUPP, EPERM, ERANGE,
+    ENOSYS, ENOTCONN, ENOTDIR, ENOTSOCK, ENOTTY, EOPNOTSUPP, EPERM, ERANGE,
 };
 use crate::include::uapi::fcntl::{O_NONBLOCK, O_RDWR};
 use crate::kernel::capability::{CAP_NET_ADMIN, CAP_NET_RAW, capable};
@@ -864,7 +864,11 @@ fn socket_release(file: FileRef) {
 
 fn socket_from_file(file: &FileRef) -> Result<SocketRef, i32> {
     if file.fops.name != SOCKET_FILE_OPS.name {
-        return Err(EBADF);
+        // vendor/linux/net/socket.c::sockfd_lookup() distinguishes an invalid
+        // descriptor (EBADF) from a valid descriptor whose file is not a
+        // socket (ENOTSOCK). libpulse intentionally probes with send(2) and
+        // falls back to write(2) only for ENOTSOCK.
+        return Err(ENOTSOCK);
     }
     let token = *file.private.lock();
     SOCKETS.lock().get(&token).cloned().ok_or(EBADF)
@@ -3439,6 +3443,12 @@ mod tests {
                 port: 0,
             })
         );
+    }
+
+    #[test]
+    fn valid_non_socket_file_reports_enotsock_for_socket_operations() {
+        let file = alloc_anon_file("pulse-wakeup-pipe", &NOOP_FILE_OPS, 0);
+        assert!(matches!(socket_from_file(&file), Err(ENOTSOCK)));
     }
 
     #[test]

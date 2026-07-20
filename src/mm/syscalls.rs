@@ -5,8 +5,6 @@
 
 extern crate alloc;
 
-use alloc::sync::Arc;
-
 use crate::arch::x86::kernel::uaccess;
 
 use crate::include::uapi::errno::{EACCES, EBADF, EFAULT, EINVAL};
@@ -55,7 +53,7 @@ pub unsafe fn sys_mmap(addr: u64, len: u64, prot: u32, flags: u32, fd: i32, off:
                     return -(errno as i64);
                 }
                 crate::fs::file::note_file_mmap_for_integrity(None, &file);
-                Arc::into_raw(file) as usize
+                crate::mm::vma::vma_file_from_ref(file)
             }
             Err(errno) => return -(errno as i64),
         }
@@ -66,9 +64,7 @@ pub unsafe fn sys_mmap(addr: u64, len: u64, prot: u32, flags: u32, fd: i32, off:
         Ok(mapped) => mapped as i64,
         Err(errno) => {
             if file != 0 {
-                unsafe {
-                    drop(Arc::from_raw(file as *const crate::fs::types::File));
-                }
+                unsafe { crate::mm::vma::vma_file_put_raw(file) };
             }
             errno as i64
         }

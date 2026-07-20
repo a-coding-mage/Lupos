@@ -926,8 +926,11 @@ fn policy_allows_measurement_context(
     context: &ImaPolicyContext<'_>,
 ) -> bool {
     let policy = POLICY.lock();
+    // vendor/linux/security/integrity/ima/ima_main.c short-circuits file
+    // hooks while ima_policy_flag is zero. An empty policy therefore means
+    // "no measurement", not an implicit measure-all policy.
     if policy.rules.is_empty() {
-        return default_should_measure_path_context(context);
+        return false;
     }
     for rule in policy.rules.iter() {
         if !matches!(
@@ -3348,6 +3351,8 @@ appraise func=MMAP_CHECK fowner=0 appraise_type=imasig|modsig\n"
         crate::security::lsm_list::reset_for_test();
         reset_for_test();
         init();
+        let active_policy = b"measure func=FILE_CHECK mask=MAY_READ fsname=rootfs\n";
+        assert_eq!(load_policy(active_policy), Ok(active_policy.len()));
 
         let static_inode = Inode::new(
             1,
@@ -3400,7 +3405,7 @@ appraise func=MMAP_CHECK fowner=0 appraise_type=imasig|modsig\n"
     }
 
     #[test]
-    fn ima_opened_inode_measurement_filters_volatile_paths_and_non_regular_files() {
+    fn ima_opened_inode_measurement_requires_an_active_vendor_policy() {
         let _guard = crate::security::lsm_list::TEST_LSM_LOCK.lock();
         crate::security::lsm_list::reset_for_test();
         reset_for_test();
@@ -3423,6 +3428,11 @@ appraise func=MMAP_CHECK fowner=0 appraise_type=imasig|modsig\n"
             .expect("skip securityfs")
         );
         assert!(!measure_opened_inode("/proc/self/status", &inode).expect("skip proc"));
+        assert!(
+            !measure_opened_inode("/etc/passwd", &inode).expect("empty policy disables file hook")
+        );
+        let active_policy = b"measure func=FILE_CHECK mask=MAY_READ fsname=rootfs\n";
+        assert_eq!(load_policy(active_policy), Ok(active_policy.len()));
         assert!(measure_opened_inode("/etc/passwd", &inode).expect("measure regular path"));
 
         let dir = Inode::new(
@@ -3439,5 +3449,8 @@ appraise func=MMAP_CHECK fowner=0 appraise_type=imasig|modsig\n"
         assert!(ascii.contains("/etc/passwd"));
         assert!(!ascii.contains("/proc/self/status"));
         assert!(!ascii.contains("ascii_runtime_measurements_sha1"));
+
+        let vendor = include_str!("../../../vendor/linux/security/integrity/ima/ima_main.c");
+        assert!(vendor.contains("if (!ima_policy_flag || !S_ISREG(inode->i_mode))"));
     }
 }

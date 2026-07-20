@@ -293,13 +293,16 @@ pub struct File {
     pub mode: u32,
     pub fops: &'static FileOps,
     pub f_count: AtomicUsize,
+    /// Per-open notification generation, used by kernfs poll just like
+    /// `kernfs_open_file::event` in vendor Linux.
+    pub poll_event: AtomicU64,
     /// FS-private file state (e.g., readdir cursor).
     pub private: Mutex<usize>,
 }
 
 impl File {
     pub fn new(dentry: DentryRef, flags: u32, mode: u32, fops: &'static FileOps) -> FileRef {
-        Arc::new(Self {
+        let file = Arc::new(Self {
             dentry,
             path_hint: Mutex::new(None),
             pos: Mutex::new(0),
@@ -308,8 +311,13 @@ impl File {
             mode,
             fops,
             f_count: AtomicUsize::new(1),
+            poll_event: AtomicU64::new(0),
             private: Mutex::new(0),
-        })
+        });
+        if fops.name == "kernfs_file" {
+            crate::fs::kernfs::initialize_poll_event(&file);
+        }
+        file
     }
     pub fn inode(&self) -> Option<InodeRef> {
         self.dentry.inode()

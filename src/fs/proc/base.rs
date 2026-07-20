@@ -223,6 +223,17 @@ pub fn add_task_common(dir: &Arc<KernfsNode>) {
         dir,
         KernfsNode::new_dynamic_symlink("exe", proc_pid_exe_readlink),
     );
+    // vendor/linux/fs/proc/base.c::proc_cwd_link / proc_root_link expose
+    // the target task's retained fs_struct paths.  PipeWire relies on opening
+    // /proc/<peer-pid>/root as a directory when determining sandbox status.
+    add_child(
+        dir,
+        KernfsNode::new_dynamic_symlink("cwd", proc_pid_cwd_readlink),
+    );
+    add_child(
+        dir,
+        KernfsNode::new_dynamic_symlink("root", proc_pid_root_readlink),
+    );
     add_child(
         dir,
         KernfsNode::new_file(
@@ -285,6 +296,41 @@ fn proc_pid_exe_readlink(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize
     let n = target.len().min(buf.len());
     buf[..n].copy_from_slice(&target.as_bytes()[..n]);
     crate::fs::file::fput(file);
+    Ok(n)
+}
+
+fn proc_pid_cwd_readlink(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    proc_pid_fs_path_readlink(node, false, buf)
+}
+
+fn proc_pid_root_readlink(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    proc_pid_fs_path_readlink(node, true, buf)
+}
+
+fn proc_pid_fs_path_readlink(
+    node: &Arc<KernfsNode>,
+    root: bool,
+    buf: &mut [u8],
+) -> Result<usize, i32> {
+    let task = task_by_pid(proc_pid_from_node(node)?);
+    if task.is_null() {
+        return Err(ENOENT);
+    }
+    let fs = unsafe { crate::fs::fs_struct::task_fs(task) };
+    if fs.is_null() {
+        return Err(ENOENT);
+    }
+    let path = if root {
+        unsafe { (*fs).root.lock().clone() }
+    } else {
+        unsafe { (*fs).pwd.lock().clone() }
+    }
+    .ok_or(ENOENT)?;
+    let target = crate::fs::mount::namespace_path(&path)
+        .or_else(|| crate::fs::mount::stable_path_for_dentry(&path.dentry))
+        .ok_or(ENOENT)?;
+    let n = target.len().min(buf.len());
+    buf[..n].copy_from_slice(&target.as_bytes()[..n]);
     Ok(n)
 }
 
@@ -498,5 +544,22 @@ mod tests {
         super::add_task_common(&dir);
         let ns = lookup(&dir, "ns").expect("/proc/<pid>/ns");
         assert!(lookup(&ns, "user").is_some());
+    }
+
+    #[test]
+    fn task_common_exposes_vendor_fs_magic_links() {
+        let dir = crate::fs::kernfs::KernfsNode::new_dir("123", 0o555);
+        super::add_task_common(&dir);
+        for name in ["cwd", "root", "exe"] {
+            let node = lookup(&dir, name).unwrap_or_else(|| panic!("/proc/<pid>/{name}"));
+            assert_eq!(
+                node.mode & crate::include::uapi::stat::S_IFMT,
+                crate::include::uapi::stat::S_IFLNK
+            );
+        }
+
+        let vendor = include_str!("../../../vendor/linux/fs/proc/base.c");
+        assert!(vendor.contains("LNK(\"cwd\",        proc_cwd_link)"));
+        assert!(vendor.contains("LNK(\"root\",       proc_root_link)"));
     }
 }

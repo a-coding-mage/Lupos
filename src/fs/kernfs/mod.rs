@@ -27,6 +27,7 @@ use spin::Mutex;
 
 use crate::include::uapi::errno::{EBUSY, EEXIST, EINVAL, ENOENT, ENOSYS, ENOTDIR, EROFS};
 use crate::include::uapi::stat::{S_IFDIR, S_IFLNK, S_IFREG};
+use crate::kernel::sched::wait::WaitQueueHead;
 
 use super::types::{
     FileRef, Inode, InodeKind, InodePrivate, InodeRef, SuperBlockRef, init_inode_owner,
@@ -81,6 +82,9 @@ pub struct KernfsNode {
     pub ino: u64,
     /// Filesystem-private payload (e.g., the cgroup `TaskGroup` pointer).
     pub priv_ptr: AtomicU64,
+    /// Vendor `kernfs_open_node::event` generation and poll waitqueue.
+    notify_event: AtomicU64,
+    notify_wait: WaitQueueHead,
     pub dynamic_lookup: Option<DynamicLookupFn>,
     pub dynamic_readdir: Option<DynamicReaddirFn>,
 }
@@ -95,6 +99,8 @@ impl KernfsNode {
             mode: mode | S_IFDIR,
             ino: alloc_kn_ino(),
             priv_ptr: AtomicU64::new(0),
+            notify_event: AtomicU64::new(0),
+            notify_wait: WaitQueueHead::new(),
             dynamic_lookup: None,
             dynamic_readdir: None,
         })
@@ -113,6 +119,8 @@ impl KernfsNode {
             mode: mode | S_IFDIR,
             ino: alloc_kn_ino(),
             priv_ptr: AtomicU64::new(0),
+            notify_event: AtomicU64::new(0),
+            notify_wait: WaitQueueHead::new(),
             dynamic_lookup: lookup,
             dynamic_readdir: readdir,
         })
@@ -137,6 +145,8 @@ impl KernfsNode {
             mode: mode | S_IFREG,
             ino: alloc_kn_ino(),
             priv_ptr: AtomicU64::new(0),
+            notify_event: AtomicU64::new(0),
+            notify_wait: WaitQueueHead::new(),
             dynamic_lookup: None,
             dynamic_readdir: None,
         })
@@ -165,6 +175,8 @@ impl KernfsNode {
             mode: mode | S_IFREG,
             ino: alloc_kn_ino(),
             priv_ptr: AtomicU64::new(0),
+            notify_event: AtomicU64::new(0),
+            notify_wait: WaitQueueHead::new(),
             dynamic_lookup: None,
             dynamic_readdir: None,
         })
@@ -181,6 +193,8 @@ impl KernfsNode {
             mode: mode_for_symlink(),
             ino: alloc_kn_ino(),
             priv_ptr: AtomicU64::new(0),
+            notify_event: AtomicU64::new(0),
+            notify_wait: WaitQueueHead::new(),
             dynamic_lookup: None,
             dynamic_readdir: None,
         })
@@ -195,6 +209,8 @@ impl KernfsNode {
             mode: mode_for_symlink(),
             ino: alloc_kn_ino(),
             priv_ptr: AtomicU64::new(0),
+            notify_event: AtomicU64::new(0),
+            notify_wait: WaitQueueHead::new(),
             dynamic_lookup: None,
             dynamic_readdir: None,
         })
@@ -424,6 +440,7 @@ fn kernfs_mkdir(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> 
     }
     let child = crate::kernel::cgroup::new_cgroup_dir(name, mode);
     add_child(&parent, child.clone());
+    crate::kernel::cgroup::register_cgroup_dir(&child, &sb);
     let inode = inode_for_node(&sb, child);
     // cgroup mkdir follows normal VFS ownership rules.  This is essential
     // for systemd's user-manager delegation: descendants created by uid 1000
@@ -456,6 +473,7 @@ fn kernfs_rmdir(dir: &InodeRef, name: &str) -> Result<(), i32> {
     if has_child_cgroup {
         return Err(EBUSY);
     }
+    crate::kernel::cgroup::unregister_cgroup_dir(&child);
     children.remove(&key);
     Ok(())
 }
@@ -514,7 +532,7 @@ fn kernfs_read_scratch_len(node: &KernfsNode) -> usize {
 
 fn kernfs_poll(
     file: &super::types::FileRef,
-    _table: Option<&mut crate::fs::select::PollTable>,
+    table: Option<&mut crate::fs::select::PollTable>,
 ) -> u32 {
     let Some(inode) = file.inode() else {
         return 0;
@@ -523,7 +541,46 @@ fn kernfs_poll(
     if matches!(node.name.as_str(), "mounts" | "mountinfo" | "mountstats") {
         return crate::fs::proc_namespace::poll_mount_table(file);
     }
+    // vendor/linux/fs/kernfs/file.c::kernfs_generic_poll: register before
+    // sampling the generation so notify cannot be lost between the two.
+    crate::fs::select::poll_wait(file, &node.notify_wait, table);
+    if file.poll_event.load(Ordering::Acquire) != node.notify_event.load(Ordering::Acquire) {
+        return (crate::fs::select::POLLERR | crate::fs::select::POLLPRI) as u32;
+    }
     0
+}
+
+pub(crate) fn initialize_poll_event(file: &FileRef) {
+    let Some(inode) = file.inode() else {
+        return;
+    };
+    let node = node_from_inode(&inode);
+    file.poll_event
+        .store(node.notify_event.load(Ordering::Acquire), Ordering::Release);
+}
+
+/// Vendor `kernfs_notify()`: immediately advance the poll generation and wake
+/// registered poll/epoll waiters, then emit the matching fsnotify modification
+/// event for inotify users.
+pub fn notify(dentry: &super::types::DentryRef) {
+    let Some(inode) = dentry.inode() else {
+        return;
+    };
+    let node = node_from_inode(&inode);
+    let Some(sb) = inode.sb.lock().clone() else {
+        return;
+    };
+    notify_node(&node, &sb);
+}
+
+/// Vendor `kernfs_notify()` through the stable node owned by the subsystem.
+///
+/// Cgroup exit notifications run after task filesystem teardown, so Linux
+/// retains the `kernfs_node` instead of resolving the control file by path.
+pub fn notify_node(node: &Arc<KernfsNode>, sb: &super::types::SuperBlockRef) {
+    node.notify_event.fetch_add(1, Ordering::AcqRel);
+    node.notify_wait.wake_up_all();
+    crate::fs::inotify::notify_modify_identity(sb, node.ino);
 }
 
 pub fn consume_poll_event(file: &super::types::FileRef) {
@@ -536,6 +593,9 @@ pub fn consume_poll_event(file: &super::types::FileRef) {
     let node = node_from_inode(&inode);
     if matches!(node.name.as_str(), "mounts" | "mountinfo" | "mountstats") {
         crate::fs::proc_namespace::consume_mount_table_poll(file);
+    } else {
+        file.poll_event
+            .store(node.notify_event.load(Ordering::Acquire), Ordering::Release);
     }
 }
 
@@ -644,6 +704,30 @@ mod tests {
 
         assert_eq!(kernfs_read_scratch_len(&swaps), 4 * 1024);
         assert_eq!(kernfs_read_scratch_len(&mountinfo), 128 * 1024);
+    }
+
+    #[test]
+    fn kernfs_notify_wakes_poll_until_open_file_consumes_generation() {
+        let node = KernfsNode::new_file("cgroup.events", 0o444, None, None);
+        let sb = super::super::types::SuperBlock::alloc(
+            "cgroup2",
+            0x63677270,
+            &super::super::ops::NOOP_SUPER_OPS,
+        );
+        let inode = inode_for_node(&sb, node);
+        let dentry = super::super::types::Dentry::new_negative("cgroup.events");
+        dentry.instantiate(inode);
+        let file = super::super::types::File::new(dentry.clone(), 0, 0, &KERNFS_FILE_FILE_OPS);
+
+        assert_eq!(kernfs_poll(&file, None), 0);
+        notify(&dentry);
+        assert_eq!(
+            kernfs_poll(&file, None)
+                & (crate::fs::select::POLLERR | crate::fs::select::POLLPRI) as u32,
+            (crate::fs::select::POLLERR | crate::fs::select::POLLPRI) as u32
+        );
+        consume_poll_event(&file);
+        assert_eq!(kernfs_poll(&file, None), 0);
     }
 
     #[test]

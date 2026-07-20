@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/power
 //! linux-source: vendor/linux/drivers/base/power
 //! Power-management helpers.
@@ -7,8 +7,9 @@ pub mod em_netlink_autogen;
 pub mod poweroff;
 
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
-use crate::include::uapi::errno::EINVAL;
+use crate::include::uapi::errno::{EACCES, EAGAIN, EINVAL};
 use crate::kernel::module::{export_symbol, find_symbol};
 
 static mut CPU_LATENCY_CONSTRAINTS: [usize; 6] = [0; 6];
@@ -21,8 +22,103 @@ const PM_QOS_REQUEST_NODE_PRIO_LIST_OFFSET: usize = 8;
 const PM_QOS_REQUEST_NODE_NODE_LIST_OFFSET: usize = 24;
 const PM_QOS_REQUEST_QOS_OFFSET: usize = 40;
 const PM_QOS_REQUEST_SIZE: usize = 48;
-const RPM_ACTIVE: u32 = 0;
-const RPM_SUSPENDED: u32 = 2;
+const RPM_ACTIVE: i32 = 0;
+const RPM_INVALID: i32 = -1;
+const RPM_SUSPENDED: i32 = 2;
+const RPM_GET_PUT: i32 = 0x04;
+
+// Configured x86_64 `struct device` / `struct dev_pm_info` offsets. These are
+// asserted by `xtask/vendor_abi_probe/lupos_abi_layout_probe.c`.
+const DEVICE_PM_USAGE_COUNT_OFFSET: usize = 456;
+const DEVICE_PM_CHILD_COUNT_OFFSET: usize = 460;
+const DEVICE_PM_CONTROL_OFFSET: usize = 464;
+const DEVICE_PM_RUNTIME_STATUS_OFFSET: usize = 476;
+const DEVICE_PM_LAST_STATUS_OFFSET: usize = 480;
+const DEVICE_PM_RUNTIME_ERROR_OFFSET: usize = 484;
+const PM_DISABLE_DEPTH_MASK: u32 = 0x7;
+const PM_RUNTIME_AUTO: u32 = 1 << 7;
+const PM_IGNORE_CHILDREN: u32 = 1 << 8;
+const PM_NO_CALLBACKS: u32 = 1 << 9;
+const PM_USE_AUTOSUSPEND: u32 = 1 << 11;
+
+unsafe fn pm_atomic_i32(dev: *mut c_void, offset: usize) -> &'static AtomicI32 {
+    unsafe { &*((dev as *mut u8).add(offset).cast::<AtomicI32>()) }
+}
+
+unsafe fn pm_atomic_u32(dev: *mut c_void, offset: usize) -> &'static AtomicU32 {
+    unsafe { &*((dev as *mut u8).add(offset).cast::<AtomicU32>()) }
+}
+
+unsafe fn pm_usage_count(dev: *mut c_void) -> &'static AtomicI32 {
+    unsafe { pm_atomic_i32(dev, DEVICE_PM_USAGE_COUNT_OFFSET) }
+}
+
+unsafe fn pm_child_count(dev: *mut c_void) -> &'static AtomicI32 {
+    unsafe { pm_atomic_i32(dev, DEVICE_PM_CHILD_COUNT_OFFSET) }
+}
+
+unsafe fn pm_control(dev: *mut c_void) -> &'static AtomicU32 {
+    unsafe { pm_atomic_u32(dev, DEVICE_PM_CONTROL_OFFSET) }
+}
+
+unsafe fn pm_runtime_status(dev: *mut c_void) -> &'static AtomicI32 {
+    unsafe { pm_atomic_i32(dev, DEVICE_PM_RUNTIME_STATUS_OFFSET) }
+}
+
+unsafe fn pm_last_status(dev: *mut c_void) -> &'static AtomicI32 {
+    unsafe { pm_atomic_i32(dev, DEVICE_PM_LAST_STATUS_OFFSET) }
+}
+
+unsafe fn pm_runtime_error(dev: *mut c_void) -> &'static AtomicI32 {
+    unsafe { pm_atomic_i32(dev, DEVICE_PM_RUNTIME_ERROR_OFFSET) }
+}
+
+fn pm_disable_depth(control: u32) -> u32 {
+    control & PM_DISABLE_DEPTH_MASK
+}
+
+unsafe fn pm_update_control(dev: *mut c_void, mut update: impl FnMut(u32) -> u32) -> u32 {
+    let control = unsafe { pm_control(dev) };
+    let mut current = control.load(Ordering::Acquire);
+    loop {
+        let next = update(current);
+        match control.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Initialize the runtime-PM portion of a full vendor-layout `struct device`.
+///
+/// This is the state established by `pm_runtime_init()` during Linux
+/// `device_initialize()`. Timer/workqueue internals are deliberately left to
+/// Lupos because the compatible runtime subset completes transitions
+/// synchronously.
+pub unsafe fn runtime_pm_init_device(dev: *mut c_void) {
+    if dev.is_null() {
+        return;
+    }
+    unsafe {
+        pm_usage_count(dev).store(0, Ordering::Release);
+        pm_child_count(dev).store(0, Ordering::Release);
+        pm_control(dev).store(1 | PM_RUNTIME_AUTO, Ordering::Release);
+        pm_runtime_status(dev).store(RPM_SUSPENDED, Ordering::Release);
+        pm_last_status(dev).store(RPM_INVALID, Ordering::Release);
+        pm_runtime_error(dev).store(0, Ordering::Release);
+    }
+}
+
+unsafe fn pm_drop_usage_count(dev: *mut c_void) -> Result<i32, i32> {
+    let usage = unsafe { pm_usage_count(dev) };
+    let previous = usage.fetch_sub(1, Ordering::AcqRel);
+    if previous > 0 {
+        Ok(previous - 1)
+    } else {
+        usage.fetch_add(1, Ordering::Release);
+        Err(-EINVAL)
+    }
+}
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
@@ -227,7 +323,16 @@ pub unsafe extern "C" fn linux_pm_suspend_default_s2idle() -> bool {
 }
 
 /// `__pm_runtime_idle` - `vendor/linux/drivers/base/power/runtime.c`.
-pub unsafe extern "C" fn linux___pm_runtime_idle(_dev: *mut c_void, _rpmflags: i32) -> i32 {
+pub unsafe extern "C" fn linux___pm_runtime_idle(dev: *mut c_void, rpmflags: i32) -> i32 {
+    if dev.is_null() {
+        return -EINVAL;
+    }
+    if rpmflags & RPM_GET_PUT != 0 {
+        return match unsafe { pm_drop_usage_count(dev) } {
+            Ok(_) => 0,
+            Err(error) => error,
+        };
+    }
     0
 }
 
@@ -235,45 +340,230 @@ pub unsafe extern "C" fn linux___pm_runtime_idle(_dev: *mut c_void, _rpmflags: i
 ///
 /// Runtime PM callbacks are not modeled yet, so devices remain effectively
 /// active and transition requests complete synchronously.
-pub unsafe extern "C" fn linux___pm_runtime_suspend(_dev: *mut c_void, _rpmflags: i32) -> i32 {
+pub unsafe extern "C" fn linux___pm_runtime_suspend(dev: *mut c_void, rpmflags: i32) -> i32 {
+    if dev.is_null() {
+        return -EINVAL;
+    }
+    if rpmflags & RPM_GET_PUT != 0 {
+        match unsafe { pm_drop_usage_count(dev) } {
+            Ok(remaining) if remaining > 0 => return 0,
+            Ok(_) => {}
+            Err(error) => return error,
+        }
+    }
+    if pm_disable_depth(unsafe { pm_control(dev).load(Ordering::Acquire) }) > 0 {
+        return -EACCES;
+    }
+    // Runtime callbacks are not modeled. Keep the hardware and observable
+    // state active, matching Linux's no-callback successful path without
+    // pretending that a driver power-down callback ran.
     0
 }
 
 /// `__pm_runtime_resume` - `vendor/linux/drivers/base/power/runtime.c`.
-pub unsafe extern "C" fn linux___pm_runtime_resume(_dev: *mut c_void, _rpmflags: i32) -> i32 {
-    0
+pub unsafe extern "C" fn linux___pm_runtime_resume(dev: *mut c_void, rpmflags: i32) -> i32 {
+    if dev.is_null() {
+        return -EINVAL;
+    }
+    if rpmflags & RPM_GET_PUT != 0 {
+        unsafe { pm_usage_count(dev).fetch_add(1, Ordering::AcqRel) };
+    }
+    if unsafe { pm_runtime_error(dev).load(Ordering::Acquire) } != 0 {
+        return -EINVAL;
+    }
+    let control = unsafe { pm_control(dev).load(Ordering::Acquire) };
+    if pm_disable_depth(control) > 0 {
+        return if unsafe { pm_runtime_status(dev).load(Ordering::Acquire) } == RPM_ACTIVE
+            && unsafe { pm_last_status(dev).load(Ordering::Acquire) } == RPM_ACTIVE
+        {
+            1
+        } else {
+            -EACCES
+        };
+    }
+    let previous = unsafe { pm_runtime_status(dev).swap(RPM_ACTIVE, Ordering::AcqRel) };
+    if previous == RPM_ACTIVE { 1 } else { 0 }
 }
 
 /// `__pm_runtime_set_status` - `vendor/linux/drivers/base/power/runtime.c`.
-pub unsafe extern "C" fn linux___pm_runtime_set_status(_dev: *mut c_void, status: u32) -> i32 {
-    match status {
-        RPM_ACTIVE | RPM_SUSPENDED => 0,
-        _ => -EINVAL,
+pub unsafe extern "C" fn linux___pm_runtime_set_status(dev: *mut c_void, status: u32) -> i32 {
+    if dev.is_null() || status as i32 != RPM_ACTIVE && status as i32 != RPM_SUSPENDED {
+        return -EINVAL;
     }
-}
 
-/// `__pm_runtime_disable` - `vendor/linux/drivers/base/power/runtime.c`.
-pub unsafe extern "C" fn linux___pm_runtime_disable(_dev: *mut c_void, _check_resume: bool) {}
+    let control = unsafe { pm_control(dev) };
+    loop {
+        let current = control.load(Ordering::Acquire);
+        let depth = pm_disable_depth(current);
+        if depth == 0 && unsafe { pm_runtime_error(dev).load(Ordering::Acquire) } == 0 {
+            return -EAGAIN;
+        }
+        if depth == PM_DISABLE_DEPTH_MASK {
+            return -EINVAL;
+        }
+        let next = (current & !PM_DISABLE_DEPTH_MASK) | (depth + 1);
+        if control
+            .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
 
-/// `__pm_runtime_use_autosuspend` - `vendor/linux/drivers/base/power/runtime.c`.
-pub unsafe extern "C" fn linux___pm_runtime_use_autosuspend(_dev: *mut c_void, _use: bool) {}
-
-/// `pm_runtime_enable` - `vendor/linux/drivers/base/power/runtime.c`.
-pub unsafe extern "C" fn linux_pm_runtime_enable(_dev: *mut c_void) {}
-
-/// `pm_runtime_allow` - `vendor/linux/drivers/base/power/runtime.c:1691`.
-pub unsafe extern "C" fn linux_pm_runtime_allow(_dev: *mut c_void) {}
-
-/// `pm_runtime_forbid` - `vendor/linux/drivers/base/power/runtime.c`.
-pub unsafe extern "C" fn linux_pm_runtime_forbid(_dev: *mut c_void) {}
-
-/// `pm_runtime_get_if_active` - `vendor/linux/drivers/base/power/runtime.c:1261`.
-pub unsafe extern "C" fn linux_pm_runtime_get_if_active(_dev: *mut c_void) -> i32 {
+    unsafe {
+        pm_runtime_status(dev).store(status as i32, Ordering::Release);
+        pm_runtime_error(dev).store(0, Ordering::Release);
+        linux_pm_runtime_enable(dev);
+    }
     0
 }
 
+/// `__pm_runtime_disable` - `vendor/linux/drivers/base/power/runtime.c`.
+pub unsafe extern "C" fn linux___pm_runtime_disable(dev: *mut c_void, _check_resume: bool) {
+    if dev.is_null() {
+        return;
+    }
+    let previous_status = unsafe { pm_runtime_status(dev).load(Ordering::Acquire) };
+    let next = unsafe {
+        pm_update_control(dev, |current| {
+            let depth = pm_disable_depth(current);
+            (current & !PM_DISABLE_DEPTH_MASK) | depth.saturating_add(1).min(7)
+        })
+    };
+    if pm_disable_depth(next) == 1 {
+        unsafe { pm_last_status(dev).store(previous_status, Ordering::Release) };
+    }
+}
+
+/// `__pm_runtime_use_autosuspend` - `vendor/linux/drivers/base/power/runtime.c`.
+pub unsafe extern "C" fn linux___pm_runtime_use_autosuspend(dev: *mut c_void, use_: bool) {
+    if dev.is_null() {
+        return;
+    }
+    unsafe {
+        pm_update_control(dev, |control| {
+            if use_ {
+                control | PM_USE_AUTOSUSPEND
+            } else {
+                control & !PM_USE_AUTOSUSPEND
+            }
+        });
+    }
+}
+
+/// `pm_runtime_enable` - `vendor/linux/drivers/base/power/runtime.c`.
+pub unsafe extern "C" fn linux_pm_runtime_enable(dev: *mut c_void) {
+    if dev.is_null() {
+        return;
+    }
+    let next = unsafe {
+        pm_update_control(dev, |current| {
+            let depth = pm_disable_depth(current);
+            if depth == 0 {
+                current
+            } else {
+                (current & !PM_DISABLE_DEPTH_MASK) | (depth - 1)
+            }
+        })
+    };
+    if pm_disable_depth(next) == 0 {
+        unsafe { pm_last_status(dev).store(RPM_INVALID, Ordering::Release) };
+    }
+}
+
+/// `pm_runtime_allow` - `vendor/linux/drivers/base/power/runtime.c:1691`.
+pub unsafe extern "C" fn linux_pm_runtime_allow(dev: *mut c_void) {
+    if dev.is_null() {
+        return;
+    }
+    let control = unsafe { pm_control(dev) };
+    let mut current = control.load(Ordering::Acquire);
+    loop {
+        if current & PM_RUNTIME_AUTO != 0 {
+            return;
+        }
+        match control.compare_exchange_weak(
+            current,
+            current | PM_RUNTIME_AUTO,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+    let _ = unsafe { pm_drop_usage_count(dev) };
+}
+
+/// `pm_runtime_forbid` - `vendor/linux/drivers/base/power/runtime.c`.
+pub unsafe extern "C" fn linux_pm_runtime_forbid(dev: *mut c_void) {
+    if dev.is_null() {
+        return;
+    }
+    let control = unsafe { pm_control(dev) };
+    let mut current = control.load(Ordering::Acquire);
+    loop {
+        if current & PM_RUNTIME_AUTO == 0 {
+            return;
+        }
+        match control.compare_exchange_weak(
+            current,
+            current & !PM_RUNTIME_AUTO,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+    unsafe {
+        pm_usage_count(dev).fetch_add(1, Ordering::AcqRel);
+        pm_runtime_status(dev).store(RPM_ACTIVE, Ordering::Release);
+    }
+}
+
+/// `pm_runtime_get_if_active` - `vendor/linux/drivers/base/power/runtime.c:1261`.
+pub unsafe extern "C" fn linux_pm_runtime_get_if_active(dev: *mut c_void) -> i32 {
+    unsafe { pm_runtime_get_conditional(dev, true) }
+}
+
 /// `pm_runtime_get_if_in_use` - `vendor/linux/drivers/base/power/runtime.c:1280`.
-pub unsafe extern "C" fn linux_pm_runtime_get_if_in_use(_dev: *mut c_void) -> i32 {
+pub unsafe extern "C" fn linux_pm_runtime_get_if_in_use(dev: *mut c_void) -> i32 {
+    unsafe { pm_runtime_get_conditional(dev, false) }
+}
+
+unsafe fn pm_runtime_get_conditional(dev: *mut c_void, ignore_usage_count: bool) -> i32 {
+    if dev.is_null() {
+        return -EINVAL;
+    }
+    let control = unsafe { pm_control(dev).load(Ordering::Acquire) };
+    if pm_disable_depth(control) > 0 {
+        return -EINVAL;
+    }
+    if unsafe { pm_runtime_status(dev).load(Ordering::Acquire) } != RPM_ACTIVE {
+        return 0;
+    }
+
+    let active_child = control & PM_IGNORE_CHILDREN == 0
+        && unsafe { pm_child_count(dev).load(Ordering::Acquire) } > 0;
+    let usage = unsafe { pm_usage_count(dev) };
+    if ignore_usage_count || active_child {
+        usage.fetch_add(1, Ordering::AcqRel);
+        return 1;
+    }
+
+    let mut current = usage.load(Ordering::Acquire);
+    while current != 0 {
+        match usage.compare_exchange_weak(
+            current,
+            current.saturating_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return 1,
+            Err(observed) => current = observed,
+        }
+    }
     0
 }
 
@@ -352,7 +642,14 @@ pub unsafe extern "C" fn linux_dev_pm_domain_set_performance_state(
 pub unsafe extern "C" fn linux_dev_pm_domain_set(_dev: *mut c_void, _pd: *mut c_void) {}
 
 /// `pm_runtime_no_callbacks` - `vendor/linux/drivers/base/power/runtime.c:1719`.
-pub unsafe extern "C" fn linux_pm_runtime_no_callbacks(_dev: *mut c_void) {}
+pub unsafe extern "C" fn linux_pm_runtime_no_callbacks(dev: *mut c_void) {
+    if dev.is_null() {
+        return;
+    }
+    unsafe {
+        pm_update_control(dev, |control| control | PM_NO_CALLBACKS);
+    }
+}
 
 pub unsafe extern "C" fn linux_dev_pm_set_wake_irq(_dev: *mut c_void, _irq: i32) -> i32 {
     0
@@ -436,7 +733,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_pm_conditional_get_exports_and_defers() {
+    fn runtime_pm_conditional_get_exports_and_rejects_null() {
         register_module_exports();
         assert_eq!(
             find_symbol("power_group_name"),
@@ -452,7 +749,104 @@ mod tests {
         );
         assert_eq!(
             unsafe { linux_pm_runtime_get_if_active(core::ptr::null_mut()) },
-            0
+            -EINVAL
+        );
+    }
+
+    fn pm_test_device() -> [u32; 190] {
+        [0_u32; 190]
+    }
+
+    #[test]
+    fn runtime_pm_init_matches_vendor_disabled_suspended_state() {
+        let mut storage = pm_test_device();
+        let dev = storage.as_mut_ptr().cast();
+
+        unsafe { runtime_pm_init_device(dev) };
+
+        assert_eq!(unsafe { pm_usage_count(dev).load(Ordering::Acquire) }, 0);
+        assert_eq!(unsafe { pm_child_count(dev).load(Ordering::Acquire) }, 0);
+        let control = unsafe { pm_control(dev).load(Ordering::Acquire) };
+        assert_eq!(pm_disable_depth(control), 1);
+        assert_ne!(control & PM_RUNTIME_AUTO, 0);
+        assert_eq!(
+            unsafe { pm_runtime_status(dev).load(Ordering::Acquire) },
+            RPM_SUSPENDED
+        );
+        assert_eq!(
+            unsafe { pm_last_status(dev).load(Ordering::Acquire) },
+            RPM_INVALID
+        );
+        assert_eq!(unsafe { linux_pm_runtime_get_if_active(dev) }, -EINVAL);
+    }
+
+    #[test]
+    fn runtime_pm_set_active_and_enable_unlocks_hda_conditional_get() {
+        let mut storage = pm_test_device();
+        let dev = storage.as_mut_ptr().cast();
+        unsafe {
+            runtime_pm_init_device(dev);
+            assert_eq!(linux___pm_runtime_set_status(dev, RPM_ACTIVE as u32), 0);
+            pm_usage_count(dev).fetch_add(1, Ordering::AcqRel);
+        }
+
+        assert_eq!(
+            unsafe { pm_runtime_status(dev).load(Ordering::Acquire) },
+            RPM_ACTIVE
+        );
+        assert_eq!(
+            pm_disable_depth(unsafe { pm_control(dev).load(Ordering::Acquire) }),
+            1
+        );
+        // This -EINVAL is the vendor result while PM remains disabled. HDA
+        // treats it as "access allowed", unlike a zero inactive result.
+        assert_eq!(unsafe { linux_pm_runtime_get_if_active(dev) }, -EINVAL);
+
+        unsafe { linux_pm_runtime_enable(dev) };
+        assert_eq!(unsafe { linux_pm_runtime_get_if_active(dev) }, 1);
+        assert_eq!(unsafe { pm_usage_count(dev).load(Ordering::Acquire) }, 2);
+    }
+
+    #[test]
+    fn runtime_pm_get_if_in_use_requires_a_reference_or_active_child() {
+        let mut storage = pm_test_device();
+        let dev = storage.as_mut_ptr().cast();
+        unsafe {
+            runtime_pm_init_device(dev);
+            assert_eq!(linux___pm_runtime_set_status(dev, RPM_ACTIVE as u32), 0);
+            linux_pm_runtime_enable(dev);
+        }
+
+        assert_eq!(unsafe { linux_pm_runtime_get_if_in_use(dev) }, 0);
+        unsafe { pm_usage_count(dev).store(1, Ordering::Release) };
+        assert_eq!(unsafe { linux_pm_runtime_get_if_in_use(dev) }, 1);
+        assert_eq!(unsafe { pm_usage_count(dev).load(Ordering::Acquire) }, 2);
+    }
+
+    #[test]
+    fn runtime_pm_disable_and_enable_preserve_last_status() {
+        let mut storage = pm_test_device();
+        let dev = storage.as_mut_ptr().cast();
+        unsafe {
+            runtime_pm_init_device(dev);
+            assert_eq!(linux___pm_runtime_set_status(dev, RPM_ACTIVE as u32), 0);
+            linux_pm_runtime_enable(dev);
+            linux___pm_runtime_disable(dev, false);
+        }
+
+        assert_eq!(
+            pm_disable_depth(unsafe { pm_control(dev).load(Ordering::Acquire) }),
+            1
+        );
+        assert_eq!(
+            unsafe { pm_last_status(dev).load(Ordering::Acquire) },
+            RPM_ACTIVE
+        );
+
+        unsafe { linux_pm_runtime_enable(dev) };
+        assert_eq!(
+            unsafe { pm_last_status(dev).load(Ordering::Acquire) },
+            RPM_INVALID
         );
     }
 

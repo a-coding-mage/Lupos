@@ -240,17 +240,17 @@ fn securebit_mask(bit: u32) -> u32 {
     1u32 << bit
 }
 
-fn exec_creds_privileged_before(old: &Cred, new: &Cred) -> bool {
-    old.uid != new.uid
-        || old.euid != new.euid
-        || old.gid != new.gid
-        || old.egid != new.egid
-        || old.suid != new.suid
-        || old.sgid != new.sgid
-        || old.fsuid != new.fsuid
-        || old.fsgid != new.fsgid
-        || old.cap_permitted != new.cap_permitted
-        || old.cap_effective != new.cap_effective
+fn exec_creds_require_secure_mode(old: &Cred, new: &Cred, has_file_caps: bool) -> bool {
+    // vendor/linux/security/commoncap.c:cap_bprm_creds_from_file() marks
+    // AT_SECURE for privilege-elevating execs.  In particular, dropping
+    // effective capabilities or resetting saved/fs IDs on an ordinary exec
+    // is *not* a secure exec.  Treating any credential-field difference as
+    // privilege elevation makes glibc's secure_getenv() hide the complete
+    // environment from daemons which dropped privileges before exec.
+    let id_changed = new.euid != old.euid || new.egid != old.egid;
+    let non_root = new.uid.0 != 0 || new.euid.0 != 0;
+
+    id_changed || new.euid != old.uid || new.egid != old.gid || (non_root && has_file_caps)
 }
 
 fn final_exec_nosuid(program: &LoadedProgram) -> bool {
@@ -320,8 +320,7 @@ fn prepare_exec_creds(program: &LoadedProgram) -> Result<ProposedExecCreds, i32>
         new.cap_effective = KernelCapT::empty();
     }
 
-    let changed_privilege = exec_creds_privileged_before(old, new);
-    let secure_exec = changed_privilege || (!allow_privilege && setid_or_caps);
+    let secure_exec = exec_creds_require_secure_mode(old, new, has_file_caps);
     let security = ExecSecurityContext {
         uid: new.uid.0,
         euid: new.euid.0,
@@ -2042,7 +2041,7 @@ mod tests {
 
         assert_eq!(
             proposed.security(),
-            test_security(1000, 1000, 1000, 1000, true)
+            test_security(1000, 1000, 1000, 1000, false)
         );
         unsafe {
             assert_eq!((*proposed.cred).euid, KUid(1000));
@@ -2054,14 +2053,14 @@ mod tests {
     }
 
     #[test]
-    fn exec_creds_ignore_setuid_on_nosuid_mount_and_enable_secure_mode() {
+    fn exec_creds_ignore_setuid_on_nosuid_mount_without_secure_mode() {
         let old = test_nonroot_cred(1000, 1000);
         let (_task, previous) = install_test_task(&old, 0);
         let program = test_setid_program(0o4755, 123, 0, MS_NOSUID as u32, false);
         let proposed = prepare_exec_creds(&program).expect("prepare exec creds");
 
         assert_eq!(proposed.security().euid, 1000);
-        assert!(proposed.security().secure_exec);
+        assert!(!proposed.security().secure_exec);
         unsafe { sched::set_current(previous) };
     }
 
@@ -2074,7 +2073,27 @@ mod tests {
         let proposed = prepare_exec_creds(&program).expect("prepare exec creds");
 
         assert_eq!(proposed.security().euid, 1000);
-        assert!(proposed.security().secure_exec);
+        assert!(!proposed.security().secure_exec);
+        unsafe { sched::set_current(previous) };
+    }
+
+    #[test]
+    fn exec_creds_capability_drop_does_not_enable_secure_mode() {
+        let mut old = test_nonroot_cred(1000, 1000);
+        old.cap_permitted = KernelCapT::full();
+        old.cap_effective = KernelCapT::full();
+        let (_task, previous) = install_test_task(&old, 0);
+        let program = test_setid_program(0o0755, 0, 0, 0, false);
+        let proposed = prepare_exec_creds(&program).expect("prepare exec creds");
+
+        assert!(
+            unsafe { (*proposed.cred).cap_effective.is_empty() },
+            "ordinary non-root exec must drop effective capabilities"
+        );
+        assert!(
+            !proposed.security().secure_exec,
+            "dropping privilege is not a Linux secure exec"
+        );
         unsafe { sched::set_current(previous) };
     }
 

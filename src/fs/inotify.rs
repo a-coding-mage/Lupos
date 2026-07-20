@@ -95,8 +95,13 @@ const ALL_INOTIFY_BITS: u32 = IN_ALL_EVENTS
 struct InotifyWatch {
     wd: i32,
     mask: u32,
-    inode_key: usize,
+    inode_key: InodeKey,
 }
+
+/// Linux attaches fsnotify marks to an inode identified within its
+/// superblock. Synthetic filesystems may recreate the local `Arc<Inode>` for
+/// a lookup while retaining that same `(superblock, i_ino)` identity.
+type InodeKey = (usize, u64);
 
 struct InotifyQueue {
     events: VecDeque<Vec<u8>>,
@@ -369,8 +374,13 @@ fn lookup_watch_inode(path: &str, mask: u32) -> Result<InodeRef, i32> {
     Ok(inode)
 }
 
-fn inode_key(inode: &InodeRef) -> usize {
-    alloc::sync::Arc::as_ptr(inode) as usize
+fn inode_key(inode: &InodeRef) -> InodeKey {
+    let sb = inode.sb.lock();
+    let sb_key = sb
+        .as_ref()
+        .map(|superblock| alloc::sync::Arc::as_ptr(superblock) as usize)
+        .unwrap_or(0);
+    (sb_key, inode.ino)
 }
 
 fn event_mask(event: &[u8]) -> u32 {
@@ -411,7 +421,10 @@ fn enqueue_event(queue: &mut InotifyQueue, wd: i32, mask: u32, name: Option<&str
 }
 
 fn queue_event_for_inode(inode: &InodeRef, mask: u32, name: Option<&str>) {
-    let key = inode_key(inode);
+    queue_event_for_key(inode_key(inode), mask, name);
+}
+
+fn queue_event_for_key(key: InodeKey, mask: u32, name: Option<&str>) {
     let event_bits = mask & IN_ALL_EVENTS;
     if event_bits == 0 {
         return;
@@ -495,6 +508,14 @@ pub fn notify_modify(dentry: &DentryRef) {
     queue_event_for_inode(&inode, IN_MODIFY, None);
 }
 
+pub(crate) fn notify_modify_identity(sb: &crate::fs::types::SuperBlockRef, ino: u64) {
+    queue_event_for_key(
+        (alloc::sync::Arc::as_ptr(sb) as usize, ino),
+        IN_MODIFY,
+        None,
+    );
+}
+
 pub fn notify_close(file: &FileRef) {
     let Some(inode) = file.inode() else {
         return;
@@ -543,7 +564,7 @@ pub fn notify_move(
 mod tests {
     use super::*;
     use crate::fs::eventpoll::{
-        EPOLL_CTL_ADD, EPOLLIN, EpollEvent, sys_epoll_create1, sys_epoll_ctl,
+        EPOLL_CTL_ADD, EPOLLIN, EpollEvent, sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait,
     };
     use crate::fs::fdtable::FilesStruct;
     use crate::fs::mount::{Mount, set_rootfs};
@@ -615,6 +636,115 @@ mod tests {
         assert_eq!(core::mem::offset_of!(InotifyEvent, mask), 4);
         assert_eq!(core::mem::offset_of!(InotifyEvent, cookie), 8);
         assert_eq!(core::mem::offset_of!(InotifyEvent, len), 12);
+    }
+
+    #[test]
+    fn inode_key_survives_synthetic_inode_reinstantiation() {
+        let sb = crate::fs::types::SuperBlock::alloc(
+            "kernfs-test",
+            0x6b65726e,
+            &crate::fs::ops::NOOP_SUPER_OPS,
+        );
+        let make_inode = || {
+            let inode = crate::fs::types::Inode::new(
+                42,
+                InodeKind::Regular,
+                0o444,
+                &crate::fs::ops::NOOP_INODE_OPS,
+                &crate::fs::ops::NOOP_FILE_OPS,
+                crate::fs::types::InodePrivate::None,
+            );
+            *inode.sb.lock() = Some(sb.clone());
+            inode
+        };
+        let first = make_inode();
+        let second = make_inode();
+
+        assert!(!alloc::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(inode_key(&first), inode_key(&second));
+    }
+
+    #[test]
+    fn cgroup_events_notify_reaches_watch_from_separate_path_resolution() {
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        let (mut current, previous) = setup_current_with_rootfs(293);
+        unsafe {
+            assert_eq!(crate::fs::syscalls::sys_mkdir(b"/sys\0".as_ptr(), 0o755), 0);
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdir(b"/sys/fs\0".as_ptr(), 0o755),
+                0
+            );
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdir(b"/sys/fs/cgroup\0".as_ptr(), 0o755),
+                0
+            );
+            crate::fs::mount::do_mount("cgroup2", "cgroup2", "/sys/fs/cgroup", 0, "")
+                .expect("mount cgroup2");
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdir(
+                    b"/sys/fs/cgroup/session-c5.scope\0".as_ptr(),
+                    0o755,
+                ),
+                0
+            );
+
+            let ifd = sys_inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+            assert!(ifd >= 0);
+            let epfd = sys_epoll_create1(0);
+            assert!(epfd >= 0);
+            let registration = EpollEvent {
+                events: EPOLLIN,
+                data: 0xc5,
+            };
+            assert_eq!(
+                sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, ifd as i32, &registration,),
+                0
+            );
+            let wd = sys_inotify_add_watch(
+                ifd as i32,
+                b"/sys/fs/cgroup/session-c5.scope/cgroup.events\0".as_ptr() as *const i8,
+                IN_MODIFY,
+            );
+            assert!(wd > 0);
+
+            let cgroup_path = "/session-c5.scope";
+            crate::kernel::cgroup::assign_pid_to_cgroup_path(901, cgroup_path);
+
+            let mut ready = [EpollEvent { events: 0, data: 0 }; 1];
+            assert_eq!(
+                sys_epoll_wait(epfd as i32, ready.as_mut_ptr(), ready.len() as i32, 0),
+                1
+            );
+            let ready_data = ready[0].data;
+            assert_eq!(ready_data, 0xc5);
+            let ft = files::get_task_files(&mut *current as *mut TaskStruct).unwrap();
+            let file = ft.get(ifd as i32).unwrap();
+            let mut buf = [0u8; core::mem::size_of::<InotifyEvent>()];
+            let n = vfs_read(&file, &mut buf).expect("read cgroup.events notification");
+            assert_eq!(n, buf.len());
+            assert_eq!(i32::from_ne_bytes(buf[0..4].try_into().unwrap()), wd as i32);
+            assert_eq!(
+                u32::from_ne_bytes(buf[4..8].try_into().unwrap()) & IN_MODIFY,
+                IN_MODIFY
+            );
+            assert_eq!(
+                sys_epoll_wait(epfd as i32, ready.as_mut_ptr(), ready.len() as i32, 0),
+                0,
+                "draining the first event must leave the persistent watch idle"
+            );
+
+            crate::kernel::cgroup::mark_pid_exited_from_cgroup(901);
+            assert_eq!(
+                sys_epoll_wait(epfd as i32, ready.as_mut_ptr(), ready.len() as i32, 0),
+                1,
+                "the final populated transition must notify the retained kernfs node"
+            );
+            let n = vfs_read(&file, &mut buf).expect("read final cgroup.events notification");
+            assert_eq!(n, buf.len());
+            crate::kernel::cgroup::forget_pid_cgroup(901);
+
+            teardown_current(current, previous);
+        }
     }
 
     #[test]

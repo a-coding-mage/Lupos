@@ -597,11 +597,11 @@ impl LinuxPciDev {
             _pad_after_device_prefix: [0; LINUX_PCI_DEV_CFG_SIZE_OFFSET
                 - (LINUX_PCI_DEV_DEVICE_OFFSET + size_of::<LinuxDevice>())],
             cfg_size: dev.cfg_size as i32,
-            irq: if pin == 0 {
-                0
-            } else {
-                dev.config_space[0x3c] as u32
-            },
+            // Lupos currently routes every q35 PCI INTx GSI to one shared
+            // Linux IRQ.  Keep the Linux ABI object consistent with that
+            // routing instead of exposing the firmware Interrupt Line byte:
+            // modules call request_irq() with this field.
+            irq: crate::arch::x86::kernel::apic_io_apic::linux_pci_intx_irq(pin),
             resource,
             driver_exclusive_resource: LinuxResource {
                 start: 0,

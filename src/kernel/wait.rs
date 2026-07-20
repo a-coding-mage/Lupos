@@ -25,7 +25,7 @@ use core::sync::atomic::Ordering;
 use crate::arch::x86::kernel::uaccess::copy_to_user;
 use crate::kernel::exit::release_task;
 use crate::kernel::sched;
-use crate::kernel::signal::{SIGCHLD, SIGKILL, has_unblocked_pending_signals};
+use crate::kernel::signal::{SIGCHLD, has_unblocked_pending_signals};
 use crate::kernel::task::task_state::{
     __TASK_STOPPED, EXIT_ZOMBIE, TASK_INTERRUPTIBLE, TASK_RUNNING,
 };
@@ -1051,34 +1051,10 @@ pub unsafe fn sys_exit(code: i32) -> ! {
     }
 }
 
-unsafe fn exit_group_peers(current: *mut TaskStruct, code: i64) {
-    if current.is_null() {
-        return;
-    }
-    let tgid = unsafe { (*current).tgid };
-    let mut visit = |task: *mut TaskStruct| unsafe {
-        if task.is_null() || task == current || (*task).tgid != tgid {
-            return;
-        }
-        (*task).m26.exit_code = code as i32;
-
-        // Linux zap_other_threads() never tears a peer down remotely, even
-        // when that peer is off-CPU: an off-CPU task may still own live
-        // stack-resident waitqueue/futex state. Queue SIGKILL and wake it so
-        // it unwinds the blocked syscall and reaches do_exit() in its own
-        // context before finish_task_switch() releases its kernel stack.
-        let _ = crate::kernel::signal::send_signal_to_task(task, SIGKILL);
-        crate::kernel::sched::request_reschedule((*task).thread_info.cpu);
-    };
-    crate::kernel::fork::for_each_heap_task(&mut visit);
-    crate::kernel::sched::for_each_pool_task(&mut visit);
-}
-
 /// Linux `exit_group(code)` — syscall 231.  Never returns.
 ///
-/// In a single-threaded (one-task-per-tgid) world this is identical to
-/// `sys_exit`.  Once threads-per-tgid land we will iterate the thread group
-/// and call `do_exit` on every peer.
+/// `do_group_exit()` queues SIGKILL for every sibling so each unwinds its own
+/// stack before the current task publishes its terminal state.
 pub unsafe fn sys_exit_group(code: i32) -> ! {
     let current = unsafe { sched::get_current() };
     #[cfg(not(test))]
@@ -1096,8 +1072,7 @@ pub unsafe fn sys_exit_group(code: i32) -> ! {
     }
     let packed = w_exitcode(code, 0) as i64;
     unsafe {
-        exit_group_peers(current, packed);
-        crate::kernel::exit::do_exit(packed);
+        crate::kernel::exit::do_group_exit(packed);
     }
 }
 

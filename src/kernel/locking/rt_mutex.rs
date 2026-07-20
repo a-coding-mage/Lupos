@@ -135,31 +135,45 @@ impl RtMutex {
     }
 
     pub fn unlock(&self) {
+        let (next, _) = self.unlock_handoff();
+        if !next.is_null() {
+            unsafe {
+                crate::kernel::sched::wake_task(next);
+            }
+        }
+    }
+
+    /// Transfer ownership to the first waiter without waking it.
+    ///
+    /// PI futex unlock must publish the new owner's TID in the user word
+    /// before the waiter can run. The plain rt-mutex API wakes immediately;
+    /// this split form lets futex perform that vendor/Linux ordering and then
+    /// wake the returned task.
+    pub fn unlock_handoff(&self) -> (*mut TaskStruct, bool) {
         let prev = self.owner.load(Ordering::Acquire);
         if prev & RT_MUTEX_HAS_WAITERS == 0 {
             self.owner.store(0, Ordering::Release);
-            return;
+            return (core::ptr::null_mut(), false);
         }
         self.wait_lock.lock();
         let waiters = unsafe { &mut *self.waiters.get() };
-        if !waiters.is_empty() {
+        let result = if !waiters.is_empty() {
             let w = waiters.remove(0);
+            let more_waiters = !waiters.is_empty();
             let handoff = (w.task as u64)
-                | if waiters.is_empty() {
-                    0
-                } else {
+                | if more_waiters {
                     RT_MUTEX_HAS_WAITERS
+                } else {
+                    0
                 };
             self.owner.store(handoff, Ordering::Release);
-            if !w.task.is_null() {
-                unsafe {
-                    crate::kernel::sched::wake_task(w.task);
-                }
-            }
+            (w.task, more_waiters)
         } else {
             self.owner.store(0, Ordering::Release);
-        }
+            (core::ptr::null_mut(), false)
+        };
         self.wait_lock.unlock();
+        result
     }
 
     pub fn is_locked(&self) -> bool {
@@ -233,5 +247,29 @@ mod tests {
     fn pi_state_new_is_null() {
         let s = PiState::new();
         assert!(s.owner.is_null());
+    }
+
+    #[test]
+    fn unlock_handoff_returns_next_owner_before_wakeup() {
+        let mutex = RtMutex::new();
+        let owner = 0x1000usize as *mut TaskStruct;
+        let next = 0x2000usize as *mut TaskStruct;
+        mutex.adopt_owner(owner, true);
+        unsafe {
+            (*mutex.waiters.get()).push(RtMutexWaiter {
+                task: next,
+                prio: 100,
+                deadline: 0,
+            });
+        }
+
+        let (handoff, more_waiters) = mutex.unlock_handoff();
+
+        assert_eq!(handoff, next);
+        assert!(!more_waiters);
+        assert_eq!(
+            mutex.owner.load(Ordering::Acquire) & !RT_MUTEX_HAS_WAITERS,
+            next as u64
+        );
     }
 }

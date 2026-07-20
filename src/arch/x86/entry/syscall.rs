@@ -1320,11 +1320,18 @@ fn trace_systemd_service_syscall(
     let comm = unsafe { &(*task).comm };
     let pid = unsafe { (*task).pid };
     let syscall_trace = crate::kernel::debug_trace::syscall_enabled();
+    let proc_trace = crate::kernel::debug_trace::proc_enabled();
     let ping_trace = crate::kernel::debug_trace::ping_enabled();
     let systemctl_trace = crate::kernel::debug_trace::systemctl_enabled();
     let glycin_trace = crate::kernel::debug_trace::glycin_enabled();
     let pixbuf_trace = crate::kernel::debug_trace::pixbuf_enabled();
-    if !syscall_trace && !ping_trace && !systemctl_trace && !glycin_trace && !pixbuf_trace {
+    if !syscall_trace
+        && !proc_trace
+        && !ping_trace
+        && !systemctl_trace
+        && !glycin_trace
+        && !pixbuf_trace
+    {
         return;
     }
     let trace_pid1 = syscall_trace && pid == 1;
@@ -1339,7 +1346,8 @@ fn trace_systemd_service_syscall(
         && (comm_starts_with(comm, b"xfce4-session")
             || comm_starts_with(comm, b"dbus-launch")
             || comm_starts_with(comm, b"dbus-daemon"));
-    let trace_user_manager = task_euid_for_trace(task) == Some(1000)
+    let trace_user_manager = proc_trace
+        && task_euid_for_trace(task) == Some(1000)
         && (comm_starts_with(comm, b"systemd") || comm_starts_with(comm, b"dbus-broker"));
     let trace_glycin = glycin_trace
         && (comm_starts_with(comm, b"glycin")
@@ -1361,6 +1369,7 @@ fn trace_systemd_service_syscall(
         && !trace_systemctl
         && !trace_dbus
         && !trace_ping
+        && !trace_user_manager
         && !trace_glycin
         && !trace_pixbuf
     {
