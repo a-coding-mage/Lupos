@@ -25,7 +25,10 @@ use crate::fs::ops::SuperOps;
 use crate::fs::super_block::{FileSystemType, register_filesystem};
 use crate::fs::types::{SuperBlock, SuperBlockRef};
 use crate::include::uapi::errno::{EBADF, EINVAL, ENODEV};
-use crate::kernel::cgroup::cpu::{TaskGroup, format_cpu_stat, parse_cpu_max};
+use crate::kernel::cgroup::cpu::{
+    TaskGroup, format_cpu_stat, parse_cpu_max, sched_weight_to_cgroup,
+};
+use crate::kernel::sched::prio::scale_load_down;
 
 const CGROUP2_MAGIC: u64 = 0x63677270;
 
@@ -99,8 +102,7 @@ fn cpu_max_quota_us_to_ns(quota_us: u64) -> Result<u64, i32> {
 
 fn cpu_weight_show(_n: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
     let g = ROOT_CG.lock();
-    // shares = weight * 1024 / 100, so weight = shares * 100 / 1024
-    let weight = g.shares.saturating_mul(100) / 1024;
+    let weight = sched_weight_to_cgroup(scale_load_down(g.shares));
     let s = alloc::format!("{}\n", weight);
     let n = s.len().min(buf.len());
     buf[..n].copy_from_slice(&s.as_bytes()[..n]);

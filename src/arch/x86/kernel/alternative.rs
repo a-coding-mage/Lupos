@@ -477,9 +477,13 @@ fn sync_core_all() -> Result<(), i32> {
         if cpu == current || online & (1u64 << cpu) == 0 {
             continue;
         }
+        let Some(apic_id) = crate::arch::x86::kernel::smp::logical_cpu_to_apic_id(cpu as u32)
+        else {
+            return Err(EIO);
+        };
         unsafe {
             crate::arch::x86::kernel::apic::send_ipi(
-                cpu as u8,
+                apic_id,
                 crate::arch::x86::kernel::idt::TEXT_POKE_SYNC_VECTOR,
             );
         }

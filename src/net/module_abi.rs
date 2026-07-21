@@ -1,5 +1,7 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/net
+//! test-origin: linux:vendor/linux/net/core/dev.c
+//! test-origin: linux:vendor/linux/net/sched/sch_generic.c
 //! Minimal networking ABI symbols required by Linux-built net driver modules.
 
 extern crate alloc;
@@ -386,6 +388,8 @@ const LINUX_SPEED_UNKNOWN: i32 = -1;
 const LINUX_ETHTOOL_LINK_MEDIUM_NONE: i32 = 10;
 const LINUX_EOPNOTSUPP: i32 = 95;
 const NET_XMIT_DROP: i32 = 0x01;
+const NET_XMIT_CN: i32 = 0x02;
+const NET_XMIT_MASK: i32 = 0x0f;
 
 const LINUX_LINK_MODE_UNKNOWN: LinuxLinkModeInfo = LinuxLinkModeInfo {
     speed: LINUX_SPEED_UNKNOWN,
@@ -788,6 +792,7 @@ const SKB_DEV_OFFSET: usize = 16;
 const SKB_LEN_OFFSET: usize = 112;
 const SKB_DATA_LEN_OFFSET: usize = 116;
 const SKB_MAC_LEN_OFFSET: usize = 120;
+const SKB_QUEUE_MAPPING_OFFSET: usize = 124;
 const SKB_FLAGS_OFFSET: usize = 126;
 const SKB_PKT_TYPE_OFFSET: usize = 128;
 const SKB_ALLOC_CPU_OFFSET: usize = 136;
@@ -1710,8 +1715,191 @@ unsafe extern "C" fn ptp_schedule_worker(_clock: *mut u8, _delay: usize) -> i32 
     0
 }
 
+struct LocalBhDisabled;
+
+impl LocalBhDisabled {
+    fn new() -> Self {
+        crate::kernel::locking::preempt::local_bh_disable();
+        Self
+    }
+}
+
+impl Drop for LocalBhDisabled {
+    fn drop(&mut self) {
+        crate::kernel::locking::preempt::local_bh_enable();
+    }
+}
+
+struct LinuxHardTxLockGuard {
+    queue: *mut u8,
+    locked: bool,
+}
+
+impl LinuxHardTxLockGuard {
+    unsafe fn acquire(dev: *mut u8, queue: *mut u8) -> Self {
+        let locked = unsafe { read_field::<u64>(dev, 0) } & NET_DEVICE_LLTX_BIT == 0;
+        if locked {
+            unsafe { txq_lock(queue) };
+        }
+        Self { queue, locked }
+    }
+}
+
+impl Drop for LinuxHardTxLockGuard {
+    fn drop(&mut self) {
+        if self.locked {
+            unsafe { txq_unlock(self.queue) };
+        }
+    }
+}
+
+struct LinuxXmitRecursionGuard;
+
+impl LinuxXmitRecursionGuard {
+    unsafe fn new() -> Self {
+        let recursion = unsafe { current_softnet_xmit_recursion_ptr() };
+        let value = unsafe { core::ptr::read_volatile(recursion) };
+        unsafe { core::ptr::write_volatile(recursion, value.wrapping_add(1)) };
+        Self
+    }
+}
+
+impl Drop for LinuxXmitRecursionGuard {
+    fn drop(&mut self) {
+        let recursion = unsafe { current_softnet_xmit_recursion_ptr() };
+        let value = unsafe { core::ptr::read_volatile(recursion) };
+        unsafe { core::ptr::write_volatile(recursion, value.wrapping_sub(1)) };
+    }
+}
+
+enum LinuxNoqueueXmitResult {
+    Consumed(i32),
+    Retained(i32),
+}
+
+unsafe fn current_softnet_xmit_recursion_ptr() -> *mut u16 {
+    unsafe {
+        crate::arch::x86::kernel::setup_percpu::current_softnet_data()
+            .add(SOFTNET_XMIT_RECURSION_OFFSET)
+            .cast::<u16>()
+    }
+}
+
+unsafe fn dev_xmit_recursion() -> bool {
+    (unsafe { core::ptr::read_volatile(current_softnet_xmit_recursion_ptr()) })
+        > XMIT_RECURSION_LIMIT
+}
+
+unsafe fn netdev_xmit_set_more(more: bool) {
+    let field = unsafe {
+        crate::arch::x86::kernel::setup_percpu::current_softnet_data().add(SOFTNET_XMIT_MORE_OFFSET)
+    };
+    unsafe { core::ptr::write_volatile(field, u8::from(more)) };
+}
+
+unsafe fn linux_noqueue_pick_tx(dev: *mut u8, skb: *mut u8) -> Option<*mut u8> {
+    let (queues, allocated_count) = unsafe { tx_queues(dev) };
+    let real_count = unsafe { read_field::<u32>(dev, NET_DEVICE_REAL_NUM_TX_QUEUES_OFFSET) };
+    if queues.is_null() || allocated_count == 0 || real_count == 0 {
+        return None;
+    }
+
+    // `netdev_core_pick_tx()`: the target virtio-net device has one queue.
+    // For a multiqueue driver, honor ndo_select_queue when present. Lupos does
+    // not yet carry Linux's flow-dissector hash on these internally created
+    // skbs, so the no-selector fallback retains their zero queue mapping. The
+    // current generic-x86_64 virtio target has exactly one active TX queue and
+    // therefore takes Linux's queue-0 fast path above this distinction.
+    let mut queue_index = 0u16;
+    if real_count != 1 {
+        let ops = unsafe { read_field::<*const u8>(dev, NET_DEVICE_OPS_OFFSET) };
+        if !ops.is_null() {
+            let select = unsafe {
+                ops.add(NET_DEVICE_OPS_SELECT_QUEUE_OFFSET)
+                    .cast::<usize>()
+                    .read_unaligned()
+            };
+            if select != 0 {
+                let select_queue: unsafe extern "C" fn(*mut u8, *mut u8, *mut u8) -> u16 =
+                    unsafe { core::mem::transmute(select) };
+                queue_index = unsafe { select_queue(dev, skb, core::ptr::null_mut()) };
+            }
+        }
+        if u32::from(queue_index) >= real_count {
+            queue_index = 0;
+        }
+    }
+    if usize::from(queue_index) >= allocated_count {
+        return None;
+    }
+
+    unsafe { write_field(skb, SKB_QUEUE_MAPPING_OFFSET, queue_index) };
+    Some(unsafe { queues.add(usize::from(queue_index) * NETDEV_QUEUE_SIZE) })
+}
+
+unsafe fn linux_noqueue_start_xmit(
+    dev: *mut u8,
+    skb: *mut u8,
+    start_xmit: unsafe extern "C" fn(*mut u8, *mut u8) -> i32,
+) -> LinuxNoqueueXmitResult {
+    // `__dev_queue_xmit()` enters this noqueue branch under
+    // `rcu_read_lock_bh()`, which pins the CPU before queue selection.
+    let _bh_disabled = LocalBhDisabled::new();
+    let Some(queue) = (unsafe { linux_noqueue_pick_tx(dev, skb) }) else {
+        return LinuxNoqueueXmitResult::Retained(crate::include::uapi::errno::ENODEV);
+    };
+
+    if unsafe { read_field::<u32>(dev, NET_DEVICE_FLAGS_OFFSET) } & IFF_UP == 0 {
+        return LinuxNoqueueXmitResult::Retained(crate::include::uapi::errno::ENETDOWN);
+    }
+
+    if unsafe { read_field::<u32>(queue, NETDEV_QUEUE_XMIT_OWNER_OFFSET) }
+        == crate::kernel::sched::current_cpu()
+    {
+        return LinuxNoqueueXmitResult::Retained(crate::include::uapi::errno::ENETDOWN);
+    }
+    if unsafe { dev_xmit_recursion() } {
+        return LinuxNoqueueXmitResult::Retained(crate::include::uapi::errno::ENETDOWN);
+    }
+
+    let lltx = unsafe { read_field::<u64>(dev, 0) } & NET_DEVICE_LLTX_BIT != 0;
+    let _hard_tx_lock = unsafe { LinuxHardTxLockGuard::acquire(dev, queue) };
+    let state = unsafe {
+        &*queue
+            .add(NETDEV_QUEUE_STATE_OFFSET)
+            .cast::<core::sync::atomic::AtomicU64>()
+    };
+    if state.load(core::sync::atomic::Ordering::Acquire) & QUEUE_STATE_ANY_XOFF != 0 {
+        return LinuxNoqueueXmitResult::Retained(crate::include::uapi::errno::ENETDOWN);
+    }
+
+    let result = {
+        let _recursion = unsafe { LinuxXmitRecursionGuard::new() };
+        unsafe { netdev_xmit_set_more(false) };
+        let result = unsafe { start_xmit(skb, dev) };
+        if result == 0 && !lltx {
+            unsafe {
+                write_field(
+                    queue,
+                    NETDEV_QUEUE_TRANS_START_OFFSET,
+                    crate::kernel::time::jiffies::jiffies(),
+                )
+            };
+        }
+        result
+    };
+    if result < NET_XMIT_MASK {
+        LinuxNoqueueXmitResult::Consumed(result)
+    } else {
+        // NETDEV_TX_BUSY (or another non-complete result) leaves ownership
+        // with the noqueue caller, which drops the skb and reports ENETDOWN.
+        LinuxNoqueueXmitResult::Retained(crate::include::uapi::errno::ENETDOWN)
+    }
+}
+
 /// Submit one complete Ethernet frame through a registered vendor driver's
-/// `ndo_start_xmit` entry point.
+/// `ndo_start_xmit` entry point, following Linux's `__dev_queue_xmit()`
+/// noqueue branch (`vendor/linux/net/core/dev.c`).
 pub fn transmit_linux_ethernet_frame(linux_dev: *mut u8, frame: &[u8]) -> Result<(), i32> {
     if linux_dev.is_null() || frame.len() < 14 || frame.len() > u32::MAX as usize {
         return Err(crate::include::uapi::errno::EINVAL);
@@ -1746,31 +1934,47 @@ pub fn transmit_linux_ethernet_frame(linux_dev: *mut u8, frame: &[u8]) -> Result
         return Err(crate::include::uapi::errno::ENOMEM);
     }
     unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), payload, frame.len()) };
-    let ops = unsafe { read_field::<*const u8>(linux_dev, 8) };
+    let ops = unsafe { read_field::<*const u8>(linux_dev, NET_DEVICE_OPS_OFFSET) };
     if ops.is_null() {
         unsafe { free_raw_skb(skb) };
         return Err(crate::include::uapi::errno::ENODEV);
     }
-    let function = unsafe { ops.add(32).cast::<usize>().read_unaligned() };
+    let function = unsafe {
+        ops.add(NET_DEVICE_OPS_START_XMIT_OFFSET)
+            .cast::<usize>()
+            .read_unaligned()
+    };
     if function == 0 {
         unsafe { free_raw_skb(skb) };
         return Err(crate::include::uapi::errno::EOPNOTSUPP);
     }
-    let start_xmit: unsafe extern "C" fn(*mut u8, *mut u8) -> u32 =
+    let start_xmit: unsafe extern "C" fn(*mut u8, *mut u8) -> i32 =
         unsafe { core::mem::transmute(function) };
-    let result = unsafe { start_xmit(skb, linux_dev) };
+    let result = unsafe { linux_noqueue_start_xmit(linux_dev, skb, start_xmit) };
+    let raw_result = match result {
+        LinuxNoqueueXmitResult::Consumed(result) => result,
+        LinuxNoqueueXmitResult::Retained(errno) => {
+            unsafe { free_raw_skb(skb) };
+            return Err(errno);
+        }
+    };
     #[cfg(not(test))]
     if crate::kernel::debug_trace::ping_enabled() {
         crate::linux_driver_abi::tty::serial_println!(
             "net-tx: len={} ethertype={:04x} xmit={}",
             frame.len(),
             u16::from_be_bytes([frame[12], frame[13]]),
-            result
+            raw_result
         );
     }
-    if result != 0 {
-        unsafe { free_raw_skb(skb) };
-        return Err(crate::include::uapi::errno::EAGAIN);
+    if raw_result < 0 {
+        return Err(raw_result.saturating_neg());
+    }
+    if raw_result == NET_XMIT_CN {
+        return Ok(());
+    }
+    if raw_result != 0 {
+        return Err(crate::include::uapi::errno::ENOBUFS);
     }
     if let Some(dev) = crate::net::device::lookup_linux_netdevice(linux_dev) {
         dev.tx_packets
@@ -1800,6 +2004,9 @@ unsafe extern "C" fn nf_conntrack_destroy(_nfct: *mut core::ffi::c_void) {
 }
 
 const NET_DEVICE_TX_PTR_OFFSET: usize = 24;
+const NET_DEVICE_OPS_OFFSET: usize = 8;
+const NET_DEVICE_OPS_START_XMIT_OFFSET: usize = 32;
+const NET_DEVICE_OPS_SELECT_QUEUE_OFFSET: usize = 48;
 const NET_DEVICE_REAL_NUM_TX_QUEUES_OFFSET: usize = 40;
 const NET_DEVICE_GSO_MAX_SIZE_OFFSET: usize = 44;
 const NET_DEVICE_GSO_IPV4_MAX_SIZE_OFFSET: usize = 48;
@@ -1832,13 +2039,21 @@ const NETDEV_RX_QUEUE_SIZE: usize = 256;
 const NAPI_CONFIG_SIZE: usize = 40;
 const GSO_MAX_SIZE: u32 = 65_536;
 const IFF_LIVE_ADDR_CHANGE: u64 = 1 << 15;
+const IFF_UP: u32 = 1;
+const NET_DEVICE_LLTX_BIT: u64 = 1 << 32;
 const LINK_STATE_START: u64 = 1 << 0;
 const NETDEV_QUEUE_XMIT_LOCK_OFFSET: usize = 256;
 const NETDEV_QUEUE_XMIT_OWNER_OFFSET: usize = 260;
+const NETDEV_QUEUE_TRANS_START_OFFSET: usize = 264;
 const NETDEV_QUEUE_STATE_OFFSET: usize = 272;
 const NETDEV_QUEUE_NUMA_NODE_OFFSET: usize = 288;
 const QUEUE_STATE_DRV_XOFF: u64 = 1;
+const QUEUE_STATE_STACK_XOFF: u64 = 1 << 1;
 const QUEUE_STATE_FROZEN: u64 = 1 << 2;
+const QUEUE_STATE_ANY_XOFF: u64 = QUEUE_STATE_DRV_XOFF | QUEUE_STATE_STACK_XOFF;
+const SOFTNET_XMIT_RECURSION_OFFSET: usize = 96;
+const SOFTNET_XMIT_MORE_OFFSET: usize = 98;
+const XMIT_RECURSION_LIMIT: u16 = 8;
 
 unsafe fn read_field<T: Copy>(base: *const u8, offset: usize) -> T {
     unsafe { base.add(offset).cast::<T>().read_unaligned() }
@@ -2799,7 +3014,226 @@ unsafe extern "C" fn __netif_set_xps_queue(
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+
+    use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    static TX_ABI_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+    static TX_CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static TX_CALLBACK_PREEMPT_COUNT: AtomicU32 = AtomicU32::new(0);
+    static TX_CALLBACK_OWNER_MATCHED: AtomicBool = AtomicBool::new(false);
+
+    #[repr(align(64))]
+    struct AlignedTxQueue([u8; NETDEV_QUEUE_SIZE]);
+
+    struct TestQueueLockGuard<'a> {
+        lock: &'a crate::kernel::locking::qspinlock::QSpinLock,
+        held: bool,
+    }
+
+    impl<'a> TestQueueLockGuard<'a> {
+        fn acquire(lock: &'a crate::kernel::locking::qspinlock::QSpinLock) -> Self {
+            lock.lock();
+            Self { lock, held: true }
+        }
+
+        fn unlock(&mut self) {
+            if self.held {
+                self.lock.unlock();
+                self.held = false;
+            }
+        }
+    }
+
+    impl Drop for TestQueueLockGuard<'_> {
+        fn drop(&mut self) {
+            self.unlock();
+        }
+    }
+
+    unsafe extern "C" fn observing_busy_start_xmit(_skb: *mut u8, dev: *mut u8) -> i32 {
+        TX_CALLBACK_COUNT.fetch_add(1, Ordering::AcqRel);
+        TX_CALLBACK_PREEMPT_COUNT.store(
+            crate::kernel::locking::preempt::preempt_count(),
+            Ordering::Release,
+        );
+        let queue = unsafe { read_field::<*mut u8>(dev, NET_DEVICE_TX_PTR_OFFSET) };
+        if !queue.is_null() {
+            TX_CALLBACK_OWNER_MATCHED.store(
+                unsafe { read_field::<u32>(queue, NETDEV_QUEUE_XMIT_OWNER_OFFSET) }
+                    == crate::kernel::sched::current_cpu(),
+                Ordering::Release,
+            );
+        }
+        0x10
+    }
+
+    #[test]
+    fn ndo_start_xmit_honors_linux_tx_queue_lock() {
+        // Linux's __dev_queue_xmit() noqueue branch excludes bottom halves and
+        // holds the selected netdev_queue::_xmit_lock around the driver
+        // callback. No upstream test exposes this internal callback boundary,
+        // so this Lupos-specific harness pre-locks the Linux-layout queue and
+        // proves that the real wrapper cannot enter ndo_start_xmit early.
+
+        let _test_guard = TX_ABI_TEST_LOCK.lock();
+        TX_CALLBACK_COUNT.store(0, Ordering::Release);
+        TX_CALLBACK_PREEMPT_COUNT.store(0, Ordering::Release);
+        TX_CALLBACK_OWNER_MATCHED.store(false, Ordering::Release);
+        let mut dev = Box::new([0u8; NET_DEVICE_SIZE]);
+        let mut ops = Box::new([0u8; 64]);
+        let mut tx_queue = Box::new(AlignedTxQueue([0u8; NETDEV_QUEUE_SIZE]));
+        let dev_ptr = dev.as_mut_ptr();
+        let queue_ptr = tx_queue.0.as_mut_ptr();
+        unsafe {
+            write_field(
+                ops.as_mut_ptr(),
+                NET_DEVICE_OPS_START_XMIT_OFFSET,
+                observing_busy_start_xmit as usize,
+            );
+            write_field(dev_ptr, 8, ops.as_mut_ptr());
+            write_field(dev_ptr, NET_DEVICE_TX_PTR_OFFSET, queue_ptr);
+            write_field(dev_ptr, NET_DEVICE_REAL_NUM_TX_QUEUES_OFFSET, 1u32);
+            write_field(dev_ptr, NET_DEVICE_NUM_TX_QUEUES_OFFSET, 1u32);
+            write_field(dev_ptr, NET_DEVICE_FLAGS_OFFSET, 1u32); // IFF_UP
+            write_field(queue_ptr, 0, dev_ptr);
+            write_field(queue_ptr, NETDEV_QUEUE_XMIT_OWNER_OFFSET, u32::MAX);
+        }
+
+        let mut warmup_frame = [0u8; 64];
+        warmup_frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        assert_eq!(
+            transmit_linux_ethernet_frame(dev_ptr, &warmup_frame),
+            Err(crate::include::uapi::errno::ENETDOWN)
+        );
+        TX_CALLBACK_COUNT.store(0, Ordering::Release);
+        TX_CALLBACK_PREEMPT_COUNT.store(0, Ordering::Release);
+        TX_CALLBACK_OWNER_MATCHED.store(false, Ordering::Release);
+
+        let lock = unsafe {
+            &*queue_ptr
+                .add(NETDEV_QUEUE_XMIT_LOCK_OFFSET)
+                .cast::<crate::kernel::locking::qspinlock::QSpinLock>()
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let dev_address = dev_ptr as usize;
+        std::thread::scope(|scope| {
+            let mut lock_guard = TestQueueLockGuard::acquire(lock);
+            let worker = scope.spawn(move || {
+                let mut frame = [0u8; 64];
+                frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+                let _ = started_tx.send(());
+                let result = transmit_linux_ethernet_frame(dev_address as *mut u8, &frame);
+                let _ = finished_tx.send(result);
+            });
+
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("TX worker must start");
+            let completed_while_locked = finished_rx.recv_timeout(Duration::from_millis(250)).ok();
+            lock_guard.unlock();
+            let result = completed_while_locked.unwrap_or_else(|| {
+                finished_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("TX worker must complete after queue unlock")
+            });
+            worker.join().expect("TX worker must not panic");
+
+            assert!(
+                completed_while_locked.is_none(),
+                "ndo_start_xmit bypassed the selected Linux TX queue lock"
+            );
+            assert_eq!(
+                result,
+                Err(crate::include::uapi::errno::ENETDOWN),
+                "Linux's noqueue branch drops a BUSY skb and reports ENETDOWN"
+            );
+        });
+        assert_eq!(TX_CALLBACK_COUNT.load(Ordering::Acquire), 1);
+        assert_ne!(
+            TX_CALLBACK_PREEMPT_COUNT.load(Ordering::Acquire)
+                & crate::kernel::locking::preempt::SOFTIRQ_MASK,
+            0,
+            "ndo_start_xmit must run with local bottom halves disabled"
+        );
+        assert!(TX_CALLBACK_OWNER_MATCHED.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn noqueue_xmit_honors_stack_stop_and_restores_bh_and_lock_state() {
+        let _test_guard = TX_ABI_TEST_LOCK.lock();
+        TX_CALLBACK_COUNT.store(0, Ordering::Release);
+        TX_CALLBACK_PREEMPT_COUNT.store(0, Ordering::Release);
+        TX_CALLBACK_OWNER_MATCHED.store(false, Ordering::Release);
+
+        let mut dev = Box::new([0u8; NET_DEVICE_SIZE]);
+        let mut ops = Box::new([0u8; 64]);
+        let mut tx_queue = Box::new(AlignedTxQueue([0u8; NETDEV_QUEUE_SIZE]));
+        let dev_ptr = dev.as_mut_ptr();
+        let queue_ptr = tx_queue.0.as_mut_ptr();
+        unsafe {
+            write_field(
+                ops.as_mut_ptr(),
+                NET_DEVICE_OPS_START_XMIT_OFFSET,
+                observing_busy_start_xmit as usize,
+            );
+            write_field(dev_ptr, NET_DEVICE_OPS_OFFSET, ops.as_mut_ptr());
+            write_field(dev_ptr, NET_DEVICE_TX_PTR_OFFSET, queue_ptr);
+            write_field(dev_ptr, NET_DEVICE_REAL_NUM_TX_QUEUES_OFFSET, 1u32);
+            write_field(dev_ptr, NET_DEVICE_NUM_TX_QUEUES_OFFSET, 1u32);
+            write_field(dev_ptr, NET_DEVICE_FLAGS_OFFSET, IFF_UP);
+            write_field(queue_ptr, 0, dev_ptr);
+            write_field(queue_ptr, NETDEV_QUEUE_XMIT_OWNER_OFFSET, u32::MAX);
+            write_field(queue_ptr, NETDEV_QUEUE_STATE_OFFSET, QUEUE_STATE_STACK_XOFF);
+        }
+
+        let mut frame = [0u8; 64];
+        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        let before = crate::kernel::locking::preempt::preempt_count();
+        assert_eq!(
+            transmit_linux_ethernet_frame(dev_ptr, &frame),
+            Err(crate::include::uapi::errno::ENETDOWN)
+        );
+        assert_eq!(
+            TX_CALLBACK_COUNT.load(Ordering::Acquire),
+            0,
+            "STACK_XOFF must suppress the driver callback"
+        );
+
+        unsafe { write_field(queue_ptr, NETDEV_QUEUE_STATE_OFFSET, 0u64) };
+        assert_eq!(
+            transmit_linux_ethernet_frame(dev_ptr, &frame),
+            Err(crate::include::uapi::errno::ENETDOWN)
+        );
+        assert_eq!(TX_CALLBACK_COUNT.load(Ordering::Acquire), 1);
+        assert_ne!(
+            TX_CALLBACK_PREEMPT_COUNT.load(Ordering::Acquire)
+                & crate::kernel::locking::preempt::SOFTIRQ_MASK,
+            0,
+            "ndo_start_xmit must run with local bottom halves disabled"
+        );
+        assert_eq!(
+            crate::kernel::locking::preempt::preempt_count(),
+            before,
+            "the noqueue path must restore the incoming preempt/BH state"
+        );
+        assert_eq!(
+            unsafe { read_field::<u32>(queue_ptr, NETDEV_QUEUE_XMIT_OWNER_OFFSET) },
+            u32::MAX
+        );
+        let lock = unsafe {
+            &*queue_ptr
+                .add(NETDEV_QUEUE_XMIT_LOCK_OFFSET)
+                .cast::<crate::kernel::locking::qspinlock::QSpinLock>()
+        };
+        assert!(!lock.is_locked());
+    }
 
     #[test]
     fn virtio_net_link_stubs_include_expected_core_symbols() {

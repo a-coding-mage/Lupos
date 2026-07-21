@@ -8,10 +8,10 @@
 //! then `__switch_to` doing TSS RSP0 update, per-CPU current pointer,
 //! CR3/active_mm, and FS+GS base save/restore (the user GS base is round-tripped
 //! through `MSR_KERNEL_GS_BASE` so involuntary preemption preserves
-//! `arch_prctl(ARCH_SET_GS)` state). Remaining work vs Linux `process_64.c` for
-//! `complete`: `load_TLS(next)` (needs three TLS GDT slots added to the GDT),
-//! and FPU/xstate switch (needs a per-task xstate save area); both are
-//! boot-ABI-sensitive and tracked separately.
+//! `arch_prctl(ARCH_SET_GS)` state). The switch also implements Linux's
+//! user/kernel `active_mm` borrowing rules and task-local x87/SSE state.
+//! It loads the incoming task's three TLS descriptors into the per-CPU GDT
+//! before restoring DS/ES/FS/GS, matching Linux `process_64.c`.
 //!
 //! Implements M21: the two-phase context switch that is the heart of every
 //! scheduler invocation.
@@ -40,7 +40,10 @@
 //!   vendor/linux/arch/x86/kernel/asm-offsets_64.c — x86-64 offsets
 
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+#[cfg(any(test, debug_assertions))]
+use core::sync::atomic::{AtomicI32, AtomicU64};
 
 use crate::kernel::task::TaskStruct;
 use crate::kernel::thread::ThreadStruct;
@@ -71,17 +74,99 @@ pub struct SwitchAttempt {
     pub next_stack: u64,
 }
 
+// Keep the last-switch snapshot as debug-only crash instrumentation. Linux
+// does not unconditionally serialize a diagnostic record into shared atomics
+// on every context switch, and doing so is especially costly on SMP.
+#[cfg(any(test, debug_assertions))]
 static SWITCH_ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, debug_assertions))]
 static SWITCH_ATTEMPT_PREV: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, debug_assertions))]
 static SWITCH_ATTEMPT_NEXT: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, debug_assertions))]
 static SWITCH_ATTEMPT_PREV_PID: AtomicI32 = AtomicI32::new(-1);
+#[cfg(any(test, debug_assertions))]
 static SWITCH_ATTEMPT_NEXT_PID: AtomicI32 = AtomicI32::new(-1);
+#[cfg(any(test, debug_assertions))]
 static SWITCH_ATTEMPT_PREV_SP: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, debug_assertions))]
 static SWITCH_ATTEMPT_NEXT_SP: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, debug_assertions))]
 static SWITCH_ATTEMPT_PREV_STACK: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, debug_assertions))]
 static SWITCH_ATTEMPT_NEXT_STACK: AtomicU64 = AtomicU64::new(0);
 
+/// Lazy active_mm references released after the physical stack/CR3 switch.
+///
+/// Linux carries this as `rq->prev_mm` from `context_switch()` to
+/// `finish_task_switch()`. Scheduler core deliberately stays architecture
+/// agnostic in Lupos, so the x86 switch path carries the identical ownership
+/// through one per-CPU slot.
+static PREV_MM_TO_DROP: [AtomicUsize; crate::kernel::sched::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; crate::kernel::sched::MAX_CPUS];
+
+// Linux resolves X86_BUG_NULL_SEG during CPU identification and turns the
+// context-switch check into a static CPU capability branch. Lupos' current
+// partial CPU-bug model approximates that flag by vendor, but must still cache
+// the result: executing the serializing CPUID instruction for both FS and GS
+// on every context switch is not equivalent to static_cpu_has_bug().
+const NULL_SEG_BUG_UNKNOWN: u8 = 0;
+const NULL_SEG_BUG_ABSENT: u8 = 1;
+const NULL_SEG_BUG_PRESENT: u8 = 2;
+static NULL_SEG_BUG_STATE: AtomicU8 = AtomicU8::new(NULL_SEG_BUG_UNKNOWN);
+
+const fn null_seg_bug_for_vendor(vendor: crate::arch::x86::kernel::cpu::CpuVendor) -> bool {
+    matches!(
+        vendor,
+        crate::arch::x86::kernel::cpu::CpuVendor::Amd
+            | crate::arch::x86::kernel::cpu::CpuVendor::Hygon
+    )
+}
+
+#[cfg(not(test))]
 #[inline]
+fn cpu_has_null_seg_bug() -> bool {
+    match NULL_SEG_BUG_STATE.load(Ordering::Relaxed) {
+        NULL_SEG_BUG_ABSENT => false,
+        NULL_SEG_BUG_PRESENT => true,
+        _ => {
+            let present =
+                null_seg_bug_for_vendor(crate::arch::x86::kernel::cpu::CpuVendor::current());
+            NULL_SEG_BUG_STATE.store(
+                if present {
+                    NULL_SEG_BUG_PRESENT
+                } else {
+                    NULL_SEG_BUG_ABSENT
+                },
+                Ordering::Relaxed,
+            );
+            present
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MmSwitchKind {
+    UserToUser,
+    UserToKernel,
+    KernelToUser,
+    KernelToKernel,
+}
+
+fn classify_mm_switch(
+    prev_mm: *mut crate::mm::mm_types::MmStruct,
+    next_mm: *mut crate::mm::mm_types::MmStruct,
+) -> MmSwitchKind {
+    match (prev_mm.is_null(), next_mm.is_null()) {
+        (false, false) => MmSwitchKind::UserToUser,
+        (false, true) => MmSwitchKind::UserToKernel,
+        (true, false) => MmSwitchKind::KernelToUser,
+        (true, true) => MmSwitchKind::KernelToKernel,
+    }
+}
+
+#[inline]
+#[cfg(any(test, debug_assertions))]
 unsafe fn task_pid(task: *mut TaskStruct) -> i32 {
     if task.is_null() {
         -1
@@ -91,6 +176,7 @@ unsafe fn task_pid(task: *mut TaskStruct) -> i32 {
 }
 
 #[inline]
+#[cfg(any(test, debug_assertions))]
 unsafe fn task_sp(task: *mut TaskStruct) -> u64 {
     if task.is_null() {
         0
@@ -100,6 +186,7 @@ unsafe fn task_sp(task: *mut TaskStruct) -> u64 {
 }
 
 #[inline]
+#[cfg(any(test, debug_assertions))]
 unsafe fn task_stack(task: *mut TaskStruct) -> u64 {
     if task.is_null() {
         0
@@ -108,6 +195,7 @@ unsafe fn task_stack(task: *mut TaskStruct) -> u64 {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
 pub unsafe fn record_switch_attempt(prev: *mut TaskStruct, next: *mut TaskStruct) {
     SWITCH_ATTEMPT_PREV.store(prev as u64, Ordering::Relaxed);
     SWITCH_ATTEMPT_NEXT.store(next as u64, Ordering::Relaxed);
@@ -120,6 +208,11 @@ pub unsafe fn record_switch_attempt(prev: *mut TaskStruct, next: *mut TaskStruct
     SWITCH_ATTEMPT_SEQUENCE.fetch_add(1, Ordering::Release);
 }
 
+#[cfg(not(any(test, debug_assertions)))]
+#[inline(always)]
+pub unsafe fn record_switch_attempt(_prev: *mut TaskStruct, _next: *mut TaskStruct) {}
+
+#[cfg(any(test, debug_assertions))]
 pub fn last_switch_attempt() -> SwitchAttempt {
     SwitchAttempt {
         sequence: SWITCH_ATTEMPT_SEQUENCE.load(Ordering::Acquire),
@@ -134,6 +227,22 @@ pub fn last_switch_attempt() -> SwitchAttempt {
     }
 }
 
+#[cfg(not(any(test, debug_assertions)))]
+#[inline(always)]
+pub fn last_switch_attempt() -> SwitchAttempt {
+    SwitchAttempt {
+        sequence: 0,
+        prev: 0,
+        next: 0,
+        prev_pid: -1,
+        next_pid: -1,
+        prev_sp: 0,
+        next_sp: 0,
+        prev_stack: 0,
+        next_stack: 0,
+    }
+}
+
 /// Make the incoming task's kernel stack visible before `__switch_to_asm`
 /// loads it into RSP.
 ///
@@ -145,40 +254,38 @@ pub unsafe fn prepare_switch_to_task(next: *mut TaskStruct) {
     if next.is_null() {
         return;
     }
-    unsafe {
-        prepare_switch_stack_canaries(crate::kernel::sched::get_current(), next);
-    }
-    let stack_top = unsafe { (*next).stack as u64 };
-    if stack_top == 0 {
-        return;
-    }
-    let Some(stack_bottom) = stack_top.checked_sub(crate::kernel::sched::KTHREAD_STACK_SIZE as u64)
-    else {
-        return;
-    };
-    if !crate::mm::vmalloc::is_vmalloc_addr(stack_bottom as *const u8) {
-        return;
-    }
-
     let current = unsafe { crate::kernel::sched::get_current() };
     if current.is_null() {
         return;
     }
-    let mm = unsafe {
-        if !(*current).mm.is_null() {
-            (*current).mm
-        } else {
-            (*current).active_mm
+    unsafe {
+        prepare_switch_stack_canaries(current, next);
+    }
+
+    // The incoming stack must exist in the currently loaded PGD until the
+    // assembly stub changes RSP. A subsequent user-mm switch synchronizes the
+    // complete vmalloc slot into the incoming PGD before loading CR3.
+    let stack_top = unsafe { (*next).stack as u64 };
+    if let Some(stack_bottom) =
+        stack_top.checked_sub(crate::kernel::sched::KTHREAD_STACK_SIZE as u64)
+        && crate::mm::vmalloc::is_vmalloc_addr(stack_bottom as *const u8)
+    {
+        let mm = unsafe { task_active_mm(current) };
+        if !mm.is_null() {
+            unsafe {
+                crate::mm::vmalloc::sync_vmalloc_pgd_slot_to_mm(
+                    mm,
+                    stack_bottom,
+                    crate::kernel::sched::KTHREAD_STACK_SIZE,
+                );
+            }
         }
-    };
-    if !mm.is_null() {
-        unsafe {
-            crate::mm::vmalloc::sync_vmalloc_pgd_slot_to_mm(
-                mm,
-                stack_bottom,
-                crate::kernel::sched::KTHREAD_STACK_SIZE,
-            );
-        }
+    }
+
+    // Linux performs active_mm/CR3 switching in context_switch(), before
+    // `switch_to()` changes the kernel stack.
+    unsafe {
+        prepare_switch_mm(current, next);
     }
 }
 
@@ -190,6 +297,142 @@ pub unsafe fn prepare_switch_to_task(next: *mut TaskStruct) {
         }
     }
 }
+
+#[cfg(not(test))]
+unsafe fn task_active_mm(task: *mut TaskStruct) -> *mut crate::mm::mm_types::MmStruct {
+    if task.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        if !(*task).mm.is_null() {
+            (*task).mm
+        } else {
+            (*task).active_mm
+        }
+    }
+}
+
+#[cfg(not(test))]
+unsafe fn publish_mm_drop(cpu: usize, mm: *mut crate::mm::mm_types::MmStruct) {
+    if mm.is_null() {
+        return;
+    }
+    let installed =
+        PREV_MM_TO_DROP[cpu].compare_exchange(0, mm as usize, Ordering::AcqRel, Ordering::Acquire);
+    assert!(
+        installed.is_ok(),
+        "context switch already carries an undropped active_mm"
+    );
+}
+
+#[cfg(not(test))]
+unsafe fn load_user_mm(cpu: usize, mm: *mut crate::mm::mm_types::MmStruct) {
+    assert!(!mm.is_null(), "load_user_mm requires an mm");
+
+    // Linux keys the overwhelmingly common same-mm path off the per-CPU
+    // loaded_mm tracker. It does not read CR3 in production: tlb.c explicitly
+    // keeps that expensive check under CONFIG_DEBUG_VM. With no-op lazy TLB,
+    // this also preserves a borrowed mm without a needless CR3 reload when a
+    // user task resumes after a kernel thread.
+    if crate::arch::x86::mm::tlb::loaded_mm_matches(cpu as u32, mm) {
+        return;
+    }
+
+    let pgd = unsafe { (*mm).pgd as u64 };
+    let pgd_phys = crate::arch::x86::mm::paging::direct_map_virt_to_phys(pgd)
+        .filter(|phys| phys & (crate::arch::x86::mm::paging::PAGE_SIZE - 1) == 0)
+        .unwrap_or_else(|| panic!("load_user_mm: mm PGD is outside the aligned direct map"));
+    unsafe {
+        crate::mm::vmalloc::sync_vmalloc_to_mm(mm);
+    }
+
+    unsafe {
+        // Linux publishes LOADED_MM_SWITCHING before changing CR3 so a
+        // concurrent shootdown conservatively targets this CPU regardless
+        // of whether the old or new address space is currently loaded.
+        crate::arch::x86::mm::tlb::set_active_mm_switching(cpu as u32);
+        core::sync::atomic::fence(Ordering::SeqCst);
+        core::arch::asm!(
+            "mov cr3, {0}",
+            in(reg) pgd_phys,
+            options(nostack, preserves_flags)
+        );
+        crate::arch::x86::mm::tlb::set_active_mm(cpu as u32, mm);
+    }
+}
+
+/// Linux `context_switch()` active_mm transitions.
+///
+/// - user -> kernel: borrow and take one lazy `mm_count` reference;
+/// - kernel -> kernel: transfer that reference;
+/// - kernel -> user: load user CR3 and defer the lazy drop until the new stack;
+/// - user -> user: load the incoming user CR3 with no lazy refcount traffic.
+#[cfg(not(test))]
+unsafe fn prepare_switch_mm(prev: *mut TaskStruct, next: *mut TaskStruct) {
+    let prev_mm = unsafe { (*prev).mm };
+    let next_mm = unsafe { (*next).mm };
+    let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number();
+
+    match classify_mm_switch(prev_mm, next_mm) {
+        MmSwitchKind::UserToKernel => {
+            let borrowed = unsafe { task_active_mm(prev) };
+            debug_assert!(
+                unsafe { (*next).active_mm.is_null() },
+                "non-current kernel task retained active_mm"
+            );
+            unsafe {
+                (*next).active_mm = borrowed;
+                if !borrowed.is_null() {
+                    (*borrowed).mmdrop_get();
+                }
+                // Linux explicitly permits enter_lazy_tlb() to do nothing.
+                // Keep the borrowed CR3 targetable by shootdowns; this avoids
+                // a full CR3 reload on every kthread round trip until Lupos has
+                // Linux's per-mm TLB generations.
+                crate::arch::x86::mm::tlb::set_active_mm(cpu as u32, borrowed);
+            }
+        }
+        MmSwitchKind::KernelToKernel => {
+            let borrowed = unsafe { task_active_mm(prev) };
+            debug_assert!(
+                unsafe { (*next).active_mm.is_null() },
+                "non-current kernel task retained active_mm"
+            );
+            unsafe {
+                (*next).active_mm = borrowed;
+                (*prev).active_mm = core::ptr::null_mut();
+                crate::arch::x86::mm::tlb::set_active_mm(cpu as u32, borrowed);
+            }
+        }
+        MmSwitchKind::KernelToUser => {
+            let borrowed = unsafe { task_active_mm(prev) };
+            unsafe {
+                (*next).active_mm = next_mm;
+                load_user_mm(cpu, next_mm);
+                (*prev).active_mm = core::ptr::null_mut();
+                publish_mm_drop(cpu, borrowed);
+            }
+        }
+        MmSwitchKind::UserToUser => unsafe {
+            (*next).active_mm = next_mm;
+            load_user_mm(cpu, next_mm);
+        },
+    }
+}
+
+#[cfg(not(test))]
+unsafe fn finish_switch_mm_drop() {
+    let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number();
+    let mm = PREV_MM_TO_DROP[cpu].swap(0, Ordering::AcqRel) as *mut crate::mm::mm_types::MmStruct;
+    if !mm.is_null() {
+        unsafe {
+            crate::mm::fork::mmdrop(mm);
+        }
+    }
+}
+
+#[cfg(test)]
+unsafe fn finish_switch_mm_drop() {}
 
 fn fresh_stack_canary() -> u64 {
     let canary = crate::kernel::syscalls::next_random_u64() & 0xffff_ffff_ffff_ff00;
@@ -353,12 +596,6 @@ pub unsafe extern "C" fn __switch_to_asm(
 /// `prev` — returned to `schedule()` via RAX so that `finish_task_switch()`
 /// (future milestone) can release reference counts.
 ///
-/// # TODO (M22)
-/// - `load_TLS(next)`: write next's three TLS GDT entries into the GDT.
-/// - GS base and selector switching for nontrivial GS users.
-/// - Stack-protector canary update.
-/// - FPU state switch.
-///
 /// # Safety
 /// Must be called immediately after `__switch_to_asm` with the kernel stack
 /// already switched to `next`'s stack.
@@ -367,12 +604,27 @@ pub unsafe extern "C" fn __switch_to(
     prev: *mut TaskStruct,
     next: *mut TaskStruct,
 ) -> *mut TaskStruct {
+    // Linux process_64.c starts __switch_to() with switch_fpu(). The outgoing
+    // hardware image is still live even though __switch_to_asm already changed
+    // the kernel stack.
+    unsafe {
+        crate::arch::x86::kernel::fpu::switch_fpu(prev, next);
+    }
+
     // Linux saves FS/GS before loading the next task's TLS/segment state:
     // vendor/linux/arch/x86/kernel/process_64.c `save_fsgs()` and
     // `x86_fsgsbase_load()`. Lupos currently uses FS base for libc TLS, so
     // preserving it across involuntary context switches is mandatory.
     unsafe {
         save_fsgs(prev);
+    }
+
+    // Linux must install next->thread.tls_array before any segment selector is
+    // restored, because selectors 0x63/0x6b/0x73 resolve through these slots.
+    let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number();
+    unsafe {
+        crate::arch::x86::kernel::gdt::load_tls(&(*next).thread, cpu);
+        load_fsgs(prev, next);
     }
 
     // 1. Update TSS.RSP0 to the top of next's kernel stack so that the next
@@ -391,20 +643,6 @@ pub unsafe extern "C" fn __switch_to(
     unsafe {
         crate::arch::x86::kernel::tss::set_rsp0(stack_top);
     }
-    unsafe {
-        load_task_cr3(next);
-    }
-    unsafe {
-        load_fsgs(next);
-    }
-    unsafe {
-        let mm = if !(*next).mm.is_null() {
-            (*next).mm
-        } else {
-            (*next).active_mm
-        };
-        crate::arch::x86::mm::tlb::set_active_mm(crate::kernel::sched::current_cpu(), mm);
-    }
 
     // 2. Update the per-CPU current_task pointer so that `get_current()`
     //    returns `next` from this point forward on this CPU.
@@ -412,6 +650,7 @@ pub unsafe extern "C" fn __switch_to(
     //    Ref: Linux process_64.c `raw_cpu_write(current_task, next_p)`
     unsafe {
         crate::kernel::sched::set_current(next);
+        finish_switch_mm_drop();
     }
 
     // Return `prev` so the caller knows which task just stopped running.
@@ -427,19 +666,144 @@ unsafe fn save_fsgs(task: *mut TaskStruct) {
     }
 
     unsafe {
-        (*task).thread.fsbase =
-            crate::arch::x86::kernel::msr::read(crate::arch::x86::kernel::msr::MSR_FS_BASE);
-        // While we run in kernel context the user's GS base lives in
-        // KERNEL_GS_BASE (swapgs on entry stashed it there). Save it so an
-        // involuntary switch does not clobber an ARCH_SET_GS user's GS base.
-        // Ref: Linux process_64.c `save_fsgs()` / `save_base_legacy()`.
-        (*task).thread.gsbase =
-            crate::arch::x86::kernel::msr::read(crate::arch::x86::kernel::msr::MSR_KERNEL_GS_BASE);
+        let fsindex = crate::arch::x86::kernel::gdt::read_fs();
+        let gsindex = crate::arch::x86::kernel::gdt::read_gs();
+        (*task).thread.fsindex = fsindex;
+        (*task).thread.gsindex = gsindex;
+
+        // Lupos does not enable CR4.FSGSBASE. Match Linux save_base_legacy():
+        // selector zero is the overwhelmingly common 64-bit TLS case and its
+        // task-thread base is already authoritative, so avoid two RDMSRs on
+        // every switch. For every nonzero selector Linux's save_base_legacy()
+        // records zero: selectors 1..=3 have base zero and selectors >3 get
+        // their base from the descriptor that load_TLS() installs.
+        if fsindex != 0 {
+            (*task).thread.fsbase = 0;
+        }
+        if gsindex != 0 {
+            (*task).thread.gsbase = 0;
+        }
     }
 }
 
 #[cfg(test)]
 unsafe fn save_fsgs(_task: *mut TaskStruct) {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyLoadPlan {
+    None,
+    Selector,
+    Base,
+    SelectorAndBase,
+}
+
+const fn selector_after_tls_load(
+    selector: u16,
+    tls: [crate::kernel::thread::DescStruct; 3],
+) -> u16 {
+    // A GDT selector has TI clear. Linux's exception-table segment loaders
+    // turn a selector whose newly installed descriptor is empty into zero.
+    if selector & 0x4 == 0 {
+        let index = (selector >> 3) as usize;
+        if index >= crate::arch::x86::kernel::gdt::GDT_ENTRY_TLS_MIN
+            && index <= crate::arch::x86::kernel::gdt::GDT_ENTRY_TLS_MAX
+            && tls[index - crate::arch::x86::kernel::gdt::GDT_ENTRY_TLS_MIN].0 == 0
+        {
+            return 0;
+        }
+    }
+    selector
+}
+
+const fn legacy_load_plan(
+    prev_index: u16,
+    prev_base: u64,
+    next_index: u16,
+    next_base: u64,
+) -> LegacyLoadPlan {
+    if next_index <= 3 {
+        if next_base == 0 {
+            if prev_index != 0 || next_index != 0 || prev_base != 0 {
+                LegacyLoadPlan::Selector
+            } else {
+                LegacyLoadPlan::None
+            }
+        } else if prev_index != next_index {
+            LegacyLoadPlan::SelectorAndBase
+        } else {
+            LegacyLoadPlan::Base
+        }
+    } else {
+        LegacyLoadPlan::Selector
+    }
+}
+
+const fn null_seg_bug_requires_two_loads(
+    next_index: u16,
+    next_base: u64,
+    null_seg_bug: bool,
+) -> bool {
+    null_seg_bug && next_index <= 3 && next_base == 0
+}
+
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+enum FsgsSelector {
+    Fs,
+    Gs,
+}
+
+#[cfg(not(test))]
+unsafe fn load_user_selector(which: FsgsSelector, selector: u16) {
+    unsafe {
+        match which {
+            FsgsSelector::Fs => crate::arch::x86::kernel::gdt::load_fs(selector),
+            FsgsSelector::Gs => crate::arch::x86::kernel::gdt::load_gs_index(selector),
+        }
+    }
+}
+
+#[cfg(not(test))]
+unsafe fn load_seg_legacy(
+    prev_index: u16,
+    prev_base: u64,
+    next_index: u16,
+    next_base: u64,
+    null_seg_bug: bool,
+    which: FsgsSelector,
+) {
+    // Linux uses X86_BUG_NULL_SEG to decide whether a null selector needs a
+    // USER_DS intermediate load. Lupos does not yet carry bug bits, so apply
+    // the architectural workaround to AMD/Hygon CPUs. Linux performs both
+    // loads even when all saved values are zero; that is the case where the
+    // workaround is most important because a stale hidden base may remain.
+    if null_seg_bug_requires_two_loads(next_index, next_base, null_seg_bug) {
+        unsafe {
+            load_user_selector(which, crate::arch::x86::kernel::gdt::sel::USER_DS);
+            load_user_selector(which, next_index);
+        }
+        return;
+    }
+
+    let plan = legacy_load_plan(prev_index, prev_base, next_index, next_base);
+    if matches!(
+        plan,
+        LegacyLoadPlan::Selector | LegacyLoadPlan::SelectorAndBase
+    ) {
+        unsafe {
+            load_user_selector(which, next_index);
+        }
+    }
+    if matches!(plan, LegacyLoadPlan::Base | LegacyLoadPlan::SelectorAndBase) {
+        let msr = match which {
+            FsgsSelector::Fs => crate::arch::x86::kernel::msr::MSR_FS_BASE,
+            FsgsSelector::Gs => crate::arch::x86::kernel::msr::MSR_KERNEL_GS_BASE,
+        };
+        unsafe {
+            crate::arch::x86::kernel::msr::write(msr, next_base);
+        }
+    }
+}
 
 /// Snapshot the current task's live user FS/GS bases before copying thread
 /// state.  With FSGSBASE enabled userspace may change either base directly, so
@@ -452,70 +816,70 @@ pub(crate) unsafe fn current_save_fsgs() {
     if task.is_null() {
         return;
     }
+    let flags = crate::kernel::locking::irqflags::local_irq_save();
     unsafe {
         save_fsgs(task);
     }
+    crate::kernel::locking::irqflags::local_irq_restore(flags);
 }
 
 #[cfg(not(test))]
-unsafe fn load_fsgs(task: *mut TaskStruct) {
-    if task.is_null() {
+unsafe fn load_fsgs(prev: *mut TaskStruct, next: *mut TaskStruct) {
+    if prev.is_null() || next.is_null() {
         return;
     }
 
     unsafe {
-        crate::arch::x86::kernel::msr::write(
-            crate::arch::x86::kernel::msr::MSR_FS_BASE,
-            (*task).thread.fsbase,
-        );
-        // Restore the incoming task's user GS base into KERNEL_GS_BASE; the
-        // matching swapgs on the next ring-0 → ring-3 transition makes it the
-        // active GS base in user mode.
-        crate::arch::x86::kernel::msr::write(
-            crate::arch::x86::kernel::msr::MSR_KERNEL_GS_BASE,
-            (*task).thread.gsbase,
-        );
-    }
-}
+        let next_tls = (*next).thread.tls_array;
+        let prev_es = crate::arch::x86::kernel::gdt::read_es();
+        (*prev).thread.es = prev_es;
+        let next_es = selector_after_tls_load((*next).thread.es, next_tls);
+        if next_es != 0 || prev_es != 0 {
+            crate::arch::x86::kernel::gdt::load_es(next_es);
+        }
+        let prev_ds = crate::arch::x86::kernel::gdt::read_ds();
+        (*prev).thread.ds = prev_ds;
+        let next_ds = selector_after_tls_load((*next).thread.ds, next_tls);
+        if next_ds != 0 || prev_ds != 0 {
+            crate::arch::x86::kernel::gdt::load_ds(next_ds);
+        }
 
-#[cfg(test)]
-unsafe fn load_fsgs(_task: *mut TaskStruct) {}
-
-#[cfg(not(test))]
-unsafe fn load_task_cr3(task: *mut TaskStruct) {
-    if task.is_null() {
-        return;
-    }
-    let mm = unsafe {
-        if !(*task).mm.is_null() {
-            (*task).mm
+        let saved_fsindex = (*next).thread.fsindex;
+        let next_fsindex = selector_after_tls_load(saved_fsindex, next_tls);
+        let next_fsbase = if next_fsindex == saved_fsindex {
+            (*next).thread.fsbase
         } else {
-            (*task).active_mm
-        }
-    };
-    if mm.is_null() {
-        return;
-    }
-    unsafe {
-        crate::mm::vmalloc::sync_vmalloc_to_mm(mm);
-    }
-    let pgd = unsafe { (*mm).pgd as u64 };
-    if let Some(pgd_phys) = crate::arch::x86::mm::paging::virt_to_phys(pgd) {
-        let current = crate::arch::x86::mm::paging::read_cr3();
-        if current != pgd_phys {
-            unsafe {
-                core::arch::asm!(
-                    "mov cr3, {0}",
-                    in(reg) pgd_phys,
-                    options(nostack, preserves_flags)
-                );
-            }
-        }
+            0
+        };
+        let null_seg_bug = cpu_has_null_seg_bug();
+        load_seg_legacy(
+            (*prev).thread.fsindex,
+            (*prev).thread.fsbase,
+            next_fsindex,
+            next_fsbase,
+            null_seg_bug,
+            FsgsSelector::Fs,
+        );
+        let saved_gsindex = (*next).thread.gsindex;
+        let next_gsindex = selector_after_tls_load(saved_gsindex, next_tls);
+        let next_gsbase = if next_gsindex == saved_gsindex {
+            (*next).thread.gsbase
+        } else {
+            0
+        };
+        load_seg_legacy(
+            (*prev).thread.gsindex,
+            (*prev).thread.gsbase,
+            next_gsindex,
+            next_gsbase,
+            null_seg_bug,
+            FsgsSelector::Gs,
+        );
     }
 }
 
 #[cfg(test)]
-unsafe fn load_task_cr3(_task: *mut TaskStruct) {}
+unsafe fn load_fsgs(_prev: *mut TaskStruct, _next: *mut TaskStruct) {}
 
 #[cfg(test)]
 mod tests {
@@ -549,6 +913,66 @@ mod tests {
         let return_addr_slot = 1usize;
         let frame_size = (callee_saved_regs + return_addr_slot) * 8;
         assert_eq!(frame_size, 56);
+    }
+
+    #[test]
+    fn legacy_fsgs_load_plan_matches_linux_selector_base_ordering() {
+        // Origin: vendor/linux/arch/x86/kernel/process_64.c
+        // `load_seg_legacy`.
+        assert_eq!(legacy_load_plan(0, 0, 0, 0), LegacyLoadPlan::None);
+        assert_eq!(legacy_load_plan(0x63, 0, 0, 0), LegacyLoadPlan::Selector);
+        assert_eq!(legacy_load_plan(0, 0, 0, 0x1234), LegacyLoadPlan::Base);
+        assert_eq!(
+            legacy_load_plan(0x63, 0, 0, 0x1234),
+            LegacyLoadPlan::SelectorAndBase
+        );
+        assert_eq!(legacy_load_plan(0, 0x1234, 0, 0), LegacyLoadPlan::Selector);
+        assert_eq!(legacy_load_plan(0, 0, 0x6b, 0), LegacyLoadPlan::Selector);
+        assert!(
+            null_seg_bug_requires_two_loads(0, 0, true),
+            "Linux's AMD null-segment workaround must not skip the all-zero case"
+        );
+        assert!(!null_seg_bug_requires_two_loads(0, 0, false));
+        assert!(!null_seg_bug_for_vendor(
+            crate::arch::x86::kernel::cpu::CpuVendor::Intel
+        ));
+        assert!(null_seg_bug_for_vendor(
+            crate::arch::x86::kernel::cpu::CpuVendor::Amd
+        ));
+        assert!(null_seg_bug_for_vendor(
+            crate::arch::x86::kernel::cpu::CpuVendor::Hygon
+        ));
+
+        let empty = [crate::kernel::thread::DescStruct(0); 3];
+        let populated = [
+            crate::kernel::thread::DescStruct(1),
+            crate::kernel::thread::DescStruct(2),
+            crate::kernel::thread::DescStruct(3),
+        ];
+        assert_eq!(selector_after_tls_load(0x63, empty), 0);
+        assert_eq!(selector_after_tls_load(0x63, populated), 0x63);
+        assert_eq!(selector_after_tls_load(0x7, empty), 0x7);
+    }
+
+    #[test]
+    fn active_mm_transition_classifies_all_linux_context_switch_cases() {
+        let user_a = 0x1000usize as *mut crate::mm::mm_types::MmStruct;
+        let user_b = 0x2000usize as *mut crate::mm::mm_types::MmStruct;
+        let kernel = core::ptr::null_mut();
+
+        assert_eq!(classify_mm_switch(user_a, user_b), MmSwitchKind::UserToUser);
+        assert_eq!(
+            classify_mm_switch(user_a, kernel),
+            MmSwitchKind::UserToKernel
+        );
+        assert_eq!(
+            classify_mm_switch(kernel, user_b),
+            MmSwitchKind::KernelToUser
+        );
+        assert_eq!(
+            classify_mm_switch(kernel, kernel),
+            MmSwitchKind::KernelToKernel
+        );
     }
 
     #[test]

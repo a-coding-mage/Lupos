@@ -3,9 +3,10 @@
 //! test-origin: linux:vendor/linux/kernel/sched
 //! Nice → weight tables for CFS — verbatim from `vendor/linux/kernel/sched/core.c`.
 //!
-//! `SCHED_PRIO_TO_WEIGHT[nice + 20]` gives the integer load weight Linux uses
-//! when computing fair share.  Weight ratio between nice 0 and nice 19 is
-//! 1024 / 15 ≈ 68× (Linux documentation rounds this to "≈10% per nice level").
+//! `SCHED_PRIO_TO_WEIGHT[nice + 20]` gives Linux's raw task weight.  On the
+//! generic x86_64 target `scale_load()` shifts that value left by 10 before it
+//! is stored in `sched_entity::load`; the fair-share ratio remains
+//! 1024 / 15 ≈ 68×.
 //!
 //! `SCHED_PRIO_TO_WMULT[nice + 20]` is the precomputed `2^32 / weight` used by
 //! `__calc_delta` to avoid a 64-bit divide on the fast path.
@@ -37,12 +38,31 @@ pub const DEFAULT_PRIO: i32 = MAX_RT_PRIO + NICE_WIDTH / 2; // 120
 
 pub const SCHED_FIXEDPOINT_SHIFT: u32 = 10;
 pub const SCHED_FIXEDPOINT_SCALE: u64 = 1u64 << SCHED_FIXEDPOINT_SHIFT;
-/// Linux defaults `NICE_0_LOAD_SHIFT = SCHED_FIXEDPOINT_SHIFT`.
-pub const NICE_0_LOAD_SHIFT: u32 = SCHED_FIXEDPOINT_SHIFT;
+/// Linux `CONFIG_64BIT` raises task-load resolution by another 10 bits.
+pub const NICE_0_LOAD_SHIFT: u32 = SCHED_FIXEDPOINT_SHIFT + SCHED_FIXEDPOINT_SHIFT;
 pub const NICE_0_LOAD: u64 = 1u64 << NICE_0_LOAD_SHIFT;
 
 /// Idle class weight (Linux `WEIGHT_IDLEPRIO`).
 pub const WEIGHT_IDLEPRIO: u64 = 3;
+/// Precomputed inverse for `WEIGHT_IDLEPRIO` (Linux `WMULT_IDLEPRIO`).
+pub const WMULT_IDLEPRIO: u32 = 1_431_655_765;
+
+/// Linux x86_64 `scale_load()` (`CONFIG_64BIT`).
+#[inline]
+pub const fn scale_load(weight: u64) -> u64 {
+    weight << SCHED_FIXEDPOINT_SHIFT
+}
+
+/// Linux x86_64 `scale_load_down()` (`CONFIG_64BIT`).
+#[inline]
+pub const fn scale_load_down(weight: u64) -> u64 {
+    if weight == 0 {
+        0
+    } else {
+        let down = weight >> SCHED_FIXEDPOINT_SHIFT;
+        if down < 2 { 2 } else { down }
+    }
+}
 
 // ── Nice-to-weight tables (verbatim from Linux core.c) ───────────────────────
 
@@ -68,7 +88,7 @@ pub const SCHED_PRIO_TO_WMULT: [u32; 40] = [
 #[inline]
 pub fn nice_to_weight(nice: i32) -> u64 {
     let n = nice.clamp(MIN_NICE, MAX_NICE);
-    SCHED_PRIO_TO_WEIGHT[(n - MIN_NICE) as usize]
+    scale_load(SCHED_PRIO_TO_WEIGHT[(n - MIN_NICE) as usize])
 }
 
 /// Convert a nice value (-20..19) into a precomputed inverse weight.
@@ -94,13 +114,13 @@ pub const fn prio_to_nice(prio: i32) -> i32 {
 /// transform actual CPU time into virtual runtime.
 ///
 /// Equivalent to Linux `__calc_delta(delta_exec, NICE_0_LOAD, &se->load)`.
+/// As in Linux, the entity load weight must be nonzero.
 #[inline]
 pub fn calc_delta_fair(delta_exec: u64, weight: u64) -> u64 {
-    if weight == 0 {
+    if weight == NICE_0_LOAD {
         return delta_exec;
     }
-    // For NICE_0 (weight=1024) this is the identity, matching Linux.
-    delta_exec.saturating_mul(NICE_0_LOAD) / weight
+    delta_exec.wrapping_mul(NICE_0_LOAD) / weight
 }
 
 #[cfg(test)]
@@ -108,19 +128,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nice_0_weight_is_1024() {
-        assert_eq!(nice_to_weight(0), 1024);
+    fn x86_64_nice_0_load_matches_linux_config_64bit() {
+        // Linux sched.h raises load resolution by SCHED_FIXEDPOINT_SHIFT on
+        // CONFIG_64BIT: scale_load(1024) == NICE_0_LOAD == 1 << 20.
+        assert_eq!(SCHED_FIXEDPOINT_SHIFT, 10);
+        assert_eq!(NICE_0_LOAD_SHIFT, 20);
+        assert_eq!(NICE_0_LOAD, 1_048_576);
         assert_eq!(nice_to_weight(0), NICE_0_LOAD);
     }
 
     #[test]
-    fn nice_minus20_weight_is_88761() {
-        assert_eq!(nice_to_weight(-20), 88761);
+    fn x86_64_nice_minus20_load_is_scaled() {
+        assert_eq!(nice_to_weight(-20), 88761 << SCHED_FIXEDPOINT_SHIFT);
     }
 
     #[test]
-    fn nice_19_weight_is_15() {
-        assert_eq!(nice_to_weight(19), 15);
+    fn x86_64_nice_19_load_is_scaled() {
+        assert_eq!(nice_to_weight(19), 15 << SCHED_FIXEDPOINT_SHIFT);
     }
 
     #[test]
@@ -133,7 +157,7 @@ mod tests {
 
     #[test]
     fn calc_delta_fair_nice0_is_identity() {
-        // delta * 1024 / 1024 = delta
+        // Linux bypasses __calc_delta when weight == NICE_0_LOAD.
         assert_eq!(calc_delta_fair(1_000_000, NICE_0_LOAD), 1_000_000);
     }
 

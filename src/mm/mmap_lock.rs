@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/mm/mmap_lock.c
 //! test-origin: linux:vendor/linux/mm/mmap_lock.c
 //! Semantic wrappers for Linux `mmap_lock` and per-VMA lock entry points.
@@ -12,6 +12,100 @@ use spin::Mutex;
 
 use crate::kernel::module::{export_symbol, find_symbol};
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
+
+/// RAII holder for a per-mm mmap read lock.
+#[must_use = "dropping the guard immediately releases mmap read exclusion"]
+pub struct MmapReadGuard {
+    mm: *mut MmStruct,
+}
+
+impl MmapReadGuard {
+    /// Acquire `mm->mmap_lock` for reading.
+    ///
+    /// # Safety
+    /// `mm` must be non-null and remain valid until the returned guard drops.
+    pub unsafe fn lock(mm: *mut MmStruct) -> Self {
+        debug_assert!(!mm.is_null());
+        unsafe {
+            (*mm).mmap_lock.read_lock();
+        }
+        Self { mm }
+    }
+}
+
+impl Drop for MmapReadGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.mm).mmap_lock.read_unlock();
+        }
+    }
+}
+
+/// RAII holder for a real per-mm mmap write lock.
+///
+/// The raw pointer is intentional: callers need to pass `&mut MmStruct` into
+/// the Linux-shaped `do_*` implementation while the lock field inside that
+/// same object remains held. The caller must therefore guarantee that `mm`
+/// stays alive until this guard is dropped.
+#[must_use = "dropping the guard immediately releases mmap write exclusion"]
+pub struct MmapWriteGuard {
+    mm: *mut MmStruct,
+}
+
+impl MmapWriteGuard {
+    /// Acquire `mm->mmap_lock` for writing.
+    ///
+    /// # Safety
+    /// `mm` must be non-null and remain valid until the returned guard drops.
+    pub unsafe fn lock(mm: *mut MmStruct) -> Self {
+        debug_assert!(!mm.is_null());
+        unsafe {
+            (*mm).mmap_lock.write_lock();
+        }
+        Self { mm }
+    }
+
+    /// Attempt to acquire `mm->mmap_lock` without waiting.
+    ///
+    /// # Safety
+    /// `mm` must be non-null and remain valid until the returned guard drops.
+    pub unsafe fn try_lock(mm: *mut MmStruct) -> Option<Self> {
+        if mm.is_null() || !unsafe { (*mm).mmap_lock.try_write_lock() } {
+            None
+        } else {
+            Some(Self { mm })
+        }
+    }
+
+    /// Downgrade an exclusive lock to a read lock without an unlocked window.
+    ///
+    /// This is the transition used by Linux's `lock_mm_and_find_vma()` after
+    /// expanding a downward-growing stack.
+    pub fn downgrade(self) -> MmapReadGuard {
+        let mm = self.mm;
+        unsafe {
+            (*mm).mmap_lock.write_downgrade();
+        }
+        core::mem::forget(self);
+        MmapReadGuard { mm }
+    }
+}
+
+impl Drop for MmapWriteGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.mm).mmap_lock.write_unlock();
+        }
+    }
+}
+
+fn mm_from_opaque(mm: *mut u8) -> Option<&'static MmStruct> {
+    if mm.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(mm as *const MmStruct) })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MmapLockState {
@@ -120,42 +214,71 @@ pub fn mm_lock_seqcount_begin(mm: *mut u8) -> u64 {
 pub fn mm_lock_seqcount_end(_mm: *mut u8, _seq: u64) {}
 
 pub fn mmap_read_lock_killable(mm: *mut u8) -> i32 {
+    let Some(real_lock) = mm_from_opaque(mm).map(|mm| &mm.mmap_lock) else {
+        return -22;
+    };
+    if real_lock.is_write_locked() {
+        with_mm_state(mm, |state| state.contended = true);
+    }
+    real_lock.read_lock();
     with_mm_state(mm, |state| {
-        if state.writers != 0 {
-            state.contended = true;
-        }
         state.readers = state.readers.saturating_add(1);
     });
     0
 }
 
 pub fn mmap_read_trylock(mm: *mut u8) -> bool {
+    let Some(real_lock) = mm_from_opaque(mm).map(|mm| &mm.mmap_lock) else {
+        return false;
+    };
+    if !real_lock.try_read_lock() {
+        with_mm_state(mm, |state| state.contended = true);
+        return false;
+    }
     with_mm_state(mm, |state| {
-        if state.writers != 0 {
-            state.contended = true;
-            false
-        } else {
-            state.readers = state.readers.saturating_add(1);
-            true
-        }
-    })
+        state.readers = state.readers.saturating_add(1);
+    });
+    true
 }
 
 pub fn mmap_read_unlock_non_owner(mm: *mut u8) {
+    let Some(real_lock) = mm_from_opaque(mm).map(|mm| &mm.mmap_lock) else {
+        return;
+    };
     with_mm_state(mm, |state| {
         state.readers = state.readers.saturating_sub(1);
     });
+    real_lock.read_unlock();
 }
 
 pub fn mmap_write_lock_killable(mm: *mut u8) -> i32 {
+    let Some(real_lock) = mm_from_opaque(mm).map(|mm| &mm.mmap_lock) else {
+        return -22;
+    };
+    if real_lock.is_locked() {
+        with_mm_state(mm, |state| state.contended = true);
+    }
+    real_lock.write_lock();
     with_mm_state(mm, |state| {
-        if state.readers != 0 || state.writers != 0 {
-            state.contended = true;
-        }
         state.writers = state.writers.saturating_add(1);
         bump_seq(state);
     });
     0
+}
+
+pub fn mmap_write_trylock(mm: *mut u8) -> bool {
+    let Some(real_lock) = mm_from_opaque(mm).map(|mm| &mm.mmap_lock) else {
+        return false;
+    };
+    if !real_lock.try_write_lock() {
+        with_mm_state(mm, |state| state.contended = true);
+        return false;
+    }
+    with_mm_state(mm, |state| {
+        state.writers = state.writers.saturating_add(1);
+        bump_seq(state);
+    });
+    true
 }
 
 pub fn mmap_write_lock_nested(mm: *mut u8, _subclass: i32) {
@@ -163,11 +286,26 @@ pub fn mmap_write_lock_nested(mm: *mut u8, _subclass: i32) {
 }
 
 pub fn mmap_write_downgrade(mm: *mut u8) {
+    let Some(real_lock) = mm_from_opaque(mm).map(|mm| &mm.mmap_lock) else {
+        return;
+    };
+    real_lock.write_downgrade();
     with_mm_state(mm, |state| {
         state.writers = state.writers.saturating_sub(1);
         state.readers = state.readers.saturating_add(1);
         bump_seq(state);
     });
+}
+
+pub fn mmap_write_unlock(mm: *mut u8) {
+    let Some(real_lock) = mm_from_opaque(mm).map(|mm| &mm.mmap_lock) else {
+        return;
+    };
+    with_mm_state(mm, |state| {
+        state.writers = state.writers.saturating_sub(1);
+        bump_seq(state);
+    });
+    real_lock.write_unlock();
 }
 
 pub fn mmap_lock_is_contended(mm: *mut u8) -> bool {
@@ -179,15 +317,26 @@ pub fn mmap_lock_speculate_try_begin(mm: *mut u8) -> u64 {
 }
 
 pub fn mmap_lock_speculate_retry(mm: *mut u8, seq: u64) -> bool {
-    with_mm_state(mm, |state| state.seq != seq || state.writers != 0)
+    with_mm_state(mm, |state| state.seq != seq)
+        || mm_from_opaque(mm)
+            .map(|mm| mm.mmap_lock.is_write_locked())
+            .unwrap_or(false)
 }
 
 pub fn mmap_assert_locked(mm: *mut u8) {
-    debug_assert!(with_mm_state(mm, |state| state.readers != 0 || state.writers != 0));
+    debug_assert!(
+        mm_from_opaque(mm)
+            .map(|mm| mm.mmap_lock.is_locked())
+            .unwrap_or(false)
+    );
 }
 
 pub fn mmap_assert_write_locked(mm: *mut u8) {
-    debug_assert!(with_mm_state(mm, |state| state.writers != 0));
+    debug_assert!(
+        mm_from_opaque(mm)
+            .map(|mm| mm.mmap_lock.is_write_locked())
+            .unwrap_or(false)
+    );
 }
 
 pub fn vma_lock_init(vma: *mut u8) {
@@ -392,6 +541,8 @@ pub fn reset_for_tests() {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
     use crate::mm::list::ListHead;
     use crate::mm::test_lock::GLOBAL_HW_TEST_LOCK;
@@ -404,16 +555,70 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         reset_for_tests();
-        let mm = 0x1000usize as *mut u8;
+        let mut mm_box = Box::new(MmStruct::new(0));
+        let mm = (&mut *mm_box as *mut MmStruct).cast::<u8>();
 
         mm_lock_seqcount_init(mm);
         let seq = mmap_lock_speculate_try_begin(mm);
         assert_eq!(mmap_read_lock_killable(mm), 0);
-        assert_eq!(mmap_write_lock_killable(mm), 0);
+        assert!(!mmap_write_trylock(mm));
         assert!(mmap_lock_is_contended(mm));
+        mmap_read_unlock_non_owner(mm);
+        assert_eq!(mmap_write_lock_killable(mm), 0);
         assert!(mmap_lock_speculate_retry(mm, seq));
         mmap_write_downgrade(mm);
         mmap_read_unlock_non_owner(mm);
+    }
+
+    #[test]
+    fn mmap_write_guard_excludes_a_concurrent_writer() {
+        use std::sync::{Arc, mpsc};
+
+        let mm = Arc::new(MmStruct::new(0));
+        let mm_ptr = Arc::as_ptr(&mm) as *mut MmStruct;
+        let held = unsafe { MmapWriteGuard::lock(mm_ptr) };
+        let (result_tx, result_rx) = mpsc::sync_channel(0);
+        let (retry_tx, retry_rx) = mpsc::sync_channel(0);
+
+        let child_mm = Arc::clone(&mm);
+        let child = std::thread::spawn(move || {
+            let child_ptr = Arc::as_ptr(&child_mm) as *mut MmStruct;
+            let first = unsafe { MmapWriteGuard::try_lock(child_ptr) };
+            result_tx.send(first.is_some()).unwrap();
+            drop(first);
+
+            retry_rx.recv().unwrap();
+            let second = unsafe { MmapWriteGuard::try_lock(child_ptr) };
+            result_tx.send(second.is_some()).unwrap();
+            drop(second);
+        });
+
+        assert!(
+            !result_rx.recv().unwrap(),
+            "a second CPU acquired the same mm write lock"
+        );
+        drop(held);
+        retry_tx.send(()).unwrap();
+        assert!(
+            result_rx.recv().unwrap(),
+            "the mm write lock stayed held after its guard dropped"
+        );
+        child.join().unwrap();
+    }
+
+    #[test]
+    fn mmap_write_guards_are_scoped_to_one_mm() {
+        let mut first = Box::new(MmStruct::new(0));
+        let mut second = Box::new(MmStruct::new(0));
+        let first_guard = unsafe { MmapWriteGuard::lock(&mut *first) };
+        let second_guard = unsafe { MmapWriteGuard::try_lock(&mut *second) };
+
+        assert!(
+            second_guard.is_some(),
+            "an mmap writer on one mm serialized an unrelated address space"
+        );
+        drop(second_guard);
+        drop(first_guard);
     }
 
     #[test]

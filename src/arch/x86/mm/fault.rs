@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/mm/fault.c
 //! test-origin: linux:vendor/linux/arch/x86/mm/fault.c
 // x86-specific page-fault entry and dispatch.
@@ -26,6 +26,7 @@ use crate::mm::fault::{
     VM_FAULT_ERROR, VmFaultFlags, handle_mm_fault,
 };
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
+use crate::mm::mmap_lock::{MmapReadGuard, MmapWriteGuard};
 use crate::mm::vm_flags::{VM_EXEC, VM_GROWSDOWN, VM_READ, VM_WRITE};
 use crate::mm::vma::find_vma;
 
@@ -172,6 +173,40 @@ fn is_ioremap_fault_candidate(ec: u64, addr: u64) -> bool {
 // User-address fault
 // ---------------------------------------------------------------------------
 
+/// Reduced `lock_mm_and_find_vma()` for Lupos's current fault feature set.
+///
+/// The common path holds `mmap_lock` for reading across VMA lookup and
+/// `handle_mm_fault()`. A downward-growing stack follows Linux's fallback
+/// upgrade path: drop read, take write, repeat the lookup and checks, expand,
+/// then atomically downgrade to read.
+fn lock_mm_and_find_vma(
+    mm: *mut MmStruct,
+    addr: u64,
+) -> Option<(MmapReadGuard, *mut VmAreaStruct)> {
+    let read_guard = unsafe { MmapReadGuard::lock(mm) };
+    let vma = find_vma(unsafe { &*mm }, addr)?;
+    if unsafe { (*vma).vm_start <= addr } {
+        return Some((read_guard, vma));
+    }
+    if unsafe { (*vma).vm_flags & VM_GROWSDOWN == 0 } {
+        return None;
+    }
+
+    // Linux's non-atomic upgrade fallback deliberately revalidates the VMA
+    // after the unlocked window.
+    drop(read_guard);
+    let write_guard = unsafe { MmapWriteGuard::lock(mm) };
+    let vma = find_vma(unsafe { &*mm }, addr)?;
+    if unsafe { (*vma).vm_start > addr } {
+        if unsafe { (*vma).vm_flags & VM_GROWSDOWN == 0 }
+            || crate::mm::mm_public::expand_stack_locked(vma, addr) != 0
+        {
+            return None;
+        }
+    }
+    Some((write_guard.downgrade(), vma))
+}
+
 /// Handle a #PF whose faulting address is in user space (cr2 < TASK_SIZE_MAX).
 ///
 /// Ref: arch/x86/mm/fault.c — `do_user_addr_fault()`
@@ -207,32 +242,25 @@ fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
         return;
     }
 
-    // Look up the VMA containing (or just above) the faulting address.
-    let vma_opt = find_vma(unsafe { &*mm }, addr);
-    let vma = match vma_opt {
-        Some(v) => v,
+    // Linux enables interrupts before taking the sleepable mmap lock. A
+    // normal user fault necessarily interrupted an IF-enabled context.
+    const X86_EFLAGS_IF: u64 = 1 << 9;
+    if frame.rflags & X86_EFLAGS_IF == 0 {
+        bad_area(frame, ec, addr);
+        return;
+    }
+    crate::kernel::locking::local_irq_enable();
+
+    let (mmap_guard, vma) = match lock_mm_and_find_vma(mm, addr) {
+        Some(locked) => locked,
         None => {
             bad_area(frame, ec, addr);
             return;
         }
     };
 
-    // The faulting address may lie *below* the VMA start if the VMA can grow
-    // downward (e.g., a stack).  For non-growsdown VMAs it is a bad area.
-    if addr < unsafe { (*vma).vm_start } {
-        if unsafe { (*vma).vm_flags } & VM_GROWSDOWN == 0 {
-            bad_area(frame, ec, addr);
-            return;
-        }
-        if crate::mm::mm_public::expand_stack_locked(vma, addr) != 0
-            || addr < unsafe { (*vma).vm_start }
-        {
-            bad_area(frame, ec, addr);
-            return;
-        }
-    }
-
     if crate::mm::huge::hwpoison_fault_pfn_for_addr(addr).is_some() {
+        drop(mmap_guard);
         if is_user_mode_fault(frame, ec) && deliver_user_sigbus_hwpoison(frame, task, addr) {
             return;
         }
@@ -242,12 +270,14 @@ fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
 
     // Check that the access type is permitted by the VMA flags.
     if access_error(ec, unsafe { &*vma }) {
+        drop(mmap_guard);
         bad_area(frame, ec, addr);
         return;
     }
 
     // Run the generic demand-paging state machine.
     let ret: VmFaultFlags = handle_mm_fault(vma, addr, flags);
+    drop(mmap_guard);
     if ret & VM_FAULT_ERROR != 0 {
         bad_area(frame, ec, addr);
         return;
@@ -260,7 +290,14 @@ fn should_resched_after_user_fault(frame: &ExceptionFrame, ec: u64, task: *mut T
     if !is_user_mode_fault(frame, ec) || task.is_null() {
         return false;
     }
-    let need_resched = unsafe { (*task).thread_info.flags & TIF_NEED_RESCHED != 0 };
+    let need_resched = unsafe {
+        (*task)
+            .thread_info
+            .flags
+            .load(core::sync::atomic::Ordering::Acquire)
+            & TIF_NEED_RESCHED
+            != 0
+    };
     need_resched && crate::kernel::locking::preempt::preempt_count() == 0
 }
 
@@ -590,7 +627,9 @@ mod tests {
 
         assert!(!should_resched_after_user_fault(&frame, 0, task_ptr));
 
-        task.thread_info.flags |= TIF_NEED_RESCHED;
+        task.thread_info
+            .flags
+            .fetch_or(TIF_NEED_RESCHED, core::sync::atomic::Ordering::Release);
         assert!(should_resched_after_user_fault(&frame, 0, task_ptr));
 
         frame.cs = 0x8;

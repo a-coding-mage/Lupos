@@ -23,7 +23,7 @@ use crate::arch::x86::mm::paging::{
     _PAGE_PRESENT, _PAGE_PSE, PMD_SHIFT, PMD_SIZE, PTE_PFN_MASK, PUD_SHIFT, PUD_SIZE, pgprot_t,
     pmd_huge, pmd_t, pte_t, pud_huge, pud_t,
 };
-use crate::include::uapi::errno::{EINVAL, ENOENT, ENOMEM, EOPNOTSUPP};
+use crate::include::uapi::errno::{EINVAL, ENOENT, ENOMEM, EOPNOTSUPP, EOVERFLOW};
 use crate::mm::page::Page;
 use crate::mm::page_flags::{PG_HWPOISON, folio_order};
 
@@ -470,17 +470,46 @@ pub fn split_huge_page(id: u64) -> Result<usize, i32> {
     Ok(nr_pages)
 }
 
+/// Take another reference to a hugetlb reservation owned by a duplicated VMA.
+///
+/// Linux's `__split_vma()` duplicates the VMA and invokes `vm_ops->open()`;
+/// `hugetlb_vm_op_open()` then takes another reference on the private
+/// reservation map. Lupos represents that reservation by the hugetlb page ID,
+/// so VMA split paths call this before publishing the duplicate.
+///
+/// Ref: Linux `mm/vma.c` — `__split_vma()`; `mm/hugetlb.c` —
+/// `hugetlb_vm_op_open()`.
+pub fn retain_hugetlb_page(id: u64) -> Result<(), i32> {
+    let mut state = HUGE_STATE.lock();
+    let page = state
+        .pages
+        .iter_mut()
+        .find(|page| page.id == id && matches!(page.kind, HugePageKind::Hugetlb))
+        .ok_or(ENOENT)?;
+    page.refcount = page.refcount.checked_add(1).ok_or(EOVERFLOW)?;
+    Ok(())
+}
+
+/// Drop one VMA reference to a hugetlb reservation.
+///
+/// A split private hugetlb mapping has one reservation-map reference per VMA
+/// fragment in Linux. Return the modeled huge page to the pool only after the
+/// last fragment closes.
+///
+/// Ref: Linux `mm/hugetlb.c` — `hugetlb_vm_op_close()`.
 pub fn free_hugetlb_page(id: u64) -> Result<(), i32> {
     let mut state = HUGE_STATE.lock();
     let idx = state
         .pages
         .iter()
-        .position(|page| page.id == id)
+        .position(|page| page.id == id && matches!(page.kind, HugePageKind::Hugetlb))
         .ok_or(ENOENT)?;
-    let page = state.pages.swap_remove(idx);
-    if matches!(page.kind, HugePageKind::Hugetlb) {
-        state.pool_pages += page.nr_pages;
+    if state.pages[idx].refcount > 1 {
+        state.pages[idx].refcount -= 1;
+        return Ok(());
     }
+    let page = state.pages.swap_remove(idx);
+    state.pool_pages += page.nr_pages;
     Ok(())
 }
 
@@ -1431,6 +1460,49 @@ mod tests {
         assert!(huge_page(id).unwrap().split);
         assert_eq!(free_hugetlb_page(id), Ok(()));
         assert_eq!(huge_stats().pool_pages, HPAGE_PMD_NR);
+    }
+
+    /// Linux `__split_vma()` calls the hugetlb VMA open callback for the new
+    /// fragment, and each fragment's close callback drops one reservation-map
+    /// reference. The pool reservation is released by the final close only.
+    ///
+    /// Test origin: `vendor/linux/mm/vma.c::__split_vma()` and
+    /// `vendor/linux/mm/hugetlb.c::{hugetlb_vm_op_open,hugetlb_vm_op_close}`.
+    #[test]
+    fn hugetlb_split_reservation_survives_until_last_vma_close() {
+        let _guard = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        reset_for_tests();
+        configure_hugetlb_pool(HPAGE_PMD_NR);
+
+        let id = allocate_hugetlb_page(HPAGE_PMD_ORDER).unwrap();
+        assert_eq!(retain_hugetlb_page(id), Ok(()));
+        assert_eq!(huge_page(id).unwrap().refcount, 2);
+        assert_eq!(huge_stats().pool_pages, 0);
+
+        assert_eq!(free_hugetlb_page(id), Ok(()));
+        assert_eq!(huge_page(id).unwrap().refcount, 1);
+        assert_eq!(huge_stats().pool_pages, 0);
+
+        assert_eq!(free_hugetlb_page(id), Ok(()));
+        assert_eq!(huge_page(id), None);
+        assert_eq!(huge_stats().pool_pages, HPAGE_PMD_NR);
+    }
+
+    /// A stale VMA-private ID must fail cleanly instead of manufacturing an
+    /// ownership reference or panicking.
+    ///
+    /// Test origin: Linux `mm/hugetlb.c` private reservation-map kref
+    /// invariants exercised by `hugetlb_vm_op_open()`.
+    #[test]
+    fn hugetlb_retain_rejects_unknown_reservation() {
+        let _guard = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        reset_for_tests();
+
+        assert_eq!(retain_hugetlb_page(1), Err(ENOENT));
     }
 
     #[test]

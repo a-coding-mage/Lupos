@@ -66,7 +66,8 @@ pub const NOMINAL_INITIAL_COUNT: u32 = FALLBACK_INITIAL_COUNT;
 
 static LAPIC_TIMER_PERIOD: AtomicU32 = AtomicU32::new(0);
 
-/// Monotonic LAPIC timer tick counter, incremented by `on_tick()`.
+/// Monotonic system tick counter, advanced only by the designated timekeeper
+/// CPU.  Per-CPU LAPIC delivery counts live in `PER_CPU_TIMER_TICKS`.
 pub static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
 static PER_CPU_TIMER_TICKS: [AtomicU64; crate::kernel::sched::MAX_CPUS] =
@@ -297,14 +298,17 @@ pub unsafe fn init_ap() {
 /// Called from the IDT timer ISR (`idt::on_timer_interrupt`).
 #[inline]
 pub fn on_tick(frame: Option<&ExceptionFrame>) {
-    let cpu = crate::arch::x86::kernel::smp::current_cpu_id();
+    let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number();
     record_tick_for_cpu(cpu);
-    TIMER_TICKS.fetch_add(1, Ordering::Release);
-    crate::kernel::time::clockevents::tick_handle_periodic();
+    if crate::kernel::time::clockevents::tick_do_timer_cpu(cpu) {
+        TIMER_TICKS.fetch_add(1, Ordering::Release);
+    }
+    crate::kernel::time::clockevents::tick_handle_periodic_for_cpu(cpu);
     // Wake timed sleepers whose deadline has passed before the scheduler runs,
     // so a `schedule_timeout`/`msleep` returns promptly (event-driven) instead
-    // of the task busy-yielding to its deadline. Only the BSP runs tasks.
-    if cpu == 0 {
+    // of the task busy-yielding to its deadline. The timeout wheel is currently
+    // global, so the same CPU that owns jiffies is its sole expiry runner.
+    if crate::kernel::time::clockevents::tick_do_timer_cpu(cpu) {
         crate::kernel::time::sleep_timeout::sleep_timers_expire(
             crate::kernel::time::jiffies::jiffies(),
         );

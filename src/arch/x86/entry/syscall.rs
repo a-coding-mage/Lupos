@@ -12,9 +12,6 @@
 //! (`rcx==rip`, `r11==eflags`, `cs==USER_CS`, `ss==USER_DS`, RF/TF clear).
 //!
 //! Remaining work vs Linux for genuine `complete`:
-//!   * Per-CPU syscall scratch: the entry stub stores user RSP/RIP into slot 0
-//!     of `SYSCALL_USER_RSP[]` (single-CPU safe only). Linux uses GS-relative
-//!     per-CPU storage; needs per-CPU GS base before SMP syscall entry.
 //!   * x32 ABI dispatch (`do_syscall_x32`) is not implemented (x86-64 only).
 //!   * `check_pending_signals()` is a legacy no-op kept as an exported symbol;
 //!     the live exit path is `syscall_exit_slowpath()`, which delivers frames.
@@ -42,9 +39,9 @@
 //!
 //! # GDT layout requirement
 //!
-//! With STAR[63:48] = KERNEL_DS = 0x10 (see `gdt::sel`):
-//!   SYSRET SS = 0x10 + 8  = 0x18 → gdt[USER_DS] ✓
-//!   SYSRET CS = 0x10 + 16 = 0x20 → gdt[USER_CS] ✓
+//! With STAR[63:48] = USER32_CS = 0x23 (see `gdt::sel`):
+//!   SYSRET SS = 0x23 + 8  = 0x2b → gdt[USER_DS] ✓
+//!   SYSRET CS = 0x23 + 16 = 0x33 → gdt[USER_CS] ✓
 //!
 //! # References
 //!   AMD64 APM Vol. 2 §2.5 "SYSCALL and SYSRET Instructions"
@@ -67,22 +64,6 @@ use crate::kernel::trace::ring_buffer::{
     TRACE_RB, TRACE_SYSCALL_ENTER, TRACE_SYSCALL_EXIT, TraceEvent,
 };
 use crate::kernel::{audit, ptrace, sched};
-
-// ── Per-CPU scratch storage ──────────────────────────────────────────────────
-//
-// On syscall entry, we need to save the user RSP before switching to the kernel
-// stack. This static array (indexed by CPU) holds per-CPU scratch space for that.
-//
-// Accessed directly from assembly via:
-//   mov [rax + SYSCALL_USER_RSP_ARRAY], rsp   (to save)
-//   mov rsp, [rax + SYSCALL_USER_RSP_ARRAY]   (to restore)
-//
-// Where RAX = &SYSCALL_USER_RSP_ARRAY + (cpu_id * 8).
-
-const MAX_CPUS: usize = 64; // Must match MAX_CPUS in sched.rs
-static mut SYSCALL_USER_RSP: [u64; MAX_CPUS] = [0; MAX_CPUS];
-static mut SYSCALL_USER_RIP: [u64; MAX_CPUS] = [0; MAX_CPUS];
-static mut SYSCALL_ORIG_RAX: [u64; MAX_CPUS] = [0; MAX_CPUS];
 
 const ENOSYS: i64 = 38;
 const EPERM: i64 = 1;
@@ -109,7 +90,6 @@ const MSR_EFER: u32 = 0xC000_0080; // Extended Feature Enable Register
 const MSR_STAR: u32 = 0xC000_0081; // Segment selectors for SYSCALL/SYSRET
 const MSR_LSTAR: u32 = 0xC000_0082; // SYSCALL target RIP (Long mode, 64-bit)
 const MSR_FMASK: u32 = 0xC000_0084; // RFLAGS bits to clear on SYSCALL
-const MSR_FS_BASE: u32 = 0xC000_0100; // User FS base (x86-64 TLS)
 
 // ── EFER flags ───────────────────────────────────────────────────────────────
 
@@ -177,32 +157,26 @@ pub unsafe extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
         // Save the user entry context before we touch any registers.
         "swapgs",
-        // TODO: SMP-safe indexing (cpu id) — for now store into slot 0.
-        "mov qword ptr [rip + {user_rsp_array}], rsp",
-        "mov qword ptr [rip + {user_rip_array}], rcx",
-        "mov qword ptr [rip + {orig_rax_array}], rax",
-
-        // Switch to the current task's kernel stack (RSP0 is maintained by __switch_to()).
-        "lea rcx, [rip + {tss}]",
-        "mov rsp, [rcx + 4]",
+        // Linux uses the per-CPU TSS sp2 slot as scratch here.  Lupos keeps an
+        // equivalent GS-relative scratch slot and a pointer to the CPU-local
+        // TSS, whose RSP0 is maintained by __switch_to().
+        "mov qword ptr gs:[rip + {percpu_base} + {user_rsp_offset}], rsp",
+        "mov rsp, qword ptr gs:[rip + {percpu_base} + {syscall_tss_offset}]",
+        "mov rsp, qword ptr [rsp + 4]",
 
         // Construct a Linux-shaped `struct pt_regs` on the kernel stack.
         "push {user_ds}", // ss
-        "mov rax, qword ptr [rip + {user_rsp_array}]",
-        "push rax", // rsp
+        "push qword ptr gs:[rip + {percpu_base} + {user_rsp_offset}]", // rsp
         "push r11", // eflags
         "push {user_cs}", // cs
-        "mov rax, qword ptr [rip + {user_rip_array}]",
-        "push rax", // rip
-        "mov rax, qword ptr [rip + {orig_rax_array}]",
+        "push rcx", // rip
         "push rax", // orig_rax
 
         // General purpose registers (reverse order so RSP points at r15).
         "push rdi",
         "push rsi",
         "push rdx",
-        "mov rax, qword ptr [rip + {user_rip_array}]",
-        "push rax", // rcx (syscall clobbers rcx to RIP)
+        "push rcx", // rcx (syscall clobbers rcx to RIP)
         "mov rax, -38", // -ENOSYS default
         "push rax", // rax
         "push r8",
@@ -216,53 +190,47 @@ pub unsafe extern "C" fn syscall_entry() {
         "push r14",
         "push r15",
 
-        // Preserve the interrupted user x87/SSE state while Rust handles the
-        // syscall.  The dynamic linker keeps bootstrap state in vector
-        // registers across syscalls, matching Linux's user-visible contract.
+        // Preserve the pt_regs pointer in a minimal aligned call frame.
+        // The kernel target uses the soft-float ABI, exactly like Linux's
+        // -mno-sse kernel build, so entry must not pay an FXSAVE/FXRSTOR pair
+        // on every syscall. Task state is saved only by the context switch.
         "mov rdi, rsp",
-        "sub rsp, 528",
+        "sub rsp, 16",
         "and rsp, -16",
-        "mov [rsp + 512], rdi",
-        "fxsave64 [rsp]",
+        "mov [rsp], rdi",
 
         // rdi = &pt_regs, do_syscall_64-like table dispatch.
         // Linux runs normal syscall bodies with IRQs enabled after the entry
         // frame is complete; otherwise blocking syscalls can schedule with IF
         // masked and starve timer-driven wakeups.
         "sti",
-        "mov rdi, [rsp + 512]",
+        "mov rdi, [rsp]",
         "call {dispatch_ptregs}",
 
         // Store return value into pt_regs.rax so the restore path reloads it.
-        "mov rdi, [rsp + 512]",
+        "mov rdi, [rsp]",
         "mov [rdi + 80], rax",
 
-        // Run exit slowpath work before we reload user TLS and SYSRET.
-        "mov rdi, [rsp + 512]",
+        // Run exit slowpath work before choosing the user return instruction.
+        "mov rdi, [rsp]",
         "call {exit_slowpath}",
-
-        // Linux reloads user TLS state before returning from the syscall path.
-        // `arch_prctl(ARCH_SET_FS)` updates task.thread.fsbase; make that value
-        // effective for libc before SYSRET resumes userspace.
-        "call {load_user_tls}",
 
         // Linux only uses SYSRET for a clean syscall frame. Signal delivery
         // and rt_sigreturn can make user-visible RCX/R11 differ from the
         // SYSRET target/flags pair, so those paths must return via IRET.
-        "mov rdi, [rsp + 512]",
+        "mov rdi, [rsp]",
         "call {should_use_sysret}",
-        // Keep the branch decision in the FXSAVE scratch tail across the
-        // restore and stack-pointer reload below.
-        "mov [rsp + 520], al",
+        // Keep the branch decision in the second scratch word across the
+        // interrupt-disable and stack-pointer reload below.
+        "mov [rsp + 8], al",
 
         // Keep interrupts closed while restoring userspace state and doing
         // SWAPGS/SYSRET or IRET, matching Linux's exit-to-user discipline.
         "cli",
 
-        // Restore the user vector state and pt_regs stack pointer.
-        "fxrstor64 [rsp]",
-        "mov al, [rsp + 520]",
-        "mov rsp, [rsp + 512]",
+        // Restore the branch decision and pt_regs stack pointer.
+        "mov al, [rsp + 8]",
+        "mov rsp, [rsp]",
 
         "test al, al",
         "jz 3f",
@@ -310,26 +278,17 @@ pub unsafe extern "C" fn syscall_entry() {
         "swapgs",
         "iretq",
 
-        user_rsp_array = sym SYSCALL_USER_RSP,
-        user_rip_array = sym SYSCALL_USER_RIP,
-        orig_rax_array = sym SYSCALL_ORIG_RAX,
-        tss = sym crate::arch::x86::kernel::tss::TSS,
+        percpu_base = sym crate::arch::x86::kernel::setup_percpu::LINUX_PER_CPU_AREAS,
+        user_rsp_offset =
+            const crate::arch::x86::kernel::setup_percpu::SYSCALL_USER_RSP_OFFSET,
+        syscall_tss_offset =
+            const crate::arch::x86::kernel::setup_percpu::SYSCALL_TSS_OFFSET,
         dispatch_ptregs = sym syscall_dispatch_ptregs,
         exit_slowpath = sym syscall_exit_slowpath,
-        load_user_tls = sym load_current_user_tls_base,
         should_use_sysret = sym syscall_should_use_sysret,
         user_cs = const sel::USER_CS as u64,
         user_ds = const sel::USER_DS as u64,
     );
-}
-
-pub(crate) unsafe extern "C" fn load_current_user_tls_base() {
-    let task = sched::get_current();
-    if task.is_null() {
-        return;
-    }
-    let fsbase = unsafe { (*task).thread.fsbase };
-    unsafe { wrmsr(MSR_FS_BASE, fsbase) };
 }
 
 pub unsafe extern "C" fn syscall_exit_slowpath(
@@ -344,7 +303,15 @@ pub unsafe extern "C" fn syscall_exit_slowpath(
     } else {
         matches!(unsafe { (*regs).rax as i64 }, -512 | -513 | -514 | -516)
     };
-    if unsafe { (*task).thread_info.flags & TIF_SIGPENDING != 0 } || restart_pending {
+    if unsafe {
+        (*task)
+            .thread_info
+            .flags
+            .load(core::sync::atomic::Ordering::Acquire)
+            & TIF_SIGPENDING
+            != 0
+    } || restart_pending
+    {
         if regs.is_null() {
             while unsafe { crate::kernel::signal::do_signal_stop_only() } {}
         } else {
@@ -368,7 +335,14 @@ pub unsafe extern "C" fn syscall_exit_slowpath(
         }
     }
     sanitize_syscall_user_rflags(regs);
-    let need_resched = unsafe { (*task).thread_info.flags & TIF_NEED_RESCHED != 0 };
+    let need_resched = unsafe {
+        (*task)
+            .thread_info
+            .flags
+            .load(core::sync::atomic::Ordering::Acquire)
+            & TIF_NEED_RESCHED
+            != 0
+    };
     if need_resched && crate::kernel::locking::preempt::preempt_count() == 0 {
         unsafe {
             // The returning task is runnable; yield for fairness but never halt
@@ -442,11 +416,19 @@ unsafe fn load_current_user_cr3() {
     let pgd_virt = unsafe { (*mm).pgd as u64 };
     if let Some(pgd_phys) = crate::arch::x86::mm::paging::virt_to_phys(pgd_virt) {
         unsafe {
+            // Match switch_mm_irqs_off()'s conservative transition state.
+            // This exec path can still have IRQs enabled, so a shootdown that
+            // lands on either side of MOV-to-CR3 must flush rather than infer
+            // which address space is currently loaded.
+            let cpu = sched::current_cpu();
+            crate::arch::x86::mm::tlb::set_active_mm_switching(cpu);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             core::arch::asm!(
                 "mov cr3, {0}",
                 in(reg) pgd_phys,
                 options(nostack, preserves_flags)
             );
+            crate::arch::x86::mm::tlb::set_active_mm(cpu, mm);
         }
     }
 }
@@ -471,8 +453,23 @@ pub unsafe extern "C" fn syscall_dispatch_ptregs(
 }
 
 /// Last jiffy on which the per-syscall console drain ran (throttle state).
+///
+/// The common case is a read that observes the current jiffy. Only syscalls
+/// racing at a jiffy transition attempt the locked compare/exchange, so
+/// syscall-heavy SMP workloads do not serialize on an unconditional exchange.
 static SYSCALL_DRAIN_LAST_JIFFY: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
+
+#[inline]
+fn syscall_console_drain_due(last_jiffy: &core::sync::atomic::AtomicU64, now: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let previous = last_jiffy.load(Ordering::Relaxed);
+    previous != now
+        && last_jiffy
+            .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
 
 unsafe fn syscall_dispatch_ptregs_inner(
     regs: *mut crate::arch::x86::kernel::ptrace::PtRegs,
@@ -494,7 +491,7 @@ unsafe fn syscall_dispatch_ptregs_inner(
     #[cfg(not(test))]
     {
         let now = crate::kernel::time::jiffies::jiffies();
-        if SYSCALL_DRAIN_LAST_JIFFY.swap(now, core::sync::atomic::Ordering::Relaxed) != now {
+        if syscall_console_drain_due(&SYSCALL_DRAIN_LAST_JIFFY, now) {
             crate::init::rootfs::drain_console_control_bytes();
         }
     }
@@ -551,6 +548,7 @@ unsafe fn syscall_dispatch_ptregs_inner(
                 if ctx.old_mm != 0 {
                     crate::mm::fork::mmput(ctx.old_mm as *mut crate::mm::mm_types::MmStruct);
                 }
+                reset_successful_exec_user_tls_bases(task);
                 initialize_exec_registers(&mut *regs, &ctx);
             }
         }
@@ -559,6 +557,38 @@ unsafe fn syscall_dispatch_ptregs_inner(
     trace_systemd_service_syscall(unsafe { &*regs }, ret, task);
     trace_udev_syscall_exit(unsafe { &*regs }, ret, task);
     ret
+}
+
+/// Install the new image's live FS/GS bases on successful `execve`.
+///
+/// Ordinary syscalls leave the hardware bases untouched. `arch_prctl()` writes
+/// a current task's requested base immediately, and `__switch_to()` restores
+/// bases for a task switch. Exec is the exception: it replaces the image
+/// without switching tasks, after `exec.rs` has reset the saved bases. Linux's
+/// `start_thread_common()` clears the live FS/GS state at this same transition.
+unsafe fn reset_successful_exec_user_tls_bases(task: *mut crate::kernel::task::TaskStruct) {
+    if task.is_null() {
+        return;
+    }
+
+    let fsbase = unsafe { (*task).thread.fsbase };
+    let gsbase = unsafe { (*task).thread.gsbase };
+    unsafe {
+        // Linux start_thread_common() clears the selectors before installing
+        // the new image's bases.
+        crate::arch::x86::kernel::gdt::load_ds(0);
+        crate::arch::x86::kernel::gdt::load_es(0);
+        crate::arch::x86::kernel::gdt::load_fs(0);
+        crate::arch::x86::kernel::gdt::load_gs_index(0);
+        crate::arch::x86::kernel::msr::write(crate::arch::x86::kernel::msr::MSR_FS_BASE, fsbase);
+        // SYSCALL entry has swapped to the kernel GS base. The new image's
+        // inactive user GS base therefore lives in IA32_KERNEL_GS_BASE until
+        // the matching return-to-user SWAPGS.
+        crate::arch::x86::kernel::msr::write(
+            crate::arch::x86::kernel::msr::MSR_KERNEL_GS_BASE,
+            gsbase,
+        );
+    }
 }
 
 /// Initialize the x86-64 user register image for a newly executed ELF.
@@ -667,23 +697,13 @@ fn trace_udev_syscall_exit(
 }
 
 /// Helper function to get the current CPU's ID.
-/// Returns 0–63, clamped to MAX_CPUS.
+/// Returns the dense logical CPU number from Linux's GS-relative per-CPU area.
 ///
-/// Called from the syscall entry stub on *every* syscall. Reading the LAPIC ID
-/// is an MMIO access — a VM-exit under VirtualBox (no APICv) and slow emulated
-/// MMIO under TCG — so doing it per syscall dominated VBox boot time (systemd's
-/// thousands of fast generator/manager syscalls each paid a VM-exit; the cost is
-/// invisible on KVM where APICv makes the read free). When no AP is online the
-/// only CPU is the BSP (id 0), so skip the LAPIC entirely; otherwise read it.
+/// The assembly entry path no longer needs this out-of-line helper, but the
+/// exported symbol remains for compatibility with existing probes.
 #[unsafe(no_mangle)]
 pub extern "C" fn current_cpu_id() -> usize {
-    if crate::arch::x86::kernel::smp::AP_READY_COUNT.load(core::sync::atomic::Ordering::Acquire)
-        == 0
-    {
-        return 0;
-    }
-    let cpu_id = unsafe { crate::arch::x86::kernel::apic::id() } as usize;
-    cpu_id.min(MAX_CPUS - 1)
+    crate::arch::x86::kernel::setup_percpu::current_cpu_number()
 }
 
 /// Check for pending signals on the current task and deliver them if present.
@@ -705,7 +725,11 @@ pub extern "C" fn check_pending_signals() {
         // Check if TIF_SIGPENDING is set.
         let has_pending = {
             let thread_info = &(*task).thread_info;
-            (thread_info.flags & TIF_SIGPENDING) != 0
+            (thread_info
+                .flags
+                .load(core::sync::atomic::Ordering::Acquire)
+                & TIF_SIGPENDING)
+                != 0
         };
 
         if !has_pending {
@@ -829,8 +853,7 @@ unsafe fn rdmsr(msr: u32) -> u64 {
 /// - Must run at CPL=0 (`wrmsr` is privileged).
 /// - Must run on the target physical CPU (MSRs are per-CPU registers).
 /// - Not re-entrant; call once from `kernel_main`.
-pub unsafe fn init() {
-    crate::arch::x86::kernel::setup_percpu::setup_percpu_segment(0);
+unsafe fn init_cpu_msrs() {
     unsafe {
         // 1. Enable SCE in EFER.
         //    arch/x86/boot/header.S set LME (bit 8) and the CPU set LMA (bit 10) automatically.
@@ -841,13 +864,13 @@ pub unsafe fn init() {
         // 2. Configure IA32_STAR — segment selectors for SYSCALL/SYSRET.
         //
         //    STAR[47:32] = kernel CS selector (SYSCALL loads CS and CS+8 as SS)
-        //      → KERNEL_CS = 0x08 → CS = 0x08, SS = 0x10 = KERNEL_DS ✓
+        //      → KERNEL_CS = 0x10 → CS = 0x10, SS = 0x18 = KERNEL_DS ✓
         //
         //    STAR[63:48] = base for user selectors (SYSRET adds 8 for SS, 16 for CS)
-        //      → KERNEL_DS = 0x10 → SS = 0x18 = USER_DS, CS = 0x20 = USER_CS ✓
+        //      → USER32_CS = 0x23 → SS = 0x2b = USER_DS, CS = 0x33 = USER_CS ✓
         //
         //    CPU automatically forces RPL=3 on the CS/SS selectors loaded by SYSRET.
-        let star: u64 = ((sel::KERNEL_DS as u64) << 48) | ((sel::KERNEL_CS as u64) << 32);
+        let star: u64 = ((sel::USER32_CS as u64) << 48) | ((sel::KERNEL_CS as u64) << 32);
         wrmsr(MSR_STAR, star);
 
         // 3. Set LSTAR — the RIP the CPU jumps to on SYSCALL.
@@ -857,6 +880,32 @@ pub unsafe fn init() {
         //    Clearing IF disables hardware interrupts until the kernel explicitly
         //    re-enables them after switching to a safe kernel stack.
         wrmsr(MSR_FMASK, SYSCALL_RFLAGS_MASK);
+    }
+}
+
+/// Initialize CPU0's per-CPU entry area and SYSCALL MSRs.
+///
+/// # Safety
+/// Same constraints as `init_cpu_msrs`; CPU0's GDT and TSS must already be live.
+pub unsafe fn init() {
+    crate::arch::x86::kernel::setup_percpu::setup_percpu_segment(0);
+    unsafe {
+        init_cpu_msrs();
+    }
+}
+
+/// Program SYSCALL/SYSRET MSRs on the current application processor.
+///
+/// `setup_percpu_segment(cpu)` must already have installed this AP's GS base.
+/// Unlike `init()`, this deliberately does not touch GS, so it cannot reset the
+/// BSP's per-CPU state and it preserves the AP-local area selected by bring-up.
+///
+/// # Safety
+/// Must run once at CPL0 on the target AP after its GDT, TSS, and per-CPU GS
+/// area are initialized.
+pub unsafe fn init_ap() {
+    unsafe {
+        init_cpu_msrs();
     }
 }
 
@@ -1626,18 +1675,44 @@ mod tests {
     }
 
     #[test]
+    fn successful_exec_resets_live_tls_only_at_image_transition() {
+        let source = include_str!("syscall.rs");
+        let dispatch = source
+            .split("unsafe fn syscall_dispatch_ptregs_inner(")
+            .nth(1)
+            .expect("pt_regs syscall dispatcher must exist")
+            .split("/// Install the new image's live FS/GS bases")
+            .next()
+            .expect("dispatcher must end before exec TLS helper");
+        let exec_success = dispatch
+            .split("if ret == 0")
+            .nth(1)
+            .expect("exec transition must require a successful syscall");
+        let take_context = exec_success
+            .find("take_exec_start_for_current()")
+            .expect("successful exec must consume its start context");
+        let reset_tls = exec_success
+            .find("reset_successful_exec_user_tls_bases(task)")
+            .expect("successful exec must install its reset TLS bases");
+        let initialize_regs = exec_success
+            .find("initialize_exec_registers")
+            .expect("successful exec must initialize its user registers");
+
+        assert!(take_context < reset_tls);
+        assert!(reset_tls < initialize_regs);
+    }
+
+    #[test]
     fn star_msr_value_encodes_correct_selectors() {
         // Verify STAR layout without touching MSRs (host-side test).
-        let star: u64 = ((sel::KERNEL_DS as u64) << 48) | ((sel::KERNEL_CS as u64) << 32);
+        let star: u64 = ((sel::USER32_CS as u64) << 48) | ((sel::KERNEL_CS as u64) << 32);
 
         let syscall_cs = ((star >> 32) & 0xFFFF) as u16;
         let sysret_base = ((star >> 48) & 0xFFFF) as u16;
 
         assert_eq!(syscall_cs, sel::KERNEL_CS, "SYSCALL CS selector");
-        // SYSRET SS = sysret_base + 8 → USER_DS (without RPL bits)
-        assert_eq!(sysret_base + 8, sel::USER_DS & !3, "SYSRET SS selector");
-        // SYSRET CS = sysret_base + 16 → USER_CS (without RPL bits)
-        assert_eq!(sysret_base + 16, sel::USER_CS & !3, "SYSRET CS selector");
+        assert_eq!(sysret_base + 8, sel::USER_DS, "SYSRET SS selector");
+        assert_eq!(sysret_base + 16, sel::USER_CS, "SYSRET CS selector");
     }
 
     #[test]
@@ -1651,32 +1726,77 @@ mod tests {
     #[test]
     fn syscall_entry_reenables_irqs_only_inside_kernel_body() {
         let source = include_str!("syscall.rs");
-        let frame_complete = source
-            .find("\"fxsave64 [rsp]\"")
-            .expect("syscall entry must save user vector state");
-        let irq_enable = source[frame_complete..]
+        let entry = source
+            .split("pub unsafe extern \"C\" fn syscall_entry()")
+            .nth(1)
+            .expect("syscall entry stub must exist")
+            .split("pub unsafe extern \"C\" fn syscall_exit_slowpath")
+            .next()
+            .expect("syscall entry stub must end before exit slowpath");
+        assert!(
+            !entry.contains("fxsave64") && !entry.contains("fxrstor64"),
+            "soft-float syscall entry must not save FPU state per call"
+        );
+        assert!(
+            !entry.contains("[rsp + 512]"),
+            "minimal syscall scratch must not retain the removed FXSAVE offset"
+        );
+        assert!(
+            !entry.contains("load_user_tls") && !entry.contains("wrmsr"),
+            "syscall return must retain the live FS base; arch_prctl and context switch own updates"
+        );
+        let frame_complete = entry
+            .find("\"mov [rsp], rdi\"")
+            .expect("syscall entry must preserve the pt_regs pointer");
+        let irq_enable = entry[frame_complete..]
             .find("\"sti\"")
             .map(|off| frame_complete + off)
             .expect("syscall entry must enable IRQs before dispatch");
-        let dispatch = source
+        let dispatch = entry
             .find("\"call {dispatch_ptregs}\"")
             .expect("syscall entry must call syscall dispatch");
-        let exit_decision = source
+        let exit_decision = entry
             .find("\"call {should_use_sysret}\"")
             .expect("syscall entry must choose SYSRET vs IRET");
-        let irq_disable = source[exit_decision..]
+        let irq_disable = entry[exit_decision..]
             .find("\"cli\"")
             .map(|off| exit_decision + off)
             .expect("syscall entry must disable IRQs before user restore");
-        let restore = source
-            .find("\"fxrstor64 [rsp]\"")
-            .expect("syscall entry must restore user vector state");
+        let restore = entry
+            .find("\"mov rsp, [rsp]\"")
+            .expect("syscall entry must restore pt_regs stack pointer");
 
         assert!(frame_complete < irq_enable);
         assert!(irq_enable < dispatch);
         assert!(dispatch < exit_decision);
         assert!(exit_decision < irq_disable);
         assert!(irq_disable < restore);
+    }
+
+    #[test]
+    fn syscall_entry_uses_cpu_local_scratch_and_tss() {
+        let source = include_str!("syscall.rs");
+        let entry = source
+            .split("pub unsafe extern \"C\" fn syscall_entry()")
+            .nth(1)
+            .expect("syscall entry stub must exist")
+            .split("pub unsafe extern \"C\" fn syscall_exit_slowpath")
+            .next()
+            .expect("syscall entry stub must end before exit slowpath");
+
+        assert!(entry.contains("gs:[rip + {percpu_base} + {user_rsp_offset}]"));
+        assert!(entry.contains("gs:[rip + {percpu_base} + {syscall_tss_offset}]"));
+        assert!(!entry.contains("sym crate::arch::x86::kernel::tss::TSS"));
+    }
+
+    #[test]
+    fn syscall_console_drain_claim_avoids_same_jiffy_exchange() {
+        let last = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+        assert!(syscall_console_drain_due(&last, 100));
+        assert!(!syscall_console_drain_due(&last, 100));
+        assert!(syscall_console_drain_due(&last, 101));
+        assert!(!syscall_console_drain_due(&last, 101));
     }
 
     #[test]
@@ -1848,6 +1968,7 @@ mod tests {
 
     #[test]
     fn dispatch_records_audit_and_trace_for_syscall() {
+        let _audit_guard = audit::test_lock();
         audit::reset_for_test();
         audit::audit_add_rule(audit::AuditRule {
             syscall_nr: 9999,

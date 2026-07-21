@@ -24,9 +24,8 @@
 //! callback (or `None`/`false`) without invoking it.
 //!
 //! Notification modes (`TWA_RESUME`, `TWA_SIGNAL`, `TWA_SIGNAL_NO_IPI`,
-//! `TWA_NMI_CURRENT`) are recorded but the actual cross-CPU IPI wiring is
-//! deferred to a follow-up milestone — under the cooperative scheduler the
-//! target task always picks the work up on its next schedule.
+//! `TWA_NMI_CURRENT`) preserve their Linux side effects. `TWA_SIGNAL` also
+//! kicks a remote target CPU so its return path observes the pending work.
 
 extern crate alloc;
 
@@ -256,19 +255,19 @@ unsafe fn kick_remote_task(task: *mut TaskStruct) {
         if task.is_null() {
             return;
         }
-        // The target's `on_cpu` is the CPU where it runs; fall back to
-        // `wake_cpu` if it isn't currently scheduled.  Both fields live
-        // inside M29SchedFields (`task.m29`).
-        let on_cpu = (*task).m29.on_cpu;
-        let wake_cpu = (*task).m29.wake_cpu;
-        let chosen = if on_cpu >= 0 { on_cpu } else { wake_cpu };
-        let current_cpu = crate::arch::x86::kernel::smp::current_cpu_id() as i32;
-        if chosen < 0 || chosen == current_cpu {
-            // Target either isn't running or is on our CPU — the local
-            // syscall-exit path will pick the work up without an IPI.
-            return;
+        // Linux's kick_process() pins the caller, reads task_cpu(), and sends
+        // only while the target is currently running. `on_cpu` is a boolean
+        // handoff flag; `wake_cpu` carries the dense logical CPU number.
+        crate::kernel::locking::preempt::preempt_disable();
+        let target_cpu = (*task).m29.wake_cpu;
+        let current_cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number() as i32;
+        if (0..crate::kernel::sched::MAX_CPUS as i32).contains(&target_cpu)
+            && target_cpu != current_cpu
+            && crate::kernel::sched::task_on_cpu(task)
+        {
+            crate::arch::x86::kernel::idt::send_reschedule_ipi(target_cpu as u8);
         }
-        crate::arch::x86::kernel::idt::send_reschedule_ipi(chosen as u8);
+        crate::kernel::locking::preempt::preempt_enable();
     }
     #[cfg(test)]
     {

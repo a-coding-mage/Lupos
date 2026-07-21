@@ -29,24 +29,28 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::arch::x86::mm::paging::{
-    PAGE_MASK, PAGE_SHIFT, PAGE_SIZE, flush_tlb_range, p4d_offset, pfn_to_virt, pgd_none,
+    PAGE_MASK, PAGE_SHIFT, PAGE_SIZE, PMD_SIZE, PUD_SIZE, p4d_offset, pfn_to_virt, pgd_none,
     pgd_offset_pgd, pgd_t, pmd_huge, pmd_none, pmd_offset, pte_offset_kernel, pte_pfn, pte_present,
     pte_special, pte_t, ptep_get, ptep_get_and_clear, pud_huge, pud_none, pud_offset,
 };
+use crate::arch::x86::mm::tlb::flush_tlb_mm_range;
 use crate::include::uapi::errno::EINVAL;
 use crate::include::uapi::fcntl::{O_ACCMODE, O_RDWR, O_WRONLY};
 use crate::kernel::module::{export_symbol, find_symbol};
 use crate::mm::address_space::{AS_SHARED_ANON, AddressSpace};
+#[cfg(not(test))]
+use crate::mm::buddy::page_to_pfn;
 use crate::mm::buddy::{pfn_valid, with_global_buddy};
+use crate::mm::maple_tree::MapleRangeEdit;
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
+use crate::mm::mmap_lock::MmapWriteGuard;
 use crate::mm::pgprot::vm_get_page_prot;
 use crate::mm::vm_flags::{
     VM_EXEC, VM_GROWSDOWN, VM_HUGETLB, VM_LOCKED, VM_MAYEXEC, VM_MAYREAD, VM_MAYSHARE, VM_MAYWRITE,
     VM_NORESERVE, VM_READ, VM_SHARED, VM_WRITE, VmFlags,
 };
 use crate::mm::vma::{
-    find_vma, find_vma_prev, insert_vma, remove_vma, vm_area_dup, vm_area_free, vma_file_put_raw,
-    vma_merge,
+    find_vma, find_vma_prev, insert_vma, vm_area_free, vm_area_try_dup, vma_file_put_raw, vma_merge,
 };
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
@@ -515,7 +519,8 @@ pub(crate) unsafe fn range_contains_secretmem(mm: &MmStruct, start: u64, len: us
 ///
 /// Linux passes a `struct file *` and byte offset here; Lupos keeps the file
 /// handle as an opaque kernel address until the VFS layer owns full lifetime
-/// integration.
+/// integration. Like Linux `vm_mmap_pgoff()`, this wrapper owns the mmap write
+/// lock; lock-holding internal paths call `do_mmap()` directly.
 pub unsafe fn vm_mmap(
     mm: &mut MmStruct,
     file: usize,
@@ -528,6 +533,8 @@ pub unsafe fn vm_mmap(
     if offset & (PAGE_SIZE - 1) != 0 {
         return Err(-22);
     }
+    let mm_ptr = mm as *mut MmStruct;
+    let _mmap_guard = unsafe { MmapWriteGuard::lock(mm_ptr) };
     unsafe { do_mmap(mm, addr, len, prot, flags, offset >> PAGE_SHIFT, file) }
 }
 
@@ -756,6 +763,244 @@ unsafe fn present_pte_for_addr(mm: &MmStruct, addr: u64) -> Option<pte_t> {
 // unmap_page_range
 // ---------------------------------------------------------------------------
 
+/// Number of cleared PTEs retained on the kernel stack before a shootdown.
+///
+/// Linux starts with an eight-pointer fallback and then links GFP_NOWAIT pages
+/// until roughly 10K folios are pending. Lupos follows the same inline bundle,
+/// linked-page, and allocation-failure fallback policy.
+///
+/// Ref: Linux `MMU_GATHER_BUNDLE` and `mmu_gather_batch` —
+/// `include/asm-generic/tlb.h`; `tlb_next_batch()` — `mm/mmu_gather.c`.
+const UNMAP_PTE_BATCH_SIZE: usize = 8;
+const UNMAP_SHARED_ANON_WORDS: usize = UNMAP_PTE_BATCH_SIZE.div_ceil(64);
+const UNMAP_GATHER_PAGE_CAPACITY: usize = 496;
+const UNMAP_GATHER_PAGE_WORDS: usize = UNMAP_GATHER_PAGE_CAPACITY.div_ceil(64);
+const UNMAP_GATHER_MAX_PAGES: usize = 10_000 / 510;
+
+/// One GFP_NOWAIT-backed continuation page in the unmap gather.
+///
+/// Keep the complete object below 4 KiB so it can live directly in one buddy
+/// page, like Linux `struct mmu_gather_batch`.
+#[repr(C)]
+struct UnmapPteBatchPage {
+    next: *mut UnmapPteBatchPage,
+    backing_page: *mut crate::mm::page::Page,
+    len: usize,
+    ptes: [core::mem::MaybeUninit<pte_t>; UNMAP_GATHER_PAGE_CAPACITY],
+    shared_anon: [u64; UNMAP_GATHER_PAGE_WORDS],
+}
+
+const _: () = assert!(core::mem::size_of::<UnmapPteBatchPage>() <= PAGE_SIZE as usize);
+
+/// Linux-style `mmu_gather` subset used by the PTE zap path.
+///
+/// The batch retains the cleared PTE values until the target address space has
+/// been invalidated.  Its range deliberately spans from the first through the
+/// last collected present PTE, including any holes between them, just as
+/// Linux's `__tlb_adjust_range()` widens `mmu_gather::{start,end}`.
+struct UnmapPteBatch {
+    // Like Linux's C array, only the `[..len]` prefix is initialized. Avoid
+    // zeroing even the small fallback payload for an empty munmap.
+    ptes: [core::mem::MaybeUninit<pte_t>; UNMAP_PTE_BATCH_SIZE],
+    // Preserve the VMA-specific release mode while entries from several VMAs
+    // share one gather. One bit corresponds to each slot in `ptes`.
+    shared_anon: [u64; UNMAP_SHARED_ANON_WORDS],
+    len: usize,
+    head: *mut UnmapPteBatchPage,
+    tail: *mut UnmapPteBatchPage,
+    page_count: usize,
+    needs_flush: bool,
+    start: u64,
+    end: u64,
+}
+
+impl UnmapPteBatch {
+    const fn new() -> Self {
+        Self {
+            ptes: [core::mem::MaybeUninit::uninit(); UNMAP_PTE_BATCH_SIZE],
+            shared_anon: [0; UNMAP_SHARED_ANON_WORDS],
+            len: 0,
+            head: core::ptr::null_mut(),
+            tail: core::ptr::null_mut(),
+            page_count: 0,
+            needs_flush: false,
+            start: 0,
+            end: 0,
+        }
+    }
+
+    /// Extend the invalidation range for a cleared leaf which owns no queued
+    /// order-0 page release (for example a PMD/PUD huge entry).
+    #[inline]
+    fn note_cleared(&mut self, start: u64, end: u64) {
+        debug_assert!(start < end);
+        if self.needs_flush {
+            self.start = self.start.min(start);
+            self.end = self.end.max(end);
+        } else {
+            self.start = start;
+            self.end = end;
+            self.needs_flush = true;
+        }
+    }
+
+    #[cfg(not(test))]
+    fn try_add_page(&mut self) -> bool {
+        use crate::mm::page_flags::GFP_NOWAIT;
+
+        if self.page_count >= UNMAP_GATHER_MAX_PAGES {
+            return false;
+        }
+        let Some(backing_page) = with_global_buddy(|buddy| buddy.alloc_pages(0, GFP_NOWAIT)) else {
+            return false;
+        };
+        let page_addr = pfn_to_virt(page_to_pfn(backing_page));
+        unsafe {
+            core::ptr::write_bytes(page_addr, 0, PAGE_SIZE as usize);
+        }
+        let page = page_addr.cast::<UnmapPteBatchPage>();
+        unsafe {
+            (*page).backing_page = backing_page;
+            if self.tail.is_null() {
+                self.head = page;
+            } else {
+                (*self.tail).next = page;
+            }
+        }
+        self.tail = page;
+        self.page_count += 1;
+        true
+    }
+
+    #[cfg(test)]
+    fn try_add_page(&mut self) -> bool {
+        // Host page-table tests use identity "physical" addresses without a
+        // direct-map allocation backing them. Exercise the guaranteed inline
+        // fallback there; QEMU runtime gates cover continuation pages.
+        false
+    }
+
+    /// Queue one already-cleared present PTE.
+    ///
+    /// Returns whether storage cannot grow beyond the just-queued entry and
+    /// the caller must flush before clearing another PTE. This matches Linux's
+    /// `__tlb_remove_page_size()` contract: the page which made the gather full
+    /// is already owned by the gather.
+    #[inline]
+    fn push(&mut self, addr: u64, pte: pte_t, release_shared_anon: bool) -> bool {
+        debug_assert!(pte_present(pte));
+        self.note_cleared(addr, addr + PAGE_SIZE);
+
+        if self.len < UNMAP_PTE_BATCH_SIZE {
+            self.ptes[self.len].write(pte);
+            let word = self.len / 64;
+            let mask = 1u64 << (self.len % 64);
+            if release_shared_anon {
+                self.shared_anon[word] |= mask;
+            } else {
+                self.shared_anon[word] &= !mask;
+            }
+            self.len += 1;
+            return self.len == UNMAP_PTE_BATCH_SIZE && !self.try_add_page();
+        }
+
+        debug_assert!(!self.tail.is_null());
+        let page_became_full = {
+            let tail = unsafe { &mut *self.tail };
+            debug_assert!(tail.len < UNMAP_GATHER_PAGE_CAPACITY);
+            tail.ptes[tail.len].write(pte);
+            let word = tail.len / 64;
+            let mask = 1u64 << (tail.len % 64);
+            if release_shared_anon {
+                tail.shared_anon[word] |= mask;
+            } else {
+                tail.shared_anon[word] &= !mask;
+            }
+            tail.len += 1;
+            tail.len == UNMAP_GATHER_PAGE_CAPACITY
+        };
+        page_became_full && !self.try_add_page()
+    }
+
+    /// Invalidate the accumulated range before releasing any queued page.
+    ///
+    /// Ref: Linux generic MMU-gather ordering in
+    /// `include/asm-generic/tlb.h`: unhook, invalidate, then free.
+    #[inline]
+    fn drain_with<F, R>(&mut self, mut flush: F, mut release: R)
+    where
+        F: FnMut(u64, u64),
+        R: FnMut(pte_t, bool),
+    {
+        if !self.needs_flush {
+            return;
+        }
+
+        flush(self.start, self.end);
+        for (index, pte) in self.ptes[..self.len].iter().enumerate() {
+            // `push()` initializes every slot below `len`, and `len` is reset
+            // only after all of them have been consumed.
+            let release_shared_anon = self.shared_anon[index / 64] & (1u64 << (index % 64)) != 0;
+            release(unsafe { pte.assume_init_read() }, release_shared_anon);
+        }
+
+        let mut page = self.head;
+        while !page.is_null() {
+            let next = unsafe { (*page).next };
+            let page_len = unsafe { (*page).len };
+            for index in 0..page_len {
+                let pte = unsafe { (*page).ptes[index].assume_init_read() };
+                let release_shared_anon =
+                    unsafe { (*page).shared_anon[index / 64] } & (1u64 << (index % 64)) != 0;
+                release(pte, release_shared_anon);
+            }
+            let backing_page = unsafe { (*page).backing_page };
+            if !backing_page.is_null() {
+                with_global_buddy(|buddy| unsafe { buddy.free_pages(backing_page, 0) });
+            }
+            page = next;
+        }
+
+        self.len = 0;
+        self.head = core::ptr::null_mut();
+        self.tail = core::ptr::null_mut();
+        self.page_count = 0;
+        self.needs_flush = false;
+        self.start = 0;
+        self.end = 0;
+    }
+
+    /// Drain the gather, then run teardown that may invalidate VMA-owned
+    /// metadata. Keeping this ordering in one helper makes it impossible for
+    /// the munmap completion path to close a detached VMA while one of its
+    /// queued PTEs still awaits a shootdown.
+    #[inline]
+    fn drain_with_then<F, R, A>(&mut self, flush: F, release: R, after_drain: A)
+    where
+        F: FnMut(u64, u64),
+        R: FnMut(pte_t, bool),
+        A: FnOnce(),
+    {
+        self.drain_with(flush, release);
+        after_drain();
+    }
+}
+
+#[inline]
+unsafe fn flush_and_release_pte_batch(batch: &mut UnmapPteBatch, mm: *mut MmStruct) {
+    batch.drain_with(
+        |batch_start, batch_end| {
+            assert!(
+                unsafe { flush_tlb_mm_range(mm, batch_start, batch_end) },
+                "TLB shootdown failed before releasing unmapped pages"
+            );
+        },
+        |pte, release_shared_anon| unsafe {
+            put_page_from_pte(pte, release_shared_anon);
+        },
+    );
+}
+
 /// Walk page tables for `[start, end)` and free all present PTEs.
 ///
 /// For anonymous pages the backing `Page` refcount is decremented; if it hits
@@ -767,8 +1012,11 @@ unsafe fn present_pte_for_addr(mm: &MmStruct, addr: u64) -> Option<pte_t> {
 /// # Safety
 /// `mm` must be exclusively accessible.  `start` and `end` must be page-aligned.
 pub unsafe fn unmap_page_range(mm: &mut MmStruct, start: u64, end: u64) {
+    let mm_ptr = mm as *mut MmStruct;
+    let mut batch = UnmapPteBatch::new();
     unsafe {
-        unmap_page_range_inner(mm, start, end, false);
+        unmap_page_range_inner(mm, start, end, false, &mut batch);
+        flush_and_release_pte_batch(&mut batch, mm_ptr);
     }
 }
 
@@ -777,19 +1025,21 @@ unsafe fn unmap_page_range_inner(
     start: u64,
     end: u64,
     release_shared_anon: bool,
+    batch: &mut UnmapPteBatch,
 ) {
     let pgd_base = mm.pgd as *mut pgd_t;
     if pgd_base.is_null() {
         return;
     }
 
+    let mm_ptr = mm as *mut MmStruct;
     let mut addr = start;
     while addr < end {
         // PGD level
         let pgdp = unsafe { pgd_offset_pgd(pgd_base, addr) };
         if unsafe { pgd_none(*pgdp) } {
             // Advance to next PGD slot (512 GiB).
-            let next = ((addr >> 39) + 1) << 39;
+            let next = ((((addr >> 39) + 1) << 39).min(end)).max(addr + PAGE_SIZE);
             addr = next;
             continue;
         }
@@ -797,40 +1047,38 @@ unsafe fn unmap_page_range_inner(
         let p4dp = unsafe { p4d_offset(pgdp, addr) };
         let pudp = unsafe { pud_offset(p4dp, addr) };
         if unsafe { pud_none(*pudp) } {
-            let next = ((addr >> 30) + 1) << 30;
+            let next = ((addr & !(PUD_SIZE - 1)) + PUD_SIZE).min(end);
             addr = next;
             continue;
         }
         if unsafe { pud_huge(*pudp) } {
-            let next = ((addr >> 30) + 1) << 30;
-            addr = next;
+            // A correct user huge-leaf zap needs Linux's hugetlb/THP locks,
+            // notifier interval, compound-folio release, and rmap accounting.
+            // Preserve the leaf until that protocol exists instead of
+            // releasing its tails as unrelated order-0 pages.
+            addr = ((addr & !(PUD_SIZE - 1)) + PUD_SIZE).min(end);
             continue;
         }
         // PMD level
         let pmdp = unsafe { pmd_offset(pudp, addr) };
         if unsafe { pmd_none(*pmdp) } {
-            let next = ((addr >> 21) + 1) << 21;
+            let next = ((addr & !(PMD_SIZE - 1)) + PMD_SIZE).min(end);
             addr = next;
             continue;
         }
         if unsafe { pmd_huge(*pmdp) } {
-            let next = ((addr >> 21) + 1) << 21;
-            addr = next;
+            addr = ((addr & !(PMD_SIZE - 1)) + PMD_SIZE).min(end);
             continue;
         }
         // PTE level
         let ptep = unsafe { pte_offset_kernel(pmdp, addr) };
-        let pte: pte_t = unsafe { ptep_get_and_clear(core::ptr::null_mut(), addr, ptep) };
-        if pte_present(pte) {
+        let pte: pte_t = ptep_get_and_clear(mm_ptr.cast::<()>(), addr, ptep);
+        if pte_present(pte) && batch.push(addr, pte, release_shared_anon) {
             unsafe {
-                put_page_from_pte(pte, release_shared_anon);
+                flush_and_release_pte_batch(batch, mm_ptr);
             }
         }
         addr += PAGE_SIZE;
-    }
-
-    unsafe {
-        flush_tlb_range(start, end);
     }
 }
 
@@ -920,94 +1168,200 @@ unsafe fn put_page_from_pte(pte: pte_t, release_shared_anon: bool) {
 /// # Safety
 /// `mm` must be exclusively accessed (mmap_lock held for write).
 pub unsafe fn do_munmap(mm: &mut MmStruct, start: u64, len: u64) -> Result<(), i32> {
-    if len == 0 {
-        return Ok(());
+    // Linux do_vmi_munmap() rejects an unaligned start and any range outside
+    // the userspace limit before consulting the VMA tree.
+    if start & !PAGE_MASK != 0 || start > TASK_SIZE || len > TASK_SIZE - start {
+        return Err(-EINVAL);
     }
 
-    let start = start & PAGE_MASK;
     let len = len.wrapping_add(PAGE_SIZE - 1) & PAGE_MASK;
     if len == 0 {
+        return Err(-EINVAL);
+    }
+    let end = start + len;
+    let tree_end = end - 1;
+
+    // Linux preallocates the VMA iterator edit and a possible right-hand VMA
+    // before clearing page tables. Lupos's sorted-Vec Maple Tree needs at most
+    // one extra slot: only one VMA can straddle both munmap boundaries.
+    mm.mm_mt.prepare_edit_range(start, tree_end)?;
+
+    // Linux retains removed VMAs in a detached Maple Tree until after the
+    // primary tree is cleared and the page-table/TLB work completes.  Lupos
+    // needs the same detached lifetime for close callbacks, but its compact
+    // sorted-Vec tree cannot embed a second tree node in each VMA.  Reserve the
+    // maximum possible pointer count before the point of no return so the edit
+    // callback below cannot allocate.
+    let mut affected_vmas = 0usize;
+    let mut split_error = None;
+    mm.mm_mt
+        .for_each_range(start, tree_end, |vstart, vend_inclusive, entry| {
+            affected_vmas += 1;
+            let vend = vend_inclusive.saturating_add(1);
+            let vma = unsafe { &*(entry as *const VmAreaStruct) };
+            if vma.vm_flags & VM_HUGETLB != 0 {
+                let huge_mask = crate::mm::huge::HPAGE_PMD_NR as u64 * PAGE_SIZE - 1;
+                if (vstart < start && start < vend && start & huge_mask != 0)
+                    || (vstart < end && end < vend && end & huge_mask != 0)
+                {
+                    split_error = Some(-EINVAL);
+                }
+            }
+        });
+    if let Some(errno) = split_error {
+        return Err(errno);
+    }
+    if affected_vmas == 0 {
+        // Linux do_vmi_munmap() returns immediately when vma_find() finds no
+        // overlap; no detached-VMA storage or userfault notification is
+        // needed.
         return Ok(());
     }
-    let end = start.checked_add(len).ok_or(-12i32)?;
+    // Linux's detached tree keeps its root entry inline. Keep the common
+    // small munmap allocation-free as well, and reserve any overflow before
+    // page-table clears.
+    const INLINE_DETACHED_VMAS: usize = 8;
+    let mut removed_inline: [*mut VmAreaStruct; INLINE_DETACHED_VMAS] =
+        [core::ptr::null_mut(); INLINE_DETACHED_VMAS];
+    let mut removed_overflow: Vec<*mut VmAreaStruct> = Vec::new();
+    removed_overflow
+        .try_reserve_exact(affected_vmas.saturating_sub(INLINE_DETACHED_VMAS))
+        .map_err(|_| -12i32)?;
+    let mut removed_count = 0usize;
+
+    let mut prepared_right = core::ptr::null_mut();
+    if let Some((vstart, vend_inclusive, entry)) = mm.mm_mt.find(start, tree_end) {
+        if vstart < start && vend_inclusive >= end {
+            let source = entry as *const VmAreaStruct;
+            prepared_right = unsafe { vm_area_try_dup(source) }?;
+            let huge_id = unsafe {
+                if (*source).vm_flags & VM_HUGETLB != 0 {
+                    (*source).vm_private_data as u64
+                } else {
+                    0
+                }
+            };
+            if huge_id != 0
+                && let Err(errno) = crate::mm::huge::retain_hugetlb_page(huge_id)
+            {
+                unsafe { vm_area_free(prepared_right) };
+                return Err(-errno);
+            }
+        }
+    }
+
+    let mm_ptr = mm as *mut MmStruct;
+    let tree_ptr = &mm.mm_mt as *const crate::mm::maple_tree::MapleTree;
     crate::mm::shmem::userfaultfd_unregister_range(start, len);
 
-    // Snapshot overlapping VMAs before we start mutating the tree.
-    let overlapping: Vec<*mut VmAreaStruct> = {
-        mm.mm_mt
-            .collect_entries()
-            .into_iter()
-            .filter_map(|(vstart, vend_incl, ptr)| {
-                let vend = vend_incl + 1;
-                if vstart < end && vend > start {
-                    Some(ptr as *mut VmAreaStruct)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    };
-
-    for vma_ptr in overlapping {
-        let vstart = unsafe { (*vma_ptr).vm_start };
-        let vend = unsafe { (*vma_ptr).vm_end };
-
-        let isect_start = vstart.max(start);
-        let isect_end = vend.min(end);
-        let locked_pages = unsafe {
-            if (*vma_ptr).vm_flags & VM_LOCKED != 0 {
-                (isect_end - isect_start) >> PAGE_SHIFT
-            } else {
-                0
-            }
-        };
-
-        // Free pages in the intersection.
-        let release_shared_anon = unsafe {
-            (*vma_ptr).vm_file == 0
+    // Like Linux's `mmu_gather`, retain one batch for the entire VMA walk.
+    // The write lock keeps the still-published VMA descriptors inaccessible to
+    // fault-side readers until every queued leaf has passed through
+    // clear -> shootdown -> page release. Tree edits and VMA close callbacks
+    // happen only after the final drain.
+    let mut batch = UnmapPteBatch::new();
+    unsafe {
+        (*tree_ptr).for_each_range(start, tree_end, |vstart, vend_inclusive, entry| {
+            let vma_ptr = entry as *mut VmAreaStruct;
+            let vend = vend_inclusive.saturating_add(1);
+            let isect_start = vstart.max(start);
+            let isect_end = vend.min(end);
+            let release_shared_anon = (*vma_ptr).vm_file == 0
                 && (*vma_ptr).vm_ops == 0
-                && ((*vma_ptr).vm_flags & VM_SHARED) != 0
-        };
-        unsafe {
-            unmap_page_range_inner(mm, isect_start, isect_end, release_shared_anon);
-        }
-        if locked_pages != 0 {
-            mm.locked_vm = mm.locked_vm.saturating_sub(locked_pages);
-        }
-
-        if isect_start == vstart && isect_end == vend {
-            // Exact match.
-            unsafe {
-                remove_vma(mm, vma_ptr);
-                release_vma_resources(vma_ptr);
-                vm_area_free(vma_ptr);
+                && ((*vma_ptr).vm_flags & VM_SHARED) != 0;
+            unmap_page_range_inner(
+                &mut *mm_ptr,
+                isect_start,
+                isect_end,
+                release_shared_anon,
+                &mut batch,
+            );
+            if (*vma_ptr).vm_flags & VM_LOCKED != 0 {
+                let locked_pages = (isect_end - isect_start) >> PAGE_SHIFT;
+                (*mm_ptr).locked_vm = (*mm_ptr).locked_vm.saturating_sub(locked_pages);
             }
-        } else if isect_start == vstart {
-            // Left side removed; keep [isect_end, vend).
-            unsafe {
-                remove_vma(mm, vma_ptr);
+        });
+    }
+    unsafe {
+        flush_and_release_pte_batch(&mut batch, mm_ptr);
+    }
+
+    // With stale translations gone, compact the affected VMA interval in one
+    // pass. Completely removed VMAs are retained in the inline/overflow
+    // detached buffers: invoking vm_ops.close while edit_range holds the
+    // backing Vec's exclusive borrow would leave the VMA published during
+    // close and permit callback reentry to invalidate that borrow.
+    let right_slot = &mut prepared_right as *mut *mut VmAreaStruct;
+    let edited = unsafe {
+        (*tree_ptr).edit_range(start, tree_end, |vstart, vend_inclusive, entry| {
+            let vma_ptr = entry as *mut VmAreaStruct;
+            let vend = vend_inclusive.saturating_add(1);
+            let isect_start = vstart.max(start);
+            let isect_end = vend.min(end);
+            let removed_pages = (isect_end - isect_start) >> PAGE_SHIFT;
+            (*mm_ptr).total_vm = (*mm_ptr).total_vm.saturating_sub(removed_pages);
+
+            if isect_start == vstart && isect_end == vend {
+                (*mm_ptr).map_count = (*mm_ptr).map_count.saturating_sub(1);
+                if removed_count < INLINE_DETACHED_VMAS {
+                    removed_inline[removed_count] = vma_ptr;
+                } else {
+                    removed_overflow.push(vma_ptr);
+                }
+                removed_count += 1;
+                MapleRangeEdit::Remove
+            } else if isect_start == vstart {
                 (*vma_ptr).vm_start = isect_end;
                 (*vma_ptr).vm_pgoff += (isect_end - vstart) >> PAGE_SHIFT;
-                let _ = insert_vma(mm, vma_ptr);
-            }
-        } else if isect_end == vend {
-            // Right side removed; keep [vstart, isect_start).
-            unsafe {
-                remove_vma(mm, vma_ptr);
+                MapleRangeEdit::Keep {
+                    start: isect_end,
+                    end: vend - 1,
+                    value: entry,
+                }
+            } else if isect_end == vend {
                 (*vma_ptr).vm_end = isect_start;
-                let _ = insert_vma(mm, vma_ptr);
-            }
-        } else {
-            // Middle removed; keep left [vstart, isect_start) and right [isect_end, vend).
-            let right = unsafe { vm_area_dup(vma_ptr) };
-            unsafe {
-                remove_vma(mm, vma_ptr);
+                MapleRangeEdit::Keep {
+                    start: vstart,
+                    end: isect_start - 1,
+                    value: entry,
+                }
+            } else {
+                let right = *right_slot;
+                assert!(
+                    !right.is_null(),
+                    "munmap middle split missing preallocated VMA"
+                );
+                *right_slot = core::ptr::null_mut();
                 (*vma_ptr).vm_end = isect_start;
                 (*right).vm_start = isect_end;
                 (*right).vm_pgoff += (isect_end - vstart) >> PAGE_SHIFT;
-                let _ = insert_vma(mm, vma_ptr);
-                let _ = insert_vma(mm, right);
+                (*mm_ptr).map_count = (*mm_ptr).map_count.saturating_add(1);
+                MapleRangeEdit::Split {
+                    left_start: vstart,
+                    left_end: isect_start - 1,
+                    left_value: entry,
+                    right_start: isect_end,
+                    right_end: vend - 1,
+                    right_value: right as usize,
+                }
             }
+        })
+    }?;
+    debug_assert!(edited > 0 || prepared_right.is_null());
+    debug_assert!(prepared_right.is_null());
+
+    // Linux's vms_complete_munmap_vmas() likewise invokes remove_vma() only
+    // after the VMAs have been detached from the primary Maple Tree.
+    for &vma_ptr in &removed_inline[..removed_count.min(INLINE_DETACHED_VMAS)] {
+        unsafe {
+            release_vma_resources(vma_ptr);
+            vm_area_free(vma_ptr);
+        }
+    }
+    for vma_ptr in removed_overflow {
+        unsafe {
+            release_vma_resources(vma_ptr);
+            vm_area_free(vma_ptr);
         }
     }
 
@@ -1015,7 +1369,12 @@ pub unsafe fn do_munmap(mm: &mut MmStruct, start: u64, len: u64) -> Result<(), i
 }
 
 /// Linux-visible `vm_munmap()` wrapper over `do_munmap()`.
+///
+/// This is the lock-owning entry point. Internal MAP_FIXED, brk, and mremap
+/// paths call `do_munmap()` while their outer syscall guard remains held.
 pub unsafe fn vm_munmap(mm: &mut MmStruct, start: u64, len: u64) -> Result<(), i32> {
+    let mm_ptr = mm as *mut MmStruct;
+    let _mmap_guard = unsafe { MmapWriteGuard::lock(mm_ptr) };
     unsafe { do_munmap(mm, start, len) }
 }
 
@@ -1102,9 +1461,93 @@ mod tests {
     use crate::mm::mm_types::MmStruct;
     use crate::mm::test_lock::GLOBAL_HW_TEST_LOCK as TEST_LOCK;
     use crate::mm::vma::find_vma;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     fn make_mm() -> MmStruct {
         MmStruct::new(0)
+    }
+
+    static CLOSE_SAW_DETACHED_VMA: AtomicBool = AtomicBool::new(false);
+    static CLOSE_REENTERED_MAPLE_TREE: AtomicBool = AtomicBool::new(false);
+    static CLOSE_ORDER: std::sync::Mutex<std::vec::Vec<usize>> =
+        std::sync::Mutex::new(std::vec::Vec::new());
+
+    unsafe extern "C" fn check_detached_vma_on_close(vma: *mut VmAreaStruct) {
+        let mm = unsafe { &mut *(*vma).vm_mm };
+        let start = unsafe { (*vma).vm_start };
+        let detached = mm.mm_mt.load(start) != Some(vma as usize);
+        CLOSE_SAW_DETACHED_VMA.store(detached, Ordering::SeqCst);
+
+        // Only reenter after confirming detachment, so the regression fails
+        // cleanly on the old ordering instead of deliberately aliasing the
+        // edit_range Vec borrow.
+        if detached {
+            let inserted = mm.mm_mt.insert_range(start, start, vma as usize).is_ok();
+            let erased = mm.mm_mt.erase(start) == Some(vma as usize);
+            CLOSE_REENTERED_MAPLE_TREE.store(inserted && erased, Ordering::SeqCst);
+        }
+    }
+
+    static DETACH_CHECK_VM_OPS: crate::mm::fault::VmOperationsStruct =
+        crate::mm::fault::VmOperationsStruct {
+            open: None,
+            close: Some(check_detached_vma_on_close),
+            fault: None,
+            map_pages: None,
+            pfn_mkwrite: None,
+            access: None,
+        };
+
+    unsafe extern "C" fn record_close_order(vma: *mut VmAreaStruct) {
+        let tag = unsafe { (*vma).vm_private_data };
+        CLOSE_ORDER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(tag);
+    }
+
+    static CLOSE_ORDER_VM_OPS: crate::mm::fault::VmOperationsStruct =
+        crate::mm::fault::VmOperationsStruct {
+            open: None,
+            close: Some(record_close_order),
+            fault: None,
+            map_pages: None,
+            pfn_mkwrite: None,
+            access: None,
+        };
+
+    /// Linux do_vmi_munmap() returns immediately when vma_find() finds no
+    /// overlap. The no-op must not instantiate Lupos's lazy tree backing.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vma.c:do_vmi_munmap
+    #[test]
+    fn munmap_empty_mm_does_not_allocate_maple_storage() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mm = make_mm();
+
+        unsafe { do_munmap(&mut mm, 0x10000, PAGE_SIZE) }.expect("empty munmap");
+
+        assert_eq!(
+            mm.mm_mt.ma_root.load(core::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// test-origin: linux:vendor/linux/mm/vma.c:do_vmi_munmap
+    #[test]
+    fn munmap_rejects_zero_unaligned_and_out_of_range_requests() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mm = make_mm();
+
+        assert_eq!(unsafe { do_munmap(&mut mm, 0x1000, 0) }, Err(-EINVAL));
+        assert_eq!(
+            unsafe { do_munmap(&mut mm, 0x1001, PAGE_SIZE) },
+            Err(-EINVAL)
+        );
+        assert_eq!(
+            unsafe { do_munmap(&mut mm, TASK_SIZE, PAGE_SIZE) },
+            Err(-EINVAL)
+        );
     }
 
     #[test]
@@ -1177,6 +1620,121 @@ mod tests {
         unsafe {
             put_page_from_pte(pte, false);
         }
+    }
+
+    /// Linux's generic MMU-gather contract requires unhook -> invalidate ->
+    /// free. This host test exercises Lupos's representation of that contract
+    /// because Linux's pointer-based gather cannot run directly in the Rust
+    /// host harness.
+    ///
+    /// test-origin: linux:vendor/linux/include/asm-generic/tlb.h
+    #[test]
+    fn unmap_batch_aggregates_vmas_and_preserves_release_metadata() {
+        use core::cell::{Cell, RefCell};
+
+        let first = pte_t(crate::arch::x86::mm::paging::_PAGE_PRESENT | 0x1000);
+        let second = pte_t(crate::arch::x86::mm::paging::_PAGE_PRESENT | 0x2000);
+        let mut batch = UnmapPteBatch::new();
+        // Model two VMAs separated by a hole. The second VMA is shared
+        // anonymous, so its page needs the extra address-space release.
+        assert!(!batch.push(0x4000, first, false));
+        assert!(!batch.push(0xa000, second, true));
+
+        let flushed = Cell::new(false);
+        let flushed_range = Cell::new((0, 0));
+        let released = RefCell::new(std::vec::Vec::new());
+        batch.drain_with(
+            |start, end| {
+                assert!(released.borrow().is_empty());
+                flushed_range.set((start, end));
+                flushed.set(true);
+            },
+            |pte, release_shared_anon| {
+                assert!(flushed.get(), "page released before TLB invalidation");
+                released.borrow_mut().push((pte, release_shared_anon));
+            },
+        );
+
+        assert_eq!(flushed_range.get(), (0x4000, 0xb000));
+        assert_eq!(
+            released.borrow().as_slice(),
+            &[(first, false), (second, true)]
+        );
+
+        // A second drain must not emit a spurious flush for an empty batch.
+        flushed.set(false);
+        batch.drain_with(
+            |_, _| flushed.set(true),
+            |_, _| panic!("empty batch released a PTE"),
+        );
+        assert!(!flushed.get());
+    }
+
+    /// test-origin: linux:vendor/linux/mm/vma.c:vms_complete_munmap_vmas
+    #[test]
+    fn unmap_batch_drains_before_detached_vma_resources() {
+        use core::cell::RefCell;
+
+        let pte = pte_t(crate::arch::x86::mm::paging::_PAGE_PRESENT | 0x3000);
+        let mut batch = UnmapPteBatch::new();
+        assert!(!batch.push(0x8000, pte, false));
+        let events = RefCell::new(std::vec::Vec::new());
+
+        batch.drain_with_then(
+            |_, _| events.borrow_mut().push("flush"),
+            |_, _| events.borrow_mut().push("page-release"),
+            || events.borrow_mut().push("vma-resource-release"),
+        );
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            &["flush", "page-release", "vma-resource-release"]
+        );
+    }
+
+    /// If a GFP_NOWAIT continuation page is unavailable, Linux falls back to
+    /// its eight-pointer on-stack bundle and asks the caller to drain at that
+    /// exact boundary. Host tests deliberately exercise that fallback.
+    ///
+    /// test-origin: linux:vendor/linux/mm/mmu_gather.c:tlb_next_batch
+    #[test]
+    fn unmap_batch_reports_full_at_inline_fallback_capacity() {
+        use core::cell::Cell;
+
+        assert_eq!(UNMAP_PTE_BATCH_SIZE, 8);
+        assert!(core::mem::size_of::<UnmapPteBatchPage>() <= PAGE_SIZE as usize);
+        assert_eq!(UNMAP_GATHER_MAX_PAGES, 10_000 / 510);
+        let mut batch = UnmapPteBatch::new();
+        for index in 0..UNMAP_PTE_BATCH_SIZE {
+            let addr = 0x1000 + index as u64 * PAGE_SIZE;
+            let pte = pte_t(
+                crate::arch::x86::mm::paging::_PAGE_PRESENT | ((index as u64 + 1) << PAGE_SHIFT),
+            );
+            assert_eq!(
+                batch.push(addr, pte, index % 2 == 0),
+                index + 1 == UNMAP_PTE_BATCH_SIZE
+            );
+        }
+
+        let flush_count = Cell::new(0);
+        let release_count = Cell::new(0);
+        let shared_release_count = Cell::new(0);
+        batch.drain_with(
+            |start, end| {
+                assert_eq!(start, 0x1000);
+                assert_eq!(end, 0x1000 + UNMAP_PTE_BATCH_SIZE as u64 * PAGE_SIZE);
+                flush_count.set(flush_count.get() + 1);
+            },
+            |_, release_shared_anon| {
+                release_count.set(release_count.get() + 1);
+                if release_shared_anon {
+                    shared_release_count.set(shared_release_count.get() + 1);
+                }
+            },
+        );
+        assert_eq!(flush_count.get(), 1);
+        assert_eq!(release_count.get(), UNMAP_PTE_BATCH_SIZE);
+        assert_eq!(shared_release_count.get(), UNMAP_PTE_BATCH_SIZE / 2);
     }
 
     // ── Test 1 ─────────────────────────────────────────────────────────────────
@@ -1298,6 +1856,42 @@ mod tests {
             }
             .is_ok()
         );
+    }
+
+    #[test]
+    fn map_fixed_replacement_uses_one_outer_mmap_write_lock() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mm = make_mm();
+        let mm_ptr = &mut mm as *mut MmStruct;
+        let _mmap_guard = unsafe { MmapWriteGuard::lock(mm_ptr) };
+
+        unsafe {
+            do_mmap(
+                &mut mm,
+                0x40000,
+                PAGE_SIZE,
+                PROT_READ,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                0,
+                0,
+            )
+        }
+        .expect("initial mapping");
+        let replaced = unsafe {
+            do_mmap(
+                &mut mm,
+                0x40000,
+                PAGE_SIZE,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                0,
+                0,
+            )
+        }
+        .expect("MAP_FIXED replacement under syscall-level write lock");
+
+        assert_eq!(replaced, 0x40000);
+        assert_eq!(mm.map_count, 1);
     }
 
     // ── Test 3 ─────────────────────────────────────────────────────────────────
@@ -1451,6 +2045,93 @@ mod tests {
         assert_eq!(crate::mm::huge::huge_stats().allocated_hugetlb, 1);
     }
 
+    /// Linux takes a reservation-map reference for the new VMA when munmap
+    /// splits a private hugetlb VMA. Closing either surviving fragment must
+    /// not return the reservation to the pool while the other remains.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vma.c:vms_gather_munmap_vmas
+    /// test-origin: linux:vendor/linux/mm/hugetlb.c:hugetlb_vm_op_open
+    #[test]
+    fn hugetlb_middle_munmap_retains_each_surviving_vma_fragment() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::mm::huge::reset_for_tests();
+        crate::mm::huge::configure_hugetlb_pool(crate::mm::huge::HPAGE_PMD_NR);
+        let mut mm = make_mm();
+        let huge_size = crate::mm::huge::HPAGE_PMD_NR as u64 * PAGE_SIZE;
+        let base = 0x4000_0000;
+
+        unsafe {
+            do_mmap(
+                &mut mm,
+                base,
+                3 * huge_size,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_FIXED_NOREPLACE,
+                0,
+                0,
+            )
+        }
+        .expect("three-page hugetlb VMA");
+        let original = find_vma(&mm, base).expect("hugetlb VMA");
+        let huge_id = unsafe { (*original).vm_private_data as u64 };
+
+        unsafe { do_munmap(&mut mm, base + huge_size, huge_size) }.expect("middle hugetlb munmap");
+        assert_eq!(mm.map_count, 2);
+        assert_eq!(crate::mm::huge::huge_page(huge_id).unwrap().refcount, 2);
+        assert_eq!(crate::mm::huge::huge_stats().pool_pages, 0);
+
+        unsafe { do_munmap(&mut mm, base, huge_size) }.expect("left fragment munmap");
+        assert_eq!(crate::mm::huge::huge_page(huge_id).unwrap().refcount, 1);
+        assert_eq!(crate::mm::huge::huge_stats().pool_pages, 0);
+
+        unsafe { do_munmap(&mut mm, base + 2 * huge_size, huge_size) }
+            .expect("right fragment munmap");
+        assert_eq!(crate::mm::huge::huge_page(huge_id), None);
+        assert_eq!(
+            crate::mm::huge::huge_stats().pool_pages,
+            crate::mm::huge::HPAGE_PMD_NR
+        );
+    }
+
+    /// Linux's hugetlb VMA split callback rejects boundaries which are not
+    /// aligned to the mapping's huge-page size.
+    ///
+    /// test-origin: linux:vendor/linux/mm/hugetlb.c:hugetlb_vm_op_split
+    #[test]
+    fn hugetlb_munmap_rejects_unaligned_vma_split() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::mm::huge::reset_for_tests();
+        crate::mm::huge::configure_hugetlb_pool(crate::mm::huge::HPAGE_PMD_NR);
+        let mut mm = make_mm();
+        let huge_size = crate::mm::huge::HPAGE_PMD_NR as u64 * PAGE_SIZE;
+        let base = 0x6000_0000;
+
+        unsafe {
+            do_mmap(
+                &mut mm,
+                base,
+                huge_size,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_FIXED_NOREPLACE,
+                0,
+                0,
+            )
+        }
+        .expect("hugetlb VMA");
+        let vma = find_vma(&mm, base).expect("hugetlb VMA");
+        let huge_id = unsafe { (*vma).vm_private_data as u64 };
+
+        assert_eq!(
+            unsafe { do_munmap(&mut mm, base + PAGE_SIZE, PAGE_SIZE) },
+            Err(-EINVAL)
+        );
+        assert_eq!(mm.map_count, 1);
+        assert_eq!(crate::mm::huge::huge_page(huge_id).unwrap().refcount, 1);
+
+        unsafe { do_munmap(&mut mm, base, huge_size) }.expect("hugetlb cleanup");
+        assert_eq!(crate::mm::huge::huge_page(huge_id), None);
+    }
+
     #[test]
     fn munmap_partial_start_advances_pgoff_for_anonymous_vma() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1503,6 +2184,94 @@ mod tests {
 
         assert_eq!(mm.map_count, 0);
         assert!(find_vma(&mm, addr).is_none());
+    }
+
+    /// Linux clears the primary VMA Maple Tree before remove_vma() invokes a
+    /// driver's vm_ops.close callback. The callback may therefore inspect or
+    /// mutate that tree without observing the closing VMA or aliasing an
+    /// in-progress tree edit.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vma.c:vms_complete_munmap_vmas
+    #[test]
+    fn munmap_detaches_vma_before_close_callback_reenters_tree() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mm = make_mm();
+        CLOSE_SAW_DETACHED_VMA.store(false, Ordering::SeqCst);
+        CLOSE_REENTERED_MAPLE_TREE.store(false, Ordering::SeqCst);
+
+        let addr = unsafe {
+            do_mmap(
+                &mut mm,
+                0x180000,
+                PAGE_SIZE,
+                PROT_READ,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                0,
+                0,
+            )
+        }
+        .expect("mmap for close callback");
+        let vma = find_vma(&mm, addr).expect("mapped VMA");
+        unsafe {
+            (*vma).vm_ops = &DETACH_CHECK_VM_OPS as *const _ as usize;
+            do_munmap(&mut mm, addr, PAGE_SIZE).expect("munmap with close callback");
+        }
+
+        assert!(CLOSE_SAW_DETACHED_VMA.load(Ordering::SeqCst));
+        assert!(CLOSE_REENTERED_MAPLE_TREE.load(Ordering::SeqCst));
+        assert_eq!(mm.map_count, 0);
+        assert!(find_vma(&mm, addr).is_none());
+    }
+
+    /// Linux walks its detached Maple Tree in ascending VMA order when
+    /// remove_vma() invokes close callbacks. Exercise both Lupos's eight-entry
+    /// inline detached buffer and its preallocated overflow without changing
+    /// that order.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vma.c:vms_complete_munmap_vmas
+    #[test]
+    fn munmap_overflow_preserves_detached_close_order() {
+        const VMA_COUNT: usize = 10;
+
+        let _g = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let mut mm = make_mm();
+        CLOSE_ORDER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+
+        let base = 0x20_0000;
+        for index in 0..VMA_COUNT {
+            let addr = base + index as u64 * 2 * PAGE_SIZE;
+            unsafe {
+                do_mmap(
+                    &mut mm,
+                    addr,
+                    PAGE_SIZE,
+                    PROT_READ,
+                    MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                    index as u64,
+                    0,
+                )
+            }
+            .expect("distinct VMA for detached overflow");
+            let vma = find_vma(&mm, addr).expect("new detached-overflow VMA");
+            unsafe {
+                (*vma).vm_ops = &CLOSE_ORDER_VM_OPS as *const _ as usize;
+                (*vma).vm_private_data = index + 1;
+            }
+        }
+
+        unsafe { do_munmap(&mut mm, base, (VMA_COUNT as u64 * 2 - 1) * PAGE_SIZE) }
+            .expect("munmap spanning inline and overflow detached VMAs");
+
+        let expected: std::vec::Vec<usize> = (1..=VMA_COUNT).collect();
+        let close_order = CLOSE_ORDER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(close_order.as_slice(), expected.as_slice());
+        assert_eq!(mm.map_count, 0);
+        assert!(mm.mm_mt.is_empty());
     }
 
     #[test]
@@ -1589,6 +2358,84 @@ mod tests {
         let vma = unsafe { &*find_vma(&mm, 0x10000).unwrap() };
         assert_eq!(vma.vm_start, 0x10000);
         assert_eq!(vma.vm_end, 0x28000);
+    }
+
+    /// Linux splits a VMA at both boundaries before clearing a hole from its
+    /// middle, preserving both residual ranges and their page offsets.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vma.c:vms_gather_munmap_vmas
+    #[test]
+    fn munmap_middle_keeps_two_preallocated_vma_halves() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mm = make_mm();
+        let base = 0x50_0000;
+
+        unsafe {
+            do_mmap(
+                &mut mm,
+                base,
+                4 * PAGE_SIZE,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                9,
+                0,
+            )
+        }
+        .expect("four-page VMA");
+
+        unsafe { do_munmap(&mut mm, base + PAGE_SIZE, 2 * PAGE_SIZE) }.expect("middle munmap");
+
+        assert_eq!(mm.map_count, 2);
+        assert_eq!(mm.total_vm, 2);
+        let left = find_vma(&mm, base).expect("left VMA");
+        let right = find_vma(&mm, base + PAGE_SIZE).expect("right VMA after hole");
+        assert_ne!(left, right);
+        unsafe {
+            assert_eq!(((*left).vm_start, (*left).vm_end), (base, base + PAGE_SIZE));
+            assert_eq!(
+                ((*right).vm_start, (*right).vm_end),
+                (base + 3 * PAGE_SIZE, base + 4 * PAGE_SIZE)
+            );
+            assert_eq!((*left).vm_pgoff, 9);
+            assert_eq!((*right).vm_pgoff, 12);
+        }
+    }
+
+    /// A single munmap over many VMAs must walk only the intersecting native
+    /// tree range and bulk-remove it; this is the behavioral counterpart of
+    /// Linux's `for_each_vma_range()`/`vma_iter_clear_gfp()` path.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vma.c:do_vmi_align_munmap
+    #[test]
+    fn munmap_many_distinct_vmas_removes_the_native_range() {
+        const VMA_COUNT: usize = 128;
+
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mm = make_mm();
+        let base = 0x1_0000_0000;
+        for index in 0..VMA_COUNT {
+            let addr = base + index as u64 * PAGE_SIZE;
+            unsafe {
+                do_mmap(
+                    &mut mm,
+                    addr,
+                    PAGE_SIZE,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                    index as u64,
+                    0,
+                )
+            }
+            .expect("distinct shared-anonymous VMA");
+        }
+        assert_eq!(mm.map_count, VMA_COUNT as i32);
+        assert_eq!(mm.total_vm, VMA_COUNT as u64);
+
+        unsafe { do_munmap(&mut mm, base, VMA_COUNT as u64 * PAGE_SIZE) }.expect("bulk munmap");
+
+        assert_eq!(mm.map_count, 0);
+        assert_eq!(mm.total_vm, 0);
+        assert_eq!(mm.mm_mt.count(), 0);
     }
 
     // ── Test 9 ─────────────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/mm/rmap.c
 //! test-origin: linux:vendor/linux/mm/rmap.c
 /// Reverse-mapping infrastructure — minimal port of `vendor/linux/mm/rmap.c`.
@@ -368,12 +368,36 @@ pub unsafe fn anon_vma_unlink(vma: *mut VmAreaStruct) {
 // Ref: Linux `mm/rmap.c` — `try_to_unmap()`
 // ---------------------------------------------------------------------------
 
+/// Complete the TLB invalidation for an unmapped PTE before installing its
+/// swap entry and releasing reverse-map ownership.
+///
+/// The injected operations keep the ordering contract directly testable while
+/// the production instantiation calls `flush_tlb_mm_range()` synchronously.
+#[inline]
+fn flush_before_swap_and_rmap_release<Flush, Release>(
+    mm: *mut crate::mm::mm_types::MmStruct,
+    start: u64,
+    end: u64,
+    flush: Flush,
+    release: Release,
+) where
+    Flush: FnOnce(*mut crate::mm::mm_types::MmStruct, u64, u64) -> bool,
+    Release: FnOnce(),
+{
+    assert!(
+        flush(mm, start, end),
+        "TLB shootdown failed before installing swap PTE and releasing rmap ownership"
+    );
+    release();
+}
+
 /// Replace every PTE mapping `page` with a swap PTE encoding `entry`.
 ///
 /// Walks the `AnonVma::chains` list to find all `AnonVmaChain` nodes, then
 /// for each VMA performs a linear scan of `[vm_start, vm_end)` looking for a
-/// PTE whose PFN matches `page_to_pfn(page)`.  When found the PTE is atomically
-/// replaced with `swp_entry_to_pte(entry)` and the TLB is flushed.
+/// PTE whose PFN matches `page_to_pfn(page)`. When found, the PTE is atomically
+/// cleared, the target mm's TLB is flushed, and `swp_entry_to_pte(entry)` is
+/// installed before reverse-map ownership is released.
 ///
 /// After this call `page._mapcount` should be -1 (all PTEs removed).
 /// Returns `true` if all PTEs were successfully removed.
@@ -388,9 +412,8 @@ pub unsafe fn anon_vma_unlink(vma: *mut VmAreaStruct) {
 /// Ref: Linux `mm/rmap.c` — `try_to_unmap()`
 pub unsafe fn try_to_unmap(page: *mut Page, entry: SwpEntry, _flags: u32) -> bool {
     use crate::arch::x86::mm::paging::{
-        flush_tlb_page, p4d_offset, pgd_offset_pgd, pmd_huge, pmd_none, pmd_offset, pte_none,
-        pte_offset_kernel, pte_pfn, pte_present, ptep_get_and_clear, pud_huge, pud_none,
-        pud_offset, set_pte_at,
+        p4d_offset, pgd_offset_pgd, pmd_huge, pmd_none, pmd_offset, pte_none, pte_offset_kernel,
+        pte_pfn, pte_present, ptep_get_and_clear, pud_huge, pud_none, pud_offset, set_pte_at,
     };
     use crate::mm::buddy::page_to_pfn;
     use crate::mm::swap::swp_entry_to_pte;
@@ -459,9 +482,18 @@ pub unsafe fn try_to_unmap(page: *mut Page, entry: SwpEntry, _flags: u32) -> boo
                 let pte = *ptep;
                 if pte_present(pte) && pte_pfn(pte) as usize == target_pfn {
                     ptep_get_and_clear(mm as *mut (), addr, ptep);
-                    set_pte_at(mm as *mut (), addr, ptep, swap_pte);
-                    flush_tlb_page(addr);
-                    (*page)._mapcount().fetch_sub(1, Ordering::Relaxed);
+                    flush_before_swap_and_rmap_release(
+                        mm,
+                        addr,
+                        addr + crate::mm::frame::PAGE_SIZE as u64,
+                        |target_mm, start, end| unsafe {
+                            crate::arch::x86::mm::tlb::flush_tlb_mm_range(target_mm, start, end)
+                        },
+                        || {
+                            set_pte_at(mm as *mut (), addr, ptep, swap_pte);
+                            (*page)._mapcount().fetch_sub(1, Ordering::Relaxed);
+                        },
+                    );
                     break;
                 }
             }
@@ -878,6 +910,40 @@ mod tests {
             );
             drop(Box::from_raw(vma));
         }
+    }
+
+    /// Linux `try_to_unmap_one()` flushes `vma->vm_mm` after clearing the PTE
+    /// and before installing the swap PTE or dropping rmap/page references.
+    ///
+    /// test-origin: linux:vendor/linux/mm/rmap.c
+    #[test]
+    fn reclaim_flushes_explicit_vma_mm_before_swap_and_rmap_release() {
+        use core::cell::Cell;
+
+        let expected_mm = 0x1234usize as *mut crate::mm::mm_types::MmStruct;
+        let state = Cell::new(0u8);
+        let observed_mm = Cell::new(core::ptr::null_mut());
+
+        flush_before_swap_and_rmap_release(
+            expected_mm,
+            0x4000,
+            0x5000,
+            |mm, start, end| {
+                assert_eq!(state.get(), 0, "flush must be the first operation");
+                assert_eq!(start, 0x4000);
+                assert_eq!(end, 0x5000);
+                observed_mm.set(mm);
+                state.set(1);
+                true
+            },
+            || {
+                assert_eq!(state.get(), 1, "release raced ahead of TLB completion");
+                state.set(2);
+            },
+        );
+
+        assert_eq!(observed_mm.get(), expected_mm);
+        assert_eq!(state.get(), 2);
     }
 
     #[test]

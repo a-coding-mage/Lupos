@@ -1245,12 +1245,14 @@ unsafe fn wake_signal_task(task: *mut crate::kernel::task::TaskStruct, sig: i32)
         || state == crate::kernel::task::task_state::TASK_RUNNING
         || sig == SIGKILL
     {
-        unsafe {
-            let _ = crate::kernel::sched::wake_task(task);
+        let woken = unsafe { crate::kernel::sched::wake_task(task) };
+        // Linux signal_wake_up_state() calls kick_process() when TTWU reports
+        // that the task was already running. Force a remote kernel entry so
+        // the published TIF_SIGPENDING is observed promptly.
+        if !woken && crate::kernel::sched::task_on_cpu(task) {
+            let cpu = unsafe { (*task).thread_info.cpu };
+            crate::kernel::sched::request_reschedule(cpu);
         }
-    }
-    if sig == SIGKILL {
-        wake_fatal_signal_target(task);
     }
 }
 
@@ -2134,35 +2136,10 @@ pub fn set_tif_sigpending(task: *mut crate::kernel::task::TaskStruct) {
     }
     unsafe {
         let thread_info = &mut (*task).thread_info;
-        thread_info.flags |= crate::kernel::task::TIF_SIGPENDING;
-        let state = (*task).__state.load(core::sync::atomic::Ordering::Acquire);
-        if state & crate::kernel::task::task_state::TASK_INTERRUPTIBLE != 0 {
-            (*task).__state.store(
-                crate::kernel::task::task_state::TASK_RUNNING,
-                core::sync::atomic::Ordering::Release,
-            );
-            let _ = crate::kernel::sched::wake_task(task);
-        }
-    }
-}
-
-fn wake_fatal_signal_target(task: *mut crate::kernel::task::TaskStruct) {
-    if task.is_null() {
-        return;
-    }
-    unsafe {
-        let state = (*task).__state.load(core::sync::atomic::Ordering::Acquire);
-        let wake_mask = crate::kernel::task::task_state::TASK_INTERRUPTIBLE
-            | crate::kernel::task::task_state::TASK_UNINTERRUPTIBLE
-            | crate::kernel::task::task_state::__TASK_STOPPED
-            | crate::kernel::task::task_state::__TASK_TRACED
-            | crate::kernel::task::task_state::TASK_WAKEKILL;
-        if state & wake_mask != 0 {
-            (*task).__state.store(
-                crate::kernel::task::task_state::TASK_RUNNING,
-                core::sync::atomic::Ordering::Release,
-            );
-        }
+        thread_info.flags.fetch_or(
+            crate::kernel::task::TIF_SIGPENDING,
+            core::sync::atomic::Ordering::Release,
+        );
     }
 }
 
@@ -2173,7 +2150,11 @@ pub fn has_pending_signals(task: *const crate::kernel::task::TaskStruct) -> bool
     }
     unsafe {
         let thread_info = &(*task).thread_info;
-        (thread_info.flags & crate::kernel::task::TIF_SIGPENDING) != 0
+        (thread_info
+            .flags
+            .load(core::sync::atomic::Ordering::Acquire)
+            & crate::kernel::task::TIF_SIGPENDING)
+            != 0
     }
 }
 
@@ -2467,9 +2448,15 @@ fn recalc_tif_sigpending(task: *mut crate::kernel::task::TaskStruct) -> bool {
     let pending = task_has_unblocked_pending_signal_state(task);
     unsafe {
         if pending {
-            (*task).thread_info.flags |= crate::kernel::task::TIF_SIGPENDING;
+            (*task).thread_info.flags.fetch_or(
+                crate::kernel::task::TIF_SIGPENDING,
+                core::sync::atomic::Ordering::Release,
+            );
         } else {
-            (*task).thread_info.flags &= !crate::kernel::task::TIF_SIGPENDING;
+            (*task).thread_info.flags.fetch_and(
+                !crate::kernel::task::TIF_SIGPENDING,
+                core::sync::atomic::Ordering::AcqRel,
+            );
         }
     }
     pending
@@ -2547,7 +2534,10 @@ pub fn clear_tif_sigpending(task: *mut crate::kernel::task::TaskStruct) {
     }
     unsafe {
         let thread_info = &mut (*task).thread_info;
-        thread_info.flags &= !crate::kernel::task::TIF_SIGPENDING;
+        thread_info.flags.fetch_and(
+            !crate::kernel::task::TIF_SIGPENDING,
+            core::sync::atomic::Ordering::AcqRel,
+        );
     }
 }
 
@@ -3025,6 +3015,20 @@ pub unsafe fn sys_rt_sigreturn_impl(regs: *mut crate::kernel::task::PtRegs) -> i
     let sc: &SigContext = &frame.uc.uc_mcontext;
     let mask = frame.uc.uc_sigmask;
 
+    // Linux restores the blocked mask before restore_sigcontext(). A bad
+    // fpstate therefore still leaves the mask from the user frame installed.
+    {
+        let mut table = SIGNAL_TABLE.lock();
+        if let Ok(state) = table.get_or_create_current() {
+            let mut next = mask;
+            next.remove(SIGKILL);
+            next.remove(SIGSTOP);
+            state.blocked = next;
+        }
+    }
+    let task = unsafe { crate::kernel::sched::get_current() };
+    recalc_tif_sigpending(task);
+
     let regs_mut = unsafe { &mut *regs };
     const FIX_EFLAGS: u64 = 0x50dd5;
     regs_mut.r8 = sc.r8;
@@ -3049,18 +3053,9 @@ pub unsafe fn sys_rt_sigreturn_impl(regs: *mut crate::kernel::task::PtRegs) -> i
     regs_mut.ss = (sc.ss as u64) | 0x3;
     regs_mut.orig_ax = u64::MAX;
 
-    // Restore the saved signal mask.
-    {
-        let mut table = SIGNAL_TABLE.lock();
-        if let Ok(state) = table.get_or_create_current() {
-            let mut next = mask;
-            next.remove(SIGKILL);
-            next.remove(SIGSTOP);
-            state.blocked = next;
-        }
+    if !unsafe { crate::arch::x86::kernel::fpu_signal::restore_fpstate_from_sigframe(sc.fpstate) } {
+        return unsafe { bad_rt_sigreturn() };
     }
-    let task = unsafe { crate::kernel::sched::get_current() };
-    recalc_tif_sigpending(task);
 
     // Linux: rt_sigreturn returns the restored rax verbatim so the resumed
     // program sees the syscall return value untouched.
@@ -3487,10 +3482,17 @@ mod tests {
         unsafe {
             sched::set_current(&mut *current as *mut TaskStruct);
             register_test_task(188, 188);
-            current.thread_info.flags |= crate::kernel::task::TIF_SIGPENDING;
+            current.thread_info.flags.fetch_or(
+                crate::kernel::task::TIF_SIGPENDING,
+                core::sync::atomic::Ordering::Release,
+            );
             linux_recalc_sigpending();
             assert_eq!(
-                current.thread_info.flags & crate::kernel::task::TIF_SIGPENDING,
+                current
+                    .thread_info
+                    .flags
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    & crate::kernel::task::TIF_SIGPENDING,
                 0
             );
 
@@ -3503,7 +3505,14 @@ mod tests {
                     .add(SIGTERM);
             }
             linux_recalc_sigpending();
-            assert!(current.thread_info.flags & crate::kernel::task::TIF_SIGPENDING != 0);
+            assert!(
+                current
+                    .thread_info
+                    .flags
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    & crate::kernel::task::TIF_SIGPENDING
+                    != 0
+            );
 
             sched::set_current(previous);
         }
@@ -3562,7 +3571,12 @@ mod tests {
             "SIGCONT must resume the stopped job"
         );
         assert!(
-            target.thread_info.flags & crate::kernel::task::TIF_SIGPENDING != 0,
+            target
+                .thread_info
+                .flags
+                .load(core::sync::atomic::Ordering::Acquire)
+                & crate::kernel::task::TIF_SIGPENDING
+                != 0,
             "the resumed job must recheck signals so the pending SIGTERM is delivered"
         );
 
@@ -4272,10 +4286,21 @@ mod tests {
             );
 
             assert_eq!(
-                leader.thread_info.flags & crate::kernel::task::TIF_SIGPENDING,
+                leader
+                    .thread_info
+                    .flags
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    & crate::kernel::task::TIF_SIGPENDING,
                 0
             );
-            assert!(sibling.thread_info.flags & crate::kernel::task::TIF_SIGPENDING != 0);
+            assert!(
+                sibling
+                    .thread_info
+                    .flags
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    & crate::kernel::task::TIF_SIGPENDING
+                    != 0
+            );
             assert!(has_unblocked_pending_signals(
                 &mut *sibling as *mut TaskStruct
             ));
@@ -4425,12 +4450,23 @@ mod tests {
                 send_signal_to_task(&mut *current as *mut TaskStruct, SIGUSR1),
                 0
             );
-            assert!(current.thread_info.flags & crate::kernel::task::TIF_SIGPENDING != 0);
+            assert!(
+                current
+                    .thread_info
+                    .flags
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    & crate::kernel::task::TIF_SIGPENDING
+                    != 0
+            );
 
             assert!(do_signal(&mut regs));
             assert_eq!(regs.ip, action.sa_handler as u64);
             assert_eq!(
-                current.thread_info.flags & crate::kernel::task::TIF_SIGPENDING,
+                current
+                    .thread_info
+                    .flags
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    & crate::kernel::task::TIF_SIGPENDING,
                 0
             );
 

@@ -32,7 +32,7 @@
 use core::{
     ffi::c_void,
     mem::{offset_of, size_of},
-    sync::atomic::AtomicU32,
+    sync::atomic::{AtomicI32, AtomicU32, AtomicU64},
 };
 
 use crate::kernel::signal::SignalStruct;
@@ -276,6 +276,7 @@ const PAD_FILES_TO_SIGNAL: usize =
 const PAD_SIGNAL_TO_THREAD_TOTAL: usize = LINUX_OFFSET_THREAD - (LINUX_OFFSET_SIGNAL + 8);
 const PAD_SIGNAL_TO_THREAD: usize = PAD_SIGNAL_TO_THREAD_TOTAL
     - core::mem::size_of::<crate::kernel::seccomp::Seccomp>()
+    - core::mem::size_of::<crate::arch::x86::kernel::fpu::TaskFpuState>()
     - core::mem::size_of::<u64>();
 
 // ── M26 fields (parent / children / exit / ptrace) ───────────────────────────
@@ -499,7 +500,11 @@ impl M39FsFields {
 #[repr(C)]
 pub struct M29SchedFields {
     /// Set when this task is currently running on a CPU.
-    pub on_cpu: i32,
+    ///
+    /// Linux pairs `smp_store_release(&p->on_cpu, 0)` in `finish_task()` with
+    /// acquire loads in wakeup and migration paths. `AtomicI32` preserves the
+    /// Linux four-byte C ABI while making that handoff explicit in Rust.
+    pub on_cpu: AtomicI32,
     /// 4-byte alignment pad before the 8-aligned wake_entry.
     pub _pad_a: u32,
     /// `__call_single_node` used by IPI-driven wake-ups.
@@ -560,7 +565,7 @@ impl M29SchedFields {
     /// All-zero state; sched_class defaults to NULL (caller assigns CFS).
     pub const fn zeroed() -> Self {
         Self {
-            on_cpu: 0,
+            on_cpu: AtomicI32::new(0),
             _pad_a: 0,
             wake_entry: WakeEntry::zeroed(),
             wakee_flips: 0,
@@ -615,7 +620,12 @@ const PAD_M29_TAIL: usize = PAD_STACK_TO_MM - core::mem::size_of::<M29SchedField
 #[repr(C)]
 pub struct ThreadInfo {
     /// Low-level thread flags (TIF_NEED_RESCHED, TIF_SIGPENDING, …).
-    pub flags: u64,
+    ///
+    /// Linux declares this as `unsigned long` and accesses it through atomic
+    /// bitops (`set_bit`, `clear_bit`, and `test_bit`). `AtomicU64` has the
+    /// same x86_64 C size/alignment while preventing mixed plain/atomic Rust
+    /// accesses.
+    pub flags: AtomicU64,
     /// Syscall work flags (SYSCALL_WORK_* bits, introduced Linux 5.15).
     pub syscall_work: u64,
     /// Thread-synchronous status flags (TS_* bits, per-CPU, not per-task).
@@ -687,8 +697,8 @@ pub struct PtRegs {
 ///
 /// This struct is `!Sync` because it contains raw pointer fields and atomic
 /// fields that require external locking per Linux semantics.  Access to fields
-/// other than `__state` and `thread_info.flags` must be serialised by the
-/// appropriate per-task or per-run-queue lock.
+/// other than `__state`, `thread_info.flags`, and `m29.on_cpu` must be
+/// serialised by the appropriate per-task or per-run-queue lock.
 #[repr(C)]
 pub struct TaskStruct {
     // ── Fixed-offset header ──────────────────────────────────────────────────
@@ -795,6 +805,15 @@ pub struct TaskStruct {
     /// M27 seccomp state (mode + filter chain head).  Placed at the start of
     /// the signal → thread block; Linux places `seccomp` in the same span.
     pub m27_seccomp: crate::kernel::seccomp::Seccomp,
+    /// Per-task x87/SSE state used by the x86 context switch.
+    ///
+    /// Linux allocates `struct fpu` and its dynamically-sized fpstate adjacent
+    /// to `task_struct`. Lupos has fixed-size static task pools and heap
+    /// allocations of exactly `TaskStruct`, so the state lives in the
+    /// otherwise-unmodelled signal → thread span. This preserves every
+    /// externally calibrated task-field offset while retaining task-local
+    /// state across CPU migration.
+    pub x86_fpu: crate::arch::x86::kernel::fpu::TaskFpuState,
     /// Per-task x86 stack canary installed into the current CPU's
     /// `__stack_chk_guard` by `__switch_to_asm`.
     pub stack_canary: u64,
@@ -816,6 +835,20 @@ pub struct TaskStruct {
 // is to catch arithmetic mistakes in the PAD_* computations.
 
 const _: () = {
+    // Atomic wrappers must remain ABI-transparent over Linux's integer fields.
+    assert!(size_of::<AtomicU64>() == size_of::<u64>());
+    assert!(core::mem::align_of::<AtomicU64>() == core::mem::align_of::<u64>());
+    assert!(size_of::<AtomicI32>() == size_of::<i32>());
+    assert!(core::mem::align_of::<AtomicI32>() == core::mem::align_of::<i32>());
+    assert!(size_of::<ThreadInfo>() == 24);
+    assert!(offset_of!(ThreadInfo, flags) == 0);
+    assert!(offset_of!(ThreadInfo, syscall_work) == 8);
+    assert!(offset_of!(ThreadInfo, status) == 16);
+    assert!(offset_of!(ThreadInfo, cpu) == 20);
+    assert!(offset_of!(M29SchedFields, on_cpu) == 0);
+    assert!(offset_of!(M29SchedFields, _pad_a) == 4);
+    assert!(offset_of!(M29SchedFields, wake_entry) == 8);
+
     // Fixed-offset fields: these match Linux unconditionally.
     assert!(
         offset_of!(TaskStruct, thread_info) == 0,
@@ -861,6 +894,8 @@ const _: () = {
     assert!(offset_of!(TaskStruct, m28_nsproxy) < offset_of!(TaskStruct, signal));
     assert!(offset_of!(TaskStruct, m27_seccomp) > offset_of!(TaskStruct, signal));
     assert!(offset_of!(TaskStruct, m27_seccomp) < offset_of!(TaskStruct, thread));
+    assert!(core::mem::align_of::<crate::arch::x86::kernel::fpu::TaskFpuState>() <= 8);
+    assert!(offset_of!(TaskStruct, x86_fpu) < offset_of!(TaskStruct, thread));
     assert!(offset_of!(TaskStruct, stack_canary) < offset_of!(TaskStruct, thread));
 
     // M29 invariants:
@@ -1018,5 +1053,28 @@ mod tests {
     #[test]
     fn thread_info_cpu_at_offset_20() {
         assert_eq!(offset_of!(ThreadInfo, cpu), 20);
+    }
+
+    #[test]
+    fn atomic_scheduler_fields_preserve_linux_layout() {
+        assert_eq!(size_of::<AtomicU64>(), size_of::<u64>());
+        assert_eq!(
+            core::mem::align_of::<AtomicU64>(),
+            core::mem::align_of::<u64>()
+        );
+        assert_eq!(size_of::<AtomicI32>(), size_of::<i32>());
+        assert_eq!(
+            core::mem::align_of::<AtomicI32>(),
+            core::mem::align_of::<i32>()
+        );
+        assert_eq!(offset_of!(M29SchedFields, on_cpu), 0);
+        assert_eq!(offset_of!(M29SchedFields, _pad_a), 4);
+        assert_eq!(offset_of!(M29SchedFields, wake_entry), 8);
+        assert_eq!(
+            M29SchedFields::zeroed()
+                .on_cpu
+                .load(core::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 }

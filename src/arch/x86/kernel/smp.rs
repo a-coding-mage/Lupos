@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/kernel/smp.c
 //! test-origin: linux:vendor/linux/arch/x86/kernel/smp.c
 //! SMP (Symmetric Multi-Processing) bring-up — Milestone 5.
@@ -21,10 +21,12 @@
 //! The trampoline code (`arch/x86/realmode/trampoline.S`, assembled as a flat binary) transitions
 //! them to 64-bit long mode and calls `ap_main()`.
 //!
-//! # Rendezvous barrier
-//! `AP_READY_COUNT` is an atomic counter incremented by each AP when it has
-//! initialized its LAPIC and enabled interrupts.  The BSP spins on this counter
-//! until all expected APs have checked in.
+//! # Rendezvous barriers
+//! Each AP publishes an early-alive bit as soon as it reaches `ap_main()`.
+//! The BSP uses that bit to decide whether the second SIPI is needed and to
+//! know when the shared trampoline may safely be reused. `AP_READY_COUNT` is
+//! published separately, after the AP has completed its per-CPU scheduler and
+//! timer initialization.
 //!
 //! References:
 //!   Intel SDM Vol. 3A §10.6.7 "Broadcast/Self-Directed IPIs"
@@ -34,7 +36,7 @@
 //!   https://wiki.osdev.org/Symmetric_Multiprocessing
 //!   https://wiki.osdev.org/APIC#Sending_an_Inter-Processor_Interrupt
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::x86::kernel::acpi::CpuInfo;
 #[cfg(feature = "test-smp")]
@@ -44,12 +46,40 @@ use crate::arch::x86::{
     kernel::{apic, msr},
 };
 
-// ── Shared atomic counters ────────────────────────────────────────────────────
+// ── CPU maps and startup state ────────────────────────────────────────────────
 
-/// Number of APs that have completed startup (LAPIC init + sti).
+/// Maximum CPUs tracked by the scheduler: one BSP plus [`MAX_APS`] APs.
+const MAX_CPUS: usize = crate::kernel::sched::MAX_CPUS;
+
+/// Sentinel for an unpublished logical-CPU to physical-APIC mapping.
+const INVALID_APIC_ID: u32 = u32::MAX;
+
+/// Linux's `x86_cpu_to_apicid`: dense logical CPU number to physical APIC ID.
 ///
-/// Each AP increments this with `Release` ordering before entering its spin
-/// loop.  The BSP reads it with `Acquire` ordering in `wait_for_aps()`.
+/// The MADT may contain sparse APIC IDs, so a physical APIC ID must never be
+/// used directly as an index into scheduler or per-CPU storage.
+static LOGICAL_TO_APIC_ID: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(INVALID_APIC_ID) }; MAX_CPUS];
+
+/// Number of entries published in [`LOGICAL_TO_APIC_ID`].
+static LOGICAL_CPU_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// APs which have entered [`ap_main`], indexed by dense logical CPU number.
+///
+/// This is deliberately separate from full readiness. Linux likewise has an
+/// early `SYNC_STATE_ALIVE` rendezvous before `start_secondary()` completes
+/// per-CPU setup.
+static AP_ALIVE_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// APs which have completed all initialization, indexed by logical CPU number.
+static AP_READY_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// Number of APs that have completed startup.
+///
+/// Each AP increments this with `Release` ordering after scheduler and timer
+/// initialization, immediately before enabling local interrupts and entering
+/// the scheduler idle loop. The BSP reads it with `Acquire` ordering in
+/// `wait_for_aps()`.
 pub static AP_READY_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Number of IPI ping signals received across all APs (Milestone 5 TDD).
@@ -58,7 +88,37 @@ pub static AP_READY_COUNT: AtomicU32 = AtomicU32::new(0);
 /// The BSP reads this with `Acquire` ordering in `run_ipi_ping_test()`.
 pub static IPI_RECEIVED_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// Return the current LAPIC-backed CPU index, clamped to scheduler storage.
+/// Return the physical APIC ID assigned to a dense logical CPU number.
+///
+/// This is the x86 destination translation required by physical-mode IPIs.
+/// Unmapped and out-of-range logical CPU numbers return `None`.
+pub fn logical_cpu_to_apic_id(cpu: u32) -> Option<u8> {
+    let count = LOGICAL_CPU_COUNT.load(Ordering::Acquire);
+    if cpu >= count {
+        return None;
+    }
+    let apic_id = LOGICAL_TO_APIC_ID[cpu as usize].load(Ordering::Acquire);
+    u8::try_from(apic_id).ok()
+}
+
+/// Translate a physical APIC ID to its dense logical CPU number.
+fn apic_id_to_logical_cpu(apic_id: u8) -> Option<u32> {
+    let count = LOGICAL_CPU_COUNT.load(Ordering::Acquire) as usize;
+    (0..count)
+        .find(|&cpu| LOGICAL_TO_APIC_ID[cpu].load(Ordering::Acquire) == apic_id as u32)
+        .map(|cpu| cpu as u32)
+}
+
+#[inline]
+fn logical_cpu_bit(cpu: u32) -> Option<u64> {
+    if cpu < MAX_CPUS as u32 && cpu < u64::BITS {
+        Some(1u64 << cpu)
+    } else {
+        None
+    }
+}
+
+/// Return the current dense logical CPU number.
 ///
 /// Non-syscall kernel paths use this during boot-test builds where depending
 /// on the syscall module's helper creates an avoidable link-time coupling.
@@ -69,12 +129,15 @@ pub fn current_cpu_id() -> usize {
 
 #[cfg(not(test))]
 pub fn current_cpu_id() -> usize {
-    // Skip the LAPIC MMIO read (a VM-exit on VBox) when only the BSP is online.
-    if AP_READY_COUNT.load(Ordering::Acquire) == 0 {
+    // Skip the LAPIC MMIO read (a VM-exit on VBox) until an AP has reached
+    // Rust. Before that point only the BSP can execute this path.
+    if AP_ALIVE_MASK.load(Ordering::Acquire) == 0 {
         return 0;
     }
-    let cpu = unsafe { apic::id() } as usize;
-    cpu.min(crate::kernel::sched::MAX_CPUS - 1)
+    let apic_id = unsafe { apic::id() };
+    apic_id_to_logical_cpu(apic_id)
+        .unwrap_or_else(|| panic!("smp: current APIC ID {apic_id} has no logical CPU mapping"))
+        as usize
 }
 
 // ── Trampoline binary ─────────────────────────────────────────────────────────
@@ -159,26 +222,36 @@ const fn ap_efer_pre_paging(bsp_efer: u64) -> u64 {
 // ── Per-AP stacks ─────────────────────────────────────────────────────────────
 
 /// Maximum number of APs supported.
-const MAX_APS: usize = 8;
+const MAX_APS: usize = MAX_CPUS - 1;
 
-/// Stack size per AP (16 KiB — generous for the simple spin-loop workload).
-const AP_STACK_SIZE: usize = 16 * 1024;
+/// Stack size per AP, matching production scheduler kernel-thread stacks.
+const AP_STACK_SIZE: usize = crate::kernel::sched::KTHREAD_STACK_SIZE;
 
-/// AP stack alignment required by the SysV AMD64 ABI.
-const AP_STACK_ALIGNMENT: usize = 16;
+/// Scheduler stack lookup masks the low 16 bits, so stacks need 64 KiB alignment.
+const AP_STACK_ALIGNMENT: usize = 64 * 1024;
 
 #[allow(dead_code)]
-#[repr(align(16))]
-#[derive(Copy, Clone)]
+#[repr(align(65536))]
 struct ApStack([u8; AP_STACK_SIZE]);
 
-/// Dedicated stacks for each AP, indexed by (apic_id - 1) for APIC IDs 1–8.
+/// Dedicated stacks for each AP, indexed by `(logical_cpu - 1)`.
 ///
 /// Static allocation avoids heap dependency during AP bring-up (the heap may
 /// not be initialized on APs before they call `ap_main()`).
 // SAFETY: written only during the single-threaded BSP init phase (before APs
 // start) or by the AP itself (which has exclusive access to its own slot).
-static mut AP_STACKS: [ApStack; MAX_APS] = [ApStack([0u8; AP_STACK_SIZE]); MAX_APS];
+static mut AP_STACKS: [ApStack; MAX_APS] = [const { ApStack([0u8; AP_STACK_SIZE]) }; MAX_APS];
+
+/// Return the exact top of the scheduler-compatible stack for an AP.
+fn ap_stack_top(logical_cpu: u32) -> Option<usize> {
+    let index = (logical_cpu as usize).checked_sub(1)?;
+    if index >= MAX_APS {
+        return None;
+    }
+    let stacks = core::ptr::addr_of_mut!(AP_STACKS).cast::<ApStack>();
+    let base = unsafe { stacks.add(index) } as usize;
+    Some(base + AP_STACK_SIZE)
+}
 
 // ── GDTR/IDTR helpers ─────────────────────────────────────────────────────────
 
@@ -267,8 +340,8 @@ unsafe fn read_cr4() -> u64 {
 /// - Physical 0x8000 must be identity-mapped (guaranteed by boot stub).
 /// - Called only during single-threaded BSP init (before any SIPI is sent).
 unsafe fn setup_trampoline(
-    ap_index: usize, // 0-based index into AP_STACKS
-    pml4_phys: u32,  // BSP's CR3 value (physical address of PML4)
+    stack_top: usize, // exact top of this AP's scheduler-compatible stack
+    pml4_phys: u32,   // BSP's CR3 value (physical address of PML4)
     gdt_limit: u16,
     gdt_base: u64,
     idt_limit: u16,
@@ -317,13 +390,9 @@ unsafe fn setup_trampoline(
     trampoline_write!(OFF_PML4_ADDR, u32, pml4_phys);
 
     // Step 3: Write AP stack top (u64) at offset 0xE8.
-    // x86 stacks grow downward; RSP = top = (base + size).
-    let stack_top: u64 = unsafe {
-        let base = core::ptr::addr_of_mut!(AP_STACKS[ap_index]) as *mut ApStack as *mut u8 as u64;
-        base + AP_STACK_SIZE as u64
-    };
-    debug_assert_eq!(stack_top as usize % AP_STACK_ALIGNMENT, 0);
-    trampoline_write!(OFF_STACK_TOP, u64, stack_top);
+    // x86 stacks grow downward; RSP starts at the exact scheduler stack top.
+    debug_assert_eq!(stack_top % AP_STACK_ALIGNMENT, 0);
+    trampoline_write!(OFF_STACK_TOP, u64, stack_top as u64);
 
     // Step 4: Write GDT descriptor (10 bytes) at offset 0xF0.
     // Format: u16 limit + u64 base.
@@ -346,17 +415,80 @@ unsafe fn setup_trampoline(
 
 // ── Public SMP API ────────────────────────────────────────────────────────────
 
+/// Build Linux-style dense logical CPU mappings from the MADT.
+///
+/// CPU 0 is always the running BSP. Enabled non-BSP processors receive logical
+/// IDs 1..N in MADT discovery order, regardless of how sparse their physical
+/// APIC IDs are.
+fn publish_cpu_mappings(cpus: &[CpuInfo], bsp_apic_id: u8) -> u32 {
+    assert_eq!(
+        LOGICAL_CPU_COUNT.load(Ordering::Acquire),
+        0,
+        "smp: logical CPU mappings may only be published once"
+    );
+    assert_ne!(bsp_apic_id, u8::MAX, "smp: BSP reported Linux BAD_APICID");
+
+    LOGICAL_TO_APIC_ID[0].store(bsp_apic_id as u32, Ordering::Relaxed);
+    let mut logical_cpu = 1usize;
+
+    for cpu in cpus {
+        if !cpu.enabled || cpu.apic_id == bsp_apic_id {
+            continue;
+        }
+        if cpu.apic_id == u8::MAX {
+            crate::kernel::printk::log_warn!(
+                "smp",
+                "smp: ignoring MADT processor with invalid APIC ID {:#x}",
+                cpu.apic_id
+            );
+            continue;
+        }
+        if (0..logical_cpu).any(|existing| {
+            LOGICAL_TO_APIC_ID[existing].load(Ordering::Relaxed) == cpu.apic_id as u32
+        }) {
+            crate::kernel::printk::log_warn!(
+                "smp",
+                "smp: ignoring duplicate MADT APIC ID {}",
+                cpu.apic_id
+            );
+            continue;
+        }
+        if logical_cpu >= MAX_CPUS {
+            crate::kernel::printk::log_warn!(
+                "smp",
+                "smp: ignoring APIC ID {}: scheduler supports {} CPUs",
+                cpu.apic_id,
+                MAX_CPUS
+            );
+            continue;
+        }
+
+        LOGICAL_TO_APIC_ID[logical_cpu].store(cpu.apic_id as u32, Ordering::Relaxed);
+        logical_cpu += 1;
+    }
+
+    // Publish all table entries together. APs acquire this count before
+    // scanning the table at the first instruction of `ap_main()`.
+    LOGICAL_CPU_COUNT.store(logical_cpu as u32, Ordering::Release);
+    logical_cpu as u32
+}
+
 /// Wake up the AP with the given APIC ID using the INIT-SIPI-SIPI sequence.
 ///
 /// # Arguments
-/// - `apic_id`  — xAPIC ID of the target AP (from MADT).
-/// - `ap_index` — 0-based index into `AP_STACKS` for this AP's stack.
+/// - `apic_id`     — physical xAPIC ID of the target AP (from MADT).
+/// - `logical_cpu` — dense logical CPU number assigned by the BSP.
 ///
 /// # Safety
 /// - LAPIC must be initialized on the BSP (`apic::init()` called).
 /// - The trampoline at 0x8000 must not be in use by another AP concurrently.
 ///   Start APs one-at-a-time and wait for each before starting the next.
-unsafe fn start_ap(apic_id: u8, ap_index: usize) {
+unsafe fn start_ap(apic_id: u8, logical_cpu: u32) {
+    let stack_top = ap_stack_top(logical_cpu)
+        .unwrap_or_else(|| panic!("smp: logical CPU {logical_cpu} has no AP stack"));
+    let alive_bit = logical_cpu_bit(logical_cpu)
+        .unwrap_or_else(|| panic!("smp: logical CPU {logical_cpu} exceeds startup mask"));
+
     // Read BSP's page tables and segment descriptor tables to share with AP.
     // In 64-bit mode, CR3 is a 64-bit register; we read into a 64-bit register
     // and then truncate to u32 for the 32-bit trampoline.
@@ -378,7 +510,7 @@ unsafe fn start_ap(apic_id: u8, ap_index: usize) {
     // Set up the trampoline page with this AP's parameters.
     unsafe {
         setup_trampoline(
-            ap_index,
+            stack_top,
             pml4_phys,
             gdt_limit,
             gdt_base,
@@ -426,7 +558,7 @@ unsafe fn start_ap(apic_id: u8, ap_index: usize) {
     //    is already running can leave the ICR in delivery-pending state.
     delay_us(200);
 
-    if AP_READY_COUNT.load(Ordering::Acquire) < (ap_index + 1) as u32 {
+    if AP_ALIVE_MASK.load(Ordering::Acquire) & alive_bit == 0 {
         crate::linux_driver_abi::tty::serial_println!("[smp] SIPI2 AP {}", apic_id);
         unsafe {
             apic::send_startup_ipi(apic_id, TRAMPOLINE_VECTOR_PAGE);
@@ -435,45 +567,80 @@ unsafe fn start_ap(apic_id: u8, ap_index: usize) {
     }
 }
 
-/// Wake up all non-BSP CPUs listed in `cpus`.
+/// Prepare dense logical CPU mappings for all usable MADT processors.
 ///
-/// APs are started one at a time (sequential).  After each SIPI we wait for
-/// the AP to increment `AP_READY_COUNT` before moving to the next, ensuring
-/// the shared trampoline page at 0x8000 is not overwritten while in use.
+/// This is the mapping portion of Linux's `native_smp_prepare_cpus()`. It must
+/// run once on the BSP before [`start_aps`], while no secondary CPU can observe
+/// a partially published table.
+pub fn prepare_cpus(cpus: &[CpuInfo]) -> usize {
+    let bsp_id = unsafe { apic::id() };
+    publish_cpu_mappings(cpus, bsp_id).saturating_sub(1) as usize
+}
+
+/// Wake up all non-BSP CPUs prepared by [`prepare_cpus`].
+///
+/// APs are started one at a time. After each SIPI, the BSP first waits for that
+/// AP's early-alive bit, which proves the shared trampoline page is no longer
+/// being read, and then waits separately for full scheduler readiness.
 ///
 /// # Safety
 /// LAPIC must be initialized on the BSP.
-pub unsafe fn start_aps(cpus: &[CpuInfo]) {
-    let bsp_id = unsafe { apic::id() };
-    let mut ap_index = 0usize;
+pub unsafe fn start_aps() {
+    let logical_cpu_count = LOGICAL_CPU_COUNT.load(Ordering::Acquire);
+    assert_ne!(
+        logical_cpu_count, 0,
+        "smp: prepare_cpus() must publish CPU mappings before start_aps()"
+    );
 
-    for cpu in cpus {
-        if !cpu.enabled || cpu.apic_id == bsp_id {
-            continue;
+    for logical_cpu in 1..logical_cpu_count {
+        let apic_id = logical_cpu_to_apic_id(logical_cpu)
+            .unwrap_or_else(|| panic!("smp: logical CPU {logical_cpu} mapping disappeared"));
+        unsafe {
+            start_ap(apic_id, logical_cpu);
         }
-        if ap_index >= MAX_APS {
+
+        // `ap_main()` has consumed all shared trampoline fields before it sets
+        // the alive bit. If that never happens, reusing the page for another AP
+        // would race a late starter, so abandon the remaining bring-up.
+        let tsc_2s = 2_000_000_000u64; // ~2s on a ≥1 GHz clock
+        if !wait_for_ap_state(&AP_ALIVE_MASK, logical_cpu, tsc_2s) {
+            crate::kernel::printk::log_warn!(
+                "smp",
+                "smp: APIC ID {} (logical CPU {}) did not reach alive state within 2s",
+                apic_id,
+                logical_cpu
+            );
             break;
         }
 
-        let expected_after = (ap_index + 1) as u32;
-        unsafe {
-            start_ap(cpu.apic_id, ap_index);
-        }
-
-        // Wait up to 2 seconds for this AP to check in before sending the
-        // next SIPI (which would overwrite the trampoline page).
-        let tsc_2s = 2_000_000_000u64; // ~2s on a ≥1 GHz clock
-        if !wait_for_aps(expected_after as usize, tsc_2s) {
-            // AP didn't respond — log but continue with remaining CPUs.
+        // Full readiness is a distinct, later milestone. Once alive is
+        // observed the trampoline is safe to reuse even if initialization
+        // subsequently times out.
+        if !wait_for_ap_state(&AP_READY_MASK, logical_cpu, tsc_2s) {
             crate::kernel::printk::log_warn!(
                 "smp",
-                "smp: AP {} (index {}) did not respond within 2s",
-                cpu.apic_id,
-                ap_index
+                "smp: APIC ID {} (logical CPU {}) did not become ready within 2s",
+                apic_id,
+                logical_cpu
             );
         }
+    }
+}
 
-        ap_index += 1;
+/// Wait for one logical CPU's bit in an AP startup-state mask.
+fn wait_for_ap_state(state: &AtomicU64, logical_cpu: u32, timeout_cycles: u64) -> bool {
+    let Some(bit) = logical_cpu_bit(logical_cpu) else {
+        return false;
+    };
+    let deadline = rdtsc().saturating_add(timeout_cycles);
+    loop {
+        if state.load(Ordering::Acquire) & bit != 0 {
+            return true;
+        }
+        if rdtsc() >= deadline {
+            return false;
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -503,10 +670,10 @@ pub fn wait_for_aps(expected: usize, timeout_cycles: u64) -> bool {
 /// Entry point called by the AP trampoline after transitioning to 64-bit mode.
 ///
 /// This function:
-///   1. Initializes the AP's own Local APIC.
-///   2. Increments `AP_READY_COUNT` to signal the BSP.
-///   3. Enables interrupts so IPIs can be received.
-///   4. Spins in a low-power loop (waiting for IPI ping and future work).
+///   1. Publishes the early-alive handshake.
+///   2. Initializes GDT/TSS, FPU, LAPIC, per-CPU GS, and syscall MSRs.
+///   3. Installs the scheduler idle task and LAPIC timer.
+///   4. Publishes full readiness and enters the scheduler idle loop.
 ///
 /// # ABI
 /// Called with `extern "C"` from naked assembly in `arch/x86/realmode/trampoline.S`.
@@ -517,48 +684,64 @@ pub fn wait_for_aps(expected: usize, timeout_cycles: u64) -> bool {
 /// The stack and segment registers are already configured by the trampoline.
 #[unsafe(no_mangle)]
 pub extern "C" fn ap_main(apic_id: u64) -> ! {
-    let cpu_slot = (apic_id as usize).min(crate::kernel::sched::MAX_CPUS - 1);
-    crate::arch::x86::kernel::setup_percpu::setup_percpu_segment(cpu_slot);
-    unsafe {
-        crate::arch::x86::kernel::gdt::init_ap(cpu_slot);
-        crate::arch::x86::kernel::fpu::init();
-    }
+    let physical_apic_id = u8::try_from(apic_id)
+        .unwrap_or_else(|_| panic!("smp: trampoline supplied invalid APIC ID {apic_id:#x}"));
+    let cpu = apic_id_to_logical_cpu(physical_apic_id).unwrap_or_else(|| {
+        panic!("smp: APIC ID {physical_apic_id} has no dense logical CPU mapping")
+    });
+    assert_ne!(cpu, 0, "smp: BSP entered the AP startup path");
+    let startup_bit =
+        logical_cpu_bit(cpu).unwrap_or_else(|| panic!("smp: logical CPU {cpu} is out of range"));
+    let stack_top =
+        ap_stack_top(cpu).unwrap_or_else(|| panic!("smp: logical CPU {cpu} has no AP stack"));
 
-    // Initialize this AP's Local APIC.
-    // Each CPU has its own LAPIC at the same MMIO address (0xFEE00000).
+    // Match Linux's early SYNC_STATE_ALIVE rendezvous. This must precede all
+    // potentially lengthy per-CPU initialization so the BSP never uses full
+    // readiness as its second-SIPI decision.
+    let was_alive = AP_ALIVE_MASK.fetch_or(startup_bit, Ordering::Release);
+    assert_eq!(
+        was_alive & startup_bit,
+        0,
+        "smp: logical CPU {cpu} entered ap_main twice"
+    );
+
+    // Linux's start_secondary() establishes descriptor/FPU/APIC state before
+    // installing the CPU-local GS base. In particular, init_ap() must load the
+    // per-CPU GDT before setup_percpu_segment() writes MSR_GS_BASE.
     unsafe {
+        crate::arch::x86::kernel::gdt::init_ap(cpu as usize);
+        crate::arch::x86::kernel::fpu::init();
         apic::init();
     }
-
-    // Milestone 6: mask the AP's LAPIC timer.  Only the BSP drives ticks
-    // for now (see kernel::softirq Risk #3 — no per-CPU storage yet, so we
-    // need TIMER_TICKS to remain a single-writer counter).
-    let cpu = unsafe { apic::id() } as u32;
+    crate::arch::x86::kernel::setup_percpu::setup_percpu_segment(cpu as usize);
     unsafe {
-        crate::kernel::sched::sched_init_ap(cpu);
+        crate::arch::x86::entry::syscall::init_ap();
+    }
+
+    unsafe {
+        crate::kernel::sched::sched_init_ap(cpu, stack_top);
         crate::arch::x86::kernel::apic_timer::init_ap();
     }
+    crate::kernel::sched::sched_activate_cpu(cpu);
     crate::kernel::rcu::tasks_rcu_qs();
     crate::kernel::rcu::rcu_qs();
 
-    // Signal the BSP that this AP is ready.
+    let was_ready = AP_READY_MASK.fetch_or(startup_bit, Ordering::Release);
+    assert_eq!(
+        was_ready & startup_bit,
+        0,
+        "smp: logical CPU {cpu} published readiness twice"
+    );
     AP_READY_COUNT.fetch_add(1, Ordering::Release);
 
-    // Enable interrupts so this AP can receive IPI pings.
+    // Linux enables local interrupts only after the CPU is online and its
+    // local clock event is installed. An IPI sent after the ready publication
+    // remains pending across this short window and is serviced after STI.
     unsafe {
-        core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+        core::arch::asm!("sti", options(nostack));
     }
 
-    // Spin in a low-power loop.
-    loop {
-        crate::kernel::watchdog::touch_softlockup_watchdog_sched();
-        crate::kernel::softirq::do_softirq();
-        crate::kernel::rcu::tasks_rcu_qs();
-        crate::kernel::rcu::rcu_qs();
-        unsafe {
-            core::arch::asm!("sti; hlt", options(nomem, nostack));
-        }
-    }
+    crate::kernel::sched::idle::cpu_startup_entry()
 }
 
 // ── TDD: CPU ping test (Milestone 5) ─────────────────────────────────────────
@@ -577,13 +760,9 @@ pub extern "C" fn ap_main(apic_id: u64) -> ! {
 ///
 /// Reference: Intel SDM Vol. 3A §10.6 "Issuing Interprocessor Interrupts"
 #[cfg(feature = "test-smp")]
-pub fn run_ipi_ping_test(cpus: &[CpuInfo]) {
-    let bsp_id = unsafe { apic::id() };
-
-    // Find the first enabled non-BSP CPU.
-    let target = cpus.iter().find(|c| c.enabled && c.apic_id != bsp_id);
-
-    let Some(ap) = target else {
+pub fn run_ipi_ping_test() {
+    // Logical CPU1 is the first AP accepted by prepare_cpus().
+    let Some(apic_id) = logical_cpu_to_apic_id(1) else {
         panic!("smp: IPI ping test FAILED - no enabled non-BSP CPU found");
     };
 
@@ -593,7 +772,7 @@ pub fn run_ipi_ping_test(cpus: &[CpuInfo]) {
     // Send fixed IPI to the AP at our ping vector.
     // Reference: Intel SDM Vol. 3A §10.6.1 "Interrupt Command Register (ICR)"
     unsafe {
-        apic::send_ipi(ap.apic_id, IPI_PING_VECTOR);
+        apic::send_ipi(apic_id, IPI_PING_VECTOR);
     }
 
     // Poll for the counter to increment (2-second TSC timeout).
@@ -606,7 +785,7 @@ pub fn run_ipi_ping_test(cpus: &[CpuInfo]) {
             crate::kernel::printk::log_info!(
                 "smp",
                 "smp: IPI ping test PASSED (AP {} replied)",
-                ap.apic_id
+                apic_id
             );
 
             #[cfg(feature = "qemu-test")]
@@ -618,7 +797,7 @@ pub fn run_ipi_ping_test(cpus: &[CpuInfo]) {
         if rdtsc() >= deadline {
             panic!(
                 "smp: IPI ping test FAILED - AP {} did not reply within timeout",
-                ap.apic_id
+                apic_id
             );
         }
         core::hint::spin_loop();
@@ -694,11 +873,19 @@ mod tests {
         // The global atomic must start at 0 so wait_for_aps(0, _) returns true
         // immediately (no APs expected) and wait_for_aps(1, _) waits correctly.
         assert_eq!(AP_READY_COUNT.load(Ordering::Relaxed), 0);
+        assert_eq!(AP_ALIVE_MASK.load(Ordering::Relaxed), 0);
+        assert_eq!(AP_READY_MASK.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn ipi_received_count_starts_at_zero() {
         assert_eq!(IPI_RECEIVED_COUNT.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn logical_cpu_map_starts_unpublished() {
+        assert_eq!(LOGICAL_CPU_COUNT.load(Ordering::Relaxed), 0);
+        assert_eq!(logical_cpu_to_apic_id(0), None);
     }
 
     #[test]
@@ -791,11 +978,11 @@ mod tests {
     }
 
     #[test]
-    fn ap_stack_is_16_byte_aligned() {
+    fn ap_stack_is_scheduler_aligned() {
         assert_eq!(
             align_of::<ApStack>(),
             AP_STACK_ALIGNMENT,
-            "AP stack alignment must be 16"
+            "AP stack alignment must be 64 KiB"
         );
         assert_eq!(
             size_of::<ApStack>(),
@@ -807,6 +994,16 @@ mod tests {
             0,
             "AP stack size must preserve alignment"
         );
+        assert_eq!(
+            AP_STACK_SIZE,
+            crate::kernel::sched::KTHREAD_STACK_SIZE,
+            "AP and scheduler kernel stacks must have identical size"
+        );
+        assert_eq!(ap_stack_top(0), None, "logical CPU 0 uses the BSP stack");
+        for cpu in 1..MAX_CPUS as u32 {
+            let top = ap_stack_top(cpu).expect("every supported AP needs a stack");
+            assert_eq!(top % AP_STACK_ALIGNMENT, 0);
+        }
     }
 
     #[test]
@@ -865,12 +1062,8 @@ mod tests {
     }
 
     #[test]
-    fn ap_stack_size_is_reasonable() {
-        // At least 8 KiB (two guard pages' worth) but not wasteful.
-        assert!(AP_STACK_SIZE >= 8 * 1024, "AP stack must be at least 8 KiB");
-        assert!(
-            AP_STACK_SIZE <= 64 * 1024,
-            "AP stack should not exceed 64 KiB"
-        );
+    fn ap_stack_size_is_64_kib() {
+        assert_eq!(AP_STACK_SIZE, 64 * 1024);
+        assert_eq!(AP_STACK_ALIGNMENT, 64 * 1024);
     }
 }

@@ -1,11 +1,17 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/kernel
 //! test-origin: linux:vendor/linux/arch/x86/kernel
-//! Minimal x86-64 FPU/SSE enablement.
+//! test-origin: linux:vendor/linux/tools/testing/selftests/x86/xstate.c
+//! x86-64 x87/SSE enablement and task context switching.
 //!
 //! Userland built by modern musl/Rust uses SSE instructions during C/Rust
 //! runtime startup. Linux enables OSFXSR/OSXMMEXCPT before returning to user
-//! mode; do the same before the login boot launches real PID1.
+//! mode and preserves each task's fpstate across context switches; do the same
+//! before the login boot launches real PID1.
+//!
+//! Lupos deliberately keeps XCR0 restricted to x87/SSE. FXSAVE therefore
+//! preserves every xfeature userspace can enable. AVX/YMM must remain disabled
+//! until this file grows Linux's dynamically-sized XSAVE-family fpstate.
 //!
 //! References:
 //! - `vendor/linux/arch/x86/kernel/fpu/core.c`
@@ -25,8 +31,9 @@ const CR4_OSXSAVE: u64 = 1 << 18;
 
 const X86_FEATURE_FPU: u32 = 0;
 const X86_FEATURE_XMM: u32 = 0 * 32 + 25;
-const KFPU_387: u32 = 1 << 0;
-const KFPU_MXCSR: u32 = 1 << 1;
+const X86_FEATURE_XSAVE: u32 = 4 * 32 + 26;
+pub(crate) const KFPU_387: u32 = 1 << 0;
+pub(crate) const KFPU_MXCSR: u32 = 1 << 1;
 const MXCSR_DEFAULT: u32 = 0x1f80;
 
 pub const XFEATURE_MASK_FP: u64 = 1 << 0;
@@ -42,6 +49,7 @@ static KERNEL_FPU_DEPTH: [AtomicU32; crate::kernel::sched::MAX_CPUS] =
     [const { AtomicU32::new(0) }; crate::kernel::sched::MAX_CPUS];
 static KERNEL_FPU_LOCKED_BH: [AtomicBool; crate::kernel::sched::MAX_CPUS] =
     [const { AtomicBool::new(false) }; crate::kernel::sched::MAX_CPUS];
+static MXCSR_FEATURE_MASK: AtomicU32 = AtomicU32::new(u32::MAX);
 
 #[inline]
 unsafe fn read_cr0() -> u64 {
@@ -100,11 +108,10 @@ pub fn xcr0_mask_for_features(features: crate::arch::x86::kernel::cpu::CpuFeatur
         return 0;
     }
 
-    // Do not enable the AVX/YMM xfeature yet.  The context-switch path only
-    // preserves GPRs (and, in later Rust-side bookkeeping, FS/GS), so allowing
-    // user tasks to execute AVX would leave YMM state shared between tasks.
-    // Keep XCR0 limited to the x87/SSE baseline until per-task XSAVE/XRSTOR
-    // support is wired into __switch_to.
+    // Do not enable the AVX/YMM xfeature yet. The task context-switch path
+    // preserves the architectural 512-byte FXSAVE image, which fully covers
+    // x87/SSE but not the upper halves of YMM registers. Keep XCR0 limited to
+    // that baseline until dynamically-sized XSAVE/XRSTOR state is available.
     XFEATURE_MASK_FPSSE
 }
 
@@ -120,11 +127,75 @@ impl FxSaveArea {
             bytes: [0; FXSAVE_AREA_SIZE],
         }
     }
+
+    /// Architectural initial state used by Linux's `init_fpstate`.
+    ///
+    /// An all-zero image is not a valid userspace reset image: x87 FCW resets
+    /// to 0x037f and MXCSR resets to 0x1f80.
+    pub const fn init_state() -> Self {
+        let mut bytes = [0; FXSAVE_AREA_SIZE];
+        bytes[0] = 0x7f;
+        bytes[1] = 0x03;
+        bytes[24] = 0x80;
+        bytes[25] = 0x1f;
+        Self { bytes }
+    }
 }
 
 impl Default for FxSaveArea {
     fn default() -> Self {
         Self::zeroed()
+    }
+}
+
+/// Task-local x87/SSE state and the small amount of Linux `struct fpu`
+/// metadata needed by Lupos's eager FXSAVE/FXRSTOR implementation.
+///
+/// `switches` is diagnostic state for the runtime xstate selftest. It is
+/// incremented whenever this task's image is saved or restored.
+const TASK_FPU_STORAGE_SIZE: usize = FXSAVE_AREA_SIZE + 15;
+
+#[repr(C)]
+pub struct TaskFpuState {
+    storage: [u8; TASK_FPU_STORAGE_SIZE],
+    pub switches: u64,
+    pub initialized: u8,
+    pub runtime_test: u8,
+    _pad: [u8; 6],
+}
+
+impl TaskFpuState {
+    pub const fn empty() -> Self {
+        Self {
+            storage: [0; TASK_FPU_STORAGE_SIZE],
+            switches: 0,
+            initialized: 0,
+            runtime_test: 0,
+            _pad: [0; 6],
+        }
+    }
+
+    #[inline]
+    fn regs_ptr(&self) -> *const FxSaveArea {
+        let start = self.storage.as_ptr();
+        let offset = (16 - (start as usize & 15)) & 15;
+        start.wrapping_add(offset).cast::<FxSaveArea>()
+    }
+
+    #[inline]
+    fn regs_mut_ptr(&mut self) -> *mut FxSaveArea {
+        let start = self.storage.as_mut_ptr();
+        let offset = (16 - (start as usize & 15)) & 15;
+        start.wrapping_add(offset).cast::<FxSaveArea>()
+    }
+
+    unsafe fn reset(&mut self) {
+        unsafe {
+            self.regs_mut_ptr().write(FxSaveArea::init_state());
+        }
+        self.switches = 0;
+        self.initialized = 1;
+        self.runtime_test = 0;
     }
 }
 
@@ -187,6 +258,319 @@ pub unsafe fn restore_fxstate(state: &FxSaveArea) {
 
 #[cfg(test)]
 pub unsafe fn restore_fxstate(_state: &FxSaveArea) {}
+
+/// Whether the boot CPU uses Linux's XSAVE signal-frame ABI.
+///
+/// Lupos currently enables only x87 and SSE in XCR0, but Linux still exposes
+/// those components through the 512-byte legacy area followed by the 64-byte
+/// XSAVE header whenever XSAVE is enabled.
+#[inline]
+pub fn signal_uses_xsave() -> bool {
+    crate::arch::x86::kernel::cpu::common::boot_cpu_has(X86_FEATURE_XSAVE)
+}
+
+/// MXCSR bits accepted from userspace.
+///
+/// Linux intersects the `mxcsr_mask` reported by every initialized CPU and
+/// uses `0x0000ffbf` when the architectural FXSAVE field is zero.
+#[inline]
+pub fn mxcsr_feature_mask() -> u32 {
+    #[cfg(test)]
+    {
+        0x0000_ffbf
+    }
+    #[cfg(not(test))]
+    {
+        MXCSR_FEATURE_MASK.load(Ordering::Acquire)
+    }
+}
+
+#[inline]
+unsafe fn task_uses_fpu(task: *mut crate::kernel::task::TaskStruct) -> bool {
+    !task.is_null() && unsafe { !(*task).mm.is_null() || (*task).x86_fpu.runtime_test != 0 }
+}
+
+/// Snapshot the current task's live x87/SSE register image for a signal frame.
+///
+/// Linux's `copy_fpstate_to_sigframe()` saves the live register state rather
+/// than trusting the task's potentially stale memory image.  Keep the task
+/// image coherent as well so a later context switch cannot expose older state.
+///
+/// # Safety
+/// The caller must be the current task and must not migrate during the save.
+pub unsafe fn save_current_user_fxstate(state: &mut FxSaveArea) {
+    *state = FxSaveArea::init_state();
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if !unsafe { task_uses_fpu(task) } {
+        return;
+    }
+
+    #[cfg(not(test))]
+    unsafe {
+        save_fxstate_raw(state as *mut FxSaveArea);
+    }
+    #[cfg(test)]
+    unsafe {
+        if (*task).x86_fpu.initialized != 0 {
+            core::ptr::copy_nonoverlapping(
+                (*task).x86_fpu.regs_ptr().cast::<u8>(),
+                state.bytes.as_mut_ptr(),
+                FXSAVE_AREA_SIZE,
+            );
+        }
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            state.bytes.as_ptr(),
+            (*task).x86_fpu.regs_mut_ptr().cast::<u8>(),
+            FXSAVE_AREA_SIZE,
+        );
+        (*task).x86_fpu.initialized = 1;
+    }
+}
+
+/// Install a validated signal-frame x87/SSE image into the current task.
+///
+/// # Safety
+/// The caller must be the current task and must not migrate during the
+/// restore. `state` must have passed the signal-frame validation in
+/// `fpu_signal`.
+pub unsafe fn restore_current_user_fxstate(state: &FxSaveArea) {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if !unsafe { task_uses_fpu(task) } {
+        return;
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            state.bytes.as_ptr(),
+            (*task).x86_fpu.regs_mut_ptr().cast::<u8>(),
+            FXSAVE_AREA_SIZE,
+        );
+        (*task).x86_fpu.initialized = 1;
+        restore_fxstate_raw((*task).x86_fpu.regs_ptr());
+    }
+}
+
+/// Reset the current task's user-visible FPU state after a null or invalid
+/// sigreturn fpstate pointer, matching `fpu__clear_user_states()`.
+///
+/// # Safety
+/// The caller must be the current task and must not migrate during the reset.
+pub unsafe fn clear_current_user_fxstate() {
+    let initial = FxSaveArea::init_state();
+    unsafe { restore_current_user_fxstate(&initial) };
+}
+
+/// Save the outgoing task's live user fpstate and restore the incoming task.
+///
+/// This is the eager FXSAVE equivalent of Linux
+/// `switch_fpu_prepare()`/`switch_fpu_finish()`. Kernel threads neither own
+/// nor perturb user fpstate, matching Linux's PF_KTHREAD exclusion. Because
+/// Lupos advertises only x87/SSE in XCR0, the 512-byte image covers all
+/// userspace-visible state.
+///
+/// # Safety
+/// `prev` and `next` must be the valid tasks participating in the current
+/// IRQ-disabled context switch.
+pub unsafe fn switch_fpu(
+    prev: *mut crate::kernel::task::TaskStruct,
+    next: *mut crate::kernel::task::TaskStruct,
+) {
+    if prev == next {
+        return;
+    }
+
+    if unsafe { task_uses_fpu(prev) } {
+        unsafe {
+            save_fxstate_raw((*prev).x86_fpu.regs_mut_ptr());
+            (*prev).x86_fpu.initialized = 1;
+            if (*prev).x86_fpu.runtime_test != 0 {
+                (*prev).x86_fpu.switches = (*prev).x86_fpu.switches.wrapping_add(1);
+            }
+        }
+    }
+
+    if unsafe { task_uses_fpu(next) } {
+        unsafe {
+            if (*next).x86_fpu.initialized == 0 {
+                (*next).x86_fpu.reset();
+            }
+            restore_fxstate_raw((*next).x86_fpu.regs_ptr());
+            if (*next).x86_fpu.runtime_test != 0 {
+                (*next).x86_fpu.switches = (*next).x86_fpu.switches.wrapping_add(1);
+            }
+        }
+    }
+}
+
+/// Initialize a fork child from the parent's live fpstate.
+///
+/// Linux's `fpu_clone()` writes the current CPU's register image directly
+/// into the child because the parent's buffered image may be stale. The same
+/// rule matters when `clone(2)` is entered from userspace in Lupos.
+///
+/// # Safety
+/// `parent` and `child` must be valid; `parent` must be current for a user
+/// clone, and the child must not yet be runnable.
+pub unsafe fn clone_task_fpu(
+    parent: *mut crate::kernel::task::TaskStruct,
+    child: *mut crate::kernel::task::TaskStruct,
+    kernel_thread: bool,
+) {
+    if child.is_null() {
+        return;
+    }
+
+    unsafe {
+        (*child).x86_fpu = TaskFpuState::empty();
+        (*child).x86_fpu.reset();
+    }
+    if kernel_thread || unsafe { (*child).mm.is_null() } {
+        return;
+    }
+
+    #[cfg(not(test))]
+    unsafe {
+        debug_assert_eq!(crate::kernel::sched::get_current(), parent);
+        save_fxstate_raw((*child).x86_fpu.regs_mut_ptr());
+    }
+    #[cfg(test)]
+    if !parent.is_null() && unsafe { (*parent).x86_fpu.initialized != 0 } {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (*parent).x86_fpu.regs_ptr().cast::<u8>(),
+                (*child).x86_fpu.regs_mut_ptr().cast::<u8>(),
+                FXSAVE_AREA_SIZE,
+            );
+        }
+    }
+}
+
+/// Reset the current task and live hardware to the architectural exec state.
+///
+/// Linux calls `fpu_flush_thread()` from `flush_thread()` while committing a
+/// new image. Kernel code is compiled with the soft-float ABI, so syscall and
+/// interrupt entry do not save a second FPU image which could overwrite this
+/// reset on return.
+///
+/// # Safety
+/// `task` must be the current task and must not migrate during the reset.
+pub unsafe fn reset_task_fpu_for_exec(task: *mut crate::kernel::task::TaskStruct) {
+    if task.is_null() {
+        return;
+    }
+    debug_assert_eq!(unsafe { crate::kernel::sched::get_current() }, task);
+    unsafe {
+        (*task).x86_fpu.reset();
+        restore_fxstate_raw((*task).x86_fpu.regs_ptr());
+    }
+}
+
+/// Result of one runtime xstate context-switch probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct XstateSwitchProbe {
+    pub expected: [u64; 2],
+    pub observed: [u64; 2],
+    pub switches_before: u64,
+    pub switches_after: u64,
+    pub cpu_before: u32,
+    pub cpu_after: u32,
+}
+
+impl XstateSwitchProbe {
+    pub fn preserved(self) -> bool {
+        self.expected == self.observed && self.switches_after > self.switches_before
+    }
+}
+
+#[cfg(not(test))]
+unsafe extern "C" fn xstate_probe_yield() {
+    unsafe {
+        crate::kernel::sched::reschedule_runnable();
+    }
+}
+
+/// Assembly envelope for the runtime probe.
+///
+/// Keeping the set/yield/read sequence in one assembly function prevents the
+/// Rust ABI's caller-clobbered XMM rules from obscuring what the test is
+/// checking. R12-R15 carry the pointers and pre-yield switch count across the
+/// scheduler;
+/// Lupos's normal switch stub already preserves those callee-saved GPRs.
+#[cfg(not(test))]
+#[unsafe(naked)]
+unsafe extern "C" fn xstate_probe_asm(
+    _expected: *const [u64; 2],
+    _observed: *mut [u64; 2],
+    _switches: *const u64,
+) -> u64 {
+    core::arch::naked_asm!(
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov r12, rdi",
+        "mov r13, rsi",
+        "mov r14, rdx",
+        "movdqu xmm15, xmmword ptr [r12]",
+        "mov r15, [r14]",
+        "call {yield_fn}",
+        "movdqu xmmword ptr [r13], xmm15",
+        "mov rax, r15",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "ret",
+        yield_fn = sym xstate_probe_yield,
+    );
+}
+
+/// Exercise x87/SSE preservation across one real scheduler yield.
+///
+/// This adapts the core technique from Linux selftests `xstate.c`: install a
+/// per-thread randomized register value, block/yield to force context
+/// switches, then validate the register after resumption. A runtime harness
+/// should run at least two probe kthreads on the same CPU and retry until
+/// `switches_after > switches_before`; running probes on multiple CPUs also
+/// covers migration.
+///
+/// The current task is temporarily treated as an fpstate-owning test task so
+/// the helper is usable from Lupos's existing SMP kernel test mode without a
+/// userspace test binary.
+#[cfg(not(test))]
+pub unsafe fn run_xstate_switch_probe(expected: [u64; 2]) -> XstateSwitchProbe {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    assert!(!task.is_null(), "xstate probe requires a current task");
+
+    let mut observed = [0u64; 2];
+    let cpu_before = crate::arch::x86::kernel::setup_percpu::current_cpu_number() as u32;
+    let switches_before = unsafe {
+        (*task).x86_fpu.runtime_test = 1;
+        let before = xstate_probe_asm(
+            &expected,
+            &mut observed,
+            core::ptr::addr_of!((*task).x86_fpu.switches),
+        );
+        (*task).x86_fpu.runtime_test = 0;
+        before
+    };
+    let switches_after = unsafe { (*task).x86_fpu.switches };
+    let cpu_after = crate::arch::x86::kernel::setup_percpu::current_cpu_number() as u32;
+
+    XstateSwitchProbe {
+        expected,
+        observed,
+        switches_before,
+        switches_after,
+        cpu_before,
+        cpu_after,
+    }
+}
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
@@ -324,7 +708,21 @@ pub unsafe fn init() {
 
     unsafe {
         core::arch::asm!("fninit", options(nomem, nostack));
+        ldmxcsr_default();
     }
+
+    let mut initial = FxSaveArea::zeroed();
+    unsafe { save_fxstate_raw(&mut initial) };
+    let mut mask = u32::from_le_bytes([
+        initial.bytes[28],
+        initial.bytes[29],
+        initial.bytes[30],
+        initial.bytes[31],
+    ]);
+    if mask == 0 {
+        mask = 0x0000_ffbf;
+    }
+    MXCSR_FEATURE_MASK.fetch_and(mask, Ordering::AcqRel);
 }
 
 #[cfg(test)]
@@ -375,6 +773,64 @@ mod tests {
         assert_eq!(core::mem::align_of::<FxSaveArea>(), 16);
         let area = FxSaveArea::zeroed();
         assert!(area.bytes.iter().all(|b| *b == 0));
+        let initial = FxSaveArea::init_state();
+        assert_eq!(
+            u16::from_le_bytes([initial.bytes[0], initial.bytes[1]]),
+            0x037f
+        );
+        assert_eq!(
+            u32::from_le_bytes([
+                initial.bytes[24],
+                initial.bytes[25],
+                initial.bytes[26],
+                initial.bytes[27],
+            ]),
+            MXCSR_DEFAULT
+        );
+        assert_eq!(core::mem::size_of::<TaskFpuState>(), 544);
+        assert_eq!(core::mem::align_of::<TaskFpuState>(), 8);
+        let mut task_state = TaskFpuState::empty();
+        assert_eq!(task_state.regs_ptr() as usize % 16, 0);
+        assert_eq!(task_state.regs_mut_ptr() as usize % 16, 0);
+    }
+
+    #[test]
+    fn exec_reset_installs_architectural_initial_fpstate() {
+        struct RestoreCurrent(*mut crate::kernel::task::TaskStruct);
+        impl Drop for RestoreCurrent {
+            fn drop(&mut self) {
+                unsafe {
+                    crate::kernel::sched::set_current(self.0);
+                }
+            }
+        }
+
+        let previous = unsafe { crate::kernel::sched::get_current() };
+        let mut task: alloc::boxed::Box<crate::kernel::task::TaskStruct> =
+            alloc::boxed::Box::new(unsafe { core::mem::zeroed() });
+        task.x86_fpu = TaskFpuState::empty();
+        let task_ptr = &mut *task as *mut crate::kernel::task::TaskStruct;
+        unsafe {
+            crate::kernel::sched::set_current(task_ptr);
+            reset_task_fpu_for_exec(task_ptr);
+        }
+        let _restore = RestoreCurrent(previous);
+
+        let scratch = unsafe { &*task.x86_fpu.regs_ptr() };
+        assert_eq!(
+            u16::from_le_bytes([scratch.bytes[0], scratch.bytes[1]]),
+            0x037f
+        );
+        assert_eq!(
+            u32::from_le_bytes([
+                scratch.bytes[24],
+                scratch.bytes[25],
+                scratch.bytes[26],
+                scratch.bytes[27],
+            ]),
+            MXCSR_DEFAULT
+        );
+        assert_eq!(task.x86_fpu.initialized, 1);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/kernel
 //! test-origin: linux:vendor/linux/arch/x86/kernel
 //! 64-bit Task State Segment (TSS) and Interrupt Stack Table (IST).
@@ -153,24 +153,19 @@ pub static mut TSS: Tss = Tss::new();
 
 /// Per-CPU TSS storage for APs.
 ///
-/// CPU0 intentionally keeps the public `TSS` symbol because the current
-/// syscall entry stub reads CPU0 RSP0 by symbol before the GS-relative per-CPU
-/// entry path lands. APs use their own TSS slots so `ltr` never reuses the
-/// BSP's busy TSS descriptor.
+/// CPU0 intentionally keeps the public `TSS` symbol for the boot GDT. APs use
+/// their own TSS slots so `ltr` never reuses the BSP's busy TSS descriptor.
+/// The syscall entry path reaches the current CPU's TSS through its
+/// GS-relative per-CPU pointer.
 static mut AP_TSS: [Tss; MAX_CPUS] = [Tss::new(); MAX_CPUS];
 
 const fn cpu_slot(cpu: usize) -> usize {
     if cpu >= MAX_CPUS { MAX_CPUS - 1 } else { cpu }
 }
 
-#[cfg(test)]
+#[inline]
 fn current_cpu_index() -> usize {
-    0
-}
-
-#[cfg(not(test))]
-fn current_cpu_index() -> usize {
-    crate::arch::x86::kernel::smp::current_cpu_id().min(MAX_CPUS - 1)
+    crate::arch::x86::kernel::setup_percpu::current_cpu_number()
 }
 
 unsafe fn tss_for_cpu_mut(cpu: usize) -> *mut Tss {

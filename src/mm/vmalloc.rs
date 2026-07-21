@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/mm/vmalloc.c
 //! test-origin: linux:vendor/linux/mm/vmalloc.c
 /// Kernel virtual memory allocator — non-contiguous physical pages mapped into
@@ -612,6 +612,34 @@ unsafe fn sync_vmalloc_pgd_slot_to_current_mm(start: u64, size: usize) {
 #[cfg(test)]
 unsafe fn sync_vmalloc_pgd_slot_to_current_mm(_start: u64, _size: usize) {}
 
+/// Copy the requested top-level kernel slots and report whether any entry
+/// actually changed.
+///
+/// Once an mm points at the same lower-level vmalloc tables as `init_mm`, new
+/// stacks and other vmalloc mappings become visible through those shared
+/// tables without rewriting its PGD. This is the same steady state Linux gets
+/// from `sync_global_pgds()`, which only installs a missing kernel entry.
+#[inline]
+unsafe fn sync_changed_pgd_slots(
+    dst: *mut crate::arch::x86::mm::paging::pgd_t,
+    src: *const crate::arch::x86::mm::paging::pgd_t,
+    first: usize,
+    last: usize,
+) -> bool {
+    let mut changed = false;
+    for idx in first..=last {
+        let src_entry = unsafe { *src.add(idx) };
+        let dst_entry = unsafe { *dst.add(idx) };
+        if dst_entry != src_entry {
+            unsafe {
+                *dst.add(idx) = src_entry;
+            }
+            changed = true;
+        }
+    }
+    changed
+}
+
 #[cfg(not(test))]
 pub unsafe fn sync_vmalloc_pgd_slot_to_mm(
     mm: *mut crate::mm::mm_types::MmStruct,
@@ -628,12 +656,9 @@ pub unsafe fn sync_vmalloc_pgd_slot_to_mm(
     let last = pgd_index(end);
     let src = phys_to_virt(init_pgd_phys()) as *mut pgd_t;
     let dst = unsafe { (*mm).pgd as *mut pgd_t };
-    for idx in first..=last {
-        unsafe {
-            *dst.add(idx) = *src.add(idx);
-        }
+    if unsafe { sync_changed_pgd_slots(dst, src, first, last) } {
+        unsafe { flush_cr3_if_mm_is_current(mm) };
     }
-    unsafe { flush_cr3_if_mm_is_current(mm) };
 }
 
 #[cfg(test)]
@@ -1137,5 +1162,35 @@ mod tests {
 
         assert_eq!(virt_to_phys(ptr as u64), None);
         assert_eq!(virt_to_phys((ptr as u64) + PAGE_SIZE as u64), None);
+    }
+
+    #[test]
+    fn pgd_slot_sync_does_not_rewrite_identical_entries() {
+        use crate::arch::x86::mm::paging::pgd_t;
+
+        let src = [pgd_t(0x1003), pgd_t(0x2003), pgd_t(0x3003)];
+        let mut dst = src;
+
+        let changed =
+            unsafe { sync_changed_pgd_slots(dst.as_mut_ptr(), src.as_ptr(), 0, src.len() - 1) };
+
+        assert!(!changed);
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn pgd_slot_sync_reports_and_copies_only_changed_entries() {
+        use crate::arch::x86::mm::paging::pgd_t;
+
+        let src = [pgd_t(0x1003), pgd_t(0x2003), pgd_t(0x3003), pgd_t(0x4003)];
+        let mut dst = [pgd_t(0xaaaa), pgd_t(0), pgd_t(0), pgd_t(0xbbbb)];
+
+        let changed = unsafe { sync_changed_pgd_slots(dst.as_mut_ptr(), src.as_ptr(), 1, 2) };
+
+        assert!(changed);
+        assert_eq!(dst[0], pgd_t(0xaaaa));
+        assert_eq!(dst[1], src[1]);
+        assert_eq!(dst[2], src[2]);
+        assert_eq!(dst[3], pgd_t(0xbbbb));
     }
 }

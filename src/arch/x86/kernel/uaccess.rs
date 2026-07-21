@@ -855,12 +855,10 @@ pub unsafe fn copy_from_user_nmi(to: *mut u8, from: *const u8, n: usize) -> usiz
 /// CR3 / mm sanity check used by NMI-context user copies. Mirrors
 /// `nmi_uaccess_okay()` in `vendor/linux/arch/x86/include/asm/tlbflush.h`.
 ///
-/// Linux returns true iff CR3 still points at `current->active_mm`'s
-/// PGD — that guarantees the user pointers we're about to dereference
-/// resolve through the right page tables. Lupos hides the CR3 read
-/// behind the paging module; until that exposes the predicate the
-/// safe default is "true" on UP and "true when CR3 matches the
-/// current task's mm" on SMP.
+/// Linux returns true iff the per-CPU loaded mm still equals `current->mm`.
+/// `switch_mm_irqs_off()` publishes `LOADED_MM_SWITCHING` before changing CR3,
+/// so this conservative comparison rejects both the CR3 transition itself and
+/// the surrounding window where `current` still names the other task.
 #[inline]
 pub fn nmi_uaccess_okay() -> bool {
     #[cfg(test)]
@@ -869,9 +867,15 @@ pub fn nmi_uaccess_okay() -> bool {
     }
     #[cfg(not(test))]
     {
-        // TODO(batch-D): compare CR3 against current task's mm->pgd
-        // once `crate::mm::paging::current_cr3()` is exposed.
-        true
+        let current = unsafe { crate::kernel::sched::get_current() };
+        if current.is_null() {
+            return false;
+        }
+        let current_mm = unsafe { (*current).mm };
+        crate::arch::x86::mm::tlb::loaded_mm_matches(
+            crate::kernel::sched::current_cpu(),
+            current_mm,
+        )
     }
 }
 

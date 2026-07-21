@@ -155,12 +155,15 @@ pub unsafe fn do_exit(code: i64) -> ! {
     }
 }
 
-/// Drop the task's `mm` reference.
+/// Drop the task's real `mm` reference and enter lazy-TLB mode.
 ///
 /// For kernel threads `mm == NULL`, so this is a no-op.  For user tasks it
-/// decrements `mm_users`; full VMA + page-table teardown lives in M14/M15
-/// helpers and is invoked when `mm_users` reaches zero — deferred until M28
-/// can validate it under namespace teardown.
+/// first takes the lazy `active_mm` structural reference, clears only `mm`,
+/// and then decrements `mm_users`. The PGD remains alive until the scheduler
+/// transfers or drops `active_mm` after a CR3 switch.
+///
+/// Ref: Linux `kernel/exit.c::exit_mm()` (`mmgrab_lazy_tlb()`,
+/// `current->mm = NULL`, `enter_lazy_tlb()`, then `mmput()`).
 ///
 /// # Safety
 /// `tsk` must be valid.  Caller must ensure no further accesses to `tsk.mm`
@@ -171,44 +174,20 @@ pub unsafe fn exit_mm(tsk: *mut TaskStruct) {
     }
     unsafe {
         let mm = (*tsk).mm;
-        (*tsk).mm = core::ptr::null_mut();
-        (*tsk).active_mm = core::ptr::null_mut();
-        if !mm.is_null() {
-            // mmput returns true when mm_users hit zero — full teardown
-            // (free VMAs + page tables) lands in a follow-up.  In M26 the
-            // smoke test exercises only kthreads (mm == NULL).
-            if (*mm).mmput() {
-                switch_to_kernel_cr3_before_destroy(mm);
-                crate::mm::fork::destroy_mm(mm);
-            }
+        if mm.is_null() {
+            return;
         }
-    }
-}
 
-#[cfg(not(test))]
-unsafe fn switch_to_kernel_cr3_before_destroy(mm: *mut crate::mm::mm_types::MmStruct) {
-    if mm.is_null() {
-        return;
-    }
-    let pgd_virt = unsafe { (*mm).pgd as u64 };
-    let Some(pgd_phys) = crate::arch::x86::mm::paging::virt_to_phys(pgd_virt) else {
-        return;
-    };
-    if crate::arch::x86::mm::paging::read_cr3() != pgd_phys {
-        return;
-    }
-    let init_pgd = crate::arch::x86::mm::paging::init_pgd_phys();
-    unsafe {
-        core::arch::asm!(
-            "mov cr3, {0}",
-            in(reg) init_pgd,
-            options(nostack, preserves_flags)
+        debug_assert!(
+            (*tsk).active_mm.is_null() || (*tsk).active_mm == mm,
+            "exit_mm: user task active_mm must match mm"
         );
+        (*mm).mmdrop_get();
+        (*tsk).active_mm = mm;
+        (*tsk).mm = core::ptr::null_mut();
+        crate::mm::fork::mmput(mm);
     }
 }
-
-#[cfg(test)]
-unsafe fn switch_to_kernel_cr3_before_destroy(_mm: *mut crate::mm::mm_types::MmStruct) {}
 
 unsafe fn add_child_link(parent: *mut TaskStruct, child: *mut TaskStruct) {
     if parent.is_null() || child.is_null() {
@@ -770,6 +749,7 @@ mod tests {
 
     #[test]
     fn exit_notify_sends_sigchld_to_parent() {
+        let _signal_guard = signal::SIGNAL_TEST_LOCK.lock();
         signal::reset_for_tests();
         signal::register_test_task(7777, 7777); // parent state pre-exists
 
@@ -794,6 +774,9 @@ mod tests {
 
             child.m26.real_parent = &mut *parent as *mut TaskStruct;
             child.m26.exit_signal = SIGCHLD;
+            child.m26.exit_code = crate::kernel::wait::w_exitcode(7, 0);
+            child.cred = &raw const crate::kernel::cred::INIT_CRED;
+            child.m27.real_cred = &raw const crate::kernel::cred::INIT_CRED;
 
             exit_notify(&mut *child as *mut TaskStruct);
 
@@ -801,7 +784,22 @@ mod tests {
                 signal::has_pending_signal_for_pid(7777, SIGCHLD),
                 "exit_notify must queue SIGCHLD on the real_parent"
             );
+
+            // vendor/linux/kernel/signal.c::do_notify_parent publishes a
+            // process-directed CLD_EXITED record, not a generic code-zero
+            // task signal. signalfd consumers use this code to decide whether
+            // to reap the child with waitpid().
+            sched::set_current(&mut *parent as *mut TaskStruct);
+            let info = signal::dequeue_current_pending_signal_mask(1u64 << (SIGCHLD - 1))
+                .expect("parent SIGCHLD record");
+            assert_eq!(info.signo, SIGCHLD);
+            assert_eq!(info.code, crate::kernel::wait::CLD_EXITED);
+            assert_eq!(info.sender_pid(), 7778);
+            assert_eq!(info.sender_uid(), 0);
+            assert_eq!(info.sigval() as i32, 7);
+            sched::set_current(previous);
         }
+        signal::reset_for_tests();
     }
 
     #[test]

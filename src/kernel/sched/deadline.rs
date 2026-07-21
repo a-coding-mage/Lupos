@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/sched/deadline.c
 //! test-origin: linux:vendor/linux/kernel/sched/deadline.c
 //! `SCHED_DEADLINE` — Earliest Deadline First (EDF) with bandwidth admission
@@ -12,6 +12,8 @@
 //!
 //! Admission is enforced via `running_bw + dl_runtime / dl_period <= bw_cap`,
 //! where `bw_cap = 95% * (1 << BW_SHIFT)` (Linux default).
+
+use core::sync::atomic::Ordering;
 
 use crate::kernel::task::TaskStruct;
 
@@ -32,6 +34,18 @@ pub const fn to_ratio(runtime: u64, period: u64) -> u64 {
 pub fn dl_bw_admit(rq: &Rq, runtime: u64, period: u64) -> bool {
     let bw = to_ratio(runtime, period);
     rq.dl.running_bw.saturating_add(bw) <= rq.dl.bw_cap
+}
+
+unsafe fn wakeup_preempt_dl(rq: &mut Rq, p: *mut TaskStruct, _flags: u32) {
+    let current = rq.current;
+    if current.is_null() || p.is_null() || current == p {
+        return;
+    }
+    unsafe {
+        if (*p).m29.dl.deadline < (*current).m29.dl.deadline {
+            super::set_task_need_resched(current);
+        }
+    }
 }
 
 unsafe fn enqueue_task_dl(rq: &mut Rq, p: *mut TaskStruct, flags: u32) {
@@ -80,6 +94,9 @@ unsafe fn pick_next_task_dl(rq: &mut Rq) -> *mut TaskStruct {
     if !p.is_null() {
         rq.dl.current = p;
         rq.current = p;
+        unsafe {
+            (*p).m29.se.exec_start = rq.clock_task.max(sched_clock_ns());
+        }
     }
     p
 }
@@ -91,13 +108,19 @@ unsafe fn task_tick_dl(rq: &mut Rq, p: *mut TaskStruct, _queued: bool) {
         return;
     }
     unsafe {
-        // Decrement runtime by one tick budget (25 ms = 25 000 000 ns on QEMU).
-        let consumed: i64 = 25_000_000;
+        // Linux update_curr_dl() charges actual rq-clock execution time, not a
+        // fictitious fixed tick duration.
+        let now = rq.clock_task.max(sched_clock_ns());
+        let last = (*p).m29.se.exec_start;
+        let consumed = now.saturating_sub(last) as i64;
+        (*p).m29.se.exec_start = now;
         (*p).m29.dl.runtime = (*p).m29.dl.runtime.saturating_sub(consumed);
         if (*p).m29.dl.runtime <= 0 {
             // Throttle until next period.
             (*p).m29.dl.dl_throttled = 1;
-            (*p).thread_info.flags |= crate::kernel::task::TIF_NEED_RESCHED;
+            (*p).thread_info
+                .flags
+                .fetch_or(crate::kernel::task::TIF_NEED_RESCHED, Ordering::Release);
         }
     }
     let _ = rq;
@@ -124,7 +147,7 @@ pub static DL_SCHED_CLASS: SchedClass = SchedClass {
     enqueue_task: Some(enqueue_task_dl),
     dequeue_task: Some(dequeue_task_dl),
     yield_task: None,
-    wakeup_preempt: None,
+    wakeup_preempt: Some(wakeup_preempt_dl),
     pick_next_task: Some(pick_next_task_dl),
     put_prev_task: Some(put_prev_task_dl),
     set_next_task: None,

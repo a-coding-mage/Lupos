@@ -213,7 +213,7 @@ impl IdtEntry {
     /// An interrupt gate **clears IF** on entry, preventing nested hardware IRQs.
     ///
     /// - `handler` — address of the ISR stub (pushed to IDT, not called directly)
-    /// - `cs`      — code segment selector (always `sel::KERNEL_CS = 0x08`)
+    /// - `cs`      — code segment selector (always `sel::KERNEL_CS = 0x10`)
     /// - `ist`     — IST index (0 = current stack; 1–7 = dedicated IST stack)
     pub fn interrupt_gate(handler: unsafe extern "C" fn(), cs: u16, ist: u8) -> Self {
         let addr = handler as u64;
@@ -352,6 +352,12 @@ pub struct ExceptionFrame {
 unsafe extern "C" fn isr_common() {
     // SAFETY: Naked function — we emit the complete prologue and epilogue.
     core::arch::naked_asm!(
+        // RFLAGS is already saved in the hardware frame, so clear the live
+        // direction flag before any Rust/C code runs. This is Linux's `cld`
+        // in every 64-bit `idtentry`: userspace may set DF, while the kernel
+        // ABI requires forward string operations.
+        "cld",
+
         // ── Save GP registers ──────────────────────────────────────────────
         // Push in order rax…r15 (reverse of ExceptionFrame field order because
         // the stack grows downward).  After all 15 pushes, RSP points to r15.
@@ -380,24 +386,23 @@ unsafe extern "C" fn isr_common() {
         "push r14",
         "push r15",
 
-        // ── Save x87/SSE state ────────────────────────────────────────────
-        // Kernel Rust may use XMM registers while handling a user fault.  ld.so
-        // keeps bootstrap relocation state in XMM registers, so preserve the
-        // interrupted FPU/SIMD image around the Rust dispatcher.
+        // ── Build an aligned Rust call frame ──────────────────────────────
+        // Lupos's kernel target uses the soft-float ABI (`-mmx,-sse,...`),
+        // matching Linux's kernel build. Interrupt entry therefore must not
+        // pay FXSAVE/FXRSTOR on every timer/IPI/device interrupt. Per-task FPU
+        // state is saved only when the scheduler actually changes tasks.
         "mov rdi, rsp",
-        "sub rsp, 528",
+        "sub rsp, 16",
         "and rsp, -16",
-        "mov [rsp + 512], rdi",
-        "fxsave64 [rsp]",
+        "mov [rsp], rdi",
 
         // ── Call Rust dispatcher ───────────────────────────────────────────
         // System V AMD64 ABI: first argument in RDI = pointer to frame.
-        "mov rdi, [rsp + 512]",
+        "mov rdi, [rsp]",
         "call {dispatch}",
 
-        // Restore the interrupted x87/SSE state and the frame stack pointer.
-        "fxrstor64 [rsp]",
-        "mov rsp, [rsp + 512]",
+        // Restore the frame stack pointer.
+        "mov rsp, [rsp]",
 
         // ── Restore GP registers ───────────────────────────────────────────
         "pop r15",
@@ -704,12 +709,25 @@ fn on_legacy_irq(vector: u8) {
 
 fn irq_exit_resched(frame: &ExceptionFrame) {
     crate::kernel::locking::preempt::__irq_exit_raw();
+    // Linux __irq_exit_rcu() drains pending softirqs after leaving the
+    // outermost hardirq and before considering task preemption.
+    if crate::kernel::locking::preempt::preempt_count() == 0
+        && crate::kernel::softirq::local_softirq_pending() != 0
+    {
+        crate::kernel::softirq::do_softirq();
+    }
     let current = unsafe { crate::kernel::sched::get_current() };
     if current.is_null() {
         return;
     }
-    let need_resched =
-        unsafe { (*current).thread_info.flags & crate::kernel::task::TIF_NEED_RESCHED != 0 };
+    let need_resched = unsafe {
+        (*current)
+            .thread_info
+            .flags
+            .load(core::sync::atomic::Ordering::Acquire)
+            & crate::kernel::task::TIF_NEED_RESCHED
+            != 0
+    };
     if should_irq_exit_resched(
         frame,
         need_resched,
@@ -751,6 +769,23 @@ fn should_irq_exit_resched(
 /// In a debugger-free kernel context we just log it.  A future milestone will
 /// hook this into a kernel debugger / kprobe infrastructure.
 fn on_breakpoint(frame: &ExceptionFrame) {
+    #[cfg(feature = "test-smp-preempt")]
+    if IDT_DF_SELFTEST_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        let flags: u64;
+        unsafe {
+            core::arch::asm!(
+                "pushfq",
+                "pop {flags}",
+                flags = out(reg) flags,
+                options(nomem),
+            );
+        }
+        IDT_DF_SELFTEST_OBSERVED.store(
+            flags & crate::arch::x86::kernel::ptrace::X86_EFLAGS_DF != 0,
+            core::sync::atomic::Ordering::Release,
+        );
+        return;
+    }
     if crate::arch::x86::kernel::alternative::text_poke_bp_handler(frame) {
         return;
     }
@@ -760,6 +795,31 @@ fn on_breakpoint(frame: &ExceptionFrame) {
     log_warn!("cpu", "cpu: #BP Breakpoint at rip={:#018x}", frame.rip);
     // Breakpoint is a trap — RIP points to the instruction *after* `int3`,
     // so returning from the handler (via `iretq`) continues execution.
+}
+
+#[cfg(feature = "test-smp-preempt")]
+static IDT_DF_SELFTEST_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "test-smp-preempt")]
+static IDT_DF_SELFTEST_OBSERVED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Exercise a real IDT trap with DF set and report the flags observed by the
+/// Rust handler. Linux clears DF in every 64-bit IDT entry before calling C.
+/// The original flags are restored after `int3`, and `cld` is executed before
+/// Rust regains control so the compiler's forward-string ABI remains valid.
+#[cfg(feature = "test-smp-preempt")]
+pub fn direction_flag_entry_selftest() -> bool {
+    use core::sync::atomic::Ordering;
+
+    IDT_DF_SELFTEST_OBSERVED.store(true, Ordering::Relaxed);
+    IDT_DF_SELFTEST_ACTIVE.store(true, Ordering::Release);
+    unsafe {
+        core::arch::asm!("pushfq", "cli", "std", "int3", "cld", "popfq");
+    }
+    IDT_DF_SELFTEST_ACTIVE.store(false, Ordering::Release);
+    !IDT_DF_SELFTEST_OBSERVED.load(Ordering::Acquire)
 }
 
 /// #PF — Page Fault.
@@ -1311,9 +1371,18 @@ pub unsafe fn init() {
     }
 }
 
-pub unsafe fn send_reschedule_ipi(target_id: u8) {
+/// Send a reschedule IPI to a dense logical CPU.
+///
+/// Linux passes a logical CPU number to `native_smp_send_reschedule()` and
+/// translates it through `x86_cpu_to_apicid` in the APIC backend. Keep the
+/// same boundary here: callers never pass a physical APIC ID.
+pub unsafe fn send_reschedule_ipi(target_cpu: u8) {
+    let Some(apic_id) = crate::arch::x86::kernel::smp::logical_cpu_to_apic_id(target_cpu as u32)
+    else {
+        return;
+    };
     unsafe {
-        crate::arch::x86::kernel::apic::send_ipi(target_id, RESCHEDULE_VECTOR);
+        crate::arch::x86::kernel::apic::send_ipi(apic_id, RESCHEDULE_VECTOR);
     }
 }
 
@@ -1522,7 +1591,16 @@ mod tests {
         let body = source
             .split("unsafe extern \"C\" fn isr_common()")
             .nth(1)
-            .expect("isr_common must exist");
+            .expect("isr_common must exist")
+            .split("macro_rules! isr_no_error")
+            .next()
+            .expect("isr_common must end before ISR macros");
+        assert!(
+            !body.contains("fxsave64") && !body.contains("fxrstor64"),
+            "soft-float interrupt entry must not save FPU state per interrupt"
+        );
+        assert!(body.contains("\"sub rsp, 16\""));
+        assert!(body.contains("\"call {dispatch}\""));
         let entry_test = body
             .find("\"test qword ptr [rsp + 24], 3\"")
             .expect("entry must test interrupted CS before swapgs");

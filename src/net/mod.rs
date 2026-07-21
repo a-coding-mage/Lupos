@@ -130,6 +130,8 @@ pub fn run_networking_acceptance() -> Result<(), i32> {
     use self::tcp::{TCP_ACK, TCP_SYN, TcpConnection, TcpSegment, TcpState};
 
     init();
+    #[cfg(feature = "test-networking")]
+    device::registry_rcu_read_acceptance();
     linux_sources::all_sources_have_policy()?;
     let niche = niche::registration_snapshot();
     assert!(niche.mpls_gso);

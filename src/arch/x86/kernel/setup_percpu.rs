@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/kernel/setup_percpu.c
 //! test-origin: linux:vendor/linux/arch/x86/kernel/setup_percpu.c
 //! x86 per-CPU area setup.
@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::include::uapi::errno::EINVAL;
 use crate::kernel::module::{export_symbol, find_symbol};
@@ -42,6 +42,16 @@ pub struct LinuxPerCpuArea {
     cpu_number: AtomicU32,
     _cpu_number_pad: u32,
     this_cpu_off: AtomicU64,
+    /// Linux's cache-hot `current_task` per-CPU variable.  The module-visible
+    /// `current_task` and `const_current_task` symbols alias this same slot.
+    current_task: AtomicUsize,
+    /// Scratch slot used by `entry_SYSCALL_64` while RSP still points into
+    /// userspace.  Linux uses `cpu_tss_rw.sp2` for the same purpose.
+    syscall_user_rsp: AtomicU64,
+    /// Pointer to this CPU's hardware TSS.  The syscall entry stub follows the
+    /// pointer and reads RSP0 directly, so `tss::set_rsp0()` remains the single
+    /// source of truth across task switches.
+    syscall_tss: AtomicUsize,
     preempt_count: AtomicU32,
     /// x86 `__stack_chk_guard`, addressed by C as
     /// `%gs:__ref_stack_chk_guard` when SMP stack protection is enabled.
@@ -68,6 +78,9 @@ impl LinuxPerCpuArea {
             cpu_number: AtomicU32::new(0),
             _cpu_number_pad: 0,
             this_cpu_off: AtomicU64::new(0),
+            current_task: AtomicUsize::new(0),
+            syscall_user_rsp: AtomicU64::new(0),
+            syscall_tss: AtomicUsize::new(0),
             preempt_count: AtomicU32::new(0),
             stack_chk_guard: AtomicU64::new(0),
             x86_call_depth: AtomicU64::new(crate::arch::x86::kernel::callthunks::RET_DEPTH_INIT),
@@ -90,6 +103,10 @@ pub(crate) static LINUX_PER_CPU_AREAS: [LinuxPerCpuArea; MAX_CPUS] =
 /// exactly like `PER_CPU_VAR(__stack_chk_guard)` in entry_64.S.
 pub const STACK_CHK_GUARD_OFFSET: usize = offset_of!(LinuxPerCpuArea, stack_chk_guard);
 pub const X86_CALL_DEPTH_OFFSET: usize = offset_of!(LinuxPerCpuArea, x86_call_depth);
+pub const CPU_NUMBER_OFFSET: usize = offset_of!(LinuxPerCpuArea, cpu_number);
+pub const PREEMPT_COUNT_OFFSET: usize = offset_of!(LinuxPerCpuArea, preempt_count);
+pub const SYSCALL_USER_RSP_OFFSET: usize = offset_of!(LinuxPerCpuArea, syscall_user_rsp);
+pub const SYSCALL_TSS_OFFSET: usize = offset_of!(LinuxPerCpuArea, syscall_tss);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PerCpuLayout {
@@ -137,6 +154,10 @@ pub fn setup_percpu_segment(cpu: usize) {
     LINUX_PER_CPU_AREAS[cpu]
         .this_cpu_off
         .store(offset, Ordering::Release);
+    LINUX_PER_CPU_AREAS[cpu].syscall_tss.store(
+        unsafe { crate::arch::x86::kernel::tss::tss_for_cpu(cpu) as usize },
+        Ordering::Release,
+    );
     LINUX_PER_CPU_AREAS[cpu]
         .preempt_count
         .store(0, Ordering::Release);
@@ -191,8 +212,51 @@ pub fn cpu_number_symbol() -> usize {
     core::ptr::addr_of!(LINUX_PER_CPU_AREAS[0].cpu_number) as usize
 }
 
+/// Return the logical CPU number from Linux's GS-relative per-CPU area.
+///
+/// This is the Rust equivalent of `raw_smp_processor_id()`.  Once the per-CPU
+/// segment is installed it avoids a LAPIC MMIO read (and the corresponding
+/// virtual-machine exit) on scheduler, timer, and softirq hot paths.
+#[cfg(not(test))]
+#[inline]
+pub fn current_cpu_number() -> usize {
+    let cpu: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {cpu:e}, dword ptr gs:[rip + {percpu_base} + {cpu_offset}]",
+            cpu = lateout(reg) cpu,
+            percpu_base = sym LINUX_PER_CPU_AREAS,
+            cpu_offset = const CPU_NUMBER_OFFSET,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    (cpu as usize).min(MAX_CPUS - 1)
+}
+
+#[cfg(test)]
+#[inline]
+pub const fn current_cpu_number() -> usize {
+    0
+}
+
 pub fn this_cpu_off_symbol() -> usize {
     core::ptr::addr_of!(LINUX_PER_CPU_AREAS[0].this_cpu_off) as usize
+}
+
+pub fn current_task_symbol() -> usize {
+    core::ptr::addr_of!(LINUX_PER_CPU_AREAS[0].current_task) as usize
+}
+
+pub fn set_current_task(cpu: usize, task: usize) {
+    LINUX_PER_CPU_AREAS[cpu.min(MAX_CPUS - 1)]
+        .current_task
+        .store(task, Ordering::Release);
+}
+
+pub fn current_task(cpu: usize) -> usize {
+    LINUX_PER_CPU_AREAS[cpu.min(MAX_CPUS - 1)]
+        .current_task
+        .load(Ordering::Acquire)
 }
 
 pub fn preempt_count_symbol() -> usize {
@@ -237,6 +301,15 @@ pub fn softnet_data_symbol() -> usize {
     core::ptr::addr_of!(LINUX_PER_CPU_AREAS[0].softnet_data) as usize
 }
 
+/// Rust-side equivalent of Linux's `this_cpu_ptr(&softnet_data)`.
+///
+/// Callers must already pin execution to the current CPU (for example through
+/// local-BH or preemption exclusion) before retaining the returned pointer.
+pub(crate) fn current_softnet_data() -> *mut u8 {
+    let cpu = current_cpu_number();
+    core::ptr::addr_of!(LINUX_PER_CPU_AREAS[cpu].softnet_data) as *mut u8
+}
+
 pub fn cpu_info_symbol() -> usize {
     core::ptr::addr_of!(LINUX_PER_CPU_AREAS[0].cpu_info) as usize
 }
@@ -265,6 +338,19 @@ mod tests {
             (core::mem::size_of::<LinuxPerCpuArea>() * 2) as u64
         );
         assert_eq!(LINUX_PER_CPU_AREAS[2].cpu_number.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn current_task_slots_are_cpu_local() {
+        set_current_task(1, 0x1111);
+        set_current_task(2, 0x2222);
+
+        assert_eq!(current_task(1), 0x1111);
+        assert_eq!(current_task(2), 0x2222);
+        assert_eq!(
+            current_task_symbol(),
+            core::ptr::addr_of!(LINUX_PER_CPU_AREAS[0].current_task) as usize
+        );
     }
 
     #[test]

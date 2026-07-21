@@ -1341,6 +1341,7 @@ unsafe fn commit_exec_for_current(
         (*task).thread.gsbase = 0;
         (*task).thread.fsindex = 0;
         (*task).thread.gsindex = 0;
+        crate::arch::x86::kernel::fpu::reset_task_fpu_for_exec(task);
         set_task_comm_from_path(task, path);
         (*mm).start_code = main_bias
             + program

@@ -58,6 +58,31 @@ pub const ULONG_MAX: u64 = u64::MAX;
 pub const MT_FLAGS_ALLOC_RANGE: u32 = 0x01;
 pub const MT_FLAGS_LOCK_EXTERN: u32 = 0x02;
 
+/// In-place replacement requested by [`MapleTree::edit_range`].
+///
+/// Linux's VMA iterator clears and rewrites a contiguous Maple Tree range
+/// without first copying the complete tree.  Lupos' current Maple Tree uses a
+/// sorted `Vec` internally, so expose the same operation as a bounded edit:
+/// every intersecting entry is removed, replaced by one entry, or (for the
+/// single VMA straddling both boundaries) split into two.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MapleRangeEdit {
+    Remove,
+    Keep {
+        start: u64,
+        end: u64,
+        value: usize,
+    },
+    Split {
+        left_start: u64,
+        left_end: u64,
+        left_value: usize,
+        right_start: u64,
+        right_end: u64,
+        right_value: usize,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Node type tags — mirrors `enum maple_type`.
 // ---------------------------------------------------------------------------
@@ -265,12 +290,11 @@ impl MapleTree {
     /// Ref: Linux `mtree_load()`.
     pub fn load(&self, index: u64) -> Option<usize> {
         let entries = self.get_entries();
-        for e in entries {
-            if index >= e.start && index <= e.end {
-                return Some(e.value);
-            }
-        }
-        None
+        let position = entries.partition_point(|entry| entry.end < index);
+        entries
+            .get(position)
+            .filter(|entry| entry.start <= index)
+            .map(|entry| entry.value)
     }
 
     /// Find the first entry in `[start, max]`.
@@ -281,16 +305,13 @@ impl MapleTree {
     /// Ref: Linux `mt_find()`.
     pub fn find(&self, start: u64, max: u64) -> Option<(u64, u64, usize)> {
         let entries = self.get_entries();
-        for e in entries {
-            if e.end < start {
-                continue;
-            }
-            if e.start > max {
-                break;
-            }
-            return Some((e.start, e.end, e.value));
+        let index = entries.partition_point(|entry| entry.end < start);
+        let entry = entries.get(index)?;
+        if entry.start > max {
+            None
+        } else {
+            Some((entry.start, entry.end, entry.value))
         }
-        None
     }
 
     /// Find the first entry whose range ends after `addr`.
@@ -303,12 +324,10 @@ impl MapleTree {
     /// Returns `Some((start, end, entry))` or `None`.
     pub fn find_first_gte(&self, addr: u64) -> Option<(u64, u64, usize)> {
         let entries = self.get_entries();
-        for e in entries {
-            if e.end >= addr {
-                return Some((e.start, e.end, e.value));
-            }
-        }
-        None
+        let index = entries.partition_point(|entry| entry.end < addr);
+        entries
+            .get(index)
+            .map(|entry| (entry.start, entry.end, entry.value))
     }
 
     /// Find the next entry after `index`.
@@ -316,12 +335,10 @@ impl MapleTree {
     /// Ref: Linux `mt_next()`.
     pub fn next_entry(&self, index: u64) -> Option<(u64, u64, usize)> {
         let entries = self.get_entries();
-        for e in entries {
-            if e.start > index {
-                return Some((e.start, e.end, e.value));
-            }
-        }
-        None
+        let next = entries.partition_point(|entry| entry.start <= index);
+        entries
+            .get(next)
+            .map(|entry| (entry.start, entry.end, entry.value))
     }
 
     /// Find the previous entry before `index`.
@@ -329,15 +346,158 @@ impl MapleTree {
     /// Ref: Linux `mt_prev()`.
     pub fn prev_entry(&self, index: u64) -> Option<(u64, u64, usize)> {
         let entries = self.get_entries();
-        let mut result = None;
-        for e in entries {
-            if e.end < index {
-                result = Some((e.start, e.end, e.value));
-            } else {
+        let next = entries.partition_point(|entry| entry.end < index);
+        next.checked_sub(1)
+            .and_then(|previous| entries.get(previous))
+            .map(|entry| (entry.start, entry.end, entry.value))
+    }
+
+    /// Visit entries intersecting `[start, max]` in ascending order.
+    ///
+    /// The initial lookup is logarithmic and the walk does not allocate.
+    /// Callers must provide the same external exclusion required by the other
+    /// borrowed-slice Maple Tree operations.
+    ///
+    /// Ref: Linux `mas_find()` / `for_each_vma_range()`.
+    pub fn for_each_range<F: FnMut(u64, u64, usize)>(&self, start: u64, max: u64, mut f: F) {
+        if start > max {
+            return;
+        }
+
+        let entries = self.get_entries();
+        let first = entries.partition_point(|entry| entry.end < start);
+        for entry in &entries[first..] {
+            if entry.start > max {
                 break;
             }
+            f(entry.start, entry.end, entry.value);
         }
-        result
+    }
+
+    /// Preallocate the only extra slot a bounded range edit can require.
+    ///
+    /// A non-overlapping range tree can grow during removal only when one
+    /// entry straddles both boundaries and is split in two. Munmap calls this
+    /// before clearing any page-table entry, matching Linux's VMA-iterator
+    /// preallocation point.
+    pub fn prepare_edit_range(&self, start: u64, max: u64) -> Result<(), i32> {
+        if start > max {
+            return Ok(());
+        }
+
+        // Keep an empty/no-overlap edit read-only.  In particular, do not
+        // lazily allocate the sorted-Vec root merely because munmap queried an
+        // unmapped range.
+        let needs_extra_slot = {
+            let entries = self.get_entries();
+            let first = entries.partition_point(|entry| entry.end < start);
+            entries
+                .get(first)
+                .is_some_and(|entry| entry.start <= max && entry.start < start && entry.end > max)
+        };
+        if needs_extra_slot {
+            self.get_entries_mut().try_reserve(1).map_err(|_| -12)?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite every entry intersecting `[start, max]` in one linear pass.
+    ///
+    /// This is the sorted-`Vec` analogue of Linux's VMA iterator range clear:
+    /// it avoids an all-tree snapshot and compacts removed entries with one
+    /// suffix move instead of repeatedly shifting the vector.  A split can
+    /// only be requested for the sole entry which straddles both range
+    /// boundaries; one slot is preallocated before the callback is invoked so
+    /// mutation is at the same point-of-no-return as Linux's munmap gather.
+    ///
+    /// Returns the number of original entries presented to `edit`.
+    pub fn edit_range<F>(&self, start: u64, max: u64, mut edit: F) -> Result<usize, i32>
+    where
+        F: FnMut(u64, u64, usize) -> MapleRangeEdit,
+    {
+        if start > max {
+            return Ok(0);
+        }
+
+        // Discover an empty/no-overlap edit without instantiating the lazy
+        // backing Vec.  External mmap locking keeps these indices stable until
+        // the mutable phase below.
+        let (first, affected, needs_extra_slot) = {
+            let entries = self.get_entries();
+            let first = entries.partition_point(|entry| entry.end < start);
+            let affected = entries[first..].partition_point(|entry| entry.start <= max);
+            let needs_extra_slot =
+                affected == 1 && entries[first].start < start && entries[first].end > max;
+            (first, affected, needs_extra_slot)
+        };
+        if affected == 0 {
+            return Ok(0);
+        }
+
+        let entries = self.get_entries_mut();
+        let last = first + affected;
+
+        // Only a VMA spanning both boundaries can grow the tree.  Reserve its
+        // extra slot before callbacks make VMA/accounting changes.
+        if needs_extra_slot {
+            entries.try_reserve(1).map_err(|_| -12)?;
+        }
+
+        let old_len = entries.len();
+        let mut read = first;
+        let mut write = first;
+        while read < last {
+            let original = entries[read];
+            match edit(original.start, original.end, original.value) {
+                MapleRangeEdit::Remove => {}
+                MapleRangeEdit::Keep { start, end, value } => {
+                    debug_assert!(start <= end);
+                    debug_assert_ne!(value, 0);
+                    entries[write] = MapleEntry { start, end, value };
+                    write += 1;
+                }
+                MapleRangeEdit::Split {
+                    left_start,
+                    left_end,
+                    left_value,
+                    right_start,
+                    right_end,
+                    right_value,
+                } => {
+                    debug_assert_eq!(affected, 1);
+                    debug_assert!(left_start <= left_end);
+                    debug_assert!(left_end < right_start);
+                    debug_assert!(right_start <= right_end);
+                    debug_assert_ne!(left_value, 0);
+                    debug_assert_ne!(right_value, 0);
+                    entries[write] = MapleEntry {
+                        start: left_start,
+                        end: left_end,
+                        value: left_value,
+                    };
+                    entries.insert(
+                        write + 1,
+                        MapleEntry {
+                            start: right_start,
+                            end: right_end,
+                            value: right_value,
+                        },
+                    );
+                    return Ok(affected);
+                }
+            }
+            read += 1;
+        }
+
+        if write != last {
+            entries.copy_within(last..old_len, write);
+            entries.truncate(old_len - (last - write));
+        }
+        let became_empty = entries.is_empty();
+        if became_empty {
+            self.release_empty_backing();
+        }
+        Ok(affected)
     }
 
     /// Erase the entry at `index`.
@@ -463,12 +623,37 @@ impl MapleTree {
     }
 
     fn vec_erase(&self, index: u64) -> Option<usize> {
-        let entries = self.get_entries_mut();
-        let pos = entries
-            .iter()
-            .position(|e| index >= e.start && index <= e.end)?;
-        let removed = entries.remove(pos);
+        let removed = {
+            let entries = self.get_entries_mut();
+            let pos = entries
+                .iter()
+                .position(|e| index >= e.start && index <= e.end)?;
+            entries.remove(pos)
+        };
+        self.release_empty_backing();
         Some(removed.value)
+    }
+
+    /// Collapse an allocated but empty sorted-Vec root back to Linux's NULL
+    /// empty-tree representation.
+    ///
+    /// Callers provide the same external exclusion required by every mutable
+    /// Maple Tree operation, and must not retain a borrow of the backing Vec.
+    fn release_empty_backing(&self) {
+        let root = self.ma_root.load(Ordering::Acquire);
+        if root == 0 {
+            return;
+        }
+        let entries = unsafe { &*(root as *const Vec<MapleEntry>) };
+        if !entries.is_empty() {
+            return;
+        }
+
+        let removed = self.ma_root.swap(0, Ordering::AcqRel);
+        debug_assert_eq!(removed, root);
+        unsafe {
+            drop(Box::from_raw(removed as *mut Vec<MapleEntry>));
+        }
     }
 
     fn vec_erase_range(&self, start: u64, end: u64) {
@@ -489,7 +674,7 @@ impl Drop for MapleTree {
 }
 
 /// Internal entry stored in the sorted vec.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct MapleEntry {
     start: u64,
     end: u64,
@@ -552,6 +737,25 @@ mod tests {
         assert!(tree.load(0).is_none());
         assert!(tree.load(42).is_none());
         assert!(tree.load(ULONG_MAX).is_none());
+    }
+
+    /// An empty Linux VMA iterator munmap is a no-op; it must not instantiate
+    /// storage in the mm's Maple Tree.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vma.c:do_vmi_munmap
+    #[test]
+    fn empty_range_edit_does_not_allocate_tree_storage() {
+        let tree = MapleTree::new();
+
+        tree.prepare_edit_range(0x1000, 0x1fff).unwrap();
+        assert_eq!(
+            tree.edit_range(0x1000, 0x1fff, |_, _, _| {
+                panic!("empty range must not invoke edit callback")
+            }),
+            Ok(0)
+        );
+
+        assert_eq!(tree.ma_root.load(core::sync::atomic::Ordering::Relaxed), 0);
     }
 
     // -- Single insert + find --
@@ -785,6 +989,84 @@ mod tests {
         let mut result = Vec::new();
         tree.for_each(|s, e, v| result.push((s, e, v)));
         assert_eq!(result, vec![(100, 199, 1), (300, 399, 2), (500, 599, 3),]);
+    }
+
+    /// test-origin: linux:vendor/linux/lib/maple_tree.c:mas_find
+    #[test]
+    fn for_each_range_visits_only_intersections_in_order() {
+        let tree = MapleTree::new();
+        tree.insert_range(100, 199, 1).unwrap();
+        tree.insert_range(300, 399, 2).unwrap();
+        tree.insert_range(500, 599, 3).unwrap();
+        tree.insert_range(700, 799, 4).unwrap();
+
+        let mut result = Vec::new();
+        tree.for_each_range(150, 550, |start, end, value| {
+            result.push((start, end, value));
+        });
+        assert_eq!(result, vec![(100, 199, 1), (300, 399, 2), (500, 599, 3)]);
+    }
+
+    /// Linux munmap clears one contiguous iterator range and preserves the
+    /// boundary fragments. The sorted-Vec backing must do the same without a
+    /// snapshot or one suffix shift per removed entry.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vma.c:do_vmi_align_munmap
+    #[test]
+    fn edit_range_bulk_removes_entries_and_keeps_boundary_fragment() {
+        let tree = MapleTree::new();
+        tree.insert_range(100, 199, 1).unwrap();
+        tree.insert_range(300, 399, 2).unwrap();
+        tree.insert_range(500, 599, 3).unwrap();
+        tree.insert_range(700, 799, 4).unwrap();
+
+        tree.prepare_edit_range(150, 650).unwrap();
+        let edited = tree
+            .edit_range(150, 650, |start, _end, value| {
+                if start == 100 {
+                    MapleRangeEdit::Keep {
+                        start,
+                        end: 149,
+                        value,
+                    }
+                } else {
+                    MapleRangeEdit::Remove
+                }
+            })
+            .unwrap();
+
+        assert_eq!(edited, 3);
+        assert_eq!(tree.collect_entries(), vec![(100, 149, 1), (700, 799, 4)]);
+    }
+
+    /// test-origin: linux:vendor/linux/mm/vma.c:vms_gather_munmap_vmas
+    #[test]
+    fn edit_range_splits_one_straddling_entry_with_preallocated_slot() {
+        let tree = MapleTree::new();
+        tree.insert_range(0, 99, 1).unwrap();
+        tree.insert_range(100, 399, 2).unwrap();
+        tree.insert_range(500, 599, 3).unwrap();
+
+        tree.prepare_edit_range(200, 299).unwrap();
+        let edited = tree
+            .edit_range(200, 299, |start, end, value| {
+                assert_eq!((start, end, value), (100, 399, 2));
+                MapleRangeEdit::Split {
+                    left_start: 100,
+                    left_end: 199,
+                    left_value: 2,
+                    right_start: 300,
+                    right_end: 399,
+                    right_value: 4,
+                }
+            })
+            .unwrap();
+
+        assert_eq!(edited, 1);
+        assert_eq!(
+            tree.collect_entries(),
+            vec![(0, 99, 1), (100, 199, 2), (300, 399, 4), (500, 599, 3)]
+        );
     }
 
     // -- Stress test --

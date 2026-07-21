@@ -1,9 +1,11 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/net/core/net-sysfs.c
+//! test-origin: linux:vendor/linux/net/core/net-sysfs.c
 //! Sysfs exposure for network devices.
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
@@ -15,13 +17,18 @@ use crate::fs::kernfs::{KernfsNode, add_child, lookup};
 use crate::include::uapi::errno::{EINVAL, ENODEV};
 use crate::net::device::{
     IF_OPER_DORMANT, IF_OPER_DOWN, IF_OPER_TESTING, IF_OPER_UNKNOWN, IF_OPER_UP, IFF_LOOPBACK,
-    LOOPBACK_MTU, NetDeviceRef, list_netdevices,
+    LOOPBACK_MTU, NetDeviceRef, list_netdevices_rtnl_locked,
 };
 use crate::net::uevent::UeventAction;
 
 lazy_static! {
     static ref NET_CLASS_ROOT: Mutex<Option<Arc<KernfsNode>>> = Mutex::new(None);
     static ref NET_DEVICES_ROOT: Mutex<Option<Arc<KernfsNode>>> = Mutex::new(None);
+    /// Linux's `struct device` retains its enclosing `net_device` while sysfs
+    /// is registered.  Keep the equivalent strong reference here so an
+    /// attribute read does not depend on RCU-list publication ordering.
+    static ref NET_DEVICE_REFS: Mutex<BTreeMap<u32, NetDeviceRef>> =
+        Mutex::new(BTreeMap::new());
 }
 
 fn copy_text(buf: &mut [u8], text: &str) -> Result<usize, i32> {
@@ -32,10 +39,7 @@ fn copy_text(buf: &mut [u8], text: &str) -> Result<usize, i32> {
 
 fn netdev_from_node(node: &Arc<KernfsNode>) -> Result<NetDeviceRef, i32> {
     let ifindex = node.priv_ptr.load(Ordering::Acquire) as u32;
-    list_netdevices()
-        .into_iter()
-        .find(|dev| dev.ifindex == ifindex)
-        .ok_or(ENODEV)
+    NET_DEVICE_REFS.lock().get(&ifindex).cloned().ok_or(ENODEV)
 }
 
 fn netdev_attr_file(
@@ -213,6 +217,7 @@ fn netdev_zero_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i3
 fn build_virtual_net_dir(dev: &NetDeviceRef) -> Arc<KernfsNode> {
     let dir = KernfsNode::new_dir(&dev.name, 0o555);
     let ifindex = dev.ifindex;
+    dir.priv_ptr.store(ifindex as u64, Ordering::Release);
     let mtu = if dev.flags.load(Ordering::Acquire) & IFF_LOOPBACK != 0 {
         LOOPBACK_MTU
     } else {
@@ -253,29 +258,35 @@ fn build_virtual_net_dir(dev: &NetDeviceRef) -> Arc<KernfsNode> {
 }
 
 pub fn attach_roots(class_root: &Arc<KernfsNode>, devices_root: &Arc<KernfsNode>) {
-    let net_class = lookup(class_root, "net").unwrap_or_else(|| {
-        let dir = KernfsNode::new_dir("net", 0o555);
-        add_child(class_root, dir.clone());
-        dir
+    // Serialize first-root attachment with net-device registration.  Without
+    // RTNL, a device could create no nodes against the old `None` roots and
+    // then publish after this function's registry snapshot was taken.
+    crate::net::device::rtnl_lock(|| {
+        let net_class = lookup(class_root, "net").unwrap_or_else(|| {
+            let dir = KernfsNode::new_dir("net", 0o555);
+            add_child(class_root, dir.clone());
+            dir
+        });
+        let virtual_root = lookup(devices_root, "virtual").unwrap_or_else(|| {
+            let dir = KernfsNode::new_dir("virtual", 0o555);
+            add_child(devices_root, dir.clone());
+            dir
+        });
+        let virtual_net = lookup(&virtual_root, "net").unwrap_or_else(|| {
+            let dir = KernfsNode::new_dir("net", 0o555);
+            add_child(&virtual_root, dir.clone());
+            dir
+        });
+        *NET_CLASS_ROOT.lock() = Some(net_class);
+        *NET_DEVICES_ROOT.lock() = Some(virtual_net);
+        for dev in list_netdevices_rtnl_locked() {
+            register_netdevice(&dev);
+        }
     });
-    let virtual_root = lookup(devices_root, "virtual").unwrap_or_else(|| {
-        let dir = KernfsNode::new_dir("virtual", 0o555);
-        add_child(devices_root, dir.clone());
-        dir
-    });
-    let virtual_net = lookup(&virtual_root, "net").unwrap_or_else(|| {
-        let dir = KernfsNode::new_dir("net", 0o555);
-        add_child(&virtual_root, dir.clone());
-        dir
-    });
-    *NET_CLASS_ROOT.lock() = Some(net_class);
-    *NET_DEVICES_ROOT.lock() = Some(virtual_net);
-    for dev in list_netdevices() {
-        register_netdevice(&dev);
-    }
 }
 
 pub fn register_netdevice(dev: &NetDeviceRef) {
+    NET_DEVICE_REFS.lock().insert(dev.ifindex, dev.clone());
     let class_root = NET_CLASS_ROOT.lock().clone();
     let devices_root = NET_DEVICES_ROOT.lock().clone();
     let Some(class_root) = class_root else {
@@ -289,29 +300,121 @@ pub fn register_netdevice(dev: &NetDeviceRef) {
     add_child(&devices_root, build_virtual_net_dir(dev));
 
     class_root.children.lock().remove(&dev.name);
-    add_child(
-        &class_root,
-        KernfsNode::new_symlink(
-            &dev.name,
-            &format!("../../devices/virtual/net/{}", dev.name),
-        ),
+    let class_link = KernfsNode::new_symlink(
+        &dev.name,
+        &format!("../../devices/virtual/net/{}", dev.name),
     );
+    class_link
+        .priv_ptr
+        .store(dev.ifindex as u64, Ordering::Release);
+    add_child(&class_root, class_link);
 }
 
-pub fn unregister_netdevice(name: &str) {
+fn remove_device_child(root: &Arc<KernfsNode>, dev: &NetDeviceRef) {
+    let mut children = root.children.lock();
+    let belongs_to_device = children
+        .get(&dev.name)
+        .is_some_and(|node| node.priv_ptr.load(Ordering::Acquire) == dev.ifindex as u64);
+    if belongs_to_device {
+        children.remove(&dev.name);
+    }
+}
+
+pub fn unregister_netdevice(dev: &NetDeviceRef) {
     if let Some(class_root) = NET_CLASS_ROOT.lock().clone() {
-        class_root.children.lock().remove(name);
+        remove_device_child(&class_root, dev);
     }
     if let Some(devices_root) = NET_DEVICES_ROOT.lock().clone() {
-        devices_root.children.lock().remove(name);
+        remove_device_child(&devices_root, dev);
     }
+    NET_DEVICE_REFS.lock().remove(&dev.ifindex);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fs::kernfs::KernfsKind;
-    use crate::net::device::{DUMMY_NETDEV_OPS, register_netdevice as register_device};
+    use crate::net::device::{
+        DUMMY_NETDEV_OPS, IF_LINK_MODE_DEFAULT, IF_OPER_DOWN, NetDevice,
+        register_netdevice as register_device,
+    };
+    use alloc::string::String;
+    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64};
+
+    fn test_netdevice(ifindex: u32, name: &str, mtu: u32) -> NetDeviceRef {
+        Arc::new(NetDevice {
+            ifindex,
+            name: String::from(name),
+            mtu,
+            flags: AtomicU32::new(0),
+            dev_addr: [2, 0, 0, 0, 0, 12],
+            ops: &DUMMY_NETDEV_OPS,
+            carrier: AtomicBool::new(false),
+            operstate: AtomicU8::new(IF_OPER_DOWN),
+            link_mode: AtomicU8::new(IF_LINK_MODE_DEFAULT),
+            tx_packets: AtomicU64::new(0),
+            rx_packets: AtomicU64::new(0),
+            linux_dev: None,
+        })
+    }
+
+    #[test]
+    fn sysfs_attribute_retains_netdevice_before_rcu_publication() {
+        let ifindex = u32::MAX;
+        let name = String::from("sysfs-unpublished-netdev0");
+        assert!(crate::net::device::lookup_netdevice(&name).is_none());
+        let dev = test_netdevice(ifindex, &name, 1500);
+
+        NET_DEVICE_REFS.lock().insert(ifindex, dev);
+        let node = netdev_attr_file(ifindex, "mtu", 0o444, netdev_mtu_show);
+        let KernfsKind::File {
+            show: Some(show), ..
+        } = &node.kind
+        else {
+            panic!("MTU node must be a readable file");
+        };
+        let mut buf = [0u8; 16];
+        let n = show(&node, &mut buf).expect("sysfs read before RCU publication");
+        assert_eq!(&buf[..n], b"1500\n");
+        NET_DEVICE_REFS.lock().remove(&ifindex);
+    }
+
+    #[test]
+    fn sysfs_cleanup_uses_ifindex_identity_for_same_name_devices() {
+        let name = "sysfs-netns-cleanup0";
+        let retired = test_netdevice(u32::MAX - 2, name, 1500);
+        let current = test_netdevice(u32::MAX - 1, name, 9000);
+        NET_DEVICE_REFS
+            .lock()
+            .insert(retired.ifindex, retired.clone());
+        NET_DEVICE_REFS
+            .lock()
+            .insert(current.ifindex, current.clone());
+
+        let root = KernfsNode::new_dir("net", 0o555);
+        let current_node = KernfsNode::new_dir(name, 0o555);
+        current_node
+            .priv_ptr
+            .store(current.ifindex as u64, Ordering::Release);
+        add_child(&root, current_node);
+
+        remove_device_child(&root, &retired);
+        assert_eq!(
+            lookup(&root, name)
+                .expect("same-name current device must survive")
+                .priv_ptr
+                .load(Ordering::Acquire),
+            current.ifindex as u64
+        );
+        unregister_netdevice(&retired);
+        assert!(!NET_DEVICE_REFS.lock().contains_key(&retired.ifindex));
+        assert!(NET_DEVICE_REFS.lock().contains_key(&current.ifindex));
+
+        remove_device_child(&root, &current);
+        assert!(lookup(&root, name).is_none());
+        unregister_netdevice(&current);
+        assert!(!NET_DEVICE_REFS.lock().contains_key(&current.ifindex));
+    }
 
     #[test]
     fn netdev_uevent_reports_interface_and_ifindex() {

@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/mm
 //! test-origin: linux:vendor/linux/arch/x86/mm
 /// x86-64 four-level page table types and operations.
@@ -24,12 +24,9 @@
 /// - Linux `include/linux/pgtable.h` — index / offset / alloc helpers
 /// - Linux `mm/vmalloc.c` — `map_kernel_range_noflush`, `vmap_pte_range`
 /// - Intel SDM Vol. 3A §4.5 — 4-level paging
-
 // ---------------------------------------------------------------------------
 // Scalar types — Linux arch/x86/include/asm/pgtable_64_types.h
 // ---------------------------------------------------------------------------
-
-#[cfg(not(test))]
 use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(test))]
 use spin::Mutex;
@@ -422,6 +419,16 @@ pub fn phys_to_virt(phys: u64) -> *mut u8 {
     PAGE_OFFSET.wrapping_add(phys) as *mut u8
 }
 
+/// Translate an address in Linux's linear/direct map back to physical memory.
+///
+/// Unlike [`virt_to_phys`], this is the constant-time `__pa()` operation used
+/// for page-table roots allocated from the buddy allocator. Callers must not
+/// pass vmalloc or kernel-image aliases.
+#[inline]
+pub(crate) fn direct_map_virt_to_phys(virt: u64) -> Option<u64> {
+    virt.checked_sub(PAGE_OFFSET)
+}
+
 /// Translate a page frame number (PFN) to its kernel virtual address.
 ///
 /// Equivalent to Linux's `page_to_virt()` / `pfn_to_kaddr()`:
@@ -808,11 +815,14 @@ pub fn pte_clear(_mm: *mut (), _addr: u64, ptep: *mut pte_t) {
 /// Linux `ptep_get_and_clear` — atomic read-and-clear of a PTE word.
 #[inline]
 pub fn ptep_get_and_clear(_mm: *mut (), _addr: u64, ptep: *mut pte_t) -> pte_t {
-    unsafe {
-        let old = *ptep;
-        (*ptep).0 = 0;
-        old
-    }
+    // CONFIG_SMP x86 uses xchg(&ptep->pte, 0), which is a full-barrier
+    // read-modify-write and returns the exact entry that lost the race.
+    //
+    // AtomicU64::swap(SeqCst) lowers to the same locked xchg semantics on the
+    // generic x86_64 target. `pte_t` is repr(transparent) over u64, so the
+    // pointer has the size and alignment required by AtomicU64::from_ptr().
+    let old = unsafe { AtomicU64::from_ptr(ptep.cast::<u64>()).swap(0, Ordering::SeqCst) };
+    pte_t(old)
 }
 
 /// Linux `ptep_set_wrprotect` — clear `_PAGE_RW` on a live PTE.
@@ -1233,40 +1243,85 @@ pub fn virt_to_phys_in_pgd(pgd_phys: u64, virt: u64) -> Option<u64> {
 }
 
 #[cfg(not(test))]
+#[derive(Clone, Copy)]
+pub struct TemporaryKernelPgdState {
+    previous_pgd_phys: u64,
+    previous_active_mm: *mut crate::mm::mm_types::MmStruct,
+    cpu: u32,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub struct TemporaryKernelPgdState {
+    previous_pgd_phys: u64,
+}
+
+#[cfg(not(test))]
 #[inline]
-pub unsafe fn use_temporary_kernel_pgd(pgd_phys: u64) -> u64 {
-    let previous = read_cr3();
+pub unsafe fn use_temporary_kernel_pgd(pgd_phys: u64) -> TemporaryKernelPgdState {
+    let cpu = crate::kernel::sched::current_cpu();
+    // Linux use_temporary_mm() disables local IRQs around
+    // switch_mm_irqs_off(). Keep the firmware interval's original IF state,
+    // but do not allow a TLB IPI to interleave either CR3 transition edge.
+    let irq_flags = crate::kernel::locking::local_irq_save();
+    let state = TemporaryKernelPgdState {
+        previous_pgd_phys: read_cr3(),
+        previous_active_mm: crate::arch::x86::mm::tlb::active_mm(cpu),
+        cpu,
+    };
     unsafe {
+        // Match Linux use_temporary_mm()/switch_mm_irqs_off(): publish the
+        // conservative state only across the actual CR3 transition.
+        crate::arch::x86::mm::tlb::set_active_mm_switching(cpu);
+        core::sync::atomic::fence(Ordering::SeqCst);
         core::arch::asm!(
             "mov cr3, {0}",
             in(reg) pgd_phys & PTE_PFN_MASK,
             options(nostack, preserves_flags),
         );
+        // Linux publishes the temporary mm after MOV-to-CR3. The EFI root has
+        // no MmStruct, so use the equivalent private-temporary state: NMI
+        // uaccess rejects it and unrelated user-mm shootdowns skip this CPU.
+        crate::arch::x86::mm::tlb::set_active_mm_temporary(cpu);
     }
-    previous
+    crate::kernel::locking::local_irq_restore(irq_flags);
+    state
 }
 
 #[cfg(test)]
 #[inline]
-pub unsafe fn use_temporary_kernel_pgd(_pgd_phys: u64) -> u64 {
-    0
+pub unsafe fn use_temporary_kernel_pgd(_pgd_phys: u64) -> TemporaryKernelPgdState {
+    TemporaryKernelPgdState {
+        previous_pgd_phys: 0,
+    }
 }
 
 #[cfg(not(test))]
 #[inline]
-pub unsafe fn unuse_temporary_kernel_pgd(previous_pgd_phys: u64) {
+pub unsafe fn unuse_temporary_kernel_pgd(state: TemporaryKernelPgdState) {
+    let irq_flags = crate::kernel::locking::local_irq_save();
     unsafe {
+        // Re-enter the conservative transition state before restoring CR3.
+        // Paired full barriers in the shootdown path guarantee that either an
+        // invalidation observes SWITCHING or this MOV-to-CR3 occurs after its
+        // page-table update.
+        crate::arch::x86::mm::tlb::set_active_mm_switching(state.cpu);
+        core::sync::atomic::fence(Ordering::SeqCst);
         core::arch::asm!(
             "mov cr3, {0}",
-            in(reg) previous_pgd_phys & PTE_PFN_MASK,
+            in(reg) state.previous_pgd_phys & PTE_PFN_MASK,
             options(nostack, preserves_flags),
         );
+        // MOV-to-CR3 is serializing and flushes the restored non-PCID address
+        // space before it becomes eligible for NMI uaccess again.
+        crate::arch::x86::mm::tlb::set_active_mm(state.cpu, state.previous_active_mm);
     }
+    crate::kernel::locking::local_irq_restore(irq_flags);
 }
 
 #[cfg(test)]
 #[inline]
-pub unsafe fn unuse_temporary_kernel_pgd(_previous_pgd_phys: u64) {}
+pub unsafe fn unuse_temporary_kernel_pgd(_state: TemporaryKernelPgdState) {}
 
 // ---------------------------------------------------------------------------
 // Physical page allocator for page-table pages
@@ -1953,8 +2008,10 @@ pub unsafe fn flush_tlb_page(addr: u64) {
             );
         }
     } else {
-        let _ =
-            unsafe { crate::arch::x86::mm::tlb::flush_tlb_mm_range(mm, addr, addr + PAGE_SIZE) };
+        assert!(
+            unsafe { crate::arch::x86::mm::tlb::flush_tlb_mm_range(mm, addr, addr + PAGE_SIZE) },
+            "TLB shootdown failed after page-table update"
+        );
     }
 }
 
@@ -2008,7 +2065,10 @@ pub unsafe fn flush_tlb_range(start: u64, end: u64) {
             addr += PAGE_SIZE;
         }
     } else {
-        let _ = unsafe { crate::arch::x86::mm::tlb::flush_tlb_mm_range(mm, start, end) };
+        assert!(
+            unsafe { crate::arch::x86::mm::tlb::flush_tlb_mm_range(mm, start, end) },
+            "TLB range shootdown failed after page-table update"
+        );
     }
 }
 
@@ -2893,7 +2953,48 @@ mod tests {
         assert_eq!(pte_phys(pte), phys);
     }
 
+    /// Linux CONFIG_SMP uses xchg(), so exactly one concurrent clearer must
+    /// receive the complete old PTE and every loser must receive zero.
+    ///
+    /// test-origin: linux:vendor/linux/arch/x86/include/asm/pgtable_64.h
+    #[test]
+    fn ptep_get_and_clear_is_atomic_and_returns_exact_old_value() {
+        const OLD: u64 = 0x8000_1234_5678_90e7;
+        const THREADS: usize = 8;
+
+        let entry = std::sync::Arc::new(AtomicU64::new(OLD));
+        let mut clearers = std::vec::Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let entry = entry.clone();
+            clearers.push(std::thread::spawn(move || {
+                let ptep = std::sync::Arc::as_ptr(&entry) as *mut pte_t;
+                ptep_get_and_clear(core::ptr::null_mut(), 0x4000, ptep).0
+            }));
+        }
+
+        let values: std::vec::Vec<u64> = clearers
+            .into_iter()
+            .map(|clearer| clearer.join().expect("PTE clearer panicked"))
+            .collect();
+        assert_eq!(values.iter().filter(|&&value| value == OLD).count(), 1);
+        assert_eq!(
+            values.iter().filter(|&&value| value == 0).count(),
+            THREADS - 1
+        );
+        assert_eq!(entry.load(Ordering::SeqCst), 0);
+    }
+
     // ── map_kernel_page / virt_to_phys ──────────────────────────────────
+
+    #[test]
+    fn direct_map_translation_is_constant_offset_inverse() {
+        // Origin: vendor/linux/arch/x86/include/asm/page_64.h::__phys_addr.
+        let phys = 0x1234_5000;
+        let direct = phys_to_virt(phys) as u64;
+
+        assert_eq!(direct_map_virt_to_phys(direct), Some(phys));
+        assert_eq!(direct_map_virt_to_phys(PAGE_OFFSET - 1), None);
+    }
 
     #[test]
     fn map_then_virt_to_phys_returns_phys() {

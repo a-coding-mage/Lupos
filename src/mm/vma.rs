@@ -31,7 +31,9 @@ extern crate alloc;
 
 use crate::mm::list::ListHead;
 use crate::mm::vm_flags::{VmFlags, vm_flags_equal};
+use alloc::alloc::{alloc, handle_alloc_error};
 use alloc::boxed::Box;
+use core::alloc::Layout;
 
 pub use crate::mm::mm_types::{MmStruct, VmAreaStruct};
 
@@ -168,40 +170,55 @@ pub unsafe fn vma_file_put_raw(file: usize) {
     }
 }
 
-/// Duplicate a VMA — allocate a new copy with identical fields.
+/// Fallibly duplicate a VMA with identical fields.
 ///
 /// The caller is responsible for inserting the copy into the Maple Tree
 /// and adjusting `map_count`.
 ///
-/// Ref: Linux `mm/vma.c` — `vm_area_dup()`
+/// Allocation failure is returned before taking the copied file reference or
+/// invoking `vm_ops.open`, matching Linux `vm_area_dup()`'s side-effect-free
+/// `NULL` return.
+///
+/// Ref: Linux `mm/vma_init.c` — `vm_area_dup()`
 ///
 /// # Safety
 ///
 /// `src` must be a valid pointer to a live `VmAreaStruct`.
-pub unsafe fn vm_area_dup(src: *const VmAreaStruct) -> *mut VmAreaStruct {
+unsafe fn vm_area_try_dup_with_allocator<F>(
+    src: *const VmAreaStruct,
+    allocate: F,
+) -> Result<*mut VmAreaStruct, i32>
+where
+    F: FnOnce(Layout) -> *mut u8,
+{
     let orig = unsafe { &*src };
+
+    let layout = Layout::new::<VmAreaStruct>();
+    let ptr = allocate(layout).cast::<VmAreaStruct>();
+    if ptr.is_null() {
+        return Err(-12);
+    }
+
+    // These are the first externally visible duplication side effects. The
+    // allocation above must succeed before either can run.
     unsafe {
         vma_file_get(src);
-    }
-    let copy = Box::new(VmAreaStruct {
-        vm_start: orig.vm_start,
-        vm_end: orig.vm_end,
-        vm_mm: orig.vm_mm,
-        vm_page_prot: orig.vm_page_prot,
-        vm_flags: orig.vm_flags,
-        // Clear anon_vma — the caller (dup_mmap) will call anon_vma_fork()
-        // which sets this up correctly for the child.
-        anon_vma: core::ptr::null_mut(),
-        // anon_vma_chain is initialized fresh below after the Box is stable.
-        anon_vma_chain: ListHead::uninit(),
-        vm_file: orig.vm_file,
-        vm_pgoff: orig.vm_pgoff,
-        vm_ops: orig.vm_ops,
-        vm_private_data: orig.vm_private_data,
-    });
-    let ptr = Box::into_raw(copy);
-    // Initialise the fresh chain list-head now that the pointer is stable.
-    unsafe {
+        ptr.write(VmAreaStruct {
+            vm_start: orig.vm_start,
+            vm_end: orig.vm_end,
+            vm_mm: orig.vm_mm,
+            vm_page_prot: orig.vm_page_prot,
+            vm_flags: orig.vm_flags,
+            // Clear anon_vma — the caller (dup_mmap) will call anon_vma_fork()
+            // which sets this up correctly for the child.
+            anon_vma: core::ptr::null_mut(),
+            // anon_vma_chain is initialized fresh below after allocation.
+            anon_vma_chain: ListHead::uninit(),
+            vm_file: orig.vm_file,
+            vm_pgoff: orig.vm_pgoff,
+            vm_ops: orig.vm_ops,
+            vm_private_data: orig.vm_private_data,
+        });
         ListHead::init(&mut (*ptr).anon_vma_chain);
         if (*ptr).vm_ops != 0 {
             let ops = &*((*ptr).vm_ops as *const crate::mm::fault::VmOperationsStruct);
@@ -210,7 +227,35 @@ pub unsafe fn vm_area_dup(src: *const VmAreaStruct) -> *mut VmAreaStruct {
             }
         }
     }
-    ptr
+
+    Ok(ptr)
+}
+
+/// Fallible public entry point for VMA duplication.
+///
+/// # Safety
+///
+/// `src` must be a valid pointer to a live `VmAreaStruct`.
+pub unsafe fn vm_area_try_dup(src: *const VmAreaStruct) -> Result<*mut VmAreaStruct, i32> {
+    unsafe { vm_area_try_dup_with_allocator(src, |layout| unsafe { alloc(layout) }) }
+}
+
+/// Duplicate a VMA, invoking the allocation-error handler on failure.
+///
+/// Existing callers which have not yet been converted to Linux's nullable
+/// `vm_area_dup()` contract retain their previous infallible interface. New
+/// error-propagating paths should use [`vm_area_try_dup`].
+///
+/// # Safety
+///
+/// `src` must be a valid pointer to a live `VmAreaStruct`.
+pub unsafe fn vm_area_dup(src: *const VmAreaStruct) -> *mut VmAreaStruct {
+    match unsafe { vm_area_try_dup(src) } {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            handle_alloc_error(Layout::new::<VmAreaStruct>());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -682,9 +727,29 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     static VMA_FILE_RELEASES: AtomicUsize = AtomicUsize::new(0);
+    static VMA_DUP_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static VMA_DUP_FILE_RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn count_vma_dup_open(_vma: *mut VmAreaStruct) {
+        VMA_DUP_OPEN_CALLS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    static VMA_DUP_OPS: crate::mm::fault::VmOperationsStruct =
+        crate::mm::fault::VmOperationsStruct {
+            open: Some(count_vma_dup_open),
+            close: None,
+            fault: None,
+            map_pages: None,
+            pfn_mkwrite: None,
+            access: None,
+        };
 
     fn count_vma_file_release(_file: FileRef) {
         VMA_FILE_RELEASES.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn count_vma_dup_file_release(_file: FileRef) {
+        VMA_DUP_FILE_RELEASES.fetch_add(1, Ordering::AcqRel);
     }
 
     static VMA_FILE_OPS: FileOps = FileOps {
@@ -697,6 +762,19 @@ mod tests {
         ioctl: None,
         mmap: None,
         release: Some(count_vma_file_release),
+        readdir: None,
+    };
+
+    static VMA_DUP_FILE_OPS: FileOps = FileOps {
+        name: "vma-dup-file-lifetime-test",
+        read: None,
+        write: None,
+        llseek: None,
+        fsync: None,
+        poll: None,
+        ioctl: None,
+        mmap: None,
+        release: Some(count_vma_dup_file_release),
         readdir: None,
     };
 
@@ -849,14 +927,15 @@ mod tests {
 
     // -- vm_area_dup --
 
+    /// test-origin: linux:vendor/linux/mm/vma_init.c:vm_area_dup
     #[test]
-    fn dup_copies_all_fields() {
+    fn try_dup_copies_all_fields() {
         let vma = vma_alloc(0x1000, 0x2000, VM_READ | VM_WRITE);
         unsafe {
             (*vma).vm_pgoff = 42;
             (*vma).vm_page_prot = 0xFF;
 
-            let copy = vm_area_dup(vma);
+            let copy = vm_area_try_dup(vma).expect("fallible VMA duplication");
             assert_eq!((*copy).vm_start, 0x1000);
             assert_eq!((*copy).vm_end, 0x2000);
             assert_eq!((*copy).vm_flags, VM_READ | VM_WRITE);
@@ -869,6 +948,54 @@ mod tests {
             vm_area_free(copy);
             vm_area_free(vma);
         }
+    }
+
+    /// Linux vm_area_dup() returns NULL before duplicating ancillary state
+    /// when its VMA-cache allocation fails.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vma_init.c:vm_area_dup
+    #[test]
+    fn try_dup_allocation_failure_has_no_open_side_effect() {
+        let vma = vma_alloc(0x1000, 0x2000, VM_READ);
+        VMA_DUP_OPEN_CALLS.store(0, Ordering::Release);
+        unsafe {
+            (*vma).vm_ops = &VMA_DUP_OPS as *const _ as usize;
+
+            let result = vm_area_try_dup_with_allocator(vma, |_| core::ptr::null_mut());
+            assert_eq!(result, Err(-12));
+            assert_eq!(VMA_DUP_OPEN_CALLS.load(Ordering::Acquire), 0);
+
+            vm_area_free(vma);
+        }
+    }
+
+    /// Linux does not get_file() until after vm_area_dup() has returned a
+    /// successfully allocated VMA to its caller.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vma.c:__split_vma
+    #[test]
+    fn try_dup_allocation_failure_does_not_take_file_reference() {
+        VMA_DUP_FILE_RELEASES.store(0, Ordering::Release);
+        let fd_file = alloc_file(d_alloc("dup-oom"), 0, 0, &VMA_DUP_FILE_OPS);
+        let raw_vma_file = vma_file_from_ref(fd_file.clone());
+        let vma = vma_alloc(0x1000, 0x2000, VM_READ);
+        unsafe {
+            (*vma).vm_file = raw_vma_file;
+            (*vma).vm_ops = &crate::mm::fault::LUPOS_FILE_VM_OPS as *const _ as usize;
+        }
+        assert_eq!(fd_file.f_count.load(Ordering::Acquire), 2);
+
+        let result = unsafe { vm_area_try_dup_with_allocator(vma, |_| core::ptr::null_mut()) };
+        assert_eq!(result, Err(-12));
+        assert_eq!(fd_file.f_count.load(Ordering::Acquire), 2);
+
+        unsafe {
+            vm_area_free(vma);
+        }
+        assert_eq!(fd_file.f_count.load(Ordering::Acquire), 1);
+        assert_eq!(VMA_DUP_FILE_RELEASES.load(Ordering::Acquire), 0);
+        fput(fd_file);
+        assert_eq!(VMA_DUP_FILE_RELEASES.load(Ordering::Acquire), 1);
     }
 
     // -- vm_area_free --

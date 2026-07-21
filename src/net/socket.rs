@@ -1,5 +1,7 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/net/socket.c
+//! linux-source: vendor/linux/net/core/sock.c
+//! linux-source: vendor/linux/net/ipv4/inet_hashtables.c
 //! test-origin: linux:vendor/linux/net/socket.c
 //! Socket layer scaffolding for AF_INET, AF_INET6, AF_UNIX, AF_PACKET, AF_NETLINK.
 
@@ -83,7 +85,29 @@ pub const RCV_SHUTDOWN: u8 = 1;
 pub const SEND_SHUTDOWN: u8 = 2;
 pub const SHUTDOWN_MASK: u8 = RCV_SHUTDOWN | SEND_SHUTDOWN;
 
-pub type SocketRef = Arc<Mutex<KernelSocket>>;
+/// Socket state plus Linux's process-owner/receive-backlog split.
+///
+/// Linux process context uses `lock_sock()`, while NET_RX takes only
+/// `sk_lock.slock`. If process context owns the socket, `tcp_v4_rcv()` queues
+/// the skb on `sk_backlog` and `release_sock()` drains it before publishing the
+/// socket unlocked. Lupos keeps the Rust state mutex, but places the receive
+/// backlog beside it so softirq context can enqueue without waiting for the
+/// interrupted owner.
+pub struct SocketLock {
+    inner: Mutex<KernelSocket>,
+    deferred_inet_rx: Mutex<VecDeque<crate::net::wire::DeferredInetPacket>>,
+    inet_lookup: Mutex<InetSocketLookup>,
+    inet_bh_locking: bool,
+}
+
+pub struct SocketGuard<'a> {
+    socket: &'a SocketLock,
+    inner: Option<spin::MutexGuard<'a, KernelSocket>>,
+    bh_disabled: bool,
+    inet_completion: Option<crate::net::wire::DeferredInetCompletion>,
+}
+
+pub type SocketRef = Arc<SocketLock>;
 
 #[derive(Debug)]
 pub struct SocketPidRef {
@@ -193,6 +217,218 @@ pub struct KernelSocket {
     pub(crate) wire_tcp: Option<crate::net::wire::TcpState>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct InetSocketLookup {
+    pub family: u16,
+    pub sock_type: u16,
+    pub protocol: u16,
+    pub net_ns: usize,
+    pub local_port: Option<u16>,
+    pub tcp_local_port: Option<u16>,
+    pub tcp_remote_addr: Option<u32>,
+    pub tcp_remote_port: Option<u16>,
+}
+
+impl InetSocketLookup {
+    fn from_socket(socket: &KernelSocket) -> Self {
+        let local_port = match socket.local {
+            Some(SockAddr::Inet { port, .. }) => Some(port),
+            _ => None,
+        };
+        let (tcp_local_port, tcp_remote_addr, tcp_remote_port) = socket
+            .wire_tcp
+            .as_ref()
+            .map(|tcp| {
+                (
+                    Some(tcp.local_port),
+                    Some(tcp.remote_addr),
+                    Some(tcp.remote_port),
+                )
+            })
+            .unwrap_or((None, None, None));
+        Self {
+            family: socket.family,
+            sock_type: socket.sock_type,
+            protocol: socket.protocol,
+            net_ns: socket.net_ns,
+            local_port,
+            tcp_local_port,
+            tcp_remote_addr,
+            tcp_remote_port,
+        }
+    }
+}
+
+#[inline]
+fn socket_bh_disable() {
+    #[cfg(not(test))]
+    crate::kernel::locking::preempt::local_bh_disable();
+}
+
+#[inline]
+fn socket_bh_enable() {
+    #[cfg(not(test))]
+    crate::kernel::locking::preempt::local_bh_enable();
+}
+
+impl SocketLock {
+    fn new(socket: KernelSocket) -> Self {
+        let inet_lookup = InetSocketLookup::from_socket(&socket);
+        Self {
+            inner: Mutex::new(socket),
+            deferred_inet_rx: Mutex::new(VecDeque::new()),
+            inet_lookup: Mutex::new(inet_lookup),
+            inet_bh_locking: inet_lookup.family == AF_INET,
+        }
+    }
+
+    pub fn lock(&self) -> SocketGuard<'_> {
+        if self.inet_bh_locking {
+            socket_bh_disable();
+        }
+        SocketGuard {
+            socket: self,
+            inner: Some(self.inner.lock()),
+            bh_disabled: self.inet_bh_locking,
+            inet_completion: None,
+        }
+    }
+
+    pub fn try_lock(&self) -> Option<SocketGuard<'_>> {
+        if self.inet_bh_locking {
+            socket_bh_disable();
+        }
+        match self.inner.try_lock() {
+            Some(inner) => Some(SocketGuard {
+                socket: self,
+                inner: Some(inner),
+                bh_disabled: self.inet_bh_locking,
+                inet_completion: None,
+            }),
+            None => {
+                if self.inet_bh_locking {
+                    socket_bh_enable();
+                }
+                None
+            }
+        }
+    }
+
+    pub(crate) fn inet_lookup(&self) -> InetSocketLookup {
+        if self.inet_bh_locking {
+            socket_bh_disable();
+        }
+        let lookup = *self.inet_lookup.lock();
+        if self.inet_bh_locking {
+            socket_bh_enable();
+        }
+        lookup
+    }
+
+    /// Queue receive work only while an owner still holds `inner`.
+    ///
+    /// The release path takes `deferred_inet_rx` before dropping `inner`.
+    /// Rechecking under this lock closes the otherwise possible race where the
+    /// owner releases between a failed try-lock and backlog insertion.
+    pub(crate) fn defer_inet_rx(
+        &self,
+        packet: crate::net::wire::DeferredInetPacket,
+    ) -> Result<(), crate::net::wire::DeferredInetPacket> {
+        if self.inet_bh_locking {
+            socket_bh_disable();
+        }
+        let mut backlog = self.deferred_inet_rx.lock();
+        let result = if self.inner.is_locked() {
+            backlog.push_back(packet);
+            Ok(())
+        } else {
+            Err(packet)
+        };
+        drop(backlog);
+        if self.inet_bh_locking {
+            socket_bh_enable();
+        }
+        result
+    }
+}
+
+impl core::ops::Deref for SocketGuard<'_> {
+    type Target = KernelSocket;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_deref().expect("live socket guard")
+    }
+}
+
+impl core::ops::DerefMut for SocketGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.as_deref_mut().expect("live socket guard")
+    }
+}
+
+impl SocketGuard<'_> {
+    pub(crate) fn finish_inet_on_unlock(
+        &mut self,
+        completion: crate::net::wire::DeferredInetCompletion,
+    ) {
+        debug_assert!(self.inet_completion.is_none());
+        self.inet_completion = Some(completion);
+    }
+}
+
+impl Drop for SocketGuard<'_> {
+    fn drop(&mut self) {
+        if !self.bh_disabled {
+            // AF_UNIX/AF_NETLINK/AF_PACKET never participate in the INET
+            // NET_RX owner/backlog protocol. Preserve their original hot
+            // unlock path (notably D-Bus and desktop Unix sockets).
+            drop(self.inner.take());
+            return;
+        }
+
+        let mut completions: Option<Vec<crate::net::wire::DeferredInetCompletion>> = None;
+        loop {
+            let pending = {
+                let mut backlog = self.socket.deferred_inet_rx.lock();
+                if backlog.is_empty() {
+                    let lookup = InetSocketLookup::from_socket(
+                        self.inner.as_deref().expect("live socket guard"),
+                    );
+                    *self.socket.inet_lookup.lock() = lookup;
+
+                    // Publish the socket unlocked while holding the backlog
+                    // lock. A receiver which lost the initial try-lock must
+                    // either enqueue before this point or observe `inner`
+                    // unlocked and retry direct delivery.
+                    drop(self.inner.take());
+                    None
+                } else {
+                    Some(core::mem::take(&mut *backlog))
+                }
+            };
+            let Some(pending) = pending else {
+                break;
+            };
+            let socket = self.inner.as_deref_mut().expect("live socket guard");
+            for packet in pending {
+                completions.get_or_insert_with(Vec::new).push(
+                    crate::net::wire::process_deferred_inet_packet(socket, packet),
+                );
+            }
+        }
+
+        if let Some(completion) = self.inet_completion.take() {
+            crate::net::wire::finish_deferred_inet_packet(completion);
+        }
+        if let Some(completions) = completions {
+            for completion in completions {
+                crate::net::wire::finish_deferred_inet_packet(completion);
+            }
+        }
+        socket_bh_enable();
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PacketMeta {
     pub ifindex: u32,
@@ -224,7 +460,20 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
     static ref ROUTE4S_BY_NAMESPACE: Mutex<BTreeMap<usize, Vec<Route4Record>>> =
         Mutex::new(BTreeMap::new());
-    static ref INET_SOCKETS: Mutex<Vec<Weak<Mutex<KernelSocket>>>> = Mutex::new(Vec::new());
+    static ref INET_SOCKETS: Mutex<Vec<Weak<SocketLock>>> = Mutex::new(Vec::new());
+}
+
+fn with_inet_socket_registry<R>(f: impl FnOnce(&mut Vec<Weak<SocketLock>>) -> R) -> R {
+    // Linux's inet hash mutations use BH-safe bucket locking and lookup runs
+    // under RCU. Lupos's compact registry is still a Vec, so exclude NET_RX
+    // around its short mutation/snapshot lock instead of allowing an IRQ-exit
+    // lookup to spin on the interrupted task's raw Rust mutex.
+    socket_bh_disable();
+    let mut sockets = INET_SOCKETS.lock();
+    let result = f(&mut sockets);
+    drop(sockets);
+    socket_bh_enable();
+    result
 }
 
 fn current_net_namespace_key() -> usize {
@@ -299,10 +548,12 @@ fn with_current_routes<R>(f: impl FnOnce(&mut Vec<Route4Record>) -> R) -> R {
 pub fn unregister_net_namespace(namespace_key: usize) {
     IFADDRS_BY_NAMESPACE.lock().remove(&namespace_key);
     ROUTE4S_BY_NAMESPACE.lock().remove(&namespace_key);
-    INET_SOCKETS.lock().retain(|entry| {
-        entry
-            .upgrade()
-            .is_some_and(|socket| socket.lock().net_ns != namespace_key)
+    with_inet_socket_registry(|sockets| {
+        sockets.retain(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|socket| socket.lock().net_ns != namespace_key)
+        });
     });
     BOUND.lock().retain(|_, sockets| {
         sockets.retain(|socket| socket.lock().net_ns != namespace_key);
@@ -494,7 +745,7 @@ pub fn socket(family: u16, sock_type: u16, protocol: u16) -> Result<SocketRef, i
     } else {
         None
     };
-    let socket = Arc::new(Mutex::new(KernelSocket {
+    let socket = Arc::new(SocketLock::new(KernelSocket {
         family,
         sock_type,
         protocol,
@@ -526,23 +777,24 @@ pub fn socket(family: u16, sock_type: u16, protocol: u16) -> Result<SocketRef, i
         wire_tcp: None,
     }));
     if family == AF_INET {
-        let mut sockets = INET_SOCKETS.lock();
-        sockets.retain(|entry| entry.strong_count() != 0);
-        sockets.push(Arc::downgrade(&socket));
+        with_inet_socket_registry(|sockets| {
+            sockets.retain(|entry| entry.strong_count() != 0);
+            sockets.push(Arc::downgrade(&socket));
+        });
     }
     Ok(socket)
 }
 
 pub(crate) fn inet_socket_snapshot() -> Vec<SocketRef> {
-    let namespace_key = current_net_namespace_key();
-    let mut sockets = INET_SOCKETS.lock();
-    let live = sockets
-        .iter()
-        .filter_map(Weak::upgrade)
-        .filter(|socket| socket.lock().net_ns == namespace_key)
-        .collect::<Vec<_>>();
-    sockets.retain(|entry| entry.strong_count() != 0);
-    live
+    with_inet_socket_registry(|sockets| {
+        // Linux's __inet_lookup_established() walks its RCU-protected hash and
+        // takes a socket reference without acquiring the process-owned socket
+        // lock. Keep this registry lifetime snapshot equally independent of
+        // KernelSocket state; tuple and namespace matching use `inet_lookup`.
+        let live = sockets.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+        sockets.retain(|entry| entry.strong_count() != 0);
+        live
+    })
 }
 
 fn validate_inet_socket(sock_type: u16, protocol: u16) -> Result<(), i32> {
