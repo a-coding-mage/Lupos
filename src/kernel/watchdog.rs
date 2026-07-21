@@ -50,14 +50,7 @@ pub const fn watchdog_sample_period_ns(watchdog_thresh_secs: u64) -> u64 {
 }
 
 fn current_cpu_index() -> usize {
-    #[cfg(test)]
-    {
-        0
-    }
-    #[cfg(not(test))]
-    {
-        crate::arch::x86::kernel::smp::current_cpu_id().min(MAX_CPUS - 1)
-    }
+    crate::arch::x86::kernel::setup_percpu::current_cpu_number()
 }
 
 fn timestamp_secs() -> u64 {
@@ -91,7 +84,14 @@ pub fn touch_softlockup_watchdog() {
 }
 
 pub fn touch_softlockup_watchdog_sched() {
-    touch_softlockup_watchdog();
+    // Linux's scheduler-specific touch is intentionally just a raw per-CPU
+    // sentinel write. Reading the clock and refreshing watchdog_touch_ts on
+    // every context switch adds unnecessary work and changes the detector's
+    // meaning from "delay the next report" to "pretend the watchdog ran".
+    let cpu = current_cpu_index();
+    if cpu < MAX_CPUS {
+        WATCHDOG_REPORT_TS[cpu].store(SOFTLOCKUP_DELAY_REPORT, Ordering::Relaxed);
+    }
 }
 
 pub fn softlockup_report_count(cpu: usize) -> u64 {
@@ -317,6 +317,22 @@ mod tests {
         assert!(!watchdog_tick_at(0, 20, None, false));
         assert_eq!(WATCHDOG_REPORT_TS[0].load(Ordering::Acquire), 20);
         assert_eq!(softlockup_report_count(0), 0);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/watchdog.c:touch_softlockup_watchdog_sched
+    #[test]
+    fn scheduler_touch_only_delays_reporting() {
+        let _guard = TEST_LOCK.lock();
+        reset();
+        WATCHDOG_TOUCH_TS[0].store(17, Ordering::Release);
+
+        touch_softlockup_watchdog_sched();
+
+        assert_eq!(WATCHDOG_TOUCH_TS[0].load(Ordering::Acquire), 17);
+        assert_eq!(
+            WATCHDOG_REPORT_TS[0].load(Ordering::Acquire),
+            SOFTLOCKUP_DELAY_REPORT
+        );
     }
 
     #[test]

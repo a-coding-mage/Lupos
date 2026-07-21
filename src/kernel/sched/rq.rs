@@ -16,8 +16,15 @@
 
 extern crate alloc;
 
+use core::mem::offset_of;
+use core::ptr;
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::kernel::locking::raw_spinlock::RawSpinLocked;
-use crate::kernel::task::TaskStruct;
+use crate::kernel::task::{M29SchedFields, TaskStruct};
+use crate::lib::rbtree::{
+    LinuxRbNode, LinuxRbRoot, linux_rb_erase, linux_rb_insert_color, linux_rb_next,
+};
 use alloc::vec::Vec;
 
 use super::entity::SchedEntity;
@@ -70,6 +77,187 @@ impl TaskOrderMap {
     }
 }
 
+/// Intrusive cached rb-tree for CFS entities.
+///
+/// Linux keeps `sched_entity::run_node` inside the task and therefore never
+/// allocates while holding `rq->lock`. Reuse the translated Linux rbtree core
+/// and retain a cached leftmost node for O(1) selection.
+pub struct CfsTimeline {
+    root: LinuxRbRoot,
+    leftmost: *mut LinuxRbNode,
+    len: usize,
+}
+
+unsafe impl Send for CfsTimeline {}
+
+const TASK_RUN_NODE_OFFSET: usize = offset_of!(TaskStruct, m29)
+    + offset_of!(M29SchedFields, se)
+    + offset_of!(SchedEntity, run_node);
+
+#[inline]
+unsafe fn task_from_run_node(node: *mut LinuxRbNode) -> *mut TaskStruct {
+    unsafe {
+        (node as *mut u8)
+            .sub(TASK_RUN_NODE_OFFSET)
+            .cast::<TaskStruct>()
+    }
+}
+
+#[inline]
+unsafe fn run_node(task: *mut TaskStruct) -> *mut LinuxRbNode {
+    unsafe { ptr::addr_of_mut!((*task).m29.se.run_node) }
+}
+
+#[inline]
+unsafe fn timeline_key(task: *mut TaskStruct) -> (u64, usize) {
+    unsafe { ((*task).m29.se.vruntime, task as usize) }
+}
+
+impl CfsTimeline {
+    pub const fn new() -> Self {
+        Self {
+            root: LinuxRbRoot {
+                rb_node: ptr::null_mut(),
+            },
+            leftmost: ptr::null_mut(),
+            len: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn contains_key(&self, key: &(u64, usize)) -> bool {
+        let mut node = self.root.rb_node;
+        while !node.is_null() {
+            let task = unsafe { task_from_run_node(node) };
+            let existing = unsafe { timeline_key(task) };
+            if *key < existing {
+                node = unsafe { (*node).rb_left };
+            } else if *key > existing {
+                node = unsafe { (*node).rb_right };
+            } else {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn insert(&mut self, task: *mut TaskStruct, vruntime: u64) {
+        debug_assert!(!task.is_null());
+        let key = (vruntime, task as usize);
+        let node = unsafe { run_node(task) };
+        let mut parent = ptr::null_mut();
+        let mut link = ptr::addr_of_mut!(self.root.rb_node);
+
+        while !unsafe { *link }.is_null() {
+            parent = unsafe { *link };
+            let existing_task = unsafe { task_from_run_node(parent) };
+            let existing_key = unsafe { timeline_key(existing_task) };
+            if key < existing_key {
+                link = unsafe { ptr::addr_of_mut!((*parent).rb_left) };
+            } else if key > existing_key {
+                link = unsafe { ptr::addr_of_mut!((*parent).rb_right) };
+            } else {
+                return;
+            }
+        }
+
+        unsafe {
+            (*node).__rb_parent_color = parent as usize;
+            (*node).rb_left = ptr::null_mut();
+            (*node).rb_right = ptr::null_mut();
+            *link = node;
+            linux_rb_insert_color(node, ptr::addr_of_mut!(self.root));
+        }
+        if self.leftmost.is_null()
+            || key < unsafe { timeline_key(task_from_run_node(self.leftmost)) }
+        {
+            self.leftmost = node;
+        }
+        self.len += 1;
+    }
+
+    pub fn remove(&mut self, task: *mut TaskStruct, vruntime: u64) -> bool {
+        if task.is_null() {
+            return false;
+        }
+        let key = (vruntime, task as usize);
+        let mut node = self.root.rb_node;
+        while !node.is_null() {
+            let existing_task = unsafe { task_from_run_node(node) };
+            let existing_key = unsafe { timeline_key(existing_task) };
+            if key < existing_key {
+                node = unsafe { (*node).rb_left };
+            } else if key > existing_key {
+                node = unsafe { (*node).rb_right };
+            } else {
+                break;
+            }
+        }
+        if node.is_null() {
+            return false;
+        }
+
+        if self.leftmost == node {
+            self.leftmost = unsafe { linux_rb_next(node) };
+        }
+        unsafe {
+            linux_rb_erase(node, ptr::addr_of_mut!(self.root));
+            // Linux RB_CLEAR_NODE(): mark the intrusive node as unlinked.
+            (*node).__rb_parent_color = node as usize;
+            (*node).rb_left = ptr::null_mut();
+            (*node).rb_right = ptr::null_mut();
+        }
+        self.len -= 1;
+        true
+    }
+
+    pub fn first(&self) -> *mut TaskStruct {
+        if self.leftmost.is_null() {
+            ptr::null_mut()
+        } else {
+            unsafe { task_from_run_node(self.leftmost) }
+        }
+    }
+
+    pub fn last_vruntime(&self) -> Option<u64> {
+        let mut node = self.root.rb_node;
+        if node.is_null() {
+            return None;
+        }
+        while unsafe { !(*node).rb_right.is_null() } {
+            node = unsafe { (*node).rb_right };
+        }
+        let task = unsafe { task_from_run_node(node) };
+        Some(unsafe { (*task).m29.se.vruntime })
+    }
+
+    pub fn iter(&self) -> CfsTimelineIter {
+        CfsTimelineIter {
+            node: self.leftmost,
+        }
+    }
+}
+
+pub struct CfsTimelineIter {
+    node: *mut LinuxRbNode,
+}
+
+impl Iterator for CfsTimelineIter {
+    type Item = *mut TaskStruct;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.node.is_null() {
+            return None;
+        }
+        let node = self.node;
+        self.node = unsafe { linux_rb_next(node) };
+        Some(unsafe { task_from_run_node(node) })
+    }
+}
+
 /// CFS runqueue (`struct cfs_rq` in Linux).
 ///
 /// `tasks_timeline` is the rb-tree equivalent keyed by `vruntime`.
@@ -85,7 +273,7 @@ pub struct CfsRq {
     /// Ordered map keyed by (vruntime, task pointer cast to usize) → task.
     /// The compound key disambiguates entities that share a vruntime so the
     /// map remains a strict total order without dropping entries.
-    pub tasks_timeline: TaskOrderMap,
+    pub tasks_timeline: CfsTimeline,
     /// Currently running entity on this CPU (NULL if idle).
     pub current: *mut TaskStruct,
     /// Last update timestamp (ns since boot), updated by `update_curr`.
@@ -100,7 +288,7 @@ impl CfsRq {
             nr_running: 0,
             min_vruntime: 0,
             load_weight: 0,
-            tasks_timeline: TaskOrderMap::new(),
+            tasks_timeline: CfsTimeline::new(),
             current: core::ptr::null_mut(),
             last_update_ns: 0,
         }
@@ -111,35 +299,41 @@ impl CfsRq {
         if old_key == new_key {
             return;
         }
-        self.tasks_timeline.remove(&(old_key, p as usize));
-        self.tasks_timeline.insert((new_key, p as usize), p);
+        self.tasks_timeline.remove(p, old_key);
+        self.tasks_timeline.insert(p, new_key);
     }
 
     /// Return the leftmost (smallest-vruntime) entity, or NULL when empty.
     pub fn leftmost(&self) -> *mut TaskStruct {
-        self.tasks_timeline
-            .iter()
-            .next()
-            .map(|(_, &p)| p)
-            .unwrap_or(core::ptr::null_mut())
+        self.tasks_timeline.first()
     }
 
     /// Insert `p` at vruntime `key`.
     pub fn insert(&mut self, p: *mut TaskStruct, key: u64) {
-        self.tasks_timeline.insert((key, p as usize), p);
+        self.tasks_timeline.insert(p, key);
     }
 
     /// Remove `p` from the timeline at vruntime `key`.
     pub fn remove(&mut self, p: *mut TaskStruct, key: u64) {
-        self.tasks_timeline.remove(&(key, p as usize));
+        self.tasks_timeline.remove(p, key);
     }
 
     /// Update `min_vruntime` to the smaller of (current value, leftmost).
     pub fn update_min_vruntime(&mut self) {
-        if let Some(((vrt, _), _)) = self.tasks_timeline.iter().next() {
-            if *vrt > self.min_vruntime {
-                self.min_vruntime = *vrt;
-            }
+        let mut candidate = if self.current.is_null() {
+            None
+        } else {
+            Some(unsafe { (*self.current).m29.se.vruntime })
+        };
+        let leftmost = self.tasks_timeline.first();
+        if !leftmost.is_null() {
+            let left_vruntime = unsafe { (*leftmost).m29.se.vruntime };
+            candidate = Some(candidate.map_or(left_vruntime, |value| value.min(left_vruntime)));
+        }
+        if let Some(vruntime) = candidate
+            && vruntime > self.min_vruntime
+        {
+            self.min_vruntime = vruntime;
         }
     }
 
@@ -347,6 +541,12 @@ pub const MAX_RQ_CPUS: usize = super::MAX_CPUS;
 static RQS: [RawSpinLocked<Option<Rq>>; MAX_RQ_CPUS] =
     [const { RawSpinLocked::new(None) }; MAX_RQ_CPUS];
 
+/// Lockless load snapshots used by wake placement and domain scans.
+///
+/// Linux's placement path consumes scheduler load/capacity snapshots before
+/// taking a target rq lock; it does not lock every active rq for every wake.
+static NR_RUNNING_SNAPSHOT: [AtomicU32; MAX_RQ_CPUS] = [const { AtomicU32::new(0) }; MAX_RQ_CPUS];
+
 /// Initialise runqueues for all CPUs the system might use.
 ///
 /// Called once from `sched_init()`.
@@ -356,6 +556,7 @@ pub fn init_rqs() {
         if g.is_none() {
             *g = Some(Rq::new(cpu as u32));
         }
+        NR_RUNNING_SNAPSHOT[cpu].store(g.as_ref().map_or(0, |rq| rq.nr_running), Ordering::Release);
     }
 }
 
@@ -414,35 +615,76 @@ pub fn with_rq<R>(cpu: u32, f: impl FnOnce(&mut Rq) -> R) -> Option<R> {
     let flags = local_irq_save();
     let result = {
         let mut g = RQS[cpu].lock();
-        g.as_mut().map(f)
+        g.as_mut().map(|rq| {
+            let result = f(rq);
+            NR_RUNNING_SNAPSHOT[cpu].store(rq.nr_running, Ordering::Release);
+            result
+        })
     };
+    local_irq_restore(flags);
+    result
+}
+
+/// Run a closure while holding two runqueue locks in logical-CPU order.
+///
+/// Linux's `double_rq_lock()` always takes the lower-addressed runqueue first.
+/// Lupos runqueues have a stable CPU-index order, so ordering by CPU provides
+/// the same deadlock exclusion. Local IRQs remain disabled until both locks
+/// have been released.
+pub fn with_double_rq<R>(
+    first_cpu: u32,
+    second_cpu: u32,
+    f: impl FnOnce(&mut Rq, &mut Rq) -> R,
+) -> Option<R> {
+    let first_cpu = first_cpu as usize;
+    let second_cpu = second_cpu as usize;
+    if first_cpu >= MAX_RQ_CPUS || second_cpu >= MAX_RQ_CPUS || first_cpu == second_cpu {
+        return None;
+    }
+
+    let flags = local_irq_save();
+    let (low_cpu, high_cpu, first_is_low) = if first_cpu < second_cpu {
+        (first_cpu, second_cpu, true)
+    } else {
+        (second_cpu, first_cpu, false)
+    };
+    let mut low_guard = RQS[low_cpu].lock();
+    let mut high_guard = RQS[high_cpu].lock();
+    let result = match (low_guard.as_mut(), high_guard.as_mut()) {
+        (Some(low_rq), Some(high_rq)) => {
+            let value = if first_is_low {
+                f(low_rq, high_rq)
+            } else {
+                f(high_rq, low_rq)
+            };
+            NR_RUNNING_SNAPSHOT[low_cpu].store(low_rq.nr_running, Ordering::Release);
+            NR_RUNNING_SNAPSHOT[high_cpu].store(high_rq.nr_running, Ordering::Release);
+            Some(value)
+        }
+        _ => None,
+    };
+    drop(high_guard);
+    drop(low_guard);
     local_irq_restore(flags);
     result
 }
 
 /// Run a closure with mutable access to the runqueue of the current CPU.
 pub fn with_this_rq<R>(f: impl FnOnce(&mut Rq) -> R) -> Option<R> {
-    // Skip the LAPIC MMIO read (a VM-exit on VBox) when only the BSP is online;
-    // the single online runqueue is CPU 0.
-    let cpu = if crate::arch::x86::kernel::smp::AP_READY_COUNT
-        .load(core::sync::atomic::Ordering::Acquire)
-        == 0
-    {
-        0
-    } else {
-        (unsafe { crate::arch::x86::kernel::apic::id() }) as u32
-    };
-    with_rq(cpu, f)
+    with_rq(super::current_cpu(), f)
 }
 
 /// Return the current `nr_running` snapshot for `cpu`.
 pub fn rq_nr_running(cpu: u32) -> Option<u32> {
-    with_rq(cpu, |rq| rq.nr_running)
+    NR_RUNNING_SNAPSHOT
+        .get(cpu as usize)
+        .map(|snapshot| snapshot.load(Ordering::Acquire))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
 
     #[test]
     fn runqueue_lock_is_held_with_interrupts_disabled() {
@@ -495,15 +737,67 @@ mod tests {
     #[test]
     fn cfs_rq_leftmost_returns_smallest_vruntime() {
         let mut rq = CfsRq::new();
-        let mut a = 0u64;
-        let mut b = 0u64;
-        let pa = &mut a as *mut u64 as *mut TaskStruct;
-        let pb = &mut b as *mut u64 as *mut TaskStruct;
+        let mut a = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut b = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let pa = &mut *a as *mut TaskStruct;
+        let pb = &mut *b as *mut TaskStruct;
+        a.m29.se.vruntime = 100;
+        b.m29.se.vruntime = 50;
         rq.insert(pa, 100);
         rq.insert(pb, 50);
         assert_eq!(rq.leftmost(), pb);
         rq.remove(pb, 50);
         assert_eq!(rq.leftmost(), pa);
+    }
+
+    /// Exercise Linux's intrusive rb-tree insertion and erase paths with
+    /// enough entities to force rotations at several depths.
+    ///
+    /// test-origin: linux:vendor/linux/lib/rbtree_test.c
+    #[test]
+    fn cfs_timeline_remains_sorted_across_rotations_and_erases() {
+        const TASKS: usize = 127;
+        let mut timeline = CfsTimeline::new();
+        let mut tasks: Vec<Box<TaskStruct>> = (0..TASKS)
+            .map(|_| Box::new(unsafe { core::mem::zeroed::<TaskStruct>() }))
+            .collect();
+
+        for (index, task) in tasks.iter_mut().enumerate() {
+            let vruntime = ((index * 37) % TASKS) as u64;
+            task.m29.se.vruntime = vruntime;
+            timeline.insert(&mut **task, vruntime);
+        }
+
+        let ordered: Vec<u64> = timeline
+            .iter()
+            .map(|task| unsafe { (*task).m29.se.vruntime })
+            .collect();
+        assert_eq!(ordered, (0..TASKS as u64).collect::<Vec<_>>());
+
+        for task in tasks.iter_mut().step_by(2) {
+            let ptr = &mut **task as *mut TaskStruct;
+            assert!(timeline.remove(ptr, task.m29.se.vruntime));
+        }
+        let remaining: Vec<u64> = timeline
+            .iter()
+            .map(|task| unsafe { (*task).m29.se.vruntime })
+            .collect();
+        assert_eq!(
+            remaining,
+            (0..TASKS as u64)
+                .filter(|vruntime| {
+                    let insertion_index = (*vruntime as usize * 103) % TASKS;
+                    insertion_index % 2 == 1
+                })
+                .collect::<Vec<_>>()
+        );
+
+        for task in tasks.iter_mut().skip(1).step_by(2) {
+            let ptr = &mut **task as *mut TaskStruct;
+            assert!(timeline.remove(ptr, task.m29.se.vruntime));
+        }
+        assert!(timeline.is_empty());
+        assert!(timeline.first().is_null());
     }
 
     #[test]

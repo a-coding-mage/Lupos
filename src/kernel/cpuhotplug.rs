@@ -20,6 +20,7 @@ pub type CpuHpCallback = Option<unsafe extern "C" fn(cpu: u32) -> i32>;
 struct LinuxCpuMask(AtomicU64);
 
 static LINUX_CPU_ONLINE_MASK: LinuxCpuMask = LinuxCpuMask(AtomicU64::new(1));
+static LINUX_CPU_ACTIVE_MASK: LinuxCpuMask = LinuxCpuMask(AtomicU64::new(1));
 static LINUX_NUM_ONLINE_CPUS: AtomicU32 = AtomicU32::new(1);
 static LINUX_NR_CPU_IDS: AtomicU32 = AtomicU32::new(1);
 static CPU_HOTPLUG_LOCK: PerCpuRwSem = PerCpuRwSem::new();
@@ -34,6 +35,11 @@ pub fn register_module_exports() {
     export_symbol_once(
         "__cpu_online_mask",
         core::ptr::addr_of!(LINUX_CPU_ONLINE_MASK) as usize,
+        false,
+    );
+    export_symbol_once(
+        "__cpu_active_mask",
+        core::ptr::addr_of!(LINUX_CPU_ACTIVE_MASK) as usize,
         false,
     );
     export_symbol_once(
@@ -81,6 +87,7 @@ pub fn register_module_exports() {
 /// `set_cpu_online(0, true)` sequence in `vendor/linux/kernel/cpu.c`.
 pub fn reset_cpu_maps() {
     LINUX_CPU_ONLINE_MASK.0.store(1, Ordering::Release);
+    LINUX_CPU_ACTIVE_MASK.0.store(1, Ordering::Release);
     LINUX_NUM_ONLINE_CPUS.store(1, Ordering::Release);
     LINUX_NR_CPU_IDS.store(1, Ordering::Release);
 }
@@ -98,6 +105,10 @@ pub fn set_cpu_online(cpu: u32, online: bool) {
         }
         LINUX_NR_CPU_IDS.fetch_max(cpu + 1, Ordering::AcqRel);
     } else {
+        // Linux requires cpu_active_mask to remain a subset of
+        // cpu_online_mask. Stop normal placement before withdrawing the CPU
+        // from the module-visible online mask.
+        LINUX_CPU_ACTIVE_MASK.0.fetch_and(!bit, Ordering::AcqRel);
         let old = LINUX_CPU_ONLINE_MASK.0.fetch_and(!bit, Ordering::AcqRel);
         if old & bit != 0 {
             LINUX_NUM_ONLINE_CPUS.fetch_sub(1, Ordering::AcqRel);
@@ -107,6 +118,31 @@ pub fn set_cpu_online(cpu: u32, online: bool) {
 
 pub fn cpu_online_mask() -> u64 {
     LINUX_CPU_ONLINE_MASK.0.load(Ordering::Acquire)
+}
+
+/// Publish whether normal scheduler placement may target `cpu`.
+///
+/// Linux brings a CPU online before activating it for the scheduler. Keeping
+/// the masks distinct prevents a half-initialized AP from receiving ordinary
+/// tasks while still allowing per-CPU bring-up work to observe it as online.
+pub fn set_cpu_active(cpu: u32, active: bool) -> bool {
+    if cpu >= 64 {
+        return false;
+    }
+    let bit = 1u64 << cpu;
+    if active {
+        if LINUX_CPU_ONLINE_MASK.0.load(Ordering::Acquire) & bit == 0 {
+            return false;
+        }
+        LINUX_CPU_ACTIVE_MASK.0.fetch_or(bit, Ordering::Release);
+    } else {
+        LINUX_CPU_ACTIVE_MASK.0.fetch_and(!bit, Ordering::Release);
+    }
+    true
+}
+
+pub fn cpu_active_mask() -> u64 {
+    LINUX_CPU_ACTIVE_MASK.0.load(Ordering::Acquire)
 }
 
 pub fn nr_cpu_ids() -> u32 {

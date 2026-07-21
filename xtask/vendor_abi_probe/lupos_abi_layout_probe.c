@@ -582,6 +582,12 @@ ABI_OFFSET(struct net_device, dev_addr_shadow, 2472);
 ABI_OFFSET(struct net_device, napi_config, 2544);
 ABI_OFFSET(struct net_device, num_napi_configs, 2552);
 ABI_SIZE(struct net_device, 2624);
+ABI_OFFSET(struct net_device_ops, ndo_start_xmit, 32);
+ABI_OFFSET(struct net_device_ops, ndo_select_queue, 48);
+
+ABI_OFFSET(struct netdev_xmit, recursion, 0);
+ABI_OFFSET(struct netdev_xmit, more, 2);
+ABI_OFFSET(struct softnet_data, xmit, 96);
 
 _Static_assert(_Alignof(struct netdev_queue) == 64,
 	       "struct netdev_queue alignment changed");
@@ -589,6 +595,7 @@ ABI_OFFSET(struct netdev_queue, dev, 0);
 ABI_OFFSET(struct netdev_queue, dql, 128);
 ABI_OFFSET(struct netdev_queue, _xmit_lock, 256);
 ABI_OFFSET(struct netdev_queue, xmit_lock_owner, 260);
+ABI_OFFSET(struct netdev_queue, trans_start, 264);
 ABI_OFFSET(struct netdev_queue, state, 272);
 ABI_OFFSET(struct netdev_queue, napi, 280);
 ABI_OFFSET(struct netdev_queue, numa_node, 288);
@@ -625,6 +632,7 @@ ABI_OFFSET(struct sk_buff, dev, 16);
 ABI_OFFSET(struct sk_buff, len, 112);
 ABI_OFFSET(struct sk_buff, data_len, 116);
 ABI_OFFSET(struct sk_buff, mac_len, 120);
+ABI_OFFSET(struct sk_buff, queue_mapping, 124);
 _Static_assert(CLONED_OFFSET == 126, "struct sk_buff cloned flags moved");
 _Static_assert(PKT_TYPE_OFFSET == 128, "struct sk_buff pkt_type flags moved");
 ABI_OFFSET(struct sk_buff, alloc_cpu, 136);

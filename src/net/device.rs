@@ -5,16 +5,17 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-
-use lazy_static::lazy_static;
-use spin::Mutex;
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use crate::include::uapi::errno::{EBUSY, EINVAL, ENODEV};
 use crate::kernel::locking::qspinlock::QSpinLock;
+use crate::kernel::sched::MAX_CPUS;
 use crate::net::skbuff::SkBuff;
 
 pub const IFF_UP: u32 = 0x1;
@@ -164,13 +165,121 @@ pub struct NetDeviceStats {
 static NEXT_IFINDEX: AtomicU32 = AtomicU32::new(1);
 static NETDEV_INIT_DONE: AtomicBool = AtomicBool::new(false);
 
-lazy_static! {
-    static ref NETDEV_BY_NAME: Mutex<BTreeMap<String, NetDeviceRef>> = Mutex::new(BTreeMap::new());
-    /// Device registries for non-init network namespaces.  Physical/vendor
-    /// devices stay exclusively in `NETDEV_BY_NAME`; each child namespace is
-    /// lazily populated with its own down loopback device.
-    static ref NETDEV_BY_NAMESPACE: Mutex<BTreeMap<usize, BTreeMap<String, NetDeviceRef>>> =
-        Mutex::new(BTreeMap::new());
+/// Rust's `BTreeMap` cannot express Linux's intrusive RCU hash/list updates
+/// without exposing mutable aliases.  Keep one immutable snapshot instead:
+/// RTNL writers clone and publish it, while packet-path readers pin their CPU
+/// and never wait for a writer.  Publication waits only for readers that could
+/// still hold the retired snapshot before reclaiming that snapshot, matching
+/// the `list_*_rcu()` registry lifetime contract in Linux `dev.c`.  The raw C
+/// `struct net_device` lifetime remains owned by the Linux driver ABI.
+#[derive(Clone, Default)]
+struct NetDeviceRegistry {
+    by_name: BTreeMap<String, NetDeviceRef>,
+    by_linux_dev: BTreeMap<usize, NetDeviceRef>,
+    /// Physical/vendor devices stay exclusively in `by_name`; each child
+    /// namespace is lazily populated with its own down loopback device.
+    by_namespace: BTreeMap<usize, BTreeMap<String, NetDeviceRef>>,
+}
+
+static EMPTY_NETDEV_REGISTRY: NetDeviceRegistry = NetDeviceRegistry {
+    by_name: BTreeMap::new(),
+    by_linux_dev: BTreeMap::new(),
+    by_namespace: BTreeMap::new(),
+};
+static NETDEV_REGISTRY: AtomicPtr<NetDeviceRegistry> = AtomicPtr::new(core::ptr::null_mut());
+static NETDEV_REGISTRY_EPOCH: AtomicUsize = AtomicUsize::new(0);
+#[repr(align(64))]
+struct NetdevReaderCounter(AtomicU32);
+
+impl NetdevReaderCounter {
+    const fn new() -> Self {
+        Self(AtomicU32::new(0))
+    }
+}
+
+static NETDEV_REGISTRY_READERS: [[NetdevReaderCounter; MAX_CPUS]; 2] =
+    [const { [const { NetdevReaderCounter::new() }; MAX_CPUS] }; 2];
+
+#[inline]
+fn with_registry<T>(f: impl FnOnce(&NetDeviceRegistry) -> T) -> T {
+    #[cfg(not(test))]
+    crate::kernel::locking::preempt::preempt_disable();
+    let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number();
+
+    // Sequential consistency closes the publish-vs-reader-entry race.  The
+    // writer swaps the pointer before flipping epochs, so an old-epoch reader
+    // can see either snapshot and is drained; a new-epoch reader can see only
+    // the replacement.
+    let epoch = loop {
+        let observed = NETDEV_REGISTRY_EPOCH.load(Ordering::SeqCst) & 1;
+        NETDEV_REGISTRY_READERS[observed][cpu]
+            .0
+            .fetch_add(1, Ordering::SeqCst);
+        if NETDEV_REGISTRY_EPOCH.load(Ordering::SeqCst) & 1 == observed {
+            break observed;
+        }
+        NETDEV_REGISTRY_READERS[observed][cpu]
+            .0
+            .fetch_sub(1, Ordering::SeqCst);
+        core::hint::spin_loop();
+    };
+    let registry = NETDEV_REGISTRY.load(Ordering::SeqCst);
+    let result = if registry.is_null() {
+        f(&EMPTY_NETDEV_REGISTRY)
+    } else {
+        f(unsafe { &*registry })
+    };
+    NETDEV_REGISTRY_READERS[epoch][cpu]
+        .0
+        .fetch_sub(1, Ordering::SeqCst);
+    #[cfg(not(test))]
+    crate::kernel::locking::preempt::preempt_enable();
+    result
+}
+
+fn cloned_registry() -> NetDeviceRegistry {
+    let registry = NETDEV_REGISTRY.load(Ordering::Acquire);
+    if registry.is_null() {
+        NetDeviceRegistry::default()
+    } else {
+        // Registry writers are serialized by RTNL.  The published snapshot is
+        // immutable and cannot be retired until this writer replaces it.
+        unsafe { (*registry).clone() }
+    }
+}
+
+fn publish_registry(registry: NetDeviceRegistry) {
+    let replacement = Box::into_raw(Box::new(registry));
+    let retired_epoch = NETDEV_REGISTRY_EPOCH.load(Ordering::SeqCst) & 1;
+    let retired = NETDEV_REGISTRY.swap(replacement, Ordering::SeqCst);
+    NETDEV_REGISTRY_EPOCH.store(retired_epoch ^ 1, Ordering::SeqCst);
+    while NETDEV_REGISTRY_READERS[retired_epoch]
+        .iter()
+        .any(|readers| readers.0.load(Ordering::SeqCst) != 0)
+    {
+        core::hint::spin_loop();
+    }
+    if !retired.is_null() {
+        unsafe {
+            drop(Box::from_raw(retired));
+        }
+    }
+}
+
+fn update_registry<T>(f: impl FnOnce(&mut NetDeviceRegistry) -> T) -> T {
+    let mut registry = cloned_registry();
+    let result = f(&mut registry);
+    publish_registry(registry);
+    result
+}
+
+fn try_update_registry<T>(
+    f: impl FnOnce(&mut NetDeviceRegistry) -> Result<T, i32>,
+) -> Result<T, i32> {
+    let mut registry = cloned_registry();
+    let result = f(&mut registry)?;
+    publish_registry(registry);
+    Ok(result)
 }
 
 static RTNL: QSpinLock = QSpinLock::new();
@@ -192,6 +301,37 @@ pub fn linux_rtnl_unlock() {
 
 pub fn linux_rtnl_is_locked() -> bool {
     RTNL.is_locked()
+}
+
+/// Lupos-specific runtime probe for Linux's guarantee that net-device lookup
+/// is a nonblocking RCU read-side operation.  Linux exercises this through its
+/// packet path rather than a directly reusable KUnit test, so the acceptance
+/// gate checks the equivalent translated-registry contract.
+#[cfg(feature = "test-networking")]
+pub fn registry_rcu_read_acceptance() {
+    use crate::kernel::locking::irqflags::irqs_disabled;
+    use crate::kernel::locking::preempt::{PREEMPT_OFFSET, preempt_count};
+
+    let interrupts_were_disabled = irqs_disabled();
+    assert!(
+        !interrupts_were_disabled,
+        "networking acceptance must enter with interrupts enabled"
+    );
+    let preempt_before = preempt_count();
+    with_registry(|_| {
+        assert_eq!(
+            irqs_disabled(),
+            interrupts_were_disabled,
+            "RCU net-device lookup must not mask IRQs"
+        );
+        assert_eq!(
+            preempt_count(),
+            preempt_before + PREEMPT_OFFSET,
+            "RCU net-device lookup must pin the reader to its CPU"
+        );
+    });
+    assert_eq!(irqs_disabled(), interrupts_were_disabled);
+    assert_eq!(preempt_count(), preempt_before);
 }
 
 pub fn init() {
@@ -216,53 +356,74 @@ pub fn init() {
 }
 
 fn register_loopback_netdevice(namespace_key: usize) -> Result<NetDeviceRef, i32> {
-    rtnl_lock(|| {
-        let dev = Arc::new(NetDevice {
-            ifindex: NEXT_IFINDEX.fetch_add(1, Ordering::AcqRel),
-            name: String::from("lo"),
-            mtu: LOOPBACK_MTU,
-            flags: AtomicU32::new(IFF_LOOPBACK),
-            dev_addr: [0; 6],
-            ops: &LOOPBACK_NETDEV_OPS,
-            carrier: AtomicBool::new(false),
-            operstate: AtomicU8::new(IF_OPER_UNKNOWN),
-            link_mode: AtomicU8::new(IF_LINK_MODE_DEFAULT),
-            tx_packets: AtomicU64::new(0),
-            rx_packets: AtomicU64::new(0),
-            linux_dev: None,
-        });
+    rtnl_lock(|| register_loopback_netdevice_locked(namespace_key))
+}
+
+fn register_loopback_netdevice_locked(namespace_key: usize) -> Result<NetDeviceRef, i32> {
+    let present = with_registry(|registry| {
         if namespace_key == 0 {
-            let mut registry = NETDEV_BY_NAME.lock();
-            if registry.contains_key("lo") {
-                return Err(EBUSY);
-            }
-            registry.insert(String::from("lo"), dev.clone());
-            crate::fs::sysfs::net::register_netdevice(&dev);
-            crate::net::uevent::announce_netdevice(
-                crate::net::uevent::UeventAction::Add,
-                "lo",
-                dev.ifindex,
-            );
+            registry.by_name.contains_key("lo")
         } else {
-            let mut namespaces = NETDEV_BY_NAMESPACE.lock();
-            let registry = namespaces.entry(namespace_key).or_default();
-            if registry.contains_key("lo") {
-                return Err(EBUSY);
-            }
-            registry.insert(String::from("lo"), dev.clone());
+            registry
+                .by_namespace
+                .get(&namespace_key)
+                .is_some_and(|devices| devices.contains_key("lo"))
         }
-        Ok(dev)
-    })
+    });
+    if present {
+        return Err(EBUSY);
+    }
+
+    let dev = Arc::new(NetDevice {
+        ifindex: NEXT_IFINDEX.fetch_add(1, Ordering::AcqRel),
+        name: String::from("lo"),
+        mtu: LOOPBACK_MTU,
+        flags: AtomicU32::new(IFF_LOOPBACK),
+        dev_addr: [0; 6],
+        ops: &LOOPBACK_NETDEV_OPS,
+        carrier: AtomicBool::new(false),
+        operstate: AtomicU8::new(IF_OPER_UNKNOWN),
+        link_mode: AtomicU8::new(IF_LINK_MODE_DEFAULT),
+        tx_packets: AtomicU64::new(0),
+        rx_packets: AtomicU64::new(0),
+        linux_dev: None,
+    });
+    if namespace_key == 0 {
+        // Linux register_netdevice() registers the kobject before
+        // list_netdevice() makes the device visible to RCU readers.
+        crate::fs::sysfs::net::register_netdevice(&dev);
+        crate::net::uevent::announce_netdevice(
+            crate::net::uevent::UeventAction::Add,
+            "lo",
+            dev.ifindex,
+        );
+        let registry_name = dev.name.clone();
+        update_registry(|registry| {
+            registry.by_name.insert(registry_name, dev.clone());
+        });
+    } else {
+        let registry_name = dev.name.clone();
+        update_registry(|registry| {
+            registry
+                .by_namespace
+                .entry(namespace_key)
+                .or_default()
+                .insert(registry_name, dev.clone());
+        });
+    }
+    Ok(dev)
 }
 
 fn ensure_current_namespace_loopback(namespace_key: usize) {
     if namespace_key == 0 {
         return;
     }
-    let present = NETDEV_BY_NAMESPACE
-        .lock()
-        .get(&namespace_key)
-        .is_some_and(|registry| registry.contains_key("lo"));
+    let present = with_registry(|registry| {
+        registry
+            .by_namespace
+            .get(&namespace_key)
+            .is_some_and(|devices| devices.contains_key("lo"))
+    });
     if !present {
         let _ = register_loopback_netdevice(namespace_key);
     }
@@ -270,7 +431,19 @@ fn ensure_current_namespace_loopback(namespace_key: usize) {
 
 pub fn unregister_net_namespace(namespace_key: usize) {
     if namespace_key != 0 {
-        NETDEV_BY_NAMESPACE.lock().remove(&namespace_key);
+        rtnl_lock(|| {
+            let removed = update_registry(|registry| registry.by_namespace.remove(&namespace_key));
+            if let Some(devices) = removed {
+                for dev in devices.values() {
+                    crate::net::uevent::announce_netdevice(
+                        crate::net::uevent::UeventAction::Remove,
+                        &dev.name,
+                        dev.ifindex,
+                    );
+                    crate::fs::sysfs::net::unregister_netdevice(dev);
+                }
+            }
+        });
     }
 }
 
@@ -282,11 +455,9 @@ pub fn register_netdevice(
 ) -> Result<NetDeviceRef, i32> {
     validate_mtu(mtu)?;
     rtnl_lock(|| {
-        let mut registry = NETDEV_BY_NAME.lock();
-        if registry.contains_key(name) {
+        if with_registry(|registry| registry.by_name.contains_key(name)) {
             return Err(EBUSY);
         }
-
         let dev = Arc::new(NetDevice {
             ifindex: NEXT_IFINDEX.fetch_add(1, Ordering::AcqRel),
             name: String::from(name),
@@ -301,13 +472,18 @@ pub fn register_netdevice(
             rx_packets: AtomicU64::new(0),
             linux_dev: None,
         });
-        registry.insert(String::from(name), dev.clone());
+        // Linux register_netdevice() registers the kobject before
+        // list_netdevice() makes the device visible to RCU readers.
         crate::fs::sysfs::net::register_netdevice(&dev);
         crate::net::uevent::announce_netdevice(
             crate::net::uevent::UeventAction::Add,
             name,
             dev.ifindex,
         );
+        let registry_name = dev.name.clone();
+        update_registry(|registry| {
+            registry.by_name.insert(registry_name, dev.clone());
+        });
         Ok(dev)
     })
 }
@@ -322,8 +498,7 @@ pub fn register_linux_netdevice_locked(
     if linux_dev.is_null() {
         return Err(EINVAL);
     }
-    let mut registry = NETDEV_BY_NAME.lock();
-    if registry.contains_key(name) {
+    if with_registry(|registry| registry.by_name.contains_key(name)) {
         return Err(EBUSY);
     }
     let dev = Arc::new(NetDevice {
@@ -340,50 +515,46 @@ pub fn register_linux_netdevice_locked(
         rx_packets: AtomicU64::new(0),
         linux_dev: Some(linux_dev as usize),
     });
-    registry.insert(String::from(name), dev.clone());
+    // Linux register_netdevice() registers the kobject before
+    // list_netdevice() makes the device visible to RCU readers.
     crate::fs::sysfs::net::register_netdevice(&dev);
     crate::net::uevent::announce_netdevice(
         crate::net::uevent::UeventAction::Add,
         name,
         dev.ifindex,
     );
+    let registry_name = dev.name.clone();
+    let address = linux_dev as usize;
+    update_registry(|registry| {
+        registry.by_name.insert(registry_name, dev.clone());
+        registry.by_linux_dev.insert(address, dev.clone());
+    });
     crate::net::socket::broadcast_rtnl_newlink(&dev);
     Ok(dev)
 }
 
 pub fn lookup_linux_netdevice(linux_dev: *const u8) -> Option<NetDeviceRef> {
     let address = linux_dev as usize;
-    NETDEV_BY_NAME
-        .lock()
-        .values()
-        .find(|dev| dev.linux_dev == Some(address))
-        .cloned()
+    with_registry(|registry| registry.by_linux_dev.get(&address).cloned())
 }
 
 pub fn unregister_linux_netdevice_locked(linux_dev: *const u8) -> Result<(), i32> {
     let address = linux_dev as usize;
-    let name = NETDEV_BY_NAME
-        .lock()
-        .iter()
-        .find(|(_, dev)| dev.linux_dev == Some(address))
-        .map(|(name, _)| name.clone());
-    match name {
-        Some(name) => {
-            if let Some(dev) = NETDEV_BY_NAME.lock().get(&name).cloned() {
-                crate::net::uevent::announce_netdevice(
-                    crate::net::uevent::UeventAction::Remove,
-                    &dev.name,
-                    dev.ifindex,
-                );
-                crate::net::socket::drop_rtnl_ifaddrs_for_device(dev.ifindex);
-                crate::net::socket::drop_rtnl_routes_for_device(dev.ifindex);
-            }
-            NETDEV_BY_NAME.lock().remove(&name);
-            crate::fs::sysfs::net::unregister_netdevice(&name);
-            Ok(())
-        }
-        None => Err(ENODEV),
-    }
+    let dev = try_update_registry(|registry| {
+        let dev = registry.by_linux_dev.remove(&address).ok_or(ENODEV)?;
+        registry.by_name.remove(&dev.name).ok_or(ENODEV)?;
+        Ok(dev)
+    })?;
+
+    crate::net::uevent::announce_netdevice(
+        crate::net::uevent::UeventAction::Remove,
+        &dev.name,
+        dev.ifindex,
+    );
+    crate::net::socket::drop_rtnl_ifaddrs_for_device(dev.ifindex);
+    crate::net::socket::drop_rtnl_routes_for_device(dev.ifindex);
+    crate::fs::sysfs::net::unregister_netdevice(&dev);
+    Ok(())
 }
 
 pub fn validate_mtu(mtu: u32) -> Result<(), i32> {
@@ -396,48 +567,79 @@ pub fn validate_mtu(mtu: u32) -> Result<(), i32> {
 
 pub fn unregister_netdevice(name: &str) -> Result<(), i32> {
     rtnl_lock(|| {
-        let mut registry = NETDEV_BY_NAME.lock();
-        if let Some(dev) = registry.remove(name) {
-            crate::net::uevent::announce_netdevice(
-                crate::net::uevent::UeventAction::Remove,
-                &dev.name,
-                dev.ifindex,
-            );
-            crate::net::socket::drop_rtnl_ifaddrs_for_device(dev.ifindex);
-            crate::net::socket::drop_rtnl_routes_for_device(dev.ifindex);
-            crate::fs::sysfs::net::unregister_netdevice(name);
-            Ok(())
-        } else {
-            Err(ENODEV)
-        }
+        let dev = try_update_registry(|registry| {
+            let dev = registry.by_name.remove(name).ok_or(ENODEV)?;
+            if let Some(address) = dev.linux_dev {
+                registry.by_linux_dev.remove(&address);
+            }
+            Ok(dev)
+        })?;
+        crate::net::uevent::announce_netdevice(
+            crate::net::uevent::UeventAction::Remove,
+            &dev.name,
+            dev.ifindex,
+        );
+        crate::net::socket::drop_rtnl_ifaddrs_for_device(dev.ifindex);
+        crate::net::socket::drop_rtnl_routes_for_device(dev.ifindex);
+        crate::fs::sysfs::net::unregister_netdevice(&dev);
+        Ok(())
     })
 }
 
 pub fn lookup_netdevice(name: &str) -> Option<NetDeviceRef> {
     let namespace_key = crate::net::core::net_namespace::current_net_namespace_key();
     if namespace_key == 0 {
-        NETDEV_BY_NAME.lock().get(name).cloned()
+        with_registry(|registry| registry.by_name.get(name).cloned())
     } else {
         ensure_current_namespace_loopback(namespace_key);
-        NETDEV_BY_NAMESPACE
-            .lock()
-            .get(&namespace_key)
-            .and_then(|registry| registry.get(name).cloned())
+        with_registry(|registry| {
+            registry
+                .by_namespace
+                .get(&namespace_key)
+                .and_then(|devices| devices.get(name).cloned())
+        })
     }
 }
 
 pub fn list_netdevices() -> alloc::vec::Vec<NetDeviceRef> {
     let namespace_key = crate::net::core::net_namespace::current_net_namespace_key();
-    if namespace_key == 0 {
-        NETDEV_BY_NAME.lock().values().cloned().collect()
-    } else {
+    if namespace_key != 0 {
         ensure_current_namespace_loopback(namespace_key);
-        NETDEV_BY_NAMESPACE
-            .lock()
-            .get(&namespace_key)
-            .map(|registry| registry.values().cloned().collect())
-            .unwrap_or_default()
     }
+    list_netdevices_in_namespace(namespace_key)
+}
+
+fn list_netdevices_in_namespace(namespace_key: usize) -> alloc::vec::Vec<NetDeviceRef> {
+    if namespace_key == 0 {
+        with_registry(|registry| registry.by_name.values().cloned().collect())
+    } else {
+        with_registry(|registry| {
+            registry
+                .by_namespace
+                .get(&namespace_key)
+                .map(|devices| devices.values().cloned().collect())
+                .unwrap_or_default()
+        })
+    }
+}
+
+/// Enumerate the current namespace while the caller holds RTNL.  Sysfs root
+/// attachment needs this form so lazy per-netns loopback creation does not
+/// recursively acquire the non-reentrant RTNL lock.
+pub fn list_netdevices_rtnl_locked() -> alloc::vec::Vec<NetDeviceRef> {
+    let namespace_key = crate::net::core::net_namespace::current_net_namespace_key();
+    if namespace_key != 0 {
+        let present = with_registry(|registry| {
+            registry
+                .by_namespace
+                .get(&namespace_key)
+                .is_some_and(|devices| devices.contains_key("lo"))
+        });
+        if !present {
+            let _ = register_loopback_netdevice_locked(namespace_key);
+        }
+    }
+    list_netdevices_in_namespace(namespace_key)
 }
 
 pub fn set_device_up(dev: &NetDeviceRef) -> Result<(), i32> {
@@ -663,5 +865,32 @@ mod tests {
         );
         unregister_netdevice(name).unwrap();
         let _ = crate::net::uevent::drain_pending();
+    }
+
+    #[test]
+    fn duplicate_linux_name_preserves_ifindex_and_lookup_identity() {
+        let _guard = crate::net::uevent::test_lock();
+        let name = "linux-netdev-duplicate0";
+        let raw = 0x1000usize as *mut u8;
+        let duplicate_raw = 0x2000usize as *mut u8;
+
+        rtnl_lock(|| {
+            let _ = unregister_linux_netdevice_locked(raw);
+            let dev = register_linux_netdevice_locked(name, 1500, [2, 0, 0, 0, 0, 5], raw)
+                .expect("first Linux netdev registration");
+            let next_ifindex = NEXT_IFINDEX.load(Ordering::Acquire);
+
+            assert!(matches!(
+                register_linux_netdevice_locked(name, 1500, [2, 0, 0, 0, 0, 6], duplicate_raw,),
+                Err(EBUSY)
+            ));
+            assert_eq!(NEXT_IFINDEX.load(Ordering::Acquire), next_ifindex);
+            assert!(lookup_linux_netdevice(duplicate_raw).is_none());
+            assert!(Arc::ptr_eq(
+                &dev,
+                &lookup_linux_netdevice(raw).expect("raw pointer lookup")
+            ));
+            unregister_linux_netdevice_locked(raw).expect("Linux netdev unregister");
+        });
     }
 }

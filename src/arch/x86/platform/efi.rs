@@ -18,12 +18,13 @@ use crate::arch::x86::boot::compressed::efi::{
     EfiType, efi_get_memmap, efi_get_system_table, efi_get_type,
 };
 use crate::arch::x86::include::uapi::asm::bootparam::BootParams;
-use crate::arch::x86::kernel::fpu::{FxSaveArea, restore_fxstate, save_fxstate};
+use crate::arch::x86::kernel::fpu::{KFPU_387, KFPU_MXCSR, kernel_fpu_begin_mask, kernel_fpu_end};
 use crate::efi::vars::{self, GetVariableProvider, Guid};
 use crate::include::uapi::errno::{EBADMSG, EINVAL, EIO, ENODEV, ENOMEM, EOPNOTSUPP, EOVERFLOW};
 use crate::kernel::locking::irqflags::{
     IrqFlags, X86_EFLAGS_IF, arch_local_save_flags, local_irq_restore, local_irq_save,
 };
+use crate::kernel::locking::preempt::{preempt_disable, preempt_enable};
 
 use super::EfiMode;
 
@@ -57,6 +58,7 @@ static OVMF_VIRTUAL_MODE: Mutex<Option<EfiRuntimeVirtualMode>> = Mutex::new(None
 static OVMF_EFI_MM: Mutex<Option<EfiRuntimePageTables>> = Mutex::new(None);
 static EFI_RUNTIME_CALL_LOCK: Mutex<()> = Mutex::new(());
 const ARCH_EFI_IRQ_FLAGS_MASK: IrqFlags = X86_EFLAGS_IF;
+const EFI_RUNTIME_FPU_MASK: u32 = KFPU_387 | KFPU_MXCSR;
 
 pub fn init_from_boot_params(bp: &BootParams) -> Result<EfiGetVariableBackend, i32> {
     let state = unsafe { discover_efi_get_variable_backend_from_boot_params(bp) }?;
@@ -861,6 +863,27 @@ pub enum EfiRuntimeCallKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EfiRuntimeCallOrder {
+    enter_mm_before_fpu: bool,
+    fpu_end_before_leave_mm: bool,
+}
+
+const fn efi_runtime_call_order(kind: EfiRuntimeCallKind) -> EfiRuntimeCallOrder {
+    match kind {
+        // arch_efi_call_virt_setup()/teardown()
+        EfiRuntimeCallKind::RuntimeService => EfiRuntimeCallOrder {
+            enter_mm_before_fpu: false,
+            fpu_end_before_leave_mm: false,
+        },
+        // efi_64.c::efi_set_virtual_address_map()
+        EfiRuntimeCallKind::SetVirtualAddressMap => EfiRuntimeCallOrder {
+            enter_mm_before_fpu: true,
+            fpu_end_before_leave_mm: true,
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EfiRuntimeCallGuardAudit {
     pub kind: EfiRuntimeCallKind,
     pub flags_before: IrqFlags,
@@ -897,17 +920,40 @@ struct EfiRuntimeCallGuard {
     kind: EfiRuntimeCallKind,
     flags_before: IrqFlags,
     irq_restore: Option<IrqFlags>,
-    previous_pgd_phys: Option<u64>,
+    temporary_pgd: Option<crate::arch::x86::mm::paging::TemporaryKernelPgdState>,
     efi_mm_pgd_phys: Option<u64>,
-    fpu: FxSaveArea,
 }
 
 impl EfiRuntimeCallGuard {
     fn enter(kind: EfiRuntimeCallKind) -> Self {
-        let mut fpu = FxSaveArea::zeroed();
-        unsafe {
-            save_fxstate(&mut fpu);
+        let efi_mm_pgd_phys = runtime_page_tables_snapshot().map(|tables| tables.pgd_phys);
+        if let Some(pgd_phys) = efi_mm_pgd_phys {
+            let _ = unsafe {
+                crate::arch::x86::mm::paging::sync_kernel_mappings_around_window(
+                    pgd_phys,
+                    EFI_VA_END,
+                    EFI_VA_START,
+                )
+            };
         }
+
+        let order = efi_runtime_call_order(kind);
+        let temporary_pgd = if order.enter_mm_before_fpu {
+            // Linux reaches SetVirtualAddressMap's early path already pinned;
+            // Lupos makes that external precondition explicit here.
+            preempt_disable();
+            let temporary = efi_mm_pgd_phys.map(|pgd_phys| unsafe {
+                crate::arch::x86::mm::paging::use_temporary_kernel_pgd(pgd_phys)
+            });
+            kernel_fpu_begin_mask(EFI_RUNTIME_FPU_MASK);
+            temporary
+        } else {
+            kernel_fpu_begin_mask(EFI_RUNTIME_FPU_MASK);
+            let temporary = efi_mm_pgd_phys.map(|pgd_phys| unsafe {
+                crate::arch::x86::mm::paging::use_temporary_kernel_pgd(pgd_phys)
+            });
+            temporary
+        };
         let (flags_before, irq_restore) = match kind {
             EfiRuntimeCallKind::RuntimeService => (arch_local_save_flags(), None),
             EfiRuntimeCallKind::SetVirtualAddressMap => {
@@ -915,31 +961,16 @@ impl EfiRuntimeCallGuard {
                 (flags, Some(flags))
             }
         };
-        let efi_mm_pgd_phys = runtime_page_tables_snapshot().map(|tables| tables.pgd_phys);
-        let previous_pgd_phys = efi_mm_pgd_phys.map(|pgd_phys| unsafe {
-            let _ = crate::arch::x86::mm::paging::sync_kernel_mappings_around_window(
-                pgd_phys,
-                EFI_VA_END,
-                EFI_VA_START,
-            );
-            crate::arch::x86::mm::paging::use_temporary_kernel_pgd(pgd_phys)
-        });
         Self {
             kind,
             flags_before,
             irq_restore,
-            previous_pgd_phys,
+            temporary_pgd,
             efi_mm_pgd_phys,
-            fpu,
         }
     }
 
     fn exit(self) -> EfiRuntimeCallGuardAudit {
-        if let Some(previous) = self.previous_pgd_phys {
-            unsafe {
-                crate::arch::x86::mm::paging::unuse_temporary_kernel_pgd(previous);
-            }
-        }
         let flags_after = arch_local_save_flags();
         let audit = efi_runtime_call_guard_audit(
             self.kind,
@@ -960,8 +991,24 @@ impl EfiRuntimeCallGuard {
             }
             None => {}
         }
-        unsafe {
-            restore_fxstate(&self.fpu);
+        let order = efi_runtime_call_order(self.kind);
+        if order.fpu_end_before_leave_mm {
+            // The explicit outer preempt pin keeps the temporary-mm interval
+            // valid after kernel_fpu_end() releases its own BH/preempt guard.
+            kernel_fpu_end();
+            if let Some(previous) = self.temporary_pgd {
+                unsafe {
+                    crate::arch::x86::mm::paging::unuse_temporary_kernel_pgd(previous);
+                }
+            }
+            preempt_enable();
+        } else {
+            if let Some(previous) = self.temporary_pgd {
+                unsafe {
+                    crate::arch::x86::mm::paging::unuse_temporary_kernel_pgd(previous);
+                }
+            }
+            kernel_fpu_end();
         }
         audit
     }
@@ -1526,6 +1573,18 @@ mod tests {
 
     #[test]
     fn runtime_call_guard_matches_linux_irq_and_fpu_policy() {
+        // Origin: vendor/linux/arch/x86/include/asm/efi.h::efi_fpu_begin.
+        // UEFI requires both the x87 control word and MXCSR to be initialized.
+        assert_eq!(EFI_RUNTIME_FPU_MASK, KFPU_387 | KFPU_MXCSR);
+
+        // Origin: vendor/linux/arch/x86/platform/efi/efi_64.c.
+        let runtime_order = efi_runtime_call_order(EfiRuntimeCallKind::RuntimeService);
+        assert!(!runtime_order.enter_mm_before_fpu);
+        assert!(!runtime_order.fpu_end_before_leave_mm);
+        let set_va_order = efi_runtime_call_order(EfiRuntimeCallKind::SetVirtualAddressMap);
+        assert!(set_va_order.enter_mm_before_fpu);
+        assert!(set_va_order.fpu_end_before_leave_mm);
+
         let runtime_ok = efi_runtime_call_guard_audit(
             EfiRuntimeCallKind::RuntimeService,
             X86_EFLAGS_IF,

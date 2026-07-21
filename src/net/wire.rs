@@ -1,20 +1,24 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/net/ethernet, vendor/linux/net/ipv4
+//! linux-source: vendor/linux/net/ipv4/tcp_ipv4.c
 //! test-origin: linux:vendor/linux/net/ipv4/af_inet.c
+//! test-origin: linux:vendor/linux/net/ipv4/tcp_ipv4.c
 //! Ethernet/ARP/IPv4 transport path used by module-backed net devices.
 
 extern crate alloc;
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use spin::Mutex;
 
 use crate::include::uapi::errno::{EADDRNOTAVAIL, EHOSTUNREACH, EINVAL, ENETDOWN, ENOTCONN};
+use crate::kernel::sched::wait::WaitQueueHead;
 use crate::net::ip::{IPPROTO_ICMP, IPPROTO_TCP, IPPROTO_UDP, checksum};
 use crate::net::socket::{
-    AF_INET, KernelSocket, QueuedPacket, RCV_SHUTDOWN, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, SockAddr,
-    SocketCred, SocketRef, SocketState,
+    AF_INET, InetSocketLookup, KernelSocket, QueuedPacket, RCV_SHUTDOWN, SOCK_DGRAM, SOCK_RAW,
+    SOCK_STREAM, SockAddr, SocketCred, SocketRef, SocketState,
 };
 
 const ETH_P_IP: u16 = 0x0800;
@@ -43,6 +47,54 @@ pub(crate) struct TcpState {
     pub snd_nxt: u32,
     pub rcv_nxt: u32,
     pub fin_received: bool,
+}
+
+#[derive(Clone)]
+pub(crate) enum DeferredInetPacket {
+    Tcp {
+        namespace_key: usize,
+        source: u32,
+        source_port: u16,
+        destination_port: u16,
+        sequence: u32,
+        acknowledgement: u32,
+        flags: u8,
+        payload: Vec<u8>,
+    },
+    Udp {
+        namespace_key: usize,
+        source: u32,
+        destination: u32,
+        source_port: u16,
+        destination_port: u16,
+        bytes: Vec<u8>,
+        ifindex: u32,
+        ttl: u8,
+    },
+    Icmp {
+        namespace_key: usize,
+        source: u32,
+        bytes: Vec<u8>,
+        ifindex: u32,
+        destination: u32,
+        ttl: u8,
+    },
+}
+
+pub(crate) struct DeferredInetCompletion {
+    wake_before_ack: Option<Arc<WaitQueueHead>>,
+    ack: Option<(u32, Vec<u8>)>,
+    wake_after_ack: Option<Arc<WaitQueueHead>>,
+}
+
+impl DeferredInetCompletion {
+    fn none() -> Self {
+        Self {
+            wake_before_ack: None,
+            ack: None,
+            wake_after_ack: None,
+        }
+    }
 }
 
 struct PendingFrame {
@@ -248,21 +300,6 @@ fn build_tcp_segment(
     let sum = transport_checksum(source, destination, IPPROTO_TCP, &segment);
     segment[16..18].copy_from_slice(&sum.to_be_bytes());
     segment
-}
-
-fn send_tcp_control(sock: &SocketRef, flags: u8) -> Result<(), i32> {
-    let tcp = sock.lock().wire_tcp.clone().ok_or(ENOTCONN)?;
-    let segment = build_tcp_segment(
-        tcp.local_addr,
-        tcp.remote_addr,
-        tcp.local_port,
-        tcp.remote_port,
-        tcp.snd_nxt,
-        tcp.rcv_nxt,
-        flags,
-        &[],
-    );
-    send_ipv4(tcp.remote_addr, IPPROTO_TCP, &segment)
 }
 
 pub(crate) fn tcp_connect(sock: &SocketRef, remote_addr: u32, remote_port: u16) -> Result<(), i32> {
@@ -503,47 +540,262 @@ fn handle_arp(linux_dev: *mut u8, frame: &[u8]) {
     }
 }
 
-fn matching_socket(
-    protocol: u8,
-    local_port: u16,
-    remote_addr: u32,
-    remote_port: u16,
-) -> Option<SocketRef> {
-    crate::net::socket::inet_socket_snapshot()
-        .into_iter()
-        .find(|sock| {
-            let socket = sock.lock();
-            if socket.family != AF_INET {
-                return false;
+impl DeferredInetPacket {
+    fn matches_lookup(&self, lookup: InetSocketLookup) -> bool {
+        if lookup.family != AF_INET || lookup.net_ns != self.namespace_key() {
+            return false;
+        }
+        match self {
+            Self::Tcp {
+                source,
+                source_port,
+                destination_port,
+                ..
+            } => {
+                lookup.tcp_local_port == Some(*destination_port)
+                    && lookup.tcp_remote_addr == Some(*source)
+                    && lookup.tcp_remote_port == Some(*source_port)
             }
-            match protocol {
-                IPPROTO_TCP => socket.wire_tcp.as_ref().is_some_and(|tcp| {
-                    tcp.local_port == local_port
-                        && tcp.remote_addr == remote_addr
-                        && tcp.remote_port == remote_port
-                }),
-                IPPROTO_UDP => {
-                    socket.sock_type == SOCK_DGRAM
-                        && matches!(socket.local, Some(SockAddr::Inet { port, .. }) if port == local_port)
-                }
-                IPPROTO_ICMP => {
-                    matches!(socket.sock_type, SOCK_DGRAM | SOCK_RAW)
-                        && socket.protocol == IPPROTO_ICMP as u16
-                }
-                _ => false,
+            Self::Udp {
+                destination_port, ..
+            } => lookup.sock_type == SOCK_DGRAM && lookup.local_port == Some(*destination_port),
+            Self::Icmp { .. } => {
+                matches!(lookup.sock_type, SOCK_DGRAM | SOCK_RAW)
+                    && lookup.protocol == IPPROTO_ICMP as u16
             }
-        })
+        }
+    }
+
+    fn matches_socket(&self, socket: &KernelSocket) -> bool {
+        if socket.family != AF_INET || socket.net_ns != self.namespace_key() {
+            return false;
+        }
+        match self {
+            Self::Tcp {
+                source,
+                source_port,
+                destination_port,
+                ..
+            } => socket.wire_tcp.as_ref().is_some_and(|tcp| {
+                tcp.local_port == *destination_port
+                    && tcp.remote_addr == *source
+                    && tcp.remote_port == *source_port
+            }),
+            Self::Udp {
+                destination_port, ..
+            } => {
+                socket.sock_type == SOCK_DGRAM
+                    && matches!(
+                        socket.local,
+                        Some(SockAddr::Inet { port, .. }) if port == *destination_port
+                    )
+            }
+            Self::Icmp { .. } => {
+                matches!(socket.sock_type, SOCK_DGRAM | SOCK_RAW)
+                    && socket.protocol == IPPROTO_ICMP as u16
+            }
+        }
+    }
+
+    fn namespace_key(&self) -> usize {
+        match self {
+            Self::Tcp { namespace_key, .. }
+            | Self::Udp { namespace_key, .. }
+            | Self::Icmp { namespace_key, .. } => *namespace_key,
+        }
+    }
 }
 
-fn queue_packet(sock: &SocketRef, bytes: Vec<u8>, peer: SockAddr) {
-    sock.lock().recvq.push_back(QueuedPacket {
-        bytes,
-        peer: Some(peer),
-        fds: Vec::new(),
-        cred: SocketCred::default(),
-        meta: crate::net::socket::PacketMeta::default(),
-    });
-    crate::net::socket::wake_socket_recv(sock);
+fn dispatch_inet_packet(packet: DeferredInetPacket) {
+    let mut packet = packet;
+    for socket in crate::net::socket::inet_socket_snapshot() {
+        if !packet.matches_lookup(socket.inet_lookup()) {
+            continue;
+        }
+        loop {
+            if let Some(mut state) = socket.try_lock() {
+                if !packet.matches_socket(&state) {
+                    // The process owner may have changed the tuple after its
+                    // lookup snapshot was published. Continue through the
+                    // remaining candidates rather than dropping a packet
+                    // which now belongs to another socket.
+                    break;
+                }
+                let completion = process_deferred_inet_packet(&mut state, packet);
+                state.finish_inet_on_unlock(completion);
+                drop(state);
+                return;
+            }
+            match socket.defer_inet_rx(packet) {
+                Ok(()) => return,
+                Err(retry) => packet = retry,
+            }
+        }
+    }
+}
+
+pub(crate) fn process_deferred_inet_packet(
+    socket: &mut KernelSocket,
+    packet: DeferredInetPacket,
+) -> DeferredInetCompletion {
+    match packet {
+        DeferredInetPacket::Tcp {
+            source,
+            source_port,
+            sequence,
+            acknowledgement,
+            flags,
+            payload,
+            ..
+        } => {
+            let state = socket.state;
+            let Some(tcp) = socket.wire_tcp.as_mut() else {
+                return DeferredInetCompletion::none();
+            };
+            let payload_len = payload.len();
+            let mut send_ack = false;
+            let mut delivered = false;
+            let mut wake = false;
+            if flags & TCP_RST != 0 {
+                socket.pending_error = crate::include::uapi::errno::ECONNREFUSED;
+                socket.state = SocketState::Created;
+                wake = true;
+            } else if state == SocketState::Connecting
+                && flags & (TCP_SYN | TCP_ACK) == (TCP_SYN | TCP_ACK)
+                && acknowledgement == tcp.snd_nxt
+            {
+                tcp.snd_una = acknowledgement;
+                tcp.rcv_nxt = sequence.wrapping_add(1);
+                socket.state = SocketState::Connected;
+                send_ack = true;
+                wake = true;
+            } else if state == SocketState::Connected {
+                if flags & TCP_ACK != 0 && acknowledgement.wrapping_sub(tcp.snd_una) < 0x8000_0000 {
+                    tcp.snd_una = acknowledgement.min(tcp.snd_nxt);
+                }
+                if payload_len != 0 && sequence == tcp.rcv_nxt {
+                    tcp.rcv_nxt = tcp.rcv_nxt.wrapping_add(payload_len as u32);
+                    socket.recvq.push_back(QueuedPacket {
+                        bytes: payload,
+                        peer: Some(SockAddr::Inet {
+                            addr: source,
+                            port: source_port,
+                        }),
+                        fds: Vec::new(),
+                        cred: SocketCred::default(),
+                        meta: crate::net::socket::PacketMeta::default(),
+                    });
+                    delivered = true;
+                    send_ack = true;
+                } else if payload_len != 0 {
+                    send_ack = true;
+                }
+                let fin_sequence = sequence.wrapping_add(payload_len as u32);
+                if flags & TCP_FIN != 0 && fin_sequence == tcp.rcv_nxt {
+                    tcp.rcv_nxt = tcp.rcv_nxt.wrapping_add(1);
+                    tcp.fin_received = true;
+                    socket.shutdown |= RCV_SHUTDOWN;
+                    send_ack = true;
+                    wake = true;
+                }
+            }
+            let wait = socket.recv_wait.clone();
+            let ack = send_ack.then(|| {
+                (
+                    tcp.remote_addr,
+                    build_tcp_segment(
+                        tcp.local_addr,
+                        tcp.remote_addr,
+                        tcp.local_port,
+                        tcp.remote_port,
+                        tcp.snd_nxt,
+                        tcp.rcv_nxt,
+                        TCP_ACK,
+                        &[],
+                    ),
+                )
+            });
+            DeferredInetCompletion {
+                // Preserve the existing receive ordering: queued payload
+                // readiness was published before its ACK, while connect/FIN
+                // state wakeups followed the ACK.
+                wake_before_ack: delivered.then(|| wait.clone()),
+                ack,
+                wake_after_ack: wake.then_some(wait),
+            }
+        }
+        DeferredInetPacket::Udp {
+            source,
+            destination,
+            source_port,
+            bytes,
+            ifindex,
+            ttl,
+            ..
+        } => {
+            socket.recvq.push_back(QueuedPacket {
+                bytes,
+                peer: Some(SockAddr::Inet {
+                    addr: source,
+                    port: source_port,
+                }),
+                fds: Vec::new(),
+                cred: SocketCred::default(),
+                meta: crate::net::socket::PacketMeta {
+                    ifindex,
+                    local_inet_addr: Some(destination),
+                    ttl: Some(ttl),
+                    netlink_group: 0,
+                },
+            });
+            DeferredInetCompletion {
+                wake_before_ack: Some(socket.recv_wait.clone()),
+                ack: None,
+                wake_after_ack: None,
+            }
+        }
+        DeferredInetPacket::Icmp {
+            source,
+            bytes,
+            ifindex,
+            destination,
+            ttl,
+            ..
+        } => {
+            socket.recvq.push_back(QueuedPacket {
+                bytes,
+                peer: Some(SockAddr::Inet {
+                    addr: source,
+                    port: 0,
+                }),
+                fds: Vec::new(),
+                cred: SocketCred::default(),
+                meta: crate::net::socket::PacketMeta {
+                    ifindex,
+                    local_inet_addr: Some(destination),
+                    ttl: Some(ttl),
+                    netlink_group: 0,
+                },
+            });
+            DeferredInetCompletion {
+                wake_before_ack: Some(socket.recv_wait.clone()),
+                ack: None,
+                wake_after_ack: None,
+            }
+        }
+    }
+}
+
+pub(crate) fn finish_deferred_inet_packet(completion: DeferredInetCompletion) {
+    if let Some(wait) = completion.wake_before_ack {
+        wait.wake_up_all();
+    }
+    if let Some((remote, segment)) = completion.ack {
+        let _ = send_ipv4(remote, IPPROTO_TCP, &segment);
+    }
+    if let Some(wait) = completion.wake_after_ack {
+        wait.wake_up_all();
+    }
 }
 
 fn handle_tcp(source: u32, destination: u32, segment: &[u8]) {
@@ -559,69 +811,16 @@ fn handle_tcp(source: u32, destination: u32, segment: &[u8]) {
         return;
     }
     let flags = segment[13];
-    let payload = &segment[header_length..];
-    let Some(sock) = matching_socket(IPPROTO_TCP, destination_port, source, source_port) else {
-        return;
-    };
-    let mut send_ack = false;
-    let mut deliver = None;
-    let mut wake = false;
-    {
-        let mut socket = sock.lock();
-        let state = socket.state;
-        let Some(tcp) = socket.wire_tcp.as_mut() else {
-            return;
-        };
-        if flags & TCP_RST != 0 {
-            socket.pending_error = crate::include::uapi::errno::ECONNREFUSED;
-            socket.state = SocketState::Created;
-            wake = true;
-        } else if state == SocketState::Connecting
-            && flags & (TCP_SYN | TCP_ACK) == (TCP_SYN | TCP_ACK)
-            && acknowledgement == tcp.snd_nxt
-        {
-            tcp.snd_una = acknowledgement;
-            tcp.rcv_nxt = sequence.wrapping_add(1);
-            socket.state = SocketState::Connected;
-            send_ack = true;
-            wake = true;
-        } else if state == SocketState::Connected {
-            if flags & TCP_ACK != 0 && acknowledgement.wrapping_sub(tcp.snd_una) < 0x8000_0000 {
-                tcp.snd_una = acknowledgement.min(tcp.snd_nxt);
-            }
-            if !payload.is_empty() && sequence == tcp.rcv_nxt {
-                tcp.rcv_nxt = tcp.rcv_nxt.wrapping_add(payload.len() as u32);
-                deliver = Some(payload.to_vec());
-                send_ack = true;
-            } else if !payload.is_empty() {
-                send_ack = true;
-            }
-            let fin_sequence = sequence.wrapping_add(payload.len() as u32);
-            if flags & TCP_FIN != 0 && fin_sequence == tcp.rcv_nxt {
-                tcp.rcv_nxt = tcp.rcv_nxt.wrapping_add(1);
-                tcp.fin_received = true;
-                socket.shutdown |= RCV_SHUTDOWN;
-                send_ack = true;
-                wake = true;
-            }
-        }
-    }
-    if let Some(bytes) = deliver {
-        queue_packet(
-            &sock,
-            bytes,
-            SockAddr::Inet {
-                addr: source,
-                port: source_port,
-            },
-        );
-    }
-    if send_ack {
-        let _ = send_tcp_control(&sock, TCP_ACK);
-    }
-    if wake {
-        crate::net::socket::wake_socket_recv(&sock);
-    }
+    dispatch_inet_packet(DeferredInetPacket::Tcp {
+        namespace_key: crate::net::core::net_namespace::current_net_namespace_key(),
+        source,
+        source_port,
+        destination_port,
+        sequence,
+        acknowledgement,
+        flags,
+        payload: segment[header_length..].to_vec(),
+    });
 }
 
 fn handle_udp(source: u32, destination: u32, datagram: &[u8], ifindex: u32, ttl: u8) {
@@ -681,25 +880,16 @@ fn handle_udp(source: u32, destination: u32, datagram: &[u8], ifindex: u32, ttl:
             udp_checksum
         );
     }
-    let matched = matching_socket(IPPROTO_UDP, destination_port, source, source_port);
-    if let Some(sock) = matched {
-        sock.lock().recvq.push_back(QueuedPacket {
-            bytes: datagram[8..length].to_vec(),
-            peer: Some(SockAddr::Inet {
-                addr: source,
-                port: source_port,
-            }),
-            fds: Vec::new(),
-            cred: SocketCred::default(),
-            meta: crate::net::socket::PacketMeta {
-                ifindex,
-                local_inet_addr: Some(destination),
-                ttl: Some(ttl),
-                netlink_group: 0,
-            },
-        });
-        crate::net::socket::wake_socket_recv(&sock);
-    }
+    dispatch_inet_packet(DeferredInetPacket::Udp {
+        namespace_key: crate::net::core::net_namespace::current_net_namespace_key(),
+        source,
+        destination,
+        source_port,
+        destination_port,
+        bytes: datagram[8..length].to_vec(),
+        ifindex,
+        ttl,
+    });
 }
 
 fn handle_ipv4(linux_dev: *mut u8, frame: &[u8]) {
@@ -735,26 +925,14 @@ fn handle_ipv4(linux_dev: *mut u8, frame: &[u8]) {
     match ip[9] {
         IPPROTO_TCP => handle_tcp(source, destination, payload),
         IPPROTO_UDP => handle_udp(source, destination, payload, ifindex, ttl),
-        IPPROTO_ICMP => {
-            if let Some(sock) = matching_socket(IPPROTO_ICMP, 0, source, 0) {
-                sock.lock().recvq.push_back(QueuedPacket {
-                    bytes: payload.to_vec(),
-                    peer: Some(SockAddr::Inet {
-                        addr: source,
-                        port: 0,
-                    }),
-                    fds: Vec::new(),
-                    cred: SocketCred::default(),
-                    meta: crate::net::socket::PacketMeta {
-                        ifindex,
-                        local_inet_addr: Some(destination),
-                        ttl: Some(ttl),
-                        netlink_group: 0,
-                    },
-                });
-                crate::net::socket::wake_socket_recv(&sock);
-            }
-        }
+        IPPROTO_ICMP => dispatch_inet_packet(DeferredInetPacket::Icmp {
+            namespace_key: crate::net::core::net_namespace::current_net_namespace_key(),
+            source,
+            bytes: payload.to_vec(),
+            ifindex,
+            destination,
+            ttl,
+        }),
         _ => {}
     }
 }
@@ -772,8 +950,48 @@ pub(crate) fn receive_frame(linux_dev: *mut u8, frame: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
     use crate::net::fib::ipv4;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn ethernet_ipv4_tcp_frame(
+        source: u32,
+        destination: u32,
+        source_port: u16,
+        destination_port: u16,
+        sequence: u32,
+        acknowledgement: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let segment = build_tcp_segment(
+            source,
+            destination,
+            source_port,
+            destination_port,
+            sequence,
+            acknowledgement,
+            TCP_ACK | TCP_PSH,
+            payload,
+        );
+        let total_length = 20 + segment.len();
+        let mut frame = alloc::vec![0u8; 14 + total_length];
+        frame[12..14].copy_from_slice(&ETH_P_IP.to_be_bytes());
+        let ip = &mut frame[14..34];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&(total_length as u16).to_be_bytes());
+        ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = IPPROTO_TCP;
+        ip[12..16].copy_from_slice(&source.to_be_bytes());
+        ip[16..20].copy_from_slice(&destination.to_be_bytes());
+        let sum = checksum(ip);
+        ip[10..12].copy_from_slice(&sum.to_be_bytes());
+        frame[34..].copy_from_slice(&segment);
+        frame
+    }
 
     #[test]
     fn bound_receive_only_ipv4_addresses_do_not_become_wire_sources() {
@@ -791,6 +1009,75 @@ mod tests {
         assert_eq!(
             select_ipv4_source_addr(None, ipv4(127, 0, 0, 53)),
             ipv4(127, 0, 0, 53)
+        );
+    }
+
+    #[test]
+    fn net_rx_does_not_spin_behind_process_owned_tcp_socket() {
+        // Linux tcp_v4_rcv() performs its tuple lookup without taking the
+        // process-owned socket lock. Under bh_lock_sock_nested(), an owned
+        // socket sends the skb to tcp_add_backlog() and returns instead of
+        // spinning behind the interrupted task. This Lupos-specific harness
+        // recreates that ownership overlap because no upstream KUnit test
+        // exposes the internal tcp_v4_rcv() lock decision directly.
+        let source = ipv4(10, 0, 2, 2);
+        let source_port = 443;
+        let destination_port = 49_152;
+        let sequence = 0x1020_3040;
+        let acknowledgement = 0x5060_7080;
+        let payload = b"softirq-backlog";
+        let socket = crate::net::socket::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP as u16).unwrap();
+        {
+            let mut state = socket.lock();
+            state.state = SocketState::Connected;
+            state.local = Some(SockAddr::Inet {
+                addr: GUEST_IPV4,
+                port: destination_port,
+            });
+            state.peer = Some(SockAddr::Inet {
+                addr: source,
+                port: source_port,
+            });
+            state.wire_tcp = Some(TcpState {
+                local_addr: GUEST_IPV4,
+                remote_addr: source,
+                local_port: destination_port,
+                remote_port: source_port,
+                snd_una: acknowledgement,
+                snd_nxt: acknowledgement,
+                rcv_nxt: sequence,
+                fin_received: false,
+            });
+        }
+        let frame = ethernet_ipv4_tcp_frame(
+            source,
+            GUEST_IPV4,
+            source_port,
+            destination_port,
+            sequence,
+            acknowledgement,
+            payload,
+        );
+
+        let process_owner = socket.lock();
+        let (done_tx, done_rx) = mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            receive_frame(core::ptr::null_mut(), &frame);
+            done_tx.send(()).unwrap();
+        });
+        let completed_while_owned = done_rx.recv_timeout(Duration::from_millis(500));
+        drop(process_owner);
+        receiver.join().unwrap();
+        let delivered = socket.lock().recvq.pop_front().map(|packet| packet.bytes);
+
+        assert!(
+            completed_while_owned.is_ok(),
+            "NET_RX must backlog an skb instead of spinning behind a process-owned socket"
+        );
+        assert_eq!(
+            delivered.as_deref(),
+            Some(&payload[..]),
+            "release_sock must drain the backlogged TCP payload instead of dropping it"
         );
     }
 }

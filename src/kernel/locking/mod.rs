@@ -54,7 +54,7 @@ pub use mutex::{Mutex, MutexGuard};
 pub use preempt::{
     HARDIRQ_OFFSET, NMI_OFFSET, PREEMPT_OFFSET, SOFTIRQ_OFFSET, in_atomic, in_hardirq, in_irq,
     in_nmi, in_softirq, local_bh_disable, local_bh_enable, might_sleep, preempt_count,
-    preempt_disable, preempt_enable,
+    preempt_count_dec_and_test, preempt_disable, preempt_enable, preempt_enable_no_resched,
 };
 pub use raw_spinlock::{RawSpinGuard, RawSpinLock, RawSpinLocked};
 pub use rt_mutex::{PiState, RT_MUTEX_HAS_WAITERS, RtMutex, RtMutexWaiter};

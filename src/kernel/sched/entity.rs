@@ -28,14 +28,20 @@
 //!   * `vendor/linux/include/linux/sched.h` (struct sched_rt_entity, ~623)
 //!   * `vendor/linux/include/linux/sched.h` (struct sched_dl_entity, ~644)
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::AtomicU64;
+
+#[cfg(test)]
+use core::sync::atomic::Ordering;
+
+use crate::lib::rbtree::LinuxRbNode;
 
 // ── Load weight ──────────────────────────────────────────────────────────────
 
 /// Linux `struct load_weight` — fixed-point load factor for CFS.
 ///
-/// `weight` is the integer weight (from `sched_prio_to_weight[nice + 20]`),
-/// `inv_weight` is `2^32 / weight` precomputed for fast `__calc_delta`.
+/// On x86_64, `weight` is `scale_load(sched_prio_to_weight[nice + 20])`.
+/// `inv_weight` remains the unscaled table entry precomputed for Linux's
+/// `__calc_delta` fast path.
 ///
 /// Reference: `vendor/linux/include/linux/sched.h` `struct load_weight`.
 #[repr(C)]
@@ -117,18 +123,13 @@ impl SchedAvg {
 #[repr(C)]
 pub struct SchedEntity {
     pub load: LoadWeight,
-    /// Linked-list pointer used by `cfs_rq.tasks_timeline` / sibling lists.
-    /// Lupos M29 uses a `BTreeMap<u64, *mut SchedEntity>` keyed by vruntime as
-    /// a stand-in for the upstream rbtree; the pointer is stored per-entity in
-    /// `cfs_rq` rather than via inline rb_node pointers.
-    pub run_node_left: *mut SchedEntity,
-    pub run_node_right: *mut SchedEntity,
-    pub run_node_parent: *mut SchedEntity,
-    pub run_node_color: u64,
+    /// Intrusive CFS timeline node, matching Linux `sched_entity::run_node`.
+    pub run_node: LinuxRbNode,
 
     pub deadline: u64,
     pub min_vruntime: u64,
     pub min_slice: u64,
+    pub max_slice: u64,
 
     pub group_node_next: *mut SchedEntity,
     pub group_node_prev: *mut SchedEntity,
@@ -177,13 +178,15 @@ impl SchedEntity {
     pub const fn zeroed() -> Self {
         Self {
             load: LoadWeight::zeroed(),
-            run_node_left: core::ptr::null_mut(),
-            run_node_right: core::ptr::null_mut(),
-            run_node_parent: core::ptr::null_mut(),
-            run_node_color: 0,
+            run_node: LinuxRbNode {
+                __rb_parent_color: 0,
+                rb_right: core::ptr::null_mut(),
+                rb_left: core::ptr::null_mut(),
+            },
             deadline: 0,
             min_vruntime: 0,
             min_slice: 0,
+            max_slice: 0,
             group_node_next: core::ptr::null_mut(),
             group_node_prev: core::ptr::null_mut(),
             on_rq: 0,
@@ -394,11 +397,22 @@ const _: () = assert!(core::mem::size_of::<CpuMask>() == 8);
 
 // ── Per-CPU clock helper (used by sched_class.update_curr) ───────────────────
 
-/// Last scheduler-clock value observed through [`sched_clock_ns`].
+/// Host-test scheduler-clock accumulator.
 ///
-/// This keeps the scheduler-facing clock monotonic across CPUs while the
-/// shared timekeeping clock supplies the actual high-resolution reading.
+/// Host-side scheduler fixtures advance this explicitly because they do not
+/// initialize the x86 TSC/timekeeper. Production [`sched_clock_ns`] does not
+/// access it: Linux's stable x86 scheduler clock reads the current TSC-derived
+/// value without a system-wide read-modify-write.
 pub static SCHED_CLOCK_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Linux's stable x86 scheduler-clock fast path returns the current raw clock
+/// plus its fixed offset; it does not globally clamp each CPU's read against
+/// every other CPU. Lupos's timekeeping clock already includes its epoch, so
+/// the equivalent value here is the current reading itself.
+#[inline(always)]
+const fn stable_sched_clock_value(now: u64) -> u64 {
+    now
+}
 
 /// Return the current scheduler-clock value in nanoseconds.
 ///
@@ -408,17 +422,26 @@ pub static SCHED_CLOCK_NS: AtomicU64 = AtomicU64::new(0);
 /// assumed amount on each LAPIC interrupt.
 pub fn sched_clock_ns() -> u64 {
     let now = crate::kernel::time::sched_clock::sched_clock();
+    #[cfg(not(test))]
+    {
+        // `vendor/linux/kernel/sched/clock.c::local_clock_noinstr()` takes
+        // this lockless path once x86 marks the scheduler clock stable.
+        stable_sched_clock_value(now)
+    }
+
     // Host-side Rust unit tests do not initialize the kernel timekeeper/TSC,
     // while the existing Linux-derived scheduler fixtures advance the LAPIC
     // tick counter explicitly.  Use the configured HZ fallback only in that
     // environment; production keeps the high-resolution Linux clock above.
     #[cfg(test)]
-    let now = now.max(
-        crate::arch::x86::kernel::apic_timer::TIMER_TICKS
-            .load(Ordering::Acquire)
-            .saturating_mul(crate::kernel::time::jiffies::NSEC_PER_TICK),
-    );
-    SCHED_CLOCK_NS.fetch_max(now, Ordering::AcqRel).max(now)
+    {
+        let now = now.max(
+            crate::arch::x86::kernel::apic_timer::TIMER_TICKS
+                .load(Ordering::Acquire)
+                .saturating_mul(crate::kernel::time::jiffies::NSEC_PER_TICK),
+        );
+        SCHED_CLOCK_NS.fetch_max(now, Ordering::AcqRel).max(now)
+    }
 }
 
 #[cfg(test)]
@@ -466,5 +489,15 @@ mod tests {
     #[test]
     fn wake_entry_is_16_bytes() {
         assert_eq!(core::mem::size_of::<WakeEntry>(), 16);
+    }
+
+    #[test]
+    fn stable_x86_clock_does_not_globally_clamp_cpu_reads() {
+        // Linux `local_clock_noinstr()` returns `sched_clock_noinstr()` plus a
+        // fixed offset when `__sched_clock_stable` is set. In particular, a
+        // later read is not raised to a value previously observed by another
+        // CPU through one globally contended atomic.
+        assert_eq!(stable_sched_clock_value(200), 200);
+        assert_eq!(stable_sched_clock_value(100), 100);
     }
 }

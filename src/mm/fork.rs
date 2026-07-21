@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/mm
 //! test-origin: linux:vendor/linux/mm
 /// Memory management for fork — `dup_mm()` and `dup_mmap()`.
@@ -31,6 +31,7 @@ use crate::arch::x86::mm::paging::{
     pmd_huge, pmd_none_or_clear_bad, pmd_t, pte_present, pte_t, pud_huge, pud_none_or_clear_bad,
     pud_t, record_pt_page_free,
 };
+use crate::arch::x86::mm::tlb::flush_tlb_mm_range;
 use crate::mm::buddy::{pfn_to_page, pfn_valid, with_global_buddy};
 use crate::mm::fault::copy_page_range;
 use crate::mm::mm_types::{MmStruct, VmAreaStruct, mmf_init_legacy_flags};
@@ -38,7 +39,7 @@ use crate::mm::mmap::{TASK_SIZE, do_munmap};
 use crate::mm::page_flags::{GFP_KERNEL, PGTY_TABLE, decode_page_type};
 use crate::mm::pagewalk::{MmWalk, MmWalkOps, walk_page_vma};
 use crate::mm::rmap::anon_vma_fork;
-use crate::mm::vm_flags::VM_DONTCOPY;
+use crate::mm::vm_flags::{VM_DONTCOPY, VM_WIPEONFORK};
 use crate::mm::vma::{insert_vma, vm_area_dup};
 
 const PAGE_SIZE: usize = 4096;
@@ -57,8 +58,8 @@ const PAGE_SIZE: usize = 4096;
 /// failure.
 ///
 /// # Safety
-/// `old_mm` must be a valid `mm_struct` pointer.  The caller is responsible
-/// for calling `mmdrop()` on the returned mm when done.
+/// `old_mm` must be a valid `mm_struct` pointer. The returned mm owns one
+/// `mm_users` reference; the caller must release it with [`mmput`].
 ///
 /// Ref: Linux `kernel/fork.c` — `dup_mm()` line 1515
 pub unsafe fn dup_mm(old_mm: *mut MmStruct) -> Option<*mut MmStruct> {
@@ -188,6 +189,31 @@ unsafe fn copy_kernel_pgd_entries(
 ///
 /// Ref: Linux `mm/mmap.c` — `dup_mmap()` line 1732
 pub unsafe fn dup_mmap(new_mm: *mut MmStruct, old_mm: *mut MmStruct) -> Result<(), i32> {
+    // Linux takes both mmap locks for the complete VMA/PTE duplication.  The
+    // parent lock is write-held because COW setup downgrades source PTEs; the
+    // child is not yet published, so nesting cannot deadlock.
+    let old_guard = unsafe { crate::mm::mmap_lock::MmapWriteGuard::lock(old_mm) };
+    let new_guard = unsafe { crate::mm::mmap_lock::MmapWriteGuard::lock(new_mm) };
+    let result = unsafe { dup_mmap_inner(new_mm, old_mm) };
+
+    // Linux converges successful duplication and every failure after taking
+    // oldmm's mmap lock on `out:`, where it invalidates all parent translations
+    // exactly once. `copy_page_range()` may have write-protected an arbitrary
+    // prefix before returning an error, so the flush cannot be success-only.
+    drop(new_guard);
+    let result = finish_dup_mmap(old_mm, result, |mm, start, end| {
+        let _ = unsafe { flush_tlb_mm_range(mm, start, end) };
+    });
+    drop(old_guard);
+    result
+}
+
+/// Duplicate the VMA/page-table state without publishing the result or
+/// invalidating parent translations.
+///
+/// All early errors stay inside this helper so [`dup_mmap`] has one common
+/// flush-and-return tail, matching Linux's `loop_out -> out` control flow.
+unsafe fn dup_mmap_inner(new_mm: *mut MmStruct, old_mm: *mut MmStruct) -> Result<(), i32> {
     unsafe {
         // Iterate over all VMAs in the source mm.
         // The Maple Tree is accessed directly here.
@@ -209,7 +235,6 @@ pub unsafe fn dup_mmap(new_mm: *mut MmStruct, old_mm: *mut MmStruct) -> Result<(
             (*dst_vma).vm_mm = new_mm;
 
             // Check for VM_WIPEONFORK — do not copy page tables to the child.
-            const VM_WIPEONFORK: u64 = 1 << 18; // Linux value
             if src_flags & VM_WIPEONFORK != 0 {
                 // Clear the anon_vma on the child VMA so new pages are faulted on demand.
                 (*dst_vma).anon_vma = core::ptr::null_mut();
@@ -228,6 +253,22 @@ pub unsafe fn dup_mmap(new_mm: *mut MmStruct, old_mm: *mut MmStruct) -> Result<(
     }
 }
 
+/// Run the one full parent-mm TLB flush and then propagate the duplication
+/// result unchanged.
+///
+/// `flush_tlb_mm_range()` represents a full invalidation with `end <= start`;
+/// zero/zero makes that contract explicit and lets host tests verify the
+/// common success/error tail without executing privileged invalidation.
+#[inline]
+fn finish_dup_mmap<T>(
+    old_mm: *mut MmStruct,
+    result: Result<T, i32>,
+    flush_old_mm: impl FnOnce(*mut MmStruct, u64, u64),
+) -> Result<T, i32> {
+    flush_old_mm(old_mm, 0, 0);
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
@@ -237,7 +278,8 @@ pub unsafe fn dup_mmap(new_mm: *mut MmStruct, old_mm: *mut MmStruct) -> Result<(
 /// Ref: Linux `mm/mmap.c` — `exit_mmap()`
 ///
 /// # Safety
-/// `mm` must be exclusively owned by the caller and must not be active on a CPU.
+/// The caller must exclusively own teardown of this address space and no task
+/// may access its userspace mappings. CPUs may retain it as a lazy active_mm.
 pub unsafe fn exit_mmap(mm: *mut MmStruct) {
     if mm.is_null() {
         return;
@@ -252,11 +294,14 @@ pub unsafe fn exit_mmap(mm: *mut MmStruct) {
     let _ = unsafe { do_munmap(&mut *mm, 0, TASK_SIZE) };
 }
 
-/// Drop a userspace mm reference and destroy the address space on the last user.
+/// Drop a userspace mm reference and tear down the address space on the last
+/// real user.
 ///
-/// This is the Lupos equivalent of Linux `mmput()`: when `mm_users` reaches
-/// zero it tears down VMAs, page tables, the PGD page, and finally the
-/// `mm_struct` heap allocation.
+/// This is the Lupos equivalent of Linux `mmput()`/`__mmput()`: when
+/// `mm_users` reaches zero it tears down user VMAs and clears their leaf
+/// mappings, then drops the owning `mm_count` reference. Lazy-TLB users keep
+/// the page-table hierarchy, PGD, and `mm_struct` alive until their matching
+/// [`mmdrop`] after switching CR3.
 ///
 /// # Safety
 /// `mm` must be a valid `MmStruct` pointer owned by task mm lifetime rules.
@@ -270,41 +315,71 @@ pub unsafe fn mmput(mm: *mut MmStruct) {
     }
 }
 
-/// Destroy an mm whose `mm_users` count has already reached zero.
+/// Tear down an mm whose `mm_users` count has already reached zero.
 ///
 /// # Safety
-/// The caller must ensure no CPU is still executing with this mm loaded in
-/// CR3. `exit_mm()` switches away before calling this for the current task;
-/// exec teardown calls it only after loading the replacement mm.
+/// `mm_users` must be zero. CPUs may still carry the mm as a lazy active_mm,
+/// but none may access its userspace mappings.
 pub unsafe fn destroy_mm(mm: *mut MmStruct) {
     if mm.is_null() {
         return;
     }
 
     unsafe {
-        crate::kernel::futex::futex_private_hash_mm_destroy(mm as u64);
-        crate::mm::mm_public::clear_mm_exe_file_ref(mm);
         exit_mmap(mm);
-        free_user_page_tables(mm);
-        free_mm_pgd(mm);
-        let _ = Box::from_raw(mm);
+        // Linux's mmu_gather marks `freed_tables` and sends the TLB flush IPI
+        // even to CPUs in lazy-TLB mode before reusing hierarchy pages
+        // (`arch/x86/mm/tlb.c::native_flush_tlb_multi`). Lupos does not yet
+        // have that freed_tables/lazy-CPU protocol. exit_mmap() has cleared the
+        // leaf mappings and freed their backing pages; retain every user-half
+        // hierarchy page until final mmdrop(), when no CPU can retain this CR3.
+        crate::mm::mm_public::clear_mm_exe_file_ref(mm);
+        crate::kernel::futex::futex_private_hash_mm_destroy(mm as u64);
+        mmdrop(mm);
     }
 }
 
-unsafe fn free_user_page_tables(mm: *mut MmStruct) {
-    let pgd = unsafe { (*mm).pgd as *mut pgd_t };
-    if pgd.is_null() {
+/// Drop a structural/lazy-TLB reference and free the PGD plus `mm_struct` on
+/// the last reference.
+///
+/// Ref: Linux `include/linux/sched/mm.h::mmdrop()` and
+/// `kernel/fork.c::__mmdrop()`.
+///
+/// # Safety
+/// `mm` must point to a live `MmStruct` carrying one reference owned by the
+/// caller. The CPU performing the final drop must no longer have this PGD in
+/// CR3.
+pub unsafe fn mmdrop(mm: *mut MmStruct) {
+    if mm.is_null() {
         return;
     }
 
+    if unsafe { (*mm).mmdrop() } {
+        unsafe {
+            free_mm_pgd(mm);
+            let _ = Box::from_raw(mm);
+        }
+    }
+}
+
+/// Free page-table hierarchy pages owned by `pgd[first..end]`.
+///
+/// Leaf mappings have already been unmapped by [`exit_mmap`]. Huge identity
+/// mappings and any remaining leaf entries describe backing pages that this
+/// helper does not own; only the page-table hierarchy itself is released.
+///
+/// # Safety
+/// Every non-leaf table reachable from the selected slots must either be
+/// exclusively owned by this mm or rejected by [`owned_table_ptr_from_entry`].
+/// None of the selected slots may be required by a CPU still using this PGD.
+unsafe fn free_owned_pgd_slots(pgd: *mut pgd_t, first: usize, end: usize) {
+    debug_assert!(!pgd.is_null());
+    debug_assert!(first <= end);
+    debug_assert!(end <= PTRS_PER_PGD);
+
     unsafe {
-        // Slots 0..255 are the user half for this transitional x86_64 layout.
-        // Slot 0 also carries cloned low identity-map tables; the leaf mappings
-        // are kernel mappings, but the cloned table pages themselves are owned
-        // by this mm and must be released.
-        let user_limit = PTRS_PER_PGD / 2;
-        let mut pgd_idx = 0usize;
-        while pgd_idx < user_limit {
+        let mut pgd_idx = first;
+        while pgd_idx < end {
             let pgdp = pgd.add(pgd_idx);
             if !pgd_none_or_clear_bad(&mut *pgdp) {
                 let pgd_entry = *pgdp;
@@ -380,6 +455,16 @@ unsafe fn free_mm_pgd(mm: *mut MmStruct) {
         return;
     }
 
+    // All user-half hierarchy pages are deliberately retained while any CPU
+    // may hold this mm as active_mm. This includes slot 0's low kernel identity
+    // mappings and slots 1..255: without Linux's `freed_tables` shootdown, a
+    // lazy CPU could speculatively walk a freed and reused hierarchy page.
+    // Final mmdrop means every lazy structural reference is gone and the caller
+    // has switched CR3 away, so the hierarchy and root can now be released.
+    unsafe {
+        free_owned_pgd_slots(pgd as *mut pgd_t, 0, PTRS_PER_PGD / 2);
+    }
+
     if let Some(phys) = direct_map_phys_from_virt(pgd) {
         unsafe { free_table_page_phys(phys, "pgd_root", 0, 0, 0) };
     }
@@ -433,7 +518,7 @@ unsafe fn owned_table_ptr_from_entry(
             "mm",
             crate::kernel::time::jiffies::HZ,
             3,
-            "free_user_page_tables: skip invalid table level={} pgd={} pud={} pmd={} slot={:#018x} entry={:#018x} phys={:#018x} dm_phys={:#018x}",
+            "free_owned_pgd_slots: skip invalid table level={} pgd={} pud={} pmd={} slot={:#018x} entry={:#018x} phys={:#018x} dm_phys={:#018x}",
             level,
             pgd_idx,
             pud_idx,
@@ -460,7 +545,7 @@ unsafe fn owned_table_ptr_from_entry(
             "mm",
             crate::kernel::time::jiffies::HZ,
             3,
-            "free_user_page_tables: skip non-table level={} pgd={} pud={} pmd={} slot={:#018x} entry={:#018x} phys={:#018x} dm_phys={:#018x} page_type={:#x}",
+            "free_owned_pgd_slots: skip non-table level={} pgd={} pud={} pmd={} slot={:#018x} entry={:#018x} phys={:#018x} dm_phys={:#018x} page_type={:#x}",
             level,
             pgd_idx,
             pud_idx,
@@ -648,6 +733,40 @@ mod tests {
     }
 
     #[test]
+    fn dup_mmap_common_tail_flushes_full_old_mm_once_before_success_return() {
+        // Linux mm/mmap.c::dup_mmap reaches `out:` before returning success,
+        // and `flush_tlb_mm(oldmm)` is the only parent invalidation there.
+        let old_mm = 0x1234usize as *mut MmStruct;
+        let mut flushes = 0usize;
+
+        let result = finish_dup_mmap(old_mm, Ok(7usize), |mm, start, end| {
+            assert_eq!(mm, old_mm);
+            assert_eq!((start, end), (0, 0), "zero/zero denotes a full flush");
+            flushes += 1;
+        });
+
+        assert_eq!(flushes, 1);
+        assert_eq!(result, Ok(7));
+    }
+
+    #[test]
+    fn dup_mmap_common_tail_flushes_full_old_mm_once_before_error_return() {
+        // Linux takes the same `loop_out -> out` tail when copy_page_range()
+        // fails after write-protecting a prefix of the parent page tables.
+        let old_mm = 0x5678usize as *mut MmStruct;
+        let mut flushes = 0usize;
+
+        let result: Result<(), i32> = finish_dup_mmap(old_mm, Err(-12), |mm, start, end| {
+            assert_eq!(mm, old_mm);
+            assert_eq!((start, end), (0, 0), "zero/zero denotes a full flush");
+            flushes += 1;
+        });
+
+        assert_eq!(flushes, 1);
+        assert_eq!(result, Err(-12));
+    }
+
+    #[test]
     fn exit_mmap_detaches_the_complete_vma_tree() {
         let _g = GLOBAL_HW_TEST_LOCK
             .lock()
@@ -669,6 +788,84 @@ mod tests {
             assert_eq!((*mm).map_count, 0);
             assert!((*mm).mm_mt.collect_entries().is_empty());
             let _ = Box::from_raw(mm);
+        }
+    }
+
+    #[test]
+    fn lazy_tlb_mm_count_defers_structural_free_after_last_mm_user() {
+        // Linux __mmput() releases userspace resources at mm_users == 0 but
+        // leaves the PGD/mm allocation alive for a lazy active_mm reference.
+        let _g = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mm = Box::into_raw(Box::new(MmStruct::new(0)));
+            (*mm).mmdrop_get(); // lazy active_mm reference: mm_count 1 -> 2
+
+            mmput(mm);
+
+            assert_eq!((*mm).mm_users.load(Ordering::Acquire), 0);
+            assert_eq!((*mm).mm_count.load(Ordering::Acquire), 1);
+            assert_eq!((*mm).map_count, 0);
+
+            // Final lazy drop frees `mm`; do not dereference it afterwards.
+            mmdrop(mm);
+        }
+    }
+
+    #[test]
+    fn user_pgd_hierarchies_survive_mmput_until_final_mmdrop() {
+        // Linux `exit_mmap()` may run while the mm remains active, whereas
+        // its `freed_tables` TLB flush protects hierarchy reuse from lazy CPUs.
+        // Lupos-specific adaptation: without that lazy-CPU protocol, every
+        // user-half hierarchy follows PGD lifetime and is freed by __mmdrop().
+        use crate::arch::x86::mm::paging::{
+            _PAGE_TABLE, init_pgd_for_test, reset_test_pool, test_pool,
+        };
+
+        let _g = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            reset_test_pool();
+            let pgd = init_pgd_for_test();
+            let low_identity_pud = test_pool::alloc().expect("low identity PUD");
+            let ordinary_user_pud = test_pool::alloc().expect("ordinary user PUD");
+            let low_entry = low_identity_pud | _PAGE_TABLE;
+            *pgd.add(0) = pgd_t(low_entry);
+            *pgd.add(1) = pgd_t(ordinary_user_pud | _PAGE_TABLE);
+
+            let mm = Box::into_raw(Box::new(MmStruct::new(pgd as usize)));
+            (*mm).mmdrop_get(); // current/lazy active_mm reference
+            mmput(mm);
+
+            assert_eq!(
+                (*pgd.add(0)).0,
+                low_entry,
+                "mm_users teardown must preserve the active low identity map"
+            );
+            assert_eq!(
+                (*pgd.add(1)).0,
+                ordinary_user_pud | _PAGE_TABLE,
+                "mmput must preserve ordinary hierarchy pages from lazy CPUs"
+            );
+            assert_eq!((*mm).mm_count.load(Ordering::Acquire), 1);
+
+            // Drops the final active_mm reference and frees the mm. The host
+            // page-table pool is static, so its cleared entry remains
+            // observable after the MmStruct itself is gone.
+            mmdrop(mm);
+
+            assert_eq!(
+                (*pgd.add(0)).0,
+                0,
+                "final mmdrop should release the deferred slot-0 hierarchy"
+            );
+            assert_eq!(
+                (*pgd.add(1)).0,
+                0,
+                "final mmdrop should release ordinary user hierarchy pages"
+            );
         }
     }
 

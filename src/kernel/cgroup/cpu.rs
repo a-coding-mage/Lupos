@@ -16,7 +16,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::kernel::sched::prio::nice_to_weight;
+use crate::kernel::sched::prio::{NICE_0_LOAD, WEIGHT_IDLEPRIO, nice_to_weight, scale_load};
 
 /// Linux `default_cfs_period_us = 100000` (100 ms).
 pub const BANDWIDTH_PERIOD_NS_DEFAULT: u64 = 100_000_000;
@@ -30,6 +30,20 @@ pub const CGROUP_WEIGHT_MIN: u64 = 1;
 pub const CGROUP_WEIGHT_DFL: u64 = 100;
 /// Linux `CGROUP_WEIGHT_MAX = 10000`.
 pub const CGROUP_WEIGHT_MAX: u64 = 10_000;
+const SCHED_WEIGHT_DFL: u64 = 1024;
+
+/// Linux `sched_weight_from_cgroup()`: convert the UAPI range to raw scheduler
+/// weight units. Internal task-group shares are scaled separately.
+pub(super) fn sched_weight_from_cgroup(cgroup_weight: u64) -> u64 {
+    (cgroup_weight * SCHED_WEIGHT_DFL + CGROUP_WEIGHT_DFL / 2) / CGROUP_WEIGHT_DFL
+}
+
+/// Linux `sched_weight_to_cgroup()`: convert raw scheduler weight units back
+/// to the rounded, clamped cgroup-v2 UAPI range.
+pub(super) fn sched_weight_to_cgroup(weight: u64) -> u64 {
+    ((weight * CGROUP_WEIGHT_DFL + SCHED_WEIGHT_DFL / 2) / SCHED_WEIGHT_DFL)
+        .clamp(CGROUP_WEIGHT_MIN, CGROUP_WEIGHT_MAX)
+}
 
 /// Per-cgroup CPU statistics (mirrors `struct cpu_stat` produced by `cpu.stat`).
 #[derive(Clone, Copy, Debug, Default)]
@@ -50,7 +64,7 @@ pub struct TaskGroup {
     pub bw_period: u64,
     /// Burst allowance.
     pub bw_burst: u64,
-    /// CFS load weight (mapped from `cpu.weight`).
+    /// Scaled CFS task-group shares (mapped from `cpu.weight`).
     pub shares: u64,
     /// `cpu.idle` flag — 1 means run at IDLE class.
     pub idle: bool,
@@ -69,7 +83,7 @@ impl TaskGroup {
             bw_quota: u64::MAX,
             bw_period: BANDWIDTH_PERIOD_NS_DEFAULT,
             bw_burst: 0,
-            shares: 1024, // NICE_0_LOAD
+            shares: NICE_0_LOAD,
             idle: false,
             runtime_remaining_ns: AtomicU64::new(u64::MAX),
             stat_usage_usec: AtomicU64::new(0),
@@ -96,14 +110,15 @@ impl TaskGroup {
         Ok(())
     }
 
-    /// Apply `cpu.weight <w>` (1..10000 → CFS load_weight via Linux's
-    /// `scale_load(w * NICE_0_LOAD / 100)`).
+    /// Apply `cpu.weight <w>` (1..10000 → scaled CFS task-group shares).
     pub fn set_weight(&mut self, weight: u64) -> Result<(), &'static str> {
         if weight < CGROUP_WEIGHT_MIN || weight > CGROUP_WEIGHT_MAX {
             return Err("weight out of range");
         }
-        // Linux: shares = weight * NICE_0_LOAD / 100
-        self.shares = weight.saturating_mul(1024) / 100;
+        if self.idle {
+            return Err("idle group weight is fixed");
+        }
+        self.shares = scale_load(sched_weight_from_cgroup(weight));
         Ok(())
     }
 
@@ -112,12 +127,20 @@ impl TaskGroup {
         if !(-20..=19).contains(&nice) {
             return Err("nice out of range");
         }
+        if self.idle {
+            return Err("idle group weight is fixed");
+        }
         self.shares = nice_to_weight(nice);
         Ok(())
     }
 
     pub fn set_idle(&mut self, idle: bool) {
         self.idle = idle;
+        self.shares = if idle {
+            scale_load(WEIGHT_IDLEPRIO)
+        } else {
+            NICE_0_LOAD
+        };
     }
 
     /// Charge `delta_ns` of CPU time to this group.  Returns `true` if the
@@ -232,16 +255,30 @@ mod tests {
     fn root_group_has_no_quota() {
         let g = TaskGroup::new_root();
         assert_eq!(g.bw_quota, u64::MAX);
-        assert_eq!(g.shares, 1024);
+        assert_eq!(g.shares, NICE_0_LOAD);
     }
 
     #[test]
     fn set_weight_scales_to_shares() {
         let mut g = TaskGroup::new_root();
         g.set_weight(100).unwrap();
-        assert_eq!(g.shares, 1024);
+        assert_eq!(g.shares, NICE_0_LOAD);
         g.set_weight(200).unwrap();
-        assert_eq!(g.shares, 2048);
+        assert_eq!(g.shares, NICE_0_LOAD * 2);
+        assert_eq!(
+            sched_weight_to_cgroup(crate::kernel::sched::prio::scale_load_down(g.shares)),
+            200
+        );
+    }
+
+    #[test]
+    fn idle_group_uses_linux_idle_shares() {
+        let mut g = TaskGroup::new_root();
+        g.set_idle(true);
+        assert_eq!(g.shares, scale_load(WEIGHT_IDLEPRIO));
+        assert!(g.set_weight(100).is_err());
+        g.set_idle(false);
+        assert_eq!(g.shares, NICE_0_LOAD);
     }
 
     #[test]

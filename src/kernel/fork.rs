@@ -43,10 +43,9 @@ use alloc::alloc::dealloc;
 use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
-use crate::arch::x86::entry::syscall::load_current_user_tls_base;
 use crate::arch::x86::kernel::ptrace::PtRegs;
 use crate::arch::x86::kernel::uaccess;
 use crate::kernel::clone::{
@@ -57,7 +56,7 @@ use crate::kernel::pid::{INIT_PID_NS, alloc_pid};
 use crate::kernel::sched::{
     KTHREAD_STACK_SIZE, enqueue_task, get_current, schedule_with_irqs_enabled,
 };
-use crate::kernel::task::{TaskStruct, ThreadInfo};
+use crate::kernel::task::{TIF_NEED_RESCHED, TIF_SIGPENDING, TaskStruct, ThreadInfo};
 use crate::kernel::thread::ThreadStruct;
 use crate::mm::mm_types::MmStruct;
 
@@ -399,7 +398,6 @@ pub unsafe extern "C" fn user_fork_child_return() -> ! {
         "sub rsp, 8",
         "call {schedule_tail}",
         "call {set_child_tid}",
-        "call {load_tls}",
         "add rsp, 8",
         // Close the interrupt window before switching RSP to the user stack.
         "cli",
@@ -424,7 +422,6 @@ pub unsafe extern "C" fn user_fork_child_return() -> ! {
         "sysretq",
         schedule_tail = sym crate::kernel::sched::schedule_tail,
         set_child_tid = sym user_fork_child_set_tid,
-        load_tls = sym load_current_user_tls_base,
     );
 }
 
@@ -500,9 +497,12 @@ pub unsafe fn copy_process(
     let mut task_allocated = false;
 
     unsafe {
-        // ── 4. Copy thread_info from parent; clear TIF_SIGPENDING (bit 2) ──
+        // ── 4. Copy thread_info; clear child-inapplicable pending work ─────
         (*child).thread_info = ThreadInfo {
-            flags: (*parent).thread_info.flags & !(1u64 << 2), // TIF_SIGPENDING
+            flags: AtomicU64::new(
+                (*parent).thread_info.flags.load(Ordering::Acquire)
+                    & !(TIF_SIGPENDING | TIF_NEED_RESCHED),
+            ),
             syscall_work: (*parent).thread_info.syscall_work,
             status: 0,
             cpu: (*parent).thread_info.cpu,
@@ -678,13 +678,14 @@ pub unsafe fn copy_process(
         };
 
         // ── 9. copy_files (M39) — share on CLONE_FILES, dup otherwise ───────
-        (*child).active_mm = if !(*child).mm.is_null() {
-            (*child).mm
-        } else {
-            (*parent).active_mm
-        };
-        if args.flags & CLONE_VM != 0 && !(*child).active_mm.is_null() {
-            crate::kernel::futex::futex_private_hash_note_clone((*child).active_mm as u64);
+        // Linux copy_mm() initializes both pointers to NULL. A userspace child
+        // owns its mm as active_mm; a kernel thread acquires a lazy active_mm
+        // only when context_switch() actually schedules it. Copying the
+        // parent's borrowed pointer here creates an uncounted lazy-TLB user.
+        (*child).active_mm = (*child).mm;
+        crate::arch::x86::kernel::fpu::clone_task_fpu(parent, child, args.kthread != 0);
+        if args.flags & CLONE_VM != 0 && !(*child).mm.is_null() {
+            crate::kernel::futex::futex_private_hash_note_clone((*child).mm as u64);
         }
 
         crate::kernel::files::copy_files(child, parent, args.flags & CLONE_FILES != 0);

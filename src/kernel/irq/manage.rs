@@ -199,7 +199,7 @@ pub unsafe extern "C" fn linux_irq_apply_affinity_hint(
         // Linux cpumask occupies exactly one machine word.  Lupos's IRQ
         // descriptor currently tracks its supported CPU slots in its u32
         // affinity field; CPUs outside that field cannot be online.
-        let requested = unsafe { (*mask).bits[0] } as u32;
+        let requested = unsafe { (*mask).bits[0].load(Ordering::Acquire) } as u32;
         let _ = irq_set_affinity(irq, requested);
     }
     0

@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/sched/fair.c
 //! test-origin: linux:vendor/linux/kernel/sched/fair.c
 //! CFS — Completely Fair Scheduler (M29).
@@ -16,16 +16,12 @@
 //!         └→ pick_next_entity()    // leftmost in rb-tree
 //! ```
 
-use core::sync::atomic::Ordering;
-
 use super::class::{
     CLASS_PRIO_FAIR, DEQUEUE_SLEEP, ENQUEUE_HEAD, ENQUEUE_INITIAL, ENQUEUE_MIGRATED,
     ENQUEUE_WAKEUP, SchedClass,
 };
 use super::entity::{SchedEntity, sched_clock_ns};
-use super::prio::{
-    DEFAULT_PRIO, MAX_PRIO, MAX_RT_PRIO, NICE_0_LOAD, calc_delta_fair, nice_to_weight, prio_to_nice,
-};
+use super::prio::calc_delta_fair;
 use super::rq::Rq;
 use crate::kernel::task::{M29SchedFields, TaskStruct};
 
@@ -64,7 +60,7 @@ fn sched_slice(rq: &Rq, se_weight: u64) -> u64 {
     let nr = rq.cfs.nr_running.max(1) as u64;
     // sched_period: max(SCHED_LATENCY_NS, nr * SCHED_MIN_GRANULARITY_NS)
     let period = SYSCTL_SCHED_LATENCY_NS.max(nr.saturating_mul(SYSCTL_SCHED_MIN_GRANULARITY_NS));
-    let total_weight = rq.cfs.load_weight.max(NICE_0_LOAD);
+    let total_weight = rq.cfs.load_weight.max(1);
     period.saturating_mul(se_weight) / total_weight
 }
 
@@ -90,13 +86,10 @@ pub unsafe fn update_curr(rq: &mut Rq) {
     unsafe {
         (*se).exec_start = now;
         (*se).sum_exec_runtime = (*se).sum_exec_runtime.saturating_add(delta_exec);
-        let weight = (*se).load.weight.max(NICE_0_LOAD);
-        let old_vrt = (*se).vruntime;
-        let new_vrt = old_vrt.saturating_add(calc_delta_fair(delta_exec, weight));
-        (*se).vruntime = new_vrt;
-        if (*se).on_rq != 0 {
-            rq.cfs.reinsert(curr, old_vrt, new_vrt);
-        }
+        let weight = (*se).load.weight;
+        (*se).vruntime = (*se)
+            .vruntime
+            .saturating_add(calc_delta_fair(delta_exec, weight));
         rq.cfs.last_update_ns = now;
 
         // Check slice expiry — if exceeded, request a reschedule.
@@ -108,7 +101,7 @@ pub unsafe fn update_curr(rq: &mut Rq) {
             // Set TIF_NEED_RESCHED — picked up by schedule() at the next yield
             // point; under the cooperative scheduler this becomes effective on
             // the next explicit `schedule()` call.
-            (*curr).thread_info.flags |= crate::kernel::task::TIF_NEED_RESCHED;
+            super::set_task_need_resched(curr);
         }
     }
     rq.cfs.update_min_vruntime();
@@ -117,12 +110,12 @@ pub unsafe fn update_curr(rq: &mut Rq) {
 /// Linux `place_entity(cfs_rq, se, initial)` — set the starting vruntime for
 /// an entity that's about to be enqueued.
 pub unsafe fn place_entity(rq: &Rq, se: *mut SchedEntity, initial: bool) {
-    let mut vrt = rq.cfs.min_vruntime;
+    let mut vrt = unsafe { (*se).vruntime.max(rq.cfs.min_vruntime) };
     if initial {
         // Linux gives a small head-start advantage based on `START_DEBIT`,
         // proportional to `sched_vslice(cfs_rq, se)`; we approximate with one
         // minimum granularity tick scaled by weight.
-        let weight = unsafe { (*se).load.weight.max(NICE_0_LOAD) };
+        let weight = unsafe { (*se).load.weight };
         vrt = vrt.saturating_add(calc_delta_fair(SYSCTL_SCHED_MIN_GRANULARITY_NS, weight));
     }
     unsafe {
@@ -132,6 +125,26 @@ pub unsafe fn place_entity(rq: &Rq, se: *mut SchedEntity, initial: bool) {
 
 // ── sched_class hooks ────────────────────────────────────────────────────────
 
+unsafe fn wakeup_preempt_fair(rq: &mut Rq, p: *mut TaskStruct, _flags: u32) {
+    let current = rq.current;
+    if current.is_null() || p.is_null() || current == p {
+        return;
+    }
+
+    unsafe {
+        update_curr(rq);
+        let current_se = task_se(current);
+        let waking_se = task_se(p);
+        let granularity = calc_delta_fair(
+            SYSCTL_SCHED_WAKEUP_GRANULARITY_NS,
+            (*current_se).load.weight,
+        );
+        if (*current_se).vruntime.saturating_sub((*waking_se).vruntime) > granularity {
+            super::set_task_need_resched(current);
+        }
+    }
+}
+
 unsafe fn enqueue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) {
     if p.is_null() {
         return;
@@ -139,11 +152,8 @@ unsafe fn enqueue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) {
     let se = task_se(p);
     let m = task_m29(p);
     unsafe {
-        // Apply the nice → weight conversion freshly each enqueue so changes
-        // via `sched_setattr` take effect.
-        let nice = prio_to_nice((*m).static_prio);
-        (*se).load.weight = nice_to_weight(nice);
-        (*se).load.inv_weight = super::prio::nice_to_wmult(nice);
+        // Linux set_load_weight(): refresh policy-aware load before enqueue.
+        super::set_load_weight(p);
 
         if flags & ENQUEUE_INITIAL != 0 {
             place_entity(rq, se, true);
@@ -187,7 +197,7 @@ unsafe fn pick_next_task_fair(rq: &mut Rq) -> *mut TaskStruct {
         .cfs
         .tasks_timeline
         .iter()
-        .find_map(|(_, &task)| {
+        .find_map(|task| {
             if unsafe { super::task_can_switch_to(task) } {
                 Some(task)
             } else {
@@ -196,6 +206,11 @@ unsafe fn pick_next_task_fair(rq: &mut Rq) -> *mut TaskStruct {
         })
         .unwrap_or(core::ptr::null_mut());
     if !p.is_null() {
+        // Linux set_next_entity(): the running entity remains accounted as
+        // on_rq but is not kept in the ordered tree.
+        unsafe {
+            rq.cfs.remove(p, (*task_se(p)).vruntime);
+        }
         rq.cfs.current = p;
         rq.current = p;
         // Refresh exec_start so update_curr can compute delta_exec next tick.
@@ -214,6 +229,10 @@ unsafe fn put_prev_task_fair(rq: &mut Rq, prev: *mut TaskStruct) {
     }
     unsafe {
         update_curr(rq);
+        let se = task_se(prev);
+        if (*se).on_rq != 0 {
+            rq.cfs.insert(prev, (*se).vruntime);
+        }
     }
     rq.cfs.current = core::ptr::null_mut();
 }
@@ -243,9 +262,7 @@ unsafe fn task_fork_fair(p: *mut TaskStruct) {
     let m = task_m29(p);
     let se = task_se(p);
     unsafe {
-        let nice = prio_to_nice((*m).static_prio);
-        (*se).load.weight = nice_to_weight(nice);
-        (*se).load.inv_weight = super::prio::nice_to_wmult(nice);
+        super::set_load_weight(p);
         (*se).vruntime = 0;
         (*se).sum_exec_runtime = 0;
         (*se).prev_sum_exec_runtime = 0;
@@ -266,17 +283,10 @@ unsafe fn yield_task_fair(rq: &mut Rq) {
     unsafe {
         // Push our vruntime to the rightmost entity so the leftmost picks
         // someone else.  Mirrors Linux `yield_task_fair` heuristic.
-        let max_vruntime = rq
-            .cfs
-            .tasks_timeline
-            .iter()
-            .next_back()
-            .map(|((max_vrt, _), _)| *max_vrt);
+        let max_vruntime = rq.cfs.tasks_timeline.last_vruntime();
         if let Some(max_vrt) = max_vruntime {
             let bump = max_vrt.saturating_add(1);
-            let old = (*se).vruntime;
             (*se).vruntime = bump;
-            rq.cfs.reinsert(curr, old, bump);
         }
     }
 }
@@ -289,10 +299,8 @@ unsafe fn get_rr_interval_fair(_rq: &mut Rq, _p: *mut TaskStruct) -> u64 {
     SYSCTL_SCHED_LATENCY_NS
 }
 
-unsafe fn select_task_rq_fair(_p: *mut TaskStruct, prev_cpu: u32, _flags: u32) -> u32 {
-    // M31 will replace this with `find_idlest_cpu`; for now we keep the task
-    // on its previous CPU to avoid pointless migration.
-    prev_cpu
+unsafe fn select_task_rq_fair(p: *mut TaskStruct, prev_cpu: u32, flags: u32) -> u32 {
+    super::select_idlest_active_cpu(p, prev_cpu, flags)
 }
 
 // ── FAIR_SCHED_CLASS singleton ───────────────────────────────────────────────
@@ -303,7 +311,7 @@ pub static FAIR_SCHED_CLASS: SchedClass = SchedClass {
     enqueue_task: Some(enqueue_task_fair),
     dequeue_task: Some(dequeue_task_fair),
     yield_task: Some(yield_task_fair),
-    wakeup_preempt: None,
+    wakeup_preempt: Some(wakeup_preempt_fair),
     pick_next_task: Some(pick_next_task_fair),
     put_prev_task: Some(put_prev_task_fair),
     set_next_task: None,
@@ -321,6 +329,7 @@ pub static FAIR_SCHED_CLASS: SchedClass = SchedClass {
 
 #[cfg(test)]
 mod tests {
+    use super::super::prio::{DEFAULT_PRIO, NICE_0_LOAD, nice_to_weight};
     use super::*;
     use alloc::boxed::Box;
     use core::sync::atomic::Ordering;
@@ -354,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn update_curr_rekeys_running_entity_in_cfs_tree() {
+    fn update_curr_keeps_running_entity_out_of_cfs_tree() {
         let mut rq = Rq::new(0);
         let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         let ptr = &mut *task as *mut TaskStruct;
@@ -369,8 +378,6 @@ mod tests {
         rq.cfs.current = ptr;
         rq.cfs.nr_running = 1;
         rq.cfs.load_weight = NICE_0_LOAD;
-        rq.cfs.insert(ptr, 0);
-
         crate::arch::x86::kernel::apic_timer::TIMER_TICKS.store(1, Ordering::Release);
         unsafe {
             update_curr(&mut rq);
@@ -380,11 +387,76 @@ mod tests {
         assert!(new_vruntime > 0);
         assert!(!rq.cfs.tasks_timeline.contains_key(&(0, ptr as usize)));
         assert!(
-            rq.cfs
+            !rq.cfs
                 .tasks_timeline
-                .contains_key(&(new_vruntime, ptr as usize))
+                .contains_key(&(new_vruntime, ptr as usize)),
+            "Linux keeps cfs_rq->curr outside the rb-tree"
         );
         crate::arch::x86::kernel::apic_timer::TIMER_TICKS.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn update_curr_uses_positive_nice_entity_weight() {
+        // Linux fair.c::calc_delta_fair() passes curr->load unchanged to
+        // __calc_delta(); a positive nice value must therefore advance
+        // vruntime faster than nice 0.
+        let mut rq = Rq::new(0);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let ptr = &mut *task as *mut TaskStruct;
+        let weight = nice_to_weight(1);
+        let start = sched_clock_ns().max(1);
+        let _ = crate::kernel::sched::entity::SCHED_CLOCK_NS.fetch_max(start, Ordering::AcqRel);
+        unsafe {
+            (*ptr).m29.static_prio = DEFAULT_PRIO + 1;
+            (*ptr).m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
+            (*ptr).m29.se.load.weight = weight;
+            (*ptr).m29.se.on_rq = 1;
+            (*ptr).m29.se.exec_start = start;
+        }
+        rq.cfs.current = ptr;
+        rq.cfs.nr_running = 1;
+        rq.cfs.load_weight = weight;
+        let _ = crate::kernel::sched::entity::SCHED_CLOCK_NS.fetch_add(1_000_000, Ordering::AcqRel);
+
+        unsafe {
+            update_curr(&mut rq);
+        }
+
+        let delta_exec = task.m29.se.sum_exec_runtime;
+        assert!(delta_exec > 0);
+        assert_eq!(
+            task.m29.se.vruntime,
+            calc_delta_fair(delta_exec, weight),
+            "Linux accounts a positive-nice entity using its actual load weight"
+        );
+    }
+
+    #[test]
+    fn enqueue_sched_idle_uses_linux_idle_weight() {
+        // Linux core.c::set_load_weight() assigns
+        // scale_load(WEIGHT_IDLEPRIO) to a task with SCHED_IDLE policy. On
+        // CONFIG_64BIT x86_64 this is 3 << 10 == 3072.
+        let mut rq = Rq::new(0);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let ptr = &mut *task as *mut TaskStruct;
+        task.m29.policy = super::super::prio::SCHED_IDLE;
+        task.m29.static_prio = DEFAULT_PRIO;
+        task.m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
+
+        unsafe {
+            enqueue_task_fair(&mut rq, ptr, 0);
+        }
+
+        assert_eq!(
+            task.m29.se.load.weight,
+            3_u64 << super::super::prio::SCHED_FIXEDPOINT_SHIFT,
+            "Linux uses scale_load(WEIGHT_IDLEPRIO) for SCHED_IDLE"
+        );
+        assert_eq!(
+            task.m29.se.load.inv_weight,
+            super::super::prio::WMULT_IDLEPRIO,
+            "Linux uses WMULT_IDLEPRIO for SCHED_IDLE"
+        );
     }
 
     #[test]
@@ -396,7 +468,14 @@ mod tests {
             (*ptr).m29.static_prio = DEFAULT_PRIO;
             (*ptr).m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
             (*ptr).m29.se.load.weight = NICE_0_LOAD;
+            (*ptr).m29.se.on_rq = 1;
+            (*ptr).m29.on_rq = 1;
         }
+        // Linux keeps the current runnable entity in cfs_rq->load and
+        // nr_running even though it is outside the timeline tree.
+        rq.cfs.nr_running = 1;
+        rq.cfs.load_weight = NICE_0_LOAD;
+        rq.nr_running = 1;
 
         crate::kernel::sched::entity::SCHED_CLOCK_NS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |clock| {
@@ -423,7 +502,7 @@ mod tests {
 
         assert!(task.m29.se.sum_exec_runtime > first_runtime);
         assert_ne!(
-            task.thread_info.flags & crate::kernel::task::TIF_NEED_RESCHED,
+            task.thread_info.flags.load(Ordering::Acquire) & crate::kernel::task::TIF_NEED_RESCHED,
             0,
             "timer tick must request a cooperative reschedule for legacy fair tasks"
         );

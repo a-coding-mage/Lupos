@@ -1,29 +1,32 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/kernel
 //! test-origin: linux:vendor/linux/arch/x86/kernel
-//! 64-bit Global Descriptor Table (GDT) with TSS descriptor slot.
+//! Per-CPU x86-64 Global Descriptor Table (GDT).
 //!
 //! The minimal GDT set up by `arch/x86/boot/header.S` has only three entries (null, code,
-//! data).  This module rebuilds it with the full set required for a working
-//! kernel:
+//! data). This module replaces it with Linux's generic x86-64 16-entry layout:
 //!
-//! | Offset | Selector    | Purpose                                       |
-//! |--------|-------------|-----------------------------------------------|
-//! | 0x00   | (null)      | Required null descriptor                      |
-//! | 0x08   | KERNEL_CS   | 64-bit kernel code, DPL=0, L=1                |
-//! | 0x10   | KERNEL_DS   | Kernel data, DPL=0                            |
-//! | 0x18   | USER_DS     | User data, DPL=3 — SYSRET SS slot            |
-//! | 0x20   | USER_CS     | 64-bit user code, DPL=3, L=1 — SYSRET CS    |
-//! | 0x28   | TSS         | 64-bit TSS descriptor (16 bytes = 2 slots)    |
+//! | Index | Selector | Purpose                                      |
+//! |-------|----------|----------------------------------------------|
+//! | 1     | 0x08     | 32-bit kernel code                          |
+//! | 2     | 0x10     | 64-bit kernel code                          |
+//! | 3     | 0x18     | kernel data                                 |
+//! | 4     | 0x23     | default 32-bit user code                    |
+//! | 5     | 0x2b     | default user data / SYSRET SS               |
+//! | 6     | 0x33     | default 64-bit user code / SYSRET CS        |
+//! | 8–9   | 0x40     | 64-bit TSS descriptor                       |
+//! | 10–11 | 0x50     | LDT descriptor                              |
+//! | 12–14 | 0x63…73  | per-task TLS descriptors                    |
+//! | 15    | 0x7b     | CPU/node segment                            |
 //!
 //! Why is the TSS 16 bytes?  In 64-bit mode the base address of the TSS is
 //! 64 bits wide, so the descriptor is extended to 128 bits by appending a
 //! second 8-byte slot in the GDT.
 //!
-//! Why user segments before TSS?  The SYSCALL/SYSRET instruction uses the
+//! The SYSCALL/SYSRET instruction uses the
 //! STAR MSR to derive segment selectors via fixed arithmetic:
-//!   SYSRET CS = STAR[63:48] + 16   → 0x10 + 16 = 0x20 = USER_CS ✓
-//!   SYSRET SS = STAR[63:48] + 8    → 0x10 + 8  = 0x18 = USER_DS ✓
+//!   SYSRET CS = STAR[63:48] + 16   → 0x23 + 16 = 0x33 = USER_CS ✓
+//!   SYSRET SS = STAR[63:48] + 8    → 0x23 + 8  = 0x2b = USER_DS ✓
 //!
 //! References:
 //!   Intel SDM Vol. 3A §3.4 "Segment Descriptors"
@@ -31,11 +34,30 @@
 //!   vendor/linux/arch/x86/kernel/cpu/common.c
 //!   https://wiki.osdev.org/Global_Descriptor_Table
 //!   https://wiki.osdev.org/GDT_Tutorial
+//!
+//! Remaining descriptor-table work outside this TLS path: Linux's read-only
+//! fixmap alias and a populated CPU/node descriptor are not implemented.
 
 use core::mem::size_of;
 
 use super::tss::Tss;
 use crate::kernel::sched::MAX_CPUS;
+use crate::kernel::thread::{DescStruct, ThreadStruct};
+
+pub const GDT_ENTRIES: usize = 16;
+pub const GDT_SIZE: usize = GDT_ENTRIES * size_of::<GdtEntry>();
+pub const GDT_ENTRY_KERNEL32_CS: usize = 1;
+pub const GDT_ENTRY_KERNEL_CS: usize = 2;
+pub const GDT_ENTRY_KERNEL_DS: usize = 3;
+pub const GDT_ENTRY_DEFAULT_USER32_CS: usize = 4;
+pub const GDT_ENTRY_DEFAULT_USER_DS: usize = 5;
+pub const GDT_ENTRY_DEFAULT_USER_CS: usize = 6;
+pub const GDT_ENTRY_TSS: usize = 8;
+pub const GDT_ENTRY_LDT: usize = 10;
+pub const GDT_ENTRY_TLS_MIN: usize = 12;
+pub const GDT_ENTRY_TLS_ENTRIES: usize = 3;
+pub const GDT_ENTRY_TLS_MAX: usize = GDT_ENTRY_TLS_MIN + GDT_ENTRY_TLS_ENTRIES - 1;
+pub const GDT_ENTRY_CPUNODE: usize = 15;
 
 // ── Segment selector constants ───────────────────────────────────────────────
 //
@@ -45,22 +67,29 @@ use crate::kernel::sched::MAX_CPUS;
 // Reference: Intel SDM Vol. 3A §3.4.2 "Segment Selectors"
 
 pub mod sel {
+    use super::{
+        GDT_ENTRY_DEFAULT_USER_CS, GDT_ENTRY_DEFAULT_USER_DS, GDT_ENTRY_DEFAULT_USER32_CS,
+        GDT_ENTRY_KERNEL_CS, GDT_ENTRY_KERNEL_DS, GDT_ENTRY_TSS,
+    };
+
     /// Null descriptor — never used as a selector, but must be present.
     pub const NULL: u16 = 0x00;
     /// Kernel 64-bit code segment (RPL = 0, DPL = 0).
-    pub const KERNEL_CS: u16 = 0x08;
+    pub const KERNEL_CS: u16 = (GDT_ENTRY_KERNEL_CS * 8) as u16;
     /// Kernel data segment (RPL = 0, DPL = 0).
-    pub const KERNEL_DS: u16 = 0x10;
+    pub const KERNEL_DS: u16 = (GDT_ENTRY_KERNEL_DS * 8) as u16;
+    /// User 32-bit compatibility code segment with RPL = 3.
+    pub const USER32_CS: u16 = (GDT_ENTRY_DEFAULT_USER32_CS * 8 + 3) as u16;
     /// User data segment with RPL = 3 (DPL = 3).
     ///
-    /// Used as SS on SYSRET: STAR[63:48]=0x10, SYSRET SS = 0x10+8 = 0x18 | RPL=3
-    pub const USER_DS: u16 = 0x18 | 3;
+    /// Used as SS on SYSRET: STAR[63:48]=0x23, SYSRET SS = 0x2b.
+    pub const USER_DS: u16 = (GDT_ENTRY_DEFAULT_USER_DS * 8 + 3) as u16;
     /// User 64-bit code segment with RPL = 3 (DPL = 3, L = 1).
     ///
-    /// Used as CS on SYSRET: STAR[63:48]=0x10, SYSRET CS = 0x10+16 = 0x20 | RPL=3
-    pub const USER_CS: u16 = 0x20 | 3;
+    /// Used as CS on SYSRET: STAR[63:48]=0x23, SYSRET CS = 0x33.
+    pub const USER_CS: u16 = (GDT_ENTRY_DEFAULT_USER_CS * 8 + 3) as u16;
     /// TSS selector — no RPL (loaded via `ltr`, a privileged instruction).
-    pub const TSS: u16 = 0x28;
+    pub const TSS: u16 = (GDT_ENTRY_TSS * 8) as u16;
 }
 
 // ── 8-byte GDT entry ─────────────────────────────────────────────────────────
@@ -120,37 +149,47 @@ impl GdtEntry {
 
     /// 64-bit kernel code segment (DPL=0, L=1).
     ///
-    /// Access byte 0x9A = P(1) | DPL(00) | S(1) | Type(1010)
-    ///   Type 0xA = Execute/Read code segment.
+    /// Access byte 0x9B = P(1) | DPL(00) | S(1) | Type(1011)
+    ///   Type 0xB = accessed Execute/Read code segment.
     /// Flags nibble 0xA = G(1) | D(0) | L(1) | AVL(0)
     ///   L=1 → 64-bit code segment; D MUST be 0 when L=1 (SDM §3.4.5.1).
     pub const fn kernel_code64() -> Self {
-        Self::segment(0x9A, 0xA)
+        Self::segment(0x9B, 0xA)
+    }
+
+    /// 32-bit kernel compatibility code segment.
+    pub const fn kernel_code32() -> Self {
+        Self::segment(0x9B, 0xC)
     }
 
     /// Kernel data segment (DPL=0).
     ///
-    /// Access byte 0x92 = P(1) | DPL(00) | S(1) | Type(0010)
-    ///   Type 0x2 = Read/Write data segment.
+    /// Access byte 0x93 = P(1) | DPL(00) | S(1) | Type(0011)
+    ///   Type 0x3 = accessed Read/Write data segment.
     /// Flags nibble 0xC = G(1) | D(1) | L(0) | AVL(0)
     ///   D=1 → 32-bit default size for data (irrelevant in 64-bit mode,
     ///          but conventional to set).
     pub const fn kernel_data() -> Self {
-        Self::segment(0x92, 0xC)
+        Self::segment(0x93, 0xC)
     }
 
     /// User data segment (DPL=3).
     ///
-    /// Access byte 0xF2 = P(1) | DPL(11) | S(1) | Type(0010)
+    /// Access byte 0xF3 = P(1) | DPL(11) | S(1) | Type(0011)
     pub const fn user_data() -> Self {
-        Self::segment(0xF2, 0xC)
+        Self::segment(0xF3, 0xC)
     }
 
     /// User 64-bit code segment (DPL=3, L=1).
     ///
-    /// Access byte 0xFA = P(1) | DPL(11) | S(1) | Type(1010)
+    /// Access byte 0xFB = P(1) | DPL(11) | S(1) | Type(1011)
     pub const fn user_code64() -> Self {
-        Self::segment(0xFA, 0xA)
+        Self::segment(0xFB, 0xA)
+    }
+
+    /// User 32-bit compatibility code segment.
+    pub const fn user_code32() -> Self {
+        Self::segment(0xFB, 0xC)
     }
 }
 
@@ -162,22 +201,15 @@ impl GdtEntry {
 // Reference: Intel SDM Vol. 3A §7.2.3 "TSS Descriptor in 64-bit mode"
 // Reference: Intel SDM Vol. 3A Figure 7-4 "Format of TSS and LDT Descriptors in 64-bit Mode"
 
-/// The global GDT: null + kernel code + kernel data + user data + user code
-/// + 64-bit TSS (two 8-byte slots).
+/// One page-aligned per-CPU GDT page, matching Linux `struct gdt_page`.
 ///
-/// `#[repr(C)]` and 8-byte aligned to satisfy the `lgdt` instruction, which
+/// `#[repr(C)]` and page aligned like Linux's per-CPU allocation; `lgdt`
 /// reads the GDTR base without alignment requirements but whose address we
 /// pass directly from Rust.
-#[repr(C, align(8))]
+#[repr(C, align(4096))]
 #[derive(Clone, Copy)]
 pub struct Gdt {
-    null: GdtEntry,     // 0x00
-    kcode: GdtEntry,    // 0x08  KERNEL_CS
-    kdata: GdtEntry,    // 0x10  KERNEL_DS
-    udata: GdtEntry,    // 0x18  USER_DS
-    ucode: GdtEntry,    // 0x20  USER_CS
-    tss_low: GdtEntry,  // 0x28  TSS (lower 8 bytes of 16-byte descriptor)
-    tss_high: GdtEntry, // 0x30  TSS (upper 8 bytes: base[63:32] + reserved)
+    entries: [GdtEntry; GDT_ENTRIES],
 }
 
 /// GDTR value — the 10-byte operand for `lgdt` / `sgdt`.
@@ -216,19 +248,189 @@ unsafe fn gdt_for_cpu_mut(cpu: usize) -> *mut Gdt {
     }
 }
 
+/// Copy `thread.tls_array` into GDT entries 12..=14 for `cpu`.
+///
+/// This is Linux `native_load_tls()`. The caller must pin execution to the
+/// supplied CPU until the copy finishes.
+///
+/// # Safety
+/// `cpu` must identify the CPU whose GDT is active for the calling switch or
+/// syscall path.
+pub unsafe fn load_tls(thread: &ThreadStruct, cpu: usize) {
+    let gdt = unsafe { gdt_for_cpu_mut(cpu) };
+    unsafe {
+        (*gdt).install_tls(thread.tls_array);
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn read_ds() -> u16 {
+    let selector: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {selector:x}, ds",
+            selector = lateout(reg) selector,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    selector as u16
+}
+
+#[cfg(test)]
+#[inline]
+pub const unsafe fn read_ds() -> u16 {
+    0
+}
+
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn read_es() -> u16 {
+    let selector: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {selector:x}, es",
+            selector = lateout(reg) selector,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    selector as u16
+}
+
+#[cfg(test)]
+#[inline]
+pub const unsafe fn read_es() -> u16 {
+    0
+}
+
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn read_fs() -> u16 {
+    let selector: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {selector:x}, fs",
+            selector = lateout(reg) selector,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    selector as u16
+}
+
+#[cfg(test)]
+#[inline]
+pub const unsafe fn read_fs() -> u16 {
+    0
+}
+
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn read_gs() -> u16 {
+    let selector: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {selector:x}, gs",
+            selector = lateout(reg) selector,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    selector as u16
+}
+
+#[cfg(test)]
+#[inline]
+pub const unsafe fn read_gs() -> u16 {
+    0
+}
+
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn load_ds(selector: u16) {
+    let selector = selector as u64;
+    unsafe {
+        core::arch::asm!(
+            "mov ds, {selector:x}",
+            selector = in(reg) selector,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[cfg(test)]
+#[inline]
+pub const unsafe fn load_ds(_selector: u16) {}
+
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn load_es(selector: u16) {
+    let selector = selector as u64;
+    unsafe {
+        core::arch::asm!(
+            "mov es, {selector:x}",
+            selector = in(reg) selector,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[cfg(test)]
+#[inline]
+pub const unsafe fn load_es(_selector: u16) {}
+
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn load_fs(selector: u16) {
+    let selector = selector as u64;
+    unsafe {
+        core::arch::asm!(
+            "mov fs, {selector:x}",
+            selector = in(reg) selector,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[cfg(test)]
+#[inline]
+pub const unsafe fn load_fs(_selector: u16) {}
+
+/// Load the inactive (userspace) GS selector while kernel GS is active.
+///
+/// Linux implements this as `asm_load_gs_index`: disable interrupts, SWAPGS,
+/// load the selector, and SWAPGS back.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn load_gs_index(selector: u16) {
+    let flags = crate::kernel::locking::irqflags::local_irq_save();
+    let selector = selector as u64;
+    unsafe {
+        core::arch::asm!(
+            "swapgs",
+            "mov gs, {selector:x}",
+            "swapgs",
+            selector = in(reg) selector,
+            options(nostack, preserves_flags),
+        );
+    }
+    crate::kernel::locking::irqflags::local_irq_restore(flags);
+}
+
+#[cfg(test)]
+#[inline]
+pub const unsafe fn load_gs_index(_selector: u16) {}
+
 impl Gdt {
-    /// Construct a GDT with all non-TSS entries populated.
-    /// The TSS slots are zeroed until `set_tss()` is called.
+    /// Construct Linux's generic x86-64 GDT. TSS, LDT, TLS, and CPU/node
+    /// slots remain empty until their owning paths populate them.
     pub const fn new() -> Self {
-        Self {
-            null: GdtEntry::null(),
-            kcode: GdtEntry::kernel_code64(),
-            kdata: GdtEntry::kernel_data(),
-            udata: GdtEntry::user_data(),
-            ucode: GdtEntry::user_code64(),
-            tss_low: GdtEntry(0),
-            tss_high: GdtEntry(0),
-        }
+        let mut entries = [GdtEntry::null(); GDT_ENTRIES];
+        entries[GDT_ENTRY_KERNEL32_CS] = GdtEntry::kernel_code32();
+        entries[GDT_ENTRY_KERNEL_CS] = GdtEntry::kernel_code64();
+        entries[GDT_ENTRY_KERNEL_DS] = GdtEntry::kernel_data();
+        entries[GDT_ENTRY_DEFAULT_USER32_CS] = GdtEntry::user_code32();
+        entries[GDT_ENTRY_DEFAULT_USER_DS] = GdtEntry::user_data();
+        entries[GDT_ENTRY_DEFAULT_USER_CS] = GdtEntry::user_code64();
+        Self { entries }
     }
 
     /// Fill the TSS descriptor slots from a raw pointer to the TSS.
@@ -262,8 +464,18 @@ impl Gdt {
         // High 8 bytes: base[63:32] in the low 32 bits, upper 32 bits reserved.
         let high: u64 = (base >> 32) & 0xFFFF_FFFF;
 
-        self.tss_low = GdtEntry(low);
-        self.tss_high = GdtEntry(high);
+        self.entries[GDT_ENTRY_TSS] = GdtEntry(low);
+        self.entries[GDT_ENTRY_TSS + 1] = GdtEntry(high);
+    }
+
+    /// Linux `native_load_tls()`: copy all three task TLS descriptors to the
+    /// CPU-local GDT before any selector belonging to the task is restored.
+    fn install_tls(&mut self, tls: [DescStruct; GDT_ENTRY_TLS_ENTRIES]) {
+        let mut index = 0;
+        while index < GDT_ENTRY_TLS_ENTRIES {
+            self.entries[GDT_ENTRY_TLS_MIN + index] = GdtEntry(tls[index].0);
+            index += 1;
+        }
     }
 
     /// Load a GDT, reload all segment registers, and load the TSS.
@@ -282,7 +494,9 @@ impl Gdt {
     /// - Must be called once, from `kernel_main`, before any interrupt fires.
     pub unsafe fn load(gdt_ptr: *const Gdt) {
         let reg = GdtRegister {
-            limit: (size_of::<Gdt>() - 1) as u16,
+            // Linux exposes only the 16 descriptor entries through GDTR. The
+            // page-aligned tail is allocation padding, not part of the table.
+            limit: (GDT_SIZE - 1) as u16,
             base: gdt_ptr as u64,
         };
 
@@ -435,8 +649,10 @@ mod tests {
     #[test]
     fn all_valid_descriptors_have_present_bit() {
         for e in [
+            GdtEntry::kernel_code32(),
             GdtEntry::kernel_code64(),
             GdtEntry::kernel_data(),
+            GdtEntry::user_code32(),
             GdtEntry::user_code64(),
             GdtEntry::user_data(),
         ] {
@@ -480,13 +696,13 @@ mod tests {
     }
 
     #[test]
-    fn gdt_struct_size_is_56_bytes() {
-        // 5 × 8-byte entries + 1 × 16-byte TSS descriptor = 56 bytes.
-        assert_eq!(
-            size_of::<Gdt>(),
-            56,
-            "GDT must be 56 bytes (5 regular + 1 TSS descriptor)"
-        );
+    fn gdt_page_has_linux_size_and_descriptor_limit() {
+        // Origin: vendor/linux/arch/x86/include/asm/desc.h `struct gdt_page`
+        // and vendor/linux/arch/x86/include/asm/segment.h `GDT_SIZE`.
+        assert_eq!(size_of::<Gdt>(), 4096);
+        assert_eq!(core::mem::align_of::<Gdt>(), 4096);
+        assert_eq!(GDT_SIZE, 16 * 8);
+        assert_eq!(offset_of!(Gdt, entries), 0);
     }
 
     #[test]
@@ -510,17 +726,50 @@ mod tests {
 
     #[test]
     fn selector_constants_are_consistent_with_gdt_layout() {
-        // The TSS selector offset (0x28 = 40) must equal the byte offset of
-        // `tss_low` in the Gdt struct: 5 entries × 8 bytes = 40.
-        assert_eq!(sel::TSS, 0x28, "TSS selector is part of the ABI");
-        let gdt = Gdt::new();
-        let gdt_base = &gdt as *const Gdt as usize;
-        let tss_low_addr = &gdt.tss_low as *const GdtEntry as usize;
+        // Origin: vendor/linux/arch/x86/include/asm/segment.h.
+        assert_eq!(sel::KERNEL_CS, 0x10);
+        assert_eq!(sel::KERNEL_DS, 0x18);
+        assert_eq!(sel::USER32_CS, 0x23);
+        assert_eq!(sel::USER_DS, 0x2b);
+        assert_eq!(sel::USER_CS, 0x33);
+        assert_eq!(sel::TSS, 0x40);
+        assert_eq!(GDT_ENTRY_TLS_MIN, 12);
+        assert_eq!(GDT_ENTRY_TLS_MAX, 14);
+    }
+
+    #[test]
+    fn tss_descriptor_occupies_linux_entries_eight_and_nine() {
+        let mut gdt = Gdt::new();
+        gdt.set_tss(0x1234_5678_9abc_def0usize as *const Tss);
+        assert_ne!(gdt.entries[GDT_ENTRY_TSS].0, 0);
         assert_eq!(
-            tss_low_addr - gdt_base,
-            sel::TSS as usize,
-            "TSS selector must equal byte offset of tss_low in Gdt"
+            gdt.entries[GDT_ENTRY_TSS + 1].0,
+            0x1234_5678,
+            "upper TSS descriptor holds base[63:32]"
         );
+        assert_eq!(gdt.entries[7].0, 0);
+        assert_eq!(gdt.entries[GDT_ENTRY_LDT].0, 0);
+    }
+
+    #[test]
+    fn native_load_tls_updates_exactly_linux_slots_twelve_through_fourteen() {
+        // Origin: vendor/linux/arch/x86/include/asm/desc.h::native_load_tls.
+        let mut gdt = Gdt::new();
+        let before = gdt.entries;
+        let tls = [
+            DescStruct(0x1111_1111_1111_1111),
+            DescStruct(0x2222_2222_2222_2222),
+            DescStruct(0x3333_3333_3333_3333),
+        ];
+        gdt.install_tls(tls);
+
+        for index in 0..GDT_ENTRIES {
+            if (GDT_ENTRY_TLS_MIN..=GDT_ENTRY_TLS_MAX).contains(&index) {
+                assert_eq!(gdt.entries[index].0, tls[index - GDT_ENTRY_TLS_MIN].0);
+            } else {
+                assert_eq!(gdt.entries[index].0, before[index].0);
+            }
+        }
     }
 
     #[test]
@@ -534,19 +783,32 @@ mod tests {
     #[test]
     fn sysret_selectors_obey_star_arithmetic() {
         // SYSRET 64-bit: CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
-        // With STAR[63:48] = KERNEL_DS = 0x10:
-        //   SS = 0x10 + 8  = 0x18 = USER_DS selector (before OR with RPL=3)
-        //   CS = 0x10 + 16 = 0x20 = USER_CS selector (before OR with RPL=3)
-        let star_base = sel::KERNEL_DS as u32; // 0x10
+        // Linux programs STAR[63:48] to __USER32_CS (0x23).
+        let star_base = sel::USER32_CS as u32;
         assert_eq!(
             star_base + 8,
-            (sel::USER_DS & !3) as u32,
+            sel::USER_DS as u32,
             "SYSRET SS must map to USER_DS"
         );
         assert_eq!(
             star_base + 16,
-            (sel::USER_CS & !3) as u32,
+            sel::USER_CS as u32,
             "SYSRET CS must map to USER_CS"
         );
+    }
+
+    #[test]
+    fn runtime_selector_inventory_has_no_pre_linux_layout_consumers() {
+        // Behavioral assertions above prove the table. This inventory catches
+        // the few assembly/standalone constants that cannot import `sel`.
+        assert_eq!(crate::arch::x86::kernel::kgdb::KERNEL_CS, 0x10);
+        assert_eq!(crate::arch::x86::kernel::kgdb::KERNEL_DS, 0x18);
+        assert_eq!(crate::arch::x86::kernel::fred::KERNEL_DS, 0x18);
+        assert_eq!(crate::arch::x86::entry::syscall_32::USER32_CS, 0x23);
+        assert_eq!(crate::arch::x86::entry::syscall_32::USER_DS, 0x2b);
+
+        let trampoline = include_str!("../realmode/rm/trampoline_64.S");
+        assert!(trampoline.contains("push qword 0x10"));
+        assert!(trampoline.contains("BSP's KERNEL_DS = 0x18"));
     }
 }

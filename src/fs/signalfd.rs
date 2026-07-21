@@ -464,4 +464,75 @@ mod tests {
         }
         crate::kernel::signal::reset_for_tests();
     }
+
+    #[test]
+    fn signalfd_preserves_sigchld_exit_fields() {
+        // Linux signalfd_copyinfo(SIL_CHLD) copies the child identity and exit
+        // status from the do_notify_parent() siginfo record.
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 185;
+        current.tgid = 185;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let mask = 1u64 << (SIGCHLD - 1);
+            let blocked = SigSet { bits: mask };
+            assert_eq!(
+                crate::kernel::signal::sys_rt_sigprocmask(
+                    SIG_BLOCK,
+                    &blocked,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<SigSet>(),
+                ),
+                0
+            );
+            let fd = sys_signalfd4(-1, &mask as *const u64 as *const u8, 8, SFD_CLOEXEC);
+            assert!(fd >= 0);
+            let ft = files::get_task_files(&mut *current as *mut TaskStruct).unwrap();
+            let file = ft.get(fd as i32).unwrap();
+
+            // with_sender_value has the same first 16 union bytes as Linux's
+            // _sigchld layout and lets the regression fail before adding the
+            // dedicated constructor used by the production fix.
+            let info = SigInfo::with_sender_value(
+                SIGCHLD,
+                crate::kernel::wait::CLD_EXITED,
+                357,
+                42,
+                7,
+            );
+            assert_eq!(
+                crate::kernel::signal::send_signal_info_to_task(
+                    &mut *current as *mut TaskStruct,
+                    info,
+                ),
+                0
+            );
+
+            let mut buf = [0u8; core::mem::size_of::<SignalfdSiginfo>()];
+            let mut pos = 0;
+            assert_eq!(
+                signalfd_read(&file, &mut buf, &mut pos).unwrap(),
+                core::mem::size_of::<SignalfdSiginfo>()
+            );
+            let record = core::ptr::read_unaligned(buf.as_ptr() as *const SignalfdSiginfo);
+            assert_eq!(record.ssi_signo, SIGCHLD as u32);
+            assert_eq!(record.ssi_code, crate::kernel::wait::CLD_EXITED);
+            assert_eq!(record.ssi_pid, 357);
+            assert_eq!(record.ssi_uid, 42);
+            assert_eq!(record.ssi_status, 7);
+            assert_eq!(record.ssi_utime, 0);
+            assert_eq!(record.ssi_stime, 0);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+        crate::kernel::signal::reset_for_tests();
+    }
 }

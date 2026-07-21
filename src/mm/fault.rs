@@ -34,9 +34,9 @@ use crate::arch::x86::mm::paging::{
     self, __pte, _PAGE_ACCESSED, _PAGE_NX, _PAGE_PRESENT, _PAGE_TABLE, _PAGE_USER, PAGE_MASK,
     PAGE_SHIFT, PAGE_SIZE, flush_tlb_page, flush_tlb_range, p4d_offset, pfn_pte, pfn_to_virt,
     pgd_offset_pgd, pgd_t, pgprot_t, pmd_alloc, pmd_huge, pmd_none, pmd_offset, pmd_t, pte_alloc,
-    pte_mkdirty, pte_mkspecial, pte_mkwrite, pte_mkyoung, pte_none, pte_offset_kernel, pte_pfn,
-    pte_present, pte_special, pte_t, pte_write, pte_wrprotect, ptep_get, ptep_get_and_clear,
-    pud_alloc, pud_huge, pud_none, pud_offset, pud_t, set_pte_at,
+    pte_mkclean, pte_mkdirty, pte_mkold, pte_mkspecial, pte_mkwrite, pte_mkyoung, pte_none,
+    pte_offset_kernel, pte_pfn, pte_present, pte_special, pte_t, pte_write, pte_wrprotect,
+    ptep_get, ptep_get_and_clear, pud_alloc, pud_huge, pud_none, pud_offset, pud_t, set_pte_at,
 };
 use crate::mm::address_space::{AS_SHARED_ANON, AddressSpace, wait_on_page_writeback};
 use crate::mm::buddy::{page_to_pfn, pfn_to_page, pfn_valid, with_global_buddy};
@@ -46,6 +46,7 @@ use crate::mm::page_flags::{GFP_KERNEL, GfpFlags, PG_SWAPBACKED};
 use crate::mm::rmap::anon_vma_prepare;
 use crate::mm::vm_flags::{
     VM_DONTDUMP, VM_DONTEXPAND, VM_IO, VM_MAYSHARE, VM_MAYWRITE, VM_PFNMAP, VM_SHARED, VM_WRITE,
+    VmFlags,
 };
 
 // ---------------------------------------------------------------------------
@@ -773,12 +774,14 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
 
 /// Copy the page tables for one VMA from the source mm to the destination mm.
 ///
-/// For anonymous private VMAs (`!VM_SHARED`), each present PTE is:
-/// - Write-protected in the **source** (so the parent COW-faults on next write).
-/// - Copied read-only to the **destination**.
+/// For private VMAs that may be written (`VM_MAYWRITE && !VM_SHARED`), each
+/// writable present PTE is write-protected in both parent and child. Other
+/// mappings retain their source write permission; shared child PTEs are copied
+/// clean, and all child PTEs are copied old, matching Linux.
+///
+/// For every copied normal present PTE:
 /// - The backing page's refcount and mapcount are both incremented.
 ///
-/// VMAs with `VM_SHARED` are skipped (shared mappings need no COW treatment).
 /// VMAs with no `anon_vma` and no file are also skipped (no pages yet).
 ///
 /// Called from `dup_mmap()` for each source VMA during `fork`.
@@ -795,10 +798,6 @@ pub unsafe fn copy_page_range(
     unsafe {
         let flags = (*vma).vm_flags;
 
-        // Shared mappings are not COW'd — both processes see the same pages.
-        if flags & VM_SHARED != 0 {
-            return Ok(());
-        }
         #[cfg(test)]
         if (*vma).anon_vma.is_null() && (*vma).vm_file == 0 {
             return Ok(());
@@ -854,7 +853,7 @@ pub unsafe fn copy_page_range(
             let next = pmd_addr_end(addr).min(end);
 
             // Copy PTE-level entries.
-            copy_pte_range(dst_mm, src_mm, dst_pmdp, src_pmdp, addr, next)?;
+            copy_pte_range(dst_mm, src_mm, dst_pmdp, src_pmdp, addr, next, flags)?;
 
             addr = next;
         }
@@ -865,11 +864,15 @@ pub unsafe fn copy_page_range(
 
 /// Copy PTE entries from `[addr, end)` in the source PMD to the destination PMD.
 ///
-/// For each present source PTE:
-/// 1. Write-protect the source PTE.
-/// 2. Install the same read-only PTE in the destination.
-/// 3. Increment a normal backing page's `_refcount` and `_mapcount`; raw
-///    PTE-special PFN mappings have no `struct page` and skip accounting.
+/// For each present source PTE, apply Linux's `__copy_present_ptes()` policy:
+/// write-protect both copies only for a COW mapping, mark a shared child clean,
+/// mark every child old, and increment a normal backing page's `_refcount` and
+/// `_mapcount`. Raw PTE-special PFN mappings have no `struct page` and skip
+/// accounting.
+///
+/// Source PTE permission downgrades are intentionally not invalidated here.
+/// Linux batches them and performs one full `flush_tlb_mm(oldmm)` from
+/// `dup_mmap()`, including its partial-failure path.
 ///
 /// # Safety
 /// `dst_mm`, `src_mm`, `dst_pmd`, `src_pmd` must be valid.
@@ -878,11 +881,12 @@ pub unsafe fn copy_page_range(
 /// Ref: Linux `mm/memory.c` — `copy_pte_range()` line 1221
 unsafe fn copy_pte_range(
     dst_mm: *mut MmStruct,
-    _src_mm: *mut MmStruct,
+    src_mm: *mut MmStruct,
     dst_pmd: *mut pmd_t,
     src_pmd: *mut pmd_t,
     addr: u64,
     end: u64,
+    vm_flags: VmFlags,
 ) -> Result<(), i32> {
     unsafe {
         // Allocate destination PTE table if absent.
@@ -899,13 +903,15 @@ unsafe fn copy_pte_range(
                 continue;
             }
 
-            let ro_pte = pte_wrprotect(src_pte);
-            set_pte_at(_src_mm as *mut (), cur, src_ptep, ro_pte);
-            flush_tlb_page(cur);
+            let (source_update, child_pte) = fork_present_pte(src_pte, vm_flags);
+            if let Some(source_pte) = source_update {
+                set_pte_at(src_mm as *mut (), cur, src_ptep, source_pte);
+            }
 
-            // Install the same read-only PTE in the destination.
+            // Install the Linux-adjusted PTE in the destination. Parent
+            // permission downgrades are flushed once by dup_mmap().
             let dst_ptep = pte_offset_kernel(dst_pmd, cur);
-            set_pte_at(dst_mm as *mut (), cur, dst_ptep, ro_pte);
+            set_pte_at(dst_mm as *mut (), cur, dst_ptep, child_pte);
 
             // vm_normal_page() returns NULL for PTE-special PFNMAP entries.
             // Linux copies the raw PTE to the child but deliberately performs
@@ -931,6 +937,30 @@ unsafe fn copy_pte_range(
 
         Ok(())
     }
+}
+
+/// Compute Linux's `__copy_present_ptes()` parent/child PTE updates.
+///
+/// The optional first result is the only source-PTE write: Linux modifies the
+/// parent only when a writable PTE belongs to a private mapping that may be
+/// written. The child additionally starts clean for a shared mapping and old
+/// for every mapping.
+#[inline]
+fn fork_present_pte(src_pte: pte_t, vm_flags: VmFlags) -> (Option<pte_t>, pte_t) {
+    let is_cow = vm_flags & (VM_SHARED | VM_MAYWRITE) == VM_MAYWRITE;
+    let (source_update, mut child_pte) = if is_cow && pte_write(src_pte) {
+        let read_only = pte_wrprotect(src_pte);
+        (Some(read_only), read_only)
+    } else {
+        (None, src_pte)
+    };
+
+    if vm_flags & VM_SHARED != 0 {
+        child_pte = pte_mkclean(child_pte);
+    }
+    child_pte = pte_mkold(child_pte);
+
+    (source_update, child_pte)
 }
 
 // ---------------------------------------------------------------------------
@@ -1579,6 +1609,7 @@ fn do_swap_page(vmf: &mut VmFault) -> VmFaultFlags {
 mod tests {
     use super::*;
     use crate::arch::x86::mm::paging;
+    use crate::mm::vm_flags::{VM_MAYSHARE, VM_MAYWRITE};
 
     // ── Constant parity with Linux ───────────────────────────────────────────
 
@@ -1639,6 +1670,51 @@ mod tests {
         // Default must NOT include WRITE or USER.
         assert_eq!(FAULT_FLAG_DEFAULT & FAULT_FLAG_WRITE, 0);
         assert_eq!(FAULT_FLAG_DEFAULT & FAULT_FLAG_USER, 0);
+    }
+
+    // ── Fork PTE policy ──────────────────────────────────────────────────────
+
+    #[test]
+    fn fork_present_pte_write_protects_only_cow_mappings() {
+        // Linux `is_cow_mapping()` keys off VM_MAYWRITE, not current VM_WRITE.
+        let src = pte_mkyoung(pte_mkdirty(pte_mkwrite(__pte(_PAGE_PRESENT))));
+
+        let (source_update, child) = fork_present_pte(src, VM_WRITE | VM_MAYWRITE);
+        let parent = source_update.expect("writable COW source must be downgraded");
+        assert_eq!(parent, pte_wrprotect(src));
+        assert!(!pte_write(parent));
+        assert!(!pte_write(child));
+        assert!(
+            paging::pte_dirty(child),
+            "private child retains the source dirty state"
+        );
+        assert!(!paging::pte_young(child), "every child PTE starts old");
+
+        let (source_update, child) = fork_present_pte(src, VM_WRITE);
+        assert!(
+            source_update.is_none(),
+            "VM_WRITE without VM_MAYWRITE is not a Linux COW mapping"
+        );
+        assert!(
+            pte_write(child),
+            "non-COW child retains the source write permission"
+        );
+    }
+
+    #[test]
+    fn fork_present_pte_keeps_shared_mapping_writable_but_clean_and_old() {
+        let src = pte_mkyoung(pte_mkdirty(pte_mkwrite(__pte(_PAGE_PRESENT))));
+        let flags = VM_SHARED | VM_WRITE | VM_MAYWRITE | VM_MAYSHARE;
+
+        let (source_update, child) = fork_present_pte(src, flags);
+
+        assert!(
+            source_update.is_none(),
+            "shared source PTE must not be write-protected"
+        );
+        assert!(pte_write(child), "shared child must stay writable");
+        assert!(!paging::pte_dirty(child), "shared child starts clean");
+        assert!(!paging::pte_young(child), "shared child starts old");
     }
 
     // ── Routing helpers ──────────────────────────────────────────────────────

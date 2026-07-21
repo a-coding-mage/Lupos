@@ -13,6 +13,7 @@ use crate::kernel::{files, sched};
 
 use super::madvise::do_madvise;
 use super::mmap::{MAP_ANONYMOUS, MAP_SHARED, PROT_WRITE, do_mmap, do_munmap};
+use super::mmap_lock::MmapWriteGuard;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -60,6 +61,7 @@ pub unsafe fn sys_mmap(addr: u64, len: u64, prot: u32, flags: u32, fd: i32, off:
     } else {
         0
     };
+    let _mmap_guard = unsafe { MmapWriteGuard::lock(mm) };
     match unsafe { do_mmap(&mut *mm, addr, len, prot, flags, off >> 12, file) } {
         Ok(mapped) => mapped as i64,
         Err(errno) => {
@@ -142,6 +144,7 @@ pub unsafe fn sys_madvise(start: u64, len: u64, advice: i32) -> i64 {
     if mm.is_null() {
         return -(EINVAL as i64);
     }
+    let _mmap_guard = unsafe { MmapWriteGuard::lock(mm) };
     match unsafe { do_madvise(&mut *mm, start, len, advice) } {
         Ok(()) => 0,
         Err(errno) => errno as i64,
@@ -187,6 +190,7 @@ pub unsafe fn sys_munmap(addr: u64, len: u64) -> i64 {
     if mm.is_null() {
         return -(EINVAL as i64);
     }
+    let _mmap_guard = unsafe { MmapWriteGuard::lock(mm) };
     match unsafe { do_munmap(&mut *mm, addr, len) } {
         Ok(()) => 0,
         Err(errno) => errno as i64,
@@ -206,6 +210,7 @@ pub unsafe fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     if mm.is_null() {
         return -(EINVAL as i64);
     }
+    let _mmap_guard = unsafe { MmapWriteGuard::lock(mm) };
     match unsafe { super::mprotect::do_mprotect(&mut *mm, addr, len, prot) } {
         Ok(()) => 0,
         Err(errno) => errno as i64,
@@ -225,6 +230,7 @@ pub unsafe fn sys_brk(new_brk: u64) -> i64 {
     if mm.is_null() {
         return -(EINVAL as i64);
     }
+    let _mmap_guard = unsafe { MmapWriteGuard::lock(mm) };
     unsafe { super::mmap::sys_brk(&mut *mm, new_brk) as i64 }
 }
 
@@ -247,6 +253,7 @@ pub unsafe fn sys_mremap(
     if mm.is_null() {
         return -(EINVAL as i64);
     }
+    let _mmap_guard = unsafe { MmapWriteGuard::lock(mm) };
     match unsafe { super::mremap::do_mremap(&mut *mm, old_addr, old_len, new_len, flags, new_addr) }
     {
         Ok(addr) => addr as i64,

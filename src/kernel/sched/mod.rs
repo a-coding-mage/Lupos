@@ -41,8 +41,9 @@
 //! # Per-CPU current_task
 //!
 //! Linux uses GS-relative per-CPU variables (`this_cpu_read(current_task)`).
-//! Full GS-based per-CPU isn't wired up yet, so we use a simple array indexed
-//! by `apic::id()`.  This is replaced by GS-relative access in M34.
+//! Lupos keeps the task pointers in a simple array, but indexes it with Linux's
+//! GS-relative `cpu_number` field so the scheduler hot path does not read LAPIC
+//! MMIO.
 
 pub mod class;
 pub mod entity;
@@ -113,7 +114,6 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsiz
 
 use spin::Mutex;
 
-use crate::arch::x86::kernel::apic;
 use crate::arch::x86::kernel::switch::{
     __switch_to_asm, prepare_switch_to_task, record_switch_attempt,
 };
@@ -209,11 +209,11 @@ unsafe fn seed_current_task_stack(_task: *mut TaskStruct) {}
 // Using static pools avoids any heap dependency during early boot.
 // The BSP task occupies slot 0; kthreads start at slot 1.
 
-/// Per-CPU current task pointer.  Index == LAPIC ID (typically 0 for BSP).
+/// Per-CPU current task pointer. Index == dense logical CPU ID.
 ///
-/// SAFETY: Each slot is written only by the CPU whose LAPIC ID equals the
-/// index, and only inside `set_current()` which is called from `__switch_to`.
-/// Cross-CPU reads are racy but acceptable for the cooperative scheduler.
+/// SAFETY: Each slot is written only by its owning CPU, during scheduler
+/// initialization or `__switch_to`. Remote scheduling decisions read
+/// `rq.current` while holding that CPU's runqueue lock instead.
 #[cfg(not(test))]
 static mut CURRENT_TASK: [*mut TaskStruct; MAX_CPUS] = [core::ptr::null_mut(); MAX_CPUS];
 
@@ -253,13 +253,23 @@ static KTHREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Production SMP scheduler gate.
 ///
-/// The legacy global queue remains active until at least one AP has joined
-/// normal scheduling.  Once enabled, `schedule()` dispatches entirely through
-/// per-CPU runqueues.
+/// `sched_prepare_smp()` transfers the legacy queue while only the BSP exists,
+/// then enables this gate before any AP is launched. Once enabled, `schedule()`
+/// dispatches entirely through per-CPU runqueues.
 static PRODUCTION_SCHED_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// The BSP has atomically transferred the legacy queue into CPU0's runqueue.
+///
+/// This becomes true before any AP is launched. It is distinct from CPU
+/// activation: CPU0 remains the only placement target until architecture
+/// bring-up explicitly activates each fully initialized AP.
+static SMP_SCHED_PREPARED: AtomicBool = AtomicBool::new(false);
 
 /// Number of CPUs that have joined the production scheduler.
 static SCHED_ONLINE_CPUS: AtomicU32 = AtomicU32::new(0);
+
+/// Per-CPU SCHED_SOFTIRQ request set by the timer tick.
+static BALANCE_PENDING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
 /// Logical CPUs which are currently active for task placement.
 ///
@@ -267,11 +277,10 @@ static SCHED_ONLINE_CPUS: AtomicU32 = AtomicU32::new(0);
 /// `NR_CPUS` width: Linux's `sched_getaffinity()` intersects a task's allowed
 /// mask with `cpu_active_mask`, so userspace must never infer 64 runnable CPUs
 /// merely because `cpumask_t` contains 64 bits.
-static SCHED_ACTIVE_CPUS: AtomicU64 = AtomicU64::new(1);
-
+///
 /// Snapshot Linux's `cpu_active_mask` in the task cpumask representation.
 pub fn cpu_active_mask() -> entity::CpuMask {
-    entity::CpuMask(SCHED_ACTIVE_CPUS.load(Ordering::Acquire))
+    entity::CpuMask(crate::kernel::cpuhotplug::cpu_active_mask())
 }
 
 // ── Run queue ────────────────────────────────────────────────────────────────
@@ -388,12 +397,9 @@ fn current_cpu_index() -> usize {
 
 #[cfg(not(test))]
 fn current_cpu_index() -> usize {
-    // Skip the LAPIC MMIO read (a VM-exit on VBox) when only the BSP is online.
-    if crate::arch::x86::kernel::smp::AP_READY_COUNT.load(Ordering::Acquire) == 0 {
-        return 0;
-    }
-    let cpu = unsafe { apic::id() } as usize;
-    cpu.min(MAX_CPUS - 1)
+    let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number();
+    assert!(cpu < MAX_CPUS, "scheduler logical CPU ID is out of range");
+    cpu
 }
 
 #[inline]
@@ -435,8 +441,7 @@ pub unsafe fn get_current() -> *mut TaskStruct {
 #[inline]
 pub fn current_needs_resched() -> bool {
     let current = unsafe { get_current() };
-    !current.is_null()
-        && unsafe { (*current).thread_info.flags & crate::kernel::task::TIF_NEED_RESCHED != 0 }
+    task_needs_resched(current)
 }
 
 /// Set the current task for this CPU.
@@ -466,12 +471,21 @@ pub unsafe fn set_current(task: *mut TaskStruct) {
 /// point, so `sched_init_ap()` passes the already-known logical CPU directly.
 #[cfg(not(test))]
 unsafe fn set_current_on_cpu(cpu: usize, task: *mut TaskStruct) {
-    let cpu = cpu.min(MAX_CPUS - 1);
+    assert!(cpu < MAX_CPUS, "scheduler logical CPU ID is out of range");
     unsafe {
         CURRENT_TASK[cpu] = task;
     }
-    if cpu == 0 {
-        crate::arch::x86::kernel::cpu::common::set_linux_current_task(task);
+    crate::arch::x86::kernel::cpu::common::set_linux_current_task_on_cpu(cpu, task);
+}
+
+#[inline]
+pub(crate) fn task_needs_resched(task: *mut TaskStruct) -> bool {
+    if task.is_null() {
+        return false;
+    }
+    unsafe {
+        (*task).thread_info.flags.load(Ordering::Acquire) & crate::kernel::task::TIF_NEED_RESCHED
+            != 0
     }
 }
 
@@ -481,17 +495,50 @@ unsafe fn clear_need_resched(task: *mut TaskStruct) {
         return;
     }
     unsafe {
-        (*task).thread_info.flags &= !crate::kernel::task::TIF_NEED_RESCHED;
+        (*task)
+            .thread_info
+            .flags
+            .fetch_and(!crate::kernel::task::TIF_NEED_RESCHED, Ordering::AcqRel);
     }
 }
 
 #[inline]
-unsafe fn set_need_resched(task: *mut TaskStruct) {
+unsafe fn set_need_resched(task: *mut TaskStruct) -> bool {
+    if task.is_null() {
+        return false;
+    }
+    let old_flags = unsafe {
+        (*task)
+            .thread_info
+            .flags
+            .fetch_or(crate::kernel::task::TIF_NEED_RESCHED, Ordering::Release)
+    };
+    old_flags & crate::kernel::task::TIF_NEED_RESCHED == 0
+}
+
+#[inline]
+pub(crate) fn set_task_need_resched(task: *mut TaskStruct) {
+    unsafe {
+        set_need_resched(task);
+    }
+}
+
+/// Acquire-load Linux's `task_struct::on_cpu` handoff flag.
+#[inline]
+pub(crate) fn task_on_cpu(task: *mut TaskStruct) -> bool {
+    !task.is_null() && unsafe { (*task).m29.on_cpu.load(Ordering::Acquire) != 0 }
+}
+
+#[inline]
+unsafe fn set_task_on_cpu(task: *mut TaskStruct, on_cpu: bool, ordering: Ordering) {
     if task.is_null() {
         return;
     }
     unsafe {
-        (*task).thread_info.flags |= crate::kernel::task::TIF_NEED_RESCHED;
+        (*task)
+            .m29
+            .on_cpu
+            .store(if on_cpu { 1 } else { 0 }, ordering);
     }
 }
 
@@ -541,20 +588,24 @@ pub unsafe fn finish_task_switch(prev: *mut TaskStruct) {
     // A remote exit_group can publish TASK_DEAD after the outgoing CPU passed
     // prepare_task_switch_release() but before the physical stack switch. Read
     // the state again here, exactly where Linux finish_task_switch() samples
-    // prev->__state. Keep on_cpu set until release finishes so another CPU can
-    // never mistake this still-owned stack for an immediately freeable task.
+    // prev->__state.
     let autoreap = !prev.is_null()
         && unsafe {
             (*prev).__state.load(Ordering::Acquire) == crate::kernel::task::task_state::TASK_DEAD
                 && (*prev).m26.exit_state == crate::kernel::task::task_state::EXIT_DEAD
         };
-    if deferred == prev || autoreap {
+
+    if !prev.is_null() {
+        unsafe {
+            // Match Linux finish_task(): publish that the incoming context no
+            // longer owns prev before any TASK_DEAD reclamation. Wakeup and
+            // migration paths pair with this release store.
+            set_task_on_cpu(prev, false, Ordering::Release);
+        }
+    }
+    if !prev.is_null() && (deferred == prev || autoreap) {
         unsafe {
             crate::kernel::exit::release_task(prev);
-        }
-    } else if !prev.is_null() {
-        unsafe {
-            (*prev).m29.on_cpu = 0;
         }
     }
 }
@@ -565,6 +616,8 @@ pub unsafe extern "C" fn schedule_tail(prev: *mut TaskStruct) {
     unsafe {
         finish_task_switch(prev);
     }
+    #[cfg(not(test))]
+    crate::kernel::locking::local_irq_enable();
 }
 
 #[inline]
@@ -575,15 +628,31 @@ fn task_allowed_on_cpu(task: *mut TaskStruct, cpu: u32) -> bool {
     unsafe { (*task).m29.cpus_mask.test(cpu) }
 }
 
-fn allowed_cpu_count(task: *mut TaskStruct) -> u32 {
+fn task_placement_mask(task: *mut TaskStruct) -> entity::CpuMask {
     if task.is_null() {
-        return 0;
+        return entity::CpuMask::empty();
     }
-    unsafe { (*task).m29.cpus_mask.weight() }
+    let allowed = unsafe { (*task).m29.cpus_mask.0 };
+    let storage_mask = if MAX_CPUS >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << MAX_CPUS) - 1
+    };
+    let active = cpu_active_mask().0 & storage_mask;
+    let eligible = allowed & active;
+    if eligible != 0 {
+        return entity::CpuMask(eligible);
+    }
+
+    // Linux's select_fallback_rq() ultimately widens an impossible affinity
+    // mask to a possible active CPU. Never strand ordinary work on an
+    // offline or half-initialized CPU merely because its saved mask became
+    // temporarily impossible.
+    entity::CpuMask(active)
 }
 
-fn idlest_allowed_cpu(mask: crate::kernel::sched::entity::CpuMask) -> u32 {
-    let mut best_cpu = 0;
+fn idlest_allowed_cpu(mask: entity::CpuMask) -> Option<u32> {
+    let mut best_cpu = None;
     let mut best_load = u32::MAX;
     for cpu in 0..MAX_CPUS as u32 {
         if !mask.test(cpu) {
@@ -591,18 +660,65 @@ fn idlest_allowed_cpu(mask: crate::kernel::sched::entity::CpuMask) -> u32 {
         }
         let load = rq::rq_nr_running(cpu).unwrap_or(u32::MAX);
         if load < best_load {
-            best_cpu = cpu;
+            best_cpu = Some(cpu);
             best_load = load;
         }
     }
     best_cpu
 }
 
-unsafe fn task_class(task: *mut TaskStruct) -> *const class::SchedClass {
+/// Flat-domain subset of Linux's wake-affine/idle-sibling placement.
+///
+/// Forks use lockless `nr_running` snapshots to pick the least-loaded CPU.
+/// Normal wakeups keep cache affinity unless an eligible sibling is completely
+/// idle. This avoids locking every active runqueue on futex/pipe wake storms.
+pub(super) fn select_idlest_active_cpu(task: *mut TaskStruct, prev_cpu: u32, flags: u32) -> u32 {
+    let eligible = task_placement_mask(task);
+    if flags & class::ENQUEUE_INITIAL != 0 || !eligible.test(prev_cpu) {
+        return idlest_allowed_cpu(eligible).unwrap_or_else(|| prev_cpu.min((MAX_CPUS - 1) as u32));
+    }
+
+    if rq::rq_nr_running(prev_cpu).unwrap_or(u32::MAX) == 0 {
+        return prev_cpu;
+    }
+    for cpu in 0..MAX_CPUS as u32 {
+        if cpu != prev_cpu
+            && eligible.test(cpu)
+            && rq::rq_nr_running(cpu).is_some_and(|load| load == 0)
+        {
+            return cpu;
+        }
+    }
+    prev_cpu
+}
+
+pub(crate) unsafe fn task_class(task: *mut TaskStruct) -> *const class::SchedClass {
     if task.is_null() {
         return core::ptr::null();
     }
     unsafe { (*task).m29.sched_class }
+}
+
+/// Linux `set_load_weight()` for the generic x86_64 configuration.
+///
+/// Lupos currently stores `SCHED_RESET_ON_FORK` in `m29.policy`, whereas Linux
+/// keeps it in a separate bitfield, so mask it before `task_has_idle_policy()`.
+/// Callers must keep the task off its runqueue; changing an on-rq entity also
+/// requires Linux's `reweight_entity()` accounting under that rq's lock.
+#[inline]
+pub(super) unsafe fn set_load_weight(task: *mut TaskStruct) {
+    if task.is_null() {
+        return;
+    }
+    let sched = unsafe { &mut (*task).m29 };
+    if (sched.policy & !prio::SCHED_RESET_ON_FORK) == prio::SCHED_IDLE {
+        sched.se.load.weight = prio::scale_load(prio::WEIGHT_IDLEPRIO);
+        sched.se.load.inv_weight = prio::WMULT_IDLEPRIO;
+    } else {
+        let nice = prio::prio_to_nice(sched.static_prio);
+        sched.se.load.weight = prio::nice_to_weight(nice);
+        sched.se.load.inv_weight = prio::nice_to_wmult(nice);
+    }
 }
 
 #[inline]
@@ -674,18 +790,53 @@ pub unsafe fn init_task_sched_from_parent(parent: *mut TaskStruct, child: *mut T
         sched.cpus_mask = entity::CpuMask::all();
     }
     sched.nr_cpus_allowed = sched.cpus_mask.weight() as i32;
-    let nice = prio::prio_to_nice(sched.static_prio);
-    sched.se.load.weight = prio::nice_to_weight(nice);
-    sched.se.load.inv_weight = prio::nice_to_wmult(nice);
-
     unsafe {
         (*child).m29 = sched;
         (*child).m29.cpus_ptr = &(*child).m29.cpus_mask as *const _;
-        (*child).m29.on_cpu = 0;
+        set_load_weight(child);
+        set_task_on_cpu(child, false, Ordering::Relaxed);
         (*child).m29.on_rq = 0;
         (*child).m29.se.on_rq = 0;
         (*child).m29.rt.on_rq = 0;
     }
+}
+
+/// Run Linux's class-aware wakeup preemption decision under the target rq lock
+/// and return whether this call newly set NEED_RESCHED.
+pub(super) unsafe fn wakeup_preempt_locked(
+    rq: &mut rq::Rq,
+    task: *mut TaskStruct,
+    flags: u32,
+) -> bool {
+    let current = rq.current;
+    if current.is_null() || task.is_null() || current == task {
+        return false;
+    }
+    if current == rq.idle {
+        return unsafe { set_need_resched(current) };
+    }
+
+    let waking_class = unsafe { task_class(task) };
+    let current_class = unsafe { task_class(current) };
+    if waking_class.is_null() || current_class.is_null() {
+        return false;
+    }
+    let task_prio = unsafe { (*waking_class).class_prio };
+    let current_prio = unsafe { (*current_class).class_prio };
+    if task_prio < current_prio {
+        return unsafe { set_need_resched(current) };
+    }
+    if task_prio > current_prio {
+        return false;
+    }
+
+    let already_set = task_needs_resched(current);
+    if let Some(preempt) = unsafe { (*waking_class).wakeup_preempt } {
+        unsafe {
+            preempt(rq, task, flags);
+        }
+    }
+    !already_set && task_needs_resched(current)
 }
 
 pub(crate) unsafe fn enqueue_on_rq(cpu: u32, task: *mut TaskStruct, flags: u32) {
@@ -696,11 +847,19 @@ pub(crate) unsafe fn enqueue_on_rq(cpu: u32, task: *mut TaskStruct, flags: u32) 
     if class.is_null() {
         return;
     }
-    let _ = rq::with_rq(cpu, |rq| unsafe {
+    let newly_set = rq::with_rq(cpu, |rq| unsafe {
+        if (*task).m29.on_rq != 0 {
+            return false;
+        }
+        (*task).thread_info.cpu = cpu;
         if let Some(enqueue) = (*class).enqueue_task {
             enqueue(rq, task, flags);
         }
+        wakeup_preempt_locked(rq, task, flags)
     });
+    if let Some(newly_set) = newly_set {
+        send_reschedule_ipi_for_transition(cpu, newly_set);
+    }
 }
 
 pub(crate) unsafe fn dequeue_from_rq(cpu: u32, task: *mut TaskStruct, flags: u32) -> bool {
@@ -761,19 +920,43 @@ pub fn find_pool_task_by_tgid(tgid: i32) -> *mut TaskStruct {
     found
 }
 
-pub fn request_reschedule(cpu: u32) {
-    let current = rq::with_rq(cpu, |rq| rq.current).unwrap_or(core::ptr::null_mut());
-    if current.is_null() {
-        return;
-    }
-    unsafe {
-        set_need_resched(current);
-    }
+#[inline]
+fn reschedule_ipi_required(
+    newly_set: bool,
+    target_cpu: u32,
+    this_cpu: u32,
+    target_active: bool,
+) -> bool {
+    newly_set && target_cpu != this_cpu && target_active
+}
+
+#[inline]
+pub(super) fn send_reschedule_ipi_for_transition(cpu: u32, newly_set: bool) {
     #[cfg(not(test))]
-    if cpu != current_cpu() {
+    if reschedule_ipi_required(newly_set, cpu, current_cpu(), cpu_active_mask().test(cpu)) {
         unsafe {
             crate::arch::x86::kernel::idt::send_reschedule_ipi(cpu as u8);
         }
+    }
+    #[cfg(test)]
+    let _ = (cpu, newly_set);
+}
+
+pub fn request_reschedule(cpu: u32) {
+    let requested = rq::with_rq(cpu, |rq| {
+        if rq.current.is_null() {
+            return false;
+        }
+        unsafe {
+            // Stabilize rq->current under the target rq lock, then publish
+            // NEED_RESCHED before the IPI exactly like Linux resched_curr().
+            // Linux's __resched_curr() returns immediately when the flag is
+            // already set, coalescing repeated remote reschedule IPIs.
+            set_need_resched(rq.current)
+        }
+    });
+    if let Some(newly_set) = requested {
+        send_reschedule_ipi_for_transition(cpu, newly_set);
     }
 }
 
@@ -786,9 +969,10 @@ pub unsafe fn enqueue_task(task: *mut TaskStruct) {
     if production_smp_scheduler_enabled() {
         let cpu = select_task_rq(task, current_cpu(), class::ENQUEUE_WAKEUP);
         unsafe {
+            (*task).thread_info.cpu = cpu;
+            (*task).m29.wake_cpu = cpu as i32;
             enqueue_on_rq(cpu, task, class::ENQUEUE_WAKEUP);
         }
-        request_reschedule(cpu);
         return;
     }
     legacy_place_after_current(task);
@@ -950,11 +1134,45 @@ unsafe fn pick_next_task(rq: &mut rq::Rq) -> *mut TaskStruct {
     rq.idle
 }
 
+/// Complete the previous task's class bookkeeping before selecting its
+/// successor.
+///
+/// Kept separate from `__schedule()` so the class-hook behavior of the real
+/// production path can be exercised by a focused regression test. Linux
+/// samples `prev->__state` and blocks/dequeues a sleeping task before
+/// `pick_next_task()` reaches its class `put_prev_task()` bookkeeping.
+unsafe fn prepare_prev_for_pick(this_rq: &mut rq::Rq, prev: *mut TaskStruct) {
+    let prev_class = unsafe { task_class(prev) };
+    let prev_state = unsafe { (*prev).__state.load(Ordering::Acquire) };
+    if prev != this_rq.idle
+        && prev_state & crate::kernel::task::task_state::NON_RUNNABLE_MASK != 0
+        && unsafe { (*prev).m29.on_rq != 0 }
+        && !prev_class.is_null()
+        && let Some(dequeue) = unsafe { (*prev_class).dequeue_task }
+    {
+        let _ = unsafe { dequeue(this_rq, prev, class::DEQUEUE_SLEEP) };
+    }
+
+    if !prev_class.is_null() {
+        if let Some(put_prev) = unsafe { (*prev_class).put_prev_task } {
+            unsafe {
+                put_prev(this_rq, prev);
+            }
+        }
+    }
+}
+
 /// Production per-CPU scheduler path used once APs join normal scheduling.
 pub unsafe fn __schedule() {
+    // Linux disables local IRQs before taking rq->lock and keeps them disabled
+    // through context_switch()/finish_task_switch(). The inner with_rq() sees
+    // IF already clear, so its irq-restore cannot reopen the select-to-switch
+    // window after dropping the runqueue lock.
+    let irq_flags = crate::kernel::locking::local_irq_save();
     let cpu = current_cpu();
     let current = unsafe { get_current() };
     if current.is_null() {
+        crate::kernel::locking::local_irq_restore(irq_flags);
         return;
     }
 
@@ -962,25 +1180,24 @@ pub unsafe fn __schedule() {
         this_rq.update_rq_clock();
 
         let prev = current;
-        let prev_class = task_class(prev);
-        if !prev_class.is_null() {
-            if let Some(put_prev) = (*prev_class).put_prev_task {
-                put_prev(this_rq, prev);
-            }
-        }
+        prepare_prev_for_pick(this_rq, prev);
 
         let picked = pick_next_task(this_rq);
         let next = if !picked.is_null() && task_can_switch_to(picked) {
             picked
+        } else if this_rq.idle != prev && task_can_switch_to(this_rq.idle) {
+            this_rq.idle
         } else {
             prev
         };
         clear_need_resched(prev);
         if !next.is_null() && next != prev {
-            (*next).m29.on_cpu = 1;
             (*next).thread_info.cpu = cpu;
             (*next).m29.recent_used_cpu = cpu as i32;
             (*next).m29.wake_cpu = cpu as i32;
+            // Publish the CPU fields before the on_cpu handoff. Remote
+            // kick/migration paths acquire-load on_cpu before consuming them.
+            set_task_on_cpu(next, true, Ordering::Release);
         }
         this_rq.current = next;
         (prev, next)
@@ -990,8 +1207,9 @@ pub unsafe fn __schedule() {
     if prev == next || next.is_null() {
         unsafe {
             clear_need_resched(current);
-            (*current).m29.on_cpu = 1;
         }
+        debug_assert!(task_on_cpu(current));
+        crate::kernel::locking::local_irq_restore(irq_flags);
         return;
     }
 
@@ -1005,26 +1223,41 @@ pub unsafe fn __schedule() {
         let last = __switch_to_asm(prev, next);
         finish_task_switch(last);
     }
+    crate::kernel::locking::local_irq_restore(irq_flags);
 }
 
 /// Main scheduler entry point.
 ///
-/// The legacy global queue remains active until the production SMP scheduler
-/// has at least one AP online.  From that point on, all runnable placement and
-/// switching happens via per-CPU runqueues.
+/// `sched_prepare_smp()` enables the production scheduler before the first AP
+/// is launched. From that point on, all runnable placement and switching
+/// happens via per-CPU runqueues.
 ///
 /// Returns `true` when the cooperative (legacy) path found the system idle
 /// (see `legacy_schedule()`). Always `false` under the production SMP
 /// scheduler, which has its own idle scheduling class.
 pub unsafe fn schedule() -> bool {
     crate::kernel::watchdog::touch_softlockup_watchdog_sched();
-    #[cfg(not(test))]
-    crate::kernel::softirq::do_softirq();
     if production_smp_scheduler_enabled() {
         unsafe { __schedule() };
         false
     } else {
         unsafe { legacy_schedule() }
+    }
+}
+
+/// Schedule from a per-CPU idle task.
+///
+/// Linux keeps idle tasks in TASK_RUNNING and uses `schedule_idle()` instead
+/// of the normal blocking-work path. Repeat until a concurrent reschedule
+/// request has been consumed.
+pub unsafe fn schedule_idle() {
+    loop {
+        unsafe {
+            __schedule();
+        }
+        if !current_needs_resched() {
+            break;
+        }
     }
 }
 
@@ -1137,9 +1370,7 @@ pub unsafe fn schedule_with_irqs_enabled() {
             }
             crate::kernel::locking::local_irq_disable();
             let woke = unsafe { task_runnable(current) };
-            let need_resched = unsafe {
-                (*current).thread_info.flags & crate::kernel::task::TIF_NEED_RESCHED != 0
-            };
+            let need_resched = task_needs_resched(current);
             if woke || need_resched {
                 crate::kernel::locking::local_irq_enable();
                 continue;
@@ -1203,7 +1434,7 @@ pub(crate) unsafe fn sched_alloc_kthread_raw(
 
     unsafe {
         (*task).thread_info = ThreadInfo {
-            flags: 0,
+            flags: AtomicU64::new(0),
             syscall_work: 0,
             status: 0,
             cpu: 0,
@@ -1219,8 +1450,10 @@ pub(crate) unsafe fn sched_alloc_kthread_raw(
         // Initialise the M29 scheduler block (CFS by default, nice 0).
         (*task).m29 = crate::kernel::task::M29SchedFields::zeroed();
         (*task).m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
-        (*task).m29.se.load.weight = prio::NICE_0_LOAD;
-        (*task).m29.se.load.inv_weight = prio::SCHED_PRIO_TO_WMULT[20]; // nice 0
+        (*task).m29.cpus_mask = entity::CpuMask::all();
+        (*task).m29.cpus_ptr = &(*task).m29.cpus_mask as *const _;
+        (*task).m29.nr_cpus_allowed = (*task).m29.cpus_mask.weight() as i32;
+        set_load_weight(task);
 
         let sp = stack_top as *mut u64;
         sp.sub(1).write(entry_fn); // return address → entry_fn
@@ -1333,8 +1566,8 @@ unsafe extern "C" fn kthread_entry_stub() -> ! {
 /// and sets it as `current` for the BSP's CPU.  The BSP task's `thread.sp`
 /// is written by `__switch_to_asm` the first time the BSP calls `schedule()`.
 ///
-/// Must be called after LAPIC is initialised (so `apic::id()` returns a valid
-/// CPU ID) and before any call to `schedule()` or `kthread_create()`.
+/// Must be called after the BSP per-CPU segment is installed and before any
+/// call to `schedule()` or `kthread_create()`.
 ///
 /// # Safety
 /// Must be called exactly once, from `kernel_main`, before interrupts are
@@ -1345,7 +1578,7 @@ pub unsafe fn sched_init() {
 
     unsafe {
         (*bsp_task).thread_info = ThreadInfo {
-            flags: 0,
+            flags: AtomicU64::new(0),
             syscall_work: 0,
             status: 0,
             cpu: 0,
@@ -1359,7 +1592,13 @@ pub unsafe fn sched_init() {
         (*bsp_task).m29 = crate::kernel::task::M29SchedFields::zeroed();
         (*bsp_task).m29.sched_class = &idle::IDLE_SCHED_CLASS as *const class::SchedClass;
         (*bsp_task).m29.policy = prio::SCHED_NORMAL;
+        (*bsp_task).m29.cpus_mask = entity::CpuMask::one(0);
         (*bsp_task).m29.cpus_ptr = &(*bsp_task).m29.cpus_mask as *const _;
+        (*bsp_task).m29.nr_cpus_allowed = 1;
+        (*bsp_task).m29.on_rq = 1;
+        (*bsp_task).m29.recent_used_cpu = 0;
+        (*bsp_task).m29.wake_cpu = 0;
+        set_task_on_cpu(bsp_task, true, Ordering::Relaxed);
         (*bsp_task).thread_info.cpu = 0;
 
         // Linux's idle task is a real task and must eventually have a real
@@ -1399,6 +1638,8 @@ pub unsafe fn sched_init() {
     // Reserve slot 0 for the BSP task so kthread_create() starts at slot 1.
     KTHREAD_COUNT.store(1, Ordering::Relaxed);
 
+    crate::kernel::cpuhotplug::reset_cpu_maps();
+
     // M29: bring up per-CPU runqueues and the sched_domain hierarchy.
     rq::init_rqs();
     topology::init_sched_domains();
@@ -1408,9 +1649,66 @@ pub unsafe fn sched_init() {
         rq0.idle = bsp_task;
         rq0.current = bsp_task;
     });
-    SCHED_ACTIVE_CPUS.store(1, Ordering::Release);
     SCHED_ONLINE_CPUS.store(1, Ordering::Release);
-    crate::kernel::cpuhotplug::reset_cpu_maps();
+    SMP_SCHED_PREPARED.store(false, Ordering::Release);
+    PRODUCTION_SCHED_ENABLED.store(false, Ordering::Release);
+}
+
+/// Transfer the BSP's legacy queue into CPU0's production runqueue.
+///
+/// This is the Lupos equivalent of completing the boot scheduler foundation
+/// before `smp_init()`: it runs while CPU0 is the only executing CPU and IRQs
+/// are disabled, so no task can be visible in both queue implementations.
+/// Single-CPU boots never call this function and retain the legacy scheduler.
+pub unsafe fn sched_prepare_smp() {
+    if SMP_SCHED_PREPARED.load(Ordering::Acquire) {
+        return;
+    }
+    #[cfg(not(test))]
+    debug_assert!(crate::kernel::locking::irqs_disabled());
+    debug_assert_eq!(current_cpu(), 0);
+
+    let bsp_idle = unsafe { get_current() };
+    let mut legacy_tasks = [core::ptr::null_mut(); MAX_RUN_QUEUE];
+    let mut task_count = 0usize;
+    with_legacy_run_queue(|legacy| {
+        legacy.normalize_legacy();
+        task_count = legacy.len;
+        legacy_tasks[..task_count].copy_from_slice(legacy.active_tasks());
+        legacy.tasks = [core::ptr::null_mut(); MAX_RUN_QUEUE];
+        legacy.len = 0;
+        legacy.current_idx = 0;
+    });
+
+    for &task in legacy_tasks[..task_count].iter() {
+        if task.is_null() || task == bsp_idle {
+            continue;
+        }
+        unsafe {
+            if (*task).m29.sched_class.is_null()
+                || (*task).m29.sched_class == &idle::IDLE_SCHED_CLASS as *const class::SchedClass
+            {
+                (*task).m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
+            }
+            if (*task).m29.cpus_mask.weight() == 0 {
+                (*task).m29.cpus_mask = entity::CpuMask::all();
+                (*task).m29.cpus_ptr = &(*task).m29.cpus_mask as *const _;
+                (*task).m29.nr_cpus_allowed = (*task).m29.cpus_mask.weight() as i32;
+            }
+            (*task).m29.on_rq = 0;
+            (*task).m29.se.on_rq = 0;
+            (*task).m29.rt.on_rq = 0;
+            (*task).thread_info.cpu = 0;
+            (*task).m29.wake_cpu = 0;
+            enqueue_on_rq(0, task, class::ENQUEUE_INITIAL);
+        }
+    }
+
+    SMP_SCHED_PREPARED.store(true, Ordering::Release);
+    PRODUCTION_SCHED_ENABLED.store(true, Ordering::Release);
+    if rq::rq_nr_running(0).unwrap_or(0) != 0 {
+        request_reschedule(0);
+    }
 }
 
 /// Bring an AP into the production scheduler as that CPU's idle task.
@@ -1418,13 +1716,16 @@ pub unsafe fn sched_init() {
 /// The AP continues executing on its trampoline-provided kernel stack until it
 /// first switches away; from that point forward `__switch_to_asm` owns the
 /// saved `thread.sp` exactly like the BSP path.
-pub unsafe fn sched_init_ap(cpu: u32) -> *mut TaskStruct {
-    let cpu = (cpu as usize).min(MAX_CPUS - 1);
+pub unsafe fn sched_init_ap(cpu: u32, exact_stack_top: usize) -> *mut TaskStruct {
+    assert!(SMP_SCHED_PREPARED.load(Ordering::Acquire));
+    assert!(cpu > 0 && (cpu as usize) < MAX_CPUS);
+    assert!(exact_stack_top != 0 && exact_stack_top % 16 == 0);
+    let cpu = cpu as usize;
     let idle_task = unsafe { &raw mut AP_IDLE_TASKS[cpu] };
 
     unsafe {
         (*idle_task).thread_info = ThreadInfo {
-            flags: 0,
+            flags: AtomicU64::new(0),
             syscall_work: 0,
             status: 0,
             cpu: cpu as u32,
@@ -1440,10 +1741,14 @@ pub unsafe fn sched_init_ap(cpu: u32) -> *mut TaskStruct {
         (*idle_task).m29.cpus_mask = crate::kernel::sched::entity::CpuMask::one(cpu as u32);
         (*idle_task).m29.cpus_ptr = &(*idle_task).m29.cpus_mask as *const _;
         (*idle_task).m29.nr_cpus_allowed = 1;
-        (*idle_task).m29.on_cpu = 1;
-        // Like Linux `init_idle()`, AP idle tasks are real per-CPU tasks. The
-        // trampoline stack becomes their saved task stack on first switch-away.
-        (*idle_task).stack = core::ptr::null_mut();
+        (*idle_task).m29.on_rq = 1;
+        (*idle_task).m29.recent_used_cpu = cpu as i32;
+        (*idle_task).m29.wake_cpu = cpu as i32;
+        set_task_on_cpu(idle_task, true, Ordering::Relaxed);
+        // Like Linux `init_idle()`, AP idle tasks have a real, exact task stack.
+        // The architecture guarantees KTHREAD_STACK_SIZE usable bytes below
+        // this top and executes on that same stack when entering this function.
+        (*idle_task).stack = exact_stack_top as *mut core::ffi::c_void;
         (*idle_task).thread = ThreadStruct {
             tls_array: [DescStruct(0); 3],
             sp: 0,
@@ -1461,9 +1766,7 @@ pub unsafe fn sched_init_ap(cpu: u32) -> *mut TaskStruct {
 
     #[cfg(not(test))]
     unsafe {
-        // AP_READY_COUNT is intentionally published only after the AP is fully
-        // initialized, so select the per-CPU current slot from the explicit
-        // logical CPU rather than current_cpu_index()'s pre-online fast path.
+        // Install the explicit logical-CPU slot before readiness publication.
         set_current_on_cpu(cpu, idle_task);
     }
     #[cfg(test)]
@@ -1474,11 +1777,43 @@ pub unsafe fn sched_init_ap(cpu: u32) -> *mut TaskStruct {
         this_rq.idle = idle_task;
         this_rq.current = idle_task;
     });
-    SCHED_ACTIVE_CPUS.fetch_or(1u64 << cpu, Ordering::AcqRel);
-    SCHED_ONLINE_CPUS.fetch_add(1, Ordering::AcqRel);
-    crate::kernel::cpuhotplug::set_cpu_online(cpu as u32, true);
-    PRODUCTION_SCHED_ENABLED.store(true, Ordering::Release);
     idle_task
+}
+
+/// Publish a fully initialized AP for ordinary scheduler placement.
+///
+/// Architecture bring-up calls this after scheduler state and the local
+/// clockevent are ready, but before publishing its AP-ready state and before
+/// enabling local interrupts. Linux publishes online before active; the
+/// active-mask release is the final scheduler-readiness transition.
+pub(crate) fn sched_activate_cpu(cpu: u32) {
+    assert!(SMP_SCHED_PREPARED.load(Ordering::Acquire));
+    assert!(cpu > 0 && (cpu as usize) < MAX_CPUS);
+    #[cfg(not(test))]
+    debug_assert!(crate::kernel::locking::irqs_disabled());
+    let ready = rq::with_rq(cpu, |rq| !rq.idle.is_null() && rq.current == rq.idle);
+    assert_eq!(ready, Some(true));
+
+    let was_active = cpu_active_mask().test(cpu);
+    crate::kernel::cpuhotplug::set_cpu_online(cpu, true);
+    assert!(crate::kernel::cpuhotplug::set_cpu_active(cpu, true));
+    if !was_active {
+        // Count scheduler-active CPUs only after the active-mask release.
+        SCHED_ONLINE_CPUS.fetch_add(1, Ordering::AcqRel);
+    }
+    if rq::rq_nr_running(cpu).unwrap_or(0) != 0 {
+        request_reschedule(cpu);
+    }
+}
+
+/// Build the final boot sched-domain span after all APs are active.
+pub fn sched_init_smp() {
+    assert!(SMP_SCHED_PREPARED.load(Ordering::Acquire));
+    let expected = crate::arch::x86::kernel::smp::AP_READY_COUNT.load(Ordering::Acquire) + 1;
+    while SCHED_ONLINE_CPUS.load(Ordering::Acquire) < expected {
+        core::hint::spin_loop();
+    }
+    topology::init_sched_domains();
 }
 
 // ── M29: scheduler_tick() — invoked from the LAPIC timer ISR ─────────────────
@@ -1502,7 +1837,7 @@ pub fn scheduler_tick() {
         return;
     }
 
-    let cpu = unsafe { apic::id() } as u32;
+    let cpu = current_cpu();
     let mut run_balance = false;
     let _ = rq::with_rq(cpu, |this_rq| {
         this_rq.update_rq_clock();
@@ -1517,14 +1852,23 @@ pub fn scheduler_tick() {
         }
         // Periodic load balance (M31).
         if this_rq.clock.saturating_sub(this_rq.last_balance_tick)
-            >= balance::DEFAULT_BALANCE_INTERVAL_TICKS * 25_000_000
+            >= balance::DEFAULT_BALANCE_INTERVAL_TICKS * crate::kernel::time::jiffies::NSEC_PER_TICK
         {
             this_rq.last_balance_tick = this_rq.clock;
             run_balance = production_smp_scheduler_enabled();
         }
     });
     if run_balance {
-        balance::run_periodic_balance(cpu);
+        BALANCE_PENDING[cpu as usize].store(true, Ordering::Release);
+        crate::kernel::softirq::raise_softirq(crate::kernel::softirq::SoftIrqVec::Sched);
+    }
+}
+
+/// Linux `run_rebalance_domains()` SCHED_SOFTIRQ action.
+pub fn run_rebalance_softirq() {
+    let cpu = current_cpu() as usize;
+    if cpu < MAX_CPUS && BALANCE_PENDING[cpu].swap(false, Ordering::AcqRel) {
+        balance::run_periodic_balance(cpu as u32);
     }
 }
 
@@ -1550,7 +1894,6 @@ pub unsafe fn wake_up_new_task(p: *mut TaskStruct) {
         (*p).m29.recent_used_cpu = cpu as i32;
         (*p).m29.wake_cpu = cpu as i32;
         enqueue_on_rq(cpu, p, class::ENQUEUE_INITIAL);
-        request_reschedule(cpu);
     }
 }
 
@@ -1558,37 +1901,21 @@ pub fn select_task_rq(p: *mut TaskStruct, prev_cpu: u32, flags: u32) -> u32 {
     if p.is_null() {
         return prev_cpu;
     }
-    let allowed = unsafe { (*p).m29.cpus_mask };
-    if allowed.weight() == 0 {
-        return prev_cpu;
-    }
-    // Lupos's APs do not run the scheduler: `ap_main` brings each AP up and then
-    // spins in a `hlt` idle loop (it never calls `schedule()`), so only the BSP
-    // (CPU 0) ever executes tasks. Load-balancing a waking task onto an "idlest"
-    // AP runqueue (which always looks idlest because APs never run anything)
-    // would leave that task permanently un-scheduled — the multi-CPU boot hang.
-    // Until APs actually run the scheduler, keep every runnable task on the BSP.
-    if allowed.test(SCHEDULING_CPU) {
-        return SCHEDULING_CPU;
-    }
+    let eligible = task_placement_mask(p);
     let class = unsafe { task_class(p) };
     if !class.is_null() {
         if let Some(select) = unsafe { (*class).select_task_rq } {
             let cpu = unsafe { select(p, prev_cpu, flags) };
-            if allowed.test(cpu) {
+            if eligible.test(cpu) {
                 return cpu;
             }
         }
     }
-    if allowed.test(prev_cpu) && rq::rq_nr_running(prev_cpu).is_some() {
+    if eligible.test(prev_cpu) && rq::rq_nr_running(prev_cpu).is_some() {
         return prev_cpu;
     }
-    idlest_allowed_cpu(allowed)
+    idlest_allowed_cpu(eligible).unwrap_or_else(|| prev_cpu.min((MAX_CPUS - 1) as u32))
 }
-
-/// The only CPU that actually runs the task scheduler today: the BSP. APs are
-/// brought up but idle in `ap_main` (see the note in `select_task_rq`).
-pub(crate) const SCHEDULING_CPU: u32 = 0;
 
 /// Wake a blocked task onto an allowed CPU and request reschedule there.
 pub unsafe fn try_to_wake_up(p: *mut TaskStruct, wake_flags: u32) -> bool {
@@ -1597,39 +1924,96 @@ pub unsafe fn try_to_wake_up(p: *mut TaskStruct, wake_flags: u32) -> bool {
     }
     let exit_mask =
         crate::kernel::task::task_state::EXIT_ZOMBIE | crate::kernel::task::task_state::EXIT_DEAD;
-    unsafe {
-        // Linux never makes an exiting task runnable again. In particular, a
-        // late SIGKILL may still resolve a zombie PID; blindly storing
-        // TASK_RUNNING here would resurrect that zombie and leave its parent
-        // spinning forever between exit_state and __state publication.
-        let state = (*p).__state.load(Ordering::Acquire);
-        if (*p).m26.exit_state & exit_mask != 0
-            || state & (exit_mask | crate::kernel::task::task_state::TASK_DEAD) != 0
-        {
-            return false;
-        }
-        (*p).__state.store(
-            crate::kernel::task::task_state::TASK_RUNNING,
-            Ordering::Release,
-        );
+    // Linux never makes an exiting task runnable again. In particular, a late
+    // SIGKILL may still resolve a zombie PID.
+    let state = unsafe { (*p).__state.load(Ordering::Acquire) };
+    if unsafe { (*p).m26.exit_state } & exit_mask != 0
+        || state & (exit_mask | crate::kernel::task::task_state::TASK_DEAD) != 0
+    {
+        return false;
     }
     if !production_smp_scheduler_enabled() {
+        unsafe {
+            (*p).__state.store(
+                crate::kernel::task::task_state::TASK_RUNNING,
+                Ordering::Release,
+            );
+        }
         legacy_place_after_current(p);
         unsafe {
             set_need_resched(get_current());
         }
         return true;
     }
-    if unsafe { (*p).m29.on_rq } != 0 {
-        request_reschedule(unsafe { (*p).thread_info.cpu });
+
+    if state == crate::kernel::task::task_state::TASK_RUNNING
+        || state == crate::kernel::task::task_state::TASK_WAKING
+        || unsafe {
+            (*p).__state.compare_exchange(
+                state,
+                crate::kernel::task::task_state::TASK_WAKING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+        }
+        .is_err()
+    {
+        return false;
+    }
+
+    let owner_cpu = unsafe { (*p).thread_info.cpu };
+    let queued_resched = rq::with_rq(owner_cpu, |owner_rq| unsafe {
+        if (*p).m29.on_rq == 0 {
+            return (false, false);
+        }
+        (*p).__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+        // Linux ttwu_runnable() runs the class-specific wakeup-preemption
+        // decision while the owner rq is locked.
+        (true, wakeup_preempt_locked(owner_rq, p, wake_flags))
+    });
+    if let Some((true, newly_set)) = queued_resched {
+        send_reschedule_ipi_for_transition(owner_cpu, newly_set);
         return true;
     }
-    let target_cpu = select_task_rq(p, unsafe { (*p).thread_info.cpu }, wake_flags);
-    unsafe {
-        enqueue_on_rq(target_cpu, p, class::ENQUEUE_WAKEUP | wake_flags);
-        (*p).thread_info.cpu = target_cpu;
+
+    // `finish_task_switch()` release-clears on_cpu only after the outgoing
+    // CPU's final reference. Do not change task_cpu or enqueue until then.
+    while task_on_cpu(p) {
+        core::hint::spin_loop();
     }
-    request_reschedule(target_cpu);
+
+    let target_cpu = select_task_rq(p, owner_cpu, wake_flags);
+    let enqueued = rq::with_rq(target_cpu, |target_rq| unsafe {
+        let class = task_class(p);
+        if class.is_null() {
+            return (false, false);
+        }
+        (*p).thread_info.cpu = target_cpu;
+        (*p).m29.recent_used_cpu = owner_cpu as i32;
+        (*p).m29.wake_cpu = target_cpu as i32;
+        if (*p).m29.on_rq == 0
+            && let Some(enqueue) = (*class).enqueue_task
+        {
+            enqueue(target_rq, p, class::ENQUEUE_WAKEUP | wake_flags);
+        }
+        (*p).__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+        let queued = (*p).m29.on_rq != 0;
+        let newly_set = queued && wakeup_preempt_locked(target_rq, p, wake_flags);
+        (queued, newly_set)
+    });
+    let Some((true, newly_set)) = enqueued else {
+        unsafe {
+            (*p).__state.store(state, Ordering::Release);
+        }
+        return false;
+    };
+    send_reschedule_ipi_for_transition(target_cpu, newly_set);
     true
 }
 
@@ -1697,6 +2081,85 @@ mod tests {
         rq.tasks = [core::ptr::null_mut(); MAX_RUN_QUEUE];
         rq.len = 0;
         rq.current_idx = 0;
+    }
+
+    #[test]
+    fn need_resched_transition_is_reported_only_once() {
+        // Linux __resched_curr() returns when TIF_NEED_RESCHED is already set,
+        // so only the first transition may trigger a remote reschedule IPI.
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+        task.thread_info
+            .flags
+            .store(crate::kernel::task::TIF_SIGPENDING, Ordering::Relaxed);
+
+        assert!(unsafe { set_need_resched(task_ptr) });
+        assert!(!unsafe { set_need_resched(task_ptr) });
+        assert_eq!(
+            task.thread_info.flags.load(Ordering::Acquire),
+            crate::kernel::task::TIF_SIGPENDING | crate::kernel::task::TIF_NEED_RESCHED,
+            "setting NEED_RESCHED must preserve unrelated thread-info flags"
+        );
+    }
+
+    #[test]
+    fn blocking_fair_prev_is_not_transiently_reinserted_before_dequeue() {
+        // Linux __schedule() reaches try_to_block_task()->block_task() before
+        // fair's put_prev_entity(). Consequently put_prev sees on_rq == 0 and
+        // never inserts a sleeping current entity into the CFS rb-tree.
+        let mut rq = rq::Rq::new(0);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        task.m29 = M29SchedFields::zeroed();
+        let task_ptr = &mut *task as *mut TaskStruct;
+
+        task.m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
+        task.m29.on_rq = 1;
+        task.m29.se.on_rq = 1;
+        task.m29.se.load.weight = prio::NICE_0_LOAD;
+        task.__state.store(
+            crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+            Ordering::Release,
+        );
+        rq.current = task_ptr;
+        rq.cfs.current = task_ptr;
+        rq.nr_running = 1;
+        rq.cfs.nr_running = 1;
+        rq.cfs.load_weight = prio::NICE_0_LOAD;
+
+        let run_node = core::ptr::addr_of!(task.m29.se.run_node);
+        assert_eq!(task.m29.se.run_node.__rb_parent_color, 0);
+        assert!(rq.cfs.tasks_timeline.is_empty());
+
+        unsafe {
+            prepare_prev_for_pick(&mut rq, task_ptr);
+        }
+
+        assert_eq!(task.m29.on_rq, 0);
+        assert_eq!(task.m29.se.on_rq, 0);
+        assert_eq!(rq.nr_running, 0);
+        assert_eq!(rq.cfs.nr_running, 0);
+        assert!(rq.cfs.tasks_timeline.is_empty());
+        assert_ne!(
+            task.m29.se.run_node.__rb_parent_color, run_node as usize,
+            "RB_CLEAR_NODE proves put_prev transiently inserted the sleeping current task before dequeue erased it"
+        );
+    }
+
+    #[test]
+    fn queued_remote_wake_uses_its_reschedule_transition_for_the_ipi() {
+        // Linux ttwu_runnable() invokes wakeup_preempt() under the owner rq
+        // lock, and __resched_curr() sends the remote IPI for that same
+        // TIF_NEED_RESCHED transition.
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let current_ptr = &mut *current as *mut TaskStruct;
+
+        let newly_set = unsafe { set_need_resched(current_ptr) };
+        assert!(reschedule_ipi_required(newly_set, 1, 0, true));
+
+        let duplicate = unsafe { set_need_resched(current_ptr) };
+        assert!(!reschedule_ipi_required(duplicate, 1, 0, true));
+        assert!(!reschedule_ipi_required(true, 0, 0, true));
+        assert!(!reschedule_ipi_required(true, 1, 0, false));
     }
 
     #[test]
@@ -1892,7 +2355,8 @@ mod tests {
         scheduler_tick();
 
         assert_ne!(
-            current.thread_info.flags & crate::kernel::task::TIF_NEED_RESCHED,
+            current.thread_info.flags.load(Ordering::Acquire)
+                & crate::kernel::task::TIF_NEED_RESCHED,
             0,
             "legacy timer tick must request reschedule without touching CFS runqueue state"
         );
@@ -1930,7 +2394,8 @@ mod tests {
         assert_eq!(rq.tasks[1], child_ptr);
         assert_eq!(rq.tasks[2], older_ptr);
         assert_ne!(
-            current.thread_info.flags & crate::kernel::task::TIF_NEED_RESCHED,
+            current.thread_info.flags.load(Ordering::Acquire)
+                & crate::kernel::task::TIF_NEED_RESCHED,
             0,
             "legacy fork placement must request a syscall-exit reschedule"
         );
@@ -1976,7 +2441,8 @@ mod tests {
             crate::kernel::task::task_state::TASK_RUNNING
         );
         assert_ne!(
-            current.thread_info.flags & crate::kernel::task::TIF_NEED_RESCHED,
+            current.thread_info.flags.load(Ordering::Acquire)
+                & crate::kernel::task::TIF_NEED_RESCHED,
             0,
             "legacy wakeup must request a syscall-exit reschedule"
         );
@@ -2020,7 +2486,10 @@ mod tests {
         let current_ptr = &mut *current as *mut TaskStruct;
         let stale_ptr = &mut *stale as *mut TaskStruct;
 
-        current.thread_info.flags |= crate::kernel::task::TIF_NEED_RESCHED;
+        current
+            .thread_info
+            .flags
+            .fetch_or(crate::kernel::task::TIF_NEED_RESCHED, Ordering::Release);
         unsafe {
             set_current(current_ptr);
         }
@@ -2038,7 +2507,8 @@ mod tests {
 
         assert_eq!(unsafe { get_current() }, current_ptr);
         assert_eq!(
-            current.thread_info.flags & crate::kernel::task::TIF_NEED_RESCHED,
+            current.thread_info.flags.load(Ordering::Acquire)
+                & crate::kernel::task::TIF_NEED_RESCHED,
             0,
             "absent current task should not switch through a stale queue entry"
         );
@@ -2052,7 +2522,10 @@ mod tests {
         let current_ptr = &mut *current as *mut TaskStruct;
         let sleeper_ptr = &mut *sleeper as *mut TaskStruct;
 
-        current.thread_info.flags |= crate::kernel::task::TIF_NEED_RESCHED;
+        current
+            .thread_info
+            .flags
+            .fetch_or(crate::kernel::task::TIF_NEED_RESCHED, Ordering::Release);
         current.thread.sp = 0x1000;
         sleeper.thread.sp = 0x2000;
         sleeper.__state.store(
@@ -2077,7 +2550,8 @@ mod tests {
 
         assert_eq!(unsafe { get_current() }, current_ptr);
         assert_eq!(
-            current.thread_info.flags & crate::kernel::task::TIF_NEED_RESCHED,
+            current.thread_info.flags.load(Ordering::Acquire)
+                & crate::kernel::task::TIF_NEED_RESCHED,
             0,
             "scheduler should clear resched when no runnable switch target exists"
         );
@@ -2095,7 +2569,10 @@ mod tests {
         let current_ptr = &mut *current as *mut TaskStruct;
         let stackless_ptr = &mut *stackless as *mut TaskStruct;
 
-        current.thread_info.flags |= crate::kernel::task::TIF_NEED_RESCHED;
+        current
+            .thread_info
+            .flags
+            .fetch_or(crate::kernel::task::TIF_NEED_RESCHED, Ordering::Release);
         current.thread.sp = 0x1000;
         stackless.__state.store(
             crate::kernel::task::task_state::TASK_RUNNING,
@@ -2120,7 +2597,8 @@ mod tests {
 
         assert_eq!(unsafe { get_current() }, current_ptr);
         assert_eq!(
-            current.thread_info.flags & crate::kernel::task::TIF_NEED_RESCHED,
+            current.thread_info.flags.load(Ordering::Acquire)
+                & crate::kernel::task::TIF_NEED_RESCHED,
             0,
             "stackless runnable tasks must not reach __switch_to_asm"
         );
@@ -2187,7 +2665,7 @@ mod tests {
             &child.m29.cpus_mask as *const entity::CpuMask
         );
         assert_eq!(child.m29.on_rq, 0);
-        assert_eq!(child.m29.on_cpu, 0);
+        assert_eq!(child.m29.on_cpu.load(Ordering::Relaxed), 0);
     }
 
     #[test]

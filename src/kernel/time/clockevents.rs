@@ -1,6 +1,8 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/time/clockevents.c
+//! linux-source: vendor/linux/kernel/time/tick-common.c
 //! test-origin: linux:vendor/linux/kernel/time/clockevents.c
+//! test-origin: linux:vendor/linux/kernel/time/tick-common.c
 //! Clockevents — M36.
 //!
 //! Mirrors `vendor/linux/kernel/time/clockevents.c`.  A `Clockevents` device
@@ -46,17 +48,43 @@ impl Clockevents {
 /// `tick_handle_periodic` callback count — one per LAPIC tick.
 static PERIODIC_TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// CPU responsible for Linux `do_timer()`/`update_wall_time()` work.
+///
+/// Linux's `tick_do_timer_cpu` can hand this role off for NOHZ and CPU hotplug.
+/// Lupos does not support either transition yet, so the always-online BSP owns
+/// the role.  Keeping a single owner is essential: every CPU still receives a
+/// local scheduler tick, but jiffies and wall time advance only once per period.
+pub const TICK_DO_TIMER_CPU: usize = 0;
+
+#[inline]
+pub const fn tick_do_timer_cpu(cpu: usize) -> bool {
+    cpu == TICK_DO_TIMER_CPU
+}
+
 /// Linux `tick_handle_periodic` — registered as the periodic callback.
 ///
 /// Order:
 ///   1. `do_timer` (advances jiffies + wall clock).
-///   2. `update_process_times` (per-task time accounting + scheduler tick).
-///   3. `hrtimer_run_queues` (expire any due hrtimers).
+///   2. `hrtimer_run_queues` (expire any due hrtimers).
+///
+/// `apic_timer::on_tick()` performs Linux's per-CPU
+/// `update_process_times()`/`scheduler_tick()` work after this callback.
 pub fn tick_handle_periodic() {
+    tick_handle_periodic_for_cpu(crate::arch::x86::kernel::setup_percpu::current_cpu_number());
+}
+
+/// CPU-explicit periodic tick handler, mirroring `tick_periodic(cpu)`.
+///
+/// The hrtimer implementation currently has one global queue rather than
+/// Linux's per-CPU bases.  Running that queue on the timekeeper CPU serializes
+/// callback execution and avoids all LAPICs contending on the same locks.
+pub fn tick_handle_periodic_for_cpu(cpu: usize) {
     PERIODIC_TICK_COUNT.fetch_add(1, Ordering::AcqRel);
-    super::jiffies::tick_jiffies();
-    super::timekeeping::tick_advance_walltime();
-    super::hrtimer::hrtimer_run_queues();
+    if tick_do_timer_cpu(cpu) {
+        super::jiffies::tick_jiffies();
+        super::timekeeping::tick_advance_walltime();
+        super::hrtimer::hrtimer_run_queues();
+    }
 }
 
 pub fn periodic_tick_count() -> u64 {
@@ -78,6 +106,12 @@ mod tests {
         let before = periodic_tick_count();
         tick_handle_periodic();
         assert_eq!(periodic_tick_count(), before + 1);
+    }
+
+    #[test]
+    fn only_timekeeper_cpu_owns_global_tick() {
+        assert!(tick_do_timer_cpu(TICK_DO_TIMER_CPU));
+        assert!(!tick_do_timer_cpu(TICK_DO_TIMER_CPU + 1));
     }
 
     #[test]

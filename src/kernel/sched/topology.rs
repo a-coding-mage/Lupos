@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/sched/topology.c
 //! test-origin: linux:vendor/linux/kernel/sched/topology.c
 //! `sched_domain` topology — M31.
@@ -6,6 +6,7 @@
 //! M29 ships an empty hierarchy; the SMP load balancer wires it in M31.
 
 use super::entity::CpuMask;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Linux `SD_*` domain flags.
 pub const SD_LOAD_BALANCE: u32 = 0x0001;
@@ -44,10 +45,24 @@ impl SchedDomain {
     }
 }
 
-/// Initialise the system's sched_domain hierarchy from APIC topology.
+/// CPUs covered by the boot-time scheduler domain.
 ///
-/// M29 stub: clears domain state.  M31 builds the SMT < MC < DIE < NUMA chain.
-pub fn init_sched_domains() {}
+/// Lupos currently has one flat domain. Keeping its span synchronized with
+/// `cpu_active_mask` preserves Linux's key placement invariant until SMT/MC
+/// child domains are represented.
+static SCHED_DOMAIN_CPUS: AtomicU64 = AtomicU64::new(1);
+
+/// Initialise the system's sched_domain hierarchy from the active CPU mask.
+///
+/// Linux builds the final domains in `sched_init_smp()` after AP activation.
+/// The flat Lupos domain follows the same publication point.
+pub fn init_sched_domains() {
+    SCHED_DOMAIN_CPUS.store(super::cpu_active_mask().0, Ordering::Release);
+}
+
+pub fn sched_domain_cpus() -> CpuMask {
+    CpuMask(SCHED_DOMAIN_CPUS.load(Ordering::Acquire))
+}
 
 #[cfg(test)]
 mod tests {

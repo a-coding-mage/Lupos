@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/sched/idle.c
 //! test-origin: linux:vendor/linux/kernel/sched/idle.c
 //! Idle scheduling class — `sched_class_idle`.
@@ -39,6 +39,69 @@ pub static IDLE_SCHED_CLASS: SchedClass = SchedClass {
     update_curr: None,
     select_task_rq: None,
 };
+
+/// One pass through Linux's generic `do_idle()` loop.
+///
+/// The final reschedule/softirq checks run with local IRQs disabled and are
+/// immediately followed by the contiguous `sti; hlt` pair. A wakeup that races
+/// with the check therefore either prevents the halt or leaves a pending IPI
+/// that wakes it without a lost-wakeup window.
+fn do_idle(cpu: u32) {
+    super::nohz::tick_nohz_idle_enter(cpu);
+    loop {
+        crate::kernel::watchdog::touch_softlockup_watchdog_sched();
+        crate::kernel::rcu::tasks_rcu_qs();
+        crate::kernel::rcu::rcu_qs();
+
+        if super::current_needs_resched() {
+            break;
+        }
+        if crate::kernel::softirq::local_softirq_pending() != 0 {
+            super::nohz::tick_nohz_idle_exit(cpu);
+            crate::kernel::softirq::do_softirq();
+            super::nohz::tick_nohz_idle_enter(cpu);
+            continue;
+        }
+
+        crate::kernel::locking::local_irq_disable();
+        if super::current_needs_resched() || crate::kernel::softirq::local_softirq_pending() != 0 {
+            crate::kernel::locking::local_irq_enable();
+            continue;
+        }
+
+        #[cfg(not(test))]
+        unsafe {
+            core::arch::asm!("sti; hlt", options(nostack));
+        }
+        #[cfg(test)]
+        {
+            crate::kernel::locking::local_irq_enable();
+            break;
+        }
+    }
+    super::nohz::tick_nohz_idle_exit(cpu);
+    unsafe {
+        super::schedule_idle();
+    }
+}
+
+/// Enter the per-CPU idle thread after architecture bring-up is complete.
+///
+/// The architecture must initialize the exact idle stack, current pointer,
+/// TSS/GS/FPU state, local APIC, and clockevent, then call
+/// `sched_activate_cpu()` before publishing its ready state or enabling local
+/// interrupts. This entry verifies that publication before entering idle.
+pub fn cpu_startup_entry() -> ! {
+    let cpu = super::current_cpu();
+    assert!(
+        super::cpu_active_mask().test(cpu),
+        "CPU entered idle before scheduler activation"
+    );
+    crate::kernel::locking::local_irq_enable();
+    loop {
+        do_idle(cpu);
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -148,7 +148,7 @@ ap_64bit:
     ; After this, the kernel's real GDT segments are active.
     ;
     ; We reload CS after loading the GDT via a 64-bit far return (retfq).
-    ; The new CS must be the BSP's KERNEL_CS = 0x08.
+    ; The new CS must be the BSP's Linux KERNEL_CS = 0x10.
     ; Reference: Intel SDM Vol. 3A §9.9.4 "Switching to Long Mode"
     ; DEBUG: 'a' before lgdt
     mov dx, 0x3F8
@@ -162,11 +162,11 @@ ap_64bit:
     mov al, 'b'
     out dx, al
 
-    ; Reload CS to 0x08 (BSP's KERNEL_CS) using 64-bit far return trick.
-    ; Push RIP (= address of .after_cs_reload) and CS (0x08), then retfq.
+    ; Reload CS to 0x10 (BSP's KERNEL_CS) using 64-bit far return trick.
+    ; Push RIP (= address of .after_cs_reload) and CS (0x10), then retfq.
     ; retfq pops RIP then CS, completing the far jump to the new segment.
-    ; Reload DS/ES/SS with BSP's KERNEL_DS = 0x10 before the far return.
-    mov ax, 0x10
+    ; Reload DS/ES/SS with BSP's KERNEL_DS = 0x18 before the far return.
+    mov ax, 0x18
     mov ds, ax
     mov es, ax
     mov ss, ax
@@ -191,7 +191,7 @@ ap_64bit:
     ; sequence uses a valid 64-bit stack instead of wrapping RSP=0.
     mov rsp, [0x8000 + 0x208]   ; ap_stack_top (u64) at offset 0x208
 
-    push qword 0x08                         ; new CS = BSP KERNEL_CS
+    push qword 0x10                         ; new CS = BSP KERNEL_CS
     lea  rax, [rel .after_cs_reload]
     push rax                                ; new RIP
     o64 retf                                ; 64-bit far return
@@ -202,8 +202,8 @@ ap_64bit:
     mov al, 'e'
     out dx, al
 
-    ; Reload DS/ES/SS with BSP's KERNEL_DS = 0x10.
-    mov ax, 0x10
+    ; Reload DS/ES/SS with BSP's KERNEL_DS = 0x18.
+    mov ax, 0x18
     mov ds, ax
     mov es, ax
     mov ss, ax
@@ -227,9 +227,9 @@ ap_64bit:
     out dx, al
 
     ; ── Set up the AP's private stack ─────────────────────────────────────
-    ; The BSP allocated a 16 KiB stack per AP and wrote the top address to
-    ; ap_stack_top (at offset 0x208).  x86 stacks grow downward, so RSP points
-    ; to the highest address in the stack region.
+    ; The BSP allocated a 64 KiB scheduler-compatible stack per AP and wrote
+    ; its top address to ap_stack_top (at offset 0x208).  x86 stacks grow
+    ; downward, so RSP points to the highest address in the stack region.
     mov rsp, [0x8000 + 0x208]   ; ap_stack_top (u64) at offset 0x208
     ; DEBUG: 'h' after stack setup
     mov dx, 0x3F8

@@ -63,8 +63,8 @@ pub const GDB_ORIG_AX: usize = 32;
 pub const DBG_MAX_REG_NUM: usize = 24;
 
 /// `__KERNEL_DS` / `__KERNEL_CS` GDT selectors.
-pub const KERNEL_DS: u32 = 0x10;
-pub const KERNEL_CS: u32 = 0x08;
+pub const KERNEL_DS: u32 = crate::arch::x86::kernel::gdt::sel::KERNEL_DS as u32;
+pub const KERNEL_CS: u32 = crate::arch::x86::kernel::gdt::sel::KERNEL_CS as u32;
 
 /// Per-register metadata in the GDB register table.
 #[derive(Debug, Clone, Copy)]

@@ -18,7 +18,10 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use super::irqflags::{
     IrqFlags, local_irq_disable, local_irq_enable, local_irq_restore, local_irq_save,
 };
-use super::preempt::{local_bh_disable, local_bh_enable, preempt_disable, preempt_enable};
+use super::preempt::{
+    SOFTIRQ_LOCK_OFFSET, linux___local_bh_disable_ip, linux___local_bh_enable_ip, preempt_disable,
+    preempt_enable,
+};
 use super::qspinlock::QSpinLock;
 use crate::kernel::module::{export_symbol, find_symbol};
 
@@ -98,7 +101,7 @@ pub unsafe extern "C" fn linux_raw_spin_unlock(lock: *mut QSpinLock) {
 /// `vendor/linux/include/linux/spinlock_api_smp.h:136`.
 #[unsafe(export_name = "_raw_spin_lock_bh")]
 pub unsafe extern "C" fn linux_raw_spin_lock_bh(lock: *mut QSpinLock) {
-    local_bh_disable();
+    linux___local_bh_disable_ip(0, SOFTIRQ_LOCK_OFFSET);
     unsafe { &*lock }.lock();
 }
 
@@ -107,7 +110,7 @@ pub unsafe extern "C" fn linux_raw_spin_lock_bh(lock: *mut QSpinLock) {
 #[unsafe(export_name = "_raw_spin_unlock_bh")]
 pub unsafe extern "C" fn linux_raw_spin_unlock_bh(lock: *mut QSpinLock) {
     unsafe { &*lock }.unlock();
-    local_bh_enable();
+    linux___local_bh_enable_ip(0, SOFTIRQ_LOCK_OFFSET);
 }
 
 /// `_raw_spin_lock_irqsave` —
@@ -389,6 +392,38 @@ mod tests {
         }
         let g = l.lock();
         assert_eq!(*g, 42);
+    }
+
+    #[test]
+    fn raw_spin_bh_uses_linux_softirq_lock_offset() {
+        // Origin: vendor/linux/include/linux/preempt.h::SOFTIRQ_LOCK_OFFSET
+        // and vendor/linux/include/linux/spinlock_api_smp.h::
+        // __raw_spin_lock_bh/__raw_spin_unlock_bh.
+        let linux_lock_offset = crate::kernel::locking::preempt::SOFTIRQ_DISABLE_OFFSET
+            + crate::kernel::locking::preempt::PREEMPT_OFFSET;
+        assert_eq!(linux_lock_offset, 0x0000_0201);
+
+        let before = crate::kernel::locking::preempt::preempt_count();
+        let lock = QSpinLock::new();
+        unsafe {
+            linux_raw_spin_lock_bh(&lock as *const QSpinLock as *mut QSpinLock);
+        }
+        let while_locked = crate::kernel::locking::preempt::preempt_count();
+        unsafe {
+            linux_raw_spin_unlock_bh(&lock as *const QSpinLock as *mut QSpinLock);
+        }
+        let after = crate::kernel::locking::preempt::preempt_count();
+
+        assert_eq!(
+            while_locked,
+            before + linux_lock_offset,
+            "_raw_spin_lock_bh must add SOFTIRQ_LOCK_OFFSET"
+        );
+        assert_eq!(
+            after, before,
+            "_raw_spin_unlock_bh must restore the exact incoming preempt count"
+        );
+        assert!(!lock.is_locked());
     }
 
     #[test]

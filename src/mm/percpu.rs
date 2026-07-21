@@ -70,7 +70,7 @@ static PERCPU_STATE: Mutex<PerCpuState> = Mutex::new(PerCpuState::new());
 
 /// Static per-CPU array. Used via `DEFINE_PER_CPU`-style declarations.
 pub struct PerCpu<T: 'static> {
-    /// Storage for each CPU. Indexed by `apic::id().min(MAX_CPUS - 1)`.
+    /// Storage for each dense logical CPU number.
     pub slots: [T; MAX_CPUS],
 }
 
@@ -87,20 +87,7 @@ impl<T: 'static + Copy> PerCpu<T> {
 
 #[inline]
 pub fn cpu_index() -> usize {
-    #[cfg(test)]
-    return 0;
-    #[cfg(not(test))]
-    {
-        // Skip the LAPIC MMIO read (a VM-exit on VBox) when only the BSP is
-        // online; single-CPU per-CPU access always resolves to index 0.
-        if crate::arch::x86::kernel::smp::AP_READY_COUNT.load(core::sync::atomic::Ordering::Acquire)
-            == 0
-        {
-            return 0;
-        }
-        let id = unsafe { crate::arch::x86::kernel::apic::id() } as usize;
-        id.min(MAX_CPUS - 1)
-    }
+    crate::arch::x86::kernel::setup_percpu::current_cpu_number()
 }
 
 /// `this_cpu_ptr(&PERCPU)` - return a reference for the local CPU's slot.

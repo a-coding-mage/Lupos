@@ -129,8 +129,14 @@ fn should_preempt_schedule() -> bool {
     if current.is_null() {
         return false;
     }
-    let need_resched =
-        unsafe { (*current).thread_info.flags & crate::kernel::task::TIF_NEED_RESCHED != 0 };
+    let need_resched = unsafe {
+        (*current)
+            .thread_info
+            .flags
+            .load(core::sync::atomic::Ordering::Acquire)
+            & crate::kernel::task::TIF_NEED_RESCHED
+            != 0
+    };
     should_preempt_schedule_with(
         need_resched,
         crate::kernel::locking::preempt::preempt_count(),

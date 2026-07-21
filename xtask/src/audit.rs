@@ -3422,7 +3422,23 @@ mod tests {
 
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn tmp_repo() -> PathBuf {
+    struct TempRepo(PathBuf);
+
+    impl std::ops::Deref for TempRepo {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp_repo() -> TempRepo {
         let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
         let base =
             std::env::temp_dir().join(format!("lupos-xtask-audit-{}-{}", std::process::id(), n));
@@ -3430,7 +3446,19 @@ mod tests {
             fs::remove_dir_all(&base).unwrap();
         }
         fs::create_dir_all(&base).unwrap();
-        base
+        TempRepo(base)
+    }
+
+    #[test]
+    fn temporary_audit_repositories_are_removed_on_drop() {
+        let path = {
+            let repo = tmp_repo();
+            let path = repo.to_path_buf();
+            assert!(path.is_dir());
+            path
+        };
+
+        assert!(!path.exists());
     }
 
     fn write(repo: &Path, rel: &str, content: &str) {

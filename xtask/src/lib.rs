@@ -191,6 +191,8 @@ const LUPOS_TIMEZONE_ENV: &str = "LUPOS_TIMEZONE";
 const TMPDIR_ENV: &str = "TMPDIR";
 const DEFAULT_QEMU_MEMORY: &str = "1024M";
 const GUI_SHELL_QEMU_MEMORY: &str = "4096M";
+const SUPPORTED_GUI_SMP_COUNT: usize = 4;
+const GRAPHICS_X11_GREETER_PROMPT: &str = "Prompt greeter with 1 message(s)";
 const GRAPHICS_ROOT_DISK_SIZE: &str = "40G";
 const GRAPHICS_ROOT_DISK_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const GUI_SHELL_ROOT_DISK_SIZE: &str = GRAPHICS_ROOT_DISK_SIZE;
@@ -885,8 +887,7 @@ pub const BPF_PERF_BANNER: &str =
 pub const LSM_SUITE_BANNER: &str = "phase11-m64: lsm dispatch ok; cap LSM ok; apparmor ok; keyring ok; landlock deny outside/allow inside ok; audit ring ok";
 /// Serial log substring expected when the KUnit TAP runner passes.
 pub const KUNIT_TAP_BANNER: &str = "kunit TAP ok; source-backed cases passed";
-pub const ABI_PARITY_SMP_PREEMPT_BANNER: &str =
-    "smp-preempt: ap bring-up, timers, and resched slowpaths ok";
+pub const ABI_PARITY_SMP_PREEMPT_BANNER: &str = "smp-preempt: AP scheduling, local timers, XSTATE switch, stale-TLB shootdown, and resched slowpaths ok";
 pub const ABI_PARITY_SMP_MIGRATION_BANNER: &str =
     "smp-migration: affinity routing and tlb shootdown ok";
 pub const ABI_PARITY_PTHREAD_SMOKE_BANNER: &str =
@@ -5790,7 +5791,12 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // regressions that still function eventually but make the desktop
         // unusably slow.
         "echo 'graphics-x11: desktop-rpc-probe begin'\n",
-        "desktop_rpc_ok=1; desktop_rpc_i=0; desktop_rpc_start=\"$(date +%s%N 2>/dev/null || true)\"\n",
+        "desktop_rpc_ok=1; desktop_rpc_warmup_i=0\n",
+        "while [ \"$desktop_rpc_warmup_i\" -lt 2 ]; do\n",
+        "    sudo -n -u lupos env DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout 2 /usr/bin/dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1 || desktop_rpc_ok=0\n",
+        "    desktop_rpc_warmup_i=$((desktop_rpc_warmup_i + 1))\n",
+        "done\n",
+        "desktop_rpc_i=0; desktop_rpc_start=\"$(date +%s%N 2>/dev/null || true)\"\n",
         "while [ \"$desktop_rpc_i\" -lt 10 ]; do\n",
         "    desktop_rpc_sample_start=\"${EPOCHREALTIME/./}\"\n",
         "    sudo -n -u lupos env DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout 2 /usr/bin/dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1 || desktop_rpc_ok=0\n",
@@ -5800,7 +5806,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "done\n",
         "desktop_rpc_end=\"$(date +%s%N 2>/dev/null || true)\"; desktop_rpc_ms=999999\n",
         "if [ -n \"$desktop_rpc_start\" ] && [ -n \"$desktop_rpc_end\" ]; then desktop_rpc_ms=$(((desktop_rpc_end - desktop_rpc_start) / 1000000)); fi\n",
-        "printf 'graphics-x11: desktop-rpc iterations=%s elapsed-ms=%s\\n' \"$desktop_rpc_i\" \"$desktop_rpc_ms\"\n",
+        "printf 'graphics-x11: desktop-rpc warmups=%s iterations=%s elapsed-ms=%s\\n' \"$desktop_rpc_warmup_i\" \"$desktop_rpc_i\" \"$desktop_rpc_ms\"\n",
         "if [ \"$desktop_rpc_ok\" -eq 1 ] && [ \"$desktop_rpc_ms\" -le 10000 ]; then echo 'graphics-x11: desktop-rpc ok'; else echo 'graphics-x11: desktop-rpc failed'; fi\n",
         "echo 'graphics-x11: desktop-rpc-probe end'\n",
         // Prove that the unprivileged desktop session can resolve a real
@@ -6054,7 +6060,12 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    firefox_responsive=1; responsive_i=0\n",
         "    while [ \"$responsive_i\" -lt 5 ]; do DISPLAY=:0 timeout 2 /usr/bin/xprop -root _NET_CLIENT_LIST >/dev/null 2>&1 || firefox_responsive=0; responsive_i=$((responsive_i + 1)); done\n",
         "    if [ \"$firefox_responsive\" -eq 1 ]; then echo 'graphics-x11: firefox-desktop-responsive ok'; else echo 'graphics-x11: firefox-desktop-responsive failed'; fi\n",
-        "    firefox_rpc_ok=1; firefox_rpc_i=0; firefox_rpc_start=\"$(date +%s%N 2>/dev/null || true)\"\n",
+        "    firefox_rpc_ok=1; firefox_rpc_warmup_i=0\n",
+        "    while [ \"$firefox_rpc_warmup_i\" -lt 2 ]; do\n",
+        "        sudo -n -u lupos env DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout 2 /usr/bin/dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1 || firefox_rpc_ok=0\n",
+        "        firefox_rpc_warmup_i=$((firefox_rpc_warmup_i + 1))\n",
+        "    done\n",
+        "    firefox_rpc_i=0; firefox_rpc_start=\"$(date +%s%N 2>/dev/null || true)\"\n",
         "    while [ \"$firefox_rpc_i\" -lt 10 ]; do\n",
         "        firefox_rpc_sample_start=\"${EPOCHREALTIME/./}\"\n",
         "        sudo -n -u lupos env DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout 2 /usr/bin/dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1 || firefox_rpc_ok=0\n",
@@ -6064,7 +6075,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    done\n",
         "    firefox_rpc_end=\"$(date +%s%N 2>/dev/null || true)\"; firefox_rpc_ms=999999\n",
         "    if [ -n \"$firefox_rpc_start\" ] && [ -n \"$firefox_rpc_end\" ]; then firefox_rpc_ms=$(((firefox_rpc_end - firefox_rpc_start) / 1000000)); fi\n",
-        "    printf 'graphics-x11: firefox-desktop-rpc iterations=%s elapsed-ms=%s\\n' \"$firefox_rpc_i\" \"$firefox_rpc_ms\"\n",
+        "    printf 'graphics-x11: firefox-desktop-rpc warmups=%s iterations=%s elapsed-ms=%s\\n' \"$firefox_rpc_warmup_i\" \"$firefox_rpc_i\" \"$firefox_rpc_ms\"\n",
         // Keep the runtime assertion a profile-independent liveness budget;
         // release performance is evaluated from the emitted per-call samples.
         "    if [ \"$firefox_rpc_ok\" -eq 1 ] && [ \"$firefox_rpc_ms\" -le 10000 ]; then echo 'graphics-x11: firefox-desktop-rpc ok'; else echo 'graphics-x11: firefox-desktop-rpc failed'; fi\n",
@@ -12227,6 +12238,8 @@ fn normalize_boot_test_mode(mode: &str) -> &str {
         "test-login-stack" => "login-stack",
         "graphics-x11" => "graphics-x11",
         "test-graphics-x11" => "graphics-x11",
+        "graphics-x11-greeter" => "graphics-x11-greeter",
+        "test-graphics-x11-greeter" => "graphics-x11-greeter",
         "disk-root-fsck" => "disk-root-fsck",
         "test-disk-root-fsck" => "disk-root-fsck",
         "test-zswap-pressure" => "zswap-pressure",
@@ -12337,6 +12350,7 @@ fn resolve_boot_test_mode(mode: &str) -> Option<fn() -> Result<()>> {
         "test-rcu" | "rcu" => Some(run_rcu_tests),
         "test-percpu-atomic-wq" | "percpu-atomic-wq" => Some(run_percpu_atomic_wq_tests),
         "test-time" | "time" => Some(run_time_tests),
+        "test-softirq" | "softirq" | "softirq-test" => Some(run_softirq_tests),
         "test-lockup-watchdog"
         | "lockup-watchdog"
         | "test-softlockup-watchdog"
@@ -12356,6 +12370,9 @@ fn resolve_boot_test_mode(mode: &str) -> Option<fn() -> Result<()>> {
         "test-login-stack" | "login-stack" => Some(run_login_stack_tests),
         "test-terminal-login" | "terminal-login" => Some(run_login_stack_tests),
         "test-graphics-x11" | "graphics-x11" => Some(run_graphics_x11_tests),
+        "test-graphics-x11-greeter" | "graphics-x11-greeter" => {
+            Some(run_graphics_x11_greeter_tests)
+        }
         "test-userspace-smoke" | "userspace-smoke" => Some(run_userspace_smoke_tests),
         "test-runtime-stress" | "runtime-stress" => Some(run_runtime_stress_tests),
         "test-shipped-commands" | "shipped-commands" => Some(run_shipped_commands_tests),
@@ -16418,6 +16435,109 @@ pub fn run_gui_shell_tests() -> Result<()> {
     bail!("gui-shell was removed; Arch base has no desktop gate")
 }
 
+fn graphics_x11_run_options(timeout: Duration) -> RunOptions {
+    RunOptions {
+        exit_after_boot: false,
+        qemu_timeout: Some(timeout),
+        smp_count: SUPPORTED_GUI_SMP_COUNT,
+    }
+}
+
+/// Focused four-vCPU regression gate for the reported splash-to-black boot.
+///
+/// This intentionally stops at the first painted LightDM greeter. The complete
+/// `graphics-x11` gate remains responsible for login, XFCE, Firefox, and
+/// desktop responsiveness.
+pub fn run_graphics_x11_greeter_tests() -> Result<()> {
+    let _graphics_guard = EnvVarGuard::set("LUPOS_USERLAND_GRAPHICS", "1");
+    let _memory_guard = default_gui_shell_memory_guard();
+    let _release_guard = default_login_boot_release_guard();
+    let _root_snapshot_guard = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_SNAPSHOT_ENV, "1");
+    let _tablet_guard = EnvVarGuard::set(LUPOS_QEMU_USB_TABLET_ENV, "0");
+    ensure_userland_stage()?;
+
+    let _stage_guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
+    let current_cmdline = env::var(LUPOS_KERNEL_CMDLINE_ENV).unwrap_or_default();
+    let polling_baseline = env::var_os(LUPOS_I8042_POLL_BASELINE_ENV).is_some();
+    let mut graphics_args = vec![
+        "systemd.show_status=yes",
+        "lupos.serial_getty=1",
+        "lupos.graphics_probe=1",
+    ];
+    if polling_baseline {
+        graphics_args.push("lupos.i8042_poll=1");
+    }
+    let serial_cmdline = append_kernel_args(&current_cmdline, &graphics_args);
+    let _cmdline_guard = EnvVarGuard::set(LUPOS_KERNEL_CMDLINE_ENV, &serial_cmdline);
+
+    let steps = [SerialExpectStep {
+        label: "greeter ready shutdown",
+        wait_for: GRAPHICS_X11_GREETER_PROMPT,
+        send: b" poweroff -f\n",
+    }];
+    let hmp_steps = [HmpExpectStep {
+        label: "visible greeter capture",
+        wait_for: GRAPHICS_X11_GREETER_PROMPT,
+        metric: Some("graphics-x11: greeter-ready"),
+        action: HmpExpectAction::CaptureFrame("greeter-ready"),
+    }];
+    let run = build_and_run_iso_with_serial_expect_display(
+        BootMode::GraphicsX11,
+        graphics_x11_run_options(Duration::from_secs(600)),
+        &steps,
+        "none",
+        &hmp_steps,
+    )?;
+    let greeter_frame = frame_screendump_path(&run.artifacts.serial_log, "greeter-ready");
+    let greeter_ppm = fs::read(&greeter_frame)
+        .with_context(|| format!("failed to read {}", greeter_frame.display()))?;
+    let greeter_stats = analyze_initial_desktop_ppm(&greeter_ppm)
+        .context("failed to analyze the captured LightDM greeter frame")?;
+    if !greeter_stats.wallpaper_is_visible() {
+        bail!(
+            "graphics-x11-greeter captured an unpainted frame: path={} dimensions={}x{} painted={}/{} ({}%)",
+            greeter_frame.display(),
+            greeter_stats.width,
+            greeter_stats.height,
+            greeter_stats.painted_pixels,
+            greeter_stats.interior_pixels,
+            greeter_stats.painted_percent(),
+        );
+    }
+
+    let topology = format!("smp: Brought up 1 node, {} CPUs", SUPPORTED_GUI_SMP_COUNT);
+    for needle in [
+        topology.as_str(),
+        "Started Light Display Manager",
+        "Greeter connected version=",
+        GRAPHICS_X11_GREETER_PROMPT,
+    ] {
+        if !serial_log_contains(&run.serial_output, needle) {
+            bail!(
+                "graphics-x11-greeter serial log did not contain {:?}\nserial log:\n{}",
+                needle,
+                run.serial_output
+            );
+        }
+    }
+    for forbidden in [
+        "=== KERNEL PANIC ===",
+        "BUG: soft lockup",
+        "Fatal server error",
+        "no screens found",
+        "Failed to start Light Display Manager",
+    ] {
+        if serial_log_contains(&run.serial_output, forbidden) {
+            bail!(
+                "graphics-x11-greeter serial log contained forbidden marker {:?}\nserial log:\n{}",
+                forbidden,
+                run.serial_output
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Run the graphical userspace gate: LightDM, Xorg fbdev, and XFCE.
 ///
 /// The automated check keeps QEMU headless and uses a temporary serial getty
@@ -16485,12 +16605,14 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             // login. LightDM must keep the greeter/X server alive and start a
             // fresh authentication conversation after PAM_AUTH_ERR.
             label: "greeter first password prompt",
-            wait_for: "Prompt greeter with 1 message(s)",
+            wait_for: GRAPHICS_X11_GREETER_PROMPT,
+            metric: Some("graphics-x11: greeter-ready"),
             action: HmpExpectAction::TypeText("wrong"),
         },
         HmpExpectStep {
             label: "greeter rejects wrong password",
             wait_for: "Authenticate result for user lupos: Authentication failure",
+            metric: None,
             action: HmpExpectAction::None,
         },
         HmpExpectStep {
@@ -16498,7 +16620,8 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             // it proves the same greeter reached a new prompt before typing
             // the valid password.
             label: "greeter retry password prompt",
-            wait_for: "Prompt greeter with 1 message(s)",
+            wait_for: GRAPHICS_X11_GREETER_PROMPT,
+            metric: None,
             action: HmpExpectAction::TypeText("lupos"),
         },
         HmpExpectStep {
@@ -16508,6 +16631,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             // guest probe command for the same marker.
             label: "untouched initial desktop capture",
             wait_for: "graphics-x11: desktop-initial-ready",
+            metric: Some("graphics-x11: desktop-ready"),
             action: HmpExpectAction::CaptureFrame("initial-desktop"),
         },
         HmpExpectStep {
@@ -16516,21 +16640,14 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             // a three-second paint interval.
             label: "firefox CJK suggestion input",
             wait_for: "graphics-x11: firefox-window-ready",
+            metric: Some("graphics-x11: firefox-ready"),
             action: HmpExpectAction::FirefoxSuggestionProbe,
         },
     ];
 
     let run = build_and_run_iso_with_serial_expect_display(
         BootMode::GraphicsX11,
-        RunOptions {
-            exit_after_boot: false,
-            qemu_timeout: Some(Duration::from_secs(1800)),
-            // Production APs currently stop in the architecture idle loop and
-            // do not execute per-CPU runqueues. Keep the desktop gate on the
-            // one scheduling CPU until that separate scheduler subsystem is
-            // complete; the launcher still honors smp_count for SMP gates.
-            smp_count: 1,
-        },
+        graphics_x11_run_options(Duration::from_secs(1800)),
         &steps,
         "none",
         &hmp_steps,
@@ -16541,6 +16658,14 @@ pub fn run_graphics_x11_tests() -> Result<()> {
     } else {
         "i8042: IRQ-driven input online: keyboard=1"
     };
+    let topology = format!("smp: Brought up 1 node, {} CPUs", SUPPORTED_GUI_SMP_COUNT);
+    if !serial_log_contains(&run.serial_output, &topology) {
+        bail!(
+            "graphics-x11 serial log did not contain supported topology {:?}\nserial log:\n{}",
+            topology,
+            run.serial_output
+        );
+    }
     if !serial_log_contains(&run.serial_output, input_marker) {
         bail!(
             "graphics-x11 serial log did not contain input marker {:?}\nserial log:\n{}",
@@ -19199,6 +19324,26 @@ pub fn run_buddy_tests() -> Result<()> {
     Ok(())
 }
 
+/// Run only the Milestone 6 softirq/tasklet/ksoftirqd acceptance test.
+///
+/// Invoked by `cargo xtask test-boot --mode softirq`. Use the production
+/// four-CPU topology so ksoftirqd is spawned after AP scheduler activation for
+/// every online CPU, while the source-backed probe forces CPU0 past Linux's
+/// inline restart budget and verifies that its daemon drains the remainder.
+pub fn run_softirq_tests() -> Result<()> {
+    let run = build_and_run_iso(
+        BootMode::SoftirqTest,
+        RunOptions {
+            exit_after_boot: true,
+            qemu_timeout: Some(Duration::from_secs(60)),
+            smp_count: 4,
+        },
+    )?;
+    assert_boot_outcome(&run, SOFTIRQ_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
+    println!("softirq tests passed");
+    Ok(())
+}
+
 /// Run only the Milestone 8 slab allocator acceptance test.
 ///
 /// Invoked by `cargo xtask test-boot --mode slab`.
@@ -19448,6 +19593,7 @@ struct SerialExpectStep {
 struct HmpExpectStep {
     label: &'static str,
     wait_for: &'static str,
+    metric: Option<&'static str>,
     action: HmpExpectAction,
 }
 
@@ -20424,7 +20570,7 @@ fn run_qemu_iso_login_display(iso_path: &Path, serial_log_path: &Path) -> Result
     // The interactive desktop is a workstation profile, not a uniprocessor
     // kernel test.  Four vCPUs leave Firefox's content/compositor/media
     // processes independent execution time while XFCE remains responsive.
-    command.arg("-smp").arg("4");
+    add_qemu_smp_args(&mut command, SUPPORTED_GUI_SMP_COUNT);
     command.current_dir(repo_root().context("failed to resolve repo root")?);
 
     run_command_with_optional_timeout(&mut command, serial_log_path, None)
@@ -22932,6 +23078,7 @@ fn run_qemu_iso_with_serial_expect(
 
     let qemu_lock = QemuRunLock::acquire()?;
     let rendered = render_command(&command);
+    let qemu_started = Instant::now();
     let mut guard = spawn_qemu_guard(&mut command, &rendered, &qemu_lock, "expect")?;
     let mut stdin = guard
         .child
@@ -22969,6 +23116,14 @@ fn run_qemu_iso_with_serial_expect(
                     .map(|idx| hmp_cursor + idx + hmp_step.wait_for.len());
                 if raw_match_end.is_some() || visible_stripped.contains(hmp_step.wait_for) {
                     progress.note_expect_match(hmp_step.label);
+                    if let Some(metric) = hmp_step.metric {
+                        println!(
+                            "{metric} elapsed-us={} smp={} serial-log={}",
+                            qemu_started.elapsed().as_micros(),
+                            smp_count,
+                            serial_log_path.display(),
+                        );
+                    }
                     match hmp_step.action {
                         HmpExpectAction::None => {
                             hmp_cursor = raw_match_end.unwrap_or(log.len());
@@ -22988,6 +23143,10 @@ fn run_qemu_iso_with_serial_expect(
                             hmp_cursor = log.len();
                         }
                         HmpExpectAction::CaptureFrame(frame_label) => {
+                            // Serial readiness markers can precede the final
+                            // X11 repaint. Give the displayed framebuffer one
+                            // stable paint interval before taking evidence.
+                            thread::sleep(Duration::from_secs(2));
                             let monitor = match hmp_monitor.as_mut() {
                                 Some(monitor) => monitor,
                                 None => {
@@ -24223,6 +24382,28 @@ pub(crate) fn repo_root() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gui_launchers_and_runtime_gates_share_four_vcpus() {
+        assert_eq!(SUPPORTED_GUI_SMP_COUNT, 4);
+        assert_eq!(
+            graphics_x11_run_options(Duration::from_secs(1)).smp_count,
+            SUPPORTED_GUI_SMP_COUNT
+        );
+        assert_eq!(
+            normalize_boot_test_mode("test-graphics-x11-greeter"),
+            "graphics-x11-greeter"
+        );
+        assert!(resolve_boot_test_mode("graphics-x11-greeter").is_some());
+
+        let mut command = Command::new(QEMU_BINARY);
+        add_qemu_smp_args(&mut command, SUPPORTED_GUI_SMP_COUNT);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["-smp", "4"]);
+    }
 
     fn read_repo_file(path: &str) -> String {
         let root = repo_root().expect("repo root");
@@ -29218,6 +29399,16 @@ CONFIG_MODULES=y
         let features = feature_list(BootMode::SoftirqTest, true);
         assert!(features.contains(&"test-softirq"));
         assert!(features.contains(&"qemu-test"));
+    }
+
+    #[test]
+    fn focused_softirq_mode_resolves() {
+        for mode in ["softirq", "softirq-test", "test-softirq"] {
+            assert!(
+                resolve_boot_test_mode(mode).is_some(),
+                "focused softirq boot mode should resolve: {mode}"
+            );
+        }
     }
 
     #[test]

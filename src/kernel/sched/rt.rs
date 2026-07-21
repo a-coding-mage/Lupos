@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/sched/rt.c
 //! test-origin: linux:vendor/linux/kernel/sched/rt.c
 //! Realtime scheduling class — `SCHED_FIFO` and `SCHED_RR` (M30).
@@ -8,6 +8,8 @@
 //! order is preserved; RR rotates the head every `RR_TIMESLICE_TICKS`.
 //!
 //! Class priority order: stop > dl > **rt** > fair > idle.
+
+use core::sync::atomic::Ordering;
 
 use crate::kernel::task::TaskStruct;
 
@@ -21,8 +23,20 @@ use super::rq::Rq;
 /// `RR_TIMESLICE = 100 * HZ / 1000` jiffies.
 pub const RR_TIMESLICE_NS: u64 = 100_000_000;
 
-/// Linux RR slice in scheduler ticks (100 ms / 25 ms tick = 4 ticks).
-pub const RR_TIMESLICE_TICKS: u32 = 4;
+/// Linux `RR_TIMESLICE = 100 * HZ / 1000` scheduler ticks.
+pub const RR_TIMESLICE_TICKS: u32 = (100 * crate::kernel::time::jiffies::HZ / 1000) as u32;
+
+unsafe fn wakeup_preempt_rt(rq: &mut Rq, p: *mut TaskStruct, _flags: u32) {
+    let current = rq.current;
+    if current.is_null() || p.is_null() || current == p {
+        return;
+    }
+    unsafe {
+        if (*p).m29.prio < (*current).m29.prio {
+            super::set_task_need_resched(current);
+        }
+    }
+}
 
 unsafe fn enqueue_task_rt(rq: &mut Rq, p: *mut TaskStruct, flags: u32) {
     if p.is_null() {
@@ -84,7 +98,9 @@ unsafe fn task_tick_rt(rq: &mut Rq, p: *mut TaskStruct, _queued: bool) {
             (*p).m29.rt.time_slice = RR_TIMESLICE_TICKS;
             // Rotate this priority's FIFO so the next pick takes the sibling.
             rq.rt.requeue_tail((*p).m29.prio);
-            (*p).thread_info.flags |= crate::kernel::task::TIF_NEED_RESCHED;
+            (*p).thread_info
+                .flags
+                .fetch_or(crate::kernel::task::TIF_NEED_RESCHED, Ordering::Release);
         }
     }
 }
@@ -125,7 +141,7 @@ pub static RT_SCHED_CLASS: SchedClass = SchedClass {
     enqueue_task: Some(enqueue_task_rt),
     dequeue_task: Some(dequeue_task_rt),
     yield_task: None,
-    wakeup_preempt: None,
+    wakeup_preempt: Some(wakeup_preempt_rt),
     pick_next_task: Some(pick_next_task_rt),
     put_prev_task: Some(put_prev_task_rt),
     set_next_task: None,
@@ -145,6 +161,7 @@ mod tests {
     #[test]
     fn rr_timeslice_is_100ms() {
         assert_eq!(RR_TIMESLICE_NS, 100_000_000);
+        assert_eq!(RR_TIMESLICE_TICKS, 25);
     }
     #[test]
     fn rt_class_above_fair() {

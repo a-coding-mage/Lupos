@@ -1,4 +1,4 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/sched/syscalls.c
 //! test-origin: linux:vendor/linux/kernel/sched/syscalls.c
 //! Scheduler syscalls — `sched_setattr`, `sched_setscheduler`, `sched_yield`,
@@ -9,7 +9,9 @@
 //! `kernel/sched/syscalls.c` paths.
 //!
 //! The full syscall table wiring lands in M59; for M30 these entry points are
-//! reachable from in-kernel test fixtures.
+//! reachable from in-kernel test fixtures. Linux's on-rq `sched_change` /
+//! `reweight_entity` transaction is not yet represented here, so changing a
+//! running task's nice value or fair policy takes effect on its next enqueue.
 
 use crate::kernel::task::TaskStruct;
 

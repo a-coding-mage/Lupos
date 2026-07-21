@@ -153,6 +153,25 @@ fn copy_itimerspec_to_user(dst: *mut Itimerspec64, value: &Itimerspec64) -> Resu
     if not_copied == 0 { Ok(()) } else { Err(EFAULT) }
 }
 
+fn copy_itimerspec_from_user(src: *const Itimerspec64) -> Result<Itimerspec64, i32> {
+    if src.is_null() {
+        return Err(EFAULT);
+    }
+    let mut value = Itimerspec64::default();
+    let not_copied = unsafe {
+        uaccess::copy_from_user(
+            (&mut value as *mut Itimerspec64).cast::<u8>(),
+            src.cast::<u8>(),
+            core::mem::size_of::<Itimerspec64>(),
+        )
+    };
+    if not_copied == 0 {
+        Ok(value)
+    } else {
+        Err(EFAULT)
+    }
+}
+
 pub unsafe fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
     let allowed = crate::kernel::time::timerfd::TFD_CLOEXEC
         | crate::kernel::time::timerfd::TFD_NONBLOCK
@@ -187,14 +206,18 @@ pub unsafe fn sys_timerfd_settime(
     new_value: *const Itimerspec64,
     old_value: *mut Itimerspec64,
 ) -> i64 {
-    if new_value.is_null() {
-        return -(EFAULT as i64);
-    }
+    // Linux copies and validates the userspace itimerspec before looking up
+    // the timerfd.  Besides preserving the observable error ordering, the
+    // uaccess helper faults in a valid-but-not-resident user page and recovers
+    // with EFAULT for an invalid one.
+    let new_value = match copy_itimerspec_from_user(new_value) {
+        Ok(value) => value,
+        Err(errno) => return -(errno as i64),
+    };
     let tfd = match timerfd_from_fd(fd) {
         Ok(tfd) => tfd,
         Err(errno) => return -(errno as i64),
     };
-    let new_value = unsafe { *new_value };
     let old = match crate::kernel::time::timerfd::sys_timerfd_settime(&tfd, flags, new_value) {
         Ok(old) => old,
         Err(errno) => return -(errno as i64),
@@ -282,5 +305,24 @@ mod tests {
             copy_itimerspec_to_user(core::ptr::null_mut(), &spec),
             Err(EFAULT)
         );
+        assert_eq!(copy_itimerspec_from_user(core::ptr::null()), Err(EFAULT));
+    }
+
+    #[test]
+    fn copy_itimerspec_from_user_matches_linux_get_itimerspec64_contract() {
+        let source = Itimerspec64 {
+            it_interval: crate::kernel::time::Timespec64 {
+                tv_sec: 17,
+                tv_nsec: 23,
+            },
+            it_value: crate::kernel::time::Timespec64 {
+                tv_sec: 42,
+                tv_nsec: 99,
+            },
+        };
+        assert_eq!(copy_itimerspec_from_user(&source), Ok(source));
+
+        let invalid = (1u64 << 47) as *const Itimerspec64;
+        assert_eq!(copy_itimerspec_from_user(invalid), Err(EFAULT));
     }
 }

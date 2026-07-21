@@ -337,20 +337,7 @@ pub unsafe extern "C" fn linux_synchronize_srcu_expedited(ssp: *mut u8) {
 
 #[inline]
 fn cpu_index() -> usize {
-    #[cfg(test)]
-    return 0;
-    #[cfg(not(test))]
-    {
-        // Skip the LAPIC MMIO read (a VM-exit on VBox) when only the BSP is
-        // online; single-CPU SRCU read-side always resolves to index 0.
-        if crate::arch::x86::kernel::smp::AP_READY_COUNT.load(core::sync::atomic::Ordering::Acquire)
-            == 0
-        {
-            return 0;
-        }
-        let id = unsafe { crate::arch::x86::kernel::apic::id() } as usize;
-        id.min(MAX_CPUS - 1)
-    }
+    crate::arch::x86::kernel::setup_percpu::current_cpu_number()
 }
 
 /// `srcu_read_lock(ssp)` — returns the index that must be passed to

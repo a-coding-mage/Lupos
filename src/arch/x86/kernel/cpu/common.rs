@@ -7,11 +7,9 @@
 //! `vendor/linux/kernel/cpu.c`.
 
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::kernel::module::{export_symbol, find_symbol};
-
-static LINUX_CONST_CURRENT_TASK: AtomicUsize = AtomicUsize::new(0);
 
 /// `struct cpuinfo_x86 boot_cpu_data` - `vendor/linux/arch/x86/kernel/setup.c:133`.
 ///
@@ -287,10 +285,37 @@ fn ensure_linux_boot_cpu_data() {
 /// `struct cpumask` - `vendor/linux/include/linux/cpumask_types.h`.
 #[repr(C)]
 pub struct LinuxCpuMask {
-    pub bits: [usize; 1],
+    pub bits: [AtomicU64; 1],
 }
 
-static LINUX_CPU_POSSIBLE_MASK: LinuxCpuMask = LinuxCpuMask { bits: [1] };
+static LINUX_CPU_POSSIBLE_MASK: LinuxCpuMask = LinuxCpuMask {
+    bits: [AtomicU64::new(1)],
+};
+static LINUX_CPU_PRESENT_MASK: LinuxCpuMask = LinuxCpuMask {
+    bits: [AtomicU64::new(1)],
+};
+static LINUX_NUM_POSSIBLE_CPUS: AtomicU32 = AtomicU32::new(1);
+
+/// Publish the dense CPU set prepared from MADT topology.
+///
+/// Linux fixes possible CPUs during `native_smp_prepare_cpus()` and marks the
+/// enumerated boot CPUs present before APs become online. Lupos has the same
+/// dense logical mapping available before module exports are registered.
+fn publish_linux_boot_cpu_masks() {
+    let mut mask = 0u64;
+    for cpu in 0..crate::kernel::sched::MAX_CPUS.min(64) {
+        if crate::arch::x86::kernel::smp::logical_cpu_to_apic_id(cpu as u32).is_some() {
+            mask |= 1u64 << cpu;
+        }
+    }
+    if mask == 0 {
+        // Host unit tests and pre-topology callers still have the boot CPU.
+        mask = 1;
+    }
+    LINUX_CPU_POSSIBLE_MASK.bits[0].store(mask, Ordering::Release);
+    LINUX_CPU_PRESENT_MASK.bits[0].store(mask, Ordering::Release);
+    LINUX_NUM_POSSIBLE_CPUS.store(mask.count_ones(), Ordering::Release);
+}
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
@@ -302,6 +327,7 @@ pub fn register_module_exports() {
     super::cpu_match::register_module_exports();
     super::hypervisor::register_module_exports();
     ensure_linux_boot_cpu_data();
+    publish_linux_boot_cpu_masks();
     export_symbol_once(
         "boot_cpu_data",
         core::ptr::addr_of_mut!(LINUX_BOOT_CPU_DATA) as usize,
@@ -333,13 +359,28 @@ pub fn register_module_exports() {
         false,
     );
     export_symbol_once(
+        "current_task",
+        crate::arch::x86::kernel::setup_percpu::current_task_symbol(),
+        false,
+    );
+    export_symbol_once(
         "const_current_task",
-        core::ptr::addr_of!(LINUX_CONST_CURRENT_TASK) as usize,
-        true,
+        crate::arch::x86::kernel::setup_percpu::current_task_symbol(),
+        false,
     );
     export_symbol_once(
         "__cpu_possible_mask",
         core::ptr::addr_of!(LINUX_CPU_POSSIBLE_MASK) as usize,
+        false,
+    );
+    export_symbol_once(
+        "__cpu_present_mask",
+        core::ptr::addr_of!(LINUX_CPU_PRESENT_MASK) as usize,
+        false,
+    );
+    export_symbol_once(
+        "__num_possible_cpus",
+        core::ptr::addr_of!(LINUX_NUM_POSSIBLE_CPUS) as usize,
         false,
     );
     export_symbol_once(
@@ -355,15 +396,23 @@ pub fn register_module_exports() {
 }
 
 pub fn set_linux_current_task(task: *mut crate::kernel::task::TaskStruct) {
-    #[cfg(not(test))]
-    if crate::kernel::sched::current_cpu() != 0 {
-        return;
-    }
-    LINUX_CONST_CURRENT_TASK.store(task as usize, Ordering::Release);
+    let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number();
+    set_linux_current_task_on_cpu(cpu, task);
+}
+
+/// Install Linux's module-visible `current_task` value in an explicitly
+/// identified per-CPU slot.
+///
+/// AP bring-up uses the explicit form before the CPU is marked online, matching
+/// Linux `smpboot.c` initialization of the idle/current task.
+pub fn set_linux_current_task_on_cpu(cpu: usize, task: *mut crate::kernel::task::TaskStruct) {
+    crate::arch::x86::kernel::setup_percpu::set_current_task(cpu, task as usize);
 }
 
 pub fn linux_current_task() -> *mut crate::kernel::task::TaskStruct {
-    LINUX_CONST_CURRENT_TASK.load(Ordering::Acquire) as *mut crate::kernel::task::TaskStruct
+    let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number();
+    crate::arch::x86::kernel::setup_percpu::current_task(cpu)
+        as *mut crate::kernel::task::TaskStruct
 }
 
 #[cfg(test)]
@@ -379,7 +428,12 @@ mod tests {
     fn x86_cpu_common_exports_register_for_modules() {
         register_module_exports();
         assert!(crate::kernel::module::find_symbol("__preempt_count").is_some());
+        assert!(crate::kernel::module::find_symbol("current_task").is_some());
         assert!(crate::kernel::module::find_symbol("const_current_task").is_some());
+        assert_eq!(
+            crate::kernel::module::find_symbol("current_task"),
+            crate::kernel::module::find_symbol("const_current_task")
+        );
         assert!(crate::kernel::module::find_symbol("x86_match_cpu").is_some());
         assert!(crate::kernel::module::find_symbol("x86_hyper_type").is_some());
         assert!(crate::kernel::module::find_symbol("cpu_info").is_some());
@@ -389,7 +443,24 @@ mod tests {
             crate::kernel::module::find_symbol("__cpu_possible_mask"),
             Some(core::ptr::addr_of!(LINUX_CPU_POSSIBLE_MASK) as usize)
         );
-        assert_eq!(LINUX_CPU_POSSIBLE_MASK.bits[0], 1);
+        assert_eq!(
+            crate::kernel::module::find_symbol("__cpu_present_mask"),
+            Some(core::ptr::addr_of!(LINUX_CPU_PRESENT_MASK) as usize)
+        );
+        assert_eq!(
+            crate::kernel::module::find_symbol("__num_possible_cpus"),
+            Some(core::ptr::addr_of!(LINUX_NUM_POSSIBLE_CPUS) as usize)
+        );
+        assert_eq!(
+            LINUX_CPU_POSSIBLE_MASK.bits[0].load(Ordering::Acquire),
+            LINUX_CPU_PRESENT_MASK.bits[0].load(Ordering::Acquire)
+        );
+        assert_eq!(
+            LINUX_NUM_POSSIBLE_CPUS.load(Ordering::Acquire),
+            LINUX_CPU_POSSIBLE_MASK.bits[0]
+                .load(Ordering::Acquire)
+                .count_ones()
+        );
     }
 
     #[test]
@@ -415,7 +486,7 @@ mod tests {
 
         assert_eq!(linux_current_task_for_tests(), task);
         assert_eq!(
-            LINUX_CONST_CURRENT_TASK.load(Ordering::Acquire),
+            crate::arch::x86::kernel::setup_percpu::current_task(0),
             task as usize
         );
     }

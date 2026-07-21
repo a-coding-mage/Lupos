@@ -94,8 +94,8 @@ pub trait FredCpu {
     fn ist_top_va(&self, vector: u32) -> u64;
 }
 
-/// `__KERNEL_DS` GDT selector — bit 3 of the GDT, ring 0.
-pub const KERNEL_DS: u16 = 0x10;
+/// `__KERNEL_DS` GDT selector from Linux's generic x86-64 layout.
+pub const KERNEL_DS: u16 = crate::arch::x86::kernel::gdt::sel::KERNEL_DS;
 
 /// Linux's `cpu_init_fred_exceptions` — boot/online path that flips a CPU
 /// onto FRED.

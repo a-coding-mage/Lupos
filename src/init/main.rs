@@ -2,6 +2,10 @@
 #![no_main]
 //! linux-parity: partial
 //! linux-source: vendor/linux/init/main.c
+//! test-origin: linux:vendor/linux/tools/testing/selftests/x86/ldt_gdt.c
+//! test-origin: linux:vendor/linux/tools/testing/selftests/x86/xstate.c
+//! test-origin: linux:vendor/linux/arch/x86/mm/tlb.c
+//! test-origin: linux:vendor/linux/kernel/locking/rwsem.c
 
 //! lupos kernel entry point - Linux boot_params ABI.
 //!
@@ -20,6 +24,387 @@ use lupos::{
     arch, block, fs, include, init, io_uring, kernel, linux_driver_abi, mm, net, security,
 };
 use lupos::{log_error, log_info, log_warn, print, printk, println, serial_print, serial_println};
+
+#[cfg(feature = "test-smp-preempt")]
+static SMP_XSTATE_START: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_XSTATE_WORKER_CPU: [core::sync::atomic::AtomicU32; 2] =
+    [const { core::sync::atomic::AtomicU32::new(u32::MAX) }; 2];
+#[cfg(feature = "test-smp-preempt")]
+static SMP_XSTATE_RESULT: [core::sync::atomic::AtomicI32; 2] =
+    [const { core::sync::atomic::AtomicI32::new(-1) }; 2];
+
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MMAP_LOCK_PHASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MMAP_LOCK_WRITER_ATTEMPTING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MMAP_LOCK_LATE_READER_ATTEMPTING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MMAP_LOCK_WRITER_ACQUIRED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MMAP_LOCK_LATE_READER_ACQUIRED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MMAP_LOCK_ACQUIRE_ORDER: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MMAP_LOCK_WRITER_ORDER: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MMAP_LOCK_LATE_READER_ORDER: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MMAP_LOCK_WORKER_CPU: [core::sync::atomic::AtomicU32; 3] =
+    [const { core::sync::atomic::AtomicU32::new(u32::MAX) }; 3];
+
+// Use PGD slot 1 so the test PTE hierarchy cannot alias the low identity
+// mappings that Lupos still needs while executing kernel code.
+#[cfg(feature = "test-smp-preempt")]
+const SMP_TLB_TEST_ADDR: u64 = 0x0000_0080_4000_0000;
+#[cfg(feature = "test-smp-preempt")]
+const SMP_TLB_ITERATIONS: u64 = 64;
+#[cfg(feature = "test-smp-preempt")]
+const SMP_TLB_WAIT_SPINS: usize = 20_000_000;
+
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_START: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_PRIMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_SWITCHER_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_COMMAND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_ACK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_M_HELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_WANT_OTHER_MM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_OTHER_MM_HELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_RELEASE_OTHER_MM: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_RESULT: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_EXPECTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_OBSERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_READER_CPU: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_TLB_SWITCHER_CPU: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Allocate a process-style mm with private user PGD entries and the kernel
+/// mappings required to execute a scheduled task. This mirrors the PGD setup
+/// in `exec`/`dup_mm`; the test intentionally leaks it because QEMU exits as
+/// soon as the boot gate completes.
+#[cfg(feature = "test-smp-preempt")]
+unsafe fn smp_tlb_alloc_test_mm() -> *mut mm::mm_types::MmStruct {
+    use alloc::boxed::Box;
+    use arch::x86::mm::paging::{pgd_t, phys_to_virt};
+    use mm::buddy::{page_to_pfn, with_global_buddy};
+    use mm::frame::PAGE_SIZE;
+    use mm::page_flags::GFP_KERNEL;
+
+    let pgd_page = with_global_buddy(|buddy| buddy.alloc_pages(0, GFP_KERNEL))
+        .expect("smp-tlb: failed to allocate PGD");
+    let pgd_pfn = page_to_pfn(pgd_page) as u64;
+    let pgd = phys_to_virt(pgd_pfn << 12) as *mut pgd_t;
+    let init_pgd = phys_to_virt(arch::x86::mm::paging::init_pgd_phys()) as *const pgd_t;
+
+    unsafe {
+        core::ptr::write_bytes(pgd.cast::<u8>(), 0, PAGE_SIZE);
+        core::ptr::copy_nonoverlapping(init_pgd, pgd, 512);
+        for index in 1..256 {
+            pgd.add(index).write(pgd_t(0));
+        }
+        arch::x86::mm::paging::clone_low_identity_pgd_slot_for_user(pgd, init_pgd)
+            .expect("smp-tlb: failed to clone low identity PGD slot");
+    }
+
+    Box::into_raw(Box::new(mm::mm_types::MmStruct::new(pgd as usize)))
+}
+
+/// Read the version through the test mm's user VA without the normal
+/// `get_user` prefault, whose access-bit update includes its own TLB flush and
+/// would mask a stale translation. Lupos does not enable CR4.SMAP.
+#[cfg(feature = "test-smp-preempt")]
+#[inline(never)]
+unsafe fn smp_tlb_read_version() -> u64 {
+    let value: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {value}, qword ptr [{addr}]",
+            value = out(reg) value,
+            addr = in(reg) SMP_TLB_TEST_ADDR,
+            options(nostack, readonly),
+        );
+    }
+    value
+}
+
+#[cfg(feature = "test-smp-preempt")]
+fn smp_tlb_record_failure(expected: u64, observed: u64) {
+    use core::sync::atomic::Ordering;
+
+    SMP_TLB_EXPECTED.store(expected, Ordering::Relaxed);
+    SMP_TLB_OBSERVED.store(observed, Ordering::Relaxed);
+    SMP_TLB_RESULT.store(0, Ordering::Release);
+    SMP_TLB_DONE.store(true, Ordering::Release);
+}
+
+#[cfg(feature = "test-smp-preempt")]
+fn smp_tlb_wait_at_least(value: &core::sync::atomic::AtomicU64, target: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    for _ in 0..SMP_TLB_WAIT_SPINS {
+        if value.load(Ordering::Acquire) >= target {
+            return true;
+        }
+        if SMP_TLB_RESULT.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+#[cfg(feature = "test-smp-preempt")]
+unsafe fn smp_tlb_park_current() -> ! {
+    use core::sync::atomic::Ordering;
+
+    let current = unsafe { kernel::sched::get_current() };
+    assert!(!current.is_null());
+    unsafe {
+        (*current)
+            .__state
+            .store(kernel::task::task_state::TASK_PARKED, Ordering::Release);
+    }
+    loop {
+        unsafe {
+            kernel::sched::schedule_with_irqs_enabled();
+        }
+    }
+}
+
+/// CPU1 task whose real `mm` maps [`SMP_TLB_TEST_ADDR`].
+///
+/// Odd iterations hold this mm active while CPU0 performs the shootdown.
+/// Even iterations first yield to the other-mm task, then re-enter this mm
+/// through the real user-to-user CR3 switch before loading the versioned VA.
+#[cfg(feature = "test-smp-preempt")]
+unsafe extern "C" fn smp_tlb_cpu1_reader(_arg: *mut core::ffi::c_void) -> ! {
+    use core::sync::atomic::Ordering;
+
+    SMP_TLB_READER_CPU.store(kernel::sched::current_cpu(), Ordering::Release);
+    while !SMP_TLB_START.load(Ordering::Acquire) {
+        unsafe {
+            kernel::sched::reschedule_runnable();
+        }
+    }
+
+    let initial = unsafe { smp_tlb_read_version() };
+    if initial != 0 {
+        smp_tlb_record_failure(0, initial);
+    }
+    SMP_TLB_PRIMED.store(true, Ordering::Release);
+
+    if initial == 0 {
+        for version in 1..=SMP_TLB_ITERATIONS {
+            let observed = if version & 1 != 0 {
+                // Keep the tested mm loaded until CPU0 has invalidated and
+                // replaced the primed translation. Interrupts remain enabled,
+                // so the remote TLB IPI can run and acknowledge normally.
+                kernel::locking::preempt::preempt_disable();
+                SMP_TLB_M_HELD.store(version, Ordering::Release);
+                while SMP_TLB_COMMAND.load(Ordering::Acquire) < version {
+                    core::hint::spin_loop();
+                }
+                let value = unsafe { smp_tlb_read_version() };
+                kernel::locking::preempt::preempt_enable();
+                value
+            } else {
+                // Force M -> other_mm -> M around this replacement. Repeated
+                // yields make progress independent of CFS's current choice.
+                SMP_TLB_WANT_OTHER_MM.store(version, Ordering::Release);
+                while SMP_TLB_OTHER_MM_HELD.load(Ordering::Acquire) < version {
+                    unsafe {
+                        kernel::sched::reschedule_runnable();
+                    }
+                }
+                while SMP_TLB_COMMAND.load(Ordering::Acquire) < version {
+                    core::hint::spin_loop();
+                }
+                unsafe { smp_tlb_read_version() }
+            };
+
+            if observed != version {
+                smp_tlb_record_failure(version, observed);
+                break;
+            }
+            SMP_TLB_ACK.store(version, Ordering::Release);
+        }
+    }
+
+    if SMP_TLB_RESULT.load(Ordering::Acquire) != 0 {
+        SMP_TLB_RESULT.store(1, Ordering::Release);
+        SMP_TLB_DONE.store(true, Ordering::Release);
+    }
+    unsafe { smp_tlb_park_current() }
+}
+
+/// CPU1 task with a second real mm. It holds that CR3 loaded for even
+/// iterations until CPU0 has finished the clear/flush/poison/remap sequence.
+#[cfg(feature = "test-smp-preempt")]
+unsafe extern "C" fn smp_tlb_cpu1_switcher(_arg: *mut core::ffi::c_void) -> ! {
+    use core::sync::atomic::Ordering;
+
+    SMP_TLB_SWITCHER_CPU.store(kernel::sched::current_cpu(), Ordering::Release);
+    while !SMP_TLB_START.load(Ordering::Acquire) {
+        unsafe {
+            kernel::sched::reschedule_runnable();
+        }
+    }
+
+    let mut handled = 0u64;
+    while !SMP_TLB_DONE.load(Ordering::Acquire) {
+        let requested = SMP_TLB_WANT_OTHER_MM.load(Ordering::Acquire);
+        if requested > handled {
+            kernel::locking::preempt::preempt_disable();
+            SMP_TLB_OTHER_MM_HELD.store(requested, Ordering::Release);
+            while SMP_TLB_RELEASE_OTHER_MM.load(Ordering::Acquire) < requested
+                && !SMP_TLB_DONE.load(Ordering::Acquire)
+            {
+                core::hint::spin_loop();
+            }
+            kernel::locking::preempt::preempt_enable();
+            handled = requested;
+        }
+        unsafe {
+            kernel::sched::reschedule_runnable();
+        }
+    }
+
+    SMP_TLB_SWITCHER_DONE.store(true, Ordering::Release);
+    unsafe { smp_tlb_park_current() }
+}
+
+/// Affinity-pinned xstate probe adapted from Linux selftests `xstate.c`.
+///
+/// Two workers install distinct XMM15 values and yield to each other on CPU1.
+/// Each worker parks itself after publishing its result so it cannot retain
+/// CPU1 in a kernel-mode halt loop and starve its peer or RCU.
+#[cfg(feature = "test-smp-preempt")]
+unsafe extern "C" fn smp_xstate_cpu1_worker(arg: *mut core::ffi::c_void) -> ! {
+    use core::sync::atomic::Ordering;
+
+    let index = arg as usize;
+    assert!(index < 2);
+    while !SMP_XSTATE_START.load(Ordering::Acquire) {
+        unsafe {
+            kernel::sched::reschedule_runnable();
+        }
+    }
+
+    let mut passed = false;
+    for attempt in 0..256u64 {
+        let expected = [
+            0x5853_5441_5445_0000u64 ^ ((index as u64) << 32) ^ attempt,
+            0xa5a5_5a5a_d3c3_b4b4u64 ^ ((index as u64) << 48) ^ attempt.rotate_left(17),
+        ];
+        let probe = unsafe { arch::x86::kernel::fpu::run_xstate_switch_probe(expected) };
+        if probe.preserved() {
+            passed = true;
+            break;
+        }
+    }
+
+    SMP_XSTATE_WORKER_CPU[index].store(kernel::sched::current_cpu(), Ordering::Release);
+    SMP_XSTATE_RESULT[index].store(if passed { 1 } else { 0 }, Ordering::Release);
+
+    let current = unsafe { kernel::sched::get_current() };
+    assert!(!current.is_null());
+    unsafe {
+        (*current)
+            .__state
+            .store(kernel::task::task_state::TASK_PARKED, Ordering::Release);
+    }
+    loop {
+        unsafe {
+            kernel::sched::schedule_with_irqs_enabled();
+        }
+    }
+}
+
+/// Four-CPU mmap_lock contention probe derived from Linux rwsem.c's stack
+/// waiter and phase-fair wake rules. CPU1 holds a read lock, CPU2 queues a
+/// writer, and CPU3 queues a later reader. Both contenders must become
+/// TASK_UNINTERRUPTIBLE, then the writer must acquire before the late reader.
+#[cfg(feature = "test-smp-preempt")]
+unsafe extern "C" fn smp_mmap_lock_reader(arg: *mut core::ffi::c_void) -> ! {
+    use core::sync::atomic::Ordering;
+
+    let mm = arg.cast::<mm::mm_types::MmStruct>();
+    SMP_MMAP_LOCK_WORKER_CPU[0].store(kernel::sched::current_cpu(), Ordering::Release);
+    let guard = unsafe { mm::mmap_lock::MmapReadGuard::lock(mm) };
+    SMP_MMAP_LOCK_PHASE.store(1, Ordering::Release);
+    while SMP_MMAP_LOCK_PHASE.load(Ordering::Acquire) < 4 {
+        core::hint::spin_loop();
+    }
+    drop(guard);
+    unsafe { smp_tlb_park_current() }
+}
+
+#[cfg(feature = "test-smp-preempt")]
+unsafe extern "C" fn smp_mmap_lock_writer(arg: *mut core::ffi::c_void) -> ! {
+    use core::sync::atomic::Ordering;
+
+    let mm = arg.cast::<mm::mm_types::MmStruct>();
+    SMP_MMAP_LOCK_WORKER_CPU[1].store(kernel::sched::current_cpu(), Ordering::Release);
+    while SMP_MMAP_LOCK_PHASE.load(Ordering::Acquire) < 2 {
+        core::hint::spin_loop();
+    }
+    SMP_MMAP_LOCK_WRITER_ATTEMPTING.store(true, Ordering::Release);
+    let guard = unsafe { mm::mmap_lock::MmapWriteGuard::lock(mm) };
+    let order = SMP_MMAP_LOCK_ACQUIRE_ORDER.fetch_add(1, Ordering::AcqRel) + 1;
+    SMP_MMAP_LOCK_WRITER_ORDER.store(order, Ordering::Release);
+    SMP_MMAP_LOCK_WRITER_ACQUIRED.store(true, Ordering::Release);
+    while SMP_MMAP_LOCK_PHASE.load(Ordering::Acquire) < 5 {
+        core::hint::spin_loop();
+    }
+    drop(guard);
+    unsafe { smp_tlb_park_current() }
+}
+
+#[cfg(feature = "test-smp-preempt")]
+unsafe extern "C" fn smp_mmap_lock_late_reader(arg: *mut core::ffi::c_void) -> ! {
+    use core::sync::atomic::Ordering;
+
+    let mm = arg.cast::<mm::mm_types::MmStruct>();
+    SMP_MMAP_LOCK_WORKER_CPU[2].store(kernel::sched::current_cpu(), Ordering::Release);
+    while SMP_MMAP_LOCK_PHASE.load(Ordering::Acquire) < 3 {
+        core::hint::spin_loop();
+    }
+    SMP_MMAP_LOCK_LATE_READER_ATTEMPTING.store(true, Ordering::Release);
+    let guard = unsafe { mm::mmap_lock::MmapReadGuard::lock(mm) };
+    let order = SMP_MMAP_LOCK_ACQUIRE_ORDER.fetch_add(1, Ordering::AcqRel) + 1;
+    SMP_MMAP_LOCK_LATE_READER_ORDER.store(order, Ordering::Release);
+    SMP_MMAP_LOCK_LATE_READER_ACQUIRED.store(true, Ordering::Release);
+    drop(guard);
+    unsafe { smp_tlb_park_current() }
+}
 
 /// Early 64-bit boot marker used to confirm the higher-half handoff reached
 /// Rust code. Brings up the UART so the printk emitter can write the Linux
@@ -424,57 +809,18 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         }
     }
 
-    // Count non-BSP CPUs so we know how many APs to wait for.
-    let bsp_apic_id = unsafe { arch::x86::kernel::apic::id() };
-    let ap_count = acpi_info.cpus[..acpi_info.cpu_count]
-        .iter()
-        .filter(|c| c.enabled && c.apic_id != bsp_apic_id)
-        .count();
-
-    // Linux: vendor/linux/arch/x86/kernel/smpboot.c — native_smp_prepare_cpus.
-    if ap_count > 0 {
-        log_info!("", "smpboot: x86: Booting SMP configuration:");
-        log_info!("", "smpboot: .... node  #0, CPUs:      #1");
-        unsafe {
-            arch::x86::kernel::smp::start_aps(&acpi_info.cpus[..acpi_info.cpu_count]);
-        }
-        // wait_for_aps is called inside start_aps per AP, but we do a final
-        // confirmation here with a generous 500M-cycle timeout (~0.5s).
-        if arch::x86::kernel::smp::wait_for_aps(ap_count, 500_000_000) {
-            log_info!("", "smp: Brought up 1 node, {} CPUs", ap_count + 1);
-        } else {
-            log_warn!(
-                "",
-                "smpboot: do_boot_cpu failed: timeout waiting for {} AP(s) ({} ready)",
-                ap_count,
-                arch::x86::kernel::smp::AP_READY_COUNT.load(core::sync::atomic::Ordering::Relaxed)
-            );
-        }
-    } else {
-        log_info!("", "smpboot: CPU0: hyperthreading disabled");
-    }
-
-    // ── TDD: Milestone 5 "CPU ping" IPI test ──────────────────────────────
-    //
-    // When the `test-smp` feature is active (set by `cargo xtask` for the
-    // `SmpTest` boot mode), the BSP sends an IPI at vector 0xF0 to the first
-    // enabled AP and verifies that the AP's IDT handler increments the shared
-    // IPI_RECEIVED_COUNT counter.
-    //
-    // Exits QEMU with success code 0x21 on pass, panics (code 0x01) on fail.
-    // Requires QEMU to be launched with -smp 2 (done automatically by xtask).
-    #[cfg(feature = "test-smp")]
-    {
-        arch::x86::kernel::smp::run_ipi_ping_test(&acpi_info.cpus[..acpi_info.cpu_count]);
-    }
-
-    // Linux start_kernel sets up the scheduler before starting interrupt
-    // sources such as the timer. Full topology setup still happens later, but
-    // the BSP has a current task and runqueue before IRQs can schedule work.
-    // Ref: vendor/linux/init/main.c — sched_init().
+    // Linux initializes every possible runqueue and the boot idle task before
+    // any interrupt source or secondary CPU can observe scheduler state.
+    // Full SMP topology setup remains deferred until all APs are active.
+    // Ref: vendor/linux/init/main.c and vendor/linux/kernel/sched/core.c.
     unsafe {
         kernel::sched::sched_init();
     }
+
+    // Linux builds dense logical CPU mappings during native_smp_prepare_cpus()
+    // and later starts only those accepted CPUs. Keep the final rendezvous
+    // count tied to that prepared set rather than raw/malformed MADT entries.
+    let ap_count = arch::x86::kernel::smp::prepare_cpus(&acpi_info.cpus[..acpi_info.cpu_count]);
 
     // Linux seeds CLOCK_REALTIME from the persistent wall clock before timer
     // ticks start advancing xtime. Ref: vendor/linux/kernel/time/timekeeping.c.
@@ -618,6 +964,49 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     init::start_kernel::acpi_subsystem_init();
     init::start_kernel::arch_post_acpi_subsys_init();
     init::start_kernel::kcsan_init();
+
+    arch::x86::mm::tlb::init();
+
+    // Linux runs smp_init() and sched_init_smp() from
+    // kernel_init_freeable(), before free_initmem() and mark_readonly().
+    // Keep that ordering: the AP's 32-bit trampoline must still be executable
+    // when enabling EFER.NXE and paging. Each AP completes its per-CPU
+    // scheduler/syscall/timer setup before entering cpu_startup_entry().
+    if ap_count > 0 {
+        unsafe {
+            kernel::sched::sched_prepare_smp();
+        }
+        log_info!("", "smpboot: x86: Booting SMP configuration:");
+        log_info!("", "smpboot: .... node  #0, CPUs:      #1");
+        unsafe {
+            arch::x86::kernel::smp::start_aps();
+        }
+        if arch::x86::kernel::smp::wait_for_aps(ap_count, 500_000_000) {
+            kernel::sched::sched_init_smp();
+            log_info!("", "smp: Brought up 1 node, {} CPUs", ap_count + 1);
+        } else {
+            log_warn!(
+                "",
+                "smpboot: do_boot_cpu failed: timeout waiting for {} AP(s) ({} ready)",
+                ap_count,
+                arch::x86::kernel::smp::AP_READY_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+            );
+        }
+    } else {
+        log_info!("", "smpboot: CPU0: hyperthreading disabled");
+    }
+
+    // Linux's early_initcall(spawn_ksoftirqd) registers one smpboot thread for
+    // every online CPU. Do this only after AP scheduler activation so each
+    // Lupos task can be created with its final one-CPU affinity.
+    kernel::softirq::spawn_ksoftirqd();
+
+    // The source-backed CPU-ping gate runs only after APs reached their online
+    // idle state, matching Linux's post-bring-up IPI expectations.
+    #[cfg(feature = "test-smp")]
+    {
+        arch::x86::kernel::smp::run_ipi_ping_test();
+    }
 
     {
         const LOW_IDENTITY_DIRECT_MAP_END: u64 = 64 * 1024 * 1024 * 1024;
@@ -792,8 +1181,6 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         }
         boot_options
     };
-
-    arch::x86::mm::tlb::init();
 
     unsafe {
         core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
@@ -2951,12 +3338,22 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     {
         use kernel::sched::class::CLASS_PRIO_FAIR;
         use kernel::sched::fair::FAIR_SCHED_CLASS;
-        use kernel::sched::prio::{NICE_0_LOAD, SCHED_PRIO_TO_WEIGHT, nice_to_weight};
+        use kernel::sched::prio::{
+            NICE_0_LOAD, SCHED_FIXEDPOINT_SHIFT, SCHED_PRIO_TO_WEIGHT, nice_to_weight,
+        };
 
-        // 1. Nice-to-weight table parity with Linux core.c.
-        assert_eq!(nice_to_weight(0), 1024, "nice 0 → 1024");
-        assert_eq!(nice_to_weight(-20), 88761, "nice -20 → 88761");
-        assert_eq!(nice_to_weight(19), 15, "nice 19 → 15");
+        // 1. Raw table and x86_64 scale_load parity with Linux.
+        assert_eq!(nice_to_weight(0), NICE_0_LOAD, "nice 0 → NICE_0_LOAD");
+        assert_eq!(
+            nice_to_weight(-20),
+            88761 << SCHED_FIXEDPOINT_SHIFT,
+            "nice -20 → scale_load(88761)"
+        );
+        assert_eq!(
+            nice_to_weight(19),
+            15 << SCHED_FIXEDPOINT_SHIFT,
+            "nice 19 → scale_load(15)"
+        );
         assert_eq!(SCHED_PRIO_TO_WEIGHT.len(), 40);
 
         // 2. nice 0 / nice 19 ratio matches Linux documented value (~68×).
@@ -3082,11 +3479,17 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     #[cfg(feature = "test-smp-preempt")]
     {
         use core::sync::atomic::Ordering;
+        use kernel::sched::entity::CpuMask;
 
         assert!(kernel::sched::production_smp_scheduler_enabled());
         assert!(
             arch::x86::kernel::smp::AP_READY_COUNT.load(Ordering::Acquire) >= 1,
             "expected at least one AP online"
+        );
+
+        assert!(
+            arch::x86::kernel::idt::direction_flag_entry_selftest(),
+            "x86 IDT entry exposed RFLAGS.DF to Rust code"
         );
 
         let start_ticks = arch::x86::kernel::apic_timer::TIMER_TICKS.load(Ordering::Acquire);
@@ -3103,23 +3506,443 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             "expected LAPIC timer ticks to continue after SMP scheduler enablement"
         );
 
+        // Linux rwsem.c queues stack waiters under an irq-safe raw lock,
+        // changes them to TASK_UNINTERRUPTIBLE, grants a reader phase as a
+        // batch, and keeps a queued writer ahead of readers which arrive
+        // later. Drive that path on three APs while the BSP observes task
+        // state and wake order.
+        assert!(
+            arch::x86::kernel::smp::AP_READY_COUNT.load(Ordering::Acquire) >= 3,
+            "mmap_lock SMP probe requires three APs"
+        );
+        let mmap_lock_mm =
+            alloc::boxed::Box::into_raw(alloc::boxed::Box::new(mm::mm_types::MmStruct::new(0)));
+        let mmap_lock_workers = [
+            unsafe {
+                kernel::sched::kthread_create(
+                    smp_mmap_lock_reader,
+                    mmap_lock_mm.cast(),
+                    b"smp-mm/read\0\0\0\0\0",
+                )
+            },
+            unsafe {
+                kernel::sched::kthread_create(
+                    smp_mmap_lock_writer,
+                    mmap_lock_mm.cast(),
+                    b"smp-mm/write\0\0\0\0",
+                )
+            },
+            unsafe {
+                kernel::sched::kthread_create(
+                    smp_mmap_lock_late_reader,
+                    mmap_lock_mm.cast(),
+                    b"smp-mm/late\0\0\0\0\0",
+                )
+            },
+        ];
+        for (index, worker) in mmap_lock_workers.iter().copied().enumerate() {
+            assert!(!worker.is_null(), "failed to create mmap_lock probe");
+            unsafe {
+                (*worker).m29.cpus_mask = CpuMask::one((index + 1) as u32);
+                (*worker).m29.cpus_ptr = &(*worker).m29.cpus_mask as *const _;
+                (*worker).m29.nr_cpus_allowed = 1;
+                kernel::sched::enqueue_task(worker);
+            }
+        }
+
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            if SMP_MMAP_LOCK_PHASE.load(Ordering::Acquire) >= 1 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert_eq!(
+            SMP_MMAP_LOCK_PHASE.load(Ordering::Acquire),
+            1,
+            "CPU1 reader did not acquire mmap_lock"
+        );
+
+        SMP_MMAP_LOCK_PHASE.store(2, Ordering::Release);
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            let writer_state = unsafe { (*mmap_lock_workers[1]).__state.load(Ordering::Acquire) };
+            if SMP_MMAP_LOCK_WRITER_ATTEMPTING.load(Ordering::Acquire)
+                && writer_state == kernel::task::task_state::TASK_UNINTERRUPTIBLE
+            {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(SMP_MMAP_LOCK_WRITER_ATTEMPTING.load(Ordering::Acquire));
+        assert_eq!(
+            unsafe { (*mmap_lock_workers[1]).__state.load(Ordering::Acquire) },
+            kernel::task::task_state::TASK_UNINTERRUPTIBLE,
+            "contended mmap_lock writer stayed runnable"
+        );
+
+        SMP_MMAP_LOCK_PHASE.store(3, Ordering::Release);
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            let reader_state = unsafe { (*mmap_lock_workers[2]).__state.load(Ordering::Acquire) };
+            if SMP_MMAP_LOCK_LATE_READER_ATTEMPTING.load(Ordering::Acquire)
+                && reader_state == kernel::task::task_state::TASK_UNINTERRUPTIBLE
+            {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(SMP_MMAP_LOCK_LATE_READER_ATTEMPTING.load(Ordering::Acquire));
+        assert_eq!(
+            unsafe { (*mmap_lock_workers[2]).__state.load(Ordering::Acquire) },
+            kernel::task::task_state::TASK_UNINTERRUPTIBLE,
+            "late mmap_lock reader stayed runnable"
+        );
+        assert!(!SMP_MMAP_LOCK_WRITER_ACQUIRED.load(Ordering::Acquire));
+        assert!(!SMP_MMAP_LOCK_LATE_READER_ACQUIRED.load(Ordering::Acquire));
+
+        SMP_MMAP_LOCK_PHASE.store(4, Ordering::Release);
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            if SMP_MMAP_LOCK_WRITER_ACQUIRED.load(Ordering::Acquire) {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(SMP_MMAP_LOCK_WRITER_ACQUIRED.load(Ordering::Acquire));
+        assert_eq!(SMP_MMAP_LOCK_WRITER_ORDER.load(Ordering::Acquire), 1);
+        assert!(
+            !SMP_MMAP_LOCK_LATE_READER_ACQUIRED.load(Ordering::Acquire),
+            "late reader bypassed the queued mmap_lock writer"
+        );
+
+        SMP_MMAP_LOCK_PHASE.store(5, Ordering::Release);
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            if SMP_MMAP_LOCK_LATE_READER_ACQUIRED.load(Ordering::Acquire) {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(SMP_MMAP_LOCK_LATE_READER_ACQUIRED.load(Ordering::Acquire));
+        assert_eq!(SMP_MMAP_LOCK_LATE_READER_ORDER.load(Ordering::Acquire), 2);
+        assert_eq!(
+            [
+                SMP_MMAP_LOCK_WORKER_CPU[0].load(Ordering::Acquire),
+                SMP_MMAP_LOCK_WORKER_CPU[1].load(Ordering::Acquire),
+                SMP_MMAP_LOCK_WORKER_CPU[2].load(Ordering::Acquire),
+            ],
+            [1, 2, 3],
+            "mmap_lock workers did not execute on three distinct APs"
+        );
+
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            let all_parked = mmap_lock_workers.iter().copied().all(|worker| unsafe {
+                (*worker).__state.load(Ordering::Acquire) == kernel::task::task_state::TASK_PARKED
+            });
+            if all_parked {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(
+            mmap_lock_workers.iter().copied().all(|worker| unsafe {
+                (*worker).__state.load(Ordering::Acquire) == kernel::task::task_state::TASK_PARKED
+            }),
+            "mmap_lock workers did not park after the probe"
+        );
+        log_info!("m91", "smp-preempt: mmap_lock sleeping FIFO waiters ok");
+
+        // Linux xstate.c runs distinct register patterns in competing threads
+        // and validates them after blocking/yielding. Pin two real tasks to
+        // CPU1 so each must save and restore XMM15 across an actual switch.
+        let workers = [
+            unsafe {
+                kernel::sched::kthread_create(
+                    smp_xstate_cpu1_worker,
+                    core::ptr::null_mut(),
+                    b"smp-xstate/0\0\0\0\0",
+                )
+            },
+            unsafe {
+                kernel::sched::kthread_create(
+                    smp_xstate_cpu1_worker,
+                    1usize as *mut core::ffi::c_void,
+                    b"smp-xstate/1\0\0\0\0",
+                )
+            },
+        ];
+        for worker in workers {
+            assert!(!worker.is_null(), "failed to create CPU1 xstate probe");
+            unsafe {
+                (*worker).m29.cpus_mask = CpuMask::one(1);
+                (*worker).m29.cpus_ptr = &(*worker).m29.cpus_mask as *const _;
+                (*worker).m29.nr_cpus_allowed = 1;
+                kernel::sched::enqueue_task(worker);
+            }
+        }
+        SMP_XSTATE_START.store(true, Ordering::Release);
+
+        let ap_ticks_before = arch::x86::kernel::apic_timer::timer_ticks_for_cpu(1).unwrap_or(0);
+        let mut results = [-1i32; 2];
+        let mut worker_cpus = [u32::MAX; 2];
+        let mut ap_ticks_after = ap_ticks_before;
+        for _ in 0..5_000_000 {
+            for index in 0..2 {
+                results[index] = SMP_XSTATE_RESULT[index].load(Ordering::Acquire);
+                worker_cpus[index] = SMP_XSTATE_WORKER_CPU[index].load(Ordering::Acquire);
+            }
+            ap_ticks_after = arch::x86::kernel::apic_timer::timer_ticks_for_cpu(1).unwrap_or(0);
+            if results == [1, 1] && worker_cpus == [1, 1] && ap_ticks_after > ap_ticks_before {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert_eq!(
+            worker_cpus,
+            [1, 1],
+            "both CPU1-affine xstate tasks must execute on CPU1"
+        );
+        assert_eq!(
+            results,
+            [1, 1],
+            "both workers must preserve distinct XMM15 state across a real switch"
+        );
+        assert!(
+            ap_ticks_after > ap_ticks_before,
+            "CPU1 scheduler probe must run with its local timer active"
+        );
+
+        // Linux has no userspace selftest for its internal
+        // switch_mm()/flush_tlb_mm_range() ordering contract, so this
+        // Lupos-specific boot gate drives the corresponding tlb.c race with
+        // real process-style page tables and real CPU1 VA loads. The two
+        // backing pages are alternately unmapped, poisoned, and reused so a
+        // surviving translation returns a previous/poison version.
+        use arch::x86::mm::paging::{
+            __pgprot, _PAGE_ACCESSED, _PAGE_DIRTY, _PAGE_NX, _PAGE_PRESENT, _PAGE_RW, _PAGE_TABLE,
+            _PAGE_USER, PAGE_SIZE, pfn_pte, pgd_offset_pgd, pgd_t, pmd_alloc, pte_alloc, pte_pfn,
+            ptep_get_and_clear, pud_alloc, set_pte,
+        };
+        use mm::buddy::{page_to_pfn, with_global_buddy};
+        use mm::page_flags::GFP_KERNEL;
+
+        let test_mm = unsafe { smp_tlb_alloc_test_mm() };
+        let other_mm = unsafe { smp_tlb_alloc_test_mm() };
+        assert!(!test_mm.is_null() && !other_mm.is_null());
+
+        let backing_pages = [
+            with_global_buddy(|buddy| buddy.alloc_pages(0, GFP_KERNEL))
+                .expect("smp-tlb: failed to allocate backing page 0"),
+            with_global_buddy(|buddy| buddy.alloc_pages(0, GFP_KERNEL))
+                .expect("smp-tlb: failed to allocate backing page 1"),
+        ];
+        let backing_pfns = [
+            page_to_pfn(backing_pages[0]) as u64,
+            page_to_pfn(backing_pages[1]) as u64,
+        ];
+        let backing_virt = [
+            arch::x86::mm::paging::phys_to_virt(backing_pfns[0] << 12) as *mut u64,
+            arch::x86::mm::paging::phys_to_virt(backing_pfns[1] << 12) as *mut u64,
+        ];
+        unsafe {
+            backing_virt[0].write_volatile(0);
+            backing_virt[1].write_volatile(0xdeaf_cafe_0000_0000);
+        }
+
+        let test_pte = unsafe {
+            let pgdp = pgd_offset_pgd((*test_mm).pgd as *mut pgd_t, SMP_TLB_TEST_ADDR);
+            let pudp = pud_alloc(pgdp, SMP_TLB_TEST_ADDR, _PAGE_TABLE)
+                .expect("smp-tlb: failed to allocate PUD");
+            let pmdp = pmd_alloc(pudp, SMP_TLB_TEST_ADDR, _PAGE_TABLE)
+                .expect("smp-tlb: failed to allocate PMD");
+            pte_alloc(pmdp, SMP_TLB_TEST_ADDR, _PAGE_TABLE)
+                .expect("smp-tlb: failed to allocate PTE table")
+        };
+        let leaf_prot = __pgprot(
+            _PAGE_PRESENT | _PAGE_RW | _PAGE_USER | _PAGE_ACCESSED | _PAGE_DIRTY | _PAGE_NX,
+        );
+        unsafe {
+            set_pte(test_pte, pfn_pte(backing_pfns[0], leaf_prot));
+        }
+
+        let reader = unsafe {
+            kernel::sched::kthread_create(
+                smp_tlb_cpu1_reader,
+                core::ptr::null_mut(),
+                b"smp-tlb/read\0\0\0\0",
+            )
+        };
+        let switcher = unsafe {
+            kernel::sched::kthread_create(
+                smp_tlb_cpu1_switcher,
+                core::ptr::null_mut(),
+                b"smp-tlb/switch\0\0",
+            )
+        };
+        assert!(
+            !reader.is_null() && !switcher.is_null(),
+            "smp-tlb: failed to create CPU1 tasks"
+        );
+        for (task, task_mm) in [(reader, test_mm), (switcher, other_mm)] {
+            unsafe {
+                // These begin life through kthread_create only to reuse its
+                // kernel stack/entry trampoline. A non-null task.mm makes
+                // each one a real user-mm participant in context_switch().
+                (*task).mm = task_mm;
+                (*task).active_mm = task_mm;
+                (*task).m29.cpus_mask = CpuMask::one(1);
+                (*task).m29.cpus_ptr = &(*task).m29.cpus_mask as *const _;
+                (*task).m29.nr_cpus_allowed = 1;
+                kernel::sched::enqueue_task(task);
+            }
+        }
+
+        let shootdown_acks_before =
+            arch::x86::mm::tlb::TLB_SHOOTDOWN_ACK_COUNT.load(Ordering::Acquire);
+        SMP_TLB_START.store(true, Ordering::Release);
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            if SMP_TLB_PRIMED.load(Ordering::Acquire) || SMP_TLB_RESULT.load(Ordering::Acquire) == 0
+            {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(
+            SMP_TLB_PRIMED.load(Ordering::Acquire) && SMP_TLB_RESULT.load(Ordering::Acquire) != 0,
+            "smp-tlb: reader failed to prime VA (expected={}, observed={:#x})",
+            SMP_TLB_EXPECTED.load(Ordering::Acquire),
+            SMP_TLB_OBSERVED.load(Ordering::Acquire),
+        );
+
+        for version in 1..=SMP_TLB_ITERATIONS {
+            if version & 1 != 0 {
+                assert!(
+                    smp_tlb_wait_at_least(&SMP_TLB_M_HELD, version),
+                    "smp-tlb: CPU1 did not hold tested mm for version {}",
+                    version
+                );
+                assert_eq!(
+                    arch::x86::mm::tlb::active_mm(1),
+                    test_mm,
+                    "smp-tlb: reader phase did not load tested mm"
+                );
+            } else {
+                assert!(
+                    smp_tlb_wait_at_least(&SMP_TLB_OTHER_MM_HELD, version),
+                    "smp-tlb: CPU1 did not enter other mm for version {}",
+                    version
+                );
+                assert_eq!(
+                    arch::x86::mm::tlb::active_mm(1),
+                    other_mm,
+                    "smp-tlb: switcher phase did not load other mm"
+                );
+            }
+
+            let old_index = ((version - 1) & 1) as usize;
+            let new_index = (version & 1) as usize;
+            let old_pte = ptep_get_and_clear(core::ptr::null_mut(), SMP_TLB_TEST_ADDR, test_pte);
+            assert_eq!(
+                pte_pfn(old_pte),
+                backing_pfns[old_index],
+                "smp-tlb: unexpected old PFN at version {}",
+                version
+            );
+            assert!(unsafe {
+                arch::x86::mm::tlb::flush_tlb_mm_range(
+                    test_mm,
+                    SMP_TLB_TEST_ADDR,
+                    SMP_TLB_TEST_ADDR + PAGE_SIZE,
+                )
+            });
+
+            // Reusing the two pages makes any stale translation observable:
+            // it resolves to this poison after the unmap shootdown instead of
+            // the newly published version in the replacement page.
+            unsafe {
+                backing_virt[old_index].write_volatile(0xdeaf_cafe_0000_0000u64 | version);
+                backing_virt[new_index].write_volatile(version);
+                set_pte(test_pte, pfn_pte(backing_pfns[new_index], leaf_prot));
+            }
+            assert!(unsafe {
+                arch::x86::mm::tlb::flush_tlb_mm_range(
+                    test_mm,
+                    SMP_TLB_TEST_ADDR,
+                    SMP_TLB_TEST_ADDR + PAGE_SIZE,
+                )
+            });
+            SMP_TLB_COMMAND.store(version, Ordering::Release);
+            if version & 1 == 0 {
+                SMP_TLB_RELEASE_OTHER_MM.store(version, Ordering::Release);
+            }
+
+            assert!(
+                smp_tlb_wait_at_least(&SMP_TLB_ACK, version),
+                "smp-tlb: stale translation at version {} (expected={}, observed={:#x})",
+                version,
+                SMP_TLB_EXPECTED.load(Ordering::Acquire),
+                SMP_TLB_OBSERVED.load(Ordering::Acquire),
+            );
+        }
+
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            if SMP_TLB_RESULT.load(Ordering::Acquire) == 1
+                && SMP_TLB_SWITCHER_DONE.load(Ordering::Acquire)
+            {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert_eq!(
+            SMP_TLB_RESULT.load(Ordering::Acquire),
+            1,
+            "smp-tlb: expected version {}, observed {:#x}",
+            SMP_TLB_EXPECTED.load(Ordering::Acquire),
+            SMP_TLB_OBSERVED.load(Ordering::Acquire),
+        );
+        assert!(
+            SMP_TLB_SWITCHER_DONE.load(Ordering::Acquire),
+            "smp-tlb: other-mm task did not park"
+        );
+        assert_eq!(
+            SMP_TLB_READER_CPU.load(Ordering::Acquire),
+            1,
+            "smp-tlb: reader did not execute on CPU1"
+        );
+        assert_eq!(
+            SMP_TLB_SWITCHER_CPU.load(Ordering::Acquire),
+            1,
+            "smp-tlb: switcher did not execute on CPU1"
+        );
+        let shootdown_acks_after =
+            arch::x86::mm::tlb::TLB_SHOOTDOWN_ACK_COUNT.load(Ordering::Acquire);
+        assert!(
+            shootdown_acks_after.saturating_sub(shootdown_acks_before) >= SMP_TLB_ITERATIONS,
+            "smp-tlb: active-mm phases did not receive remote shootdown ACKs"
+        );
+
         let current = unsafe { kernel::sched::get_current() };
         assert!(!current.is_null());
         let irq_flags = kernel::locking::local_irq_save();
         unsafe {
-            (*current).thread_info.flags |= kernel::task::TIF_NEED_RESCHED;
+            (*current).thread_info.flags.fetch_or(
+                kernel::task::TIF_NEED_RESCHED,
+                core::sync::atomic::Ordering::Release,
+            );
             arch::x86::entry::syscall::syscall_exit_slowpath(core::ptr::null_mut());
         }
         kernel::locking::local_irq_restore(irq_flags);
         assert_eq!(
-            unsafe { (*current).thread_info.flags & kernel::task::TIF_NEED_RESCHED },
+            unsafe {
+                (*current)
+                    .thread_info
+                    .flags
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    & kernel::task::TIF_NEED_RESCHED
+            },
             0,
             "syscall exit slowpath must clear TIF_NEED_RESCHED"
         );
 
         log_info!(
             "m91",
-            "smp-preempt: ap bring-up, timers, and resched slowpaths ok"
+            "smp-preempt: AP scheduling, local timers, XSTATE switch, stale-TLB shootdown, and resched slowpaths ok"
         );
         #[cfg(feature = "qemu-test")]
         qemu::exit_success();
@@ -3183,14 +4006,15 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             FUTEX_BITSET_MATCH_ANY, futex_cmp_requeue_pi, futex_lock_pi, futex_trylock_pi,
             futex_unlock_pi, futex_wait, futex_wake,
         };
+        use kernel::sched::prio::NICE_0_LOAD;
 
         // ── cgroup CPU controller ────────────────────────────────────────────
         let mut tg = TaskGroup::new_root();
         // Default: no quota.
         assert_eq!(tg.bw_period, BANDWIDTH_PERIOD_NS_DEFAULT);
-        // cpu.weight 200 → shares 2048.
+        // cpu.weight 200 → scale_load(2048).
         tg.set_weight(200).expect("set_weight(200)");
-        assert_eq!(tg.shares, 2048);
+        assert_eq!(tg.shares, NICE_0_LOAD * 2);
         // cpu.max 1000 100000 (quota=1ms, period=100ms): charge 600µs ok, then 600µs ok, third throttles.
         tg.set_max(1_000_000, 100_000_000).expect("set_max");
         assert!(tg.charge(600_000));
@@ -3468,7 +4292,7 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
 
         // 9. Preempt offset bit-field constants.
         assert_eq!(PREEMPT_OFFSET, 1);
-        assert_eq!(HARDIRQ_OFFSET, 1u32 << 20);
+        assert_eq!(HARDIRQ_OFFSET, 1u32 << 16);
 
         log_info!("m33", "locking: spin/mutex/rwsem/sem/completion ok");
         #[cfg(feature = "qemu-test")]
@@ -4420,11 +5244,18 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
                 );
             }
             unsafe {
+                // Match switch_mm_irqs_off(): do not publish `mm` as loaded
+                // until its CR3 actually is.  Shootdowns and NMI uaccess must
+                // conservatively reject the transition window.
+                let cpu = kernel::sched::current_cpu();
+                arch::x86::mm::tlb::set_active_mm_switching(cpu);
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                 core::arch::asm!(
                     "mov cr3, {0}",
                     in(reg) pgd_phys,
                     options(nostack, preserves_flags)
                 );
+                arch::x86::mm::tlb::set_active_mm(cpu, mm);
             }
             let stack_top = unsafe { (*task).stack as u64 };
             assert!(
