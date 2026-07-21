@@ -19,14 +19,18 @@ use crate::kernel::task::TaskStruct;
 
 /// Flags accepted by `enqueue_task` / `dequeue_task` (subset of Linux `ENQUEUE_*`).
 pub const ENQUEUE_WAKEUP: u32 = 0x01;
-pub const ENQUEUE_HEAD: u32 = 0x02;
+pub const ENQUEUE_HEAD: u32 = 0x0001_0000;
 pub const ENQUEUE_NOCLOCK: u32 = 0x08;
-pub const ENQUEUE_MIGRATED: u32 = 0x40;
-pub const ENQUEUE_INITIAL: u32 = 0x80;
+pub const ENQUEUE_MIGRATED: u32 = 0x0004_0000;
+pub const ENQUEUE_INITIAL: u32 = 0x0008_0000;
 
 pub const DEQUEUE_SLEEP: u32 = 0x01;
 pub const DEQUEUE_NOCLOCK: u32 = 0x08;
-pub const DEQUEUE_MIGRATED: u32 = 0x100;
+pub const DEQUEUE_MIGRATING: u32 = 0x0010;
+
+/// Fork placement flag passed to `select_task_rq()` / `wakeup_preempt()`.
+/// This is a wake flag, not an `ENQUEUE_*` flag.
+pub const WF_FORK: u32 = 0x04;
 
 /// Forward declaration — concrete `Rq` lives in `rq.rs`.
 pub type Rq = crate::kernel::sched::rq::Rq;
@@ -112,5 +116,20 @@ mod tests {
         let c = SchedClass::empty(CLASS_PRIO_FAIR);
         assert!(c.enqueue_task.is_none());
         assert!(c.pick_next_task.is_none());
+    }
+
+    #[test]
+    fn new_task_flags_match_linux_sched_h() {
+        assert_eq!(WF_FORK, 0x04);
+        assert_eq!(ENQUEUE_NOCLOCK, 0x0008);
+        assert_eq!(ENQUEUE_INITIAL, 0x0008_0000);
+        assert_eq!(WF_FORK & ENQUEUE_INITIAL, 0);
+    }
+
+    #[test]
+    fn queue_head_and_migration_flags_match_linux_sched_h() {
+        assert_eq!(DEQUEUE_MIGRATING, 0x0010);
+        assert_eq!(ENQUEUE_HEAD, 0x0001_0000);
+        assert_eq!(ENQUEUE_MIGRATED, 0x0004_0000);
     }
 }

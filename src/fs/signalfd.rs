@@ -127,6 +127,16 @@ fn signalfd_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize
                 | crate::kernel::signal::SI_QUEUE
                 | crate::kernel::signal::SI_TKILL
         );
+        let child_fields = info.signo == crate::kernel::signal::SIGCHLD
+            && matches!(
+                info.code,
+                crate::kernel::wait::CLD_EXITED
+                    | crate::kernel::wait::CLD_KILLED
+                    | crate::kernel::wait::CLD_DUMPED
+                    | crate::kernel::wait::CLD_TRAPPED
+                    | crate::kernel::wait::CLD_STOPPED
+                    | crate::kernel::wait::CLD_CONTINUED
+            );
         let queued_value = if info.code == crate::kernel::signal::SI_QUEUE {
             info.sigval()
         } else {
@@ -136,8 +146,15 @@ fn signalfd_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize
             ssi_signo: info.signo as u32,
             ssi_errno: info.errno,
             ssi_code: info.code,
-            ssi_pid: sender_fields.then(|| info.sender_pid() as u32).unwrap_or(0),
-            ssi_uid: sender_fields.then(|| info.sender_uid()).unwrap_or(0),
+            ssi_pid: (sender_fields || child_fields)
+                .then(|| info.sender_pid() as u32)
+                .unwrap_or(0),
+            ssi_uid: (sender_fields || child_fields)
+                .then(|| info.sender_uid())
+                .unwrap_or(0),
+            ssi_status: child_fields.then(|| info.sigchld_status()).unwrap_or(0),
+            ssi_utime: child_fields.then(|| info.sigchld_utime()).unwrap_or(0),
+            ssi_stime: child_fields.then(|| info.sigchld_stime()).unwrap_or(0),
             ssi_int: queued_value as i32,
             ssi_ptr: queued_value,
             ..SignalfdSiginfo::default()
@@ -497,16 +514,8 @@ mod tests {
             let ft = files::get_task_files(&mut *current as *mut TaskStruct).unwrap();
             let file = ft.get(fd as i32).unwrap();
 
-            // with_sender_value has the same first 16 union bytes as Linux's
-            // _sigchld layout and lets the regression fail before adding the
-            // dedicated constructor used by the production fix.
-            let info = SigInfo::with_sender_value(
-                SIGCHLD,
-                crate::kernel::wait::CLD_EXITED,
-                357,
-                42,
-                7,
-            );
+            let info =
+                SigInfo::with_sigchld(SIGCHLD, crate::kernel::wait::CLD_EXITED, 357, 42, 7, 0, 0);
             assert_eq!(
                 crate::kernel::signal::send_signal_info_to_task(
                     &mut *current as *mut TaskStruct,

@@ -9,7 +9,7 @@
 
 use core::sync::atomic::Ordering;
 
-use super::class::{DEQUEUE_MIGRATED, ENQUEUE_MIGRATED, ENQUEUE_WAKEUP};
+use super::class::{DEQUEUE_MIGRATING, ENQUEUE_MIGRATED, ENQUEUE_WAKEUP};
 use super::rq::{MAX_RQ_CPUS, Rq, rq_nr_running, with_double_rq};
 use crate::kernel::sched;
 use crate::kernel::task::TaskStruct;
@@ -59,7 +59,7 @@ fn pull_one_task(src_cpu: u32, dst_cpu: u32) -> bool {
         let Some(enqueue) = (*class).enqueue_task else {
             return (false, false);
         };
-        if !dequeue(src_rq, task, DEQUEUE_MIGRATED) {
+        if !dequeue(src_rq, task, DEQUEUE_MIGRATING) {
             return (false, false);
         }
         (*task).thread_info.cpu = dst_cpu;

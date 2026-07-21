@@ -7688,6 +7688,14 @@ mod tests {
                 ),
                 -(ERESTARTNOHAND as i64)
             );
+            assert_ne!(
+                current
+                    .unserialized_flags
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    & crate::kernel::task::TASK_RESTORE_SIGMASK,
+                0,
+                "pselect's non-null temporary mask must arm Linux restore_sigmask"
+            );
             assert!(
                 crate::kernel::signal::current_has_unblocked_pending_signals(),
                 "pselect's temporary empty mask must expose pending SIGTERM"
@@ -7697,6 +7705,13 @@ mod tests {
             // original mask for restoration.
             crate::kernel::signal::restore_saved_sigmask_unless(false);
             assert!(!crate::kernel::signal::current_has_unblocked_pending_signals());
+            assert_eq!(
+                current
+                    .unserialized_flags
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    & crate::kernel::task::TASK_RESTORE_SIGMASK,
+                0
+            );
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);

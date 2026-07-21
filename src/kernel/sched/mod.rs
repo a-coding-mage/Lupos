@@ -223,6 +223,35 @@ static mut CURRENT_TASK: [*mut TaskStruct; MAX_CPUS] = [core::ptr::null_mut(); M
 static DEFERRED_TASK_RELEASE: [AtomicPtr<TaskStruct>; MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
 
+// Lupos-specific runtime instrumentation for the Linux rq-lock handoff race:
+// stop one self-pick after rq unlock so another CPU can enqueue work in the
+// exact window before __schedule() returns.  No upstream selftest can expose
+// this internal point without a scheduler trace hook.
+#[cfg(feature = "test-smp-preempt")]
+static SELF_PICK_TEST_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+#[cfg(feature = "test-smp-preempt")]
+static SELF_PICK_TEST_REACHED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SELF_PICK_TEST_RELEASE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "test-smp-preempt")]
+pub fn arm_self_pick_rq_unlock_test(cpu: u32) {
+    SELF_PICK_TEST_REACHED.store(false, Ordering::Relaxed);
+    SELF_PICK_TEST_RELEASE.store(false, Ordering::Relaxed);
+    SELF_PICK_TEST_CPU.store(cpu, Ordering::Release);
+    request_reschedule(cpu);
+}
+
+#[cfg(feature = "test-smp-preempt")]
+pub fn self_pick_rq_unlock_test_reached() -> bool {
+    SELF_PICK_TEST_REACHED.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "test-smp-preempt")]
+pub fn release_self_pick_rq_unlock_test() {
+    SELF_PICK_TEST_RELEASE.store(true, Ordering::Release);
+}
+
 #[cfg(test)]
 std::thread_local! {
     static TEST_CURRENT_TASK: core::cell::Cell<*mut TaskStruct> =
@@ -674,7 +703,7 @@ fn idlest_allowed_cpu(mask: entity::CpuMask) -> Option<u32> {
 /// idle. This avoids locking every active runqueue on futex/pipe wake storms.
 pub(super) fn select_idlest_active_cpu(task: *mut TaskStruct, prev_cpu: u32, flags: u32) -> u32 {
     let eligible = task_placement_mask(task);
-    if flags & class::ENQUEUE_INITIAL != 0 || !eligible.test(prev_cpu) {
+    if flags & class::WF_FORK != 0 || !eligible.test(prev_cpu) {
         return idlest_allowed_cpu(eligible).unwrap_or_else(|| prev_cpu.min((MAX_CPUS - 1) as u32));
     }
 
@@ -762,30 +791,67 @@ unsafe fn task_can_switch_to(task: *mut TaskStruct) -> bool {
 /// Initialise scheduler-owned fields for a newly forked task.
 ///
 /// This is the Lupos equivalent of Linux `sched_fork()`: inherit scheduling
-/// policy from the parent, reset runqueue-owned state, and default to CFS when
-/// the parent was an early boot task without a class yet.
-pub unsafe fn init_task_sched_from_parent(parent: *mut TaskStruct, child: *mut TaskStruct) {
+/// policy without leaking a PI boost, apply `SCHED_RESET_ON_FORK`, reject an
+/// inherited deadline priority, and reset runqueue-owned state.
+pub unsafe fn init_task_sched_from_parent(
+    parent: *mut TaskStruct,
+    child: *mut TaskStruct,
+) -> Result<(), i32> {
     if child.is_null() {
-        return;
+        return Ok(());
     }
 
     let mut sched = M29SchedFields::zeroed();
     if !parent.is_null() {
         unsafe {
-            sched.prio = (*parent).m29.prio;
+            // Linux sched_fork(): do not leak a transient PI boost from
+            // current->prio into the child.
+            sched.prio = (*parent).m29.normal_prio;
             sched.static_prio = (*parent).m29.static_prio;
             sched.normal_prio = (*parent).m29.normal_prio;
             sched.rt_priority = (*parent).m29.rt_priority;
-            sched.sched_class = (*parent).m29.sched_class;
             sched.policy = (*parent).m29.policy;
             sched.cpus_mask = (*parent).m29.cpus_mask;
+            // __sched_fork() preserves the configured fair slice while
+            // resetting runtime/accounting fields.
+            sched.se.custom_slice = (*parent).m29.se.custom_slice;
+            sched.se.slice = (*parent).m29.se.slice;
         }
     }
-    if sched.sched_class.is_null()
-        || sched.sched_class == &idle::IDLE_SCHED_CLASS as *const class::SchedClass
-    {
-        sched.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
+
+    if sched.policy & prio::SCHED_RESET_ON_FORK != 0 {
+        let inherited_policy = sched.policy & !prio::SCHED_RESET_ON_FORK;
+        if matches!(
+            inherited_policy,
+            prio::SCHED_DEADLINE | prio::SCHED_FIFO | prio::SCHED_RR
+        ) {
+            sched.policy = prio::SCHED_NORMAL;
+            sched.static_prio = prio::DEFAULT_PRIO;
+            sched.rt_priority = 0;
+        } else {
+            sched.policy = inherited_policy;
+            if prio::prio_to_nice(sched.static_prio) < 0 {
+                sched.static_prio = prio::DEFAULT_PRIO;
+            }
+        }
+
+        sched.prio = sched.static_prio;
+        sched.normal_prio = sched.static_prio;
+        sched.se.custom_slice = 0;
+        sched.se.slice = fair::SYSCTL_SCHED_BASE_SLICE_NS;
     }
+
+    // vendor/linux/include/linux/sched/deadline.h::dl_prio(). Linux returns
+    // -EAGAIN rather than allowing an unadmitted DL task to fork.
+    if sched.prio < 0 {
+        return Err(-11);
+    }
+
+    sched.sched_class = if sched.prio < prio::MAX_RT_PRIO {
+        &rt::RT_SCHED_CLASS as *const class::SchedClass
+    } else {
+        &fair::FAIR_SCHED_CLASS as *const class::SchedClass
+    };
     if sched.cpus_mask.weight() == 0 {
         sched.cpus_mask = entity::CpuMask::all();
     }
@@ -798,6 +864,28 @@ pub unsafe fn init_task_sched_from_parent(parent: *mut TaskStruct, child: *mut T
         (*child).m29.on_rq = 0;
         (*child).m29.se.on_rq = 0;
         (*child).m29.rt.on_rq = 0;
+    }
+    Ok(())
+}
+
+/// Linux `sched_cgroup_fork()`'s unconditional scheduler portion.
+///
+/// Lupos's CPU-cgroup attachment lives in `kernel::cgroup`, but the generic
+/// x86_64 path must still establish the child's first CPU and run its class
+/// fork hook before the task becomes visible.
+pub unsafe fn sched_cgroup_fork(p: *mut TaskStruct) {
+    if p.is_null() {
+        return;
+    }
+    unsafe {
+        if (*p).m29.sched_class.is_null() {
+            (*p).m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
+        }
+        (*p).thread_info.cpu = current_cpu();
+        let sched_class = (*p).m29.sched_class;
+        if let Some(task_fork) = (*sched_class).task_fork {
+            task_fork(p);
+        }
     }
 }
 
@@ -1204,10 +1292,22 @@ pub unsafe fn __schedule() {
     })
     .unwrap_or((current, current));
 
-    if prev == next || next.is_null() {
-        unsafe {
-            clear_need_resched(current);
+    #[cfg(feature = "test-smp-preempt")]
+    if prev == next
+        && SELF_PICK_TEST_CPU
+            .compare_exchange(cpu, u32::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        SELF_PICK_TEST_REACHED.store(true, Ordering::Release);
+        while !SELF_PICK_TEST_RELEASE.load(Ordering::Acquire) {
+            core::hint::spin_loop();
         }
+    }
+
+    if prev == next || next.is_null() {
+        // Linux clears prev's request exactly once, while rq->lock is held.
+        // A remote wake can set a new request after that unlock; clearing it
+        // here would lose the wake and let an idle CPU halt with queued work.
         debug_assert!(task_on_cpu(current));
         crate::kernel::locking::local_irq_restore(irq_flags);
         return;
@@ -1251,6 +1351,14 @@ pub unsafe fn schedule() -> bool {
 /// of the normal blocking-work path. Repeat until a concurrent reschedule
 /// request has been consumed.
 pub unsafe fn schedule_idle() {
+    // Lupos still retains a cooperative runqueue for one-CPU configurations.
+    // Rust cannot route that queue through Linux's `__schedule()` classes, so
+    // preserve the same idle entry contract with its existing picker. SMP —
+    // the generic x86_64 target — follows Linux's loop below.
+    if !production_smp_scheduler_enabled() {
+        let _ = unsafe { legacy_schedule() };
+        return;
+    }
     loop {
         unsafe {
             __schedule();
@@ -1816,6 +1924,35 @@ pub fn sched_init_smp() {
     topology::init_sched_domains();
 }
 
+/// Prepare Lupos's future PID 1 for Linux's post-`sched_init_smp()` CPU mask.
+///
+/// Lupos currently creates PID 1 after AP bring-up, directly from swapper/0,
+/// whereas Linux widens the already-created `kernel_init` task inside
+/// `sched_init_smp()`.  This hook is kept at the pre-wakeup clone boundary so
+/// the lifecycle ordering can be translated without making an idle task
+/// migratable.
+pub unsafe fn prepare_boot_init_task(task: *mut TaskStruct) {
+    if task.is_null() {
+        return;
+    }
+
+    let allowed = isolation::housekeeping_cpumask(cpu_active_mask());
+    assert!(
+        allowed.weight() != 0,
+        "boot init task has no active housekeeping CPU"
+    );
+    unsafe {
+        debug_assert_eq!(
+            (*task).__state.load(Ordering::Acquire),
+            crate::kernel::task::task_state::TASK_NEW,
+            "boot init affinity must be installed before first wakeup"
+        );
+        (*task).m29.cpus_mask = allowed;
+        (*task).m29.cpus_ptr = &(*task).m29.cpus_mask as *const _;
+        (*task).m29.nr_cpus_allowed = allowed.weight() as i32;
+    }
+}
+
 // ── M29: scheduler_tick() — invoked from the LAPIC timer ISR ─────────────────
 
 /// Periodic scheduler tick.  Mirrors `vendor/linux/kernel/sched/core.c::scheduler_tick`.
@@ -1872,28 +2009,69 @@ pub fn run_rebalance_softirq() {
     }
 }
 
-/// Wake-up a freshly-forked task — installs `sched_class` defaults and
-/// inserts the entity into the appropriate per-CPU runqueue.
+/// Wake a freshly-forked task for the first time and activate its scheduling
+/// entity on the selected runqueue.
 ///
 /// Mirrors Linux `wake_up_new_task(p)`.
 pub unsafe fn wake_up_new_task(p: *mut TaskStruct) {
     if p.is_null() {
         return;
     }
+
+    // Single-CPU configurations retain the cooperative queue. Preserve its
+    // established child-after-parent placement while matching Linux's state
+    // transition at this API boundary.
+    if !production_smp_scheduler_enabled() {
+        unsafe {
+            (*p).__state.store(
+                crate::kernel::task::task_state::TASK_RUNNING,
+                Ordering::Release,
+            );
+            enqueue_task(p);
+        }
+        return;
+    }
+
     unsafe {
-        // If the parent didn't pre-set a class, default to CFS.
         if (*p).m29.sched_class.is_null() {
             (*p).m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
         }
-        let class = (*p).m29.sched_class;
-        if let Some(fork) = (*class).task_fork {
-            fork(p);
-        }
-        let cpu = select_task_rq(p, current_cpu(), class::ENQUEUE_INITIAL);
+        (*p).__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+
+        // Linux records task_cpu(p) before fork balancing, then passes
+        // WF_FORK to select_task_rq(). ENQUEUE_INITIAL belongs only to the
+        // subsequent activation/accounting step.
+        let prev_cpu = (*p).thread_info.cpu;
+        (*p).m29.recent_used_cpu = prev_cpu as i32;
+        let cpu = select_task_rq(p, prev_cpu, class::WF_FORK);
         (*p).thread_info.cpu = cpu;
-        (*p).m29.recent_used_cpu = cpu as i32;
         (*p).m29.wake_cpu = cpu as i32;
-        enqueue_on_rq(cpu, p, class::ENQUEUE_INITIAL);
+
+        let sched_class = (*p).m29.sched_class;
+        let newly_set = rq::with_rq(cpu, |target_rq| unsafe {
+            target_rq.update_rq_clock();
+            // Linux calls post_init_entity_util_avg() here. Lupos's CfsRq
+            // does not yet represent the aggregate sched_avg that function
+            // consumes, so there is no equivalent state to update; initial
+            // runqueue membership and load accounting remain class-owned.
+            if (*p).m29.on_rq != 0 {
+                return false;
+            }
+            if let Some(enqueue) = (*sched_class).enqueue_task {
+                enqueue(
+                    target_rq,
+                    p,
+                    class::ENQUEUE_NOCLOCK | class::ENQUEUE_INITIAL,
+                );
+            }
+            (*p).m29.on_rq != 0 && wakeup_preempt_locked(target_rq, p, class::WF_FORK)
+        });
+        if let Some(newly_set) = newly_set {
+            send_reschedule_ipi_for_transition(cpu, newly_set);
+        }
     }
 }
 
@@ -1928,7 +2106,11 @@ pub unsafe fn try_to_wake_up(p: *mut TaskStruct, wake_flags: u32) -> bool {
     // SIGKILL may still resolve a zombie PID.
     let state = unsafe { (*p).__state.load(Ordering::Acquire) };
     if unsafe { (*p).m26.exit_state } & exit_mask != 0
-        || state & (exit_mask | crate::kernel::task::task_state::TASK_DEAD) != 0
+        || state
+            & (exit_mask
+                | crate::kernel::task::task_state::TASK_DEAD
+                | crate::kernel::task::task_state::TASK_NEW)
+            != 0
     {
         return false;
     }
@@ -2045,6 +2227,94 @@ mod tests {
 
     static LEGACY_SCHED_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
+    // test-origin: linux:vendor/linux/kernel/sched/core.c:wake_up_new_task
+    // and linux:vendor/linux/kernel/fork.c:kernel_clone
+    // Linux has no selftest that exposes internal class-hook ordering or
+    // enqueue flags, so this probe class records those otherwise-unobservable
+    // scheduler decisions without replacing the real runqueue boundary.
+    static NEW_TASK_TEST_PHASE: AtomicU32 = AtomicU32::new(0);
+    static NEW_TASK_TEST_ERROR: AtomicU32 = AtomicU32::new(0);
+    static NEW_TASK_TEST_SELECT_FLAGS: AtomicU32 = AtomicU32::new(0);
+    static NEW_TASK_TEST_ENQUEUE_FLAGS: AtomicU32 = AtomicU32::new(0);
+
+    unsafe fn new_task_test_task_fork(p: *mut TaskStruct) {
+        if p.is_null()
+            || unsafe { (*p).__state.load(Ordering::Acquire) }
+                != crate::kernel::task::task_state::TASK_NEW
+        {
+            NEW_TASK_TEST_ERROR.fetch_or(1 << 0, Ordering::AcqRel);
+        }
+        if NEW_TASK_TEST_PHASE
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            NEW_TASK_TEST_ERROR.fetch_or(1 << 1, Ordering::AcqRel);
+        }
+    }
+
+    unsafe fn new_task_test_select_rq(_p: *mut TaskStruct, prev_cpu: u32, flags: u32) -> u32 {
+        NEW_TASK_TEST_SELECT_FLAGS.store(flags, Ordering::Release);
+        if prev_cpu != 0
+            || NEW_TASK_TEST_PHASE
+                .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            NEW_TASK_TEST_ERROR.fetch_or(1 << 2, Ordering::AcqRel);
+        }
+        0
+    }
+
+    unsafe fn new_task_test_enqueue(rq: &mut rq::Rq, p: *mut TaskStruct, flags: u32) {
+        NEW_TASK_TEST_ENQUEUE_FLAGS.store(flags, Ordering::Release);
+        if p.is_null()
+            || unsafe { (*p).__state.load(Ordering::Acquire) }
+                != crate::kernel::task::task_state::TASK_RUNNING
+            || unsafe { (*p).m29.recent_used_cpu } != 0
+            || NEW_TASK_TEST_PHASE
+                .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            NEW_TASK_TEST_ERROR.fetch_or(1 << 3, Ordering::AcqRel);
+        }
+        if !p.is_null() {
+            unsafe {
+                (*p).m29.on_rq = 1;
+            }
+            rq.nr_running = rq.nr_running.saturating_add(1);
+        }
+    }
+
+    unsafe fn new_task_test_dequeue(rq: &mut rq::Rq, p: *mut TaskStruct, _flags: u32) -> bool {
+        if p.is_null() || unsafe { (*p).m29.on_rq } == 0 {
+            return false;
+        }
+        unsafe {
+            (*p).m29.on_rq = 0;
+        }
+        rq.nr_running = rq.nr_running.saturating_sub(1);
+        true
+    }
+
+    static NEW_TASK_TEST_CLASS: class::SchedClass = class::SchedClass {
+        class_prio: class::CLASS_PRIO_FAIR,
+        _pad: [0; 7],
+        enqueue_task: Some(new_task_test_enqueue),
+        dequeue_task: Some(new_task_test_dequeue),
+        yield_task: None,
+        wakeup_preempt: None,
+        pick_next_task: None,
+        put_prev_task: None,
+        set_next_task: None,
+        task_tick: None,
+        task_fork: Some(new_task_test_task_fork),
+        task_dead: None,
+        switched_to: None,
+        prio_changed: None,
+        get_rr_interval: None,
+        update_curr: None,
+        select_task_rq: Some(new_task_test_select_rq),
+    };
+
     struct LegacySchedTestGuard {
         _lock: StdMutexGuard<'static, ()>,
         previous_current: *mut TaskStruct,
@@ -2143,6 +2413,50 @@ mod tests {
             task.m29.se.run_node.__rb_parent_color, run_node as usize,
             "RB_CLEAR_NODE proves put_prev transiently inserted the sleeping current task before dequeue erased it"
         );
+    }
+
+    #[test]
+    fn pending_signal_cancels_interruptible_block_before_dequeue() {
+        // test-origin: linux:vendor/linux/kernel/sched/core.c:try_to_block_task
+        // No upstream userspace test can deterministically stop inside this
+        // scheduler race window, so exercise the production class boundary:
+        // signal_pending_state() must restore TASK_RUNNING and leave the
+        // current entity runnable instead of calling dequeue_task().
+        let mut rq = rq::Rq::new(0);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        task.m29 = M29SchedFields::zeroed();
+        let task_ptr = &mut *task as *mut TaskStruct;
+
+        task.m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
+        task.m29.on_rq = 1;
+        task.m29.se.on_rq = 1;
+        task.m29.se.load.weight = prio::NICE_0_LOAD;
+        task.thread_info
+            .flags
+            .store(crate::kernel::task::TIF_SIGPENDING, Ordering::Release);
+        task.__state.store(
+            crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+            Ordering::Release,
+        );
+        rq.current = task_ptr;
+        rq.cfs.current = task_ptr;
+        rq.nr_running = 1;
+        rq.cfs.nr_running = 1;
+        rq.cfs.load_weight = prio::NICE_0_LOAD;
+
+        unsafe {
+            prepare_prev_for_pick(&mut rq, task_ptr);
+        }
+
+        assert_eq!(
+            task.__state.load(Ordering::Acquire),
+            crate::kernel::task::task_state::TASK_RUNNING,
+            "a pending signal must cancel TASK_INTERRUPTIBLE under rq lock"
+        );
+        assert_eq!(task.m29.on_rq, 1, "the task must remain runnable");
+        assert_eq!(task.m29.se.on_rq, 1, "the FAIR entity must stay queued");
+        assert_eq!(rq.nr_running, 1);
+        assert_eq!(rq.cfs.nr_running, 1);
     }
 
     #[test]
@@ -2261,7 +2575,7 @@ mod tests {
     }
 
     #[test]
-    fn bsp_idle_loop_schedules_and_closes_the_check_halt_race() {
+    fn bsp_idle_loop_only_schedules_when_linux_need_resched_is_set() {
         let source = include_str!("../../init/main.rs");
         let body = source
             .split("fn halt_loop_with_softirq() -> !")
@@ -2271,25 +2585,14 @@ mod tests {
             .next()
             .expect("BSP idle loop must end before panic handler");
 
-        let schedule = body
-            .find("kernel::sched::schedule()")
-            .expect("BSP idle task must run the scheduler");
-        let disable = body[schedule..]
-            .find("kernel::locking::local_irq_disable()")
-            .map(|offset| schedule + offset)
-            .expect("BSP idle task must disable IRQs before its final checks");
-        let need_resched = body[disable..]
-            .find("kernel::sched::current_needs_resched()")
-            .map(|offset| disable + offset)
-            .expect("BSP idle task must recheck need_resched with IRQs disabled");
-        let halt = body[need_resched..]
-            .find("core::arch::asm!(\"sti; hlt\"")
-            .map(|offset| need_resched + offset)
-            .expect("BSP idle task must atomically enable IRQs and halt");
-
-        assert!(schedule < disable);
-        assert!(disable < need_resched);
-        assert!(need_resched < halt);
+        assert!(
+            body.contains("kernel::sched::idle::cpu_startup_entry()"),
+            "BSP and AP swapper tasks must share Linux's do_idle implementation"
+        );
+        assert!(
+            !body.contains("kernel::sched::schedule()"),
+            "the BSP must not schedule unconditionally after every interrupt"
+        );
     }
 
     #[test]
@@ -2363,7 +2666,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_enqueue_places_new_task_after_current() {
+    fn legacy_new_task_activation_places_child_after_current() {
         let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         let mut older = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         let mut child = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
@@ -2371,6 +2674,9 @@ mod tests {
         let current_ptr = &mut *current as *mut TaskStruct;
         let older_ptr = &mut *older as *mut TaskStruct;
         let child_ptr = &mut *child as *mut TaskStruct;
+        child
+            .__state
+            .store(crate::kernel::task::task_state::TASK_NEW, Ordering::Release);
 
         unsafe {
             set_current(current_ptr);
@@ -2385,7 +2691,7 @@ mod tests {
         }
 
         unsafe {
-            enqueue_task(child_ptr);
+            wake_up_new_task(child_ptr);
         }
 
         let rq = RUN_QUEUE.lock();
@@ -2399,7 +2705,87 @@ mod tests {
             0,
             "legacy fork placement must request a syscall-exit reschedule"
         );
+        assert_eq!(
+            child.__state.load(Ordering::Acquire),
+            crate::kernel::task::task_state::TASK_RUNNING,
+            "wake_up_new_task must publish TASK_RUNNING before legacy placement"
+        );
         drop(rq);
+    }
+
+    #[test]
+    fn new_task_activation_runs_fork_hook_then_initial_accounting() {
+        let mut parent = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut child = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let _guard = legacy_sched_test_guard();
+        let parent_ptr = &mut *parent as *mut TaskStruct;
+        let child_ptr = &mut *child as *mut TaskStruct;
+
+        rq::init_rqs();
+        PRODUCTION_SCHED_ENABLED.store(true, Ordering::Release);
+        parent.m29 = M29SchedFields::zeroed();
+        parent.m29.sched_class = &NEW_TASK_TEST_CLASS as *const class::SchedClass;
+        child.m29 = M29SchedFields::zeroed();
+        child.m29.sched_class = &NEW_TASK_TEST_CLASS as *const class::SchedClass;
+        child
+            .__state
+            .store(crate::kernel::task::task_state::TASK_NEW, Ordering::Release);
+        unsafe {
+            set_current(parent_ptr);
+        }
+
+        NEW_TASK_TEST_PHASE.store(0, Ordering::Relaxed);
+        NEW_TASK_TEST_ERROR.store(0, Ordering::Relaxed);
+        NEW_TASK_TEST_SELECT_FLAGS.store(0, Ordering::Relaxed);
+        NEW_TASK_TEST_ENQUEUE_FLAGS.store(0, Ordering::Relaxed);
+        let previous_rq_current = rq::with_rq(0, |rq| {
+            let previous = rq.current;
+            rq.current = core::ptr::null_mut();
+            previous
+        })
+        .expect("CPU0 runqueue must exist");
+        let before = rq::rq_nr_running(0).expect("CPU0 runqueue must exist");
+
+        unsafe {
+            sched_cgroup_fork(child_ptr);
+            wake_up_new_task(child_ptr);
+        }
+
+        let phase = NEW_TASK_TEST_PHASE.load(Ordering::Acquire);
+        let error = NEW_TASK_TEST_ERROR.load(Ordering::Acquire);
+        let select_flags = NEW_TASK_TEST_SELECT_FLAGS.load(Ordering::Acquire);
+        let enqueue_flags = NEW_TASK_TEST_ENQUEUE_FLAGS.load(Ordering::Acquire);
+        let placement = (
+            child.thread_info.cpu,
+            child.m29.recent_used_cpu,
+            child.m29.wake_cpu,
+            child.m29.on_rq,
+        );
+        let after_enqueue = rq::rq_nr_running(0);
+
+        unsafe {
+            dequeue_task(child_ptr);
+        }
+        let after_dequeue = rq::rq_nr_running(0);
+        let _ = rq::with_rq(0, |rq| {
+            rq.current = previous_rq_current;
+        });
+
+        assert_eq!(phase, 3);
+        assert_eq!(error, 0);
+        assert_eq!(
+            select_flags,
+            class::WF_FORK,
+            "fork balancing must receive WF_FORK, not an enqueue flag"
+        );
+        assert_eq!(
+            enqueue_flags,
+            class::ENQUEUE_NOCLOCK | class::ENQUEUE_INITIAL,
+            "a never-run child must enter through ENQUEUE_INITIAL"
+        );
+        assert_eq!(placement, (0, 0, 0, 1));
+        assert_eq!(after_enqueue, Some(before + 1));
+        assert_eq!(after_dequeue, Some(before));
     }
 
     #[test]
@@ -2450,7 +2836,7 @@ mod tests {
     }
 
     #[test]
-    fn wake_rejects_exiting_tasks_without_resurrecting_them() {
+    fn wake_rejects_dead_exiting_and_not_yet_runnable_tasks() {
         let _guard = legacy_sched_test_guard();
         for (exit_state, task_state) in [
             (
@@ -2466,6 +2852,7 @@ mod tests {
                 crate::kernel::task::task_state::EXIT_DEAD,
             ),
             (0, crate::kernel::task::task_state::TASK_DEAD),
+            (0, crate::kernel::task::task_state::TASK_NEW),
         ] {
             let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
             let task_ptr = &mut *task as *mut TaskStruct;
@@ -2652,7 +3039,8 @@ mod tests {
             init_task_sched_from_parent(
                 &mut *parent as *mut TaskStruct,
                 &mut *child as *mut TaskStruct,
-            );
+            )
+            .expect("idle parent must fork into FAIR");
         }
 
         assert_eq!(
@@ -2666,6 +3054,102 @@ mod tests {
         );
         assert_eq!(child.m29.on_rq, 0);
         assert_eq!(child.m29.on_cpu.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn sched_fork_uses_normal_prio_instead_of_inherited_pi_boost() {
+        let mut parent = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut child = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        parent.m29 = M29SchedFields::zeroed();
+        parent.m29.prio = 7;
+        parent.m29.normal_prio = prio::DEFAULT_PRIO;
+        parent.m29.static_prio = prio::DEFAULT_PRIO;
+        parent.m29.policy = prio::SCHED_NORMAL;
+
+        unsafe {
+            init_task_sched_from_parent(&mut *parent, &mut *child)
+                .expect("a PI-boosted normal task may fork");
+        }
+
+        assert_eq!(child.m29.prio, prio::DEFAULT_PRIO);
+        assert_eq!(child.m29.normal_prio, prio::DEFAULT_PRIO);
+        assert_eq!(
+            child.m29.sched_class,
+            &fair::FAIR_SCHED_CLASS as *const class::SchedClass
+        );
+    }
+
+    #[test]
+    fn sched_fork_reset_on_fork_demotes_rt_and_consumes_reset_flag() {
+        let mut parent = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut child = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        parent.m29 = M29SchedFields::zeroed();
+        parent.m29.prio = 49;
+        parent.m29.normal_prio = 49;
+        parent.m29.static_prio = prio::DEFAULT_PRIO;
+        parent.m29.rt_priority = 50;
+        parent.m29.policy = prio::SCHED_FIFO | prio::SCHED_RESET_ON_FORK;
+        parent.m29.se.custom_slice = 1;
+        parent.m29.se.slice = 9_000_000;
+
+        unsafe {
+            init_task_sched_from_parent(&mut *parent, &mut *child)
+                .expect("RESET_ON_FORK must make an RT child admissible");
+        }
+
+        assert_eq!(child.m29.policy, prio::SCHED_NORMAL);
+        assert_eq!(child.m29.prio, prio::DEFAULT_PRIO);
+        assert_eq!(child.m29.normal_prio, prio::DEFAULT_PRIO);
+        assert_eq!(child.m29.static_prio, prio::DEFAULT_PRIO);
+        assert_eq!(child.m29.rt_priority, 0);
+        assert_eq!(child.m29.se.custom_slice, 0);
+        assert_eq!(child.m29.se.slice, fair::SYSCTL_SCHED_BASE_SLICE_NS);
+        assert_eq!(
+            child.m29.sched_class,
+            &fair::FAIR_SCHED_CLASS as *const class::SchedClass
+        );
+        assert_ne!(
+            parent.m29.policy & prio::SCHED_RESET_ON_FORK,
+            0,
+            "the reset request belongs to the parent and remains armed there"
+        );
+    }
+
+    #[test]
+    fn sched_fork_reset_on_fork_clamps_negative_nice() {
+        let mut parent = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut child = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        parent.m29 = M29SchedFields::zeroed();
+        parent.m29.prio = prio::nice_to_prio(-10);
+        parent.m29.normal_prio = prio::nice_to_prio(-10);
+        parent.m29.static_prio = prio::nice_to_prio(-10);
+        parent.m29.policy = prio::SCHED_BATCH | prio::SCHED_RESET_ON_FORK;
+
+        unsafe {
+            init_task_sched_from_parent(&mut *parent, &mut *child)
+                .expect("RESET_ON_FORK must retain a normal-class child");
+        }
+
+        assert_eq!(child.m29.policy, prio::SCHED_BATCH);
+        assert_eq!(child.m29.static_prio, prio::DEFAULT_PRIO);
+        assert_eq!(child.m29.normal_prio, prio::DEFAULT_PRIO);
+        assert_eq!(child.m29.prio, prio::DEFAULT_PRIO);
+    }
+
+    #[test]
+    fn sched_fork_rejects_unreset_deadline_child() {
+        let mut parent = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut child = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        parent.m29 = M29SchedFields::zeroed();
+        parent.m29.prio = -1;
+        parent.m29.normal_prio = -1;
+        parent.m29.policy = prio::SCHED_DEADLINE;
+
+        assert_eq!(
+            unsafe { init_task_sched_from_parent(&mut *parent, &mut *child) },
+            Err(-11),
+            "Linux sched_fork returns -EAGAIN for inherited DL priority"
+        );
     }
 
     #[test]

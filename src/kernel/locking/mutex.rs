@@ -83,25 +83,79 @@ impl<T> Mutex<T> {
     }
 
     unsafe fn lock_slow(&self, me: u64) -> MutexGuard<'_, T> {
+        let cur_task = me as *mut TaskStruct;
+        let mut queued = false;
+
+        self.wait_lock.lock();
         loop {
-            // Mark "waiters present" so the unlocker knows to wake.
-            self.wait_lock.lock();
-            let cur = self.owner.load(Ordering::Acquire);
-            if cur == 0 {
-                // It became free between fast path and now — claim it.
-                self.owner.store(me, Ordering::Release);
+            let owner = self.owner.load(Ordering::Acquire);
+            let owner_task = owner & !MUTEX_FLAGS_MASK;
+            let first = unsafe { (*self.waiters.get()).first().copied() };
+            let can_take_free = owner_task == 0
+                && ((!queued && first.is_none()) || (queued && first == Some(cur_task)));
+            let can_pick_up = owner_task == me && owner & MUTEX_FLAG_PICKUP != 0;
+
+            if can_take_free || can_pick_up {
+                if queued {
+                    let waiters = unsafe { &mut *self.waiters.get() };
+                    let index = waiters
+                        .iter()
+                        .position(|&task| task == cur_task)
+                        .expect("mutex waiter disappeared before acquisition");
+                    debug_assert_eq!(index, 0, "mutex handoff bypassed the FIFO head");
+                    waiters.remove(index);
+                }
+
+                let waiters_remain = unsafe { !(*self.waiters.get()).is_empty() };
+                let desired = me
+                    | if waiters_remain {
+                        MUTEX_FLAG_WAITERS
+                    } else {
+                        0
+                    };
+                if can_take_free
+                    && self
+                        .owner
+                        .compare_exchange(owner, desired, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                {
+                    // A fast-path owner raced the free-owner retry. Restore
+                    // our queue position before rechecking under wait_lock.
+                    if queued {
+                        unsafe {
+                            (*self.waiters.get()).insert(0, cur_task);
+                        }
+                    }
+                    continue;
+                }
+                if can_pick_up {
+                    self.owner.store(desired, Ordering::Release);
+                }
+                if !cur_task.is_null() {
+                    unsafe {
+                        (*cur_task)
+                            .__state
+                            .store(task_state::TASK_RUNNING, Ordering::Release);
+                    }
+                }
                 self.wait_lock.unlock();
                 return MutexGuard { parent: self };
             }
-            // Set the WAITERS flag in the owner word (idempotent if already set).
-            let _ = self.owner.fetch_or(MUTEX_FLAG_WAITERS, Ordering::AcqRel);
 
-            // Park ourselves.
-            let cur_task = me as *mut TaskStruct;
-            unsafe {
-                (*self.waiters.get()).push(cur_task);
+            if !queued {
+                // Linux adds each waiter once, then retries acquisition while
+                // still holding wait_lock. The retry closes the race where
+                // unlock clears owner immediately before WAITERS is published.
+                unsafe {
+                    (*self.waiters.get()).push(cur_task);
+                }
+                queued = true;
+                self.owner.fetch_or(MUTEX_FLAG_WAITERS, Ordering::AcqRel);
+                continue;
             }
-            // Mark ourselves uninterruptible (would-be slow-path semantics).
+
+            // Linux set_current_state(TASK_UNINTERRUPTIBLE) is ordered by
+            // wait_lock against the handoff and wakeup below.
             if !cur_task.is_null() {
                 unsafe {
                     (*cur_task)
@@ -121,13 +175,21 @@ impl<T> Mutex<T> {
                 // In host tests we can't yield; pretend we acquired so the
                 // test-side `unlock` scenarios remain reachable.
                 self.wait_lock.lock();
-                unsafe {
-                    (*self.waiters.get()).retain(|&t| t != cur_task);
-                }
-                self.owner.store(me, Ordering::Release);
+                let waiters = unsafe { &mut *self.waiters.get() };
+                waiters.retain(|&task| task != cur_task);
+                let desired = me
+                    | if waiters.is_empty() {
+                        0
+                    } else {
+                        MUTEX_FLAG_WAITERS
+                    };
+                self.owner.store(desired, Ordering::Release);
                 self.wait_lock.unlock();
                 return MutexGuard { parent: self };
             }
+
+            #[cfg(not(test))]
+            self.wait_lock.lock();
         }
     }
 
@@ -146,21 +208,47 @@ impl<T> Mutex<T> {
     }
 
     fn unlock(&self) {
-        // Clear owner.
-        let prev = self.owner.swap(0, Ordering::AcqRel);
-        if prev & MUTEX_FLAG_WAITERS != 0 {
-            // Wake one waiter if any.
-            self.wait_lock.lock();
-            let waiters = unsafe { &mut *self.waiters.get() };
-            if !waiters.is_empty() {
-                let head = waiters.remove(0);
-                unsafe {
-                    (*head)
-                        .__state
-                        .store(task_state::TASK_RUNNING, Ordering::Release);
-                }
+        let me = Self::current_task();
+        let owner = self.owner.load(Ordering::Acquire);
+        debug_assert_eq!(
+            owner & !MUTEX_FLAGS_MASK,
+            me,
+            "mutex unlocked by a non-owner"
+        );
+
+        // Linux's uncontended release cmpxchg avoids taking wait_lock.
+        if owner & MUTEX_FLAG_WAITERS == 0
+            && self
+                .owner
+                .compare_exchange(owner, 0, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+        {
+            return;
+        }
+
+        self.wait_lock.lock();
+        let head = unsafe { (*self.waiters.get()).first().copied() };
+        if let Some(head) = head {
+            // Lupos has no optimistic mutex spinner, so perform Linux's
+            // explicit handoff: the waiter remains queued until it observes
+            // PICKUP and removes itself in lock_slow(). Keeping WAITERS set
+            // also preserves every later FIFO waiter.
+            self.owner.store(
+                head as u64 | MUTEX_FLAG_WAITERS | MUTEX_FLAG_PICKUP,
+                Ordering::Release,
+            );
+        } else {
+            self.owner.store(0, Ordering::Release);
+        }
+        self.wait_lock.unlock();
+
+        // vendor/linux/kernel/locking/mutex.c::__mutex_unlock_slowpath drops
+        // wait_lock before wake_up_process(). A state-only store strands an
+        // SMP waiter after schedule() has dequeued it.
+        if let Some(head) = head {
+            unsafe {
+                crate::kernel::sched::wake_task_normal(head);
             }
-            self.wait_lock.unlock();
         }
     }
 

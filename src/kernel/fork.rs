@@ -54,7 +54,7 @@ use crate::kernel::clone::{
 };
 use crate::kernel::pid::{INIT_PID_NS, alloc_pid};
 use crate::kernel::sched::{
-    KTHREAD_STACK_SIZE, enqueue_task, get_current, schedule_with_irqs_enabled,
+    KTHREAD_STACK_SIZE, get_current, schedule_with_irqs_enabled, wake_up_new_task,
 };
 use crate::kernel::task::{TIF_NEED_RESCHED, TIF_SIGPENDING, TaskStruct, ThreadInfo};
 use crate::kernel::thread::ThreadStruct;
@@ -147,6 +147,7 @@ unsafe impl Send for HeapTaskEntry {}
 struct HeapTaskTracker {
     entries: [Option<HeapTaskEntry>; MAX_HEAP_TASKS],
     len: usize,
+    reserved: usize,
 }
 
 // SAFETY: Protected by Mutex.
@@ -155,18 +156,66 @@ unsafe impl Send for HeapTaskTracker {}
 static HEAP_TASKS: Mutex<HeapTaskTracker> = Mutex::new(HeapTaskTracker {
     entries: [const { None }; MAX_HEAP_TASKS],
     len: 0,
+    reserved: 0,
 });
 static CHILD_SETTID_REGISTRATIONS: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
 
-fn track_heap_task(task: *mut TaskStruct, stack: *mut u8) {
-    let mut tracker = HEAP_TASKS.lock();
-    for i in 0..MAX_HEAP_TASKS {
-        if tracker.entries[i].is_none() {
-            tracker.entries[i] = Some(HeapTaskEntry { task, stack });
-            tracker.len += 1;
-            return;
+/// Capacity reservation for an allocation which is not visible in the task
+/// registry yet.
+///
+/// Linux allocates and initializes `task_struct` before publishing it under
+/// `tasklist_lock`.  The reservation preserves the same ownership boundary:
+/// it prevents a concurrent fork from consuming the last tracker slot without
+/// exposing a zeroed or partially initialized task through PID lookup.
+struct HeapTaskReservation {
+    active: bool,
+}
+
+impl HeapTaskReservation {
+    /// Publish the completed task and execute `before_unlock` while registry
+    /// lookups are still excluded.
+    ///
+    /// `kernel_clone()` uses the callback for `wake_up_new_task()`. Lupos does
+    /// not yet model Linux's `p->pi_lock`; keeping the task undiscoverable
+    /// instead removes the competing affinity operation until initial CPU
+    /// selection and runqueue placement are complete.
+    fn publish_with(mut self, task: *mut TaskStruct, stack: *mut u8, before_unlock: impl FnOnce()) {
+        let mut tracker = HEAP_TASKS.lock();
+        debug_assert!(self.active);
+        debug_assert!(tracker.reserved != 0);
+
+        let slot = tracker
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .expect("reserved heap-task tracker slot disappeared");
+        tracker.reserved -= 1;
+        tracker.entries[slot] = Some(HeapTaskEntry { task, stack });
+        tracker.len += 1;
+        self.active = false;
+
+        before_unlock();
+        drop(tracker);
+    }
+}
+
+impl Drop for HeapTaskReservation {
+    fn drop(&mut self) {
+        if self.active {
+            let mut tracker = HEAP_TASKS.lock();
+            debug_assert!(tracker.reserved != 0);
+            tracker.reserved -= 1;
         }
     }
+}
+
+fn reserve_heap_task() -> Result<HeapTaskReservation, i32> {
+    let mut tracker = HEAP_TASKS.lock();
+    if tracker.len.saturating_add(tracker.reserved) >= MAX_HEAP_TASKS {
+        return Err(-12); // ENOMEM
+    }
+    tracker.reserved += 1;
+    Ok(HeapTaskReservation { active: true })
 }
 
 /// Number of heap-allocated tasks currently tracked.
@@ -309,6 +358,20 @@ unsafe fn free_kernel_stack(stack: *mut u8) {
 
 fn alloc_task_struct_zeroed() -> *mut TaskStruct {
     unsafe { alloc_zeroed(Layout::new::<TaskStruct>()) as *mut TaskStruct }
+}
+
+/// Recover the allocation base from the kernel-stack top stored in
+/// `task_struct.stack` by this fork implementation.
+unsafe fn task_kernel_stack_base(task: *mut TaskStruct) -> *mut u8 {
+    if task.is_null() {
+        return core::ptr::null_mut();
+    }
+    let stack_top = unsafe { (*task).stack as *mut u8 };
+    if stack_top.is_null() {
+        core::ptr::null_mut()
+    } else {
+        unsafe { stack_top.sub(KTHREAD_STACK_SIZE) }
+    }
 }
 
 unsafe fn write_user_tid(ptr: *mut i32, tid: i32) -> Result<(), i32> {
@@ -461,7 +524,7 @@ pub fn user_fork_child_return_addr() -> u64 {
 /// # Safety
 ///
 /// `parent` must be a valid, non-null `TaskStruct` pointer.
-pub unsafe fn copy_process(
+unsafe fn copy_process_unpublished(
     parent: *mut TaskStruct,
     args: &KernelCloneArgs,
 ) -> Result<*mut TaskStruct, i32> {
@@ -493,7 +556,6 @@ pub unsafe fn copy_process(
     }
     let stack_top = unsafe { stack_ptr.add(KTHREAD_STACK_SIZE) };
 
-    track_heap_task(child, stack_ptr);
     let mut task_allocated = false;
 
     unsafe {
@@ -508,11 +570,21 @@ pub unsafe fn copy_process(
             cpu: (*parent).thread_info.cpu,
         };
 
-        // ── 5. Set initial task state: TASK_RUNNING ─────────────────────────
-        (*child).__state = core::sync::atomic::AtomicU32::new(0);
+        // ── 5. Set initial task state: TASK_NEW ────────────────────────────
+        // Linux sched_fork() publishes TASK_NEW so an external event cannot
+        // put a partially constructed child on a runqueue.
+        (*child).__state =
+            core::sync::atomic::AtomicU32::new(crate::kernel::task::task_state::TASK_NEW);
         (*child).saved_state = 0;
         (*child).stack = stack_top as *mut _;
-        crate::kernel::sched::init_task_sched_from_parent(parent, child);
+        if let Err(errno) = crate::kernel::sched::init_task_sched_from_parent(parent, child) {
+            // sched_fork() precedes PID and shared-resource setup, so unwind
+            // only the two allocations made so far. Running the later cleanup
+            // ladder here would operate on the all-zero PID key.
+            drop(Box::from_raw(child));
+            free_kernel_stack(stack_ptr);
+            return Err(errno);
+        }
 
         // ── 6. Allocate a PID ───────────────────────────────────────────────
         let kpid = match alloc_pid(&INIT_PID_NS, args.set_tid) {
@@ -743,6 +815,11 @@ pub unsafe fn copy_process(
         }
 
         // ── 12. Copy comm from parent ────────────────────────────────────────
+        // Linux copy_process() runs sched_cgroup_fork() before making the
+        // child visible. Besides its cgroup placement, that establishes the
+        // initial CPU and invokes sched_class::task_fork exactly once.
+        crate::kernel::sched::sched_cgroup_fork(child);
+
         (*child).comm = (*parent).comm;
         if !clone_thread {
             let parent_count = (*parent).m26.children_count as usize;
@@ -768,6 +845,24 @@ pub unsafe fn copy_process(
         }
     }
 
+    Ok(child)
+}
+
+/// Allocate and fully initialize a child, then publish it in Lupos's early
+/// task registry while it remains `TASK_NEW`.
+///
+/// Production fork/clone uses the unpublished helper from `kernel_clone()` so
+/// registry publication and `wake_up_new_task()` can be one atomic lifecycle
+/// boundary.  This public helper remains available to focused kernel tests
+/// which need a constructed, discoverable task without starting it.
+pub unsafe fn copy_process(
+    parent: *mut TaskStruct,
+    args: &KernelCloneArgs,
+) -> Result<*mut TaskStruct, i32> {
+    let reservation = reserve_heap_task()?;
+    let child = unsafe { copy_process_unpublished(parent, args)? };
+    let stack = unsafe { task_kernel_stack_base(child) };
+    reservation.publish_with(child, stack, || {});
     Ok(child)
 }
 
@@ -876,7 +971,13 @@ unsafe fn cleanup_failed_child(
         }
 
         let tracked_stack = begin_heap_task_release(child);
-        let stack_to_free = tracked_stack.unwrap_or(stack_ptr);
+        let stack_to_free = tracked_stack.unwrap_or_else(|| {
+            if stack_ptr.is_null() {
+                task_kernel_stack_base(child)
+            } else {
+                stack_ptr
+            }
+        });
         drop(Box::from_raw(child));
         free_kernel_stack(stack_to_free);
     }
@@ -928,12 +1029,18 @@ pub unsafe fn kernel_clone(args: &KernelCloneArgs) -> i64 {
         // propagation operation is modeled.
         return -1; // EPERM
     }
+    // Reserve ownership without publishing a child pointer. Linux likewise
+    // allocates all task resources before tasklist publication.
+    let heap_task_reservation = match reserve_heap_task() {
+        Ok(reservation) => reservation,
+        Err(errno) => return errno as i64,
+    };
     let cgroup_fork_state = if effective_args.flags & CLONE_INTO_CGROUP == 0 {
         crate::kernel::cgroup::prepare_pid_cgroup_fork(unsafe { (*parent).pid })
     } else {
         None
     };
-    let child = match unsafe { copy_process(parent, &effective_args) } {
+    let child = match unsafe { copy_process_unpublished(parent, &effective_args) } {
         Ok(c) => c,
         Err(e) => return e as i64,
     };
@@ -1017,8 +1124,26 @@ pub unsafe fn kernel_clone(args: &KernelCloneArgs) -> i64 {
         );
     }
 
-    // Enqueue the child so the scheduler can run it.
-    unsafe { enqueue_task(child) };
+    // Linux creates kernel_init before sched_init_smp(), pins it to the boot
+    // CPU temporarily, and widens that task there. Lupos creates PID 1 later
+    // from swapper/0, so perform the equivalent update while the child is
+    // still TASK_NEW and cannot race its first execution. Keep swapper/0
+    // itself one-CPU affine like every Linux idle task.
+    if effective_args.set_tid == Some(1) && unsafe { (*parent).pid } == 0 {
+        unsafe {
+            crate::kernel::sched::prepare_boot_init_task(child);
+        }
+    }
+
+    // Linux kernel_clone() activates a never-run child through the dedicated
+    // fork path, not through try_to_wake_up()/ENQUEUE_WAKEUP. Keep the early
+    // task registry locked across publication and initial runqueue placement:
+    // PID-based sched_setaffinity cannot discover the child in the interval
+    // between select_task_rq() and enqueue.
+    let stack = unsafe { task_kernel_stack_base(child) };
+    heap_task_reservation.publish_with(child, stack, || unsafe {
+        wake_up_new_task(child);
+    });
 
     if effective_args.flags & CLONE_VFORK != 0 {
         while !vfork_child_done(parent, child) {
@@ -1062,6 +1187,9 @@ mod tests {
         p.pid = 1000;
         p.tgid = 1000;
         p.comm = *b"test-parent\0\0\0\0\0";
+        p.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        p.m29.sched_class = &crate::kernel::sched::fair::FAIR_SCHED_CLASS
+            as *const crate::kernel::sched::class::SchedClass;
         p
     }
 
@@ -1162,6 +1290,45 @@ mod tests {
         }
         assert_eq!(heap_task_count(), baseline);
         crate::kernel::signal::reset_for_tests();
+    }
+
+    #[test]
+    fn copy_process_publishes_only_after_task_new_scheduler_initialization() {
+        let _test_guard = TEST_LOCK.lock().unwrap();
+        clean_lsm_hooks!();
+        let baseline = heap_task_count();
+        let mut parent = make_parent();
+        let reservation = reserve_heap_task().expect("reserve tracker capacity");
+
+        let child = unsafe {
+            copy_process_unpublished(&mut *parent, &KernelCloneArgs::default())
+                .expect("construct unpublished child")
+        };
+        let child_pid = unsafe { (*child).pid };
+
+        assert_eq!(heap_task_count(), baseline);
+        assert!(
+            find_heap_task_by_pid(child_pid).is_null(),
+            "PID lookup must not expose a task while copy_process initializes it"
+        );
+        assert_eq!(
+            unsafe { (*child).__state.load(Ordering::Acquire) },
+            crate::kernel::task::task_state::TASK_NEW
+        );
+        assert!(!unsafe { (*child).m29.sched_class }.is_null());
+
+        let stack = unsafe { task_kernel_stack_base(child) };
+        reservation.publish_with(child, stack, || {
+            assert!(
+                HEAP_TASKS.try_lock().is_none(),
+                "first-wake callback must run before PID lookup can acquire the registry"
+            );
+        });
+        assert_eq!(find_heap_task_by_pid(child_pid), child);
+        assert_eq!(heap_task_count(), baseline + 1);
+
+        unsafe { cleanup_child_fully(child) };
+        assert_eq!(heap_task_count(), baseline);
     }
 
     // ── PID assignment ────────────────────────────────────────────────────────

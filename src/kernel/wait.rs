@@ -128,8 +128,11 @@ pub const fn w_termsig(status: i32) -> i32 {
 
 #[inline]
 const fn waitid_code_status(exit_code: i32) -> (i32, i32) {
+    // vendor/linux/kernel/exit.c::wait_task_zombie first classifies a zero
+    // low-seven-bit term signal as a normal exit, even for malformed packed
+    // values carrying WCOREFLAG without a signal number.
     if w_ifexited(exit_code) {
-        (CLD_EXITED, w_exitstatus(exit_code))
+        (CLD_EXITED, exit_code >> 8)
     } else if exit_code & WCOREFLAG != 0 {
         (CLD_DUMPED, w_termsig(exit_code))
     } else {
@@ -1139,6 +1142,14 @@ mod tests {
         assert_eq!(P_PID, 1);
         assert_eq!(P_PIDFD, 3);
         assert_eq!(CLD_EXITED, 1);
+    }
+
+    #[test]
+    fn waitid_zombie_status_uses_linux_branch_order_and_full_exit_status() {
+        assert_eq!(waitid_code_status(WCOREFLAG), (CLD_EXITED, 0));
+        assert_eq!(waitid_code_status(0x1234_00), (CLD_EXITED, 0x1234));
+        assert_eq!(waitid_code_status(WCOREFLAG | 11), (CLD_DUMPED, 11));
+        assert_eq!(waitid_code_status(9), (CLD_KILLED, 9));
     }
 
     #[test]

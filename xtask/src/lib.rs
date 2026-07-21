@@ -5373,8 +5373,10 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "if [ \"$(/usr/bin/stat -c '%a:%u:%g' /etc/passwd)\" = 644:0:0 ] && [ \"$(/usr/bin/stat -c '%a:%u:%g' /etc/group)\" = 644:0:0 ] && [ \"$(/usr/bin/stat -c '%a:%u:%g' /etc/shadow)\" = 600:0:0 ] && [ \"$(/usr/bin/stat -c '%a:%u:%g' /etc/gshadow)\" = 600:0:0 ]; then echo 'graphics-x11: account-file-modes ok'; else echo 'graphics-x11: account-file-modes failed'; /usr/bin/stat -c 'graphics-x11: account-mode %a:%u:%g %n' /etc/passwd /etc/group /etc/shadow /etc/gshadow; fi\n",
         "if /usr/bin/sudo -n -u lupos /bin/sh -c '/usr/bin/sudo -K; ! /usr/bin/sudo -n /usr/bin/pacman --config /etc/pacman-lupos.conf --version >/dev/null 2>&1'; then echo 'graphics-x11: sudo-password-required ok'; else echo 'graphics-x11: sudo-password-required failed'; fi\n",
         "if /usr/bin/sudo -n -u lupos /bin/sh -c \"printf '%s\\n' lupos | /usr/bin/sudo -S -k -p '' /usr/bin/pacman --config /etc/pacman-lupos.conf --version >/dev/null 2>&1; rc=\\$?; /usr/bin/sudo -k; exit \\$rc\"; then echo 'graphics-x11: sudo-pacman ok'; else echo 'graphics-x11: sudo-pacman failed'; fi\n",
-        "if /usr/bin/sudo -n -u lupos /bin/sh -c \"printf '%s\\n' lupos | /usr/bin/timeout -k 2 15 /usr/bin/script -qfec \\\"/usr/bin/sudo -k -p '' /usr/bin/su -c '/usr/bin/id -u' root\\\" /dev/null; rc=\\$?; /usr/bin/sudo -k; [ \\\"\\$rc\\\" -eq 0 ] || [ \\\"\\$rc\\\" -eq 124 ]\" >/tmp/lupos-sudo-su.log 2>&1 && tr -d '\\r' </tmp/lupos-sudo-su.log | grep -qx 0; then echo 'graphics-x11: sudo-su ok'; else echo 'graphics-x11: sudo-su failed'; sed 's/^/graphics-x11: sudo-su-log /' /tmp/lupos-sudo-su.log 2>/dev/null || true; fi\n",
-        "rm -f /tmp/lupos-sudo-su.log\n",
+        "rm -f /tmp/lupos-sudo-su.log /tmp/lupos-sudo-su-script.rc\n",
+        "if /usr/bin/sudo -n -u lupos /bin/sh -c \"printf '%s\\n' lupos | /usr/bin/timeout -k 2 15 /usr/bin/script -qfec \\\"/usr/bin/sudo -k -p '' /usr/bin/su -c '/usr/bin/id -u' root\\\" /dev/null; rc=\\$?; printf '%s\\n' \\\"\\$rc\\\" > /tmp/lupos-sudo-su-script.rc; /usr/bin/sudo -k; exit \\$rc\" >/tmp/lupos-sudo-su.log 2>&1; then sudo_su_outer_rc=0; else sudo_su_outer_rc=$?; fi\n",
+        "if [ \"$sudo_su_outer_rc\" -eq 0 ] && grep -qx 0 /tmp/lupos-sudo-su-script.rc 2>/dev/null && tr -d '\\r' </tmp/lupos-sudo-su.log | grep -qx 0; then echo 'graphics-x11: sudo-su ok'; else printf 'graphics-x11: sudo-su failed outer-rc=%s script-rc=%s\\n' \"$sudo_su_outer_rc\" \"$(cat /tmp/lupos-sudo-su-script.rc 2>/dev/null || true)\"; sed 's/^/graphics-x11: sudo-su-log /' /tmp/lupos-sudo-su.log 2>/dev/null || true; fi\n",
+        "rm -f /tmp/lupos-sudo-su.log /tmp/lupos-sudo-su-script.rc\n",
         "echo 'graphics-x11: sudo-probe end'\n",
         // D-Bus parses PolicyKit's packaged user=polkitd rules at startup, so
         // prove the early account provisioner ran and that the unmodified
@@ -5563,15 +5565,34 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // Feed commands into an interactive child rather than using `-c echo`,
         // which only proves slave-to-master output.  The side-effect file can
         // only be created after the shell consumes master-to-slave input; a
-        // script(1)'s status is reported separately; the real-xterm probe above
-        // owns the clean child-exit/PTY-teardown acceptance criterion.
+        // Require script(1) itself to reap the child and terminate cleanly as
+        // well as observing the round trip.  Accepting timeout status 124 here
+        // hid broken SIGCHLD/signalfd delivery behind a successful marker.
         "    rm -f /tmp/lupos-pty-child.ok /tmp/lupos-pty.log /tmp/lupos-pty.out /tmp/lupos-pty.err\n",
         "    printf '%s\\n' 'printf PTY_INPUT_OK > /tmp/lupos-pty-child.ok' 'exit' | timeout -k 5 20 script -q -e -f -c /bin/sh /tmp/lupos-pty.log >/tmp/lupos-pty.out 2>/tmp/lupos-pty.err; sc=$?\n",
-        "    if grep -q PTY_INPUT_OK /tmp/lupos-pty-child.ok 2>/dev/null; then\n",
+        "    if [ \"$sc\" -eq 0 ] && grep -q PTY_INPUT_OK /tmp/lupos-pty-child.ok 2>/dev/null; then\n",
         "        printf 'graphics-x11: pty-roundtrip ok (script-rc=%s)\\n' \"$sc\"\n",
         "    else\n",
         "        printf 'graphics-x11: pty-roundtrip failed rc=%s marker=%s\\n' \"$sc\" \"$(cat /tmp/lupos-pty-child.ok 2>/dev/null || true)\"\n",
         "    fi\n",
+        // util-linux script(1) waits for its child through SIGCHLD/signalfd.
+        // Keep raw warm-up and measured samples in the serial log so this
+        // real userspace path catches both correctness failures (timeout or
+        // missing round trip) and latency regressions.
+        "    script_signalfd_ok=1\n",
+        "    script_signalfd_sample=1\n",
+        "    while [ \"$script_signalfd_sample\" -le 12 ]; do\n",
+        "        if [ \"$script_signalfd_sample\" -le 2 ]; then script_signalfd_phase=warmup; script_signalfd_iteration=$script_signalfd_sample; else script_signalfd_phase=measure; script_signalfd_iteration=$((script_signalfd_sample - 2)); fi\n",
+        "        rm -f /tmp/lupos-script-signalfd-child.ok /tmp/lupos-script-signalfd.log /tmp/lupos-script-signalfd.out /tmp/lupos-script-signalfd.err\n",
+        "        script_signalfd_start=\"${EPOCHREALTIME/./}\"\n",
+        "        printf '%s\\n' 'printf SCRIPT_SIGNALFD_OK > /tmp/lupos-script-signalfd-child.ok' 'exit' | timeout -k 5 20 script -q -e -f -c /bin/sh /tmp/lupos-script-signalfd.log >/tmp/lupos-script-signalfd.out 2>/tmp/lupos-script-signalfd.err; script_signalfd_rc=$?\n",
+        "        script_signalfd_end=\"${EPOCHREALTIME/./}\"\n",
+        "        if grep -q SCRIPT_SIGNALFD_OK /tmp/lupos-script-signalfd-child.ok 2>/dev/null; then script_signalfd_marker=1; else script_signalfd_marker=0; fi\n",
+        "        printf 'graphics-x11: script-signalfd-sample phase=%s iteration=%s elapsed-us=%s rc=%s marker=%s\\n' \"$script_signalfd_phase\" \"$script_signalfd_iteration\" \"$((script_signalfd_end - script_signalfd_start))\" \"$script_signalfd_rc\" \"$script_signalfd_marker\"\n",
+        "        if [ \"$script_signalfd_rc\" -ne 0 ] || [ \"$script_signalfd_marker\" -ne 1 ]; then script_signalfd_ok=0; break; fi\n",
+        "        script_signalfd_sample=$((script_signalfd_sample + 1))\n",
+        "    done\n",
+        "    if [ \"$script_signalfd_ok\" -eq 1 ] && [ \"$script_signalfd_sample\" -eq 13 ]; then echo 'graphics-x11: script-signalfd-benchmark ok warmups=2 iterations=10'; else printf 'graphics-x11: script-signalfd-benchmark failed sample=%s\\n' \"$script_signalfd_sample\"; fi\n",
         "    if [ -e /dev/pts/0 ]; then echo 'graphics-x11: devpts-slave present'; fi\n",
         "    for f in /tmp/lupos-pty-child.ok /tmp/lupos-pty.log /tmp/lupos-pty.out /tmp/lupos-pty.err; do\n",
         "        if [ -s \"$f\" ]; then printf 'graphics-x11: pty-diag %s begin\\n' \"$f\"; tail -30 \"$f\"; printf '\\ngraphics-x11: pty-diag %s end\\n' \"$f\"; fi\n",
@@ -16729,6 +16750,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: xclient-roundtrip ok",
         "graphics-x11: pointer ok",
         "graphics-x11: pty-roundtrip ok",
+        "graphics-x11: script-signalfd-benchmark ok warmups=2 iterations=10",
         "graphics-x11: xterm-shell ok",
         // Kernel diagnostics may be interleaved between the prefix and the
         // file payload on the serial console, so require the two facts
@@ -16844,6 +16866,7 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: pty-roundtrip failed",
         "graphics-x11: pty-roundtrip no-ptmx",
         "graphics-x11: pty-roundtrip no-script",
+        "graphics-x11: script-signalfd-benchmark failed",
         "graphics-x11: xterm-shell failed",
         "graphics-x11: xterm-shell missing-xterm",
         "graphics-x11: xterm-shell missing-bash",
@@ -23245,8 +23268,9 @@ fn run_qemu_iso_with_serial_expect(
 }
 
 pub fn read_serial_log(path: &Path) -> Result<String> {
-    fs::read_to_string(path)
-        .with_context(|| format!("failed to read serial log from {}", path.display()))
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read serial log from {}", path.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 pub fn serial_log_contains(log: &str, needle: &str) -> bool {
@@ -24331,7 +24355,9 @@ fn run_command_with_timeout(
 }
 
 fn read_serial_log_if_present(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_default()
+    fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
 }
 
 fn render_command(command: &Command) -> String {
@@ -24420,6 +24446,27 @@ mod tests {
         let log = "firmware noise\n[    0.000000] Linux version 0.1.0-lupos (lupos@build)\n";
         assert!(serial_log_contains(log, HELLO_BANNER));
         assert!(!serial_log_contains(log, "missing"));
+    }
+
+    #[test]
+    fn serial_expect_keeps_valid_markers_after_non_utf8_console_bytes() {
+        let path = env::temp_dir().join(format!(
+            "lupos-xtask-lossy-serial-{}-{}.log",
+            std::process::id(),
+            artifact_run_id()
+        ));
+        fs::write(
+            &path,
+            b"console prefix \xff\xfe\nPrompt greeter with 1 message(s)\n",
+        )
+        .expect("write invalid-UTF-8 serial fixture");
+
+        let log = read_serial_log_if_present(&path);
+        let _ = fs::remove_file(&path);
+        assert!(
+            log.contains(GRAPHICS_X11_GREETER_PROMPT),
+            "serial expect discarded the entire log after non-UTF-8 bytes"
+        );
     }
 
     fn test_ppm(width: usize, height: usize, pixel: [u8; 3]) -> Vec<u8> {
@@ -26299,9 +26346,20 @@ failed command output\n";
         assert!(probe.contains("graphics-x11: sudo-pacman ok"));
         assert!(probe.contains("/usr/bin/script -qfec"));
         assert!(probe.contains("/usr/bin/su -c '/usr/bin/id -u' root"));
-        assert!(probe.contains("[ \\\"\\$rc\\\" -eq 0 ] || [ \\\"\\$rc\\\" -eq 124 ]"));
+        assert!(probe.contains("/tmp/lupos-sudo-su-script.rc"));
+        assert!(probe.contains("exit \\$rc"));
+        assert!(!probe.contains("[ \\\"\\$rc\\\" -eq 124 ]"));
         assert!(probe.contains("grep -qx 0"));
         assert!(probe.contains("graphics-x11: sudo-su ok"));
+        assert!(
+            probe.contains("[ \"$sc\" -eq 0 ] && grep -q PTY_INPUT_OK /tmp/lupos-pty-child.ok")
+        );
+        assert!(probe.contains(
+            "script-signalfd-sample phase=%s iteration=%s elapsed-us=%s rc=%s marker=%s"
+        ));
+        assert!(
+            probe.contains("graphics-x11: script-signalfd-benchmark ok warmups=2 iterations=10")
+        );
         assert!(probe.contains("graphics-x11: bwrap-sandbox secure-fail-closed"));
         assert!(probe.contains("No permissions to create a new namespace"));
         assert!(probe.contains("legacy_tiocsti 2>/dev/null)\" = '0'"));

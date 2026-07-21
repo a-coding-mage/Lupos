@@ -33,6 +33,8 @@ pub const SYSCTL_SCHED_LATENCY_NS: u64 = 6_000_000;
 pub const SYSCTL_SCHED_MIN_GRANULARITY_NS: u64 = 750_000;
 /// Wakeup-preemption granularity (Linux default 1 ms).
 pub const SYSCTL_SCHED_WAKEUP_GRANULARITY_NS: u64 = 1_000_000;
+/// `sysctl_sched_base_slice` default in the vendored Linux EEVDF scheduler.
+pub const SYSCTL_SCHED_BASE_SLICE_NS: u64 = 700_000;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

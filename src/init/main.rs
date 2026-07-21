@@ -6,6 +6,8 @@
 //! test-origin: linux:vendor/linux/tools/testing/selftests/x86/xstate.c
 //! test-origin: linux:vendor/linux/arch/x86/mm/tlb.c
 //! test-origin: linux:vendor/linux/kernel/locking/rwsem.c
+//! test-origin: linux:vendor/linux/kernel/locking/mutex.c
+//! test-origin: linux:vendor/linux/tools/testing/selftests/mm/map_populate.c
 
 //! lupos kernel entry point - Linux boot_params ABI.
 //!
@@ -36,6 +38,13 @@ static SMP_XSTATE_RESULT: [core::sync::atomic::AtomicI32; 2] =
     [const { core::sync::atomic::AtomicI32::new(-1) }; 2];
 
 #[cfg(feature = "test-smp-preempt")]
+static SMP_SELF_PICK_WAKE_RAN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_SELF_PICK_WAKE_CPU: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+#[cfg(feature = "test-smp-preempt")]
 static SMP_MMAP_LOCK_PHASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 #[cfg(feature = "test-smp-preempt")]
 static SMP_MMAP_LOCK_WRITER_ATTEMPTING: core::sync::atomic::AtomicBool =
@@ -61,6 +70,45 @@ static SMP_MMAP_LOCK_LATE_READER_ORDER: core::sync::atomic::AtomicU32 =
 #[cfg(feature = "test-smp-preempt")]
 static SMP_MMAP_LOCK_WORKER_CPU: [core::sync::atomic::AtomicU32; 3] =
     [const { core::sync::atomic::AtomicU32::new(u32::MAX) }; 3];
+
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MUTEX: kernel::locking::Mutex<()> = kernel::locking::Mutex::new(());
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MUTEX_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MUTEX_RELEASE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MUTEX_WAITER_ATTEMPTING: [core::sync::atomic::AtomicBool; 2] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; 2];
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MUTEX_WAITER_ACQUIRED: [core::sync::atomic::AtomicBool; 2] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; 2];
+#[cfg(feature = "test-smp-preempt")]
+static SMP_MUTEX_WORKER_CPU: [core::sync::atomic::AtomicU32; 3] =
+    [const { core::sync::atomic::AtomicU32::new(u32::MAX) }; 3];
+
+#[cfg(feature = "test-smp-preempt")]
+static SMP_PAGE_LOCK_HELD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_PAGE_LOCK_START: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_PAGE_LOCK_WAITER_ATTEMPTING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_PAGE_LOCK_OWNER_RESUMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_PAGE_LOCK_ALLOW_UNLOCK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_PAGE_LOCK_WAITER_ACQUIRED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-smp-preempt")]
+static SMP_PAGE_LOCK_WORKER_CPU: [core::sync::atomic::AtomicU32; 2] =
+    [const { core::sync::atomic::AtomicU32::new(u32::MAX) }; 2];
 
 // Use PGD slot 1 so the test PTE hierarchy cannot alias the low identity
 // mappings that Lupos still needs while executing kernel code.
@@ -197,6 +245,100 @@ unsafe fn smp_tlb_park_current() -> ! {
             kernel::sched::schedule_with_irqs_enabled();
         }
     }
+}
+
+#[cfg(feature = "test-smp-preempt")]
+unsafe extern "C" fn smp_boot_init_affinity_worker(_arg: *mut core::ffi::c_void) -> i32 {
+    // Keep the real kernel_clone() child alive for the duration of the SMP
+    // gate.  The BSP inspects its published scheduling state immediately
+    // after the first wakeup.
+    unsafe { smp_tlb_park_current() }
+}
+
+#[cfg(feature = "test-smp-preempt")]
+unsafe extern "C" fn smp_self_pick_wake_worker(_arg: *mut core::ffi::c_void) -> ! {
+    use core::sync::atomic::Ordering;
+
+    SMP_SELF_PICK_WAKE_CPU.store(kernel::sched::current_cpu(), Ordering::Release);
+    SMP_SELF_PICK_WAKE_RAN.store(true, Ordering::Release);
+    unsafe {
+        smp_tlb_park_current();
+    }
+}
+
+/// Cross-CPU mutex wake probe derived from Linux mutex.c's slow unlock path.
+/// The unlocker must call wake_up_process() after dropping wait_lock so the
+/// scheduler re-enqueues a waiter which schedule() removed from its runqueue.
+#[cfg(feature = "test-smp-preempt")]
+unsafe extern "C" fn smp_mutex_holder(_arg: *mut core::ffi::c_void) -> ! {
+    use core::sync::atomic::Ordering;
+
+    SMP_MUTEX_WORKER_CPU[0].store(kernel::sched::current_cpu(), Ordering::Release);
+    let guard = SMP_MUTEX.lock();
+    SMP_MUTEX_HELD.store(true, Ordering::Release);
+    while !SMP_MUTEX_RELEASE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    drop(guard);
+    unsafe { smp_tlb_park_current() }
+}
+
+#[cfg(feature = "test-smp-preempt")]
+unsafe extern "C" fn smp_mutex_waiter(arg: *mut core::ffi::c_void) -> ! {
+    use core::sync::atomic::Ordering;
+
+    let index = arg as usize;
+    assert!(index < 2);
+    SMP_MUTEX_WORKER_CPU[index + 1].store(kernel::sched::current_cpu(), Ordering::Release);
+    SMP_MUTEX_WAITER_ATTEMPTING[index].store(true, Ordering::Release);
+    let guard = SMP_MUTEX.lock();
+    SMP_MUTEX_WAITER_ACQUIRED[index].store(true, Ordering::Release);
+    drop(guard);
+    unsafe { smp_tlb_park_current() }
+}
+
+/// Same-CPU page-lock contention probe derived from Linux's folio wait-bit
+/// protocol.  The selftest above exercises mmap population but does not expose
+/// scheduler state, so this Lupos-specific runtime extension pins the owner and
+/// waiter together: a sleeping waiter lets the owner resume and unlock, while
+/// a busy-spinning waiter starves it indefinitely.
+#[cfg(feature = "test-smp-preempt")]
+unsafe extern "C" fn smp_page_lock_owner(arg: *mut core::ffi::c_void) -> ! {
+    use core::sync::atomic::Ordering;
+
+    let page = arg.cast::<mm::page::Page>();
+    assert!(!page.is_null());
+    SMP_PAGE_LOCK_WORKER_CPU[0].store(kernel::sched::current_cpu(), Ordering::Release);
+    unsafe { mm::address_space::lock_page(page) };
+    SMP_PAGE_LOCK_HELD.store(true, Ordering::Release);
+
+    while !SMP_PAGE_LOCK_START.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    while !SMP_PAGE_LOCK_WAITER_ATTEMPTING.load(Ordering::Acquire) {
+        unsafe { kernel::sched::reschedule_runnable() };
+    }
+    SMP_PAGE_LOCK_OWNER_RESUMED.store(true, Ordering::Release);
+    while !SMP_PAGE_LOCK_ALLOW_UNLOCK.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+
+    unsafe { mm::address_space::unlock_page(page) };
+    unsafe { smp_tlb_park_current() }
+}
+
+#[cfg(feature = "test-smp-preempt")]
+unsafe extern "C" fn smp_page_lock_waiter(arg: *mut core::ffi::c_void) -> ! {
+    use core::sync::atomic::Ordering;
+
+    let page = arg.cast::<mm::page::Page>();
+    assert!(!page.is_null());
+    SMP_PAGE_LOCK_WORKER_CPU[1].store(kernel::sched::current_cpu(), Ordering::Release);
+    SMP_PAGE_LOCK_WAITER_ATTEMPTING.store(true, Ordering::Release);
+    unsafe { mm::address_space::lock_page(page) };
+    SMP_PAGE_LOCK_WAITER_ACQUIRED.store(true, Ordering::Release);
+    unsafe { mm::address_space::unlock_page(page) };
+    unsafe { smp_tlb_park_current() }
 }
 
 /// CPU1 task whose real `mm` maps [`SMP_TLB_TEST_ADDR`].
@@ -3487,6 +3629,49 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             "expected at least one AP online"
         );
 
+        // Linux keeps each idle task pinned to its own CPU, while
+        // sched_init_smp() widens kernel_init before it enters userspace. In
+        // Lupos PID 1 is created later from swapper/0, so drive the real
+        // kernel_clone() lifecycle and verify that the child is widened before
+        // it is published and first woken, without widening the idle parent.
+        use kernel::fork::{KernelCloneArgs, find_heap_task_by_pid, kernel_clone};
+        let boot_task = unsafe { kernel::sched::get_current() };
+        assert_eq!(
+            unsafe { (*boot_task).m29.cpus_mask.0 },
+            CpuMask::one(0).0,
+            "swapper/0 lost its Linux one-CPU idle affinity"
+        );
+        let init_pid = unsafe {
+            kernel_clone(&KernelCloneArgs {
+                kthread: 1,
+                set_tid: Some(1),
+                fn_ptr: Some(smp_boot_init_affinity_worker),
+                ..KernelCloneArgs::default()
+            })
+        };
+        assert_eq!(init_pid, 1, "boot init affinity probe did not become PID 1");
+        let init_task = find_heap_task_by_pid(init_pid as i32);
+        assert!(
+            !init_task.is_null(),
+            "boot init affinity probe was not published"
+        );
+        let expected_boot_mask =
+            kernel::sched::isolation::housekeeping_cpumask(kernel::sched::cpu_active_mask());
+        assert_eq!(
+            unsafe { (*init_task).m29.cpus_mask.0 },
+            expected_boot_mask.0,
+            "boot init task retained swapper/0's temporary CPU pin"
+        );
+        assert_eq!(
+            unsafe { (*init_task).m29.nr_cpus_allowed },
+            expected_boot_mask.weight() as i32,
+            "boot init task retained stale nr_cpus_allowed"
+        );
+        log_info!(
+            "m91",
+            "smp-preempt: boot task widened to active housekeeping CPUs"
+        );
+
         assert!(
             arch::x86::kernel::idt::direction_flag_entry_selftest(),
             "x86 IDT entry exposed RFLAGS.DF to Rust code"
@@ -3504,6 +3689,212 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         assert!(
             observed_ticks > start_ticks,
             "expected LAPIC timer ticks to continue after SMP scheduler enablement"
+        );
+
+        // Linux mutex.c::__mutex_unlock_slowpath() removes the selected
+        // waiter under wait_lock, drops that lock, then calls
+        // wake_up_process(). Exercise the same off-rq wake on two APs: merely
+        // changing TASK_UNINTERRUPTIBLE to TASK_RUNNING cannot make progress.
+        let mutex_holder = unsafe {
+            kernel::sched::kthread_create(
+                smp_mutex_holder,
+                core::ptr::null_mut(),
+                b"smp-mutex/hold\0\0",
+            )
+        };
+        assert!(!mutex_holder.is_null(), "failed to create mutex holder");
+        unsafe {
+            (*mutex_holder).m29.cpus_mask = CpuMask::one(1);
+            (*mutex_holder).m29.cpus_ptr = &(*mutex_holder).m29.cpus_mask as *const _;
+            (*mutex_holder).m29.nr_cpus_allowed = 1;
+            kernel::sched::enqueue_task(mutex_holder);
+        }
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            if SMP_MUTEX_HELD.load(Ordering::Acquire) {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(SMP_MUTEX_HELD.load(Ordering::Acquire));
+
+        let mutex_waiters = [
+            unsafe {
+                kernel::sched::kthread_create(
+                    smp_mutex_waiter,
+                    core::ptr::null_mut(),
+                    b"smp-mutex/wait0\0",
+                )
+            },
+            unsafe {
+                kernel::sched::kthread_create(
+                    smp_mutex_waiter,
+                    1usize as *mut core::ffi::c_void,
+                    b"smp-mutex/wait1\0",
+                )
+            },
+        ];
+        for (index, waiter) in mutex_waiters.iter().copied().enumerate() {
+            assert!(!waiter.is_null(), "failed to create mutex waiter");
+            unsafe {
+                (*waiter).m29.cpus_mask = CpuMask::one((index + 2) as u32);
+                (*waiter).m29.cpus_ptr = &(*waiter).m29.cpus_mask as *const _;
+                (*waiter).m29.nr_cpus_allowed = 1;
+                kernel::sched::enqueue_task(waiter);
+            }
+        }
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            let both_sleeping = mutex_waiters.iter().copied().all(|waiter| unsafe {
+                (*waiter).__state.load(Ordering::Acquire)
+                    == kernel::task::task_state::TASK_UNINTERRUPTIBLE
+            });
+            if SMP_MUTEX_WAITER_ATTEMPTING
+                .iter()
+                .all(|attempting| attempting.load(Ordering::Acquire))
+                && both_sleeping
+            {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(
+            SMP_MUTEX_WAITER_ATTEMPTING
+                .iter()
+                .all(|attempting| attempting.load(Ordering::Acquire))
+        );
+        assert!(
+            mutex_waiters.iter().copied().all(|waiter| unsafe {
+                (*waiter).__state.load(Ordering::Acquire)
+                    == kernel::task::task_state::TASK_UNINTERRUPTIBLE
+            }),
+            "contended mutex waiters did not sleep"
+        );
+
+        SMP_MUTEX_RELEASE.store(true, Ordering::Release);
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            if SMP_MUTEX_WAITER_ACQUIRED
+                .iter()
+                .all(|acquired| acquired.load(Ordering::Acquire))
+            {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(
+            SMP_MUTEX_WAITER_ACQUIRED
+                .iter()
+                .all(|acquired| acquired.load(Ordering::Acquire)),
+            "mutex unlock did not re-enqueue every sleeping waiter"
+        );
+        assert_eq!(
+            [
+                SMP_MUTEX_WORKER_CPU[0].load(Ordering::Acquire),
+                SMP_MUTEX_WORKER_CPU[1].load(Ordering::Acquire),
+                SMP_MUTEX_WORKER_CPU[2].load(Ordering::Acquire),
+            ],
+            [1, 2, 3],
+            "mutex workers did not execute on three distinct pinned APs"
+        );
+        log_info!("m91", "smp-preempt: mutex slowpath wake re-enqueued waiter");
+
+        // Linux folio_lock() sleeps in folio_wait_bit_common() after a final
+        // retry under the hashed waitqueue lock.  This is intentionally a
+        // same-CPU owner/waiter pair: an incorrect busy loop in the waiter
+        // consumes CPU1 forever and prevents the owner from running again.
+        let page_lock_page =
+            alloc::boxed::Box::into_raw(alloc::boxed::Box::new(mm::page::Page::new()));
+        let page_lock_owner = unsafe {
+            kernel::sched::kthread_create(
+                smp_page_lock_owner,
+                page_lock_page.cast(),
+                b"smp-page/owner\0\0",
+            )
+        };
+        assert!(
+            !page_lock_owner.is_null(),
+            "failed to create page-lock owner"
+        );
+        unsafe {
+            (*page_lock_owner).m29.cpus_mask = CpuMask::one(1);
+            (*page_lock_owner).m29.cpus_ptr = &(*page_lock_owner).m29.cpus_mask as *const _;
+            (*page_lock_owner).m29.nr_cpus_allowed = 1;
+            kernel::sched::enqueue_task(page_lock_owner);
+        }
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            if SMP_PAGE_LOCK_HELD.load(Ordering::Acquire) {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(
+            SMP_PAGE_LOCK_HELD.load(Ordering::Acquire),
+            "page-lock owner did not acquire the page"
+        );
+
+        let page_lock_waiter = unsafe {
+            kernel::sched::kthread_create(
+                smp_page_lock_waiter,
+                page_lock_page.cast(),
+                b"smp-page/wait\0\0\0",
+            )
+        };
+        assert!(
+            !page_lock_waiter.is_null(),
+            "failed to create page-lock waiter"
+        );
+        unsafe {
+            (*page_lock_waiter).m29.cpus_mask = CpuMask::one(1);
+            (*page_lock_waiter).m29.cpus_ptr = &(*page_lock_waiter).m29.cpus_mask as *const _;
+            (*page_lock_waiter).m29.nr_cpus_allowed = 1;
+            kernel::sched::enqueue_task(page_lock_waiter);
+        }
+        SMP_PAGE_LOCK_START.store(true, Ordering::Release);
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            if SMP_PAGE_LOCK_OWNER_RESUMED.load(Ordering::Acquire) {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(
+            SMP_PAGE_LOCK_WAITER_ATTEMPTING.load(Ordering::Acquire),
+            "page-lock waiter never attempted the contended lock"
+        );
+        assert!(
+            SMP_PAGE_LOCK_OWNER_RESUMED.load(Ordering::Acquire),
+            "busy-spinning page-lock waiter starved the runnable owner"
+        );
+        assert_eq!(
+            unsafe { (*page_lock_waiter).__state.load(Ordering::Acquire) },
+            kernel::task::task_state::TASK_UNINTERRUPTIBLE,
+            "contended page-lock waiter did not sleep"
+        );
+        assert_eq!(
+            unsafe { (*page_lock_waiter).m29.on_rq },
+            0,
+            "sleeping page-lock waiter remained on its runqueue"
+        );
+
+        SMP_PAGE_LOCK_ALLOW_UNLOCK.store(true, Ordering::Release);
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            if SMP_PAGE_LOCK_WAITER_ACQUIRED.load(Ordering::Acquire) {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(
+            SMP_PAGE_LOCK_WAITER_ACQUIRED.load(Ordering::Acquire),
+            "page unlock did not wake and re-enqueue the sleeping waiter"
+        );
+        assert_eq!(
+            [
+                SMP_PAGE_LOCK_WORKER_CPU[0].load(Ordering::Acquire),
+                SMP_PAGE_LOCK_WORKER_CPU[1].load(Ordering::Acquire),
+            ],
+            [1, 1],
+            "page-lock owner and waiter were not pinned to the same AP"
+        );
+        log_info!(
+            "m91",
+            "smp-preempt: contended page lock slept and woke on unlock"
         );
 
         // Linux rwsem.c queues stack waiters under an irq-safe raw lock,
@@ -3647,6 +4038,58 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             "mmap_lock workers did not park after the probe"
         );
         log_info!("m91", "smp-preempt: mmap_lock sleeping FIFO waiters ok");
+
+        // Linux clears TIF_NEED_RESCHED once while rq->lock is held.  This
+        // Lupos-specific gate stops CPU1 immediately after that unlock, then
+        // enqueues a CPU1-only task from CPU0.  Returning from the self-pick
+        // must preserve the remote wake's new reschedule request.
+        let self_pick_worker = unsafe {
+            kernel::sched::kthread_create(
+                smp_self_pick_wake_worker,
+                core::ptr::null_mut(),
+                b"smp-self-pick\0\0\0",
+            )
+        };
+        assert!(
+            !self_pick_worker.is_null(),
+            "failed to create self-pick wake probe"
+        );
+        unsafe {
+            (*self_pick_worker).m29.cpus_mask = CpuMask::one(1);
+            (*self_pick_worker).m29.cpus_ptr = &(*self_pick_worker).m29.cpus_mask as *const _;
+            (*self_pick_worker).m29.nr_cpus_allowed = 1;
+        }
+        kernel::sched::arm_self_pick_rq_unlock_test(1);
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            if kernel::sched::self_pick_rq_unlock_test_reached() {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(
+            kernel::sched::self_pick_rq_unlock_test_reached(),
+            "CPU1 did not reach the post-rq-unlock self-pick window"
+        );
+        unsafe {
+            kernel::sched::enqueue_task(self_pick_worker);
+        }
+        kernel::sched::release_self_pick_rq_unlock_test();
+        for _ in 0..SMP_TLB_WAIT_SPINS {
+            if SMP_SELF_PICK_WAKE_RAN.load(Ordering::Acquire) {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(
+            SMP_SELF_PICK_WAKE_RAN.load(Ordering::Acquire),
+            "post-unlock remote wake lost TIF_NEED_RESCHED"
+        );
+        assert_eq!(
+            SMP_SELF_PICK_WAKE_CPU.load(Ordering::Acquire),
+            1,
+            "self-pick wake probe ran on the wrong CPU"
+        );
+        log_info!("m91", "smp-preempt: post-rq-unlock remote wake preserved");
 
         // Linux xstate.c runs distinct register patterns in competing threads
         // and validates them after blocking/yielding. Pin two real tasks to
@@ -5294,8 +5737,42 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
 
         let pid = unsafe { kernel_clone(&args) };
         assert!(pid > 0, "pid1-handoff: kernel_clone failed: {pid}");
+        assert_eq!(pid, 1, "pid1-handoff: init did not receive PID 1");
         let init = find_heap_task_by_pid(pid as i32);
         assert!(!init.is_null(), "pid1-handoff: init task missing");
+        let expected_init_mask =
+            kernel::sched::isolation::housekeeping_cpumask(kernel::sched::cpu_active_mask());
+        assert_eq!(
+            unsafe { (*init).m29.cpus_mask.0 },
+            expected_init_mask.0,
+            "pid1-handoff: PID1 retained swapper/0's temporary CPU pin"
+        );
+        assert_eq!(
+            unsafe { (*init).m29.nr_cpus_allowed },
+            expected_init_mask.weight() as i32,
+            "pid1-handoff: PID1 retained stale nr_cpus_allowed"
+        );
+        let swapper = unsafe { kernel::sched::get_current() };
+        assert!(!swapper.is_null(), "pid1-handoff: swapper/0 missing");
+        assert_eq!(
+            unsafe { (*swapper).pid },
+            0,
+            "pid1-handoff: current is not swapper/0"
+        );
+        assert_eq!(
+            unsafe { (*swapper).m29.cpus_mask.0 },
+            kernel::sched::entity::CpuMask::one(0).0,
+            "pid1-handoff: widening PID1 also widened swapper/0"
+        );
+        assert_eq!(
+            unsafe { (*swapper).m29.nr_cpus_allowed },
+            1,
+            "pid1-handoff: swapper/0 lost its one-CPU idle affinity"
+        );
+        log_info!(
+            "m91",
+            "pid1-handoff: init affinity widened before first handoff"
+        );
 
         #[cfg(feature = "test-login-stack")]
         loop {
@@ -7234,37 +7711,14 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     halt_loop_with_softirq()
 }
 
-/// BSP idle loop that schedules runnable work and drains pending softirqs.
+/// Enter Linux's common per-CPU idle loop for the BSP.
 ///
-/// Linux's `do_idle()` leaves its halt loop when `need_resched()` becomes true
-/// and calls `schedule_idle()`. The Lupos BSP is also `swapper/0`, so merely
-/// draining softirqs and halting here strands tasks woken by timers: IRQ exit
-/// deliberately does not preempt a kernel-mode frame. Run the scheduler on
-/// every idle-loop iteration, then close the check/halt race with IRQs
-/// disabled exactly as Linux does before entering an idle instruction.
+/// CPU0 and the APs are all swapper tasks, so they must share the same
+/// `do_idle()` control flow. In particular, an interrupt that does not set
+/// `need_resched()` returns to the idle instruction without a scheduler pass.
 #[allow(dead_code)]
 fn halt_loop_with_softirq() -> ! {
-    loop {
-        kernel::watchdog::touch_softlockup_watchdog_sched();
-        kernel::softirq::do_softirq();
-        unsafe {
-            kernel::locking::local_irq_enable();
-            let _ = kernel::sched::schedule();
-            kernel::locking::local_irq_enable();
-        }
-
-        kernel::locking::local_irq_disable();
-        if kernel::sched::current_needs_resched() || kernel::softirq::local_softirq_pending() != 0 {
-            kernel::locking::local_irq_enable();
-            continue;
-        }
-        unsafe {
-            // IF is clear for the final checks above. `sti`'s one-instruction
-            // grace window makes the following `hlt` atomic with respect to a
-            // wakeup interrupt.
-            core::arch::asm!("sti; hlt", options(nomem, nostack));
-        }
-    }
+    kernel::sched::idle::cpu_startup_entry()
 }
 
 /// Panic handler — prints a structured panic message to serial and VGA.
