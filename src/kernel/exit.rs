@@ -362,7 +362,30 @@ unsafe fn notify_parent_exit(tsk: *mut TaskStruct) {
         crate::fs::pidfd::notify_task_exit(tsk);
 
         if !parent.is_null() && sig > 0 {
-            let _ = signal::send_signal_to_task(parent, sig);
+            // vendor/linux/kernel/signal.c::do_notify_parent constructs a
+            // precise SIL_CHLD record from the packed wait status before it
+            // queues the signal to PIDTYPE_TGID.  signalfd users (including
+            // service supervisors) use si_code to decide when to reap.
+            let exit_code = (*tsk).m26.exit_code;
+            let status = exit_code & 0x7f;
+            let (code, status) = if exit_code & 0x80 != 0 {
+                (crate::kernel::wait::CLD_DUMPED, status)
+            } else if status != 0 {
+                (crate::kernel::wait::CLD_KILLED, status)
+            } else {
+                (crate::kernel::wait::CLD_EXITED, exit_code >> 8)
+            };
+            let cred = if !(*tsk).m27.real_cred.is_null() {
+                (*tsk).m27.real_cred
+            } else {
+                (*tsk).cred
+            };
+            let uid = if cred.is_null() { 0 } else { (*cred).uid.0 };
+            // Lupos does not yet split task runtime into user/system buckets;
+            // keep both fields zero rather than fabricating a split. The child
+            // identity, CLD code, and status match Linux exactly.
+            let info = signal::SigInfo::with_sigchld(sig, code, (*tsk).pid, uid, status, 0, 0);
+            let _ = signal::send_signal_info_to_process_for_target(parent, sig, info);
         }
 
         // Default exit_signal to SIGCHLD if not explicitly set (so the parent
@@ -796,7 +819,7 @@ mod tests {
             assert_eq!(info.code, crate::kernel::wait::CLD_EXITED);
             assert_eq!(info.sender_pid(), 7778);
             assert_eq!(info.sender_uid(), 0);
-            assert_eq!(info.sigval() as i32, 7);
+            assert_eq!(info.sigchld_status(), 7);
             sched::set_current(previous);
         }
         signal::reset_for_tests();

@@ -91,6 +91,14 @@ pub const TIF_SIGPENDING: u64 = 1 << 2;
 /// Reference: Linux `arch/x86/include/asm/thread_info.h::TIF_NEED_RESCHED`.
 pub const TIF_NEED_RESCHED: u64 = 1 << 3;
 
+/// `task_struct.restore_sigmask` in the second scheduler-bitfield word.
+///
+/// Generic x86_64 has `CONFIG_RT_MUTEXES=y`, so Linux lays this out after
+/// `sched_remote_wakeup`, `sched_rt_mutex`, `in_execve`, and `in_iowait`.
+/// Rust cannot express C bitfields, therefore Lupos keeps the ABI word as an
+/// atomic `u32` and manipulates the Linux bit explicitly.
+pub const TASK_RESTORE_SIGMASK: u32 = 1 << 4;
+
 // ── Task state bitmask (M26) ─────────────────────────────────────────────────
 //
 // Linux `__state` is a bitmask, so plain constants — not a Rust enum — preserve
@@ -241,6 +249,10 @@ pub const RESTART_BLOCK_FN_FUTEX: usize = 1;
 
 const PAD_ACTIVE_MM_TO_RESTART_BLOCK: usize =
     PAD_ACTIVE_MM_TO_PID - core::mem::size_of::<RestartBlock>();
+const PAD_ACTIVE_MM_TO_UNSERIALIZED_FLAGS: usize = PAD_ACTIVE_MM_TO_RESTART_BLOCK
+    - core::mem::size_of::<AtomicU32>()
+    - core::mem::size_of::<u32>()
+    - core::mem::size_of::<AtomicU64>();
 
 // After `tgid` (4 bytes), next acceptance field is `cred`.
 // M26 inserts `M26Fields` (`size_of::<M26Fields>()` bytes) at the start of
@@ -739,7 +751,14 @@ pub struct TaskStruct {
     //
     // Contains: exit_state, exit_code, exit_signal, pdeath_signal, jobctl,
     // personality, scheduler bitfields, atomic_flags, restart_block.
-    _pad_active_mm_to_restart_block: [u8; PAD_ACTIVE_MM_TO_RESTART_BLOCK],
+    _pad_active_mm_to_unserialized_flags: [u8; PAD_ACTIVE_MM_TO_UNSERIALIZED_FLAGS],
+    /// Linux's second scheduler-bitfield word (`restore_sigmask` et al.).
+    pub unserialized_flags: AtomicU32,
+    /// Explicit alignment corresponding to the C compiler's padding before
+    /// `atomic_flags` on x86_64.
+    _pad_unserialized_flags: u32,
+    /// Linux `task_struct.atomic_flags`.
+    pub atomic_flags: AtomicU64,
     pub restart_block: RestartBlock,
 
     /// Process ID (unique per-task; equals tgid for the group leader).
@@ -874,6 +893,13 @@ const _: () = {
     assert!(offset_of!(TaskStruct, files) == LINUX_OFFSET_FILES);
     assert!(offset_of!(TaskStruct, signal) == LINUX_OFFSET_SIGNAL);
     assert!(offset_of!(TaskStruct, thread) == LINUX_OFFSET_THREAD);
+    assert!(
+        offset_of!(TaskStruct, unserialized_flags) + 16 == offset_of!(TaskStruct, restart_block)
+    );
+    assert!(
+        offset_of!(TaskStruct, atomic_flags) + size_of::<AtomicU64>()
+            == offset_of!(TaskStruct, restart_block)
+    );
 
     // Relative invariants that hold regardless of absolute offsets.
     assert!(offset_of!(TaskStruct, tgid) == offset_of!(TaskStruct, pid) + 4);

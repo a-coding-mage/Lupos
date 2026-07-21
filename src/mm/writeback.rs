@@ -21,7 +21,7 @@ use spin::Mutex;
 
 use crate::arch::x86::mm::paging::PAGE_SIZE;
 
-use super::address_space::{AddressSpace, lock_page, unlock_page};
+use super::address_space::{AddressSpace, clear_page_writeback_and_wake, lock_page, unlock_page};
 use super::page::Page;
 use super::page_flags::{PG_DIRTY, PG_RECLAIM, PG_WRITEBACK};
 use super::xarray::XaMark;
@@ -280,7 +280,8 @@ pub unsafe fn page_cache_remove(page: *mut Page) {
     unsafe {
         (&*page)
             .flags
-            .fetch_and(!(PG_DIRTY | PG_WRITEBACK | PG_RECLAIM), Ordering::Release);
+            .fetch_and(!(PG_DIRTY | PG_RECLAIM), Ordering::Release);
+        clear_page_writeback_and_wake(page);
     }
 }
 
@@ -336,7 +337,7 @@ pub unsafe fn end_page_writeback(page: *mut Page) {
         return;
     }
 
-    let old = unsafe { (&*page).flags.fetch_and(!PG_WRITEBACK, Ordering::Release) };
+    let old = unsafe { clear_page_writeback_and_wake(page) };
     if (old & PG_WRITEBACK) == 0 {
         return;
     }

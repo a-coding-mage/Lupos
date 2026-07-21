@@ -19,6 +19,7 @@ use alloc::collections::BTreeMap;
 
 use spin::Mutex;
 
+use crate::mm::address_space::clear_page_writeback_and_wake;
 use crate::mm::page::Page;
 use crate::mm::page_flags::{PG_DIRTY, PG_REFERENCED, PG_WORKINGSET, PG_WRITEBACK};
 
@@ -100,8 +101,8 @@ pub fn set_page_writeback(page: &Page) {
 }
 
 pub fn end_page_writeback(page: &Page) {
-    if page.test_flag(PG_WRITEBACK) {
-        page.clear_flag(PG_WRITEBACK);
+    let old = unsafe { clear_page_writeback_and_wake(core::ptr::from_ref(page).cast_mut()) };
+    if old & PG_WRITEBACK != 0 {
         let mut state = PAGE_ACCOUNTING.lock();
         state.vmstat.nr_writeback = state.vmstat.nr_writeback.saturating_sub(1);
     }

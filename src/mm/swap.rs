@@ -38,6 +38,7 @@ use crate::arch::x86::mm::paging::{
     arch_swp_entry, arch_swp_offset, arch_swp_type, is_swap_pte, pte_t,
 };
 use crate::kernel::module::{export_symbol, find_symbol};
+use crate::mm::address_space::clear_page_writeback_and_wake;
 use crate::mm::frame::PAGE_SIZE;
 use crate::mm::page::Page;
 use crate::mm::page_flags::{PG_SWAPBACKED, PG_SWAPCACHE, PG_UPTODATE, PG_WRITEBACK};
@@ -716,8 +717,8 @@ pub fn swap_writepage(page: *mut Page, entry: SwpEntry) -> i32 {
         if !src.is_null()
             && crate::mm::zswap::zswap_store(entry.swp_type(), entry.swp_offset(), src).is_ok()
         {
-            (*page).clear_flag(PG_WRITEBACK);
             (*page).set_flag(PG_UPTODATE);
+            clear_page_writeback_and_wake(page);
             return 0;
         }
     }
@@ -736,8 +737,8 @@ pub fn swap_writepage(page: *mut Page, entry: SwpEntry) -> i32 {
             let dst = si.backing[start..end].as_mut_ptr();
             core::ptr::copy_nonoverlapping(src, dst, pg_size);
         }
-        (*page).clear_flag(PG_WRITEBACK);
         (*page).set_flag(PG_UPTODATE);
+        clear_page_writeback_and_wake(page);
     }
     0
 }

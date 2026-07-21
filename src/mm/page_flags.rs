@@ -829,8 +829,12 @@ pub fn folio_test_lazyfree(_folio: *const Page) -> bool {
     false
 }
 
-pub fn folio_xor_flags_has_waiters(folio: *const Page, mask: u64) -> bool {
-    !folio.is_null() && unsafe { ((*folio).flags.load(Ordering::Acquire) ^ mask) & PG_WAITERS != 0 }
+pub fn folio_xor_flags_has_waiters(folio: *mut Page, mask: u64) -> bool {
+    if folio.is_null() {
+        return false;
+    }
+    let old = unsafe { (*folio).flags.fetch_xor(mask, Ordering::Release) };
+    old & PG_WAITERS != 0
 }
 
 pub fn set_page_private(page: *mut Page, private: usize) {

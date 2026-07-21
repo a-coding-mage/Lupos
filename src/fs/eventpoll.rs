@@ -1295,6 +1295,47 @@ mod tests {
     }
 
     #[test]
+    fn epoll_pwait_null_mask_does_not_materialize_signal_state() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 31_163;
+        current.tgid = 31_163;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+            let epfd = sys_epoll_create1(0);
+            assert!(epfd >= 0);
+            let mut out = [EpollEvent { events: 0, data: 0 }; 1];
+            assert_eq!(
+                sys_epoll_pwait(
+                    epfd as i32,
+                    out.as_mut_ptr(),
+                    1,
+                    0,
+                    core::ptr::null(),
+                    usize::MAX,
+                ),
+                0
+            );
+            assert_eq!(crate::kernel::signal::signal_state_count_for_tests(), 0);
+            assert_eq!(
+                current
+                    .unserialized_flags
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    & crate::kernel::task::TASK_RESTORE_SIGMASK,
+                0
+            );
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+        crate::kernel::signal::reset_for_tests();
+    }
+
+    #[test]
     fn fatal_signal_interrupts_epoll_without_consuming_signal_or_leaking_arcs() {
         let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
         crate::kernel::signal::reset_for_tests();
