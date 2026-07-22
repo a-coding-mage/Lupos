@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/fs/netfs
+//! test-origin: linux:vendor/linux/fs/netfs
 //! Netfs and FS-Cache source coverage.
 
 use core::ffi::c_void;

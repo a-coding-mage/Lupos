@@ -343,6 +343,7 @@ mod tests {
 
     fn test_netdevice(ifindex: u32, name: &str, mtu: u32) -> NetDeviceRef {
         Arc::new(NetDevice {
+            namespace_key: 0,
             ifindex,
             name: String::from(name),
             mtu,

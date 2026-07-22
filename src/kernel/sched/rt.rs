@@ -114,8 +114,17 @@ unsafe fn task_fork_rt(p: *mut TaskStruct) {
     }
 }
 
-unsafe fn switched_to_rt(rq: &mut Rq, _p: *mut TaskStruct) {
-    let _ = rq;
+unsafe fn switched_to_rt(rq: &mut Rq, p: *mut TaskStruct) {
+    if p.is_null() || rq.current == p || unsafe { (*p).m29.on_rq == 0 } {
+        return;
+    }
+    let current = rq.current;
+    if current.is_null() {
+        return;
+    }
+    if current == rq.idle || unsafe { (*p).m29.prio < (*current).m29.prio } {
+        super::set_task_need_resched(current);
+    }
 }
 
 unsafe fn get_rr_interval_rt(_rq: &mut Rq, p: *mut TaskStruct) -> u64 {

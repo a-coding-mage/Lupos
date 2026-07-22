@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/kernel/notifier.c
+//! test-origin: linux:vendor/linux/kernel/notifier.c
 //! Notifier-chain ABI exports used by Linux-built modules.
 
 use core::ffi::c_void;

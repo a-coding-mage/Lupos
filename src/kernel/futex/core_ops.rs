@@ -17,6 +17,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Mutex;
 
+use crate::kernel::locking::SpinLock;
+
 use super::{
     EAGAIN, EFAULT, EINVAL, ENOSYS, ETIMEDOUT, FUTEX_32, FUTEX_OP_ADD, FUTEX_OP_ANDN,
     FUTEX_OP_CMP_EQ, FUTEX_OP_CMP_GE, FUTEX_OP_CMP_GT, FUTEX_OP_CMP_LE, FUTEX_OP_CMP_LT,
@@ -203,8 +205,8 @@ impl Bucket {
     }
 }
 
-static BUCKETS: [Mutex<Bucket>; FUTEX_HASH_BUCKETS] = [const {
-    Mutex::new(Bucket {
+static BUCKETS: [SpinLock<Bucket>; FUTEX_HASH_BUCKETS] = [const {
+    SpinLock::new(Bucket {
         waiters: Vec::new(),
     })
 }; FUTEX_HASH_BUCKETS];
@@ -370,6 +372,15 @@ fn futex_uaddr_valid(uaddr: u64) -> Result<bool, i32> {
 pub(crate) unsafe fn futex_get(uaddr: u64) -> Result<u32, i32> {
     if futex_uaddr_valid(uaddr)? {
         unsafe { crate::arch::x86::kernel::uaccess::get_user_u32(uaddr as *const u32) }
+    } else {
+        let p = uaddr as *const AtomicU32;
+        Ok(unsafe { (*p).load(Ordering::Acquire) })
+    }
+}
+
+unsafe fn futex_get_locked(uaddr: u64, user_addr: bool) -> Result<u32, i32> {
+    if user_addr {
+        unsafe { crate::arch::x86::kernel::uaccess::get_user_u32_nofault(uaddr as *const u32) }
     } else {
         let p = uaddr as *const AtomicU32;
         Ok(unsafe { (*p).load(Ordering::Acquire) })
@@ -616,9 +627,10 @@ unsafe fn futex_wait_impl(
     if bitset == 0 {
         return -EINVAL as i64;
     }
-    if let Err(errno) = futex_uaddr_valid(uaddr) {
-        return -(errno as i64);
-    }
+    let user_addr = match futex_uaddr_valid(uaddr) {
+        Ok(user_addr) => user_addr,
+        Err(errno) => return -(errno as i64),
+    };
 
     let mm_id = mm_for(private);
     let bucket_idx = hash_key(mm_id, uaddr);
@@ -642,11 +654,24 @@ unsafe fn futex_wait_impl(
     let has_timeout = deadline.is_some();
     let mut timeout =
         FutexTimeoutSleeper::new(cur, deadline.unwrap_or(FutexDeadline::monotonic(0)));
-    {
+    loop {
         let mut b = BUCKETS[bucket_idx].lock();
-        let observed = match unsafe { futex_get(uaddr) } {
+        let observed = match unsafe { futex_get_locked(uaddr, user_addr) } {
             Ok(value) => value,
-            Err(errno) => return -(errno as i64),
+            Err(errno) => {
+                drop(b);
+                if user_addr && errno == EFAULT {
+                    let observed = match unsafe { futex_get(uaddr) } {
+                        Ok(value) => value,
+                        Err(errno) => return -(errno as i64),
+                    };
+                    if observed != val {
+                        return -EAGAIN as i64;
+                    }
+                    continue;
+                }
+                return -(errno as i64);
+            }
         };
         if observed != val {
             return -EAGAIN as i64;
@@ -668,6 +693,7 @@ unsafe fn futex_wait_impl(
             requeue_pi,
             awoken: false,
         });
+        break;
     }
     if has_timeout {
         timeout.start();
@@ -1415,35 +1441,62 @@ pub unsafe fn futex_waitv_deadline(waiters: &[FutexWaitv], deadline: Option<Fute
             return -EINVAL as i64;
         }
         let private = waiter.flags & super::FUTEX2_PRIVATE != 0;
-        let mm_id = mm_for(private);
-        let bucket_idx = hash_key(mm_id, waiter.uaddr);
-        let mut b = BUCKETS[bucket_idx].lock();
-        let observed = match unsafe { futex_get(waiter.uaddr) } {
-            Ok(value) => value,
+        let user_addr = match futex_uaddr_valid(waiter.uaddr) {
+            Ok(user_addr) => user_addr,
             Err(errno) => {
-                drop(b);
                 remove_waitv_waiters(waitv_id);
                 finish_futex_timeout(&mut timeout, has_timeout, cur);
                 return -(errno as i64);
             }
         };
-        if observed != waiter.val as u32 {
-            drop(b);
-            remove_waitv_waiters(waitv_id);
-            finish_futex_timeout(&mut timeout, has_timeout, cur);
-            return -EAGAIN as i64;
+        let mm_id = mm_for(private);
+        let bucket_idx = hash_key(mm_id, waiter.uaddr);
+        loop {
+            let mut b = BUCKETS[bucket_idx].lock();
+            let observed = match unsafe { futex_get_locked(waiter.uaddr, user_addr) } {
+                Ok(value) => value,
+                Err(errno) => {
+                    drop(b);
+                    if user_addr && errno == EFAULT {
+                        let observed = match unsafe { futex_get(waiter.uaddr) } {
+                            Ok(value) => value,
+                            Err(errno) => {
+                                remove_waitv_waiters(waitv_id);
+                                finish_futex_timeout(&mut timeout, has_timeout, cur);
+                                return -(errno as i64);
+                            }
+                        };
+                        if observed != waiter.val as u32 {
+                            remove_waitv_waiters(waitv_id);
+                            finish_futex_timeout(&mut timeout, has_timeout, cur);
+                            return -EAGAIN as i64;
+                        }
+                        continue;
+                    }
+                    remove_waitv_waiters(waitv_id);
+                    finish_futex_timeout(&mut timeout, has_timeout, cur);
+                    return -(errno as i64);
+                }
+            };
+            if observed != waiter.val as u32 {
+                drop(b);
+                remove_waitv_waiters(waitv_id);
+                finish_futex_timeout(&mut timeout, has_timeout, cur);
+                return -EAGAIN as i64;
+            }
+            b.waiters.push(FutexQ {
+                uaddr: waiter.uaddr,
+                mm_id,
+                bitset: super::FUTEX_BITSET_MATCH_ANY,
+                task: cur,
+                task_pid: pid,
+                waitv_id,
+                waitv_index: index,
+                requeue_pi: false,
+                awoken: false,
+            });
+            break;
         }
-        b.waiters.push(FutexQ {
-            uaddr: waiter.uaddr,
-            mm_id,
-            bitset: super::FUTEX_BITSET_MATCH_ANY,
-            task: cur,
-            task_pid: pid,
-            waitv_id,
-            waitv_index: index,
-            requeue_pi: false,
-            awoken: false,
-        });
     }
     if has_timeout {
         timeout.start();
@@ -1545,6 +1598,58 @@ mod tests {
     #[test]
     fn hash_key_is_stable() {
         assert_eq!(hash_key(1, 0x1000), hash_key(1, 0x1000));
+    }
+
+    #[test]
+    fn wait_setup_faults_user_word_outside_bucket_spinlock() {
+        // test-origin: linux:vendor/linux/kernel/futex/waitwake.c:futex_wait_setup
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/kernel/futex/waitwake.c"
+        ));
+        let linux_setup = linux
+            .split("int futex_wait_setup(u32 __user *uaddr")
+            .nth(1)
+            .and_then(|s| s.split("int __futex_wait").next())
+            .expect("Linux futex_wait_setup present");
+        let lock = linux_setup
+            .find("futex_q_lock(q, hb);")
+            .expect("Linux locks futex bucket before value check");
+        let locked_read = linux_setup
+            .find("futex_get_value_locked(&uval, uaddr);")
+            .expect("Linux uses locked nofault read");
+        let unlock = linux_setup
+            .find("futex_q_unlock(hb);")
+            .expect("Linux unlocks bucket on locked-read fault");
+        let faulting_read = linux_setup
+            .find("get_user(uval, uaddr)")
+            .expect("Linux faults the user word only after unlocking");
+        assert!(lock < locked_read);
+        assert!(locked_read < unlock);
+        assert!(unlock < faulting_read);
+
+        let local = include_str!("core_ops.rs");
+        assert!(local.contains("static BUCKETS: [SpinLock<Bucket>; FUTEX_HASH_BUCKETS]"));
+        let wait_impl = local
+            .split("unsafe fn futex_wait_impl(")
+            .nth(1)
+            .and_then(|s| s.split("pub unsafe fn futex_wait(").next())
+            .expect("Lupos futex_wait_impl present");
+        let locked_read = wait_impl
+            .find("futex_get_locked(uaddr, user_addr)")
+            .expect("Lupos must use locked nofault futex read");
+        let locked_read_tail = wait_impl
+            .split("let observed = match unsafe { futex_get_locked(uaddr, user_addr) }")
+            .nth(1)
+            .expect("Lupos locked-read branch present");
+        let unlock = locked_read_tail
+            .find("drop(b);")
+            .expect("Lupos must drop bucket before faulting retry");
+        let faulting_read = locked_read_tail
+            .find("futex_get(uaddr)")
+            .expect("Lupos must fault in the user word outside the bucket lock");
+        assert!(locked_read < wait_impl.len());
+        assert!(unlock < faulting_read);
     }
 
     #[test]

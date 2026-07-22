@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/lib/maple_tree.c
+//! test-origin: linux:vendor/linux/lib/maple_tree.c
 //! Maple-tree ABI helpers for Linux-built modules.
 //!
 //! Lupos' native VMA maple tree lives in `mm::maple_tree` and uses Rust-owned

@@ -335,6 +335,7 @@ unsafe fn load_user_mm(cpu: usize, mm: *mut crate::mm::mm_types::MmStruct) {
     // this also preserves a borrowed mm without a needless CR3 reload when a
     // user task resumes after a kernel thread.
     if crate::arch::x86::mm::tlb::loaded_mm_matches(cpu as u32, mm) {
+        crate::arch::x86::mm::tlb::reactivate_lazy_tlb(cpu as u32, mm);
         return;
     }
 
@@ -385,11 +386,7 @@ unsafe fn prepare_switch_mm(prev: *mut TaskStruct, next: *mut TaskStruct) {
                 if !borrowed.is_null() {
                     (*borrowed).mmdrop_get();
                 }
-                // Linux explicitly permits enter_lazy_tlb() to do nothing.
-                // Keep the borrowed CR3 targetable by shootdowns; this avoids
-                // a full CR3 reload on every kthread round trip until Lupos has
-                // Linux's per-mm TLB generations.
-                crate::arch::x86::mm::tlb::set_active_mm(cpu as u32, borrowed);
+                crate::arch::x86::mm::tlb::enter_lazy_tlb(cpu as u32, borrowed);
             }
         }
         MmSwitchKind::KernelToKernel => {
@@ -401,7 +398,7 @@ unsafe fn prepare_switch_mm(prev: *mut TaskStruct, next: *mut TaskStruct) {
             unsafe {
                 (*next).active_mm = borrowed;
                 (*prev).active_mm = core::ptr::null_mut();
-                crate::arch::x86::mm::tlb::set_active_mm(cpu as u32, borrowed);
+                crate::arch::x86::mm::tlb::enter_lazy_tlb(cpu as u32, borrowed);
             }
         }
         MmSwitchKind::KernelToUser => {

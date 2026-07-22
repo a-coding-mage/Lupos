@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/fs/proc/root.c
+//! test-origin: linux:vendor/linux/fs/proc/root.c
 //! procfs root directory population.
 //!
 //! Ref: `vendor/linux/fs/proc/root.c`
@@ -128,7 +129,7 @@ fn proc_root_readdir(file: &FileRef) -> Result<Option<(String, u64, InodeKind)>,
 
 fn proc_pid_dir(pid: i32) -> Arc<KernfsNode> {
     let dir = KernfsNode::new_dir(&format!("{}", pid), 0o555);
-    super::base::add_task_common(&dir);
+    super::base::add_tgid_base(&dir);
     dir
 }
 

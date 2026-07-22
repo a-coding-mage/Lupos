@@ -319,6 +319,9 @@ struct SignalState {
     /// Linux `sighand_struct::signalfd_wqh`.  Thread-group tasks share this
     /// stable allocation because `CLONE_THREAD` implies `CLONE_SIGHAND`.
     signalfd_wqh: Arc<WaitQueueHead>,
+    /// Linux `signal_struct::wait_chldexit`. Threads in one process wait on
+    /// the same queue; a non-`CLONE_THREAD` child receives a fresh queue.
+    wait_chldexit: Arc<WaitQueueHead>,
     altstack: SigAltStack,
     pid: i32,
     tgid: i32,
@@ -347,6 +350,7 @@ impl SignalState {
             task_posix_timer_ids: [0; NSIG + 1],
             shared_itimer_sigalrm: false,
             signalfd_wqh: Arc::new(WaitQueueHead::new()),
+            wait_chldexit: Arc::new(WaitQueueHead::new()),
             altstack: SigAltStack::default(),
             pid,
             tgid,
@@ -531,6 +535,7 @@ impl SignalTable {
         {
             state.actions = source.actions;
             state.signalfd_wqh = source.signalfd_wqh.clone();
+            state.wait_chldexit = source.wait_chldexit.clone();
         }
         state
     }
@@ -615,6 +620,7 @@ impl SignalTable {
         child.task_addr = child_task as usize;
         if inherited.tgid == child_tgid {
             child.signalfd_wqh = inherited.signalfd_wqh;
+            child.wait_chldexit = inherited.wait_chldexit;
         }
 
         if let Some(existing) = self.states.iter_mut().find(|state| state.pid == child_pid) {
@@ -700,6 +706,24 @@ pub fn current_signalfd_waitqueue() -> Option<Arc<WaitQueueHead>> {
     let mut table = SIGNAL_TABLE.lock();
     let idx = table.get_or_create_current_index().ok()?;
     Some(table.states[idx].signalfd_wqh.clone())
+}
+
+/// Return the parent-owned child-exit waitqueue used by Linux `do_wait()` and
+/// `__wake_up_parent()`. The stable `Arc` models the queue embedded in the
+/// process-shared `signal_struct` while Lupos keeps signal state in a table.
+pub(crate) fn wait_chldexit_queue(
+    task: *mut crate::kernel::task::TaskStruct,
+) -> Option<Arc<WaitQueueHead>> {
+    if task.is_null() {
+        return None;
+    }
+    let (pid, tgid) = unsafe { ((*task).pid, (*task).tgid) };
+    let table = SIGNAL_TABLE.lock();
+    table
+        .states
+        .iter()
+        .find(|state| state.pid == pid && state.tgid == tgid && state.task_addr == task as usize)
+        .map(|state| state.wait_chldexit.clone())
 }
 
 fn signalfd_notify(waitqueue: Arc<WaitQueueHead>) {
@@ -2196,6 +2220,34 @@ pub fn has_pending_signal_for_pid(pid: i32, sig: i32) -> bool {
     false
 }
 
+/// Linux `do_notify_parent()` SIGCHLD autoreap decision.
+///
+/// Returns `(autoreap, suppress_signal)`. An explicit `SIG_IGN` disposition
+/// suppresses the signal; `SA_NOCLDWAIT` still allows SIGCHLD delivery.
+pub(crate) fn sigchld_autoreap_disposition(
+    parent: *const crate::kernel::task::TaskStruct,
+) -> (bool, bool) {
+    if parent.is_null() {
+        return (false, false);
+    }
+
+    let (pid, tgid) = unsafe { ((*parent).pid, (*parent).tgid) };
+    let table = SIGNAL_TABLE.lock();
+    let Some(state) = table
+        .states
+        .iter()
+        .find(|state| state.pid == pid)
+        .or_else(|| table.states.iter().find(|state| state.tgid == tgid))
+    else {
+        return (false, false);
+    };
+
+    let action = state.actions[SIGCHLD as usize];
+    let ignored = handler_kind(&action) == HandlerKind::Ignore;
+    let no_cldwait = action.sa_flags & SA_NOCLDWAIT != 0;
+    (ignored || no_cldwait, ignored)
+}
+
 #[cfg(test)]
 pub(crate) fn pending_signal_scopes_for_pid(pid: i32, sig: i32) -> (bool, bool) {
     let table = SIGNAL_TABLE.lock();
@@ -3357,6 +3409,94 @@ pub(crate) fn inherit_signal_state_for_clone(
         .inherit_for_clone(parent_pid, child_pid, child_tgid, child_task)
 }
 
+/// Reparent every live task in a child process, matching Linux
+/// `forget_original_parent()` and its `for_each_thread(p, t)` loop.
+///
+/// `SIGNAL_TABLE` task bindings are Lupos's equivalent of Linux's
+/// `signal->thread_head`. The caller holds the exit task-list lock, so each
+/// bound task remains live while its parent pointers are updated. Signals are
+/// delivered after dropping the signal-table lock because delivery takes that
+/// same lock.
+///
+/// # Safety
+/// `leader`, `old_parent`, and `new_parent` must be task-list-stable pointers,
+/// and `leader` must be the process leader whose natural parent is
+/// `old_parent`.
+pub(crate) unsafe fn reparent_thread_group(
+    leader: *mut crate::kernel::task::TaskStruct,
+    old_parent: *mut crate::kernel::task::TaskStruct,
+    new_parent: *mut crate::kernel::task::TaskStruct,
+) {
+    if leader.is_null() {
+        return;
+    }
+
+    let leader_addr = leader as usize;
+    let tgid = unsafe { (*leader).tgid };
+    let leader_is_bound = SIGNAL_TABLE
+        .lock()
+        .states
+        .iter()
+        .any(|state| state.tgid == tgid && state.pid == tgid && state.task_addr == leader_addr);
+
+    unsafe fn reparent_one(
+        task: *mut crate::kernel::task::TaskStruct,
+        old_parent: *mut crate::kernel::task::TaskStruct,
+        new_parent: *mut crate::kernel::task::TaskStruct,
+    ) -> i32 {
+        unsafe {
+            (*task).m26.real_parent = new_parent;
+            let untraced = (*task).m26.ptrace == 0;
+            debug_assert_eq!(
+                untraced,
+                (*task).m26.parent == old_parent,
+                "Linux forget_original_parent parent/ptrace invariant"
+            );
+            if untraced {
+                (*task).m26.parent = new_parent;
+            }
+            (*task).m26.pdeath_signal
+        }
+    }
+
+    let leader_signal = unsafe { reparent_one(leader, old_parent, new_parent) };
+    if leader_signal > 0 {
+        let _ = send_signal_to_process_for_target(leader, leader_signal);
+    }
+    if !leader_is_bound {
+        return;
+    }
+
+    let mut last_pid = i32::MIN;
+    loop {
+        let next = {
+            let table = SIGNAL_TABLE.lock();
+            table
+                .states
+                .iter()
+                .filter(|state| {
+                    state.tgid == tgid
+                        && state.task_addr != 0
+                        && state.task_addr != leader_addr
+                        && state.pid > last_pid
+                })
+                .min_by_key(|state| state.pid)
+                .map(|state| {
+                    let task = state.task_addr as *mut crate::kernel::task::TaskStruct;
+                    let pdeath_signal = unsafe { reparent_one(task, old_parent, new_parent) };
+                    (state.pid, task, pdeath_signal)
+                })
+        };
+        let Some((pid, task, pdeath_signal)) = next else {
+            break;
+        };
+        last_pid = pid;
+        if pdeath_signal > 0 {
+            let _ = send_signal_to_process_for_target(task, pdeath_signal);
+        }
+    }
+}
+
 /// Publish or observe Linux's shared `SIGNAL_GROUP_EXIT` state.
 ///
 /// The first exiting thread fixes the process exit code. Later peers use that
@@ -3811,6 +3951,17 @@ mod tests {
         reset_for_tests();
         register_test_task(100, 100);
 
+        let parent_wait_chldexit = {
+            let table = SIGNAL_TABLE.lock();
+            table
+                .states
+                .iter()
+                .find(|state| state.pid == 100)
+                .expect("parent signal state")
+                .wait_chldexit
+                .clone()
+        };
+
         {
             let mut table = SIGNAL_TABLE.lock();
             let parent = table.get_by_pid_mut(100).expect("parent signal state");
@@ -3848,10 +3999,29 @@ mod tests {
         assert_eq!(child.shared_pending.bits, 0);
         assert!(child.rt_queue.is_empty());
         assert!(child.shared_queue.is_empty());
+        assert!(Arc::ptr_eq(&child.wait_chldexit, &parent_wait_chldexit));
         assert!(
             !signal_is_default_fatal(child, SIGRTMIN + 1),
             "inherited NPTL realtime handler must prevent default termination"
         );
+
+        drop(table);
+        assert!(inherit_signal_state_for_clone(
+            100,
+            102,
+            102,
+            core::ptr::null_mut()
+        ));
+        let table = SIGNAL_TABLE.lock();
+        let process_child = table
+            .states
+            .iter()
+            .find(|state| state.pid == 102)
+            .expect("process child signal state");
+        assert!(!Arc::ptr_eq(
+            &process_child.wait_chldexit,
+            &parent_wait_chldexit
+        ));
     }
 
     #[test]
@@ -3920,6 +4090,10 @@ mod tests {
         }
         assert_eq!(SIGNAL_TABLE.lock().states.len(), 2);
         assert!(unsafe { release_signal_task_binding(&mut *peer as *mut TaskStruct) });
+        assert!(
+            wait_chldexit_queue(&mut *peer as *mut TaskStruct).is_none(),
+            "wait/exit lookup must not recreate a released signal_struct binding"
+        );
         {
             let table = SIGNAL_TABLE.lock();
             assert_eq!(table.states.len(), 1);

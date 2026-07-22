@@ -175,9 +175,9 @@ pub unsafe fn vma_file_put_raw(file: usize) {
 /// The caller is responsible for inserting the copy into the Maple Tree
 /// and adjusting `map_count`.
 ///
-/// Allocation failure is returned before taking the copied file reference or
-/// invoking `vm_ops.open`, matching Linux `vm_area_dup()`'s side-effect-free
-/// `NULL` return.
+/// Allocation failure is returned before taking the copied file reference.
+/// `vm_ops.open` is deliberately left to the caller, matching Linux
+/// `vm_area_dup()`'s side-effect-free callback behavior.
 ///
 /// Ref: Linux `mm/vma_init.c` — `vm_area_dup()`
 ///
@@ -220,15 +220,29 @@ where
             vm_private_data: orig.vm_private_data,
         });
         ListHead::init(&mut (*ptr).anon_vma_chain);
-        if (*ptr).vm_ops != 0 {
-            let ops = &*((*ptr).vm_ops as *const crate::mm::fault::VmOperationsStruct);
-            if let Some(open) = ops.open {
-                open(ptr);
-            }
-        }
     }
 
     Ok(ptr)
+}
+
+/// Invoke a duplicated VMA's `vm_ops.open` callback after the caller has
+/// accepted the VMA, as Linux callers do after `vm_area_dup()`.
+///
+/// # Safety
+/// `vma` must be a valid duplicated VMA whose caller has reached the matching
+/// Linux open-callback point.
+pub unsafe fn vma_open(vma: *mut VmAreaStruct) {
+    if vma.is_null() {
+        return;
+    }
+    unsafe {
+        if (*vma).vm_ops != 0 {
+            let ops = &*((*vma).vm_ops as *const crate::mm::fault::VmOperationsStruct);
+            if let Some(open) = ops.open {
+                open(vma);
+            }
+        }
+    }
 }
 
 /// Fallible public entry point for VMA duplication.
@@ -592,6 +606,12 @@ pub unsafe fn vma_split(
     if right.vm_file != 0 {
         right.vm_pgoff += (addr - orig.vm_start) >> 12;
     }
+    if let Err(e) = unsafe { crate::mm::rmap::anon_vma_clone(new_vma, vma) } {
+        unsafe {
+            vm_area_free(new_vma);
+        }
+        return Err(e);
+    }
 
     // Remove the original from the tree.
     unsafe {
@@ -632,6 +652,9 @@ pub unsafe fn vma_split(
 
     // map_count was decremented once by remove_vma and incremented twice
     // by insert_vma, net +1 which is correct (split one VMA into two).
+    unsafe {
+        vma_open(new_vma);
+    }
     Ok(new_vma)
 }
 
@@ -969,6 +992,28 @@ mod tests {
         }
     }
 
+    /// Linux vm_area_dup() copies the VMA body only; callers invoke
+    /// vm_ops->open() after they reach the corresponding publish point.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vma_init.c:vm_area_dup
+    #[test]
+    fn try_dup_success_does_not_call_vm_ops_open() {
+        let vma = vma_alloc(0x1000, 0x2000, VM_READ);
+        VMA_DUP_OPEN_CALLS.store(0, Ordering::Release);
+        unsafe {
+            (*vma).vm_ops = &VMA_DUP_OPS as *const _ as usize;
+
+            let copy = vm_area_try_dup(vma).expect("fallible VMA duplication");
+            assert_eq!(VMA_DUP_OPEN_CALLS.load(Ordering::Acquire), 0);
+
+            vma_open(copy);
+            assert_eq!(VMA_DUP_OPEN_CALLS.load(Ordering::Acquire), 1);
+
+            vm_area_free(copy);
+            vm_area_free(vma);
+        }
+    }
+
     /// Linux does not get_file() until after vm_area_dup() has returned a
     /// successfully allocated VMA to its caller.
     ///
@@ -1074,6 +1119,36 @@ mod tests {
         let right = find_vma(&mm, 0x6000).unwrap();
         assert_eq!(unsafe { (*right).vm_start }, 0x4000);
         assert_eq!(unsafe { (*right).vm_end }, 0x8000);
+    }
+
+    /// Linux `__split_vma()` calls `anon_vma_clone()` after `vm_area_dup()` so a
+    /// split of an already faulted anonymous VMA keeps fork-visible anon
+    /// metadata on the new half.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vma.c:__split_vma
+    #[test]
+    fn split_clones_anon_vma_for_faulted_anonymous_vma() {
+        let (mut mm, vma) = make_mm_with_vma(0x0000, 0x8000, VM_READ | VM_WRITE);
+        unsafe {
+            crate::mm::rmap::anon_vma_prepare(vma).expect("anon_vma_prepare");
+            let anon_vma = (*vma).anon_vma;
+            assert!(!anon_vma.is_null());
+            assert_eq!((*anon_vma).num_active_vmas, 1);
+
+            let right = vma_split(&mut mm, vma, 0x4000).expect("split faulted anon VMA");
+
+            assert_eq!((*vma).anon_vma, anon_vma);
+            assert_eq!(
+                (*right).anon_vma,
+                anon_vma,
+                "split right half must retain anon_vma metadata"
+            );
+            assert_eq!(
+                (*anon_vma).num_active_vmas,
+                2,
+                "both split halves must hold active anon_vma references"
+            );
+        }
     }
 
     // -- vma_merge --

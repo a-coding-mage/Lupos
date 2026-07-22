@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/firmware/dmi_scan.c
+//! test-origin: linux:vendor/linux/drivers/firmware/dmi_scan.c
 //! x86 DMI firmware table exports.
 
 use core::ffi::{c_char, c_int, c_void};

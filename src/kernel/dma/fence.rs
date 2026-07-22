@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/dma-buf/{dma-fence,dma-fence-array,dma-fence-chain,dma-fence-unwrap}.c
+//! test-origin: linux:vendor/linux/drivers/dma-buf
 //! DMA fence core ABI used by DRM and dma-buf modules.
 
 use core::ffi::{c_char, c_void};

@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers
+//! test-origin: linux:vendor/linux/drivers
 //! Lupos Linux driver ABI glue.
 //!
 //! This module owns the kernel-facing ABI that Linux-built driver artifacts

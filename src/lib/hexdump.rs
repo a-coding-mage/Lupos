@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/lib/hexdump.c
+//! test-origin: linux:vendor/linux/lib/hexdump.c
 //! Hexdump ABI exports used by Linux-built modules.
 
 use core::ffi::{c_char, c_void};

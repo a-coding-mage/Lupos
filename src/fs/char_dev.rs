@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/fs/char_dev.c
+//! test-origin: linux:vendor/linux/fs/char_dev.c
 //! Character-device number registration for Linux-built modules.
 
 extern crate alloc;
@@ -17,7 +18,7 @@ use spin::Mutex;
 use crate::fs::file::alloc_file;
 use crate::fs::ops::FileOps;
 use crate::fs::types::{DentryRef, FileRef, InodeKind};
-use crate::include::uapi::errno::{EBADF, EBUSY, EINVAL, ENODEV, ENOSYS, ENOTTY, ENXIO};
+use crate::include::uapi::errno::{EBADF, EBUSY, EINVAL, ENODEV, ENOTTY, ENXIO};
 use crate::include::uapi::fcntl::{O_ACCMODE, O_PATH, O_RDONLY, O_RDWR, O_WRONLY};
 use crate::kernel::module::{export_symbol, find_symbol};
 use crate::mm::page_flags::{__GFP_ZERO, GFP_KERNEL};
@@ -78,11 +79,16 @@ pub fn register_module_exports() {
     export_symbol_once("cdev_device_del", linux_cdev_device_del as usize, false);
 }
 
-pub fn registered_chrdev_fops(major: u32) -> Option<usize> {
+pub fn registered_chrdev_fops(major: u32, minor: u32) -> Option<usize> {
     CHRDEVS
         .lock()
         .iter()
-        .find(|region| region.major == major)
+        .find(|region| {
+            region.fops != 0
+                && region.major == major
+                && minor >= region.baseminor
+                && minor < region.baseminor.saturating_add(region.count)
+        })
         .map(|region| region.fops)
 }
 
@@ -544,10 +550,14 @@ pub fn open_linux_module_chardev(
     let encoded = inode.rdev.load(Ordering::Acquire);
     let major = linux_decode_major(encoded);
     let minor = linux_decode_minor(encoded);
-    let top_fops = registered_chrdev_fops(major)?;
-    if top_fops == 0 {
-        return Some(Err(ENODEV));
+    let module_major = CHRDEVS.lock().iter().any(|region| region.major == major);
+    if !module_major {
+        return None;
     }
+    let top_fops = match registered_chrdev_fops(major, minor) {
+        Some(fops) => fops,
+        None => return Some(Err(ENXIO)),
+    };
 
     Some((|| {
         if flags & O_PATH != 0 {
@@ -636,7 +646,7 @@ pub unsafe fn linux_module_chardev_read(
     let fops = unsafe { linux_char_current_fops(raw_file) }?;
     let read = unsafe { raw_read_usize(fops, LINUX_FOPS_READ_OFFSET) };
     if read == 0 {
-        return Some(-(ENOSYS as i64));
+        return Some(-(EINVAL as i64));
     }
     let callback: unsafe extern "C" fn(*mut c_void, *mut u8, usize, *mut i64) -> isize =
         unsafe { core::mem::transmute(read) };
@@ -658,7 +668,7 @@ pub unsafe fn linux_module_chardev_write(
     let fops = unsafe { linux_char_current_fops(raw_file) }?;
     let write = unsafe { raw_read_usize(fops, LINUX_FOPS_WRITE_OFFSET) };
     if write == 0 {
-        return Some(-(ENOSYS as i64));
+        return Some(-(EINVAL as i64));
     }
     let callback: unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut i64) -> isize =
         unsafe { core::mem::transmute(write) };
@@ -698,6 +708,25 @@ unsafe fn cdev_write_dev_count(cdev: *mut c_void, dev: u32, count: u32) {
             .add(LINUX_CDEV_COUNT_OFFSET)
             .cast::<u32>()
             .write(count);
+    }
+}
+
+unsafe fn cdev_read_ops(cdev: *const c_void) -> usize {
+    unsafe {
+        cdev.cast::<u8>()
+            .add(LINUX_CDEV_OPS_OFFSET)
+            .cast::<usize>()
+            .read()
+    }
+}
+
+unsafe fn cdev_read_dev_count(cdev: *const c_void) -> (u32, u32) {
+    unsafe {
+        let bytes = cdev.cast::<u8>();
+        (
+            bytes.add(LINUX_CDEV_DEV_OFFSET).cast::<u32>().read(),
+            bytes.add(LINUX_CDEV_COUNT_OFFSET).cast::<u32>().read(),
+        )
     }
 }
 
@@ -864,6 +893,40 @@ unsafe extern "C" fn linux_cdev_add(cdev: *mut c_void, dev: u32, count: u32) -> 
         return -EINVAL;
     }
     unsafe { cdev_write_dev_count(cdev, dev, count) };
+    let fops = unsafe { cdev_read_ops(cdev.cast_const()) };
+    if fops == 0 {
+        return -EINVAL;
+    }
+    let major = dev >> MINORBITS;
+    let baseminor = dev & MINORMASK;
+    if baseminor > MINORMASK || count - 1 > MINORMASK - baseminor {
+        return -EINVAL;
+    }
+
+    let mut regions = CHRDEVS.lock();
+    if let Some(region) = regions.iter_mut().find(|region| {
+        region.major == major
+            && region.baseminor == baseminor
+            && region.count == count
+            && region.fops == 0
+    }) {
+        region.fops = fops;
+        return 0;
+    }
+    if regions.iter().any(|region| {
+        region.fops != 0
+            && region.major == major
+            && ranges_overlap(region.baseminor, region.count, baseminor, count)
+    }) {
+        return -EBUSY;
+    }
+    regions.push(CharDeviceRegion {
+        major,
+        baseminor,
+        count,
+        name: String::new(),
+        fops,
+    });
     0
 }
 
@@ -871,6 +934,15 @@ unsafe extern "C" fn linux_cdev_del(cdev: *mut c_void) {
     if cdev.is_null() {
         return;
     }
+    let (dev, count) = unsafe { cdev_read_dev_count(cdev.cast_const()) };
+    let major = dev >> MINORBITS;
+    let baseminor = dev & MINORMASK;
+    CHRDEVS.lock().retain(|region| {
+        !(region.major == major
+            && region.baseminor == baseminor
+            && region.count == count
+            && region.fops != 0)
+    });
     let mut dynamic = DYNAMIC_CDEVS.lock();
     if let Some(pos) = dynamic.iter().position(|ptr| *ptr == cdev as usize) {
         dynamic.swap_remove(pos);
@@ -926,6 +998,49 @@ mod tests {
         assert_eq!(rc, 0);
         assert_eq!(dev & MINORMASK, 2);
         assert!(dev >> MINORBITS >= FIRST_DYNAMIC_MAJOR);
+    }
+
+    /// test-origin: linux:vendor/linux/fs/char_dev.c:chrdev_open
+    #[test]
+    fn registered_chrdev_lookup_requires_matching_minor_range() {
+        let major = 123;
+        let name = b"range-test\0";
+        unsafe { linux_unregister_chrdev_region(mkdev(major, 0), MINORMASK) };
+
+        assert_eq!(
+            unsafe {
+                linux___register_chrdev(major, 4, 2, name.as_ptr().cast(), 0x1110 as *const _)
+            },
+            0
+        );
+
+        assert_eq!(registered_chrdev_fops(major, 3), None);
+        assert_eq!(registered_chrdev_fops(major, 4), Some(0x1110));
+        assert_eq!(registered_chrdev_fops(major, 5), Some(0x1110));
+        assert_eq!(registered_chrdev_fops(major, 6), None);
+
+        unsafe { linux___unregister_chrdev(major, 4, 2, name.as_ptr().cast()) };
+    }
+
+    /// test-origin: linux:vendor/linux/fs/char_dev.c:cdev_add
+    #[test]
+    fn cdev_add_publishes_exact_minor_range() {
+        let major = 124;
+        let dev = mkdev(major, 8);
+        unsafe { linux_unregister_chrdev_region(mkdev(major, 0), MINORMASK) };
+        let mut cdev = [0u8; LINUX_CDEV_SIZE];
+
+        unsafe {
+            linux_cdev_init(cdev.as_mut_ptr().cast(), 0x2220 as *const _);
+            assert_eq!(linux_cdev_add(cdev.as_mut_ptr().cast(), dev, 2), 0);
+        }
+
+        assert_eq!(registered_chrdev_fops(major, 7), None);
+        assert_eq!(registered_chrdev_fops(major, 8), Some(0x2220));
+        assert_eq!(registered_chrdev_fops(major, 9), Some(0x2220));
+        assert_eq!(registered_chrdev_fops(major, 10), None);
+
+        unsafe { linux_cdev_del(cdev.as_mut_ptr().cast()) };
     }
 
     #[test]

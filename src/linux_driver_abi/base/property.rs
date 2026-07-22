@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/base/property.c
+//! test-origin: linux:vendor/linux/drivers/base/property.c
 //! Generic device property helpers.
 
 use core::ffi::{c_char, c_void};

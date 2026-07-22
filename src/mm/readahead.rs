@@ -200,10 +200,11 @@ pub fn blk_finish_plug(plug: &mut BlkPlug) {
 /// Core readahead engine — allocate and submit `nr_to_read` pages.
 ///
 /// 1. Loops through pages at indices `[rac._index, rac._index + nr_to_read)`.
-/// 2. Calls `filemap_grab_folio` to get-or-create each page (locked).
-/// 3. After allocating all pages, calls `a_ops->readahead(rac)` if set.
+/// 2. Skips already-present cache pages, matching Linux's `xa_load` check.
+/// 3. Calls `filemap_grab_folio` to allocate missing pages (locked).
+/// 4. After allocating pages, calls `a_ops->readahead(rac)` if set.
 ///    The filesystem callback fills each page and calls `unlock_page`.
-/// 4. If no readahead callback, pages remain allocated but not yet uptodate —
+/// 5. If no readahead callback, pages remain allocated but not yet uptodate —
 ///    the read path will call `read_folio` per page instead.
 ///
 /// The `lookahead_count` trailing pages are marked `PG_READAHEAD` so that
@@ -217,7 +218,7 @@ pub unsafe fn page_cache_ra_unbounded(
     lookahead_count: u32,
 ) {
     use super::address_space::AddressSpace;
-    use super::filemap::filemap_grab_folio;
+    use super::filemap::{filemap_grab_folio, find_get_page};
     use super::page_flags::PG_READAHEAD;
 
     if rac.is_null() || nr_to_read == 0 {
@@ -232,8 +233,23 @@ pub unsafe fn page_cache_ra_unbounded(
         let mut plug = BlkPlug::new();
         blk_start_plug(&mut plug);
 
+        let mut batch_index = start_index;
+        let mut staged = 0u32;
         for i in 0..nr_to_read {
             let index = start_index + i as u64;
+            let existing = find_get_page(mapping, index);
+            if !existing.is_null() {
+                (*existing).put_page();
+                if staged == 0 {
+                    batch_index = index + 1;
+                    continue;
+                }
+                break;
+            }
+
+            if staged == 0 {
+                batch_index = index;
+            }
             let page = filemap_grab_folio(mapping, index);
             if page.is_null() {
                 break;
@@ -256,9 +272,11 @@ pub unsafe fn page_cache_ra_unbounded(
             // the XArray reference.  Readahead retains only the latter after
             // staging the page, matching page_cache_ra_unbounded().
             (*page).put_page();
+            staged += 1;
         }
 
-        (*rac)._nr_pages = nr_to_read;
+        (*rac)._index = batch_index;
+        (*rac)._nr_pages = staged;
         (*rac)._batch_count = 0;
 
         blk_finish_plug(&mut plug);
@@ -398,6 +416,7 @@ mod tests {
                 let ptr = Box::into_raw(p);
                 unsafe { filemap_add_folio(mapping_ptr, ptr, i as u64, GFP_KERNEL) };
                 unsafe { set_page_uptodate(ptr) };
+                unsafe { unlock_page(ptr) };
                 ptr
             })
             .collect();
@@ -454,6 +473,7 @@ mod tests {
                 p.private = buf as usize;
                 let ptr = Box::into_raw(p);
                 unsafe { filemap_add_folio(mapping_ptr, ptr, i as u64, GFP_KERNEL) };
+                unsafe { unlock_page(ptr) };
                 ptr
             })
             .collect();

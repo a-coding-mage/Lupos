@@ -38,9 +38,7 @@
 
 extern crate alloc;
 
-#[cfg(test)]
-use alloc::alloc::dealloc;
-use alloc::alloc::{Layout, alloc_zeroed};
+use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -54,9 +52,13 @@ use crate::kernel::clone::{
 };
 use crate::kernel::pid::{INIT_PID_NS, alloc_pid};
 use crate::kernel::sched::{
-    KTHREAD_STACK_SIZE, get_current, schedule_with_irqs_enabled, wake_up_new_task,
+    KTHREAD_STACK_SIZE, MAX_CPUS, current_cpu, get_current, schedule_with_irqs_enabled,
+    wake_up_new_task,
 };
-use crate::kernel::task::{TIF_NEED_RESCHED, TIF_SIGPENDING, TaskStruct, ThreadInfo};
+use crate::kernel::task::{
+    TIF_NEED_RESCHED, TIF_SIGPENDING, TaskStruct, ThreadInfo,
+    task_state::{TASK_KILLABLE, TASK_RUNNING},
+};
 use crate::kernel::thread::ThreadStruct;
 use crate::mm::mm_types::MmStruct;
 
@@ -135,10 +137,19 @@ impl Default for KernelCloneArgs {
 
 /// Maximum number of concurrently-live heap-allocated tasks.
 pub const MAX_HEAP_TASKS: usize = crate::kernel::sched::MAX_RUN_QUEUE;
+const PID_INDEX_SIZE: usize = crate::kernel::pid::PID_MAX_DEFAULT as usize;
+const PID_INDEX_EMPTY: usize = usize::MAX;
+const TASK_PTR_INDEX_SIZE: usize = MAX_HEAP_TASKS * 2;
+const TASK_PTR_INDEX_EMPTY: usize = usize::MAX;
+const TASK_PTR_INDEX_DELETED: usize = usize::MAX - 1;
 
 struct HeapTaskEntry {
     task: *mut TaskStruct,
     stack: *mut u8,
+    released: bool,
+    release_complete: bool,
+    vfork_parent: *mut TaskStruct,
+    exec_start: Option<crate::kernel::exec::UserStartContext>,
 }
 
 // SAFETY: Protected by HEAP_TASKS mutex.
@@ -147,7 +158,11 @@ unsafe impl Send for HeapTaskEntry {}
 struct HeapTaskTracker {
     entries: [Option<HeapTaskEntry>; MAX_HEAP_TASKS],
     len: usize,
+    occupied: usize,
     reserved: usize,
+    free_hint: usize,
+    pid_index: [usize; PID_INDEX_SIZE],
+    task_ptr_index: [usize; TASK_PTR_INDEX_SIZE],
 }
 
 // SAFETY: Protected by Mutex.
@@ -156,7 +171,11 @@ unsafe impl Send for HeapTaskTracker {}
 static HEAP_TASKS: Mutex<HeapTaskTracker> = Mutex::new(HeapTaskTracker {
     entries: [const { None }; MAX_HEAP_TASKS],
     len: 0,
+    occupied: 0,
     reserved: 0,
+    free_hint: 0,
+    pid_index: [PID_INDEX_EMPTY; PID_INDEX_SIZE],
+    task_ptr_index: [TASK_PTR_INDEX_EMPTY; TASK_PTR_INDEX_SIZE],
 });
 static CHILD_SETTID_REGISTRATIONS: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
 
@@ -172,30 +191,42 @@ struct HeapTaskReservation {
 }
 
 impl HeapTaskReservation {
-    /// Publish the completed task and execute `before_unlock` while registry
-    /// lookups are still excluded.
+    /// Publish the completed task and execute `after_publish` after registry
+    /// lookups can observe it.
     ///
-    /// `kernel_clone()` uses the callback for `wake_up_new_task()`. Lupos does
-    /// not yet model Linux's `p->pi_lock`; keeping the task undiscoverable
-    /// instead removes the competing affinity operation until initial CPU
-    /// selection and runqueue placement are complete.
-    fn publish_with(mut self, task: *mut TaskStruct, stack: *mut u8, before_unlock: impl FnOnce()) {
+    /// Linux's `copy_process()` publishes the fully initialized task before
+    /// `wake_up_new_task()`. The first wake then serializes with runqueue/task
+    /// locks, not with task-list allocation bookkeeping.
+    fn publish_with(
+        mut self,
+        task: *mut TaskStruct,
+        stack: *mut u8,
+        vfork_parent: *mut TaskStruct,
+        after_publish: impl FnOnce(),
+    ) {
         let mut tracker = HEAP_TASKS.lock();
         debug_assert!(self.active);
         debug_assert!(tracker.reserved != 0);
 
-        let slot = tracker
-            .entries
-            .iter()
-            .position(Option::is_none)
+        let slot = find_free_heap_task_slot(&tracker)
             .expect("reserved heap-task tracker slot disappeared");
         tracker.reserved -= 1;
-        tracker.entries[slot] = Some(HeapTaskEntry { task, stack });
+        tracker.entries[slot] = Some(HeapTaskEntry {
+            task,
+            stack,
+            released: false,
+            release_complete: false,
+            vfork_parent,
+            exec_start: None,
+        });
         tracker.len += 1;
+        tracker.occupied += 1;
+        tracker.free_hint = (slot + 1) % MAX_HEAP_TASKS;
+        index_heap_task_entry(&mut tracker, slot);
         self.active = false;
 
-        before_unlock();
         drop(tracker);
+        after_publish();
     }
 }
 
@@ -211,39 +242,290 @@ impl Drop for HeapTaskReservation {
 
 fn reserve_heap_task() -> Result<HeapTaskReservation, i32> {
     let mut tracker = HEAP_TASKS.lock();
-    if tracker.len.saturating_add(tracker.reserved) >= MAX_HEAP_TASKS {
+    if tracker.occupied.saturating_add(tracker.reserved) >= MAX_HEAP_TASKS {
         return Err(-12); // ENOMEM
     }
     tracker.reserved += 1;
     Ok(HeapTaskReservation { active: true })
 }
 
-/// Number of heap-allocated tasks currently tracked.
+/// Number of heap-allocated tasks still visible through task/PID iteration.
 ///
 /// Used by tests to verify that `release_task` drains the tracker.
 pub fn heap_task_count() -> usize {
     HEAP_TASKS.lock().len
 }
 
-/// Claim the sole release ownership for a heap task.
-///
-/// The pointer comparison deliberately happens before any `TaskStruct`
-/// dereference.  A second waiter/scheduler reaping path can therefore pass a
-/// stale pointer here safely: only the first claimant removes the tracker
-/// entry and may continue with `release_task()` cleanup.
-pub(crate) fn begin_heap_task_release(task: *mut TaskStruct) -> Option<*mut u8> {
-    let mut tracker = HEAP_TASKS.lock();
-    for i in 0..MAX_HEAP_TASKS {
-        if let Some(entry) = &tracker.entries[i] {
-            if entry.task == task {
-                let stack = entry.stack;
-                tracker.entries[i] = None;
-                tracker.len -= 1;
-                return Some(stack);
-            }
+#[cfg(test)]
+pub(crate) fn heap_task_allocation_tracked_for_tests(task: *mut TaskStruct) -> bool {
+    let tracker = HEAP_TASKS.lock();
+    tracker
+        .entries
+        .iter()
+        .flatten()
+        .any(|entry| entry.task == task)
+}
+
+fn find_free_heap_task_slot(tracker: &HeapTaskTracker) -> Option<usize> {
+    for offset in 0..MAX_HEAP_TASKS {
+        let slot = (tracker.free_hint + offset) % MAX_HEAP_TASKS;
+        if tracker.entries[slot].is_none() {
+            return Some(slot);
         }
     }
     None
+}
+
+fn pid_index_slot(tracker: &HeapTaskTracker, pid: i32) -> Option<usize> {
+    if pid < 0 || pid as usize >= PID_INDEX_SIZE {
+        return None;
+    }
+    let slot = tracker.pid_index[pid as usize];
+    if slot == PID_INDEX_EMPTY || slot >= MAX_HEAP_TASKS {
+        return None;
+    }
+    let entry = tracker.entries[slot].as_ref()?;
+    if entry.released || entry.task.is_null() {
+        return None;
+    }
+    (unsafe { (*entry.task).pid == pid }).then_some(slot)
+}
+
+fn task_ptr_hash(task: *mut TaskStruct) -> usize {
+    debug_assert!(TASK_PTR_INDEX_SIZE.is_power_of_two());
+    let value = task as usize;
+    ((value >> 4) ^ (value >> 12) ^ (value >> 20)) & (TASK_PTR_INDEX_SIZE - 1)
+}
+
+fn insert_task_ptr_index(tracker: &mut HeapTaskTracker, task: *mut TaskStruct, slot: usize) {
+    if task.is_null() {
+        return;
+    }
+    let start = task_ptr_hash(task);
+    let mut first_deleted = None;
+    for offset in 0..TASK_PTR_INDEX_SIZE {
+        let bucket = (start + offset) & (TASK_PTR_INDEX_SIZE - 1);
+        match tracker.task_ptr_index[bucket] {
+            TASK_PTR_INDEX_EMPTY => {
+                let target = first_deleted.unwrap_or(bucket);
+                tracker.task_ptr_index[target] = slot;
+                return;
+            }
+            TASK_PTR_INDEX_DELETED => {
+                if first_deleted.is_none() {
+                    first_deleted = Some(bucket);
+                }
+            }
+            existing if existing == slot => return,
+            existing if existing < MAX_HEAP_TASKS => {
+                if let Some(entry) = &tracker.entries[existing]
+                    && entry.task == task
+                {
+                    tracker.task_ptr_index[bucket] = slot;
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(bucket) = first_deleted {
+        tracker.task_ptr_index[bucket] = slot;
+    } else {
+        panic!("heap-task pointer index exhausted");
+    }
+}
+
+fn find_task_ptr_slot(tracker: &HeapTaskTracker, task: *mut TaskStruct) -> Option<usize> {
+    if task.is_null() {
+        return None;
+    }
+    let start = task_ptr_hash(task);
+    for offset in 0..TASK_PTR_INDEX_SIZE {
+        let bucket = (start + offset) & (TASK_PTR_INDEX_SIZE - 1);
+        match tracker.task_ptr_index[bucket] {
+            TASK_PTR_INDEX_EMPTY => return None,
+            TASK_PTR_INDEX_DELETED => {}
+            slot if slot < MAX_HEAP_TASKS => {
+                if let Some(entry) = &tracker.entries[slot]
+                    && entry.task == task
+                {
+                    return Some(slot);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn remove_task_ptr_index(tracker: &mut HeapTaskTracker, task: *mut TaskStruct, slot: usize) {
+    if task.is_null() {
+        return;
+    }
+    let start = task_ptr_hash(task);
+    for offset in 0..TASK_PTR_INDEX_SIZE {
+        let bucket = (start + offset) & (TASK_PTR_INDEX_SIZE - 1);
+        match tracker.task_ptr_index[bucket] {
+            TASK_PTR_INDEX_EMPTY => return,
+            TASK_PTR_INDEX_DELETED => {}
+            indexed if indexed == slot => {
+                tracker.task_ptr_index[bucket] = TASK_PTR_INDEX_DELETED;
+                return;
+            }
+            indexed if indexed < MAX_HEAP_TASKS => {
+                if let Some(entry) = &tracker.entries[indexed]
+                    && entry.task == task
+                {
+                    tracker.task_ptr_index[bucket] = TASK_PTR_INDEX_DELETED;
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn clear_pid_index_for_slot(tracker: &mut HeapTaskTracker, slot: usize) {
+    let Some(entry) = &tracker.entries[slot] else {
+        return;
+    };
+    if entry.task.is_null() {
+        return;
+    }
+    let pid = unsafe { (*entry.task).pid };
+    if pid >= 0 && (pid as usize) < PID_INDEX_SIZE && tracker.pid_index[pid as usize] == slot {
+        tracker.pid_index[pid as usize] = PID_INDEX_EMPTY;
+    }
+}
+
+fn index_heap_task_entry(tracker: &mut HeapTaskTracker, slot: usize) {
+    let Some(entry) = &tracker.entries[slot] else {
+        return;
+    };
+    let task = entry.task;
+    let released = entry.released;
+    insert_task_ptr_index(tracker, task, slot);
+
+    if !released && !task.is_null() {
+        let pid = unsafe { (*task).pid };
+        if pid >= 0 && (pid as usize) < PID_INDEX_SIZE {
+            tracker.pid_index[pid as usize] = slot;
+        }
+    }
+}
+
+fn unindex_heap_task_entry(tracker: &mut HeapTaskTracker, slot: usize) {
+    let Some(entry) = &tracker.entries[slot] else {
+        return;
+    };
+    let task = entry.task;
+    clear_pid_index_for_slot(tracker, slot);
+    remove_task_ptr_index(tracker, task, slot);
+}
+
+fn remove_heap_task_entry(
+    tracker: &mut HeapTaskTracker,
+    task: *mut TaskStruct,
+) -> Option<HeapTaskEntry> {
+    let slot = find_task_ptr_slot(tracker, task)?;
+    unindex_heap_task_entry(tracker, slot);
+    let entry = tracker.entries[slot]
+        .take()
+        .expect("indexed entry must exist");
+    tracker.occupied -= 1;
+    tracker.free_hint = tracker.free_hint.min(slot);
+    if !entry.released {
+        tracker.len -= 1;
+    }
+    Some(entry)
+}
+
+/// Claim immediate allocation ownership for an unpublished or failed heap task.
+///
+/// The pointer comparison deliberately happens before any `TaskStruct`
+/// dereference. A second cleanup path can therefore pass a stale pointer here
+/// safely: only the first claimant removes the tracker entry.
+pub(crate) fn begin_heap_task_release(task: *mut TaskStruct) -> Option<*mut u8> {
+    let mut tracker = HEAP_TASKS.lock();
+    remove_heap_task_entry(&mut tracker, task).map(|entry| entry.stack)
+}
+
+/// Claim logical `release_task()` ownership while keeping the allocation alive.
+///
+/// Linux separates task-list/PID teardown from the final scheduler-owned
+/// `task_struct` reference.  Lupos models that split by marking the entry as
+/// released, hiding it from PID iteration, and freeing it only when the caller
+/// proves no scheduler state still references it.
+pub(crate) fn begin_heap_task_logical_release(task: *mut TaskStruct) -> Option<*mut u8> {
+    let mut tracker = HEAP_TASKS.lock();
+    let slot = find_task_ptr_slot(&tracker, task)?;
+    if tracker.entries[slot]
+        .as_ref()
+        .expect("indexed entry must exist")
+        .released
+    {
+        return None;
+    }
+    clear_pid_index_for_slot(&mut tracker, slot);
+    let entry = tracker.entries[slot]
+        .as_mut()
+        .expect("indexed entry must exist");
+    entry.released = true;
+    entry.release_complete = false;
+    let stack = entry.stack;
+    tracker.len -= 1;
+    Some(stack)
+}
+
+pub(crate) fn complete_heap_task_logical_release(task: *mut TaskStruct) {
+    let mut tracker = HEAP_TASKS.lock();
+    let Some(slot) = find_task_ptr_slot(&tracker, task) else {
+        return;
+    };
+    if let Some(entry) = &mut tracker.entries[slot]
+        && entry.released
+    {
+        entry.release_complete = true;
+    }
+}
+
+pub(crate) fn take_logically_released_heap_task(task: *mut TaskStruct) -> Option<*mut u8> {
+    let mut tracker = HEAP_TASKS.lock();
+    let slot = find_task_ptr_slot(&tracker, task)?;
+    if let Some(entry) = &tracker.entries[slot]
+        && entry.released
+        && entry.release_complete
+    {
+        unindex_heap_task_entry(&mut tracker, slot);
+        let entry = tracker.entries[slot].take().expect("entry checked above");
+        tracker.occupied -= 1;
+        tracker.free_hint = tracker.free_hint.min(slot);
+        return Some(entry.stack);
+    }
+    None
+}
+
+pub(crate) fn set_heap_task_exec_start(
+    task: *mut TaskStruct,
+    ctx: crate::kernel::exec::UserStartContext,
+) -> bool {
+    let mut tracker = HEAP_TASKS.lock();
+    let Some(slot) = find_task_ptr_slot(&tracker, task) else {
+        return false;
+    };
+    let Some(entry) = &mut tracker.entries[slot] else {
+        return false;
+    };
+    entry.exec_start = Some(ctx);
+    true
+}
+
+pub(crate) fn take_heap_task_exec_start(
+    task: *mut TaskStruct,
+) -> Option<crate::kernel::exec::UserStartContext> {
+    let mut tracker = HEAP_TASKS.lock();
+    let slot = find_task_ptr_slot(&tracker, task)?;
+    tracker.entries[slot].as_mut()?.exec_start.take()
 }
 
 fn register_child_set_tid(pid: i32, ptr: *mut i32) {
@@ -285,12 +567,13 @@ fn child_set_tid_for_tests(pid: i32) -> *mut i32 {
 /// future PID-keyed kernel lookup before the M28 IDR-backed PID hash lands.
 pub fn find_heap_task_by_pid(pid: i32) -> *mut TaskStruct {
     let tracker = HEAP_TASKS.lock();
-    for entry in tracker.entries.iter().flatten() {
-        unsafe {
-            if !entry.task.is_null() && (*entry.task).pid == pid {
-                return entry.task;
-            }
-        }
+    let Some(slot) = pid_index_slot(&tracker, pid) else {
+        return core::ptr::null_mut();
+    };
+    if let Some(entry) = &tracker.entries[slot]
+        && !entry.released
+    {
+        return entry.task;
     }
     core::ptr::null_mut()
 }
@@ -301,28 +584,35 @@ pub fn find_heap_task_by_pid(pid: i32) -> *mut TaskStruct {
 pub fn for_each_heap_task(mut f: impl FnMut(*mut TaskStruct)) {
     let tracker = HEAP_TASKS.lock();
     for entry in tracker.entries.iter().flatten() {
+        if entry.released {
+            continue;
+        }
         if !entry.task.is_null() {
             f(entry.task);
         }
     }
 }
 
-/// Free the allocations whose unique ownership was returned by
-/// `begin_heap_task_release()`.
+/// Free task allocations after the caller has unique release ownership.
 ///
-/// Called by `crate::kernel::exit::release_task` once the parent has reaped a
-/// zombie child.  After this call returns, `task` is dangling and must not be
-/// dereferenced.
+/// Called by `crate::kernel::exit::release_task` for tasks with no scheduler
+/// reference left, or by `finish_task_switch()` after a logically released
+/// current task has switched away. After this call returns, `task` is dangling
+/// and must not be dereferenced.
 ///
 /// # Safety
-/// `task` and `stack` must be the pair claimed by
-/// `begin_heap_task_release()`. No other CPU may hold a reference to the task;
-/// the caller removes it from its indexes and run queue before finishing.
+/// `task` and `stack` must be the pair claimed by either the immediate heap
+/// release path or the completed logical release path. No scheduler-visible
+/// state may still reference the task.
 pub(crate) unsafe fn finish_heap_task_release(task: *mut TaskStruct, stack: *mut u8) {
+    {
+        let mut tracker = HEAP_TASKS.lock();
+        let _ = remove_heap_task_entry(&mut tracker, task);
+    }
     unsafe {
         free_kernel_stack(stack);
         // Reclaim the TaskStruct allocation last — `task` becomes invalid.
-        drop(Box::from_raw(task));
+        free_task_struct_allocation(task);
     }
 }
 
@@ -340,7 +630,49 @@ fn alloc_kernel_stack() -> *mut u8 {
 }
 
 #[cfg(not(test))]
+const NR_CACHED_STACKS: usize = 2;
+
+#[cfg(not(test))]
+struct KernelStackCache {
+    slots: [[usize; NR_CACHED_STACKS]; MAX_CPUS],
+}
+
+#[cfg(not(test))]
+static KERNEL_STACK_CACHE: Mutex<KernelStackCache> = Mutex::new(KernelStackCache {
+    slots: [[0; NR_CACHED_STACKS]; MAX_CPUS],
+});
+
+#[cfg(not(test))]
+const NR_CACHED_TASK_STRUCTS: usize = 2;
+
+#[cfg(not(test))]
+struct TaskStructCache {
+    slots: [[usize; NR_CACHED_TASK_STRUCTS]; MAX_CPUS],
+}
+
+#[cfg(not(test))]
+static TASK_STRUCT_CACHE: Mutex<TaskStructCache> = Mutex::new(TaskStructCache {
+    slots: [[0; NR_CACHED_TASK_STRUCTS]; MAX_CPUS],
+});
+
+#[cfg(not(test))]
 fn alloc_kernel_stack() -> *mut u8 {
+    let cpu = (current_cpu() as usize).min(MAX_CPUS - 1);
+    let mut cache = KERNEL_STACK_CACHE.lock();
+    for slot in &mut cache.slots[cpu] {
+        if *slot != 0 {
+            let stack = *slot as *mut u8;
+            *slot = 0;
+            drop(cache);
+            unsafe {
+                // Linux clears stale pointers when reusing a cached vmapped
+                // thread stack.
+                core::ptr::write_bytes(stack, 0, KTHREAD_STACK_SIZE);
+            }
+            return stack;
+        }
+    }
+    drop(cache);
     crate::mm::vmalloc::vmalloc_stack(KTHREAD_STACK_SIZE)
 }
 
@@ -353,11 +685,63 @@ unsafe fn free_kernel_stack(stack: *mut u8) {
 
 #[cfg(not(test))]
 unsafe fn free_kernel_stack(stack: *mut u8) {
+    if stack.is_null() {
+        return;
+    }
+    let cpu = (current_cpu() as usize).min(MAX_CPUS - 1);
+    let mut cache = KERNEL_STACK_CACHE.lock();
+    for slot in &mut cache.slots[cpu] {
+        if *slot == 0 {
+            *slot = stack as usize;
+            return;
+        }
+    }
+    drop(cache);
     crate::mm::vmalloc::vfree_stack(stack);
 }
 
 fn alloc_task_struct_zeroed() -> *mut TaskStruct {
+    #[cfg(not(test))]
+    {
+        let cpu = (current_cpu() as usize).min(MAX_CPUS - 1);
+        let mut cache = TASK_STRUCT_CACHE.lock();
+        for slot in &mut cache.slots[cpu] {
+            if *slot != 0 {
+                let task = *slot as *mut TaskStruct;
+                *slot = 0;
+                drop(cache);
+                unsafe {
+                    core::ptr::write_bytes(
+                        task.cast::<u8>(),
+                        0,
+                        core::mem::size_of::<TaskStruct>(),
+                    );
+                }
+                return task;
+            }
+        }
+    }
     unsafe { alloc_zeroed(Layout::new::<TaskStruct>()) as *mut TaskStruct }
+}
+
+unsafe fn free_task_struct_allocation(task: *mut TaskStruct) {
+    if task.is_null() {
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        let cpu = (current_cpu() as usize).min(MAX_CPUS - 1);
+        let mut cache = TASK_STRUCT_CACHE.lock();
+        for slot in &mut cache.slots[cpu] {
+            if *slot == 0 {
+                *slot = task as usize;
+                return;
+            }
+        }
+    }
+    unsafe {
+        dealloc(task.cast::<u8>(), Layout::new::<TaskStruct>());
+    }
 }
 
 /// Recover the allocation base from the kernel-stack top stored in
@@ -550,7 +934,7 @@ unsafe fn copy_process_unpublished(
     let stack_ptr: *mut u8 = alloc_kernel_stack();
     if stack_ptr.is_null() {
         unsafe {
-            drop(Box::from_raw(child));
+            free_task_struct_allocation(child);
         }
         return Err(-12);
     }
@@ -581,8 +965,8 @@ unsafe fn copy_process_unpublished(
             // sched_fork() precedes PID and shared-resource setup, so unwind
             // only the two allocations made so far. Running the later cleanup
             // ladder here would operate on the all-zero PID key.
-            drop(Box::from_raw(child));
             free_kernel_stack(stack_ptr);
+            free_task_struct_allocation(child);
             return Err(errno);
         }
 
@@ -862,7 +1246,7 @@ pub unsafe fn copy_process(
     let reservation = reserve_heap_task()?;
     let child = unsafe { copy_process_unpublished(parent, args)? };
     let stack = unsafe { task_kernel_stack_base(child) };
-    reservation.publish_with(child, stack, || {});
+    reservation.publish_with(child, stack, core::ptr::null_mut(), || {});
     Ok(child)
 }
 
@@ -978,22 +1362,78 @@ unsafe fn cleanup_failed_child(
                 stack_ptr
             }
         });
-        drop(Box::from_raw(child));
         free_kernel_stack(stack_to_free);
+        free_task_struct_allocation(child);
     }
+}
+
+/// Linux `complete_vfork_done()` as used by `mm_release()`.
+///
+/// Linux stores a `completion *` in `task_struct.vfork_done`; Lupos stores the
+/// waiting parent task pointer in heap-task ownership metadata because the
+/// compact fixed-offset `M26Fields` block has no spare bytes without moving
+/// `cred`. Clearing the token before the wake mirrors Linux's
+/// `tsk->vfork_done = NULL; complete(vfork)`.
+///
+/// # Safety
+/// `child` must name the task passing through exec/exit mm release.
+pub(crate) unsafe fn complete_vfork_done(child: *mut TaskStruct) -> bool {
+    if child.is_null() {
+        return false;
+    }
+    let parent = {
+        let mut tracker = HEAP_TASKS.lock();
+        let Some(slot) = find_task_ptr_slot(&tracker, child) else {
+            return false;
+        };
+        let Some(entry) = &mut tracker.entries[slot] else {
+            return false;
+        };
+        let parent = entry.vfork_parent;
+        entry.vfork_parent = core::ptr::null_mut();
+        parent
+    };
+    if parent.is_null() {
+        return false;
+    }
+    unsafe {
+        crate::kernel::sched::wake_task(parent);
+    }
+    true
 }
 
 fn vfork_child_done(parent: *mut TaskStruct, child: *mut TaskStruct) -> bool {
     if parent.is_null() || child.is_null() {
         return true;
     }
+    let tracker = HEAP_TASKS.lock();
+    let Some(slot) = find_task_ptr_slot(&tracker, child) else {
+        return true;
+    };
+    tracker.entries[slot]
+        .as_ref()
+        .is_none_or(|entry| entry.vfork_parent != parent)
+}
+
+unsafe fn wait_for_vfork_done(parent: *mut TaskStruct, child: *mut TaskStruct) {
+    if parent.is_null() || child.is_null() {
+        return;
+    }
+
+    while !vfork_child_done(parent, child) {
+        unsafe {
+            (*parent).__state.store(TASK_KILLABLE, Ordering::Release);
+        }
+        if vfork_child_done(parent, child) {
+            break;
+        }
+        unsafe {
+            schedule_with_irqs_enabled();
+        }
+    }
+
     unsafe {
-        let child_state = (*child).__state.load(Ordering::Acquire);
-        child_state
-            & (crate::kernel::task::task_state::EXIT_ZOMBIE
-                | crate::kernel::task::task_state::EXIT_DEAD)
-            != 0
-            || (*child).mm != (*parent).mm
+        (*parent).__state.store(TASK_RUNNING, Ordering::Release);
     }
 }
 
@@ -1136,19 +1576,22 @@ pub unsafe fn kernel_clone(args: &KernelCloneArgs) -> i64 {
     }
 
     // Linux kernel_clone() activates a never-run child through the dedicated
-    // fork path, not through try_to_wake_up()/ENQUEUE_WAKEUP. Keep the early
-    // task registry locked across publication and initial runqueue placement:
-    // PID-based sched_setaffinity cannot discover the child in the interval
-    // between select_task_rq() and enqueue.
+    // fork path, not through try_to_wake_up()/ENQUEUE_WAKEUP. The child is
+    // fully initialized and PID-visible before the first wake; wakeup itself
+    // owns the runqueue/task locking.
+    let vfork_parent = if effective_args.flags & CLONE_VFORK != 0 {
+        parent
+    } else {
+        core::ptr::null_mut()
+    };
+
     let stack = unsafe { task_kernel_stack_base(child) };
-    heap_task_reservation.publish_with(child, stack, || unsafe {
+    heap_task_reservation.publish_with(child, stack, vfork_parent, || unsafe {
         wake_up_new_task(child);
     });
 
     if effective_args.flags & CLONE_VFORK != 0 {
-        while !vfork_child_done(parent, child) {
-            unsafe { schedule_with_irqs_enabled() };
-        }
+        unsafe { wait_for_vfork_done(parent, child) };
     }
 
     child_pid
@@ -1293,7 +1736,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_process_publishes_only_after_task_new_scheduler_initialization() {
+    fn copy_process_publishes_before_first_wake_without_registry_lock() {
         let _test_guard = TEST_LOCK.lock().unwrap();
         clean_lsm_hooks!();
         let baseline = heap_task_count();
@@ -1318,10 +1761,15 @@ mod tests {
         assert!(!unsafe { (*child).m29.sched_class }.is_null());
 
         let stack = unsafe { task_kernel_stack_base(child) };
-        reservation.publish_with(child, stack, || {
+        reservation.publish_with(child, stack, core::ptr::null_mut(), || {
             assert!(
-                HEAP_TASKS.try_lock().is_none(),
-                "first-wake callback must run before PID lookup can acquire the registry"
+                HEAP_TASKS.try_lock().is_some(),
+                "first-wake callback must not run under the heap task registry lock"
+            );
+            assert_eq!(
+                find_heap_task_by_pid(child_pid),
+                child,
+                "Linux publishes the child before wake_up_new_task()"
             );
         });
         assert_eq!(find_heap_task_by_pid(child_pid), child);
@@ -1537,70 +1985,132 @@ mod tests {
         }
     }
 
+    /// test-origin: lupos: Rust task_struct.vfork_done token translation
+    ///
+    /// Linux's upstream behavior is covered by `kernel/fork.c`'s
+    /// `wait_for_vfork_done()` and `mm_release()` control flow. This regression
+    /// is Lupos-specific because the local Rust task allocator represents the
+    /// stack `struct completion` as a parent-task token in `TaskStruct`.
     #[test]
-    fn vfork_child_done_stays_false_while_child_shares_parent_mm() {
+    fn vfork_child_done_stays_false_while_completion_pending() {
+        let _test_guard = TEST_LOCK.lock().unwrap();
+        let baseline = heap_task_count();
         let mut parent = make_parent();
         let mut child = make_parent();
         child.pid = 1001;
         child.tgid = 1001;
-        let shared_mm = Box::into_raw(Box::new(MmStruct::new(0)));
-        parent.mm = shared_mm;
-        child.mm = shared_mm;
+        let parent_ptr = &mut *parent as *mut TaskStruct;
+        let child_ptr = &mut *child as *mut TaskStruct;
+        let reservation = reserve_heap_task().expect("reserve tracker capacity");
+        reservation.publish_with(child_ptr, core::ptr::null_mut(), parent_ptr, || {});
 
         assert!(
-            !vfork_child_done(&mut *parent, &mut *child),
-            "CLONE_VFORK parent must keep waiting while child still shares its mm"
+            !vfork_child_done(parent_ptr, child_ptr),
+            "CLONE_VFORK parent must keep waiting until mm_release completes"
         );
 
-        unsafe {
-            let _ = Box::from_raw(shared_mm);
+        {
+            let mut tracker = HEAP_TASKS.lock();
+            let _ = remove_heap_task_entry(&mut tracker, child_ptr);
         }
+        assert_eq!(heap_task_count(), baseline);
     }
 
+    /// test-origin: lupos: Rust task_struct.vfork_done token translation
+    ///
+    /// Linux completes `task_struct.vfork_done` from `mm_release()` and wakes
+    /// the blocked parent. Lupos must clear its parent-token equivalent before
+    /// waking so a racing waiter cannot go back to sleep on stale state.
     #[test]
-    fn vfork_child_done_when_child_exits() {
+    fn complete_vfork_done_clears_token_and_wakes_parent() {
+        let _test_guard = TEST_LOCK.lock().unwrap();
+        let baseline = heap_task_count();
         let mut parent = make_parent();
         let mut child = make_parent();
         child.pid = 1001;
         child.tgid = 1001;
-        let shared_mm = Box::into_raw(Box::new(MmStruct::new(0)));
-        parent.mm = shared_mm;
-        child.mm = shared_mm;
-        child.__state.store(
-            crate::kernel::task::task_state::EXIT_ZOMBIE,
-            Ordering::Release,
-        );
+        let parent_ptr = &mut *parent as *mut TaskStruct;
+        let child_ptr = &mut *child as *mut TaskStruct;
+        let reservation = reserve_heap_task().expect("reserve tracker capacity");
+        reservation.publish_with(child_ptr, core::ptr::null_mut(), parent_ptr, || {});
+        parent.__state.store(TASK_KILLABLE, Ordering::Release);
 
-        assert!(
-            vfork_child_done(&mut *parent, &mut *child),
-            "Linux completes vfork when the child exits through mm_release()"
-        );
+        assert!(unsafe { complete_vfork_done(child_ptr) });
+        assert!(vfork_child_done(parent_ptr, child_ptr));
+        assert_eq!(parent.__state.load(Ordering::Acquire), TASK_RUNNING);
 
-        unsafe {
-            let _ = Box::from_raw(shared_mm);
+        {
+            let mut tracker = HEAP_TASKS.lock();
+            let _ = remove_heap_task_entry(&mut tracker, child_ptr);
         }
+        assert_eq!(heap_task_count(), baseline);
     }
 
+    /// test-origin: lupos: Rust task_struct.vfork_done token translation
+    ///
+    /// `exec_mm_release()` and `exit_mm_release()` can never complete the same
+    /// Linux `completion` twice because `complete_vfork_done()` NULLs the task
+    /// field first. The Rust token must have the same idempotence.
     #[test]
-    fn vfork_child_done_when_child_execs() {
+    fn complete_vfork_done_is_idempotent_after_mm_release() {
+        let _test_guard = TEST_LOCK.lock().unwrap();
+        let baseline = heap_task_count();
         let mut parent = make_parent();
         let mut child = make_parent();
         child.pid = 1001;
         child.tgid = 1001;
-        let shared_mm = Box::into_raw(Box::new(MmStruct::new(0)));
-        let exec_mm = Box::into_raw(Box::new(MmStruct::new(0)));
-        parent.mm = shared_mm;
-        child.mm = exec_mm;
+        let parent_ptr = &mut *parent as *mut TaskStruct;
+        let child_ptr = &mut *child as *mut TaskStruct;
+        let reservation = reserve_heap_task().expect("reserve tracker capacity");
+        reservation.publish_with(child_ptr, core::ptr::null_mut(), parent_ptr, || {});
 
-        assert!(
-            vfork_child_done(&mut *parent, &mut *child),
-            "Linux completes vfork when exec replaces the child's mm"
+        assert!(unsafe { complete_vfork_done(child_ptr) });
+        assert!(!unsafe { complete_vfork_done(child_ptr) });
+
+        {
+            let mut tracker = HEAP_TASKS.lock();
+            let _ = remove_heap_task_entry(&mut tracker, child_ptr);
+        }
+        assert_eq!(heap_task_count(), baseline);
+    }
+
+    /// test-origin: lupos: syscall-return exec handoff side metadata
+    ///
+    /// Linux returns from successful exec through architecture register state.
+    /// Lupos has a Rust-only handoff from `execve()` to syscall return; normal
+    /// heap tasks should use the task-pointer-indexed metadata slot instead of
+    /// the fallback global Vec.
+    #[test]
+    fn heap_task_exec_start_handoff_is_indexed_by_task_pointer() {
+        let _test_guard = TEST_LOCK.lock().unwrap();
+        let baseline = heap_task_count();
+        let mut child = make_parent();
+        child.pid = 1001;
+        child.tgid = 1001;
+        let child_ptr = &mut *child as *mut TaskStruct;
+        let reservation = reserve_heap_task().expect("reserve tracker capacity");
+        reservation.publish_with(
+            child_ptr,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            || {},
         );
 
-        unsafe {
-            let _ = Box::from_raw(shared_mm);
-            let _ = Box::from_raw(exec_mm);
+        let ctx = crate::kernel::exec::UserStartContext {
+            ip: 0x401000,
+            sp: 0x7fff_f000,
+            rflags: 0x202,
+            old_mm: 0x1234,
+        };
+        assert!(set_heap_task_exec_start(child_ptr, ctx));
+        assert_eq!(take_heap_task_exec_start(child_ptr), Some(ctx));
+        assert_eq!(take_heap_task_exec_start(child_ptr), None);
+
+        {
+            let mut tracker = HEAP_TASKS.lock();
+            let _ = remove_heap_task_entry(&mut tracker, child_ptr);
         }
+        assert_eq!(heap_task_count(), baseline);
     }
 
     #[test]

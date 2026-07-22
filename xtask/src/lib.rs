@@ -192,6 +192,7 @@ const TMPDIR_ENV: &str = "TMPDIR";
 const DEFAULT_QEMU_MEMORY: &str = "1024M";
 const GUI_SHELL_QEMU_MEMORY: &str = "4096M";
 const SUPPORTED_GUI_SMP_COUNT: usize = 4;
+const GRAPHICS_X11_GREETER_CONNECTED: &str = "Greeter connected version=";
 const GRAPHICS_X11_GREETER_PROMPT: &str = "Prompt greeter with 1 message(s)";
 const GRAPHICS_ROOT_DISK_SIZE: &str = "40G";
 const GRAPHICS_ROOT_DISK_BYTES: u64 = 40 * 1024 * 1024 * 1024;
@@ -562,6 +563,16 @@ const RUNTIME_STRESS_SCRIPT: &str = concat!(
     "  /bin/true\n",
     "  /bin/echo \"forkexec-$i\" >/dev/null\n",
     "  i=$((i + 1))\n",
+    "done\n",
+    "bench_i=0\n",
+    "while [ \"$bench_i\" -lt 10 ]; do\n",
+    "  bench_start=$(date +%s%N)\n",
+    "  /bin/true\n",
+    "  /bin/echo \"bench-fork-$bench_i\" >/dev/null\n",
+    "  bench_end=$(date +%s%N)\n",
+    "  bench_us=$(((bench_end - bench_start) / 1000))\n",
+    "  echo \"runtime-stress: fork-wake-exit sample iteration=$bench_i elapsed_us=$bench_us\"\n",
+    "  bench_i=$((bench_i + 1))\n",
     "done\n",
     "echo runtime-stress: fork-exec ok\n",
     "i=0\n",
@@ -4470,7 +4481,10 @@ fn lupos_user_provision_script() -> Vec<u8> {
         "set -eu\n",
         "umask 077\n",
         "/usr/bin/systemd-sysusers\n",
-        "/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/lupos-home.conf /usr/lib/tmpfiles.d/lightdm.conf\n",
+        "/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/lupos-home.conf\n",
+        "if [ -e /usr/lib/tmpfiles.d/lightdm.conf ]; then\n",
+        "  /usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/lightdm.conf\n",
+        "fi\n",
         "password_hash='$6$lupos$kfqTeHWlA.9yNwAV7ku8p6jKF5ULWSzdhP3d/4Cq0ObxXStDoiUHezFLQH0Kh5EIXypcHW4AGgV6gn/KgMxou/'\n",
         "printf 'root:%s\\nlupos:%s\\n' \"$password_hash\" \"$password_hash\" | /usr/bin/chpasswd -e\n",
         "/usr/bin/chown 0:0 /etc/passwd /etc/group /etc/shadow /etc/gshadow\n",
@@ -4801,8 +4815,40 @@ fn lightdm_user_xsession() -> Vec<u8> {
 fn graphics_x11_desktop_ready_relay_script() -> Vec<u8> {
     concat!(
         "#!/bin/sh\n",
+        "lightdm_greeter_start_failed() {\n",
+        "    [ -s /var/log/lightdm/lightdm.log ] || return 1\n",
+        "    awk '\n",
+        "        /Stopping; failed to start a greeter/ { found = 1 }\n",
+        "        END { exit found ? 0 : 1 }\n",
+        "    ' /var/log/lightdm/lightdm.log\n",
+        "}\n",
+        "lightdm_user_session_exited() {\n",
+        "    [ -s /var/log/lightdm/lightdm.log ] || return 1\n",
+        "    awk '\n",
+        "        /Running command \\/etc\\/lightdm\\/Xsession startxfce4/ { seen = 1 }\n",
+        "        seen && /Session pid=.*Exited with return value/ { found = 1 }\n",
+        "        END { exit found ? 0 : 1 }\n",
+        "    ' /var/log/lightdm/lightdm.log\n",
+        "}\n",
+        "dump_desktop_failure_logs() {\n",
+        "    if [ -s /home/lupos/.xsession-errors ]; then echo 'graphics-x11: xsession-errors begin'; tail -160 /home/lupos/.xsession-errors; echo 'graphics-x11: xsession-errors end'; fi\n",
+        "    for f in /var/log/lightdm/lightdm.log /var/log/lightdm/seat0-greeter.log /var/log/lightdm/x-0.log; do\n",
+        "        [ -s \"$f\" ] || continue\n",
+        "        printf 'graphics-x11: desktop-failure-log %s begin\\n' \"$f\"\n",
+        "        tail -120 \"$f\"\n",
+        "        printf 'graphics-x11: desktop-failure-log %s end\\n' \"$f\"\n",
+        "    done\n",
+        "}\n",
         "i=0\n",
         "while [ \"$i\" -lt 360 ] && [ ! -e /tmp/lupos-desktop-initial-ready ] && [ ! -e /tmp/lupos-desktop-initial-failed ]; do\n",
+        "    if lightdm_greeter_start_failed; then\n",
+        "        : > /tmp/lupos-desktop-initial-failed\n",
+        "        break\n",
+        "    fi\n",
+        "    if lightdm_user_session_exited; then\n",
+        "        : > /tmp/lupos-desktop-initial-failed\n",
+        "        break\n",
+        "    fi\n",
         "    i=$((i + 1)); sleep 1\n",
         "done\n",
         "if [ -e /tmp/lupos-desktop-initial-ready ]; then\n",
@@ -4810,6 +4856,7 @@ fn graphics_x11_desktop_ready_relay_script() -> Vec<u8> {
         "    exit 0\n",
         "fi\n",
         "echo 'graphics-x11: desktop-initial-failed'\n",
+        "dump_desktop_failure_logs\n",
         "exit 1\n",
     )
     .as_bytes()
@@ -13720,7 +13767,7 @@ pub fn run_boot_smoke_suite() -> Result<()> {
     assert_boot_outcome(&signals, SIGNALS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
 
     // Milestone 26 acceptance: exit/wait/zombies/ptrace.
-    let ewp = build_and_run_iso(BootMode::ExitWaitPtraceTest, boot_test_run_options())?;
+    let ewp = build_and_run_iso(BootMode::ExitWaitPtraceTest, exit_wait_ptrace_run_options())?;
     assert_boot_outcome(&ewp, EXIT_WAIT_PTRACE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
 
     // Milestone 27 acceptance: credentials, capabilities, seccomp (cBPF).
@@ -16493,12 +16540,12 @@ pub fn run_graphics_x11_greeter_tests() -> Result<()> {
 
     let steps = [SerialExpectStep {
         label: "greeter ready shutdown",
-        wait_for: GRAPHICS_X11_GREETER_PROMPT,
+        wait_for: GRAPHICS_X11_GREETER_CONNECTED,
         send: b" poweroff -f\n",
     }];
     let hmp_steps = [HmpExpectStep {
         label: "visible greeter capture",
-        wait_for: GRAPHICS_X11_GREETER_PROMPT,
+        wait_for: GRAPHICS_X11_GREETER_CONNECTED,
         metric: Some("graphics-x11: greeter-ready"),
         action: HmpExpectAction::CaptureFrame("greeter-ready"),
     }];
@@ -16529,9 +16576,8 @@ pub fn run_graphics_x11_greeter_tests() -> Result<()> {
     let topology = format!("smp: Brought up 1 node, {} CPUs", SUPPORTED_GUI_SMP_COUNT);
     for needle in [
         topology.as_str(),
-        "Started Light Display Manager",
-        "Greeter connected version=",
-        GRAPHICS_X11_GREETER_PROMPT,
+        "Starting Light Display Manager",
+        GRAPHICS_X11_GREETER_CONNECTED,
     ] {
         if !serial_log_contains(&run.serial_output, needle) {
             bail!(
@@ -17061,6 +17107,8 @@ pub fn run_runtime_stress_tests() -> Result<()> {
 
     assert_boot_outcome(&run, RUNTIME_STRESS_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
     for needle in [
+        "runtime-stress: fork-wake-exit sample iteration=0 elapsed_us=",
+        "runtime-stress: fork-wake-exit sample iteration=9 elapsed_us=",
         "runtime-stress: fork-exec ok",
         "runtime-stress: mmap-libc ok",
         "runtime-stress: fs ok",
@@ -19533,10 +19581,7 @@ pub fn run_signals_tests() -> Result<()> {
 ///
 /// Invoked by `cargo xtask test-boot --mode test-exit-wait-ptrace`.
 pub fn run_exit_wait_ptrace_tests() -> Result<()> {
-    let run = build_and_run_iso(
-        BootMode::ExitWaitPtraceTest,
-        phase17_late_boot_run_options(),
-    )?;
+    let run = build_and_run_iso(BootMode::ExitWaitPtraceTest, exit_wait_ptrace_run_options())?;
     assert_boot_outcome(&run, EXIT_WAIT_PTRACE_BANNER, QEMU_SUCCESS_EXIT_CODE)?;
     println!("exit-wait-ptrace tests passed");
     Ok(())
@@ -23520,6 +23565,17 @@ fn phase17_smp_runtime_run_options() -> RunOptions {
     }
 }
 
+fn exit_wait_ptrace_run_options() -> RunOptions {
+    RunOptions {
+        exit_after_boot: true,
+        // Child-exit publication and blocking wait registration are an SMP
+        // ordering contract. Exercise this gate under the four-CPU topology
+        // used by the production desktop rather than only on the BSP.
+        qemu_timeout: Some(Duration::from_secs(300)),
+        smp_count: 4,
+    }
+}
+
 fn phase17_late_boot_run_options() -> RunOptions {
     RunOptions {
         exit_after_boot: true,
@@ -25700,6 +25756,23 @@ failed command output\n";
                 .any(|w| w == b"chmod 0600 /etc/shadow /etc/gshadow"),
             "account provisioner must restore secure shadow database modes"
         );
+        let provision_text =
+            core::str::from_utf8(provision).expect("account provisioner must be UTF-8");
+        let home_tmpfiles =
+            "/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/lupos-home.conf\n";
+        assert!(
+            provision_text.contains(home_tmpfiles),
+            "Lupos home tmpfiles setup must stay mandatory"
+        );
+        assert!(
+            provision_text.contains("if [ -e /usr/lib/tmpfiles.d/lightdm.conf ]; then\n"),
+            "desktop-only LightDM tmpfiles setup must be optional for terminal images"
+        );
+        assert!(
+            !provision_text
+                .contains("/usr/lib/tmpfiles.d/lupos-home.conf /usr/lib/tmpfiles.d/lightdm.conf"),
+            "terminal images must not fail provisioning when LightDM tmpfiles are absent"
+        );
         assert!(
             provision
                 .windows(b"users-provisioned-v2".len())
@@ -25800,6 +25873,54 @@ failed command output\n";
         assert!(
             delete_paths.contains(&"var/lib/pacman/db.lck"),
             "cached direct-stage disks must never preserve a stale pacman lock"
+        );
+    }
+
+    #[test]
+    fn runtime_stress_provisioner_does_not_require_lightdm_tmpfiles() {
+        let files = direct_stage_login_root_disk_overlay_files(
+            BootMode::RuntimeStressTest,
+            SYSTEMD_DISK_ROOT_FSTAB,
+            &[],
+            Path::new("/nonexistent-login-stage"),
+        );
+
+        assert!(
+            find_initramfs_entry(&files, "usr/lib/tmpfiles.d/lightdm.conf").is_none(),
+            "runtime-stress must not stage desktop-only LightDM tmpfiles"
+        );
+        let provision = core::str::from_utf8(
+            initramfs_file_bytes(&files, "usr/libexec/lupos-provision-users")
+                .expect("runtime-stress account provisioner staged"),
+        )
+        .expect("runtime-stress account provisioner UTF-8");
+        assert!(
+            provision.contains("if [ -e /usr/lib/tmpfiles.d/lightdm.conf ]; then\n"),
+            "runtime-stress must skip absent LightDM tmpfiles instead of failing the oneshot"
+        );
+        let home_tmpfiles =
+            "/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/lupos-home.conf\n";
+        assert!(
+            provision.contains(home_tmpfiles),
+            "runtime-stress must still create the Lupos home directory"
+        );
+    }
+
+    #[test]
+    fn runtime_stress_script_emits_fork_wake_exit_samples() {
+        assert!(
+            RUNTIME_STRESS_SCRIPT.contains("while [ \"$bench_i\" -lt 10 ]; do\n"),
+            "runtime-stress benchmark must retain ten measured samples"
+        );
+        assert!(
+            RUNTIME_STRESS_SCRIPT.contains("bench_start=$(date +%s%N)\n"),
+            "runtime-stress benchmark must use guest monotonic-ish timestamps"
+        );
+        assert!(
+            RUNTIME_STRESS_SCRIPT.contains(
+                "runtime-stress: fork-wake-exit sample iteration=$bench_i elapsed_us=$bench_us"
+            ),
+            "runtime-stress benchmark samples must remain machine-readable"
         );
     }
 
@@ -26105,6 +26226,18 @@ failed command output\n";
         )
         .expect("desktop-ready relay UTF-8");
         assert!(desktop_relay.contains("graphics-x11: desktop-initial-ready"));
+        assert!(
+            desktop_relay.contains("lightdm_user_session_exited"),
+            "desktop relay must diagnose an authenticated Xsession abort before timeout"
+        );
+        assert!(
+            desktop_relay.contains("lightdm_greeter_start_failed"),
+            "desktop relay must diagnose a greeter abort before waiting for XFCE"
+        );
+        assert!(
+            desktop_relay.contains("graphics-x11: xsession-errors begin"),
+            "desktop relay must print .xsession-errors on early desktop failure"
+        );
         assert_eq!(
             find_initramfs_symlink_target(
                 &files,

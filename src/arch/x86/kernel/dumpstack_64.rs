@@ -9,7 +9,7 @@
 use crate::arch::x86::kernel::dumpstack::{StackInfo, StackType};
 use crate::arch::x86::mm::paging::PAGE_SIZE;
 
-pub const THREAD_SIZE_ORDER: u32 = 3;
+pub const THREAD_SIZE_ORDER: u32 = crate::kernel::sched::KTHREAD_STACK_ORDER;
 pub const THREAD_SIZE: u64 = PAGE_SIZE << THREAD_SIZE_ORDER;
 pub const EXCEPTION_STACK_ORDER: u32 = 1;
 pub const EXCEPTION_STKSZ: u64 = PAGE_SIZE << EXCEPTION_STACK_ORDER;

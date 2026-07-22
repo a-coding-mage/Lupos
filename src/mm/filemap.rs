@@ -39,8 +39,8 @@ use super::buddy::page_in_mem_map;
 use super::lru::{lru_cache_add, mark_page_accessed, remove_lru_page};
 use super::page::Page;
 use super::page_flags::{
-    GFP_KERNEL, GfpFlags, PG_DIRTY, PG_DROPBEHIND, PG_PRIVATE, PG_PRIVATE_2, PG_UPTODATE,
-    folio_mapped,
+    GFP_KERNEL, GfpFlags, PG_DIRTY, PG_DROPBEHIND, PG_LOCKED, PG_PRIVATE, PG_PRIVATE_2,
+    PG_UPTODATE, folio_mapped,
 };
 use super::writeback::{
     balance_dirty_pages, clear_page_dirty_for_io, end_page_writeback,
@@ -192,6 +192,7 @@ pub unsafe fn filemap_add_folio(
         return -12; // -ENOMEM
     }
     unsafe {
+        (*page).flags.fetch_or(PG_LOCKED, Ordering::Acquire);
         (*page).mapping = mapping as usize;
         (*page).index = index as usize;
         (*page).init_lru();
@@ -207,6 +208,7 @@ pub unsafe fn filemap_add_folio(
             (*page).put_page();
             (*page).mapping = 0;
             (*page).index = 0;
+            (*page).flags.fetch_and(!PG_LOCKED, Ordering::Release);
             return -17; // -EEXIST
         }
         let old_nrpages = (*mapping).nrpages.fetch_add(1, Ordering::Relaxed);
@@ -369,9 +371,9 @@ pub unsafe fn filemap_grab_folio(mapping: *mut AddressSpace, index: u64) -> *mut
         };
 
         // The freshly allocated folio is returned with one caller reference;
-        // filemap_add_folio() takes the separate mapping/XArray reference.
+        // filemap_add_folio() takes the separate mapping/XArray reference and
+        // locks the folio before publishing it, matching Linux.
         (*page)._refcount.store(1, Ordering::Relaxed);
-        lock_page(page);
 
         // In test mode, allocate a data buffer and store it in page->private.
         #[cfg(test)]
@@ -392,7 +394,6 @@ pub unsafe fn filemap_grab_folio(mapping: *mut AddressSpace, index: u64) -> *mut
                     (*page).private = 0;
                 }
             }
-            unlock_page(page);
             (*page).put_page();
             super::buddy::with_global_buddy(|b| b.free_pages(page, 0));
             return find_lock_page(mapping, index);
@@ -2117,6 +2118,12 @@ mod tests {
 
         let r = unsafe { filemap_add_folio(mptr, page, 0, GFP_KERNEL) };
         assert_eq!(r, 0);
+        assert_ne!(
+            unsafe { (*page).flags.load(Ordering::Relaxed) } & PG_LOCKED,
+            0,
+            "filemap_add_folio must return the inserted folio locked like Linux"
+        );
+        unsafe { unlock_page(page) };
 
         let found = unsafe { find_get_page(mptr, 0) };
         assert_eq!(found, page);
@@ -2203,6 +2210,7 @@ mod tests {
         let mptr = mapping.as_mut() as *mut AddressSpace;
         let page = alloc_test_page(0);
         unsafe { filemap_add_folio(mptr, page, 3, GFP_KERNEL) };
+        unsafe { unlock_page(page) };
 
         let locked = unsafe { find_lock_page(mptr, 3) };
         assert_eq!(locked, page);

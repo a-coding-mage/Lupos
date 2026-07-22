@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/i2c/i2c-boardinfo.c
+//! test-origin: linux:vendor/linux/drivers/i2c/i2c-boardinfo.c
 //! I2C core globals exported by built-in Linux board-info support.
 
 use core::ffi::c_void;

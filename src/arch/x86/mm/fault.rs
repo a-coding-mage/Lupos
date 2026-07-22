@@ -144,6 +144,10 @@ fn do_kern_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
         return;
     }
 
+    if kernelmode_fixup_exception(frame) {
+        return;
+    }
+
     log_page_fault(frame, ec, addr);
 
     // Milestone 4 TDD: deliberate kernel #PF from main.rs → exit QEMU.
@@ -237,8 +241,11 @@ fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
     } else {
         task_mm
     };
-    if mm.is_null() {
-        bad_area(frame, ec, addr);
+    if crate::arch::x86::kernel::uaccess::pagefault_disabled()
+        || crate::kernel::locking::preempt::in_atomic()
+        || mm.is_null()
+    {
+        bad_area_or_kernelmode_fixup(frame, ec, addr);
         return;
     }
 
@@ -246,7 +253,7 @@ fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
     // normal user fault necessarily interrupted an IF-enabled context.
     const X86_EFLAGS_IF: u64 = 1 << 9;
     if frame.rflags & X86_EFLAGS_IF == 0 {
-        bad_area(frame, ec, addr);
+        bad_area_or_kernelmode_fixup(frame, ec, addr);
         return;
     }
     crate::kernel::locking::local_irq_enable();
@@ -254,7 +261,7 @@ fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
     let (mmap_guard, vma) = match lock_mm_and_find_vma(mm, addr) {
         Some(locked) => locked,
         None => {
-            bad_area(frame, ec, addr);
+            bad_area_or_kernelmode_fixup(frame, ec, addr);
             return;
         }
     };
@@ -264,14 +271,14 @@ fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
         if is_user_mode_fault(frame, ec) && deliver_user_sigbus_hwpoison(frame, task, addr) {
             return;
         }
-        bad_area(frame, ec, addr);
+        bad_area_or_kernelmode_fixup(frame, ec, addr);
         return;
     }
 
     // Check that the access type is permitted by the VMA flags.
     if access_error(ec, unsafe { &*vma }) {
         drop(mmap_guard);
-        bad_area(frame, ec, addr);
+        bad_area_or_kernelmode_fixup(frame, ec, addr);
         return;
     }
 
@@ -279,7 +286,7 @@ fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
     let ret: VmFaultFlags = handle_mm_fault(vma, addr, flags);
     drop(mmap_guard);
     if ret & VM_FAULT_ERROR != 0 {
-        bad_area(frame, ec, addr);
+        bad_area_or_kernelmode_fixup(frame, ec, addr);
         return;
     }
 
@@ -312,6 +319,27 @@ fn resched_after_user_fault(frame: &ExceptionFrame, ec: u64, task: *mut TaskStru
         let _ = unsafe { sched::schedule() };
         crate::kernel::locking::local_irq_disable();
     }
+}
+
+fn kernelmode_fixup_exception(frame: &ExceptionFrame) -> bool {
+    if (frame.cs & 3) == 3 {
+        return false;
+    }
+    let Some(fixup) = crate::arch::x86::kernel::extable::search_extable(frame.rip) else {
+        return false;
+    };
+    unsafe {
+        let frame_mut = frame as *const ExceptionFrame as *mut ExceptionFrame;
+        (*frame_mut).rip = fixup;
+    }
+    true
+}
+
+fn bad_area_or_kernelmode_fixup(frame: &ExceptionFrame, ec: u64, addr: u64) {
+    if kernelmode_fixup_exception(frame) {
+        return;
+    }
+    bad_area(frame, ec, addr);
 }
 
 // ---------------------------------------------------------------------------
@@ -654,12 +682,100 @@ mod tests {
             .nth(1)
             .expect("do_user_addr_fault must call handle_mm_fault");
         let error_return = tail
-            .find("bad_area(frame, ec, addr);\n        return;")
+            .find("bad_area_or_kernelmode_fixup(frame, ec, addr);\n        return;")
             .expect("VM_FAULT_ERROR path must return before reschedule check");
         let resched = tail
             .find("resched_after_user_fault(frame, ec, task);")
             .expect("successful user fault path must check reschedule");
         assert!(error_return < resched);
+    }
+
+    /// Linux handles user-address faults from kernel code through
+    /// `do_user_addr_fault()` first. Only the bad-area fallback reaches
+    /// `kernelmode_fixup_or_oops()` and searches the exception table.
+    ///
+    /// test-origin: linux:vendor/linux/arch/x86/mm/fault.c:do_user_addr_fault
+    #[test]
+    fn kernelmode_user_fault_fixup_is_bad_area_fallback() {
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/arch/x86/mm/fault.c"
+        ));
+        assert!(
+            linux.contains("void do_user_addr_fault(struct pt_regs *regs,"),
+            "Linux must keep user-address page faults in do_user_addr_fault"
+        );
+        assert!(
+            linux.contains("bad_area_nosemaphore(regs, error_code, address);"),
+            "Linux bad-area path must be the exception-table fallback gateway"
+        );
+        assert!(
+            linux.contains("kernelmode_fixup_or_oops(regs, error_code, address"),
+            "Linux bad-area path must call kernelmode_fixup_or_oops"
+        );
+
+        let source = include_str!("fault.rs");
+        let body = source
+            .split("fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64)")
+            .nth(1)
+            .expect("do_user_addr_fault must exist")
+            .split("fn should_resched_after_user_fault")
+            .next()
+            .expect("do_user_addr_fault body must end before reschedule helper");
+        let handle = body
+            .find("let ret: VmFaultFlags = handle_mm_fault(vma, addr, flags);")
+            .expect("do_user_addr_fault must call handle_mm_fault");
+        let _first_bad_area = body
+            .find("bad_area_or_kernelmode_fixup(frame, ec, addr);")
+            .expect("do_user_addr_fault must funnel failures through bad-area fixup");
+        assert!(
+            !body[..handle].contains("search_extable"),
+            "kernel user-copy faults must not search extable before handle_mm_fault"
+        );
+
+        let fallback = source
+            .split("fn kernelmode_fixup_exception(frame: &ExceptionFrame)")
+            .nth(1)
+            .expect("kernelmode fixup helper must exist");
+        assert!(fallback.contains("search_extable(frame.rip)"));
+    }
+
+    #[test]
+    fn faulthandler_disabled_user_fault_uses_extable_before_mmap_lock() {
+        // test-origin: linux:vendor/linux/arch/x86/mm/fault.c:do_user_addr_fault
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/arch/x86/mm/fault.c"
+        ));
+        let linux_body = linux
+            .split("void do_user_addr_fault(struct pt_regs *regs,")
+            .nth(1)
+            .and_then(|s| s.split("local_irq_enable();").next())
+            .expect("Linux do_user_addr_fault prologue present");
+        assert!(linux_body.contains("faulthandler_disabled() || !mm"));
+        assert!(linux_body.contains("bad_area_nosemaphore(regs, error_code, address);"));
+
+        let source = include_str!("fault.rs");
+        let body = source
+            .split("fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64)")
+            .nth(1)
+            .and_then(|s| s.split("let (mmap_guard, vma)").next())
+            .expect("Lupos do_user_addr_fault prologue present");
+        let disabled = body
+            .find("pagefault_disabled()")
+            .expect("pagefault-disabled faults must take bad-area fixup");
+        let atomic = body
+            .find("preempt::in_atomic()")
+            .expect("atomic-context faults must take bad-area fixup");
+        let fixup = body
+            .find("bad_area_or_kernelmode_fixup(frame, ec, addr);")
+            .expect("disabled fault handler must use extable fallback");
+        let irq_enable = body
+            .find("local_irq_enable();")
+            .expect("normal fault path should enable IRQs before mmap lock");
+        assert!(disabled < fixup);
+        assert!(atomic < fixup);
+        assert!(fixup < irq_enable);
     }
 
     #[test]

@@ -57,6 +57,12 @@ const AT_STATX_FORCE_SYNC: u32 = 0x2000;
 const AT_STATX_DONT_SYNC: u32 = 0x4000;
 const AT_STATX_SYNC_TYPE: u32 = AT_STATX_FORCE_SYNC | AT_STATX_DONT_SYNC;
 
+const MAXQUOTAS: u32 = 3;
+const SUBCMDMASK: u32 = 0x00ff;
+const SUBCMDSHIFT: u32 = 8;
+#[cfg(test)]
+const Q_GETQUOTA: u32 = 0x800007;
+
 const STATX_TYPE: u32 = 0x0000_0001;
 const STATX_MODE: u32 = 0x0000_0002;
 const STATX_NLINK: u32 = 0x0000_0004;
@@ -4782,8 +4788,17 @@ pub fn sys_mount_setattr(
     result.map(|_| 0).unwrap_or_else(|errno| -(errno as i64))
 }
 
-pub fn sys_quotactl_fd(_fd: i32, _cmd: u32, _id: i32, _addr: *mut u8) -> i64 {
-    -(EBADF as i64)
+pub fn sys_quotactl_fd(fd: i32, cmd: u32, _id: i32, _addr: *mut u8) -> i64 {
+    let _cmds = cmd >> SUBCMDSHIFT;
+    let type_ = cmd & SUBCMDMASK;
+    if current_files().and_then(|ft| ft.get(fd)).is_err() {
+        return -(EBADF as i64);
+    }
+
+    if type_ >= MAXQUOTAS {
+        return -(EINVAL as i64);
+    }
+    -(ENOSYS as i64)
 }
 
 pub fn sys_statmount(
@@ -6507,6 +6522,39 @@ mod tests {
     }
 
     #[test]
+    fn proc_self_fd_directory_open_uses_vfs_directory() {
+        let _guard = mount::TEST_MOUNT_LOCK.lock();
+        let (mut current, previous) = setup_current_with_rootfs(886);
+        unsafe {
+            assert_eq!(sys_mkdir(b"/proc\0".as_ptr(), 0o755), 0);
+            mount::do_mount("proc", "proc", "/proc", 0, "").expect("proc");
+
+            let fd = crate::fs::openat::sys_openat(
+                AT_FDCWD,
+                b"/proc/self/fd/\0".as_ptr(),
+                (O_RDONLY | O_DIRECTORY) as i32,
+                0,
+            );
+            assert!(
+                fd >= 0,
+                "/proc/self/fd/ must resolve as the proc fd directory"
+            );
+
+            let mut dirents = [0u8; 256];
+            let len = sys_getdents64(fd as i32, dirents.as_mut_ptr(), dirents.len());
+            assert!(len > 0, "proc fd directory should emit entries");
+            let names = dirent64_names(&dirents, len as usize);
+            assert!(names.iter().any(|name| name == "."));
+            assert!(names.iter().any(|name| name == ".."));
+            assert!(names.iter().any(|name| name == "0"));
+            assert_eq!(crate::fs::fdtable::sys_close(fd as i32), 0);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
     fn proc_fd_file_bind_mount_is_visible_in_mountinfo() {
         let _guard = mount::TEST_MOUNT_LOCK.lock();
         let (mut current, previous) = setup_current_with_rootfs(884);
@@ -8013,6 +8061,16 @@ mod tests {
             assert_eq!(
                 sys_quotactl_fd(-1, 0, 0, core::ptr::null_mut()),
                 -(EBADF as i64)
+            );
+            let q_getquota_usr = (Q_GETQUOTA << SUBCMDSHIFT) | 0;
+            assert_eq!(
+                sys_quotactl_fd(fd as i32, q_getquota_usr, 0, core::ptr::null_mut()),
+                -(ENOSYS as i64)
+            );
+            let q_getquota_bad_type = (Q_GETQUOTA << SUBCMDSHIFT) | MAXQUOTAS;
+            assert_eq!(
+                sys_quotactl_fd(fd as i32, q_getquota_bad_type, 0, core::ptr::null_mut()),
+                -(EINVAL as i64)
             );
             assert_eq!(
                 crate::kernel::syscalls::sys_quotactl(

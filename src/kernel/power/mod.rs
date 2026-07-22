@@ -1,6 +1,7 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/kernel/power
 //! linux-source: vendor/linux/drivers/base/power
+//! test-origin: linux:vendor/linux/kernel/power
 //! Power-management helpers.
 
 pub mod em_netlink_autogen;

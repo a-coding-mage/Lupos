@@ -119,6 +119,7 @@ pub mod task_state {
     pub const TASK_WAKING: u32 = 0x0200;
     pub const TASK_NOLOAD: u32 = 0x0400;
     pub const TASK_NEW: u32 = 0x0800;
+    pub const TASK_KILLABLE: u32 = TASK_WAKEKILL | TASK_UNINTERRUPTIBLE;
     pub const TASK_STOPPED: u32 = TASK_WAKEKILL | __TASK_STOPPED;
     pub const TASK_TRACED: u32 = __TASK_TRACED;
     pub const TASK_NORMAL: u32 = TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE;

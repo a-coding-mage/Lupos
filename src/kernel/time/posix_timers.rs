@@ -13,7 +13,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -136,6 +136,7 @@ impl Drop for PosixTimer {
 
 static NEXT_TIMER_ID: AtomicI32 = AtomicI32::new(1);
 static TIMERS: Mutex<BTreeMap<i32, alloc::boxed::Box<PosixTimer>>> = Mutex::new(BTreeMap::new());
+static TIMER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// `timer_create(clockid, sigev_signo, sigev_value)`.
 pub fn sys_timer_create(clock: ClockId, signo: i32, value: u64) -> Result<i32, i32> {
@@ -161,6 +162,7 @@ pub fn sys_timer_create(clock: ClockId, signo: i32, value: u64) -> Result<i32, i
         (*timer.timer_ptr()).data = owner;
     }
     TIMERS.lock().insert(id, timer);
+    TIMER_COUNT.fetch_add(1, Ordering::AcqRel);
     Ok(id)
 }
 
@@ -227,6 +229,7 @@ pub fn sys_timer_gettime(id: i32) -> Result<Itimerspec64, i32> {
 pub fn sys_timer_delete(id: i32) -> Result<(), i32> {
     let mut g = TIMERS.lock();
     let t = g.remove(&id).ok_or(EINVAL)?;
+    TIMER_COUNT.fetch_sub(1, Ordering::AcqRel);
     drop(g);
     t.cancel_synchronously();
     Ok(())
@@ -314,6 +317,9 @@ pub(crate) fn release_task_posix_timers(pid: i32) {
     if pid <= 0 {
         return;
     }
+    if TIMER_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
     loop {
         let timer = {
             let mut timers = TIMERS.lock();
@@ -327,6 +333,7 @@ pub(crate) fn release_task_posix_timers(pid: i32) {
         let Some(timer) = timer else {
             return;
         };
+        TIMER_COUNT.fetch_sub(1, Ordering::AcqRel);
         timer.cancel_synchronously();
     }
 }
@@ -346,6 +353,7 @@ mod tests {
     fn timer_create_valid_clock_returns_id() {
         let id = sys_timer_create(CLOCK_MONOTONIC, 14, 0).unwrap();
         assert!(id > 0);
+        sys_timer_delete(id).unwrap();
     }
 
     #[test]

@@ -59,6 +59,25 @@ fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     }
 }
 
+unsafe fn set_page_refcounted(page: *mut Page) {
+    debug_assert_eq!(
+        unsafe { (*page)._refcount.load(Ordering::Acquire) },
+        0,
+        "set_page_refcounted requires a frozen page"
+    );
+    unsafe { (*page)._refcount.store(1, Ordering::Release) };
+}
+
+unsafe fn put_page_testzero(page: *mut Page) -> i32 {
+    let old = unsafe { (*page)._refcount.fetch_sub(1, Ordering::AcqRel) };
+    debug_assert!(old > 0, "put_page_testzero on an unreferenced page");
+    old - 1
+}
+
+fn free_frozen_pages(page: *mut Page, order: u32) {
+    with_global_buddy(|buddy| buddy.free_pages(page, order as usize));
+}
+
 pub fn register_module_exports() {
     init_linux_node_abi();
     export_symbol_once(
@@ -149,11 +168,11 @@ pub extern "C" fn __alloc_pages_noprof(
     _nid: i32,
     _nodemask: *const u8,
 ) -> *mut Page {
-    if !is_buddy_ready() {
-        return core::ptr::null_mut();
+    let page = __alloc_frozen_pages_noprof(gfp, order, _nid, _nodemask);
+    if !page.is_null() {
+        unsafe { set_page_refcounted(page) };
     }
-    with_global_buddy(|buddy| buddy.alloc_pages(order as usize, gfp))
-        .unwrap_or(core::ptr::null_mut())
+    page
 }
 
 pub extern "C" fn alloc_pages_noprof(gfp: GfpFlags, order: u32) -> *mut Page {
@@ -167,10 +186,14 @@ pub fn alloc_pages_nolock_noprof(gfp: GfpFlags, order: u32) -> *mut Page {
 pub fn __alloc_frozen_pages_noprof(
     gfp: GfpFlags,
     order: u32,
-    nid: i32,
-    nodemask: *const u8,
+    _nid: i32,
+    _nodemask: *const u8,
 ) -> *mut Page {
-    __alloc_pages_noprof(gfp, order, nid, nodemask)
+    if !is_buddy_ready() {
+        return core::ptr::null_mut();
+    }
+    with_global_buddy(|buddy| buddy.alloc_pages(order as usize, gfp))
+        .unwrap_or(core::ptr::null_mut())
 }
 
 pub fn __folio_alloc_noprof(gfp: GfpFlags, order: u32) -> *mut Page {
@@ -195,8 +218,24 @@ pub extern "C" fn get_zeroed_page_noprof(gfp: GfpFlags) -> usize {
 }
 
 pub extern "C" fn __free_pages(page: *mut Page, order: u32) {
-    if !page.is_null() && is_buddy_ready() && page_in_mem_map(page) {
-        with_global_buddy(|buddy| buddy.free_pages(page, order as usize));
+    if page.is_null()
+        || !is_buddy_ready()
+        || !page_in_mem_map(page)
+        || order as usize > crate::mm::zone::MAX_PAGE_ORDER
+    {
+        return;
+    }
+
+    let refs = unsafe { put_page_testzero(page) };
+    if refs == 0 {
+        free_frozen_pages(page, order);
+    } else if refs > 0 && !crate::mm::page_flags::PageHead(page) {
+        let mut tail_order = order;
+        while tail_order > 0 {
+            tail_order -= 1;
+            let tail = unsafe { page.add(1usize << tail_order) };
+            free_frozen_pages(tail, tail_order);
+        }
     }
 }
 
@@ -670,6 +709,19 @@ mod tests {
     use crate::mm::test_lock::GLOBAL_HW_TEST_LOCK;
     use core::sync::atomic::Ordering;
 
+    unsafe fn install_page_alloc_test_buddy<const N: usize>(
+        pages: &mut [Page; N],
+        base_pfn: usize,
+    ) {
+        for page in pages.iter_mut() {
+            unsafe { page.init_lru() };
+        }
+        unsafe {
+            crate::mm::buddy::set_mem_map(pages.as_mut_ptr(), base_pfn, N);
+            crate::mm::buddy::install_test_buddy(base_pfn, N);
+        }
+    }
+
     #[test]
     fn allocation_wrappers_return_disabled_shape_before_buddy_init() {
         let _guard = GLOBAL_HW_TEST_LOCK
@@ -748,6 +800,96 @@ mod tests {
         let end = unsafe { start.add(bytes.len()) };
         assert_eq!(free_reserved_area(start, end, 0, core::ptr::null()), 2);
         assert_eq!(free_reserved_area(start, start, 0, core::ptr::null()), 0);
+    }
+
+    #[test]
+    fn alloc_pages_wrapper_returns_refcounted_page_like_linux() {
+        let _guard = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        crate::mm::buddy::reset_buddy_state_for_test();
+
+        const TEST_PAGES: usize = 8;
+        let mut pages = [const { Page::new() }; TEST_PAGES];
+        unsafe { install_page_alloc_test_buddy(&mut pages, 32) };
+
+        let initial_free = crate::mm::buddy::with_global_buddy(|buddy| buddy.free_count());
+        let page = alloc_pages_noprof(GFP_KERNEL, 0);
+
+        assert!(!page.is_null());
+        assert_eq!(
+            unsafe { (*page)._refcount.load(Ordering::Acquire) },
+            1,
+            "Linux __alloc_pages_noprof() calls set_page_refcounted()"
+        );
+        assert_eq!(
+            crate::mm::buddy::with_global_buddy(|buddy| buddy.free_count()),
+            initial_free - 1
+        );
+
+        __free_pages(page, 0);
+        assert_eq!(
+            crate::mm::buddy::with_global_buddy(|buddy| buddy.free_count()),
+            initial_free
+        );
+    }
+
+    #[test]
+    fn frozen_alloc_wrapper_returns_zero_refcounted_page_like_linux() {
+        let _guard = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        crate::mm::buddy::reset_buddy_state_for_test();
+
+        const TEST_PAGES: usize = 8;
+        let mut pages = [const { Page::new() }; TEST_PAGES];
+        unsafe { install_page_alloc_test_buddy(&mut pages, 64) };
+
+        let page = __alloc_frozen_pages_noprof(GFP_KERNEL, 0, -1, core::ptr::null());
+
+        assert!(!page.is_null());
+        assert_eq!(
+            unsafe { (*page)._refcount.load(Ordering::Acquire) },
+            0,
+            "Linux __alloc_frozen_pages_noprof() returns a frozen page"
+        );
+        crate::mm::buddy::with_global_buddy(|buddy| buddy.free_pages(page, 0));
+    }
+
+    #[test]
+    fn free_pages_wrapper_releases_only_on_final_reference() {
+        let _guard = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        crate::mm::buddy::reset_buddy_state_for_test();
+
+        const TEST_PAGES: usize = 8;
+        let mut pages = [const { Page::new() }; TEST_PAGES];
+        unsafe { install_page_alloc_test_buddy(&mut pages, 96) };
+
+        let initial_free = crate::mm::buddy::with_global_buddy(|buddy| buddy.free_count());
+        let page = alloc_pages_noprof(GFP_KERNEL, 0);
+        assert!(!page.is_null());
+        unsafe { (*page).get_page() };
+
+        __free_pages(page, 0);
+        assert_eq!(
+            unsafe { (*page)._refcount.load(Ordering::Acquire) },
+            1,
+            "first __free_pages() must only drop the caller's reference"
+        );
+        assert_eq!(
+            crate::mm::buddy::with_global_buddy(|buddy| buddy.free_count()),
+            initial_free - 1,
+            "page must remain allocated while another reference exists"
+        );
+
+        __free_pages(page, 0);
+        assert_eq!(unsafe { (*page)._refcount.load(Ordering::Acquire) }, 0);
+        assert_eq!(
+            crate::mm::buddy::with_global_buddy(|buddy| buddy.free_count()),
+            initial_free
+        );
     }
 
     #[test]

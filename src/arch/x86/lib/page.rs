@@ -1,6 +1,7 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/lib/copy_page_64.S
 //! linux-source: vendor/linux/arch/x86/lib/clear_page_64.S
+//! test-origin: linux:vendor/linux/arch/x86/lib
 //! x86 page copy/clear helpers exported to Linux-built modules.
 
 use crate::kernel::module::{export_symbol, find_symbol};

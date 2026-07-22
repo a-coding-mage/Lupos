@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/lib/vsprintf.c
+//! test-origin: linux:vendor/linux/lib/vsprintf.c
 //! x86-64 module-ABI formatting support for C variadic entry points.
 //!
 //! Rust cannot declare a C-variadic function on the kernel's stable language

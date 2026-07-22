@@ -1,19 +1,25 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/fs/proc/base.c
+//! test-origin: linux:vendor/linux/fs/proc/base.c
 //! Process procfs base directory builders.
 //!
 //! Ref: `vendor/linux/fs/proc/base.c`
 
-use alloc::sync::Arc;
+use alloc::{string::String, sync::Arc};
 use core::sync::atomic::Ordering;
 
 use crate::fs::anon_inode::alloc_anon_file_with_kind;
 use crate::fs::kernfs::{KernfsNode, add_child};
 use crate::fs::ops::FileOps;
-use crate::fs::types::{FileRef, InodeKind};
-use crate::include::uapi::errno::{EFAULT, EINVAL, ENOENT};
-use crate::kernel::task::TaskStruct;
-use crate::kernel::task::task_state::{EXIT_DEAD, EXIT_ZOMBIE};
+use crate::fs::types::{FileRef, InodeKind, InodeRef};
+use crate::include::uapi::errno::{EACCES, EFAULT, EINVAL, ENOENT};
+use crate::kernel::capability::{CAP_SYS_PTRACE, ns_capable};
+use crate::kernel::cred::{Cred, INIT_CRED};
+use crate::kernel::task::{
+    TASK_COMM_LEN, TASK_CTRL_DUMPABLE_MASK, TASK_CTRL_DUMPABLE_SHIFT, TASK_CTRL_DUMPABLE_VALID,
+    TaskStruct,
+    task_state::{EXIT_DEAD, EXIT_ZOMBIE},
+};
 
 static PROC_PID_STAT_FILE_OPS: FileOps = FileOps {
     name: "proc-pid-stat",
@@ -179,7 +185,13 @@ unsafe fn task_stat_text(task: *mut TaskStruct) -> alloc::string::String {
     super::array::stat_text_with_ppid(pid, &comm, state, ppid)
 }
 
+pub fn add_tgid_base(dir: &Arc<KernfsNode>) {
+    add_task_common(dir);
+    add_child(dir, new_task_dir());
+}
+
 pub fn add_task_common(dir: &Arc<KernfsNode>) {
+    add_child(dir, super::fd::new_fd_dir());
     add_child(
         dir,
         KernfsNode::new_file("stat", 0o444, Some(proc_pid_stat_show), None),
@@ -213,7 +225,12 @@ pub fn add_task_common(dir: &Arc<KernfsNode>) {
     );
     add_child(
         dir,
-        KernfsNode::new_file("comm", 0o444, Some(proc_pid_comm_show), None),
+        KernfsNode::new_file(
+            "comm",
+            0o644,
+            Some(proc_pid_comm_show),
+            Some(proc_pid_comm_store),
+        ),
     );
     add_child(
         dir,
@@ -282,11 +299,121 @@ pub fn add_task_common(dir: &Arc<KernfsNode>) {
     );
 }
 
+fn new_task_dir() -> Arc<KernfsNode> {
+    KernfsNode::new_dynamic_dir(
+        "task",
+        0o555,
+        Some(proc_task_lookup),
+        Some(proc_task_readdir),
+    )
+}
+
+fn proc_task_lookup(dir: &InodeRef, name: &str) -> Result<InodeRef, i32> {
+    let tid = parse_task_dir_tid(name)?;
+    let leader = task_by_pid(proc_tgid_from_task_dir(dir)?);
+    if leader.is_null() {
+        return Err(ENOENT);
+    }
+    let task = task_by_pid(tid);
+    if task.is_null() || unsafe { (*task).tgid != (*leader).tgid } {
+        return Err(ENOENT);
+    }
+    let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
+    Ok(crate::fs::kernfs::inode_for_node(&sb, proc_tid_dir(tid)))
+}
+
+fn proc_task_readdir(file: &FileRef) -> Result<Option<(String, u64, InodeKind)>, i32> {
+    if let Some(dot) = crate::fs::libfs::synthetic_readdir_dot_entry(file)? {
+        return Ok(Some(dot));
+    }
+    let inode = file.inode().ok_or(EINVAL)?;
+    let leader = task_by_pid(proc_tgid_from_task_dir(&inode)?);
+    if leader.is_null() {
+        return Err(ENOENT);
+    }
+    let tids = live_tids_for_tgid(unsafe { (*leader).tgid });
+    let mut idx = file.pos.lock();
+    let tid_idx = idx.saturating_sub(2) as usize;
+    if tid_idx >= tids.len() {
+        return Ok(None);
+    }
+    let tid = tids[tid_idx];
+    *idx += 1;
+    Ok(Some((
+        alloc::format!("{}", tid),
+        proc_tid_ino(tid),
+        InodeKind::Directory,
+    )))
+}
+
+fn proc_tgid_from_task_dir(dir: &InodeRef) -> Result<i32, i32> {
+    let node = crate::fs::kernfs::node_from_inode(dir);
+    let parent = node.parent.lock().upgrade().ok_or(EINVAL)?;
+    if parent.name == "self" {
+        let task = unsafe { crate::kernel::sched::get_current() };
+        if task.is_null() {
+            return Err(ENOENT);
+        }
+        return Ok(unsafe { (*task).tgid });
+    }
+    parent.name.parse::<i32>().map_err(|_| ENOENT)
+}
+
+fn parse_task_dir_tid(name: &str) -> Result<i32, i32> {
+    if name.is_empty() || name.as_bytes().iter().any(|byte| !byte.is_ascii_digit()) {
+        return Err(ENOENT);
+    }
+    let tid = name.parse::<i32>().map_err(|_| ENOENT)?;
+    if tid <= 0 {
+        return Err(ENOENT);
+    }
+    Ok(tid)
+}
+
+fn proc_tid_dir(tid: i32) -> Arc<KernfsNode> {
+    let dir = KernfsNode::new_dir(&alloc::format!("{}", tid), 0o555);
+    add_task_common(&dir);
+    dir
+}
+
+fn live_tids_for_tgid(tgid: i32) -> alloc::vec::Vec<i32> {
+    let mut tids = alloc::vec::Vec::new();
+    push_live_tid_for_tgid(
+        &mut tids,
+        unsafe { crate::kernel::sched::get_current() },
+        tgid,
+    );
+    crate::kernel::fork::for_each_heap_task(|task| push_live_tid_for_tgid(&mut tids, task, tgid));
+    crate::kernel::sched::for_each_pool_task(|task| push_live_tid_for_tgid(&mut tids, task, tgid));
+    tids.sort_unstable();
+    tids.dedup();
+    tids
+}
+
+fn push_live_tid_for_tgid(tids: &mut alloc::vec::Vec<i32>, task: *mut TaskStruct, tgid: i32) {
+    if task.is_null() {
+        return;
+    }
+    unsafe {
+        if (*task).pid <= 0 || (*task).tgid != tgid || ((*task).m26.exit_state & EXIT_DEAD) != 0 {
+            return;
+        }
+        tids.push((*task).pid);
+    }
+}
+
+fn proc_tid_ino(tid: i32) -> u64 {
+    0x7100_0000u64 + tid.max(0) as u64
+}
+
 fn proc_pid_exe_readlink(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
     let pid = proc_pid_from_node(node)?;
     let task = task_by_pid(pid);
     if task.is_null() {
         return Err(ENOENT);
+    }
+    if !unsafe { proc_pid_ptrace_may_read_fscreds(task) } {
+        return Err(EACCES);
     }
     let mm = unsafe { (*task).mm };
     let file = unsafe { crate::mm::mm_public::get_mm_exe_file_ref(mm) }.ok_or(ENOENT)?;
@@ -297,6 +424,62 @@ fn proc_pid_exe_readlink(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize
     buf[..n].copy_from_slice(&target.as_bytes()[..n]);
     crate::fs::file::fput(file);
     Ok(n)
+}
+
+unsafe fn proc_pid_ptrace_may_read_fscreds(target: *mut TaskStruct) -> bool {
+    let current = unsafe { crate::kernel::sched::get_current() };
+    if current.is_null() || target.is_null() {
+        return false;
+    }
+    if current == target || unsafe { (*current).tgid == (*target).tgid } {
+        return true;
+    }
+
+    let current_cred = unsafe { task_cred_or_init(current) };
+    let target_cred = unsafe { task_cred_or_init(target) };
+    if current_cred.is_null() || target_cred.is_null() {
+        return false;
+    }
+
+    let has_ptrace_cap = unsafe { ns_capable((*target_cred).user_ns, CAP_SYS_PTRACE) };
+    let ids_match = unsafe {
+        let caller_uid = (*current_cred).fsuid;
+        let caller_gid = (*current_cred).fsgid;
+        caller_uid == (*target_cred).euid
+            && caller_uid == (*target_cred).suid
+            && caller_uid == (*target_cred).uid
+            && caller_gid == (*target_cred).egid
+            && caller_gid == (*target_cred).sgid
+            && caller_gid == (*target_cred).gid
+    };
+    if !ids_match && !has_ptrace_cap {
+        return false;
+    }
+
+    unsafe { proc_pid_task_still_dumpable(target) || has_ptrace_cap }
+}
+
+unsafe fn proc_pid_task_still_dumpable(task: *mut TaskStruct) -> bool {
+    let control = unsafe { (*task).m27.mdwe_flags };
+    if control & TASK_CTRL_DUMPABLE_VALID == 0 {
+        return true;
+    }
+    ((control & TASK_CTRL_DUMPABLE_MASK) >> TASK_CTRL_DUMPABLE_SHIFT) == 1
+}
+
+unsafe fn task_cred_or_init(task: *mut TaskStruct) -> *const Cred {
+    if task.is_null() {
+        return &raw const INIT_CRED;
+    }
+    unsafe {
+        if !(*task).cred.is_null() {
+            (*task).cred
+        } else if !(*task).m27.real_cred.is_null() {
+            (*task).m27.real_cred
+        } else {
+            &raw const INIT_CRED
+        }
+    }
 }
 
 fn proc_pid_cwd_readlink(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
@@ -395,6 +578,39 @@ fn proc_pid_comm_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i
     }
     let text = alloc::format!("{}\n", super::util::task_comm(task));
     super::util::copy_into(buf, &text)
+}
+
+fn proc_pid_comm_store(node: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize, i32> {
+    let pid = proc_pid_from_node(node)?;
+    let task = task_by_pid(pid);
+    let current = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() || current.is_null() || unsafe { (*task).tgid != (*current).tgid } {
+        return Err(EINVAL);
+    }
+
+    let copy = buf.len().min(TASK_COMM_LEN - 1);
+    let mut comm = [0u8; TASK_COMM_LEN];
+    comm[..copy].copy_from_slice(&buf[..copy]);
+    unsafe {
+        (*task).comm = comm;
+    }
+    Ok(buf.len())
+}
+
+pub fn proc_comm_write_allowed(inode: &InodeRef) -> bool {
+    if !core::ptr::eq(inode.fops, &crate::fs::kernfs::KERNFS_FILE_FILE_OPS) {
+        return false;
+    }
+    let node = crate::fs::kernfs::node_from_inode(inode);
+    if node.name != "comm" {
+        return false;
+    }
+    let Ok(pid) = proc_pid_from_node(&node) else {
+        return false;
+    };
+    let task = task_by_pid(pid);
+    let current = unsafe { crate::kernel::sched::get_current() };
+    !task.is_null() && !current.is_null() && unsafe { (*task).tgid == (*current).tgid }
 }
 
 fn proc_pid_cmdline_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
@@ -523,7 +739,48 @@ fn proc_pid_setgroups_store(_node: &Arc<KernfsNode>, buf: &[u8]) -> Result<usize
 
 #[cfg(test)]
 mod tests {
-    use crate::fs::kernfs::lookup;
+    use alloc::boxed::Box;
+    use core::sync::atomic::AtomicUsize;
+
+    use crate::kernel::capability::{CAP_SYS_PTRACE, KernelCapT};
+    use crate::kernel::cred::{GroupInfo, KGid, KUid};
+    use crate::kernel::sched;
+
+    use super::*;
+    use crate::fs::kernfs::{inode_for_node, lookup};
+    use crate::fs::ops::NOOP_SUPER_OPS;
+    use crate::fs::types::SuperBlock;
+
+    fn test_cred(uid: u32, gid: u32, fsuid: u32, fsgid: u32, caps: KernelCapT) -> Box<Cred> {
+        Box::new(Cred {
+            usage: AtomicUsize::new(1),
+            uid: KUid(uid),
+            gid: KGid(gid),
+            suid: KUid(uid),
+            sgid: KGid(gid),
+            euid: KUid(uid),
+            egid: KGid(gid),
+            fsuid: KUid(fsuid),
+            fsgid: KGid(fsgid),
+            cap_inheritable: KernelCapT::empty(),
+            cap_permitted: caps,
+            cap_effective: caps,
+            cap_bset: KernelCapT::full(),
+            cap_ambient: KernelCapT::empty(),
+            securebits: 0,
+            group_info: GroupInfo::default(),
+            user_ns: core::ptr::null(),
+        })
+    }
+
+    fn test_task(pid: i32, tgid: i32, cred: &Cred) -> Box<TaskStruct> {
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        task.pid = pid;
+        task.tgid = tgid;
+        task.cred = cred as *const Cred;
+        task.m27.real_cred = cred as *const Cred;
+        task
+    }
 
     #[test]
     fn proc_pid_cmdline_uses_pid_specific_show_handler() {
@@ -561,5 +818,106 @@ mod tests {
         let vendor = include_str!("../../../vendor/linux/fs/proc/base.c");
         assert!(vendor.contains("LNK(\"cwd\",        proc_cwd_link)"));
         assert!(vendor.contains("LNK(\"root\",       proc_root_link)"));
+    }
+
+    #[test]
+    fn tgid_base_exposes_linux_task_and_fd_directories() {
+        let dir = crate::fs::kernfs::KernfsNode::new_dir("123", 0o555);
+        super::add_tgid_base(&dir);
+        assert!(lookup(&dir, "fd").is_some());
+        assert!(lookup(&dir, "task").is_some());
+
+        let vendor = include_str!("../../../vendor/linux/fs/proc/base.c");
+        assert!(vendor.contains("DIR(\"task\",       S_IRUGO|S_IXUGO"));
+        assert!(vendor.contains("DIR(\"fd\",         S_IRUSR|S_IXUSR"));
+    }
+
+    #[test]
+    fn proc_task_lookup_exposes_current_thread_comm() {
+        let previous = unsafe { sched::get_current() };
+        let cred = test_cred(1000, 1000, 1000, 1000, KernelCapT::empty());
+        let mut current = test_task(3210, 3210, &cred);
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            let sb = SuperBlock::alloc("proc", 0x9fa0, &NOOP_SUPER_OPS);
+            let self_dir = crate::fs::kernfs::KernfsNode::new_dir("self", 0o555);
+            super::add_tgid_base(&self_dir);
+            let task_node = lookup(&self_dir, "task").expect("/proc/self/task");
+            let task_inode = inode_for_node(&sb, task_node);
+            let lookup_task = task_inode.ops.lookup.expect("task lookup");
+            let tid_inode = lookup_task(&task_inode, "3210").expect("/proc/self/task/3210");
+            let tid_node = crate::fs::kernfs::node_from_inode(&tid_inode);
+            let comm = lookup(&tid_node, "comm").expect("tid comm");
+
+            proc_pid_comm_store(&comm, b"wp-data-loop").expect("comm write");
+            assert_eq!(
+                crate::fs::proc::util::task_comm(&mut *current as *mut TaskStruct),
+                "wp-data-loop"
+            );
+
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn proc_pid_exe_ptrace_read_fscreds_uses_fs_ids() {
+        let previous = unsafe { sched::get_current() };
+        let current_cred = test_cred(1000, 1000, 2000, 3000, KernelCapT::empty());
+        let target_cred = test_cred(2000, 3000, 2000, 3000, KernelCapT::empty());
+        let mut current = test_task(10, 10, &current_cred);
+        let mut target = test_task(20, 20, &target_cred);
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            assert!(proc_pid_ptrace_may_read_fscreds(
+                &mut *target as *mut TaskStruct
+            ));
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn proc_pid_exe_ptrace_read_fscreds_rejects_cross_ids() {
+        let previous = unsafe { sched::get_current() };
+        let current_cred = test_cred(1000, 1000, 1000, 1000, KernelCapT::empty());
+        let target_cred = test_cred(2000, 3000, 2000, 3000, KernelCapT::empty());
+        let mut current = test_task(10, 10, &current_cred);
+        let mut target = test_task(20, 20, &target_cred);
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            assert!(!proc_pid_ptrace_may_read_fscreds(
+                &mut *target as *mut TaskStruct
+            ));
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn proc_pid_exe_ptrace_read_fscreds_rechecks_dumpability() {
+        let previous = unsafe { sched::get_current() };
+        let current_cred = test_cred(1000, 1000, 1000, 1000, KernelCapT::empty());
+        let target_cred = test_cred(1000, 1000, 1000, 1000, KernelCapT::empty());
+        let mut current = test_task(10, 10, &current_cred);
+        let mut target = test_task(20, 20, &target_cred);
+        target.m27.mdwe_flags = TASK_CTRL_DUMPABLE_VALID;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+            assert!(!proc_pid_ptrace_may_read_fscreds(
+                &mut *target as *mut TaskStruct
+            ));
+
+            let mut caps = KernelCapT::empty();
+            caps.raise(CAP_SYS_PTRACE);
+            let privileged_cred = test_cred(3000, 3000, 3000, 3000, caps);
+            let mut privileged = test_task(30, 30, &privileged_cred);
+            sched::set_current(&mut *privileged as *mut TaskStruct);
+            assert!(proc_pid_ptrace_may_read_fscreds(
+                &mut *target as *mut TaskStruct
+            ));
+            sched::set_current(previous);
+        }
     }
 }

@@ -1,6 +1,7 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/arch/x86/kernel/unwind_orc.c
 //! linux-source: vendor/linux/arch/x86/include/asm/orc_types.h
+//! test-origin: linux:vendor/linux/arch/x86/kernel/unwind_orc.c
 //! x86 ORC module-table registration and lookup.
 //!
 //! `unwind_module_init()` below follows the module-specific path in

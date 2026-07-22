@@ -246,6 +246,65 @@ pub unsafe fn anon_vma_prepare(vma: *mut VmAreaStruct) -> Result<(), i32> {
 // anon_vma_fork — fork-time VMA duplication
 // ---------------------------------------------------------------------------
 
+unsafe fn anon_vma_link_existing(
+    dst: *mut VmAreaStruct,
+    anon_vma: *mut AnonVma,
+) -> Result<(), i32> {
+    if dst.is_null() || anon_vma.is_null() {
+        return Ok(());
+    }
+
+    unsafe {
+        if !(*dst).anon_vma.is_null() {
+            return if (*dst).anon_vma == anon_vma {
+                Ok(())
+            } else {
+                Err(-22)
+            };
+        }
+
+        if (*dst).anon_vma_chain.next.is_null() {
+            ListHead::init(&mut (*dst).anon_vma_chain);
+        }
+
+        let avc = anon_vma_chain_alloc_raw().ok_or(-12i32)?;
+
+        get_anon_vma(anon_vma);
+        (*anon_vma).num_active_vmas += 1;
+
+        (*avc).vma = dst;
+        (*avc).anon_vma = anon_vma;
+        ListHead::init(&mut (*avc).same_vma);
+        ListHead::list_add_tail(&mut (*avc).same_vma, &mut (*dst).anon_vma_chain);
+        ListHead::init(&mut (*avc).anon_vma_list);
+        ListHead::list_add_tail(&mut (*avc).anon_vma_list, &mut (*anon_vma).chains);
+
+        (*dst).anon_vma = anon_vma;
+        Ok(())
+    }
+}
+
+/// Clone anon-vma links for same-mm VMA duplication such as `__split_vma()`.
+///
+/// Linux `anon_vma_clone(..., VMA_OP_SPLIT)` copies the source VMA's
+/// `anon_vma_chain` so a split VMA that already has present anonymous pages
+/// remains visible to fork's `vma_needs_copy()` and reverse mapping.
+///
+/// Ref: Linux `mm/rmap.c` — `anon_vma_clone()`
+pub unsafe fn anon_vma_clone(dst: *mut VmAreaStruct, src: *const VmAreaStruct) -> Result<(), i32> {
+    if dst.is_null() || src.is_null() {
+        return Err(-22);
+    }
+
+    unsafe {
+        let src_av = (*src).anon_vma;
+        if src_av.is_null() {
+            return Ok(());
+        }
+        anon_vma_link_existing(dst, src_av)
+    }
+}
+
 /// Set up `AnonVma` linkage for a child VMA produced by `dup_mmap()`.
 ///
 /// If the parent VMA has no `anon_vma` (no pages faulted in), returns `Ok(())`

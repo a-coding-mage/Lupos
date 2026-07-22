@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/base/class.c
+//! test-origin: linux:vendor/linux/drivers/base/class.c
 //! `struct class` — `vendor/linux/include/linux/device/class.h`.
 //!
 //! A class is a logical grouping of devices that share a userspace contract

@@ -10,11 +10,16 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::kernel::module::{export_symbol, find_symbol};
 
-use super::cpuid::CpuidResult;
 use super::cpuid::cpuid;
+use super::cpuid::{CpuidResult, max_basic_leaf, vendor_string};
 
 pub const NSEC_PER_SEC: u64 = 1_000_000_000;
 pub const USEC_PER_SEC: u64 = 1_000_000;
+const INTEL_VENDOR: [u8; 12] = *b"GenuineIntel";
+const ACRN_HYPERVISOR_SIGNATURE: [u8; 12] = *b"ACRNACRNACRN";
+const ACRN_CPUID_TIMING_INFO: u32 = 0x4000_0010;
+const MIN_REASONABLE_TSC_KHZ: u64 = 100_000;
+const MAX_REASONABLE_TSC_KHZ: u64 = 10_000_000;
 
 #[inline]
 pub fn read() -> u64 {
@@ -82,6 +87,53 @@ pub const fn khz_from_cpuid_leaf16(leaf16: CpuidResult) -> Option<u64> {
     Some(base_mhz.saturating_mul(1000))
 }
 
+pub const fn plausible_tsc_khz(khz: u64) -> Option<u64> {
+    if khz >= MIN_REASONABLE_TSC_KHZ && khz <= MAX_REASONABLE_TSC_KHZ {
+        Some(khz)
+    } else {
+        None
+    }
+}
+
+fn khz_from_cpuid_tsc_ratio(
+    vendor: [u8; 12],
+    max_basic: u32,
+    leaf15: CpuidResult,
+    leaf16: CpuidResult,
+) -> Option<u64> {
+    if vendor != INTEL_VENDOR || max_basic < 0x15 {
+        return None;
+    }
+
+    let denominator = leaf15.eax as u64;
+    let numerator = leaf15.ebx as u64;
+    if denominator == 0 || numerator == 0 {
+        return None;
+    }
+
+    let mut crystal_khz = leaf15.ecx as u64 / 1000;
+    if crystal_khz == 0 && max_basic >= 0x16 {
+        let base_mhz = (leaf16.eax & 0xffff) as u64;
+        crystal_khz = base_mhz.saturating_mul(1000).saturating_mul(denominator) / numerator;
+    }
+    if crystal_khz == 0 {
+        return None;
+    }
+
+    Some(crystal_khz.saturating_mul(numerator) / denominator)
+}
+
+fn khz_from_cpuid_cpu_frequency(
+    vendor: [u8; 12],
+    max_basic: u32,
+    leaf16: CpuidResult,
+) -> Option<u64> {
+    if vendor != INTEL_VENDOR || max_basic < 0x16 {
+        return None;
+    }
+    khz_from_cpuid_leaf16(leaf16)
+}
+
 /// Global TSC frequency in kHz, populated by `calibrate()`. Zero means
 /// "uncalibrated, do not trust" — callers should fall back to jiffies.
 static TSC_KHZ: AtomicU32 = AtomicU32::new(0);
@@ -114,9 +166,11 @@ pub fn register_module_exports() {
 ///
 /// Linux: `vendor/linux/arch/x86/kernel/tsc.c::native_calibrate_tsc` /
 /// `tsc_init`. Strategy mirror:
-///   1. Try CPUID leaf 0x15 (TSC / Core Crystal Clock).
-///   2. Try CPUID leaf 0x16 (Processor Frequency Information).
-///   3. Fall back to PIT channel-2 gated calibration.
+///   1. Prefer a Linux-wired hypervisor-published TSC frequency when present.
+///   2. Try Intel CPUID leaf 0x15 (TSC / Core Crystal Clock), including
+///      Linux's leaf 0x16-derived crystal fallback.
+///   3. Try Intel CPUID leaf 0x16 as a last fast CPU-frequency fallback.
+///   4. Fall back to PIT channel-2 gated calibration.
 ///
 /// Returns the cached kHz value. Idempotent — re-calibration only runs if
 /// the global is still zero.
@@ -126,52 +180,79 @@ pub fn calibrate() -> u64 {
         return existing;
     }
 
-    if let Some(khz) = khz_from_cpuid_leaf15(cpuid(0x15, 0)) {
+    // Linux wires hypervisor TSC calibration through vendor-specific platform
+    // hooks before native CPUID/PIT calibration. Do the same only for the
+    // CPUID timing leaf Linux documents as such (ACRN); KVM, Hyper-V, and
+    // VMware use pvclock/MSRs/hypercalls rather than a generic 0x40000010
+    // contract, and QEMU TCG can expose a plausible-but-wrong value there.
+    if let Some(khz) = khz_from_hypervisor().and_then(plausible_tsc_khz) {
         store_tsc_khz(khz);
         return khz;
     }
 
-    let max_basic = cpuid(0, 0).eax;
-    if max_basic >= 0x16 {
-        if let Some(khz) = khz_from_cpuid_leaf16(cpuid(0x16, 0)) {
-            store_tsc_khz(khz);
-            return khz;
-        }
-    }
+    let vendor = vendor_string();
+    let max_basic = max_basic_leaf();
+    let leaf16 = cpuid(0x16, 0);
 
-    // Under a hypervisor (KVM/Hyper-V/WHPX/VMware), the host publishes the TSC
-    // frequency directly so the guest need not — and must not — rely on the
-    // i8254 PIT. The PIT channel-2 OUT2 line (port 0x61 bit 5) is not reliably
-    // emulated by hardware-assisted hypervisors, so `pit_calibrate_khz()` can
-    // spin forever there. Prefer the paravirt timing leaf when present.
-    if let Some(khz) = khz_from_hypervisor() {
+    if let Some(khz) = khz_from_cpuid_tsc_ratio(vendor, max_basic, cpuid(0x15, 0), leaf16)
+        .and_then(plausible_tsc_khz)
+    {
         store_tsc_khz(khz);
         return khz;
     }
 
-    let khz = pit_calibrate_khz();
+    if let Some(khz) =
+        khz_from_cpuid_cpu_frequency(vendor, max_basic, leaf16).and_then(plausible_tsc_khz)
+    {
+        store_tsc_khz(khz);
+        return khz;
+    }
+
+    let khz = plausible_tsc_khz(pit_calibrate_khz()).unwrap_or(0);
     store_tsc_khz(khz);
     khz
 }
 
-/// TSC kHz from the hypervisor's paravirtual timing leaf, when running under a
-/// VM. Returns `None` on bare metal or if the leaf is absent/zero.
+/// TSC kHz from a Linux-recognized CPUID paravirtual timing leaf.
 ///
-/// Convention (KVM, Hyper-V, VMware): CPUID.1:ECX[31] flags "hypervisor
-/// present"; the max paravirt leaf lives at `0x4000_0000`; leaf `0x4000_0010`
-/// EAX carries the (virtual) TSC frequency in kHz. Mirrors Linux's
-/// `vendor/linux/arch/x86/kernel/cpu/vmware.c` / `kvmclock.c` TSC-from-host
-/// path, used before the native PIT calibration.
+/// Linux's ACRN guest path uses `ACRN_CPUID_TIMING_INFO` (`0x40000010`) as a
+/// TSC-frequency leaf. Other hypervisors do not share that ABI in Linux:
+/// KVM uses pvclock, Hyper-V uses frequency MSRs, and VMware uses a hypercall.
 fn khz_from_hypervisor() -> Option<u64> {
     // Bit 31 of CPUID.1:ECX is the architectural "running on a hypervisor" flag.
-    if cpuid(1, 0).ecx & (1 << 31) == 0 {
+    let hypervisor_present = cpuid(1, 0).ecx & (1 << 31) != 0;
+    let hv_info = cpuid(0x4000_0000, 0);
+    khz_from_hypervisor_timing_leaf(
+        hypervisor_present,
+        hv_info.eax,
+        hypervisor_signature(hv_info),
+        cpuid(ACRN_CPUID_TIMING_INFO, 0),
+    )
+}
+
+fn hypervisor_signature(info_leaf: CpuidResult) -> [u8; 12] {
+    let mut signature = [0u8; 12];
+    // Hypervisor signatures are EBX, ECX, EDX. This differs from CPUID.0's
+    // CPU vendor string order (EBX, EDX, ECX).
+    signature[0..4].copy_from_slice(&info_leaf.ebx.to_le_bytes());
+    signature[4..8].copy_from_slice(&info_leaf.ecx.to_le_bytes());
+    signature[8..12].copy_from_slice(&info_leaf.edx.to_le_bytes());
+    signature
+}
+
+fn khz_from_hypervisor_timing_leaf(
+    hypervisor_present: bool,
+    max_hv_leaf: u32,
+    signature: [u8; 12],
+    timing_leaf: CpuidResult,
+) -> Option<u64> {
+    if !hypervisor_present
+        || signature != ACRN_HYPERVISOR_SIGNATURE
+        || max_hv_leaf < ACRN_CPUID_TIMING_INFO
+    {
         return None;
     }
-    let max_hv_leaf = cpuid(0x4000_0000, 0).eax;
-    if max_hv_leaf < 0x4000_0010 {
-        return None;
-    }
-    let tsc_khz = cpuid(0x4000_0010, 0).eax as u64;
+    let tsc_khz = timing_leaf.eax as u64;
     if tsc_khz == 0 { None } else { Some(tsc_khz) }
 }
 
@@ -300,6 +381,163 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn plausible_tsc_frequency_rejects_tcg_placeholder_values() {
+        assert_eq!(plausible_tsc_khz(1_000), None);
+        assert_eq!(plausible_tsc_khz(0), None);
+        assert_eq!(plausible_tsc_khz(2_400_000), Some(2_400_000));
+        assert_eq!(plausible_tsc_khz(20_000_000), None);
+    }
+
+    #[test]
+    fn cpuid_tsc_ratio_matches_linux_intel_only_path() {
+        let leaf15 = CpuidResult {
+            eax: 2,
+            ebx: 192,
+            ecx: 25_000_000,
+            edx: 0,
+        };
+        let zero = CpuidResult {
+            eax: 0,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+        };
+        assert_eq!(
+            khz_from_cpuid_tsc_ratio(INTEL_VENDOR, 0x16, leaf15, zero),
+            Some(2_400_000)
+        );
+        assert_eq!(
+            khz_from_cpuid_tsc_ratio(*b"AuthenticAMD", 0x16, leaf15, zero),
+            None
+        );
+    }
+
+    #[test]
+    fn cpuid_tsc_ratio_uses_leaf16_crystal_fallback_like_linux() {
+        let leaf15 = CpuidResult {
+            eax: 2,
+            ebx: 192,
+            ecx: 0,
+            edx: 0,
+        };
+        let leaf16 = CpuidResult {
+            eax: 2400,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+        };
+
+        assert_eq!(
+            khz_from_cpuid_tsc_ratio(INTEL_VENDOR, 0x16, leaf15, leaf16),
+            Some(2_400_000)
+        );
+    }
+
+    #[test]
+    fn cpuid_leaf16_cpu_frequency_matches_linux_intel_only_path() {
+        let leaf16 = CpuidResult {
+            eax: 2400,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+        };
+
+        assert_eq!(
+            khz_from_cpuid_cpu_frequency(INTEL_VENDOR, 0x16, leaf16),
+            Some(2_400_000)
+        );
+        assert_eq!(
+            khz_from_cpuid_cpu_frequency(*b"AuthenticAMD", 0x16, leaf16),
+            None
+        );
+        assert_eq!(
+            khz_from_cpuid_cpu_frequency(INTEL_VENDOR, 0x15, leaf16),
+            None
+        );
+    }
+
+    #[test]
+    fn hypervisor_timing_leaf_matches_linux_acrn_only_contract() {
+        let timing_leaf = CpuidResult {
+            eax: 2_400_000,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+        };
+
+        assert_eq!(
+            khz_from_hypervisor_timing_leaf(
+                true,
+                ACRN_CPUID_TIMING_INFO,
+                ACRN_HYPERVISOR_SIGNATURE,
+                timing_leaf,
+            ),
+            Some(2_400_000)
+        );
+        assert_eq!(
+            khz_from_hypervisor_timing_leaf(
+                false,
+                ACRN_CPUID_TIMING_INFO,
+                ACRN_HYPERVISOR_SIGNATURE,
+                timing_leaf,
+            ),
+            None
+        );
+        assert_eq!(
+            khz_from_hypervisor_timing_leaf(
+                true,
+                ACRN_CPUID_TIMING_INFO - 1,
+                ACRN_HYPERVISOR_SIGNATURE,
+                timing_leaf,
+            ),
+            None
+        );
+        assert_eq!(
+            khz_from_hypervisor_timing_leaf(
+                true,
+                ACRN_CPUID_TIMING_INFO,
+                ACRN_HYPERVISOR_SIGNATURE,
+                CpuidResult {
+                    eax: 0,
+                    ebx: 0,
+                    ecx: 0,
+                    edx: 0,
+                },
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hypervisor_timing_leaf_rejects_non_acrn_signatures() {
+        let timing_leaf = CpuidResult {
+            eax: 543_000,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+        };
+
+        for signature in [
+            *b"TCGTCGTCGTCG",
+            *b"KVMKVMKVM\0\0\0",
+            *b"Microsoft Hv",
+            *b"VMwareVMware",
+        ] {
+            assert_eq!(
+                khz_from_hypervisor_timing_leaf(
+                    true,
+                    ACRN_CPUID_TIMING_INFO,
+                    signature,
+                    timing_leaf,
+                ),
+                None,
+                "Linux does not treat {:?} leaf 0x40000010 as ACRN timing info",
+                core::str::from_utf8(&signature).unwrap_or("<non-utf8>")
+            );
+        }
     }
 
     #[test]

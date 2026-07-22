@@ -37,6 +37,7 @@ use super::socket::{
 
 const MAX_RW: usize = 1 << 20;
 const UIO_MAXIOV: usize = 1024;
+const SOCKADDR_STORAGE_SIZE: usize = 128;
 const ERESTARTSYS: i32 = 512;
 
 // ── cmsg / SCM_RIGHTS constants ─────────────────────────────────────────────
@@ -1441,21 +1442,44 @@ static TEST_SOCKET_RECV_WAIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static TEST_SOCKET_RECV_SIGNAL_AFTER_PREPARE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-fn read_sockaddr(ptr: *const u8, len: u32) -> Result<SockAddr, i32> {
-    if ptr.is_null() {
+fn copy_user_bytes(ptr: *const u8, len: usize) -> Result<alloc::vec::Vec<u8>, i32> {
+    if ptr.is_null() && len != 0 {
         return Err(EFAULT);
     }
-    let family = unsafe { core::ptr::read_unaligned(ptr as *const u16) };
+    let mut bytes = alloc::vec![0u8; len];
+    if len == 0 {
+        return Ok(bytes);
+    }
+    let not_copied = unsafe { uaccess::copy_from_user(bytes.as_mut_ptr(), ptr, len) };
+    if not_copied != 0 {
+        return Err(EFAULT);
+    }
+    Ok(bytes)
+}
+
+fn copy_sockaddr_from_user(ptr: *const u8, len: u32) -> Result<alloc::vec::Vec<u8>, i32> {
+    if len as usize > SOCKADDR_STORAGE_SIZE {
+        return Err(EINVAL);
+    }
+    copy_user_bytes(ptr, len as usize)
+}
+
+fn read_sockaddr(ptr: *const u8, len: u32) -> Result<SockAddr, i32> {
+    let raw = copy_sockaddr_from_user(ptr, len)?;
+    if raw.len() < core::mem::size_of::<u16>() {
+        return Err(EINVAL);
+    }
+    let family = u16::from_ne_bytes(raw[..2].try_into().unwrap());
     match family {
         AF_INET if len as usize >= core::mem::size_of::<LinuxSockAddrIn>() => {
-            let raw = unsafe { core::ptr::read_unaligned(ptr as *const LinuxSockAddrIn) };
+            let raw = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const LinuxSockAddrIn) };
             Ok(SockAddr::Inet {
                 addr: u32::from_be(raw.addr),
                 port: u16::from_be(raw.port),
             })
         }
         AF_INET6 if len as usize >= core::mem::size_of::<LinuxSockAddrIn6>() => {
-            let raw = unsafe { core::ptr::read_unaligned(ptr as *const LinuxSockAddrIn6) };
+            let raw = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const LinuxSockAddrIn6) };
             Ok(SockAddr::Inet6 {
                 addr: raw.addr,
                 port: u16::from_be(raw.port),
@@ -1465,7 +1489,7 @@ fn read_sockaddr(ptr: *const u8, len: u32) -> Result<SockAddr, i32> {
             if len <= 2 {
                 return Err(EINVAL);
             }
-            let bytes = unsafe { core::slice::from_raw_parts(ptr.add(2), len as usize - 2) };
+            let bytes = &raw[2..];
             let path = if bytes.first() == Some(&0) {
                 core::str::from_utf8(bytes).map_err(|_| EINVAL)?
             } else {
@@ -1484,14 +1508,15 @@ fn read_sockaddr(ptr: *const u8, len: u32) -> Result<SockAddr, i32> {
             Ok(SockAddr::Unix(path))
         }
         AF_NETLINK if len as usize >= core::mem::size_of::<LinuxSockAddrNetlink>() => {
-            let raw = unsafe { core::ptr::read_unaligned(ptr as *const LinuxSockAddrNetlink) };
+            let raw =
+                unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const LinuxSockAddrNetlink) };
             Ok(SockAddr::Netlink {
                 pid: raw.pid,
                 groups: raw.groups,
             })
         }
         AF_PACKET if len as usize >= core::mem::size_of::<LinuxSockAddr>() => {
-            let raw = unsafe { core::ptr::read_unaligned(ptr as *const LinuxSockAddr) };
+            let raw = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const LinuxSockAddr) };
             let protocol = u16::from_be_bytes([raw.data[0], raw.data[1]]);
             let ifindex = u32::from_ne_bytes([raw.data[2], raw.data[3], raw.data[4], raw.data[5]]);
             Ok(SockAddr::Packet { ifindex, protocol })
@@ -1709,13 +1734,42 @@ fn write_sockaddr_with_kernel_len(
     })
 }
 
-fn copy_iov_bytes(iov: *const LinuxIovec, iovlen: usize) -> Result<alloc::vec::Vec<u8>, i32> {
+fn copy_iovec_from_user(
+    iov: *const LinuxIovec,
+    iovlen: usize,
+) -> Result<alloc::vec::Vec<LinuxIovec>, i32> {
+    if iovlen > UIO_MAXIOV {
+        return Err(EINVAL);
+    }
     if iov.is_null() && iovlen != 0 {
         return Err(EFAULT);
     }
+    let bytes = iovlen
+        .checked_mul(core::mem::size_of::<LinuxIovec>())
+        .ok_or(EINVAL)?;
+    let mut entries = alloc::vec![
+        LinuxIovec {
+            base: core::ptr::null_mut(),
+            len: 0,
+        };
+        iovlen
+    ];
+    if bytes == 0 {
+        return Ok(entries);
+    }
+    let not_copied = unsafe {
+        uaccess::copy_from_user(entries.as_mut_ptr().cast::<u8>(), iov.cast::<u8>(), bytes)
+    };
+    if not_copied != 0 {
+        return Err(EFAULT);
+    }
+    Ok(entries)
+}
+
+fn copy_iov_bytes(iov: *const LinuxIovec, iovlen: usize) -> Result<alloc::vec::Vec<u8>, i32> {
+    let entries = copy_iovec_from_user(iov, iovlen)?;
     let mut bytes = alloc::vec::Vec::new();
-    for n in 0..iovlen {
-        let ent = unsafe { *iov.add(n) };
+    for ent in entries {
         if ent.base.is_null() && ent.len != 0 {
             return Err(EFAULT);
         }
@@ -1725,22 +1779,24 @@ fn copy_iov_bytes(iov: *const LinuxIovec, iovlen: usize) -> Result<alloc::vec::V
         if ent.len == 0 {
             continue;
         }
-        let slice = unsafe { core::slice::from_raw_parts(ent.base as *const u8, ent.len) };
-        bytes.extend_from_slice(slice);
+        let start = bytes.len();
+        bytes.resize(start + ent.len, 0);
+        let not_copied =
+            unsafe { uaccess::copy_from_user(bytes[start..].as_mut_ptr(), ent.base, ent.len) };
+        if not_copied != 0 {
+            return Err(EFAULT);
+        }
     }
     Ok(bytes)
 }
 
 fn scatter_iov_bytes(iov: *mut LinuxIovec, iovlen: usize, bytes: &[u8]) -> Result<usize, i32> {
-    if iov.is_null() && iovlen != 0 {
-        return Err(EFAULT);
-    }
+    let entries = copy_iovec_from_user(iov.cast_const(), iovlen)?;
     let mut copied = 0usize;
-    for n in 0..iovlen {
+    for ent in entries {
         if copied == bytes.len() {
             break;
         }
-        let ent = unsafe { *iov.add(n) };
         if ent.base.is_null() && ent.len != 0 {
             return Err(EFAULT);
         }
@@ -1751,10 +1807,13 @@ fn scatter_iov_bytes(iov: *mut LinuxIovec, iovlen: usize, bytes: &[u8]) -> Resul
         if take == 0 {
             continue;
         }
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr().add(copied), ent.base, take);
+        let not_copied =
+            unsafe { uaccess::copy_to_user(ent.base, bytes.as_ptr().add(copied), take) };
+        let done = take.saturating_sub(not_copied);
+        copied += done;
+        if not_copied != 0 {
+            return if copied == 0 { Err(EFAULT) } else { Ok(copied) };
         }
-        copied += take;
     }
     Ok(copied)
 }
@@ -2228,6 +2287,21 @@ pub unsafe fn sys_setsockopt(fd: i32, level: i32, opt: i32, val: *const u8, len:
             };
             return match socket_from_fd(fd)
                 .and_then(|sock| set_socket_timeout(&sock, opt_u32, timeout_ns))
+            {
+                Ok(()) => 0,
+                Err(errno) => -(errno as i64),
+            };
+        }
+        if opt_u32 == socket::SO_PRIORITY {
+            if len < core::mem::size_of::<i32>() as u32 {
+                return -(EINVAL as i64);
+            }
+            let value = match unsafe { uaccess::get_user_u32(val as *const u32) } {
+                Ok(value) => value,
+                Err(_) => return -(EFAULT as i64),
+            };
+            return match socket_from_fd(fd)
+                .and_then(|sock| socket::setsockopt(&sock, opt_u32, value))
             {
                 Ok(()) => 0,
                 Err(errno) => -(errno as i64),
@@ -2738,20 +2812,19 @@ pub unsafe fn sys_sendto(
     if buf.is_null() && len != 0 {
         return -(EFAULT as i64);
     }
+    let bytes = match copy_user_bytes(buf, len.min(MAX_RW)) {
+        Ok(bytes) => bytes,
+        Err(errno) => return -(errno as i64),
+    };
     let sock = match socket_from_fd(fd) {
         Ok(sock) => sock,
         Err(errno) => return -(errno as i64),
     };
-    let bytes = if len == 0 {
-        &[]
-    } else {
-        unsafe { core::slice::from_raw_parts(buf, len) }
-    };
     let result = if !dest.is_null() {
         let parsed = read_sockaddr(dest, dest_len);
-        parsed.and_then(|peer| socket::sendto(&sock, bytes, peer))
+        parsed.and_then(|peer| socket::sendto(&sock, &bytes, peer))
     } else {
-        socket::sendmsg(&sock, bytes)
+        socket::sendmsg(&sock, &bytes)
     };
     match result {
         Ok(n) => n as i64,
@@ -2776,18 +2849,18 @@ pub unsafe fn sys_recvfrom(
     };
     let nonblocking = recvmsg_is_nonblocking(&file, flags);
     let recv_timeout_ns = sock.lock().recv_timeout_ns;
-    let mut empty = [];
-    let out = if len == 0 {
-        &mut empty[..]
-    } else {
-        unsafe { core::slice::from_raw_parts_mut(buf, len) }
-    };
+    let recv_tmp_len = len.min(MAX_RW);
+    let mut tmp = alloc::vec![0u8; recv_tmp_len];
     // Honour MSG_PEEK / MSG_TRUNC for parity with sock_recvmsg.
     // Ref: vendor/linux/net/socket.c::__sys_recvfrom.
     loop {
-        match socket::recvmsg_full(&sock, out, flags) {
+        match socket::recvmsg_full(&sock, &mut tmp, flags) {
             Ok((n, peer, files, _, real_len, _)) => {
                 drop_file_refs(files);
+                let not_copied = unsafe { uaccess::copy_to_user(buf, tmp.as_ptr(), n) };
+                if not_copied != 0 {
+                    return -(EFAULT as i64);
+                }
                 if (!src.is_null() || !src_len.is_null())
                     && let Some(peer) = peer
                 {
@@ -3962,6 +4035,52 @@ mod tests {
         assert_eq!(&out, b"xy");
     }
 
+    #[test]
+    fn socket_payload_usercopy_matches_linux_import_ubuf_boundary() {
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/net/socket.c"
+        ));
+        assert!(linux.contains("err = import_ubuf(ITER_DEST, ubuf, size, &msg.msg_iter);"));
+        assert!(linux.contains("err = sock_recvmsg(sock, &msg, flags);"));
+
+        let source = include_str!("syscalls.rs");
+        assert!(source.contains("copy_user_bytes(buf, len.min(MAX_RW))"));
+        assert!(source.contains("uaccess::copy_to_user(buf, tmp.as_ptr(), n)"));
+        assert!(source.contains("copy_iovec_from_user(iov, iovlen)"));
+        assert!(source.contains("uaccess::copy_from_user(bytes[start..].as_mut_ptr()"));
+        assert!(source.contains("uaccess::copy_to_user(ent.base"));
+        let direct_recvfrom_slice = concat!("core::slice::from_raw_parts_mut", "(buf, len)");
+        let direct_scatter_copy = concat!(
+            "core::ptr::copy_nonoverlapping",
+            "(bytes.as_ptr().add(copied)"
+        );
+        assert!(!source.contains(direct_recvfrom_slice));
+        assert!(!source.contains(direct_scatter_copy));
+    }
+
+    #[test]
+    fn socket_payload_usercopy_rejects_bad_user_payload_pointers() {
+        let bad_user = uaccess::TASK_SIZE_MAX as *mut u8;
+        let iov = [LinuxIovec {
+            base: bad_user,
+            len: 4,
+        }];
+
+        assert_eq!(copy_iov_bytes(iov.as_ptr(), iov.len()), Err(EFAULT));
+        assert_eq!(
+            scatter_iov_bytes(iov.as_ptr() as *mut LinuxIovec, iov.len(), b"abcd"),
+            Err(EFAULT)
+        );
+        assert_eq!(
+            read_sockaddr(
+                bad_user.cast_const(),
+                core::mem::size_of::<LinuxSockAddrIn>() as u32
+            ),
+            Err(EFAULT)
+        );
+    }
+
     fn build_scm_rights_control(fd_count: usize) -> alloc::vec::Vec<u8> {
         let cmsg_len = CMSG_HDR_LEN + fd_count * core::mem::size_of::<i32>();
         let mut control = alloc::vec![0u8; cmsg_align(cmsg_len)];
@@ -4322,6 +4441,72 @@ mod tests {
             let sock = socket_from_fd(fd as i32).unwrap();
             assert_eq!(sock.lock().recv_timeout_ns, 250_000_000);
 
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn setsockopt_so_priority_follows_linux_permissions_and_lengths() {
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let cred = unprivileged_cred();
+        current.pid = 283;
+        current.tgid = 283;
+        current.cred = &*cred as *const Cred;
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let fd = sys_socket(AF_UNIX as i32, socket::SOCK_DGRAM as i32, 0);
+            assert!(fd >= 0);
+            let low = 6i32;
+            assert_eq!(
+                sys_setsockopt(
+                    fd as i32,
+                    SOL_SOCKET,
+                    socket::SO_PRIORITY as i32,
+                    &low as *const i32 as *const u8,
+                    core::mem::size_of::<i32>() as u32,
+                ),
+                0
+            );
+            let mut readback = 0u32;
+            let mut readback_len = core::mem::size_of::<u32>() as u32;
+            assert_eq!(
+                sys_getsockopt(
+                    fd as i32,
+                    SOL_SOCKET,
+                    socket::SO_PRIORITY as i32,
+                    &mut readback as *mut u32 as *mut u8,
+                    &mut readback_len,
+                ),
+                0
+            );
+            assert_eq!(readback, low as u32);
+
+            let high = 7i32;
+            assert_eq!(
+                sys_setsockopt(
+                    fd as i32,
+                    SOL_SOCKET,
+                    socket::SO_PRIORITY as i32,
+                    &high as *const i32 as *const u8,
+                    core::mem::size_of::<i32>() as u32,
+                ),
+                -(EPERM as i64)
+            );
+            assert_eq!(
+                sys_setsockopt(
+                    fd as i32,
+                    SOL_SOCKET,
+                    socket::SO_PRIORITY as i32,
+                    &low as *const i32 as *const u8,
+                    (core::mem::size_of::<i32>() - 1) as u32,
+                ),
+                -(EINVAL as i64)
+            );
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
     }

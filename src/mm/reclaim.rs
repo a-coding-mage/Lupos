@@ -475,6 +475,7 @@ mod tests {
             .map(|index| {
                 let page = alloc_test_page();
                 unsafe { filemap_add_folio(mptr, page, index, GFP_KERNEL) };
+                unsafe { unlock_page(page) };
                 page
             })
             .collect();
@@ -506,6 +507,7 @@ mod tests {
         let mptr = mapping.as_mut() as *mut AddressSpace;
         let page = alloc_test_page();
         unsafe { filemap_add_folio(mptr, page, 0, GFP_KERNEL) };
+        unsafe { unlock_page(page) };
         unsafe { (*page)._mapcount().store(0, Ordering::Relaxed) };
         lru_add_drain();
 
@@ -538,6 +540,8 @@ mod tests {
         unsafe { filemap_add_folio(mptr, p0, 0, GFP_KERNEL) };
         unsafe { filemap_add_folio(mptr, p1, 1, GFP_KERNEL) };
         unsafe { set_page_dirty(p0) };
+        unsafe { unlock_page(p0) };
+        unsafe { unlock_page(p1) };
         lru_add_drain();
 
         let result = drop_caches(1);

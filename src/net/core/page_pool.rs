@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/net/core/page_pool.c
+//! test-origin: linux:vendor/linux/net/core/page_pool.c
 //! Page-pool ABI exports for Linux-built network modules.
 
 extern crate alloc;

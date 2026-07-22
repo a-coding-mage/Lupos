@@ -974,17 +974,16 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
 
     // ── Milestone 6: Deferred Interrupts & Timebase ───────────────────────
     //
-    // Wire up the LAPIC timer (BSP only — APs are masked), the softirq /
-    // tasklet layer, and the TLB shootdown IPI plumbing, then finally enable
-    // hardware interrupts on the BSP with `sti`.  This is the FIRST point in
-    // boot where IF is set on the BSP — every prior subsystem (PIC mask,
-    // LAPIC SVR enable, IDT load) was deliberately preparing the ground.
+    // Wire up the LAPIC timer (BSP only — APs are masked) and the softirq /
+    // tasklet layer, then finally enable hardware interrupts on the BSP with
+    // `sti`.  This is the FIRST point in boot where IF is set on the BSP —
+    // every prior subsystem (PIC mask, LAPIC SVR enable, IDT load) was
+    // deliberately preparing the ground.
     //
     // Order:
     //   1. apic_timer::init  — program LVT, divisor, initial count
     //   2. softirq::init     — register tasklet dispatcher
-    //   3. tlb::init         — log "online" (counters already zero)
-    //   4. sti               — finally let IRQs fire
+    //   3. sti               — finally let IRQs fire
     unsafe {
         arch::x86::kernel::apic_timer::init();
     }
@@ -1106,8 +1105,6 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
     init::start_kernel::acpi_subsystem_init();
     init::start_kernel::arch_post_acpi_subsys_init();
     init::start_kernel::kcsan_init();
-
-    arch::x86::mm::tlb::init();
 
     // Linux runs smp_init() and sched_init_smp() from
     // kernel_init_freeable(), before free_initmem() and mark_readonly().
@@ -1323,6 +1320,8 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         }
         boot_options
     };
+
+    arch::x86::mm::tlb::init();
 
     unsafe {
         core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
@@ -2716,6 +2715,8 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         use alloc::boxed::Box;
         use arch::x86::mm::paging::{PAGE_SIZE, phys_to_virt, read_cr3};
         use core::ffi::c_void;
+        use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        use kernel::clone::{CLONE_SIGHAND, CLONE_THREAD, CLONE_VM};
         use kernel::fork::{KernelCloneArgs, heap_task_count, kernel_clone};
         use kernel::ptrace;
         use kernel::signal::SIGCHLD;
@@ -2837,7 +2838,211 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             "heap_task_count did not decrease after wait4 reaped the zombie"
         );
 
-        // ── 4. Ptrace TRACEME on a child (BSP attaches first via the API) ──────
+        // Linux `do_wait()` registers on `signal->wait_chldexit` before it
+        // scans children, and `do_notify_parent()` wakes that same queue. Keep
+        // a real SMP blocking-wait workload here so that ordering cannot be
+        // replaced by a check/register/sleep sequence with a lost-wakeup gap.
+        unsafe extern "C" fn delayed_child_exit_fn(arg: *mut c_void) -> i32 {
+            let exit_started = unsafe { &*(arg.cast::<AtomicU64>()) };
+            let delay_start = arch::x86::kernel::tsc::read_ordered();
+            while arch::x86::kernel::tsc::read_ordered().wrapping_sub(delay_start) < 5_000_000 {
+                core::hint::spin_loop();
+            }
+            exit_started.store(
+                arch::x86::kernel::tsc::read_ordered(),
+                AtomicOrdering::Release,
+            );
+            unsafe { kernel::exit::do_exit(0) }
+        }
+
+        log_info!("m26", "exit-wait-ptrace: step 4 blocking wait benchmark");
+        const WAIT_BENCH_WARMUPS: usize = 2;
+        const WAIT_BENCH_SAMPLES: usize = 10;
+        for sample in 0..WAIT_BENCH_WARMUPS + WAIT_BENCH_SAMPLES {
+            let exit_started = Box::new(AtomicU64::new(0));
+            args.fn_ptr = Some(delayed_child_exit_fn);
+            args.fn_arg = (&*exit_started as *const AtomicU64).cast_mut().cast();
+            let child_pid = unsafe { kernel_clone(&args) };
+            assert!(child_pid > 0, "delayed kernel_clone returned {}", child_pid);
+            let (wait_ret, wait_status) =
+                unsafe { wait4_user_status(child_pid as i32, wait_status_addr, 0) };
+            let finished = arch::x86::kernel::tsc::read_ordered();
+            let exit_started = exit_started.load(AtomicOrdering::Acquire);
+            assert_eq!(wait_ret, child_pid, "blocking wait4 returned {}", wait_ret);
+            assert_eq!(wait_status, 0, "blocking wait4 status={:#x}", wait_status);
+            assert!(exit_started != 0, "child must publish benchmark timestamp");
+            if sample >= WAIT_BENCH_WARMUPS {
+                log_info!(
+                    "m26",
+                    "wait-chldexit-bench: sample={} cycles={}",
+                    sample - WAIT_BENCH_WARMUPS,
+                    finished.wrapping_sub(exit_started)
+                );
+            }
+        }
+
+        unsafe extern "C" fn immediate_child_exit_fn(_: *mut c_void) -> i32 {
+            unsafe { kernel::exit::do_exit(0) }
+        }
+
+        log_info!("m26", "exit-wait-ptrace: step 5 SMP blocking wait stress");
+        args.fn_ptr = Some(immediate_child_exit_fn);
+        args.fn_arg = core::ptr::null_mut();
+        for iteration in 0..256 {
+            let child_pid = unsafe { kernel_clone(&args) };
+            assert!(child_pid > 0, "stress kernel_clone returned {}", child_pid);
+            let (wait_ret, wait_status) =
+                unsafe { wait4_user_status(child_pid as i32, wait_status_addr, 0) };
+            assert_eq!(
+                wait_ret, child_pid,
+                "blocking wait4 stress iteration {} returned {}",
+                iteration, wait_ret
+            );
+            assert_eq!(
+                wait_status, 0,
+                "blocking wait4 stress iteration {} status={:#x}",
+                iteration, wait_status
+            );
+        }
+        log_info!("m26", "exit-wait-ptrace: blocking wait stress passed");
+
+        // Linux `forget_original_parent()` updates `real_parent` for every
+        // thread in each reparented child process. An untraced nonleader then
+        // autoreaps without notifying that natural parent. Drive that exact
+        // topology so stale thread-group membership cannot make the original
+        // group leader permanently invisible to wait4().
+        static REPARENT_CHILD_READY: AtomicU64 = AtomicU64::new(0);
+        static REPARENT_ALLOW_PARENT_THREAD_EXIT: AtomicU64 = AtomicU64::new(0);
+        static REPARENT_ALLOW_HELPER_THREAD_EXIT: AtomicU64 = AtomicU64::new(0);
+        static REPARENT_PARENT_THREAD_PID: AtomicU64 = AtomicU64::new(0);
+        static REPARENT_CHILD_PID: AtomicU64 = AtomicU64::new(0);
+        static REPARENT_HELPER_THREAD_PID: AtomicU64 = AtomicU64::new(0);
+
+        unsafe extern "C" fn reparent_helper_thread_fn(_: *mut c_void) -> i32 {
+            while REPARENT_ALLOW_HELPER_THREAD_EXIT.load(AtomicOrdering::Acquire) == 0 {
+                unsafe { kernel::sched::schedule_with_irqs_enabled() };
+            }
+            unsafe { kernel::exit::do_exit(0) }
+        }
+
+        unsafe extern "C" fn reparent_child_process_fn(_: *mut c_void) -> i32 {
+            let mut helper_args = KernelCloneArgs::default();
+            helper_args.flags = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD;
+            helper_args.kthread = 1;
+            helper_args.fn_ptr = Some(reparent_helper_thread_fn);
+            let helper_pid = unsafe { kernel_clone(&helper_args) };
+            assert!(
+                helper_pid > 0,
+                "helper thread clone returned {}",
+                helper_pid
+            );
+            REPARENT_HELPER_THREAD_PID.store(helper_pid as u64, AtomicOrdering::Release);
+            REPARENT_CHILD_READY.store(1, AtomicOrdering::Release);
+
+            while !kernel::fork::find_heap_task_by_pid(helper_pid as i32).is_null() {
+                unsafe { kernel::sched::schedule_with_irqs_enabled() };
+            }
+            unsafe { kernel::exit::do_exit(0) }
+        }
+
+        unsafe extern "C" fn reparent_parent_thread_fn(_: *mut c_void) -> i32 {
+            let mut child_args = KernelCloneArgs::default();
+            child_args.exit_signal = SIGCHLD;
+            child_args.kthread = 1;
+            child_args.fn_ptr = Some(reparent_child_process_fn);
+            let child_pid = unsafe { kernel_clone(&child_args) };
+            assert!(child_pid > 0, "nested process clone returned {}", child_pid);
+            REPARENT_CHILD_PID.store(child_pid as u64, AtomicOrdering::Release);
+
+            while REPARENT_ALLOW_PARENT_THREAD_EXIT.load(AtomicOrdering::Acquire) == 0 {
+                unsafe { kernel::sched::schedule_with_irqs_enabled() };
+            }
+            unsafe { kernel::exit::do_exit(0) }
+        }
+
+        unsafe extern "C" fn reparent_group_leader_fn(_: *mut c_void) -> i32 {
+            let mut thread_args = KernelCloneArgs::default();
+            thread_args.flags = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD;
+            thread_args.kthread = 1;
+            thread_args.fn_ptr = Some(reparent_parent_thread_fn);
+            let thread_pid = unsafe { kernel_clone(&thread_args) };
+            assert!(
+                thread_pid > 0,
+                "parent thread clone returned {}",
+                thread_pid
+            );
+            REPARENT_PARENT_THREAD_PID.store(thread_pid as u64, AtomicOrdering::Release);
+
+            while REPARENT_CHILD_READY.load(AtomicOrdering::Acquire) == 0 {
+                unsafe { kernel::sched::schedule_with_irqs_enabled() };
+            }
+            REPARENT_ALLOW_PARENT_THREAD_EXIT.store(1, AtomicOrdering::Release);
+            while !kernel::fork::find_heap_task_by_pid(thread_pid as i32).is_null() {
+                unsafe { kernel::sched::schedule_with_irqs_enabled() };
+            }
+
+            REPARENT_ALLOW_HELPER_THREAD_EXIT.store(1, AtomicOrdering::Release);
+            let helper_pid = REPARENT_HELPER_THREAD_PID.load(AtomicOrdering::Acquire) as i32;
+            while !kernel::fork::find_heap_task_by_pid(helper_pid).is_null() {
+                unsafe { kernel::sched::schedule_with_irqs_enabled() };
+            }
+            unsafe { kernel::exit::do_exit(0) }
+        }
+
+        log_info!("m26", "exit-wait-ptrace: step 6 threaded reparent wait");
+        REPARENT_CHILD_READY.store(0, AtomicOrdering::Release);
+        REPARENT_ALLOW_PARENT_THREAD_EXIT.store(0, AtomicOrdering::Release);
+        REPARENT_ALLOW_HELPER_THREAD_EXIT.store(0, AtomicOrdering::Release);
+        REPARENT_PARENT_THREAD_PID.store(0, AtomicOrdering::Release);
+        REPARENT_CHILD_PID.store(0, AtomicOrdering::Release);
+        REPARENT_HELPER_THREAD_PID.store(0, AtomicOrdering::Release);
+
+        args.fn_ptr = Some(reparent_group_leader_fn);
+        args.fn_arg = core::ptr::null_mut();
+        let group_pid = unsafe { kernel_clone(&args) };
+        assert!(group_pid > 0, "group leader clone returned {}", group_pid);
+        let mut group_wait_ret = 0;
+        for _ in 0..16_384 {
+            let (wait_ret, wait_status) =
+                unsafe { wait4_user_status(group_pid as i32, wait_status_addr, wait::WNOHANG) };
+            group_wait_ret = wait_ret;
+            if wait_ret == group_pid {
+                assert_eq!(
+                    wait_status, 0,
+                    "threaded group wait status={:#x}",
+                    wait_status
+                );
+                break;
+            }
+            assert_eq!(wait_ret, 0, "threaded group wait returned {}", wait_ret);
+            unsafe { kernel::sched::schedule_with_irqs_enabled() };
+        }
+        assert_eq!(
+            group_wait_ret, group_pid,
+            "threaded group leader stayed hidden after its last real thread exited"
+        );
+
+        let nested_child_pid = REPARENT_CHILD_PID.load(AtomicOrdering::Acquire) as i32;
+        assert!(nested_child_pid > 0, "nested child PID was not published");
+        let mut nested_wait_ret = 0;
+        for _ in 0..4096 {
+            let (wait_ret, wait_status) =
+                unsafe { wait4_user_status(nested_child_pid, wait_status_addr, wait::WNOHANG) };
+            nested_wait_ret = wait_ret;
+            if wait_ret == nested_child_pid as i64 {
+                assert_eq!(
+                    wait_status, 0,
+                    "nested child wait status={:#x}",
+                    wait_status
+                );
+                break;
+            }
+            assert_eq!(wait_ret, 0, "nested child wait returned {}", wait_ret);
+            unsafe { kernel::sched::schedule_with_irqs_enabled() };
+        }
+        assert_eq!(nested_wait_ret, nested_child_pid as i64);
+
+        // ── 6. Ptrace TRACEME on a child (BSP attaches first via the API) ──────
         if false {
             log_info!("m26", "exit-wait-ptrace: step 4 ptrace traceme child");
             unsafe extern "C" fn traceme_fn(_: *mut c_void) -> i32 {
@@ -2868,7 +3073,7 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         // ptrace/seccomp selftests. Keep the Milestone 26 gate focused on the
         // basic TRACEME contract so it does not duplicate that broader child
         // stop/exit coverage here.
-        log_info!("m26", "exit-wait-ptrace: step 4 ptrace traceme");
+        log_info!("m26", "exit-wait-ptrace: step 6 ptrace traceme");
         let current = unsafe { kernel::sched::get_current() };
         assert!(!current.is_null(), "current task must exist");
         let saved_ptrace = unsafe { (*current).m26.ptrace };
@@ -2884,8 +3089,8 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             (*current).m26.tracer = saved_tracer;
         }
 
-        // ── 5. Ptrace ATTACH/DETACH dispatch sanity (no live tracee) ───────────
-        log_info!("m26", "exit-wait-ptrace: step 5 ptrace dispatch sanity");
+        // ── 7. Ptrace ATTACH/DETACH dispatch sanity (no live tracee) ───────────
+        log_info!("m26", "exit-wait-ptrace: step 7 ptrace dispatch sanity");
         // Attaching to PID 0 (the BSP) returns -EINVAL because it is `current`.
         let r_attach_self = unsafe { ptrace::sys_ptrace(ptrace::PTRACE_ATTACH, 0, 0, 0) };
         assert!(
@@ -5775,10 +5980,11 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         );
 
         #[cfg(feature = "test-login-stack")]
-        loop {
+        {
             init::rootfs::drain_console_control_bytes();
             kernel::console::maintenance_budgeted();
             unsafe { kernel::sched::schedule_with_irqs_enabled() };
+            halt_loop_with_softirq();
         }
 
         #[cfg(not(feature = "test-login-stack"))]

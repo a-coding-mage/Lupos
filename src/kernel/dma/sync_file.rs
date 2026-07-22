@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/dma-buf/sync_file.c
+//! test-origin: linux:vendor/linux/drivers/dma-buf/sync_file.c
 //! Sync-file dma-fence ABI used by Linux-built dma-buf and DRM modules.
 
 use core::ffi::c_void;

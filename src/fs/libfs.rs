@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/fs/libfs.c
+//! test-origin: linux:vendor/linux/fs/libfs.c
 //! Generic filesystem helpers — ports of `vendor/linux/fs/libfs.c`.
 //!
 //! `simple_*` routines that any in-memory filesystem (ramfs, tmpfs, debugfs,

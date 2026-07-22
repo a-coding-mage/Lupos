@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/fs/seq_file.c
+//! test-origin: linux:vendor/linux/fs/seq_file.c
 //! Minimal seq-file ABI exports for Linux-built modules.
 
 use core::ffi::{c_char, c_void};

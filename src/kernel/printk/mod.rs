@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/kernel/printk
+//! test-origin: linux:vendor/linux/kernel/printk
 //! Linux-shaped printk surface (M61).
 //!
 //! Wraps the existing `src/log.rs` ring buffer with a Linux-format adapter:

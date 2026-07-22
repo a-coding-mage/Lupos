@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/lib/iov_iter.c
+//! test-origin: linux:vendor/linux/lib/iov_iter.c
 //! Minimal iov_iter ABI exports used by Linux-built modules.
 
 use core::ffi::c_void;

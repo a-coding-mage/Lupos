@@ -143,13 +143,27 @@ pub const MAX_CPUS: usize = 9;
 // still leaving enough threads for AHCI/SCSI per-port workers.
 pub const MAX_KTHREADS: usize = 30;
 
+/// Linux x86-64 `THREAD_SIZE_ORDER` with 4 KiB pages and KASAN disabled.
+///
+/// Ref: `vendor/linux/arch/x86/include/asm/page_64_types.h`.
+pub const LINUX_X86_64_THREAD_SIZE_ORDER: u32 = 2;
+
+/// Kernel stack order used by this build.
+///
+/// Release builds match Linux's x86-64 `THREAD_SIZE` exactly. Debug-profile
+/// Rust kernels keep the larger stack already required by the module-loader
+/// boot gate, whose debug frame plus nested finalizers exceed Linux's optimized
+/// stack budget.
+#[cfg(debug_assertions)]
+pub const KTHREAD_STACK_ORDER: u32 = 4;
+#[cfg(not(debug_assertions))]
+pub const KTHREAD_STACK_ORDER: u32 = LINUX_X86_64_THREAD_SIZE_ORDER;
+
 /// Kernel stack size per thread.
 ///
-/// Lupos runs a Rust debug-profile kernel in boot gates.  The module loader's
-/// debug frame plus nested finalizers exceeds 32 KiB even though an optimized
-/// Linux build normally fits its architecture default.  Heap-created task
-/// stacks also carry an unmapped leading guard page (see `vmalloc_stack`).
-pub const KTHREAD_STACK_SIZE: usize = 64 * 1024;
+/// Heap-created task stacks also carry an unmapped leading guard page (see
+/// `vmalloc_stack`), like Linux `CONFIG_VMAP_STACK`.
+pub const KTHREAD_STACK_SIZE: usize = 1usize << (12 + KTHREAD_STACK_ORDER);
 
 /// Maximum tasks in the legacy cooperative run queue.
 ///
@@ -558,6 +572,44 @@ pub(crate) fn task_on_cpu(task: *mut TaskStruct) -> bool {
     !task.is_null() && unsafe { (*task).m29.on_cpu.load(Ordering::Acquire) != 0 }
 }
 
+/// True while scheduler state still owns the task as a CPU's current task.
+pub(crate) fn task_has_current_reference(task: *mut TaskStruct) -> bool {
+    if task.is_null() {
+        return false;
+    }
+    if task_on_cpu(task) {
+        return true;
+    }
+    #[cfg(test)]
+    {
+        if unsafe { get_current() } == task {
+            return true;
+        }
+    }
+    #[cfg(not(test))]
+    unsafe {
+        for cpu in 0..MAX_CPUS {
+            if CURRENT_TASK[cpu] == task {
+                return true;
+            }
+        }
+    }
+    for cpu in 0..MAX_CPUS {
+        if rq::with_rq(cpu as u32, |rq| rq.current == task || rq.idle == task).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True while any scheduler-visible state can still dereference `task`.
+pub(crate) fn task_has_scheduler_reference(task: *mut TaskStruct) -> bool {
+    if task_has_current_reference(task) {
+        return true;
+    }
+    !task.is_null() && unsafe { (*task).m29.on_rq != 0 }
+}
+
 #[inline]
 unsafe fn set_task_on_cpu(task: *mut TaskStruct, on_cpu: bool, ordering: Ordering) {
     if task.is_null() {
@@ -631,6 +683,14 @@ pub unsafe fn finish_task_switch(prev: *mut TaskStruct) {
             // migration paths pair with this release store.
             set_task_on_cpu(prev, false, Ordering::Release);
         }
+    }
+    if !prev.is_null()
+        && let Some(kernel_stack) = crate::kernel::fork::take_logically_released_heap_task(prev)
+    {
+        unsafe {
+            crate::kernel::fork::finish_heap_task_release(prev, kernel_stack);
+        }
+        return;
     }
     if !prev.is_null() && (deferred == prev || autoreap) {
         unsafe {
@@ -925,6 +985,141 @@ pub(super) unsafe fn wakeup_preempt_locked(
         }
     }
     !already_set && task_needs_resched(current)
+}
+
+/// Linux `sched_change_begin()` / `sched_change_end()` transaction.
+///
+/// The caller supplies the field update performed while the task is detached
+/// from its old class queue. Queue membership, current-task bookkeeping, and
+/// reschedule delivery remain serialized by the task's runqueue lock.
+unsafe fn change_task_scheduler(
+    p: *mut TaskStruct,
+    next_class: *const class::SchedClass,
+    new_prio: i32,
+    mut apply_fields: impl FnMut(*mut TaskStruct),
+) {
+    loop {
+        let cpu = unsafe { (*p).thread_info.cpu };
+        let result = rq::with_rq(cpu, |rq| unsafe {
+            // Linux task_rq_lock() retries if migration changed task_rq(p)
+            // before the selected rq lock was acquired.
+            if (*p).thread_info.cpu != cpu {
+                return None;
+            }
+
+            rq.update_rq_clock();
+            let previous_class = (*p).m29.sched_class;
+            if previous_class.is_null() {
+                apply_fields(p);
+                return Some(false);
+            }
+
+            let class_changed = previous_class != next_class;
+            let queued = (*p).m29.on_rq != 0;
+            let running = rq.current == p;
+            let old_prio = (*p).m29.prio;
+            let resched_task = rq.current;
+            let already_rescheduled = task_needs_resched(resched_task);
+
+            let mut dequeue_flags =
+                class::DEQUEUE_SAVE | class::DEQUEUE_MOVE | class::DEQUEUE_NOCLOCK;
+            if class_changed {
+                dequeue_flags |= class::DEQUEUE_CLASS;
+            }
+            if queued && let Some(dequeue) = (*previous_class).dequeue_task {
+                debug_assert!(dequeue(rq, p, dequeue_flags));
+            }
+            if running && let Some(put_prev) = (*previous_class).put_prev_task {
+                put_prev(rq, p);
+            }
+
+            apply_fields(p);
+
+            let mut enqueue_flags =
+                class::ENQUEUE_RESTORE | class::ENQUEUE_MOVE | class::ENQUEUE_NOCLOCK;
+            if class_changed {
+                enqueue_flags |= class::ENQUEUE_CLASS;
+            }
+            if queued {
+                if old_prio < new_prio {
+                    enqueue_flags |= class::ENQUEUE_HEAD;
+                }
+                if let Some(enqueue) = (*next_class).enqueue_task {
+                    enqueue(rq, p, enqueue_flags);
+                }
+            }
+            if running && let Some(set_next) = (*next_class).set_next_task {
+                set_next(rq, p, false);
+            }
+
+            if class_changed {
+                if let Some(switched_to) = (*next_class).switched_to {
+                    switched_to(rq, p);
+                }
+                if running && (*previous_class).class_prio < (*next_class).class_prio {
+                    set_task_need_resched(p);
+                }
+            } else if let Some(prio_changed) = (*next_class).prio_changed {
+                prio_changed(rq, p, old_prio);
+            }
+
+            Some(
+                !already_rescheduled && !resched_task.is_null() && task_needs_resched(resched_task),
+            )
+        });
+
+        match result {
+            Some(Some(newly_rescheduled)) => {
+                send_reschedule_ipi_for_transition(cpu, newly_rescheduled);
+                return;
+            }
+            Some(None) => continue,
+            None => {
+                // Early single-CPU initialization has no class runqueue yet.
+                // Such a task cannot be queued in a class-specific structure.
+                apply_fields(p);
+                return;
+            }
+        }
+    }
+}
+
+/// Linux `kernel/sched/core.c::rt_mutex_setprio()`.
+///
+/// Change only the effective priority and scheduler class. The configured
+/// policy and `normal_prio` remain untouched and are restored when `pi_task`
+/// becomes NULL.
+pub unsafe fn rt_mutex_setprio(p: *mut TaskStruct, pi_task: *mut TaskStruct) {
+    if p.is_null() {
+        return;
+    }
+    let normal_prio = unsafe { (*p).m29.normal_prio };
+    let new_prio = if pi_task.is_null() {
+        normal_prio
+    } else {
+        normal_prio.min(unsafe { (*pi_task).m29.prio })
+    };
+    if unsafe { (*p).m29.prio } == new_prio && new_prio >= 0 {
+        return;
+    }
+
+    // vendor/linux/kernel/sched/core.c::__setscheduler_class(). Lupos does
+    // not implement SCHED_EXT, so every non-DL/non-RT effective priority is
+    // governed by CFS regardless of the configured normal policy.
+    let next_class = if new_prio < 0 {
+        &deadline::DL_SCHED_CLASS as *const class::SchedClass
+    } else if new_prio < prio::MAX_RT_PRIO {
+        &rt::RT_SCHED_CLASS as *const class::SchedClass
+    } else {
+        &fair::FAIR_SCHED_CLASS as *const class::SchedClass
+    };
+
+    unsafe {
+        change_task_scheduler(p, next_class, new_prio, |task| {
+            (*task).m29.sched_class = next_class;
+            (*task).m29.prio = new_prio;
+        });
+    }
 }
 
 pub(crate) unsafe fn enqueue_on_rq(cpu: u32, task: *mut TaskStruct, flags: u32) {
@@ -1231,7 +1426,18 @@ unsafe fn pick_next_task(rq: &mut rq::Rq) -> *mut TaskStruct {
 /// `pick_next_task()` reaches its class `put_prev_task()` bookkeeping.
 unsafe fn prepare_prev_for_pick(this_rq: &mut rq::Rq, prev: *mut TaskStruct) {
     let prev_class = unsafe { task_class(prev) };
-    let prev_state = unsafe { (*prev).__state.load(Ordering::Acquire) };
+    let mut prev_state = unsafe { (*prev).__state.load(Ordering::Acquire) };
+    if prev_state & crate::kernel::task::task_state::TASK_INTERRUPTIBLE != 0
+        && crate::kernel::signal::has_pending_signals(prev)
+    {
+        unsafe {
+            (*prev).__state.store(
+                crate::kernel::task::task_state::TASK_RUNNING,
+                Ordering::Release,
+            );
+        }
+        prev_state = crate::kernel::task::task_state::TASK_RUNNING;
+    }
     if prev != this_rq.idle
         && prev_state & crate::kernel::task::task_state::NON_RUNNABLE_MASK != 0
         && unsafe { (*prev).m29.on_rq != 0 }
@@ -2516,28 +2722,37 @@ mod tests {
     }
 
     #[test]
-    fn kthread_stack_is_64k() {
-        assert_eq!(KTHREAD_STACK_SIZE, 64 * 1024);
+    fn kthread_stack_size_matches_profile_contract() {
+        if cfg!(debug_assertions) {
+            assert_eq!(KTHREAD_STACK_ORDER, 4);
+            assert_eq!(KTHREAD_STACK_SIZE, 64 * 1024);
+        } else {
+            assert_eq!(KTHREAD_STACK_ORDER, LINUX_X86_64_THREAD_SIZE_ORDER);
+            assert_eq!(KTHREAD_STACK_SIZE, 16 * 1024);
+        }
     }
 
     #[test]
     fn stack_top_for_sp_uses_kernel_thread_size_window() {
         assert_eq!(stack_top_for_sp(0), 0);
-        assert_eq!(stack_top_for_sp(0xffff), 0x10000);
-        assert_eq!(stack_top_for_sp(0x10000), 0x10000);
-        assert_eq!(stack_top_for_sp(0x10001), 0x20000);
+        assert_eq!(stack_top_for_sp(KTHREAD_STACK_SIZE - 1), KTHREAD_STACK_SIZE);
+        assert_eq!(stack_top_for_sp(KTHREAD_STACK_SIZE), KTHREAD_STACK_SIZE);
+        assert_eq!(
+            stack_top_for_sp(KTHREAD_STACK_SIZE + 1),
+            KTHREAD_STACK_SIZE * 2
+        );
 
         let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         let task_ptr = &mut *task as *mut TaskStruct;
         unsafe {
-            seed_current_task_stack_from_sp(task_ptr, 0xfff0);
+            seed_current_task_stack_from_sp(task_ptr, KTHREAD_STACK_SIZE - 16);
         }
-        assert_eq!(task.stack as usize, 0x10000);
+        assert_eq!(task.stack as usize, KTHREAD_STACK_SIZE);
         unsafe {
-            seed_current_task_stack_from_sp(task_ptr, 0x1fff0);
+            seed_current_task_stack_from_sp(task_ptr, KTHREAD_STACK_SIZE * 2 - 16);
         }
         assert_eq!(
-            task.stack as usize, 0x10000,
+            task.stack as usize, KTHREAD_STACK_SIZE,
             "once seeded, the saved task stack top must be owned by switch code"
         );
     }
@@ -2592,6 +2807,32 @@ mod tests {
         assert!(
             !body.contains("kernel::sched::schedule()"),
             "the BSP must not schedule unconditionally after every interrupt"
+        );
+    }
+
+    #[test]
+    fn login_stack_pid1_handoff_enters_linux_bsp_idle_after_first_schedule() {
+        // test-origin: linux:vendor/linux/init/main.c:rest_init
+        let source = include_str!("../../init/main.rs");
+        let body = source
+            .split("#[cfg(feature = \"test-login-stack\")]")
+            .nth(1)
+            .expect("login-stack PID1 handoff block must exist")
+            .split("#[cfg(not(feature = \"test-login-stack\"))]")
+            .next()
+            .expect("login-stack PID1 handoff block must precede non-login fallback");
+
+        assert!(
+            body.contains("unsafe { kernel::sched::schedule_with_irqs_enabled() };"),
+            "Linux rest_init() calls schedule_preempt_disabled() once before idle"
+        );
+        assert!(
+            body.contains("halt_loop_with_softirq();"),
+            "after the first schedule, the BSP must enter the common Linux idle loop"
+        );
+        assert!(
+            !body.contains("loop {"),
+            "login-stack images must not keep CPU0 in a private scheduler loop"
         );
     }
 

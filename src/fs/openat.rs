@@ -24,7 +24,7 @@ use super::file::{alloc_file, note_file_access_for_integrity, path_hint, set_pat
 use super::namei::{LookupCtx, validate_open_how};
 use super::ops::PATH_FILE_OPS;
 use super::permission::check_file_write_permission;
-use super::types::{DentryRef, FileRef, InodeKind};
+use super::types::{DentryRef, FileRef, InodeKind, touch_inode_now};
 
 const O_PATH_FLAGS: u32 = O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC;
 const S_IALLUGO: u32 = 0o7777;
@@ -336,6 +336,7 @@ fn do_openat2_with_path_hint(
             if let crate::fs::types::InodePrivate::RamBytes(m) = &inode.private {
                 m.lock().clear();
                 inode.size.store(0, core::sync::atomic::Ordering::Release);
+                touch_inode_now(&inode);
             }
         }
         let fops = if flags & O_PATH != 0 {
@@ -501,6 +502,7 @@ fn do_openat2_with_path_hint(
         if let crate::fs::types::InodePrivate::RamBytes(m) = &inode.private {
             m.lock().clear();
             inode.size.store(0, core::sync::atomic::Ordering::Release);
+            touch_inode_now(&inode);
         }
     }
 

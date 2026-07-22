@@ -15,14 +15,19 @@ use crate::fs::kernfs::KernfsNode;
 use crate::fs::ops::{FileOps, InodeOps};
 use crate::fs::types::{FileRef, Inode, InodeKind, InodePrivate, InodeRef};
 use crate::include::uapi::errno::{EBADF, EINVAL, ENOENT};
-use crate::kernel::{files, sched};
+use crate::kernel::{files, sched, task::TaskStruct};
 
 pub fn new_fd_dir() -> Arc<KernfsNode> {
     KernfsNode::new_dynamic_dir("fd", 0o555, Some(fd_dir_lookup), Some(fd_dir_readdir))
 }
 
 pub fn current_fd_path(fd: i32) -> Result<String, i32> {
-    let file = current_fd_file(fd)?;
+    let task = unsafe { sched::get_current() };
+    task_fd_path(task, fd)
+}
+
+fn task_fd_path(task: *mut TaskStruct, fd: i32) -> Result<String, i32> {
+    let file = task_fd_file(task, fd)?;
     Ok(crate::fs::file::path_hint(&file)
         .or_else(|| crate::fs::mount::stable_path_for_dentry(&file.dentry))
         .unwrap_or_else(|| file_path(&file)))
@@ -30,6 +35,10 @@ pub fn current_fd_path(fd: i32) -> Result<String, i32> {
 
 pub fn current_fd_file(fd: i32) -> Result<FileRef, i32> {
     let task = unsafe { sched::get_current() };
+    task_fd_file(task, fd)
+}
+
+fn task_fd_file(task: *mut TaskStruct, fd: i32) -> Result<FileRef, i32> {
     if task.is_null() {
         return Err(EBADF);
     }
@@ -37,8 +46,7 @@ pub fn current_fd_file(fd: i32) -> Result<FileRef, i32> {
     files.get(fd)
 }
 
-fn current_open_fds() -> Vec<i32> {
-    let task = unsafe { sched::get_current() };
+fn task_open_fds(task: *mut TaskStruct) -> Vec<i32> {
     if task.is_null() {
         return Vec::new();
     }
@@ -61,14 +69,16 @@ fn parse_fd_name(name: &str) -> Result<i32, i32> {
 
 fn fd_dir_lookup(dir: &InodeRef, name: &str) -> Result<InodeRef, i32> {
     let fd = parse_fd_name(name)?;
-    current_fd_file(fd).map_err(|_| ENOENT)?;
+    let task = task_from_fd_dir_inode(dir)?;
+    task_fd_file(task, fd).map_err(|_| ENOENT)?;
+    let pid = unsafe { (*task).pid };
     let inode = Inode::new(
         proc_fd_ino(fd),
         InodeKind::Symlink,
         0o777,
         &PROC_FD_SYMLINK_INODE_OPS,
         &PROC_FD_SYMLINK_FILE_OPS,
-        InodePrivate::Opaque(fd as usize),
+        InodePrivate::Opaque(pack_proc_fd(pid, fd)),
     );
     *inode.sb.lock() = dir.sb.lock().clone();
     Ok(inode)
@@ -78,7 +88,9 @@ fn fd_dir_readdir(file: &FileRef) -> Result<Option<(String, u64, InodeKind)>, i3
     if let Some(dot) = crate::fs::libfs::synthetic_readdir_dot_entry(file)? {
         return Ok(Some(dot));
     }
-    let fds = current_open_fds();
+    let inode = file.inode().ok_or(EINVAL)?;
+    let task = task_from_fd_dir_inode(&inode)?;
+    let fds = task_open_fds(task);
     let mut idx = file.pos.lock();
     let fd_idx = idx.saturating_sub(2) as usize;
     if fd_idx >= fds.len() {
@@ -120,14 +132,50 @@ static PROC_FD_SYMLINK_FILE_OPS: FileOps = FileOps {
 };
 
 fn proc_fd_readlink(inode: &InodeRef, buf: &mut [u8]) -> Result<usize, i32> {
-    let fd = match inode.private {
-        InodePrivate::Opaque(fd) => fd as i32,
+    let (pid, fd) = match inode.private {
+        InodePrivate::Opaque(value) => unpack_proc_fd(value),
         _ => return Err(EINVAL),
     };
-    let target = current_fd_path(fd).map_err(|_| ENOENT)?;
+    let task = crate::fs::proc::base::task_by_pid(pid);
+    if task.is_null() {
+        return Err(ENOENT);
+    }
+    let target = task_fd_path(task, fd).map_err(|_| ENOENT)?;
     let n = target.len().min(buf.len());
     buf[..n].copy_from_slice(&target.as_bytes()[..n]);
     Ok(n)
+}
+
+fn pack_proc_fd(pid: i32, fd: i32) -> usize {
+    ((pid.max(0) as u64) << 32 | fd.max(0) as u32 as u64) as usize
+}
+
+fn unpack_proc_fd(value: usize) -> (i32, i32) {
+    (((value as u64) >> 32) as i32, (value as u32) as i32)
+}
+
+fn task_from_proc_pid_name(name: &str) -> Result<*mut TaskStruct, i32> {
+    if name == "self" {
+        let task = unsafe { sched::get_current() };
+        return if task.is_null() {
+            Err(ENOENT)
+        } else {
+            Ok(task)
+        };
+    }
+    let pid = name.parse::<i32>().map_err(|_| ENOENT)?;
+    let task = crate::fs::proc::base::task_by_pid(pid);
+    if task.is_null() {
+        Err(ENOENT)
+    } else {
+        Ok(task)
+    }
+}
+
+fn task_from_fd_dir_inode(dir: &InodeRef) -> Result<*mut TaskStruct, i32> {
+    let node = crate::fs::kernfs::node_from_inode(dir);
+    let parent = node.parent.lock().upgrade().ok_or(EINVAL)?;
+    task_from_proc_pid_name(&parent.name)
 }
 
 static FDINFO_FILE_OPS: FileOps = FileOps {
@@ -177,14 +225,7 @@ pub fn current_fdinfo_file_from_proc_path(
     Some(current_fdinfo_file(fd, flags, mode))
 }
 
-/// Accept `/proc/<pid>/fd/` for the calling process itself, exactly like
-/// `/proc/self/fd/`.  Staged gdk-pixbuf 2.44 recovers an fd's filename with
-/// `readlink("/proc/%u/fd/%d")` (io-glycin-utils.c), i.e. the numeric-pid
-/// spelling of its own fd — without this the gdk-pixbuf→glycin bridge fails
-/// and every GTK icon decode silently yields nothing.  Foreign pids are not
-/// resolved here: that requires another task's fd table, which the dynamic
-/// shortcut deliberately does not reach for.
-fn strip_current_pid_fd_prefix(path: &str) -> Option<&str> {
+fn strip_numeric_pid_fd_prefix(path: &str) -> Option<(i32, &str)> {
     let rest = path.strip_prefix("/proc/")?;
     let digit_len = rest
         .as_bytes()
@@ -196,21 +237,30 @@ fn strip_current_pid_fd_prefix(path: &str) -> Option<&str> {
     }
     let pid = rest[..digit_len].parse::<i32>().ok()?;
     let rest = rest[digit_len..].strip_prefix("/fd/")?;
-    let task = unsafe { sched::get_current() };
-    if task.is_null() {
-        return None;
-    }
-    let (cur_pid, cur_tgid) = unsafe { ((*task).pid, (*task).tgid) };
-    (pid == cur_pid || pid == cur_tgid).then_some(rest)
+    Some((pid, rest))
 }
 
-fn parse_proc_fd_path(path: &str) -> Option<Result<(i32, &str), i32>> {
-    let rest = path
+fn parse_proc_fd_path(path: &str) -> Option<Result<(*mut TaskStruct, i32, &str), i32>> {
+    let (task, rest) = if let Some(rest) = path
         .strip_prefix("/proc/self/fd/")
         .or_else(|| path.strip_prefix("/dev/fd/"))
-        .or_else(|| strip_current_pid_fd_prefix(path))?;
+    {
+        let task = unsafe { sched::get_current() };
+        if task.is_null() {
+            return Some(Err(ENOENT));
+        }
+        (task, rest)
+    } else if let Some((pid, rest)) = strip_numeric_pid_fd_prefix(path) {
+        let task = crate::fs::proc::base::task_by_pid(pid);
+        if task.is_null() {
+            return Some(Err(ENOENT));
+        }
+        (task, rest)
+    } else {
+        return None;
+    };
     if rest.is_empty() {
-        return Some(Err(ENOENT));
+        return None;
     }
     let digit_len = rest
         .as_bytes()
@@ -228,7 +278,7 @@ fn parse_proc_fd_path(path: &str) -> Option<Result<(i32, &str), i32>> {
         Ok(fd) => fd,
         Err(_) => return Some(Err(ENOENT)),
     };
-    Some(Ok((fd, suffix)))
+    Some(Ok((task, fd, suffix)))
 }
 
 fn fdinfo_read(file: &FileRef, buf: &mut [u8], pos: &mut u64) -> Result<usize, i32> {
@@ -321,11 +371,11 @@ fn trace_fdinfo_read(fd: i32, result: Result<(), i32>, target_pid: Option<i32>) 
 fn trace_fdinfo_read(_fd: i32, _result: Result<(), i32>, _target_pid: Option<i32>) {}
 
 pub fn current_fd_path_from_proc_path(path: &str) -> Option<Result<String, i32>> {
-    let (fd, suffix) = match parse_proc_fd_path(path)? {
+    let (task, fd, suffix) = match parse_proc_fd_path(path)? {
         Ok(parts) => parts,
         Err(errno) => return Some(Err(errno)),
     };
-    Some(current_fd_path(fd).map(|mut base| {
+    Some(task_fd_path(task, fd).map(|mut base| {
         if suffix.is_empty() {
             return base;
         }
@@ -339,14 +389,14 @@ pub fn current_fd_path_from_proc_path(path: &str) -> Option<Result<String, i32>>
 }
 
 pub fn current_fd_file_from_proc_path(path: &str) -> Option<Result<FileRef, i32>> {
-    let (fd, suffix) = match parse_proc_fd_path(path)? {
+    let (task, fd, suffix) = match parse_proc_fd_path(path)? {
         Ok(parts) => parts,
         Err(errno) => return Some(Err(errno)),
     };
     if !suffix.is_empty() {
         return None;
     }
-    Some(current_fd_file(fd))
+    Some(task_fd_file(task, fd))
 }
 
 #[cfg(test)]
@@ -358,6 +408,7 @@ mod tests {
     use crate::fs::dcache::d_alloc;
     use crate::fs::fdtable::FilesStruct;
     use crate::fs::file::{alloc_file, set_path_hint};
+    use crate::fs::kernfs::lookup;
     use crate::fs::ops::NOOP_FILE_OPS;
     use crate::fs::read_write::vfs_read;
     use crate::fs::types::SuperBlock;
@@ -410,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn proc_numeric_pid_fd_path_resolves_for_current_task_only() {
+    fn proc_numeric_pid_fd_path_resolves_for_current_task() {
         let previous = unsafe { sched::get_current() };
 
         let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
@@ -436,8 +487,14 @@ mod tests {
                 current_fd_path_from_proc_path("/proc/self/fd/5"),
                 Some(Ok(String::from("/newroot/usr")))
             );
-            // Foreign pids are not served by the dynamic shortcut.
-            assert_eq!(current_fd_path_from_proc_path("/proc/435/fd/5"), None);
+            assert_eq!(current_fd_path_from_proc_path("/proc/self/fd/"), None);
+            assert!(current_fd_file_from_proc_path("/proc/self/fd/").is_none());
+            // A numeric proc-fd path with no live task now fails like procfs
+            // lookup instead of silently falling through as a non-proc path.
+            assert_eq!(
+                current_fd_path_from_proc_path("/proc/435/fd/5"),
+                Some(Err(ENOENT))
+            );
             // Unknown fds under the caller's own pid report EBADF, matching
             // the existing /proc/self/fd shortcut behaviour.
             assert_eq!(
@@ -468,7 +525,9 @@ mod tests {
             sched::set_current(&mut *current as *mut TaskStruct);
 
             let sb = SuperBlock::alloc("proc", 0x9fa0, &crate::fs::proc::PROCFS_SUPER_OPS);
-            let fd_dir = new_fd_dir();
+            let self_dir = KernfsNode::new_dir("self", 0o555);
+            crate::fs::proc::base::add_tgid_base(&self_dir);
+            let fd_dir = lookup(&self_dir, "fd").expect("/proc/self/fd");
             let dir_inode = crate::fs::kernfs::inode_for_node(&sb, fd_dir);
             let dir_dentry = d_alloc("fd");
             dir_dentry.instantiate(dir_inode.clone());

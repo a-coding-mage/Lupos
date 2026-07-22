@@ -74,6 +74,9 @@ pub fn check_inode_write_permission(inode: &InodeRef) -> Result<(), i32> {
 
 pub fn check_file_write_permission(dentry: &DentryRef, inode: &InodeRef) -> Result<(), i32> {
     check_file_write_mount(dentry, inode.kind)?;
+    if crate::fs::proc::base::proc_comm_write_allowed(inode) {
+        return Ok(());
+    }
     check_inode_write_permission(inode)
 }
 

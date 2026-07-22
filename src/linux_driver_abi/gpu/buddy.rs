@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/gpu/buddy.c
+//! test-origin: linux:vendor/linux/drivers/gpu/buddy.c
 //! Core GPU buddy allocator ABI used by vendor-built DRM drivers.
 //!
 //! Lupos loads the GPU drivers from `vendor/linux`; this module only resolves

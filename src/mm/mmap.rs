@@ -50,7 +50,8 @@ use crate::mm::vm_flags::{
     VM_NORESERVE, VM_READ, VM_SHARED, VM_WRITE, VmFlags,
 };
 use crate::mm::vma::{
-    find_vma, find_vma_prev, insert_vma, vm_area_free, vm_area_try_dup, vma_file_put_raw, vma_merge,
+    find_vma, find_vma_prev, insert_vma, vm_area_free, vm_area_try_dup, vma_file_put_raw,
+    vma_merge, vma_open,
 };
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
@@ -1230,6 +1231,7 @@ pub unsafe fn do_munmap(mm: &mut MmStruct, start: u64, len: u64) -> Result<(), i
     let mut removed_count = 0usize;
 
     let mut prepared_right = core::ptr::null_mut();
+    let mut split_right = core::ptr::null_mut();
     if let Some((vstart, vend_inclusive, entry)) = mm.mm_mt.find(start, tree_end) {
         if vstart < start && vend_inclusive >= end {
             let source = entry as *const VmAreaStruct;
@@ -1336,6 +1338,7 @@ pub unsafe fn do_munmap(mm: &mut MmStruct, start: u64, len: u64) -> Result<(), i
                 (*right).vm_start = isect_end;
                 (*right).vm_pgoff += (isect_end - vstart) >> PAGE_SHIFT;
                 (*mm_ptr).map_count = (*mm_ptr).map_count.saturating_add(1);
+                split_right = right;
                 MapleRangeEdit::Split {
                     left_start: vstart,
                     left_end: isect_start - 1,
@@ -1349,6 +1352,11 @@ pub unsafe fn do_munmap(mm: &mut MmStruct, start: u64, len: u64) -> Result<(), i
     }?;
     debug_assert!(edited > 0 || prepared_right.is_null());
     debug_assert!(prepared_right.is_null());
+    if !split_right.is_null() {
+        unsafe {
+            vma_open(split_right);
+        }
+    }
 
     // Linux's vms_complete_munmap_vmas() likewise invokes remove_vma() only
     // after the VMAs have been detached from the primary Maple Tree.
