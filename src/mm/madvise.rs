@@ -1,7 +1,11 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/mm/madvise.c
 //! test-origin: linux:vendor/linux/mm/madvise.c
-use crate::arch::x86::mm::paging::{PAGE_MASK, PAGE_SHIFT, PAGE_SIZE};
+use crate::arch::x86::mm::paging::{
+    _PAGE_TABLE, PAGE_MASK, PAGE_SHIFT, PAGE_SIZE, flush_tlb_page, p4d_offset, pgd_none,
+    pgd_offset_pgd, pgd_t, pmd_alloc, pmd_huge, pmd_none, pmd_offset, pte_alloc, pte_clear,
+    pte_offset_kernel, pte_t, ptep_get, pud_alloc, pud_huge, pud_none, pud_offset, set_pte_at,
+};
 /// Memory advice — `madvise`.
 ///
 /// Implements the subset of `madvise` behaviors relevant for anonymous memory
@@ -19,8 +23,9 @@ use crate::arch::x86::mm::paging::{PAGE_MASK, PAGE_SHIFT, PAGE_SIZE};
 /// - Linux `include/uapi/asm-generic/mman-common.h` — MADV_* values
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
 use crate::mm::mmap::unmap_page_range;
+use crate::mm::swap::{PTE_MARKER_GUARD, is_guard_pte_marker, make_pte_marker};
 use crate::mm::vm_flags::{
-    VM_DONTCOPY, VM_HUGEPAGE, VM_HUGETLB, VM_NOHUGEPAGE, VM_READ, VM_WRITE, VmFlags,
+    VM_DONTCOPY, VM_HUGEPAGE, VM_HUGETLB, VM_LOCKED, VM_NOHUGEPAGE, VM_READ, VM_SPECIAL, VM_WRITE,
 };
 use crate::mm::vma::{find_vma, vma_split};
 
@@ -53,6 +58,117 @@ pub const MADV_POPULATE_READ: i32 = 22;
 pub const MADV_POPULATE_WRITE: i32 = 23;
 pub const MADV_DONTNEED_LOCKED: i32 = 24;
 pub const MADV_COLLAPSE: i32 = 25;
+pub const MADV_GUARD_INSTALL: i32 = 102;
+pub const MADV_GUARD_REMOVE: i32 = 103;
+
+fn is_valid_guard_vma(vma: *const VmAreaStruct, allow_locked: bool) -> bool {
+    let mut disallowed = VM_SPECIAL | VM_HUGETLB;
+    if !allow_locked {
+        disallowed |= VM_LOCKED;
+    }
+    unsafe { (*vma).vm_flags & disallowed == 0 }
+}
+
+unsafe fn guard_pte_alloc(mm: &mut MmStruct, addr: u64) -> Result<*mut pte_t, i32> {
+    const ENOMEM: i32 = -12;
+
+    let pgd_base = mm.pgd as *mut pgd_t;
+    if pgd_base.is_null() {
+        return Err(ENOMEM);
+    }
+    let pgdp = unsafe { pgd_offset_pgd(pgd_base, addr) };
+    let pudp = unsafe { pud_alloc(pgdp, addr, _PAGE_TABLE) }.ok_or(ENOMEM)?;
+    let pmdp = unsafe { pmd_alloc(pudp, addr, _PAGE_TABLE) }.ok_or(ENOMEM)?;
+    unsafe { pte_alloc(pmdp, addr, _PAGE_TABLE) }.ok_or(ENOMEM)
+}
+
+unsafe fn guard_pte_lookup(mm: &MmStruct, addr: u64) -> Option<*mut pte_t> {
+    let pgd_base = mm.pgd as *mut pgd_t;
+    if pgd_base.is_null() {
+        return None;
+    }
+    let pgdp = unsafe { pgd_offset_pgd(pgd_base, addr) };
+    if unsafe { pgd_none(*pgdp) } {
+        return None;
+    }
+    let p4dp = unsafe { p4d_offset(pgdp, addr) };
+    let pudp = unsafe { pud_offset(p4dp, addr) };
+    if unsafe { pud_none(*pudp) || pud_huge(*pudp) } {
+        return None;
+    }
+    let pmdp = unsafe { pmd_offset(pudp, addr) };
+    if unsafe { pmd_none(*pmdp) || pmd_huge(*pmdp) } {
+        return None;
+    }
+    Some(unsafe { pte_offset_kernel(pmdp, addr) })
+}
+
+unsafe fn madvise_guard_install(
+    mm: &mut MmStruct,
+    vma: *mut VmAreaStruct,
+    start: u64,
+    end: u64,
+) -> Result<(), i32> {
+    const EINVAL: i32 = -22;
+
+    if !is_valid_guard_vma(vma, false) {
+        return Err(EINVAL);
+    }
+    if crate::mm::fault::vma_is_anonymous(vma) {
+        // Linux also sets VMA_MAYBE_GUARD so fork copies guard-marker PTEs.
+        // Lupos does not model that VMA flag yet; preparing anon_vma preserves
+        // the same fork-copy behavior for the anonymous path exercised here.
+        unsafe { crate::mm::rmap::anon_vma_prepare(vma)? };
+    }
+
+    unsafe {
+        unmap_page_range(mm, start, end);
+    }
+
+    let mm_ptr = mm as *mut MmStruct;
+    let mut addr = start;
+    while addr < end {
+        let ptep = unsafe { guard_pte_alloc(mm, addr)? };
+        unsafe {
+            set_pte_at(
+                mm_ptr.cast::<()>(),
+                addr,
+                ptep,
+                make_pte_marker(PTE_MARKER_GUARD),
+            );
+        }
+        flush_tlb_page(addr);
+        addr += PAGE_SIZE;
+    }
+    Ok(())
+}
+
+unsafe fn madvise_guard_remove(
+    mm: &mut MmStruct,
+    vma: *mut VmAreaStruct,
+    start: u64,
+    end: u64,
+) -> Result<(), i32> {
+    const EINVAL: i32 = -22;
+
+    if !is_valid_guard_vma(vma, true) {
+        return Err(EINVAL);
+    }
+
+    let mm_ptr = mm as *mut MmStruct;
+    let mut addr = start;
+    while addr < end {
+        if let Some(ptep) = unsafe { guard_pte_lookup(mm, addr) } {
+            let pte = unsafe { ptep_get(ptep) };
+            if is_guard_pte_marker(pte) {
+                pte_clear(mm_ptr.cast::<()>(), addr, ptep);
+                flush_tlb_page(addr);
+            }
+        }
+        addr += PAGE_SIZE;
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // madvise_vma_behavior — apply advice to one VMA sub-range
@@ -69,6 +185,8 @@ pub const MADV_COLLAPSE: i32 = 25;
 ///   `VM_READ` (`EINVAL`) or a page cannot be allocated (`ENOMEM`).
 /// - `MADV_POPULATE_WRITE`: pre-fault each page writable; error if VMA lacks
 ///   `VM_WRITE` (`EINVAL`).
+/// - `MADV_GUARD_INSTALL` / `MADV_GUARD_REMOVE`: install/remove Linux PTE
+///   guard markers; later access faults with `VM_FAULT_SIGSEGV`.
 /// - `MADV_NORMAL`, `MADV_RANDOM`, `MADV_SEQUENTIAL`, `MADV_WILLNEED`:
 ///   readahead hints — accepted as no-ops (M16 adds readahead).
 /// - All others: `EINVAL`.
@@ -100,6 +218,12 @@ pub unsafe fn madvise_vma_behavior(
             }
             Ok(())
         }
+
+        // ── MADV_GUARD_INSTALL / MADV_GUARD_REMOVE: PTE guard markers ─────
+        //
+        // Ref: Linux `madvise_guard_install()` / `madvise_guard_remove()`.
+        MADV_GUARD_INSTALL => unsafe { madvise_guard_install(mm, vma, start, end) },
+        MADV_GUARD_REMOVE => unsafe { madvise_guard_remove(mm, vma, start, end) },
 
         // ── MADV_REMOVE: punch a hole in a shared file-backed range ────────
         //
@@ -335,12 +459,24 @@ pub unsafe fn do_madvise(mm: &mut MmStruct, start: u64, len: u64, advice: i32) -
 mod tests {
     extern crate std;
     use super::*;
+    use crate::arch::x86::mm::paging;
+    use crate::mm::fault::{FAULT_FLAG_USER, VM_FAULT_SIGSEGV, handle_mm_fault};
     use crate::mm::mm_types::MmStruct;
     use crate::mm::mmap::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, do_mmap};
     use crate::mm::test_lock::GLOBAL_HW_TEST_LOCK as TEST_LOCK;
+    use crate::mm::vma::find_vma;
 
     fn make_mm() -> MmStruct {
         MmStruct::new(0)
+    }
+
+    fn make_paged_mm() -> MmStruct {
+        MmStruct::new(paging::init_pgd_for_test() as usize)
+    }
+
+    unsafe fn pte_for(mm: &MmStruct, addr: u64) -> paging::pte_t {
+        let ptep = unsafe { guard_pte_lookup(mm, addr).expect("PTE table must exist") };
+        unsafe { paging::ptep_get(ptep) }
     }
 
     // ── Test 1 ─────────────────────────────────────────────────────────────────
@@ -428,5 +564,88 @@ mod tests {
 
         let r = unsafe { do_madvise(&mut mm, 0x10000, 0x10000, 9999) };
         assert_eq!(r, Err(-22)); // EINVAL
+    }
+
+    #[test]
+    fn madvise_guard_install_sets_marker_that_faults_sigsegv() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mm = make_paged_mm();
+
+        unsafe {
+            do_mmap(
+                &mut mm,
+                0x10000,
+                0x10000,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                0,
+                0,
+            )
+        }
+        .unwrap();
+
+        let r = unsafe { do_madvise(&mut mm, 0x10000, 0x1000, MADV_GUARD_INSTALL) };
+        assert_eq!(r, Ok(()));
+
+        let pte = unsafe { pte_for(&mm, 0x10000) };
+        assert!(crate::mm::swap::is_guard_pte_marker(pte));
+
+        let vma = find_vma(&mm, 0x10000).unwrap();
+        assert_eq!(
+            handle_mm_fault(vma, 0x10000, FAULT_FLAG_USER),
+            VM_FAULT_SIGSEGV
+        );
+    }
+
+    #[test]
+    fn madvise_guard_remove_clears_only_guard_marker() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mm = make_paged_mm();
+
+        unsafe {
+            do_mmap(
+                &mut mm,
+                0x10000,
+                0x10000,
+                PROT_READ,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                0,
+                0,
+            )
+        }
+        .unwrap();
+
+        unsafe { do_madvise(&mut mm, 0x10000, 0x1000, MADV_GUARD_INSTALL) }.unwrap();
+        unsafe { do_madvise(&mut mm, 0x10000, 0x1000, MADV_GUARD_REMOVE) }.unwrap();
+
+        let pte = unsafe { pte_for(&mm, 0x10000) };
+        assert!(paging::pte_none(pte), "guard remove must clear the marker");
+    }
+
+    #[test]
+    fn madvise_guard_install_rejects_locked_vma_like_linux() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mm = make_paged_mm();
+
+        unsafe {
+            do_mmap(
+                &mut mm,
+                0x10000,
+                0x10000,
+                PROT_READ,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                0,
+                0,
+            )
+        }
+        .unwrap();
+
+        let vma = find_vma(&mm, 0x10000).unwrap();
+        unsafe {
+            (*vma).vm_flags |= VM_LOCKED;
+        }
+
+        let r = unsafe { do_madvise(&mut mm, 0x10000, 0x1000, MADV_GUARD_INSTALL) };
+        assert_eq!(r, Err(-22));
     }
 }

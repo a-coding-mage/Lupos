@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/base/firmware_loader
+//! test-origin: linux:vendor/linux/drivers/base/firmware_loader
 //! Firmware loader ABI for vendor-built modules.
 //!
 //! Lupos does not yet provide a firmware filesystem loader to Linux modules.

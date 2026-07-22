@@ -52,6 +52,18 @@ config SERIAL_8250
 	bool "8250/16550 serial port support"
 	default y
 
+config HW_RANDOM
+	tristate "Hardware Random Number Generator Core support"
+	default n
+
+config NVRAM
+	tristate "Non-volatile RAM support"
+	default n
+
+config CONNECTOR
+	tristate "Connector - unified userspace <-> kernelspace linker"
+	default n
+
 config FRAMEBUFFER
 	bool "Framebuffer console support"
 	default y
@@ -125,6 +137,51 @@ config HID
 	depends on INPUT
 	default y
 
+config INPUT_EVDEV
+	tristate "Event interface"
+	depends on INPUT
+	default n
+
+config HID_GYRATION
+	tristate "Gyration remote control"
+	depends on HID
+	default n
+
+config HID_NTRIG
+	tristate "N-Trig touch screen"
+	depends on HID
+	default n
+
+config HID_PANTHERLORD
+	tristate "Pantherlord/GreenAsia game controller"
+	depends on HID
+	default n
+
+config HID_PETALYNX
+	tristate "Petalynx Maxter remote control"
+	depends on HID
+	default n
+
+config HID_SAMSUNG
+	tristate "Samsung infrared remote control"
+	depends on HID
+	default n
+
+config HID_SONY
+	tristate "Sony controller"
+	depends on HID
+	default n
+
+config HID_SUNPLUS
+	tristate "Sunplus wireless desktop"
+	depends on HID
+	default n
+
+config HID_TOPSEED
+	tristate "TopSeed Cyberlink remote control"
+	depends on HID
+	default n
+
 menu "I2C support"
 
 config I2C
@@ -159,6 +216,11 @@ config USB_XHCI
 	bool "xHCI host controller support"
 	depends on USB && PCI
 	default y
+
+config USB_XHCI_HCD
+	tristate "xHCI HCD (USB 3.0) support"
+	depends on USB_XHCI && PCI
+	default n
 
 config USB_PCI
 	bool "PCI based USB host interface"
@@ -207,6 +269,146 @@ menu "Network device support"
 config NET
 	bool "Networking support"
 	default y
+
+config PACKET
+	tristate "Packet socket"
+	depends on NET
+	default n
+
+config XFRM_USER
+	tristate "Transformation user configuration interface"
+	depends on NET
+	default n
+
+config INET6_AH
+	tristate "IPv6: AH transformation"
+	depends on NET
+	default n
+
+config INET6_ESP
+	tristate "IPv6: ESP transformation"
+	depends on NET
+	default n
+
+config NF_CONNTRACK
+	tristate "Netfilter connection tracking support"
+	depends on NET
+	default n
+
+config NF_CONNTRACK_FTP
+	tristate "FTP protocol support"
+	depends on NF_CONNTRACK
+	default n
+
+config NF_CONNTRACK_IRC
+	tristate "IRC protocol support"
+	depends on NF_CONNTRACK
+	default n
+
+config NF_CONNTRACK_SIP
+	tristate "SIP protocol support"
+	depends on NF_CONNTRACK
+	default n
+
+config NF_CT_NETLINK
+	tristate "Connection tracking netlink interface"
+	depends on NF_CONNTRACK
+	default n
+
+config NF_NAT
+	tristate "Netfilter NAT"
+	depends on NF_CONNTRACK
+	default n
+
+config NETFILTER_XT_TARGET_CONNSECMARK
+	tristate "CONNSECMARK target support"
+	depends on NET
+	default n
+
+config NETFILTER_XT_TARGET_NFLOG
+	tristate "NFLOG target support"
+	depends on NET
+	default n
+
+config NETFILTER_XT_TARGET_SECMARK
+	tristate "SECMARK target support"
+	depends on NET
+	default n
+
+config NETFILTER_XT_TARGET_TCPMSS
+	tristate "TCPMSS target support"
+	depends on NET
+	default n
+
+config NETFILTER_XT_MATCH_CONNTRACK
+	tristate "conntrack match support"
+	depends on NF_CONNTRACK
+	default n
+
+config NETFILTER_XT_MATCH_POLICY
+	tristate "IPsec policy match support"
+	depends on NET
+	default n
+
+config NETFILTER_XT_MATCH_STATE
+	tristate "state match support"
+	depends on NF_CONNTRACK
+	default n
+
+config IP_NF_FILTER
+	tristate "IPv4 packet filtering"
+	depends on NET
+	default n
+
+config IP_NF_TARGET_REJECT
+	tristate "IPv4 REJECT target"
+	depends on IP_NF_FILTER
+	default n
+
+config IP_NF_MANGLE
+	tristate "IPv4 packet mangling"
+	depends on NET
+	default n
+
+config IP6_NF_MATCH_IPV6HEADER
+	tristate "IPv6 header match"
+	depends on NET
+	default n
+
+config IP6_NF_FILTER
+	tristate "IPv6 packet filtering"
+	depends on NET
+	default n
+
+config IP6_NF_TARGET_REJECT
+	tristate "IPv6 REJECT target"
+	depends on IP6_NF_FILTER
+	default n
+
+config IP6_NF_MANGLE
+	tristate "IPv6 packet mangling"
+	depends on NET
+	default n
+
+config NET_CLS_CGROUP
+	tristate "Control Group Classifier"
+	depends on NET
+	default n
+
+config CFG80211
+	tristate "Wireless configuration API"
+	depends on NET
+	default n
+
+config MAC80211
+	tristate "Generic IEEE 802.11 Networking Stack"
+	depends on CFG80211
+	default n
+
+config RFKILL
+	tristate "RF switch subsystem support"
+	depends on NET
+	default n
 
 config NETDEVICES
 	bool "Network device support"
@@ -313,6 +515,34 @@ config X86_PKG_TEMP_THERMAL
 	select INTEL_TCC
 	default m if MODULES
 
+config CPU_FREQ_GOV_ONDEMAND
+	tristate "CPUfreq ondemand governor"
+	depends on X86_64
+	default n
+
+endmenu
+
+menu "Platform support"
+
+config PCCARD
+	tristate "PCCard (PCMCIA/CardBus) support"
+	depends on PCI
+	default n
+
+config YENTA
+	tristate "CardBus yenta-compatible bridge support"
+	depends on PCCARD && PCI
+	default n
+
+config MAC_EMUMOUSEBTN
+	tristate "Support for mouse button 2+3 emulation"
+	default n
+
+config EEEPC_LAPTOP
+	tristate "Eee PC Hotkey Driver"
+	depends on ACPI
+	default n
+
 endmenu
 
 menu "Sound support"
@@ -411,6 +641,31 @@ config SND_HDA_GENERIC
 endmenu
 
 menu "SCSI and ATA storage"
+
+config BLK_DEV_LOOP
+	tristate "Loopback device support"
+	depends on BLOCK
+	default n
+
+config BLK_DEV_MD
+	tristate "Multiple devices driver support"
+	depends on BLOCK
+	default n
+
+config BLK_DEV_DM
+	tristate "Device mapper support"
+	depends on BLOCK
+	default n
+
+config DM_MIRROR
+	tristate "Mirror target"
+	depends on BLK_DEV_DM
+	default n
+
+config DM_ZERO
+	tristate "Zero target"
+	depends on BLK_DEV_DM
+	default n
 
 config SCSI_COMMON
 	tristate

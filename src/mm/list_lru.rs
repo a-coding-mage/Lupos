@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/mm/list_lru.c
+//! test-origin: linux:vendor/linux/mm/list_lru.c
 //! List-LRU core ABI used by Linux-built shrinkers.
 
 use core::ffi::c_void;

@@ -206,7 +206,7 @@ fn record_slab_free_rejection(
     cursor: usize,
 ) {
     LAST_REJECTED_FREE_PTR.store(ptr as usize, Ordering::Release);
-    LAST_REJECTED_FREE_HEAD_PFN.store(page_to_pfn(head_page), Ordering::Release);
+    LAST_REJECTED_FREE_HEAD_PFN.store(slab_page_to_pfn(head_page), Ordering::Release);
     LAST_REJECTED_FREE_REASON.store(reason, Ordering::Release);
     LAST_REJECTED_FREE_CACHE.store(cache as *const KmemCache as usize, Ordering::Release);
     LAST_REJECTED_FREE_OBJECT_SIZE.store(cache.object_size, Ordering::Release);
@@ -350,7 +350,7 @@ impl KmemCache {
     /// Ref: Linux `mm/slub.c` — `new_slab()`
     unsafe fn new_slab(&mut self, gfp: GfpFlags) -> Option<*mut Page> {
         let (head_page, mem) = unsafe { alloc_slab_page(self.order, gfp)? };
-        let head_pfn = page_to_pfn(head_page);
+        let head_pfn = slab_page_to_pfn(head_page);
         let n_pages = 1usize << self.order;
 
         // Mark ALL pages in this slab block.
@@ -358,7 +358,7 @@ impl KmemCache {
         // Non-head pages: private = (head_pfn << 1) | 1 (low bit = non-head flag).
         unsafe {
             for i in 0..n_pages {
-                let p = pfn_to_page(head_pfn + i);
+                let p = slab_pfn_to_page(head_pfn + i);
                 (*p).page_type
                     .store(encode_page_type(PGTY_SLAB), Ordering::Relaxed);
                 if i == 0 {
@@ -458,7 +458,7 @@ impl KmemCache {
     ///
     /// Ref: Linux `mm/slub.c` — `slab_free()`
     pub unsafe fn free_object(&mut self, head_page: *mut Page, ptr: *mut u8) -> bool {
-        let slab_start = page_to_pfn(head_page).saturating_mul(PAGE_SIZE);
+        let slab_start = slab_page_to_pfn(head_page).saturating_mul(PAGE_SIZE);
         #[cfg(not(test))]
         let slab_start = phys_to_virt(slab_start as u64) as usize;
         let object_bytes = self.objects_per_slab.saturating_mul(self.size);
@@ -619,6 +619,85 @@ static mut TEST_PHYS: TestPhysMem = TestPhysMem([0u8; PAGE_SIZE * TEST_N_PAGES])
 #[cfg(test)]
 static mut TEST_META: [Page; TEST_N_PAGES] = [const { Page::new() }; TEST_N_PAGES];
 
+#[cfg(test)]
+fn test_meta_ptr() -> *mut Page {
+    core::ptr::addr_of_mut!(TEST_META).cast::<Page>()
+}
+
+#[cfg(test)]
+fn test_pool_page_for_index(idx: usize) -> Option<*mut Page> {
+    if idx < TEST_N_PAGES {
+        Some(unsafe { test_meta_ptr().add(idx) })
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn test_pool_page_index(page: *const Page) -> Option<usize> {
+    let base = test_meta_ptr() as usize;
+    let addr = page as usize;
+    let size = core::mem::size_of::<Page>();
+    let end = base.saturating_add(TEST_N_PAGES.saturating_mul(size));
+    if addr < base || addr >= end || (addr - base) % size != 0 {
+        return None;
+    }
+    Some((addr - base) / size)
+}
+
+#[cfg(test)]
+fn test_pool_page_for_pfn(pfn: usize) -> Option<*mut Page> {
+    let base_pfn = TEST_BASE_PFN.load(Ordering::SeqCst);
+    let idx = pfn.checked_sub(base_pfn)?;
+    test_pool_page_for_index(idx)
+}
+
+#[cfg(test)]
+fn test_pool_page_for_address(addr: usize) -> Option<*mut Page> {
+    let mem_base = TEST_MEM_PTR.load(Ordering::SeqCst);
+    if mem_base == 0 {
+        return None;
+    }
+    let end = mem_base.saturating_add(PAGE_SIZE.saturating_mul(TEST_N_PAGES));
+    if addr < mem_base || addr >= end {
+        return None;
+    }
+    test_pool_page_for_index((addr - mem_base) / PAGE_SIZE)
+}
+
+#[cfg(test)]
+fn slab_pfn_to_page(pfn: usize) -> *mut Page {
+    if let Some(page) = test_pool_page_for_pfn(pfn) {
+        return page;
+    }
+    if crate::mm::buddy::pfn_valid(pfn) {
+        pfn_to_page(pfn)
+    } else {
+        core::ptr::null_mut()
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn slab_pfn_to_page(pfn: usize) -> *mut Page {
+    pfn_to_page(pfn)
+}
+
+#[cfg(test)]
+fn slab_page_to_pfn(page: *const Page) -> usize {
+    if let Some(idx) = test_pool_page_index(page) {
+        TEST_BASE_PFN.load(Ordering::SeqCst) + idx
+    } else {
+        page_to_pfn(page)
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn slab_page_to_pfn(page: *const Page) -> usize {
+    page_to_pfn(page)
+}
+
 /// Test-only slab page allocator.
 ///
 /// Hands out consecutive 4 KiB pages from the static TEST_PHYS pool.
@@ -629,7 +708,6 @@ static mut TEST_META: [Page; TEST_N_PAGES] = [const { Page::new() }; TEST_N_PAGE
 unsafe fn alloc_slab_page(order: usize, _gfp: GfpFlags) -> Option<(*mut Page, *mut u8)> {
     let n = 1usize << order;
     let mem_base = TEST_MEM_PTR.load(Ordering::SeqCst);
-    let base_pfn = TEST_BASE_PFN.load(Ordering::SeqCst);
     if mem_base == 0 {
         return None;
     }
@@ -651,11 +729,11 @@ unsafe fn alloc_slab_page(order: usize, _gfp: GfpFlags) -> Option<(*mut Page, *m
     unsafe {
         core::ptr::write_bytes(mem, 0, PAGE_SIZE * n);
     }
-    let page = pfn_to_page(base_pfn + idx);
+    let page = test_pool_page_for_index(idx)?;
     // Ensure non-head pages have been init'd (new_slab marks them itself,
     // but we guarantee lru is initialised here).
     for i in 1..n {
-        let p = pfn_to_page(base_pfn + idx + i);
+        let p = test_pool_page_for_index(idx + i)?;
         unsafe {
             core::ptr::write(p, Page::new());
             (*p).init_lru();
@@ -668,11 +746,13 @@ unsafe fn alloc_slab_page(order: usize, _gfp: GfpFlags) -> Option<(*mut Page, *m
 #[cfg(test)]
 #[allow(dead_code)]
 unsafe fn free_slab_page(page: *mut Page, order: usize) {
-    let base_pfn = TEST_BASE_PFN.load(Ordering::SeqCst);
-    let pfn = page_to_pfn(page);
-    let idx = pfn.saturating_sub(base_pfn);
+    let Some(idx) = test_pool_page_index(page) else {
+        return;
+    };
     for i in 0..(1usize << order) {
-        let p = pfn_to_page(base_pfn + idx + i);
+        let Some(p) = test_pool_page_for_index(idx + i) else {
+            return;
+        };
         unsafe {
             core::ptr::write(p, Page::new());
             (*p).init_lru();
@@ -797,9 +877,19 @@ pub unsafe fn kfree(ptr: *mut u8) {
     }
 
     #[cfg(test)]
-    let pfn = ptr as usize / PAGE_SIZE;
+    let page = match test_pool_page_for_address(ptr as usize) {
+        Some(page) => page,
+        None => {
+            let pfn = ptr as usize / PAGE_SIZE;
+            if crate::mm::buddy::pfn_valid(pfn) {
+                pfn_to_page(pfn)
+            } else {
+                return;
+            }
+        }
+    };
     #[cfg(not(test))]
-    let pfn = {
+    let page = {
         let addr = ptr as u64;
         // A kfree target must live in the kernel direct map (vmalloc was handled
         // above). A pointer below PAGE_OFFSET is not an object this allocator
@@ -816,9 +906,9 @@ pub unsafe fn kfree(ptr: *mut u8) {
             );
             return;
         }
-        ((addr - crate::arch::x86::mm::paging::PAGE_OFFSET) as usize) / PAGE_SIZE
+        let pfn = ((addr - crate::arch::x86::mm::paging::PAGE_OFFSET) as usize) / PAGE_SIZE;
+        pfn_to_page(pfn)
     };
-    let page = pfn_to_page(pfn);
     let page_type = decode_page_type(unsafe { (*page).page_type.load(Ordering::Relaxed) });
 
     if page_type == PGTY_SLAB {
@@ -829,7 +919,7 @@ pub unsafe fn kfree(ptr: *mut u8) {
             if private & 1 == 1 {
                 // Non-head page: redirect to head.
                 // Ref: Linux `compound_head()` for multi-page slabs.
-                pfn_to_page(private >> 1)
+                slab_pfn_to_page(private >> 1)
             } else {
                 page
             }
@@ -885,22 +975,32 @@ pub fn ksize(ptr: *const u8) -> usize {
         return crate::mm::vmalloc::vmalloc_usable_size(ptr);
     }
     #[cfg(test)]
-    let pfn = ptr as usize / PAGE_SIZE;
+    let page = match test_pool_page_for_address(ptr as usize) {
+        Some(page) => page,
+        None => {
+            let pfn = ptr as usize / PAGE_SIZE;
+            if crate::mm::buddy::pfn_valid(pfn) {
+                pfn_to_page(pfn)
+            } else {
+                return 0;
+            }
+        }
+    };
     #[cfg(not(test))]
-    let pfn = {
+    let page = {
         let addr = ptr as u64;
         if addr < crate::arch::x86::mm::paging::PAGE_OFFSET {
             return 0;
         }
-        ((addr - crate::arch::x86::mm::paging::PAGE_OFFSET) as usize) / PAGE_SIZE
+        let pfn = ((addr - crate::arch::x86::mm::paging::PAGE_OFFSET) as usize) / PAGE_SIZE;
+        pfn_to_page(pfn)
     };
-    let page = pfn_to_page(pfn);
     let page_type = decode_page_type(unsafe { (*page).page_type.load(Ordering::Relaxed) });
     if page_type == PGTY_SLAB {
         let head_page = unsafe {
             let private = (*page).private;
             if private & 1 == 1 {
-                pfn_to_page(private >> 1)
+                slab_pfn_to_page(private >> 1)
             } else {
                 page
             }
@@ -1596,6 +1696,33 @@ mod tests {
             cache.init(name, size, 8);
         }
         cache
+    }
+
+    /// test-origin: linux:vendor/linux/mm/slub.c and
+    /// linux:vendor/linux/mm/page_alloc.c
+    ///
+    /// Linux's slab allocator owns page metadata for pages it allocated; a
+    /// separate test reset of the buddy allocator must not invalidate slab's
+    /// already-published slab-page metadata. This is Lupos-specific host-test
+    /// coverage for the static TEST_PHYS/TEST_META backend used when no real
+    /// boot-time buddy/slab initialization exists.
+    #[test]
+    fn host_test_slab_pool_survives_buddy_mem_map_reset() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            setup();
+            crate::mm::buddy::reset_buddy_state_for_test();
+
+            let ptr = kmalloc(64, GFP_KERNEL);
+            assert!(
+                !ptr.is_null(),
+                "host test slab allocation must not depend on buddy mem_map"
+            );
+            assert_eq!(ksize(ptr), 64);
+            kfree(ptr);
+
+            setup();
+        }
     }
 
     // -----------------------------------------------------------------------

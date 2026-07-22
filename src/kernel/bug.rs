@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/lib/bug.c
+//! test-origin: linux:vendor/linux/lib/bug.c
 //! Generic BUG/WARN lookup for vendor/Linux C modules.
 //!
 //! The selected x86-64 module ABI uses 16-byte, PREL32 `struct bug_entry`

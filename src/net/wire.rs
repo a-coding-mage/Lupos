@@ -798,7 +798,7 @@ pub(crate) fn finish_deferred_inet_packet(completion: DeferredInetCompletion) {
     }
 }
 
-fn handle_tcp(source: u32, destination: u32, segment: &[u8]) {
+fn handle_tcp(namespace_key: usize, source: u32, destination: u32, segment: &[u8]) {
     if segment.len() < 20 || transport_checksum(source, destination, IPPROTO_TCP, segment) != 0 {
         return;
     }
@@ -812,7 +812,7 @@ fn handle_tcp(source: u32, destination: u32, segment: &[u8]) {
     }
     let flags = segment[13];
     dispatch_inet_packet(DeferredInetPacket::Tcp {
-        namespace_key: crate::net::core::net_namespace::current_net_namespace_key(),
+        namespace_key,
         source,
         source_port,
         destination_port,
@@ -823,7 +823,14 @@ fn handle_tcp(source: u32, destination: u32, segment: &[u8]) {
     });
 }
 
-fn handle_udp(source: u32, destination: u32, datagram: &[u8], ifindex: u32, ttl: u8) {
+fn handle_udp(
+    namespace_key: usize,
+    source: u32,
+    destination: u32,
+    datagram: &[u8],
+    ifindex: u32,
+    ttl: u8,
+) {
     if datagram.len() < 8 {
         return;
     }
@@ -881,7 +888,7 @@ fn handle_udp(source: u32, destination: u32, datagram: &[u8], ifindex: u32, ttl:
         );
     }
     dispatch_inet_packet(DeferredInetPacket::Udp {
-        namespace_key: crate::net::core::net_namespace::current_net_namespace_key(),
+        namespace_key,
         source,
         destination,
         source_port,
@@ -918,15 +925,15 @@ fn handle_ipv4(linux_dev: *mut u8, frame: &[u8]) {
     if destination != GUEST_IPV4 {
         return;
     }
-    let ifindex = crate::net::device::lookup_linux_netdevice(linux_dev)
-        .map(|dev| dev.ifindex)
-        .unwrap_or(0);
+    let (ifindex, namespace_key) = crate::net::device::lookup_linux_netdevice(linux_dev)
+        .map(|dev| (dev.ifindex, dev.namespace_key))
+        .unwrap_or((0, 0));
     let payload = &ip[header_length..total_length];
     match ip[9] {
-        IPPROTO_TCP => handle_tcp(source, destination, payload),
-        IPPROTO_UDP => handle_udp(source, destination, payload, ifindex, ttl),
+        IPPROTO_TCP => handle_tcp(namespace_key, source, destination, payload),
+        IPPROTO_UDP => handle_udp(namespace_key, source, destination, payload, ifindex, ttl),
         IPPROTO_ICMP => dispatch_inet_packet(DeferredInetPacket::Icmp {
-            namespace_key: crate::net::core::net_namespace::current_net_namespace_key(),
+            namespace_key,
             source,
             bytes: payload.to_vec(),
             ifindex,
@@ -954,6 +961,7 @@ mod tests {
 
     use super::*;
     use crate::net::fib::ipv4;
+    use core::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -1079,5 +1087,88 @@ mod tests {
             Some(&payload[..]),
             "release_sock must drain the backlogged TCP payload instead of dropping it"
         );
+    }
+
+    #[test]
+    fn net_rx_uses_ingress_device_namespace_not_current_task_namespace() {
+        // Linux derives the receive-side net namespace from skb->dev via
+        // dev_net(), not from the task interrupted by NET_RX. Lupos currently
+        // keeps Linux netdevices in init_net, so an init-net socket must still
+        // receive the packet while current belongs to another namespace.
+        let previous = unsafe { crate::kernel::sched::get_current() };
+        let mut foreign_nsproxy = crate::kernel::nsproxy::Nsproxy {
+            count: AtomicUsize::new(1),
+            uts_ns: core::ptr::null_mut(),
+            ipc_ns: core::ptr::null_mut(),
+            mnt_ns: core::ptr::null_mut(),
+            pid_ns_for_children: core::ptr::null_mut(),
+            net_ns: 0x1234usize as *mut crate::net::core::net_namespace::Net,
+            cgroup_ns: core::ptr::null_mut(),
+        };
+        let mut current = unsafe { core::mem::zeroed::<crate::kernel::task::TaskStruct>() };
+        current.m28_nsproxy.nsproxy = &mut foreign_nsproxy as *mut _;
+
+        let source = ipv4(10, 0, 2, 2);
+        let source_port = 443;
+        let destination_port = 49_153;
+        let sequence = 0x2030_4050;
+        let acknowledgement = 0x6070_8090;
+        let payload = b"device-netns";
+        let socket = crate::net::socket::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP as u16).unwrap();
+        {
+            let mut state = socket.lock();
+            state.net_ns = 0;
+            state.state = SocketState::Connected;
+            state.local = Some(SockAddr::Inet {
+                addr: GUEST_IPV4,
+                port: destination_port,
+            });
+            state.peer = Some(SockAddr::Inet {
+                addr: source,
+                port: source_port,
+            });
+            state.wire_tcp = Some(TcpState {
+                local_addr: GUEST_IPV4,
+                remote_addr: source,
+                local_port: destination_port,
+                remote_port: source_port,
+                snd_una: acknowledgement,
+                snd_nxt: acknowledgement,
+                rcv_nxt: sequence,
+                fin_received: false,
+            });
+        }
+
+        let name = "rx-dev-netns0";
+        let mut raw_linux_dev = 0u8;
+        let raw_linux_dev = &mut raw_linux_dev as *mut u8;
+        let _ = crate::net::device::unregister_linux_netdevice_locked(raw_linux_dev);
+        let _ = crate::net::device::unregister_netdevice(name);
+        let registered = crate::net::device::register_linux_netdevice_locked(
+            name,
+            1500,
+            [2, 0, 0, 0, 0, 42],
+            raw_linux_dev,
+        )
+        .expect("register Linux netdevice");
+        assert_eq!(registered.namespace_key, 0);
+        let frame = ethernet_ipv4_tcp_frame(
+            source,
+            GUEST_IPV4,
+            source_port,
+            destination_port,
+            sequence,
+            acknowledgement,
+            payload,
+        );
+
+        unsafe { crate::kernel::sched::set_current(&mut current as *mut _) };
+        receive_frame(raw_linux_dev, &frame);
+        unsafe { crate::kernel::sched::set_current(previous) };
+        crate::net::device::unregister_linux_netdevice_locked(raw_linux_dev).expect("cleanup");
+        let _ = crate::net::device::unregister_netdevice(name);
+
+        let delivered = socket.lock().recvq.pop_front().map(|packet| packet.bytes);
+        assert_eq!(delivered.as_deref(), Some(&payload[..]));
     }
 }

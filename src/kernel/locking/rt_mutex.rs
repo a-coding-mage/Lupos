@@ -1,5 +1,6 @@
-//! linux-parity: complete
-//! linux-source: vendor/linux/kernel/locking
+//! linux-parity: partial
+//! linux-source: vendor/linux/kernel/locking/rtmutex.c
+//! linux-source: vendor/linux/kernel/sched/core.c
 //! test-origin: linux:vendor/linux/kernel/locking
 //! Priority-inheritance mutex.
 //!
@@ -7,6 +8,8 @@
 //! through the scheduler and wakes them with cross-CPU aware task wakeups.
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
@@ -115,7 +118,7 @@ impl RtMutex {
             self.owner.fetch_or(RT_MUTEX_HAS_WAITERS, Ordering::AcqRel);
             boost_owner_prio(
                 self.owner.load(Ordering::Acquire) & !RT_MUTEX_HAS_WAITERS,
-                waiter_prio,
+                waiter_task,
             );
             self.wait_lock.unlock();
 
@@ -151,8 +154,10 @@ impl RtMutex {
     /// wake the returned task.
     pub fn unlock_handoff(&self) -> (*mut TaskStruct, bool) {
         let prev = self.owner.load(Ordering::Acquire);
+        let previous_owner = (prev & !RT_MUTEX_HAS_WAITERS) as *mut TaskStruct;
         if prev & RT_MUTEX_HAS_WAITERS == 0 {
             self.owner.store(0, Ordering::Release);
+            restore_owner_prio(previous_owner);
             return (core::ptr::null_mut(), false);
         }
         self.wait_lock.lock();
@@ -173,6 +178,10 @@ impl RtMutex {
             (core::ptr::null_mut(), false)
         };
         self.wait_lock.unlock();
+        // Linux removes the old owner's donation and requeues it before the
+        // handoff target can run. `unlock()` and futex PI publish/wake the new
+        // owner only after this function returns.
+        restore_owner_prio(previous_owner);
         result
     }
 
@@ -191,7 +200,14 @@ impl RtMutex {
 
 fn current_task() -> u64 {
     #[cfg(test)]
-    return 0xCAFE_F00D;
+    {
+        static TEST_CURRENT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        return *TEST_CURRENT.get_or_init(|| {
+            let mut task = alloc::boxed::Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+            task.m29 = crate::kernel::task::M29SchedFields::zeroed();
+            alloc::boxed::Box::into_raw(task) as usize
+        }) as u64;
+    }
     #[cfg(not(test))]
     unsafe {
         crate::kernel::sched::get_current() as u64
@@ -205,21 +221,31 @@ fn current_prio(task: *mut TaskStruct) -> i32 {
     unsafe { (*task).m29.prio }
 }
 
-fn boost_owner_prio(owner_bits: u64, prio: i32) {
+fn boost_owner_prio(owner_bits: u64, pi_task: *mut TaskStruct) {
     let owner = owner_bits as *mut TaskStruct;
+    if owner.is_null() || pi_task.is_null() {
+        return;
+    }
+    unsafe {
+        if (*owner).m29.prio > (*pi_task).m29.prio {
+            crate::kernel::sched::rt_mutex_setprio(owner, pi_task);
+        }
+    }
+}
+
+fn restore_owner_prio(owner: *mut TaskStruct) {
     if owner.is_null() {
         return;
     }
     unsafe {
-        if (*owner).m29.prio > prio {
-            (*owner).m29.prio = prio;
-        }
+        crate::kernel::sched::rt_mutex_setprio(owner, core::ptr::null_mut());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
 
     #[test]
     fn try_lock_succeeds_when_free() {
@@ -249,11 +275,121 @@ mod tests {
         assert!(s.owner.is_null());
     }
 
+    // test-origin: linux:vendor/linux/tools/testing/selftests/futex/functional/futex_requeue_pi.c
+    // and linux:vendor/linux/kernel/sched/core.c:rt_mutex_setprio
+    // The upstream userspace test covers PI ownership and scheduling. This
+    // focused adaptation checks the internal queue invariant that is otherwise
+    // only observable as a system-wide scheduler hang.
+    #[test]
+    fn pi_boost_keeps_rt_task_removable_during_policy_reset() {
+        const TEST_CPU: u32 = (crate::kernel::sched::MAX_CPUS - 2) as u32;
+
+        struct ResetRunqueue(u32);
+
+        impl Drop for ResetRunqueue {
+            fn drop(&mut self) {
+                let _ = crate::kernel::sched::rq::with_rq(self.0, |rq| {
+                    *rq = crate::kernel::sched::rq::Rq::new(self.0);
+                });
+            }
+        }
+
+        crate::kernel::sched::rq::init_rqs();
+        crate::kernel::sched::rq::with_rq(TEST_CPU, |rq| {
+            *rq = crate::kernel::sched::rq::Rq::new(TEST_CPU);
+        })
+        .expect("test runqueue exists");
+        let _reset_runqueue = ResetRunqueue(TEST_CPU);
+
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+        task.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        task.m29.sched_class = &crate::kernel::sched::fair::FAIR_SCHED_CLASS;
+        task.m29.policy = crate::kernel::sched::prio::SCHED_NORMAL;
+        task.m29.prio = crate::kernel::sched::prio::DEFAULT_PRIO;
+        task.m29.normal_prio = crate::kernel::sched::prio::DEFAULT_PRIO;
+        task.m29.static_prio = crate::kernel::sched::prio::DEFAULT_PRIO;
+        task.m29.cpus_mask = crate::kernel::sched::entity::CpuMask::one(TEST_CPU);
+        task.m29.cpus_ptr = &task.m29.cpus_mask;
+        task.m29.nr_cpus_allowed = 1;
+        task.thread_info.cpu = TEST_CPU;
+
+        unsafe {
+            crate::kernel::sched::enqueue_on_rq(
+                TEST_CPU,
+                task_ptr,
+                crate::kernel::sched::class::ENQUEUE_INITIAL,
+            );
+        }
+        let fifo = crate::kernel::sched::syscalls::SchedAttr {
+            size: crate::kernel::sched::syscalls::SCHED_ATTR_SIZE_VER1,
+            sched_policy: crate::kernel::sched::prio::SCHED_FIFO,
+            sched_priority: 83,
+            ..crate::kernel::sched::syscalls::SchedAttr::default()
+        };
+        assert_eq!(
+            unsafe { crate::kernel::sched::syscalls::sys_sched_setattr(task_ptr, &fifo) },
+            0
+        );
+        crate::kernel::sched::rq::with_rq(TEST_CPU, |rq| {
+            assert_eq!(rq.rt.highest_prio(), Some(16));
+        })
+        .expect("test runqueue exists");
+
+        let mut donor = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        donor.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        donor.m29.prio = 11;
+        let donor_ptr = &mut *donor as *mut TaskStruct;
+        let mutex = RtMutex::new();
+        mutex.adopt_owner(task_ptr, true);
+        unsafe {
+            (*mutex.waiters.get()).push(RtMutexWaiter {
+                task: donor_ptr,
+                prio: donor.m29.prio,
+                deadline: 0,
+            });
+        }
+
+        boost_owner_prio(task_ptr as u64, donor_ptr);
+        assert_eq!(task.m29.prio, 11);
+
+        let (handoff, more_waiters) = mutex.unlock_handoff();
+        assert_eq!(handoff, donor_ptr);
+        assert!(!more_waiters);
+        assert_eq!(task.m29.prio, 16);
+        crate::kernel::sched::rq::with_rq(TEST_CPU, |rq| {
+            assert_eq!(rq.rt.highest_prio(), Some(16));
+        })
+        .expect("test runqueue exists");
+
+        let normal = crate::kernel::sched::syscalls::SchedAttr {
+            size: crate::kernel::sched::syscalls::SCHED_ATTR_SIZE_VER1,
+            sched_policy: crate::kernel::sched::prio::SCHED_NORMAL,
+            ..crate::kernel::sched::syscalls::SchedAttr::default()
+        };
+        assert_eq!(
+            unsafe { crate::kernel::sched::syscalls::sys_sched_setattr(task_ptr, &normal) },
+            0
+        );
+        crate::kernel::sched::rq::with_rq(TEST_CPU, |rq| {
+            assert_eq!(rq.rt.nr_running, 0);
+            assert_eq!(rq.cfs.nr_running, 1);
+            assert_eq!(rq.nr_running, 1);
+        })
+        .expect("test runqueue exists");
+        assert_eq!(task.m29.rt.on_rq, 0);
+        assert_eq!(task.m29.se.on_rq, 1);
+    }
+
     #[test]
     fn unlock_handoff_returns_next_owner_before_wakeup() {
         let mutex = RtMutex::new();
-        let owner = 0x1000usize as *mut TaskStruct;
-        let next = 0x2000usize as *mut TaskStruct;
+        let mut owner_task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        owner_task.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        let owner = &mut *owner_task as *mut TaskStruct;
+        let mut next_task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        next_task.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        let next = &mut *next_task as *mut TaskStruct;
         mutex.adopt_owner(owner, true);
         unsafe {
             (*mutex.waiters.get()).push(RtMutexWaiter {

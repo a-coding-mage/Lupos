@@ -10,7 +10,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::x86::kernel::idt::ExceptionFrame;
-use crate::kernel::sched::MAX_CPUS;
+use crate::kernel::sched::{KTHREAD_STACK_SIZE, MAX_CPUS};
 
 pub const WATCHDOG_THRESH_DEFAULT_SECS: u64 = 10;
 pub const NUM_SAMPLE_PERIODS: u64 = 5;
@@ -38,7 +38,6 @@ fn watchdog_serial_println(args: core::fmt::Arguments<'_>) {
     let mut serial = WatchdogSerial;
     let _ = serial.write_fmt(args);
     let _ = serial.write_str("\n");
-    let _ = crate::linux_driver_abi::tty::serial::flush_budget(1024);
 }
 
 pub const fn get_softlockup_thresh(watchdog_thresh_secs: u64) -> u64 {
@@ -120,6 +119,53 @@ fn comm_as_str(comm: &[u8; crate::kernel::task::TASK_COMM_LEN]) -> &str {
     core::str::from_utf8(&comm[..len]).unwrap_or("<nonutf8>")
 }
 
+fn exception_frame_stack_pointer(frame: &ExceptionFrame) -> u64 {
+    if frame.cs & 0x3 == 0x3 {
+        frame.user_rsp
+    } else {
+        core::ptr::addr_of!(frame.user_rsp) as u64
+    }
+}
+
+fn current_task_stack_bounds(current: *mut crate::kernel::task::TaskStruct, sp: u64) -> (u64, u64) {
+    if !current.is_null() {
+        let stack_top = unsafe { (*current).stack as u64 };
+        if let Some(stack_bottom) = stack_top.checked_sub(KTHREAD_STACK_SIZE as u64)
+            && sp >= stack_bottom
+            && sp <= stack_top
+        {
+            return (stack_bottom, stack_top);
+        }
+    }
+    let stack_size = KTHREAD_STACK_SIZE as u64;
+    let stack_base = sp & !(stack_size - 1);
+    (stack_base, stack_base + stack_size)
+}
+
+fn kernel_stack_word_range(bounds: (u64, u64), sp: u64, addr: u64, words: usize) -> bool {
+    if sp == 0 || addr & 0x7 != 0 {
+        return false;
+    }
+    let Some(size) = (words as u64).checked_mul(core::mem::size_of::<u64>() as u64) else {
+        return false;
+    };
+    let Some(end) = addr.checked_add(size) else {
+        return false;
+    };
+    let (stack_base, stack_end) = bounds;
+    addr >= stack_base && end <= stack_end
+}
+
+fn kernel_stack_word_addr(bounds: (u64, u64), sp: u64, index: usize) -> Option<*const u64> {
+    let offset = (index as u64).checked_mul(core::mem::size_of::<u64>() as u64)?;
+    let addr = sp.checked_add(offset)?;
+    kernel_stack_word_range(bounds, sp, addr, 1).then_some(addr as *const u64)
+}
+
+fn kernel_text_return_candidate(word: u64) -> bool {
+    (0x0020_0000..0x0090_0000).contains(&word)
+}
+
 fn report_softlockup(cpu: usize, duration: u64, frame: Option<&ExceptionFrame>) {
     let current = unsafe { crate::kernel::sched::get_current() };
     let (pid, tgid, comm) = if current.is_null() {
@@ -139,14 +185,16 @@ fn report_softlockup(cpu: usize, duration: u64, frame: Option<&ExceptionFrame>) 
         cpu, duration, comm, pid, tgid
     ));
     if let Some(frame) = frame {
+        let sp = exception_frame_stack_pointer(frame);
+        let stack_bounds = current_task_stack_bounds(current, sp);
         watchdog_serial_println(format_args!(
             "soft lockup: rip={:#x} rsp={:#x} rflags={:#x} rbp={:#x}",
-            frame.rip, frame.user_rsp, frame.rflags, frame.rbp
+            frame.rip, sp, frame.rflags, frame.rbp
         ));
         let mut rbp = frame.rbp as *const u64;
         for depth in 0..12 {
             let rbp_addr = rbp as u64;
-            if rbp_addr < crate::arch::x86::mm::paging::PAGE_OFFSET || rbp_addr & 0x7 != 0 {
+            if !kernel_stack_word_range(stack_bounds, sp, rbp_addr, 2) {
                 break;
             }
             let next = unsafe { core::ptr::read_unaligned(rbp) };
@@ -160,16 +208,16 @@ fn report_softlockup(cpu: usize, duration: u64, frame: Option<&ExceptionFrame>) 
             }
             rbp = next as *const u64;
         }
-        if frame.user_rsp >= 0x1000 && frame.user_rsp & 0x7 == 0 {
-            let stack = frame.user_rsp as *const u64;
-            for index in 0..96 {
-                let word = unsafe { core::ptr::read_unaligned(stack.add(index)) };
-                if (0x0020_0000..0x0090_0000).contains(&word) {
-                    watchdog_serial_println(format_args!(
-                        "soft lockup: stack[{}] ret={:#x}",
-                        index, word
-                    ));
-                }
+        for index in 0..96 {
+            let Some(addr) = kernel_stack_word_addr(stack_bounds, sp, index) else {
+                break;
+            };
+            let word = unsafe { core::ptr::read_unaligned(addr) };
+            if kernel_text_return_candidate(word) {
+                watchdog_serial_println(format_args!(
+                    "soft lockup: stack[{}] ret={:#x}",
+                    index, word
+                ));
             }
         }
     } else {
@@ -357,6 +405,55 @@ mod tests {
         assert!(frame_is_user_mode(Some(&frame)));
     }
 
+    /// test-origin: linux:vendor/linux/arch/x86/include/asm/ptrace.h:regs_get_kernel_stack_nth_addr
+    #[test]
+    fn same_ring_exception_stack_pointer_uses_frame_slot_address() {
+        let _guard = TEST_LOCK.lock();
+        let mut frame = unsafe { core::mem::zeroed::<ExceptionFrame>() };
+        frame.cs = 0x10;
+        frame.user_rsp = 0xffff_c900_0001_1000;
+
+        assert_eq!(
+            exception_frame_stack_pointer(&frame),
+            core::ptr::addr_of!(frame.user_rsp) as u64
+        );
+    }
+
+    /// test-origin: linux:vendor/linux/arch/x86/include/asm/ptrace.h:regs_get_kernel_stack_nth_addr
+    #[test]
+    fn user_exception_stack_pointer_uses_saved_rsp() {
+        let _guard = TEST_LOCK.lock();
+        let mut frame = unsafe { core::mem::zeroed::<ExceptionFrame>() };
+        frame.cs = 0x33;
+        frame.user_rsp = 0x7fff_ffff_f000;
+
+        assert_eq!(exception_frame_stack_pointer(&frame), frame.user_rsp);
+    }
+
+    /// test-origin: linux:vendor/linux/arch/x86/include/asm/ptrace.h:regs_get_kernel_stack_nth_addr
+    #[test]
+    fn stack_scan_stays_inside_current_task_stack_bounds() {
+        let _guard = TEST_LOCK.lock();
+        let mut task = alloc::boxed::Box::new(unsafe {
+            core::mem::zeroed::<crate::kernel::task::TaskStruct>()
+        });
+        let stack_bottom = 0xffff_c900_0000_1000u64;
+        let stack_top = stack_bottom + KTHREAD_STACK_SIZE as u64;
+        task.stack = stack_top as *mut core::ffi::c_void;
+        let sp = stack_bottom + 0x18;
+        let bounds = current_task_stack_bounds(&mut *task, sp);
+
+        assert_eq!(bounds, (stack_bottom, stack_top));
+        assert!(kernel_stack_word_range(bounds, sp, stack_top - 8, 1));
+        assert!(!kernel_stack_word_range(bounds, sp, stack_top, 1));
+        let last_index = ((stack_top - 8 - sp) / 8) as usize;
+        assert_eq!(
+            kernel_stack_word_addr(bounds, sp, last_index).map(|addr| addr as u64),
+            Some(stack_top - 8)
+        );
+        assert!(kernel_stack_word_addr(bounds, sp, last_index + 1).is_none());
+    }
+
     #[test]
     fn watchdog_reports_once_per_soft_threshold() {
         let _guard = TEST_LOCK.lock();
@@ -378,6 +475,15 @@ mod tests {
 
         watchdog_serial_println(format_args!("watchdog queue report"));
 
+        assert_eq!(
+            crate::linux_driver_abi::tty::serial::captured_bytes_for_tests(),
+            b""
+        );
+        assert_eq!(
+            crate::linux_driver_abi::tty::serial::queued_len(),
+            b"watchdog queue report\r\n".len()
+        );
+        let _ = crate::linux_driver_abi::tty::serial::flush_budget(usize::MAX);
         assert_eq!(
             crate::linux_driver_abi::tty::serial::captured_bytes_for_tests(),
             b"watchdog queue report\r\n"

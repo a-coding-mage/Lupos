@@ -20,6 +20,9 @@
 //! is returned with fault-tolerant `copy_to_user` helpers so bad user addresses
 //! fail with `-EFAULT` instead of being dereferenced in kernel mode.
 
+extern crate alloc;
+
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::Ordering;
 
 use crate::arch::x86::kernel::uaccess::copy_to_user;
@@ -557,9 +560,9 @@ unsafe fn report_stopped_task(task: *mut TaskStruct, stat_addr: *mut i32, option
 }
 
 /// Append `parent` to `child.wait_waiters` so `exit_notify` will wake it.
-unsafe fn add_waiter(child: *mut TaskStruct, parent: *mut TaskStruct) {
+unsafe fn add_waiter(child: *mut TaskStruct, parent: *mut TaskStruct) -> bool {
     if child.is_null() || parent.is_null() {
-        return;
+        return false;
     }
     unsafe {
         let count = ((*child).m26.wait_count as usize).min(MAX_WAITERS);
@@ -567,13 +570,15 @@ unsafe fn add_waiter(child: *mut TaskStruct, parent: *mut TaskStruct) {
             .iter()
             .any(|waiter| *waiter == parent)
         {
-            return;
+            return false;
         }
         if count < MAX_WAITERS {
             (*child).m26.wait_waiters[count] = parent;
             (*child).m26.wait_count = (count + 1) as u32;
+            return true;
         }
     }
+    false
 }
 
 /// Remove every registration of `parent` from one task's child-exit queue.
@@ -598,47 +603,142 @@ unsafe fn remove_waiter(child: *mut TaskStruct, parent: *mut TaskStruct) {
     }
 }
 
-/// Remove the current task from every live per-child wait queue.
-///
-/// Linux installs one `child_wait` entry on `current->signal->wait_chldexit`
-/// and unconditionally calls `remove_wait_queue()` before `do_wait()` returns.
-/// Lupos currently stores the inverse relation on each child, so a live-task
-/// scan is the equivalent operation and also covers a child whose pgrp or
-/// ptrace relationship changed while the syscall slept.
-unsafe fn remove_wait_registrations(parent: *mut TaskStruct) {
-    if parent.is_null() {
-        return;
-    }
-
-    unsafe {
-        // Preserve stack-backed test/process-bootstrap children which are not
-        // present in either global task registry.
-        let count = ((*parent).m26.children_count as usize).min(MAX_CHILDREN);
-        for index in 0..count {
-            remove_waiter((*parent).m26.children[index], parent);
-        }
-
-        let mut remove = |task: *mut TaskStruct| {
-            remove_waiter(task, parent);
-        };
-        crate::kernel::fork::for_each_heap_task(&mut remove);
-        sched::for_each_pool_task(&mut remove);
-    }
+#[derive(Clone, Copy)]
+struct WaitRegistration {
+    task: *mut TaskStruct,
+    pid: i32,
 }
 
 struct WaitRegistrationGuard {
     parent: *mut TaskStruct,
+    registrations: Vec<WaitRegistration>,
 }
 
 impl WaitRegistrationGuard {
     fn new(parent: *mut TaskStruct) -> Self {
-        Self { parent }
+        Self {
+            parent,
+            registrations: Vec::new(),
+        }
+    }
+
+    /// Register the current wait on `child` and remember the exact inverse
+    /// edge for removal.
+    ///
+    /// Linux removes one stack waitqueue entry from `current->signal` when
+    /// `do_wait()` returns. Lupos stores waiters on each child, so tracking
+    /// only edges installed by this syscall avoids scanning the entire task
+    /// table on every fork/exec/wait round trip.
+    unsafe fn register(&mut self, child: *mut TaskStruct) {
+        if child.is_null()
+            || self.parent.is_null()
+            || self
+                .registrations
+                .iter()
+                .any(|registration| registration.task == child)
+        {
+            return;
+        }
+        let pid = unsafe { (*child).pid };
+        if unsafe { add_waiter(child, self.parent) } {
+            self.registrations
+                .push(WaitRegistration { task: child, pid });
+        }
+    }
+
+    /// Remove a child edge before the caller reaps `child`.
+    ///
+    /// `release_task()` can free the `TaskStruct`; dropping a guard that still
+    /// contains that pointer would not be equivalent to Linux's stack waitqueue
+    /// removal.
+    unsafe fn unregister_before_release(&mut self, child: *mut TaskStruct) {
+        if let Some(pos) = self
+            .registrations
+            .iter()
+            .position(|registration| registration.task == child)
+        {
+            let registration = self.registrations.swap_remove(pos);
+            unsafe {
+                remove_waiter(registration.task, self.parent);
+            }
+        }
+    }
+
+    unsafe fn cleanup(&mut self) {
+        while let Some(registration) = self.registrations.pop() {
+            if unsafe { registration_still_names_child(self.parent, registration) } {
+                unsafe {
+                    remove_waiter(registration.task, self.parent);
+                }
+            }
+        }
     }
 }
 
 impl Drop for WaitRegistrationGuard {
     fn drop(&mut self) {
-        unsafe { remove_wait_registrations(self.parent) };
+        unsafe { self.cleanup() };
+    }
+}
+
+unsafe fn registration_still_names_child(
+    parent: *mut TaskStruct,
+    registration: WaitRegistration,
+) -> bool {
+    if parent.is_null() || registration.task.is_null() {
+        return false;
+    }
+
+    if lookup_task_by_pid(registration.pid) == registration.task {
+        return true;
+    }
+
+    unsafe {
+        // Preserve stack-backed test/process-bootstrap children which are not
+        // present in either global task registry. The comparison is by pointer
+        // only so it does not dereference a possibly released child.
+        let count = ((*parent).m26.children_count as usize).min(MAX_CHILDREN);
+        for index in 0..count {
+            if (*parent).m26.children[index] == registration.task {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Linux keeps one `wait_chldexit` waitqueue in the process-shared
+/// `signal_struct`. Register before each child scan so either the scan observes
+/// an already-published event or `__wake_up_parent()` observes this waiter.
+struct WaitChldexitGuard {
+    parent: *mut TaskStruct,
+    queue: Option<Arc<crate::kernel::sched::wait::WaitQueueHead>>,
+}
+
+impl WaitChldexitGuard {
+    fn new(parent: *mut TaskStruct) -> Self {
+        Self {
+            parent,
+            queue: crate::kernel::signal::wait_chldexit_queue(parent),
+        }
+    }
+
+    unsafe fn prepare(&self) {
+        if let Some(queue) = self.queue.as_ref() {
+            unsafe {
+                queue.prepare_to_wait(self.parent, TASK_INTERRUPTIBLE);
+            }
+        }
+    }
+}
+
+impl Drop for WaitChldexitGuard {
+    fn drop(&mut self) {
+        if let Some(queue) = self.queue.as_ref() {
+            unsafe {
+                queue.finish_wait(self.parent);
+            }
+        }
     }
 }
 
@@ -688,9 +788,13 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
     } else {
         WaitTarget::Pid(pid)
     };
-    let _wait_registration_guard = WaitRegistrationGuard::new(parent);
+    let wait_chldexit_guard = WaitChldexitGuard::new(parent);
+    let mut wait_registration_guard = WaitRegistrationGuard::new(parent);
 
     loop {
+        unsafe {
+            wait_chldexit_guard.prepare();
+        }
         // Fast path: zombie child already available?
         if let Some(child) = unsafe { find_zombie_child(parent, target) } {
             let child_pid = unsafe { (*child).pid };
@@ -702,6 +806,7 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
             // WNOWAIT keeps the zombie alive; otherwise reap it.
             if options & WNOWAIT == 0 {
                 unsafe {
+                    wait_registration_guard.unregister_before_release(child);
                     release_task(child);
                 }
             }
@@ -764,10 +869,10 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
         // `exit_notify` flips us back to TASK_RUNNING.
         unsafe {
             for_each_real_child(parent, target, |c| {
-                add_waiter(c, parent);
+                wait_registration_guard.register(c);
             });
             for_each_ptrace_wait_match(parent, target, |task| {
-                add_waiter(task, parent);
+                wait_registration_guard.register(task);
             });
             (*parent)
                 .__state
@@ -872,9 +977,13 @@ pub unsafe fn sys_waitid(
     if parent.is_null() {
         return EINVAL;
     }
-    let _wait_registration_guard = WaitRegistrationGuard::new(parent);
+    let wait_chldexit_guard = WaitChldexitGuard::new(parent);
+    let mut wait_registration_guard = WaitRegistrationGuard::new(parent);
 
     loop {
+        unsafe {
+            wait_chldexit_guard.prepare();
+        }
         if let Some(child) = unsafe { find_zombie_child(parent, target) } {
             let child_pid = unsafe { (*child).pid };
             let exit_code = unsafe { (*child).m26.exit_code };
@@ -898,6 +1007,7 @@ pub unsafe fn sys_waitid(
 
             if options & WNOWAIT == 0 {
                 unsafe {
+                    wait_registration_guard.unregister_before_release(child);
                     release_task(child);
                 }
             }
@@ -999,10 +1109,10 @@ pub unsafe fn sys_waitid(
 
         unsafe {
             for_each_real_child(parent, target, |c| {
-                add_waiter(c, parent);
+                wait_registration_guard.register(c);
             });
             for_each_ptrace_wait_match(parent, target, |task| {
-                add_waiter(task, parent);
+                wait_registration_guard.register(task);
             });
             (*parent)
                 .__state
@@ -1182,6 +1292,32 @@ mod tests {
         assert!(unsafe {
             has_reportable_wait_event(&mut *parent as *mut TaskStruct, WaitTarget::Any, 0)
         });
+    }
+
+    #[test]
+    fn wait_chldexit_registration_is_visible_before_child_scan() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        let mut parent = task(109);
+        assert_eq!(
+            unsafe { crate::kernel::signal::prepare_timer_signal_target(&mut *parent) },
+            0
+        );
+        let queue = crate::kernel::signal::wait_chldexit_queue(&mut *parent)
+            .expect("registered parent wait_chldexit queue");
+        let guard = WaitChldexitGuard::new(&mut *parent);
+
+        unsafe {
+            guard.prepare();
+        }
+        assert_eq!(queue.len(), 1);
+        assert_eq!(parent.__state.load(Ordering::Acquire), TASK_INTERRUPTIBLE);
+        assert_eq!(queue.wake_up_all(), 1);
+        assert_eq!(parent.__state.load(Ordering::Acquire), TASK_RUNNING);
+
+        drop(guard);
+        assert!(queue.is_empty());
+        crate::kernel::signal::reset_for_tests();
     }
 
     #[test]

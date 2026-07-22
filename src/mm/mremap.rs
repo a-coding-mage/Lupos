@@ -33,6 +33,7 @@ use crate::mm::mmap::{
 use crate::mm::vm_flags::{VM_DONTEXPAND, VM_PFNMAP, VmFlags, vm_flags_equal};
 use crate::mm::vma::{
     find_vma, insert_vma, remove_vma, vm_area_dup, vm_area_free, vma_file_get, vma_file_put_raw,
+    vma_open,
 };
 
 // ---------------------------------------------------------------------------
@@ -256,7 +257,10 @@ unsafe fn reserve_mremap_destination_segment(
         (*dst_vma).vm_end = dest + len;
         (*dst_vma).vm_pgoff = pgoff;
         match insert_vma(mm, dst_vma) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                vma_open(dst_vma);
+                Ok(())
+            }
             Err(err) => {
                 vm_area_free(dst_vma);
                 Err(err)

@@ -44,7 +44,6 @@ use crate::mm::{
         MAP_ANONYMOUS, MAP_FIXED, MAP_GROWSDOWN, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE,
         TASK_SIZE, do_mmap,
     },
-    mprotect::do_mprotect,
     page_flags::GFP_KERNEL,
     vma::find_vma,
 };
@@ -76,7 +75,11 @@ const MAX_INTERP_RECURSION: usize = 4;
 const MAX_ARG_STRLEN: usize = 128 * 1024;
 const MAX_ARG_COUNT: usize = 4096;
 const MAX_EXEC_FILE_BYTES: usize = 128 * 1024 * 1024;
+const BINPRM_BUF_SIZE: usize = 256;
 const EXEC_READ_CHUNK: usize = 64 * 1024;
+const ELF_PHDR_SIZE: u16 = 56;
+const ELF_MAX_PHDR_BYTES: usize = 65_536;
+const PATH_MAX: u64 = 4096;
 const STACK_SIZE: u64 = 8 * 1024 * 1024;
 const PIE_LOAD_BIAS: u64 = 0x0000_5555_5555_4000;
 const INTERP_LOAD_BIAS: u64 = 0x0000_7fff_0000_0000;
@@ -150,6 +153,7 @@ struct LoadedImage {
     path: String,
     elf: ElfImage,
     bytes: Vec<u8>,
+    complete_bytes: bool,
     inode: crate::fs::types::InodeRef,
     dentry: crate::fs::types::DentryRef,
     mount: alloc::sync::Arc<crate::fs::mount::Mount>,
@@ -240,7 +244,101 @@ fn securebit_mask(bit: u32) -> u32 {
     1u32 << bit
 }
 
-fn exec_creds_require_secure_mode(old: &Cred, new: &Cred, has_file_caps: bool) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecFileCaps {
+    effective: bool,
+    permitted: KernelCapT,
+    inheritable: KernelCapT,
+}
+
+const VFS_CAP_REVISION_MASK: u32 = 0xFF00_0000;
+const VFS_CAP_FLAGS_EFFECTIVE: u32 = 0x0000_0001;
+const VFS_CAP_REVISION_1: u32 = 0x0100_0000;
+const VFS_CAP_REVISION_2: u32 = 0x0200_0000;
+const VFS_CAP_REVISION_3: u32 = 0x0300_0000;
+const XATTR_CAPS_SZ_1: usize = 12;
+const XATTR_CAPS_SZ_2: usize = 20;
+const XATTR_CAPS_SZ_3: usize = 24;
+
+fn cap_intersect(a: KernelCapT, b: KernelCapT) -> KernelCapT {
+    KernelCapT {
+        cap: [a.cap[0] & b.cap[0], a.cap[1] & b.cap[1]],
+    }
+}
+
+fn cap_combine(a: KernelCapT, b: KernelCapT) -> KernelCapT {
+    KernelCapT {
+        cap: [a.cap[0] | b.cap[0], a.cap[1] | b.cap[1]],
+    }
+}
+
+fn cap_issubset(a: KernelCapT, b: KernelCapT) -> bool {
+    a.cap[0] & !b.cap[0] == 0 && a.cap[1] & !b.cap[1] == 0
+}
+
+fn cap_grew(target: KernelCapT, source: KernelCapT) -> bool {
+    !cap_issubset(target, source)
+}
+
+fn read_le32(value: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        value[offset],
+        value[offset + 1],
+        value[offset + 2],
+        value[offset + 3],
+    ])
+}
+
+fn valid_cap_mask() -> KernelCapT {
+    let full = KernelCapT::full();
+    KernelCapT {
+        cap: [full.cap[0], full.cap[1]],
+    }
+}
+
+fn parse_vfs_cap_xattr(value: &[u8]) -> Result<Option<ExecFileCaps>, i32> {
+    if value.len() < core::mem::size_of::<u32>() {
+        return Err(-22);
+    }
+
+    let magic = read_le32(value, 0);
+    let revision = magic & VFS_CAP_REVISION_MASK;
+    if magic & !VFS_CAP_FLAGS_EFFECTIVE != revision {
+        return Err(-22);
+    }
+
+    let words = match revision {
+        VFS_CAP_REVISION_1 if value.len() == XATTR_CAPS_SZ_1 => 1,
+        VFS_CAP_REVISION_2 if value.len() == XATTR_CAPS_SZ_2 => 2,
+        VFS_CAP_REVISION_3 if value.len() == XATTR_CAPS_SZ_3 => {
+            let rootid = read_le32(value, 20);
+            if rootid != 0 {
+                return Ok(None);
+            }
+            2
+        }
+        _ => return Err(-22),
+    };
+
+    let mut permitted = KernelCapT::empty();
+    let mut inheritable = KernelCapT::empty();
+    for idx in 0..words {
+        permitted.cap[idx] = read_le32(value, 4 + idx * 8);
+        inheritable.cap[idx] = read_le32(value, 8 + idx * 8);
+    }
+
+    let valid = valid_cap_mask();
+    permitted = cap_intersect(permitted, valid);
+    inheritable = cap_intersect(inheritable, valid);
+
+    Ok(Some(ExecFileCaps {
+        effective: magic & VFS_CAP_FLAGS_EFFECTIVE != 0,
+        permitted,
+        inheritable,
+    }))
+}
+
+fn exec_creds_require_secure_mode(old: &Cred, new: &Cred, file_caps: Option<ExecFileCaps>) -> bool {
     // vendor/linux/security/commoncap.c:cap_bprm_creds_from_file() marks
     // AT_SECURE for privilege-elevating execs.  In particular, dropping
     // effective capabilities or resetting saved/fs IDs on an ordinary exec
@@ -249,20 +347,23 @@ fn exec_creds_require_secure_mode(old: &Cred, new: &Cred, has_file_caps: bool) -
     // environment from daemons which dropped privileges before exec.
     let id_changed = new.euid != old.euid || new.egid != old.egid;
     let non_root = new.uid.0 != 0 || new.euid.0 != 0;
+    let file_caps_secure = file_caps.is_some_and(|caps| {
+        non_root && (caps.effective || cap_grew(new.cap_permitted, new.cap_ambient))
+    });
 
-    id_changed || new.euid != old.uid || new.egid != old.gid || (non_root && has_file_caps)
+    id_changed || new.euid != old.uid || new.egid != old.gid || file_caps_secure
 }
 
 fn final_exec_nosuid(program: &LoadedProgram) -> bool {
     (program.main.mount.flags.load(Ordering::Acquire) & MS_NOSUID as u32) != 0
 }
 
-fn final_exec_has_file_caps(image: &LoadedImage) -> bool {
-    image
-        .inode
-        .xattrs
-        .lock()
-        .contains_key("security.capability")
+fn final_exec_file_caps(image: &LoadedImage) -> Result<Option<ExecFileCaps>, i32> {
+    let xattrs = image.inode.xattrs.lock();
+    match xattrs.get("security.capability") {
+        Some(value) => parse_vfs_cap_xattr(value),
+        None => Ok(None),
+    }
 }
 
 fn prepare_exec_creds(program: &LoadedProgram) -> Result<ProposedExecCreds, i32> {
@@ -283,7 +384,12 @@ fn prepare_exec_creds(program: &LoadedProgram) -> Result<ProposedExecCreds, i32>
     let no_new_privs = !task.is_null() && unsafe { (*task).m27.no_new_privs != 0 };
     let nosuid = final_exec_nosuid(program);
     let script = program.main.from_script;
-    let has_file_caps = final_exec_has_file_caps(&program.main);
+    let file_caps = if nosuid || script {
+        None
+    } else {
+        final_exec_file_caps(&program.main)?
+    };
+    let has_file_caps = file_caps.is_some();
     let setid_or_caps = (mode & (S_ISUID | S_ISGID)) != 0 || has_file_caps;
     let allow_privilege = !nosuid && !no_new_privs && !script;
 
@@ -306,21 +412,36 @@ fn prepare_exec_creds(program: &LoadedProgram) -> Result<ProposedExecCreds, i32>
     if has_file_caps || (!allow_privilege && setid_or_caps) {
         new.cap_ambient = KernelCapT::empty();
     }
+    if allow_privilege && let Some(caps) = file_caps {
+        new.cap_permitted = cap_combine(
+            cap_intersect(new.cap_bset, caps.permitted),
+            cap_intersect(new.cap_inheritable, caps.inheritable),
+        );
+    }
     if new.euid.0 == 0
         && old.euid.0 != 0
+        && !(has_file_caps && new.uid.0 != 0)
         && new.securebits & securebit_mask(cred::securebits::SECURE_NOROOT) == 0
         && new.securebits & securebit_mask(cred::securebits::SECURE_NO_SETUID_FIXUP) == 0
     {
         new.cap_permitted = new.cap_bset;
         new.cap_effective = new.cap_permitted;
     }
-    if new.euid.0 != 0
+    let applied_file_caps = allow_privilege && has_file_caps;
+    if applied_file_caps {
+        let caps = file_caps.expect("has_file_caps");
+        new.cap_effective = if caps.effective {
+            new.cap_permitted
+        } else {
+            new.cap_ambient
+        };
+    } else if new.euid.0 != 0
         && new.securebits & securebit_mask(cred::securebits::SECURE_NO_SETUID_FIXUP) == 0
     {
         new.cap_effective = KernelCapT::empty();
     }
 
-    let secure_exec = exec_creds_require_secure_mode(old, new, has_file_caps);
+    let secure_exec = exec_creds_require_secure_mode(old, new, file_caps);
     let security = ExecSecurityContext {
         uid: new.uid.0,
         euid: new.euid.0,
@@ -341,13 +462,19 @@ pub fn take_exec_start_for_current() -> Option<UserStartContext> {
     if task.is_null() {
         return None;
     }
+    if let Some(ctx) = crate::kernel::fork::take_heap_task_exec_start(task) {
+        return Some(ctx);
+    }
     let pid = unsafe { (*task).pid };
     let mut starts = EXEC_STARTS.lock();
     let idx = starts.iter().position(|(p, _)| *p == pid)?;
     Some(starts.swap_remove(idx).1)
 }
 
-fn set_exec_start_for_pid(pid: i32, ctx: UserStartContext) {
+fn set_exec_start_for_task(task: *mut TaskStruct, pid: i32, ctx: UserStartContext) {
+    if crate::kernel::fork::set_heap_task_exec_start(task, ctx) {
+        return;
+    }
     let mut starts = EXEC_STARTS.lock();
     if let Some(entry) = starts.iter_mut().find(|(p, _)| *p == pid) {
         *entry = (pid, ctx);
@@ -377,7 +504,7 @@ pub fn parse_elf_image(bytes: &[u8]) -> Result<ElfImage, i32> {
     if (e_type != ET_EXEC && e_type != ET_DYN) || e_machine != EM_X86_64 {
         return Err(-8);
     }
-    if e_phentsize < 56 {
+    if e_phentsize != ELF_PHDR_SIZE {
         return Err(-8);
     }
 
@@ -478,6 +605,7 @@ fn load_image_with_shebang(path: &str, depth: usize) -> Result<LoadedImage, i32>
         path: normalize_exec_path(path),
         elf,
         bytes: meta.bytes,
+        complete_bytes: meta.complete_bytes,
         inode: meta.inode,
         dentry: meta.dentry,
         mount: meta.mount,
@@ -492,6 +620,7 @@ fn read_shebang_spec(path: &str) -> Result<Option<ShebangSpec>, i32> {
 
 struct ExecFileMeta {
     bytes: Vec<u8>,
+    complete_bytes: bool,
     inode: crate::fs::types::InodeRef,
     dentry: crate::fs::types::DentryRef,
     mount: alloc::sync::Arc<crate::fs::mount::Mount>,
@@ -508,24 +637,144 @@ fn read_exec_file_meta(path: &str) -> Result<ExecFileMeta, i32> {
     if inode.kind != crate::fs::types::InodeKind::Regular {
         return Err(-13);
     }
-    let bytes = match &inode.private {
-        crate::fs::types::InodePrivate::StaticBytes(bytes) => Ok(bytes.to_vec()),
+    let (bytes, complete_bytes) = match &inode.private {
+        crate::fs::types::InodePrivate::StaticBytes(bytes) => Ok((bytes.to_vec(), true)),
         crate::fs::types::InodePrivate::StaticCowBytes { base, overlay } => {
             if let Some(bytes) = overlay.lock().as_ref() {
-                Ok(bytes.clone())
+                Ok((bytes.clone(), true))
             } else {
-                Ok(base.to_vec())
+                Ok((base.to_vec(), true))
             }
         }
-        crate::fs::types::InodePrivate::RamBytes(bytes) => Ok(bytes.lock().clone()),
-        _ => read_regular_inode_bytes(path, dentry.clone(), inode.clone()),
+        crate::fs::types::InodePrivate::RamBytes(bytes) => Ok((bytes.lock().clone(), true)),
+        _ => read_regular_exec_metadata_bytes(path, dentry.clone(), inode.clone()),
     }?;
     Ok(ExecFileMeta {
         bytes,
+        complete_bytes,
         inode,
         dentry,
         mount,
     })
+}
+
+fn read_regular_exec_metadata_bytes(
+    path: &str,
+    dentry: crate::fs::types::DentryRef,
+    inode: crate::fs::types::InodeRef,
+) -> Result<(Vec<u8>, bool), i32> {
+    let size = inode.size.load(Ordering::Acquire) as usize;
+    if size > MAX_EXEC_FILE_BYTES {
+        return Err(-7); // E2BIG
+    }
+
+    let prefix_len = core::cmp::min(BINPRM_BUF_SIZE, size);
+    let mut metadata =
+        read_regular_inode_range(path, dentry.clone(), inode.clone(), 0, prefix_len, false)?;
+    if metadata.len() < 64 || metadata.get(0..4) != Some(ELF_MAGIC) {
+        let complete = metadata.len() == size;
+        return Ok((metadata, complete));
+    }
+
+    let phoff = read_u64(&metadata, 32)?;
+    let phentsize = read_u16(&metadata, 54)?;
+    let phnum = read_u16(&metadata, 56)?;
+    if phentsize != ELF_PHDR_SIZE || phnum == 0 {
+        return Ok((metadata, false));
+    }
+    let phdr_bytes = (phentsize as usize).checked_mul(phnum as usize).ok_or(-8)?;
+    if phdr_bytes == 0 || phdr_bytes > ELF_MAX_PHDR_BYTES {
+        return Ok((metadata, false));
+    }
+    let phoff_usize = usize::try_from(phoff).map_err(|_| -8)?;
+    let phend = phoff_usize.checked_add(phdr_bytes).ok_or(-8)?;
+    if phend > MAX_EXEC_FILE_BYTES {
+        return Err(-8);
+    }
+    if metadata.len() < phend {
+        metadata.resize(phend, 0);
+    }
+    let phdrs =
+        read_regular_inode_range(path, dentry.clone(), inode.clone(), phoff, phdr_bytes, true)?;
+    metadata[phoff_usize..phend].copy_from_slice(&phdrs);
+
+    for idx in 0..phnum {
+        let off = idx as usize * phentsize as usize;
+        let p_type = read_u32(&phdrs, off)?;
+        if p_type != PT_INTERP {
+            continue;
+        }
+        let p_offset = read_u64(&phdrs, off + 8)?;
+        let p_filesz = read_u64(&phdrs, off + 32)?;
+        if !(2..=PATH_MAX).contains(&p_filesz) {
+            return Err(-8);
+        }
+        let interp_start = usize::try_from(p_offset).map_err(|_| -8)?;
+        let interp_len = usize::try_from(p_filesz).map_err(|_| -8)?;
+        let interp_end = interp_start.checked_add(interp_len).ok_or(-8)?;
+        if interp_end > MAX_EXEC_FILE_BYTES {
+            return Err(-8);
+        }
+        if metadata.len() < interp_end {
+            metadata.resize(interp_end, 0);
+        }
+        let interp = read_regular_inode_range(
+            path,
+            dentry.clone(),
+            inode.clone(),
+            p_offset,
+            interp_len,
+            true,
+        )?;
+        metadata[interp_start..interp_end].copy_from_slice(&interp);
+        break;
+    }
+
+    let complete = metadata.len() == size;
+    Ok((metadata, complete))
+}
+
+fn read_regular_inode_range(
+    path: &str,
+    dentry: crate::fs::types::DentryRef,
+    inode: crate::fs::types::InodeRef,
+    offset: u64,
+    len: usize,
+    exact: bool,
+) -> Result<Vec<u8>, i32> {
+    let mut out = vec![0u8; len];
+    if len == 0 {
+        return Ok(out);
+    }
+
+    let file = crate::fs::file::alloc_file(
+        dentry,
+        crate::include::uapi::fcntl::O_RDONLY,
+        inode.mode.load(Ordering::Acquire),
+        inode.fops,
+    );
+    crate::fs::file::set_path_hint(&file, path.to_string());
+
+    let result = (|| {
+        let read = file.fops.read.ok_or(-38)?;
+        let mut pos = offset;
+        let mut filled = 0usize;
+        while filled < len {
+            let n = read(&file, &mut out[filled..], &mut pos).map_err(|errno| -(errno as i32))?;
+            if n == 0 {
+                break;
+            }
+            filled = filled.checked_add(n).ok_or(-7)?;
+        }
+        if exact && filled != len {
+            return Err(-5); // EIO, matching elf_read() short-read handling.
+        }
+        out.truncate(filled);
+        Ok(out)
+    })();
+
+    crate::fs::file::fput(file);
+    result
 }
 
 fn read_regular_inode_bytes(
@@ -830,71 +1079,105 @@ fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
 }
 
+fn open_exec_file_for_mapping(image: &LoadedImage) -> Result<crate::fs::types::FileRef, i32> {
+    if image.inode.fops.read.is_none() {
+        return Err(-8);
+    }
+    let file = crate::fs::file::alloc_file(
+        image.dentry.clone(),
+        crate::include::uapi::fcntl::O_RDONLY,
+        image.inode.mode.load(Ordering::Acquire),
+        image.inode.fops,
+    );
+    crate::fs::file::set_path_hint(&file, image.path.clone());
+    Ok(file)
+}
+
+unsafe fn do_mmap_with_file_ref(
+    mm: *mut MmStruct,
+    addr: u64,
+    len: u64,
+    prot: u32,
+    flags: u32,
+    pgoff: u64,
+    path: &str,
+    file: crate::fs::types::FileRef,
+) -> Result<u64, i32> {
+    crate::fs::file::note_file_mmap_for_integrity(Some(path), &file);
+    let raw_file = crate::mm::vma::vma_file_from_ref(file);
+    match unsafe { do_mmap(&mut *mm, addr, len, prot, flags, pgoff, raw_file) } {
+        Ok(mapped) => Ok(mapped),
+        Err(err) => {
+            unsafe { crate::mm::vma::vma_file_put_raw(raw_file) };
+            Err(err)
+        }
+    }
+}
+
 unsafe fn map_elf_into_mm(
     mm: *mut MmStruct,
-    image: &ElfImage,
-    data: &[u8],
+    image: &LoadedImage,
     load_bias: u64,
 ) -> Result<(), i32> {
-    for seg in image.load_segments.iter() {
+    for seg in image.elf.load_segments.iter() {
         let Some(window) = elf_load_window(seg, load_bias)? else {
             continue;
         };
         let final_prot = prot_from_segment_flags(seg.flags);
-        // We copy segment contents into anonymous memory, so we must temporarily
-        // allow writes even for RX mappings; afterwards we mprotect back to the
-        // final ELF p_flags-derived prot.
-        let load_prot = final_prot | PROT_WRITE;
 
-        unsafe {
-            do_mmap(
-                &mut *mm,
-                window.map_start,
-                window.map_len,
-                load_prot,
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-                0,
-                0,
-            )?
-        };
-
-        if window.file_len > 0 {
-            let file_end = window.file_offset.checked_add(window.file_len).ok_or(-8)?;
-            if file_end > data.len() {
-                return Err(-8);
+        let file_map_len = align_up(window.file_len as u64, PAGE_SIZE as u64);
+        if file_map_len != 0 {
+            if window.file_offset & (PAGE_SIZE - 1) != 0 {
+                return Err(-22);
             }
-            if let Err(err) =
-                unsafe { user_write(mm, window.map_start, &data[window.file_offset..file_end]) }
-            {
-                crate::kernel::printk::log_error!(
-                    "exec",
-                    "map_elf: file write failed vaddr={:#x} len={:#x} err={}",
+            let file = open_exec_file_for_mapping(image)?;
+            unsafe {
+                do_mmap_with_file_ref(
+                    mm,
                     window.map_start,
-                    window.file_len,
-                    err
-                );
-                return Err(err);
-            }
+                    file_map_len,
+                    final_prot,
+                    MAP_PRIVATE | MAP_FIXED,
+                    (window.file_offset >> 12) as u64,
+                    &image.path,
+                    file,
+                )?
+            };
         }
 
-        if window.zero_len > 0 {
-            let zero_len = window.zero_len as usize;
-            let zeroes = vec![0u8; zero_len];
+        let map_end = window.map_start.checked_add(window.map_len).ok_or(-12)?;
+        let bss_start = if file_map_len == 0 {
+            window.map_start
+        } else {
+            align_up(window.zero_start, PAGE_SIZE as u64)
+        };
+        if file_map_len != 0 && bss_start > window.zero_start && final_prot & PROT_WRITE != 0 {
+            let pad_len = usize::try_from(bss_start - window.zero_start).map_err(|_| -12)?;
+            let zeroes = vec![0u8; pad_len];
             if let Err(err) = unsafe { user_write(mm, window.zero_start, &zeroes) } {
                 crate::kernel::printk::log_error!(
                     "exec",
-                    "map_elf: zero write failed vaddr={:#x} len={:#x} err={}",
+                    "map_elf: padzero failed vaddr={:#x} len={:#x} err={}",
                     window.zero_start,
-                    zero_len,
+                    pad_len,
                     err
                 );
                 return Err(err);
             }
         }
-
-        // Downgrade back to the final mapping protections (e.g. RX for text).
-        if (final_prot & PROT_WRITE) == 0 {
-            unsafe { do_mprotect(&mut *mm, window.map_start, window.map_len, final_prot)? };
+        if bss_start < map_end {
+            let bss_prot = PROT_READ | PROT_WRITE | (final_prot & PROT_EXEC);
+            unsafe {
+                do_mmap(
+                    &mut *mm,
+                    bss_start,
+                    map_end - bss_start,
+                    bss_prot,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                    0,
+                    0,
+                )?
+            };
         }
     }
     Ok(())
@@ -1266,7 +1549,7 @@ unsafe fn commit_exec_for_current(
     let layout = exec_load_layout(program)?;
     let relocation_plan = exec_relocation_plan(program);
     let main_bias = layout.main_bias;
-    unsafe { map_elf_into_mm(mm, &program.main.elf, &program.main.bytes, main_bias)? };
+    unsafe { map_elf_into_mm(mm, &program.main, main_bias)? };
     if relocation_plan.relocate_main_relative {
         unsafe {
             apply_elf_relative_relocations(
@@ -1281,7 +1564,7 @@ unsafe fn commit_exec_for_current(
 
     let entry_ip = if let Some(interp) = program.interp.as_ref() {
         let interp_bias = layout.interp_bias;
-        unsafe { map_elf_into_mm(mm, &interp.elf, &interp.bytes, interp_bias)? };
+        unsafe { map_elf_into_mm(mm, interp, interp_bias)? };
         layout.entry_ip
     } else {
         layout.entry_ip
@@ -1323,6 +1606,9 @@ unsafe fn commit_exec_for_current(
     let old_mm = unsafe { (*task).mm };
 
     unsafe {
+        // Linux `exec_mmap()` calls `exec_mm_release()` before installing the
+        // new image's mm, which completes a pending vfork parent wait.
+        crate::kernel::fork::complete_vfork_done(task);
         security::security_bprm_committing_creds(path.as_bytes());
         proposed_creds.commit();
         let exe_file = crate::fs::file::alloc_file(
@@ -1373,7 +1659,7 @@ unsafe fn commit_exec_for_current(
         old_mm: old_mm as usize,
     };
     let pid = unsafe { (*task).pid };
-    set_exec_start_for_pid(pid, ctx);
+    set_exec_start_for_task(task, pid, ctx);
     security::security_bprm_committed_creds(path.as_bytes());
     Ok(ctx)
 }
@@ -1393,27 +1679,33 @@ fn prepare_exec_security(path: &str) -> Result<(), i32> {
 
 fn measure_exec_program(program: &LoadedProgram) -> usize {
     let mut measured = 0;
-    if security::integrity::ima::measure_file_for_hook(
-        security::integrity::ima::ImaHook::BprmCheck,
-        &program.main.path,
-        &program.main.bytes,
-    )
-    .unwrap_or(false)
-    {
+    if measure_exec_image(&program.main) {
         measured += 1;
     }
     if let Some(interp) = program.interp.as_ref() {
-        if security::integrity::ima::measure_file_for_hook(
-            security::integrity::ima::ImaHook::BprmCheck,
-            &interp.path,
-            &interp.bytes,
-        )
-        .unwrap_or(false)
-        {
+        if measure_exec_image(interp) {
             measured += 1;
         }
     }
     measured
+}
+
+fn measure_exec_image(image: &LoadedImage) -> bool {
+    if image.complete_bytes {
+        security::integrity::ima::measure_file_for_hook(
+            security::integrity::ima::ImaHook::BprmCheck,
+            &image.path,
+            &image.bytes,
+        )
+        .unwrap_or(false)
+    } else {
+        security::integrity::ima::measure_inode_private_for_hook(
+            security::integrity::ima::ImaHook::BprmCheck,
+            &image.path,
+            &image.inode.private,
+        )
+        .unwrap_or(false)
+    }
 }
 
 pub unsafe fn sys_execve(
@@ -1817,6 +2109,8 @@ mod tests {
     use crate::security::register_lsm;
 
     static EXEC_HOOK_LOG: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    static EXEC_METADATA_TEST_BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static EXEC_METADATA_READ_LOG: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::new());
 
     fn test_bprm_creds_for_exec(_filename: &[u8]) -> i32 {
         EXEC_HOOK_LOG.lock().unwrap().push("creds");
@@ -1834,6 +2128,23 @@ mod tests {
 
     fn test_bprm_committed_creds(_filename: &[u8]) {
         EXEC_HOOK_LOG.lock().unwrap().push("committed");
+    }
+
+    fn exec_metadata_test_read(
+        _file: &crate::fs::types::FileRef,
+        buf: &mut [u8],
+        pos: &mut u64,
+    ) -> Result<usize, i32> {
+        let data = EXEC_METADATA_TEST_BYTES.lock().unwrap();
+        let start = *pos as usize;
+        if start >= data.len() {
+            return Ok(0);
+        }
+        let n = core::cmp::min(buf.len(), data.len() - start);
+        buf[..n].copy_from_slice(&data[start..start + n]);
+        EXEC_METADATA_READ_LOG.lock().unwrap().push((*pos, n));
+        *pos += n as u64;
+        Ok(n)
     }
 
     #[test]
@@ -1934,6 +2245,7 @@ mod tests {
             path: path.to_string(),
             elf,
             bytes,
+            complete_bytes: true,
             inode,
             dentry,
             mount,
@@ -1976,6 +2288,20 @@ mod tests {
             main: image,
             interp: None,
         }
+    }
+
+    fn test_vfs_cap_xattr_v2(effective: bool, permitted: u64, inheritable: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut magic = VFS_CAP_REVISION_2;
+        if effective {
+            magic |= VFS_CAP_FLAGS_EFFECTIVE;
+        }
+        out.extend_from_slice(&magic.to_le_bytes());
+        out.extend_from_slice(&(permitted as u32).to_le_bytes());
+        out.extend_from_slice(&(inheritable as u32).to_le_bytes());
+        out.extend_from_slice(&((permitted >> 32) as u32).to_le_bytes());
+        out.extend_from_slice(&((inheritable >> 32) as u32).to_le_bytes());
+        out
     }
 
     fn test_nonroot_cred(uid: u32, gid: u32) -> Box<Cred> {
@@ -2099,6 +2425,60 @@ mod tests {
     }
 
     #[test]
+    fn exec_creds_reject_invalid_file_capability_xattr() {
+        let old = test_nonroot_cred(1000, 1000);
+        let (_task, previous) = install_test_task(&old, 0);
+        let program = test_setid_program(0o0755, 0, 0, 0, false);
+        program
+            .main
+            .inode
+            .xattrs
+            .lock()
+            .insert("security.capability".to_string(), b"cap-v1".to_vec());
+
+        let result = prepare_exec_creds(&program);
+        assert!(matches!(result, Err(-22)));
+        unsafe { sched::set_current(previous) };
+    }
+
+    #[test]
+    fn exec_creds_empty_file_capability_xattr_does_not_enable_secure_mode() {
+        let old = test_nonroot_cred(1000, 1000);
+        let (_task, previous) = install_test_task(&old, 0);
+        let program = test_setid_program(0o0755, 0, 0, 0, false);
+        program.main.inode.xattrs.lock().insert(
+            "security.capability".to_string(),
+            test_vfs_cap_xattr_v2(false, 0, 0),
+        );
+
+        let proposed = prepare_exec_creds(&program).expect("prepare exec creds");
+        assert!(!proposed.security().secure_exec);
+        assert!(unsafe { (*proposed.cred).cap_effective.is_empty() });
+        unsafe { sched::set_current(previous) };
+    }
+
+    #[test]
+    fn exec_creds_file_capability_effective_bit_sets_secure_mode() {
+        let old = test_nonroot_cred(1000, 1000);
+        let (_task, previous) = install_test_task(&old, 0);
+        let program = test_setid_program(0o0755, 0, 0, 0, false);
+        let cap_net_raw = 1u64 << crate::kernel::capability::CAP_NET_RAW;
+        program.main.inode.xattrs.lock().insert(
+            "security.capability".to_string(),
+            test_vfs_cap_xattr_v2(true, cap_net_raw, 0),
+        );
+
+        let proposed = prepare_exec_creds(&program).expect("prepare exec creds");
+        assert!(proposed.security().secure_exec);
+        assert!(unsafe {
+            (*proposed.cred)
+                .cap_effective
+                .raised(crate::kernel::capability::CAP_NET_RAW)
+        });
+        unsafe { sched::set_current(previous) };
+    }
+
+    #[test]
     fn parse_elf_extracts_loads_and_interp() {
         let elf = tiny_elf(Some("/lib/ld-musl-x86_64.so.1"));
         let parsed = parse_elf_image(&elf).expect("parse");
@@ -2157,6 +2537,19 @@ mod tests {
         readdir: None,
     };
 
+    static EXEC_METADATA_TEST_FOPS: crate::fs::ops::FileOps = crate::fs::ops::FileOps {
+        name: "exec-metadata-test",
+        read: Some(exec_metadata_test_read),
+        write: None,
+        llseek: None,
+        fsync: None,
+        poll: None,
+        ioctl: None,
+        mmap: None,
+        release: None,
+        readdir: None,
+    };
+
     #[test]
     fn read_exec_file_falls_back_to_vfs_for_opaque_regular_inode() {
         let dentry = crate::fs::dcache::d_alloc("exec-opaque");
@@ -2176,6 +2569,46 @@ mod tests {
         let bytes = read_regular_inode_bytes("/sbin/init", dentry, inode).expect("vfs read");
 
         assert_eq!(bytes, EXEC_OPAQUE_TEST_BYTES);
+    }
+
+    #[test]
+    fn regular_exec_metadata_read_stops_before_far_pt_load_payload() {
+        // test-origin: linux:vendor/linux/fs/exec.c:prepare_binprm
+        // test-origin: linux:vendor/linux/fs/binfmt_elf.c:load_elf_phdrs
+        let mut bytes = tiny_elf(None);
+        let payload_offset = 0x2_0000usize;
+        let p0 = 64usize;
+        bytes[p0 + 8..p0 + 16].copy_from_slice(&(payload_offset as u64).to_le_bytes());
+        bytes.resize(payload_offset + PAGE_SIZE, 0xcc);
+        *EXEC_METADATA_TEST_BYTES.lock().unwrap() = bytes.clone();
+        EXEC_METADATA_READ_LOG.lock().unwrap().clear();
+
+        let dentry = crate::fs::dcache::d_alloc("exec-metadata");
+        let inode = crate::fs::types::Inode::new(
+            100,
+            crate::fs::types::InodeKind::Regular,
+            0o755,
+            &crate::fs::ops::NOOP_INODE_OPS,
+            &EXEC_METADATA_TEST_FOPS,
+            crate::fs::types::InodePrivate::Opaque(100),
+        );
+        inode.size.store(bytes.len() as u64, Ordering::Release);
+        dentry.instantiate(inode.clone());
+
+        let (metadata, complete) = read_regular_exec_metadata_bytes("/bin/far-load", dentry, inode)
+            .expect("ELF metadata read");
+
+        assert!(!complete);
+        assert!(metadata.len() < payload_offset);
+        parse_elf_image(&metadata).expect("metadata contains ELF phdrs");
+        assert!(
+            EXEC_METADATA_READ_LOG
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(off, len)| (*off as usize) + *len <= payload_offset),
+            "Linux exec reads the binprm buffer and phdrs, not the far PT_LOAD payload"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/hwmon/hwmon.c
+//! test-origin: linux:vendor/linux/drivers/hwmon/hwmon.c
 //! Hardware-monitoring class ABI used by Linux-built drivers.
 //!
 //! Lupos does not yet expose the Linux hwmon class or sensor sysfs files.  The

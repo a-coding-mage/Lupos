@@ -227,11 +227,12 @@ const MAX_APS: usize = MAX_CPUS - 1;
 /// Stack size per AP, matching production scheduler kernel-thread stacks.
 const AP_STACK_SIZE: usize = crate::kernel::sched::KTHREAD_STACK_SIZE;
 
-/// Scheduler stack lookup masks the low 16 bits, so stacks need 64 KiB alignment.
-const AP_STACK_ALIGNMENT: usize = 64 * 1024;
+/// AP stacks use the same alignment window as scheduler task stacks.
+const AP_STACK_ALIGNMENT: usize = crate::kernel::sched::KTHREAD_STACK_SIZE;
 
 #[allow(dead_code)]
-#[repr(align(65536))]
+#[cfg_attr(debug_assertions, repr(align(65536)))]
+#[cfg_attr(not(debug_assertions), repr(align(16384)))]
 struct ApStack([u8; AP_STACK_SIZE]);
 
 /// Dedicated stacks for each AP, indexed by `(logical_cpu - 1)`.
@@ -982,7 +983,7 @@ mod tests {
         assert_eq!(
             align_of::<ApStack>(),
             AP_STACK_ALIGNMENT,
-            "AP stack alignment must be 64 KiB"
+            "AP stack alignment must match the scheduler stack window"
         );
         assert_eq!(
             size_of::<ApStack>(),
@@ -1062,8 +1063,8 @@ mod tests {
     }
 
     #[test]
-    fn ap_stack_size_is_64_kib() {
-        assert_eq!(AP_STACK_SIZE, 64 * 1024);
-        assert_eq!(AP_STACK_ALIGNMENT, 64 * 1024);
+    fn ap_stack_size_matches_scheduler_profile() {
+        assert_eq!(AP_STACK_SIZE, crate::kernel::sched::KTHREAD_STACK_SIZE);
+        assert_eq!(AP_STACK_ALIGNMENT, crate::kernel::sched::KTHREAD_STACK_SIZE);
     }
 }

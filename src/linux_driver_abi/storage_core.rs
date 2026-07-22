@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/base vendor/linux/block vendor/linux/kernel
+//! test-origin: linux:vendor/linux/drivers/base
 //! Core Linux ABI exports needed by generic disk-controller modules.
 //!
 //! AHCI/SCSI/libata pull in a broader part of Linux's driver core than the

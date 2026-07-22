@@ -7,8 +7,8 @@
 //!
 //! Implemented: access_ok, copy_from_user/copy_to_user, clear_user,
 //! get_user_u8/u32/u64, put_user_*, cmpxchg_user_u32, VMA fault-in,
-//! strncpy_from_user, strnlen_user, copy_from_user_nmi, rep_movs_alternative,
-//! rep_stos_alternative
+//! pagefault_disable/pagefault_enable, strncpy_from_user, strnlen_user,
+//! copy_from_user_nmi, rep_movs_alternative, rep_stos_alternative
 //! — each with `__ex_table` fault recovery matching Linux's
 //! `_ASM_EXTABLE_UA` mechanism.
 //!
@@ -31,7 +31,10 @@
 //! directives below) and rewrites RIP to the fixup label — exactly the Linux
 //! mechanism (Linux uses `_ASM_EXTABLE_UA`).
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::kernel::module::{export_symbol, find_symbol};
+use crate::kernel::sched::MAX_CPUS;
 
 /// Linux x86-64 task size: `(1 << 47) - PAGE_SIZE`.
 /// Any user pointer at or above this is invalid (kernel half).
@@ -352,6 +355,7 @@ fn fault_in_user_range(addr: u64, size: usize, write: bool) -> Result<(), i32> {
         return Err(-14);
     }
 
+    let _mmap_guard = unsafe { crate::mm::mmap_lock::MmapReadGuard::lock(mm) };
     let start = addr & !(4096 - 1);
     let end = addr
         .checked_add(size as u64)
@@ -525,6 +529,39 @@ pub unsafe fn get_user_u8(src: *const u8) -> Result<u8, i32> {
         );
     }
     Ok(val)
+}
+
+/// Read a `u32` from user space without taking the page-fault slow path.
+///
+/// Mirrors Linux's pagefault-disabled `futex_get_value_locked()` users: the
+/// load is protected only by the exception table. A fault returns `-EFAULT`
+/// and the caller must drop any atomic locks before faulting the page in.
+pub unsafe fn get_user_u32_nofault(src: *const u32) -> Result<u32, i32> {
+    if !access_ok(src as u64, 4) {
+        return Err(-14);
+    }
+    let _guard = PagefaultDisabled::new();
+    let mut err: i32 = 0;
+    let val: u32;
+    unsafe {
+        core::arch::asm!(
+            "21: mov {val:e}, dword ptr [{src}]",
+            "22: jmp 24f",
+            "23: mov {err:e}, 0xfffffff2",
+            "24:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 4",
+            ".long (21b - .)",
+            ".long (23b - .)",
+            ".long 3",
+            ".popsection",
+            val = lateout(reg) val,
+            err = inout(reg) err,
+            src = in(reg) src,
+            options(nostack, readonly),
+        );
+    }
+    if err == 0 { Ok(val) } else { Err(err) }
 }
 
 /// Read a `u32` from user space.
@@ -884,14 +921,47 @@ pub fn nmi_uaccess_okay() -> bool {
 /// counterpart of this RAII type.
 struct PagefaultDisabled;
 
+#[cfg(not(test))]
+static PAGEFAULT_DISABLED: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+
+#[cfg(not(test))]
+#[inline]
+fn pagefault_disabled_slot() -> &'static AtomicU32 {
+    let cpu = crate::kernel::sched::current_cpu() as usize;
+    &PAGEFAULT_DISABLED[cpu.min(MAX_CPUS - 1)]
+}
+
+pub fn pagefault_disabled() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        pagefault_disabled_slot().load(Ordering::Acquire) != 0
+    }
+}
+
+pub fn pagefault_disable() {
+    #[cfg(not(test))]
+    {
+        pagefault_disabled_slot().fetch_add(1, Ordering::AcqRel);
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
+pub fn pagefault_enable() {
+    #[cfg(not(test))]
+    {
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        pagefault_disabled_slot().fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl PagefaultDisabled {
     #[inline]
     fn new() -> Self {
-        // Counter manipulation lives behind crate::kernel::preempt — the
-        // bookkeeping landed with the M30 preempt module. We avoid a
-        // hard call here until the symbol is exposed from a public
-        // accessor; on x86 the page-fault handler additionally checks
-        // the in_interrupt() count, so NMI context is already covered.
+        pagefault_disable();
         Self
     }
 }
@@ -899,7 +969,7 @@ impl PagefaultDisabled {
 impl Drop for PagefaultDisabled {
     #[inline]
     fn drop(&mut self) {
-        // Symmetric `pagefault_enable()`.
+        pagefault_enable();
     }
 }
 
@@ -971,6 +1041,80 @@ mod tests {
         ));
         assert!(source.contains("SYM_FUNC_START(rep_movs_alternative)"));
         assert!(source.contains("EXPORT_SYMBOL(rep_movs_alternative)"));
+    }
+
+    #[test]
+    fn pagefault_disable_nofault_get_matches_linux_uaccess_contract() {
+        // test-origin: linux:vendor/linux/include/linux/uaccess.h:pagefault_disable
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/include/linux/uaccess.h"
+        ));
+        assert!(linux.contains("static inline void pagefault_disable(void)"));
+        assert!(linux.contains("pagefault_disabled_inc();"));
+        assert!(linux.contains("static inline bool pagefault_disabled(void)"));
+
+        let local = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/arch/x86/kernel/uaccess.rs"
+        ));
+        assert!(local.contains("pub fn pagefault_disabled() -> bool"));
+        assert!(local.contains("fn get_user_u32_nofault(src: *const u32)"));
+        let nofault = local
+            .split("pub unsafe fn get_user_u32_nofault(src: *const u32)")
+            .nth(1)
+            .and_then(|s| s.split("/// Read a `u32` from user space.").next())
+            .expect("nofault get_user helper present");
+        assert!(nofault.contains("let _guard = PagefaultDisabled::new();"));
+        assert!(nofault.contains(".pushsection __ex_table"));
+
+        let guard = local
+            .split("impl PagefaultDisabled")
+            .nth(1)
+            .expect("PagefaultDisabled guard present");
+        assert!(guard.contains("pagefault_disable();"));
+        assert!(local.contains("pagefault_enable();"));
+    }
+
+    #[test]
+    fn fault_in_user_range_holds_mmap_lock_like_fixup_user_fault() {
+        // test-origin: linux:vendor/linux/mm/gup.c:fault_in_safe_writeable
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/mm/gup.c"
+        ));
+        let linux_fault_in = linux
+            .split("size_t fault_in_safe_writeable")
+            .nth(1)
+            .and_then(|s| s.split("EXPORT_SYMBOL(fault_in_safe_writeable)").next())
+            .expect("Linux fault_in_safe_writeable present");
+        assert!(linux_fault_in.contains("mmap_read_lock(mm);"));
+        assert!(linux_fault_in.contains("fixup_user_fault(mm, cur, FAULT_FLAG_WRITE, &unlocked)"));
+        assert!(linux_fault_in.contains("mmap_read_unlock(mm);"));
+
+        let local = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/arch/x86/kernel/uaccess.rs"
+        ));
+        let local_fault_in = local
+            .split("fn fault_in_user_range(addr: u64, size: usize, write: bool)")
+            .nth(1)
+            .and_then(|s| {
+                s.split("/// Serial-trace a kernel-side user-copy fault")
+                    .next()
+            })
+            .expect("Lupos fault_in_user_range present");
+        let lock = local_fault_in
+            .find("MmapReadGuard::lock(mm)")
+            .expect("fault_in_user_range must hold mmap_lock while faulting user pages");
+        let find_vma = local_fault_in
+            .find("crate::mm::vma::find_vma")
+            .expect("fault_in_user_range should lookup VMAs");
+        let handle_fault = local_fault_in
+            .find("crate::mm::fault::handle_mm_fault")
+            .expect("fault_in_user_range should call handle_mm_fault");
+        assert!(lock < find_vma);
+        assert!(lock < handle_fault);
     }
 
     #[test]

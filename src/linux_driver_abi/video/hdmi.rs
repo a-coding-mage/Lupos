@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/video/hdmi.c
+//! test-origin: linux:vendor/linux/drivers/video/hdmi.c
 //! HDMI infoframe helper exports built into Linux when `CONFIG_HDMI=y`.
 
 use core::ffi::{c_char, c_void};

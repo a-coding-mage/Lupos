@@ -2,6 +2,7 @@
 //! linux-source: vendor/linux/drivers/thermal/thermal_core.c
 //! linux-source: vendor/linux/drivers/thermal/intel/intel_tcc.c
 //! linux-source: vendor/linux/drivers/thermal/intel/therm_throt.c
+//! test-origin: linux:vendor/linux/drivers/thermal
 //! Thermal core ABI used by Linux-built thermal drivers.
 //!
 //! Lupos does not yet expose Linux's full thermal class, netlink, hwmon, or

@@ -346,11 +346,21 @@ pub const unsafe fn read_gs() -> u16 {
 #[cfg(not(test))]
 #[inline]
 pub unsafe fn load_ds(selector: u16) {
-    let selector = selector as u64;
+    let mut selector = selector as u64;
     unsafe {
         core::arch::asm!(
+            "31: mov ds, {selector:x}",
+            "32: jmp 34f",
+            "33: xor {selector:e}, {selector:e}",
             "mov ds, {selector:x}",
-            selector = in(reg) selector,
+            "34:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 4",
+            ".long (31b - .)",
+            ".long (33b - .)",
+            ".long 3",
+            ".popsection",
+            selector = inout(reg) selector,
             options(nostack, preserves_flags),
         );
     }
@@ -363,11 +373,21 @@ pub const unsafe fn load_ds(_selector: u16) {}
 #[cfg(not(test))]
 #[inline]
 pub unsafe fn load_es(selector: u16) {
-    let selector = selector as u64;
+    let mut selector = selector as u64;
     unsafe {
         core::arch::asm!(
+            "31: mov es, {selector:x}",
+            "32: jmp 34f",
+            "33: xor {selector:e}, {selector:e}",
             "mov es, {selector:x}",
-            selector = in(reg) selector,
+            "34:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 4",
+            ".long (31b - .)",
+            ".long (33b - .)",
+            ".long 3",
+            ".popsection",
+            selector = inout(reg) selector,
             options(nostack, preserves_flags),
         );
     }
@@ -380,11 +400,24 @@ pub const unsafe fn load_es(_selector: u16) {}
 #[cfg(not(test))]
 #[inline]
 pub unsafe fn load_fs(selector: u16) {
-    let selector = selector as u64;
+    let mut selector = selector as u64;
     unsafe {
         core::arch::asm!(
+            "31: mov fs, {selector:x}",
+            "32: jmp 34f",
+            "33: mov {selector:e}, {user_ds}",
             "mov fs, {selector:x}",
-            selector = in(reg) selector,
+            "xor {selector:e}, {selector:e}",
+            "mov fs, {selector:x}",
+            "34:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 4",
+            ".long (31b - .)",
+            ".long (33b - .)",
+            ".long 3",
+            ".popsection",
+            selector = inout(reg) selector,
+            user_ds = const sel::USER_DS as u32,
             options(nostack, preserves_flags),
         );
     }
@@ -402,13 +435,28 @@ pub const unsafe fn load_fs(_selector: u16) {}
 #[inline]
 pub unsafe fn load_gs_index(selector: u16) {
     let flags = crate::kernel::locking::irqflags::local_irq_save();
-    let selector = selector as u64;
+    let mut selector = selector as u64;
     unsafe {
         core::arch::asm!(
             "swapgs",
+            "31: mov gs, {selector:x}",
+            "32:",
+            "swapgs",
+            "jmp 34f",
+            "33: mov {selector:e}, {user_ds}",
+            "mov gs, {selector:x}",
+            "xor {selector:e}, {selector:e}",
             "mov gs, {selector:x}",
             "swapgs",
-            selector = in(reg) selector,
+            "34:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 4",
+            ".long (31b - .)",
+            ".long (33b - .)",
+            ".long 3",
+            ".popsection",
+            selector = inout(reg) selector => _,
+            user_ds = const sel::USER_DS as u32,
             options(nostack, preserves_flags),
         );
     }
@@ -778,6 +826,31 @@ mod tests {
         assert_eq!(cpu_slot(0), 0);
         assert_eq!(cpu_slot(1), 1);
         assert_eq!(cpu_slot(MAX_CPUS + 4), MAX_CPUS - 1);
+    }
+
+    /// test-origin: linux:vendor/linux/arch/x86/include/asm/segment.h:LOAD_SEGMENT
+    /// and linux:vendor/linux/arch/x86/entry/entry_64.S:asm_load_gs_index
+    #[test]
+    fn segment_loaders_emit_exception_table_fixups() {
+        let source = include_str!("gdt.rs");
+        for (name, needle) in [
+            ("load_ds", "pub unsafe fn load_ds"),
+            ("load_es", "pub unsafe fn load_es"),
+            ("load_fs", "pub unsafe fn load_fs"),
+            ("load_gs_index", "pub unsafe fn load_gs_index"),
+        ] {
+            let body = source
+                .split(needle)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} must exist"))
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap_or("");
+            assert!(
+                body.contains(".pushsection __ex_table"),
+                "{name} must recover bad user selectors through the extable"
+            );
+        }
     }
 
     #[test]

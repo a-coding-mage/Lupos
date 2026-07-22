@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/lib/seq_buf.c
+//! test-origin: linux:vendor/linux/lib/seq_buf.c
 //! Minimal `struct seq_buf` helpers for Linux-built modules.
 
 use core::ffi::c_char;

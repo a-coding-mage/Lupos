@@ -8,10 +8,9 @@
 //! `vendor/linux/include/uapi/linux/sched/types.h` and the corresponding
 //! `kernel/sched/syscalls.c` paths.
 //!
-//! The full syscall table wiring lands in M59; for M30 these entry points are
-//! reachable from in-kernel test fixtures. Linux's on-rq `sched_change` /
-//! `reweight_entity` transaction is not yet represented here, so changing a
-//! running task's nice value or fair policy takes effect on its next enqueue.
+//! On-rq policy changes use the same dequeue/change/enqueue transaction as
+//! Linux `sched_change_begin()` / `sched_change_end()`. Fair-policy changes
+//! still lack Linux's full `reweight_entity()` load-accounting update.
 
 use crate::kernel::task::TaskStruct;
 
@@ -81,6 +80,30 @@ pub fn effective_prio(policy: u32, rt_priority: u32, nice: i32) -> i32 {
 
 // ── sys_sched_setattr ────────────────────────────────────────────────────────
 
+unsafe fn apply_sched_attr_fields(
+    p: *mut TaskStruct,
+    attr: &SchedAttr,
+    policy: u32,
+    next_class: *const SchedClass,
+    new_prio: i32,
+) {
+    unsafe {
+        (*p).m29.policy = policy;
+        (*p).m29.rt_priority = attr.sched_priority;
+        (*p).m29.static_prio = DEFAULT_PRIO + attr.sched_nice;
+        (*p).m29.normal_prio = new_prio;
+        (*p).m29.prio = new_prio;
+        (*p).m29.dl.dl_runtime = attr.sched_runtime;
+        (*p).m29.dl.dl_deadline = if attr.sched_deadline != 0 {
+            attr.sched_deadline
+        } else {
+            attr.sched_period
+        };
+        (*p).m29.dl.dl_period = attr.sched_period;
+        (*p).m29.sched_class = next_class;
+    }
+}
+
 /// Apply a `sched_attr` to a task.  Returns 0 on success, negative `errno` on
 /// failure.
 pub unsafe fn sys_sched_setattr(p: *mut TaskStruct, attr: &SchedAttr) -> i32 {
@@ -116,20 +139,12 @@ pub unsafe fn sys_sched_setattr(p: *mut TaskStruct, attr: &SchedAttr) -> i32 {
         _ => return -EINVAL,
     }
 
+    let next_class = class_for_policy(policy).unwrap() as *const SchedClass;
+    let new_prio = effective_prio(policy, attr.sched_priority, attr.sched_nice);
     unsafe {
-        (*p).m29.policy = policy;
-        (*p).m29.rt_priority = attr.sched_priority;
-        (*p).m29.static_prio = DEFAULT_PRIO + attr.sched_nice;
-        (*p).m29.normal_prio = effective_prio(policy, attr.sched_priority, attr.sched_nice);
-        (*p).m29.prio = (*p).m29.normal_prio;
-        (*p).m29.dl.dl_runtime = attr.sched_runtime;
-        (*p).m29.dl.dl_deadline = if attr.sched_deadline != 0 {
-            attr.sched_deadline
-        } else {
-            attr.sched_period
-        };
-        (*p).m29.dl.dl_period = attr.sched_period;
-        (*p).m29.sched_class = class_for_policy(policy).unwrap() as *const SchedClass;
+        super::change_task_scheduler(p, next_class, new_prio, |task| {
+            apply_sched_attr_fields(task, attr, policy, next_class, new_prio);
+        });
     }
     0
 }
@@ -222,6 +237,7 @@ pub unsafe fn sys_sched_yield() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
 
     #[test]
     fn sched_attr_is_56_bytes() {
@@ -276,5 +292,64 @@ mod tests {
     fn effective_prio_normal_is_default_plus_nice() {
         assert_eq!(effective_prio(SCHED_NORMAL, 0, 5), DEFAULT_PRIO + 5);
         assert_eq!(effective_prio(SCHED_NORMAL, 0, -10), DEFAULT_PRIO - 10);
+    }
+
+    // test-origin: linux:vendor/linux/kernel/sched/syscalls.c:__sched_setscheduler
+    // Linux has no userspace selftest for the internal dequeue/change/enqueue
+    // transaction. This checks the queue-membership invariant exposed by a
+    // runnable PipeWire thread changing from CFS to SCHED_FIFO.
+    #[test]
+    fn runnable_policy_change_moves_task_between_class_runqueues() {
+        const TEST_CPU: u32 = (super::super::MAX_CPUS - 1) as u32;
+
+        struct ResetRunqueue(u32);
+
+        impl Drop for ResetRunqueue {
+            fn drop(&mut self) {
+                let _ = super::super::rq::with_rq(self.0, |rq| {
+                    *rq = super::super::rq::Rq::new(self.0);
+                });
+            }
+        }
+
+        super::super::rq::init_rqs();
+        super::super::rq::with_rq(TEST_CPU, |rq| {
+            *rq = super::super::rq::Rq::new(TEST_CPU);
+        })
+        .expect("test runqueue exists");
+        let _reset_runqueue = ResetRunqueue(TEST_CPU);
+
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+        task.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        task.m29.sched_class = &super::super::fair::FAIR_SCHED_CLASS;
+        task.m29.policy = SCHED_NORMAL;
+        task.m29.cpus_mask = super::super::entity::CpuMask::one(TEST_CPU);
+        task.m29.cpus_ptr = &task.m29.cpus_mask;
+        task.m29.nr_cpus_allowed = 1;
+        task.thread_info.cpu = TEST_CPU;
+
+        unsafe {
+            super::super::enqueue_on_rq(TEST_CPU, task_ptr, super::super::class::ENQUEUE_INITIAL);
+        }
+        assert_eq!(task.m29.se.on_rq, 1);
+
+        let attr = SchedAttr {
+            size: SCHED_ATTR_SIZE_VER1,
+            sched_policy: SCHED_FIFO,
+            sched_priority: 88,
+            ..SchedAttr::default()
+        };
+        assert_eq!(unsafe { sys_sched_setattr(task_ptr, &attr) }, 0);
+
+        assert_eq!(task.m29.on_rq, 1);
+        assert_eq!(task.m29.se.on_rq, 0);
+        assert_eq!(task.m29.rt.on_rq, 1);
+        super::super::rq::with_rq(TEST_CPU, |rq| {
+            assert_eq!(rq.cfs.nr_running, 0);
+            assert_eq!(rq.rt.nr_running, 1);
+            assert_eq!(rq.nr_running, 1);
+        })
+        .expect("test runqueue exists");
     }
 }

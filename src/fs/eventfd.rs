@@ -3,8 +3,8 @@
 //! test-origin: linux:vendor/linux/fs/eventfd.c
 //! eventfd — counter-style fd for thread/process notifications.
 //!
-//! Counter and poll readiness semantics mirror vendor/linux/fs/eventfd.c.
-//! Interruptible blocking reads and writes are not implemented yet.
+//! Counter, poll readiness, and file-level blocking semantics mirror
+//! vendor/linux/fs/eventfd.c.
 
 extern crate alloc;
 
@@ -24,7 +24,10 @@ use crate::include::uapi::errno::{EAGAIN, EBADF, EINVAL};
 use crate::include::uapi::fcntl::{O_NONBLOCK, O_RDWR};
 use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::sched::wait::WaitQueueHead;
+use crate::kernel::task::{TaskStruct, task_state};
 use crate::kernel::{files, sched};
+
+const ERESTARTSYS: i32 = 512;
 
 /// `EFD_*` flags — byte-identical to Linux UAPI.
 pub const EFD_SEMAPHORE: i32 = 0o0000001;
@@ -222,17 +225,103 @@ fn eventfd_file_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<u
     if buf.len() < 8 {
         return Err(EINVAL);
     }
-    let value = eventfd_from_file(file)?.read()?;
-    buf[..8].copy_from_slice(&value.to_ne_bytes());
-    Ok(8)
+    let eventfd = eventfd_from_file(file)?;
+    let task = unsafe { sched::get_current() };
+
+    loop {
+        // Linux wait_event_interruptible_locked_irq() links the waiter before
+        // its final ctx->count test.  Preserve that order so a producer cannot
+        // update the counter and miss the wakeup between test and sleep.
+        if !task.is_null() {
+            unsafe {
+                eventfd
+                    .wqh
+                    .prepare_to_wait(task, task_state::TASK_INTERRUPTIBLE);
+            }
+        }
+
+        match eventfd.read() {
+            Ok(value) => {
+                finish_eventfd_wait(&eventfd, task);
+                buf[..8].copy_from_slice(&value.to_ne_bytes());
+                return Ok(8);
+            }
+            Err(EAGAIN) => {}
+            Err(errno) => {
+                finish_eventfd_wait(&eventfd, task);
+                return Err(errno);
+            }
+        }
+
+        if file.flags.load(Ordering::Acquire) & O_NONBLOCK != 0 || task.is_null() {
+            finish_eventfd_wait(&eventfd, task);
+            return Err(EAGAIN);
+        }
+
+        if crate::kernel::signal::has_unblocked_pending_signals(task) {
+            finish_eventfd_wait(&eventfd, task);
+            return Err(ERESTARTSYS);
+        }
+
+        unsafe {
+            sched::schedule_with_irqs_enabled();
+        }
+        finish_eventfd_wait(&eventfd, task);
+    }
 }
 
 fn eventfd_file_write(file: &FileRef, buf: &[u8], _pos: &mut u64) -> Result<usize, i32> {
-    if buf.len() < 8 {
+    if buf.len() != 8 {
         return Err(EINVAL);
     }
-    let value = u64::from_ne_bytes(buf[..8].try_into().map_err(|_| EINVAL)?);
-    eventfd_from_file(file)?.write(value)
+    let value = u64::from_ne_bytes(buf.try_into().map_err(|_| EINVAL)?);
+    let eventfd = eventfd_from_file(file)?;
+    let task = unsafe { sched::get_current() };
+
+    loop {
+        if !task.is_null() {
+            unsafe {
+                eventfd
+                    .wqh
+                    .prepare_to_wait(task, task_state::TASK_INTERRUPTIBLE);
+            }
+        }
+
+        match eventfd.write(value) {
+            Ok(n) => {
+                finish_eventfd_wait(&eventfd, task);
+                return Ok(n);
+            }
+            Err(EAGAIN) => {}
+            Err(errno) => {
+                finish_eventfd_wait(&eventfd, task);
+                return Err(errno);
+            }
+        }
+
+        if file.flags.load(Ordering::Acquire) & O_NONBLOCK != 0 || task.is_null() {
+            finish_eventfd_wait(&eventfd, task);
+            return Err(EAGAIN);
+        }
+
+        if crate::kernel::signal::has_unblocked_pending_signals(task) {
+            finish_eventfd_wait(&eventfd, task);
+            return Err(ERESTARTSYS);
+        }
+
+        unsafe {
+            sched::schedule_with_irqs_enabled();
+        }
+        finish_eventfd_wait(&eventfd, task);
+    }
+}
+
+fn finish_eventfd_wait(eventfd: &EventFd, task: *mut TaskStruct) {
+    if !task.is_null() {
+        unsafe {
+            eventfd.wqh.finish_wait(task);
+        }
+    }
 }
 
 fn eventfd_file_poll(file: &FileRef, table: Option<&mut PollTable>) -> u32 {
@@ -356,6 +445,19 @@ mod tests {
         let mut out = [0u8; 8];
         assert_eq!(eventfd_file_read(&file, &mut out, &mut pos), Ok(8));
         assert_eq!(u64::from_ne_bytes(out), 5);
+        eventfd_release(file);
+    }
+
+    #[test]
+    fn file_write_requires_exactly_u64_count() {
+        let token = EVENTFD_TOKEN.fetch_add(1, Ordering::AcqRel) as usize;
+        EVENTFDS.lock().insert(token, Arc::new(EventFd::new(0, 0)));
+        let file = alloc_anon_file("eventfd-write-size-test", &EVENTFD_FILE_OPS, token);
+        let mut pos = 0;
+
+        assert_eq!(eventfd_file_write(&file, &[0u8; 4], &mut pos), Err(EINVAL));
+        assert_eq!(eventfd_file_write(&file, &[0u8; 16], &mut pos), Err(EINVAL));
+
         eventfd_release(file);
     }
 }

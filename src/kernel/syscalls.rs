@@ -11,7 +11,7 @@ use alloc::string::String;
 use alloc::vec;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -63,28 +63,23 @@ fn rseq_runtime_supported() -> bool {
     false
 }
 
-#[cfg(not(test))]
 const MAX_RLIMIT_ENTRIES: usize = crate::kernel::sched::MAX_RUN_QUEUE;
 
-#[cfg(not(test))]
 #[derive(Clone, Copy)]
 struct RlimitEntry {
     key: i32,
     limits: [RLimit; RLIM_NLIMITS as usize],
 }
 
-#[cfg(not(test))]
 const EMPTY_RLIMIT_ENTRY: RlimitEntry = RlimitEntry {
     key: 0,
     limits: default_rlimits(),
 };
 
-#[cfg(not(test))]
 struct ProcessRlimitTable {
     entries: [RlimitEntry; MAX_RLIMIT_ENTRIES],
 }
 
-#[cfg(not(test))]
 impl ProcessRlimitTable {
     const fn new() -> Self {
         Self {
@@ -117,24 +112,37 @@ impl ProcessRlimitTable {
         Some(&mut self.entries[idx].limits)
     }
 
-    fn insert(&mut self, key: i32, limits: [RLimit; RLIM_NLIMITS as usize]) {
-        if let Some(slot) = self.get_or_insert_mut(key) {
-            *slot = limits;
+    fn insert(&mut self, key: i32, limits: [RLimit; RLIM_NLIMITS as usize]) -> bool {
+        if key <= 0 {
+            return false;
         }
+        if let Some(idx) = self.entries.iter().position(|entry| entry.key == key) {
+            self.entries[idx].limits = limits;
+            return false;
+        }
+        let Some(idx) = self.entries.iter().position(|entry| entry.key == 0) else {
+            return false;
+        };
+        self.entries[idx] = RlimitEntry { key, limits };
+        true
     }
 
-    fn remove(&mut self, key: i32) {
+    fn remove(&mut self, key: i32) -> bool {
         if key <= 0 {
-            return;
+            return false;
         }
         if let Some(idx) = self.entries.iter().position(|entry| entry.key == key) {
             self.entries[idx] = EMPTY_RLIMIT_ENTRY;
+            return true;
         }
+        false
     }
 }
 
 #[cfg(not(test))]
 static PROCESS_RLIMITS: Mutex<ProcessRlimitTable> = Mutex::new(ProcessRlimitTable::new());
+#[cfg(not(test))]
+static PROCESS_RLIMIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy)]
 struct RseqRegistration {
@@ -171,39 +179,43 @@ impl RseqRegistry {
             .find(|entry| entry.active && entry.key == key)
     }
 
-    fn insert(&mut self, entry: RseqRegistration) -> Result<(), i32> {
+    fn insert(&mut self, entry: RseqRegistration) -> Result<bool, i32> {
         if let Some(slot) = self
             .entries
             .iter_mut()
             .find(|candidate| candidate.active && candidate.key == entry.key)
         {
             *slot = entry;
-            return Ok(());
+            return Ok(false);
         }
         let Some(slot) = self.entries.iter_mut().find(|candidate| !candidate.active) else {
             return Err(ENOMEM);
         };
         *slot = entry;
-        Ok(())
+        Ok(true)
     }
 
-    fn remove(&mut self, key: i32) {
+    fn remove(&mut self, key: i32) -> bool {
         if let Some(slot) = self
             .entries
             .iter_mut()
             .find(|entry| entry.active && entry.key == key)
         {
             *slot = EMPTY_RSEQ_REGISTRATION;
+            return true;
         }
+        false
     }
 
     #[cfg(test)]
     fn clear(&mut self) {
         self.entries = [EMPTY_RSEQ_REGISTRATION; MAX_RSEQ_REGISTRATIONS];
+        RSEQ_REGISTRATION_COUNT.store(0, Ordering::Release);
     }
 }
 
 static RSEQ_REGISTRY: Mutex<RseqRegistry> = Mutex::new(RseqRegistry::new());
+static RSEQ_REGISTRATION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct RealItimerState {
     timer: UnsafeCell<crate::kernel::time::hrtimer::Hrtimer>,
@@ -248,6 +260,7 @@ impl Drop for RealItimerState {
 /// group.  Each entry is boxed so the contained `Hrtimer` keeps a stable address
 /// while it is enqueued in the hrtimer wheel by raw pointer.
 static REAL_ITIMERS: Mutex<BTreeMap<i32, Box<RealItimerState>>> = Mutex::new(BTreeMap::new());
+static REAL_ITIMER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Cancel and drop a process's real interval timer by tgid.  Called from
 /// `release_task`; only the thread-group leader pid matches this key.
@@ -255,11 +268,15 @@ pub fn release_task_real_itimer(tgid: i32) {
     if tgid <= 0 {
         return;
     }
+    if REAL_ITIMER_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let state = {
         let mut timers = REAL_ITIMERS.lock();
         timers.remove(&tgid)
     };
     if let Some(state) = state {
+        REAL_ITIMER_COUNT.fetch_sub(1, Ordering::AcqRel);
         state.cancel_synchronously();
     }
 }
@@ -1110,6 +1127,9 @@ pub fn rearm_real_itimer_after_sigalrm(pid: i32) {
     if pid <= 0 {
         return;
     }
+    if REAL_ITIMER_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let timers = REAL_ITIMERS.lock();
     let Some(state) = timers.get(&pid) else {
         return;
@@ -1151,9 +1171,13 @@ fn arm_real_itimer(value_ns: u64, interval_ns: u64, target_tgid: i32) -> ITimerV
     }
 
     let mut timers = REAL_ITIMERS.lock();
+    let existed = timers.contains_key(&target_tgid);
     let state = timers
         .entry(target_tgid)
         .or_insert_with(|| Box::new(RealItimerState::new()));
+    if !existed {
+        REAL_ITIMER_COUNT.fetch_add(1, Ordering::AcqRel);
+    }
     let state = state.as_ref();
     let timer_ptr = state.timer_ptr();
     let old = ITimerVal {
@@ -1450,6 +1474,9 @@ const fn default_rlimit(resource: i32) -> RLimit {
 pub(crate) fn current_rlimit(resource: i32) -> RLimit {
     #[cfg(not(test))]
     {
+        if PROCESS_RLIMIT_COUNT.load(Ordering::Acquire) == 0 {
+            return default_rlimit(resource);
+        }
         let key = current_rlimit_key();
         let table = PROCESS_RLIMITS.lock();
         table
@@ -1468,8 +1495,12 @@ fn set_current_rlimit(resource: i32, limit: RLimit) {
     {
         let key = current_rlimit_key();
         let mut table = PROCESS_RLIMITS.lock();
+        let existed = table.get(key).is_some();
         if let Some(limits) = table.get_or_insert_mut(key) {
             limits[resource as usize] = limit;
+            if !existed {
+                PROCESS_RLIMIT_COUNT.fetch_add(1, Ordering::AcqRel);
+            }
         }
     }
     #[cfg(test)]
@@ -1505,9 +1536,15 @@ pub(crate) fn inherit_process_rlimits(parent: *mut TaskStruct, child: *mut TaskS
         if parent_key == child_key {
             return;
         }
+        if PROCESS_RLIMIT_COUNT.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let mut table = PROCESS_RLIMITS.lock();
-        let parent_limits = table.get(parent_key).unwrap_or_else(default_rlimits);
-        table.insert(child_key, parent_limits);
+        if let Some(parent_limits) = table.get(parent_key)
+            && table.insert(child_key, parent_limits)
+        {
+            PROCESS_RLIMIT_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
     }
     #[cfg(test)]
     {
@@ -1522,8 +1559,11 @@ pub(crate) fn release_process_rlimits(task: *mut TaskStruct) {
             return;
         }
         let should_remove = unsafe { (*task).pid == (*task).tgid };
-        if should_remove {
-            PROCESS_RLIMITS.lock().remove(rlimit_key_for_task(task));
+        if should_remove && PROCESS_RLIMIT_COUNT.load(Ordering::Acquire) != 0 {
+            let removed = PROCESS_RLIMITS.lock().remove(rlimit_key_for_task(task));
+            if removed {
+                PROCESS_RLIMIT_COUNT.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
     #[cfg(test)]
@@ -1544,14 +1584,24 @@ fn current_rseq_key() -> i32 {
 }
 
 pub(crate) fn release_task_rseq_registration(task: *mut TaskStruct) {
-    RSEQ_REGISTRY.lock().remove(rseq_key_for_task(task));
+    if RSEQ_REGISTRATION_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    if RSEQ_REGISTRY.lock().remove(rseq_key_for_task(task)) {
+        RSEQ_REGISTRATION_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub(crate) fn clear_current_rseq_registration_for_exec() {
     // linux-source: vendor/linux/fs/exec.c
     // Linux calls `rseq_execve(current)` while installing a new image; the
     // TLS address belongs to the old mm and must not survive exec.
-    RSEQ_REGISTRY.lock().remove(current_rseq_key());
+    if RSEQ_REGISTRATION_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    if RSEQ_REGISTRY.lock().remove(current_rseq_key()) {
+        RSEQ_REGISTRATION_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub unsafe fn sys_getpriority(which: i32, who: i32) -> i64 {
@@ -2297,7 +2347,12 @@ fn rseq_register(key: i32, rseq: *mut u8, rseq_len: u32, sig: u32) -> i64 {
         sig,
     };
     match RSEQ_REGISTRY.lock().insert(entry) {
-        Ok(()) => 0,
+        Ok(inserted) => {
+            if inserted {
+                RSEQ_REGISTRATION_COUNT.fetch_add(1, Ordering::AcqRel);
+            }
+            0
+        }
         Err(errno) => -(errno as i64),
     }
 }
@@ -2334,7 +2389,9 @@ fn rseq_unregister(key: i32, rseq: *mut u8, rseq_len: u32, flags: i32, sig: u32)
     if let Err(errno) = write_rseq_area(rseq, &reset) {
         return -(errno as i64);
     }
-    RSEQ_REGISTRY.lock().remove(key);
+    if RSEQ_REGISTRY.lock().remove(key) {
+        RSEQ_REGISTRATION_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
     0
 }
 
@@ -2554,32 +2611,20 @@ pub fn sys_rseq_slice_yield(_cpu: i32, _node: i32, flags: u64) -> i64 {
     0
 }
 
-pub fn sys_shmget(_key: i32, size: usize, _shmflg: i32) -> i64 {
-    if size == 0 {
-        return -(EINVAL as i64);
-    }
-    -(ENOSYS as i64)
+pub fn sys_shmget(key: i32, size: usize, shmflg: i32) -> i64 {
+    crate::ipc::shm::sys_shmget(key, size, shmflg)
 }
 
-pub fn sys_shmat(_shmid: i32, _shmaddr: u64, shmflg: i32) -> i64 {
-    if shmflg & !0x3fff != 0 {
-        return -(EINVAL as i64);
-    }
-    -(ENOSYS as i64)
+pub fn sys_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> i64 {
+    crate::ipc::shm::sys_shmat(shmid, shmaddr, shmflg)
 }
 
-pub fn sys_shmctl(_shmid: i32, cmd: i32, _buf: *mut u8) -> i64 {
-    if cmd < 0 {
-        return -(EINVAL as i64);
-    }
-    -(ENOSYS as i64)
+pub fn sys_shmctl(shmid: i32, cmd: i32, buf: *mut u8) -> i64 {
+    crate::ipc::shm::sys_shmctl(shmid, cmd, buf)
 }
 
 pub fn sys_shmdt(shmaddr: u64) -> i64 {
-    if shmaddr == 0 {
-        return -(EINVAL as i64);
-    }
-    -(ENOSYS as i64)
+    crate::ipc::shm::sys_shmdt(shmaddr)
 }
 
 pub fn sys_semget(_key: i32, nsems: i32, _semflg: i32) -> i64 {
@@ -2927,6 +2972,7 @@ mod tests {
 
     static RSEQ_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
     static ITIMER_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+    static SYSV_SHM_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
     #[repr(C, align(32))]
     struct AlignedRseqArea(RseqUserArea);
@@ -4041,14 +4087,41 @@ mod tests {
 
     #[test]
     fn syscall_m78_ipc_mqueue_parity() {
-        assert_eq!(sys_shmget(0, 0, 0), -(EINVAL as i64));
-        assert_eq!(sys_shmget(0, 4096, 0), -(ENOSYS as i64));
-        assert_eq!(sys_shmat(0, 0, 0x4000), -(EINVAL as i64));
-        assert_eq!(sys_shmat(0, 0, 0), -(ENOSYS as i64));
-        assert_eq!(sys_shmctl(0, -1, core::ptr::null_mut()), -(EINVAL as i64));
-        assert_eq!(sys_shmctl(0, 0, core::ptr::null_mut()), -(ENOSYS as i64));
+        let _shm_guard = SYSV_SHM_TEST_LOCK.lock();
+        crate::ipc::shm::reset_sysv_shm_state_for_tests();
+
+        assert_eq!(
+            sys_shmget(crate::ipc::util::IPC_PRIVATE, 0, crate::ipc::shm::IPC_CREAT),
+            -(EINVAL as i64)
+        );
+        let shmid = sys_shmget(
+            crate::ipc::util::IPC_PRIVATE,
+            4096,
+            crate::ipc::shm::IPC_CREAT | 0o600,
+        );
+        assert!(shmid >= 0, "valid shmget must not return ENOSYS: {shmid}");
+        assert_eq!(
+            sys_shmat(-1, 0, crate::ipc::shm::SHM_RDONLY),
+            -(EINVAL as i64)
+        );
+        assert_eq!(
+            sys_shmctl(shmid as i32, -1, core::ptr::null_mut()),
+            -(EINVAL as i64)
+        );
+        assert_eq!(
+            sys_shmctl(shmid as i32, 999, core::ptr::null_mut()),
+            -(EINVAL as i64)
+        );
+        assert_eq!(
+            sys_shmctl(
+                shmid as i32,
+                crate::ipc::shm::IPC_RMID,
+                core::ptr::null_mut()
+            ),
+            0
+        );
         assert_eq!(sys_shmdt(0), -(EINVAL as i64));
-        assert_eq!(sys_shmdt(0x1000), -(ENOSYS as i64));
+        assert_eq!(sys_shmdt(0x1000), -(EINVAL as i64));
 
         assert_eq!(sys_semget(0, -1, 0), -(EINVAL as i64));
         assert_eq!(sys_semget(0, 1, 0), -(ENOSYS as i64));
@@ -4086,6 +4159,157 @@ mod tests {
             sys_mq_getsetattr(-1, core::ptr::null(), core::ptr::null_mut()),
             -(EBADF as i64)
         );
+    }
+
+    #[test]
+    fn sysv_shm_private_segment_maps_shared_anonymous_vma() {
+        let _shm_guard = SYSV_SHM_TEST_LOCK.lock();
+        crate::ipc::shm::reset_sysv_shm_state_for_tests();
+
+        let previous = unsafe { sched::get_current() };
+        let mut mm = Box::new(crate::mm::mm_types::MmStruct::new(0));
+        let mut current = zeroed_task(78_100);
+        current.cred = &raw const INIT_CRED;
+        current.mm = &mut *mm as *mut crate::mm::mm_types::MmStruct;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+        }
+
+        let shmid = sys_shmget(
+            crate::ipc::util::IPC_PRIVATE,
+            4096,
+            crate::ipc::shm::IPC_CREAT | 0o600,
+        );
+        assert!(shmid >= 0, "valid shmget failed: {shmid}");
+
+        let addr = sys_shmat(shmid as i32, 0, 0);
+        assert!(addr > 0, "valid shmat failed: {addr}");
+        let vma = crate::mm::vma::find_vma(&mm, addr as u64).expect("shmat VMA");
+        unsafe {
+            assert_eq!((*vma).vm_start, addr as u64);
+            assert_eq!((*vma).vm_end - (*vma).vm_start, 4096);
+            assert_ne!((*vma).vm_private_data, 0);
+            assert_ne!((*vma).vm_flags & crate::mm::vm_flags::VM_SHARED, 0);
+        }
+
+        let mut stat = crate::ipc::shm::Shmid64Ds::default();
+        assert_eq!(
+            sys_shmctl(
+                shmid as i32,
+                crate::ipc::shm::IPC_STAT,
+                (&mut stat as *mut crate::ipc::shm::Shmid64Ds).cast::<u8>(),
+            ),
+            0
+        );
+        assert_eq!(stat.shm_segsz, 4096);
+        assert_eq!(stat.shm_nattch, 1);
+
+        assert_eq!(sys_shmdt(addr as u64), 0);
+        assert!(crate::mm::vma::find_vma(&mm, addr as u64).is_none());
+        assert_eq!(
+            sys_shmctl(
+                shmid as i32,
+                crate::ipc::shm::IPC_RMID,
+                core::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(
+            sys_shmctl(
+                shmid as i32,
+                crate::ipc::shm::IPC_STAT,
+                (&mut stat as *mut crate::ipc::shm::Shmid64Ds).cast::<u8>(),
+            ),
+            -(EINVAL as i64)
+        );
+
+        unsafe {
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn sysv_shm_allows_attach_after_ipc_rmid_while_segment_attached() {
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/ipc/shm.c"
+        ));
+        assert!(linux.contains("if (shp->shm_nattch) {\n\t\tshp->shm_perm.mode |= SHM_DEST;"));
+        assert!(linux.contains("base = get_file(shp->shm_file);\n\tshp->shm_nattch++;"));
+
+        let _shm_guard = SYSV_SHM_TEST_LOCK.lock();
+        crate::ipc::shm::reset_sysv_shm_state_for_tests();
+
+        let previous = unsafe { sched::get_current() };
+        let mut mm = Box::new(crate::mm::mm_types::MmStruct::new(0));
+        let mut current = zeroed_task(78_101);
+        current.cred = &raw const INIT_CRED;
+        current.mm = &mut *mm as *mut crate::mm::mm_types::MmStruct;
+
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+        }
+
+        let shmid = sys_shmget(
+            crate::ipc::util::IPC_PRIVATE,
+            4096,
+            crate::ipc::shm::IPC_CREAT | 0o600,
+        );
+        assert!(shmid >= 0, "valid shmget failed: {shmid}");
+
+        let first = sys_shmat(shmid as i32, 0, 0);
+        assert!(first > 0, "first shmat failed: {first}");
+        assert_eq!(
+            sys_shmctl(
+                shmid as i32,
+                crate::ipc::shm::IPC_RMID,
+                core::ptr::null_mut()
+            ),
+            0
+        );
+
+        let second = sys_shmat(shmid as i32, 0, 0);
+        assert!(
+            second > 0,
+            "Linux keeps an IPC_RMID-marked segment attachable by id while nattch is nonzero: {second}"
+        );
+
+        let mut stat = crate::ipc::shm::Shmid64Ds::default();
+        assert_eq!(
+            sys_shmctl(
+                shmid as i32,
+                crate::ipc::shm::IPC_STAT,
+                (&mut stat as *mut crate::ipc::shm::Shmid64Ds).cast::<u8>(),
+            ),
+            0
+        );
+        assert_eq!(stat.shm_nattch, 2);
+        assert_ne!(stat.shm_perm.mode & crate::ipc::shm::SHM_DEST as u32, 0);
+
+        assert_eq!(sys_shmdt(first as u64), 0);
+        assert_eq!(
+            sys_shmctl(
+                shmid as i32,
+                crate::ipc::shm::IPC_STAT,
+                (&mut stat as *mut crate::ipc::shm::Shmid64Ds).cast::<u8>(),
+            ),
+            0
+        );
+        assert_eq!(stat.shm_nattch, 1);
+        assert_eq!(sys_shmdt(second as u64), 0);
+        assert_eq!(
+            sys_shmctl(
+                shmid as i32,
+                crate::ipc::shm::IPC_STAT,
+                (&mut stat as *mut crate::ipc::shm::Shmid64Ds).cast::<u8>(),
+            ),
+            -(EINVAL as i64)
+        );
+
+        unsafe {
+            sched::set_current(previous);
+        }
     }
 
     #[test]

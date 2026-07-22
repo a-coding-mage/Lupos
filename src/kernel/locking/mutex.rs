@@ -60,7 +60,7 @@ impl<T> Mutex<T> {
 
     fn current_task() -> u64 {
         #[cfg(test)]
-        return 0xDEAD_BEEF; // sentinel non-zero "current" for unit tests
+        return 0xDEAD_BEE8; // sentinel non-zero, 8-byte-aligned "current" for unit tests
         #[cfg(not(test))]
         unsafe {
             crate::kernel::sched::get_current() as u64
@@ -229,14 +229,15 @@ impl<T> Mutex<T> {
         self.wait_lock.lock();
         let head = unsafe { (*self.waiters.get()).first().copied() };
         if let Some(head) = head {
-            // Lupos has no optimistic mutex spinner, so perform Linux's
-            // explicit handoff: the waiter remains queued until it observes
-            // PICKUP and removes itself in lock_slow(). Keeping WAITERS set
-            // also preserves every later FIFO waiter.
-            self.owner.store(
-                head as u64 | MUTEX_FLAG_WAITERS | MUTEX_FLAG_PICKUP,
-                Ordering::Release,
-            );
+            if owner & MUTEX_FLAG_HANDOFF != 0 {
+                self.owner.store(
+                    head as u64 | MUTEX_FLAG_WAITERS | MUTEX_FLAG_PICKUP,
+                    Ordering::Release,
+                );
+            } else {
+                self.owner
+                    .store(owner & MUTEX_FLAG_WAITERS, Ordering::Release);
+            }
         } else {
             self.owner.store(0, Ordering::Release);
         }
@@ -589,6 +590,7 @@ pub unsafe extern "C" fn linux_ww_mutex_unlock(lock: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
 
     #[test]
     fn lock_unlock_round_trip() {
@@ -618,6 +620,66 @@ mod tests {
         assert_eq!(MUTEX_FLAG_WAITERS, 1);
         assert_eq!(MUTEX_FLAG_HANDOFF, 2);
         assert_eq!(MUTEX_FLAG_PICKUP, 4);
+    }
+
+    /// Linux `__mutex_unlock_slowpath()` clears the owner while preserving
+    /// WAITERS unless HANDOFF was requested.
+    ///
+    /// test-origin: linux:vendor/linux/kernel/locking/mutex.c:__mutex_unlock_slowpath
+    #[test]
+    fn contended_unlock_without_handoff_preserves_waiters_without_pickup() {
+        let m = Mutex::new(());
+        let mut waiter = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        waiter
+            .__state
+            .store(task_state::TASK_RUNNING, Ordering::Release);
+        let waiter_ptr = &mut *waiter as *mut TaskStruct;
+        unsafe {
+            (*m.waiters.get()).push(waiter_ptr);
+        }
+        m.owner.store(
+            Mutex::<()>::current_task() | MUTEX_FLAG_WAITERS,
+            Ordering::Release,
+        );
+
+        m.unlock();
+
+        assert_eq!(m.owner.load(Ordering::Acquire), MUTEX_FLAG_WAITERS);
+        assert_eq!(
+            unsafe { (*m.waiters.get()).first().copied() },
+            Some(waiter_ptr)
+        );
+    }
+
+    /// Linux only installs PICKUP when the owner word carried HANDOFF.
+    ///
+    /// test-origin: linux:vendor/linux/kernel/locking/mutex.c:__mutex_unlock_slowpath
+    #[test]
+    fn contended_unlock_with_handoff_installs_pickup_for_head_waiter() {
+        let m = Mutex::new(());
+        let mut waiter = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        waiter
+            .__state
+            .store(task_state::TASK_RUNNING, Ordering::Release);
+        let waiter_ptr = &mut *waiter as *mut TaskStruct;
+        unsafe {
+            (*m.waiters.get()).push(waiter_ptr);
+        }
+        m.owner.store(
+            Mutex::<()>::current_task() | MUTEX_FLAG_WAITERS | MUTEX_FLAG_HANDOFF,
+            Ordering::Release,
+        );
+
+        m.unlock();
+
+        assert_eq!(
+            m.owner.load(Ordering::Acquire),
+            waiter_ptr as u64 | MUTEX_FLAG_WAITERS | MUTEX_FLAG_PICKUP
+        );
+        assert_eq!(
+            unsafe { (*m.waiters.get()).first().copied() },
+            Some(waiter_ptr)
+        );
     }
 
     #[test]

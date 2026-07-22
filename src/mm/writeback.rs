@@ -629,6 +629,7 @@ mod tests {
             let page = alloc_test_page();
             unsafe { filemap_add_folio(mptr, page, index, GFP_KERNEL) };
             unsafe { set_page_dirty(page) };
+            unsafe { unlock_page(page) };
             pages.push(page);
         }
         lru_add_drain();
@@ -654,6 +655,7 @@ mod tests {
         let page = alloc_test_page();
         unsafe { filemap_add_folio(mptr, page, 3, GFP_KERNEL) };
         unsafe { set_page_dirty(page) };
+        unsafe { unlock_page(page) };
         lru_add_drain();
 
         unsafe {

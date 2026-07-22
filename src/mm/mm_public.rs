@@ -1,5 +1,6 @@
 //! linux-parity: complete
 //! linux-source: vendor/linux/include/linux/mm.h
+//! test-origin: linux:vendor/linux/include/linux/mm.h
 //! Linux-visible `include/linux/mm.h` wrappers.
 
 extern crate alloc;

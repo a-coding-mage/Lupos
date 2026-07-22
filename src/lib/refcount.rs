@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/lib/refcount.c
+//! test-origin: linux:vendor/linux/lib/refcount.c
 //! Linux refcount helper exports.
 
 use core::sync::atomic::{AtomicI32, Ordering};

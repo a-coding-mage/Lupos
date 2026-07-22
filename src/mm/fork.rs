@@ -40,7 +40,7 @@ use crate::mm::page_flags::{GFP_KERNEL, PGTY_TABLE, decode_page_type};
 use crate::mm::pagewalk::{MmWalk, MmWalkOps, walk_page_vma};
 use crate::mm::rmap::anon_vma_fork;
 use crate::mm::vm_flags::{VM_DONTCOPY, VM_WIPEONFORK};
-use crate::mm::vma::{insert_vma, vm_area_dup};
+use crate::mm::vma::{insert_vma, vm_area_free, vm_area_try_dup, vma_open};
 
 const PAGE_SIZE: usize = 4096;
 
@@ -229,7 +229,7 @@ unsafe fn dup_mmap_inner(new_mm: *mut MmStruct, old_mm: *mut MmStruct) -> Result
             }
 
             // Duplicate the VMA structure.
-            let dst_vma = vm_area_dup(src_vma);
+            let dst_vma = vm_area_try_dup(src_vma)?;
 
             // Update the mm_struct pointer to the new mm.
             (*dst_vma).vm_mm = new_mm;
@@ -238,14 +238,23 @@ unsafe fn dup_mmap_inner(new_mm: *mut MmStruct, old_mm: *mut MmStruct) -> Result
             if src_flags & VM_WIPEONFORK != 0 {
                 // Clear the anon_vma on the child VMA so new pages are faulted on demand.
                 (*dst_vma).anon_vma = core::ptr::null_mut();
-            } else {
-                // Set up COW chains and copy page tables.
-                anon_vma_fork(dst_vma, src_vma)?;
-                copy_page_range(new_mm, old_mm, src_vma)?;
+            } else if let Err(err) = anon_vma_fork(dst_vma, src_vma) {
+                vm_area_free(dst_vma);
+                return Err(err);
             }
 
-            // Insert the copied VMA into the new mm.
-            insert_vma(&mut *new_mm, dst_vma)?;
+            // Insert and open the copied VMA before copying page tables, matching
+            // Linux dup_mmap(): vma_iter_bulk_store(), map_count++, ->open(),
+            // then copy_page_range().
+            if let Err(err) = insert_vma(&mut *new_mm, dst_vma) {
+                vm_area_free(dst_vma);
+                return Err(err);
+            }
+            vma_open(dst_vma);
+
+            if src_flags & VM_WIPEONFORK == 0 {
+                copy_page_range(dst_vma, src_vma)?;
+            }
         }
 
         // High-water marks are set by the caller (dup_mm).
@@ -704,8 +713,8 @@ pub unsafe fn get_mm_rss(mm: *const MmStruct) -> u64 {
 mod tests {
     use super::*;
     use crate::mm::test_lock::GLOBAL_HW_TEST_LOCK;
-    use crate::mm::vm_flags::{VM_READ, VM_WRITE, VmFlags};
-    use crate::mm::vma::{insert_vma, vm_area_free};
+    use crate::mm::vm_flags::{VM_MAYWRITE, VM_READ, VM_WRITE, VmFlags};
+    use crate::mm::vma::{insert_vma, vm_area_free, vma_split};
 
     // ---------------------------------------------------------------------------
     // dup_mmap tests — these exercise VMA duplication without touching the buddy
@@ -978,6 +987,107 @@ mod tests {
             let dst = (*new_mm).mm_mt.collect_entries();
             let dst_vma = dst[0].2 as *mut VmAreaStruct;
             assert_eq!((*dst_vma).vm_start, 0x1000);
+
+            cleanup_mm(old_mm);
+            cleanup_mm(new_mm);
+        }
+    }
+
+    /// Linux `__split_vma()` preserves anon-vma metadata, so a present
+    /// anonymous PTE in the split half remains visible to `dup_mmap()` and is
+    /// copied into the child as a COW mapping.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vma.c:__split_vma
+    #[test]
+    fn dup_mmap_copies_present_pte_after_faulted_anon_vma_split() {
+        use crate::arch::x86::mm::paging;
+        use crate::mm::buddy;
+        use crate::mm::fault::{FAULT_FLAG_USER, FAULT_FLAG_WRITE, handle_mm_fault};
+        use crate::mm::page::Page;
+
+        unsafe fn pte_for_addr(mm: *const MmStruct, addr: u64) -> paging::pte_t {
+            let pgd = (*mm).pgd as *mut paging::pgd_t;
+            if pgd.is_null() {
+                return paging::__pte(0);
+            }
+            let pgdp = paging::pgd_offset_pgd(pgd, addr);
+            if paging::pgd_none(*pgdp) {
+                return paging::__pte(0);
+            }
+            let p4dp = paging::p4d_offset(pgdp, addr);
+            let pudp = paging::pud_offset(p4dp, addr);
+            if paging::pud_none(*pudp) || paging::pud_huge(*pudp) {
+                return paging::__pte(0);
+            }
+            let pmdp = paging::pmd_offset(pudp, addr);
+            if paging::pmd_none(*pmdp) || paging::pmd_huge(*pmdp) {
+                return paging::__pte(0);
+            }
+            let ptep = paging::pte_offset_kernel(pmdp, addr);
+            paging::ptep_get(ptep)
+        }
+
+        let _g = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const TEST_PAGES: usize = 256;
+        let mut pages = Box::new([const { Page::new() }; TEST_PAGES]);
+        for page in pages.iter_mut() {
+            unsafe { page.init_lru() };
+        }
+        unsafe { buddy::set_mem_map(pages.as_mut_ptr(), 0, TEST_PAGES) };
+        unsafe { buddy::install_test_buddy(0, TEST_PAGES) };
+        unsafe { paging::reset_test_pool() };
+
+        unsafe {
+            let old_mm = Box::into_raw(Box::new(MmStruct::new(
+                paging::init_pgd_for_test() as usize
+            )));
+            let new_mm = Box::into_raw(Box::new(MmStruct::new(
+                paging::init_pgd_for_test() as usize
+            )));
+
+            let start = 0x0080_0000;
+            let split = start + PAGE_SIZE as u64;
+            let flags = VM_READ | VM_WRITE | VM_MAYWRITE;
+            let vma = make_vma(start, start + 2 * PAGE_SIZE as u64, flags);
+            insert_vma(&mut *old_mm, vma).expect("insert split source VMA");
+
+            assert_eq!(
+                handle_mm_fault(vma, split, FAULT_FLAG_USER | FAULT_FLAG_WRITE),
+                0,
+                "fault second page before split"
+            );
+            let source_pte = pte_for_addr(old_mm, split);
+            assert!(paging::pte_present(source_pte));
+            assert!(paging::pte_write(source_pte));
+            assert!(!(*vma).anon_vma.is_null());
+
+            let right = vma_split(&mut *old_mm, vma, split).expect("split faulted VMA");
+            assert_eq!((*right).vm_start, split);
+            assert!(
+                !(*right).anon_vma.is_null(),
+                "split half with present PTEs must keep anon_vma"
+            );
+
+            dup_mmap(new_mm, old_mm).expect("dup_mmap");
+
+            let parent_after = pte_for_addr(old_mm, split);
+            let child_pte = pte_for_addr(new_mm, split);
+            assert!(paging::pte_present(child_pte));
+            assert!(
+                !paging::pte_write(parent_after),
+                "fork must write-protect parent PTE after split"
+            );
+            assert!(
+                !paging::pte_write(child_pte),
+                "fork must install read-only child COW PTE after split"
+            );
+            assert_eq!(
+                paging::pte_pfn(child_pte),
+                paging::pte_pfn(source_pte),
+                "child must inherit the populated anonymous page, not fault a zero page later"
+            );
 
             cleanup_mm(old_mm);
             cleanup_mm(new_mm);

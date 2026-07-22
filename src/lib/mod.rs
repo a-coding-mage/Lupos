@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/lib
+//! test-origin: linux:vendor/linux/lib
 //! Generic Linux library helpers root.
 
 pub mod argv_split;

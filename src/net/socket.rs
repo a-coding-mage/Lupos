@@ -2,7 +2,12 @@
 //! linux-source: vendor/linux/net/socket.c
 //! linux-source: vendor/linux/net/core/sock.c
 //! linux-source: vendor/linux/net/ipv4/inet_hashtables.c
+//! linux-source: vendor/linux/net/ipv4/ping.c
+//! linux-source: vendor/linux/net/ipv4/icmp.c
+//! linux-source: vendor/linux/drivers/net/loopback.c
 //! test-origin: linux:vendor/linux/net/socket.c
+//! test-origin: linux:vendor/linux/net/ipv4/ping.c
+//! test-origin: linux:vendor/linux/net/ipv4/icmp.c
 //! Socket layer scaffolding for AF_INET, AF_INET6, AF_UNIX, AF_PACKET, AF_NETLINK.
 
 extern crate alloc;
@@ -20,11 +25,11 @@ use crate::fs::file::fput;
 use crate::fs::types::FileRef;
 use crate::include::uapi::errno::{
     EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, ECONNREFUSED, ECONNRESET, EEXIST, EINPROGRESS,
-    EINVAL, ENETDOWN, ENETUNREACH, ENODEV, ENOPROTOOPT, ENOTCONN, EOPNOTSUPP, EPERM, EPIPE,
-    EPROTONOSUPPORT, ESRCH,
+    EINVAL, EMSGSIZE, ENETDOWN, ENETUNREACH, ENODEV, ENOPROTOOPT, ENOTCONN, EOPNOTSUPP, EPERM,
+    EPIPE, EPROTONOSUPPORT, ESRCH,
 };
 use crate::kernel::capability::{
-    CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE, CAP_NET_ADMIN, capable,
+    CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE, CAP_NET_ADMIN, CAP_NET_RAW, capable,
 };
 use crate::kernel::cred::GroupInfo;
 use crate::kernel::pid::{KPid, get_pid, put_pid};
@@ -60,6 +65,7 @@ pub const SO_TYPE: u32 = 3;
 pub const SO_ERROR: u32 = 4;
 pub const SO_SNDBUF: u32 = 7;
 pub const SO_RCVBUF: u32 = 8;
+pub const SO_PRIORITY: u32 = 12;
 pub const SO_PASSCRED: u32 = 16;
 pub const SO_PEERCRED: u32 = 17;
 pub const SO_RCVTIMEO_OLD: u32 = 20;
@@ -80,6 +86,9 @@ pub const SO_PEERPIDFD: u32 = 77;
 pub const SO_PASSRIGHTS: u32 = 83;
 pub const SO_PEERGROUPS: u32 = 59;
 pub const IP_RECVTTL: u32 = 12;
+
+const TC_PRIO_BESTEFFORT: i32 = 0;
+const TC_PRIO_INTERACTIVE: i32 = 6;
 
 pub const RCV_SHUTDOWN: u8 = 1;
 pub const SEND_SHUTDOWN: u8 = 2;
@@ -205,6 +214,7 @@ pub struct KernelSocket {
     pub passcred: bool,
     pub passpidfd: bool,
     pub passrights: bool,
+    pub priority: u32,
     pub timestamp_old: bool,
     pub timestamp_new: bool,
     pub recv_ttl: bool,
@@ -765,6 +775,7 @@ pub fn socket(family: u16, sock_type: u16, protocol: u16) -> Result<SocketRef, i
         passcred: false,
         passpidfd: false,
         passrights: false,
+        priority: 0,
         timestamp_old: false,
         timestamp_new: false,
         recv_ttl: false,
@@ -868,7 +879,10 @@ fn inet_transport_protocol(sock_type: u16, protocol: u16) -> u16 {
 fn inet_uses_ephemeral_port_allocator(family: u16, sock_type: u16, protocol: u16) -> bool {
     matches!(family, AF_INET | AF_INET6)
         && ((sock_type == SOCK_STREAM && (protocol == 0 || protocol == IPPROTO_TCP as u16))
-            || (sock_type == SOCK_DGRAM && (protocol == 0 || protocol == IPPROTO_UDP as u16)))
+            || (sock_type == SOCK_DGRAM
+                && (protocol == 0
+                    || protocol == IPPROTO_UDP as u16
+                    || protocol == IPPROTO_ICMP as u16)))
 }
 
 fn bound_inet_addr_conflicts(
@@ -1690,6 +1704,10 @@ pub fn sendmsg_with_fds_meta_cred(
         drop_file_refs(fds);
         return Ok(n);
     }
+    if let Some(result) = send_loopback_icmp_echo(sock, bytes, &peer) {
+        drop_file_refs(fds);
+        return result;
+    }
     // Keep the old deterministic DNS/ICMP responder solely as unit-test
     // scaffolding.  Production traffic must always reach the device-backed
     // path, which is the behavior exercised by the QEMU/vendor selftests.
@@ -1807,6 +1825,10 @@ pub fn sendto_with_fds_meta_cred(
     if let Some(n) = synthesize_netlink_send(sock, bytes, Some(&dest), &cred) {
         drop_file_refs(fds);
         return Ok(n);
+    }
+    if let Some(result) = send_loopback_icmp_echo(sock, bytes, &dest) {
+        drop_file_refs(fds);
+        return result;
     }
     #[cfg(test)]
     if let Some(n) = synthesize_external_inet_response(sock, bytes, &dest) {
@@ -4153,6 +4175,57 @@ pub fn set_netlink_membership(sock: &SocketRef, group: u32, add: bool) -> Result
     Ok(())
 }
 
+fn send_loopback_icmp_echo(
+    sock: &SocketRef,
+    bytes: &[u8],
+    dest: &SockAddr,
+) -> Option<Result<usize, i32>> {
+    let SockAddr::Inet { addr, .. } = dest else {
+        return None;
+    };
+    if addr >> 24 != 127 {
+        return None;
+    }
+
+    let mut socket = sock.lock();
+    if socket.family != AF_INET
+        || socket.protocol != IPPROTO_ICMP as u16
+        || !matches!(socket.sock_type, SOCK_DGRAM | SOCK_RAW)
+    {
+        return None;
+    }
+    if bytes.len() > u16::MAX as usize {
+        return Some(Err(EMSGSIZE));
+    }
+
+    let ping_ident = if socket.sock_type == SOCK_DGRAM {
+        if bytes.len() < 8 || bytes[0] != 8 || bytes[1] != 0 {
+            return Some(Err(EINVAL));
+        }
+        autobind_inet(&mut socket);
+        match socket.local {
+            Some(SockAddr::Inet { port, .. }) if port != 0 => Some(port),
+            _ => return Some(Err(EADDRNOTAVAIL)),
+        }
+    } else {
+        None
+    };
+
+    let Some(response) = build_icmp_echo_reply(bytes, ping_ident) else {
+        return Some(Ok(bytes.len()));
+    };
+    socket.recvq.push_back(QueuedPacket {
+        bytes: response,
+        peer: Some(dest.clone()),
+        fds: Vec::new(),
+        cred: SocketCred::default(),
+        meta: inet_packet_meta_for_dest(dest),
+    });
+    drop(socket);
+    wake_socket_recv(sock);
+    Some(Ok(bytes.len()))
+}
+
 #[cfg(test)]
 fn synthesize_external_inet_response(
     sock: &SocketRef,
@@ -4167,6 +4240,9 @@ fn synthesize_external_inet_response(
     let SockAddr::Inet { addr, port } = dest else {
         return None;
     };
+    if addr >> 24 == 127 {
+        return None;
+    }
     if socket.sock_type == SOCK_DGRAM && socket.protocol != IPPROTO_ICMP as u16 && *port == 53 {
         if *addr == qemu_dns_ipv4()
             && let Some(response) = build_dns_a_response(bytes)
@@ -4194,7 +4270,7 @@ fn synthesize_external_inet_response(
 
     if matches!(socket.sock_type, SOCK_DGRAM | SOCK_RAW)
         && socket.protocol == IPPROTO_ICMP as u16
-        && let Some(response) = build_icmp_echo_reply(bytes)
+        && let Some(response) = build_icmp_echo_reply(bytes, None)
     {
         autobind_inet(&mut socket);
         socket.recvq.push_back(QueuedPacket {
@@ -4264,13 +4340,15 @@ fn build_dns_a_response(query: &[u8]) -> Option<Vec<u8>> {
     Some(response)
 }
 
-#[cfg(test)]
-fn build_icmp_echo_reply(packet: &[u8]) -> Option<Vec<u8>> {
+fn build_icmp_echo_reply(packet: &[u8], ident: Option<u16>) -> Option<Vec<u8>> {
     if packet.len() < 8 || packet[0] != 8 {
         return None;
     }
     let mut reply = packet.to_vec();
     reply[0] = 0;
+    if let Some(ident) = ident {
+        reply[4..6].copy_from_slice(&ident.to_be_bytes());
+    }
     reply[2] = 0;
     reply[3] = 0;
     let csum = checksum(&reply);
@@ -4516,6 +4594,18 @@ pub fn recvmsg_full(
 pub fn setsockopt(sock: &SocketRef, opt: u32, value: u32) -> Result<(), i32> {
     let mut socket = sock.lock();
     match opt {
+        SO_PRIORITY => {
+            let signed = value as i32;
+            if (TC_PRIO_BESTEFFORT..=TC_PRIO_INTERACTIVE).contains(&signed)
+                || capable(CAP_NET_RAW)
+                || capable(CAP_NET_ADMIN)
+            {
+                socket.priority = value;
+                Ok(())
+            } else {
+                Err(EPERM)
+            }
+        }
         SO_REUSEADDR => {
             socket.reuseaddr = value != 0;
             Ok(())
@@ -4658,6 +4748,7 @@ pub fn getsockopt(sock: &SocketRef, opt: u32) -> Result<u32, i32> {
             socket.pending_error = 0;
             Ok(error as u32)
         }
+        SO_PRIORITY => Ok(socket.priority),
         SO_SNDBUF | SO_RCVBUF | SO_SNDBUFFORCE | SO_RCVBUFFORCE => Ok(212_992),
         SO_PASSCRED => Ok(socket.passcred as u32),
         SO_PASSPIDFD => Ok(socket.passpidfd as u32),
@@ -7551,6 +7642,8 @@ mod tests {
 
         assert_eq!(setsockopt(&sock, SO_PASSCRED, 1), Ok(()));
         assert_eq!(getsockopt(&sock, SO_PASSCRED), Ok(1));
+        assert_eq!(setsockopt(&sock, SO_PRIORITY, 6), Ok(()));
+        assert_eq!(getsockopt(&sock, SO_PRIORITY), Ok(6));
         assert_eq!(setsockopt(&sock, SO_SNDBUFFORCE, 8 * 1024 * 1024), Ok(()));
         assert_eq!(getsockopt(&sock, SO_SNDBUFFORCE), Ok(212_992));
         assert_eq!(setsockopt(&sock, SO_RCVBUFFORCE, 8 * 1024 * 1024), Ok(()));
@@ -7617,5 +7710,37 @@ mod tests {
         assert_eq!(from, Some(peer));
         assert_eq!(buf[0], 0);
         assert_eq!(&buf[4..len], &echo[4..]);
+    }
+
+    #[test]
+    fn icmp_echo_to_loopback_uses_kernel_ping_identifier() {
+        let peer = SockAddr::Inet {
+            addr: ipv4(127, 0, 0, 1),
+            port: 0,
+        };
+        let client = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP as u16).unwrap();
+        let mut echo = Vec::from([8, 0, 0, 0, 0x12, 0x34, 0x00, 0x02, b'l', b'o', b'o', b'p']);
+        let csum = checksum(&echo);
+        echo[2..4].copy_from_slice(&csum.to_be_bytes());
+
+        assert_eq!(sendto(&client, &echo, peer.clone()).unwrap(), echo.len());
+        let local_ident = {
+            let socket = client.lock();
+            match socket.local {
+                Some(SockAddr::Inet { port, .. }) => port,
+                _ => 0,
+            }
+        };
+        assert_ne!(local_ident, 0);
+
+        let mut buf = [0u8; 64];
+        let (len, from) = recvfrom(&client, &mut buf).unwrap();
+        assert_eq!(from, Some(peer));
+        assert_eq!(len, echo.len());
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[1], 0);
+        assert_eq!(u16::from_be_bytes([buf[4], buf[5]]), local_ident);
+        assert_eq!(&buf[6..len], &echo[6..]);
+        assert_eq!(checksum(&buf[..len]), 0);
     }
 }

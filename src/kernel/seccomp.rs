@@ -1,6 +1,9 @@
-//! linux-parity: complete
+//! linux-parity: partial
 //! linux-source: vendor/linux/kernel/seccomp.c
+//! linux-source: vendor/linux/kernel/sys.c
 //! test-origin: linux:vendor/linux/kernel/seccomp.c
+//! test-origin: linux:vendor/linux/tools/testing/selftests/prctl/set-process-name.c
+//! test-origin: linux:vendor/linux/tools/testing/selftests/seccomp/seccomp_bpf.c
 //! seccomp — syscall filtering — Milestone 27.
 //!
 //! Implements:
@@ -92,6 +95,8 @@ pub const PR_SET_PDEATHSIG: i32 = 1;
 pub const PR_GET_PDEATHSIG: i32 = 2;
 pub const PR_GET_DUMPABLE: i32 = 3;
 pub const PR_SET_DUMPABLE: i32 = 4;
+pub const PR_SET_NAME: i32 = 15;
+pub const PR_GET_NAME: i32 = 16;
 pub const PR_CAPBSET_READ: i32 = 23;
 pub const PR_CAPBSET_DROP: i32 = 24;
 pub const PR_CAP_AMBIENT: i32 = 47;
@@ -140,6 +145,25 @@ const _: () = {
     assert!(core::mem::offset_of!(SeccompData, arch) == 4);
     assert!(core::mem::offset_of!(SeccompData, instruction_pointer) == 8);
     assert!(core::mem::offset_of!(SeccompData, args) == 16);
+};
+
+/// `struct seccomp_notif_sizes` — returned by `SECCOMP_GET_NOTIF_SIZES`.
+///
+/// Layout matches Linux `include/uapi/linux/seccomp.h`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SeccompNotifSizes {
+    pub seccomp_notif: u16,
+    pub seccomp_notif_resp: u16,
+    pub seccomp_data: u16,
+}
+
+pub const SECCOMP_NOTIF_SIZE: u16 = 80;
+pub const SECCOMP_NOTIF_RESP_SIZE: u16 = 24;
+
+const _: () = {
+    assert!(core::mem::size_of::<SeccompNotifSizes>() == 6);
+    assert!(core::mem::align_of::<SeccompNotifSizes>() == 2);
 };
 
 // ── sock_fprog (the userspace-supplied filter handle) ────────────────────────
@@ -398,6 +422,9 @@ pub unsafe fn sys_seccomp(operation: u32, flags: u64, args: *const core::ffi::c_
             0
         }
         SECCOMP_GET_ACTION_AVAIL => {
+            if flags != 0 {
+                return -22;
+            }
             // args points to a u32 holding the action to query.
             if args.is_null() {
                 return -14;
@@ -408,11 +435,30 @@ pub unsafe fn sys_seccomp(operation: u32, flags: u64, args: *const core::ffi::c_
                 | SECCOMP_RET_KILL_THREAD
                 | SECCOMP_RET_TRAP
                 | SECCOMP_RET_ERRNO
+                | SECCOMP_RET_USER_NOTIF
                 | SECCOMP_RET_TRACE
                 | SECCOMP_RET_LOG
                 | SECCOMP_RET_ALLOW => 0,
                 _ => -95, // EOPNOTSUPP
             }
+        }
+        SECCOMP_GET_NOTIF_SIZES => {
+            if flags != 0 {
+                return -22;
+            }
+            let sizes = SeccompNotifSizes {
+                seccomp_notif: SECCOMP_NOTIF_SIZE,
+                seccomp_notif_resp: SECCOMP_NOTIF_RESP_SIZE,
+                seccomp_data: core::mem::size_of::<SeccompData>() as u16,
+            };
+            let left = unsafe {
+                crate::arch::x86::kernel::uaccess::copy_to_user(
+                    args as *mut u8,
+                    (&sizes as *const SeccompNotifSizes).cast(),
+                    core::mem::size_of::<SeccompNotifSizes>(),
+                )
+            };
+            if left == 0 { 0 } else { -14 }
         }
         _ => -22,
     }
@@ -477,6 +523,33 @@ pub unsafe fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
                     | crate::kernel::task::TASK_CTRL_DUMPABLE_VALID;
             }
             0
+        }
+        PR_SET_NAME => {
+            let mut comm = [0u8; crate::kernel::task::TASK_COMM_LEN];
+            let copied = unsafe {
+                crate::arch::x86::kernel::uaccess::strncpy_from_user(
+                    comm.as_mut_ptr(),
+                    arg2 as *const u8,
+                    crate::kernel::task::TASK_COMM_LEN - 1,
+                )
+            };
+            if copied < 0 {
+                return copied as i64;
+            }
+            unsafe {
+                (*task).comm = comm;
+            }
+            0
+        }
+        PR_GET_NAME => {
+            let left = unsafe {
+                crate::arch::x86::kernel::uaccess::copy_to_user(
+                    arg2 as *mut u8,
+                    (*task).comm.as_ptr(),
+                    crate::kernel::task::TASK_COMM_LEN,
+                )
+            };
+            if left == 0 { 0 } else { -14 }
         }
         PR_SET_CHILD_SUBREAPER => {
             unsafe {
@@ -828,6 +901,58 @@ mod tests {
     }
 
     #[test]
+    fn prctl_set_get_name_matches_linux_selftest() {
+        let linux_sys = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/kernel/sys.c"
+        ));
+        assert!(linux_sys.contains("case PR_SET_NAME:"));
+        assert!(linux_sys.contains("strncpy_from_user(comm, (char __user *)arg2,"));
+        assert!(linux_sys.contains("case PR_GET_NAME:"));
+
+        let linux_selftest = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/tools/testing/selftests/prctl/set-process-name.c"
+        ));
+        assert!(linux_selftest.contains("prctl(PR_SET_NAME, name"));
+        assert!(linux_selftest.contains("prctl(PR_GET_NAME, name"));
+        assert!(linux_selftest.contains("#define TASK_COMM_LEN 16"));
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 157;
+        current.tgid = 157;
+        current.cred = &raw const INIT_CRED;
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let short = b"changename\0";
+            assert_eq!(sys_prctl(PR_SET_NAME, short.as_ptr() as u64, 0, 0, 0), 0);
+            let mut out = [0xffu8; crate::kernel::task::TASK_COMM_LEN];
+            assert_eq!(sys_prctl(PR_GET_NAME, out.as_mut_ptr() as u64, 0, 0, 0), 0);
+            assert_eq!(&out[..short.len()], short);
+            assert_eq!(out[short.len()], 0);
+
+            let long = b"123456789abcdefXYZ\0";
+            assert_eq!(
+                sys_prctl(PR_SET_NAME, long.as_ptr() as u64, 123, 456, 789),
+                0
+            );
+            assert_eq!(
+                (*current).comm,
+                *b"123456789abcdef\0",
+                "PR_SET_NAME stores 15 bytes plus a terminating NUL"
+            );
+
+            let bad = crate::arch::x86::kernel::uaccess::TASK_SIZE_MAX;
+            assert_eq!(sys_prctl(PR_SET_NAME, bad, 0, 0, 0), -14);
+            assert_eq!(sys_prctl(PR_GET_NAME, bad, 0, 0, 0), -14);
+
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
     fn syscall_m76_process_control_parity() {
         let previous = unsafe { sched::get_current() };
         let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
@@ -1044,6 +1169,85 @@ mod tests {
                 sys_seccomp(SECCOMP_GET_ACTION_AVAIL, 0, core::ptr::null()),
                 -14
             );
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn seccomp_get_notif_sizes_matches_linux_selftest() {
+        let linux_seccomp = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/kernel/seccomp.c"
+        ));
+        assert!(linux_seccomp.contains("static long seccomp_get_notif_sizes"));
+        assert!(linux_seccomp.contains(".seccomp_notif = sizeof(struct seccomp_notif)"));
+        assert!(linux_seccomp.contains("copy_to_user(usizes, &sizes, sizeof(sizes))"));
+
+        let linux_selftest = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/tools/testing/selftests/seccomp/seccomp_bpf.c"
+        ));
+        assert!(linux_selftest.contains("TEST(seccomp_get_notif_sizes)"));
+        assert!(linux_selftest.contains("seccomp(SECCOMP_GET_NOTIF_SIZES, 0, &sizes)"));
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 317;
+        current.tgid = 317;
+        current.cred = &raw const INIT_CRED;
+        unsafe {
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let mut sizes = SeccompNotifSizes::default();
+            assert_eq!(
+                sys_seccomp(
+                    SECCOMP_GET_NOTIF_SIZES,
+                    0,
+                    (&mut sizes as *mut SeccompNotifSizes).cast()
+                ),
+                0
+            );
+            assert_eq!(sizes.seccomp_notif, SECCOMP_NOTIF_SIZE);
+            assert_eq!(sizes.seccomp_notif_resp, SECCOMP_NOTIF_RESP_SIZE);
+            assert_eq!(
+                sizes.seccomp_data,
+                core::mem::size_of::<SeccompData>() as u16
+            );
+            assert_eq!(
+                sys_seccomp(
+                    SECCOMP_GET_NOTIF_SIZES,
+                    1,
+                    (&mut sizes as *mut SeccompNotifSizes).cast()
+                ),
+                -22
+            );
+            assert_eq!(
+                sys_seccomp(
+                    SECCOMP_GET_NOTIF_SIZES,
+                    0,
+                    crate::arch::x86::kernel::uaccess::TASK_SIZE_MAX as *const core::ffi::c_void
+                ),
+                -14
+            );
+
+            let user_notif = SECCOMP_RET_USER_NOTIF;
+            assert_eq!(
+                sys_seccomp(
+                    SECCOMP_GET_ACTION_AVAIL,
+                    0,
+                    (&user_notif as *const u32).cast()
+                ),
+                0
+            );
+            assert_eq!(
+                sys_seccomp(
+                    SECCOMP_GET_ACTION_AVAIL,
+                    1,
+                    (&user_notif as *const u32).cast()
+                ),
+                -22
+            );
+
             sched::set_current(previous);
         }
     }

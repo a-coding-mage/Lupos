@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/lib/kobject.c
+//! test-origin: linux:vendor/linux/lib/kobject.c
 //! kobject / kset / sysfs attribute model — M41.
 //!
 //! Mirrors `vendor/linux/lib/kobject.c` and `vendor/linux/include/linux/kobject.h`.

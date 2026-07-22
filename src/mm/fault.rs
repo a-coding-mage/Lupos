@@ -45,9 +45,50 @@ use crate::mm::page::Page;
 use crate::mm::page_flags::{GFP_KERNEL, GfpFlags, PG_SWAPBACKED};
 use crate::mm::rmap::anon_vma_prepare;
 use crate::mm::vm_flags::{
-    VM_DONTDUMP, VM_DONTEXPAND, VM_IO, VM_MAYSHARE, VM_MAYWRITE, VM_PFNMAP, VM_SHARED, VM_WRITE,
-    VmFlags,
+    VM_DONTDUMP, VM_DONTEXPAND, VM_IO, VM_MAYSHARE, VM_MAYWRITE, VM_MIXEDMAP, VM_PFNMAP, VM_SHARED,
+    VM_WRITE, VmFlags,
 };
+
+#[cfg(test)]
+unsafe fn fault_page_kaddr(page: *mut Page) -> *mut u8 {
+    if page.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        if (*page).private == 0 {
+            let buf: Box<[u8; PAGE_SIZE as usize]> = Box::new([0; PAGE_SIZE as usize]);
+            (*page).private = Box::into_raw(buf) as usize;
+        }
+        (*page).private as *mut u8
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+unsafe fn fault_page_kaddr(page: *mut Page) -> *mut u8 {
+    if page.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { pfn_to_virt(page_to_pfn(page)) }
+}
+
+unsafe fn free_unmapped_fault_page(page: *mut Page) {
+    if page.is_null() {
+        return;
+    }
+    #[cfg(test)]
+    unsafe {
+        if (*page).private != 0 {
+            drop(Box::from_raw(
+                (*page).private as *mut [u8; PAGE_SIZE as usize],
+            ));
+            (*page).private = 0;
+        }
+    }
+    unsafe {
+        with_global_buddy(|b| b.free_pages(page, 0));
+    }
+}
 
 // ---------------------------------------------------------------------------
 // VM_FAULT_* return codes — `vm_fault_t`
@@ -618,15 +659,26 @@ fn wp_pfn_shared(vmf: &mut VmFault) -> VmFaultFlags {
     }
 }
 
+unsafe fn wp_can_reuse_lupos_anon_page(vma: *const VmAreaStruct, page: *const Page) -> bool {
+    if vma.is_null() || page.is_null() {
+        return false;
+    }
+    unsafe {
+        (*vma).vm_file == 0
+            && !(*vma).anon_vma.is_null()
+            && (*page).mapping == (*vma).anon_vma as usize
+            && (*page).test_flag(PG_SWAPBACKED)
+            && (*page).refcount() <= 1
+    }
+}
+
 /// Handle a write-protect fault on a present PTE.
 ///
 /// Dispatches between:
-/// - `wp_page_reuse`: page is exclusively owned (refcount ≤ 1) — make the
-///   PTE writable in-place; no copy needed.
-/// - `wp_page_copy`: page is shared (refcount > 1) — allocate a new page,
-///   copy the old content, install a writable PTE, release the old page.
+/// - `wp_page_reuse`: the page is anonymous and exclusively reusable.
+/// - `wp_page_copy`: file-backed, raw PFN, or non-exclusive anonymous pages.
 ///
-/// Ref: Linux `mm/memory.c` — `do_wp_page()` line 4149
+/// Ref: Linux `mm/memory.c` — `do_wp_page()`
 fn do_wp_page(vmf: &mut VmFault) -> VmFaultFlags {
     unsafe {
         // vm_normal_page() returns NULL for a PTE-special VM_PFNMAP entry.
@@ -642,8 +694,7 @@ fn do_wp_page(vmf: &mut VmFault) -> VmFaultFlags {
         let pfn = paging::pte_pfn(vmf.orig_pte) as usize;
         let page_ptr = pfn_to_page(pfn);
 
-        if (*page_ptr).refcount() <= 1 {
-            // Exclusive page — promote to writable in-place (wp_page_reuse).
+        if wp_can_reuse_lupos_anon_page(vmf.vma, page_ptr) {
             let vma = vmf.vma;
             let mm = (*vma).vm_mm;
             let entry = pte_mkwrite(pte_mkdirty(pte_mkyoung(vmf.orig_pte)));
@@ -652,7 +703,6 @@ fn do_wp_page(vmf: &mut VmFault) -> VmFaultFlags {
             return 0;
         }
 
-        // Shared page — allocate a private copy (wp_page_copy).
         wp_page_copy(vmf)
     }
 }
@@ -672,6 +722,10 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
         let vma = vmf.vma;
         let mm = (*vma).vm_mm;
 
+        if anon_vma_prepare(vma).is_err() {
+            return VM_FAULT_OOM;
+        }
+
         // 1. Allocate a fresh page for the private copy.
         let new_page = match with_global_buddy(|b| b.alloc_pages(0, GFP_KERNEL)) {
             Some(p) => p,
@@ -688,7 +742,11 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
         } else {
             pfn_to_page(old_pfn)
         };
-        let dst = pfn_to_virt(page_to_pfn(new_page));
+        let dst = fault_page_kaddr(new_page);
+        if dst.is_null() {
+            free_unmapped_fault_page(new_page);
+            return VM_FAULT_OOM;
+        }
         if old_page.is_null() {
             let mut not_copied = crate::arch::x86::kernel::uaccess::copy_from_user(
                 dst as *mut u8,
@@ -701,7 +759,7 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
                 // revalidate the PTE around the retry so a concurrent change
                 // causes a harmless fault retry instead of copying stale data.
                 if ptep_get(vmf.pte) != vmf.orig_pte {
-                    with_global_buddy(|b| b.free_pages(new_page, 0));
+                    free_unmapped_fault_page(new_page);
                     return 0;
                 }
                 not_copied = crate::arch::x86::kernel::uaccess::copy_from_user(
@@ -710,7 +768,7 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
                     PAGE_SIZE as usize,
                 );
                 if ptep_get(vmf.pte) != vmf.orig_pte {
-                    with_global_buddy(|b| b.free_pages(new_page, 0));
+                    free_unmapped_fault_page(new_page);
                     return 0;
                 }
                 if not_copied != 0 {
@@ -718,7 +776,11 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
                 }
             }
         } else {
-            let src = pfn_to_virt(old_pfn);
+            let src = fault_page_kaddr(old_page);
+            if src.is_null() {
+                free_unmapped_fault_page(new_page);
+                return VM_FAULT_SIGBUS;
+            }
             core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE as usize);
         }
 
@@ -726,6 +788,12 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
         //    One PTE (below) will map it, so mapcount = 0 (exclusive).
         (*new_page)._refcount.store(1, Ordering::Relaxed);
         (*new_page)._mapcount().store(0, Ordering::Relaxed);
+        if !(*vma).anon_vma.is_null() {
+            (*new_page).mapping = (*vma).anon_vma as usize;
+        }
+        (*new_page).set_flag(PG_SWAPBACKED);
+        (*new_page).init_lru();
+        crate::mm::lru::lru_cache_add(new_page);
 
         // 4. Build a new writable PTE for the new page.
         let new_pfn = page_to_pfn(new_page) as u64;
@@ -740,16 +808,16 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
         };
         let new_entry = pte_mkwrite(pte_mkdirty(pte_mkyoung(pfn_pte(new_pfn, prot))));
 
-        // 5. Atomically replace the old PTE with the new one.
-        //    `ptep_get_and_clear` clears the PTE; the subsequent TLB flush
-        //    ensures the CPU stops using the old mapping.
+        // 5. Replace the old PTE with the new one using Linux's
+        //    ptep_clear_flush-before-set ordering.
         if ptep_get(vmf.pte) != vmf.orig_pte {
-            with_global_buddy(|b| b.free_pages(new_page, 0));
+            crate::mm::lru::remove_lru_page(new_page);
+            free_unmapped_fault_page(new_page);
             return 0;
         }
         ptep_get_and_clear(mm as *mut (), vmf.address, vmf.pte);
-        set_pte_at(mm as *mut (), vmf.address, vmf.pte, new_entry);
         flush_tlb_page(vmf.address);
+        set_pte_at(mm as *mut (), vmf.address, vmf.pte, new_entry);
 
         // 6. Release the old page's references from this mm.
         //    mapcount: one fewer PTE maps it.
@@ -782,26 +850,25 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
 /// For every copied normal present PTE:
 /// - The backing page's refcount and mapcount are both incremented.
 ///
-/// VMAs with no `anon_vma` and no file are also skipped (no pages yet).
-///
 /// Called from `dup_mmap()` for each source VMA during `fork`.
 ///
 /// # Safety
-/// `dst_mm` and `src_mm` must be valid.  `vma` must belong to `src_mm`.
+/// `dst_vma` and `src_vma` must be valid VMAs. `dst_vma` must belong to the
+/// destination mm and `src_vma` must belong to the source mm.
 ///
 /// Ref: Linux `mm/memory.c` — `copy_page_range()` line 1504
 pub unsafe fn copy_page_range(
-    dst_mm: *mut MmStruct,
-    src_mm: *mut MmStruct,
-    vma: *const VmAreaStruct,
+    dst_vma: *mut VmAreaStruct,
+    src_vma: *mut VmAreaStruct,
 ) -> Result<(), i32> {
     unsafe {
-        let flags = (*vma).vm_flags;
-
-        #[cfg(test)]
-        if (*vma).anon_vma.is_null() && (*vma).vm_file == 0 {
+        if !vma_needs_copy(dst_vma, src_vma) {
             return Ok(());
         }
+
+        let dst_mm = (*dst_vma).vm_mm;
+        let src_mm = (*src_vma).vm_mm;
+        let flags = (*src_vma).vm_flags;
 
         let src_pgd = (*src_mm).pgd as *mut pgd_t;
         let dst_pgd = (*dst_mm).pgd as *mut pgd_t;
@@ -809,8 +876,8 @@ pub unsafe fn copy_page_range(
             return Ok(());
         }
 
-        let mut addr = (*vma).vm_start;
-        let end = (*vma).vm_end;
+        let mut addr = (*src_vma).vm_start;
+        let end = (*src_vma).vm_end;
 
         while addr < end {
             // Locate PGD entries for this address in both mm structs.
@@ -859,6 +926,26 @@ pub unsafe fn copy_page_range(
         }
 
         Ok(())
+    }
+}
+
+/// Linux `vma_needs_copy()`: fork copies PTEs only when metadata cannot be
+/// reconstructed by a later page fault.
+///
+/// Lupos currently models the `VM_COPY_ON_FORK` subset that exists in
+/// `vm_flags.rs` (`VM_PFNMAP | VM_MIXEDMAP`). `VM_UFFD_WP` and
+/// `VM_MAYBE_GUARD` are not represented in this tree yet.
+#[inline]
+fn vma_needs_copy(dst_vma: *const VmAreaStruct, src_vma: *const VmAreaStruct) -> bool {
+    unsafe {
+        const VM_COPY_ON_FORK: VmFlags = VM_PFNMAP | VM_MIXEDMAP;
+        if (*dst_vma).vm_flags & VM_COPY_ON_FORK != 0 {
+            return true;
+        }
+        if !(*src_vma).anon_vma.is_null() {
+            return true;
+        }
+        false
     }
 }
 
@@ -1122,24 +1209,45 @@ unsafe extern "C" fn lupos_file_fault(vmf: *mut VmFault) -> VmFaultFlags {
     }
 }
 
-/// Current Rust-VFS equivalent of Linux's `filemap_fault()` plus
-/// `finish_fault()` for a regular-file mapping.
-///
-/// Lupos installs PTEs inside the VMA fault callback, so this consumes the
-/// lookup reference as the PTE reference and unlocks the cache page before
-/// returning instead of propagating `VM_FAULT_LOCKED` to a missing upper
-/// `finish_fault()` layer.
-unsafe fn lupos_cached_file_fault(
+unsafe fn lupos_file_cow_fault(vmf: *mut VmFault) -> VmFaultFlags {
+    use alloc::sync::Arc;
+
+    if vmf.is_null() {
+        return VM_FAULT_SIGBUS;
+    }
+
+    unsafe {
+        let vma = (*vmf).vma;
+        if vma.is_null() || (*vma).vm_file == 0 {
+            return VM_FAULT_SIGBUS;
+        }
+
+        let file_ptr = (*vma).vm_file as *const crate::fs::types::File;
+        Arc::increment_strong_count(file_ptr);
+        let file = Arc::from_raw(file_ptr);
+        let cacheable =
+            file.fops.read.is_some() && file.inode().is_some_and(|inode| inode.is_reg());
+        let ret = if cacheable {
+            lupos_cached_file_cow_fault(vmf, &file)
+        } else {
+            lupos_uncached_file_cow_fault(vmf, &file)
+        };
+        drop(file);
+        ret
+    }
+}
+
+unsafe fn lupos_lookup_cached_file_page(
     vmf: *mut VmFault,
     file: &crate::fs::types::FileRef,
-) -> VmFaultFlags {
+) -> Result<*mut Page, VmFaultFlags> {
     use crate::mm::address_space::{page_uptodate, set_page_uptodate, unlock_page};
     use crate::mm::filemap::{filemap_grab_folio, find_lock_page};
 
     unsafe {
         let vma = (*vmf).vma;
         let Some(inode) = file.inode() else {
-            return VM_FAULT_SIGBUS;
+            return Err(VM_FAULT_SIGBUS);
         };
         let mapping = inode.mapping();
         let index = (*vmf).pgoff;
@@ -1149,7 +1257,7 @@ unsafe fn lupos_cached_file_fault(
             .saturating_add(PAGE_SIZE - 1)
             / PAGE_SIZE;
         if index >= max_idx {
-            return VM_FAULT_SIGBUS;
+            return Err(VM_FAULT_SIGBUS);
         }
 
         let mut page = find_lock_page(mapping, index);
@@ -1157,23 +1265,28 @@ unsafe fn lupos_cached_file_fault(
             page = filemap_grab_folio(mapping, index);
         }
         if page.is_null() {
-            return VM_FAULT_OOM;
+            return Err(VM_FAULT_OOM);
         }
 
         if !page_uptodate(page) {
-            let page_virt = pfn_to_virt(page_to_pfn(page)) as *mut u8;
+            let page_virt = fault_page_kaddr(page);
+            if page_virt.is_null() {
+                unlock_page(page);
+                (*page).put_page();
+                return Err(VM_FAULT_SIGBUS);
+            }
             core::ptr::write_bytes(page_virt, 0, PAGE_SIZE as usize);
             let Some(read) = file.fops.read else {
                 unlock_page(page);
                 (*page).put_page();
-                return VM_FAULT_SIGBUS;
+                return Err(VM_FAULT_SIGBUS);
             };
             let mut pos = index.saturating_mul(PAGE_SIZE);
             let buf = core::slice::from_raw_parts_mut(page_virt, PAGE_SIZE as usize);
             if read(file, buf, &mut pos).is_err() {
                 unlock_page(page);
                 (*page).put_page();
-                return VM_FAULT_SIGBUS;
+                return Err(VM_FAULT_SIGBUS);
             }
             set_page_uptodate(page);
         }
@@ -1191,8 +1304,38 @@ unsafe fn lupos_cached_file_fault(
         {
             unlock_page(page);
             (*page).put_page();
-            return VM_FAULT_SIGBUS;
+            return Err(VM_FAULT_SIGBUS);
         }
+
+        if vma.is_null() {
+            unlock_page(page);
+            (*page).put_page();
+            return Err(VM_FAULT_SIGBUS);
+        }
+
+        Ok(page)
+    }
+}
+
+/// Current Rust-VFS equivalent of Linux's `filemap_fault()` plus
+/// `finish_fault()` for a regular-file mapping.
+///
+/// Lupos installs PTEs inside the VMA fault callback, so this consumes the
+/// lookup reference as the PTE reference and unlocks the cache page before
+/// returning instead of propagating `VM_FAULT_LOCKED` to a missing upper
+/// `finish_fault()` layer.
+unsafe fn lupos_cached_file_fault(
+    vmf: *mut VmFault,
+    file: &crate::fs::types::FileRef,
+) -> VmFaultFlags {
+    use crate::mm::address_space::unlock_page;
+
+    unsafe {
+        let vma = (*vmf).vma;
+        let page = match lupos_lookup_cached_file_page(vmf, file) {
+            Ok(page) => page,
+            Err(fault) => return fault,
+        };
 
         let ptep = match pte_alloc((*vmf).pmd, (*vmf).address, _PAGE_TABLE) {
             Some(p) => p,
@@ -1221,7 +1364,8 @@ unsafe fn lupos_cached_file_fault(
             // conflicting writeback, then dirty the cache folio once before
             // installing the writable PTE.
             wait_on_page_writeback(page);
-            if (*page).mapping != mapping as usize || (*page).index != index as usize {
+            let expected_mapping = file.mapping().map_or(0usize, |mapping| mapping as usize);
+            if (*page).mapping != expected_mapping || (*page).index != (*vmf).pgoff as usize {
                 unlock_page(page);
                 (*page).put_page();
                 return VM_FAULT_SIGBUS;
@@ -1243,6 +1387,82 @@ unsafe fn lupos_cached_file_fault(
         unlock_page(page);
 
         // Do not put `page`: the caller reference is now owned by this PTE.
+        0
+    }
+}
+
+unsafe fn lupos_cached_file_cow_fault(
+    vmf: *mut VmFault,
+    file: &crate::fs::types::FileRef,
+) -> VmFaultFlags {
+    use crate::mm::address_space::unlock_page;
+
+    unsafe {
+        let vma = (*vmf).vma;
+        let mm = (*vma).vm_mm;
+        if anon_vma_prepare(vma).is_err() {
+            return VM_FAULT_OOM;
+        }
+
+        let ptep = match pte_alloc((*vmf).pmd, (*vmf).address, _PAGE_TABLE) {
+            Some(p) => p,
+            None => return VM_FAULT_OOM,
+        };
+        if !pte_none(ptep_get(ptep)) {
+            return VM_FAULT_NOPAGE;
+        }
+
+        let file_page = match lupos_lookup_cached_file_page(vmf, file) {
+            Ok(page) => page,
+            Err(fault) => return fault,
+        };
+
+        let new_page = match with_global_buddy(|b| b.alloc_pages(0, GFP_KERNEL)) {
+            Some(page) => page,
+            None => {
+                unlock_page(file_page);
+                (*file_page).put_page();
+                return VM_FAULT_OOM;
+            }
+        };
+
+        let src = fault_page_kaddr(file_page);
+        let dst = fault_page_kaddr(new_page);
+        if src.is_null() || dst.is_null() {
+            free_unmapped_fault_page(new_page);
+            unlock_page(file_page);
+            (*file_page).put_page();
+            return VM_FAULT_SIGBUS;
+        }
+        core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE as usize);
+
+        (*new_page)._refcount.store(1, Ordering::Relaxed);
+        (*new_page)._mapcount().store(0, Ordering::Relaxed);
+        if !(*vma).anon_vma.is_null() {
+            (*new_page).mapping = (*vma).anon_vma as usize;
+        }
+        (*new_page).set_flag(PG_SWAPBACKED);
+        (*new_page).init_lru();
+        crate::mm::lru::lru_cache_add(new_page);
+
+        let prot = if (*vma).vm_page_prot != 0 {
+            pgprot_t((*vma).vm_page_prot)
+        } else {
+            pgprot_t(_PAGE_PRESENT | _PAGE_USER | _PAGE_ACCESSED | _PAGE_NX)
+        };
+        let entry = pte_mkwrite(pte_mkdirty(pte_mkyoung(pfn_pte(
+            page_to_pfn(new_page) as u64,
+            prot,
+        ))));
+        set_pte_at(mm as *mut (), (*vmf).address, ptep, entry);
+        (*vmf).cow_page = new_page;
+        (*vmf).page = new_page;
+        (*vmf).pte = ptep;
+        add_mm_rss(mm, 1);
+
+        crate::mm::lru::mark_page_accessed(file_page);
+        unlock_page(file_page);
+        (*file_page).put_page();
         0
     }
 }
@@ -1292,6 +1512,73 @@ unsafe fn lupos_uncached_file_fault(
         (*vmf).page = page_ptr;
         (*vmf).pte = ptep;
         add_mm_rss((*vma).vm_mm, 1);
+        0
+    }
+}
+
+unsafe fn lupos_uncached_file_cow_fault(
+    vmf: *mut VmFault,
+    file: &crate::fs::types::FileRef,
+) -> VmFaultFlags {
+    unsafe {
+        let vma = (*vmf).vma;
+        let mm = (*vma).vm_mm;
+        if anon_vma_prepare(vma).is_err() {
+            return VM_FAULT_OOM;
+        }
+
+        let ptep = match pte_alloc((*vmf).pmd, (*vmf).address, _PAGE_TABLE) {
+            Some(p) => p,
+            None => return VM_FAULT_OOM,
+        };
+        if !pte_none(ptep_get(ptep)) {
+            return VM_FAULT_NOPAGE;
+        }
+
+        let page_ptr = match with_global_buddy(|b| b.alloc_pages(0, GFP_KERNEL)) {
+            Some(p) => p,
+            None => return VM_FAULT_OOM,
+        };
+        (*page_ptr)._refcount.store(1, Ordering::Relaxed);
+        (*page_ptr)._mapcount().store(0, Ordering::Relaxed);
+        if !(*vma).anon_vma.is_null() {
+            (*page_ptr).mapping = (*vma).anon_vma as usize;
+        }
+        (*page_ptr).set_flag(PG_SWAPBACKED);
+        (*page_ptr).init_lru();
+
+        let page_virt = fault_page_kaddr(page_ptr);
+        if page_virt.is_null() {
+            free_unmapped_fault_page(page_ptr);
+            return VM_FAULT_SIGBUS;
+        }
+        core::ptr::write_bytes(page_virt, 0, PAGE_SIZE as usize);
+
+        if let Some(read) = file.fops.read {
+            let mut pos = (*vmf).pgoff.saturating_mul(PAGE_SIZE);
+            let buf = core::slice::from_raw_parts_mut(page_virt, PAGE_SIZE as usize);
+            if read(file, buf, &mut pos).is_err() {
+                free_unmapped_fault_page(page_ptr);
+                return VM_FAULT_SIGBUS;
+            }
+        }
+
+        crate::mm::lru::lru_cache_add(page_ptr);
+
+        let prot = if (*vma).vm_page_prot != 0 {
+            pgprot_t((*vma).vm_page_prot)
+        } else {
+            pgprot_t(_PAGE_PRESENT | _PAGE_USER | _PAGE_ACCESSED | _PAGE_NX)
+        };
+        let entry = pte_mkwrite(pte_mkdirty(pte_mkyoung(pfn_pte(
+            page_to_pfn(page_ptr) as u64,
+            prot,
+        ))));
+        set_pte_at(mm as *mut (), (*vmf).address, ptep, entry);
+        (*vmf).cow_page = page_ptr;
+        (*vmf).page = page_ptr;
+        (*vmf).pte = ptep;
+        add_mm_rss(mm, 1);
         0
     }
 }
@@ -1473,20 +1760,48 @@ pub unsafe extern "C" fn filemap_fault(vmf: *mut VmFault) -> VmFaultFlags {
 
 /// Handle a fault on a file-backed VMA.
 ///
-/// Dispatches to `vm_ops->fault` if set; returns `VM_FAULT_SIGBUS` otherwise.
+/// Dispatches like Linux `do_fault()`: read faults call `->fault` directly,
+/// private write faults use the COW path, and shared write faults call the
+/// shared fault path.
 ///
 /// Ref: Linux `mm/memory.c` — `do_fault()` line 5903
 fn do_fault(vmf: &mut VmFault) -> VmFaultFlags {
     unsafe {
-        let vm_ops = (*vmf.vma).vm_ops as *const VmOperationsStruct;
+        let vma = vmf.vma;
+        let vm_ops = (*vma).vm_ops as *const VmOperationsStruct;
         if vm_ops.is_null() {
             return VM_FAULT_SIGBUS;
         }
-        if let Some(fault_fn) = (*vm_ops).fault {
-            fault_fn(vmf as *mut VmFault)
-        } else {
-            VM_FAULT_SIGBUS
+        let Some(fault_fn) = (*vm_ops).fault else {
+            return VM_FAULT_SIGBUS;
+        };
+
+        if (vmf.flags & FAULT_FLAG_WRITE) == 0 {
+            return fault_fn(vmf as *mut VmFault);
         }
+
+        if (*vma).vm_flags & VM_SHARED == 0 {
+            return do_cow_file_fault(vmf, fault_fn);
+        }
+
+        fault_fn(vmf as *mut VmFault)
+    }
+}
+
+fn do_cow_file_fault(
+    vmf: &mut VmFault,
+    fallback_fault: unsafe extern "C" fn(*mut VmFault) -> VmFaultFlags,
+) -> VmFaultFlags {
+    unsafe {
+        let vma = vmf.vma;
+        if (*vma).vm_ops == &LUPOS_FILE_VM_OPS as *const VmOperationsStruct as usize {
+            return lupos_file_cow_fault(vmf as *mut VmFault);
+        }
+
+        // Lupos module/device callbacks still use the local "callback installs
+        // its own PTE" contract. Preserve that path until those callbacks are
+        // converted to Linux's generic finish_fault() contract.
+        fallback_fault(vmf as *mut VmFault)
     }
 }
 
@@ -1510,12 +1825,25 @@ fn do_fault(vmf: &mut VmFault) -> VmFaultFlags {
 fn do_swap_page(vmf: &mut VmFault) -> VmFaultFlags {
     use crate::arch::x86::mm::paging::is_swap_pte;
     use crate::mm::swap::{
-        free_swap_slot, pte_to_swp_entry, swap_cache_add, swap_cache_delete, swap_cache_get,
-        swap_readpage, swp_entry_to_pte,
+        PTE_MARKER_GUARD, PTE_MARKER_POISONED, free_swap_slot, pte_marker_flags, pte_to_swp_entry,
+        swap_cache_add, swap_cache_delete, swap_cache_get, swap_readpage, swp_entry_to_pte,
     };
 
     // Verify this is actually a swap PTE (not zero, not present).
     if !is_swap_pte(vmf.orig_pte) {
+        return VM_FAULT_SIGBUS;
+    }
+
+    if let Some(marker) = pte_marker_flags(vmf.orig_pte) {
+        if marker == 0 {
+            return VM_FAULT_SIGBUS;
+        }
+        if marker & PTE_MARKER_POISONED != 0 {
+            return VM_FAULT_HWPOISON;
+        }
+        if marker & PTE_MARKER_GUARD != 0 {
+            return VM_FAULT_SIGSEGV;
+        }
         return VM_FAULT_SIGBUS;
     }
 
@@ -1609,7 +1937,7 @@ fn do_swap_page(vmf: &mut VmFault) -> VmFaultFlags {
 mod tests {
     use super::*;
     use crate::arch::x86::mm::paging;
-    use crate::mm::vm_flags::{VM_MAYSHARE, VM_MAYWRITE};
+    use crate::mm::vm_flags::{VM_MAYSHARE, VM_MAYWRITE, VM_READ};
 
     // ── Constant parity with Linux ───────────────────────────────────────────
 
@@ -1672,6 +2000,47 @@ mod tests {
         assert_eq!(FAULT_FLAG_DEFAULT & FAULT_FLAG_USER, 0);
     }
 
+    /// Linux `wp_page_copy()` clears and flushes the old PTE before publishing
+    /// the replacement PTE, so no CPU can retain the old read-only translation
+    /// while another observes the new writable mapping.
+    ///
+    /// test-origin: linux:vendor/linux/mm/memory.c:wp_page_copy
+    #[test]
+    fn wp_page_copy_clears_and_flushes_before_installing_copy() {
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/mm/memory.c"
+        ));
+        let linux_clear = linux
+            .find("ptep_clear_flush(vma, vmf->address, vmf->pte);")
+            .expect("Linux wp_page_copy must clear+flush the old PTE");
+        let linux_set = linux
+            .find("set_pte_at(mm, vmf->address, vmf->pte, entry);")
+            .expect("Linux wp_page_copy must install the copied PTE");
+        assert!(
+            linux_clear < linux_set,
+            "Linux must clear+flush before installing the copied PTE"
+        );
+
+        let lupos = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mm/fault.rs"));
+        let clear = lupos
+            .find("ptep_get_and_clear(mm as *mut (), vmf.address, vmf.pte);")
+            .expect("Lupos wp_page_copy must clear the old PTE");
+        let flush = lupos[clear..]
+            .find("flush_tlb_page(vmf.address);")
+            .map(|offset| clear + offset)
+            .expect("Lupos wp_page_copy must flush after clearing the old PTE");
+        let set = lupos[clear..]
+            .find("set_pte_at(mm as *mut (), vmf.address, vmf.pte, new_entry);")
+            .map(|offset| clear + offset)
+            .expect("Lupos wp_page_copy must install the copied PTE");
+
+        assert!(
+            clear < flush && flush < set,
+            "Lupos wp_page_copy must mirror Linux ptep_clear_flush before set_pte_at"
+        );
+    }
+
     // ── Fork PTE policy ──────────────────────────────────────────────────────
 
     #[test]
@@ -1715,6 +2084,41 @@ mod tests {
         assert!(pte_write(child), "shared child must stay writable");
         assert!(!paging::pte_dirty(child), "shared child starts clean");
         assert!(!paging::pte_young(child), "shared child starts old");
+    }
+
+    /// test-origin: linux:vendor/linux/mm/memory.c:vma_needs_copy
+    #[test]
+    fn vma_needs_copy_skips_fault_reconstructable_mappings() {
+        let mut src = VmAreaStruct::new(0x1000, 0x3000, VM_READ);
+        let dst = VmAreaStruct::new(0x1000, 0x3000, VM_READ);
+
+        assert!(
+            !vma_needs_copy(&dst, &src),
+            "no anon_vma and no copy-on-fork flags means child can fault lazily"
+        );
+
+        src.vm_file = 0x1234;
+        assert!(
+            !vma_needs_copy(&dst, &src),
+            "file-backed mappings without copy-on-fork metadata are fault-reconstructable"
+        );
+    }
+
+    /// test-origin: linux:vendor/linux/mm/memory.c:vma_needs_copy
+    #[test]
+    fn vma_needs_copy_keeps_anon_or_raw_pfn_metadata() {
+        let src = VmAreaStruct::new(0x1000, 0x3000, VM_READ);
+        let dst_pfnmap = VmAreaStruct::new(0x1000, 0x3000, VM_READ | VM_PFNMAP);
+        let dst_mixed = VmAreaStruct::new(0x1000, 0x3000, VM_READ | VM_MIXEDMAP);
+
+        assert!(vma_needs_copy(&dst_pfnmap, &src));
+        assert!(vma_needs_copy(&dst_mixed, &src));
+
+        let mut src_anon = VmAreaStruct::new(0x1000, 0x3000, VM_READ);
+        let dst = VmAreaStruct::new(0x1000, 0x3000, VM_READ);
+        src_anon.anon_vma = core::ptr::NonNull::<crate::mm::rmap::AnonVma>::dangling().as_ptr();
+
+        assert!(vma_needs_copy(&dst, &src_anon));
     }
 
     // ── Routing helpers ──────────────────────────────────────────────────────
@@ -1787,6 +2191,15 @@ mod tests {
     }
 
     #[test]
+    fn do_swap_page_routes_guard_marker_to_sigsegv() {
+        let mut vma = VmAreaStruct::new(0x1000, 0x2000, VM_WRITE);
+        let mut vmf = make_vmf(&mut vma, 0x1000, 0);
+        vmf.orig_pte = crate::mm::swap::make_pte_marker(crate::mm::swap::PTE_MARKER_GUARD);
+
+        assert_eq!(do_swap_page(&mut vmf), VM_FAULT_SIGSEGV);
+    }
+
+    #[test]
     fn do_pte_missing_routes_to_anonymous() {
         let vma = VmAreaStruct::new(0x1000, 0x2000, VM_SHARED | VM_WRITE);
         assert!(vma_is_shared_anonymous(&vma));
@@ -1807,6 +2220,375 @@ mod tests {
         let mut vmf = make_vmf(&mut vma, 0x1000, 0);
         // Route: file-backed → do_fault → fault=None → SIGBUS
         assert_eq!(do_pte_missing(&mut vmf), VM_FAULT_SIGBUS);
+    }
+
+    /// Linux `do_fault()` routes first writes to private file mappings through
+    /// `do_cow_fault()`: the installed PTE maps an anonymous copy, and the VMA
+    /// gains anon metadata so `copy_page_range()` must preserve it across fork.
+    ///
+    /// test-origin: linux:vendor/linux/mm/memory.c:do_cow_fault
+    #[test]
+    fn private_file_write_fault_installs_anon_copy_for_fork() {
+        use crate::fs::dcache::{d_alloc, d_instantiate};
+        use crate::fs::file::alloc_file;
+        use crate::fs::ops::{FileOps, NOOP_INODE_OPS};
+        use crate::fs::types::{FileRef, Inode, InodeKind, InodePrivate};
+        use crate::mm::buddy;
+        use crate::mm::filemap::find_lock_page;
+        use crate::mm::mm_types::MmStruct;
+        use crate::mm::page::Page;
+        use crate::mm::test_lock::GLOBAL_HW_TEST_LOCK;
+        use crate::mm::vma::{vma_file_from_ref, vma_file_put_raw};
+
+        fn cow_file_read(_file: &FileRef, buf: &mut [u8], pos: &mut u64) -> Result<usize, i32> {
+            for (index, byte) in buf.iter_mut().enumerate() {
+                *byte = 0x40u8.wrapping_add((index + *pos as usize) as u8);
+            }
+            *pos = (*pos).saturating_add(buf.len() as u64);
+            Ok(buf.len())
+        }
+
+        static COW_FILE_OPS: FileOps = FileOps {
+            name: "private-file-cow-test",
+            read: Some(cow_file_read),
+            write: None,
+            llseek: None,
+            fsync: None,
+            poll: None,
+            ioctl: None,
+            mmap: None,
+            release: None,
+            readdir: None,
+        };
+
+        let _g = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut pages = Box::new([const { Page::new() }; TEST_PAGES]);
+        for page in pages.iter_mut() {
+            unsafe { page.init_lru() };
+        }
+        unsafe { buddy::set_mem_map(pages.as_mut_ptr(), 0, TEST_PAGES) };
+        unsafe { buddy::install_test_buddy(0, TEST_PAGES) };
+        unsafe { paging::reset_test_pool() };
+
+        let dentry = d_alloc("private-file-cow");
+        let inode = Inode::new(
+            1,
+            InodeKind::Regular,
+            0o644,
+            &NOOP_INODE_OPS,
+            &COW_FILE_OPS,
+            InodePrivate::None,
+        );
+        inode
+            .size
+            .store(PAGE_SIZE, core::sync::atomic::Ordering::Release);
+        d_instantiate(&dentry, inode.clone());
+        let file = alloc_file(dentry, 0, 0, &COW_FILE_OPS);
+        let raw_file = vma_file_from_ref(file.clone());
+
+        let test_addr = 0x00d0_0000;
+        let mut mm = MmStruct::new(paging::init_pgd_for_test() as usize);
+        let flags = VM_READ | VM_WRITE | VM_MAYWRITE;
+        let mut vma = VmAreaStruct::new(test_addr, test_addr + PAGE_SIZE, flags);
+        vma.vm_mm = &mut mm as *mut MmStruct;
+        vma.vm_file = raw_file;
+        vma.vm_ops = &LUPOS_FILE_VM_OPS as *const VmOperationsStruct as usize;
+        vma.vm_page_prot = crate::mm::pgprot::vm_get_page_prot(flags);
+
+        let ret = handle_mm_fault(&mut vma, test_addr, FAULT_FLAG_WRITE | FAULT_FLAG_USER);
+        assert_eq!(ret, 0, "private file write fault should succeed");
+        assert!(
+            !vma.anon_vma.is_null(),
+            "private file write fault must attach anon_vma for fork"
+        );
+
+        let ptep = unsafe {
+            let pgdp = paging::pgd_offset_pgd(mm.pgd as *mut pgd_t, test_addr);
+            let p4dp = paging::p4d_offset(pgdp, test_addr);
+            let pudp = paging::pud_offset(p4dp, test_addr);
+            let pmdp = paging::pmd_offset(pudp, test_addr);
+            paging::pte_offset_kernel(pmdp, test_addr)
+        };
+        let pte = unsafe { paging::ptep_get(ptep) };
+        assert!(paging::pte_present(pte));
+        assert!(paging::pte_write(pte));
+        assert!(paging::pte_dirty(pte));
+
+        let anon_page = buddy::pfn_to_page(paging::pte_pfn(pte) as usize);
+        assert_eq!(unsafe { (*anon_page).mapping }, vma.anon_vma as usize);
+        assert!(
+            unsafe { (*anon_page).test_flag(PG_SWAPBACKED) },
+            "private file COW page must be anonymous/swap-backed"
+        );
+
+        let copied = unsafe { core::slice::from_raw_parts(fault_page_kaddr(anon_page), 16) };
+        let expected: [u8; 16] = core::array::from_fn(|index| 0x40u8.wrapping_add(index as u8));
+        assert_eq!(copied, expected.as_slice());
+
+        let file_page = unsafe { find_lock_page(inode.mapping(), 0) };
+        assert!(
+            !file_page.is_null(),
+            "source file page remains in page cache"
+        );
+        assert_ne!(
+            paging::pte_pfn(pte),
+            buddy::page_to_pfn(file_page) as u64,
+            "private file write fault must not map the page-cache folio"
+        );
+        unsafe {
+            crate::mm::address_space::unlock_page(file_page);
+            (*file_page).put_page();
+        }
+
+        let dst = VmAreaStruct::new(test_addr, test_addr + PAGE_SIZE, flags);
+        assert!(
+            vma_needs_copy(&dst, &vma),
+            "fork must copy PTEs after private file COW metadata is attached"
+        );
+
+        unsafe {
+            vma_file_put_raw(raw_file);
+        }
+    }
+
+    /// Linux `do_wp_page()` must copy a private file-backed PTE into an
+    /// anonymous folio on the first write, even when the file page was installed
+    /// by an earlier read fault.
+    ///
+    /// test-origin: linux:vendor/linux/mm/memory.c:do_wp_page
+    #[test]
+    fn private_file_read_then_write_fault_installs_anon_copy_for_fork() {
+        use crate::fs::dcache::{d_alloc, d_instantiate};
+        use crate::fs::file::alloc_file;
+        use crate::fs::ops::{FileOps, NOOP_INODE_OPS};
+        use crate::fs::types::{FileRef, Inode, InodeKind, InodePrivate};
+        use crate::mm::buddy;
+        use crate::mm::mm_types::MmStruct;
+        use crate::mm::page::Page;
+        use crate::mm::test_lock::GLOBAL_HW_TEST_LOCK;
+        use crate::mm::vma::{vma_file_from_ref, vma_file_put_raw};
+
+        fn cow_file_read(_file: &FileRef, buf: &mut [u8], pos: &mut u64) -> Result<usize, i32> {
+            for (index, byte) in buf.iter_mut().enumerate() {
+                *byte = 0x60u8.wrapping_add((index + *pos as usize) as u8);
+            }
+            *pos = (*pos).saturating_add(buf.len() as u64);
+            Ok(buf.len())
+        }
+
+        static COW_FILE_OPS: FileOps = FileOps {
+            name: "private-file-read-then-write-cow-test",
+            read: Some(cow_file_read),
+            write: None,
+            llseek: None,
+            fsync: None,
+            poll: None,
+            ioctl: None,
+            mmap: None,
+            release: None,
+            readdir: None,
+        };
+
+        let _g = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut pages = Box::new([const { Page::new() }; TEST_PAGES]);
+        for page in pages.iter_mut() {
+            unsafe { page.init_lru() };
+        }
+        unsafe { buddy::set_mem_map(pages.as_mut_ptr(), 0, TEST_PAGES) };
+        unsafe { buddy::install_test_buddy(0, TEST_PAGES) };
+        unsafe { paging::reset_test_pool() };
+
+        let dentry = d_alloc("private-file-read-then-write-cow");
+        let inode = Inode::new(
+            1,
+            InodeKind::Regular,
+            0o644,
+            &NOOP_INODE_OPS,
+            &COW_FILE_OPS,
+            InodePrivate::None,
+        );
+        inode
+            .size
+            .store(PAGE_SIZE, core::sync::atomic::Ordering::Release);
+        d_instantiate(&dentry, inode.clone());
+        let file = alloc_file(dentry, 0, 0, &COW_FILE_OPS);
+        let raw_file = vma_file_from_ref(file.clone());
+
+        let test_addr = 0x00d2_0000;
+        let mut mm = MmStruct::new(paging::init_pgd_for_test() as usize);
+        let flags = VM_READ | VM_WRITE | VM_MAYWRITE;
+        let mut vma = VmAreaStruct::new(test_addr, test_addr + PAGE_SIZE, flags);
+        vma.vm_mm = &mut mm as *mut MmStruct;
+        vma.vm_file = raw_file;
+        vma.vm_ops = &LUPOS_FILE_VM_OPS as *const VmOperationsStruct as usize;
+        vma.vm_page_prot = crate::mm::pgprot::vm_get_page_prot(flags);
+
+        let read_ret = handle_mm_fault(&mut vma, test_addr, FAULT_FLAG_USER);
+        assert_eq!(read_ret, 0, "private file read fault should succeed");
+        assert!(
+            vma.anon_vma.is_null(),
+            "read-only private file fault remains fault-reconstructable"
+        );
+
+        let ptep = unsafe {
+            let pgdp = paging::pgd_offset_pgd(mm.pgd as *mut pgd_t, test_addr);
+            let p4dp = paging::p4d_offset(pgdp, test_addr);
+            let pudp = paging::pud_offset(p4dp, test_addr);
+            let pmdp = paging::pmd_offset(pudp, test_addr);
+            paging::pte_offset_kernel(pmdp, test_addr)
+        };
+        let read_pte = unsafe { paging::ptep_get(ptep) };
+        assert!(paging::pte_present(read_pte));
+        assert!(
+            !paging::pte_write(read_pte),
+            "private file read fault must leave PTE write-protected"
+        );
+        let file_page = buddy::pfn_to_page(paging::pte_pfn(read_pte) as usize);
+        assert_eq!(unsafe { (*file_page).mapping }, inode.mapping() as usize);
+        assert!(
+            !unsafe { (*file_page).test_flag(PG_SWAPBACKED) },
+            "read fault initially maps the file-cache page"
+        );
+
+        let write_ret = handle_mm_fault(&mut vma, test_addr, FAULT_FLAG_WRITE | FAULT_FLAG_USER);
+        assert_eq!(
+            write_ret, VM_FAULT_DONE_COW,
+            "private file write-protect fault must run wp_page_copy"
+        );
+        assert!(
+            !vma.anon_vma.is_null(),
+            "write-protect COW must attach anon_vma for fork"
+        );
+
+        let cow_pte = unsafe { paging::ptep_get(ptep) };
+        assert!(paging::pte_present(cow_pte));
+        assert!(paging::pte_write(cow_pte));
+        assert!(paging::pte_dirty(cow_pte));
+        assert_ne!(
+            paging::pte_pfn(cow_pte),
+            paging::pte_pfn(read_pte),
+            "private file write fault must replace the file page with an anon copy"
+        );
+
+        let anon_page = buddy::pfn_to_page(paging::pte_pfn(cow_pte) as usize);
+        assert_eq!(unsafe { (*anon_page).mapping }, vma.anon_vma as usize);
+        assert!(
+            unsafe { (*anon_page).test_flag(PG_SWAPBACKED) },
+            "wp_page_copy result must be anonymous/swap-backed"
+        );
+        let copied = unsafe { core::slice::from_raw_parts(fault_page_kaddr(anon_page), 16) };
+        let expected: [u8; 16] = core::array::from_fn(|index| 0x60u8.wrapping_add(index as u8));
+        assert_eq!(copied, expected.as_slice());
+
+        let dst = VmAreaStruct::new(test_addr, test_addr + PAGE_SIZE, flags);
+        assert!(
+            vma_needs_copy(&dst, &vma),
+            "fork must preserve private file COW PTEs after write-protect COW"
+        );
+
+        unsafe {
+            vma_file_put_raw(raw_file);
+        }
+    }
+
+    /// Lupos-specific regression for the Rust translation of Linux
+    /// `do_wp_page()`: Linux only reuses anonymous exclusive pages. A private
+    /// file-backed page must be copied even if its local refcount looks
+    /// exclusive.
+    ///
+    /// test-origin: lupos-specific: mirrors linux:vendor/linux/mm/memory.c:do_wp_page
+    #[test]
+    fn private_file_wp_fault_does_not_reuse_exclusive_file_page() {
+        use crate::mm::buddy;
+        use crate::mm::mm_types::MmStruct;
+        use crate::mm::page::Page;
+        use crate::mm::test_lock::GLOBAL_HW_TEST_LOCK;
+
+        let _g = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut pages = Box::new([const { Page::new() }; TEST_PAGES]);
+        for page in pages.iter_mut() {
+            unsafe { page.init_lru() };
+        }
+        unsafe { buddy::set_mem_map(pages.as_mut_ptr(), 0, TEST_PAGES) };
+        unsafe { buddy::install_test_buddy(0, TEST_PAGES) };
+        unsafe { paging::reset_test_pool() };
+
+        let test_addr = 0x00d4_0000;
+        let mut mm = MmStruct::new(paging::init_pgd_for_test() as usize);
+        let flags = VM_READ | VM_WRITE | VM_MAYWRITE;
+        let mut vma = VmAreaStruct::new(test_addr, test_addr + PAGE_SIZE, flags);
+        vma.vm_mm = &mut mm as *mut MmStruct;
+        vma.vm_file = 0x1234;
+        vma.vm_page_prot = crate::mm::pgprot::vm_get_page_prot(flags);
+
+        let source_page = unsafe {
+            buddy::with_global_buddy(|b| b.alloc_pages(0, GFP_KERNEL))
+                .expect("source page allocation")
+        };
+        unsafe {
+            (*source_page)._refcount.store(1, Ordering::Relaxed);
+            (*source_page)._mapcount().store(0, Ordering::Relaxed);
+            (*source_page).mapping = 0xCAFE_0000;
+            (*source_page).index = 0;
+            (*source_page).init_lru();
+            let src = fault_page_kaddr(source_page);
+            for index in 0..16 {
+                *src.add(index) = 0x90u8.wrapping_add(index as u8);
+            }
+        }
+
+        let ptep = unsafe {
+            let pgdp = paging::pgd_offset_pgd(mm.pgd as *mut pgd_t, test_addr);
+            let p4dp = paging::p4d_offset(pgdp, test_addr);
+            let pudp =
+                pud_alloc(p4dp as *mut pgd_t, test_addr, _PAGE_TABLE).expect("test PUD allocation");
+            let pmdp = pmd_alloc(pudp, test_addr, _PAGE_TABLE).expect("test PMD allocation");
+            pte_alloc(pmdp, test_addr, _PAGE_TABLE).expect("test PTE allocation")
+        };
+        let source_pte = unsafe {
+            let prot = pgprot_t(vma.vm_page_prot);
+            pte_wrprotect(pte_mkyoung(pfn_pte(
+                buddy::page_to_pfn(source_page) as u64,
+                prot,
+            )))
+        };
+        unsafe {
+            set_pte_at(mm.pgd as *mut (), test_addr, ptep, source_pte);
+        }
+
+        let ret = handle_mm_fault(&mut vma, test_addr, FAULT_FLAG_WRITE | FAULT_FLAG_USER);
+        assert_eq!(
+            ret, VM_FAULT_DONE_COW,
+            "private file PTE must copy instead of reusing by refcount alone"
+        );
+
+        let cow_pte = unsafe { paging::ptep_get(ptep) };
+        assert!(paging::pte_write(cow_pte));
+        assert_ne!(
+            paging::pte_pfn(cow_pte),
+            buddy::page_to_pfn(source_page) as u64,
+            "file-backed private page must not be promoted in-place"
+        );
+        assert!(!vma.anon_vma.is_null());
+
+        let anon_page = buddy::pfn_to_page(paging::pte_pfn(cow_pte) as usize);
+        assert_eq!(unsafe { (*anon_page).mapping }, vma.anon_vma as usize);
+        assert!(
+            unsafe { (*anon_page).test_flag(PG_SWAPBACKED) },
+            "copied private page must be anonymous/swap-backed"
+        );
+        let copied = unsafe { core::slice::from_raw_parts(fault_page_kaddr(anon_page), 16) };
+        let expected: [u8; 16] = core::array::from_fn(|index| 0x90u8.wrapping_add(index as u8));
+        assert_eq!(copied, expected.as_slice());
     }
 
     // ── Integration: full anonymous write fault through the page-table walk ──

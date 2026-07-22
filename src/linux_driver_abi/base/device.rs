@@ -852,16 +852,6 @@ pub unsafe extern "C" fn linux_device_add(dev: *mut LinuxDevice) -> i32 {
         }
     }
 
-    let mut bound_driver = core::ptr::null_mut();
-    if !bus.is_null() {
-        for driver in crate::linux_driver_abi::base::linux_device_drivers_on_bus(bus) {
-            if unsafe { linux_device_probe_driver(dev, driver) } {
-                bound_driver = driver;
-                break;
-            }
-        }
-    }
-
     unsafe {
         if !(*dev).init_name.is_null() && (*dev).kobj.name.is_null() {
             (*dev).kobj.name = (*dev).init_name;
@@ -871,7 +861,7 @@ pub unsafe extern "C" fn linux_device_add(dev: *mut LinuxDevice) -> i32 {
         if !(*dev).p.is_null() {
             let private = (*dev).p.cast::<LinuxDevicePrivate>();
             (*private).bus = bus as usize;
-            (*private).driver = bound_driver as usize;
+            (*private).driver = 0;
         }
     }
     let name = unsafe { linux_dev_name(&*dev) };
@@ -887,7 +877,7 @@ pub unsafe extern "C" fn linux_device_add(dev: *mut LinuxDevice) -> i32 {
     devices.push(LinuxDeviceRegistration {
         device: dev_addr,
         bus: bus as usize,
-        driver: bound_driver as usize,
+        driver: 0,
         name: name as usize,
     });
     drop(devices);
@@ -959,6 +949,15 @@ pub unsafe extern "C" fn linux_device_add(dev: *mut LinuxDevice) -> i32 {
             node.major,
             node.minor,
         );
+    }
+
+    if !bus.is_null() {
+        for driver in crate::linux_driver_abi::base::linux_device_drivers_on_bus(bus) {
+            if unsafe { linux_device_probe_driver(dev, driver) } {
+                record_linux_device_driver(dev, driver);
+                break;
+            }
+        }
     }
 
     0
@@ -1037,6 +1036,9 @@ pub unsafe extern "C" fn linux_device_unregister(dev: *mut LinuxDevice) {
     }
 
     let node = unsafe { linux_device_get_devnode(dev) };
+    if let Some(node) = node.as_ref() {
+        let _ = crate::init::rootfs::devtmpfs_delete_linux_char_node(&node.name);
+    }
     if let Some((devpath, class, devname, major, minor)) =
         crate::fs::sysfs::mount_ops::unpublish_linux_class_device(dev as usize)
     {
@@ -1062,9 +1064,6 @@ pub unsafe extern "C" fn linux_device_unregister(dev: *mut LinuxDevice) {
             node.major,
             node.minor,
         );
-    }
-    if let Some(node) = node {
-        let _ = crate::init::rootfs::devtmpfs_delete_linux_char_node(&node.name);
     }
     LINUX_DEVICES
         .lock()
@@ -1447,17 +1446,26 @@ mod tests {
     #[test]
     fn linux_device_register_tracks_raw_device_and_dispatches_raw_probe() {
         static PROBE_COUNT: AtomicU32 = AtomicU32::new(0);
+        static PROBE_SAW_PUBLISHED_DEVICE: AtomicU32 = AtomicU32::new(0);
 
         unsafe extern "C" fn always_match(_dev: *mut c_void, _drv: *const c_void) -> i32 {
             1
         }
 
-        unsafe extern "C" fn probe(_dev: *mut c_void) -> i32 {
+        unsafe extern "C" fn probe(dev: *mut c_void) -> i32 {
             PROBE_COUNT.fetch_add(1, Ordering::AcqRel);
+            let dev = dev.cast::<LinuxDevice>();
+            if linux_device_registered(dev)
+                && unsafe { (*dev).kobj.state_flags & KOBJ_STATE_IN_SYSFS != 0 }
+            {
+                PROBE_SAW_PUBLISHED_DEVICE.store(1, Ordering::Release);
+            }
             0
         }
 
         unsafe {
+            PROBE_COUNT.store(0, Ordering::Release);
+            PROBE_SAW_PUBLISHED_DEVICE.store(0, Ordering::Release);
             assert_eq!(linux_device_add(core::ptr::null_mut()), -EINVAL);
 
             let mut bus = core::mem::zeroed::<LinuxBusType>();
@@ -1490,6 +1498,7 @@ mod tests {
             assert!(dev.kobj.state_flags & KOBJ_STATE_INITIALIZED != 0);
             assert!(dev.kobj.state_flags & KOBJ_STATE_IN_SYSFS != 0);
             assert_eq!(PROBE_COUNT.load(Ordering::Acquire), 1);
+            assert_eq!(PROBE_SAW_PUBLISHED_DEVICE.load(Ordering::Acquire), 1);
             assert_eq!(registered_linux_device_count(), before + 1);
             assert_eq!(linux_device_add(&mut dev), -EBUSY);
 

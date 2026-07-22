@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/fs/sysfs/file.c
+//! test-origin: linux:vendor/linux/fs/sysfs/file.c
 //! sysfs file helpers.
 //!
 //! Ref: `vendor/linux/fs/sysfs/file.c`

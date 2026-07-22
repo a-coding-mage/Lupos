@@ -834,18 +834,20 @@ pub fn direction_flag_entry_selftest() -> bool {
 ///
 /// Reference: Intel SDM Vol. 3A §6.15 "Interrupt 14 — Page-Fault Exception"
 fn on_page_fault(frame: &ExceptionFrame) {
-    // M59: extable fixup for a kernel-mode fault.  Linux reaches
-    // fixup_exception() through kernelmode_fixup_or_oops(); user faults go
-    // directly through do_user_addr_fault().  Searching module exception
-    // tables for every userspace demand fault both violates that contract and
-    // turns normal Firefox paging into a global MODULES-lock/string-scan hot
-    // path.
+    crate::arch::x86::mm::fault::do_page_fault(frame);
+}
+
+/// #GP — General Protection Fault.
+///
+/// Caused by segment violations, privilege violations, or misaligned operands.
+/// The error code encodes the segment selector that caused the fault (or 0).
+fn on_general_protection(frame: &ExceptionFrame) {
+    // Linux's #GP path calls fixup_exception() for kernel faults before
+    // reporting/oopsing. Segment-load wrappers rely on this for bad user TLS
+    // selectors restored during context switch.
     //
-    // SAFETY: `frame` is the iretq frame on the kernel stack — writing
-    // through a *mut alias mutates the saved RIP that iretq will pop.
-    //
-    // Ref: vendor/linux/arch/x86/mm/fault.c::kernelmode_fixup_or_oops
-    if page_fault_needs_extable_lookup(frame)
+    // Ref: vendor/linux/arch/x86/kernel/traps.c::exc_general_protection
+    if !is_user_exception(frame)
         && let Some(fixup) = super::extable::search_extable(frame.rip)
     {
         unsafe {
@@ -855,19 +857,6 @@ fn on_page_fault(frame: &ExceptionFrame) {
         return;
     }
 
-    crate::arch::x86::mm::fault::do_page_fault(frame);
-}
-
-#[inline]
-fn page_fault_needs_extable_lookup(frame: &ExceptionFrame) -> bool {
-    !is_user_exception(frame)
-}
-
-/// #GP — General Protection Fault.
-///
-/// Caused by segment violations, privilege violations, or misaligned operands.
-/// The error code encodes the segment selector that caused the fault (or 0).
-fn on_general_protection(frame: &ExceptionFrame) {
     log_error!(
         "cpu",
         "cpu: #GP General Protection error={:#010x} rip={:#018x} cs={:#06x} rsp={:#018x}",
@@ -1572,17 +1561,49 @@ mod tests {
         )));
     }
 
-    /// Linux reaches `fixup_exception()` from `kernelmode_fixup_or_oops()`,
-    /// whose `WARN_ON_ONCE(user_mode(regs))` contract excludes user faults.
+    /// Linux routes page faults by faulting address first; kernel exception
+    /// table fixup is the bad-area fallback in `arch/x86/mm/fault.c`, not an
+    /// eager IDT decision before user-address fault handling.
     ///
-    /// test-origin: linux:vendor/linux/arch/x86/mm/fault.c
+    /// test-origin: linux:vendor/linux/arch/x86/mm/fault.c:handle_page_fault
     #[test]
-    fn user_page_fault_skips_kernel_exception_table_lookup() {
-        let user = test_exception_frame(sel::USER_CS as u64);
-        let kernel = test_exception_frame(sel::KERNEL_CS as u64);
+    fn page_fault_entry_delegates_before_exception_table_fixup() {
+        let source = include_str!("idt.rs");
+        let body = source
+            .split("fn on_page_fault(frame: &ExceptionFrame)")
+            .nth(1)
+            .expect("page fault handler must exist")
+            .split("/// #GP")
+            .next()
+            .expect("page fault handler must end before #GP handler");
 
-        assert!(!page_fault_needs_extable_lookup(&user));
-        assert!(page_fault_needs_extable_lookup(&kernel));
+        assert!(body.contains("crate::arch::x86::mm::fault::do_page_fault(frame);"));
+        assert!(
+            !body.contains("search_extable"),
+            "page-fault entry must not fix up kernel user-copy faults before do_user_addr_fault"
+        );
+    }
+
+    /// test-origin: linux:vendor/linux/arch/x86/kernel/traps.c:exc_general_protection
+    #[test]
+    fn general_protection_handler_tries_kernel_extable_before_oops() {
+        let source = include_str!("idt.rs");
+        let body = source
+            .split("fn on_general_protection(frame: &ExceptionFrame)")
+            .nth(1)
+            .expect("general protection handler must exist")
+            .split("fn on_control_protection")
+            .next()
+            .expect("handler body must end before control-protection handler");
+        let extable = body
+            .find("super::extable::search_extable(frame.rip)")
+            .expect("#GP must consult extable for kernel faults");
+        let first_log = body
+            .find("log_error!(")
+            .expect("#GP handler should still log unfixed faults");
+
+        assert!(extable < first_log);
+        assert!(body[..extable].contains("!is_user_exception(frame)"));
     }
 
     #[test]

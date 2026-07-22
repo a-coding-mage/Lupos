@@ -1,6 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/base/component.c
-//! test-origin: vendor/linux/drivers/base/component.c
+//! test-origin: linux:vendor/linux/drivers/base/component.c
 //! Linux component helper registry.
 
 extern crate alloc;

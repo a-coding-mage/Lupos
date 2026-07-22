@@ -957,7 +957,7 @@ fn with_console_mut<R>(f: impl FnOnce(&mut VirtualConsole) -> R) -> R {
 }
 
 pub fn write_bytes(bytes: &[u8]) {
-    crate::linux_driver_abi::tty::serial::enqueue_bytes(bytes);
+    crate::linux_driver_abi::tty::serial::enqueue_bytes_blocking(bytes);
     write_visible_bytes(bytes);
     render_dirty_to_display(usize::MAX);
     flush_serial_budgeted();

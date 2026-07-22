@@ -209,6 +209,11 @@ pub const VM_MERGEABLE: VmFlags = 1 << 29;
 // Composite aliases.
 // ---------------------------------------------------------------------------
 
+/// Special VMAs that are not mergeable or mlockable.
+///
+/// Ref: Linux `include/linux/mm.h` — `VM_SPECIAL`.
+pub const VM_SPECIAL: VmFlags = VM_IO | VM_DONTEXPAND | VM_PFNMAP | VM_MIXEDMAP;
+
 /// Stack VMA (alias for VM_GROWSDOWN).
 pub const VM_STACK: VmFlags = VM_GROWSDOWN;
 
@@ -281,6 +286,12 @@ mod tests {
     #[test]
     fn vm_stack_equals_growsdown() {
         assert_eq!(VM_STACK, VM_GROWSDOWN);
+    }
+
+    /// VM_SPECIAL is the Linux composite for non-mergeable special VMAs.
+    #[test]
+    fn vm_special_matches_linux_composite() {
+        assert_eq!(VM_SPECIAL, VM_IO | VM_DONTEXPAND | VM_PFNMAP | VM_MIXEDMAP);
     }
 
     /// VM_NONE is zero.

@@ -544,10 +544,14 @@ fn kernfs_poll(
     // vendor/linux/fs/kernfs/file.c::kernfs_generic_poll: register before
     // sampling the generation so notify cannot be lost between the two.
     crate::fs::select::poll_wait(file, &node.notify_wait, table);
+    let default_pollmask = (crate::fs::select::POLLIN
+        | crate::fs::select::POLLOUT
+        | crate::fs::select::POLLRDNORM
+        | crate::fs::select::POLLWRNORM) as u32;
     if file.poll_event.load(Ordering::Acquire) != node.notify_event.load(Ordering::Acquire) {
-        return (crate::fs::select::POLLERR | crate::fs::select::POLLPRI) as u32;
+        return default_pollmask | (crate::fs::select::POLLERR | crate::fs::select::POLLPRI) as u32;
     }
-    0
+    default_pollmask
 }
 
 pub(crate) fn initialize_poll_event(file: &FileRef) {
@@ -719,7 +723,11 @@ mod tests {
         dentry.instantiate(inode);
         let file = super::super::types::File::new(dentry.clone(), 0, 0, &KERNFS_FILE_FILE_OPS);
 
-        assert_eq!(kernfs_poll(&file, None), 0);
+        let default_pollmask = (crate::fs::select::POLLIN
+            | crate::fs::select::POLLOUT
+            | crate::fs::select::POLLRDNORM
+            | crate::fs::select::POLLWRNORM) as u32;
+        assert_eq!(kernfs_poll(&file, None), default_pollmask);
         notify(&dentry);
         assert_eq!(
             kernfs_poll(&file, None)
@@ -727,7 +735,7 @@ mod tests {
             (crate::fs::select::POLLERR | crate::fs::select::POLLPRI) as u32
         );
         consume_poll_event(&file);
-        assert_eq!(kernfs_poll(&file, None), 0);
+        assert_eq!(kernfs_poll(&file, None), default_pollmask);
     }
 
     #[test]

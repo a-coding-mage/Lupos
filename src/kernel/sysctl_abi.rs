@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/kernel/sysctl.c
+//! test-origin: linux:vendor/linux/kernel/sysctl.c
 //! Sysctl handler ABI exports used by Linux-built modules.
 
 extern crate alloc;

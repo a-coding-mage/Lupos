@@ -27,6 +27,8 @@ const STATUS_AUX_DATA: u8 = 0x20;
 const COMMAND_READ_CONFIG: u8 = 0x20;
 const COMMAND_WRITE_CONFIG: u8 = 0x60;
 const COMMAND_ENABLE_KEYBOARD: u8 = 0xAE;
+/// `0xA7` - disable the aux (mouse) port / clock.
+const COMMAND_DISABLE_AUX: u8 = 0xA7;
 /// `0xA8` — enable the aux (mouse) port / clock.
 const COMMAND_ENABLE_AUX: u8 = 0xA8;
 /// `0xD4` — the next byte written to the data port is routed to the mouse.
@@ -192,28 +194,44 @@ pub fn init(use_irqs: bool) {
     IRQ_BYTE_QUEUE.clear();
     drain_pending();
 
-    // Linux requests both i8042 IRQs before enabling the corresponding port.
-    // Keep the controller's interrupt bits clear while commands and ACKs are
-    // exchanged, then enable only after the handlers and deferred consumer
-    // are installed.
+    // Keep controller interrupt bits clear while commands and ACKs are
+    // exchanged. Linux probes AUX first; a real IRQ12 handler is installed
+    // only after the AUX path is known present.
     let mut config = read_config().unwrap_or(CONFIG_TRANSLATION);
     config &= !(CONFIG_IRQ1 | CONFIG_IRQ12);
     write_config(config);
 
-    let (keyboard_irq, aux_irq) = if use_irqs {
+    let softirq_ready = if use_irqs {
         crate::kernel::softirq::open_softirq(
             crate::kernel::softirq::SoftIrqVec::IrqPoll,
             drain_irq_bytes,
         );
+        true
+    } else {
+        false
+    };
+
+    // Enable the aux (mouse) clock only for the synchronous probe. Linux's
+    // `i8042_setup_aux()` does not request the live IRQ or set AUXINT until
+    // `i8042_check_aux()` has succeeded.
+    let _ = write_command(COMMAND_ENABLE_AUX);
+    let mouse_present = init_mouse();
+    drain_pending();
+
+    let (mut keyboard_irq, mut aux_irq) = if use_irqs {
         let dev_id = core::ptr::addr_of_mut!(I8042_IRQ_COOKIE).cast();
-        let aux_irq = crate::kernel::irq::request_irq(
-            12,
-            i8042_interrupt,
-            crate::kernel::irq::IRQF_SHARED,
-            "i8042",
-            dev_id,
-        )
-        .is_ok();
+        let aux_irq = if mouse_present && softirq_ready {
+            crate::kernel::irq::request_irq(
+                12,
+                i8042_interrupt,
+                crate::kernel::irq::IRQF_SHARED,
+                "i8042",
+                dev_id,
+            )
+            .is_ok()
+        } else {
+            false
+        };
         let keyboard_irq = crate::kernel::irq::request_irq(
             1,
             i8042_interrupt,
@@ -227,21 +245,29 @@ pub fn init(use_irqs: bool) {
         (false, false)
     };
 
-    // Enable the aux (mouse) port before touching the config byte so the
-    // controller accepts the mouse-directed writes below.
-    let _ = write_command(COMMAND_ENABLE_AUX);
+    if use_irqs && !keyboard_irq && aux_irq {
+        let dev_id = core::ptr::addr_of_mut!(I8042_IRQ_COOKIE).cast();
+        let _ = crate::kernel::irq::free_irq(12, dev_id);
+        aux_irq = false;
+    }
+
     let _ = write_command(COMMAND_ENABLE_KEYBOARD);
     let _ = write_data(KEYBOARD_ENABLE_SCANNING);
+    if !mouse_present {
+        let _ = write_command(COMMAND_DISABLE_AUX);
+    }
 
-    init_mouse();
-    drain_pending();
-
-    config &= !(CONFIG_DISABLE_KEYBOARD | CONFIG_DISABLE_MOUSE);
+    config &= !CONFIG_DISABLE_KEYBOARD;
+    if mouse_present {
+        config &= !CONFIG_DISABLE_MOUSE;
+    } else {
+        config |= CONFIG_DISABLE_MOUSE;
+    }
     config |= CONFIG_TRANSLATION;
     if keyboard_irq {
         config |= CONFIG_IRQ1;
     }
-    if aux_irq {
+    if aux_irq && mouse_present {
         config |= CONFIG_IRQ12;
     }
     write_config(config);
@@ -252,7 +278,7 @@ pub fn init(use_irqs: bool) {
         crate::log_info!(
             "i8042",
             "IRQ-driven input online: keyboard=1 aux={}",
-            usize::from(aux_irq)
+            usize::from(aux_irq && mouse_present)
         );
     } else {
         crate::log_warn!(
@@ -307,12 +333,15 @@ fn drain_irq_bytes() {
 /// Initialise the PS/2 mouse: restore defaults, then enable stream-mode data
 /// reporting.  Each command is answered with `0xFA` (ACK).  Sets
 /// [`MOUSE_PRESENT`] when reporting is successfully enabled.
-fn init_mouse() {
+fn init_mouse() -> bool {
     // Set-defaults settles sample rate / resolution / scaling.
     let _ = mouse_command(MOUSE_SET_DEFAULTS);
     // Enable data reporting — the mouse now streams 3-byte movement packets.
     if mouse_command(MOUSE_ENABLE_REPORTING) {
         MOUSE_PRESENT.store(true, Ordering::Release);
+        true
+    } else {
+        false
     }
 }
 
@@ -1223,6 +1252,26 @@ mod tests {
             assert!(queue.push(byte as u8, byte & 1 != 0));
         }
         assert!(!queue.push(0xff, false), "bounded IRQ ring must not grow");
+    }
+
+    /// test-origin: linux:vendor/linux/drivers/input/serio/i8042.c:i8042_setup_aux
+    #[test]
+    fn aux_irq_config_requires_successful_aux_probe() {
+        let mut config = CONFIG_TRANSLATION | CONFIG_DISABLE_KEYBOARD | CONFIG_DISABLE_MOUSE;
+
+        let mouse_present = false;
+        let aux_irq_registered = true;
+        if mouse_present {
+            config &= !CONFIG_DISABLE_MOUSE;
+        } else {
+            config |= CONFIG_DISABLE_MOUSE;
+        }
+        if aux_irq_registered && mouse_present {
+            config |= CONFIG_IRQ12;
+        }
+
+        assert_eq!(config & CONFIG_IRQ12, 0);
+        assert_ne!(config & CONFIG_DISABLE_MOUSE, 0);
     }
 
     #[test]

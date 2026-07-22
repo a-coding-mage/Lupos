@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/dma-buf/dma-resv.c
+//! test-origin: linux:vendor/linux/drivers/dma-buf/dma-resv.c
 //! DMA reservation object ABI used by DRM and dma-buf modules.
 
 use core::ffi::c_void;

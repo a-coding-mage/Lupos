@@ -1,6 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/drivers/pci/{pci.c,rebar.c}
-//! test-origin: linux:vendor/linux/drivers/pci/{pci.c,rebar.c}
+//! test-origin: linux:vendor/linux/drivers/pci
 //! Generic PCI helper exports used by Linux-built PCI drivers.
 
 extern crate alloc;

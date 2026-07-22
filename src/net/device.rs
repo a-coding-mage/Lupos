@@ -47,6 +47,7 @@ pub struct NetDeviceOps {
 }
 
 pub struct NetDevice {
+    pub namespace_key: usize,
     pub ifindex: u32,
     pub name: String,
     pub mtu: u32,
@@ -375,6 +376,7 @@ fn register_loopback_netdevice_locked(namespace_key: usize) -> Result<NetDeviceR
     }
 
     let dev = Arc::new(NetDevice {
+        namespace_key,
         ifindex: NEXT_IFINDEX.fetch_add(1, Ordering::AcqRel),
         name: String::from("lo"),
         mtu: LOOPBACK_MTU,
@@ -459,6 +461,7 @@ pub fn register_netdevice(
             return Err(EBUSY);
         }
         let dev = Arc::new(NetDevice {
+            namespace_key: 0,
             ifindex: NEXT_IFINDEX.fetch_add(1, Ordering::AcqRel),
             name: String::from(name),
             mtu,
@@ -502,6 +505,7 @@ pub fn register_linux_netdevice_locked(
         return Err(EBUSY);
     }
     let dev = Arc::new(NetDevice {
+        namespace_key: 0,
         ifindex: NEXT_IFINDEX.fetch_add(1, Ordering::AcqRel),
         name: String::from(name),
         mtu,

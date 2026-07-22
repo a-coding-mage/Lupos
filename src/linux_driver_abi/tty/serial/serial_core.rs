@@ -57,15 +57,20 @@ impl<const CAP: usize> ByteRing<CAP> {
         if CAP == 0 {
             return;
         }
-        if self.len == CAP {
+        if !self.push_back(byte) {
             self.buf[self.head] = byte;
             self.head = (self.head + 1) % CAP;
-            return;
         }
+    }
 
+    fn push_back(&mut self, byte: u8) -> bool {
+        if CAP == 0 || self.len == CAP {
+            return false;
+        }
         let tail = (self.head + self.len) % CAP;
         self.buf[tail] = byte;
         self.len += 1;
+        true
     }
 
     fn pop_front(&mut self) -> Option<u8> {
@@ -278,6 +283,43 @@ pub fn enqueue_bytes(bytes: &[u8]) {
     }
 }
 
+/// Queue bytes without silently dropping data.
+///
+/// Linux's userspace tty write path (`tty_write_lock()` -> `n_tty_write()` ->
+/// `uart_write()`) serializes writers and waits/retries when the UART transmit
+/// FIFO has no room. Use this for `/dev/console` writes where byte loss would
+/// corrupt user-visible output and serial-test markers.
+pub fn enqueue_bytes_blocking(bytes: &[u8]) {
+    if !serial_present() {
+        return;
+    }
+    let mut queue = SERIAL_QUEUE.lock();
+    for &byte in bytes {
+        if byte == b'\n' {
+            loop {
+                if queue.push_back(b'\r') {
+                    break;
+                }
+                drop(queue);
+                if !flush_one_blocking() {
+                    return;
+                }
+                queue = SERIAL_QUEUE.lock();
+            }
+        }
+        loop {
+            if queue.push_back(byte) {
+                break;
+            }
+            drop(queue);
+            if !flush_one_blocking() {
+                return;
+            }
+            queue = SERIAL_QUEUE.lock();
+        }
+    }
+}
+
 fn enqueue_one<const CAP: usize>(queue: &mut ByteRing<CAP>, byte: u8) {
     queue.push_drop_oldest(byte);
 }
@@ -300,17 +342,21 @@ pub fn flush_budget(budget: usize) -> usize {
         return 0;
     }
     let mut drained = 0usize;
+    let serial = SERIAL1.lock();
     while drained < budget {
-        if !SERIAL1.lock().tx_ready() {
+        if !serial.tx_ready() {
             break;
         }
         let burst = core::cmp::min(TX_FIFO_DEPTH, budget - drained);
         let mut wrote = 0usize;
+        let mut queue = SERIAL_QUEUE.lock();
         while wrote < burst {
-            let Some(byte) = SERIAL_QUEUE.lock().pop_front() else {
+            let Some(byte) = queue.pop_front() else {
                 break;
             };
-            SERIAL1.lock().write_byte_unchecked(byte);
+            #[cfg(test)]
+            assert_dequeue_write_holds_serial_port_lock();
+            serial.write_byte_unchecked(byte);
             wrote += 1;
         }
         drained += wrote;
@@ -331,11 +377,32 @@ pub fn flush_all_blocking() {
         return;
     }
     loop {
-        let Some(byte) = SERIAL_QUEUE.lock().pop_front() else {
+        if !flush_one_blocking() {
             break;
-        };
-        SERIAL1.lock().write_byte(byte);
+        }
     }
+}
+
+fn flush_one_blocking() -> bool {
+    if !serial_present() {
+        return false;
+    }
+    let serial = SERIAL1.lock();
+    let Some(byte) = SERIAL_QUEUE.lock().pop_front() else {
+        return false;
+    };
+    #[cfg(test)]
+    assert_dequeue_write_holds_serial_port_lock();
+    serial.write_byte(byte);
+    true
+}
+
+#[cfg(test)]
+fn assert_dequeue_write_holds_serial_port_lock() {
+    assert!(
+        SERIAL1.try_lock().is_none(),
+        "serial transmit popped a byte without holding the UART port lock"
+    );
 }
 
 pub fn queued_len() -> usize {
@@ -484,6 +551,45 @@ mod tests {
 
         flush_all_blocking();
         assert_eq!(captured_bytes_for_tests(), b"a\r\nb");
+        assert_eq!(queued_len(), 0);
+    }
+
+    #[test]
+    fn flush_dequeues_and_transmits_under_uart_lock() {
+        clear_capture_for_tests();
+        enqueue_bytes(b"ab");
+
+        assert_eq!(flush_budget(1), 1);
+        flush_all_blocking();
+
+        assert_eq!(captured_bytes_for_tests(), b"ab");
+        assert_eq!(queued_len(), 0);
+    }
+
+    #[test]
+    fn blocking_enqueue_flushes_in_order_instead_of_dropping_oldest() {
+        clear_capture_for_tests();
+        let fill = alloc::vec![b'x'; SERIAL_QUEUE_CAP];
+        enqueue_bytes(&fill);
+        assert_eq!(queued_len(), SERIAL_QUEUE_CAP);
+        assert!(captured_bytes_for_tests().is_empty());
+
+        enqueue_bytes_blocking(b"y");
+
+        let captured = captured_bytes_for_tests();
+        assert_eq!(captured, b"x");
+        assert_eq!(queued_len(), SERIAL_QUEUE_CAP);
+
+        flush_all_blocking();
+        let captured = captured_bytes_for_tests();
+        assert_eq!(captured.len(), SERIAL_QUEUE_CAP + 1);
+        assert_eq!(captured[0], b'x');
+        assert!(
+            captured[1..SERIAL_QUEUE_CAP]
+                .iter()
+                .all(|&byte| byte == b'x')
+        );
+        assert_eq!(captured[SERIAL_QUEUE_CAP], b'y');
         assert_eq!(queued_len(), 0);
     }
 

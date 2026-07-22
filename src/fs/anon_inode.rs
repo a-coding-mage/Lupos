@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/fs
+//! test-origin: linux:vendor/linux/fs/anon_inodes.c
 //! Minimal anon-inode file allocation for fd-backed kernel objects.
 //!
 //! Ref: `vendor/linux/fs/anon_inodes.c`.  Lupos keeps the object pointer as a

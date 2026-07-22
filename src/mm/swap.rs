@@ -100,10 +100,14 @@ pub fn register_module_exports() {
 // Generic swap entry — swp_entry_t
 // ---------------------------------------------------------------------------
 
-/// Maximum number of swap devices, matching Linux `MAX_SWAPFILES_SHIFT = 5`.
+/// Swap type bit width, matching Linux `MAX_SWAPFILES_SHIFT = 5`.
 pub const MAX_SWAPFILES_SHIFT: u32 = 5;
-/// Maximum number of simultaneous swap devices (= 2^5 = 32).
-pub const MAX_SWAPFILES: usize = 1 << MAX_SWAPFILES_SHIFT;
+/// Linux reserves one swap type for PTE markers.
+pub const SWP_PTE_MARKER_NUM: usize = 1;
+/// Maximum number of simultaneous swap devices after reserved special types.
+pub const MAX_SWAPFILES: usize = (1 << MAX_SWAPFILES_SHIFT) - SWP_PTE_MARKER_NUM;
+/// Reserved swap type used by Linux `PTE_MARKER_*` entries.
+pub const SWP_PTE_MARKER: u8 = MAX_SWAPFILES as u8;
 
 /// Position of the type field inside the generic `SwpEntry::val`.
 /// Ref: Linux `SWP_TYPE_SHIFT` — `include/linux/swapops.h`
@@ -171,6 +175,46 @@ pub fn swp_entry_to_pte(entry: SwpEntry) -> pte_t {
 #[inline]
 pub fn pte_to_swp_entry(pte: pte_t) -> SwpEntry {
     SwpEntry::new(arch_swp_type(pte.0), arch_swp_offset(pte.0))
+}
+
+// ---------------------------------------------------------------------------
+// PTE markers — include/linux/swapops.h
+// ---------------------------------------------------------------------------
+
+pub type PteMarker = usize;
+
+pub const PTE_MARKER_UFFD_WP: PteMarker = 1 << 0;
+pub const PTE_MARKER_POISONED: PteMarker = 1 << 1;
+pub const PTE_MARKER_GUARD: PteMarker = 1 << 2;
+pub const PTE_MARKER_MASK: PteMarker = (1 << 3) - 1;
+
+/// Linux `make_pte_marker()` — encode a PTE marker as a non-present PTE.
+#[inline]
+pub fn make_pte_marker(marker: PteMarker) -> pte_t {
+    swp_entry_to_pte(SwpEntry::new(
+        SWP_PTE_MARKER,
+        (marker & PTE_MARKER_MASK) as u32,
+    ))
+}
+
+/// Return the marker flags for a Linux PTE marker, if `pte` encodes one.
+#[inline]
+pub fn pte_marker_flags(pte: pte_t) -> Option<PteMarker> {
+    let entry = pte_to_swp_entry(pte);
+    if entry.swp_type() == SWP_PTE_MARKER {
+        Some(entry.swp_offset() as PteMarker & PTE_MARKER_MASK)
+    } else {
+        None
+    }
+}
+
+/// Linux `softleaf_is_guard_marker()` for PTE marker entries.
+#[inline]
+pub fn is_guard_pte_marker(pte: pte_t) -> bool {
+    match pte_marker_flags(pte) {
+        Some(marker) => marker & PTE_MARKER_GUARD != 0,
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +297,7 @@ pub struct SwapInfoStruct {
     pub flags: u32,
     /// Priority (-1 = lowest; higher = used first for allocations).
     pub priority: i32,
-    /// Index into `SWAP_INFO[]` (0–31), encoded in `SwpEntry::swp_type()`.
+    /// Index into `SWAP_INFO[]` (0–30), encoded in `SwpEntry::swp_type()`.
     pub swap_type: u8,
     /// Total page slots (including unusable slot 0).
     pub max: u32,
@@ -300,7 +344,7 @@ static NR_SWAPFILES: AtomicU32 = AtomicU32::new(0);
 /// Finds the first free slot in `SWAP_INFO`, allocates the per-slot bitmap,
 /// cluster array, and backing store, then marks the device `SWP_USED | SWP_WRITEOK`.
 ///
-/// Returns the swap type index (0–31) on success, or a negative errno on failure.
+/// Returns the swap type index (0–30) on success, or a negative errno on failure.
 ///
 /// Ref: Linux `mm/swapfile.c` — `sys_swapon()`
 pub fn swapon(max_pages: u32, priority: i32) -> Result<u8, i32> {
@@ -1292,6 +1336,28 @@ mod tests {
         let decoded = pte_to_swp_entry(pte);
         assert_eq!(decoded.swp_type(), 1);
         assert_eq!(decoded.swp_offset(), 42);
+    }
+
+    /// PTE markers reserve the highest x86 swap type and carry marker flags.
+    ///
+    /// Ref: Linux `make_pte_marker()` — include/linux/swapops.h.
+    #[test]
+    fn pte_marker_guard_encoding_matches_linux_reserved_type() {
+        assert_eq!(SWP_PTE_MARKER, 31);
+        assert_eq!(MAX_SWAPFILES, 31);
+
+        let pte = make_pte_marker(PTE_MARKER_GUARD);
+        assert!(!pte_present(pte), "marker PTE must not be hardware-present");
+        assert!(
+            is_swap_pte(pte),
+            "marker PTE uses Linux's swap-PTE encoding"
+        );
+
+        let entry = pte_to_swp_entry(pte);
+        assert_eq!(entry.swp_type(), SWP_PTE_MARKER);
+        assert_eq!(entry.swp_offset(), PTE_MARKER_GUARD as u32);
+        assert_eq!(pte_marker_flags(pte), Some(PTE_MARKER_GUARD));
+        assert!(is_guard_pte_marker(pte));
     }
 
     // ── Test 3: is_swap_pte classification ──────────────────────────────────

@@ -1,5 +1,6 @@
 //! linux-parity: partial
 //! linux-source: vendor/linux/kernel/irq_work.c
+//! test-origin: linux:vendor/linux/kernel/irq_work.c
 //! Synchronous irq_work compatibility for Linux-built modules.
 
 use core::ffi::c_void;

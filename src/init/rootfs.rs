@@ -63,6 +63,7 @@ const DISK_ROOT_WAIT_POLLS: usize = 4;
 #[cfg(not(test))]
 const DISK_ROOT_WAIT_MSECS: u64 = 10_000;
 const DISK_ROOT_READY_SETTLE_POLLS: usize = 128;
+static CONSOLE_ATOMIC_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 pub static DEV_FULL_FILE_OPS: FileOps = FileOps {
     name: "dev_full",
@@ -644,6 +645,7 @@ fn console_write(
     buf: &[u8],
     pos: &mut u64,
 ) -> Result<usize, i32> {
+    let _write_guard = CONSOLE_ATOMIC_WRITE_LOCK.lock();
     crate::kernel::console::write_bytes(buf);
     *pos = pos.saturating_add(buf.len() as u64);
     if !buf.is_empty() {
@@ -3997,6 +3999,60 @@ mod tests {
         assert_eq!(&buf[..1], b"\n");
         assert_eq!(pos, 1);
         assert_eq!(CONSOLE_WAIT_TEST_COUNT.load(Ordering::SeqCst), 1);
+
+        reset_console_buffers();
+    }
+
+    /// Linux serializes every userspace tty write with
+    /// `tty->atomic_write_lock` before entering `n_tty_write()` and
+    /// `uart_write()` (`vendor/linux/drivers/tty/tty_io.c::iterate_tty_write`).
+    /// Lupos maps `/dev/console`, `/dev/tty`, `/dev/tty0`, and `/dev/ttyS0`
+    /// to one simplified console sink, so that lock is shared here too.
+    #[test]
+    fn console_write_uses_shared_linux_atomic_write_lock() {
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        let _console_guard = crate::kernel::console::TEST_CONSOLE_LOCK.lock();
+        reset_console_buffers();
+        crate::kernel::console::reset_for_tests(80, 25);
+        crate::kernel::console::set_fbcon_enabled(false);
+        crate::linux_driver_abi::tty::serial::clear_capture_for_tests();
+
+        let held = CONSOLE_ATOMIC_WRITE_LOCK.lock();
+        assert!(
+            CONSOLE_ATOMIC_WRITE_LOCK.try_lock().is_none(),
+            "tty writes must serialize on the shared console object, not a per-fd offset lock"
+        );
+        drop(held);
+
+        let file_a = alloc_file(
+            crate::fs::dcache::d_alloc("console"),
+            O_RDWR,
+            0,
+            &CONSOLE_FILE_OPS,
+        );
+        let file_b = alloc_file(
+            crate::fs::dcache::d_alloc("ttyS0"),
+            O_RDWR,
+            0,
+            &CONSOLE_FILE_OPS,
+        );
+        let mut pos_a = 0;
+        let mut pos_b = 0;
+
+        let greeter = b"Greeter connected version=\n";
+        let desktop = b"graphics-x11: desktop-initial-ready\n";
+        assert_eq!(
+            console_write(&file_a, greeter, &mut pos_a),
+            Ok(greeter.len())
+        );
+        assert_eq!(
+            console_write(&file_b, desktop, &mut pos_b),
+            Ok(desktop.len())
+        );
+        assert_eq!(
+            crate::linux_driver_abi::tty::serial::captured_bytes_for_tests(),
+            b"Greeter connected version=\r\ngraphics-x11: desktop-initial-ready\r\n"
+        );
 
         reset_console_buffers();
     }
