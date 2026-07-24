@@ -275,26 +275,66 @@ impl CfsTimeline {
         false
     }
 
-    fn find_node_for_task(&self, task: *mut TaskStruct) -> *mut LinuxRbNode {
-        if task.is_null() {
-            return ptr::null_mut();
+    /// Linux's CFS tree is intrusive: `rb_erase_cached()` receives the
+    /// entity's embedded `run_node`, not a key reconstructed from vruntime.
+    /// A zeroed node is also treated as unlinked for Lupos's freshly allocated
+    /// task storage; after the first erase Linux's `RB_CLEAR_NODE()` self-mark
+    /// provides the normal empty-node marker.
+    #[inline]
+    unsafe fn node_is_linked(node: *const LinuxRbNode) -> bool {
+        if node.is_null() {
+            return false;
         }
-        let target = unsafe { run_node(task) };
-        let mut node = self.leftmost;
-        let mut visited = 0;
-        while !node.is_null() && visited < self.len {
-            if node == target {
-                return node;
+        let parent_color = unsafe { (*node).__rb_parent_color };
+        parent_color != 0 && parent_color != node as usize
+    }
+
+    /// Check that an embedded node is linked into this particular timeline.
+    ///
+    /// Linux gets this from rq locking: a `sched_entity` cannot be queued on
+    /// two `cfs_rq`s at once.  The translated node has no owner field, so walk
+    /// its parent chain to the root before erasing it.  The length bound also
+    /// turns a damaged/cyclic chain into a failed membership check instead of
+    /// another scheduler hang.
+    #[inline]
+    unsafe fn node_belongs_to(&self, node: *const LinuxRbNode) -> bool {
+        if !unsafe { Self::node_is_linked(node) } {
+            return false;
+        }
+
+        let mut current = node as *mut LinuxRbNode;
+        let mut steps = 0;
+        while steps <= self.len {
+            let parent_color = unsafe { (*current).__rb_parent_color };
+            let parent = (parent_color & !3usize) as *mut LinuxRbNode;
+            if parent.is_null() {
+                return current == self.root.rb_node;
             }
-            node = unsafe { linux_rb_next(node) };
-            visited += 1;
+            if parent == current {
+                return false;
+            }
+            current = parent;
+            steps += 1;
         }
-        ptr::null_mut()
+        false
+    }
+
+    /// Return whether the task's embedded rb node is linked into any CFS
+    /// timeline.  This is used before `place_entity()` so a rejected duplicate
+    /// enqueue cannot mutate the vruntime of an entity owned by another rq.
+    pub fn entity_node_linked(&self, task: *mut TaskStruct) -> bool {
+        if task.is_null() {
+            return false;
+        }
+        unsafe { Self::node_is_linked(run_node(task)) }
     }
 
     pub fn contains_task(&self, task: *mut TaskStruct) -> bool {
         self.audit("contains", task);
-        !self.find_node_for_task(task).is_null()
+        if task.is_null() {
+            return false;
+        }
+        unsafe { self.node_belongs_to(run_node(task)) }
     }
 
     fn erase_node(&mut self, node: *mut LinuxRbNode) {
@@ -315,26 +355,25 @@ impl CfsTimeline {
         }
     }
 
-    pub fn insert(&mut self, task: *mut TaskStruct, vruntime: u64) {
-        debug_assert!(!task.is_null());
+    pub fn insert(&mut self, task: *mut TaskStruct, vruntime: u64) -> bool {
+        if task.is_null() {
+            return false;
+        }
         self.audit("insert-before", task);
         let key = (vruntime, task as usize);
         let node = unsafe { run_node(task) };
-        if crate::kernel::debug_trace::sched_enabled()
-            && unsafe {
-                (*node).__rb_parent_color != 0 && (*node).__rb_parent_color != node as usize
+        if unsafe { Self::node_is_linked(node) } {
+            if crate::kernel::debug_trace::sched_enabled() {
+                crate::linux_driver_abi::tty::serial_println!(
+                    "sched-cfs-invariant: operation=insert reason=node-already-linked len={} root={:#x} leftmost={:#x} task={:#x} node={:#x}",
+                    self.len,
+                    self.root.rb_node as usize,
+                    self.leftmost as usize,
+                    task as usize,
+                    node as usize,
+                );
             }
-            && self.find_node_for_task(task).is_null()
-        {
-            crate::linux_driver_abi::tty::serial_println!(
-                "sched-cfs-invariant: operation=insert reason=node-already-linked len={} root={:#x} leftmost={:#x} task={:#x} node={:#x}",
-                self.len,
-                self.root.rb_node as usize,
-                self.leftmost as usize,
-                task as usize,
-                node as usize,
-            );
-            panic!("CFS entity inserted while its rb node is linked");
+            return false;
         }
         let mut parent = ptr::null_mut();
         let mut link = ptr::addr_of_mut!(self.root.rb_node);
@@ -349,7 +388,7 @@ impl CfsTimeline {
                 link = unsafe { ptr::addr_of_mut!((*parent).rb_right) };
             } else {
                 self.audit("insert-duplicate", task);
-                return;
+                return false;
             }
         }
 
@@ -367,6 +406,7 @@ impl CfsTimeline {
         }
         self.len += 1;
         self.audit("insert-after", task);
+        true
     }
 
     pub fn remove(&mut self, task: *mut TaskStruct, vruntime: u64) -> bool {
@@ -375,8 +415,8 @@ impl CfsTimeline {
         }
         self.audit("remove-before", task);
         let _ = vruntime;
-        let node = self.find_node_for_task(task);
-        if node.is_null() {
+        let node = unsafe { run_node(task) };
+        if unsafe { !self.node_belongs_to(node) } {
             return false;
         }
 
@@ -473,7 +513,7 @@ impl CfsRq {
             return;
         }
         if self.tasks_timeline.remove(p, old_key) {
-            self.tasks_timeline.insert(p, new_key);
+            let _ = self.tasks_timeline.insert(p, new_key);
         }
     }
 
@@ -483,8 +523,12 @@ impl CfsRq {
     }
 
     /// Insert `p` at vruntime `key`.
-    pub fn insert(&mut self, p: *mut TaskStruct, key: u64) {
-        self.tasks_timeline.insert(p, key);
+    pub fn insert(&mut self, p: *mut TaskStruct, key: u64) -> bool {
+        self.tasks_timeline.insert(p, key)
+    }
+
+    pub fn entity_node_linked(&self, p: *mut TaskStruct) -> bool {
+        self.tasks_timeline.entity_node_linked(p)
     }
 
     pub fn contains_task(&self, p: *mut TaskStruct) -> bool {
@@ -1006,6 +1050,50 @@ mod tests {
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0], pb);
         assert_eq!(remaining[1], pc);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:__dequeue_entity
+    ///
+    /// Linux's rq locking makes the embedded run_node belong to exactly one
+    /// cfs_rq.  This Lupos-specific test covers the ownership check required
+    /// by the Rust translation: a remove through a different timeline must
+    /// not clear or erase the node from its real owner.
+    #[test]
+    fn cfs_timeline_remove_does_not_erase_from_another_timeline() {
+        let mut owner = CfsTimeline::new();
+        let mut other = CfsTimeline::new();
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let ptr = &mut *task as *mut TaskStruct;
+        task.m29.se.vruntime = 10;
+
+        owner.insert(ptr, task.m29.se.vruntime);
+
+        assert!(!other.remove(ptr, task.m29.se.vruntime));
+        assert_eq!(owner.first(), ptr);
+        assert_eq!(owner.len, 1);
+        assert_eq!(other.len, 0);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:__enqueue_entity
+    ///
+    /// The embedded Linux rb_node cannot be inserted into two cfs_rq trees at
+    /// once.  Keep the first owner intact if a broken migration/wakeup path
+    /// attempts that operation.
+    #[test]
+    fn cfs_timeline_insert_rejects_already_owned_node() {
+        let mut owner = CfsTimeline::new();
+        let mut other = CfsTimeline::new();
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let ptr = &mut *task as *mut TaskStruct;
+        task.m29.se.vruntime = 10;
+
+        owner.insert(ptr, task.m29.se.vruntime);
+        other.insert(ptr, task.m29.se.vruntime);
+
+        assert_eq!(owner.first(), ptr);
+        assert_eq!(owner.len, 1);
+        assert!(other.first().is_null());
+        assert_eq!(other.len, 0);
     }
 
     #[test]

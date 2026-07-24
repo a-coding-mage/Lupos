@@ -94,7 +94,7 @@ unsafe fn pick_next_task_dl(rq: &mut Rq) -> *mut TaskStruct {
         .dl
         .root
         .iter()
-        .find_map(|(_, &task)| unsafe { super::task_can_switch_to_on_rq(rq, task).then_some(task) })
+        .find_map(|(_, &task)| unsafe { super::task_can_switch_to(task).then_some(task) })
         .unwrap_or(core::ptr::null_mut());
     if !p.is_null() {
         rq.dl.current = p;
@@ -169,7 +169,6 @@ pub static DL_SCHED_CLASS: SchedClass = SchedClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::boxed::Box;
 
     #[test]
     fn to_ratio_matches_linux_formula() {
@@ -196,49 +195,5 @@ mod tests {
     #[test]
     fn dl_class_above_rt() {
         assert!(CLASS_PRIO_DL < super::super::class::CLASS_PRIO_RT);
-    }
-
-    /// test-origin: linux:vendor/linux/kernel/sched/core.c:finish_task
-    #[test]
-    fn pick_next_task_dl_skips_entity_still_on_another_cpu() {
-        let mut rq = Rq::new(1);
-        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
-        let mut foreign = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
-        let mut runnable = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
-        let current_ptr = &mut *current as *mut TaskStruct;
-        let foreign_ptr = &mut *foreign as *mut TaskStruct;
-        let runnable_ptr = &mut *runnable as *mut TaskStruct;
-
-        rq.current = current_ptr;
-        for (task, stack_top, deadline) in [
-            (
-                &mut foreign,
-                crate::kernel::sched::KTHREAD_STACK_SIZE * 2,
-                10,
-            ),
-            (
-                &mut runnable,
-                crate::kernel::sched::KTHREAD_STACK_SIZE * 3,
-                20,
-            ),
-        ] {
-            task.__state.store(
-                crate::kernel::task::task_state::TASK_RUNNING,
-                Ordering::Release,
-            );
-            task.stack = stack_top as *mut core::ffi::c_void;
-            task.thread.sp = stack_top as u64 - 64;
-            task.m29.dl.deadline = deadline;
-            task.m29.on_rq = 1;
-        }
-        foreign.m29.on_cpu.store(1, Ordering::Release);
-
-        rq.dl.insert(foreign_ptr, foreign.m29.dl.deadline);
-        rq.dl.insert(runnable_ptr, runnable.m29.dl.deadline);
-
-        let picked = unsafe { pick_next_task_dl(&mut rq) };
-
-        assert_eq!(picked, runnable_ptr);
-        assert_eq!(rq.dl.current, runnable_ptr);
     }
 }

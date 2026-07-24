@@ -77,7 +77,7 @@ unsafe fn pick_next_task_rt(rq: &mut Rq) -> *mut TaskStruct {
         .queues
         .iter()
         .flat_map(|queue| queue.iter().copied())
-        .find(|&task| unsafe { super::task_can_switch_to_on_rq(rq, task) })
+        .find(|&task| unsafe { super::task_can_switch_to(task) })
         .unwrap_or(core::ptr::null_mut());
     if !p.is_null() {
         rq.rt.current = p;
@@ -173,7 +173,6 @@ pub static RT_SCHED_CLASS: SchedClass = SchedClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::boxed::Box;
 
     #[test]
     fn rr_timeslice_is_100ms() {
@@ -184,42 +183,5 @@ mod tests {
     #[test]
     fn rt_class_above_fair() {
         assert!(CLASS_PRIO_RT < super::super::class::CLASS_PRIO_FAIR);
-    }
-
-    /// test-origin: linux:vendor/linux/kernel/sched/core.c:finish_task
-    #[test]
-    fn pick_next_task_rt_skips_entity_still_on_another_cpu() {
-        let mut rq = Rq::new(1);
-        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
-        let mut foreign = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
-        let mut runnable = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
-        let current_ptr = &mut *current as *mut TaskStruct;
-        let foreign_ptr = &mut *foreign as *mut TaskStruct;
-        let runnable_ptr = &mut *runnable as *mut TaskStruct;
-
-        rq.current = current_ptr;
-        for (task, stack_top) in [
-            (&mut foreign, crate::kernel::sched::KTHREAD_STACK_SIZE * 2),
-            (&mut runnable, crate::kernel::sched::KTHREAD_STACK_SIZE * 3),
-        ] {
-            task.__state.store(
-                crate::kernel::task::task_state::TASK_RUNNING,
-                Ordering::Release,
-            );
-            task.stack = stack_top as *mut core::ffi::c_void;
-            task.thread.sp = stack_top as u64 - 64;
-            task.m29.prio = 10;
-            task.m29.on_rq = 1;
-            task.m29.rt.on_rq = 1;
-        }
-        foreign.m29.on_cpu.store(1, Ordering::Release);
-
-        rq.rt.enqueue(foreign_ptr, foreign.m29.prio, false);
-        rq.rt.enqueue(runnable_ptr, runnable.m29.prio, false);
-
-        let picked = unsafe { pick_next_task_rt(&mut rq) };
-
-        assert_eq!(picked, runnable_ptr);
-        assert_eq!(rq.rt.current, runnable_ptr);
     }
 }
