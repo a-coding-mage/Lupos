@@ -158,6 +158,9 @@ unsafe fn enqueue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) {
             debug_assert_eq!((*se).on_rq != 0, (*m).on_rq != 0);
             return;
         }
+        if rq.cfs.entity_node_linked(p) {
+            return;
+        }
 
         // Linux set_load_weight(): refresh policy-aware load before enqueue.
         super::set_load_weight(p);
@@ -167,7 +170,9 @@ unsafe fn enqueue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) {
         } else if flags & ENQUEUE_WAKEUP != 0 {
             place_entity(rq, se, false);
         }
-        rq.cfs.insert(p, (*se).vruntime);
+        if !rq.cfs.insert(p, (*se).vruntime) {
+            return;
+        }
         (*se).on_rq = 1;
         (*m).on_rq = 1;
     }
@@ -207,7 +212,7 @@ unsafe fn pick_next_task_fair(rq: &mut Rq) -> *mut TaskStruct {
         .tasks_timeline
         .iter()
         .find_map(|task| {
-            if unsafe { super::task_can_switch_to_on_rq(rq, task) } {
+            if unsafe { super::task_can_switch_to(task) } {
                 Some(task)
             } else {
                 None
@@ -251,10 +256,38 @@ unsafe fn put_prev_task_fair(rq: &mut Rq, prev: *mut TaskStruct) {
     unsafe {
         let se = task_se(prev);
         if (*se).on_rq != 0 && (was_current || !was_linked) {
-            rq.cfs.insert(prev, (*se).vruntime);
+            let _ = rq.cfs.insert(prev, (*se).vruntime);
         }
     }
     rq.cfs.current = core::ptr::null_mut();
+}
+
+/// Linux `set_next_task_fair()` / `set_next_entity()`.
+///
+/// `pick_next_task_fair()` handles the usual tree pick, but the scheduler core
+/// can continue with `prev` when no class pick is available. Linux still calls
+/// this hook for that selected fair task; without it a stale `cfs.current`
+/// makes the next timer tick skip accounting forever.
+unsafe fn set_next_task_fair(rq: &mut Rq, next: *mut TaskStruct, _first: bool) {
+    if next.is_null() || rq.cfs.current == next {
+        return;
+    }
+
+    let se = task_se(next);
+    if unsafe { (*se).on_rq != 0 } && rq.cfs.contains_task(next) {
+        let removed = unsafe { rq.cfs.remove(next, (*se).vruntime) };
+        debug_assert!(
+            removed,
+            "selected fair entity must be removable by run_node"
+        );
+    }
+
+    rq.cfs.current = next;
+    let now = sched_clock_ns();
+    unsafe {
+        (*se).exec_start = now;
+        (*se).prev_sum_exec_runtime = (*se).sum_exec_runtime;
+    }
 }
 
 unsafe fn task_tick_fair(rq: &mut Rq, p: *mut TaskStruct, _queued: bool) {
@@ -328,7 +361,7 @@ pub static FAIR_SCHED_CLASS: SchedClass = SchedClass {
     wakeup_preempt: Some(wakeup_preempt_fair),
     pick_next_task: Some(pick_next_task_fair),
     put_prev_task: Some(put_prev_task_fair),
-    set_next_task: None,
+    set_next_task: Some(set_next_task_fair),
     task_tick: Some(task_tick_fair),
     task_fork: Some(task_fork_fair),
     task_dead: Some(task_dead_fair),
@@ -547,6 +580,28 @@ mod tests {
         assert_eq!(queued.next(), None);
     }
 
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:set_next_task_fair
+    #[test]
+    fn set_next_task_fair_repairs_current_handoff_and_removes_tree_node() {
+        let mut rq = Rq::new(0);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let ptr = &mut *task as *mut TaskStruct;
+        unsafe {
+            (*ptr).m29.se.on_rq = 1;
+            (*ptr).m29.on_rq = 1;
+            (*ptr).m29.se.vruntime = 17;
+        }
+        rq.cfs.insert(ptr, task.m29.se.vruntime);
+        rq.cfs.nr_running = 1;
+
+        unsafe {
+            set_next_task_fair(&mut rq, ptr, false);
+        }
+
+        assert_eq!(rq.cfs.current, ptr);
+        assert!(rq.cfs.tasks_timeline.first().is_null());
+    }
+
     /// test-origin: linux:vendor/linux/kernel/sched/fair.c:put_prev_entity
     #[test]
     fn put_prev_task_fair_clears_stale_current_after_mismatch() {
@@ -649,58 +704,42 @@ mod tests {
         assert_eq!(rq.cfs.current, runnable_ptr);
     }
 
-    /// test-origin: linux:vendor/linux/kernel/sched/core.c:finish_task
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:pick_task_fair
+    ///
+    /// Linux relies on rq ownership to keep a queued entity from being
+    /// selected twice; its picker does not add an independent `on_cpu` test.
+    /// This Lupos-specific fixture preserves a runnable queued entity with a
+    /// stale handoff bit, the state that made the former invented filter turn
+    /// a non-empty CFS runqueue into an idle pick on SMP.
     #[test]
-    fn pick_next_task_fair_skips_entity_still_on_another_cpu() {
-        // Linux's wakeup and migration paths do not let a task run on a new CPU
-        // until finish_task_switch() release-clears p->on_cpu on the old CPU.
-        // This covers the Lupos runqueue-invariant breach captured under GDB:
-        // a stale CFS tree entry must not be allowed to double-run the task.
+    fn pick_next_task_fair_does_not_filter_runnable_entity_by_on_cpu() {
         let mut rq = Rq::new(1);
         let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
-        let mut foreign = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
-        let mut runnable = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         let current_ptr = &mut *current as *mut TaskStruct;
-        let foreign_ptr = &mut *foreign as *mut TaskStruct;
-        let runnable_ptr = &mut *runnable as *mut TaskStruct;
+        let task_ptr = &mut *task as *mut TaskStruct;
 
         rq.current = current_ptr;
-        for (task, stack_top, vruntime) in [
-            (
-                &mut foreign,
-                crate::kernel::sched::KTHREAD_STACK_SIZE * 2,
-                1,
-            ),
-            (
-                &mut runnable,
-                crate::kernel::sched::KTHREAD_STACK_SIZE * 3,
-                2,
-            ),
-        ] {
-            task.__state.store(
-                crate::kernel::task::task_state::TASK_RUNNING,
-                Ordering::Release,
-            );
-            task.stack = stack_top as *mut core::ffi::c_void;
-            task.thread.sp = stack_top as u64 - 64;
-            task.m29.on_rq = 1;
-            task.m29.se.on_rq = 1;
-            task.m29.se.vruntime = vruntime;
-        }
-        foreign.m29.on_cpu.store(1, Ordering::Release);
+        task.__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+        let stack_top = crate::kernel::sched::KTHREAD_STACK_SIZE * 2;
+        task.stack = stack_top as *mut core::ffi::c_void;
+        task.thread.sp = stack_top as u64 - 64;
+        task.m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
+        task.m29.se.on_rq = 1;
+        task.m29.on_rq = 1;
+        task.m29.se.vruntime = 1;
+        task.m29.on_cpu.store(1, Ordering::Release);
 
-        rq.cfs.insert(foreign_ptr, foreign.m29.se.vruntime);
-        rq.cfs.insert(runnable_ptr, runnable.m29.se.vruntime);
+        rq.cfs.insert(task_ptr, task.m29.se.vruntime);
+        rq.cfs.nr_running = 1;
+        rq.nr_running = 1;
 
         let picked = unsafe { pick_next_task_fair(&mut rq) };
 
-        assert_eq!(picked, runnable_ptr);
-        assert_eq!(rq.cfs.current, runnable_ptr);
-        assert!(
-            rq.cfs
-                .tasks_timeline
-                .contains_key(&(foreign.m29.se.vruntime, foreign_ptr as usize)),
-            "the foreign on_cpu entity must remain queued but not selected"
-        );
+        assert_eq!(picked, task_ptr);
+        assert_eq!(rq.cfs.current, task_ptr);
     }
 }

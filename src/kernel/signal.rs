@@ -815,7 +815,15 @@ fn task_wants_signal(
     if sig == SIGKILL {
         return true;
     }
-    !task_is_stopped_or_traced(task)
+    if task_is_stopped_or_traced(task) {
+        return false;
+    }
+
+    // vendor/linux/kernel/signal.c::wants_signal(): a non-running thread
+    // which already has a pending signal will dequeue it when it next runs;
+    // do not repeatedly select it as the process-directed wake target. The
+    // current task is still eligible even when its pending flag is set.
+    crate::kernel::sched::task_on_cpu(task) || !has_pending_signals(task)
 }
 
 fn push_unique_task(
@@ -4687,6 +4695,36 @@ mod tests {
         unsafe {
             sched::set_current(previous);
         }
+        reset_for_tests();
+    }
+
+    #[test]
+    // test-origin: linux:vendor/linux/kernel/signal.c:wants_signal
+    fn signal_target_skips_nonrunning_thread_with_pending_signal() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+
+        let mut target = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        target.pid = 31_167;
+        target.tgid = 31_167;
+        target.__state.store(
+            crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+            core::sync::atomic::Ordering::Release,
+        );
+        target.thread_info.flags.store(
+            crate::kernel::task::TIF_SIGPENDING,
+            core::sync::atomic::Ordering::Release,
+        );
+        let target_ptr = &mut *target as *mut TaskStruct;
+
+        let mut table = SIGNAL_TABLE.lock();
+        table.get_or_create_task_index(target.pid, target.tgid, target_ptr);
+        assert!(
+            !task_wants_signal(&table, target_ptr, SIGUSR1),
+            "Linux does not select a sleeping thread that already has pending signals"
+        );
+        drop(table);
+
         reset_for_tests();
     }
 

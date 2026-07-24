@@ -848,11 +848,6 @@ unsafe fn task_can_switch_to(task: *mut TaskStruct) -> bool {
     unsafe { task_runnable(task) && task_has_switch_frame(task) }
 }
 
-#[inline]
-pub(super) unsafe fn task_can_switch_to_on_rq(rq: &rq::Rq, task: *mut TaskStruct) -> bool {
-    unsafe { task_can_switch_to(task) && (task == rq.current || !task_on_cpu(task)) }
-}
-
 /// Initialise scheduler-owned fields for a newly forked task.
 ///
 /// This is the Lupos equivalent of Linux `sched_fork()`: inherit scheduling
@@ -1489,6 +1484,18 @@ pub unsafe fn __schedule() {
         } else {
             prev
         };
+        if !next.is_null() {
+            let next_class = task_class(next);
+            if !next_class.is_null()
+                && let Some(set_next) = (*next_class).set_next_task
+            {
+                // This is the ordinary Linux put_prev_set_next_task() path;
+                // its class hook receives `first=true` at the scheduling
+                // boundary (the separate helper uses false for policy-change
+                // handoffs).
+                set_next(this_rq, next, true);
+            }
+        }
         clear_need_resched(prev);
         if !next.is_null() && next != prev {
             (*next).thread_info.cpu = cpu;
@@ -2355,6 +2362,7 @@ pub unsafe fn try_to_wake_up(p: *mut TaskStruct, wake_flags: u32) -> bool {
     }
 
     let owner_cpu = unsafe { (*p).thread_info.cpu };
+
     let queued_resched = rq::with_rq(owner_cpu, |owner_rq| unsafe {
         if (*p).m29.on_rq == 0 {
             return (false, false);
@@ -2377,7 +2385,6 @@ pub unsafe fn try_to_wake_up(p: *mut TaskStruct, wake_flags: u32) -> bool {
     while task_on_cpu(p) {
         core::hint::spin_loop();
     }
-
     let target_cpu = select_task_rq(p, owner_cpu, wake_flags);
     let enqueued = rq::with_rq(target_cpu, |target_rq| unsafe {
         let class = task_class(p);

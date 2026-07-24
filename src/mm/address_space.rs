@@ -20,7 +20,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::page::Page;
 use super::page_flags::{
@@ -392,6 +392,11 @@ impl FolioWaitQueue {
 static FOLIO_WAIT_TABLE: [FolioWaitQueue; PAGE_WAIT_TABLE_SIZE] =
     [const { FolioWaitQueue::new() }; PAGE_WAIT_TABLE_SIZE];
 
+#[cfg(test)]
+static WAIT_SETUP_TEST_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static WAIT_SETUP_TEST_OBSERVED_STATE: AtomicU32 = AtomicU32::new(u32::MAX);
+
 #[inline]
 fn folio_waitqueue(page: *mut Page) -> &'static FolioWaitQueue {
     // Linux hash_ptr(ptr, 8): hash_64_generic() with GOLDEN_RATIO_64.
@@ -509,16 +514,30 @@ unsafe fn folio_wait_bit_common(page: *mut Page, bit: u64, behavior: FolioWaitBe
                     .fetch_or(WQ_FLAG_WOKEN | WQ_FLAG_DONE, Ordering::Release);
             } else if !(*waiter_ptr).queued {
                 waiters.push_tail(waiter_ptr);
-            }
-        });
 
-        loop {
-            unsafe {
+                // Linux prepare_to_wait() adds the entry and sets the task
+                // state while holding the same waitqueue lock.  A waker must
+                // therefore see either the entry before it can wake, or the
+                // sleep state before it can remove and wake that entry.
                 (*task).__state.store(
                     crate::kernel::task::task_state::TASK_UNINTERRUPTIBLE,
                     Ordering::SeqCst,
                 );
             }
+            // Test-only wake injection.  It runs while the queue lock is held,
+            // at the same point a Linux wake is ordered against the state
+            // publication above.
+            #[cfg(test)]
+            if WAIT_SETUP_TEST_ARMED.swap(false, Ordering::AcqRel) {
+                WAIT_SETUP_TEST_OBSERVED_STATE
+                    .store((*task).__state.load(Ordering::Acquire), Ordering::Release);
+                (*waiter_ptr)
+                    .flags
+                    .fetch_or(WQ_FLAG_WOKEN | WQ_FLAG_DONE, Ordering::Release);
+            }
+        });
+
+        loop {
             let flags = unsafe { (*waiter_ptr).flags.load(Ordering::Acquire) };
             if flags & WQ_FLAG_WOKEN == 0 {
                 unsafe { crate::kernel::sched::schedule_with_irqs_enabled() };
@@ -754,6 +773,48 @@ mod tests {
         page.flags.fetch_or(PG_WRITEBACK, Ordering::Relaxed);
         page.flags.fetch_and(!PG_WRITEBACK, Ordering::Relaxed);
         unsafe { wait_on_page_writeback(ptr) };
+    }
+
+    #[test]
+    fn page_wait_publishes_sleep_state_before_wake_observation() {
+        // test-origin: linux:vendor/linux/mm/filemap.c:folio_wait_bit_common
+        // and vendor/linux/kernel/sched/wait.c:prepare_to_wait
+        //
+        // Linux adds the wait entry and sets TASK_UNINTERRUPTIBLE while the
+        // hashed waitqueue lock is held.  This Lupos-specific injection
+        // models a waker observing the entry at that boundary; it exists
+        // because no upstream test can force this internal ordering window.
+        use alloc::boxed::Box;
+
+        let previous = unsafe { crate::kernel::sched::get_current() };
+        let mut task = Box::new(unsafe { core::mem::zeroed::<crate::kernel::task::TaskStruct>() });
+        task.__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+        unsafe {
+            crate::kernel::sched::set_current(&mut *task);
+        }
+
+        let mut page = Page::new();
+        let page_ptr = &raw mut page;
+        unsafe { try_lock_page(page_ptr) };
+        WAIT_SETUP_TEST_OBSERVED_STATE.store(u32::MAX, Ordering::Relaxed);
+        WAIT_SETUP_TEST_ARMED.store(true, Ordering::Release);
+
+        unsafe {
+            folio_wait_bit_common(page_ptr, PG_LOCKED, FolioWaitBehavior::Exclusive);
+        }
+
+        assert_eq!(
+            WAIT_SETUP_TEST_OBSERVED_STATE.load(Ordering::Acquire),
+            crate::kernel::task::task_state::TASK_UNINTERRUPTIBLE,
+            "a page waiter must publish its sleep state before a waker can observe it"
+        );
+        unsafe {
+            unlock_page(page_ptr);
+            crate::kernel::sched::set_current(previous);
+        }
     }
 
     // ── vtable_null_read_folio_is_safe_to_call_through_option ─────────────────
