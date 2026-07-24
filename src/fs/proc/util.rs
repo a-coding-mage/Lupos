@@ -17,6 +17,7 @@ use crate::kernel::{
     cred::{Cred, GroupInfo, INIT_CRED},
     task::TaskStruct,
 };
+use crate::mm::mmap_lock::MmapReadGuard;
 
 pub type ProcShow = fn(&Arc<KernfsNode>, &mut [u8]) -> Result<usize, i32>;
 
@@ -105,6 +106,7 @@ pub fn task_rss_anon_kb(task: *mut TaskStruct) -> u64 {
     if mm.is_null() {
         return 0;
     }
+    let _mmap_guard = unsafe { MmapReadGuard::lock(mm) };
     let mm = unsafe { &*mm };
     let mut kb = 0u64;
     for (_, _, entry) in mm.mm_mt.collect_entries() {

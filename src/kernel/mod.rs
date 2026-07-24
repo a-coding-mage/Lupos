@@ -53,6 +53,7 @@ pub mod fork; // M23
 pub mod futex; // M32
 pub mod gcov;
 pub mod groups; // M27a
+pub mod idle_stall;
 pub mod irq; // M37
 pub mod irq_work;
 pub mod kconfig; // M65

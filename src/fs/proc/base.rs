@@ -182,7 +182,8 @@ unsafe fn task_stat_text(task: *mut TaskStruct) -> alloc::string::String {
         };
         ((*task).pid, ppid, state, super::util::task_comm(task))
     };
-    super::array::stat_text_with_ppid(pid, &comm, state, ppid)
+    let ids = super::array::task_stat_ids_for_pid(pid, ppid);
+    super::array::stat_text_with_ids(pid, &comm, state, ids)
 }
 
 pub fn add_tgid_base(dir: &Arc<KernfsNode>) {

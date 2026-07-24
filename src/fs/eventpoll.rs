@@ -1123,15 +1123,20 @@ pub unsafe fn sys_epoll_wait(
                 } else {
                     deadline_timeout
                 };
-                if let Some(timeout) = timeout {
+                // Keep this timer's own handle: `schedule_with_irqs_enabled()`
+                // pumps driver completions and drains workqueues in this very
+                // task's context, and those paths arm and cancel wakeups of
+                // their own. Cancelling by task would let a nested sleep disarm
+                // this one and leave epoll_wait() sleeping with no timeout.
+                let armed = timeout.map(|timeout| {
                     let wake_at = crate::kernel::time::jiffies::jiffies().saturating_add(timeout);
-                    crate::kernel::time::sleep_timeout::arm_wakeup(task, wake_at);
-                }
+                    crate::kernel::time::sleep_timeout::arm_wakeup(task, wake_at)
+                });
                 unsafe {
                     sched::schedule_with_irqs_enabled();
                 }
-                if timeout.is_some() {
-                    crate::kernel::time::sleep_timeout::cancel_wakeup(task);
+                if let Some(armed) = armed {
+                    crate::kernel::time::sleep_timeout::cancel_wakeup(armed);
                 }
             }
             unsafe {

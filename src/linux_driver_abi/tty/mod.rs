@@ -699,6 +699,11 @@ pub fn signal_compat_foreground(sig: i32) -> i32 {
     crate::kernel::signal::send_signal_to_process_group(pgrp, sig)
 }
 
+pub fn compat_tty_foreground_pgrp() -> Option<i32> {
+    let pgrp = COMPAT_TTY_PGRP.load(Ordering::Acquire);
+    (pgrp > 0).then_some(pgrp)
+}
+
 /// `true` once a process called `TIOCSCTTY` on /dev/tty1 / /dev/console
 /// (the compat path) — i.e. a controlling-tty session has been claimed.
 /// Mirrors Linux's `tty_get_pgrp(tty)` returning non-NULL.  Used to decide

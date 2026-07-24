@@ -48,10 +48,20 @@ pub static IDLE_SCHED_CLASS: SchedClass = SchedClass {
 /// that wakes it without a lost-wakeup window.
 fn do_idle(cpu: u32) {
     super::nohz::tick_nohz_idle_enter(cpu);
+    // `do_idle()` only returns once `need_resched` is set, so this stamp makes
+    // "this CPU has been idle continuously since T" a purely local fact.
+    #[cfg(not(test))]
+    let idle_since = crate::kernel::time::jiffies::jiffies();
     loop {
         crate::kernel::watchdog::touch_softlockup_watchdog_sched();
         crate::kernel::rcu::tasks_rcu_qs();
         crate::kernel::rcu::rcu_qs();
+
+        // Every timer interrupt that wakes a halted CPU returns here, so this
+        // is where "all CPUs have been idle with nothing runnable" becomes
+        // observable. Silent unless `lupos.trace=stall` is set.
+        #[cfg(not(test))]
+        crate::kernel::idle_stall::idle_stall_check(cpu, idle_since);
 
         if super::current_needs_resched() {
             break;
@@ -60,6 +70,31 @@ fn do_idle(cpu: u32) {
             super::nohz::tick_nohz_idle_exit(cpu);
             crate::kernel::softirq::do_softirq();
             super::nohz::tick_nohz_idle_enter(cpu);
+            continue;
+        }
+
+        // Lupos-specific bridge with no Linux counterpart, because Linux does
+        // not need one: several Linux-built drivers here (AHCI/libata, virtio,
+        // the DRM module ABI) have no native IRQ wakeup path yet and deliver
+        // their completions through `poll_driver_abi_events()` instead.
+        //
+        // `schedule_with_irqs_enabled()` already pumps them at its cooperative
+        // idle chokepoint, but that path is only reached by a task that blocks.
+        // Every CPU — the BSP from `init/main.rs` and each AP from
+        // `arch/x86/kernel/smp.rs` — parks *here*, so halting without pumping
+        // strands those completions until some unrelated interrupt happens to
+        // run a task that reaches the cooperative path.
+        //
+        // Evidence this is reachable: sampling all four vCPUs 25 times at a
+        // stalled login gave 100/100 samples halted in `cpu_startup_entry`
+        // while userspace waited on I/O — see
+        // `target/xtask/investigations/boot-gui-audio-perf-20260722/pc-samples-hang2.txt`.
+        //
+        // Pump with IRQs still enabled, at the same point the cooperative path
+        // pumps, and re-run the loop when something was handled so the
+        // now-runnable waiter is picked up instead of halting on top of it.
+        #[cfg(not(test))]
+        if super::pump_driver_abi_events_on_idle() {
             continue;
         }
 

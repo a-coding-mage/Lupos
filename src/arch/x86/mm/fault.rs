@@ -384,6 +384,24 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
         if !task.is_null() {
             let pid = unsafe { (*task).pid };
             if pid == 1 {
+                // PID 1 is fatal in this milestone, but retain the same
+                // Linux page-fault evidence before panicking so an init fault
+                // is not reduced to an address-only message.
+                log_page_fault(frame, ec, addr);
+                log_error!(
+                    "cpu",
+                    "cpu: init #PF cs={:#x} rflags={:#x} user-rsp={:#018x} rax={:#018x} rbx={:#018x} rcx={:#018x} rdx={:#018x} rsi={:#018x} rdi={:#018x} rbp={:#018x}",
+                    frame.cs,
+                    frame.rflags,
+                    frame.user_rsp,
+                    frame.rax,
+                    frame.rbx,
+                    frame.rcx,
+                    frame.rdx,
+                    frame.rsi,
+                    frame.rdi,
+                    frame.rbp,
+                );
                 panic!(
                     "init died from SIGSEGV: addr={:#018x} error={:#010x} rip={:#018x}",
                     addr, ec, frame.rip
@@ -408,6 +426,31 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
         frame.rip,
         frame.user_rsp,
     );
+    // A kernel-mode *instruction fetch* at a null/low address is a call through
+    // a NULL function pointer. The `call` has already pushed its return address,
+    // so the top of the faulting stack names the exact call site. In long mode
+    // the CPU pushes SS:RSP for same-privilege faults too, so `user_rsp` is the
+    // faulting kernel stack here. This is far more precise than the heuristic
+    // stack scan in the panic handler, which reports every word that merely
+    // looks like a text address.
+    const PF_INSTR: u64 = 1 << 4;
+    if !is_user_mode_fault(frame, ec) && ec & PF_INSTR != 0 && addr < 0x1000 {
+        let sp = frame.user_rsp;
+        // Only touch an aligned kernel address; we were executing on this stack,
+        // so it is mapped, but stay defensive to avoid faulting inside a fault.
+        if sp >= 0xffff_8000_0000_0000 && sp % 8 == 0 {
+            for slot in 0..4u64 {
+                let value = unsafe { core::ptr::read_volatile((sp + slot * 8) as *const u64) };
+                log_error!(
+                    "cpu",
+                    "cpu: null-call return address [rsp+{:#04x}] = {:#018x}",
+                    slot * 8,
+                    value,
+                );
+            }
+        }
+    }
+
     panic!("Segmentation fault");
 }
 
@@ -542,6 +585,47 @@ fn log_page_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
         u8::from((ec & X86_PF_INSTR) != 0),
         frame.rip,
     );
+
+    // A supervisor fault in the user-address half is the important case for
+    // diagnosing missing uaccess fixups: the saved general registers identify
+    // the bad pointer, while the interrupted kernel RSP lets us recover the
+    // return addresses around a faulting leaf function without a debugger.
+    log_error!(
+        "cpu",
+        "cpu: #PF regs rax={:#018x} rbx={:#018x} rcx={:#018x} rdx={:#018x} rsi={:#018x} rdi={:#018x} rbp={:#018x} r8={:#018x} r9={:#018x} cs={:#x} rflags={:#x}",
+        frame.rax,
+        frame.rbx,
+        frame.rcx,
+        frame.rdx,
+        frame.rsi,
+        frame.rdi,
+        frame.rbp,
+        frame.r8,
+        frame.r9,
+        frame.cs,
+        frame.rflags,
+    );
+
+    if frame.cs & 3 == 0 {
+        // For a same-privilege exception the CPU did not push RSP/SS. The
+        // synthetic `user_rsp` slot therefore contains the interrupted kernel
+        // RSP: frame + 160 bytes.
+        let interrupted_rsp = (frame as *const ExceptionFrame as u64)
+            .saturating_add(core::mem::offset_of!(ExceptionFrame, user_rsp) as u64);
+        let thread_size = crate::arch::x86::kernel::dumpstack_64::THREAD_SIZE;
+        let stack_end = (interrupted_rsp | (thread_size - 1)).saturating_add(1);
+        if interrupted_rsp >= crate::arch::x86::mm::paging::PAGE_OFFSET
+            && interrupted_rsp.saturating_add(0xa8) < stack_end
+        {
+            log_error!(
+                "cpu",
+                "cpu: #PF interrupted-rsp={:#018x} stack-return-68={:#018x} stack-return-a0={:#018x}",
+                interrupted_rsp,
+                unsafe { core::ptr::read_unaligned((interrupted_rsp + 0x68) as *const u64) },
+                unsafe { core::ptr::read_unaligned((interrupted_rsp + 0xa0) as *const u64) },
+            );
+        }
+    }
 }
 
 fn is_user_mode_fault(frame: &ExceptionFrame, ec: u64) -> bool {

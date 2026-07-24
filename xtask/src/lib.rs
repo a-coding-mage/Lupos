@@ -148,6 +148,8 @@ pub const SHIPPED_COMMANDS_MARKERS: &[&str] = &[
     "shipped-commands: packaging ok",
     "shipped-commands: systemd-tools ok",
     "shipped-commands: procps ok",
+    // Terminal-mode reduction of the `graphics-x11: sudo-su` PTY probe.
+    "shipped-commands: pty-session ok",
     "shipped-commands: util-linux ok",
     "shipped-commands: networking ok",
 ];
@@ -696,6 +698,102 @@ const SHIPPED_COMMANDS_SCRIPT: &str = concat!(
     "top -b -n 1 >/dev/null\n",
     "free -m | grep -q '^Mem:'\n",
     "echo shipped-commands: procps ok\n",
+    // util-linux script(1) PTY session parity.  This is the terminal-mode
+    // reduction of the `graphics-x11: sudo-su` probe: `printf pw | script
+    // -qfec \"<cmd needing /dev/tty>\" /dev/null`.  Linux propagates the
+    // child's exit status through `script -e`, reports the slave in
+    // `/proc/<pid>/stat` fields 7/8 (`tty_nr`/`tty_pgrp`) and in `ps -o tty=`,
+    // and honours `stty -echo` on the slave so password reads are not echoed.
+    // Ref: vendor/linux/drivers/tty/pty.c, vendor/linux/fs/proc/array.c
+    // (`do_task_stat`), vendor/linux/drivers/tty/tty_io.c (`tty_open`).
+    "cat >/tmp/lupos-pty-inner.sh <<'PTYEOF'\n",
+    "#!/bin/sh\n",
+    "echo \"inner-tty=$(tty 2>&1)\"\n",
+    "echo \"inner-ps-tty=$(ps -o tty= -p $$ 2>&1)\"\n",
+    "echo \"inner-ps-sid=$(ps -o sid= -p $$ 2>&1)\"\n",
+    "awk '{print \"inner-stat pgrp=\"$5\" sess=\"$6\" ttynr=\"$7\" ttypgrp=\"$8}' /proc/self/stat\n",
+    "exit 7\n",
+    "PTYEOF\n",
+    "chmod 0755 /tmp/lupos-pty-inner.sh\n",
+    "cat >/tmp/lupos-pty-echo.sh <<'PTYEOF'\n",
+    "#!/bin/sh\n",
+    "stty -echo\n",
+    "read v\n",
+    "stty echo\n",
+    "echo \"inner-read=$v\"\n",
+    "PTYEOF\n",
+    "chmod 0755 /tmp/lupos-pty-echo.sh\n",
+    // Same shape as the GUI `sudo-su` probe, minus sudo (which the base
+    // profile does not stage): an unprivileged user pipes the password into
+    // `script`, and the command inside the PTY reads it from /dev/tty.
+    "cat >/tmp/lupos-pty-su.sh <<'PTYEOF'\n",
+    "#!/bin/sh\n",
+    "printf 'lupos\\n' | /usr/bin/script -qfec \"/usr/bin/su -c '/usr/bin/id -u' root\" /dev/null\n",
+    "echo \"pty-su-inner-rc=$?\"\n",
+    "PTYEOF\n",
+    "chmod 0755 /tmp/lupos-pty-su.sh\n",
+    // Controlling-terminal accounting for the serial login shell itself.
+    // `agetty` claims the console, then `login` forks a child that calls
+    // `setsid()` + `ioctl(0, TIOCSCTTY, 1)`; Linux hands the terminal over, so
+    // every process in the login session reports a real `tty_nr` in
+    // `/proc/<pid>/stat` field 7 and a real `TT` column in `ps`.
+    // Ref: vendor/linux/drivers/tty/tty_jobctrl.c::tiocsctty(),
+    // vendor/linux/fs/proc/array.c::do_task_stat().
+    "echo \"shipped-commands: pty-console-tty=$(tty)\"\n",
+    "ps -o pid,ppid,pgid,sid,tty,comm -p $$ | sed 's/^/shipped-commands: pty-console-ps /'\n",
+    "awk '{print \"shipped-commands: pty-console-stat pgrp=\"$5\" sess=\"$6\" ttynr=\"$7\" ttypgrp=\"$8}' /proc/self/stat\n",
+    "console_tty=\"$(tty)\"\n",
+    "console_ps_tty=\"$(ps -o tty= -p $$ | tr -d ' ')\"\n",
+    "console_ttynr=\"$(awk '{print $7}' /proc/self/stat)\"\n",
+    "console_ttypgrp=\"$(awk '{print $8}' /proc/self/stat)\"\n",
+    // 1) `script -e` must return the child's exit status verbatim.
+    "pty_rc7=0\n",
+    "/usr/bin/script -qfec '/bin/sh -c \"exit 7\"' /dev/null >/tmp/lupos-pty-rc7.log 2>&1 || pty_rc7=$?\n",
+    // 2) Success path with an inherited (tty) stdin.
+    "pty_rc0=0\n",
+    "/usr/bin/script -qfec /bin/true /dev/null >/tmp/lupos-pty-rc0.log 2>&1 || pty_rc0=$?\n",
+    // 3) Success path with a pipe stdin that reaches EOF immediately. This is
+    //    the exact stdin shape the GUI probe uses.
+    "pty_pipe=0\n",
+    "printf 'x\\n' | /usr/bin/script -qfec /bin/true /dev/null >/tmp/lupos-pty-pipe.log 2>&1 || pty_pipe=$?\n",
+    // 4) Session/tty accounting observed from inside the PTY.
+    "pty_inner=0\n",
+    "/usr/bin/script -qfec /tmp/lupos-pty-inner.sh /dev/null >/tmp/lupos-pty-inner.log 2>&1 || pty_inner=$?\n",
+    // 5) `stty -echo` on the slave must suppress the echoed line.
+    "pty_echo=0\n",
+    "printf 'sekrit\\n' | /usr/bin/script -qfec /tmp/lupos-pty-echo.sh /dev/null >/tmp/lupos-pty-echo.log 2>&1 || pty_echo=$?\n",
+    // 6) Unprivileged password read through the PTY (GUI sudo-su reduction).
+    "pty_su=0\n",
+    "/usr/bin/su -s /bin/sh -c /tmp/lupos-pty-su.sh lupos >/tmp/lupos-pty-su.log 2>&1 || pty_su=$?\n",
+    "printf 'shipped-commands: pty rc7=%s rc0=%s pipe=%s inner=%s echo=%s su=%s\\n' \"$pty_rc7\" \"$pty_rc0\" \"$pty_pipe\" \"$pty_inner\" \"$pty_echo\" \"$pty_su\"\n",
+    "for pty_log in rc7 rc0 pipe inner echo su; do tr -d '\\r' </tmp/lupos-pty-$pty_log.log | sed \"s|^|shipped-commands: pty-$pty_log-log |\"; done\n",
+    "pty_fail=\n",
+    // The login session must actually own the serial console.
+    "case \"$console_tty\" in /dev/*) ;; *) pty_fail=\"$pty_fail console-tty=$console_tty\";; esac\n",
+    "test \"$console_ps_tty\" != '?' || pty_fail=\"$pty_fail console-ps-tty=?\"\n",
+    "test \"$console_ttynr\" != 0 || pty_fail=\"$pty_fail console-ttynr=0\"\n",
+    "test \"$console_ttypgrp\" -gt 0 || pty_fail=\"$pty_fail console-ttypgrp=$console_ttypgrp\"\n",
+    "test \"$pty_rc7\" = 7 || pty_fail=\"$pty_fail rc7=$pty_rc7(want 7)\"\n",
+    "test \"$pty_rc0\" = 0 || pty_fail=\"$pty_fail rc0=$pty_rc0(want 0)\"\n",
+    "test \"$pty_pipe\" = 0 || pty_fail=\"$pty_fail pipe=$pty_pipe(want 0)\"\n",
+    "test \"$pty_inner\" = 7 || pty_fail=\"$pty_fail inner=$pty_inner(want 7)\"\n",
+    "test \"$pty_echo\" = 0 || pty_fail=\"$pty_fail echo=$pty_echo(want 0)\"\n",
+    "test \"$pty_su\" = 0 || pty_fail=\"$pty_fail su=$pty_su(want 0)\"\n",
+    "tr -d '\\r' </tmp/lupos-pty-inner.log | grep -q 'inner-tty=/dev/pts/' || pty_fail=\"$pty_fail inner-tty\"\n",
+    "tr -d '\\r' </tmp/lupos-pty-inner.log | grep -q 'inner-ps-tty=pts/' || pty_fail=\"$pty_fail inner-ps-tty\"\n",
+    "tr -d '\\r' </tmp/lupos-pty-inner.log | grep -q 'inner-stat pgrp=[1-9]' || pty_fail=\"$pty_fail inner-stat-pgrp\"\n",
+    "tr -d '\\r' </tmp/lupos-pty-inner.log | grep 'inner-stat' | grep -qv 'ttynr=0' || pty_fail=\"$pty_fail inner-stat-ttynr\"\n",
+    // Only the read itself is asserted. Whether the line is *also* echoed
+    // back is a race on Linux too: `script` relays the piped stdin to the
+    // master before the child has run `stty -echo`, so util-linux 2.41 on a
+    // real kernel prints `sekrit` twice here. Asserting suppression would
+    // assert non-Linux behaviour.
+    "tr -d '\\r' </tmp/lupos-pty-echo.log | grep -qx 'inner-read=sekrit' || pty_fail=\"$pty_fail echo-read\"\n",
+    "tr -d '\\r' </tmp/lupos-pty-su.log | grep -qx 0 || pty_fail=\"$pty_fail su-id\"\n",
+    "tr -d '\\r' </tmp/lupos-pty-su.log | grep -qx 'pty-su-inner-rc=0' || pty_fail=\"$pty_fail su-inner-rc\"\n",
+    "rm -f /tmp/lupos-pty-inner.sh /tmp/lupos-pty-echo.sh /tmp/lupos-pty-su.sh\n",
+    "rm -f /tmp/lupos-pty-rc7.log /tmp/lupos-pty-rc0.log /tmp/lupos-pty-pipe.log /tmp/lupos-pty-inner.log /tmp/lupos-pty-echo.log /tmp/lupos-pty-su.log\n",
+    "if [ -z \"$pty_fail\" ]; then echo 'shipped-commands: pty-session ok'; else printf 'shipped-commands: pty-session failed%s\\n' \"$pty_fail\"; fi\n",
     // util-linux: tmpfs mount round-trip, lsblk, dmesg.  lsblk exits 1
     // (not an error here) when the VM exposes no block devices.
     "mkdir -p /tmp/scmnt\n",
@@ -4830,6 +4928,53 @@ fn graphics_x11_desktop_ready_relay_script() -> Vec<u8> {
         "        END { exit found ? 0 : 1 }\n",
         "    ' /var/log/lightdm/lightdm.log\n",
         "}\n",
+        "lightdm_restarted_before_user_session() {\n",
+        "    [ -s /var/log/lightdm/lightdm.log ] || return 1\n",
+        "    awk '\n",
+        "        /Seat seat0: Greeter stopped, running session/ { pending = 1 }\n",
+        "        pending && /Running command \\/etc\\/lightdm\\/Xsession startxfce4/ { pending = 0 }\n",
+        "        pending && /Starting Light Display Manager/ { found = 1 }\n",
+        "        END { exit found ? 0 : 1 }\n",
+        "    ' /var/log/lightdm/lightdm.log\n",
+        "}\n",
+        "dump_desktop_wait_diagnostics() {\n",
+        "    wait_secs=\"$1\"\n",
+        "    printf 'graphics-x11: desktop-wait-diagnostics begin t=%s\\n' \"$wait_secs\"\n",
+        "    for f in /tmp/lupos-desktop-initial-ready /tmp/lupos-desktop-initial-failed /home/lupos/.xsession-errors; do\n",
+        "        [ -e \"$f\" ] && ls -l \"$f\" 2>&1 | sed 's/^/graphics-x11: desktop-wait-file /'\n",
+        "    done\n",
+        "    for f in /var/log/lightdm/lightdm.log /var/log/lightdm/seat0-greeter.log /var/log/lightdm/x-0.log; do\n",
+        "        [ -s \"$f\" ] || continue\n",
+        "        printf 'graphics-x11: desktop-wait-log %s begin\\n' \"$f\"\n",
+        "        tail -80 \"$f\"\n",
+        "        printf 'graphics-x11: desktop-wait-log %s end\\n' \"$f\"\n",
+        "    done\n",
+        "    find /run/user /run/systemd/users /run/systemd/sessions -maxdepth 2 -printf 'graphics-x11: desktop-wait-runtime %m %u:%g %y %p\\n' 2>/dev/null || true\n",
+        "    for proc in /proc/[0-9]*; do\n",
+        "        [ -r \"$proc/status\" ] || continue\n",
+        "        comm=\"$(cat \"$proc/comm\" 2>/dev/null || true)\"\n",
+        "        case \"$comm\" in lightdm|lightdm-gtk-greeter|Xorg|systemd|dbus-*|xfce4-*|xfwm4|xfsettingsd|xfdesktop|xfconfd|polkitd)\n",
+        "            uid=\"$(awk '/^Uid:/ { print $2; exit }' \"$proc/status\" 2>/dev/null)\"\n",
+        "            state=\"$(grep -E '^(State|Tgid|Pid|PPid|Threads|SigPnd|ShdPnd):' \"$proc/status\" 2>/dev/null | tr '\\n' ';')\"\n",
+        "            wchan=\"$(cat \"$proc/wchan\" 2>/dev/null || true)\"\n",
+        "            cmd=\"$(tr '\\000' ' ' < \"$proc/cmdline\" 2>/dev/null || true)\"\n",
+        "            envkeys=\"$(tr '\\000' '\\n' < \"$proc/environ\" 2>/dev/null | grep -E '^(DISPLAY|XAUTHORITY|DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR)=' | tr '\\n' ' ')\"\n",
+        "            printf 'graphics-x11: desktop-wait-proc pid=%s uid=%s comm=%s wchan=%s status=[%s] cmd=%s env=[%s]\\n' \"${proc##*/}\" \"$uid\" \"$comm\" \"$wchan\" \"$state\" \"$cmd\" \"$envkeys\"\n",
+        "            ;;\n",
+        "        esac\n",
+        "    done\n",
+        "    if command -v systemctl >/dev/null 2>&1; then\n",
+        "        timeout -k 2 8 systemctl --no-pager --full status display-manager.service user-runtime-dir@1000.service user@1000.service lupos-desktop-ready-relay.service 2>&1 | sed 's/^/graphics-x11: desktop-wait-systemd /' || true\n",
+        "        timeout -k 2 8 systemctl show display-manager.service -p ActiveState -p SubState -p Result -p MainPID -p ExecMainPID -p ExecMainCode -p ExecMainStatus -p NRestarts -p ActiveEnterTimestamp 2>&1 | sed 's/^/graphics-x11: desktop-wait-systemd-show /' || true\n",
+        "        timeout -k 2 8 systemctl --no-pager --full list-jobs 2>&1 | sed 's/^/graphics-x11: desktop-wait-job /' || true\n",
+        "        timeout -k 2 8 sudo -n -u lupos env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus systemctl --user --no-pager --full status dbus.socket dbus.service xfce4-session.target 2>&1 | sed 's/^/graphics-x11: desktop-wait-user-systemd /' || true\n",
+        "    fi\n",
+        "    if command -v loginctl >/dev/null 2>&1; then\n",
+        "        timeout -k 2 8 loginctl --no-pager --full list-sessions 2>&1 | sed 's/^/graphics-x11: desktop-wait-loginctl /' || true\n",
+        "    fi\n",
+        "    timeout -k 2 8 journalctl --no-pager -b -u display-manager.service -u user-runtime-dir@1000.service -u user@1000.service -u lupos-desktop-ready-relay.service -n 160 2>&1 | sed 's/^/graphics-x11: desktop-wait-journal /' || true\n",
+        "    printf 'graphics-x11: desktop-wait-diagnostics end t=%s\\n' \"$wait_secs\"\n",
+        "}\n",
         "dump_desktop_failure_logs() {\n",
         "    if [ -s /home/lupos/.xsession-errors ]; then echo 'graphics-x11: xsession-errors begin'; tail -160 /home/lupos/.xsession-errors; echo 'graphics-x11: xsession-errors end'; fi\n",
         "    for f in /var/log/lightdm/lightdm.log /var/log/lightdm/seat0-greeter.log /var/log/lightdm/x-0.log; do\n",
@@ -4845,17 +4990,26 @@ fn graphics_x11_desktop_ready_relay_script() -> Vec<u8> {
         "        : > /tmp/lupos-desktop-initial-failed\n",
         "        break\n",
         "    fi\n",
-        "    if lightdm_user_session_exited; then\n",
+        "    if lightdm_restarted_before_user_session; then\n",
+        "        echo 'graphics-x11: lightdm-restarted-before-user-session'\n",
         "        : > /tmp/lupos-desktop-initial-failed\n",
         "        break\n",
         "    fi\n",
-        "    i=$((i + 1)); sleep 1\n",
+        "    if lightdm_user_session_exited; then\n",
+            "        : > /tmp/lupos-desktop-initial-failed\n",
+            "        break\n",
+            "    fi\n",
+            "    if [ \"$i\" -gt 0 ] && [ $((i % 45)) -eq 0 ]; then\n",
+            "        dump_desktop_wait_diagnostics \"$i\"\n",
+            "    fi\n",
+            "    i=$((i + 1)); sleep 1\n",
         "done\n",
         "if [ -e /tmp/lupos-desktop-initial-ready ]; then\n",
         "    echo 'graphics-x11: desktop-initial-ready'\n",
         "    exit 0\n",
         "fi\n",
         "echo 'graphics-x11: desktop-initial-failed'\n",
+        "dump_desktop_wait_diagnostics \"$i\"\n",
         "dump_desktop_failure_logs\n",
         "exit 1\n",
     )
@@ -5420,10 +5574,23 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "if [ \"$(/usr/bin/stat -c '%a:%u:%g' /etc/passwd)\" = 644:0:0 ] && [ \"$(/usr/bin/stat -c '%a:%u:%g' /etc/group)\" = 644:0:0 ] && [ \"$(/usr/bin/stat -c '%a:%u:%g' /etc/shadow)\" = 600:0:0 ] && [ \"$(/usr/bin/stat -c '%a:%u:%g' /etc/gshadow)\" = 600:0:0 ]; then echo 'graphics-x11: account-file-modes ok'; else echo 'graphics-x11: account-file-modes failed'; /usr/bin/stat -c 'graphics-x11: account-mode %a:%u:%g %n' /etc/passwd /etc/group /etc/shadow /etc/gshadow; fi\n",
         "if /usr/bin/sudo -n -u lupos /bin/sh -c '/usr/bin/sudo -K; ! /usr/bin/sudo -n /usr/bin/pacman --config /etc/pacman-lupos.conf --version >/dev/null 2>&1'; then echo 'graphics-x11: sudo-password-required ok'; else echo 'graphics-x11: sudo-password-required failed'; fi\n",
         "if /usr/bin/sudo -n -u lupos /bin/sh -c \"printf '%s\\n' lupos | /usr/bin/sudo -S -k -p '' /usr/bin/pacman --config /etc/pacman-lupos.conf --version >/dev/null 2>&1; rc=\\$?; /usr/bin/sudo -k; exit \\$rc\"; then echo 'graphics-x11: sudo-pacman ok'; else echo 'graphics-x11: sudo-pacman failed'; fi\n",
-        "rm -f /tmp/lupos-sudo-su.log /tmp/lupos-sudo-su-script.rc\n",
-        "if /usr/bin/sudo -n -u lupos /bin/sh -c \"printf '%s\\n' lupos | /usr/bin/timeout -k 2 15 /usr/bin/script -qfec \\\"/usr/bin/sudo -k -p '' /usr/bin/su -c '/usr/bin/id -u' root\\\" /dev/null; rc=\\$?; printf '%s\\n' \\\"\\$rc\\\" > /tmp/lupos-sudo-su-script.rc; /usr/bin/sudo -k; exit \\$rc\" >/tmp/lupos-sudo-su.log 2>&1; then sudo_su_outer_rc=0; else sudo_su_outer_rc=$?; fi\n",
+        "rm -f /tmp/lupos-sudo-su-direct.log /tmp/lupos-sudo-su-direct.rc /tmp/lupos-sudo-su-root.log /tmp/lupos-sudo-su-root.rc\n",
+        "if /usr/bin/sudo -n -u lupos /bin/sh -c \"printf '%s\\n' lupos | /usr/bin/sudo -S -k -p '' /usr/bin/su -c '/usr/bin/id -u' root; rc=\\$?; printf '%s\\n' \\\"\\$rc\\\" > /tmp/lupos-sudo-su-direct.rc; /usr/bin/sudo -k; exit 0\" >/tmp/lupos-sudo-su-direct.log 2>&1; then :; fi\n",
+        "printf 'graphics-x11: sudo-su-direct rc=%s\\n' \"$(cat /tmp/lupos-sudo-su-direct.rc 2>/dev/null || true)\"\n",
+        "sed 's/^/graphics-x11: sudo-su-direct-log /' /tmp/lupos-sudo-su-direct.log 2>/dev/null || true\n",
+        "if /usr/bin/su -c '/usr/bin/id -u' root >/tmp/lupos-sudo-su-root.log 2>&1; then printf '%s\\n' 0 >/tmp/lupos-sudo-su-root.rc; else printf '%s\\n' \"$?\" >/tmp/lupos-sudo-su-root.rc; fi\n",
+        "printf 'graphics-x11: sudo-su-root rc=%s\\n' \"$(cat /tmp/lupos-sudo-su-root.rc 2>/dev/null || true)\"\n",
+        "sed 's/^/graphics-x11: sudo-su-root-log /' /tmp/lupos-sudo-su-root.log 2>/dev/null || true\n",
+        "rm -f /tmp/lupos-sudo-su-direct.log /tmp/lupos-sudo-su-direct.rc /tmp/lupos-sudo-su-root.log /tmp/lupos-sudo-su-root.rc\n",
+        "cat >/tmp/lupos-sudo-su.sh <<'EOF'\n",
+        "#!/bin/sh\n",
+        "/usr/bin/sudo -k -p '' /usr/bin/su -c '/usr/bin/id -u' root\n",
+        "EOF\n",
+        "chmod 0755 /tmp/lupos-sudo-su.sh\n",
+        "rm -f /tmp/lupos-sudo-su.sh /tmp/lupos-sudo-su.log /tmp/lupos-sudo-su-script.rc\n",
+        "if /usr/bin/sudo -n -u lupos /bin/sh -c \"printf '%s\\n' lupos | /usr/bin/timeout -k 2 15 /usr/bin/script -qfec '/bin/sh /tmp/lupos-sudo-su.sh' /dev/null; rc=\\$?; printf '%s\\n' \\\"\\$rc\\\" > /tmp/lupos-sudo-su-script.rc; /usr/bin/sudo -k; exit \\$rc\" >/tmp/lupos-sudo-su.log 2>&1; then sudo_su_outer_rc=0; else sudo_su_outer_rc=$?; fi\n",
         "if [ \"$sudo_su_outer_rc\" -eq 0 ] && grep -qx 0 /tmp/lupos-sudo-su-script.rc 2>/dev/null && tr -d '\\r' </tmp/lupos-sudo-su.log | grep -qx 0; then echo 'graphics-x11: sudo-su ok'; else printf 'graphics-x11: sudo-su failed outer-rc=%s script-rc=%s\\n' \"$sudo_su_outer_rc\" \"$(cat /tmp/lupos-sudo-su-script.rc 2>/dev/null || true)\"; sed 's/^/graphics-x11: sudo-su-log /' /tmp/lupos-sudo-su.log 2>/dev/null || true; fi\n",
-        "rm -f /tmp/lupos-sudo-su.log /tmp/lupos-sudo-su-script.rc\n",
+        "rm -f /tmp/lupos-sudo-su.sh /tmp/lupos-sudo-su.log /tmp/lupos-sudo-su-script.rc\n",
         "echo 'graphics-x11: sudo-probe end'\n",
         // D-Bus parses PolicyKit's packaged user=polkitd rules at startup, so
         // prove the early account provisioner ran and that the unmodified
@@ -5901,6 +6068,13 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // the stock per-user PipeWire/WirePlumber graph, and real-time PCM
         // consumption by the emulated playback stream.
         "echo 'graphics-x11: audio-probe begin'\n",
+        // Snapshot the live IRQ counters around playback. A device whose
+        // interrupt never fires shows a flat count here, which is what
+        // separates "HDA IRQ never delivered" from "delivered but mishandled"
+        // when diagnosing PCM underruns.
+        "echo 'graphics-x11: interrupts-before begin'\n",
+        "cat /proc/interrupts 2>&1 | sed 's/^/graphics-x11: irq /'\n",
+        "echo 'graphics-x11: interrupts-before end'\n",
         "if [ -e /dev/snd/controlC0 ] && [ -e /dev/snd/pcmC0D0p ] && /usr/bin/aplay -l 2>/tmp/lupos-aplay.err | grep -q '^card 0:'; then\n",
         "    echo 'graphics-x11: alsa-hda-card ok'\n",
         "else\n",
@@ -5935,13 +6109,45 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // Besides proving that `/dev/snd` is more than a set of metadata-only
         // nodes, this keeps a PipeWire/WirePlumber policy-loop regression from
         // obscuring the actual HDA DMA result.
+        // Snapshot the HDA controller/stream state *while* a stream is running.
+        // The stream drains at exactly 48 kHz yet raises almost no interrupts,
+        // so the open question is whether a completion is pending in the
+        // controller that never became a CPU interrupt, or whether the
+        // completion enables were never armed. azx exposes both through its own
+        // procfs nodes, so this needs no new kernel code.
+        "( sleep 2; echo '--- t=2s ---'; cat /proc/lupos_hda 2>&1; sleep 3; echo '--- t=5s ---'; cat /proc/lupos_hda 2>&1; ) >/tmp/lupos-hda-state.log 2>&1 &\n",
         "aplay_direct_start=\"$(date +%s 2>/dev/null || true)\"\n",
-        "sudo -n -u lupos timeout -k 2 15 /usr/bin/aplay -D hw:0,0 /tmp/lupos-audio.wav >/tmp/lupos-aplay-direct.log 2>&1\n",
+        // -v dumps the negotiated hw_params (period_size/buffer_size). The
+        // measured underruns sit on a near-constant ~68 ms period, so the
+        // period size is what distinguishes "the HDA interrupt is arriving far
+        // too rarely" from "the period really is 68 ms and the refill is late".
+        "sudo -n -u lupos timeout -k 2 15 /usr/bin/aplay -v -D hw:0,0 /tmp/lupos-audio.wav >/tmp/lupos-aplay-direct.log 2>&1\n",
         "aplay_direct_rc=$?; aplay_direct_end=\"$(date +%s 2>/dev/null || true)\"; aplay_direct_elapsed=-1\n",
         "if [ -n \"$aplay_direct_start\" ] && [ -n \"$aplay_direct_end\" ]; then aplay_direct_elapsed=$((aplay_direct_end - aplay_direct_start)); fi\n",
         "printf 'graphics-x11: alsa-direct-playback rc=%s elapsed=%s\\n' \"$aplay_direct_rc\" \"$aplay_direct_elapsed\"\n",
         "if [ \"$aplay_direct_rc\" -eq 0 ] && [ \"$aplay_direct_elapsed\" -ge 4 ] && [ \"$aplay_direct_elapsed\" -le 12 ]; then echo 'graphics-x11: alsa-direct-realtime ok'; else echo 'graphics-x11: alsa-direct-realtime failed'; fi\n",
+        // The -v hw_params header is at the TOP of the log and the underrun
+        // spam is at the bottom, so `tail` alone drops the very thing needed:
+        // period_size/periods decides whether the sparse HDA interrupts are a
+        // delivery bug or simply one period per 500 ms buffer.
+        // A/B the same playback at SCHED_FIFO. The negotiated period is 125 ms
+        // and HDA raises ~8 irq/s as expected, so the XRUNs must come from the
+        // writer being scheduled late. If realtime priority removes them, that
+        // is scheduler wake latency and settles it; if they persist unchanged,
+        // the wake-latency reading is wrong.
+        "sudo -n -u lupos timeout -k 2 15 /usr/bin/chrt -f 80 /usr/bin/aplay -D hw:0,0 /tmp/lupos-audio.wav >/tmp/lupos-aplay-rt.log 2>&1\n",
+        "aplay_rt_rc=$?\n",
+        "printf 'graphics-x11: alsa-rt-playback rc=%s normal_underruns=%s rt_underruns=%s\\n' \"$aplay_rt_rc\" \"$(grep -c underrun /tmp/lupos-aplay-direct.log 2>/dev/null || echo -1)\" \"$(grep -c underrun /tmp/lupos-aplay-rt.log 2>/dev/null || echo -1)\"\n",
+        "if [ -s /tmp/lupos-aplay-rt.log ]; then echo 'graphics-x11: aplay-rt-log begin'; head -20 /tmp/lupos-aplay-rt.log | sed 's/^/graphics-x11: rt /'; echo 'graphics-x11: aplay-rt-log end'; fi\n",
+        "if [ -s /tmp/lupos-aplay-direct.log ]; then echo 'graphics-x11: audio-hwparams begin'; head -30 /tmp/lupos-aplay-direct.log | sed 's/^/graphics-x11: hwparam /'; echo 'graphics-x11: audio-hwparams end'; fi\n",
         "if [ -s /tmp/lupos-aplay-direct.log ]; then echo 'graphics-x11: audio-log /tmp/lupos-aplay-direct.log begin'; tail -80 /tmp/lupos-aplay-direct.log; echo 'graphics-x11: audio-log /tmp/lupos-aplay-direct.log end'; fi\n",
+        // Counter delta across the playback above: a live HDA stream must
+        // raise its interrupt many times over the sampled seconds.
+        "wait 2>/dev/null || true\n",
+        "if [ -s /tmp/lupos-hda-state.log ]; then echo 'graphics-x11: hda-state begin'; sed 's/^/graphics-x11: hda /' /tmp/lupos-hda-state.log; echo 'graphics-x11: hda-state end'; else echo 'graphics-x11: hda-state missing'; fi\n",
+        "echo 'graphics-x11: interrupts-after begin'\n",
+        "cat /proc/interrupts 2>&1 | sed 's/^/graphics-x11: irq /'\n",
+        "echo 'graphics-x11: interrupts-after end'\n",
         // Linux's systemctl --user start waits for all jobs. Use --no-block so
         // the acceptance script remains able to print service diagnostics if
         // a newly-started media process stops yielding.
@@ -6060,8 +6266,38 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    while [ \"$i\" -lt 90 ] && [ \"$firefox_history_seeded\" -eq 0 ]; do\n",
         "        [ -n \"$firefox_pid\" ] || firefox_pid=\"$(process_pid_named_uid firefox 1000 2>/dev/null || true)\"\n",
         "        if [ -n \"$firefox_pid\" ] && [ ! -s /tmp/lupos-firefox-maps.log ]; then\n",
+        "            echo 'graphics-x11: firefox-proc-maps begin'\n",
         "            cat \"/proc/$firefox_pid/maps\" > /tmp/lupos-firefox-maps.log 2>&1 || true\n",
+        "            echo 'graphics-x11: firefox-proc-maps end'\n",
+        "            echo 'graphics-x11: firefox-proc-status begin'\n",
         "            cat \"/proc/$firefox_pid/status\" > /tmp/lupos-firefox-status.log 2>&1 || true\n",
+        "            echo 'graphics-x11: firefox-proc-status end'\n",
+        "            echo 'graphics-x11: firefox-process-state begin'\n",
+        "            printf 'graphics-x11: firefox-launcher-pid=%s firefox-pid=%s\\n' \"$firefox_launcher_pid\" \"$firefox_pid\"\n",
+        "            for proc in \"$firefox_launcher_pid\" \"$firefox_pid\"; do\n",
+        "                [ -n \"$proc\" ] || continue\n",
+        "                printf 'graphics-x11: firefox-process pid=%s exe=' \"$proc\"; readlink \"/proc/$proc/exe\" 2>/dev/null || true\n",
+        "                printf 'graphics-x11: firefox-process pid=%s cwd=' \"$proc\"; readlink \"/proc/$proc/cwd\" 2>/dev/null || true\n",
+        "                printf 'graphics-x11: firefox-process pid=%s cmdline=' \"$proc\"; tr '\\000' ' ' < \"/proc/$proc/cmdline\" 2>/dev/null || true; echo\n",
+        "                printf 'graphics-x11: firefox-process pid=%s wchan=' \"$proc\"; cat \"/proc/$proc/wchan\" 2>/dev/null || true\n",
+        "                printf 'graphics-x11: firefox-process pid=%s syscall=' \"$proc\"; timeout 1 cat \"/proc/$proc/syscall\" 2>/dev/null || true\n",
+        "                printf 'graphics-x11: firefox-process pid=%s children=' \"$proc\"; cat \"/proc/$proc/task/$proc/children\" 2>/dev/null || true\n",
+        "                for fd in \"$proc\"/fd/[0-9]*; do\n",
+        "                    [ -e \"$fd\" ] || continue\n",
+        "                    target=; target=\"$(readlink \"$fd\" 2>/dev/null || true)\"\n",
+        "                    case \"$target\" in socket:*|pipe:*|anon_inode:*|*/.X11-unix/*) printf 'graphics-x11: firefox-fd pid=%s fd=%s target=%s\\n' \"$proc\" \"${fd##*/}\" \"$target\" ;; esac\n",
+        "                done\n",
+        "                for thread in /proc/$proc/task/[0-9]*; do\n",
+        "                    [ -r \"$thread/comm\" ] || continue\n",
+        "                    tid=\"${thread##*/}\"; comm=; IFS= read -r comm < \"$thread/comm\" 2>/dev/null || true\n",
+        "                    wchan=; IFS= read -r wchan < \"$thread/wchan\" 2>/dev/null || true\n",
+        "                    printf 'graphics-x11: firefox-thread pid=%s tid=%s comm=%s wchan=%s\\n' \"$proc\" \"$tid\" \"$comm\" \"$wchan\"\n",
+        "                done\n",
+        "            done\n",
+        "            ps -eo pid,ppid,stat,comm,args 2>/dev/null | grep -E 'firefox|Socket Process|RDD Process|GPU Process|Web Content' | grep -v grep | sed 's/^/graphics-x11: firefox-ps /' || true\n",
+        "            DISPLAY=:0 timeout 2 /usr/bin/xprop -root _NET_CLIENT_LIST 2>&1 | sed 's/^/graphics-x11: firefox-xprop-root /' || true\n",
+        "            if [ -r /proc/net/unix ]; then echo 'graphics-x11: firefox-unix-sockets begin'; tail -80 /proc/net/unix; echo 'graphics-x11: firefox-unix-sockets end'; fi\n",
+        "            echo 'graphics-x11: firefox-process-state end'\n",
         "        fi\n",
         "        : > /tmp/lupos-firefox-windows.log\n",
         "        if DISPLAY=:0 timeout 1 /usr/bin/xprop -root _NET_CLIENT_LIST > /tmp/lupos-firefox-clients.log 2>/dev/null; then\n",
@@ -26235,8 +26471,32 @@ failed command output\n";
             "desktop relay must diagnose a greeter abort before waiting for XFCE"
         );
         assert!(
+            desktop_relay.contains("lightdm_restarted_before_user_session"),
+            "desktop relay must diagnose a LightDM daemon restart before Xsession"
+        );
+        assert!(
+            desktop_relay.contains("graphics-x11: lightdm-restarted-before-user-session"),
+            "desktop relay must classify a LightDM daemon restart before Xsession"
+        );
+        assert!(
             desktop_relay.contains("graphics-x11: xsession-errors begin"),
             "desktop relay must print .xsession-errors on early desktop failure"
+        );
+        assert!(
+            desktop_relay.contains("graphics-x11: desktop-wait-log %s begin"),
+            "desktop relay must include LightDM logs in pre-ready diagnostics"
+        );
+        assert!(
+            desktop_relay.contains("graphics-x11: desktop-wait-diagnostics begin"),
+            "desktop relay must snapshot guest state during pre-ready stalls"
+        );
+        assert!(
+            desktop_relay.contains("systemctl --no-pager --full status display-manager.service"),
+            "desktop relay must include focused systemd state before the final timeout"
+        );
+        assert!(
+            desktop_relay.contains("systemctl show display-manager.service"),
+            "desktop relay must include machine-readable display-manager state"
         );
         assert_eq!(
             find_initramfs_symlink_target(
@@ -26479,6 +26739,8 @@ failed command output\n";
         assert!(probe.contains("graphics-x11: sudo-pacman ok"));
         assert!(probe.contains("/usr/bin/script -qfec"));
         assert!(probe.contains("/usr/bin/su -c '/usr/bin/id -u' root"));
+        assert!(probe.contains("graphics-x11: sudo-su-direct rc="));
+        assert!(probe.contains("graphics-x11: sudo-su-root rc="));
         assert!(probe.contains("/tmp/lupos-sudo-su-script.rc"));
         assert!(probe.contains("exit \\$rc"));
         assert!(!probe.contains("[ \\\"\\$rc\\\" -eq 124 ]"));
@@ -30995,6 +31257,19 @@ CONFIG_MODULES=y
             "umount /tmp/scmnt",
             "lsblk",
             "dmesg",
+            // util-linux script(1) PTY session parity (terminal-mode
+            // reduction of the graphics-x11 `sudo-su` probe).
+            "/usr/bin/script -qfec '/bin/sh -c \"exit 7\"' /dev/null",
+            "printf 'x\\n' | /usr/bin/script -qfec /bin/true /dev/null",
+            "/usr/bin/script -qfec /tmp/lupos-pty-inner.sh /dev/null",
+            "printf 'sekrit\\n' | /usr/bin/script -qfec /tmp/lupos-pty-echo.sh /dev/null",
+            "/usr/bin/su -s /bin/sh -c /tmp/lupos-pty-su.sh lupos",
+            "/usr/bin/su -c '/usr/bin/id -u' root",
+            "shipped-commands: pty-console-stat",
+            "console-ttynr=0",
+            "console-ps-tty=?",
+            "inner-stat pgrp=",
+            "pty-session failed",
             // networking
             "ip addr show lo",
             "ping -c 1 127.0.0.1",
@@ -31150,9 +31425,9 @@ CONFIG_MODULES=y
         }
         assert_eq!(
             SHIPPED_COMMANDS_MARKERS.len(),
-            8,
-            "eight command groups: bash-builtins, coreutils, textutils, packaging, \
-             systemd-tools, procps, util-linux, networking"
+            9,
+            "nine command groups: bash-builtins, coreutils, textutils, packaging, \
+             systemd-tools, procps, util-linux, pty-session, networking"
         );
     }
 

@@ -19,10 +19,34 @@ use crate::{
     kernel::task::task_state::{EXIT_DEAD, EXIT_ZOMBIE},
 };
 
-pub fn stat_text_with_ppid(pid: i32, comm: &str, state: char, ppid: i32) -> String {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcStatIds {
+    pub ppid: i32,
+    pub pgrp: i32,
+    pub session: i32,
+    pub tty_nr: i32,
+    pub tty_pgrp: i32,
+}
+
+pub fn stat_text_with_ids(pid: i32, comm: &str, state: char, ids: ProcStatIds) -> String {
     format!(
-        "{} ({}) {} {} 0 0 0 -1 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        pid, comm, state, ppid,
+        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        pid, comm, state, ids.ppid, ids.pgrp, ids.session, ids.tty_nr, ids.tty_pgrp,
+    )
+}
+
+pub fn stat_text_with_ppid(pid: i32, comm: &str, state: char, ppid: i32) -> String {
+    stat_text_with_ids(
+        pid,
+        comm,
+        state,
+        ProcStatIds {
+            ppid,
+            pgrp: pid,
+            session: pid,
+            tty_nr: 0,
+            tty_pgrp: -1,
+        },
     )
 }
 
@@ -36,11 +60,12 @@ pub fn self_stat_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, 
         return super::util::copy_into(buf, &stat_text(1, "lupos", 'R'));
     }
     let ppid = task_ppid(task);
+    let ids = task_stat_ids(task, ppid);
     let state = task_state_char(task);
     let comm = super::util::task_comm(task);
     super::util::copy_into(
         buf,
-        &stat_text_with_ppid(unsafe { (*task).pid }, &comm, state, ppid),
+        &stat_text_with_ids(unsafe { (*task).pid }, &comm, state, ids),
     )
 }
 
@@ -84,6 +109,51 @@ fn task_ppid(task: *mut TaskStruct) -> i32 {
         0
     } else {
         unsafe { (*parent).pid }
+    }
+}
+
+pub fn task_stat_ids_for_pid(pid: i32, ppid: i32) -> ProcStatIds {
+    let pgrp = crate::kernel::session::process_group(pid).unwrap_or(pid);
+    let session = crate::kernel::session::session_id(pid).unwrap_or(pid);
+    let (tty_nr, tty_pgrp) = task_tty_stat(pid);
+    ProcStatIds {
+        ppid,
+        pgrp,
+        session,
+        tty_nr,
+        tty_pgrp,
+    }
+}
+
+fn task_stat_ids(task: *mut TaskStruct, ppid: i32) -> ProcStatIds {
+    if task.is_null() {
+        return ProcStatIds {
+            ppid,
+            pgrp: 0,
+            session: 0,
+            tty_nr: 0,
+            tty_pgrp: -1,
+        };
+    }
+    task_stat_ids_for_pid(unsafe { (*task).pid }, ppid)
+}
+
+fn task_tty_stat(pid: i32) -> (i32, i32) {
+    match crate::kernel::session::controlling_tty(pid) {
+        Some(crate::kernel::session::ControllingTty::Console(rdev)) => {
+            let pgrp = crate::linux_driver_abi::tty::compat_tty_foreground_pgrp().unwrap_or(-1);
+            (rdev as i32, pgrp)
+        }
+        Some(crate::kernel::session::ControllingTty::Unix98Pty(index, token)) => {
+            let dev = crate::init::noinitramfs::new_encode_dev(crate::init::noinitramfs::mkdev(
+                crate::linux_driver_abi::tty::pty::UNIX98_PTY_SLAVE_MAJOR,
+                index,
+            ));
+            let pgrp =
+                crate::linux_driver_abi::tty::pty::foreground_pgrp(index, token).unwrap_or(-1);
+            (dev as i32, pgrp)
+        }
+        None => (0, -1),
     }
 }
 
@@ -212,6 +282,61 @@ mod tests {
         assert_eq!(parts.next(), Some("(executor)"));
         assert_eq!(parts.next(), Some("R"));
         assert_eq!(parts.next(), Some("424"));
+    }
+
+    #[test]
+    fn stat_text_reports_linux_session_and_tty_fields() {
+        let text = stat_text_with_ids(
+            701,
+            "xfce4-session",
+            'S',
+            ProcStatIds {
+                ppid: 700,
+                pgrp: 701,
+                session: 701,
+                tty_nr: crate::init::noinitramfs::new_encode_dev(crate::init::noinitramfs::mkdev(
+                    crate::linux_driver_abi::tty::pty::UNIX98_PTY_SLAVE_MAJOR,
+                    3,
+                )) as i32,
+                tty_pgrp: 701,
+            },
+        );
+        let fields: alloc::vec::Vec<&str> = text.split_whitespace().collect();
+
+        assert_eq!(fields[3], "700");
+        assert_eq!(fields[4], "701");
+        assert_eq!(fields[5], "701");
+        assert_eq!(fields[6], "34819");
+        assert_eq!(fields[7], "701");
+    }
+
+    #[test]
+    fn stat_ids_report_controlling_console_tty() {
+        crate::kernel::session::reset_for_tests();
+        crate::linux_driver_abi::tty::reset_compat_tty_state();
+
+        let rdev = crate::init::noinitramfs::new_encode_dev(crate::init::noinitramfs::mkdev(4, 7));
+        crate::kernel::session::claim_controlling_tty(
+            701,
+            crate::kernel::session::ControllingTty::Console(rdev as u64),
+        )
+        .unwrap();
+        crate::linux_driver_abi::tty::tty_ioctl_compat(
+            crate::linux_driver_abi::tty::TIOCSCTTY,
+            701,
+        )
+        .unwrap();
+
+        let ids = task_stat_ids_for_pid(701, 700);
+
+        assert_eq!(ids.ppid, 700);
+        assert_eq!(ids.pgrp, 701);
+        assert_eq!(ids.session, 701);
+        assert_eq!(ids.tty_nr, rdev as i32);
+        assert_eq!(ids.tty_pgrp, 701);
+
+        crate::kernel::session::reset_for_tests();
+        crate::linux_driver_abi::tty::reset_compat_tty_state();
     }
 
     #[test]

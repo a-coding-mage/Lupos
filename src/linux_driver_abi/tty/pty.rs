@@ -466,15 +466,36 @@ fn claim_as_controlling_tty_locked(pty: &Arc<Pty>) -> Result<(), i32> {
     claim_as_controlling_tty(pty)
 }
 
-fn claim_as_controlling_tty_live(pty: &Arc<Pty>) -> Result<(), i32> {
-    let reg = PTYS.lock();
-    let Some(current) = reg.get(&pty.index) else {
-        return Err(EIO);
-    };
-    if !Arc::ptr_eq(current, pty) || current.token != pty.token {
-        return Err(EIO);
+/// `TIOCSCTTY` on either end of the pair.
+///
+/// The eligibility decision and the `arg == 1 && CAP_SYS_ADMIN` steal are
+/// shared with the console path in `kernel::session::tiocsctty()`, which
+/// mirrors `vendor/linux/drivers/tty/tty_jobctrl.c::tiocsctty()`. Only the
+/// `proc_set_tty()` side effects on the tty object are done here.
+fn tiocsctty(pty: &Arc<Pty>, arg: i32, readable: bool) -> Result<(), i32> {
+    let pid = current_pid().ok_or(ENOTTY)?;
+    // `tty_lock(tty)`: refuse a slot that was freed and reused underneath us.
+    {
+        let reg = PTYS.lock();
+        let Some(current) = reg.get(&pty.index) else {
+            return Err(EIO);
+        };
+        if !Arc::ptr_eq(current, pty) || current.token != pty.token {
+            return Err(EIO);
+        }
+        if !pty.master_open.load(Ordering::Acquire) {
+            return Err(EIO);
+        }
     }
-    claim_as_controlling_tty_locked(pty)
+    let tty = crate::kernel::session::ControllingTty::Unix98Pty(pty.index, pty.token);
+    let admin = crate::kernel::capability::capable(CAP_SYS_ADMIN);
+    crate::kernel::session::tiocsctty(pid, tty, arg, readable, admin)?;
+    // `__proc_set_tty()`: publish the new owner on the tty itself.
+    let sid = crate::kernel::session::session_id(pid).unwrap_or(pid);
+    let pgrp = crate::kernel::session::process_group(pid).unwrap_or(pid);
+    pty.session.store(sid, Ordering::Release);
+    pty.pgrp.store(pgrp, Ordering::Release);
+    Ok(())
 }
 
 /// `true` if `pty`'s slave is `pid`'s controlling terminal right now.
@@ -589,6 +610,19 @@ pub fn open_current_tty(dentry: DentryRef, flags: u32, mode: u32) -> Result<File
     }
 }
 
+/// Return the foreground process group for the live UNIX98 slave.
+///
+/// This is the value Linux exposes through `tty_get_pgrp()` when
+/// `/proc/<pid>/stat` prints `tty_pgrp`.
+pub fn foreground_pgrp(index: u32, token: usize) -> Option<i32> {
+    let pty = pty_lookup(index)?;
+    if pty.token != token {
+        return None;
+    }
+    let pgrp = pty.pgrp.load(Ordering::Acquire);
+    (pgrp > 0).then_some(pgrp)
+}
+
 /// Open `/dev/ptmx`. Linux allocates the UNIX98 pair during `ptmx_open()`, so
 /// devpts creation failures are visible from `open(2)`, not deferred to the
 /// first ioctl/read/write on the master.
@@ -649,6 +683,11 @@ fn pty_yield() {}
 
 fn task_has_unblocked_signal(task: *mut crate::kernel::task::TaskStruct) -> bool {
     !task.is_null() && crate::kernel::signal::has_unblocked_pending_signals(task)
+}
+
+/// Linux `FMODE_READ` for the fd the ioctl arrived on.
+fn file_is_readable(file: &FileRef) -> bool {
+    file.flags.load(Ordering::Acquire) & O_ACCMODE != O_WRONLY
 }
 
 fn is_nonblock(file: &FileRef) -> bool {
@@ -784,7 +823,7 @@ fn ptmx_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
         // `arg` carries the new fd's open flags; unlike other ioctls this one
         // returns the installed fd number itself, not 0.
         TIOCGPTPEER => open_ptpeer(&pty, arg as u32),
-        _ => pty_common_ioctl(&pty, cmd, arg, true),
+        _ => pty_common_ioctl(&pty, cmd, arg, true, file_is_readable(file)),
     }
 }
 
@@ -855,8 +894,11 @@ fn ptmx_release(file: FileRef) {
         pty.slave_write_wait.wake_up_all();
     }
     if hup_session > 0 {
-        crate::kernel::signal::send_signal_to_process_group(hup_session, SIGHUP);
-        crate::kernel::signal::send_signal_to_process_group(hup_session, SIGCONT);
+        // Linux `pty_close(master)` calls `tty_vhangup(slave)`, which reaches
+        // `tty_signal_session_leader(exit_session = 0)`: signal the session
+        // leader's thread group, but do not fan out to the foreground pgrp.
+        crate::kernel::signal::send_signal_to_process(hup_session, SIGHUP);
+        crate::kernel::signal::send_signal_to_process(hup_session, SIGCONT);
     }
 }
 
@@ -949,7 +991,7 @@ fn pts_poll(file: &FileRef, mut table: Option<&mut crate::fs::select::PollTable>
 
 fn pts_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
     let pty = slave_attach(file).ok_or(ENODEV)?;
-    pty_common_ioctl(&pty, cmd, arg, false)
+    pty_common_ioctl(&pty, cmd, arg, false, file_is_readable(file))
 }
 
 fn pts_release(file: FileRef) {
@@ -985,7 +1027,13 @@ fn pts_release(file: FileRef) {
 
 // ── Shared job-control / termios ioctls ────────────────────────────────────────
 
-fn pty_common_ioctl(pty: &Arc<Pty>, cmd: u32, arg: u64, is_master: bool) -> Result<i64, i32> {
+fn pty_common_ioctl(
+    pty: &Arc<Pty>,
+    cmd: u32,
+    arg: u64,
+    is_master: bool,
+    readable: bool,
+) -> Result<i64, i32> {
     match cmd {
         TCGETS => {
             let t = *pty.termios.lock();
@@ -1025,7 +1073,7 @@ fn pty_common_ioctl(pty: &Arc<Pty>, cmd: u32, arg: u64, is_master: bool) -> Resu
             Ok(0)
         }
         TIOCSCTTY => {
-            claim_as_controlling_tty_live(pty)?;
+            tiocsctty(pty, arg as i32, readable)?;
             Ok(0)
         }
         // `tiocgpgrp()` (`tty_jobctrl.c`): via the *master* fd this reports
@@ -1313,6 +1361,8 @@ pub static PTS_SLAVE_FILE_OPS: FileOps = FileOps {
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
+
     use super::*;
 
     fn raw_termios(pty: &Arc<Pty>) {
@@ -1388,7 +1438,7 @@ mod tests {
         termios.__padding = [0xa5; 3];
 
         assert_eq!(
-            pty_common_ioctl(&pty, TCSETS, &termios as *const _ as u64, false),
+            pty_common_ioctl(&pty, TCSETS, &termios as *const _ as u64, false, true),
             Ok(0)
         );
         assert_eq!(pty.termios.lock().__padding, [0; 3]);
@@ -1396,7 +1446,7 @@ mod tests {
         let mut roundtrip = KernelTermios::default();
         roundtrip.__padding = [0xff; 3];
         assert_eq!(
-            pty_common_ioctl(&pty, TCGETS, &mut roundtrip as *mut _ as u64, false),
+            pty_common_ioctl(&pty, TCGETS, &mut roundtrip as *mut _ as u64, false, true),
             Ok(0)
         );
         assert_eq!(roundtrip.__padding, [0; 3]);
@@ -1404,5 +1454,49 @@ mod tests {
 
         let termios2 = KernelTermios2::from(termios);
         assert_eq!(kernel_termios_from2(termios2).__padding, [0; 3]);
+    }
+
+    #[test]
+    fn master_close_hangup_does_not_signal_foreground_pgrp_member() {
+        let _signal_guard = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        reset_for_tests();
+        crate::kernel::signal::reset_for_tests();
+        crate::kernel::session::reset_for_tests();
+
+        let previous = unsafe { crate::kernel::sched::get_current() };
+        let mut peer = Box::new(unsafe { core::mem::zeroed::<crate::kernel::task::TaskStruct>() });
+        peer.pid = 101;
+        peer.tgid = 101;
+
+        unsafe {
+            crate::kernel::sched::set_current(&mut *peer as *mut crate::kernel::task::TaskStruct);
+            assert_eq!(crate::kernel::session::sys_setpgid(0, 100), 0);
+        }
+        crate::kernel::signal::register_test_task(101, 101);
+
+        let pty = Pty::new_with_token(0, 7);
+        pty.session.store(100, Ordering::Release);
+        pty.pgrp.store(100, Ordering::Release);
+        PTYS.lock().insert(0, pty);
+
+        let file =
+            crate::fs::file::alloc_file(crate::fs::dcache::d_alloc("ptmx"), 0, 0, &PTMX_FILE_OPS);
+        *file.private.lock() = 1;
+
+        ptmx_release(file);
+
+        assert!(!crate::kernel::signal::has_pending_signal_for_pid(
+            101, SIGHUP
+        ));
+        assert!(!crate::kernel::signal::has_pending_signal_for_pid(
+            101, SIGCONT
+        ));
+
+        unsafe {
+            crate::kernel::sched::set_current(previous);
+        }
+        reset_for_tests();
+        crate::kernel::session::reset_for_tests();
+        crate::kernel::signal::reset_for_tests();
     }
 }

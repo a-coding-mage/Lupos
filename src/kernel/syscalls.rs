@@ -2671,13 +2671,59 @@ pub fn sys_msgctl(_msqid: i32, cmd: i32, _buf: *mut u8) -> i64 {
 }
 
 pub fn sys_syslog(typ: i32, buf: *mut u8, len: i32) -> i64 {
+    const SYSLOG_ACTION_READ: i32 = 2;
+    const SYSLOG_ACTION_READ_ALL: i32 = 3;
+    const SYSLOG_ACTION_READ_CLEAR: i32 = 4;
+    const SYSLOG_ACTION_CLEAR: i32 = 5;
+    const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
+    const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
+    const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
+
     if !(0..=10).contains(&typ) || len < 0 {
         return -(EINVAL as i64);
     }
-    if len != 0 && buf.is_null() {
-        return -(EFAULT as i64);
+
+    // Linux validates the pointer before treating a zero-length read as a
+    // no-op. `copy_to_user` below supplies the fault handling for a bad range.
+    if matches!(
+        typ,
+        SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR
+    ) {
+        if buf.is_null() {
+            return -(EINVAL as i64);
+        }
+        if len == 0 {
+            return 0;
+        }
     }
-    0
+
+    match typ {
+        SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
+            let records = crate::kernel::printk::PRINTK_RB.dmesg_bytes();
+            let count = records.len().min(len as usize);
+            let not_copied = unsafe { uaccess::copy_to_user(buf, records.as_ptr(), count) };
+            if not_copied != 0 {
+                -(EFAULT as i64)
+            } else {
+                count as i64
+            }
+        }
+        SYSLOG_ACTION_SIZE_UNREAD => crate::kernel::printk::PRINTK_RB
+            .dmesg_bytes()
+            .len()
+            .min(i32::MAX as usize) as i64,
+        SYSLOG_ACTION_SIZE_BUFFER => crate::kernel::printk::ringbuffer::PRB_TEXT_BUF_SIZE as i64,
+        SYSLOG_ACTION_CONSOLE_LEVEL => {
+            if !(1..=8).contains(&len) {
+                -(EINVAL as i64)
+            } else {
+                crate::kernel::printk::sysctl::CONSOLE_LOGLEVEL.store(len, Ordering::Release);
+                len as i64
+            }
+        }
+        SYSLOG_ACTION_CLEAR => 0,
+        _ => 0,
+    }
 }
 
 pub fn sys_acct(name: *const u8) -> i64 {
@@ -3520,7 +3566,14 @@ mod tests {
 
             assert_eq!(crate::kernel::session::sys_setpgid(0, 0), 0);
             assert_eq!(sys_getpgid(0), 53);
-            assert_eq!(crate::kernel::session::sys_setsid(), 53);
+            // Linux returns -EPERM here: `ksys_setsid()` refuses a caller that
+            // already leads a process group whose id equals the proposed
+            // session id. Ref: `vendor/linux/kernel/sys.c::ksys_setsid()`.
+            assert_eq!(
+                crate::kernel::session::sys_setsid(),
+                -(crate::include::uapi::errno::EPERM as i64)
+            );
+            // The rejected call left the session untouched.
             assert_eq!(sys_getsid(0), 53);
 
             assert_eq!(sys_personality(u32::MAX), 0);
@@ -4491,7 +4544,10 @@ mod tests {
     #[test]
     fn syscall_m78_security_bpf_perf_parity() {
         assert_eq!(sys_syslog(-1, core::ptr::null_mut(), 0), -(EINVAL as i64));
-        assert_eq!(sys_syslog(0, core::ptr::null_mut(), 1), -(EFAULT as i64));
+        // `SYSLOG_ACTION_CLOSE` ignores its buffer and length on Linux;
+        // validating the pointer for every syslog operation was the old
+        // non-Linux expectation.
+        assert_eq!(sys_syslog(0, core::ptr::null_mut(), 1), 0);
         assert_eq!(sys_syslog(0, core::ptr::null_mut(), 0), 0);
         assert_eq!(sys_acct(core::ptr::null()), 0);
         assert_eq!(sys_acct(b"/acct\0".as_ptr()), -(EPERM as i64));

@@ -5351,8 +5351,10 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
         // Linux /proc/<pid>/stat starts with "<pid> (comm) <state>"
         assert!(s.starts_with("1 (lupos) R"), "stat schema mismatch: {}", s);
         // ~52 whitespace-separated fields
-        let fields = s.split_whitespace().count();
-        assert!(fields >= 50, "stat field count low: {}", fields);
+        let fields = s.split_whitespace().collect::<alloc::vec::Vec<_>>();
+        assert!(fields.len() >= 50, "stat field count low: {}", fields.len());
+        assert_eq!(fields[4], "1", "stat pgrp mismatch: {}", s);
+        assert_eq!(fields[5], "1", "stat session mismatch: {}", s);
 
         // Read /proc/meminfo — first line must start with "MemTotal:"
         let mi_d = d_walk(&root, "meminfo").expect("walk meminfo");
@@ -8046,8 +8048,26 @@ fn dump_panic_stack() {
     }
 
     if is_kernel_stack_pointer(rsp) {
+        // Stop at the top of *this* stack, not after a fixed word count.
+        //
+        // Stacks grow down, so scanning upward from RSP walks already-used
+        // stack toward the base. A blind 160-word scan runs past the end of a
+        // shallow stack straight into its guard page, and the resulting
+        // not-present fault happens *inside* the panic handler — which then
+        // reports itself instead of the original panic, destroying exactly the
+        // evidence this dump exists to provide. Observed as
+        // `#PF cr2=0xffffc90000005000 error=0x0 P=0 rip=rust_begin_unwind+1249`
+        // (see investigations/boot-gui-audio-perf-20260722/stack-guard-panic.txt).
+        //
+        // `THREAD_SIZE` is a power of two and stacks are aligned to it, so the
+        // page-aligned end of the current stack is the next THREAD_SIZE
+        // boundary at or above RSP.
+        let thread_size = crate::arch::x86::kernel::dumpstack_64::THREAD_SIZE;
+        let stack_end = (rsp | (thread_size - 1)) + 1;
+        let max_words = ((stack_end - rsp) / 8).min(160) as usize;
+
         let stack = rsp as *const u64;
-        for index in 0..160 {
+        for index in 0..max_words {
             let word = unsafe { core::ptr::read_unaligned(stack.add(index)) };
             if is_lupos_text_pointer(word) {
                 serial_println!("  stack[{}]: ret={:#x}", index, word);

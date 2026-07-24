@@ -703,11 +703,24 @@ fn console_ioctl(file: &crate::fs::types::FileRef, cmd: u32, arg: u64) -> Result
             } else {
                 crate::kernel::session::ControllingTty::Console(rdev)
             };
+            // `tiocsctty()` — `vendor/linux/drivers/tty/tty_jobctrl.c`. The
+            // `arg == 1 && CAP_SYS_ADMIN` steal matters here: `agetty` claims
+            // the console for its own session and then `login` forks a child
+            // that calls `setsid()` and `ioctl(0, TIOCSCTTY, 1)`. Without the
+            // steal the second claim fails, the login session ends up with no
+            // controlling terminal, and `/proc/<pid>/stat` reports `tty_nr`
+            // 0 (`ps` prints `TT ?`) for every process on that console.
+            //
             // Keep the existing console compatibility path authoritative for
-            // early getty/login process-group setup. The side-table claim is
-            // used only to resolve `/dev/tty`; Linux eligibility failures do
-            // not prevent the underlying tty ioctl from running here.
-            let _ = crate::kernel::session::claim_controlling_tty(pid, tty);
+            // early getty/login process-group setup: Linux eligibility
+            // failures do not prevent the underlying tty ioctl from running
+            // here, so the result is still advisory.
+            let readable = file.flags.load(Ordering::Acquire)
+                & crate::include::uapi::fcntl::O_ACCMODE
+                != crate::include::uapi::fcntl::O_WRONLY;
+            let admin =
+                crate::kernel::capability::capable(crate::kernel::capability::CAP_SYS_ADMIN);
+            let _ = crate::kernel::session::tiocsctty(pid, tty, arg as i32, readable, admin);
         }
     }
     if cmd == crate::linux_driver_abi::tty::TIOCSTI {
@@ -3764,7 +3777,11 @@ mod tests {
 
         unsafe {
             crate::kernel::sched::set_current(&mut *shell);
-            assert_eq!(crate::kernel::session::sys_setpgid(0, 0), 0);
+            // Linux rejects `setsid()` from a process-group leader, so model the
+            // real getty/login sequence: the task is forked into its parent's
+            // session and group and only then calls `setsid()`.
+            // Ref: `vendor/linux/kernel/sys.c::ksys_setsid()`.
+            crate::kernel::session::inherit_from_parent(1, shell.pid);
             // Claim the controlling tty so deliver_console_signal won't
             // fall back to the current task.
             assert_eq!(crate::kernel::session::sys_setsid(), shell.pid as i64);
@@ -3831,7 +3848,11 @@ mod tests {
 
         unsafe {
             crate::kernel::sched::set_current(&mut *shell);
-            assert_eq!(crate::kernel::session::sys_setpgid(0, 0), 0);
+            // Linux rejects `setsid()` from a process-group leader, so model the
+            // real getty/login sequence: the task is forked into its parent's
+            // session and group and only then calls `setsid()`.
+            // Ref: `vendor/linux/kernel/sys.c::ksys_setsid()`.
+            crate::kernel::session::inherit_from_parent(1, shell.pid);
             assert_eq!(crate::kernel::session::sys_setsid(), shell.pid as i64);
             let pgrp = shell.pid as u32;
             crate::linux_driver_abi::tty::tty_ioctl_compat(
@@ -3881,7 +3902,11 @@ mod tests {
 
         unsafe {
             crate::kernel::sched::set_current(&mut *shell);
-            assert_eq!(crate::kernel::session::sys_setpgid(0, 0), 0);
+            // Linux rejects `setsid()` from a process-group leader, so model the
+            // real getty/login sequence: the task is forked into its parent's
+            // session and group and only then calls `setsid()`.
+            // Ref: `vendor/linux/kernel/sys.c::ksys_setsid()`.
+            crate::kernel::session::inherit_from_parent(1, shell.pid);
             assert_eq!(crate::kernel::session::sys_setsid(), shell.pid as i64);
             let pgrp = shell.pid as u32;
             crate::linux_driver_abi::tty::tty_ioctl_compat(
@@ -3945,7 +3970,11 @@ mod tests {
 
         unsafe {
             crate::kernel::sched::set_current(&mut *leader);
-            assert_eq!(crate::kernel::session::sys_setpgid(0, 0), 0);
+            // Linux rejects `setsid()` from a process-group leader, so model the
+            // real getty/login sequence: the task is forked into its parent's
+            // session and group and only then calls `setsid()`.
+            // Ref: `vendor/linux/kernel/sys.c::ksys_setsid()`.
+            crate::kernel::session::inherit_from_parent(1, leader.pid);
             assert_eq!(crate::kernel::session::sys_setsid(), leader.pid as i64);
             // Claim controlling tty but DO NOT call TIOCSPGRP — leaves
             // COMPAT_TTY_PGRP at 0.  Linux would do nothing in this state;

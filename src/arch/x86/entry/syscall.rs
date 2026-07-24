@@ -53,10 +53,10 @@
 use crate::arch::x86::kernel::gdt::sel;
 use crate::kernel::exec::UserStartContext;
 use crate::kernel::seccomp::{
-    SECCOMP_MODE_STRICT, SECCOMP_RET_ACTION_FULL, SECCOMP_RET_ALLOW, SECCOMP_RET_DATA,
-    SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD, SECCOMP_RET_LOG,
-    SECCOMP_RET_TRACE, SECCOMP_RET_TRAP, SECCOMP_RET_USER_NOTIF, Seccomp, SeccompData,
-    seccomp_run_filters,
+    SECCOMP_MODE_FILTER, SECCOMP_MODE_STRICT, SECCOMP_RET_ACTION_FULL, SECCOMP_RET_ALLOW,
+    SECCOMP_RET_DATA, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD,
+    SECCOMP_RET_LOG, SECCOMP_RET_TRACE, SECCOMP_RET_TRAP, SECCOMP_RET_USER_NOTIF, Seccomp,
+    SeccompData, seccomp_run_filters,
 };
 use crate::kernel::signal;
 use crate::kernel::task::{TIF_NEED_RESCHED, TIF_SIGPENDING};
@@ -480,6 +480,7 @@ unsafe fn syscall_dispatch_ptregs_inner(
     let task = current_task_for_syscall();
     let hook_state = syscall_enter(unsafe { &*regs }, task);
     trace_udev_syscall_enter(unsafe { &*regs }, task);
+    trace_stall_syscall_enter(unsafe { &*regs }, task);
     // Draining the console here delivers terminal signals (Ctrl-C) promptly, but
     // `try_console_input` probes the i8042 status port (`inb 0x64`) when its
     // queue is empty — a port-I/O access that is a VM-exit under VirtualBox/KVM
@@ -526,6 +527,9 @@ unsafe fn syscall_dispatch_ptregs_inner(
             unsafe { (*regs).orig_rax as i64 }
         }
     };
+
+    #[cfg(not(test))]
+    trace_seccomp_control(unsafe { &*regs }, task, ret);
 
     #[cfg(not(test))]
     if ret == -ENOSYS {
@@ -659,6 +663,83 @@ fn trace_udev_syscall_enter(
 
 #[cfg(test)]
 fn trace_udev_syscall_enter(
+    _regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    _task: *mut crate::kernel::task::TaskStruct,
+) {
+}
+
+/// Syscalls that can block indefinitely, so an *enter* record with no matching
+/// exit identifies where a task went to sleep.
+///
+/// `trace_systemd_service_syscall()` only records syscall exits, which is
+/// blind to exactly the case the boot stall needs: a task that enters a
+/// syscall and never returns emits nothing at all.  Pairing this enter record
+/// with that exit record turns the stall into a readable "last call in, no
+/// call out" for PID 1 and the `systemd-*` helpers.
+///
+/// Restricted to blocking-capable numbers so enabling `lupos.trace=syscall`
+/// does not flood the serial console with the read/write/openat storm that
+/// systemd's generators produce.
+fn trace_stall_syscall_is_blocking(nr: u64) -> bool {
+    matches!(
+        nr,
+        0     // read
+        | 7   // poll
+        | 16  // ioctl
+        | 23  // select
+        | 34  // pause
+        | 35  // nanosleep
+        | 42  // connect
+        | 43  // accept
+        | 45  // recvfrom
+        | 47  // recvmsg
+        | 61  // wait4
+        | 165 // mount
+        | 202 // futex
+        | 230 // clock_nanosleep
+        | 232 // epoll_wait
+        | 247 // waitid
+        | 257 // openat
+        | 270 // pselect6
+        | 271 // ppoll
+        | 281 // epoll_pwait
+        | 441 // epoll_pwait2
+    )
+}
+
+#[cfg(not(test))]
+fn trace_stall_syscall_enter(
+    regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    task: *mut crate::kernel::task::TaskStruct,
+) {
+    if task.is_null() || !crate::kernel::debug_trace::syscall_enabled() {
+        return;
+    }
+    let nr = regs.orig_rax;
+    if !trace_stall_syscall_is_blocking(nr) {
+        return;
+    }
+    let pid = unsafe { (*task).pid };
+    let comm = unsafe { &(*task).comm };
+    // Same selection the exit trace uses: PID 1 plus the `systemd-*` helpers.
+    if pid != 1 && !comm_starts_with(comm, b"systemd-") {
+        return;
+    }
+    // jiffies anchors the record against the stall window in the serial log.
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-stall-enter j={} pid={} nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+        crate::kernel::time::jiffies::jiffies(),
+        pid,
+        nr,
+        regs.arg0(),
+        regs.arg1(),
+        regs.arg2(),
+        regs.arg3()
+    );
+}
+
+#[cfg(test)]
+fn trace_stall_syscall_enter(
     _regs: &crate::arch::x86::kernel::ptrace::PtRegs,
     _task: *mut crate::kernel::task::TaskStruct,
 ) {
@@ -1549,7 +1630,10 @@ fn syscall_seccomp_check(
     }
 
     let seccomp = unsafe { &(*task).m27_seccomp };
-    syscall_seccomp_check_state(regs, seccomp)
+    let check = syscall_seccomp_check_state(regs, seccomp);
+    #[cfg(not(test))]
+    trace_seccomp_decision(regs, task, seccomp, check);
+    check
 }
 
 pub(crate) fn syscall_seccomp_check_state(
@@ -1584,6 +1668,96 @@ fn seccomp_action_to_result(action: u32) -> SeccompCheck {
         SECCOMP_RET_KILL_THREAD | SECCOMP_RET_KILL_PROCESS => SeccompCheck::Errno(-EPERM),
         _ => SeccompCheck::Errno(-EPERM),
     }
+}
+
+#[cfg(not(test))]
+fn trace_seccomp_decision(
+    regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    task: *mut crate::kernel::task::TaskStruct,
+    seccomp: &Seccomp,
+    check: SeccompCheck,
+) {
+    if !crate::kernel::debug_trace::seccomp_enabled() || task.is_null() {
+        return;
+    }
+    let nr = regs.orig_rax as usize;
+    let comm = unsafe { &(*task).comm };
+    // Firefox installs filters in its browser/content processes. Keep the
+    // trace focused on the control plane, process creation, affinity, and
+    // any syscall whose filter decision is already denying it.
+    let firefox_process = comm_starts_with(comm, b"firefox")
+        || comm_starts_with(comm, b"bwrap")
+        || comm_starts_with(comm, b"glycin");
+    if !firefox_process {
+        return;
+    }
+    if !matches!(nr, 157 | 202 | 204 | 231 | 317 | 435) && check == SeccompCheck::Allow {
+        return;
+    }
+    let mode = seccomp.mode.load(core::sync::atomic::Ordering::Acquire);
+    let action = if mode == SECCOMP_MODE_FILTER {
+        let data = SeccompData {
+            nr: regs.orig_rax as i32,
+            arch: AUDIT_ARCH_X86_64,
+            instruction_pointer: regs.rip,
+            args: [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9],
+        };
+        seccomp_run_filters(seccomp, &data)
+    } else {
+        SECCOMP_RET_ALLOW
+    };
+    let pid = unsafe { (*task).pid };
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-seccomp pid={} comm={} nr={} mode={} filter={} action={:#x} decision={:?}",
+        pid,
+        comm_for_trace(comm),
+        nr,
+        mode,
+        !seccomp
+            .filter
+            .load(core::sync::atomic::Ordering::Acquire)
+            .is_null(),
+        action,
+        check
+    );
+}
+
+#[cfg(not(test))]
+fn trace_seccomp_control(
+    regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    task: *mut crate::kernel::task::TaskStruct,
+    ret: i64,
+) {
+    if !crate::kernel::debug_trace::seccomp_enabled() || task.is_null() {
+        return;
+    }
+    if !matches!(regs.orig_rax, 157 | 317) {
+        return;
+    }
+    let comm = unsafe { &(*task).comm };
+    if !comm_starts_with(comm, b"firefox")
+        && !comm_starts_with(comm, b"bwrap")
+        && !comm_starts_with(comm, b"glycin")
+    {
+        return;
+    }
+    let pid = unsafe { (*task).pid };
+    let mode = unsafe {
+        (*task)
+            .m27_seccomp
+            .mode
+            .load(core::sync::atomic::Ordering::Acquire)
+    };
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-seccomp-control pid={} comm={} nr={} arg0={:#x} arg1={:#x} ret={} mode={}",
+        pid,
+        comm_for_trace(comm),
+        regs.orig_rax,
+        regs.arg0(),
+        regs.arg1(),
+        ret,
+        mode
+    );
 }
 
 #[cfg(test)]

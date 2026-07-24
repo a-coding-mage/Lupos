@@ -1790,15 +1790,18 @@ fn poll_schedule(
         } else {
             timeout
         };
-        if let Some(timeout) = timeout {
+        // Cancel by handle, not by task: nested sleeps run inside the
+        // `schedule()` below (driver pump / workqueue drain) and would
+        // otherwise disarm this timer.
+        let armed = timeout.map(|timeout| {
             let wake_at = crate::kernel::time::jiffies::jiffies().saturating_add(timeout);
-            crate::kernel::time::sleep_timeout::arm_wakeup(task, wake_at);
-        }
+            crate::kernel::time::sleep_timeout::arm_wakeup(task, wake_at)
+        });
         unsafe {
             sched::schedule_with_irqs_enabled();
         }
-        if timeout.is_some() {
-            crate::kernel::time::sleep_timeout::cancel_wakeup(task);
+        if let Some(armed) = armed {
+            crate::kernel::time::sleep_timeout::cancel_wakeup(armed);
         }
     }
     table.finish();
@@ -3316,7 +3319,7 @@ pub(crate) fn mknod_kind(mode: u32) -> Result<InodeKind, i32> {
     }
 }
 
-fn insert_special_node(
+pub(crate) fn insert_special_node(
     parent: &DentryRef,
     dir: &InodeRef,
     name: &str,
@@ -3325,6 +3328,13 @@ fn insert_special_node(
     dev: u32,
 ) -> Result<(), i32> {
     let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
+    if kind == InodeKind::Socket && sb.fs_name == "ext4" && dir.ops.name == "ext4_dir" {
+        let inode = crate::fs::ext4::ops::ext4_create_socket(dir, name, mode)?;
+        let dentry = super::dcache::d_lookup(parent, name)
+            .unwrap_or_else(|| super::dcache::d_alloc_child(parent, name));
+        dentry.instantiate(inode);
+        return Ok(());
+    }
     let fops = if kind == InodeKind::Blockdev {
         &crate::block::block_device::BLOCK_DEVICE_FILE_OPS
     } else {

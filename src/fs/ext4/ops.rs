@@ -27,7 +27,7 @@ use crate::fs::types::{
 use crate::include::uapi::errno::{
     EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EPERM, EROFS, EXDEV,
 };
-use crate::include::uapi::stat::{S_IFDIR, S_IFLNK, S_IFREG, S_ISGID};
+use crate::include::uapi::stat::{S_IFDIR, S_IFLNK, S_IFREG, S_IFSOCK, S_ISGID};
 
 use super::dir::read_all as dir_read_all;
 use super::extents;
@@ -155,6 +155,25 @@ fn ext4_create(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> {
         InodeKind::Regular,
     )?;
     if let Err(err) = ext4_add_entry(dir, name, &inode, EXT4_FT_REG_FILE) {
+        return Err(err);
+    }
+    Ok(inode)
+}
+
+pub fn ext4_create_socket(dir: &InodeRef, name: &str, mode: u32) -> Result<InodeRef, i32> {
+    if name.is_empty() || name.len() > EXT4_NAME_LEN {
+        return Err(EINVAL);
+    }
+    let sb = dir.sb.lock().clone().ok_or(EINVAL)?;
+    let sbi = get_sbi(&sb).ok_or(EINVAL)?;
+    let inode = ext4_new_inode(
+        &sbi,
+        &sb,
+        dir,
+        S_IFSOCK | (mode & 0o7777),
+        InodeKind::Socket,
+    )?;
+    if let Err(err) = ext4_add_entry(dir, name, &inode, EXT4_FT_SOCK) {
         return Err(err);
     }
     Ok(inode)
@@ -3550,12 +3569,12 @@ mod tests {
         {
             let mut data = mem.data.lock();
             data[1024 + 12..1024 + 16].copy_from_slice(&90u32.to_le_bytes());
-            data[1024 + 16..1024 + 20].copy_from_slice(&4u32.to_le_bytes());
+            data[1024 + 16..1024 + 20].copy_from_slice(&5u32.to_le_bytes());
             data[2048..2052].copy_from_slice(&3u32.to_le_bytes());
             data[2052..2056].copy_from_slice(&4u32.to_le_bytes());
             data[2056..2060].copy_from_slice(&5u32.to_le_bytes());
             data[2060..2062].copy_from_slice(&90u16.to_le_bytes());
-            data[2062..2064].copy_from_slice(&4u16.to_le_bytes());
+            data[2062..2064].copy_from_slice(&5u16.to_le_bytes());
             data[2064..2066].copy_from_slice(&1u16.to_le_bytes());
             for bit in 0..=9 {
                 metadata::bitmap_set(&mut data[3 * 1024..4 * 1024], bit).unwrap();
@@ -3589,7 +3608,7 @@ mod tests {
                 bg_inode_bitmap: 4,
                 bg_inode_table: 5,
                 bg_free_blocks_count: 90,
-                bg_free_inodes_count: 4,
+                bg_free_inodes_count: 5,
                 bg_used_dirs_count: 1,
             }],
         });
@@ -3626,6 +3645,11 @@ mod tests {
         assert_eq!(tmp.kind, InodeKind::Directory);
         let state = ext4_create(&parent, "state", 0o644).expect("create regular file");
         assert_eq!(state.kind, InodeKind::Regular);
+        let agent = ext4_create_socket(&parent, "agent.sock", 0o700).expect("create socket node");
+        assert_eq!(agent.kind, InodeKind::Socket);
+        assert_eq!(agent.mode.load(Ordering::Acquire), S_IFSOCK | 0o700);
+        let agent_raw = ialloc::read_raw_inode(&sbi, agent.ino as u32).unwrap();
+        assert_eq!(le_u16(&agent_raw, 0).unwrap(), (S_IFSOCK | 0o700) as u16);
         // GnuPG's dotlock protocol repeatedly links one temporary inode to a
         // lock name, stats the source for nlink == 2, then unlinks the lock.
         // Unlink must update that same resolved inode object, not a freshly
@@ -3655,6 +3679,11 @@ mod tests {
         let entries = dir_read_all(&sbi, &parent_ext).unwrap();
         assert!(entries.iter().any(|entry| entry.name == "tmp"));
         assert!(entries.iter().any(|entry| entry.name == "state"));
+        let agent_entry = entries
+            .iter()
+            .find(|entry| entry.name == "agent.sock")
+            .expect("socket dirent");
+        assert_eq!(agent_entry.file_type, EXT4_FT_SOCK);
         assert!(entries.iter().any(|entry| entry.name == "long-dev-link"));
         assert_eq!(parent.nlink.load(Ordering::Acquire), 3);
 

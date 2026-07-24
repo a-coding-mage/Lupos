@@ -31,19 +31,26 @@
 
 extern crate alloc;
 
+use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
 
 use super::record::{LOG_NEWLINE, PrintkInfo};
 
-/// Number of descriptor slots.  Power of two so we can mask seq → index.
-pub const PRB_DESC_COUNT: usize = 256;
-/// Size of the text data ring, in bytes.  Power of two.
-pub const PRB_TEXT_BUF_SIZE: usize = 16 * 1024;
+// Linux derives the static printk ring from CONFIG_LOG_BUF_SHIFT and a
+// conservative average record size.  The generic x86_64 defconfig uses
+// CONFIG_LOG_BUF_SHIFT=18; vendor/linux/kernel/printk/printk.c defines
+// PRB_AVGBITS=5 (32 bytes per average record), yielding 8192 descriptors.
+// Keep those values aligned with vendor/linux/arch/x86/configs/x86_64_defconfig.
+const PRB_LOG_BUF_SHIFT: usize = 18;
+const PRB_AVGBITS: usize = 5;
 
-const DESC_MASK: u64 = (PRB_DESC_COUNT as u64) - 1;
-const TEXT_MASK: usize = PRB_TEXT_BUF_SIZE - 1;
+/// Number of descriptor slots.  Power of two so we can mask seq → index.
+pub const PRB_DESC_COUNT: usize = 1 << (PRB_LOG_BUF_SHIFT - PRB_AVGBITS);
+/// Size of the text data ring, in bytes.  Power of two.
+pub const PRB_TEXT_BUF_SIZE: usize = 1 << PRB_LOG_BUF_SHIFT;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -73,8 +80,11 @@ impl DescSlot {
 }
 
 /// The lockless ring (with a coarse mutex around reserve+commit for M61).
-pub struct PrintkRingbuffer {
-    inner: Mutex<RbInner>,
+pub struct PrintkRingbuffer<
+    const DESC_COUNT: usize = PRB_DESC_COUNT,
+    const TEXT_SIZE: usize = PRB_TEXT_BUF_SIZE,
+> {
+    inner: Mutex<RbInner<DESC_COUNT, TEXT_SIZE>>,
     /// Next sequence to assign on reserve.
     head_seq: AtomicU64,
     /// Oldest valid sequence still in the ring.
@@ -83,20 +93,23 @@ pub struct PrintkRingbuffer {
     fail: AtomicU64,
 }
 
-struct RbInner {
-    descs: [DescSlot; PRB_DESC_COUNT],
-    text: [u8; PRB_TEXT_BUF_SIZE],
+struct RbInner<const DESC_COUNT: usize, const TEXT_SIZE: usize> {
+    descs: [DescSlot; DESC_COUNT],
+    text: [u8; TEXT_SIZE],
     /// Next byte offset where text will be written.  Non-wrapped 64-bit cursor
     /// would be ideal, but `usize` works with modulo for our small ring.
     text_head: usize,
 }
 
-impl PrintkRingbuffer {
+impl<const DESC_COUNT: usize, const TEXT_SIZE: usize> PrintkRingbuffer<DESC_COUNT, TEXT_SIZE> {
+    const DESC_MASK: u64 = (DESC_COUNT as u64) - 1;
+    const TEXT_MASK: usize = TEXT_SIZE - 1;
+
     pub const fn new() -> Self {
         Self {
             inner: Mutex::new(RbInner {
-                descs: [DescSlot::empty(); PRB_DESC_COUNT],
-                text: [0; PRB_TEXT_BUF_SIZE],
+                descs: [DescSlot::empty(); DESC_COUNT],
+                text: [0; TEXT_SIZE],
                 text_head: 0,
             }),
             head_seq: AtomicU64::new(0),
@@ -117,7 +130,7 @@ impl PrintkRingbuffer {
         caller_id: u32,
         text: &[u8],
     ) -> Option<u64> {
-        if text.len() > PRB_TEXT_BUF_SIZE {
+        if text.len() > TEXT_SIZE {
             self.fail.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -134,7 +147,7 @@ impl PrintkRingbuffer {
             if tail_id >= head_id {
                 break; // empty
             }
-            let tail_idx = (tail_id & DESC_MASK) as usize;
+            let tail_idx = (tail_id & Self::DESC_MASK) as usize;
             let tail = &g.descs[tail_idx];
             if tail.state != DescState::Committed {
                 break;
@@ -150,7 +163,7 @@ impl PrintkRingbuffer {
             };
             // Also push tail if descriptor slot itself collides.
             let new_id = head_id;
-            let new_idx = (new_id & DESC_MASK) as usize;
+            let new_idx = (new_id & Self::DESC_MASK) as usize;
             let slot_collide = new_idx == tail_idx;
             if !overlap && !slot_collide {
                 break;
@@ -161,14 +174,14 @@ impl PrintkRingbuffer {
 
         // Copy text into the text ring (with modulo wrap).
         for (i, b) in text.iter().enumerate() {
-            let idx = begin.wrapping_add(i) & TEXT_MASK;
+            let idx = begin.wrapping_add(i) & Self::TEXT_MASK;
             g.text[idx] = *b;
         }
-        g.text_head = end & TEXT_MASK;
+        g.text_head = end & Self::TEXT_MASK;
 
         // Allocate descriptor.
         let new_seq = self.head_seq.load(Ordering::Relaxed);
-        let new_idx = (new_seq & DESC_MASK) as usize;
+        let new_idx = (new_seq & Self::DESC_MASK) as usize;
         let slot = &mut g.descs[new_idx];
         slot.info = PrintkInfo::empty();
         slot.info.seq = new_seq;
@@ -177,7 +190,7 @@ impl PrintkRingbuffer {
         slot.info.facility = facility;
         slot.info.set_flags_level(flags | LOG_NEWLINE, level);
         slot.info.caller_id = caller_id;
-        slot.text_begin = begin & TEXT_MASK;
+        slot.text_begin = begin & Self::TEXT_MASK;
         slot.text_len = text.len();
         slot.state = DescState::Committed;
 
@@ -206,7 +219,7 @@ impl PrintkRingbuffer {
         {
             return None;
         }
-        let idx = (seq & DESC_MASK) as usize;
+        let idx = (seq & Self::DESC_MASK) as usize;
         let slot = &g.descs[idx];
         if slot.state != DescState::Committed || slot.info.seq != seq {
             return None;
@@ -214,7 +227,7 @@ impl PrintkRingbuffer {
         *dst_info = slot.info;
         let n = slot.text_len.min(dst_text.len());
         for i in 0..n {
-            let src_idx = slot.text_begin.wrapping_add(i) & TEXT_MASK;
+            let src_idx = slot.text_begin.wrapping_add(i) & Self::TEXT_MASK;
             dst_text[i] = g.text[src_idx];
         }
         Some(slot.text_len)
@@ -222,6 +235,27 @@ impl PrintkRingbuffer {
 
     pub fn fail_count(&self) -> u64 {
         self.fail.load(Ordering::Relaxed)
+    }
+
+    /// Render the current ring in the format returned by
+    /// `SYSLOG_ACTION_READ_ALL`/`dmesg(8)`.
+    ///
+    /// Ref: `vendor/linux/kernel/printk/printk.c::syslog_print_all()`.
+    pub fn dmesg_bytes(&self) -> Vec<u8> {
+        let tail = self.tail();
+        let head = self.head();
+        let mut output = Vec::new();
+        let mut text = vec![0u8; TEXT_SIZE];
+
+        for seq in tail..head {
+            let mut info = PrintkInfo::empty();
+            let Some(text_len) = self.read(seq, &mut info, &mut text) else {
+                continue;
+            };
+            let line = super::render::format_dmesg(&info, &text[..text_len]);
+            output.extend_from_slice(line.as_bytes());
+        }
+        output
     }
 }
 
@@ -239,9 +273,18 @@ mod tests {
     use super::*;
     use crate::kernel::printk::levels::*;
 
+    type TestRingbuffer = PrintkRingbuffer<512, { 16 * 1024 }>;
+    const TEST_DESC_COUNT: usize = 512;
+
+    #[test]
+    fn generic_x86_64_capacity_matches_vendor_config() {
+        assert_eq!(PRB_DESC_COUNT, 8192);
+        assert_eq!(PRB_TEXT_BUF_SIZE, 256 * 1024);
+    }
+
     #[test]
     fn reserve_commit_round_trip() {
-        let rb = PrintkRingbuffer::new();
+        let rb = TestRingbuffer::new();
         let seq = rb.emit(1234, LOG_KERN, KERN_INFO, 0, 0, b"hello").unwrap();
         let mut info = PrintkInfo::empty();
         let mut buf = [0u8; 32];
@@ -256,7 +299,7 @@ mod tests {
 
     #[test]
     fn sequential_seqs() {
-        let rb = PrintkRingbuffer::new();
+        let rb = TestRingbuffer::new();
         let s0 = rb.emit(0, 0, 6, 0, 0, b"a").unwrap();
         let s1 = rb.emit(0, 0, 6, 0, 0, b"b").unwrap();
         let s2 = rb.emit(0, 0, 6, 0, 0, b"c").unwrap();
@@ -266,25 +309,59 @@ mod tests {
 
     #[test]
     fn descriptor_overflow_recycles_oldest() {
-        let rb = PrintkRingbuffer::new();
-        for i in 0..(PRB_DESC_COUNT as u64 + 16) {
+        let rb = TestRingbuffer::new();
+        for i in 0..(TEST_DESC_COUNT as u64 + 16) {
             let _ = rb.emit(i, 0, 6, 0, 0, b"x").unwrap();
         }
         // Tail must have advanced past 0.
         assert!(rb.tail() > 0);
         // Head should be at our final write count.
-        assert_eq!(rb.head(), PRB_DESC_COUNT as u64 + 16);
+        assert_eq!(rb.head(), TEST_DESC_COUNT as u64 + 16);
     }
 
     #[test]
     fn read_old_seq_returns_none_after_recycle() {
-        let rb = PrintkRingbuffer::new();
-        for i in 0..(PRB_DESC_COUNT as u64 + 1) {
+        let rb = TestRingbuffer::new();
+        for i in 0..(TEST_DESC_COUNT as u64 + 1) {
             let _ = rb.emit(i, 0, 6, 0, 0, b"x").unwrap();
         }
         let mut info = PrintkInfo::empty();
         let mut buf = [0u8; 4];
         // seq 0 was the very first record; it must be gone now.
         assert!(rb.read(0, &mut info, &mut buf).is_none());
+    }
+
+    #[test]
+    fn dmesg_bytes_renders_records_in_sequence_order() {
+        let rb = TestRingbuffer::new();
+        rb.emit(
+            1_234_567_000,
+            0,
+            6,
+            0,
+            0,
+            b"Kernel command line: root=/dev/vda1\n",
+        )
+        .unwrap();
+        rb.emit(2_000_000_000, 0, 4, 0, 0, b"warning\n").unwrap();
+
+        let dmesg = alloc::string::String::from_utf8(rb.dmesg_bytes()).unwrap();
+        assert!(dmesg.contains("[    1.234567] Kernel command line: root=/dev/vda1"));
+        assert!(dmesg.contains("[    2.000000] warning"));
+        assert!(dmesg.find("command line").unwrap() < dmesg.find("warning").unwrap());
+    }
+
+    #[test]
+    fn early_boot_record_survives_a_boot_sized_log_burst() {
+        let rb = TestRingbuffer::new();
+        rb.emit(0, 0, 6, 0, 0, b"Kernel command line: test\n")
+            .unwrap();
+        for seq in 0..300u64 {
+            let text = alloc::format!("boot-record-{seq}\n");
+            rb.emit(seq + 1, 0, 6, 0, 0, text.as_bytes()).unwrap();
+        }
+
+        let dmesg = alloc::string::String::from_utf8(rb.dmesg_bytes()).unwrap();
+        assert!(dmesg.contains("Kernel command line: test"));
     }
 }

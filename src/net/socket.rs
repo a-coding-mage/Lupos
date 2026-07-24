@@ -4532,8 +4532,24 @@ pub fn recvmsg_full(
             }
             let chunk = (out.len() - copied).min(msg.bytes.len());
             if chunk == 0 {
-                socket.recvq.push_front(msg);
-                break;
+                // Linux `unix_stream_read_generic()` consumes an empty skb.
+                // When it carries SCM_RIGHTS, `unix_detach_fds()` runs before
+                // the skb is unlinked and recvmsg returns 0 with the
+                // ancillary files.  Keeping that packet queued turns a
+                // readable AF_UNIX socket into a permanent EAGAIN loop.
+                if !msg.fds.is_empty() {
+                    if !first_seen {
+                        first_peer = msg.peer.clone();
+                        first_cred = msg.cred.clone();
+                        first_fds = core::mem::take(&mut msg.fds);
+                        first_meta = msg.meta.clone();
+                        first_seen = true;
+                    }
+                    break;
+                }
+                // An empty packet without ancillary data is consumed and the
+                // stream scan continues, matching the Linux skb loop.
+                continue;
             }
             if !first_seen {
                 first_peer = msg.peer.clone();
@@ -4554,7 +4570,7 @@ pub fn recvmsg_full(
                 break;
             }
         }
-        if copied == 0 {
+        if copied == 0 && first_fds.is_empty() {
             return Err(EAGAIN);
         }
         socket.last_rx_meta = first_meta;
@@ -7355,6 +7371,30 @@ mod tests {
         let n = recvmsg(&right, &mut buf).unwrap();
         assert_eq!(n, 1);
         assert_eq!(&buf[..n], b"B");
+    }
+
+    #[test]
+    fn unix_stream_zero_length_scm_rights_is_readable_like_linux() {
+        use crate::fs::dcache::d_alloc;
+        use crate::fs::file::{alloc_file, fget, fput};
+        use crate::fs::ops::NOOP_FILE_OPS;
+
+        let (left, right) = socketpair(AF_UNIX, SOCK_STREAM, 0).unwrap();
+        let attached: FileRef = alloc_file(d_alloc("zero-length-rights"), 0, 0, &NOOP_FILE_OPS);
+
+        assert_eq!(
+            sendmsg_with_fds(&left, b"", alloc::vec![fget(&attached)]).unwrap(),
+            0
+        );
+        let mut out = [0u8; 8];
+        let (n, _peer, fds, _cred) = recvmsg_with_fds(&right, &mut out)
+            .expect("a zero-length SCM_RIGHTS packet is readable on Linux");
+        assert_eq!(n, 0);
+        assert_eq!(fds.len(), 1);
+        assert!(Arc::ptr_eq(&fds[0], &attached));
+        for file in fds {
+            fput(file);
+        }
     }
 
     #[test]
