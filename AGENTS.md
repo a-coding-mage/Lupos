@@ -62,6 +62,28 @@ continue without rediscovering the setup.
    after the cause is proven, but retain the reproducer, regression test, and
    useful failure diagnostics.
 
+## Bug investigation loop
+
+When the user hands you a bug, work this loop.
+
+1. Troubleshoot and analyze until you can name where the root cause most
+   likely lives — a specific file and code path, not a symptom.
+2. Compare that code against its `vendor/linux` C implementation directly:
+   control flow, ordering, locking, error paths, constants, and layouts.
+3. Fix every inconsistency found there, then test.
+4. If the bug survives, repeat from step 1 with what the pass taught you. Each
+   iteration must eliminate candidates rather than restate the hypothesis.
+5. Add unit tests covering each divergence so it cannot come back.
+6. Keep every parity fix that did not cause a regression, including fixes that
+   turn out not to be the reported bug's cause. Never revert a correct fix
+   merely because it was not the culprit; report it as a separate finding.
+
+Prefer this loop over waiting for an intermittent failure to reproduce.
+Observation only locates the suspect area; the comparison against
+`vendor/linux` is what identifies the defect. Lupos is largely machine-written,
+so assume a divergence exists and go find it rather than assuming the Rust side
+is already faithful.
+
 ## GDB-first debugging
 
 Use GDB whenever the failing path can run under QEMU. This is mandatory for

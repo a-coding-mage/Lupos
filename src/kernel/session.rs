@@ -137,8 +137,80 @@ pub fn claim_controlling_tty(pid: i32, tty: ControllingTty) -> Result<(), i32> {
 }
 
 /// Drop every session reference to a tty that is being hung up.
+///
+/// Linux `session_clear_tty()` (`drivers/tty/tty_jobctrl.c`) walks every task
+/// in the owning session and calls `proc_clear_tty()`; the side table is keyed
+/// by session id, so dropping the single entry is the same transition.
 pub fn clear_controlling_tty(tty: ControllingTty) {
     CONTROLLING_TTYS.lock().retain(|entry| entry.tty != tty);
+}
+
+/// The session id that currently owns `tty`, i.e. Linux `tty->ctrl.session`.
+pub fn controlling_tty_session(tty: ControllingTty) -> Option<i32> {
+    CONTROLLING_TTYS
+        .lock()
+        .iter()
+        .find(|entry| entry.tty == tty)
+        .map(|entry| entry.sid)
+}
+
+/// `TIOCSCTTY` — `vendor/linux/drivers/tty/tty_jobctrl.c::tiocsctty()`.
+///
+/// ```c
+/// if (current->signal->leader && task_session(current) == tty->ctrl.session)
+///         goto unlock;                    /* already ours: success, no-op */
+/// if (!current->signal->leader || current->signal->tty)
+///         return -EPERM;
+/// if (tty->ctrl.session) {
+///         if (arg == 1 && capable(CAP_SYS_ADMIN))
+///                 session_clear_tty(tty->ctrl.session);   /* steal it away */
+///         else
+///                 return -EPERM;
+/// }
+/// if ((file->f_mode & FMODE_READ) == 0 && !capable(CAP_SYS_ADMIN))
+///         return -EPERM;
+/// proc_set_tty(tty);
+/// ```
+///
+/// The steal branch is what lets `agetty`/`login` (both root, both issuing
+/// `ioctl(fd, TIOCSCTTY, 1)`) hand a terminal from the getty session to the
+/// freshly `setsid()`-ed login session. Without it the second claim fails and
+/// the new session ends up with no controlling terminal at all, which is
+/// visible as `tty_nr == 0` in `/proc/<pid>/stat` and `TT ?` in `ps`.
+pub fn tiocsctty(
+    pid: i32,
+    tty: ControllingTty,
+    arg: i32,
+    readable: bool,
+    admin: bool,
+) -> Result<(), i32> {
+    let sid = session_id(pid).unwrap_or(pid);
+    let leader = pid == sid;
+
+    let mut table = CONTROLLING_TTYS.lock();
+    let owned = table
+        .iter()
+        .find(|entry| entry.sid == sid)
+        .map(|entry| entry.tty);
+    if leader && owned == Some(tty) {
+        return Ok(());
+    }
+    if !leader || owned.is_some() {
+        return Err(EPERM);
+    }
+    if table.iter().any(|entry| entry.tty == tty) {
+        if arg == 1 && admin {
+            // `session_clear_tty()`: drop the previous owner's association.
+            table.retain(|entry| entry.tty != tty);
+        } else {
+            return Err(EPERM);
+        }
+    }
+    if !readable && !admin {
+        return Err(EPERM);
+    }
+    table.push(ControllingTtyEntry { sid, tty });
+    Ok(())
 }
 
 /// Remove the exiting/reaped task from the session side tables.
@@ -231,13 +303,39 @@ pub fn inherit_from_parent(parent_pid: i32, child_pid: i32) {
 }
 
 /// `setsid(2)` — create a new session and process group led by the caller.
+///
+/// Ref: `vendor/linux/kernel/sys.c::ksys_setsid()`. Linux rejects the call in
+/// two cases before doing anything:
+///
+///   * the caller is already a session leader (`group_leader->signal->leader`);
+///   * a process group id equal to the proposed session id already exists
+///     (`pid_task(sid, PIDTYPE_PGID)`), i.e. the caller leads a process group.
+///
+/// On success it calls `proc_clear_tty()`. The controlling-tty side table is
+/// keyed by session id, so moving to a brand-new session id (which by the
+/// checks above cannot already own a tty) drops the association implicitly.
+///
+/// Both checks are made against the caller's *pre-existing* row. A pid with no
+/// row at all has never joined a session or a group, so neither Linux
+/// condition can hold for it; materialising a default row first (whose `sid`
+/// and `pgid` both default to the pid) would make every such caller look like
+/// a leader and wrongly fail.
 pub unsafe fn sys_setsid() -> i64 {
     let pid = match current_pid() {
         Ok(pid) => pid,
         Err(errno) => return -(errno as i64),
     };
-    let cur = ensure_entry(pid);
-    if cur.pgid == pid && cur.sid != pid {
+    let existing = {
+        let table = SESSIONS.lock();
+        table.iter().find(|entry| entry.pid == pid).copied()
+    };
+    // "Fail if I am already a session leader."
+    if existing.is_some_and(|entry| entry.sid == pid) {
+        return -(EPERM as i64);
+    }
+    // "Fail if a process group id already exists that equals the proposed
+    // session id."
+    if SESSIONS.lock().iter().any(|entry| entry.pgid == pid) {
         return -(EPERM as i64);
     }
     let entry = match update_entry(pid, |entry| {
@@ -349,5 +447,233 @@ mod tests {
         release_task_session_state(51);
 
         assert_eq!(controlling_tty(50), Some(ControllingTty::Unix98Pty(1, 99)));
+    }
+    // ── vendor/linux/kernel/sys.c::ksys_setsid() parity ────────────────────
+
+    fn with_current_pid<T>(pid: i32, f: impl FnOnce() -> T) -> T {
+        let previous = unsafe { sched::get_current() };
+        let mut task = alloc::boxed::Box::new(unsafe {
+            core::mem::zeroed::<crate::kernel::task::TaskStruct>()
+        });
+        task.pid = pid;
+        task.tgid = pid;
+        unsafe { sched::set_current(&mut *task as *mut crate::kernel::task::TaskStruct) };
+        let out = f();
+        unsafe { sched::set_current(previous) };
+        out
+    }
+
+    #[test]
+    fn setsid_rejects_a_task_that_already_leads_its_session() {
+        // "Fail if I am already a session leader" — ksys_setsid().
+        reset_for_tests();
+        update_entry(60, |entry| {
+            entry.sid = 60;
+            entry.pgid = 60;
+        })
+        .unwrap();
+
+        let rc = with_current_pid(60, || unsafe { sys_setsid() });
+
+        assert_eq!(rc, -(EPERM as i64));
+        reset_for_tests();
+    }
+
+    #[test]
+    fn setsid_rejects_a_process_group_leader() {
+        // "Fail if a process group id already exists that equals the proposed
+        // session id" — ksys_setsid(). Here pid 70 leads pgrp 70 inside
+        // session 65, so `pid_task(sid, PIDTYPE_PGID)` is non-NULL.
+        reset_for_tests();
+        update_entry(65, |entry| {
+            entry.sid = 65;
+            entry.pgid = 65;
+        })
+        .unwrap();
+        update_entry(70, |entry| {
+            entry.sid = 65;
+            entry.pgid = 70;
+        })
+        .unwrap();
+
+        let rc = with_current_pid(70, || unsafe { sys_setsid() });
+
+        assert_eq!(rc, -(EPERM as i64));
+        reset_for_tests();
+    }
+
+    #[test]
+    fn setsid_promotes_a_group_member_and_drops_the_controlling_tty() {
+        // A plain member of session 65 / pgrp 65 becomes its own session and
+        // group leader, and `proc_clear_tty()` leaves it without a /dev/tty.
+        reset_for_tests();
+        update_entry(65, |entry| {
+            entry.sid = 65;
+            entry.pgid = 65;
+        })
+        .unwrap();
+        inherit_from_parent(65, 71);
+        claim_controlling_tty(65, ControllingTty::Unix98Pty(3, 4)).unwrap();
+        assert_eq!(controlling_tty(71), Some(ControllingTty::Unix98Pty(3, 4)));
+
+        let rc = with_current_pid(71, || unsafe { sys_setsid() });
+
+        assert_eq!(rc, 71);
+        assert_eq!(session_id(71), Some(71));
+        assert_eq!(process_group(71), Some(71));
+        assert_eq!(controlling_tty(71), None);
+        // The old session keeps its terminal, exactly as proc_clear_tty()
+        // only touches the calling task's signal->tty.
+        assert_eq!(controlling_tty(65), Some(ControllingTty::Unix98Pty(3, 4)));
+        reset_for_tests();
+    }
+
+    #[test]
+    fn controlling_tty_session_reports_the_owning_session() {
+        reset_for_tests();
+        update_entry(80, |entry| {
+            entry.sid = 80;
+            entry.pgid = 80;
+        })
+        .unwrap();
+        claim_controlling_tty(80, ControllingTty::Unix98Pty(5, 6)).unwrap();
+
+        assert_eq!(
+            controlling_tty_session(ControllingTty::Unix98Pty(5, 6)),
+            Some(80)
+        );
+        assert_eq!(
+            controlling_tty_session(ControllingTty::Unix98Pty(7, 8)),
+            None
+        );
+        reset_for_tests();
+    }
+
+    // ── vendor/linux/drivers/tty/tty_jobctrl.c::tiocsctty() parity ─────────
+
+    #[test]
+    fn tiocsctty_is_a_noop_when_the_leader_already_owns_the_tty() {
+        reset_for_tests();
+        update_entry(90, |entry| {
+            entry.sid = 90;
+            entry.pgid = 90;
+        })
+        .unwrap();
+        let tty = ControllingTty::Console(0x440);
+        assert_eq!(tiocsctty(90, tty, 1, true, true), Ok(()));
+
+        assert_eq!(tiocsctty(90, tty, 0, true, false), Ok(()));
+        assert_eq!(controlling_tty_session(tty), Some(90));
+        reset_for_tests();
+    }
+
+    #[test]
+    fn tiocsctty_rejects_a_non_session_leader() {
+        reset_for_tests();
+        update_entry(91, |entry| {
+            entry.sid = 91;
+            entry.pgid = 91;
+        })
+        .unwrap();
+        inherit_from_parent(91, 92);
+
+        assert_eq!(
+            tiocsctty(92, ControllingTty::Console(0x440), 1, true, true),
+            Err(EPERM)
+        );
+        reset_for_tests();
+    }
+
+    #[test]
+    fn tiocsctty_rejects_a_leader_that_already_has_another_tty() {
+        reset_for_tests();
+        update_entry(93, |entry| {
+            entry.sid = 93;
+            entry.pgid = 93;
+        })
+        .unwrap();
+        tiocsctty(93, ControllingTty::Console(0x440), 1, true, true).unwrap();
+
+        assert_eq!(
+            tiocsctty(93, ControllingTty::Unix98Pty(0, 1), 1, true, true),
+            Err(EPERM)
+        );
+        reset_for_tests();
+    }
+
+    #[test]
+    fn tiocsctty_steals_the_console_from_the_getty_session_for_root_login() {
+        // agetty owns the console for session 100; `login` forks a child that
+        // calls setsid() and then ioctl(0, TIOCSCTTY, 1) as root. Linux hands
+        // the terminal over; before this parity fix the claim failed and the
+        // login session was left with no controlling terminal, which surfaced
+        // as tty_nr == 0 in /proc/<pid>/stat and `TT ?` in ps.
+        reset_for_tests();
+        let console = ControllingTty::Console(0x440);
+        update_entry(100, |entry| {
+            entry.sid = 100;
+            entry.pgid = 100;
+        })
+        .unwrap();
+        tiocsctty(100, console, 1, true, true).unwrap();
+        update_entry(101, |entry| {
+            entry.sid = 101;
+            entry.pgid = 101;
+        })
+        .unwrap();
+
+        assert_eq!(tiocsctty(101, console, 1, true, true), Ok(()));
+
+        assert_eq!(controlling_tty_session(console), Some(101));
+        assert_eq!(controlling_tty(101), Some(console));
+        // session_clear_tty() dropped the previous owner's association.
+        assert_eq!(controlling_tty(100), None);
+        reset_for_tests();
+    }
+
+    #[test]
+    fn tiocsctty_refuses_to_steal_without_arg_one_or_cap_sys_admin() {
+        reset_for_tests();
+        let console = ControllingTty::Console(0x440);
+        update_entry(110, |entry| {
+            entry.sid = 110;
+            entry.pgid = 110;
+        })
+        .unwrap();
+        tiocsctty(110, console, 1, true, true).unwrap();
+        for pid in [111, 112] {
+            update_entry(pid, |entry| {
+                entry.sid = pid;
+                entry.pgid = pid;
+            })
+            .unwrap();
+        }
+
+        // arg != 1, even with CAP_SYS_ADMIN.
+        assert_eq!(tiocsctty(111, console, 0, true, true), Err(EPERM));
+        // arg == 1 without CAP_SYS_ADMIN.
+        assert_eq!(tiocsctty(112, console, 1, true, false), Err(EPERM));
+        assert_eq!(controlling_tty_session(console), Some(110));
+        reset_for_tests();
+    }
+
+    #[test]
+    fn tiocsctty_rejects_a_write_only_fd_without_cap_sys_admin() {
+        reset_for_tests();
+        update_entry(120, |entry| {
+            entry.sid = 120;
+            entry.pgid = 120;
+        })
+        .unwrap();
+
+        assert_eq!(
+            tiocsctty(120, ControllingTty::Console(0x440), 1, false, false),
+            Err(EPERM)
+        );
+        assert_eq!(
+            tiocsctty(120, ControllingTty::Console(0x440), 1, false, true),
+            Ok(())
+        );
+        reset_for_tests();
     }
 }

@@ -20,8 +20,8 @@ use spin::Mutex;
 use crate::arch::x86::kernel::uaccess;
 use crate::fs::anon_inode::alloc_anon_file;
 use crate::fs::fdtable::FilesStruct;
-use crate::fs::ops::{FileOps, NOOP_FILE_OPS, NOOP_INODE_OPS};
-use crate::fs::types::{FileRef, Inode, InodeKind, InodePrivate};
+use crate::fs::ops::{FileOps, NOOP_FILE_OPS};
+use crate::fs::types::{FileRef, InodeKind, InodePrivate};
 use crate::include::uapi::errno::{
     EADDRINUSE, EAGAIN, EBADF, EFAULT, EINPROGRESS, EINTR, EINVAL, ENODEV, ENOENT, ENOPROTOOPT,
     ENOSYS, ENOTCONN, ENOTDIR, ENOTSOCK, ENOTTY, EOPNOTSUPP, EPERM, ERANGE,
@@ -1400,17 +1400,20 @@ fn wait_for_socket_recv(sock: &SocketRef, timeout_ns: u64) -> Result<(), i32> {
         #[cfg(not(test))]
         {
             let task_id = task as usize;
+            // Cancel by handle: the `schedule()` below pumps driver events and
+            // drains workqueues in this task's context, and those arm/cancel
+            // wakeups of their own.
             let timer_armed = deadline_ns.map(|deadline| {
                 let remaining = deadline.saturating_sub(crate::kernel::time::ktime_get());
                 let timeout = crate::kernel::time::timeconv::nsecs_to_jiffies64(remaining).max(1);
                 let wake_at = crate::kernel::time::jiffies::jiffies().saturating_add(timeout);
-                crate::kernel::time::sleep_timeout::arm_wakeup(task_id, wake_at);
+                crate::kernel::time::sleep_timeout::arm_wakeup(task_id, wake_at)
             });
             unsafe {
                 crate::kernel::sched::schedule_with_irqs_enabled();
             }
-            if timer_armed.is_some() {
-                crate::kernel::time::sleep_timeout::cancel_wakeup(task_id);
+            if let Some(timer_armed) = timer_armed {
+                crate::kernel::time::sleep_timeout::cancel_wakeup(timer_armed);
             }
             unsafe {
                 socket::finish_socket_recv_wait(sock, task);
@@ -1552,46 +1555,27 @@ fn ensure_unix_socket_node(path: &str) -> Result<(), i32> {
     if parent_inode.kind != InodeKind::Directory {
         return Err(ENOTDIR);
     }
-    let negative_dentry = if let Some(existing) = crate::fs::dcache::d_lookup(&parent, name) {
-        match existing.inode() {
-            Some(inode) if inode.kind == InodeKind::Socket => return Ok(()),
-            Some(_) => return Err(EADDRINUSE),
-            None => Some(existing),
-        }
-    } else {
-        None
-    };
+    if let Some(existing) = crate::fs::dcache::d_lookup(&parent, name)
+        && existing.inode().is_some()
+    {
+        return Err(EADDRINUSE);
+    }
     if let Some(lookup) = parent_inode.ops.lookup
         && let Ok(inode) = lookup(&parent_inode, name)
     {
-        return if inode.kind == InodeKind::Socket {
-            let dentry = crate::fs::dcache::d_alloc_child(&parent, name);
-            dentry.instantiate(inode);
-            Ok(())
-        } else {
-            Err(EADDRINUSE)
-        };
+        let dentry = crate::fs::dcache::d_alloc_child(&parent, name);
+        dentry.instantiate(inode);
+        return Err(EADDRINUSE);
     }
 
-    let sb = parent_inode.sb.lock().clone();
-    let ino = sb.as_ref().map(|sb| sb.alloc_ino()).unwrap_or(0);
-    let inode = Inode::new(
-        ino,
-        InodeKind::Socket,
+    crate::fs::syscalls::insert_special_node(
+        &parent,
+        &parent_inode,
+        name,
         0o777 & !crate::fs::fs_struct::current_umask(),
-        &NOOP_INODE_OPS,
-        &NOOP_FILE_OPS,
-        InodePrivate::None,
-    );
-    *inode.sb.lock() = sb;
-    match &parent_inode.private {
-        InodePrivate::RamDir(children) => {
-            children.lock().insert(String::from(name), inode.clone());
-        }
-        _ => return Err(ENOSYS),
-    }
-    let dentry = negative_dentry.unwrap_or_else(|| crate::fs::dcache::d_alloc_child(&parent, name));
-    dentry.instantiate(inode);
+        InodeKind::Socket,
+        0,
+    )?;
     crate::fs::inotify::notify_create(&parent, name, false);
     Ok(())
 }
@@ -7125,7 +7109,7 @@ mod tests {
     }
 
     #[test]
-    fn unix_listener_bound_path_released_when_epoll_holds_file_reference() {
+    fn unix_listener_bound_registry_released_when_epoll_holds_file_reference() {
         let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
         crate::fs::init();
         *crate::fs::mount::MOUNTS.root.lock() = None;
@@ -7190,8 +7174,19 @@ mod tests {
             assert!(second >= 0);
             assert_eq!(
                 sys_bind(second as i32, addr.as_ptr(), addrlen),
+                -(EADDRINUSE as i64),
+                "Linux keeps the pathname S_IFSOCK node busy until userspace unlinks it"
+            );
+            assert_eq!(
+                crate::fs::syscalls::sys_unlink(
+                    b"/run/systemd/journal/epoll-release-rebind\0".as_ptr()
+                ),
+                0
+            );
+            assert_eq!(
+                sys_bind(second as i32, addr.as_ptr(), addrlen),
                 0,
-                "epoll's watched file reference must fput the listener and clear BOUND"
+                "epoll's watched file reference must fput the listener and clear BOUND after unlink removes the pathname node"
             );
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
@@ -7248,6 +7243,57 @@ mod tests {
             let inode = negative.inode().expect("socket inode");
             assert_eq!(inode.kind, InodeKind::Socket);
             assert_eq!(inode.mode.load(Ordering::Acquire) & 0o777, 0o700);
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            crate::fs::fs_struct::exit_fs(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    #[test]
+    fn unix_path_bind_existing_socket_node_returns_eaddrinuse_and_rolls_back() {
+        let _guard = crate::fs::mount::TEST_MOUNT_LOCK.lock();
+        crate::fs::init();
+        *crate::fs::mount::MOUNTS.root.lock() = None;
+        crate::fs::mount::MOUNTS.by_path.lock().clear();
+        let sb = crate::fs::super_block::mount_fs("ramfs", "", 0, "").expect("ramfs mount");
+        let root = sb.root().expect("root dentry");
+        crate::fs::mount::set_rootfs(crate::fs::mount::Mount::alloc(sb, root, 0));
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 285;
+        current.tgid = 285;
+        current.cred = &raw const INIT_CRED;
+        unsafe {
+            files::set_task_files(&mut *current as *mut TaskStruct, FilesStruct::new());
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            assert_eq!(
+                crate::fs::syscalls::sys_mkdirat(AT_FDCWD, b"/run\0".as_ptr(), 0o755),
+                0
+            );
+            let (_, parent) = crate::fs::mount::resolve_path_follow("/run").expect("socket parent");
+            let parent_inode = parent.inode().expect("parent inode");
+            crate::fs::syscalls::insert_special_node(
+                &parent,
+                &parent_inode,
+                "stale.sock",
+                0o777,
+                InodeKind::Socket,
+                0,
+            )
+            .expect("precreate stale socket node");
+
+            let fd = sys_socket(AF_UNIX as i32, socket::SOCK_STREAM as i32, 0);
+            assert!(fd >= 0);
+            let (stale, stale_len) = unix_sockaddr("/run/stale.sock");
+            assert_eq!(
+                sys_bind(fd as i32, stale.as_ptr(), stale_len),
+                -(EADDRINUSE as i64)
+            );
+            let (fresh, fresh_len) = unix_sockaddr("/run/fresh.sock");
+            assert_eq!(sys_bind(fd as i32, fresh.as_ptr(), fresh_len), 0);
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
             crate::fs::fs_struct::exit_fs(&mut *current as *mut TaskStruct);

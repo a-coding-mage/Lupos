@@ -8,7 +8,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
 
@@ -27,6 +27,9 @@ pub const MAX_SCHEDULE_TIMEOUT: u64 = u64::MAX / 2;
 // whole sleep, e.g. throughout systemd's many startup timeouts).
 
 struct SleepTimer {
+    /// Identifies this individual armed timer, so nested sleeps by the same
+    /// task cannot cancel or overwrite one another.
+    id: u64,
     /// `*mut TaskStruct` as usize (the sleeper).
     task: usize,
     /// Jiffies value at/after which the sleeper must be woken.
@@ -35,66 +38,175 @@ struct SleepTimer {
 
 static SLEEP_TIMERS: Mutex<Vec<SleepTimer>> = Mutex::new(Vec::new());
 
+/// Source of [`SleepTimerId`] values. Starts at 1 so 0 is never a live id.
+static NEXT_SLEEP_TIMER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Handle for one armed wakeup.
+///
+/// Linux gives every timed sleep its own timer: `schedule_timeout()` puts a
+/// `struct process_timer` **on the caller's stack** and arms that
+/// (`vendor/linux/kernel/time/sleep_timeout.c`), so nesting is inherently safe.
+///
+/// Lupos previously keyed this wheel by task pointer with at most one entry per
+/// task, which silently broke under nesting: `arm_wakeup()` overwrote an outer
+/// sleep's deadline, and the inner `cancel_wakeup()` deleted the outer timer
+/// outright. That is reachable — `schedule_with_irqs_enabled()` pumps driver
+/// completions, and `poll_driver_abi_events_for_wait()` drains workqueues and
+/// softirqs in the *caller's* task context, where `block_facade_acquire()`
+/// arms and cancels a wakeup for `current`. An `epoll_wait()` fallback timer
+/// could therefore be destroyed during its own `schedule()`, leaving the task
+/// asleep with no timeout at all until some unrelated event woke it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SleepTimerId(u64);
+
+impl SleepTimerId {
+    /// A handle that refers to no armed timer; cancelling it is a no-op.
+    pub const NONE: Self = Self(0);
+}
+
 /// Register `task` to be woken at `expire`.  Task context only; interrupts are
 /// disabled across the (brief) critical section so the tick handler — which
 /// takes the same lock from hard-IRQ — can never deadlock against us.
-fn sleep_timer_add(task: usize, expire: u64) {
+fn sleep_timer_add(task: usize, expire: u64) -> SleepTimerId {
     let flags = crate::kernel::locking::irqflags::local_irq_save();
-    {
+    let handle = {
         let mut timers = SLEEP_TIMERS.lock();
-        if let Some(existing) = timers.iter_mut().find(|t| t.task == task) {
-            existing.expire = expire;
-        } else {
-            timers.push(SleepTimer { task, expire });
+        let handle = next_sleep_timer_id_locked(&timers);
+        timers.push(SleepTimer {
+            id: handle.0,
+            task,
+            expire,
+        });
+        handle
+    };
+    crate::kernel::locking::irqflags::local_irq_restore(flags);
+    handle
+}
+
+fn next_sleep_timer_id_locked(timers: &[SleepTimer]) -> SleepTimerId {
+    loop {
+        let mut current = NEXT_SLEEP_TIMER_ID.load(Ordering::Relaxed);
+        let id = loop {
+            let id = if current == SleepTimerId::NONE.0 {
+                1
+            } else {
+                current
+            };
+            let next = id.wrapping_add(1);
+            let next = if next == SleepTimerId::NONE.0 {
+                1
+            } else {
+                next
+            };
+            match NEXT_SLEEP_TIMER_ID.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break id,
+                Err(observed) => current = observed,
+            }
+        };
+        if timers.iter().all(|timer| timer.id != id) {
+            return SleepTimerId(id);
         }
     }
-    crate::kernel::locking::irqflags::local_irq_restore(flags);
 }
 
 /// Arm a one-shot wakeup for `task` at jiffy `expire` (for callers that sleep
 /// on their own condition but want a bounded re-check, e.g. the block-I/O wait
 /// re-polling within a tick in case a HBA completion interrupt is delayed).
-pub fn arm_wakeup(task: usize, expire: u64) {
-    sleep_timer_add(task, expire);
+///
+/// The returned handle must be passed to [`cancel_wakeup`]; cancelling by task
+/// would disarm unrelated nested sleeps.
+#[must_use = "an armed wakeup must be cancelled by its own SleepTimerId"]
+pub fn arm_wakeup(task: usize, expire: u64) -> SleepTimerId {
+    sleep_timer_add(task, expire)
 }
 
 /// Cancel a wakeup armed with [`arm_wakeup`].
-pub fn cancel_wakeup(task: usize) {
-    sleep_timer_remove(task);
+pub fn cancel_wakeup(id: SleepTimerId) {
+    sleep_timer_remove(id);
 }
 
-/// Cancel `task`'s sleep timer (it woke for another reason or its sleep ended).
-fn sleep_timer_remove(task: usize) {
+/// Cancel one armed sleep timer (it woke for another reason or its sleep ended).
+fn sleep_timer_remove(id: SleepTimerId) {
+    if id == SleepTimerId::NONE {
+        return;
+    }
     let flags = crate::kernel::locking::irqflags::local_irq_save();
     {
         let mut timers = SLEEP_TIMERS.lock();
-        if let Some(pos) = timers.iter().position(|t| t.task == task) {
+        if let Some(pos) = timers.iter().position(|t| t.id == id.0) {
             timers.swap_remove(pos);
         }
     }
     crate::kernel::locking::irqflags::local_irq_restore(flags);
 }
 
-/// Wake every sleeper whose deadline has passed.  Called from the timer tick
-/// (`apic_timer::on_tick`) in hard-IRQ context — interrupts are already
-/// disabled, so it just takes the lock and marks expired sleepers RUNNING.
-pub fn sleep_timers_expire(now: u64) {
+/// Sleepers detached per pass. Bounded so the batch lives on the stack: this
+/// runs in hard-IRQ context, where allocating is not allowed.
+const EXPIRE_BATCH: usize = 32;
+
+/// Detach up to `EXPIRE_BATCH` expired sleepers, returning how many were
+/// written to `out`.
+///
+/// Split out from [`sleep_timers_expire`] so the wakeups happen *after*
+/// `SLEEP_TIMERS` is unlocked. `vendor/linux/kernel/time/timer.c`
+/// (`expire_timers()`) does the same thing explicitly:
+///
+/// ```text
+/// raw_spin_unlock(&base->lock);
+/// call_timer_fn(timer, fn, baseclk);
+/// raw_spin_lock(&base->lock);
+/// ```
+fn take_expired_sleepers(now: u64, out: &mut [usize; EXPIRE_BATCH]) -> usize {
+    let mut n = 0usize;
     let mut timers = SLEEP_TIMERS.lock();
     timers.retain(|timer| {
-        if time_before(now, timer.expire) {
+        if n == EXPIRE_BATCH || time_before(now, timer.expire) {
             return true;
         }
-        let task = timer.task as *mut crate::kernel::task::TaskStruct;
-        if !task.is_null() {
-            unsafe {
-                // `wake_up_process()` is what Linux timer expiry uses: merely
-                // storing TASK_RUNNING loses the wake once the production
-                // scheduler has dequeued a sleeping task.
-                crate::kernel::sched::wake_task_normal(task);
-            }
-        }
+        out[n] = timer.task;
+        n += 1;
         false
     });
+    n
+}
+
+/// Wake every sleeper whose deadline has passed.  Called from the timer tick
+/// (`apic_timer::on_tick`) in hard-IRQ context.
+///
+/// The wakeups deliberately run with `SLEEP_TIMERS` **unlocked**. Holding it
+/// across `wake_task_normal()` was a deadlock hazard rather than a mere
+/// inefficiency: that path reaches `try_to_wake_up()`, which spins on
+/// `while task_on_cpu(p) {}` (Linux's `smp_cond_load_acquire(&p->on_cpu, !VAL)`)
+/// when the target is still mid-context-switch on another CPU. A CPU can
+/// therefore sit in hard IRQ, holding this lock, waiting for a CPU that is
+/// itself blocked acquiring the very same lock in `sleep_timer_add()` /
+/// `sleep_timer_remove()` — an AB-BA cycle whose least-bad outcome is a long
+/// convoy on a lock every timed sleep in the system needs.
+pub fn sleep_timers_expire(now: u64) {
+    loop {
+        let mut batch = [0usize; EXPIRE_BATCH];
+        let n = take_expired_sleepers(now, &mut batch);
+        for &task in &batch[..n] {
+            let task = task as *mut crate::kernel::task::TaskStruct;
+            if !task.is_null() {
+                unsafe {
+                    // `wake_up_process()` is what Linux timer expiry uses:
+                    // merely storing TASK_RUNNING loses the wake once the
+                    // production scheduler has dequeued a sleeping task.
+                    crate::kernel::sched::wake_task_normal(task);
+                }
+            }
+        }
+        // A full batch may have left more expired sleepers behind.
+        if n < EXPIRE_BATCH {
+            return;
+        }
+    }
 }
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
@@ -202,11 +314,11 @@ fn schedule_timeout_runtime(timeout_jiffies: u64) -> u64 {
     // real early wake.
     if !current.is_null() && crate::kernel::locking::preempt::preempt_count() == 0 {
         let task_id = current as usize;
-        sleep_timer_add(task_id, expire);
+        let timer = sleep_timer_add(task_id, expire);
         unsafe {
             crate::kernel::sched::schedule_with_irqs_enabled();
         }
-        sleep_timer_remove(task_id);
+        sleep_timer_remove(timer);
         set_current_task_state(task_state::TASK_RUNNING);
         let now = jiffies();
         return if time_before(now, expire) {
@@ -267,6 +379,102 @@ pub fn seconds_to_timeout(sec: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SLEEP_TIMERS` is global, and the harness runs tests in parallel, so
+    /// every test that inspects the wheel must hold this first.
+    static SLEEP_TIMER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// `expire_timers()` in `vendor/linux/kernel/time/timer.c` drops
+    /// `base->lock` around `call_timer_fn()`. Lupos must likewise detach
+    /// expired sleepers and release `SLEEP_TIMERS` *before* waking them, since
+    /// `wake_task_normal()` can spin on another CPU's `on_cpu`.
+    #[test]
+    fn expired_sleepers_are_detached_with_the_lock_released() {
+        let _guard = SLEEP_TIMER_TEST_LOCK.lock();
+        SLEEP_TIMERS.lock().clear();
+        sleep_timer_add(0x1000, 10);
+        sleep_timer_add(0x2000, 20);
+        sleep_timer_add(0x3000, 30);
+
+        let mut batch = [0usize; EXPIRE_BATCH];
+        let n = take_expired_sleepers(25, &mut batch);
+
+        // Both due sleepers come back to the caller, which wakes them outside
+        // the lock; the not-yet-due one stays armed.
+        assert_eq!(n, 2);
+        let mut taken = batch[..n].to_vec();
+        taken.sort_unstable();
+        assert_eq!(taken, alloc::vec![0x1000, 0x2000]);
+
+        // The decisive assertion: nothing holds SLEEP_TIMERS once the expired
+        // set has been detached, so the wake below cannot deadlock against
+        // sleep_timer_add()/sleep_timer_remove() on another CPU.
+        assert!(
+            SLEEP_TIMERS.try_lock().is_some(),
+            "SLEEP_TIMERS must be unlocked while expired sleepers are woken"
+        );
+        assert_eq!(SLEEP_TIMERS.lock().len(), 1);
+        SLEEP_TIMERS.lock().clear();
+    }
+
+    /// A nested sleep by the same task must not disarm the outer one.
+    ///
+    /// Linux gets this for free: `schedule_timeout()` arms a `timer_list` that
+    /// lives on the caller's stack, so each nesting level owns a distinct
+    /// timer. The previous Lupos wheel kept at most one entry per task keyed by
+    /// task pointer, so the inner `arm_wakeup()` overwrote the outer deadline
+    /// and the inner `cancel_wakeup()` deleted the outer timer outright —
+    /// leaving the outer sleeper with no timeout at all. This test fails
+    /// against that design and passes with per-timer handles.
+    #[test]
+    fn nested_wakeup_cancel_leaves_the_outer_timer_armed() {
+        let _guard = SLEEP_TIMER_TEST_LOCK.lock();
+        SLEEP_TIMERS.lock().clear();
+        let task = 0xdead_beef_usize;
+
+        let outer = arm_wakeup(task, 500);
+        let inner = arm_wakeup(task, 10);
+        assert_ne!(outer, inner, "each arm must get its own handle");
+
+        // The nested sleep finishes and cancels only its own timer.
+        cancel_wakeup(inner);
+
+        let timers = SLEEP_TIMERS.lock();
+        assert_eq!(
+            timers.len(),
+            1,
+            "outer timer must survive the nested cancel"
+        );
+        assert_eq!(
+            timers[0].expire, 500,
+            "outer deadline must not be overwritten"
+        );
+        drop(timers);
+        SLEEP_TIMERS.lock().clear();
+    }
+
+    #[test]
+    fn wakeup_handle_allocation_skips_none_after_wrap() {
+        let _guard = SLEEP_TIMER_TEST_LOCK.lock();
+        SLEEP_TIMERS.lock().clear();
+        let saved_next_id = NEXT_SLEEP_TIMER_ID.load(Ordering::Relaxed);
+        NEXT_SLEEP_TIMER_ID.store(u64::MAX - 1, Ordering::Relaxed);
+
+        let first = arm_wakeup(0x1000, 10);
+        let second = arm_wakeup(0x2000, 20);
+        let third = arm_wakeup(0x3000, 30);
+
+        assert_eq!(first, SleepTimerId(u64::MAX - 1));
+        assert_eq!(second, SleepTimerId(u64::MAX));
+        assert_eq!(third, SleepTimerId(1));
+        assert_ne!(third, SleepTimerId::NONE);
+
+        cancel_wakeup(first);
+        cancel_wakeup(second);
+        cancel_wakeup(third);
+        SLEEP_TIMERS.lock().clear();
+        NEXT_SLEEP_TIMER_ID.store(saved_next_id, Ordering::Relaxed);
+    }
 
     #[test]
     fn finite_timeout_expires_to_zero() {

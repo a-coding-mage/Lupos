@@ -97,7 +97,6 @@ struct MmapLockWaiter {
     waiter_type: MmapLockWaiterType,
     granted: AtomicBool,
     wake_started: AtomicBool,
-    wake_complete: AtomicBool,
     #[cfg(test)]
     host_wait: std::sync::Mutex<bool>,
     #[cfg(test)]
@@ -117,7 +116,6 @@ impl MmapLockWaiter {
             waiter_type,
             granted: AtomicBool::new(false),
             wake_started: AtomicBool::new(false),
-            wake_complete: AtomicBool::new(false),
             #[cfg(test)]
             host_wait: std::sync::Mutex::new(false),
             #[cfg(test)]
@@ -166,28 +164,24 @@ impl MmapLock {
 
         #[cfg(not(test))]
         {
-            if !unsafe { (*waiter).wake_started.load(Ordering::Acquire) } {
-                crate::kernel::locking::preempt_enable_no_resched();
-                unsafe {
-                    crate::kernel::sched::schedule_with_irqs_enabled();
-                }
-                crate::kernel::locking::preempt_disable();
+            // Linux `rwsem_down_read_slowpath()` / `rwsem_down_write_slowpath()`
+            // only call `schedule_preempt_disabled()` here and re-check the
+            // grant on the next loop iteration.
+            //
+            // A woken waiter must never wait on its waker. The waker reaches
+            // this task through `try_to_wake_up()`, which spins on
+            // `smp_cond_load_acquire(&p->on_cpu, !VAL)` until the task has left
+            // its CPU. A reverse handshake here (waiter spinning until the
+            // waker signals completion) therefore deadlocks the two CPUs
+            // against each other: the waker cannot finish until this task is
+            // off-CPU, and this task cannot leave the CPU until the waker
+            // finishes. The waker instead completes every access to this
+            // waiter *before* publishing the grant; see `wake_waiters()`.
+            crate::kernel::locking::preempt_enable_no_resched();
+            unsafe {
+                crate::kernel::sched::schedule_with_irqs_enabled();
             }
-
-            // Linux pins a granted reader's task_struct with get_task_struct()
-            // until wake_up_q() has consumed it. Lupos has no task reference
-            // primitive yet, so the stack waiter supplies the equivalent
-            // lifetime handshake: it cannot unwind until the waker has
-            // completed its final task-pointer access.
-            if unsafe { (*waiter).wake_started.load(Ordering::Acquire) } {
-                while !unsafe { (*waiter).wake_complete.load(Ordering::Acquire) } {
-                    core::hint::spin_loop();
-                }
-                unsafe {
-                    (*waiter).wake_complete.store(false, Ordering::Relaxed);
-                    (*waiter).wake_started.store(false, Ordering::Release);
-                }
-            }
+            crate::kernel::locking::preempt_disable();
         }
 
         #[cfg(test)]
@@ -366,14 +360,13 @@ impl MmapLock {
             }
         }
 
-        let mut waiter = wake_head;
-        while !waiter.is_null() {
-            unsafe {
-                (*waiter).granted.store(true, Ordering::Release);
-                (*waiter).wake_started.store(true, Ordering::Release);
-                waiter = (*waiter).wake_next;
-            }
-        }
+        // The grant itself is published by `wake_waiters()`, which is the last
+        // access it makes to each waiter. Linux does the same in
+        // `rwsem_mark_wake()`: the reader count above is settled first, then
+        // `smp_store_release(&waiter->task, NULL)` releases the waiter. Publishing
+        // the grant here instead would let a waiter observe it, return, and unwind
+        // its stack-allocated `MmapLockWaiter` while this list is still being
+        // walked through `wake_next`.
         wake_head
     }
 
@@ -381,17 +374,30 @@ impl MmapLock {
     /// before the wake because the remote task may resume immediately.
     unsafe fn wake_waiters(&self, mut waiter: *mut MmapLockWaiter) {
         while !waiter.is_null() {
+            // Every field of `waiter` is read before its grant is published,
+            // mirroring Linux `rwsem_mark_wake()`:
+            //
+            //     tsk = waiter->task;
+            //     get_task_struct(tsk);
+            //     smp_store_release(&waiter->task, NULL);
+            //     wake_q_add_safe(wake_q, tsk);
+            //
+            // Once the grant is visible the waiter may return and unwind the
+            // stack frame holding this `MmapLockWaiter`, so nothing below may
+            // touch `waiter` again — only the locals captured here.
             let next = unsafe { (*waiter).wake_next };
             #[cfg(not(test))]
             unsafe {
-                crate::kernel::sched::wake_task_normal((*waiter).task);
-                (*waiter).wake_complete.store(true, Ordering::Release);
+                let task = (*waiter).task;
+                (*waiter).granted.store(true, Ordering::Release);
+                crate::kernel::sched::wake_task_normal(task);
             }
             #[cfg(test)]
             {
                 let mut notified = unsafe { (*waiter).host_wait.lock().unwrap() };
                 *notified = true;
                 unsafe {
+                    (*waiter).granted.store(true, Ordering::Release);
                     (*waiter).host_wake.notify_one();
                 }
             }
@@ -465,14 +471,21 @@ impl MmapLock {
         }
 
         loop {
-            unsafe {
-                self.sleep_waiter(waiter_ptr);
-            }
+            // Linux tests the grant before sleeping —
+            // `if (!smp_load_acquire(&waiter.task)) break;` — so a grant that
+            // landed between the enqueue above and this point is never slept
+            // through. The sleeping state was already armed by
+            // `set_waiter_sleeping()` before `wait_lock` was dropped, and is
+            // re-armed after every `schedule()` below, matching Linux's
+            // `set_current_state(state)` at the tail of the loop.
             if waiter.granted.load(Ordering::Acquire) {
                 unsafe {
                     Self::set_waiter_running(waiter_ptr);
                 }
                 return;
+            }
+            unsafe {
+                self.sleep_waiter(waiter_ptr);
             }
             unsafe {
                 Self::set_waiter_sleeping(waiter_ptr);
@@ -582,6 +595,26 @@ impl MmapLock {
                 }
             }
 
+            // `mark_wake_locked()` uses `wake_started` as a once-guard so a
+            // waiting writer is queued for wake at most once per sleep. The
+            // removed waiter handshake used to clear it on wake; clear it here
+            // instead, still under `wait_lock`, so the next release can queue
+            // this writer again. Without this the guard would latch set and the
+            // writer would never be woken a second time.
+            //
+            // If a release already queued this writer for wake, retry the
+            // acquisition straight away rather than paying a full sleep/wake
+            // round trip for a grant that has already been handed out. This
+            // only *skips* a sleep; unlike the removed handshake it never waits
+            // on the waker, so it cannot deadlock against `try_to_wake_up()`'s
+            // `on_cpu` spin. `mark_wake_locked()` sets the guard only when the
+            // lock word is free, so the retry is bounded.
+            let already_queued_for_wake =
+                unsafe { (*waiter_ptr).wake_started.swap(false, Ordering::AcqRel) };
+            if already_queued_for_wake {
+                self.unlock_waiters_irqrestore(flags);
+                continue;
+            }
             unsafe {
                 Self::set_waiter_sleeping(waiter_ptr);
             }
@@ -1322,6 +1355,62 @@ mod tests {
         );
     }
 
+    /// The grant must be published by the wake pass, never by the mark pass.
+    ///
+    /// Linux `rwsem_mark_wake()` settles the reader count under `wait_lock` and
+    /// only then releases each waiter, with
+    /// `smp_store_release(&waiter->task, NULL)` as its *final* access to that
+    /// waiter, before queueing the wakeup from a local `tsk`.
+    ///
+    /// Lupos previously published the grant while `mark_wake_locked()` was
+    /// still holding the intrusive wake list, and compensated with a reverse
+    /// handshake in which a woken waiter spun until its waker signalled
+    /// completion. That handshake deadlocked on SMP: the waker reaches the
+    /// waiter through `try_to_wake_up()`, which spins on
+    /// `smp_cond_load_acquire(&p->on_cpu, !VAL)`, so the waker could not finish
+    /// until the waiter left its CPU while the waiter could not leave its CPU
+    /// until the waker finished.
+    ///
+    /// Pinning the ordering here keeps that handshake from being reintroduced:
+    /// a waiter that observes its grant owns the lock and may unwind
+    /// immediately, so the walker must have finished with it already.
+    ///
+    /// test-origin: linux:vendor/linux/kernel/locking/rwsem.c
+    #[test]
+    fn mmap_lock_grant_is_published_by_wake_pass_not_mark_pass() {
+        use std::boxed::Box;
+
+        let lock = MmapLock::new();
+        let mut reader = Box::new(MmapLockWaiter::new(MmapLockWaiterType::Read));
+
+        let flags = lock.lock_waiters_irqsave();
+        unsafe {
+            lock.add_waiter(&mut *reader);
+        }
+        lock.count.store(MMAP_LOCK_FLAG_WAITERS, Ordering::Relaxed);
+        let wake_head = unsafe { lock.mark_wake_locked(MmapLockWakeType::Readers) };
+        lock.unlock_waiters_irqrestore(flags);
+
+        assert_eq!(
+            wake_head, &mut *reader as *mut MmapLockWaiter,
+            "reader phase did not select the queued reader"
+        );
+        assert!(
+            !reader.granted.load(Ordering::Acquire),
+            "mark pass published the grant while still walking the wake list; \
+             a waiter could observe it and unwind its stack waiter early"
+        );
+
+        unsafe {
+            lock.wake_waiters(wake_head);
+        }
+
+        assert!(
+            reader.granted.load(Ordering::Acquire),
+            "wake pass did not publish the grant"
+        );
+    }
+
     /// Linux's phase-fair wake pass admits readers irrespective of their
     /// position behind queued writers, while retaining writer order, and
     /// limits each pass to `MAX_READERS_WAKEUP`.
@@ -1356,6 +1445,14 @@ mod tests {
         let remaining_second = unsafe { (*remaining_first).next };
         let remaining_third = unsafe { (*remaining_second).next };
         lock.unlock_waiters_irqrestore(flags);
+
+        // The grant is published by the wake pass, not by `mark_wake_locked()`,
+        // so that every waiter field is read before the waiter is released.
+        // Mirrors Linux `rwsem_mark_wake()` settling the count under
+        // `wait_lock` and releasing each waiter as its last access to it.
+        unsafe {
+            lock.wake_waiters(wake_head);
+        }
 
         let granted_readers = readers
             .iter()

@@ -22,6 +22,22 @@ pub const TRACE_UDEV: u32 = 1 << 8;
 /// `gdk-pixbuf-*` tool syscalls (failures and readlink*), unlike the very
 /// verbose `glycin` flag which also floods the desktop-session comms.
 pub const TRACE_PIXBUF: u32 = 1 << 9;
+/// Fully-idle stall detector (`kernel/idle_stall.rs`).  Deliberately excluded
+/// from `TRACE_ALL`: it must be selected on its own, because every other flag
+/// writes to the serial console continuously and that traffic keeps the CPUs
+/// awake, which is exactly the condition the detector needs to be absent.
+pub const TRACE_STALL: u32 = 1 << 10;
+/// Audit CFS intrusive-tree membership at every scheduler mutation.  This is
+/// intentionally opt-in: the audit walks the tree and is not part of the
+/// normal scheduler fast path.
+pub const TRACE_SCHED: u32 = 1 << 11;
+/// Trace seccomp decisions and control-plane installation for sandboxed
+/// processes. This is opt-in because it runs at the syscall boundary.
+pub const TRACE_SECCOMP: u32 = 1 << 12;
+/// Trace only Firefox's process-creation, exec, socket, affinity, and
+/// sandbox-control syscalls. This is deliberately separate from the broad
+/// process trace, whose serial volume changes desktop timing.
+pub const TRACE_FIREFOX: u32 = 1 << 13;
 pub const TRACE_ALL: u32 = TRACE_SYSCALL
     | TRACE_FS
     | TRACE_NETLINK
@@ -66,14 +82,23 @@ fn parse_trace_value(value: &str, mut flags: u32) -> u32 {
             "glycin" | "image-loader" => flags |= TRACE_GLYCIN,
             "pixbuf" => flags |= TRACE_PIXBUF,
             "udev" => flags |= TRACE_UDEV,
+            "stall" => flags |= TRACE_STALL,
+            "sched" | "scheduler" => flags |= TRACE_SCHED,
+            "seccomp" | "sandbox" => flags |= TRACE_SECCOMP,
+            "firefox" => flags |= TRACE_FIREFOX,
             _ => {}
         }
     }
     flags
 }
 
+/// Every flag `set_flags()` will accept.  `TRACE_ALL` is what `lupos.trace=all`
+/// selects, which is not the same set: `TRACE_STALL` and `TRACE_SCHED` are
+/// valid but opt-in only.
+pub const TRACE_KNOWN: u32 = TRACE_ALL | TRACE_STALL | TRACE_SCHED | TRACE_SECCOMP | TRACE_FIREFOX;
+
 pub fn set_flags(flags: u32) {
-    let flags = flags & TRACE_ALL;
+    let flags = flags & TRACE_KNOWN;
     TRACE_FLAGS.store(flags, Ordering::Release);
     if flags & TRACE_PING == 0 {
         PING_TRACE_PID.store(-1, Ordering::Release);
@@ -110,6 +135,22 @@ pub fn pixbuf_enabled() -> bool {
 
 pub fn udev_enabled() -> bool {
     flags() & TRACE_UDEV != 0
+}
+
+pub fn stall_enabled() -> bool {
+    flags() & TRACE_STALL != 0
+}
+
+pub fn sched_enabled() -> bool {
+    flags() & TRACE_SCHED != 0
+}
+
+pub fn seccomp_enabled() -> bool {
+    flags() & TRACE_SECCOMP != 0
+}
+
+pub fn firefox_enabled() -> bool {
+    flags() & TRACE_FIREFOX != 0
 }
 
 pub fn remember_ping_pid_for_exec(pid: i32, path: &str, exec_path: &str) -> bool {
@@ -166,7 +207,7 @@ mod tests {
     fn parses_lupos_trace_cmdline_as_comma_list() {
         let _guard = reset_trace_state();
         let flags = parse_cmdline(
-            "quiet lupos.trace=syscall,fs,cgroup,ping,systemctl,proc,glycin,pixbuf,udev root=/dev/vda1",
+            "quiet lupos.trace=syscall,fs,cgroup,ping,systemctl,proc,glycin,pixbuf,udev,sched,seccomp,firefox root=/dev/vda1",
         );
 
         assert_ne!(flags & TRACE_SYSCALL, 0);
@@ -179,6 +220,9 @@ mod tests {
         assert_ne!(flags & TRACE_GLYCIN, 0);
         assert_ne!(flags & TRACE_PIXBUF, 0);
         assert_ne!(flags & TRACE_UDEV, 0);
+        assert_ne!(flags & TRACE_SCHED, 0);
+        assert_ne!(flags & TRACE_SECCOMP, 0);
+        assert_ne!(flags & TRACE_FIREFOX, 0);
     }
 
     #[test]
@@ -197,6 +241,28 @@ mod tests {
         assert_eq!(flags() & (1 << 31), 0);
 
         set_flags(0);
+    }
+
+    #[test]
+    fn scheduler_trace_is_opt_in_and_not_selected_by_all() {
+        let _guard = reset_trace_state();
+        assert_eq!(parse_cmdline("lupos.trace=all"), TRACE_ALL);
+        assert_eq!(parse_cmdline("lupos.trace=sched"), TRACE_SCHED);
+        set_flags(TRACE_SCHED);
+        assert!(sched_enabled());
+        set_flags(0);
+        assert!(!sched_enabled());
+    }
+
+    #[test]
+    fn seccomp_trace_is_opt_in_and_not_selected_by_all() {
+        let _guard = reset_trace_state();
+        assert_eq!(parse_cmdline("lupos.trace=all"), TRACE_ALL);
+        assert_eq!(parse_cmdline("lupos.trace=seccomp"), TRACE_SECCOMP);
+        set_flags(TRACE_SECCOMP);
+        assert!(seccomp_enabled());
+        set_flags(0);
+        assert!(!seccomp_enabled());
     }
 
     #[test]

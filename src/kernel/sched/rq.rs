@@ -93,6 +93,7 @@ unsafe impl Send for CfsTimeline {}
 const TASK_RUN_NODE_OFFSET: usize = offset_of!(TaskStruct, m29)
     + offset_of!(M29SchedFields, se)
     + offset_of!(SchedEntity, run_node);
+const CFS_AUDIT_MAX_NODES: usize = 4096;
 
 #[inline]
 unsafe fn task_from_run_node(node: *mut LinuxRbNode) -> *mut TaskStruct {
@@ -128,6 +129,136 @@ impl CfsTimeline {
         self.len == 0
     }
 
+    #[inline]
+    fn is_canonical_pointer(pointer: *const u8) -> bool {
+        let address = pointer as usize;
+        let top = address >> 48;
+        top == 0 || top == 0xffff
+    }
+
+    /// Validate the intrusive tree only when the explicit scheduler trace is
+    /// enabled.  The first bad link is much more useful than a later page
+    /// fault in `rb_erase_color`, so this deliberately checks both sides of
+    /// every parent/child relation and the cached in-order frontier.
+    fn audit(&self, operation: &'static str, task: *mut TaskStruct) {
+        if !crate::kernel::debug_trace::sched_enabled() {
+            return;
+        }
+
+        let reason = if self.len > CFS_AUDIT_MAX_NODES {
+            Some("length-exceeds-audit-bound")
+        } else if self.len == 0 {
+            if !self.root.rb_node.is_null() {
+                Some("empty-length-with-root")
+            } else if !self.leftmost.is_null() {
+                Some("empty-length-with-leftmost")
+            } else {
+                None
+            }
+        } else if self.root.rb_node.is_null() {
+            Some("nonempty-length-without-root")
+        } else if self.leftmost.is_null() {
+            Some("nonempty-length-without-leftmost")
+        } else if !Self::is_canonical_pointer(self.root.rb_node.cast()) {
+            Some("noncanonical-root")
+        } else if !Self::is_canonical_pointer(self.leftmost.cast()) {
+            Some("noncanonical-leftmost")
+        } else {
+            let root = self.root.rb_node;
+            let root_parent = unsafe { (*root).__rb_parent_color & !3usize } as *mut LinuxRbNode;
+            if !root_parent.is_null() {
+                Some("root-has-parent")
+            } else if unsafe { (*root).__rb_parent_color & 1 } == 0 {
+                Some("root-is-red")
+            } else if unsafe { !(*self.leftmost).rb_left.is_null() } {
+                Some("leftmost-has-left-child")
+            } else {
+                let mut node = self.leftmost;
+                let mut previous_key = None;
+                let mut count = 0usize;
+                let mut failure = None;
+                while !node.is_null() {
+                    if count >= self.len {
+                        failure = Some("successor-chain-exceeds-length");
+                        break;
+                    }
+                    if !Self::is_canonical_pointer(node.cast()) {
+                        failure = Some("noncanonical-node");
+                        break;
+                    }
+
+                    let parent_color = unsafe { (*node).__rb_parent_color };
+                    if parent_color == node as usize {
+                        failure = Some("linked-node-marked-empty");
+                        break;
+                    }
+                    let parent = (parent_color & !3usize) as *mut LinuxRbNode;
+                    if !parent.is_null()
+                        && (!Self::is_canonical_pointer(parent.cast())
+                            || unsafe { (*parent).rb_left != node && (*parent).rb_right != node })
+                    {
+                        failure = Some("parent-does-not-reference-child");
+                        break;
+                    }
+
+                    let left = unsafe { (*node).rb_left };
+                    let right = unsafe { (*node).rb_right };
+                    for child in [left, right] {
+                        if child.is_null() {
+                            continue;
+                        }
+                        if !Self::is_canonical_pointer(child.cast()) {
+                            failure = Some("noncanonical-child");
+                            break;
+                        }
+                        let child_parent =
+                            unsafe { (*child).__rb_parent_color & !3usize } as *mut LinuxRbNode;
+                        if child_parent != node {
+                            failure = Some("child-parent-mismatch");
+                            break;
+                        }
+                    }
+                    if failure.is_some() {
+                        break;
+                    }
+
+                    let task_at_node = unsafe { task_from_run_node(node) };
+                    if !Self::is_canonical_pointer(task_at_node.cast()) {
+                        failure = Some("noncanonical-task-from-node");
+                        break;
+                    }
+                    let key = unsafe { timeline_key(task_at_node) };
+                    if previous_key.is_some_and(|previous| previous >= key) {
+                        failure = Some("inorder-key-regression");
+                        break;
+                    }
+                    previous_key = Some(key);
+                    count += 1;
+                    let next = unsafe { linux_rb_next(node) };
+                    if next == node {
+                        failure = Some("successor-self-loop");
+                        break;
+                    }
+                    node = next;
+                }
+                failure.or_else(|| (count != self.len).then_some("length-does-not-match-tree"))
+            }
+        };
+
+        if let Some(reason) = reason {
+            crate::linux_driver_abi::tty::serial_println!(
+                "sched-cfs-invariant: operation={} reason={} len={} root={:#x} leftmost={:#x} task={:#x}",
+                operation,
+                reason,
+                self.len,
+                self.root.rb_node as usize,
+                self.leftmost as usize,
+                task as usize,
+            );
+            panic!("CFS timeline invariant violated");
+        }
+    }
+
     pub fn contains_key(&self, key: &(u64, usize)) -> bool {
         let mut node = self.root.rb_node;
         while !node.is_null() {
@@ -144,10 +275,67 @@ impl CfsTimeline {
         false
     }
 
+    fn find_node_for_task(&self, task: *mut TaskStruct) -> *mut LinuxRbNode {
+        if task.is_null() {
+            return ptr::null_mut();
+        }
+        let target = unsafe { run_node(task) };
+        let mut node = self.leftmost;
+        let mut visited = 0;
+        while !node.is_null() && visited < self.len {
+            if node == target {
+                return node;
+            }
+            node = unsafe { linux_rb_next(node) };
+            visited += 1;
+        }
+        ptr::null_mut()
+    }
+
+    pub fn contains_task(&self, task: *mut TaskStruct) -> bool {
+        self.audit("contains", task);
+        !self.find_node_for_task(task).is_null()
+    }
+
+    fn erase_node(&mut self, node: *mut LinuxRbNode) {
+        debug_assert!(!node.is_null());
+        if self.leftmost == node {
+            self.leftmost = unsafe { linux_rb_next(node) };
+        }
+        unsafe {
+            linux_rb_erase(node, ptr::addr_of_mut!(self.root));
+            // Linux RB_CLEAR_NODE(): mark the intrusive node as unlinked.
+            (*node).__rb_parent_color = node as usize;
+            (*node).rb_left = ptr::null_mut();
+            (*node).rb_right = ptr::null_mut();
+        }
+        self.len = self.len.saturating_sub(1);
+        if self.len == 0 {
+            self.leftmost = ptr::null_mut();
+        }
+    }
+
     pub fn insert(&mut self, task: *mut TaskStruct, vruntime: u64) {
         debug_assert!(!task.is_null());
+        self.audit("insert-before", task);
         let key = (vruntime, task as usize);
         let node = unsafe { run_node(task) };
+        if crate::kernel::debug_trace::sched_enabled()
+            && unsafe {
+                (*node).__rb_parent_color != 0 && (*node).__rb_parent_color != node as usize
+            }
+            && self.find_node_for_task(task).is_null()
+        {
+            crate::linux_driver_abi::tty::serial_println!(
+                "sched-cfs-invariant: operation=insert reason=node-already-linked len={} root={:#x} leftmost={:#x} task={:#x} node={:#x}",
+                self.len,
+                self.root.rb_node as usize,
+                self.leftmost as usize,
+                task as usize,
+                node as usize,
+            );
+            panic!("CFS entity inserted while its rb node is linked");
+        }
         let mut parent = ptr::null_mut();
         let mut link = ptr::addr_of_mut!(self.root.rb_node);
 
@@ -160,6 +348,7 @@ impl CfsTimeline {
             } else if key > existing_key {
                 link = unsafe { ptr::addr_of_mut!((*parent).rb_right) };
             } else {
+                self.audit("insert-duplicate", task);
                 return;
             }
         }
@@ -177,44 +366,27 @@ impl CfsTimeline {
             self.leftmost = node;
         }
         self.len += 1;
+        self.audit("insert-after", task);
     }
 
     pub fn remove(&mut self, task: *mut TaskStruct, vruntime: u64) -> bool {
         if task.is_null() {
             return false;
         }
-        let key = (vruntime, task as usize);
-        let mut node = self.root.rb_node;
-        while !node.is_null() {
-            let existing_task = unsafe { task_from_run_node(node) };
-            let existing_key = unsafe { timeline_key(existing_task) };
-            if key < existing_key {
-                node = unsafe { (*node).rb_left };
-            } else if key > existing_key {
-                node = unsafe { (*node).rb_right };
-            } else {
-                break;
-            }
-        }
+        self.audit("remove-before", task);
+        let _ = vruntime;
+        let node = self.find_node_for_task(task);
         if node.is_null() {
             return false;
         }
 
-        if self.leftmost == node {
-            self.leftmost = unsafe { linux_rb_next(node) };
-        }
-        unsafe {
-            linux_rb_erase(node, ptr::addr_of_mut!(self.root));
-            // Linux RB_CLEAR_NODE(): mark the intrusive node as unlinked.
-            (*node).__rb_parent_color = node as usize;
-            (*node).rb_left = ptr::null_mut();
-            (*node).rb_right = ptr::null_mut();
-        }
-        self.len -= 1;
+        self.erase_node(node);
+        self.audit("remove-after", task);
         true
     }
 
     pub fn first(&self) -> *mut TaskStruct {
+        self.audit("first", ptr::null_mut());
         if self.leftmost.is_null() {
             ptr::null_mut()
         } else {
@@ -235,6 +407,7 @@ impl CfsTimeline {
     }
 
     pub fn iter(&self) -> CfsTimelineIter {
+        self.audit("iter", ptr::null_mut());
         CfsTimelineIter {
             node: self.leftmost,
         }
@@ -299,8 +472,9 @@ impl CfsRq {
         if old_key == new_key {
             return;
         }
-        self.tasks_timeline.remove(p, old_key);
-        self.tasks_timeline.insert(p, new_key);
+        if self.tasks_timeline.remove(p, old_key) {
+            self.tasks_timeline.insert(p, new_key);
+        }
     }
 
     /// Return the leftmost (smallest-vruntime) entity, or NULL when empty.
@@ -313,9 +487,13 @@ impl CfsRq {
         self.tasks_timeline.insert(p, key);
     }
 
+    pub fn contains_task(&self, p: *mut TaskStruct) -> bool {
+        self.tasks_timeline.contains_task(p)
+    }
+
     /// Remove `p` from the timeline at vruntime `key`.
-    pub fn remove(&mut self, p: *mut TaskStruct, key: u64) {
-        self.tasks_timeline.remove(p, key);
+    pub fn remove(&mut self, p: *mut TaskStruct, key: u64) -> bool {
+        self.tasks_timeline.remove(p, key)
     }
 
     /// Update `min_vruntime` to the smaller of (current value, leftmost).
@@ -798,6 +976,36 @@ mod tests {
         }
         assert!(timeline.is_empty());
         assert!(timeline.first().is_null());
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:__dequeue_entity
+    #[test]
+    fn cfs_timeline_remove_uses_intrusive_node_after_vruntime_changes() {
+        let mut timeline = CfsTimeline::new();
+        let mut a = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut b = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut c = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let pa = &mut *a as *mut TaskStruct;
+        let pb = &mut *b as *mut TaskStruct;
+        let pc = &mut *c as *mut TaskStruct;
+
+        a.m29.se.vruntime = 10;
+        b.m29.se.vruntime = 20;
+        c.m29.se.vruntime = 30;
+        timeline.insert(pa, a.m29.se.vruntime);
+        timeline.insert(pb, b.m29.se.vruntime);
+        timeline.insert(pc, c.m29.se.vruntime);
+
+        a.m29.se.vruntime = 40;
+
+        assert!(
+            timeline.remove(pa, a.m29.se.vruntime),
+            "Linux erases CFS entities by embedded run_node, not by a mutable vruntime lookup"
+        );
+        let remaining = timeline.iter().collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0], pb);
+        assert_eq!(remaining[1], pc);
     }
 
     #[test]

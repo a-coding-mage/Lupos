@@ -73,6 +73,7 @@ pub fn populate_root(root: &Arc<KernfsNode>) {
             "kpageflags",
             super::page::pagetypeinfo_show as super::util::ProcShow,
         ),
+        ("lupos_hda", super::lupos_hda::show as super::util::ProcShow),
         (
             "lupos_boot_trace",
             lupos_boot_trace_show as super::util::ProcShow,

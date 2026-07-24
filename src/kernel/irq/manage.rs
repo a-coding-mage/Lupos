@@ -228,7 +228,7 @@ pub unsafe extern "C" fn linux_request_threaded_irq(
     handler: Option<IrqHandler>,
     thread_fn: Option<ThreadedHandler>,
     irqflags: usize,
-    _devname: *const c_char,
+    devname: *const c_char,
     dev_id: *mut c_void,
 ) -> i32 {
     if handler.is_none() && thread_fn.is_none() {
@@ -263,11 +263,23 @@ pub unsafe extern "C" fn linux_request_threaded_irq(
         );
         return -EBUSY;
     }
+    // Linux keeps the caller's `const char *devname` in `action->name` and
+    // prints it in /proc/interrupts, which is what makes a shared line
+    // diagnosable (`snd_hda_intel` vs `virtio-blk` rather than three identical
+    // rows). The string lives in the module's rodata for at least as long as
+    // the action is registered, matching Linux's own borrow of it.
+    let name: &'static str = if devname.is_null() {
+        "module-irq"
+    } else {
+        let devname: &'static core::ffi::CStr = unsafe { core::ffi::CStr::from_ptr(devname) };
+        devname.to_str().unwrap_or("module-irq")
+    };
+
     let action = alloc::boxed::Box::new(IrqAction {
         handler: handler.unwrap_or(irq_default_primary_handler),
         thread_fn,
         dev_id,
-        name: "module-irq",
+        name,
         flags: irqflags as u32,
         next: slot.take(),
     });

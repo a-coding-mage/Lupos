@@ -367,6 +367,24 @@ pub fn _log(msg_level: Level, module: &str, args: fmt::Arguments<'_>) {
         ring.push(msg_level, module, message, ts_us);
     }
 
+    // Keep the Linux-shaped printk ring in step with the kernel log stream.
+    // `syslog(SYSLOG_ACTION_READ_ALL)` and `/dev/kmsg` must observe the same
+    // records that reached the console; otherwise userspace `dmesg(8)` sees
+    // an empty buffer even though the serial console is full of printk output.
+    let printk_level = match msg_level {
+        Level::Error => crate::kernel::printk::KERN_ERR,
+        Level::Warn => crate::kernel::printk::KERN_WARNING,
+        Level::Info => crate::kernel::printk::KERN_INFO,
+        Level::Debug | Level::Trace => crate::kernel::printk::KERN_DEBUG,
+    };
+    crate::kernel::printk::ringbuffer::push_from_log(
+        ts_us.saturating_mul(1_000),
+        crate::kernel::printk::LOG_KERN,
+        printk_level,
+        0x8000_0000,
+        message,
+    );
+
     let mut record = LogRecord::empty();
     record.level = msg_level;
     record.jiffies = ts_us;

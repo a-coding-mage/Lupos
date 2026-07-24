@@ -27,6 +27,7 @@ pub mod interrupts;
 pub mod kcore;
 pub mod kmsg;
 pub mod loadavg;
+pub mod lupos_hda;
 pub mod meminfo;
 pub mod namespaces;
 pub mod nommu;

@@ -111,7 +111,7 @@ unsafe fn copy_waitid_siginfo_to_user(
 /// Normal `exit(N)` produces `((N & 0xff) << 8)`.
 #[inline]
 pub const fn w_exitcode(retval: i32, termsig: i32) -> i32 {
-    ((retval & 0xff) << 8) | (termsig & 0x7f)
+    ((retval & 0xff) << 8) | (termsig & 0xff)
 }
 
 #[inline]
@@ -1240,6 +1240,19 @@ mod tests {
         assert_eq!(s, 9);
         assert_eq!(w_termsig(s), 9);
         assert!(!w_ifexited(s));
+    }
+
+    #[test]
+    fn w_exitcode_preserves_linux_coredump_flag() {
+        // Linux wait_task_zombie() tests bit 7 of the packed status to choose
+        // CLD_DUMPED, so W_EXITCODE(0, SIGSEGV | WCOREFLAG) must keep 0x80.
+        let s = w_exitcode(0, crate::kernel::signal::SIGSEGV | WCOREFLAG);
+        assert_eq!(s, WCOREFLAG | crate::kernel::signal::SIGSEGV);
+        assert_eq!(w_termsig(s), crate::kernel::signal::SIGSEGV);
+        assert_eq!(
+            waitid_code_status(s),
+            (CLD_DUMPED, crate::kernel::signal::SIGSEGV)
+        );
     }
 
     #[test]

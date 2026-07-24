@@ -848,6 +848,11 @@ unsafe fn task_can_switch_to(task: *mut TaskStruct) -> bool {
     unsafe { task_runnable(task) && task_has_switch_frame(task) }
 }
 
+#[inline]
+pub(super) unsafe fn task_can_switch_to_on_rq(rq: &rq::Rq, task: *mut TaskStruct) -> bool {
+    unsafe { task_can_switch_to(task) && (task == rq.current || !task_on_cpu(task)) }
+}
+
 /// Initialise scheduler-owned fields for a newly forked task.
 ///
 /// This is the Lupos equivalent of Linux `sched_fork()`: inherit scheduling

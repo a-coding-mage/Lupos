@@ -2034,11 +2034,15 @@ fn block_facade_acquire() -> Result<BlockFacadeGuard, i32> {
             continue;
         }
         let wake_at = crate::kernel::time::jiffies::jiffies().saturating_add(1);
-        crate::kernel::time::sleep_timeout::arm_wakeup(cur_id, wake_at);
+        // Cancel this timer by its own handle. This wait can run nested inside
+        // another sleep of the same task (the driver pump and workqueue drain
+        // both execute in the caller's context), and cancelling by task would
+        // disarm that outer timer.
+        let armed = crate::kernel::time::sleep_timeout::arm_wakeup(cur_id, wake_at);
         unsafe {
             crate::kernel::sched::schedule_with_irqs_enabled();
         }
-        crate::kernel::time::sleep_timeout::cancel_wakeup(cur_id);
+        crate::kernel::time::sleep_timeout::cancel_wakeup(armed);
         unsafe {
             (*current).__state.store(
                 crate::kernel::task::task_state::TASK_RUNNING,

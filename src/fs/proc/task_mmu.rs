@@ -19,6 +19,7 @@ use crate::kernel::capability::{CAP_SYS_ADMIN, CAP_SYS_PTRACE, capable};
 use crate::kernel::cred::{Cred, INIT_CRED};
 use crate::kernel::task::TaskStruct;
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
+use crate::mm::mmap_lock::MmapReadGuard;
 use crate::mm::vm_flags::{
     VM_EXEC, VM_GROWSDOWN, VM_HUGEPAGE, VM_HUGETLB, VM_LOCKED, VM_LOCKONFAULT, VM_MAYEXEC,
     VM_MAYREAD, VM_MAYSHARE, VM_MAYWRITE, VM_READ, VM_SHARED, VM_WRITE,
@@ -97,6 +98,10 @@ pub fn statm_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32>
     let text = current_mm().map_or_else(
         || String::from("0 0 0 0 0 0 0\n"),
         |mm| {
+            // Linux's proc statm path reads the mm counters while the address
+            // space is stable.  `resident_pages()` walks the MapleTree, so it
+            // must hold the same mmap read lock as task_mmu.c's page walkers.
+            let _mmap_guard = unsafe { MmapReadGuard::lock(mm as *const _ as *mut _) };
             let resident = resident_pages(mm);
             alloc::format!(
                 "{} {} 0 0 0 {} 0\n",
@@ -318,6 +323,10 @@ fn pagemap_entry_for_pid(pid: i32, addr: u64, show_pfns: bool) -> u64 {
     let Some(mm) = mm_for_pid(pid) else {
         return 0;
     };
+    // Linux's pagemap walk is serialized by the target mm's mmap read lock;
+    // without it a concurrent mmap/munmap can invalidate the VMA pointer
+    // between `find_vma` and the page-table lookup.
+    let _mmap_guard = unsafe { MmapReadGuard::lock(mm as *const _ as *mut _) };
     let Some(vma) = crate::mm::vma::find_vma(mm, addr) else {
         return 0;
     };
@@ -571,10 +580,27 @@ fn parse_proc_pid_file(path: &str) -> Option<(i32, &str)> {
 }
 
 fn render_maps_for_pid(pid: i32, smaps: bool) -> Result<String, i32> {
-    let Some(mm) = mm_for_pid(pid) else {
+    let task = task_by_pid(pid);
+    if task.is_null() {
         return Err(ENOENT);
+    }
+    let mm = unsafe {
+        if !(*task).mm.is_null() {
+            (*task).mm
+        } else {
+            (*task).active_mm
+        }
     };
-    Ok(render_maps_for_mm(mm, smaps))
+    if mm.is_null() {
+        return Err(ENOENT);
+    }
+
+    // Linux procfs pins the target mm at open and holds mmap_read_lock() while
+    // the VMA iterator runs (`vendor/linux/fs/proc/task_mmu.c::m_start`). The
+    // lock is required here too: Firefox can add and remove VMAs while its
+    // `/proc/<pid>/maps` file is being read.
+    let _mmap_guard = unsafe { MmapReadGuard::lock(mm) };
+    Ok(render_maps_for_mm(unsafe { &*mm }, smaps))
 }
 
 fn render_maps_for_mm(mm: &MmStruct, smaps: bool) -> String {
