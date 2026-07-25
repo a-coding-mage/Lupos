@@ -864,6 +864,124 @@ mod tests {
         assert_eq!(seen, Vec::from([1, 2, 3, 4, 6]));
     }
 
+    /// test-origin: linux:vendor/linux/lib/rbtree_test.c
+    ///
+    /// Keep a deterministic stress test of the plain (non-augmented) tree
+    /// operations. The Linux test uses the same shape: randomized insertion
+    /// and deletion order plus red-black, parent-link, and ordering checks.
+    #[test]
+    fn linux_randomized_insert_erase_invariants() {
+        const NODE_COUNT: usize = 100;
+        const ITERATIONS: usize = 100;
+
+        fn next_random(state: &mut u64) -> u32 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*state >> 32) as u32
+        }
+
+        fn assert_invariants(root: &LinuxRbRoot, expected: usize) {
+            unsafe fn visit(
+                node: *const LinuxRbNode,
+                parent: *const LinuxRbNode,
+                depth: usize,
+                depth_limit: usize,
+            ) -> (usize, usize, Vec<i32>) {
+                if node.is_null() {
+                    return (0, 1, Vec::new());
+                }
+                assert!(depth <= depth_limit, "cycle or excessive tree depth");
+
+                let parent_color = (*node).__rb_parent_color;
+                assert_eq!(parent_color & !3, parent as usize, "parent link mismatch");
+
+                let left = (*node).rb_left;
+                let right = (*node).rb_right;
+                if parent_color & RB_BLACK == RB_RED {
+                    assert!(
+                        left.is_null() || (*left).__rb_parent_color & RB_BLACK == RB_BLACK,
+                        "red node has red left child"
+                    );
+                    assert!(
+                        right.is_null() || (*right).__rb_parent_color & RB_BLACK == RB_BLACK,
+                        "red node has red right child"
+                    );
+                }
+
+                let (left_count, left_black_height, mut keys) =
+                    visit(left, node, depth + 1, depth_limit);
+                let (right_count, right_black_height, right_keys) =
+                    visit(right, node, depth + 1, depth_limit);
+                assert_eq!(
+                    left_black_height, right_black_height,
+                    "black-height mismatch"
+                );
+
+                let key = (*entry_from_rb(node)).key;
+                assert!(
+                    keys.last().is_none_or(|left_key| *left_key <= key),
+                    "left subtree is out of order"
+                );
+                keys.push(key);
+                assert!(
+                    right_keys.first().is_none_or(|right_key| *right_key >= key),
+                    "right subtree is out of order"
+                );
+                keys.extend(right_keys);
+
+                (
+                    left_count + right_count + 1,
+                    left_black_height + usize::from(parent_color & RB_BLACK == RB_BLACK),
+                    keys,
+                )
+            }
+
+            let root_node = root.rb_node;
+            if expected == 0 {
+                assert!(root_node.is_null());
+                return;
+            }
+            assert!(!root_node.is_null());
+            assert_eq!(unsafe { (*root_node).__rb_parent_color & !3 }, 0);
+            assert_eq!(
+                unsafe { (*root_node).__rb_parent_color & RB_BLACK },
+                RB_BLACK
+            );
+
+            let (count, _black_height, keys) =
+                unsafe { visit(root_node, ptr::null(), 0, expected) };
+            assert_eq!(count, expected);
+            assert_eq!(keys.len(), expected);
+            assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+
+        let mut state = 3_141_592_653_589_793_238u64;
+        for _ in 0..ITERATIONS {
+            let mut root = LinuxRbRoot {
+                rb_node: ptr::null_mut(),
+            };
+            let mut entries: Vec<TestEntry> = (0..NODE_COUNT)
+                .map(|_| TestEntry::new(next_random(&mut state) as i32))
+                .collect();
+            let mut order: Vec<usize> = (0..NODE_COUNT).collect();
+            for index in (1..NODE_COUNT).rev() {
+                let swap = (next_random(&mut state) as usize) % (index + 1);
+                order.swap(index, swap);
+            }
+
+            for (inserted, &index) in order.iter().enumerate() {
+                unsafe { insert(&mut root, &mut entries[index]) };
+                assert_invariants(&root, inserted + 1);
+            }
+
+            for (removed, &index) in order.iter().enumerate() {
+                unsafe { linux_rb_erase(ptr::addr_of_mut!(entries[index].rb), &mut root) };
+                assert_invariants(&root, NODE_COUNT - removed - 1);
+            }
+        }
+    }
+
     #[test]
     fn aggregate_exports_include_vendor_rbtree_symbols() {
         register_module_exports();

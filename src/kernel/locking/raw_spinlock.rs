@@ -209,6 +209,27 @@ impl RawSpinLock {
         }
     }
 
+    /// `raw_spin_lock_irqsave()` — Linux disables interrupts and preemption
+    /// before acquiring a task or wait-queue raw spinlock.
+    #[inline]
+    pub fn lock_irqsave(&self) -> (RawSpinLockGuard<'_>, IrqFlags) {
+        let flags = local_irq_save();
+        preempt_disable();
+        self.lock();
+        (RawSpinLockGuard { parent: self }, flags)
+    }
+
+    /// `raw_spin_unlock_irqrestore()` — release the lock before restoring the
+    /// saved interrupt state, then make the caller preemptible again.
+    #[inline]
+    pub fn unlock_irqrestore(guard: RawSpinLockGuard<'_>, flags: IrqFlags) {
+        let parent = guard.parent;
+        parent.unlock();
+        local_irq_restore(flags);
+        preempt_enable();
+        core::mem::forget(guard);
+    }
+
     /// Try to acquire — returns true on success, false if held.
     #[inline]
     pub fn try_lock(&self) -> bool {
@@ -253,6 +274,19 @@ impl RawSpinLock {
 
 unsafe impl Send for RawSpinLock {}
 unsafe impl Sync for RawSpinLock {}
+
+/// Guard for a bare `raw_spinlock_t`. Linux's `task_struct::pi_lock` owns no
+/// protected Rust value, so this is separate from `RawSpinLocked<T>`.
+pub struct RawSpinLockGuard<'a> {
+    parent: &'a RawSpinLock,
+}
+
+impl Drop for RawSpinLockGuard<'_> {
+    fn drop(&mut self) {
+        self.parent.unlock();
+        preempt_enable();
+    }
+}
 
 /// Rust-flavoured `RawSpinLock<T>` wrapper.  Linux's `raw_spinlock_t` does not
 /// own data; this wrapper owns the protected value so callers don't need a

@@ -21,6 +21,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::kernel::locking::raw_spinlock::RawSpinLocked;
+use crate::kernel::locking::{local_irq_restore, local_irq_save};
 use crate::kernel::task::{M29SchedFields, TaskStruct};
 use crate::lib::rbtree::{
     LinuxRbNode, LinuxRbRoot, linux_rb_erase, linux_rb_insert_color, linux_rb_next,
@@ -786,46 +787,6 @@ pub fn init_rqs() {
 ///
 /// Returns the closure's result, or `None` if the CPU index is out-of-range
 /// or the runqueue hasn't been initialised yet.
-/// Save RFLAGS and disable interrupts, returning the saved flags.
-///
-/// Mirrors Linux `local_irq_save()`
-/// (vendor/linux/arch/x86/include/asm/irqflags.h).  The runqueue lock must
-/// never be interrupted by the LAPIC tick: `apic_timer::on_tick` →
-/// `scheduler_tick` takes the same lock from the ISR, so a tick landing
-/// inside a task-context critical section would spin on a lock owned by
-/// the interrupted frame and freeze the CPU (the systemd multi-user boot
-/// froze exactly this way under WHPX/KVM/TCG alike).
-#[cfg(not(test))]
-#[inline]
-fn local_irq_save() -> u64 {
-    let flags: u64;
-    unsafe {
-        core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem));
-    }
-    flags
-}
-
-/// Restore the interrupt flag captured by [`local_irq_save`].
-/// Mirrors Linux `local_irq_restore()`.
-#[cfg(not(test))]
-#[inline]
-fn local_irq_restore(flags: u64) {
-    const X86_EFLAGS_IF: u64 = 1 << 9;
-    if flags & X86_EFLAGS_IF != 0 {
-        unsafe {
-            core::arch::asm!("sti", options(nomem, nostack));
-        }
-    }
-}
-
-#[cfg(test)]
-fn local_irq_save() -> u64 {
-    0
-}
-
-#[cfg(test)]
-fn local_irq_restore(_flags: u64) {}
-
 pub fn with_rq<R>(cpu: u32, f: impl FnOnce(&mut Rq) -> R) -> Option<R> {
     let cpu = cpu as usize;
     if cpu >= MAX_RQ_CPUS {
@@ -930,13 +891,9 @@ mod tests {
             body.contains("local_irq_save") && body.contains("local_irq_restore"),
             "with_rq must hold RQS locks with interrupts disabled"
         );
-        let save = source
-            .split("fn local_irq_save")
-            .nth(1)
-            .expect("local_irq_save body");
         assert!(
-            save.contains("pushfq") && save.contains("cli"),
-            "local_irq_save must capture RFLAGS and disable interrupts"
+            source.contains("use crate::kernel::locking::{local_irq_restore, local_irq_save};"),
+            "with_rq must use the shared Linux-shaped IRQ wrapper"
         );
     }
 

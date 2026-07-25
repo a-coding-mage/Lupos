@@ -289,6 +289,7 @@ const PAD_FILES_TO_SIGNAL: usize =
 const PAD_SIGNAL_TO_THREAD_TOTAL: usize = LINUX_OFFSET_THREAD - (LINUX_OFFSET_SIGNAL + 8);
 const PAD_SIGNAL_TO_THREAD: usize = PAD_SIGNAL_TO_THREAD_TOTAL
     - core::mem::size_of::<crate::kernel::seccomp::Seccomp>()
+    - core::mem::size_of::<crate::kernel::locking::RawSpinLock>()
     - core::mem::size_of::<crate::arch::x86::kernel::fpu::TaskFpuState>()
     - core::mem::size_of::<u64>();
 
@@ -837,6 +838,11 @@ pub struct TaskStruct {
     /// Per-task x86 stack canary installed into the current CPU's
     /// `__stack_chk_guard` by `__switch_to_asm`.
     pub stack_canary: u64,
+    /// Linux `task_struct::pi_lock`: serializes wakeups and task-state/CPU
+    /// transitions for this task before the runqueue lock is taken. It lives
+    /// in the same reserved signal-to-thread span as the other unmodelled
+    /// Linux fields, after the aligned task-local state to preserve offsets.
+    pub pi_lock: crate::kernel::locking::RawSpinLock,
     _pad_signal_to_thread: [u8; PAD_SIGNAL_TO_THREAD],
 
     // ── Architecture-specific thread context (LAST FIELD) ───────────────────
@@ -921,6 +927,9 @@ const _: () = {
     assert!(offset_of!(TaskStruct, m28_nsproxy) < offset_of!(TaskStruct, signal));
     assert!(offset_of!(TaskStruct, m27_seccomp) > offset_of!(TaskStruct, signal));
     assert!(offset_of!(TaskStruct, m27_seccomp) < offset_of!(TaskStruct, thread));
+    assert!(offset_of!(TaskStruct, pi_lock) > offset_of!(TaskStruct, m27_seccomp));
+    assert!(offset_of!(TaskStruct, pi_lock) < offset_of!(TaskStruct, thread));
+    assert!(size_of::<crate::kernel::locking::RawSpinLock>() == size_of::<u32>());
     assert!(core::mem::align_of::<crate::arch::x86::kernel::fpu::TaskFpuState>() <= 8);
     assert!(offset_of!(TaskStruct, x86_fpu) < offset_of!(TaskStruct, thread));
     assert!(offset_of!(TaskStruct, stack_canary) < offset_of!(TaskStruct, thread));
