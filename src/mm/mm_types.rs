@@ -26,7 +26,7 @@ extern crate alloc;
 extern crate std;
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU64, Ordering};
 
 use crate::kernel::locking::RawSpinLock;
 use crate::mm::list::ListHead;
@@ -93,8 +93,16 @@ struct MmapLockWaiter {
     next: *mut MmapLockWaiter,
     prev: *mut MmapLockWaiter,
     wake_next: *mut MmapLockWaiter,
-    task: *mut crate::kernel::task::TaskStruct,
+    /// Linux `rwsem_waiter::task`. Readers clear it with release ordering
+    /// after taking a task reference; the blocked reader observes that clear
+    /// with acquire ordering before unwinding its stack waiter.
+    task: AtomicPtr<crate::kernel::task::TaskStruct>,
+    #[cfg(not(test))]
+    pinned_task: *mut crate::kernel::task::TaskStruct,
+    #[cfg(not(test))]
+    task_pinned: bool,
     waiter_type: MmapLockWaiterType,
+    #[cfg(test)]
     granted: AtomicBool,
     wake_started: AtomicBool,
     #[cfg(test)]
@@ -105,21 +113,42 @@ struct MmapLockWaiter {
 
 impl MmapLockWaiter {
     fn new(waiter_type: MmapLockWaiterType) -> Self {
+        #[cfg(not(test))]
+        let task = unsafe { crate::kernel::sched::get_current() };
+        #[cfg(not(test))]
+        let task_pinned = crate::kernel::fork::pin_task_for_mmap_waiter(task);
+
         Self {
             next: core::ptr::null_mut(),
             prev: core::ptr::null_mut(),
             wake_next: core::ptr::null_mut(),
             #[cfg(not(test))]
-            task: unsafe { crate::kernel::sched::get_current() },
+            task: AtomicPtr::new(task),
             #[cfg(test)]
-            task: core::ptr::null_mut(),
+            task: AtomicPtr::new(core::ptr::null_mut()),
+            #[cfg(not(test))]
+            pinned_task: task,
+            #[cfg(not(test))]
+            task_pinned,
             waiter_type,
+            #[cfg(test)]
             granted: AtomicBool::new(false),
             wake_started: AtomicBool::new(false),
             #[cfg(test)]
             host_wait: std::sync::Mutex::new(false),
             #[cfg(test)]
             host_wake: std::sync::Condvar::new(),
+        }
+    }
+}
+
+impl Drop for MmapLockWaiter {
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        if self.task_pinned {
+            unsafe {
+                crate::kernel::fork::unpin_task_for_mmap_waiter(self.pinned_task);
+            }
         }
     }
 }
@@ -201,9 +230,11 @@ impl MmapLock {
     #[inline]
     unsafe fn set_waiter_sleeping(waiter: *mut MmapLockWaiter) {
         #[cfg(not(test))]
-        if !unsafe { (*waiter).task.is_null() } {
+        let task = unsafe { (*waiter).task.load(Ordering::Acquire) };
+        #[cfg(not(test))]
+        if !task.is_null() {
             unsafe {
-                (*(*waiter).task).__state.store(
+                (*task).__state.store(
                     crate::kernel::task::task_state::TASK_UNINTERRUPTIBLE,
                     Ordering::SeqCst,
                 );
@@ -212,11 +243,15 @@ impl MmapLock {
     }
 
     #[inline]
-    unsafe fn set_waiter_running(waiter: *mut MmapLockWaiter) {
+    unsafe fn set_waiter_running(_waiter: *mut MmapLockWaiter) {
         #[cfg(not(test))]
-        if !unsafe { (*waiter).task.is_null() } {
+        {
+            let task = unsafe { crate::kernel::sched::get_current() };
+            if task.is_null() {
+                return;
+            }
             unsafe {
-                (*(*waiter).task).__state.store(
+                (*task).__state.store(
                     crate::kernel::task::task_state::TASK_RUNNING,
                     Ordering::Release,
                 );
@@ -388,9 +423,29 @@ impl MmapLock {
             let next = unsafe { (*waiter).wake_next };
             #[cfg(not(test))]
             unsafe {
-                let task = (*waiter).task;
-                (*waiter).granted.store(true, Ordering::Release);
-                crate::kernel::sched::wake_task_normal(task);
+                let task = (*waiter).task.load(Ordering::Acquire);
+                if !task.is_null() {
+                    let is_reader = (*waiter).waiter_type == MmapLockWaiterType::Read;
+                    if is_reader {
+                        // Linux calls get_task_struct() before clearing the
+                        // reader's task pointer. The waiter-held reference
+                        // makes this increment race-free; the extra wake
+                        // reference remains until wake_task_normal() returns.
+                        let wake_pinned = crate::kernel::fork::pin_task_for_mmap_waiter(task);
+                        (*waiter)
+                            .task
+                            .store(core::ptr::null_mut(), Ordering::Release);
+                        crate::kernel::sched::wake_task_normal(task);
+                        if wake_pinned {
+                            crate::kernel::fork::unpin_task_for_mmap_waiter(task);
+                        }
+                    } else {
+                        // Linux keeps a writer's task pointer until
+                        // rwsem_try_write_lock() removes the waiter. The
+                        // waiter's own pin covers this wakeup.
+                        crate::kernel::sched::wake_task_normal(task);
+                    }
+                }
             }
             #[cfg(test)]
             {
@@ -478,7 +533,11 @@ impl MmapLock {
             // `set_waiter_sleeping()` before `wait_lock` was dropped, and is
             // re-armed after every `schedule()` below, matching Linux's
             // `set_current_state(state)` at the tail of the loop.
-            if waiter.granted.load(Ordering::Acquire) {
+            #[cfg(not(test))]
+            let granted = waiter.task.load(Ordering::Acquire).is_null();
+            #[cfg(test)]
+            let granted = waiter.granted.load(Ordering::Acquire);
+            if granted {
                 unsafe {
                     Self::set_waiter_running(waiter_ptr);
                 }

@@ -193,8 +193,19 @@ unsafe fn dequeue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool
     let se = task_se(p);
     let m = task_m29(p);
     unsafe {
-        if rq.cfs.current != p {
-            rq.cfs.remove(p, (*se).vruntime);
+        let removed = if rq.cfs.current == p {
+            // Linux dequeue_entities() succeeds for the currently running
+            // entity, which is intentionally not present in the rb-tree.
+            true
+        } else {
+            // `__dequeue_entity()` operates on the embedded run_node and can
+            // fail here when the caller's rq is not its owner.  Preserve the
+            // Linux failure path: do not clear on_rq or release the task while
+            // another cfs_rq can still reference its intrusive node.
+            rq.cfs.remove(p, (*se).vruntime)
+        };
+        if !removed {
+            return false;
         }
         (*se).on_rq = 0;
         (*m).on_rq = 0;
@@ -207,8 +218,26 @@ unsafe fn dequeue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool
 }
 
 unsafe fn pick_next_task_fair(rq: &mut Rq) -> *mut TaskStruct {
-    let p = rq
-        .cfs
+    // Linux pick_task_fair() only selects an entity.  The scheduler core's
+    // put_prev_set_next_task() performs the ordered handoff below: first
+    // put_prev_entity() requeues the old current task, then set_next_entity()
+    // removes the selected task and records cfs_rq->curr.
+    //
+    // Linux's pick_eevdf() has a one-entity fast path: when the current fair
+    // entity is the only runnable entity, it is not in the rb-tree, so the
+    // picker must return cfs_rq->curr.  Without this, a reschedule request
+    // with no peer selects the idle class, requeues the still-runnable current
+    // task, and leaves the CPU asleep with work on its CFS tree.
+    if rq.cfs.nr_running == 1 {
+        let current = rq.cfs.current;
+        if !current.is_null()
+            && unsafe { (*current).m29.se.on_rq != 0 }
+            && unsafe { super::task_can_switch_to(current) }
+        {
+            return current;
+        }
+    }
+    rq.cfs
         .tasks_timeline
         .iter()
         .find_map(|task| {
@@ -218,28 +247,7 @@ unsafe fn pick_next_task_fair(rq: &mut Rq) -> *mut TaskStruct {
                 None
             }
         })
-        .unwrap_or(core::ptr::null_mut());
-    if !p.is_null() {
-        // Linux set_next_entity(): the running entity remains accounted as
-        // on_rq but is not kept in the ordered tree.
-        let removed = unsafe { rq.cfs.remove(p, (*task_se(p)).vruntime) };
-        debug_assert!(
-            removed,
-            "fair picker must not make an entity current while it remains linked"
-        );
-        if !removed {
-            return core::ptr::null_mut();
-        }
-        rq.cfs.current = p;
-        rq.current = p;
-        // Refresh exec_start so update_curr can compute delta_exec next tick.
-        let se = task_se(p);
-        unsafe {
-            (*se).exec_start = sched_clock_ns();
-            (*se).prev_sum_exec_runtime = (*se).sum_exec_runtime;
-        }
-    }
-    p
+        .unwrap_or(core::ptr::null_mut())
 }
 
 unsafe fn put_prev_task_fair(rq: &mut Rq, prev: *mut TaskStruct) {
@@ -274,12 +282,19 @@ unsafe fn set_next_task_fair(rq: &mut Rq, next: *mut TaskStruct, _first: bool) {
     }
 
     let se = task_se(next);
-    if unsafe { (*se).on_rq != 0 } && rq.cfs.contains_task(next) {
+    if unsafe { (*se).on_rq != 0 } {
+        // Linux set_next_entity() removes the selected on-rq entity after
+        // put_prev_entity() has completed.  Refuse the handoff if the
+        // embedded node is not owned by this cfs_rq; silently marking it
+        // current would leave another runqueue with a live intrusive node.
         let removed = unsafe { rq.cfs.remove(next, (*se).vruntime) };
         debug_assert!(
             removed,
             "selected fair entity must be removable by run_node"
         );
+        if !removed {
+            return;
+        }
     }
 
     rq.cfs.current = next;
@@ -541,6 +556,41 @@ mod tests {
         assert_eq!(rq.cfs.load_weight, NICE_0_LOAD);
     }
 
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:dequeue_task_fair
+    ///
+    /// Linux returns failure from `dequeue_task_fair()` when the entity could
+    /// not be removed from its cfs_rq.  This Lupos-specific ownership setup
+    /// exercises the equivalent failure: calling the hook with a different
+    /// runqueue must not clear `on_rq`, because task release uses that state
+    /// to keep the still-linked intrusive node alive.
+    #[test]
+    fn dequeue_task_fair_preserves_state_when_node_belongs_to_other_rq() {
+        let mut owner = Rq::new(0);
+        let mut wrong_rq = Rq::new(1);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let ptr = &mut *task as *mut TaskStruct;
+        task.m29.static_prio = DEFAULT_PRIO;
+        task.m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
+        task.m29.se.load.weight = NICE_0_LOAD;
+        task.m29.se.vruntime = 10;
+        task.m29.se.on_rq = 1;
+        task.m29.on_rq = 1;
+
+        assert!(owner.cfs.insert(ptr, task.m29.se.vruntime));
+        owner.cfs.nr_running = 1;
+        owner.cfs.load_weight = NICE_0_LOAD;
+        owner.nr_running = 1;
+
+        let dequeued = unsafe { dequeue_task_fair(&mut wrong_rq, ptr, DEQUEUE_SLEEP) };
+
+        assert!(!dequeued, "Linux reports a failed dequeue to its caller");
+        assert_eq!(task.m29.se.on_rq, 1);
+        assert_eq!(task.m29.on_rq, 1);
+        assert_eq!(owner.cfs.nr_running, 1);
+        assert_eq!(owner.nr_running, 1);
+        assert_eq!(owner.cfs.tasks_timeline.first(), ptr);
+    }
+
     /// test-origin: linux:vendor/linux/kernel/sched/fair.c:task_tick_fair
     #[test]
     fn task_tick_fair_does_not_make_a_queued_entity_current() {
@@ -685,6 +735,8 @@ mod tests {
         sleeper.stack = sleeper_stack_top as *mut core::ffi::c_void;
         sleeper.thread.sp = sleeper_stack_top as u64 - 64;
         sleeper.m29.se.vruntime = 1;
+        sleeper.m29.se.on_rq = 1;
+        sleeper.m29.on_rq = 1;
 
         runnable.__state.store(
             crate::kernel::task::task_state::TASK_RUNNING,
@@ -694,6 +746,8 @@ mod tests {
         runnable.stack = runnable_stack_top as *mut core::ffi::c_void;
         runnable.thread.sp = runnable_stack_top as u64 - 64;
         runnable.m29.se.vruntime = 2;
+        runnable.m29.se.on_rq = 1;
+        runnable.m29.on_rq = 1;
 
         rq.cfs.insert(sleeper_ptr, sleeper.m29.se.vruntime);
         rq.cfs.insert(runnable_ptr, runnable.m29.se.vruntime);
@@ -701,7 +755,64 @@ mod tests {
         let picked = unsafe { pick_next_task_fair(&mut rq) };
 
         assert_eq!(picked, runnable_ptr);
+        assert!(rq.cfs.current.is_null());
+        assert_eq!(rq.cfs.tasks_timeline.first(), sleeper_ptr);
+        unsafe {
+            set_next_task_fair(&mut rq, picked, true);
+        }
         assert_eq!(rq.cfs.current, runnable_ptr);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:pick_next_task
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:pick_task_fair
+    ///
+    /// Linux's picker only chooses an entity.  The scheduler core then calls
+    /// `put_prev_set_next_task()`, where `put_prev_entity()` requeues the old
+    /// current task and `set_next_entity()` removes the selected task.  A
+    /// picker that mutates either side early changes which task is selected
+    /// and leaves the handoff order unlike Linux.
+    #[test]
+    fn pick_next_task_fair_defers_tree_handoff_to_set_next_entity() {
+        let mut rq = Rq::new(0);
+        let mut prev = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut next = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let prev_ptr = &mut *prev as *mut TaskStruct;
+        let next_ptr = &mut *next as *mut TaskStruct;
+
+        for (task, vruntime) in [(&mut prev, 1), (&mut next, 2)] {
+            task.__state.store(
+                crate::kernel::task::task_state::TASK_RUNNING,
+                Ordering::Release,
+            );
+            let stack_top = crate::kernel::sched::KTHREAD_STACK_SIZE * (2 + vruntime as usize);
+            task.stack = stack_top as *mut core::ffi::c_void;
+            task.thread.sp = stack_top as u64 - 64;
+            task.m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
+            task.m29.se.load.weight = NICE_0_LOAD;
+            task.m29.se.vruntime = vruntime;
+            task.m29.se.on_rq = 1;
+            task.m29.on_rq = 1;
+        }
+        rq.current = prev_ptr;
+        rq.cfs.current = prev_ptr;
+        rq.cfs.nr_running = 2;
+        rq.cfs.load_weight = NICE_0_LOAD * 2;
+        rq.nr_running = 2;
+        assert!(rq.cfs.insert(next_ptr, next.m29.se.vruntime));
+
+        let picked = unsafe { pick_next_task_fair(&mut rq) };
+
+        assert_eq!(picked, next_ptr);
+        assert_eq!(rq.cfs.current, prev_ptr);
+        assert_eq!(rq.current, prev_ptr);
+        assert_eq!(rq.cfs.tasks_timeline.first(), next_ptr);
+
+        unsafe {
+            put_prev_task_fair(&mut rq, prev_ptr);
+            set_next_task_fair(&mut rq, picked, true);
+        }
+        assert_eq!(rq.cfs.current, next_ptr);
+        assert_eq!(rq.cfs.tasks_timeline.first(), prev_ptr);
     }
 
     /// test-origin: linux:vendor/linux/kernel/sched/fair.c:pick_task_fair
@@ -740,6 +851,45 @@ mod tests {
         let picked = unsafe { pick_next_task_fair(&mut rq) };
 
         assert_eq!(picked, task_ptr);
+        assert_eq!(rq.cfs.tasks_timeline.first(), task_ptr);
+        unsafe {
+            set_next_task_fair(&mut rq, picked, true);
+        }
         assert_eq!(rq.cfs.current, task_ptr);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:pick_eevdf
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:pick_task_fair
+    ///
+    /// Linux's EEVDF picker returns cfs_rq->curr when it is the only
+    /// runnable entity (`nr_queued == 1`).  The current entity is not in the
+    /// rb-tree while executing, so a tree-only picker incorrectly falls back
+    /// to the idle class and strands the sole runnable task after a tick or a
+    /// user-fault reschedule.
+    #[test]
+    fn pick_next_task_fair_keeps_the_only_current_task_running() {
+        let mut rq = Rq::new(0);
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let current_ptr = &mut *current as *mut TaskStruct;
+
+        current.__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+        let stack_top = crate::kernel::sched::KTHREAD_STACK_SIZE * 2;
+        current.stack = stack_top as *mut core::ffi::c_void;
+        current.thread.sp = stack_top as u64 - 64;
+        current.m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
+        current.m29.se.load.weight = NICE_0_LOAD;
+        current.m29.se.on_rq = 1;
+        current.m29.on_rq = 1;
+
+        rq.current = current_ptr;
+        rq.cfs.current = current_ptr;
+        rq.cfs.nr_running = 1;
+        rq.cfs.load_weight = NICE_0_LOAD;
+        rq.nr_running = 1;
+
+        assert_eq!(unsafe { pick_next_task_fair(&mut rq) }, current_ptr);
     }
 }

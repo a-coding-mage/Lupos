@@ -660,6 +660,7 @@ mod tests {
 
     use crate::kernel::fork::{
         KernelCloneArgs, copy_process, heap_task_allocation_tracked_for_tests, heap_task_count,
+        pin_task_for_mmap_waiter, unpin_task_for_mmap_waiter,
     };
     use crate::kernel::task::M26Fields;
     use crate::kernel::task::task_state::{
@@ -1313,6 +1314,44 @@ mod tests {
         assert!(
             !heap_task_allocation_tracked_for_tests(child),
             "finish_task_switch must drop the final current-task allocation"
+        );
+        assert_eq!(heap_task_count(), baseline);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/locking/rwsem.c:rwsem_mark_wake
+    /// and linux:vendor/linux/kernel/exit.c:release_task
+    ///
+    /// Linux takes a task reference before clearing a reader waiter's task
+    /// pointer.  Reaping the blocked task must therefore leave its
+    /// TaskStruct allocation alive until the waiter drops that reference.
+    #[test]
+    fn release_task_defers_mmap_waiter_task_allocation() {
+        let baseline = heap_task_count();
+        let mut parent = make_task(9200, 9200);
+        let args = KernelCloneArgs {
+            kthread: 1,
+            ..KernelCloneArgs::default()
+        };
+        let child =
+            unsafe { copy_process(&mut *parent as *mut TaskStruct, &args) }.expect("copy_process");
+
+        assert!(pin_task_for_mmap_waiter(child));
+        unsafe {
+            release_task(child);
+        }
+
+        assert_eq!(heap_task_count(), baseline);
+        assert!(
+            heap_task_allocation_tracked_for_tests(child),
+            "release_task must retain a task referenced by a queued mmap waiter"
+        );
+
+        unsafe {
+            unpin_task_for_mmap_waiter(child);
+        }
+        assert!(
+            !heap_task_allocation_tracked_for_tests(child),
+            "dropping the final mmap waiter reference must complete the deferred release"
         );
         assert_eq!(heap_task_count(), baseline);
     }

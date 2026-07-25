@@ -24,7 +24,11 @@ pub fn arch_local_save_flags() -> IrqFlags {
                 "pushfq",
                 "pop {0}",
                 out(reg) flags,
-                options(nomem, preserves_flags),
+                // Linux native_save_fl() has a memory clobber.  Saving the
+                // flags is part of the ordering contract around irq-safe
+                // locks; a no-memory-clobber option would let LLVM move protected memory
+                // accesses across this boundary.
+                options(preserves_flags),
             );
         }
         return flags;
@@ -38,7 +42,10 @@ pub fn arch_local_save_flags() -> IrqFlags {
 pub fn arch_local_irq_disable() {
     #[cfg(all(target_arch = "x86_64", not(test)))]
     unsafe {
-        core::arch::asm!("cli", options(nomem, nostack));
+        // Mirrors vendor/linux/arch/x86/include/asm/irqflags.h::native_irq_disable:
+        // the memory clobber prevents a runqueue lock operation from being
+        // scheduled before interrupts are disabled.
+        core::arch::asm!("cli");
     }
 }
 
@@ -47,7 +54,9 @@ pub fn arch_local_irq_disable() {
 pub fn arch_local_irq_enable() {
     #[cfg(all(target_arch = "x86_64", not(test)))]
     unsafe {
-        core::arch::asm!("sti", options(nomem, nostack));
+        // Mirrors native_irq_enable()'s memory clobber.  Unlocking must be
+        // visible before an interrupt can enter the protected path again.
+        core::arch::asm!("sti");
     }
 }
 
@@ -63,13 +72,13 @@ pub fn local_irq_save() -> IrqFlags {
 #[inline(always)]
 pub fn local_irq_restore(flags: IrqFlags) {
     #[cfg(all(target_arch = "x86_64", not(test)))]
-    unsafe {
-        core::arch::asm!(
-            "push {0}",
-            "popfq",
-            in(reg) flags,
-            options(nomem),
-        );
+    if !irqs_disabled_flags(flags) {
+        unsafe {
+            // Linux restores only IF here (native_local_irq_restore), rather
+            // than restoring the whole arithmetic/status register with
+            // popfq.  The memory clobber also keeps the unlock before sti.
+            core::arch::asm!("sti");
+        }
     }
     let _ = flags;
 }
@@ -109,5 +118,29 @@ mod tests {
     fn irqs_disabled_flags_inverts_if_bit() {
         assert!(irqs_disabled_flags(0));
         assert!(!irqs_disabled_flags(X86_EFLAGS_IF));
+    }
+
+    /// test-origin: linux:vendor/linux/arch/x86/include/asm/irqflags.h
+    ///
+    /// Rust's inline-assembly options are part of the observable locking
+    /// contract here.  There is no host-side way to trigger a LAPIC interrupt
+    /// between an incorrectly ordered `cli` and runqueue lock, so keep the
+    /// source contract explicit and pair it with the four-CPU QEMU scheduler
+    /// gate in the runtime validation.
+    #[test]
+    fn irq_wrappers_keep_linux_memory_ordering_and_if_only_restore() {
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/arch/x86/include/asm/irqflags.h"
+        ));
+        let local = include_str!("irqflags.rs");
+        let implementation = local.split("#[cfg(test)]").next().unwrap_or(local);
+
+        assert!(linux.contains("asm volatile(\"cli\": : :\"memory\")"));
+        assert!(linux.contains("native_local_irq_restore"));
+        assert!(!implementation.contains("options(nomem"));
+        assert!(local.contains("if !irqs_disabled_flags(flags)"));
+        assert!(local.contains("core::arch::asm!(\"cli\")"));
+        assert!(local.contains("core::arch::asm!(\"sti\")"));
     }
 }

@@ -148,6 +148,10 @@ struct HeapTaskEntry {
     stack: *mut u8,
     released: bool,
     release_complete: bool,
+    /// Linux's task_struct reference held by a queued rwsem waiter.  The
+    /// reference is external to TaskStruct so the calibrated task layout does
+    /// not move when this lifetime state is added.
+    mmap_waiter_refs: usize,
     vfork_parent: *mut TaskStruct,
     exec_start: Option<crate::kernel::exec::UserStartContext>,
 }
@@ -216,6 +220,7 @@ impl HeapTaskReservation {
             stack,
             released: false,
             release_complete: false,
+            mmap_waiter_refs: 0,
             vfork_parent,
             exec_start: None,
         });
@@ -264,6 +269,57 @@ pub(crate) fn heap_task_allocation_tracked_for_tests(task: *mut TaskStruct) -> b
         .iter()
         .flatten()
         .any(|entry| entry.task == task)
+}
+
+/// Hold the task allocation while a stack-allocated mmap waiter refers to it.
+///
+/// Linux's `rwsem_waiter::task` is protected by a task reference: a releaser
+/// cannot free the `task_struct` while the waiter is queued.  Heap tasks need
+/// the same ownership edge in Lupos; static pool tasks have a permanent
+/// allocation and therefore do not need a tracker entry.
+pub(crate) fn pin_task_for_mmap_waiter(task: *mut TaskStruct) -> bool {
+    let mut tracker = HEAP_TASKS.lock();
+    let Some(slot) = find_task_ptr_slot(&tracker, task) else {
+        return false;
+    };
+    let entry = tracker.entries[slot]
+        .as_mut()
+        .expect("indexed heap task entry must exist");
+    entry.mmap_waiter_refs = entry
+        .mmap_waiter_refs
+        .checked_add(1)
+        .expect("mmap waiter task reference count overflow");
+    true
+}
+
+/// Drop one task reference held by a mmap waiter.
+///
+/// If `release_task()` already completed the logical teardown, this is the
+/// final ownership edge and may reclaim the allocation. The scheduler check
+/// keeps a still-current task alive until `finish_task_switch()` drops its
+/// independent scheduler reference.
+pub(crate) unsafe fn unpin_task_for_mmap_waiter(task: *mut TaskStruct) {
+    let release_complete = {
+        let mut tracker = HEAP_TASKS.lock();
+        let Some(slot) = find_task_ptr_slot(&tracker, task) else {
+            return;
+        };
+        let entry = tracker.entries[slot]
+            .as_mut()
+            .expect("indexed heap task entry must exist");
+        assert!(entry.mmap_waiter_refs != 0);
+        entry.mmap_waiter_refs -= 1;
+        entry.mmap_waiter_refs == 0 && entry.released && entry.release_complete
+    };
+
+    if release_complete
+        && !crate::kernel::sched::task_has_scheduler_reference(task)
+        && let Some(stack) = take_logically_released_heap_task(task)
+    {
+        unsafe {
+            finish_heap_task_release(task, stack);
+        }
+    }
 }
 
 fn find_free_heap_task_slot(tracker: &HeapTaskTracker) -> Option<usize> {
@@ -495,6 +551,7 @@ pub(crate) fn take_logically_released_heap_task(task: *mut TaskStruct) -> Option
     if let Some(entry) = &tracker.entries[slot]
         && entry.released
         && entry.release_complete
+        && entry.mmap_waiter_refs == 0
     {
         unindex_heap_task_entry(&mut tracker, slot);
         let entry = tracker.entries[slot].take().expect("entry checked above");
@@ -605,9 +662,31 @@ pub fn for_each_heap_task(mut f: impl FnMut(*mut TaskStruct)) {
 /// release path or the completed logical release path. No scheduler-visible
 /// state may still reference the task.
 pub(crate) unsafe fn finish_heap_task_release(task: *mut TaskStruct, stack: *mut u8) {
-    {
+    let can_free = {
         let mut tracker = HEAP_TASKS.lock();
-        let _ = remove_heap_task_entry(&mut tracker, task);
+        match find_task_ptr_slot(&tracker, task) {
+            None => true,
+            Some(slot) => {
+                let entry = tracker.entries[slot]
+                    .as_mut()
+                    .expect("indexed heap task entry must exist");
+                if entry.mmap_waiter_refs != 0 {
+                    // Linux keeps the task_struct reference acquired by rwsem
+                    // until the waiter leaves the slow path.
+                    // `release_task()` has finished all logical teardown, but
+                    // the allocation must remain indexed so the final waiter
+                    // drop can reclaim it.
+                    entry.release_complete = true;
+                    false
+                } else {
+                    let _ = remove_heap_task_entry(&mut tracker, task);
+                    true
+                }
+            }
+        }
+    };
+    if !can_free {
+        return;
     }
     unsafe {
         free_kernel_stack(stack);

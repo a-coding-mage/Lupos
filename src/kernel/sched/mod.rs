@@ -301,6 +301,37 @@ static KTHREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// dispatches entirely through per-CPU runqueues.
 static PRODUCTION_SCHED_ENABLED: AtomicBool = AtomicBool::new(false);
 
+// Test-only probe for the Linux task-wakeup serialization boundary.  The
+// production hook is deliberately empty; the regression test arms it before
+// two host threads call try_to_wake_up() for the same task.  The first caller
+// pauses here, so a second caller can only reach the probe while the first is
+// still in the wakeup path if p->pi_lock is missing.
+#[cfg(test)]
+static WAKE_SERIALIZATION_TEST_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static WAKE_SERIALIZATION_TEST_FIRST_HELD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static WAKE_SERIALIZATION_TEST_SECOND_WHILE_HELD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static WAKE_SERIALIZATION_TEST_RELEASE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn wake_serialization_test_hook() {
+    if !WAKE_SERIALIZATION_TEST_ARMED.load(Ordering::Acquire) {
+        return;
+    }
+    if WAKE_SERIALIZATION_TEST_FIRST_HELD
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        while !WAKE_SERIALIZATION_TEST_RELEASE.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    } else if !WAKE_SERIALIZATION_TEST_RELEASE.load(Ordering::Acquire) {
+        WAKE_SERIALIZATION_TEST_SECOND_WHILE_HELD.store(true, Ordering::Release);
+    }
+}
+
 /// The BSP has atomically transferred the legacy queue into CPU0's runqueue.
 ///
 /// This becomes true before any AP is launched. It is distinct from CPU
@@ -1417,13 +1448,12 @@ unsafe fn pick_next_task(rq: &mut rq::Rq) -> *mut TaskStruct {
     rq.idle
 }
 
-/// Complete the previous task's class bookkeeping before selecting its
-/// successor.
+/// Apply Linux's pre-pick state transition for the previous task.
 ///
-/// Kept separate from `__schedule()` so the class-hook behavior of the real
-/// production path can be exercised by a focused regression test. Linux
-/// samples `prev->__state` and blocks/dequeues a sleeping task before
-/// `pick_next_task()` reaches its class `put_prev_task()` bookkeeping.
+/// Linux samples `prev->__state` and blocks/dequeues a sleeping task before
+/// `pick_next_task()`.  The class `put_prev_task()` hook is deliberately
+/// called only after selection, by the equivalent of
+/// `put_prev_set_next_task()` below.
 unsafe fn prepare_prev_for_pick(this_rq: &mut rq::Rq, prev: *mut TaskStruct) {
     let prev_class = unsafe { task_class(prev) };
     let mut prev_state = unsafe { (*prev).__state.load(Ordering::Acquire) };
@@ -1445,14 +1475,6 @@ unsafe fn prepare_prev_for_pick(this_rq: &mut rq::Rq, prev: *mut TaskStruct) {
         && let Some(dequeue) = unsafe { (*prev_class).dequeue_task }
     {
         let _ = unsafe { dequeue(this_rq, prev, class::DEQUEUE_SLEEP) };
-    }
-
-    if !prev_class.is_null() {
-        if let Some(put_prev) = unsafe { (*prev_class).put_prev_task } {
-            unsafe {
-                put_prev(this_rq, prev);
-            }
-        }
     }
 }
 
@@ -1484,7 +1506,17 @@ pub unsafe fn __schedule() {
         } else {
             prev
         };
-        if !next.is_null() {
+        if !next.is_null() && next != prev {
+            // Match Linux put_prev_set_next_task(): selection happens before
+            // either class hook.  CFS must see its old current task during
+            // put_prev_entity(), then remove the selected entity in
+            // set_next_entity().
+            let prev_class = task_class(prev);
+            if !prev_class.is_null()
+                && let Some(put_prev) = (*prev_class).put_prev_task
+            {
+                put_prev(this_rq, prev);
+            }
             let next_class = task_class(next);
             if !next_class.is_null()
                 && let Some(set_next) = (*next_class).set_next_task
@@ -2315,14 +2347,40 @@ pub fn select_task_rq(p: *mut TaskStruct, prev_cpu: u32, flags: u32) -> u32 {
 
 /// Wake a blocked task onto an allowed CPU and request reschedule there.
 pub unsafe fn try_to_wake_up(p: *mut TaskStruct, wake_flags: u32) -> bool {
+    unsafe { try_to_wake_up_with_state(p, 0, wake_flags) }
+}
+
+/// Wake `p` only when its state matches `state_mask`, with the state check
+/// serialized by `p->pi_lock` exactly like Linux `wake_up_state()`.
+unsafe fn try_to_wake_up_with_state(p: *mut TaskStruct, state_mask: u32, wake_flags: u32) -> bool {
     if p.is_null() {
         return false;
     }
+    // Linux `try_to_wake_up()` takes task_struct::pi_lock before inspecting
+    // __state, on_rq, on_cpu, or task_cpu. This serializes all wakeups for
+    // one embedded sched_entity while still allowing the target rq lock to be
+    // selected and acquired later.
+    let (pi_guard, pi_flags) = unsafe { (*p).pi_lock.lock_irqsave() };
+    #[cfg(test)]
+    wake_serialization_test_hook();
+    let result = unsafe { try_to_wake_up_locked(p, state_mask, wake_flags) };
+    crate::kernel::locking::RawSpinLock::unlock_irqrestore(pi_guard, pi_flags);
+    result
+}
+
+/// Body of Linux `try_to_wake_up()` after `p->pi_lock` is held.
+///
+/// # Safety
+/// The caller must hold `p->pi_lock` for the entire function.
+unsafe fn try_to_wake_up_locked(p: *mut TaskStruct, state_mask: u32, wake_flags: u32) -> bool {
     let exit_mask =
         crate::kernel::task::task_state::EXIT_ZOMBIE | crate::kernel::task::task_state::EXIT_DEAD;
     // Linux never makes an exiting task runnable again. In particular, a late
     // SIGKILL may still resolve a zombie PID.
     let state = unsafe { (*p).__state.load(Ordering::Acquire) };
+    if state_mask != 0 && state & state_mask == 0 {
+        return false;
+    }
     if unsafe { (*p).m26.exit_state } & exit_mask != 0
         || state
             & (exit_mask
@@ -2425,14 +2483,13 @@ pub unsafe fn wake_task(p: *mut TaskStruct) -> bool {
 /// `try_to_wake_up(p, TASK_NORMAL, WF_*)`. Unlike signal/ptrace-specific wake
 /// paths this must never resume a stopped or traced task.
 pub unsafe fn wake_task_normal(p: *mut TaskStruct) -> bool {
-    if p.is_null() {
-        return false;
+    unsafe {
+        try_to_wake_up_with_state(
+            p,
+            crate::kernel::task::task_state::TASK_NORMAL,
+            class::ENQUEUE_WAKEUP,
+        )
     }
-    let state = unsafe { (*p).__state.load(Ordering::Acquire) };
-    if state & crate::kernel::task::task_state::TASK_NORMAL == 0 {
-        return false;
-    }
-    unsafe { try_to_wake_up(p, class::ENQUEUE_WAKEUP) }
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
@@ -2590,6 +2647,59 @@ mod tests {
         );
     }
 
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:try_to_wake_up
+    ///
+    /// Linux serializes concurrent wakeups of one task with task_struct::pi_lock
+    /// before it reads __state or on_rq.  No upstream userspace test can hold
+    /// that internal lock boundary open, so this deterministic host probe keeps
+    /// the first waker inside the production function while a second waker is
+    /// started.  Without the lock the second call reaches the probe; with the
+    /// lock it waits until the first wakeup has left the boundary.
+    #[test]
+    fn try_to_wake_up_serializes_concurrent_wakeups_for_one_task() {
+        let _legacy = legacy_sched_test_guard();
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        task.__state.store(
+            crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+            Ordering::Release,
+        );
+        let task_addr = (&mut *task as *mut TaskStruct) as usize;
+
+        WAKE_SERIALIZATION_TEST_FIRST_HELD.store(false, Ordering::Release);
+        WAKE_SERIALIZATION_TEST_SECOND_WHILE_HELD.store(false, Ordering::Release);
+        WAKE_SERIALIZATION_TEST_RELEASE.store(false, Ordering::Release);
+        WAKE_SERIALIZATION_TEST_ARMED.store(true, Ordering::Release);
+
+        let first = std::thread::spawn(move || unsafe {
+            try_to_wake_up(task_addr as *mut TaskStruct, class::ENQUEUE_WAKEUP)
+        });
+        while !WAKE_SERIALIZATION_TEST_FIRST_HELD.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+
+        let second = std::thread::spawn(move || unsafe {
+            try_to_wake_up(task_addr as *mut TaskStruct, class::ENQUEUE_WAKEUP)
+        });
+        for _ in 0..1_000_000 {
+            if WAKE_SERIALIZATION_TEST_SECOND_WHILE_HELD.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let second_reached_wakeup_while_first_held =
+            WAKE_SERIALIZATION_TEST_SECOND_WHILE_HELD.load(Ordering::Acquire);
+        WAKE_SERIALIZATION_TEST_RELEASE.store(true, Ordering::Release);
+
+        let _ = first.join().expect("first wakeup thread must finish");
+        let _ = second.join().expect("second wakeup thread must finish");
+        WAKE_SERIALIZATION_TEST_ARMED.store(false, Ordering::Release);
+
+        assert!(
+            !second_reached_wakeup_while_first_held,
+            "concurrent wakeups must be serialized by task_struct::pi_lock"
+        );
+    }
+
     #[test]
     fn blocking_fair_prev_is_not_transiently_reinserted_before_dequeue() {
         // Linux __schedule() reaches try_to_block_task()->block_task() before
@@ -2614,7 +2724,6 @@ mod tests {
         rq.cfs.nr_running = 1;
         rq.cfs.load_weight = prio::NICE_0_LOAD;
 
-        let run_node = core::ptr::addr_of!(task.m29.se.run_node);
         assert_eq!(task.m29.se.run_node.__rb_parent_color, 0);
         assert!(rq.cfs.tasks_timeline.is_empty());
 
@@ -2627,10 +2736,56 @@ mod tests {
         assert_eq!(rq.nr_running, 0);
         assert_eq!(rq.cfs.nr_running, 0);
         assert!(rq.cfs.tasks_timeline.is_empty());
-        assert_ne!(
-            task.m29.se.run_node.__rb_parent_color, run_node as usize,
-            "RB_CLEAR_NODE proves put_prev transiently inserted the sleeping current task before dequeue erased it"
+        assert_eq!(
+            task.m29.se.run_node.__rb_parent_color, 0,
+            "the sleeping current must remain an unlinked entity through the pre-pick transition"
         );
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:__schedule
+    /// test-origin: linux:vendor/linux/kernel/sched/sched.h:put_prev_set_next_task
+    ///
+    /// Linux picks from the queued fair entities while the current entity is
+    /// still represented by `cfs_rq->curr`; only after that decision does it
+    /// requeue `prev`.  Requeueing first lets a lower-vruntime `prev` win its
+    /// own next pick and diverges from the Linux handoff state machine.
+    #[test]
+    fn fair_schedule_picks_before_requeueing_previous_current() {
+        let mut rq = rq::Rq::new(0);
+        let mut prev = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut next = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let prev_ptr = &mut *prev as *mut TaskStruct;
+        let next_ptr = &mut *next as *mut TaskStruct;
+
+        for (task, vruntime) in [(&mut prev, 1), (&mut next, 2)] {
+            task.__state.store(
+                crate::kernel::task::task_state::TASK_RUNNING,
+                Ordering::Release,
+            );
+            let stack_top = KTHREAD_STACK_SIZE * (2 + vruntime as usize);
+            task.stack = stack_top as *mut core::ffi::c_void;
+            task.thread.sp = stack_top as u64 - 64;
+            task.m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
+            task.m29.se.load.weight = prio::NICE_0_LOAD;
+            task.m29.se.vruntime = vruntime;
+            task.m29.se.on_rq = 1;
+            task.m29.on_rq = 1;
+        }
+        rq.current = prev_ptr;
+        rq.cfs.current = prev_ptr;
+        rq.cfs.nr_running = 2;
+        rq.cfs.load_weight = prio::NICE_0_LOAD * 2;
+        rq.nr_running = 2;
+        assert!(rq.cfs.insert(next_ptr, next.m29.se.vruntime));
+
+        let picked = unsafe {
+            prepare_prev_for_pick(&mut rq, prev_ptr);
+            pick_next_task(&mut rq)
+        };
+
+        assert_eq!(picked, next_ptr);
+        assert_eq!(rq.cfs.current, prev_ptr);
+        assert_eq!(rq.cfs.tasks_timeline.first(), next_ptr);
     }
 
     #[test]
