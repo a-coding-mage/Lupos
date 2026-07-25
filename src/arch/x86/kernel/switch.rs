@@ -264,6 +264,17 @@ pub unsafe fn prepare_switch_to_task(next: *mut TaskStruct) {
         prepare_switch_stack_canaries(current, next);
     }
 
+    // Focused corruption probe for the reproducible post-ALSA fault.  Every
+    // inactive x86 task context has the six callee-saved registers followed
+    // by the kernel continuation that `__switch_to_asm` will return to.  A
+    // return into low user space can never be a valid scheduler continuation;
+    // catching it here preserves the owning task and saved frame before the
+    // CPU attempts the bad instruction fetch.  Keep this probe until the
+    // writer of the slot is identified.
+    unsafe {
+        validate_incoming_switch_frame(next);
+    }
+
     // The incoming stack must exist in the currently loaded PGD until the
     // assembly stub changes RSP. A subsequent user-mm switch synchronizes the
     // complete vmalloc slot into the incoming PGD before loading CR3.
@@ -288,6 +299,42 @@ pub unsafe fn prepare_switch_to_task(next: *mut TaskStruct) {
     // `switch_to()` changes the kernel stack.
     unsafe {
         prepare_switch_mm(current, next);
+    }
+}
+
+#[cfg(not(test))]
+unsafe fn validate_incoming_switch_frame(next: *mut TaskStruct) {
+    let stack_top = unsafe { (*next).stack as u64 };
+    let sp = unsafe { (*next).thread.sp };
+    let stack_bottom = stack_top.saturating_sub(crate::kernel::sched::KTHREAD_STACK_SIZE as u64);
+    let frame_bytes = 7 * core::mem::size_of::<u64>() as u64;
+    if sp < stack_bottom || sp.saturating_add(frame_bytes) > stack_top || sp & 0x7 != 0 {
+        panic!(
+            "switch frame outside task stack: pid={} task={:#018x} sp={:#018x} stack=[{:#018x},{:#018x})",
+            unsafe { (*next).pid },
+            next as usize,
+            sp,
+            stack_bottom,
+            stack_top,
+        );
+    }
+    let continuation = unsafe { ((sp as *const u64).add(6)).read_volatile() };
+    // AP bring-up still executes the identity-mapped boot image.  The
+    // decompressed/staged image extends past 12 MiB in the debug build, so
+    // retain the complete early-image window through 32 MiB.  Once the
+    // higher-half kernel is live, normal
+    // scheduler continuations are at or above the canonical kernel split.
+    // Both are valid; the post-ALSA corrupt value is in neither range.
+    let boot_text = (0x0020_0000..0x0200_0000).contains(&continuation);
+    let higher_half = continuation >= 0xffff_8000_0000_0000;
+    if !boot_text && !higher_half {
+        panic!(
+            "switch frame has low continuation: pid={} task={:#018x} sp={:#018x} ret={:#018x}",
+            unsafe { (*next).pid },
+            next as usize,
+            sp,
+            continuation,
+        );
     }
 }
 
