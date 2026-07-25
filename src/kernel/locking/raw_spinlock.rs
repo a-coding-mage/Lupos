@@ -324,9 +324,15 @@ impl<T> RawSpinLocked<T> {
     }
 
     /// Drop a guard previously obtained via `lock_irqsave` and restore EFLAGS.
+    #[inline]
     pub fn unlock_irqrestore(guard: RawSpinGuard<'_, T>, flags: IrqFlags) {
-        drop(guard);
+        // Match Linux __raw_spin_unlock_irqrestore(): the lock is released,
+        // IF is restored, and only then does the caller become preemptible.
+        let parent = guard.parent;
+        parent.lock.unlock();
         local_irq_restore(flags);
+        preempt_enable();
+        core::mem::forget(guard);
     }
 
     pub fn try_lock(&self) -> Option<RawSpinGuard<'_, T>> {
@@ -426,6 +432,41 @@ mod tests {
         }
         let g = l.lock();
         assert_eq!(*g, 42);
+    }
+
+    /// test-origin: linux:vendor/linux/include/linux/spinlock_api_smp.h
+    #[test]
+    fn owned_irqrestore_unlock_order_matches_linux() {
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/include/linux/spinlock_api_smp.h"
+        ));
+        let local = include_str!("raw_spinlock.rs");
+        let linux_order = linux
+            .split("static inline void __raw_spin_unlock_irqrestore")
+            .nth(1)
+            .expect("Linux irqrestore helper");
+        let local_order = local
+            .split("pub fn unlock_irqrestore(guard: RawSpinGuard")
+            .nth(1)
+            .expect("Lupos owned irqrestore helper");
+
+        assert!(
+            linux_order.find("do_raw_spin_unlock").unwrap()
+                < linux_order.find("local_irq_restore").unwrap()
+        );
+        assert!(
+            linux_order.find("local_irq_restore").unwrap()
+                < linux_order.find("preempt_enable").unwrap()
+        );
+        assert!(
+            local_order.find("parent.lock.unlock").unwrap()
+                < local_order.find("local_irq_restore").unwrap()
+        );
+        assert!(
+            local_order.find("local_irq_restore").unwrap()
+                < local_order.find("preempt_enable").unwrap()
+        );
     }
 
     #[test]

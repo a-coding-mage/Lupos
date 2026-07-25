@@ -180,8 +180,8 @@ impl MmapLock {
     #[inline]
     fn unlock_waiters_irqrestore(&self, flags: crate::kernel::locking::IrqFlags) {
         self.wait_lock.unlock();
-        crate::kernel::locking::preempt_enable();
         crate::kernel::locking::local_irq_restore(flags);
+        crate::kernel::locking::preempt_enable();
     }
 
     /// Put the current waiter to sleep once. The lock acquisition entry points
@@ -1411,6 +1411,41 @@ mod tests {
         assert_eq!(
             waits_before_unlock, 1,
             "contended mmap_lock writer remained runnable and retried {waits_before_unlock} times"
+        );
+    }
+
+    /// test-origin: linux:vendor/linux/include/linux/spinlock_api_smp.h
+    #[test]
+    fn mmap_wait_lock_irqrestore_order_matches_linux() {
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/include/linux/spinlock_api_smp.h"
+        ));
+        let local = include_str!("mm_types.rs");
+        let linux_order = linux
+            .split("static inline void __raw_spin_unlock_irqrestore")
+            .nth(1)
+            .expect("Linux irqrestore helper");
+        let local_order = local
+            .split("fn unlock_waiters_irqrestore")
+            .nth(1)
+            .expect("Lupos mmap wait-lock irqrestore helper");
+
+        assert!(
+            linux_order.find("do_raw_spin_unlock").unwrap()
+                < linux_order.find("local_irq_restore").unwrap()
+        );
+        assert!(
+            linux_order.find("local_irq_restore").unwrap()
+                < linux_order.find("preempt_enable").unwrap()
+        );
+        assert!(
+            local_order.find("self.wait_lock.unlock").unwrap()
+                < local_order.find("local_irq_restore").unwrap()
+        );
+        assert!(
+            local_order.find("local_irq_restore").unwrap()
+                < local_order.find("preempt_enable").unwrap()
         );
     }
 

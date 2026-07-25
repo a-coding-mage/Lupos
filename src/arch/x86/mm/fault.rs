@@ -417,6 +417,13 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
         }
     }
 
+    // The CPU pushes only RIP/CS/RFLAGS for a same-CPL fault.  The interrupted
+    // kernel RSP is therefore the address immediately following RFLAGS, not
+    // the optional user_rsp slot in ExceptionFrame (that slot exists only
+    // when a ring-3 event supplied RSP/SS).  Linux keeps this distinction in
+    // pt_regs; retain it here so the diagnostic names the real call site.
+    let interrupted_kernel_sp = (frame as *const ExceptionFrame as u64)
+        .saturating_add((core::mem::size_of::<u64>() * 20) as u64);
     log_page_fault(frame, ec, addr);
     log_error!(
         "cpu",
@@ -424,18 +431,22 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
         addr,
         ec,
         frame.rip,
-        frame.user_rsp,
+        if (frame.cs & 3) == 3 {
+            frame.user_rsp
+        } else {
+            interrupted_kernel_sp
+        },
     );
     // A kernel-mode *instruction fetch* at a null/low address is a call through
     // a NULL function pointer. The `call` has already pushed its return address,
-    // so the top of the faulting stack names the exact call site. In long mode
-    // the CPU pushes SS:RSP for same-privilege faults too, so `user_rsp` is the
-    // faulting kernel stack here. This is far more precise than the heuristic
-    // stack scan in the panic handler, which reports every word that merely
-    // looks like a text address.
+    // so the top of the faulting stack names the exact call site. For a
+    // same-privilege fault that stack begins directly after the hardware
+    // RIP/CS/RFLAGS triple; user_rsp is not present. This is far more precise
+    // than the heuristic stack scan in the panic handler, which reports every
+    // word that merely looks like a text address.
     const PF_INSTR: u64 = 1 << 4;
     if !is_user_mode_fault(frame, ec) && ec & PF_INSTR != 0 && addr < 0x1000 {
-        let sp = frame.user_rsp;
+        let sp = interrupted_kernel_sp;
         // Only touch an aligned kernel address; we were executing on this stack,
         // so it is mapped, but stay defensive to avoid faulting inside a fault.
         if sp >= 0xffff_8000_0000_0000 && sp % 8 == 0 {
