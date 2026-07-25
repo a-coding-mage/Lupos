@@ -268,6 +268,10 @@ pub fn drain_system_workqueues() {
         flush_workqueue(&queue);
     }
     drain_kthread_workers();
+    // Linux `vfree_atomic()` posts delayed_vfree_work to the system workqueue.
+    // Lupos's cooperative workqueue runs at these explicit task-context drain
+    // points, so complete the matching vmalloc deferred-free queue here.
+    crate::mm::vmalloc::drain_deferred_vfree();
 }
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {

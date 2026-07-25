@@ -96,11 +96,12 @@ static SWITCH_ATTEMPT_PREV_STACK: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(test, debug_assertions))]
 static SWITCH_ATTEMPT_NEXT_STACK: AtomicU64 = AtomicU64::new(0);
 
-/// Lazy active_mm references released after the physical stack/CR3 switch.
+/// Lazy active_mm references transferred after the physical stack/CR3 switch.
 ///
 /// Linux carries this as `rq->prev_mm` from `context_switch()` to
-/// `finish_task_switch()`. The scheduler invokes `finish_switch_mm_drop()` at
-/// that exact post-switch boundary; the x86 switch path carries the ownership
+/// `finish_task_switch()`. The scheduler consumes this at that exact
+/// post-switch boundary, then releases it after the incoming task has unwound
+/// the Rust scheduler frames. The x86 switch path carries the ownership
 /// through one per-CPU slot instead of dropping it while `__switch_to()` is
 /// still running.
 static PREV_MM_TO_DROP: [AtomicUsize; crate::kernel::sched::MAX_CPUS] =
@@ -419,18 +420,15 @@ unsafe fn prepare_switch_mm(prev: *mut TaskStruct, next: *mut TaskStruct) {
 }
 
 #[cfg(not(test))]
-pub(crate) unsafe fn finish_switch_mm_drop() {
+pub(crate) unsafe fn take_switch_mm_drop() -> *mut crate::mm::mm_types::MmStruct {
     let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number();
-    let mm = PREV_MM_TO_DROP[cpu].swap(0, Ordering::AcqRel) as *mut crate::mm::mm_types::MmStruct;
-    if !mm.is_null() {
-        unsafe {
-            crate::mm::fork::mmdrop(mm);
-        }
-    }
+    PREV_MM_TO_DROP[cpu].swap(0, Ordering::AcqRel) as *mut crate::mm::mm_types::MmStruct
 }
 
 #[cfg(test)]
-pub(crate) unsafe fn finish_switch_mm_drop() {}
+pub(crate) unsafe fn take_switch_mm_drop() -> *mut crate::mm::mm_types::MmStruct {
+    core::ptr::null_mut()
+}
 
 fn fresh_stack_canary() -> u64 {
     let canary = crate::kernel::syscalls::next_random_u64() & 0xffff_ffff_ffff_ff00;
@@ -991,8 +989,8 @@ mod tests {
             .next()
             .expect("__switch_to body must end before unit tests");
         assert!(
-            !switch_body.contains("finish_switch_mm_drop()"),
-            "Linux does not mmdrop rq->prev_mm from __switch_to"
+            !switch_body.contains("take_switch_mm_drop()"),
+            "Linux does not consume rq->prev_mm from __switch_to"
         );
 
         let sched_source = include_str!(concat!(
@@ -1007,11 +1005,11 @@ mod tests {
             .find("set_task_on_cpu(prev, false, Ordering::Release)")
             .expect("finish_task_switch must clear prev->on_cpu");
         let drop_mm = finish_body
-            .find("finish_switch_mm_drop()")
-            .expect("finish_task_switch must drop the deferred active_mm");
+            .find("defer_switch_mm_drop()")
+            .expect("finish_task_switch must consume the deferred active_mm");
         assert!(
             clear_on_cpu < drop_mm,
-            "Linux drops rq->prev_mm only after finish_task() publishes prev off CPU"
+            "Linux consumes rq->prev_mm only after finish_task() publishes prev off CPU"
         );
     }
 

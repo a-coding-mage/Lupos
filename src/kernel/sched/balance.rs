@@ -15,7 +15,9 @@ use super::class::{
 use super::rq::{MAX_RQ_CPUS, Rq, rq_nr_running, with_double_rq};
 use crate::kernel::sched;
 use crate::kernel::task::TaskStruct;
-use crate::kernel::task::task_state::{EXIT_DEAD, EXIT_ZOMBIE, NON_RUNNABLE_MASK};
+use crate::kernel::task::task_state::{
+    EXIT_DEAD, EXIT_ZOMBIE, NON_RUNNABLE_MASK, TASK_WAKING,
+};
 
 /// Linux `sysctl_sched_balance_interval` defaults to one tick at MC level.
 pub const DEFAULT_BALANCE_INTERVAL_TICKS: u64 = 1;
@@ -122,7 +124,11 @@ fn candidate_is_migratable(
         return false;
     }
     let state = unsafe { (*candidate).__state.load(Ordering::Acquire) };
-    if state & (NON_RUNNABLE_MASK | EXIT_ZOMBIE | EXIT_DEAD) != 0 {
+    // Linux can_migrate_task() rejects a task that is blocked or in the
+    // wakeup handoff.  TASK_WAKING is not part of NON_RUNNABLE_MASK, but its
+    // embedded sched_entity is concurrently owned by try_to_wake_up() until
+    // it has been activated on its selected rq.
+    if state == TASK_WAKING || state & (NON_RUNNABLE_MASK | EXIT_ZOMBIE | EXIT_DEAD) != 0 {
         return false;
     }
     if unsafe { (*candidate).m29.migration_disabled } != 0
@@ -158,6 +164,8 @@ fn pick_migratable_task(rq: &Rq, dst_cpu: u32) -> Option<*mut TaskStruct> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
+    use crate::kernel::task::task_state::TASK_WAKING;
     #[test]
     fn balance_interval_default_is_one_tick() {
         assert_eq!(DEFAULT_BALANCE_INTERVAL_TICKS, 1);
@@ -167,5 +175,20 @@ mod tests {
         // Without init_rqs() the slots are None; no candidate.
         let busy = find_busiest_queue(0);
         assert!(busy.is_none() || busy == Some(0) || busy.is_some());
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:can_migrate_task
+    ///
+    /// Linux keeps TASK_WAKING out of balancing because ttwu owns the task's
+    /// rq transition until activation completes.  Selecting it here would let
+    /// two scheduler paths mutate one intrusive CFS run_node.
+    #[test]
+    fn waking_task_is_not_migratable() {
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        task.__state.store(TASK_WAKING, Ordering::Release);
+        task.m29.cpus_mask.set(1);
+        let ptr = &mut *task as *mut TaskStruct;
+
+        assert!(!candidate_is_migratable(core::ptr::null_mut(), ptr, 1));
     }
 }

@@ -90,6 +90,10 @@ pub unsafe fn run_irq_on_irqstack(frame: *mut crate::arch::x86::kernel::idt::Exc
     }
 
     let base = unsafe { core::ptr::addr_of_mut!(IRQ_STACK_BACKING_STORE[cpu].0) as *mut u8 };
+    // `hardirq_stack_ptr` is Linux's actual TOS, not merely an initial RSP.
+    // `call_on_stack()` stores the interrupted RSP in this exact topmost slot.
+    // Stack walkers recover the previous task stack from that slot, so do not
+    // consume it with an extra saved-stack frame.
     let top = unsafe { base.add(IRQ_STACK_SIZE - 8) } as usize;
     unsafe { irq_stack_call(top, frame, vector as usize) };
     HARDIRQ_STACK_INUSE[cpu].store(false, Ordering::Release);
@@ -102,11 +106,25 @@ unsafe extern "C" fn irq_stack_call(
     _vector: usize,
 ) {
     core::arch::naked_asm!(
-        "xchg rsp, rdi",
-        "push rdi",
+        // Linux `call_on_stack()` saves the interrupted RSP at
+        // hardirq_stack_ptr itself, invokes the handler, then restores it
+        // with `popq %rsp`.  Preserve that externally visible stack link.
+        //
+        // Linux compiles x86 kernel C with an 8-byte stack alignment
+        // (`arch/x86/Makefile:cc_stack_align8`), so its C handler may enter
+        // with RSP % 16 == 0.  Rust `extern "C"` follows the SysV AMD64 ABI
+        // and requires RSP % 16 == 8 at function entry.  Reserve one
+        // otherwise-unused word below the saved link before the Rust call,
+        // then discard it before Linux's `pop rsp` restore.  A literal C-asm
+        // translation would misalign every nested Rust call and corrupt task
+        // stacks under IRQ load.
+        "mov [rdi], rsp",
+        "mov rsp, rdi",
         "mov rdi, rsi",
         "mov rsi, rdx",
+        "sub rsp, 8",
         "call {dispatch}",
+        "add rsp, 8",
         "pop rsp",
         "ret",
         dispatch = sym crate::arch::x86::kernel::idt::run_hardirq_handler,
@@ -142,5 +160,33 @@ mod tests {
             Ok(0xdead)
         );
         assert_eq!(irq_init_percpu_irqstack(None, Ok(mapped)), Ok(mapped.0));
+    }
+
+    #[test]
+    fn irq_stack_link_uses_linux_topmost_slot() {
+        // test-origin: linux:vendor/linux/arch/x86/include/asm/irq_stack.h:call_on_stack
+        // Linux records the interrupted RSP at hardirq_stack_ptr itself.  The
+        // Rust SysV adapter leaves that link intact and reserves one word
+        // below it so the handler receives the required 16-byte call-site
+        // alignment.  It must discard that word before Linux's pop restore.
+        let base = 0x1_0000usize;
+        let top = hardirq_stack_top(base);
+        assert_eq!(top, base + IRQ_STACK_SIZE - 8);
+
+        let source = include_str!("irq_64.rs");
+        let stub = source
+            .split("unsafe extern \"C\" fn irq_stack_call")
+            .nth(1)
+            .expect("irq stack transfer stub must exist")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("irq stack transfer stub must end before tests");
+        assert!(stub.contains("\"mov [rdi], rsp\""));
+        assert!(stub.contains("\"mov rsp, rdi\""));
+        assert!(stub.contains("\"sub rsp, 8\""));
+        assert!(stub.contains("\"add rsp, 8\""));
+        assert!(stub.contains("\"add rsp, 8\",\n        \"pop rsp\""));
+        assert!(!stub.contains("\"xchg rsp, rdi\""));
+        assert!(!stub.contains("\"push rdi\""));
     }
 }

@@ -12,7 +12,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -214,8 +214,13 @@ pub fn fget(f: &FileRef) -> FileRef {
 }
 
 pub fn fput(f: FileRef) {
-    f.f_count.fetch_sub(1, Ordering::AcqRel);
-    let final_ref = Arc::strong_count(&f) == 1;
+    // Linux `file_ref_put(&file->f_ref)` decides the last-reference path
+    // from the logical file reference count.  Rust Arc clones made while
+    // borrowing an fdtable slot are not Linux file references and must not
+    // postpone `__fput()`.
+    let previous = f.f_count.fetch_sub(1, Ordering::AcqRel);
+    assert!(previous != 0, "fput without a matching file reference");
+    let final_ref = previous == 1;
     if final_ref {
         crate::fs::inotify::notify_close(&f);
     }
@@ -269,7 +274,26 @@ pub fn dentry_path(dentry: &DentryRef) -> String {
 mod tests {
     use super::*;
     use crate::fs::dcache::{d_alloc, d_alloc_child};
-    use crate::fs::ops::NOOP_FILE_OPS;
+    use crate::fs::ops::{FileOps, NOOP_FILE_OPS};
+
+    static FINAL_FPUT_RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_final_fput(_file: FileRef) {
+        FINAL_FPUT_RELEASES.fetch_add(1, Ordering::AcqRel);
+    }
+
+    static FINAL_FPUT_OPS: FileOps = FileOps {
+        name: "final-fput",
+        read: None,
+        write: None,
+        llseek: None,
+        fsync: None,
+        poll: None,
+        ioctl: None,
+        mmap: None,
+        release: Some(count_final_fput),
+        readdir: None,
+    };
 
     #[test]
     fn file_path_uses_dentry_parent_chain() {
@@ -315,5 +339,21 @@ mod tests {
         raw_file = core::ptr::null_mut();
         assert!(unsafe { linux_get_file_active(&mut raw_file as *mut *mut c_void) }.is_null());
         assert!(unsafe { linux_get_file_active(core::ptr::null_mut()) }.is_null());
+    }
+
+    /// test-origin: linux:vendor/linux/fs/file_table.c:fput
+    ///
+    /// A Rust borrowing pin is not a Linux `struct file` reference.  The last
+    /// logical fput must run release even while such a pin remains alive.
+    #[test]
+    fn fput_last_logical_reference_ignores_temporary_arc_borrow() {
+        FINAL_FPUT_RELEASES.store(0, Ordering::Release);
+        let file = alloc_file(d_alloc("final-fput"), 0, 0, &FINAL_FPUT_OPS);
+        let temporary_borrow = file.clone();
+
+        fput(file);
+
+        assert_eq!(FINAL_FPUT_RELEASES.load(Ordering::Acquire), 1);
+        drop(temporary_borrow);
     }
 }

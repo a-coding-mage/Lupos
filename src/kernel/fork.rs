@@ -41,7 +41,7 @@ extern crate alloc;
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::arch::x86::kernel::ptrace::PtRegs;
@@ -708,18 +708,55 @@ fn alloc_kernel_stack() -> *mut u8 {
     unsafe { alloc_zeroed(kernel_stack_layout()) }
 }
 
-#[cfg(not(test))]
 const NR_CACHED_STACKS: usize = 2;
 
-#[cfg(not(test))]
-struct KernelStackCache {
-    slots: [[usize; NR_CACHED_STACKS]; MAX_CPUS],
+// Linux's `cached_stacks` is a per-CPU array exchanged while preemption is
+// disabled (`alloc_thread_stack_node_from_cache()` and
+// `try_release_thread_stack_to_cache()` in kernel/fork.c).  These atomics are
+// the direct Rust representation: an interrupt on this CPU may race the
+// interrupted code, so each slot still needs an atomic exchange/CAS, but no
+// global lock or allocation is allowed on the stack-free path.
+static KERNEL_STACK_CACHE: [[AtomicUsize; NR_CACHED_STACKS]; MAX_CPUS] =
+    [const { [const { AtomicUsize::new(0) }; NR_CACHED_STACKS] }; MAX_CPUS];
+
+/// Linux `alloc_thread_stack_node_from_cache()` without NUMA policy (Lupos has
+/// no NUMA allocator yet).  Keep preemption disabled from the CPU selection
+/// through the exchange so this CPU's cache remains the cache we consume.
+fn take_cached_kernel_stack() -> *mut u8 {
+    crate::kernel::locking::preempt_disable();
+    let cpu = (current_cpu() as usize).min(MAX_CPUS - 1);
+    for slot in &KERNEL_STACK_CACHE[cpu] {
+        let stack = slot.swap(0, Ordering::AcqRel);
+        if stack != 0 {
+            crate::kernel::locking::preempt_enable();
+            return stack as *mut u8;
+        }
+    }
+    crate::kernel::locking::preempt_enable();
+    core::ptr::null_mut()
 }
 
-#[cfg(not(test))]
-static KERNEL_STACK_CACHE: Mutex<KernelStackCache> = Mutex::new(KernelStackCache {
-    slots: [[0; NR_CACHED_STACKS]; MAX_CPUS],
-});
+/// Linux `try_release_thread_stack_to_cache()` without NUMA page-locality
+/// filtering.  A failed compare-exchange means this CPU's slot was populated
+/// by an interrupt or another context, so the caller follows Linux's delayed
+/// RCU-free path instead of taking a global lock.
+fn try_release_kernel_stack_to_cache(stack: *mut u8) -> bool {
+    debug_assert!(!stack.is_null());
+
+    crate::kernel::locking::preempt_disable();
+    let cpu = (current_cpu() as usize).min(MAX_CPUS - 1);
+    for slot in &KERNEL_STACK_CACHE[cpu] {
+        if slot
+            .compare_exchange(0, stack as usize, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
+            crate::kernel::locking::preempt_enable();
+            return true;
+        }
+    }
+    crate::kernel::locking::preempt_enable();
+    false
+}
 
 #[cfg(not(test))]
 const NR_CACHED_TASK_STRUCTS: usize = 2;
@@ -736,22 +773,15 @@ static TASK_STRUCT_CACHE: Mutex<TaskStructCache> = Mutex::new(TaskStructCache {
 
 #[cfg(not(test))]
 fn alloc_kernel_stack() -> *mut u8 {
-    let cpu = (current_cpu() as usize).min(MAX_CPUS - 1);
-    let mut cache = KERNEL_STACK_CACHE.lock();
-    for slot in &mut cache.slots[cpu] {
-        if *slot != 0 {
-            let stack = *slot as *mut u8;
-            *slot = 0;
-            drop(cache);
-            unsafe {
-                // Linux clears stale pointers when reusing a cached vmapped
-                // thread stack.
-                core::ptr::write_bytes(stack, 0, KTHREAD_STACK_SIZE);
-            }
-            return stack;
+    let stack = take_cached_kernel_stack();
+    if !stack.is_null() {
+        unsafe {
+            // Linux clears stale pointers when reusing a cached vmapped thread
+            // stack, after it has been removed from the per-CPU slot.
+            core::ptr::write_bytes(stack, 0, KTHREAD_STACK_SIZE);
         }
+        return stack;
     }
-    drop(cache);
     crate::mm::vmalloc::vmalloc_stack(KTHREAD_STACK_SIZE)
 }
 
@@ -767,9 +797,15 @@ unsafe fn free_kernel_stack(stack: *mut u8) {
     if stack.is_null() {
         return;
     }
-    // Linux's VMAP_STACK path queues the stack's embedded rcu_head before it
-    // can enter the per-CPU cache or vfree(). The bottom of this downward
-    // growing stack is unused after switch-away and is the matching storage.
+    // Linux first tries its per-CPU cache synchronously.  Only a cache-full
+    // stack needs RCU protection before `vfree()`: deferring every stack made
+    // Lupos invoke cache bookkeeping from RCU_SOFTIRQ, unlike Linux.
+    if try_release_kernel_stack_to_cache(stack) {
+        return;
+    }
+
+    // The bottom of this downward-growing stack is unused after switch-away
+    // and supplies Linux's embedded `struct vm_stack`/`rcu_head` storage.
     let rcu_head = stack.cast::<crate::kernel::rcu::RcuHead>();
     unsafe {
         core::ptr::write(rcu_head, crate::kernel::rcu::RcuHead::new());
@@ -781,15 +817,9 @@ unsafe fn free_kernel_stack(stack: *mut u8) {
 #[cfg(not(test))]
 unsafe extern "C" fn thread_stack_free_rcu(head: *mut crate::kernel::rcu::RcuHead) {
     let stack = head.cast::<u8>();
-    let cpu = (current_cpu() as usize).min(MAX_CPUS - 1);
-    let mut cache = KERNEL_STACK_CACHE.lock();
-    for slot in &mut cache.slots[cpu] {
-        if *slot == 0 {
-            *slot = stack as usize;
-            return;
-        }
+    if try_release_kernel_stack_to_cache(stack) {
+        return;
     }
-    drop(cache);
     crate::mm::vmalloc::vfree_stack(stack);
 }
 
@@ -1755,6 +1785,33 @@ mod tests {
 
     fn test_task_free(_task_id: u32) {
         TASK_HOOK_LOG.lock().unwrap().push("free");
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/fork.c:try_release_thread_stack_to_cache
+    ///
+    /// Linux places a retired VMAP stack in a local cache before it schedules
+    /// RCU reclamation.  Preserve that ordering here: an available slot must
+    /// make the stack immediately reusable, rather than sending it through an
+    /// RCU softirq callback.
+    #[test]
+    fn cached_kernel_stack_is_reused_before_rcu_fallback() {
+        let _test_guard = TEST_LOCK.lock().unwrap();
+        for cache in &KERNEL_STACK_CACHE {
+            for slot in cache {
+                slot.store(0, Ordering::Release);
+            }
+        }
+
+        let stack = 0x1_0000usize as *mut u8;
+        assert!(try_release_kernel_stack_to_cache(stack));
+        assert_eq!(take_cached_kernel_stack(), stack);
+        assert!(take_cached_kernel_stack().is_null());
+
+        for cache in &KERNEL_STACK_CACHE {
+            for slot in cache {
+                assert_eq!(slot.load(Ordering::Acquire), 0);
+            }
+        }
     }
 
     #[test]

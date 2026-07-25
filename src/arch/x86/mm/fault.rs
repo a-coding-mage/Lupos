@@ -108,6 +108,43 @@ pub fn do_page_fault(frame: &ExceptionFrame) {
 
     let ec = frame.error_code;
 
+    // Focused return-frame probe for the reproducible post-ALSA supervisor
+    // instruction fetch.  This runs before do_user_addr_fault() enables IRQs
+    // or touches the mmap state, so it distinguishes a malformed hardware
+    // frame at IDT entry from a later overwrite of the saved frame.
+    if cr2 < TASK_SIZE_MAX && ec & X86_PF_INSTR != 0 && ec & X86_PF_USER == 0 {
+        let raw = frame as *const ExceptionFrame as *const u64;
+        let task = unsafe { sched::get_current() };
+        let (pid, task_ptr) = if task.is_null() {
+            (-1, 0usize)
+        } else {
+            (unsafe { (*task).pid }, task as usize)
+        };
+        log_error!(
+            "cpu",
+            "cpu: #PF entry-frame task-pid={} task={:#018x} ptr={:#018x} vector={:#018x} ec={:#018x} rip={:#018x} cs={:#018x} flags={:#018x}",
+            pid,
+            task_ptr,
+            raw as usize,
+            unsafe { raw.add(15).read_volatile() },
+            unsafe { raw.add(16).read_volatile() },
+            unsafe { raw.add(17).read_volatile() },
+            unsafe { raw.add(18).read_volatile() },
+            unsafe { raw.add(19).read_volatile() },
+        );
+        log_error!(
+            "cpu",
+            "cpu: #PF entry-regs rax={:#018x} rbx={:#018x} rcx={:#018x} rdx={:#018x} rsi={:#018x} rdi={:#018x} rbp={:#018x}",
+            frame.rax,
+            frame.rbx,
+            frame.rcx,
+            frame.rdx,
+            frame.rsi,
+            frame.rdi,
+            frame.rbp,
+        );
+    }
+
     if cr2 >= TASK_SIZE_MAX {
         do_kern_addr_fault(frame, ec, cr2);
     } else {
@@ -149,6 +186,7 @@ fn do_kern_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
     }
 
     log_page_fault(frame, ec, addr);
+    log_faulting_module_return_addresses();
 
     // Milestone 4 TDD: deliberate kernel #PF from main.rs → exit QEMU.
     #[cfg(all(feature = "qemu-test", feature = "test-page-fault"))]
@@ -161,6 +199,41 @@ fn do_kern_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
         "Kernel page fault: addr={:#018x} error={:#010x} rip={:#018x}",
         addr, ec, frame.rip,
     );
+}
+
+/// Resolve dynamically-loaded driver return addresses only on a fatal kernel
+/// fault.  Kernel ELF symbolization cannot decode the vendor C modules, while
+/// their live section ranges are authoritative for identifying the caller of
+/// an invalid indirect branch.
+fn log_faulting_module_return_addresses() {
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return;
+    }
+    let stack_top = unsafe { (*task).stack as usize };
+    let stack_bottom = stack_top.saturating_sub(crate::kernel::sched::KTHREAD_STACK_SIZE);
+    if stack_bottom == 0 || stack_top <= stack_bottom {
+        return;
+    }
+
+    let mut found = 0usize;
+    let mut word = stack_bottom;
+    while word.saturating_add(core::mem::size_of::<usize>()) <= stack_top && found < 8 {
+        let candidate = unsafe { (word as *const usize).read() };
+        if crate::kernel::module::with_module_address(candidate, |module, section, offset| {
+            log_error!(
+                "cpu",
+                "cpu: fault-module-return stack={:#018x} module={} section={} offset={:#x}",
+                word,
+                module,
+                section,
+                offset,
+            );
+        }) {
+            found += 1;
+        }
+        word = word.saturating_add(core::mem::size_of::<usize>());
+    }
 }
 
 fn is_vmalloc_fault_candidate(ec: u64, addr: u64) -> bool {
@@ -215,6 +288,21 @@ fn lock_mm_and_find_vma(
 ///
 /// Ref: arch/x86/mm/fault.c — `do_user_addr_fault()`
 fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
+    // Linux rejects a supervisor instruction fetch from the user address
+    // range before it considers VMA lookup, exception-table fixup, or IRQ
+    // enabling.  Continuing as though this were a demand-paging fault lets
+    // nested IRQ work run over the live IDT frame and obscures the original
+    // bad kernel control flow.  `is_errata93()` has no applicable generic
+    // x86_64 implementation in Lupos yet; the QEMU CPU used by this target
+    // is not an affected AMD family, so retain Linux's normal oops branch.
+    if is_supervisor_instruction_fetch_from_user_address(ec) {
+        log_page_fault(frame, ec, addr);
+        panic!(
+            "Kernel instruction fetch from user address: addr={:#018x} error={:#010x} rip={:#018x}",
+            addr, ec, frame.rip,
+        );
+    }
+
     // Build FAULT_FLAG_* from the error code and privilege level.
     let mut flags: FaultFlags = FAULT_FLAG_DEFAULT;
     if ec & X86_PF_WRITE != 0 {
@@ -312,6 +400,11 @@ fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
     }
 
     resched_after_user_fault(frame, ec, task);
+}
+
+#[inline]
+const fn is_supervisor_instruction_fetch_from_user_address(ec: u64) -> bool {
+    ec & (X86_PF_USER | X86_PF_INSTR) == X86_PF_INSTR
 }
 
 fn should_resched_after_user_fault(frame: &ExceptionFrame, ec: u64, task: *mut TaskStruct) -> bool {
@@ -480,6 +573,23 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
                     slot * 8,
                     core::ptr::read_volatile((interrupted_kernel_sp + slot * 8) as *const u64),
                 );
+            }
+            // `__switch_to_asm` stores the saved task context at thread.sp:
+            // r15, r14, r13, r12, rbx, rbp, then the continuation address.
+            // This distinguishes a bad return on the interrupted frame from a
+            // corrupted context that was restored by the scheduler.
+            let saved_sp = (*task).thread.sp;
+            let stack_top = (*task).stack as u64;
+            let stack_bottom = stack_top.saturating_sub(crate::kernel::sched::KTHREAD_STACK_SIZE as u64);
+            if saved_sp >= stack_bottom && saved_sp.saturating_add(7 * 8) < stack_top {
+                for slot in 0..7u64 {
+                    log_error!(
+                        "cpu",
+                        "cpu: instr-fault-saved-switch [sp+{:#04x}]={:#018x}",
+                        slot * 8,
+                        core::ptr::read_volatile((saved_sp + slot * 8) as *const u64),
+                    );
+                }
             }
         }
     }
@@ -672,13 +782,21 @@ fn log_page_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
         // Use the task's registered vmapped stack extent as Linux's stack
         // classifier does.  Masking RSP assumes a THREAD_SIZE-aligned top and
         // can make a diagnostic probe cross a leading guard page.
-        let stack_end =
-            crate::arch::x86::kernel::dumpstack_64::current_task_stack_bounds(interrupted_rsp)
-                .map(|(_, end)| end)
-                .unwrap_or_else(|| {
-                    let thread_size = crate::arch::x86::kernel::dumpstack_64::THREAD_SIZE;
-                    (interrupted_rsp | (thread_size - 1)).saturating_add(1)
-                });
+        let stack_bounds =
+            crate::arch::x86::kernel::dumpstack_64::current_task_stack_bounds(interrupted_rsp);
+        let stack_end = stack_bounds.map(|(_, end)| end).unwrap_or_else(|| {
+            let thread_size = crate::arch::x86::kernel::dumpstack_64::THREAD_SIZE;
+            (interrupted_rsp | (thread_size - 1)).saturating_add(1)
+        });
+        if let Some((stack_begin, stack_end)) = stack_bounds {
+            log_error!(
+                "cpu",
+                "cpu: #PF task-stack=[{:#018x},{:#018x}) used-from-top={:#x}",
+                stack_begin,
+                stack_end,
+                stack_end.saturating_sub(interrupted_rsp),
+            );
+        }
         if interrupted_rsp >= crate::arch::x86::mm::paging::PAGE_OFFSET
             && interrupted_rsp.saturating_add(0xa8) < stack_end
         {
@@ -721,6 +839,40 @@ mod tests {
         assert_eq!(X86_PF_INSTR, 1 << 4);
         assert_eq!(X86_PF_PK, 1 << 5);
         assert_eq!(X86_PF_SHSTK, 1 << 6);
+    }
+
+    /// test-origin: linux:vendor/linux/arch/x86/mm/fault.c:do_user_addr_fault
+    #[test]
+    fn supervisor_instruction_fetch_from_user_range_oopses_before_vma_work() {
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/arch/x86/mm/fault.c"
+        ));
+        let linux_body = linux
+            .split("void do_user_addr_fault(struct pt_regs *regs,")
+            .nth(1)
+            .and_then(|body| body.split("/* kprobes").next())
+            .expect("Linux do_user_addr_fault early body must exist");
+        assert!(linux_body.contains(
+            "(error_code & (X86_PF_USER | X86_PF_INSTR)) == X86_PF_INSTR"
+        ));
+        assert!(linux_body.contains("page_fault_oops(regs, error_code, address);"));
+
+        assert!(is_supervisor_instruction_fetch_from_user_address(X86_PF_INSTR));
+        assert!(!is_supervisor_instruction_fetch_from_user_address(
+            X86_PF_INSTR | X86_PF_USER
+        ));
+        assert!(!is_supervisor_instruction_fetch_from_user_address(0));
+
+        let source = include_str!("fault.rs");
+        let body = source
+            .split("fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64)")
+            .nth(1)
+            .and_then(|body| body.split("// Build FAULT_FLAG").next())
+            .expect("Lupos do_user_addr_fault early body must exist");
+        assert!(body.contains("is_supervisor_instruction_fetch_from_user_address(ec)"));
+        assert!(body.contains("log_page_fault(frame, ec, addr);"));
+        assert!(body.contains("Kernel instruction fetch from user address"));
     }
 
     #[test]

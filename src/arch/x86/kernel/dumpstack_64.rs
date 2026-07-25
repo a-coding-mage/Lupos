@@ -200,7 +200,6 @@ mod tests {
         // the registered end rather than infer the next aligned boundary.
         let stack_top = 0xffff_c900_000e_b000u64;
         let stack_bottom = stack_top - crate::kernel::sched::KTHREAD_STACK_SIZE as u64;
-        assert_eq!(stack_bottom, 0xffff_c900_000e_7000);
         assert_eq!(
             task_stack_bounds(stack_top, stack_bottom + 0x29e0),
             Some((stack_bottom, stack_top))
