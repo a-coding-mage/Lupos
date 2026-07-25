@@ -642,7 +642,15 @@ pub unsafe fn release_task(p: *mut TaskStruct) {
             }
             return;
         }
-        finish_heap_task_release(p, kernel_stack);
+        // `finish_task_switch()` runs with the local rq transition's IRQ
+        // state still disabled.  Linux defers the final task/stack drop until
+        // after that boundary; Lupos must likewise postpone a vmapped-stack
+        // `vfree()` so its synchronous kernel TLB flush can receive IPIs.
+        if crate::kernel::locking::irqs_disabled() {
+            sched::defer_heap_task_release(p, kernel_stack);
+        } else {
+            finish_heap_task_release(p, kernel_stack);
+        }
         if !zapped_leader.is_null() {
             release_task(zapped_leader);
         }

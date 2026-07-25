@@ -239,6 +239,9 @@ pub fn init() {
         SoftIrqVec::Sched,
         crate::kernel::sched::run_rebalance_softirq,
     );
+    // Linux processes ready callbacks from RCU_SOFTIRQ. Task-stack reuse must
+    // remain deferred until this post-grace-period context.
+    open_softirq(SoftIrqVec::Rcu, crate::kernel::rcu::rcu_check_callbacks);
 }
 
 /// Linux `ksoftirqd_should_run()`.
@@ -259,6 +262,17 @@ fn wakeup_softirqd_on_cpu(cpu: usize) {
     KSOFTIRQD_WAKE_REQUESTS[cpu].fetch_add(1, Ordering::SeqCst);
 
     let task = KSOFTIRQD_TASKS[cpu].load(Ordering::Acquire);
+    // Temporary crash probe for the four-CPU graphics failure. Every task
+    // allocation is at least pointer-aligned; record the owning per-CPU slot
+    // before ttwu dereferences a corrupted published pointer.
+    if (task as usize) & (core::mem::align_of::<crate::kernel::task::TaskStruct>() - 1) != 0 {
+        crate::log_error!(
+            "softirq",
+            "softirq: corrupt ksoftirqd pointer cpu={} task={:#018x}",
+            cpu,
+            task as usize,
+        );
+    }
     if !task.is_null() {
         unsafe {
             let _ = crate::kernel::sched::wake_task_normal(task);

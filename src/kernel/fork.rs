@@ -767,6 +767,20 @@ unsafe fn free_kernel_stack(stack: *mut u8) {
     if stack.is_null() {
         return;
     }
+    // Linux's VMAP_STACK path queues the stack's embedded rcu_head before it
+    // can enter the per-CPU cache or vfree(). The bottom of this downward
+    // growing stack is unused after switch-away and is the matching storage.
+    let rcu_head = stack.cast::<crate::kernel::rcu::RcuHead>();
+    unsafe {
+        core::ptr::write(rcu_head, crate::kernel::rcu::RcuHead::new());
+        crate::kernel::rcu::call_rcu(rcu_head, thread_stack_free_rcu);
+    }
+}
+
+/// Linux `thread_stack_free_rcu()` for Lupos' vmalloc-stack metadata.
+#[cfg(not(test))]
+unsafe extern "C" fn thread_stack_free_rcu(head: *mut crate::kernel::rcu::RcuHead) {
+    let stack = head.cast::<u8>();
     let cpu = (current_cpu() as usize).min(MAX_CPUS - 1);
     let mut cache = KERNEL_STACK_CACHE.lock();
     for slot in &mut cache.slots[cpu] {

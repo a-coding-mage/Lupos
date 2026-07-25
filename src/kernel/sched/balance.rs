@@ -9,7 +9,9 @@
 
 use core::sync::atomic::Ordering;
 
-use super::class::{DEQUEUE_MIGRATING, ENQUEUE_MIGRATED, ENQUEUE_WAKEUP};
+use super::class::{
+    DEQUEUE_MIGRATING, ENQUEUE_MIGRATED, ENQUEUE_WAKEUP, TASK_ON_RQ_MIGRATING, TASK_ON_RQ_QUEUED,
+};
 use super::rq::{MAX_RQ_CPUS, Rq, rq_nr_running, with_double_rq};
 use crate::kernel::sched;
 use crate::kernel::task::TaskStruct;
@@ -59,7 +61,13 @@ fn pull_one_task(src_cpu: u32, dst_cpu: u32) -> bool {
         let Some(enqueue) = (*class).enqueue_task else {
             return (false, false);
         };
+        // Linux deactivate_task() publishes TASK_ON_RQ_MIGRATING before the
+        // class dequeue and leaves it in place until activate_task() completes
+        // the destination enqueue.  release_task() relies on nonzero on_rq to
+        // retain the task allocation, including its intrusive CFS run_node.
+        (*task).m29.on_rq = TASK_ON_RQ_MIGRATING;
         if !dequeue(src_rq, task, DEQUEUE_MIGRATING) {
+            (*task).m29.on_rq = TASK_ON_RQ_QUEUED;
             return (false, false);
         }
         (*task).thread_info.cpu = dst_cpu;

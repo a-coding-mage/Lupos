@@ -607,7 +607,12 @@ extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) {
             | RESCHEDULE_VECTOR
             | TEXT_POKE_SYNC_VECTOR
     ) || legacy_irq_line(vector).is_some();
-    if is_irq {
+    // Linux's run_irq_on_irqstack_cond() carries irq_enter_rcu()/irq_exit_rcu()
+    // inside its stack-switch call sequence.  Do not account device IRQs here:
+    // doing so leaves the hardirq preempt-count state on the interrupted task
+    // stack while the handler itself runs elsewhere.
+    let irq_stack_handler = vector == TIMER_VECTOR || legacy_irq_line(vector).is_some();
+    if is_irq && !irq_stack_handler {
         crate::kernel::locking::preempt::__irq_enter_raw();
     }
     match vector {
@@ -622,16 +627,32 @@ extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) {
         VEC_DOUBLE_FAULT => on_double_fault(frame),
         VEC_MACHINE_CHECK => on_machine_check(frame),
         IPI_PING_VECTOR => on_ipi_ping(),
-        TIMER_VECTOR => on_timer_interrupt(frame),
+        TIMER_VECTOR => unsafe { super::irq_64::run_irq_on_irqstack(frame, vector) },
         TLB_SHOOTDOWN_VECTOR => on_tlb_shootdown_ipi(),
         RESCHEDULE_VECTOR => on_reschedule_ipi(),
         TEXT_POKE_SYNC_VECTOR => on_text_poke_sync_ipi(),
-        v if legacy_irq_line(v).is_some() => on_legacy_irq(v),
+        v if legacy_irq_line(v).is_some() => unsafe { super::irq_64::run_irq_on_irqstack(frame, v) },
         v => on_generic(frame, v),
     }
     if is_irq {
-        irq_exit_resched(frame);
+        irq_exit_resched(frame, !irq_stack_handler);
     }
+}
+
+/// The call sequence covered by Linux `run_irq_on_irqstack_cond()`.
+///
+/// `irq_enter_rcu()` and `irq_exit_rcu()` are intentionally inside the stack
+/// switch, matching `ASM_CALL_IRQ` in `asm/irq_stack.h`.  Softirq processing
+/// and the final user-return reschedule decision remain in the outer entry
+/// path after this returns, as part of the local `irqentry_exit` model.
+pub(crate) unsafe extern "C" fn run_hardirq_handler(frame: *mut ExceptionFrame, vector: u8) {
+    crate::kernel::locking::preempt::__irq_enter_raw();
+    match vector {
+        TIMER_VECTOR => on_timer_interrupt(unsafe { &mut *frame }),
+        v if legacy_irq_line(v).is_some() => on_legacy_irq(v),
+        _ => unreachable!("non-device vector sent to hardirq stack"),
+    }
+    crate::kernel::locking::preempt::__irq_exit_raw();
 }
 
 fn on_debug(frame: &mut ExceptionFrame) {
@@ -707,8 +728,10 @@ fn on_legacy_irq(vector: u8) {
     }
 }
 
-fn irq_exit_resched(frame: &ExceptionFrame) {
-    crate::kernel::locking::preempt::__irq_exit_raw();
+fn irq_exit_resched(frame: &ExceptionFrame, exit_hardirq: bool) {
+    if exit_hardirq {
+        crate::kernel::locking::preempt::__irq_exit_raw();
+    }
     // Linux __irq_exit_rcu() drains pending softirqs after leaving the
     // outermost hardirq and before considering task preemption.
     if crate::kernel::locking::preempt::preempt_count() == 0

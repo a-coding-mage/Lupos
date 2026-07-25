@@ -277,6 +277,16 @@ fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
 
     // Check that the access type is permitted by the VMA flags.
     if access_error(ec, unsafe { &*vma }) {
+        log_error!(
+            "cpu",
+            "cpu: user #PF access denied addr={:#018x} ec={:#x} vma=[{:#018x},{:#018x}) flags={:#x} prot={:#x}",
+            addr,
+            ec,
+            unsafe { (*vma).vm_start },
+            unsafe { (*vma).vm_end },
+            unsafe { (*vma).vm_flags },
+            unsafe { (*vma).vm_page_prot },
+        );
         drop(mmap_guard);
         bad_area_or_kernelmode_fixup(frame, ec, addr);
         return;
@@ -286,6 +296,17 @@ fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
     let ret: VmFaultFlags = handle_mm_fault(vma, addr, flags);
     drop(mmap_guard);
     if ret & VM_FAULT_ERROR != 0 {
+        log_error!(
+            "cpu",
+            "cpu: user #PF mm-fault error addr={:#018x} ec={:#x} ret={:#x} vma=[{:#018x},{:#018x}) flags={:#x} prot={:#x}",
+            addr,
+            ec,
+            ret,
+            unsafe { (*vma).vm_start },
+            unsafe { (*vma).vm_end },
+            unsafe { (*vma).vm_flags },
+            unsafe { (*vma).vm_page_prot },
+        );
         bad_area_or_kernelmode_fixup(frame, ec, addr);
         return;
     }
@@ -437,24 +458,49 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
             interrupted_kernel_sp
         },
     );
-    // A kernel-mode *instruction fetch* at a null/low address is a call through
-    // a NULL function pointer. The `call` has already pushed its return address,
-    // so the top of the faulting stack names the exact call site. For a
-    // same-privilege fault that stack begins directly after the hardware
-    // RIP/CS/RFLAGS triple; user_rsp is not present. This is far more precise
-    // than the heuristic stack scan in the panic handler, which reports every
-    // word that merely looks like a text address.
+    if !task.is_null() && !is_user_mode_fault(frame, ec) && ec & X86_PF_INSTR != 0 {
+        unsafe {
+            log_error!(
+                "cpu",
+                "cpu: instr-fault-task pid={} task={:#018x} task-sp={:#018x} stack-top={:#018x} on-rq={} on-cpu={}",
+                (*task).pid,
+                task as usize,
+                (*task).thread.sp,
+                (*task).stack as usize,
+                (*task).m29.on_rq,
+                (*task)
+                    .m29
+                    .on_cpu
+                    .load(core::sync::atomic::Ordering::Acquire),
+            );
+            for slot in 0..8u64 {
+                log_error!(
+                    "cpu",
+                    "cpu: instr-fault-stack [rsp+{:#04x}]={:#018x}",
+                    slot * 8,
+                    core::ptr::read_volatile((interrupted_kernel_sp + slot * 8) as *const u64),
+                );
+            }
+        }
+    }
+    // A kernel-mode instruction fetch at a null/low address is either an
+    // indirect call through NULL (whose caller return PC is at RSP) or a RET
+    // which consumed a zero return address (whose next word is at RSP and the
+    // consumed zero is at RSP-8). Keep both candidates: the CPU's fault frame
+    // records the post-RET RSP, so treating every null fetch as a call loses
+    // the distinction we need to identify the corrupting path.
     const PF_INSTR: u64 = 1 << 4;
     if !is_user_mode_fault(frame, ec) && ec & PF_INSTR != 0 && addr < 0x1000 {
         let sp = interrupted_kernel_sp;
         // Only touch an aligned kernel address; we were executing on this stack,
         // so it is mapped, but stay defensive to avoid faulting inside a fault.
         if sp >= 0xffff_8000_0000_0000 && sp % 8 == 0 {
-            for slot in 0..4u64 {
-                let value = unsafe { core::ptr::read_volatile((sp + slot * 8) as *const u64) };
+            for slot in -2i64..4 {
+                let address = (sp as i64).saturating_add(slot * 8) as u64;
+                let value = unsafe { core::ptr::read_volatile(address as *const u64) };
                 log_error!(
                     "cpu",
-                    "cpu: null-call return address [rsp+{:#04x}] = {:#018x}",
+                    "cpu: null-instr stack [rsp{:+#04x}] = {:#018x}",
                     slot * 8,
                     value,
                 );
