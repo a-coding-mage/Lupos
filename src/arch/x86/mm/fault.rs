@@ -669,8 +669,16 @@ fn log_page_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
         // RSP: frame + 160 bytes.
         let interrupted_rsp = (frame as *const ExceptionFrame as u64)
             .saturating_add(core::mem::offset_of!(ExceptionFrame, user_rsp) as u64);
-        let thread_size = crate::arch::x86::kernel::dumpstack_64::THREAD_SIZE;
-        let stack_end = (interrupted_rsp | (thread_size - 1)).saturating_add(1);
+        // Use the task's registered vmapped stack extent as Linux's stack
+        // classifier does.  Masking RSP assumes a THREAD_SIZE-aligned top and
+        // can make a diagnostic probe cross a leading guard page.
+        let stack_end =
+            crate::arch::x86::kernel::dumpstack_64::current_task_stack_bounds(interrupted_rsp)
+                .map(|(_, end)| end)
+                .unwrap_or_else(|| {
+                    let thread_size = crate::arch::x86::kernel::dumpstack_64::THREAD_SIZE;
+                    (interrupted_rsp | (thread_size - 1)).saturating_add(1)
+                });
         if interrupted_rsp >= crate::arch::x86::mm::paging::PAGE_OFFSET
             && interrupted_rsp.saturating_add(0xa8) < stack_end
         {

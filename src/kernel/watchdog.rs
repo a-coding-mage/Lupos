@@ -132,7 +132,7 @@ fn current_task_stack_bounds(current: *mut crate::kernel::task::TaskStruct, sp: 
         let stack_top = unsafe { (*current).stack as u64 };
         if let Some(stack_bottom) = stack_top.checked_sub(KTHREAD_STACK_SIZE as u64)
             && sp >= stack_bottom
-            && sp <= stack_top
+            && sp < stack_top
         {
             return (stack_bottom, stack_top);
         }

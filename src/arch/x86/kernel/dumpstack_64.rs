@@ -30,6 +30,34 @@ pub const CEA_ESTACK_UNIT: u64 = PAGE_SIZE + EXCEPTION_STKSZ;
 pub const CEA_ESTACK_PAGES: u64 =
     N_EXCEPTION_STACKS as u64 * (1 + (EXCEPTION_STKSZ / PAGE_SIZE)) + 1;
 
+/// Return the exact bounds of `task`'s current vmapped kernel stack when
+/// `sp` belongs to it.
+///
+/// Linux's `in_task_stack()` reports the bounds held by the task rather than
+/// deriving them from an alignment mask; that distinction is required for
+/// CONFIG_VMAP_STACK because its guard page makes the usable stack top not
+/// necessarily `THREAD_SIZE` aligned.
+pub const fn task_stack_bounds(stack_top: u64, sp: u64) -> Option<(u64, u64)> {
+    let Some(stack_bottom) = stack_top.checked_sub(crate::kernel::sched::KTHREAD_STACK_SIZE as u64)
+    else {
+        return None;
+    };
+    if sp >= stack_bottom && sp < stack_top {
+        Some((stack_bottom, stack_top))
+    } else {
+        None
+    }
+}
+
+pub fn current_task_stack_bounds(sp: u64) -> Option<(u64, u64)> {
+    let current = unsafe { crate::kernel::sched::get_current() };
+    if current.is_null() {
+        return None;
+    }
+    let stack_top = unsafe { (*current).stack as u64 };
+    task_stack_bounds(stack_top, sp)
+}
+
 pub const fn exception_stack_name(index: u8) -> Option<&'static str> {
     match index {
         ESTACK_DF => Some("#DF"),
@@ -162,5 +190,21 @@ mod tests {
         assert_eq!(info.end, top_entry + 8);
         assert_eq!(info.next_sp, Some(0x1234));
         assert!(in_irq_stack(top_entry + 8, top_entry, None).is_none());
+    }
+
+    #[test]
+    fn vmapped_task_stack_bounds_do_not_round_up_to_thread_alignment() {
+        // test-origin: linux:arch/x86/kernel/dumpstack_64.c:in_task_stack
+        // A guard page before a vmapped stack means its usable top need not
+        // be aligned to THREAD_SIZE.  The task-stack classifier must preserve
+        // the registered end rather than infer the next aligned boundary.
+        let stack_top = 0xffff_c900_000e_b000u64;
+        let stack_bottom = stack_top - crate::kernel::sched::KTHREAD_STACK_SIZE as u64;
+        assert_eq!(stack_bottom, 0xffff_c900_000e_7000);
+        assert_eq!(
+            task_stack_bounds(stack_top, stack_bottom + 0x29e0),
+            Some((stack_bottom, stack_top))
+        );
+        assert_ne!((stack_bottom + 0x29e0 | (THREAD_SIZE - 1)) + 1, stack_top);
     }
 }

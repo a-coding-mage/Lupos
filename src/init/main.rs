@@ -8059,11 +8059,17 @@ fn dump_panic_stack() {
         // `#PF cr2=0xffffc90000005000 error=0x0 P=0 rip=rust_begin_unwind+1249`
         // (see investigations/boot-gui-audio-perf-20260722/stack-guard-panic.txt).
         //
-        // `THREAD_SIZE` is a power of two and stacks are aligned to it, so the
-        // page-aligned end of the current stack is the next THREAD_SIZE
-        // boundary at or above RSP.
-        let thread_size = crate::arch::x86::kernel::dumpstack_64::THREAD_SIZE;
-        let stack_end = (rsp | (thread_size - 1)) + 1;
+        // Linux's stack dump identifies the task stack from task_struct, not
+        // by rounding RSP.  That is essential for CONFIG_VMAP_STACK: the
+        // leading guard page shifts the usable stack and its actual top is not
+        // guaranteed to be THREAD_SIZE aligned.  Keep the alignment fallback
+        // for early/static stacks which are not represented by current.
+        let stack_end = crate::arch::x86::kernel::dumpstack_64::current_task_stack_bounds(rsp)
+            .map(|(_, end)| end)
+            .unwrap_or_else(|| {
+                let thread_size = crate::arch::x86::kernel::dumpstack_64::THREAD_SIZE;
+                (rsp | (thread_size - 1)) + 1
+            });
         let max_words = ((stack_end - rsp) / 8).min(160) as usize;
 
         let stack = rsp as *const u64;
