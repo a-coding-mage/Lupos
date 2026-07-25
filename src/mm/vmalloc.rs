@@ -48,6 +48,7 @@ use crate::arch::x86::mm::paging::{
 };
 use crate::include::uapi::errno::EINVAL;
 use crate::kernel::module::{export_symbol, find_symbol};
+use crate::kernel::locking::SpinLock;
 use crate::mm::buddy::{page_to_pfn, with_global_buddy};
 use crate::mm::frame::PAGE_SIZE;
 use crate::mm::page_flags::GFP_KERNEL;
@@ -114,6 +115,34 @@ static VMALLOC_READY: AtomicBool = AtomicBool::new(false);
 
 /// Coarse subsystem lock.
 static VMALLOC_LOCK: spin::Mutex<VmallocState> = spin::Mutex::new(VmallocState::new());
+
+/// Linux `struct vfree_deferred` is an llist of addresses queued by
+/// `vfree_atomic()` and serviced later by `delayed_vfree_work()`.
+///
+/// Lupos has at most `NR_VM_STRUCTS` live vmalloc allocations.  Keeping the
+/// same bound here means an interrupt-context free never needs dynamic
+/// allocation and each address can remain queued until a cooperative worker
+/// reaches a process-context drain point.
+struct VfreeDeferred {
+    entries: [usize; NR_VM_STRUCTS],
+    len: usize,
+}
+
+impl VfreeDeferred {
+    const fn new() -> Self {
+        Self {
+            entries: [0; NR_VM_STRUCTS],
+            len: 0,
+        }
+    }
+}
+
+// Linux uses an llist because vfree_atomic() may run in interrupt context.
+// The compact Rust allocator needs out-of-line queue records rather than an
+// intrusive node in the allocation itself, so its fixed queue is protected by
+// an IRQ-save kernel spinlock.  Never use a sleepable or bare library mutex
+// here: an interrupt could otherwise spin on a lock interrupted on this CPU.
+static VFREE_DEFERRED: SpinLock<VfreeDeferred> = SpinLock::new(VfreeDeferred::new());
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
@@ -496,6 +525,21 @@ pub fn vfree_stack(stack_bottom: *mut u8) {
 ///
 /// Ref: Linux `vfree()` — `mm/vmalloc.c`
 pub fn vfree(ptr: *mut u8) {
+    // `vendor/linux/mm/vmalloc.c::vfree()` must not unmap or synchronously
+    // flush a kernel mapping from interrupt context.  Its `vfree_atomic()`
+    // branch queues the address for delayed_vfree_work instead.  In
+    // particular, RCU callbacks run from RCU_SOFTIRQ; waiting for a target
+    // CPU's TLB IPI there can deadlock when that CPU has hard IRQs disabled.
+    if crate::kernel::softirq::in_interrupt() {
+        vfree_atomic(ptr);
+        return;
+    }
+
+    vfree_immediate(ptr);
+}
+
+/// Process-context half of Linux `vfree()`.
+fn vfree_immediate(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
@@ -524,6 +568,13 @@ pub fn vfree(ptr: *mut u8) {
     state.free_backing[window_offset] = false;
 
     let alloc_size = n_pages * PAGE_SIZE;
+    // Linux `remove_vm_area()` unlinks the vmap area before its teardown, then
+    // performs the synchronous TLB flush without retaining the vmap allocator
+    // lock.  Keeping this lock over the wait lets a target CPU spin in
+    // vmalloc while the freeing CPU waits for that target's IPI completion.
+    // The VA range is not returned to `free` until after the flush below, so
+    // dropping the lock here cannot permit premature reuse.
+    drop(state);
 
     if n_pages <= VMALLOC_TLB_BATCH_PAGES {
         let mut backing = [None; VMALLOC_TLB_BATCH_PAGES];
@@ -579,7 +630,38 @@ pub fn vfree(ptr: *mut u8) {
         }
     }
 
+    let mut state = VMALLOC_LOCK.lock();
     va_free(&mut state, va_start, alloc_size);
+}
+
+/// Run Linux `delayed_vfree_work()`'s queued addresses in process context.
+///
+/// The cooperative workqueue has explicit drain points rather than dedicated
+/// worker tasks.  Callers must therefore use this only where sleeping and a
+/// synchronous TLB shootdown are valid; `drain_system_workqueues()` and
+/// `schedule_with_irqs_enabled()` provide those points.
+pub fn drain_deferred_vfree() {
+    debug_assert!(
+        !crate::kernel::softirq::in_interrupt(),
+        "deferred vfree drain must not run in interrupt context"
+    );
+
+    loop {
+        let ptr = {
+            let (mut deferred, flags) = VFREE_DEFERRED.lock_irqsave();
+            if deferred.len == 0 {
+                SpinLock::unlock_irqrestore(deferred, flags);
+                return;
+            }
+            deferred.len -= 1;
+            let index = deferred.len;
+            let ptr = deferred.entries[index];
+            deferred.entries[index] = 0;
+            SpinLock::unlock_irqrestore(deferred, flags);
+            ptr as *mut u8
+        };
+        vfree_immediate(ptr);
+    }
 }
 
 pub fn vmalloc_usable_size(ptr: *const u8) -> usize {
@@ -852,7 +934,34 @@ pub fn vrealloc_node_align_noprof(
 }
 
 pub fn vfree_atomic(ptr: *mut u8) {
-    vfree(ptr)
+    if ptr.is_null() {
+        return;
+    }
+    assert!(
+        !crate::kernel::locking::preempt::in_nmi(),
+        "vfree_atomic must not run in NMI context"
+    );
+
+    // Linux uses `llist_add()` and schedules a work item only for the first
+    // insertion.  The fixed queue has the same one-entry-per-live-allocation
+    // bound; deduplicate malformed repeated frees so they cannot consume the
+    // complete reserve before the process-context worker observes them.
+    let (mut deferred, flags) = VFREE_DEFERRED.lock_irqsave();
+    if deferred.entries[..deferred.len]
+        .iter()
+        .any(|&entry| entry == ptr as usize)
+    {
+        SpinLock::unlock_irqrestore(deferred, flags);
+        return;
+    }
+    assert!(
+        deferred.len < deferred.entries.len(),
+        "vfree_atomic queue exceeds live vmalloc allocation bound"
+    );
+    let index = deferred.len;
+    deferred.entries[index] = ptr as usize;
+    deferred.len = index + 1;
+    SpinLock::unlock_irqrestore(deferred, flags);
 }
 
 pub fn vunmap(addr: *mut u8) {
@@ -1097,6 +1206,11 @@ mod tests {
     unsafe fn setup() {
         unsafe { test_pool::reset() };
 
+        let (mut deferred, flags) = VFREE_DEFERRED.lock_irqsave();
+        deferred.entries.fill(0);
+        deferred.len = 0;
+        SpinLock::unlock_irqrestore(deferred, flags);
+
         let mut state = VMALLOC_LOCK.lock();
         // Clear free-list and metadata.
         for slot in state.free.iter_mut() {
@@ -1212,6 +1326,25 @@ mod tests {
 
         assert_eq!(virt_to_phys(ptr as u64), None);
         assert_eq!(virt_to_phys((ptr as u64) + PAGE_SIZE as u64), None);
+    }
+
+    #[test]
+    fn vfree_atomic_defers_unmap_until_process_context_drain() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { setup() };
+
+        let pfns = [0x1000_0000usize / PAGE_SIZE];
+        let ptr = vmap_pfn(pfns.as_ptr(), pfns.len(), PAGE_KERNEL);
+        assert!(!ptr.is_null());
+        assert_eq!(virt_to_phys(ptr as u64), Some(0x1000_0000));
+
+        // Linux `vfree_atomic()` puts the address on vfree_deferred and
+        // schedules delayed_vfree_work; it must not unmap in softirq context.
+        vfree_atomic(ptr);
+        assert_eq!(virt_to_phys(ptr as u64), Some(0x1000_0000));
+
+        drain_deferred_vfree();
+        assert_eq!(virt_to_phys(ptr as u64), None);
     }
 
     #[test]

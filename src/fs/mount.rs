@@ -1057,9 +1057,14 @@ fn mount_path_len_is_better(
 }
 
 fn dentry_components_below_root(dentry: &DentryRef, root: &DentryRef) -> Option<Vec<String>> {
+    // Linux's d_path walk is bounded by its caller-provided PATH_MAX buffer.
+    // This model builds components first, so impose the same finite traversal
+    // boundary before a malformed d_parent cycle can consume task resources.
+    const MAX_DENTRY_COMPONENTS: usize = 4096;
     let mut components = Vec::new();
     let mut cur = Some(dentry.clone());
-    while let Some(node) = cur {
+    for _ in 0..MAX_DENTRY_COMPONENTS {
+        let Some(node) = cur else { return None };
         if Arc::ptr_eq(&node, root) {
             components.reverse();
             return Some(components);

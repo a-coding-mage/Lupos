@@ -95,6 +95,8 @@ extern crate std;
 
 extern crate alloc;
 
+use crate::log_error;
+
 pub fn register_module_exports() {
     clock::register_module_exports();
     completion::register_module_exports();
@@ -110,7 +112,7 @@ pub fn register_module_exports() {
     }
 }
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -236,6 +238,35 @@ static mut CURRENT_TASK: [*mut TaskStruct; MAX_CPUS] = [core::ptr::null_mut(); M
 /// carries the equivalent ownership across Lupos's stack switch.
 static DEFERRED_TASK_RELEASE: [AtomicPtr<TaskStruct>; MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+
+// Focused crash evidence for the scheduler-stack canary.  `__schedule()`
+// switches stacks before it returns, so its epilogue reports only that one of
+// its post-switch phases corrupted the incoming task stack.  Keep the last
+// completed phase per CPU until the next scheduler entry; the stack-protector
+// failure path can read this without dereferencing the damaged task stack.
+//
+// This is diagnostic-only and must be removed once the responsible teardown
+// path has been proven.
+static SCHED_STACK_PHASE: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
+
+pub(crate) fn stack_corruption_phase() -> u8 {
+    let cpu = current_cpu_index();
+    SCHED_STACK_PHASE[cpu].load(Ordering::Relaxed)
+}
+
+#[inline]
+fn record_sched_stack_phase(phase: u8) {
+    SCHED_STACK_PHASE[current_cpu_index()].store(phase, Ordering::Relaxed);
+}
+
+/// The lazy active_mm reference is consumed at Linux's finish_task_switch()
+/// boundary, but its Rust page-table destructor is deferred until
+/// `__schedule()` has returned from the incoming task's deep scheduler frames.
+/// Linux's C `__mmdrop()` fits the 16 KiB task stack at that boundary; the
+/// faithful Rust translation does not. The reference remains owned and cannot
+/// be observed or reused during this short handoff.
+static POST_SWITCH_MM_DROP: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
 
 /// A physical task allocation cannot be released from `finish_task_switch()`.
 /// Linux's `finish_lock_switch()` drops the rq lock and restores IRQs before
@@ -668,10 +699,40 @@ pub(crate) fn task_has_current_reference(task: *mut TaskStruct) -> bool {
 
 /// True while any scheduler-visible state can still dereference `task`.
 pub(crate) fn task_has_scheduler_reference(task: *mut TaskStruct) -> bool {
+    if task.is_null() {
+        return false;
+    }
     if task_has_current_reference(task) {
         return true;
     }
-    !task.is_null() && unsafe { (*task).m29.on_rq != 0 }
+    if unsafe { (*task).m29.on_rq != 0 } {
+        return true;
+    }
+
+    // Linux retains the task_struct's scheduler reference until
+    // finish_task_switch() drops it; a stale `on_rq` bit alone therefore can
+    // never authorize freeing a task whose sched_entity::run_node remains in
+    // cfs_rq->tasks_timeline. Lupos models that reference in the heap-task
+    // tracker instead of task_struct's refcount, so prove the equivalent
+    // absence from every runqueue before allowing the allocation to retire.
+    //
+    // This is deliberately a membership query, not `entity_node_linked()`:
+    // a node can belong to another CPU's CFS tree during an in-progress
+    // migration, while the local rq says nothing about its ownership.
+    for cpu in 0..MAX_CPUS {
+        if rq::with_rq(cpu as u32, |rq| rq.cfs.contains_task(task)).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Linux `task_on_rq_queued(p)`: a migrating task has a nonzero `on_rq`, but
+/// is not owned by a stable runqueue and must not take the `ttwu_runnable()`
+/// fast path.
+#[inline]
+unsafe fn task_on_rq_queued(task: *const TaskStruct) -> bool {
+    !task.is_null() && unsafe { (*task).m29.on_rq == class::TASK_ON_RQ_QUEUED }
 }
 
 #[inline]
@@ -754,12 +815,60 @@ pub(crate) unsafe fn finish_deferred_heap_task_releases() {
     }
 }
 
+/// Consume Linux's `rq->prev_mm` at finish_task_switch() without running the
+/// heavy Rust destructor on the incoming task's scheduler frames.
+unsafe fn defer_switch_mm_drop() {
+    let mm = unsafe { crate::arch::x86::kernel::switch::take_switch_mm_drop() };
+    if mm.is_null() {
+        return;
+    }
+    let pending = POST_SWITCH_MM_DROP[current_cpu_index()].compare_exchange(
+        0,
+        mm as usize,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    assert!(pending.is_ok(), "post-switch mm-drop slot must be empty");
+}
+
+/// Release the consumed lazy active_mm reference after `schedule()` has
+/// unwound its scheduler frames and restored local IRQs.
+pub(crate) unsafe fn finish_deferred_mm_drops() {
+    #[cfg(not(test))]
+    debug_assert!(
+        !crate::kernel::locking::irqs_disabled(),
+        "lazy mm destruction must run after the scheduler restores IRQs"
+    );
+    let mm = POST_SWITCH_MM_DROP[current_cpu_index()].swap(0, Ordering::AcqRel)
+        as *mut crate::mm::mm_types::MmStruct;
+    if !mm.is_null() {
+        unsafe { crate::mm::fork::mmdrop(mm) };
+    }
+}
+
 /// Linux `finish_task_switch()`'s final TASK_DEAD ownership drop.
 ///
 /// This runs on the incoming task's kernel stack. `prev` is the actual task
 /// returned by `__switch_to`, not the stale local restored with that stack.
 /// Only CLONE_THREAD autoreap places a pointer in this slot.
 pub unsafe fn finish_task_switch(prev: *mut TaskStruct) {
+    // `switch_to(prev, next, prev)` returns the task switched away from.  It
+    // must never name current on the incoming stack; clearing on_cpu in that
+    // case would make a running task look sleepable and let a later wakeup
+    // corrupt its saved context.  Keep this as a focused invariant while
+    // diagnosing the pipewire epoll-wakeup crash.
+    let incoming = unsafe { get_current() };
+    if !prev.is_null() && prev == incoming {
+        unsafe {
+            log_error!(
+                "sched",
+                "sched: finish_task_switch received current task pid={} sp={:#018x}",
+                (*prev).pid,
+                (*prev).thread.sp,
+            );
+        }
+        panic!("finish_task_switch must receive the outgoing task");
+    }
     let slot = &DEFERRED_TASK_RELEASE[current_cpu_index()];
     let deferred = slot.swap(core::ptr::null_mut(), Ordering::AcqRel);
     if !deferred.is_null() && deferred != prev {
@@ -787,13 +896,21 @@ pub unsafe fn finish_task_switch(prev: *mut TaskStruct) {
         }
     }
 
-    // Linux `finish_task_switch()` calls `mmdrop_lazy_tlb_sched(rq->prev_mm)`
-    // only after finish_task() has cleared prev->on_cpu and completed the
-    // scheduler's post-switch transition.  x86 records the borrowed active_mm
-    // in PREV_MM_TO_DROP during context_switch(); consume it at this matching
-    // boundary rather than from __switch_to().
+    // Linux `finish_lock_switch()` releases the rq lock that
+    // `context_switch()` carried across the physical stack switch.  It must
+    // happen after finish_task()'s on_cpu publication and before mmdrop or
+    // TASK_DEAD reclamation, whose paths may take locks or issue TLB IPIs.
+    #[cfg(not(test))]
     unsafe {
-        crate::arch::x86::kernel::switch::finish_switch_mm_drop();
+        rq::unlock_rq_after_switch(current_cpu());
+    }
+
+    // Linux `finish_task_switch()` consumes `rq->prev_mm` only after
+    // finish_task() has cleared prev->on_cpu and completed the scheduler's
+    // post-switch transition. The Rust destructor is delayed until schedule
+    // unwinds because it exceeds the remaining 16 KiB task-stack budget here.
+    unsafe {
+        defer_switch_mm_drop();
     }
 
     if !prev.is_null()
@@ -815,10 +932,9 @@ pub unsafe extern "C" fn schedule_tail(prev: *mut TaskStruct) {
     unsafe {
         finish_task_switch(prev);
     }
-    #[cfg(not(test))]
-    crate::kernel::locking::local_irq_enable();
     unsafe {
         finish_deferred_heap_task_releases();
+        finish_deferred_mm_drops();
     }
 }
 
@@ -1133,7 +1249,11 @@ unsafe fn change_task_scheduler(
             }
 
             let class_changed = previous_class != next_class;
-            let queued = (*p).m29.on_rq != 0;
+            // Linux sched_change_begin() snapshots task_on_rq_queued(p), not
+            // merely a nonzero on_rq value. TASK_ON_RQ_MIGRATING is owned by
+            // deactivate_task()/activate_task() and has no class-runqueue
+            // membership at this decision point.
+            let queued = task_on_rq_queued(p);
             let running = rq.current == p;
             let old_prio = (*p).m29.prio;
             let resched_task = rq.current;
@@ -1361,6 +1481,24 @@ pub fn request_reschedule(cpu: u32) {
     }
 }
 
+/// Linux `wake_up_idle_cpu()`: make a target CPU leave its idle loop after
+/// runnable work has been published there.  Class wakeup-preemption normally
+/// reaches the same result, but the idle task is outside every runnable class;
+/// keep this explicit post-enqueue fallback so an idle CPU cannot remain in
+/// `sti; hlt` with a newly queued task.
+fn wake_up_idle_cpu(cpu: u32) {
+    let requested = rq::with_rq(cpu, |rq| unsafe {
+        if rq.current != rq.idle || rq.idle.is_null() {
+            false
+        } else {
+            set_need_resched(rq.idle)
+        }
+    });
+    if let Some(newly_set) = requested {
+        send_reschedule_ipi_for_transition(cpu, newly_set);
+    }
+}
+
 /// Add a task to the global run queue.
 ///
 /// # Safety
@@ -1513,6 +1651,7 @@ pub unsafe fn legacy_schedule() -> bool {
         let last = __switch_to_asm(prev, next);
         finish_task_switch(last);
         finish_deferred_heap_task_releases();
+        finish_deferred_mm_drops();
     }
     false
 }
@@ -1568,92 +1707,110 @@ unsafe fn prepare_prev_for_pick(this_rq: &mut rq::Rq, prev: *mut TaskStruct) {
 
 /// Production per-CPU scheduler path used once APs join normal scheduling.
 pub unsafe fn __schedule() {
-    // Linux disables local IRQs before taking rq->lock and keeps them disabled
-    // through context_switch()/finish_task_switch(). The inner with_rq() sees
-    // IF already clear, so its irq-restore cannot reopen the select-to-switch
-    // window after dropping the runqueue lock.
-    let irq_flags = crate::kernel::locking::local_irq_save();
+    record_sched_stack_phase(1);
     let cpu = current_cpu();
     let current = unsafe { get_current() };
     if current.is_null() {
-        crate::kernel::locking::local_irq_restore(irq_flags);
         return;
     }
 
-    let (prev, next) = rq::with_rq(cpu, |this_rq| unsafe {
-        this_rq.update_rq_clock();
+    // Match Linux __schedule()/context_switch(): local IRQs and rq->lock stay
+    // disabled/held across __switch_to_asm(), then finish_task_switch() on
+    // the incoming stack publishes prev->on_cpu and releases the carried rq
+    // lock.  `with_rq()` intentionally cannot be used here because its RAII
+    // guard would unlock before the physical stack switch.
+    let (prev, next) = unsafe {
+        rq::with_rq_lock_held_for_switch(cpu, |this_rq| unsafe {
+            this_rq.update_rq_clock();
 
-        let prev = current;
-        prepare_prev_for_pick(this_rq, prev);
-
-        let picked = pick_next_task(this_rq);
-        let next = if !picked.is_null() && task_can_switch_to(picked) {
-            picked
-        } else if this_rq.idle != prev && task_can_switch_to(this_rq.idle) {
-            this_rq.idle
-        } else {
-            prev
-        };
-        if !next.is_null() && next != prev {
-            // Match Linux put_prev_set_next_task(): selection happens before
-            // either class hook.  CFS must see its old current task during
-            // put_prev_entity(), then remove the selected entity in
-            // set_next_entity().
-            let prev_class = task_class(prev);
-            if !prev_class.is_null()
-                && let Some(put_prev) = (*prev_class).put_prev_task
-            {
-                put_prev(this_rq, prev);
+            // Linux takes `prev = rq->curr` while holding rq->lock.  The
+            // per-CPU current pointer is architecture state updated during
+            // `__switch_to`; it is an invariant check here, not the scheduler
+            // ownership source.  Selecting from it allowed a stale pointer
+            // to clear on_cpu for the task actually represented by this rq.
+            let prev = this_rq.current;
+            if prev.is_null() || prev != current {
+                log_error!(
+                    "sched",
+                    "sched: rq/current mismatch cpu={} rq={:#018x} current={:#018x}",
+                    cpu,
+                    prev as usize,
+                    current as usize,
+                );
+                panic!("scheduler rq->curr must match current task");
             }
-            let next_class = task_class(next);
-            if !next_class.is_null()
-                && let Some(set_next) = (*next_class).set_next_task
-            {
-                // This is the ordinary Linux put_prev_set_next_task() path;
-                // its class hook receives `first=true` at the scheduling
-                // boundary (the separate helper uses false for policy-change
-                // handoffs).
-                set_next(this_rq, next, true);
-            }
-        }
-        clear_need_resched(prev);
-        if !next.is_null() && next != prev {
-            (*next).thread_info.cpu = cpu;
-            (*next).m29.recent_used_cpu = cpu as i32;
-            (*next).m29.wake_cpu = cpu as i32;
-            // Publish the CPU fields before the on_cpu handoff. Remote
-            // kick/migration paths acquire-load on_cpu before consuming them.
-            set_task_on_cpu(next, true, Ordering::Release);
-        }
-        this_rq.current = next;
-        (prev, next)
-    })
-    .unwrap_or((current, current));
+            prepare_prev_for_pick(this_rq, prev);
 
-    #[cfg(feature = "test-smp-preempt")]
-    if prev == next
-        && SELF_PICK_TEST_CPU
-            .compare_exchange(cpu, u32::MAX, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    {
-        SELF_PICK_TEST_REACHED.store(true, Ordering::Release);
-        while !SELF_PICK_TEST_RELEASE.load(Ordering::Acquire) {
-            core::hint::spin_loop();
-        }
+            let picked = pick_next_task(this_rq);
+            let next = if !picked.is_null() && task_can_switch_to(picked) {
+                picked
+            } else if this_rq.idle != prev && task_can_switch_to(this_rq.idle) {
+                this_rq.idle
+            } else {
+                prev
+            };
+            if !next.is_null() && next != prev {
+                // Match Linux put_prev_set_next_task(): selection happens before
+                // either class hook.  CFS must see its old current task during
+                // put_prev_entity(), then remove the selected entity in
+                // set_next_entity().
+                let prev_class = task_class(prev);
+                if !prev_class.is_null()
+                    && let Some(put_prev) = (*prev_class).put_prev_task
+                {
+                    put_prev(this_rq, prev);
+                }
+                let next_class = task_class(next);
+                if !next_class.is_null()
+                    && let Some(set_next) = (*next_class).set_next_task
+                {
+                    // This is the ordinary Linux put_prev_set_next_task() path;
+                    // its class hook receives `first=true` at the scheduling
+                    // boundary (the separate helper uses false for policy-change
+                    // handoffs).
+                    set_next(this_rq, next, true);
+                }
+            }
+            clear_need_resched(prev);
+            if !next.is_null() && next != prev {
+                (*next).thread_info.cpu = cpu;
+                (*next).m29.recent_used_cpu = cpu as i32;
+                (*next).m29.wake_cpu = cpu as i32;
+                // Publish the CPU fields before the on_cpu handoff. Remote
+                // kick/migration paths acquire-load on_cpu before consuming them.
+                set_task_on_cpu(next, true, Ordering::Release);
+            }
+            this_rq.current = next;
+            (prev, next)
+        })
     }
+    .expect("initialized current CPU runqueue");
 
     if prev == next || next.is_null() {
         // Linux clears prev's request exactly once, while rq->lock is held.
         // A remote wake can set a new request after that unlock; clearing it
         // here would lose the wake and let an idle CPU halt with queued work.
         debug_assert!(task_on_cpu(current));
-        crate::kernel::locking::local_irq_restore(irq_flags);
+        unsafe {
+            rq::unlock_rq_after_switch(cpu);
+        }
+        #[cfg(feature = "test-smp-preempt")]
+        if SELF_PICK_TEST_CPU
+            .compare_exchange(cpu, u32::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            SELF_PICK_TEST_REACHED.store(true, Ordering::Release);
+            while !SELF_PICK_TEST_RELEASE.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+        }
         return;
     }
 
     crate::kernel::rcu::tasks_rcu_qs();
     crate::kernel::rcu::rcu_qs();
     unsafe {
+        record_sched_stack_phase(2);
         seed_current_task_stack(prev);
         record_switch_attempt(prev, next);
         prepare_switch_to_task(next);
@@ -1661,9 +1818,12 @@ pub unsafe fn __schedule() {
         let last = __switch_to_asm(prev, next);
         finish_task_switch(last);
     }
-    crate::kernel::locking::local_irq_restore(irq_flags);
     unsafe {
+        record_sched_stack_phase(3);
         finish_deferred_heap_task_releases();
+        record_sched_stack_phase(4);
+        finish_deferred_mm_drops();
+        record_sched_stack_phase(5);
     }
 }
 
@@ -1791,6 +1951,10 @@ pub unsafe fn schedule_with_irqs_enabled() {
             crate::kernel::locking::local_irq_enable();
             let idle = unsafe { schedule() };
             crate::kernel::locking::local_irq_enable();
+            // Linux delayed_vfree_work executes in process context.  This
+            // wrapper has returned on the incoming task's stack with IRQs
+            // enabled, making it a valid cooperative workqueue drain point.
+            crate::mm::vmalloc::drain_deferred_vfree();
             let current = unsafe { get_current() };
             if current.is_null() || unsafe { task_runnable(current) } {
                 return;
@@ -2515,23 +2679,41 @@ unsafe fn try_to_wake_up_locked(p: *mut TaskStruct, state_mask: u32, wake_flags:
         return false;
     }
 
-    let owner_cpu = unsafe { (*p).thread_info.cpu };
-
-    let queued_resched = rq::with_rq(owner_cpu, |owner_rq| unsafe {
-        if (*p).m29.on_rq == 0 {
-            return (false, false);
+    // Linux `ttwu_runnable()` accepts only TASK_ON_RQ_QUEUED.  In
+    // particular, TASK_ON_RQ_MIGRATING is a handoff token: task_cpu() may
+    // still name the source rq while the embedded CFS node is already being
+    // detached and transferred under double_rq_lock().  Treating every
+    // nonzero value as queued lets a waker run wakeup_preempt() against that
+    // stale source rq.  Wait for the migration publication, then retry the
+    // owner-rq lookup exactly as task_rq_lock()/ttwu do in Linux.
+    loop {
+        let owner_cpu = unsafe { (*p).thread_info.cpu };
+        let queued_resched = rq::with_rq(owner_cpu, |owner_rq| unsafe {
+            if !task_on_rq_queued(p) {
+                return (false, false);
+            }
+            // The task may have migrated between the CPU snapshot and this
+            // rq lock acquisition.  Linux retries task_rq_lock() rather than
+            // using an old rq with a newly published task_cpu().
+            if (*p).thread_info.cpu != owner_cpu {
+                return (false, false);
+            }
+            (*p).__state.store(
+                crate::kernel::task::task_state::TASK_RUNNING,
+                Ordering::Release,
+            );
+            // Linux ttwu_runnable() runs the class-specific wakeup-preemption
+            // decision while the owning rq is locked.
+            (true, wakeup_preempt_locked(owner_rq, p, wake_flags))
+        });
+        if let Some((true, newly_set)) = queued_resched {
+            send_reschedule_ipi_for_transition(owner_cpu, newly_set);
+            return true;
         }
-        (*p).__state.store(
-            crate::kernel::task::task_state::TASK_RUNNING,
-            Ordering::Release,
-        );
-        // Linux ttwu_runnable() runs the class-specific wakeup-preemption
-        // decision while the owner rq is locked.
-        (true, wakeup_preempt_locked(owner_rq, p, wake_flags))
-    });
-    if let Some((true, newly_set)) = queued_resched {
-        send_reschedule_ipi_for_transition(owner_cpu, newly_set);
-        return true;
+        if unsafe { (*p).m29.on_rq } != class::TASK_ON_RQ_MIGRATING {
+            break;
+        }
+        core::hint::spin_loop();
     }
 
     // `finish_task_switch()` release-clears on_cpu only after the outgoing
@@ -2539,6 +2721,7 @@ unsafe fn try_to_wake_up_locked(p: *mut TaskStruct, state_mask: u32, wake_flags:
     while task_on_cpu(p) {
         core::hint::spin_loop();
     }
+    let owner_cpu = unsafe { (*p).thread_info.cpu };
     let target_cpu = select_task_rq(p, owner_cpu, wake_flags);
     let enqueued = rq::with_rq(target_cpu, |target_rq| unsafe {
         let class = task_class(p);
@@ -2568,6 +2751,7 @@ unsafe fn try_to_wake_up_locked(p: *mut TaskStruct, state_mask: u32, wake_flags:
         return false;
     };
     send_reschedule_ipi_for_transition(target_cpu, newly_set);
+    wake_up_idle_cpu(target_cpu);
     true
 }
 
@@ -2743,6 +2927,27 @@ mod tests {
         );
     }
 
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:ttwu_runnable
+    ///
+    /// `TASK_ON_RQ_MIGRATING` is nonzero but intentionally excluded from the
+    /// runnable wakeup fast path. Linux waits for the migration handoff before
+    /// it resolves and locks the task's owning rq.
+    #[test]
+    fn ttwu_runnable_rejects_migrating_on_rq_state() {
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+
+        task.m29.on_rq = class::TASK_ON_RQ_MIGRATING;
+        assert!(task.m29.on_rq != 0);
+        assert!(
+            !unsafe { task_on_rq_queued(task_ptr) },
+            "Linux ttwu_runnable() must not use a source rq during migration"
+        );
+
+        task.m29.on_rq = class::TASK_ON_RQ_QUEUED;
+        assert!(unsafe { task_on_rq_queued(task_ptr) });
+    }
+
     /// test-origin: linux:vendor/linux/kernel/sched/core.c:try_to_wake_up
     ///
     /// Linux serializes concurrent wakeups of one task with task_struct::pi_lock
@@ -2794,6 +2999,44 @@ mod tests {
             !second_reached_wakeup_while_first_held,
             "concurrent wakeups must be serialized by task_struct::pi_lock"
         );
+    }
+
+    #[test]
+    fn linked_cfs_node_retains_heap_task_even_if_on_rq_was_cleared() {
+        // test-origin: linux:vendor/linux/kernel/sched/core.c:finish_task_switch
+        //
+        // Linux's current-task reference prevents a task_struct from being
+        // reclaimed while scheduler state can still reach its run_node. This
+        // intentionally inconsistent fixture is the Lupos tracker analogue:
+        // the membership scan must retain the allocation even if a preceding
+        // teardown path has already cleared p->on_rq.
+        let _guard = legacy_sched_test_guard();
+        rq::init_rqs();
+        PRODUCTION_SCHED_ENABLED.store(true, Ordering::Release);
+
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+        task.m29 = M29SchedFields::zeroed();
+        task.m29.se.vruntime = 17;
+        task.m29.on_rq = 0;
+        task.m29.se.on_rq = 0;
+
+        let inserted = rq::with_rq(0, |this_rq| {
+            this_rq.cfs.insert(task_ptr, task.m29.se.vruntime)
+        })
+        .expect("CPU0 runqueue must exist");
+        assert!(inserted);
+        assert!(
+            task_has_scheduler_reference(task_ptr),
+            "a linked CFS node must retain its task allocation independent of on_rq"
+        );
+
+        let removed = rq::with_rq(0, |this_rq| {
+            this_rq.cfs.remove(task_ptr, task.m29.se.vruntime)
+        })
+        .expect("CPU0 runqueue must exist");
+        assert!(removed);
+        assert!(!task_has_scheduler_reference(task_ptr));
     }
 
     #[test]

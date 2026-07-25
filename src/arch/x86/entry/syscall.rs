@@ -64,6 +64,7 @@ use crate::kernel::trace::ring_buffer::{
     TRACE_RB, TRACE_SYSCALL_ENTER, TRACE_SYSCALL_EXIT, TraceEvent,
 };
 use crate::kernel::{audit, ptrace, sched};
+use crate::log_error;
 
 const ENOSYS: i64 = 38;
 const EPERM: i64 = 1;
@@ -378,6 +379,30 @@ pub(crate) unsafe extern "C" fn syscall_should_use_sysret(
         return false;
     }
     let regs = unsafe { &*regs };
+    // Focused return-path probe for the four-CPU graphics failure.  A normal
+    // x86-64 executable mapping is far below this top-of-user-stack window;
+    // reaching it at the SYSRET/IRET decision point means the frame was
+    // already corrupt before the assembly restore sequence runs.  Keep this
+    // conditional diagnostic until the first divergence is proven.
+    if regs.rip >= 0x0000_7fff_f000_0000 {
+        let task = unsafe { sched::get_current() };
+        let pid = if task.is_null() {
+            -1
+        } else {
+            unsafe { (*task).pid }
+        };
+        log_error!(
+            "syscall",
+            "syscall: suspicious-user-return pid={} nr={} rip={:#018x} rsp={:#018x} rcx={:#018x} r11={:#018x} flags={:#018x}",
+            pid,
+            regs.orig_rax,
+            regs.rip,
+            regs.rsp,
+            regs.rcx,
+            regs.r11,
+            regs.eflags,
+        );
+    }
     syscall_sysret_fast_path_enabled() && syscall_frame_allows_sysret(regs)
 }
 

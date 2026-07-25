@@ -21,7 +21,9 @@ use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::kernel::locking::raw_spinlock::RawSpinLocked;
-use crate::kernel::locking::{local_irq_restore, local_irq_save};
+use crate::kernel::locking::{
+    local_irq_disable, local_irq_enable, local_irq_restore, local_irq_save,
+};
 use crate::kernel::task::{M29SchedFields, TaskStruct};
 use crate::lib::rbtree::{
     LinuxRbNode, LinuxRbRoot, linux_rb_erase, linux_rb_insert_color, linux_rb_next,
@@ -247,12 +249,24 @@ impl CfsTimeline {
         };
 
         if let Some(reason) = reason {
+            let root_parent = if self.root.rb_node.is_null() {
+                0
+            } else {
+                unsafe { (*self.root.rb_node).__rb_parent_color & !3usize }
+            };
+            let root_task = if self.root.rb_node.is_null() {
+                0
+            } else {
+                unsafe { task_from_run_node(self.root.rb_node) as usize }
+            };
             crate::linux_driver_abi::tty::serial_println!(
-                "sched-cfs-invariant: operation={} reason={} len={} root={:#x} leftmost={:#x} task={:#x}",
+                "sched-cfs-invariant: operation={} reason={} len={} root={:#x} root-parent={:#x} root-task={:#x} leftmost={:#x} task={:#x}",
                 operation,
                 reason,
                 self.len,
                 self.root.rb_node as usize,
+                root_parent,
+                root_task,
                 self.leftmost as usize,
                 task as usize,
             );
@@ -808,6 +822,51 @@ pub fn with_rq<R>(cpu: u32, f: impl FnOnce(&mut Rq) -> R) -> Option<R> {
     result
 }
 
+/// Acquire an rq lock for Linux's context-switch handoff.
+///
+/// `vendor/linux/kernel/sched/core.c::context_switch()` keeps `rq->lock`
+/// locked while `switch_to()` changes stacks.  The incoming stack releases it
+/// from `finish_task_switch()`.  Normal Rust guards are stack-owned and cannot
+/// survive that transfer, so this deliberately exposes the matching raw
+/// scheduler-only operation.  Interrupts remain disabled until
+/// [`unlock_rq_after_switch`].
+pub unsafe fn with_rq_lock_held_for_switch<R>(cpu: u32, f: impl FnOnce(&mut Rq) -> R) -> Option<R> {
+    let cpu = cpu as usize;
+    if cpu >= MAX_RQ_CPUS {
+        return None;
+    }
+
+    local_irq_disable();
+    unsafe {
+        RQS[cpu].lock_for_stack_switch();
+    }
+    let rq = unsafe { RQS[cpu].get_mut_for_stack_switch() };
+    let Some(rq) = rq.as_mut() else {
+        unsafe {
+            RQS[cpu].unlock_after_stack_switch();
+        }
+        local_irq_enable();
+        return None;
+    };
+    let result = f(rq);
+    NR_RUNNING_SNAPSHOT[cpu].store(rq.nr_running, Ordering::Release);
+    Some(result)
+}
+
+/// Finish Linux's `finish_lock_switch()` ownership transfer.
+///
+/// The matching acquisition is [`with_rq_lock_held_for_switch`].  Linux uses
+/// `raw_spin_rq_unlock_irq()` here, so this enables local interrupts instead
+/// of restoring the outgoing task's saved RFLAGS.
+pub unsafe fn unlock_rq_after_switch(cpu: u32) {
+    let cpu = cpu as usize;
+    debug_assert!(cpu < MAX_RQ_CPUS);
+    unsafe {
+        RQS[cpu].unlock_after_stack_switch();
+    }
+    local_irq_enable();
+}
+
 /// Run a closure while holding two runqueue locks in logical-CPU order.
 ///
 /// Linux's `double_rq_lock()` always takes the lower-addressed runqueue first.
@@ -867,6 +926,7 @@ pub fn rq_nr_running(cpu: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::locking::preempt::preempt_count;
     use alloc::boxed::Box;
 
     #[test]
@@ -903,6 +963,33 @@ mod tests {
         // Closure result must round-trip through the irq-save wrapper.
         init_rqs();
         assert_eq!(with_rq(0, |_| 42), Some(42));
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:context_switch
+    /// and finish_lock_switch
+    ///
+    /// Linux deliberately hands rq->lock from the outgoing task stack to the
+    /// incoming task stack. Rust's normal lock guard is stack-owned, so this
+    /// Lupos-specific test exercises the explicit equivalent handoff; upstream
+    /// has no host unit-test seam for a physical stack switch.
+    #[test]
+    fn context_switch_rq_lock_handoff_keeps_preemption_until_finish() {
+        init_rqs();
+        let before = preempt_count();
+        let cpu = 0;
+        let observed_cpu = unsafe { with_rq_lock_held_for_switch(cpu, |rq| rq.cpu) };
+        assert_eq!(observed_cpu, Some(cpu));
+        assert_eq!(
+            preempt_count(),
+            before + 1,
+            "rq lock must remain carried until finish_task_switch"
+        );
+
+        unsafe {
+            unlock_rq_after_switch(cpu);
+        }
+        assert_eq!(preempt_count(), before);
+        assert_eq!(with_rq(cpu, |rq| rq.cpu), Some(cpu));
     }
 
     #[test]

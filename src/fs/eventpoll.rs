@@ -64,7 +64,11 @@ pub struct EpollEvent {
 pub struct EpItem {
     id: usize,
     pub fd: i32,
-    file: Option<FileRef>,
+    /// Linux `epitem.ffd.file`: immutable for the epitem lifetime.  Teardown
+    /// releases its logical file reference only after the epitem is unlinked;
+    /// it must not clear this field while another close path can still inspect
+    /// the item.
+    file: FileRef,
     events: AtomicU32,
     data: AtomicU64,
     /// Only process-side eventpoll operations take this mutex.  In particular,
@@ -78,7 +82,7 @@ pub struct EpItem {
 
 impl EpItem {
     fn file(&self) -> &FileRef {
-        self.file.as_ref().expect("live epitem has a file")
+        &self.file
     }
 
     fn events(&self) -> u32 {
@@ -93,12 +97,11 @@ impl EpItem {
 impl Drop for EpItem {
     fn drop(&mut self) {
         // Linux unregisters every poll hook before dropping the watched-file
-        // relationship.  Keeping the FileRef in an Option lets Drop transfer
-        // the actual reference to fput rather than bypassing the release hook.
+        // relationship.  `ffd.file` itself remains valid through the whole
+        // destructor, matching Linux; clone only the logical reference being
+        // released so `fput()` retains the release-hook behavior.
         self.poll_table.lock().finish();
-        if let Some(file) = self.file.take() {
-            fput(file);
-        }
+        fput(self.file.clone());
     }
 }
 
@@ -445,7 +448,7 @@ impl EventPoll {
         let item = Arc::new(EpItem {
             id,
             fd,
-            file: Some(fget(&file)),
+            file: fget(&file),
             events: AtomicU32::new(events),
             data: AtomicU64::new(data),
             poll_table: Mutex::new(select::PollTable::new_callback(

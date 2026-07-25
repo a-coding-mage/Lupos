@@ -314,6 +314,43 @@ impl<T> RawSpinLocked<T> {
         RawSpinGuard { parent: self }
     }
 
+    /// Acquire the raw lock without creating a stack-owned guard.
+    ///
+    /// This is only for scheduler context-switch handoff: Linux carries
+    /// `rq->lock` from the outgoing stack to `finish_task_switch()` on the
+    /// incoming stack.  A Rust RAII guard cannot represent that transfer,
+    /// because its destructor remains on the outgoing stack.  The caller must
+    /// pair this exactly once with [`unlock_after_stack_switch`].
+    ///
+    /// # Safety
+    /// The caller must not access `inner` except while this lock remains held,
+    /// and must release it on the CPU that acquired it.
+    #[inline]
+    pub unsafe fn lock_for_stack_switch(&self) {
+        preempt_disable();
+        self.lock.lock();
+    }
+
+    /// Borrow the protected object while [`lock_for_stack_switch`] is held.
+    ///
+    /// # Safety
+    /// The caller must hold this object's raw lock acquired by
+    /// [`lock_for_stack_switch`].
+    #[inline]
+    pub unsafe fn get_mut_for_stack_switch(&self) -> &mut T {
+        unsafe { &mut *self.inner.get() }
+    }
+
+    /// Release a raw lock carried through a scheduler stack switch.
+    ///
+    /// # Safety
+    /// The caller must own a matching [`lock_for_stack_switch`] acquisition.
+    #[inline]
+    pub unsafe fn unlock_after_stack_switch(&self) {
+        self.lock.unlock();
+        preempt_enable();
+    }
+
     /// Acquire with IRQ-save semantics: saves EFLAGS, disables interrupts,
     /// and disables preemption.
     pub fn lock_irqsave(&self) -> (RawSpinGuard<'_, T>, IrqFlags) {

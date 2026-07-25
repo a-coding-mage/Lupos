@@ -198,7 +198,17 @@ unsafe fn dequeue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool
     let se = task_se(p);
     let m = task_m29(p);
     unsafe {
-        let removed = if rq.cfs.current == p {
+        // Linux's `dequeue_entities()` skips `__dequeue_entity()` only when
+        // `se == cfs_rq->curr`, because `set_next_entity()` has already
+        // removed the running entity from `tasks_timeline`.  In the compact
+        // single-entity representation, use the intrusive-tree membership as
+        // the final ownership predicate: a stale `cfs.current` must never let
+        // us clear on_rq and free a task while its run_node still anchors the
+        // tree.  This preserves Linux's postcondition that a dequeued entity
+        // has no timeline node, while keeping the current fast path when the
+        // invariant holds.
+        let in_timeline = rq.cfs.contains_task(p);
+        let removed = if rq.cfs.current == p && !in_timeline {
             // Linux dequeue_entities() succeeds for the currently running
             // entity, which is intentionally not present in the rb-tree.
             true
@@ -286,7 +296,16 @@ unsafe fn put_prev_task_fair(rq: &mut Rq, prev: *mut TaskStruct) {
 /// this hook for that selected fair task; without it a stale `cfs.current`
 /// makes the next timer tick skip accounting forever.
 unsafe fn set_next_task_fair(rq: &mut Rq, next: *mut TaskStruct, _first: bool) {
-    if next.is_null() || rq.cfs.current == next {
+    if next.is_null() {
+        return;
+    }
+
+    // `cfs_rq->curr` is an identity cache, not an ownership proof. Linux
+    // set_next_entity() requires the selected current entity to be absent
+    // from tasks_timeline; if a stale Lupos current cache names an entity
+    // still linked in the tree, returning here would leave a live tree root
+    // behind when that task later sleeps or exits.
+    if rq.cfs.current == next && !rq.cfs.contains_task(next) {
         return;
     }
 
@@ -635,6 +654,34 @@ mod tests {
         assert_eq!(owner.cfs.tasks_timeline.first(), ptr);
     }
 
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:dequeue_entities
+    ///
+    /// Linux relies on `cfs_rq->curr` never being present in
+    /// `tasks_timeline`. If a stale current cache violates that invariant,
+    /// Lupos must still detach the embedded node before clearing `on_rq`; task
+    /// reclamation otherwise overwrites an rbtree node retained by the rq.
+    #[test]
+    fn dequeue_current_still_detaches_a_stale_timeline_node() {
+        let mut rq = Rq::new(0);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let ptr = &mut *task as *mut TaskStruct;
+        task.m29.static_prio = DEFAULT_PRIO;
+        task.m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
+        task.m29.se.load.weight = NICE_0_LOAD;
+        task.m29.se.on_rq = 1;
+        task.m29.on_rq = TASK_ON_RQ_QUEUED;
+        rq.cfs.current = ptr;
+        assert!(rq.cfs.insert(ptr, task.m29.se.vruntime));
+        rq.cfs.nr_running = 1;
+        rq.cfs.load_weight = NICE_0_LOAD;
+        rq.nr_running = 1;
+
+        assert!(unsafe { dequeue_task_fair(&mut rq, ptr, DEQUEUE_SLEEP) });
+        assert!(rq.cfs.tasks_timeline.is_empty());
+        assert_eq!(task.m29.se.on_rq, 0);
+        assert_eq!(task.m29.on_rq, 0);
+    }
+
     /// test-origin: linux:vendor/linux/kernel/sched/fair.c:task_tick_fair
     #[test]
     fn task_tick_fair_does_not_make_a_queued_entity_current() {
@@ -857,6 +904,35 @@ mod tests {
         }
         assert_eq!(rq.cfs.current, next_ptr);
         assert_eq!(rq.cfs.tasks_timeline.first(), prev_ptr);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:set_next_entity
+    ///
+    /// Linux keeps the selected current entity outside `tasks_timeline`. A
+    /// stale `cfs_rq->curr` cache must not suppress that required erase.
+    #[test]
+    fn set_next_detaches_a_timeline_node_named_by_stale_current() {
+        let mut rq = Rq::new(0);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+        task.m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
+        task.m29.se.load.weight = NICE_0_LOAD;
+        task.m29.se.vruntime = 7;
+        task.m29.se.on_rq = 1;
+        task.m29.on_rq = TASK_ON_RQ_QUEUED;
+        rq.cfs.nr_running = 1;
+        rq.cfs.load_weight = NICE_0_LOAD;
+        rq.nr_running = 1;
+        assert!(rq.cfs.insert(task_ptr, task.m29.se.vruntime));
+        rq.cfs.current = task_ptr;
+
+        unsafe {
+            set_next_task_fair(&mut rq, task_ptr, true);
+        }
+
+        assert_eq!(rq.cfs.current, task_ptr);
+        assert!(rq.cfs.tasks_timeline.is_empty());
+        assert!(!rq.cfs.entity_node_linked(task_ptr));
     }
 
     /// test-origin: linux:vendor/linux/kernel/sched/fair.c:pick_task_fair

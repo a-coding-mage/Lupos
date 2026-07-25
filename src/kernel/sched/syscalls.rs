@@ -352,4 +352,60 @@ mod tests {
         })
         .expect("test runqueue exists");
     }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:sched_change_begin
+    ///
+    /// A migrating task carries a nonzero `on_rq` handoff token but is already
+    /// detached from its old class queue.  Linux does not dequeue or enqueue
+    /// it during a policy change; doing so would let this CPU mutate a queue
+    /// still owned by the migration path.
+    #[test]
+    fn migrating_policy_change_does_not_touch_class_runqueues() {
+        const TEST_CPU: u32 = (super::super::MAX_CPUS - 2) as u32;
+
+        struct ResetRunqueue(u32);
+        impl Drop for ResetRunqueue {
+            fn drop(&mut self) {
+                let _ = super::super::rq::with_rq(self.0, |rq| {
+                    *rq = super::super::rq::Rq::new(self.0);
+                });
+            }
+        }
+
+        super::super::rq::init_rqs();
+        super::super::rq::with_rq(TEST_CPU, |rq| {
+            *rq = super::super::rq::Rq::new(TEST_CPU);
+        })
+        .expect("test runqueue exists");
+        let _reset_runqueue = ResetRunqueue(TEST_CPU);
+
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+        task.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        task.m29.sched_class = &super::super::fair::FAIR_SCHED_CLASS;
+        task.m29.policy = SCHED_NORMAL;
+        task.m29.cpus_mask = super::super::entity::CpuMask::one(TEST_CPU);
+        task.m29.cpus_ptr = &task.m29.cpus_mask;
+        task.m29.nr_cpus_allowed = 1;
+        task.thread_info.cpu = TEST_CPU;
+        task.m29.on_rq = super::super::class::TASK_ON_RQ_MIGRATING;
+
+        let attr = SchedAttr {
+            size: SCHED_ATTR_SIZE_VER1,
+            sched_policy: SCHED_FIFO,
+            sched_priority: 88,
+            ..SchedAttr::default()
+        };
+        assert_eq!(unsafe { sys_sched_setattr(task_ptr, &attr) }, 0);
+
+        assert_eq!(task.m29.on_rq, super::super::class::TASK_ON_RQ_MIGRATING);
+        assert_eq!(task.m29.se.on_rq, 0);
+        assert_eq!(task.m29.rt.on_rq, 0);
+        super::super::rq::with_rq(TEST_CPU, |rq| {
+            assert_eq!(rq.cfs.nr_running, 0);
+            assert_eq!(rq.rt.nr_running, 0);
+            assert_eq!(rq.nr_running, 0);
+        })
+        .expect("test runqueue exists");
+    }
 }

@@ -288,15 +288,21 @@ pub unsafe extern "C" fn linux_io_schedule() {
     {}
     #[cfg(not(test))]
     unsafe {
-        crate::kernel::sched::schedule_with_irqs_enabled();
+        let _ = crate::kernel::sched::schedule();
     }
 }
 
 #[cfg(not(test))]
 fn schedule_timeout_runtime(timeout_jiffies: u64) -> u64 {
     if timeout_jiffies == MAX_SCHEDULE_TIMEOUT {
+        // Linux `schedule_timeout()` calls `schedule()` directly after
+        // arming its stack-resident process timer.  Do not route a driver
+        // wait through Lupos's cooperative wrapper: that wrapper loops and
+        // drains deferred work on the blocked caller's task stack, adding
+        // non-Linux stack depth to a path that vendor drivers expect to fit
+        // within THREAD_SIZE.
         unsafe {
-            crate::kernel::sched::schedule_with_irqs_enabled();
+            let _ = crate::kernel::sched::schedule();
         }
         return MAX_SCHEDULE_TIMEOUT;
     }
@@ -316,7 +322,7 @@ fn schedule_timeout_runtime(timeout_jiffies: u64) -> u64 {
         let task_id = current as usize;
         let timer = sleep_timer_add(task_id, expire);
         unsafe {
-            crate::kernel::sched::schedule_with_irqs_enabled();
+            let _ = crate::kernel::sched::schedule();
         }
         sleep_timer_remove(timer);
         set_current_task_state(task_state::TASK_RUNNING);
@@ -333,7 +339,7 @@ fn schedule_timeout_runtime(timeout_jiffies: u64) -> u64 {
     loop {
         set_current_task_state(task_state::TASK_RUNNING);
         unsafe {
-            crate::kernel::sched::schedule_with_irqs_enabled();
+            let _ = crate::kernel::sched::schedule();
         }
         let now = jiffies();
         if !time_before(now, expire) {
@@ -480,6 +486,42 @@ mod tests {
     fn finite_timeout_expires_to_zero() {
         assert_eq!(schedule_timeout(seconds_to_timeout(1)), 0);
         assert_eq!(schedule_timeout(MAX_SCHEDULE_TIMEOUT), MAX_SCHEDULE_TIMEOUT);
+    }
+
+    /// `schedule_timeout()` and `io_schedule()` must enter the scheduler once,
+    /// as Linux does.  The cooperative wrapper is for boot-only callers and
+    /// must not add recursive work/drain frames to a vendor driver's blocked
+    /// task stack.
+    ///
+    /// test-origin: linux:vendor/linux/kernel/time/sleep_timeout.c:schedule_timeout,
+    ///              linux:vendor/linux/kernel/sched/core.c:io_schedule
+    #[test]
+    fn module_sleep_entries_call_schedule_directly() {
+        let linux_timeout = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/kernel/time/sleep_timeout.c"
+        ));
+        assert!(linux_timeout.contains("schedule();\n\ttimer_delete_sync"));
+        let linux_sched = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/vendor/linux/kernel/sched/core.c"
+        ));
+        assert!(linux_sched.contains("void __sched io_schedule(void)"));
+        assert!(linux_sched.contains("\ttoken = io_schedule_prepare();\n\tschedule();"));
+
+        let source = include_str!("sleep_timeout.rs");
+        let timeout = source
+            .split("fn schedule_timeout_runtime(timeout_jiffies: u64) -> u64")
+            .nth(1)
+            .expect("runtime timeout implementation must exist");
+        assert!(timeout.contains("crate::kernel::sched::schedule()"));
+        assert!(!timeout.contains("schedule_with_irqs_enabled"));
+        let io_schedule = source
+            .split("pub unsafe extern \"C\" fn linux_io_schedule()")
+            .nth(1)
+            .and_then(|body| body.split("fn schedule_timeout_runtime").next())
+            .expect("io_schedule implementation must precede timeout runtime");
+        assert!(io_schedule.contains("crate::kernel::sched::schedule()"));
+        assert!(!io_schedule.contains("schedule_with_irqs_enabled"));
     }
 
     #[test]
