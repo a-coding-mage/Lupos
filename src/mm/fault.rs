@@ -419,17 +419,36 @@ fn handle_pte_fault(vmf: &mut VmFault) -> VmFaultFlags {
             return do_wp_page(vmf);
         }
 
-        // Spurious fault or access-bit update: mark young (and dirty on write).
-        let mut entry = vmf.orig_pte;
-        entry = pte_mkyoung(entry);
-        if (vmf.flags & FAULT_FLAG_WRITE) != 0 {
-            entry = pte_mkdirty(entry);
+        // Linux x86 `ptep_set_access_flags()` relies on hardware to maintain
+        // the accessed/dirty bits.  It updates a present PTE only when a
+        // write fault needs to publish dirty state, and its
+        // `flush_tlb_fix_spurious_fault()` is a no-op.  In particular, do
+        // not issue a cross-CPU invalidation merely because another CPU won
+        // a concurrent fault and made this one spurious.
+        //
+        // Ref: vendor/linux/arch/x86/mm/pgtable.c:ptep_set_access_flags and
+        // vendor/linux/arch/x86/include/asm/pgtable.h.
+        if let Some(entry) = x86_present_pte_access_update(vmf.orig_pte, vmf.flags) {
+            set_pte_at((*vmf.vma).vm_mm as *mut (), vmf.address, vmf.pte, entry);
         }
-        set_pte_at((*vmf.vma).vm_mm as *mut (), vmf.address, vmf.pte, entry);
-        flush_tlb_page(vmf.address);
 
         0 // minor fault, success
     }
+}
+
+/// Linux x86 `ptep_set_access_flags()` for the present-PTE fault path.
+///
+/// Hardware owns accessed and dirty updates.  The only software PTE update is
+/// a write fault that needs to publish dirty state; this transition does not
+/// invalidate a translation because it only relaxes access.
+#[inline]
+fn x86_present_pte_access_update(orig: pte_t, flags: FaultFlags) -> Option<pte_t> {
+    let dirty = flags & FAULT_FLAG_WRITE != 0;
+    if !dirty {
+        return None;
+    }
+    let entry = pte_mkdirty(pte_mkyoung(orig));
+    (entry != orig).then_some(entry)
 }
 
 // ---------------------------------------------------------------------------
@@ -1998,6 +2017,35 @@ mod tests {
         // Default must NOT include WRITE or USER.
         assert_eq!(FAULT_FLAG_DEFAULT & FAULT_FLAG_WRITE, 0);
         assert_eq!(FAULT_FLAG_DEFAULT & FAULT_FLAG_USER, 0);
+    }
+
+    /// x86 relies on hardware A/D updates and does not flush an already
+    /// present translation for a read/accessed-bit-only fault.
+    ///
+    /// test-origin: linux:vendor/linux/arch/x86/mm/pgtable.c:ptep_set_access_flags
+    #[test]
+    fn x86_present_pte_access_update_only_publishes_dirty_write_state() {
+        let clean = __pte(_PAGE_PRESENT | _PAGE_USER);
+        assert_eq!(x86_present_pte_access_update(clean, 0), None);
+
+        let updated = x86_present_pte_access_update(clean, FAULT_FLAG_WRITE)
+            .expect("write fault must publish software dirty state when absent");
+        assert!(paging::pte_dirty(updated));
+        assert!(paging::pte_young(updated));
+
+        let hardware_dirty = pte_mkyoung(pte_mkdirty(clean));
+        assert_eq!(
+            x86_present_pte_access_update(hardware_dirty, FAULT_FLAG_WRITE),
+            None,
+            "x86 must not rewrite a PTE whose hardware dirty/accessed state is current"
+        );
+
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/arch/x86/mm/pgtable.c"
+        ));
+        assert!(linux.contains("if (changed && dirty)"));
+        assert!(linux.contains("set_pte(ptep, entry);"));
     }
 
     /// Linux `wp_page_copy()` clears and flushes the old PTE before publishing

@@ -34,6 +34,15 @@ pub const DEQUEUE_NOCLOCK: u32 = 0x08;
 pub const DEQUEUE_MIGRATING: u32 = 0x0010;
 pub const DEQUEUE_CLASS: u32 = 0x40;
 
+/// Linux `task_struct::on_rq` states from `kernel/sched/sched.h`.
+///
+/// A task stays nonzero while a load-balancer migration removes its class
+/// entity from the source runqueue and attaches it to the destination.  This
+/// prevents task lifetime code from treating the embedded scheduler nodes as
+/// unreferenced in that interval.
+pub const TASK_ON_RQ_QUEUED: i32 = 1;
+pub const TASK_ON_RQ_MIGRATING: i32 = 2;
+
 /// Fork placement flag passed to `select_task_rq()` / `wakeup_preempt()`.
 /// This is a wake flag, not an `ENQUEUE_*` flag.
 pub const WF_FORK: u32 = 0x04;

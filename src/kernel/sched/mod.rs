@@ -237,6 +237,39 @@ static mut CURRENT_TASK: [*mut TaskStruct; MAX_CPUS] = [core::ptr::null_mut(); M
 static DEFERRED_TASK_RELEASE: [AtomicPtr<TaskStruct>; MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
 
+/// A physical task allocation cannot be released from `finish_task_switch()`.
+/// Linux's `finish_lock_switch()` drops the rq lock and restores IRQs before
+/// the later RCU stack teardown can reach `vfree()`.  Lupos keeps the compact
+/// heap allocation pair here until its caller has restored local IRQs, because
+/// vmapped-stack teardown needs a synchronous cross-CPU TLB flush.
+#[derive(Clone, Copy)]
+struct PostSwitchHeapRelease {
+    task: *mut TaskStruct,
+    stack: *mut u8,
+}
+
+// The heap-task tracker grants unique release ownership before this pair is
+// queued, and the per-CPU mutex serializes the only later handoff.  The raw
+// pointers are not dereferenced until that ownership is consumed.
+unsafe impl Send for PostSwitchHeapRelease {}
+
+const MAX_POST_SWITCH_HEAP_RELEASES: usize = 2;
+
+struct PostSwitchHeapReleases {
+    entries: [Option<PostSwitchHeapRelease>; MAX_POST_SWITCH_HEAP_RELEASES],
+}
+
+impl PostSwitchHeapReleases {
+    const fn new() -> Self {
+        Self {
+            entries: [None; MAX_POST_SWITCH_HEAP_RELEASES],
+        }
+    }
+}
+
+static POST_SWITCH_HEAP_RELEASES: [Mutex<PostSwitchHeapReleases>; MAX_CPUS] =
+    [const { Mutex::new(PostSwitchHeapReleases::new()) }; MAX_CPUS];
+
 // Lupos-specific runtime instrumentation for the Linux rq-lock handoff race:
 // stop one self-pick after rq unlock so another CPU can enqueue work in the
 // exact window before __schedule() returns.  No upstream selftest can expose
@@ -683,6 +716,44 @@ unsafe fn prepare_task_switch_release(task: *mut TaskStruct) {
     );
 }
 
+/// Queue physical heap-allocation teardown until the scheduling caller has
+/// restored local IRQs.  The two slots cover the exiting thread plus the
+/// group leader that `release_task()` can reap recursively.
+pub(crate) fn defer_heap_task_release(task: *mut TaskStruct, stack: *mut u8) {
+    let mut pending = POST_SWITCH_HEAP_RELEASES[current_cpu_index()].lock();
+    for slot in &mut pending.entries {
+        if slot.is_none() {
+            *slot = Some(PostSwitchHeapRelease { task, stack });
+            return;
+        }
+    }
+    panic!("post-switch heap-release queue exhausted");
+}
+
+/// Complete heap-task physical teardown after the scheduler has re-enabled
+/// local IRQs.  This is the first point where a vmapped stack may safely enter
+/// Linux-equivalent synchronous kernel TLB invalidation.
+pub(crate) unsafe fn finish_deferred_heap_task_releases() {
+    #[cfg(not(test))]
+    debug_assert!(
+        !crate::kernel::locking::irqs_disabled(),
+        "vmapped task stacks must not be released with local IRQs disabled"
+    );
+
+    loop {
+        let release = {
+            let mut pending = POST_SWITCH_HEAP_RELEASES[current_cpu_index()].lock();
+            let Some(slot) = pending.entries.iter_mut().find(|entry| entry.is_some()) else {
+                return;
+            };
+            slot.take().expect("entry checked above")
+        };
+        unsafe {
+            crate::kernel::fork::finish_heap_task_release(release.task, release.stack);
+        }
+    }
+}
+
 /// Linux `finish_task_switch()`'s final TASK_DEAD ownership drop.
 ///
 /// This runs on the incoming task's kernel stack. `prev` is the actual task
@@ -715,12 +786,20 @@ pub unsafe fn finish_task_switch(prev: *mut TaskStruct) {
             set_task_on_cpu(prev, false, Ordering::Release);
         }
     }
+
+    // Linux `finish_task_switch()` calls `mmdrop_lazy_tlb_sched(rq->prev_mm)`
+    // only after finish_task() has cleared prev->on_cpu and completed the
+    // scheduler's post-switch transition.  x86 records the borrowed active_mm
+    // in PREV_MM_TO_DROP during context_switch(); consume it at this matching
+    // boundary rather than from __switch_to().
+    unsafe {
+        crate::arch::x86::kernel::switch::finish_switch_mm_drop();
+    }
+
     if !prev.is_null()
         && let Some(kernel_stack) = crate::kernel::fork::take_logically_released_heap_task(prev)
     {
-        unsafe {
-            crate::kernel::fork::finish_heap_task_release(prev, kernel_stack);
-        }
+        defer_heap_task_release(prev, kernel_stack);
         return;
     }
     if !prev.is_null() && (deferred == prev || autoreap) {
@@ -738,6 +817,9 @@ pub unsafe extern "C" fn schedule_tail(prev: *mut TaskStruct) {
     }
     #[cfg(not(test))]
     crate::kernel::locking::local_irq_enable();
+    unsafe {
+        finish_deferred_heap_task_releases();
+    }
 }
 
 #[inline]
@@ -968,6 +1050,10 @@ pub unsafe fn sched_cgroup_fork(p: *mut TaskStruct) {
     if p.is_null() {
         return;
     }
+    // Linux sched_cgroup_fork() takes p->pi_lock even though the newborn is
+    // not PID-visible yet. Keep the same task-state/CPU ownership boundary so
+    // its embedded sched_entity cannot race a concurrent wakeup publication.
+    let (pi_guard, pi_flags) = unsafe { (*p).pi_lock.lock_irqsave() };
     unsafe {
         if (*p).m29.sched_class.is_null() {
             (*p).m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
@@ -978,6 +1064,7 @@ pub unsafe fn sched_cgroup_fork(p: *mut TaskStruct) {
             task_fork(p);
         }
     }
+    crate::kernel::locking::RawSpinLock::unlock_irqrestore(pi_guard, pi_flags);
 }
 
 /// Run Linux's class-aware wakeup preemption decision under the target rq lock
@@ -1425,6 +1512,7 @@ pub unsafe fn legacy_schedule() -> bool {
         prepare_task_switch_release(prev);
         let last = __switch_to_asm(prev, next);
         finish_task_switch(last);
+        finish_deferred_heap_task_releases();
     }
     false
 }
@@ -1574,6 +1662,9 @@ pub unsafe fn __schedule() {
         finish_task_switch(last);
     }
     crate::kernel::locking::local_irq_restore(irq_flags);
+    unsafe {
+        finish_deferred_heap_task_releases();
+    }
 }
 
 /// Main scheduler entry point.
@@ -2282,6 +2373,10 @@ pub unsafe fn wake_up_new_task(p: *mut TaskStruct) {
         return;
     }
 
+    // Linux holds p->pi_lock across TASK_RUNNING, CPU selection, and
+    // activate_task(). Without that boundary a remote waker can observe the
+    // half-published entity and mutate the same intrusive CFS rb node.
+    let (pi_guard, pi_flags) = unsafe { (*p).pi_lock.lock_irqsave() };
     unsafe {
         if (*p).m29.sched_class.is_null() {
             (*p).m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
@@ -2323,6 +2418,7 @@ pub unsafe fn wake_up_new_task(p: *mut TaskStruct) {
             send_reschedule_ipi_for_transition(cpu, newly_set);
         }
     }
+    crate::kernel::locking::RawSpinLock::unlock_irqrestore(pi_guard, pi_flags);
 }
 
 pub fn select_task_rq(p: *mut TaskStruct, prev_cpu: u32, flags: u32) -> u32 {

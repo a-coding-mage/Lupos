@@ -99,9 +99,10 @@ static SWITCH_ATTEMPT_NEXT_STACK: AtomicU64 = AtomicU64::new(0);
 /// Lazy active_mm references released after the physical stack/CR3 switch.
 ///
 /// Linux carries this as `rq->prev_mm` from `context_switch()` to
-/// `finish_task_switch()`. Scheduler core deliberately stays architecture
-/// agnostic in Lupos, so the x86 switch path carries the identical ownership
-/// through one per-CPU slot.
+/// `finish_task_switch()`. The scheduler invokes `finish_switch_mm_drop()` at
+/// that exact post-switch boundary; the x86 switch path carries the ownership
+/// through one per-CPU slot instead of dropping it while `__switch_to()` is
+/// still running.
 static PREV_MM_TO_DROP: [AtomicUsize; crate::kernel::sched::MAX_CPUS] =
     [const { AtomicUsize::new(0) }; crate::kernel::sched::MAX_CPUS];
 
@@ -418,7 +419,7 @@ unsafe fn prepare_switch_mm(prev: *mut TaskStruct, next: *mut TaskStruct) {
 }
 
 #[cfg(not(test))]
-unsafe fn finish_switch_mm_drop() {
+pub(crate) unsafe fn finish_switch_mm_drop() {
     let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number();
     let mm = PREV_MM_TO_DROP[cpu].swap(0, Ordering::AcqRel) as *mut crate::mm::mm_types::MmStruct;
     if !mm.is_null() {
@@ -429,7 +430,7 @@ unsafe fn finish_switch_mm_drop() {
 }
 
 #[cfg(test)]
-unsafe fn finish_switch_mm_drop() {}
+pub(crate) unsafe fn finish_switch_mm_drop() {}
 
 fn fresh_stack_canary() -> u64 {
     let canary = crate::kernel::syscalls::next_random_u64() & 0xffff_ffff_ffff_ff00;
@@ -647,8 +648,12 @@ pub unsafe extern "C" fn __switch_to(
     //    Ref: Linux process_64.c `raw_cpu_write(current_task, next_p)`
     unsafe {
         crate::kernel::sched::set_current(next);
-        finish_switch_mm_drop();
     }
+
+    // Linux deliberately carries rq->prev_mm through context_switch() and
+    // releases it from finish_task_switch(), after the outgoing task's
+    // on_cpu publication and scheduler lock transition.  Do not mmdrop here:
+    // it can free page tables while the scheduler still owns the switch.
 
     // Return `prev` so the caller knows which task just stopped running.
     prev
@@ -969,6 +974,44 @@ mod tests {
         assert_eq!(
             classify_mm_switch(kernel, kernel),
             MmSwitchKind::KernelToKernel
+        );
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:finish_task_switch
+    /// and linux:vendor/linux/kernel/sched/core.c:context_switch
+    #[test]
+    fn lazy_active_mm_drop_stays_at_linux_finish_task_switch_boundary() {
+        let switch_source = include_str!("switch.rs");
+        let switch_body = switch_source
+            .split("pub unsafe extern \"C\" fn __switch_to(")
+            .nth(1)
+            .expect("__switch_to must exist");
+        let switch_body = switch_body
+            .split("// ── Unit tests")
+            .next()
+            .expect("__switch_to body must end before unit tests");
+        assert!(
+            !switch_body.contains("finish_switch_mm_drop()"),
+            "Linux does not mmdrop rq->prev_mm from __switch_to"
+        );
+
+        let sched_source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/kernel/sched/mod.rs"
+        ));
+        let finish_body = sched_source
+            .split("pub unsafe fn finish_task_switch(prev: *mut TaskStruct)")
+            .nth(1)
+            .expect("finish_task_switch must exist");
+        let clear_on_cpu = finish_body
+            .find("set_task_on_cpu(prev, false, Ordering::Release)")
+            .expect("finish_task_switch must clear prev->on_cpu");
+        let drop_mm = finish_body
+            .find("finish_switch_mm_drop()")
+            .expect("finish_task_switch must drop the deferred active_mm");
+        assert!(
+            clear_on_cpu < drop_mm,
+            "Linux drops rq->prev_mm only after finish_task() publishes prev off CPU"
         );
     }
 

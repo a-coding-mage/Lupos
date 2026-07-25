@@ -67,6 +67,11 @@ pub const VMALLOC_START: u64 = 0xFFFF_C900_0000_0000;
 /// End of the vmalloc window (exclusive). 1 GiB after `VMALLOC_START`.
 pub const VMALLOC_END: u64 = VMALLOC_START + (1 << 30); // +1 GiB
 
+/// Stack allocations are five pages in the x86_64 release profile (one guard
+/// page plus a 16 KiB usable stack).  Keep their backing PFNs locally while
+/// unmapping so one Linux-equivalent range flush can precede all reuse.
+const VMALLOC_TLB_BATCH_PAGES: usize = 16;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VmStruct {
     pub addr: *mut u8,
@@ -483,7 +488,8 @@ pub fn vfree_stack(stack_bottom: *mut u8) {
 ///
 /// - Looks up the page count in the metadata array.
 /// - Unmaps each page via `unmap_kernel_page`.
-/// - Frees each backing physical frame to the buddy allocator.
+/// - Flushes each cleared shared-kernel PTE on every CPU before its backing
+///   physical frame can return to the buddy allocator.
 /// - Returns the VA range to the free list.
 ///
 /// Does nothing if `ptr` is null.
@@ -519,14 +525,58 @@ pub fn vfree(ptr: *mut u8) {
 
     let alloc_size = n_pages * PAGE_SIZE;
 
-    for i in 0..n_pages {
-        let va = va_start + (i * PAGE_SIZE) as u64;
-        if free_backing && let Some(phys) = virt_to_phys(va) {
-            let pfn = phys as usize / PAGE_SIZE;
-            let page_ptr = crate::mm::buddy::pfn_to_page(pfn);
-            with_global_buddy(|b| b.free_pages(page_ptr, 0));
+    if n_pages <= VMALLOC_TLB_BATCH_PAGES {
+        let mut backing = [None; VMALLOC_TLB_BATCH_PAGES];
+        for (i, slot) in backing.iter_mut().take(n_pages).enumerate() {
+            let va = va_start + (i * PAGE_SIZE) as u64;
+            if free_backing {
+                *slot = virt_to_phys(va);
+            }
+            unsafe { unmap_kernel_page(va) };
         }
-        unsafe { unmap_kernel_page(va) };
+        // Linux `vunmap_range()` clears the whole range and performs one
+        // `flush_tlb_kernel_range()` before either VA or backing pages can be
+        // reused.  This covers every production task stack without turning
+        // each 4 KiB leaf into an all-CPU synchronous IPI round trip.
+        assert!(
+            unsafe {
+                crate::arch::x86::mm::tlb::flush_tlb_kernel_range(
+                    va_start,
+                    va_start + alloc_size as u64,
+                )
+            },
+            "kernel TLB shootdown failed before vmalloc backing-page reuse"
+        );
+        if free_backing {
+            for phys in backing.into_iter().take(n_pages).flatten() {
+                let pfn = phys as usize / PAGE_SIZE;
+                let page_ptr = crate::mm::buddy::pfn_to_page(pfn);
+                with_global_buddy(|b| b.free_pages(page_ptr, 0));
+            }
+        }
+    } else {
+        // Preserve the same unmap/flush/reuse ordering for larger mappings.
+        // The compact allocator has no dynamic vm_struct page array yet, so it
+        // cannot retain an arbitrary number of backing PFNs across one flush.
+        for i in 0..n_pages {
+            let va = va_start + (i * PAGE_SIZE) as u64;
+            let phys = if free_backing { virt_to_phys(va) } else { None };
+            unsafe { unmap_kernel_page(va) };
+            assert!(
+                unsafe {
+                    crate::arch::x86::mm::tlb::flush_tlb_kernel_range(
+                        va,
+                        va + PAGE_SIZE as u64,
+                    )
+                },
+                "kernel TLB shootdown failed before vmalloc backing-page reuse"
+            );
+            if let Some(phys) = phys {
+                let pfn = phys as usize / PAGE_SIZE;
+                let page_ptr = crate::mm::buddy::pfn_to_page(pfn);
+                with_global_buddy(|b| b.free_pages(page_ptr, 0));
+            }
+        }
     }
 
     va_free(&mut state, va_start, alloc_size);

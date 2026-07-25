@@ -168,21 +168,31 @@ pub fn call_rcu(head: *mut RcuHead, func: unsafe extern "C" fn(*mut RcuHead)) {
         (*head).func = Some(func);
         (*head).next = core::ptr::null_mut();
     }
+    // Begin a new grace period before publishing the callback. A local timer
+    // tick alone must not recycle a vmapped stack another CPU can still see.
+    GP_SEQ.fetch_add(1, Ordering::AcqRel);
     let mut cbs = CB_LISTS[cpu_index()].lock();
     unsafe {
         cbs.enqueue(head);
     }
+    drop(cbs);
+    crate::kernel::softirq::raise_softirq(crate::kernel::softirq::SoftIrqVec::Rcu);
 }
 
 /// `rcu_check_callbacks()` — invoked from the Timer softirq once per tick.
 /// Drains and invokes any RCU callbacks whose grace period has elapsed.
-///
-/// M34: drains all queued callbacks immediately (any callback queued at
-/// `gp_seq == n` waits for the next `synchronize_rcu` call elsewhere; under
-/// the cooperative model the timer-tick + scheduler-tick cooperation makes
-/// this safe enough for the in-kernel test fixtures).
 pub fn rcu_check_callbacks() {
     rcu_qs();
+    let target = GP_SEQ.load(Ordering::Acquire);
+    let online = ONLINE_MASK.load(Ordering::Acquire);
+    let complete = (0..MAX_CPUS).all(|cpu| {
+        online & (1u64 << (cpu & 63)) == 0
+            || QS_AT_GP[cpu].load(Ordering::Acquire) >= target
+    });
+    if !complete {
+        crate::kernel::softirq::raise_softirq(crate::kernel::softirq::SoftIrqVec::Rcu);
+        return;
+    }
     let mut cbs = CB_LISTS[cpu_index()].lock();
     while let head_ptr = cbs.dequeue() {
         if head_ptr.is_null() {

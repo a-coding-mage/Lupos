@@ -4,6 +4,7 @@
 //! GCC/Clang kernel stack-protector ABI for vendor-built modules.
 
 use crate::kernel::module::{export_symbol, find_symbol};
+use crate::log_error;
 
 /// LLVM's global-guard ABI for the bare-metal Rust kernel.
 ///
@@ -35,7 +36,32 @@ pub fn register_module_exports() {
 }
 
 /// Called by compiler-generated epilogues after a canary mismatch.
+///
+/// Keep this trampoline naked: the failing function's continuation is at the
+/// original `[rsp]`, before any Rust prologue can move the stack.  The regular
+/// implementation below can then log that return PC without treating its own
+/// frame as the failing caller's frame.
+#[unsafe(naked)]
 #[unsafe(export_name = "__stack_chk_fail")]
-pub extern "C" fn __stack_chk_fail() -> ! {
+pub unsafe extern "C" fn __stack_chk_fail() -> ! {
+    core::arch::naked_asm!(
+        "mov rdi, [rsp]",
+        "jmp {impl}",
+        impl = sym stack_chk_fail_impl,
+    )
+}
+
+#[inline(never)]
+extern "C" fn stack_chk_fail_impl(caller: usize) -> ! {
+    let sp: usize;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, preserves_flags));
+        log_error!(
+            "stack-protector",
+            "stack-protector: canary caller={:#018x} rsp={:#018x}",
+            caller,
+            sp,
+        );
+    }
     panic!("stack-protector: Kernel stack is corrupted")
 }

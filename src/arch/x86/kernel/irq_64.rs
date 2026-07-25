@@ -3,11 +3,26 @@
 //! test-origin: linux:vendor/linux/arch/x86/kernel/irq_64.c
 //! x86_64 hardirq stack mapping policy.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::include::uapi::errno::ENOMEM;
 
 pub const PAGE_SHIFT: usize = 12;
 pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 pub const IRQ_STACK_SIZE: usize = 16 * 1024;
+
+#[repr(align(4096))]
+struct IrqStack([u8; IRQ_STACK_SIZE]);
+
+// Linux keeps one page-aligned backing store and one in-use bit per CPU.  The
+// Lupos allocator does not yet expose the Linux per-CPU vmap lifecycle, but
+// this backing store has the same per-CPU ownership and exact stack extent.
+// The transfer below is deliberately limited to the device/timer handler;
+// IDT entry/exit and rescheduling stay on the interrupted task stack.
+static mut IRQ_STACK_BACKING_STORE: [IrqStack; crate::kernel::sched::MAX_CPUS] =
+    [const { IrqStack([0; IRQ_STACK_SIZE]) }; crate::kernel::sched::MAX_CPUS];
+static HARDIRQ_STACK_INUSE: [AtomicBool; crate::kernel::sched::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; crate::kernel::sched::MAX_CPUS];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IrqStackBacking {
@@ -57,6 +72,45 @@ pub const fn irq_init_percpu_irqstack(
         Ok((ptr, _)) => Ok(ptr),
         Err(err) => Err(err),
     }
+}
+
+/// Linux `run_irq_on_irqstack_cond()` for the Lupos IDT's device/timer
+/// handler.  The exception frame remains on the interrupted stack, exactly as
+/// it does in Linux; only the potentially deep driver call is moved.
+///
+/// # Safety
+/// `frame` must be the live IDT frame and interrupts must be disabled.
+pub unsafe fn run_irq_on_irqstack(frame: *mut crate::arch::x86::kernel::idt::ExceptionFrame, vector: u8) {
+    let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number()
+        .min(crate::kernel::sched::MAX_CPUS - 1);
+    let user_mode = unsafe { (*frame).cs & 3 != 0 };
+    if user_mode || HARDIRQ_STACK_INUSE[cpu].swap(true, Ordering::AcqRel) {
+        unsafe { crate::arch::x86::kernel::idt::run_hardirq_handler(frame, vector) };
+        return;
+    }
+
+    let base = unsafe { core::ptr::addr_of_mut!(IRQ_STACK_BACKING_STORE[cpu].0) as *mut u8 };
+    let top = unsafe { base.add(IRQ_STACK_SIZE - 8) } as usize;
+    unsafe { irq_stack_call(top, frame, vector as usize) };
+    HARDIRQ_STACK_INUSE[cpu].store(false, Ordering::Release);
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn irq_stack_call(
+    _stack_top: usize,
+    _frame: *mut crate::arch::x86::kernel::idt::ExceptionFrame,
+    _vector: usize,
+) {
+    core::arch::naked_asm!(
+        "xchg rsp, rdi",
+        "push rdi",
+        "mov rdi, rsi",
+        "mov rsi, rdx",
+        "call {dispatch}",
+        "pop rsp",
+        "ret",
+        dispatch = sym crate::arch::x86::kernel::idt::run_hardirq_handler,
+    );
 }
 
 #[cfg(test)]

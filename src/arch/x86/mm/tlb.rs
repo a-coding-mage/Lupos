@@ -63,6 +63,41 @@ impl ShootdownDesc {
 }
 
 static DESCRIPTORS: [ShootdownDesc; MAX_CPUS] = [const { ShootdownDesc::new() }; MAX_CPUS];
+
+/// One Linux `call_single_data_t` analogue for a source/target CPU pair.
+///
+/// `smp_call_function_many_cond()` owns its CSD storage per source CPU and
+/// target CPU, then queues that independent record on the target.  A fixed
+/// target-only mailbox cannot represent two concurrent flushers without
+/// making them wait while holding unrelated MM/scheduler state.  This compact
+/// matrix is the bounded equivalent for Lupos' static CPU maximum.
+#[repr(C)]
+struct TlbCallSlot {
+    state: AtomicU32,
+    mm: AtomicUsize,
+    start: AtomicU64,
+    end: AtomicU64,
+    full: AtomicU32,
+}
+
+impl TlbCallSlot {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU32::new(0),
+            mm: AtomicUsize::new(0),
+            start: AtomicU64::new(0),
+            end: AtomicU64::new(0),
+            full: AtomicU32::new(0),
+        }
+    }
+}
+
+const TLB_CALL_IDLE: u32 = 0;
+const TLB_CALL_QUEUED: u32 = 1;
+const TLB_CALL_RUNNING: u32 = 2;
+
+static TLB_CALL_SLOTS: [[TlbCallSlot; MAX_CPUS]; MAX_CPUS] =
+    [const { [const { TlbCallSlot::new() }; MAX_CPUS] }; MAX_CPUS];
 static ACTIVE_MM: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 static ACTIVE_MM_LAZY: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
@@ -272,13 +307,72 @@ fn cpu_index() -> usize {
 
 pub fn on_shootdown_ipi() {
     let cpu = cpu_index();
-    // x86 interrupt gates enter with IF clear. Keep the non-reentrant service
-    // routine in that state until its acknowledgement is published, matching
-    // Linux flush_tlb_func().
-    service_pending_for_cpu_irqs_off(cpu);
+    // x86 interrupt gates enter with IF clear. Drain every independently
+    // queued source record before EOI, matching Linux's
+    // __flush_smp_call_function_queue() -> flush_tlb_func() boundary.
+    service_tlb_call_queue_irqs_off(cpu);
     TLB_SHOOTDOWN_COUNT.fetch_add(1, Ordering::Release);
     unsafe {
         apic::eoi();
+    }
+}
+
+/// Linux `__flush_smp_call_function_queue()` specialized to TLB callbacks.
+///
+/// The target owns execution after changing QUEUED to RUNNING.  Its release
+/// store to IDLE is the `csd_unlock()` completion observed by the source.
+fn service_tlb_call_queue_irqs_off(target: usize) -> bool {
+    debug_assert!(crate::kernel::locking::irqs_disabled());
+    let target = target.min(MAX_CPUS - 1);
+    let mut serviced = false;
+    for source in 0..MAX_CPUS {
+        let slot = &TLB_CALL_SLOTS[source][target];
+        if slot
+            .state
+            .compare_exchange(
+                TLB_CALL_QUEUED,
+                TLB_CALL_RUNNING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            continue;
+        }
+
+        let mm = slot.mm.load(Ordering::Relaxed) as *mut MmStruct;
+        let start = slot.start.load(Ordering::Relaxed);
+        let end = slot.end.load(Ordering::Relaxed);
+        let full = slot.full.load(Ordering::Relaxed) != 0;
+        if flush_applies_to_active_state(mm, active_mm_state(target as u32)) {
+            unsafe { flush_local_range(start, end, full) };
+        }
+        slot.state.store(TLB_CALL_IDLE, Ordering::Release);
+        TLB_SHOOTDOWN_ACK_COUNT.fetch_add(1, Ordering::Release);
+        serviced = true;
+    }
+    serviced
+}
+
+fn queue_tlb_call(source: usize, target: usize, mm: *mut MmStruct, start: u64, end: u64, full: bool) {
+    let slot = &TLB_CALL_SLOTS[source.min(MAX_CPUS - 1)][target.min(MAX_CPUS - 1)];
+    assert_eq!(
+        slot.state.load(Ordering::Acquire),
+        TLB_CALL_IDLE,
+        "per-source TLB call slot reused before target completion"
+    );
+    slot.mm.store(mm as usize, Ordering::Relaxed);
+    slot.start.store(start, Ordering::Relaxed);
+    slot.end.store(end, Ordering::Relaxed);
+    slot.full.store(full as u32, Ordering::Relaxed);
+    // Publish payload before the target observes the queued CSD equivalent.
+    slot.state.store(TLB_CALL_QUEUED, Ordering::Release);
+}
+
+fn wait_tlb_call(source: usize, target: usize) {
+    let slot = &TLB_CALL_SLOTS[source.min(MAX_CPUS - 1)][target.min(MAX_CPUS - 1)];
+    while slot.state.load(Ordering::Acquire) != TLB_CALL_IDLE {
+        core::hint::spin_loop();
     }
 }
 
@@ -513,8 +607,7 @@ unsafe fn flush_tlb_mm_range_inner(
             flush_local_range(start, end, full);
         }
     }
-    let mut targeted = false;
-    let mut wait: [(usize, u64); MAX_CPUS] = [(0, 0); MAX_CPUS];
+    let mut targets = [false; MAX_CPUS];
 
     for cpu in 0..MAX_CPUS as u32 {
         if cpu == this_cpu {
@@ -526,23 +619,35 @@ unsafe fn flush_tlb_mm_range_inner(
         if !remote_flush_applies_to_cpu(mm, cpu, include_lazy) {
             continue;
         }
-        targeted = true;
-        acquire_descriptor(cpu as usize);
-        let generation = publish_remote_flush_owned(cpu, mm, start, end, full);
-        wait[0] = (cpu as usize, generation);
-        assert!(
-            unsafe { send_shootdown_ipi(cpu) },
-            "active CPU has no APIC destination for TLB shootdown"
-        );
-        // Linux's call-function queue gives each request independent storage.
-        // Lupos has one descriptor per target CPU, so release each target
-        // before acquiring another to avoid descriptor-ownership cycles among
-        // concurrent flushers.
-        wait_for_remote_flushes(&wait, 1, mm, include_lazy);
+        // Linux publishes one independent call_single_data record per target
+        // before it sends IPIs or waits. The source/target matrix provides
+        // that same non-overwrite ownership without a target-only mailbox.
+        queue_tlb_call(this_cpu as usize, cpu as usize, mm, start, end, full);
+        targets[cpu as usize] = true;
     }
 
-    if !targeted {
-        return true;
+    for cpu in 0..MAX_CPUS as u32 {
+        if targets[cpu as usize] {
+            assert!(
+                unsafe { send_shootdown_ipi(cpu) },
+                "active CPU has no APIC destination for TLB shootdown"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    for cpu in 0..MAX_CPUS {
+        if targets[cpu] {
+            let irq_flags = crate::kernel::locking::local_irq_save();
+            assert!(service_tlb_call_queue_irqs_off(cpu));
+            crate::kernel::locking::local_irq_restore(irq_flags);
+        }
+    }
+
+    for cpu in 0..MAX_CPUS {
+        if targets[cpu] {
+            wait_tlb_call(this_cpu as usize, cpu);
+        }
     }
     true
 }
@@ -569,6 +674,24 @@ pub unsafe fn flush_tlb_mm_range(mm: *mut MmStruct, start: u64, end: u64) -> boo
 pub unsafe fn flush_tlb_mm_range_freed_tables(mm: *mut MmStruct, start: u64, end: u64) -> bool {
     crate::kernel::locking::preempt::preempt_disable();
     let result = unsafe { flush_tlb_mm_range_inner(mm, start, end, true) };
+    crate::kernel::locking::preempt::preempt_enable();
+    result
+}
+
+/// Invalidate a shared kernel virtual-address range on every active CPU.
+///
+/// Mirrors x86 `flush_tlb_kernel_range()`: shared kernel mappings have no
+/// task mm, so this broadcasts the null-mm flush while including lazy CPUs.
+/// Linux requires task context with IRQs enabled for its synchronous
+/// `on_each_cpu()` implementation; task-stack release enforces that boundary.
+pub unsafe fn flush_tlb_kernel_range(start: u64, end: u64) -> bool {
+    #[cfg(not(test))]
+    debug_assert!(
+        !crate::kernel::locking::irqs_disabled(),
+        "flush_tlb_kernel_range requires local IRQs enabled"
+    );
+    crate::kernel::locking::preempt::preempt_disable();
+    let result = unsafe { flush_tlb_mm_range_inner(core::ptr::null_mut(), start, end, true) };
     crate::kernel::locking::preempt::preempt_enable();
     result
 }
@@ -670,6 +793,15 @@ mod tests {
             desc.start.store(0, Ordering::SeqCst);
             desc.end.store(0, Ordering::SeqCst);
             desc.full.store(0, Ordering::SeqCst);
+        }
+        for source in &TLB_CALL_SLOTS {
+            for slot in source {
+                slot.state.store(TLB_CALL_IDLE, Ordering::SeqCst);
+                slot.mm.store(0, Ordering::SeqCst);
+                slot.start.store(0, Ordering::SeqCst);
+                slot.end.store(0, Ordering::SeqCst);
+                slot.full.store(0, Ordering::SeqCst);
+            }
         }
         for mm in &ACTIVE_MM {
             mm.store(0, Ordering::SeqCst);
@@ -882,10 +1014,10 @@ mod tests {
             assert!(flush_tlb_mm_range_freed_tables(mm, 0x3000, 0x5000));
         }
 
-        assert_ne!(DESCRIPTORS[1].generation.load(Ordering::Acquire), 0);
         assert_eq!(
-            DESCRIPTORS[1].ack.load(Ordering::Acquire),
-            DESCRIPTORS[1].generation.load(Ordering::Acquire)
+            TLB_SHOOTDOWN_ACK_COUNT.load(Ordering::Acquire),
+            1,
+            "freed-table flush must execute one remote call even for a lazy borrower"
         );
         assert_eq!(LOCAL_FLUSH_COUNT.load(Ordering::Acquire), 1);
     }
@@ -983,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn range_flush_releases_each_fixed_descriptor_before_acquiring_next() {
+    fn range_flush_publishes_all_call_slots_before_waiting() {
         // test-origin: linux:vendor/linux/arch/x86/mm/tlb.c:native_flush_tlb_multi
         let linux = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -998,18 +1130,42 @@ mod tests {
             .and_then(|s| s.split("/// Invalidate translations in one mm.").next())
             .expect("flush_tlb_mm_range_inner body present");
         let publish = body
-            .find("publish_remote_flush_owned(cpu, mm, start, end, full)")
+            .find("queue_tlb_call(this_cpu as usize, cpu as usize, mm, start, end, full)")
             .expect("range flush must publish a remote request");
+        let send = body
+            .find("send_shootdown_ipi(cpu)")
+            .expect("range flush must send after publication");
         let wait = body
-            .find("wait_for_remote_flushes(&wait, 1, mm, include_lazy);")
-            .expect("range flush must wait per target descriptor");
-        let loop_end = body[wait..]
-            .find("}\n\n    if !targeted")
-            .expect("per-target wait should remain inside the CPU loop")
-            + wait;
+            .find("wait_tlb_call(this_cpu as usize, cpu);")
+            .expect("range flush must wait for the target call slot");
         assert!(publish < wait);
-        assert!(wait < loop_end);
-        assert!(body.contains("one descriptor per target CPU"));
+        assert!(publish < send);
+        assert!(send < wait);
+        assert!(body.contains("source/target matrix"));
+    }
+
+    #[test]
+    fn target_drains_independent_calls_from_two_sources() {
+        // test-origin: linux:vendor/linux/kernel/smp.c:smp_call_function_many_cond
+        let _guard = test_guard();
+        let target = 3usize;
+        unsafe { set_active_mm(target as u32, core::ptr::null_mut()) };
+        queue_tlb_call(0, target, core::ptr::null_mut(), 0x1000, 0x2000, false);
+        queue_tlb_call(1, target, core::ptr::null_mut(), 0x3000, 0x4000, false);
+
+        let irq_flags = crate::kernel::locking::local_irq_save();
+        assert!(service_tlb_call_queue_irqs_off(target));
+        crate::kernel::locking::local_irq_restore(irq_flags);
+
+        assert_eq!(
+            TLB_CALL_SLOTS[0][target].state.load(Ordering::Acquire),
+            TLB_CALL_IDLE
+        );
+        assert_eq!(
+            TLB_CALL_SLOTS[1][target].state.load(Ordering::Acquire),
+            TLB_CALL_IDLE
+        );
+        assert_eq!(TLB_SHOOTDOWN_ACK_COUNT.load(Ordering::Acquire), 2);
     }
 
     #[test]

@@ -17,8 +17,8 @@
 //! ```
 
 use super::class::{
-    CLASS_PRIO_FAIR, DEQUEUE_SLEEP, ENQUEUE_HEAD, ENQUEUE_INITIAL, ENQUEUE_MIGRATED,
-    ENQUEUE_WAKEUP, SchedClass,
+    CLASS_PRIO_FAIR, DEQUEUE_MIGRATING, DEQUEUE_SLEEP, ENQUEUE_HEAD, ENQUEUE_INITIAL,
+    ENQUEUE_MIGRATED, ENQUEUE_WAKEUP, SchedClass, TASK_ON_RQ_MIGRATING, TASK_ON_RQ_QUEUED,
 };
 use super::entity::{SchedEntity, sched_clock_ns};
 use super::prio::calc_delta_fair;
@@ -154,7 +154,12 @@ unsafe fn enqueue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) {
     let se = task_se(p);
     let m = task_m29(p);
     unsafe {
-        if (*se).on_rq != 0 || (*m).on_rq != 0 {
+        // Linux `activate_task()` keeps p->on_rq at
+        // TASK_ON_RQ_MIGRATING while the class enqueues a detached task.
+        // Accept that one state for ENQUEUE_MIGRATED; every other nonzero
+        // value still means this entity is already queued.
+        let migrating = (*m).on_rq == TASK_ON_RQ_MIGRATING && flags & ENQUEUE_MIGRATED != 0;
+        if (*se).on_rq != 0 || ((*m).on_rq != 0 && !migrating) {
             debug_assert_eq!((*se).on_rq != 0, (*m).on_rq != 0);
             return;
         }
@@ -174,7 +179,7 @@ unsafe fn enqueue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) {
             return;
         }
         (*se).on_rq = 1;
-        (*m).on_rq = 1;
+        (*m).on_rq = TASK_ON_RQ_QUEUED;
     }
     rq.cfs.nr_running += 1;
     rq.cfs.load_weight = rq
@@ -208,7 +213,11 @@ unsafe fn dequeue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool
             return false;
         }
         (*se).on_rq = 0;
-        (*m).on_rq = 0;
+        (*m).on_rq = if flags & DEQUEUE_MIGRATING != 0 {
+            TASK_ON_RQ_MIGRATING
+        } else {
+            0
+        };
         rq.cfs.load_weight = rq.cfs.load_weight.saturating_sub((*se).load.weight);
     }
     rq.cfs.nr_running = rq.cfs.nr_running.saturating_sub(1);
@@ -554,6 +563,41 @@ mod tests {
         assert_eq!(rq.nr_running, 1);
         assert_eq!(rq.cfs.nr_running, 1);
         assert_eq!(rq.cfs.load_weight, NICE_0_LOAD);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:deactivate_task
+    /// and linux:vendor/linux/kernel/sched/core.c:activate_task
+    ///
+    /// Linux publishes TASK_ON_RQ_MIGRATING before class dequeue and does not
+    /// clear it until after destination enqueue.  The nonzero state is the
+    /// task-struct lifetime boundary for an embedded CFS run_node.
+    #[test]
+    fn fair_migration_keeps_on_rq_nonzero_across_detach_and_attach() {
+        let mut source = Rq::new(0);
+        let mut destination = Rq::new(1);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let ptr = &mut *task as *mut TaskStruct;
+        task.m29.static_prio = DEFAULT_PRIO;
+        task.m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
+        task.m29.se.load.weight = NICE_0_LOAD;
+
+        unsafe {
+            enqueue_task_fair(&mut source, ptr, ENQUEUE_INITIAL);
+            // This is Linux deactivate_task()'s store, performed before the
+            // class hook clears se.on_rq and removes the rb node.
+            (*ptr).m29.on_rq = TASK_ON_RQ_MIGRATING;
+            assert!(dequeue_task_fair(&mut source, ptr, DEQUEUE_MIGRATING));
+        }
+        assert_eq!(task.m29.se.on_rq, 0);
+        assert_eq!(task.m29.on_rq, TASK_ON_RQ_MIGRATING);
+        assert!(source.cfs.tasks_timeline.is_empty());
+
+        unsafe {
+            enqueue_task_fair(&mut destination, ptr, ENQUEUE_MIGRATED);
+        }
+        assert_eq!(task.m29.se.on_rq, 1);
+        assert_eq!(task.m29.on_rq, TASK_ON_RQ_QUEUED);
+        assert_eq!(destination.cfs.tasks_timeline.first(), ptr);
     }
 
     /// test-origin: linux:vendor/linux/kernel/sched/fair.c:dequeue_task_fair

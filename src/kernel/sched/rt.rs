@@ -13,7 +13,10 @@ use core::sync::atomic::Ordering;
 
 use crate::kernel::task::TaskStruct;
 
-use super::class::{CLASS_PRIO_RT, DEQUEUE_SLEEP, ENQUEUE_HEAD, SchedClass};
+use super::class::{
+    CLASS_PRIO_RT, DEQUEUE_MIGRATING, DEQUEUE_SLEEP, ENQUEUE_HEAD, SchedClass,
+    TASK_ON_RQ_MIGRATING, TASK_ON_RQ_QUEUED,
+};
 use super::prio::{MAX_RT_PRIO, SCHED_FIFO, SCHED_RR};
 use super::rq::Rq;
 
@@ -45,7 +48,7 @@ unsafe fn enqueue_task_rt(rq: &mut Rq, p: *mut TaskStruct, flags: u32) {
     let prio = unsafe { (*p).m29.prio };
     rq.rt.enqueue(p, prio, flags & ENQUEUE_HEAD != 0);
     unsafe {
-        (*p).m29.on_rq = 1;
+        (*p).m29.on_rq = TASK_ON_RQ_QUEUED;
         (*p).m29.rt.on_rq = 1;
         if (*p).m29.rt.time_slice == 0 {
             (*p).m29.rt.time_slice = RR_TIMESLICE_TICKS;
@@ -62,7 +65,11 @@ unsafe fn dequeue_task_rt(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool {
     let removed = rq.rt.dequeue(p, prio);
     if removed {
         unsafe {
-            (*p).m29.on_rq = 0;
+            (*p).m29.on_rq = if flags & DEQUEUE_MIGRATING != 0 {
+                TASK_ON_RQ_MIGRATING
+            } else {
+                0
+            };
             (*p).m29.rt.on_rq = 0;
         }
         rq.nr_running = rq.nr_running.saturating_sub(1);
