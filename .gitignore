@@ -5,3 +5,5 @@ vendor/**/*
 .config.old
 src/include/config/
 src/include/generated/
+core
+core.*
