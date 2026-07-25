@@ -227,11 +227,14 @@ unsafe fn seed_current_task_stack(_task: *mut TaskStruct) {}
 
 /// Per-CPU current task pointer. Index == dense logical CPU ID.
 ///
-/// SAFETY: Each slot is written only by its owning CPU, during scheduler
-/// initialization or `__switch_to`. Remote scheduling decisions read
-/// `rq.current` while holding that CPU's runqueue lock instead.
+/// The owning CPU publishes its new task with release ordering during
+/// `__switch_to`; remote exit/reap paths acquire-load the same slot before
+/// deciding whether a task's stack can be released.  This mirrors Linux's
+/// ordered current/on_cpu handoff and prevents a concurrent task teardown
+/// from treating an outgoing stack as unowned while the switch is in flight.
 #[cfg(not(test))]
-static mut CURRENT_TASK: [*mut TaskStruct; MAX_CPUS] = [core::ptr::null_mut(); MAX_CPUS];
+static CURRENT_TASK: [AtomicPtr<TaskStruct>; MAX_CPUS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
 
 /// Autoreaped current tasks cannot drop their own kernel stack. Linux keeps a
 /// final current-task reference until finish_task_switch(); this per-CPU slot
@@ -566,7 +569,7 @@ pub unsafe fn get_current() -> *mut TaskStruct {
     #[cfg(not(test))]
     {
         let cpu = current_cpu_index();
-        unsafe { CURRENT_TASK[cpu] }
+        CURRENT_TASK[cpu].load(Ordering::Acquire)
     }
 }
 
@@ -610,9 +613,7 @@ pub unsafe fn set_current(task: *mut TaskStruct) {
 #[cfg(not(test))]
 unsafe fn set_current_on_cpu(cpu: usize, task: *mut TaskStruct) {
     assert!(cpu < MAX_CPUS, "scheduler logical CPU ID is out of range");
-    unsafe {
-        CURRENT_TASK[cpu] = task;
-    }
+    CURRENT_TASK[cpu].store(task, Ordering::Release);
     crate::arch::x86::kernel::cpu::common::set_linux_current_task_on_cpu(cpu, task);
 }
 
@@ -682,11 +683,9 @@ pub(crate) fn task_has_current_reference(task: *mut TaskStruct) -> bool {
         }
     }
     #[cfg(not(test))]
-    unsafe {
-        for cpu in 0..MAX_CPUS {
-            if CURRENT_TASK[cpu] == task {
-                return true;
-            }
+    for cpu in 0..MAX_CPUS {
+        if CURRENT_TASK[cpu].load(Ordering::Acquire) == task {
+            return true;
         }
     }
     for cpu in 0..MAX_CPUS {
