@@ -78,8 +78,18 @@ impl<T> SpinLock<T> {
     /// `spin_unlock_irqrestore` — pair with `lock_irqsave`.
     #[inline]
     pub fn unlock_irqrestore(guard: SpinGuard<'_, T>, flags: IrqFlags) {
-        drop(guard);
+        // Linux __raw_spin_unlock_irqrestore() restores interrupt state
+        // before dropping the final preempt-disable count. Keep the same
+        // unlock -> IRQ restore -> preempt-enable ordering here.
+        let parent = guard.parent;
+        let restore_bh = guard.restore_bh;
+        parent.raw.unlock();
         local_irq_restore(flags);
+        preempt_enable();
+        if restore_bh {
+            local_bh_enable();
+        }
+        core::mem::forget(guard);
     }
 
     pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
@@ -147,6 +157,41 @@ mod tests {
         let l = SpinLock::new(0u32);
         let (g, flags) = l.lock_irqsave();
         SpinLock::unlock_irqrestore(g, flags);
+    }
+
+    /// test-origin: linux:vendor/linux/include/linux/spinlock_api_smp.h
+    #[test]
+    fn irqrestore_unlock_order_matches_linux() {
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/include/linux/spinlock_api_smp.h"
+        ));
+        let local = include_str!("spinlock.rs");
+        let linux_order = linux
+            .split("static inline void __raw_spin_unlock_irqrestore")
+            .nth(1)
+            .expect("Linux irqrestore helper");
+        let local_order = local
+            .split("pub fn unlock_irqrestore(guard: SpinGuard")
+            .nth(1)
+            .expect("Lupos irqrestore helper");
+
+        assert!(
+            linux_order.find("do_raw_spin_unlock").unwrap()
+                < linux_order.find("local_irq_restore").unwrap()
+        );
+        assert!(
+            linux_order.find("local_irq_restore").unwrap()
+                < linux_order.find("preempt_enable").unwrap()
+        );
+        assert!(
+            local_order.find("parent.raw.unlock").unwrap()
+                < local_order.find("local_irq_restore").unwrap()
+        );
+        assert!(
+            local_order.find("local_irq_restore").unwrap()
+                < local_order.find("preempt_enable").unwrap()
+        );
     }
 
     #[test]
