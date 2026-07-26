@@ -209,21 +209,27 @@ pub fn sleep_timers_expire(now: u64) {
     }
 }
 
-/// Observability tripwire (firefox-freeze investigation): does `task` still
-/// have an armed sleeper?
+/// Remove every armed sleeper that still references `task`.
 ///
-/// The task-free path calls this to catch a `task_struct` being deallocated
-/// while a `SLEEP_TIMERS` entry still references it — the stale reference that
-/// otherwise fires `wake_task_normal()` on freed/reused memory. Uses `try_lock`
-/// so it can never add a deadlock edge against the hard-IRQ tick that also takes
-/// this lock; a contended check just defers to the wake-site guard in
-/// `try_to_wake_up_with_state()`.
+/// Called from the task-free path so a stale `SLEEP_TIMERS` entry can never
+/// later fire `wake_task_normal()` on freed/reused memory. A sleeping task
+/// normally removes its own timer via `schedule_timeout_runtime()`; a surviving
+/// entry here means the task was torn down while still armed (e.g. a
+/// thread-pool worker killed mid-sleep). Uses the same IRQ-saved `SLEEP_TIMERS`
+/// lock as `sleep_timer_add`/`sleep_timer_remove`, so it is safe from any
+/// context against the hard-IRQ tick that also takes this lock. Returns the
+/// number of entries removed (>0 indicates a leak worth logging).
 #[cfg(not(test))]
-pub fn task_has_armed_sleeper(task: usize) -> bool {
-    match SLEEP_TIMERS.try_lock() {
-        Some(timers) => timers.iter().any(|timer| timer.task == task),
-        None => false,
-    }
+pub fn remove_task_sleepers(task: usize) -> usize {
+    let flags = crate::kernel::locking::irqflags::local_irq_save();
+    let removed = {
+        let mut timers = SLEEP_TIMERS.lock();
+        let before = timers.len();
+        timers.retain(|timer| timer.task != task);
+        before - timers.len()
+    };
+    crate::kernel::locking::irqflags::local_irq_restore(flags);
+    removed
 }
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {

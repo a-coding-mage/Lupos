@@ -2615,32 +2615,30 @@ unsafe fn try_to_wake_up_with_state(p: *mut TaskStruct, state_mask: u32, wake_fl
     if p.is_null() {
         return false;
     }
-    // Observability tripwire (firefox-freeze investigation, 2026-07-26).
-    //
-    // A wakeup target whose `sched_class` does not point into the kernel image
-    // is a freed/reused `task_struct` reached through a stale reference — most
-    // likely a `SLEEP_TIMERS` entry whose task was freed between detach and the
-    // unlocked wake in `sleep_timers_expire()`. Left unchecked this surfaces
-    // much later as a corrupted indirect call (observed live as supervisor
-    // instruction fetches at rip=0 and at a reused pixbuf page). Catch it at the
-    // exact moment of use, before we dereference `pi_lock`, so the panic names
-    // the culprit. See
+    // Guard against waking a stale/freed `task_struct` reached through a
+    // dangling reference — most importantly a `SLEEP_TIMERS` entry whose task
+    // was freed in the unlocked wake window of `sleep_timers_expire()`. Such a
+    // task reads back a `sched_class` that no longer points into the kernel
+    // image (0 when cache-zeroed, reused-page garbage otherwise). A freed task
+    // has nothing to wake, so skip it rather than dereferencing corrupt
+    // scheduler state — which otherwise surfaced as fatal supervisor
+    // instruction fetches at rip=0 / a reused pixbuf page. The free-side removal
+    // in `free_task_struct_allocation` is the primary fix; this is the backstop
+    // for the residual detach-then-free race. See
     // target/xtask/investigations/firefox-freeze-20260724/LIVE-CLASSIFICATION-20260726.md
     #[cfg(not(test))]
-    unsafe {
+    {
         // The kernel image (text + rodata + data) is linked in [1 MiB, 16 MiB);
-        // every real `sched_class` is a static within it. A freed task reads
-        // back 0 (cache-zeroed) or reused-page garbage here.
-        let sched_class = (*p).m29.sched_class as usize;
+        // every real `sched_class` is a static within it.
+        let sched_class = unsafe { (*p).m29.sched_class } as usize;
         if !(0x0010_0000..0x0100_0000).contains(&sched_class) {
-            panic!(
-                "wake on stale/freed task_struct: task={:#018x} sched_class={:#018x} state={:#010x} pid={} stack={:#018x}",
+            log_error!(
+                "sched",
+                "skipping wake of stale/freed task_struct: task={:#018x} sched_class={:#018x}",
                 p as usize,
                 sched_class,
-                (*p).__state.load(Ordering::Relaxed),
-                (*p).pid,
-                (*p).stack as usize,
             );
+            return false;
         }
     }
     // Linux `try_to_wake_up()` takes task_struct::pi_lock before inspecting
