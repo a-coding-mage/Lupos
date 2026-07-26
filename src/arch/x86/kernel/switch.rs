@@ -326,7 +326,12 @@ unsafe fn validate_incoming_switch_frame(next: *mut TaskStruct) {
     // scheduler continuations are at or above the canonical kernel split.
     // Both are valid; the post-ALSA corrupt value is in neither range.
     let boot_text = (0x0020_0000..0x0200_0000).contains(&continuation);
-    let higher_half = continuation >= 0xffff_8000_0000_0000;
+    // Only the top-2 GiB kernel-image alias is executable text in the higher
+    // half. The former `>= 0xffff_8000_0000_0000` bound also whitelisted the
+    // direct map (`PAGE_OFFSET = 0xffff_8880_…`) and vmalloc, so a continuation
+    // corrupted into a reused direct-map page (observed live at
+    // 0xffff_8881_776d_2000) slipped through. Reject those.
+    let higher_half = continuation >= 0xffff_ffff_8000_0000;
     if !boot_text && !higher_half {
         panic!(
             "switch frame has low continuation: pid={} task={:#018x} sp={:#018x} ret={:#018x}",
