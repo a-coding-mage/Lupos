@@ -2615,6 +2615,34 @@ unsafe fn try_to_wake_up_with_state(p: *mut TaskStruct, state_mask: u32, wake_fl
     if p.is_null() {
         return false;
     }
+    // Observability tripwire (firefox-freeze investigation, 2026-07-26).
+    //
+    // A wakeup target whose `sched_class` does not point into the kernel image
+    // is a freed/reused `task_struct` reached through a stale reference — most
+    // likely a `SLEEP_TIMERS` entry whose task was freed between detach and the
+    // unlocked wake in `sleep_timers_expire()`. Left unchecked this surfaces
+    // much later as a corrupted indirect call (observed live as supervisor
+    // instruction fetches at rip=0 and at a reused pixbuf page). Catch it at the
+    // exact moment of use, before we dereference `pi_lock`, so the panic names
+    // the culprit. See
+    // target/xtask/investigations/firefox-freeze-20260724/LIVE-CLASSIFICATION-20260726.md
+    #[cfg(not(test))]
+    unsafe {
+        // The kernel image (text + rodata + data) is linked in [1 MiB, 16 MiB);
+        // every real `sched_class` is a static within it. A freed task reads
+        // back 0 (cache-zeroed) or reused-page garbage here.
+        let sched_class = (*p).m29.sched_class as usize;
+        if !(0x0010_0000..0x0100_0000).contains(&sched_class) {
+            panic!(
+                "wake on stale/freed task_struct: task={:#018x} sched_class={:#018x} state={:#010x} pid={} stack={:#018x}",
+                p as usize,
+                sched_class,
+                (*p).__state.load(Ordering::Relaxed),
+                (*p).pid,
+                (*p).stack as usize,
+            );
+        }
+    }
     // Linux `try_to_wake_up()` takes task_struct::pi_lock before inspecting
     // __state, on_rq, on_cpu, or task_cpu. This serializes all wakeups for
     // one embedded sched_entity while still allowing the target rq lock to be

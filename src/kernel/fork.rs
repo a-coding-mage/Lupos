@@ -851,6 +851,18 @@ unsafe fn free_task_struct_allocation(task: *mut TaskStruct) {
     if task.is_null() {
         return;
     }
+    // Observability tripwire (firefox-freeze investigation, 2026-07-26): a
+    // task_struct must not be recycled/freed while an armed sleep timer still
+    // points at it. If it is, `sleep_timers_expire()` later wakes freed/reused
+    // memory. Catch the leak at the free site so the panic names the pid.
+    #[cfg(not(test))]
+    if crate::kernel::time::sleep_timeout::task_has_armed_sleeper(task as usize) {
+        panic!(
+            "freeing task_struct {:#018x} (pid={}) with an armed sleep timer still referencing it",
+            task as usize,
+            unsafe { (*task).pid },
+        );
+    }
     #[cfg(not(test))]
     {
         let cpu = (current_cpu() as usize).min(MAX_CPUS - 1);

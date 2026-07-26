@@ -209,6 +209,23 @@ pub fn sleep_timers_expire(now: u64) {
     }
 }
 
+/// Observability tripwire (firefox-freeze investigation): does `task` still
+/// have an armed sleeper?
+///
+/// The task-free path calls this to catch a `task_struct` being deallocated
+/// while a `SLEEP_TIMERS` entry still references it — the stale reference that
+/// otherwise fires `wake_task_normal()` on freed/reused memory. Uses `try_lock`
+/// so it can never add a deadlock edge against the hard-IRQ tick that also takes
+/// this lock; a contended check just defers to the wake-site guard in
+/// `try_to_wake_up_with_state()`.
+#[cfg(not(test))]
+pub fn task_has_armed_sleeper(task: usize) -> bool {
+    match SLEEP_TIMERS.try_lock() {
+        Some(timers) => timers.iter().any(|timer| timer.task == task),
+        None => false,
+    }
+}
+
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
         export_symbol(name, addr, gpl_only);
