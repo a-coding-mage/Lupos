@@ -23,7 +23,7 @@
 
 extern crate alloc;
 
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 use core::ffi::c_void;
 
 use crate::arch::x86::kernel::uaccess;
@@ -336,11 +336,13 @@ struct SignalState {
 }
 
 impl SignalState {
-    fn new(pid: i32, tgid: i32) -> Self {
-        let mut actions = [RtSigAction::default(); NSIG + 1];
-        actions[SIGCHLD as usize].sa_handler = 0; // SIG_DFL
-        Self {
-            actions,
+    fn new(pid: i32, tgid: i32) -> Box<Self> {
+        // Linux copy_signal() obtains signal_struct from signal_cachep.  Keep
+        // the whole state in its heap allocation as well: this object is
+        // larger than a safe kernel-stack frame once its action table is
+        // copied during clone.
+        let mut state = Box::new(Self {
+            actions: [RtSigAction::default(); NSIG + 1],
             blocked: SigSet::default(),
             sigsuspend_saved: None,
             pending: SigSet::default(),
@@ -356,7 +358,9 @@ impl SignalState {
             tgid,
             group_exit_code: None,
             task_addr: 0,
-        }
+        });
+        state.actions[SIGCHLD as usize].sa_handler = 0; // SIG_DFL
+        state
     }
 
     fn dequeue_unblocked_signal(&mut self) -> Option<SigInfo> {
@@ -521,11 +525,11 @@ pub struct SignalStruct {
 }
 
 struct SignalTable {
-    states: Vec<SignalState>,
+    states: Vec<Box<SignalState>>,
 }
 
 impl SignalTable {
-    fn state_for_new_task(&self, pid: i32, tgid: i32) -> SignalState {
+    fn state_for_new_task(&self, pid: i32, tgid: i32) -> Box<SignalState> {
         let mut state = SignalState::new(pid, tgid);
         if let Some(source) = self
             .states
@@ -558,12 +562,12 @@ impl SignalTable {
 
     fn get_or_create_current(&mut self) -> Result<&mut SignalState, i32> {
         let idx = self.get_or_create_current_index()?;
-        Ok(self.states.get_mut(idx).expect("index exists"))
+        Ok(&mut **self.states.get_mut(idx).expect("index exists"))
     }
 
     fn get_by_pid_mut(&mut self, pid: i32) -> Option<&mut SignalState> {
         let pos = self.states.iter().position(|s| s.pid == pid)?;
-        self.states.get_mut(pos)
+        Some(&mut **self.states.get_mut(pos)?)
     }
 
     fn get_or_create_task_index(
@@ -3667,6 +3671,23 @@ mod tests {
         assert_eq!(info.sigsys_call_addr(), 0x7fff_1234_5678);
         assert_eq!(info.sigsys_syscall(), 204);
         assert_eq!(info.sigsys_arch(), 0xc000_003e);
+    }
+
+    #[test]
+    fn signal_state_is_heap_backed_like_linux_signal_cache() {
+        // Linux copy_signal() obtains signal_struct from signal_cachep rather
+        // than placing the signal state on the task's kernel stack.  Keeping
+        // this large object heap-backed is also required for the 16 KiB Lupos
+        // task stack: a stack temporary can overlap an inactive switch frame.
+        let stack_marker = 0u8;
+        let state = SignalState::new(31_170, 31_170);
+        let state_ref: &SignalState = &state;
+        let state_addr = state_ref as *const SignalState as usize;
+        let stack_addr = &stack_marker as *const u8 as usize;
+        assert!(
+            state_addr.abs_diff(stack_addr) > 64 * 1024,
+            "SignalState must be heap-backed, state={state_addr:#x} stack={stack_addr:#x}"
+        );
     }
 
     fn syscall_restart_regs(errno: i32) -> crate::kernel::task::PtRegs {
