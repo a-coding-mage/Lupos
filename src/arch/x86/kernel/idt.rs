@@ -12,10 +12,12 @@
 //!
 //! # ISR stub design
 //! The CPU pushes an exception frame on the stack before jumping to the
-//! IDT handler.  We add a uniform frame by pushing the vector number and
-//! a placeholder error code (for exceptions that do not push one), then
-//! jump to a common stub that saves all GP registers and calls the Rust
-//! dispatcher.
+//! IDT handler.  We add the single `orig_ax`-sized metadata slot used by
+//! Linux for the exception error code (or the vector for an IRQ), then save
+//! all GP registers and call the Rust dispatcher with the vector as its
+//! second argument. Keeping one metadata slot is important: the initial
+//! task-switch frame occupies the same task-stack area as the CPU return
+//! frame.
 //!
 //! Stack layout on entry to `exception_dispatch` (low address at top):
 //! ```text
@@ -34,13 +36,12 @@
 //!  [RSP+96]  rcx
 //!  [RSP+104] rbx
 //!  [RSP+112] rax
-//!  [RSP+120] vector       ← pushed by individual ISR stub
-//!  [RSP+128] error_code   ← pushed by CPU (or 0 if no error code)
-//!  [RSP+136] rip          ← CPU exception frame
-//!  [RSP+144] cs
-//!  [RSP+152] rflags
-//!  [RSP+160] user_rsp     (only on privilege-level change ring3→ring0)
-//!  [RSP+168] user_ss      (only on privilege-level change ring3→ring0)
+//!  [RSP+120] error_code   ← Linux's `orig_ax` slot
+//!  [RSP+128] rip          ← CPU exception frame
+//!  [RSP+136] cs
+//!  [RSP+144] rflags
+//!  [RSP+152] user_rsp     (only on privilege-level change ring3→ring0)
+//!  [RSP+160] user_ss      (only on privilege-level change ring3→ring0)
 //! ```
 //!
 //! References:
@@ -297,15 +298,18 @@ impl Idt {
 // ── Saved register frame ─────────────────────────────────────────────────────
 //
 // `exception_dispatch` receives a pointer to this structure (via RDI).
-// The layout must match the push order in `isr_common` exactly.
+// The saved-GPR layout matches the push order below; its explicit mapping to
+// `PtRegs` is kept in the fault path. The metadata and CPU-return portion
+// matches Linux's `pt_regs`, and the vector is passed separately in RSI
+// because Linux keeps only one metadata slot between those portions.
 
-/// Complete CPU state saved by the ISR common stub on exception entry.
+/// Complete CPU state saved by an ISR entry stub on exception entry.
 ///
 /// Fields are ordered from low to high address (i.e., in push order):
 /// the first field (`r15`) is at the lowest address because it was pushed last.
 #[repr(C)]
 pub struct ExceptionFrame {
-    // Pushed by isr_common (in REVERSE order due to stack growth):
+    // Pushed by the ISR entry stub (in REVERSE order due to stack growth):
     pub r15: u64,
     pub r14: u64,
     pub r13: u64,
@@ -321,9 +325,10 @@ pub struct ExceptionFrame {
     pub rcx: u64,
     pub rbx: u64,
     pub rax: u64,
-    // Pushed by individual ISR stubs:
-    pub vector: u64,     // exception vector number
-    pub error_code: u64, // error code (or 0 placeholder for no-error exceptions)
+    // Linux's single `orig_ax`-sized metadata slot. For CPU error-code
+    // exceptions this is the hardware error code; for no-error exceptions it
+    // is -1; for IRQs it is the vector, matching `idtentry_irq`.
+    pub error_code: u64,
     // Pushed by the CPU on exception delivery:
     pub rip: u64,
     pub cs: u64,
@@ -333,152 +338,91 @@ pub struct ExceptionFrame {
     pub user_ss: u64,
 }
 
-// ── ISR common stub ──────────────────────────────────────────────────────────
+// ── Per-exception ISR entry stubs ────────────────────────────────────────────
 //
-// All per-exception stubs jump here.  This function:
-//   1. Saves all 15 GP registers.
-//   2. Passes RSP (pointing to the saved frame) as the first argument.
-//   3. Calls the Rust dispatcher.
-//   4. Restores GP registers and returns from interrupt via `iretq`.
+// Every stub emits the complete entry/exit sequence instead of jumping through
+// a common function. This lets the vector be an ABI argument without adding a
+// second stack word: Linux's `idtentry`/`idtentry_irq` passes the vector to the
+// C handler while keeping one `pt_regs::orig_ax` slot.
 //
-// IMPORTANT: This function is `#[no_mangle]` so that `global_asm!` ISR stubs
-// can reference it by name without symbol mangling.
-//
-// Reference: System V AMD64 ABI for function call conventions
-//            (first arg in RDI, callee-saved: RBX, RBP, R12–R15)
+// `$metadata` is one of:
+//   "push -1"  for CPU exceptions without a hardware error code;
+//   "push {v}" for device/IPI entries (Linux's IRQ orig_ax value);
+//   ""         for exceptions whose hardware error code is already on stack.
 
-#[unsafe(naked)]
-#[unsafe(no_mangle)]
-unsafe extern "C" fn isr_common() {
-    // SAFETY: Naked function — we emit the complete prologue and epilogue.
-    core::arch::naked_asm!(
-        // RFLAGS is already saved in the hardware frame, so clear the live
-        // direction flag before any Rust/C code runs. This is Linux's `cld`
-        // in every 64-bit `idtentry`: userspace may set DF, while the kernel
-        // ABI requires forward string operations.
-        "cld",
-
-        // ── Save GP registers ──────────────────────────────────────────────
-        // Push in order rax…r15 (reverse of ExceptionFrame field order because
-        // the stack grows downward).  After all 15 pushes, RSP points to r15.
-        // Interrupts and exceptions from ring 3 do not perform SWAPGS in
-        // hardware. Match Linux's entry discipline so any scheduler switch
-        // from this frame sees kernel GS active and the user's GS base parked
-        // in KERNEL_GS_BASE.
-        "test qword ptr [rsp + 24], 3",
-        "jz 2f",
-        "swapgs",
-        "2:",
-
-        "push rax",
-        "push rbx",
-        "push rcx",
-        "push rdx",
-        "push rbp",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-
-        // ── Build an aligned Rust call frame ──────────────────────────────
-        // Lupos's kernel target uses the soft-float ABI (`-mmx,-sse,...`),
-        // matching Linux's kernel build. Interrupt entry therefore must not
-        // pay FXSAVE/FXRSTOR on every timer/IPI/device interrupt. Per-task FPU
-        // state is saved only when the scheduler actually changes tasks.
-        "mov rdi, rsp",
-        "sub rsp, 16",
-        "and rsp, -16",
-        "mov [rsp], rdi",
-
-        // ── Call Rust dispatcher ───────────────────────────────────────────
-        // System V AMD64 ABI: first argument in RDI = pointer to frame.
-        "mov rdi, [rsp]",
-        "call {dispatch}",
-
-        // Restore the frame stack pointer.
-        "mov rsp, [rsp]",
-
-        // ── Restore GP registers ───────────────────────────────────────────
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rbp",
-        "pop rdx",
-        "pop rcx",
-        "pop rbx",
-        "pop rax",
-
-        // Skip the vector + error_code slots pushed by individual ISR stubs.
-        "add rsp, 16",
-
-        // Restore the user's GS base before returning to ring 3. After the
-        // two synthetic slots above are skipped, CS is at [rsp + 8].
-        "test qword ptr [rsp + 8], 3",
-        "jz 3f",
-        "swapgs",
-        "3:",
-
-        // Return from interrupt — restores RIP, CS, RFLAGS (and RSP/SS on
-        // privilege-level change ring3→ring0).
-        "iretq",
-
-        dispatch = sym exception_dispatch,
-    );
-}
-
-// ── Per-exception ISR stubs ──────────────────────────────────────────────────
-//
-// Each stub pushes [error_code_or_0, vector_number] onto the stack to create
-// a uniform frame layout, then jumps to `isr_common`.
-//
-// Two variants:
-//   isr_no_error!   — exception does NOT push an error code (we push 0)
-//   isr_with_error! — exception DOES push an error code (CPU already did it)
-//
-// We use `#[naked]` functions with `sym isr_common` so the linker resolves
-// the reference at link time — no hardcoded addresses needed.
-
-macro_rules! isr_no_error {
-    ($name:ident, $vec:expr) => {
+macro_rules! isr_entry {
+    ($name:ident, $vec:expr, $metadata:literal) => {
         #[unsafe(naked)]
         #[allow(dead_code)]
         unsafe extern "C" fn $name() {
             // SAFETY: Naked stub — CPU exception entry; we own the full body.
             core::arch::naked_asm!(
-                "push 0",       // dummy error code (keeps frame layout uniform)
-                "push {v}",     // vector number
-                "jmp {c}",
-                v = const $vec as u64,
-                c = sym isr_common,
-            );
-        }
-    };
-}
+                "cld",
+                $metadata,
 
-macro_rules! isr_with_error {
-    ($name:ident, $vec:expr) => {
-        #[unsafe(naked)]
-        #[allow(dead_code)]
-        unsafe extern "C" fn $name() {
-            // SAFETY: CPU already pushed the error code; we only push the vector.
-            core::arch::naked_asm!(
-                "push {v}",     // vector number
-                "jmp {c}",
+                // The CPU frame has one metadata word before RIP. This is
+                // true both for a hardware error code and for either form of
+                // synthetic entry above.
+                "test qword ptr [rsp + 16], 3",
+                "jz 2f",
+                "swapgs",
+                "2:",
+
+                "push rax",
+                "push rbx",
+                "push rcx",
+                "push rdx",
+                "push rbp",
+                "push rsi",
+                "push rdi",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+
+                // System V AMD64 ABI: RDI = frame, RSI = vector. The vector
+                // is an immediate entry-stub constant, so no saved GPR is
+                // repurposed before the register frame is complete.
+                "mov rdi, rsp",
+                "mov esi, {v}",
+                "sub rsp, 16",
+                "and rsp, -16",
+                "mov [rsp], rdi",
+                "mov rdi, [rsp]",
+                "call {dispatch}",
+                "mov rsp, [rsp]",
+
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rdi",
+                "pop rsi",
+                "pop rbp",
+                "pop rdx",
+                "pop rcx",
+                "pop rbx",
+                "pop rax",
+
+                // Skip Linux's single orig_ax/error-code slot. CS is now at
+                // [rsp + 8], as in the Linux return path.
+                "add rsp, 8",
+                "test qword ptr [rsp + 8], 3",
+                "jz 3f",
+                "swapgs",
+                "3:",
+                "iretq",
+
                 v = const $vec as u64,
-                c = sym isr_common,
+                dispatch = sym exception_dispatch,
             );
         }
     };
@@ -488,70 +432,70 @@ macro_rules! isr_with_error {
 // Exceptions that push an error code: #DF(8), #TS(10), #NP(11), #SS(12),
 // #GP(13), #PF(14), #AC(17), #CP(21).
 // All others do not push an error code.
-isr_no_error!(isr0, VEC_DIVIDE_ERROR);
-isr_no_error!(isr1, VEC_DEBUG);
-isr_no_error!(isr2, VEC_NMI);
-isr_no_error!(isr3, VEC_BREAKPOINT);
-isr_no_error!(isr4, VEC_OVERFLOW);
-isr_no_error!(isr5, VEC_BOUND_RANGE);
-isr_no_error!(isr6, VEC_INVALID_OPCODE);
-isr_no_error!(isr7, VEC_DEVICE_NOT_AVAILABLE);
-isr_with_error!(isr8, VEC_DOUBLE_FAULT); // error code always 0; IST required
-isr_no_error!(isr9, VEC_COPROC_OVERRUN);
-isr_with_error!(isr10, VEC_INVALID_TSS);
-isr_with_error!(isr11, VEC_SEGMENT_NOT_PRESENT);
-isr_with_error!(isr12, VEC_STACK_FAULT);
-isr_with_error!(isr13, VEC_GENERAL_PROTECTION);
-isr_with_error!(isr14, VEC_PAGE_FAULT);
-isr_no_error!(isr15, VEC_RESERVED_15);
-isr_no_error!(isr16, VEC_X87_FP);
-isr_with_error!(isr17, VEC_ALIGNMENT_CHECK);
-isr_no_error!(isr18, VEC_MACHINE_CHECK);
-isr_no_error!(isr19, VEC_SIMD_FP);
-isr_no_error!(isr20, VEC_VIRTUALIZATION);
-isr_with_error!(isr21, VEC_CONTROL_PROTECTION);
+isr_entry!(isr0, VEC_DIVIDE_ERROR, "push -1");
+isr_entry!(isr1, VEC_DEBUG, "push -1");
+isr_entry!(isr2, VEC_NMI, "push -1");
+isr_entry!(isr3, VEC_BREAKPOINT, "push -1");
+isr_entry!(isr4, VEC_OVERFLOW, "push -1");
+isr_entry!(isr5, VEC_BOUND_RANGE, "push -1");
+isr_entry!(isr6, VEC_INVALID_OPCODE, "push -1");
+isr_entry!(isr7, VEC_DEVICE_NOT_AVAILABLE, "push -1");
+isr_entry!(isr8, VEC_DOUBLE_FAULT, ""); // hardware error code; IST required
+isr_entry!(isr9, VEC_COPROC_OVERRUN, "push -1");
+isr_entry!(isr10, VEC_INVALID_TSS, "");
+isr_entry!(isr11, VEC_SEGMENT_NOT_PRESENT, "");
+isr_entry!(isr12, VEC_STACK_FAULT, "");
+isr_entry!(isr13, VEC_GENERAL_PROTECTION, "");
+isr_entry!(isr14, VEC_PAGE_FAULT, "");
+isr_entry!(isr15, VEC_RESERVED_15, "push -1");
+isr_entry!(isr16, VEC_X87_FP, "push -1");
+isr_entry!(isr17, VEC_ALIGNMENT_CHECK, "");
+isr_entry!(isr18, VEC_MACHINE_CHECK, "push -1");
+isr_entry!(isr19, VEC_SIMD_FP, "push -1");
+isr_entry!(isr20, VEC_VIRTUALIZATION, "push -1");
+isr_entry!(isr21, VEC_CONTROL_PROTECTION, "");
 // Vectors 22–31 are reserved; install generic no-error handlers.
-isr_no_error!(isr22, 22u8);
-isr_no_error!(isr23, 23u8);
-isr_no_error!(isr24, 24u8);
-isr_no_error!(isr25, 25u8);
-isr_no_error!(isr26, 26u8);
-isr_no_error!(isr27, 27u8);
-isr_no_error!(isr28, 28u8);
-isr_no_error!(isr29, 29u8);
-isr_no_error!(isr30, 30u8);
-isr_no_error!(isr31, 31u8);
+isr_entry!(isr22, 22u8, "push -1");
+isr_entry!(isr23, 23u8, "push -1");
+isr_entry!(isr24, 24u8, "push -1");
+isr_entry!(isr25, 25u8, "push -1");
+isr_entry!(isr26, 26u8, "push -1");
+isr_entry!(isr27, 27u8, "push -1");
+isr_entry!(isr28, 28u8, "push -1");
+isr_entry!(isr29, 29u8, "push -1");
+isr_entry!(isr30, 30u8, "push -1");
+isr_entry!(isr31, 31u8, "push -1");
 
-isr_no_error!(isr_legacy_irq0, LEGACY_IRQ_VECTOR_BASE);
-isr_no_error!(isr_legacy_irq1, LEGACY_IRQ_VECTOR_BASE + 1);
-isr_no_error!(isr_legacy_irq2, LEGACY_IRQ_VECTOR_BASE + 2);
-isr_no_error!(isr_legacy_irq3, LEGACY_IRQ_VECTOR_BASE + 3);
-isr_no_error!(isr_legacy_irq4, LEGACY_IRQ_VECTOR_BASE + 4);
-isr_no_error!(isr_legacy_irq5, LEGACY_IRQ_VECTOR_BASE + 5);
-isr_no_error!(isr_legacy_irq6, LEGACY_IRQ_VECTOR_BASE + 6);
-isr_no_error!(isr_legacy_irq7, LEGACY_IRQ_VECTOR_BASE + 7);
-isr_no_error!(isr_legacy_irq8, LEGACY_IRQ_VECTOR_BASE + 8);
-isr_no_error!(isr_legacy_irq9, LEGACY_IRQ_VECTOR_BASE + 9);
-isr_no_error!(isr_legacy_irq10, LEGACY_IRQ_VECTOR_BASE + 10);
-isr_no_error!(isr_legacy_irq11, LEGACY_IRQ_VECTOR_BASE + 11);
-isr_no_error!(isr_legacy_irq12, LEGACY_IRQ_VECTOR_BASE + 12);
-isr_no_error!(isr_legacy_irq13, LEGACY_IRQ_VECTOR_BASE + 13);
-isr_no_error!(isr_legacy_irq14, LEGACY_IRQ_VECTOR_BASE + 14);
-isr_no_error!(isr_legacy_irq15, LEGACY_IRQ_VECTOR_BASE + 15);
+isr_entry!(isr_legacy_irq0, LEGACY_IRQ_VECTOR_BASE, "push {v}");
+isr_entry!(isr_legacy_irq1, LEGACY_IRQ_VECTOR_BASE + 1, "push {v}");
+isr_entry!(isr_legacy_irq2, LEGACY_IRQ_VECTOR_BASE + 2, "push {v}");
+isr_entry!(isr_legacy_irq3, LEGACY_IRQ_VECTOR_BASE + 3, "push {v}");
+isr_entry!(isr_legacy_irq4, LEGACY_IRQ_VECTOR_BASE + 4, "push {v}");
+isr_entry!(isr_legacy_irq5, LEGACY_IRQ_VECTOR_BASE + 5, "push {v}");
+isr_entry!(isr_legacy_irq6, LEGACY_IRQ_VECTOR_BASE + 6, "push {v}");
+isr_entry!(isr_legacy_irq7, LEGACY_IRQ_VECTOR_BASE + 7, "push {v}");
+isr_entry!(isr_legacy_irq8, LEGACY_IRQ_VECTOR_BASE + 8, "push {v}");
+isr_entry!(isr_legacy_irq9, LEGACY_IRQ_VECTOR_BASE + 9, "push {v}");
+isr_entry!(isr_legacy_irq10, LEGACY_IRQ_VECTOR_BASE + 10, "push {v}");
+isr_entry!(isr_legacy_irq11, LEGACY_IRQ_VECTOR_BASE + 11, "push {v}");
+isr_entry!(isr_legacy_irq12, LEGACY_IRQ_VECTOR_BASE + 12, "push {v}");
+isr_entry!(isr_legacy_irq13, LEGACY_IRQ_VECTOR_BASE + 13, "push {v}");
+isr_entry!(isr_legacy_irq14, LEGACY_IRQ_VECTOR_BASE + 14, "push {v}");
+isr_entry!(isr_legacy_irq15, LEGACY_IRQ_VECTOR_BASE + 15, "push {v}");
 
 // IPI ping stub (Milestone 5 — SMP "CPU ping" test).
 // Vector 0xF0 is sent by the BSP to an AP to verify IPI delivery.
-isr_no_error!(isr_ipi_ping, IPI_PING_VECTOR);
+isr_entry!(isr_ipi_ping, IPI_PING_VECTOR, "push {v}");
 
 // LAPIC timer stub (Milestone 6 — periodic system tick).
 // Vector 0x40, fired by the BSP's LAPIC timer in periodic mode.
-isr_no_error!(isr_timer, TIMER_VECTOR);
+isr_entry!(isr_timer, TIMER_VECTOR, "push {v}");
 
 // TLB shootdown IPI stub (Milestone 6 — SMP TLB invalidation).
 // Vector 0xF1, sent from `tlb::flush_tlb_others` to remote CPUs.
-isr_no_error!(isr_tlb_shootdown, TLB_SHOOTDOWN_VECTOR);
-isr_no_error!(isr_reschedule, RESCHEDULE_VECTOR);
-isr_no_error!(isr_text_poke_sync, TEXT_POKE_SYNC_VECTOR);
+isr_entry!(isr_tlb_shootdown, TLB_SHOOTDOWN_VECTOR, "push {v}");
+isr_entry!(isr_reschedule, RESCHEDULE_VECTOR, "push {v}");
+isr_entry!(isr_text_poke_sync, TEXT_POKE_SYNC_VECTOR, "push {v}");
 
 // ── Exception handler helpers ────────────────────────────────────────────────
 
@@ -590,15 +534,15 @@ fn exception_name(vector: u8) -> &'static str {
 
 // ── Rust exception dispatcher ────────────────────────────────────────────────
 
-/// Called from `isr_common` with RDI = &ExceptionFrame.
+/// Called from each ISR entry stub with RDI = &ExceptionFrame and RSI = vector.
 ///
 /// # Safety
 /// The frame pointer must point to a valid `ExceptionFrame` constructed by
-/// the `isr_common` stub — never call this from Rust code directly.
-extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) {
-    // SAFETY: frame is constructed by isr_common on the exception stack.
+/// the ISR entry stub — never call this from Rust code directly.
+extern "C" fn exception_dispatch(frame: *mut ExceptionFrame, vector: u64) {
+    // SAFETY: frame is constructed by the ISR entry stub on the exception stack.
     let frame = unsafe { &mut *frame };
-    let vector = frame.vector as u8;
+    let vector = vector as u8;
     let is_irq = matches!(
         vector,
         IPI_PING_VECTOR
@@ -1101,7 +1045,7 @@ fn on_generic(frame: &mut ExceptionFrame, vector: u8) {
         }
 
         let interrupted_sp =
-            unsafe { (frame as *const ExceptionFrame as *const u8).add(160) as *const u64 };
+            unsafe { (frame as *const ExceptionFrame as *const u8).add(152) as *const u64 };
         log_error!(
             "cpu",
             "cpu: #UD regs rbx={:#018x} rbp={:#018x} stack={:#018x} pseudo_rsp={:#018x} rax={:#018x} rdi={:#018x} rsi={:#018x}",
@@ -1528,21 +1472,45 @@ mod tests {
     }
 
     #[test]
-    fn exception_frame_vector_at_correct_offset() {
-        // After 15 GP registers (15 × 8 = 120 bytes), `vector` is at offset 120.
-        assert_eq!(offset_of!(ExceptionFrame, vector), 120);
+    fn exception_frame_error_code_at_linux_orig_ax_offset() {
+        // After 15 GP registers (15 × 8 = 120 bytes), Linux has one
+        // orig_ax/error-code slot.
+        assert_eq!(offset_of!(ExceptionFrame, error_code), 120);
     }
 
     #[test]
-    fn exception_frame_error_code_after_vector() {
-        assert_eq!(offset_of!(ExceptionFrame, error_code), 128);
+    fn exception_frame_rip_at_linux_pt_regs_offset() {
+        // RIP follows the single orig_ax/error-code slot.
+        assert_eq!(offset_of!(ExceptionFrame, rip), 128);
     }
 
+    /// Linux keeps exactly one `orig_ax`-sized slot between the saved GPRs and
+    /// the CPU return frame. Device vectors are passed as the IDT entry's
+    /// error-code argument; they are not stored as a second stack word.
+    ///
+    /// test-origin: linux:vendor/linux/arch/x86/include/asm/ptrace.h:struct pt_regs
     #[test]
-    fn exception_frame_rip_at_offset_136() {
-        // RIP is the first CPU-pushed field, after vector(8) + error_code(8) = 16 bytes
-        // added by our stubs, plus 15 × 8 = 120 bytes for saved registers.
-        assert_eq!(offset_of!(ExceptionFrame, rip), 136);
+    fn exception_frame_matches_linux_pt_regs_single_orig_ax_slot() {
+        assert_eq!(
+            size_of::<ExceptionFrame>(),
+            size_of::<crate::kernel::task::PtRegs>()
+        );
+        assert_eq!(
+            offset_of!(ExceptionFrame, error_code),
+            offset_of!(crate::kernel::task::PtRegs, orig_ax)
+        );
+        assert_eq!(
+            offset_of!(ExceptionFrame, rip),
+            offset_of!(crate::kernel::task::PtRegs, ip)
+        );
+        assert_eq!(
+            offset_of!(ExceptionFrame, cs),
+            offset_of!(crate::kernel::task::PtRegs, cs)
+        );
+        assert_eq!(
+            offset_of!(ExceptionFrame, rflags),
+            offset_of!(crate::kernel::task::PtRegs, flags)
+        );
     }
 
     // ── Vector constant sanity ───────────────────────────────────────────────
@@ -1564,7 +1532,6 @@ mod tests {
             rcx: 0,
             rbx: 0,
             rax: 0,
-            vector: VEC_GENERAL_PROTECTION as u64,
             error_code: 0,
             rip: 0x4000,
             cs,
@@ -1630,31 +1597,36 @@ mod tests {
     }
 
     #[test]
-    fn isr_common_swaps_gs_around_user_frames() {
+    /// test-origin: linux:vendor/linux/arch/x86/entry/entry_64.S:idtentry
+    #[test]
+    fn isr_entry_matches_linux_single_metadata_slot() {
         let source = include_str!("idt.rs");
         let body = source
-            .split("unsafe extern \"C\" fn isr_common()")
+            .split("macro_rules! isr_entry")
             .nth(1)
-            .expect("isr_common must exist")
-            .split("macro_rules! isr_no_error")
-            .next()
-            .expect("isr_common must end before ISR macros");
+            .and_then(|body| body.split("// Reference: Intel SDM").next())
+            .expect("ISR entry macro must exist");
         assert!(
             !body.contains("fxsave64") && !body.contains("fxrstor64"),
             "soft-float interrupt entry must not save FPU state per interrupt"
         );
+        assert!(source.contains("macro_rules! isr_entry"));
+        assert!(source.contains("isr_entry!(isr0, VEC_DIVIDE_ERROR, \"push -1\")"));
+        assert!(source.contains("isr_entry!(isr_legacy_irq0, LEGACY_IRQ_VECTOR_BASE, \"push {v}\")"));
+        assert!(body.contains("\"mov esi, {v}\""));
         assert!(body.contains("\"sub rsp, 16\""));
         assert!(body.contains("\"call {dispatch}\""));
         let entry_test = body
-            .find("\"test qword ptr [rsp + 24], 3\"")
+            .find("\"test qword ptr [rsp + 16], 3\"")
             .expect("entry must test interrupted CS before swapgs");
         let entry_swapgs = body[entry_test..]
             .find("\"swapgs\"")
             .map(|off| entry_test + off)
             .expect("entry must swapgs for user frames");
         let exit_skip = body
-            .find("\"add rsp, 16\"")
-            .expect("exit must skip vector and error code");
+            .find("\"add rsp, 8\"")
+            .expect("exit must skip the single orig_ax/error-code slot");
+        assert!(!body.contains("\"add rsp, 16\""));
         let exit_test = body[exit_skip..]
             .find("\"test qword ptr [rsp + 8], 3\"")
             .map(|off| exit_skip + off)
@@ -1666,7 +1638,7 @@ mod tests {
         let iret = body[exit_swapgs..]
             .find("\"iretq\"")
             .map(|off| exit_swapgs + off)
-            .expect("isr_common must return with iretq");
+            .expect("ISR entry must return with iretq");
 
         assert!(entry_test < entry_swapgs);
         assert!(entry_swapgs < exit_skip);

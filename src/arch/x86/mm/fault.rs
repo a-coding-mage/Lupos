@@ -122,7 +122,7 @@ pub fn do_page_fault(frame: &ExceptionFrame) {
         };
         log_error!(
             "cpu",
-            "cpu: #PF entry-frame task-pid={} task={:#018x} ptr={:#018x} vector={:#018x} ec={:#018x} rip={:#018x} cs={:#018x} flags={:#018x}",
+            "cpu: #PF entry-frame task-pid={} task={:#018x} ptr={:#018x} orig_ax={:#018x} rip={:#018x} cs={:#018x} flags={:#018x} user_rsp={:#018x}",
             pid,
             task_ptr,
             raw as usize,
@@ -537,7 +537,7 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
     // when a ring-3 event supplied RSP/SS).  Linux keeps this distinction in
     // pt_regs; retain it here so the diagnostic names the real call site.
     let interrupted_kernel_sp = (frame as *const ExceptionFrame as u64)
-        .saturating_add((core::mem::size_of::<u64>() * 20) as u64);
+        .saturating_add((core::mem::size_of::<u64>() * 19) as u64);
     log_page_fault(frame, ec, addr);
     log_error!(
         "cpu",
@@ -776,7 +776,7 @@ fn log_page_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
     if frame.cs & 3 == 0 {
         // For a same-privilege exception the CPU did not push RSP/SS. The
         // synthetic `user_rsp` slot therefore contains the interrupted kernel
-        // RSP: frame + 160 bytes.
+        // RSP: it is the `user_rsp` field in the Linux-sized frame.
         let interrupted_rsp = (frame as *const ExceptionFrame as u64)
             .saturating_add(core::mem::offset_of!(ExceptionFrame, user_rsp) as u64);
         // Use the task's registered vmapped stack extent as Linux's stack
@@ -929,7 +929,6 @@ mod tests {
             rcx: 0,
             rbx: 0,
             rax: 0,
-            vector: 14,
             error_code: 0,
             rip: 0x4000,
             cs,
