@@ -186,7 +186,6 @@ fn do_kern_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
     }
 
     log_page_fault(frame, ec, addr);
-    log_faulting_module_return_addresses();
 
     // Milestone 4 TDD: deliberate kernel #PF from main.rs → exit QEMU.
     #[cfg(all(feature = "qemu-test", feature = "test-page-fault"))]
@@ -199,41 +198,6 @@ fn do_kern_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
         "Kernel page fault: addr={:#018x} error={:#010x} rip={:#018x}",
         addr, ec, frame.rip,
     );
-}
-
-/// Resolve dynamically-loaded driver return addresses only on a fatal kernel
-/// fault.  Kernel ELF symbolization cannot decode the vendor C modules, while
-/// their live section ranges are authoritative for identifying the caller of
-/// an invalid indirect branch.
-fn log_faulting_module_return_addresses() {
-    let task = unsafe { crate::kernel::sched::get_current() };
-    if task.is_null() {
-        return;
-    }
-    let stack_top = unsafe { (*task).stack as usize };
-    let stack_bottom = stack_top.saturating_sub(crate::kernel::sched::KTHREAD_STACK_SIZE);
-    if stack_bottom == 0 || stack_top <= stack_bottom {
-        return;
-    }
-
-    let mut found = 0usize;
-    let mut word = stack_bottom;
-    while word.saturating_add(core::mem::size_of::<usize>()) <= stack_top && found < 8 {
-        let candidate = unsafe { (word as *const usize).read() };
-        if crate::kernel::module::with_module_address(candidate, |module, section, offset| {
-            log_error!(
-                "cpu",
-                "cpu: fault-module-return stack={:#018x} module={} section={} offset={:#x}",
-                word,
-                module,
-                section,
-                offset,
-            );
-        }) {
-            found += 1;
-        }
-        word = word.saturating_add(core::mem::size_of::<usize>());
-    }
 }
 
 fn is_vmalloc_fault_candidate(ec: u64, addr: u64) -> bool {

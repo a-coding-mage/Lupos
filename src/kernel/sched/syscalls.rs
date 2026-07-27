@@ -100,6 +100,12 @@ unsafe fn apply_sched_attr_fields(
             attr.sched_period
         };
         (*p).m29.dl.dl_period = attr.sched_period;
+        // Linux `__setscheduler_params()` calls `set_load_weight(p, true)`
+        // before the scheduler-class transaction re-enqueues the task.  A
+        // running or migrating fair task can be detached at this point, so
+        // relying on `enqueue_task_fair()` alone leaves a zero divisor in
+        // `calc_delta_fair()`.
+        super::set_load_weight(p);
         (*p).m29.sched_class = next_class;
     }
 }
@@ -292,6 +298,57 @@ mod tests {
     fn effective_prio_normal_is_default_plus_nice() {
         assert_eq!(effective_prio(SCHED_NORMAL, 0, 5), DEFAULT_PRIO + 5);
         assert_eq!(effective_prio(SCHED_NORMAL, 0, -10), DEFAULT_PRIO - 10);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/syscalls.c:__setscheduler_params
+    ///
+    /// Linux refreshes `se.load` while applying scheduler parameters, before
+    /// the task is re-enqueued.  This matters for a running or migrating task
+    /// whose class queue is temporarily detached: waiting for enqueue leaves
+    /// a zero CFS weight for the next `update_curr()`/preemption calculation.
+    #[test]
+    fn policy_change_refreshes_detached_fair_load_weight() {
+        const TEST_CPU: u32 = (super::super::MAX_CPUS - 3) as u32;
+
+        struct ResetRunqueue(u32);
+        impl Drop for ResetRunqueue {
+            fn drop(&mut self) {
+                let _ = super::super::rq::with_rq(self.0, |rq| {
+                    *rq = super::super::rq::Rq::new(self.0);
+                });
+            }
+        }
+
+        super::super::rq::init_rqs();
+        super::super::rq::with_rq(TEST_CPU, |rq| {
+            *rq = super::super::rq::Rq::new(TEST_CPU);
+        })
+        .expect("test runqueue exists");
+        let _reset_runqueue = ResetRunqueue(TEST_CPU);
+
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+        task.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        task.m29.policy = SCHED_NORMAL;
+        task.m29.static_prio = DEFAULT_PRIO;
+        task.m29.normal_prio = DEFAULT_PRIO;
+        task.m29.prio = DEFAULT_PRIO;
+        task.m29.sched_class = &super::super::fair::FAIR_SCHED_CLASS;
+        task.m29.se.load.weight = 0;
+        task.thread_info.cpu = TEST_CPU;
+
+        let attr = SchedAttr {
+            size: SCHED_ATTR_SIZE_VER1,
+            sched_policy: SCHED_NORMAL,
+            sched_nice: 0,
+            ..SchedAttr::default()
+        };
+        assert_eq!(unsafe { sys_sched_setattr(task_ptr, &attr) }, 0);
+        assert_eq!(
+            task.m29.se.load.weight,
+            super::super::prio::nice_to_weight(0),
+            "Linux __setscheduler_params refreshes a detached task before enqueue"
+        );
     }
 
     // test-origin: linux:vendor/linux/kernel/sched/syscalls.c:__sched_setscheduler

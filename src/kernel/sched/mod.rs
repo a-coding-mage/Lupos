@@ -119,6 +119,7 @@ use spin::Mutex;
 use crate::arch::x86::kernel::switch::{
     __switch_to_asm, prepare_switch_to_task, record_switch_attempt,
 };
+use crate::kernel::locking::RawSpinLocked;
 use crate::kernel::pid::{INIT_PID_NS, alloc_pid};
 use crate::kernel::task::{LINUX_OFFSET_THREAD, M29SchedFields, TaskStruct, ThreadInfo};
 use crate::kernel::thread::{DescStruct, ThreadStruct};
@@ -235,6 +236,84 @@ unsafe fn seed_current_task_stack(_task: *mut TaskStruct) {}
 #[cfg(not(test))]
 static CURRENT_TASK: [AtomicPtr<TaskStruct>; MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+
+/// Linux `rq->ttwu_pending`/`task_struct::wake_entry` bridge.
+///
+/// `try_to_wake_up()` cannot wait on a remote task's `on_cpu` handoff without
+/// stalling the waker. Linux places that task on the owner CPU's lockless
+/// wake list and lets the target CPU activate it from its IPI callback. Lupos
+/// does not yet expose Linux's generic call-function-single queue, so keep the
+/// same ownership and lifetime rule with the task's existing intrusive
+/// `wake_entry` and a per-CPU raw-spin-protected head/tail pair.
+///
+/// The queue is intrusive and therefore has no fixed task-count limit. The
+/// `REMOTE_WAKE_QUEUED` bit prevents the same task from being linked twice
+/// while its state is `TASK_WAKING`, matching Linux's one pending
+/// `wake_entry.llist` per task.
+const REMOTE_WAKE_QUEUED: u32 = 1 << 31;
+
+struct RemoteWakeQueue {
+    head: *mut TaskStruct,
+    tail: *mut TaskStruct,
+}
+
+unsafe impl Send for RemoteWakeQueue {}
+
+impl RemoteWakeQueue {
+    const fn new() -> Self {
+        Self {
+            head: core::ptr::null_mut(),
+            tail: core::ptr::null_mut(),
+        }
+    }
+
+    /// Link `task` once and retain the Linux wake flags in its call-single
+    /// node. The caller holds this queue's raw spinlock.
+    unsafe fn push(&mut self, task: *mut TaskStruct, target_cpu: u32, wake_flags: u32) -> bool {
+        if task.is_null() {
+            return false;
+        }
+        let entry = unsafe { &mut (*task).m29.wake_entry };
+        if entry.flags & REMOTE_WAKE_QUEUED != 0 {
+            return true;
+        }
+
+        entry.next = core::ptr::null_mut();
+        entry.flags = (wake_flags & !REMOTE_WAKE_QUEUED) | REMOTE_WAKE_QUEUED;
+        entry.src = current_cpu() as u16;
+        entry.dst = target_cpu as u16;
+        if self.tail.is_null() {
+            self.head = task;
+        } else {
+            unsafe {
+                (*self.tail).m29.wake_entry.next = task.cast();
+            }
+        }
+        self.tail = task;
+        true
+    }
+
+    /// Remove one entry and return its task plus the original wake flags. The
+    /// caller holds this queue's raw spinlock.
+    unsafe fn pop(&mut self) -> Option<(*mut TaskStruct, u32)> {
+        let task = self.head;
+        if task.is_null() {
+            return None;
+        }
+        let entry = unsafe { &mut (*task).m29.wake_entry };
+        let wake_flags = entry.flags & !REMOTE_WAKE_QUEUED;
+        self.head = entry.next.cast();
+        if self.head.is_null() {
+            self.tail = core::ptr::null_mut();
+        }
+        entry.next = core::ptr::null_mut();
+        entry.flags = 0;
+        Some((task, wake_flags))
+    }
+}
+
+static REMOTE_WAKE_QUEUES: [RawSpinLocked<RemoteWakeQueue>; MAX_CPUS] =
+    [const { RawSpinLocked::new(RemoteWakeQueue::new()) }; MAX_CPUS];
 
 /// Autoreaped current tasks cannot drop their own kernel stack. Linux keeps a
 /// final current-task reference until finish_task_switch(); this per-CPU slot
@@ -912,6 +991,11 @@ pub unsafe fn finish_task_switch(prev: *mut TaskStruct) {
         rq::unlock_rq_after_switch(current_cpu());
     }
 
+    // Linux's sched_ttwu_pending() runs after the target CPU has completed
+    // finish_task() and released rq->lock. This is the first safe point at
+    // which a queued remote wake whose task was `prev` can be activated.
+    drain_remote_wakes();
+
     // Linux `finish_task_switch()` consumes `rq->prev_mm` only after
     // finish_task() has cleared prev->on_cpu and completed the scheduler's
     // post-switch transition. The Rust destructor is delayed until schedule
@@ -1082,6 +1166,23 @@ unsafe fn task_has_switch_frame(task: *mut TaskStruct) -> bool {
 #[inline]
 unsafe fn task_can_switch_to(task: *mut TaskStruct) -> bool {
     unsafe { task_runnable(task) && task_has_switch_frame(task) }
+}
+
+/// Linux's scheduler only switches to a task that is inactive on another
+/// CPU.  `task_on_cpu` is the cross-CPU handoff bit published by
+/// `prepare_task()` and cleared by `finish_task()`; the local runqueue's
+/// `current` task is the one legitimate exception because it may be selected
+/// for a self-pick.  Lupos keeps this ownership check at the class-picker
+/// boundary as a backstop for a stale/duplicate queue entry: otherwise an RT
+/// task present on two runqueues can make both CPUs enter the same task stack.
+///
+/// Ref: `vendor/linux/kernel/sched/core.c::prepare_task`,
+/// `finish_task`, and `pick_next_task`.
+#[inline]
+unsafe fn task_can_switch_to_on_rq(task: *mut TaskStruct, rq_current: *mut TaskStruct) -> bool {
+    unsafe {
+        task_can_switch_to(task) && (!task_on_cpu(task) || task == rq_current)
+    }
 }
 
 /// Initialise scheduler-owned fields for a newly forked task.
@@ -1506,6 +1607,178 @@ fn wake_up_idle_cpu(cpu: u32) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RemoteWakeDrain {
+    Activate(bool),
+    Requeue(u32),
+    Drop,
+}
+
+/// Queue a task on the owner CPU's Linux-shaped remote-wakeup list.
+///
+/// The caller has already changed the task state to `TASK_WAKING` while
+/// holding `p->pi_lock`. The queue itself is independent of that task lock so
+/// the target IPI may consume it before the waker drops `pi_lock`, just as
+/// Linux's `__ttwu_queue_wakelist()`/`sched_ttwu_pending()` pair does.
+fn queue_remote_wake(task: *mut TaskStruct, target_cpu: u32, wake_flags: u32) -> bool {
+    let Some(queue) = REMOTE_WAKE_QUEUES.get(target_cpu as usize) else {
+        return false;
+    };
+    let queued = {
+        let (mut guard, irq_flags) = queue.lock_irqsave();
+        let queued = unsafe { guard.push(task, target_cpu, wake_flags) };
+        RawSpinLocked::unlock_irqrestore(guard, irq_flags);
+        queued
+    };
+    if queued {
+        // This is the local equivalent of Linux's __smp_call_single_queue().
+        // Its call-function IPI is independent of TIF_NEED_RESCHED: the
+        // target must drain the wake list even when a prior reschedule
+        // request is already pending.  Coalescing through request_reschedule
+        // can otherwise leave a newly queued task asleep until an unrelated
+        // scheduler edge.
+        if target_cpu == current_cpu() {
+            request_reschedule(target_cpu);
+        } else if remote_wake_ipi_required(
+            target_cpu,
+            current_cpu(),
+            cpu_active_mask().test(target_cpu),
+        ) {
+            #[cfg(not(test))]
+            unsafe {
+                crate::arch::x86::kernel::idt::send_reschedule_ipi(target_cpu as u8);
+            }
+        }
+    }
+    queued
+}
+
+#[inline]
+fn remote_wake_ipi_required(target_cpu: u32, this_cpu: u32, target_active: bool) -> bool {
+    target_cpu != this_cpu && target_active
+}
+
+/// Linux `ttwu_queue_cond()`'s relevant generic-x86 decision.
+///
+/// Lupos currently has no cache-topology-backed call-function queue, but the
+/// correctness-critical case is the remote owner with no runnable task left
+/// on its rq: waking synchronously there makes the waker spin behind the
+/// owner's `on_cpu` handoff and can stall unrelated system-wide work.
+#[inline]
+fn should_queue_remote_wake_for(
+    owner_cpu: u32,
+    this_cpu: u32,
+    owner_active: bool,
+    owner_nr_running: Option<u32>,
+) -> bool {
+    owner_cpu != this_cpu && owner_active && owner_nr_running == Some(0)
+}
+
+#[inline]
+fn should_queue_remote_wake(owner_cpu: u32) -> bool {
+    should_queue_remote_wake_for(
+        owner_cpu,
+        current_cpu(),
+        cpu_active_mask().test(owner_cpu),
+        rq::rq_nr_running(owner_cpu),
+    )
+}
+
+/// Activate pending remote wakes on this CPU without waiting in interrupt
+/// context. If the owner is still in `on_cpu` handoff, the entry is retained
+/// until `finish_task_switch()` clears it with release ordering.
+pub(crate) fn drain_remote_wakes() {
+    if !production_smp_scheduler_enabled() {
+        return;
+    }
+    let cpu = current_cpu();
+
+    loop {
+        let pending = {
+            let Some(queue) = REMOTE_WAKE_QUEUES.get(cpu as usize) else {
+                return;
+            };
+            let (mut guard, irq_flags) = queue.lock_irqsave();
+            let pending = unsafe { guard.pop() };
+            RawSpinLocked::unlock_irqrestore(guard, irq_flags);
+            pending
+        };
+        let Some((task, wake_flags)) = pending else {
+            return;
+        };
+
+        let action = unsafe {
+            if task_on_cpu(task) {
+                RemoteWakeDrain::Requeue((*task).thread_info.cpu)
+            } else if (*task).thread_info.cpu != cpu {
+                RemoteWakeDrain::Requeue((*task).thread_info.cpu)
+            } else {
+                rq::with_rq(cpu, |rq| {
+                    if task_on_cpu(task) {
+                        return RemoteWakeDrain::Requeue((*task).thread_info.cpu);
+                    }
+                    if (*task).m29.on_rq == class::TASK_ON_RQ_MIGRATING {
+                        return RemoteWakeDrain::Requeue((*task).thread_info.cpu);
+                    }
+                    let sched_class = task_class(task);
+                    if sched_class.is_null() {
+                        return RemoteWakeDrain::Drop;
+                    }
+                    if (*task).m29.on_rq == 0 {
+                        if let Some(enqueue) = (*sched_class).enqueue_task {
+                            enqueue(rq, task, class::ENQUEUE_WAKEUP | wake_flags);
+                        }
+                    }
+                    if (*task).m29.on_rq != class::TASK_ON_RQ_QUEUED {
+                        return RemoteWakeDrain::Drop;
+                    }
+                    (*task)
+                        .__state
+                        .store(crate::kernel::task::task_state::TASK_RUNNING, Ordering::Release);
+                    RemoteWakeDrain::Activate(wakeup_preempt_locked(rq, task, wake_flags))
+                })
+                .unwrap_or(RemoteWakeDrain::Drop)
+            }
+        };
+
+        match action {
+            RemoteWakeDrain::Activate(newly_set) => {
+                send_reschedule_ipi_for_transition(cpu, newly_set);
+                wake_up_idle_cpu(cpu);
+            }
+            RemoteWakeDrain::Requeue(target_cpu) => {
+                // The CPU field is published before on_cpu. A malformed or
+                // stale value must not turn the intrusive queue into a lost
+                // wake; keep it on this CPU, where the next scheduler edge
+                // will retry the handoff.
+                let target_cpu = if (target_cpu as usize) < MAX_CPUS {
+                    target_cpu
+                } else {
+                    cpu
+                };
+                if !queue_remote_wake(task, target_cpu, wake_flags) {
+                    log_error!(
+                        "sched",
+                        "sched: dropping remote wake task={:#018x} target_cpu={}",
+                        task as usize,
+                        target_cpu,
+                    );
+                }
+                // Do not immediately pop the same still-running task again.
+                // The target IPI or the post-switch drain will retry it.
+                return;
+            }
+            RemoteWakeDrain::Drop => {
+                log_error!(
+                    "sched",
+                    "sched: dropping invalid remote wake task={:#018x}",
+                    task as usize,
+                );
+            }
+        }
+    }
+}
+
 /// Add a task to the global run queue.
 ///
 /// # Safety
@@ -1749,9 +2022,11 @@ pub unsafe fn __schedule() {
             prepare_prev_for_pick(this_rq, prev);
 
             let picked = pick_next_task(this_rq);
-            let next = if !picked.is_null() && task_can_switch_to(picked) {
+            let next = if !picked.is_null() && task_can_switch_to_on_rq(picked, this_rq.current) {
                 picked
-            } else if this_rq.idle != prev && task_can_switch_to(this_rq.idle) {
+            } else if this_rq.idle != prev
+                && task_can_switch_to_on_rq(this_rq.idle, this_rq.current)
+            {
                 this_rq.idle
             } else {
                 prev
@@ -2617,11 +2892,57 @@ pub unsafe fn try_to_wake_up(p: *mut TaskStruct, wake_flags: u32) -> bool {
     unsafe { try_to_wake_up_with_state(p, 0, wake_flags) }
 }
 
+/// Return whether a task's scheduler-class pointer names one of Lupos's
+/// linked-in scheduler classes.
+///
+/// Linux obtains this pointer from a live `task_struct` while holding the
+/// task's lifetime/serialization boundaries.  Lupos also keeps a defensive
+/// check for a stale task reached through a detached wake source.  That check
+/// must use pointer identity: the linker is free to place these static class
+/// objects anywhere in the kernel image, so a fixed address window is not a
+/// valid representation of the Linux invariant.
+#[inline]
+fn valid_sched_class_pointer(sched_class: *const class::SchedClass) -> bool {
+    sched_class == &stop::STOP_SCHED_CLASS
+        || sched_class == &deadline::DL_SCHED_CLASS
+        || sched_class == &rt::RT_SCHED_CLASS
+        || sched_class == &fair::FAIR_SCHED_CLASS
+        || sched_class == &idle::IDLE_SCHED_CLASS
+}
+
 /// Wake `p` only when its state matches `state_mask`, with the state check
 /// serialized by `p->pi_lock` exactly like Linux `wake_up_state()`.
 unsafe fn try_to_wake_up_with_state(p: *mut TaskStruct, state_mask: u32, wake_flags: u32) -> bool {
     if p.is_null() {
         return false;
+    }
+    // Linux special-cases a wake of current before taking p->pi_lock.  The
+    // task is already executing on this CPU, so the remote-wakeup path's
+    // `while task_on_cpu(p)` handoff cannot make progress for it.  Keep the
+    // existing Lupos state/exit checks, then publish TASK_RUNNING directly.
+    // Ref: vendor/linux/kernel/sched/core.c:try_to_wake_up.
+    if production_smp_scheduler_enabled() && p == unsafe { get_current() } {
+        let state = unsafe { (*p).__state.load(Ordering::Acquire) };
+        if state_mask != 0 && state & state_mask == 0 {
+            return false;
+        }
+        let exit_mask =
+            crate::kernel::task::task_state::EXIT_ZOMBIE | crate::kernel::task::task_state::EXIT_DEAD;
+        if unsafe { (*p).m26.exit_state } & exit_mask != 0
+            || state
+                & (exit_mask
+                    | crate::kernel::task::task_state::TASK_DEAD
+                    | crate::kernel::task::task_state::TASK_NEW)
+                    != 0
+        {
+            return false;
+        }
+        unsafe {
+            (*p)
+                .__state
+                .store(crate::kernel::task::task_state::TASK_RUNNING, Ordering::Release);
+        }
+        return true;
     }
     // Guard against waking a stale/freed `task_struct` reached through a
     // dangling reference — most importantly a `SLEEP_TIMERS` entry whose task
@@ -2634,17 +2955,14 @@ unsafe fn try_to_wake_up_with_state(p: *mut TaskStruct, state_mask: u32, wake_fl
     // in `free_task_struct_allocation` is the primary fix; this is the backstop
     // for the residual detach-then-free race. See
     // target/xtask/investigations/firefox-freeze-20260724/LIVE-CLASSIFICATION-20260726.md
-    #[cfg(not(test))]
     {
-        // The kernel image (text + rodata + data) is linked in [1 MiB, 16 MiB);
-        // every real `sched_class` is a static within it.
-        let sched_class = unsafe { (*p).m29.sched_class } as usize;
-        if !(0x0010_0000..0x0100_0000).contains(&sched_class) {
+        let sched_class = unsafe { (*p).m29.sched_class };
+        if !valid_sched_class_pointer(sched_class) {
             log_error!(
                 "sched",
                 "skipping wake of stale/freed task_struct: task={:#018x} sched_class={:#018x}",
                 p as usize,
-                sched_class,
+                sched_class as usize,
             );
             return false;
         }
@@ -2750,7 +3068,21 @@ unsafe fn try_to_wake_up_locked(p: *mut TaskStruct, state_mask: u32, wake_flags:
     }
 
     // `finish_task_switch()` release-clears on_cpu only after the outgoing
-    // CPU's final reference. Do not change task_cpu or enqueue until then.
+    // CPU's final reference. Linux avoids making a remote waker wait through
+    // that handoff when the owner has no runnable work: it publishes
+    // TASK_WAKING on the owner's wake list and activates the task from the
+    // target IPI. Without this branch the waker can consume an entire vCPU
+    // while the wakee is still finishing a syscall.
+    let owner_cpu = unsafe { (*p).thread_info.cpu };
+    if task_on_cpu(p) && should_queue_remote_wake(owner_cpu) {
+        if queue_remote_wake(p, owner_cpu, wake_flags) {
+            return true;
+        }
+    }
+
+    // Same-CPU wakeups and remote queues that are not in Linux's deferred
+    // activation condition retain the synchronous handoff. The acquire load
+    // pairs with finish_task_switch()'s release store.
     while task_on_cpu(p) {
         core::hint::spin_loop();
     }
@@ -2814,6 +3146,62 @@ mod tests {
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
 
     static LEGACY_SCHED_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:ttwu_queue_cond
+    /// and __ttwu_queue_wakelist
+    ///
+    /// Linux defers a remote wake when the owner has no runnable task left,
+    /// which is the handoff that prevents a waker from spinning behind
+    /// `p->on_cpu`. This host seam makes the policy observable without
+    /// pretending that a host test performed a physical CPU context switch.
+    #[test]
+    fn remote_wake_condition_matches_linux_idle_owner_case() {
+        assert!(should_queue_remote_wake_for(2, 0, true, Some(0)));
+        assert!(!should_queue_remote_wake_for(0, 0, true, Some(0)));
+        assert!(!should_queue_remote_wake_for(2, 0, false, Some(0)));
+        assert!(!should_queue_remote_wake_for(2, 0, true, Some(1)));
+        assert!(!should_queue_remote_wake_for(2, 0, true, None));
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:
+    /// __ttwu_queue_wakelist and vendor/linux/kernel/smp.c:
+    /// generic_smp_call_function_single_interrupt
+    ///
+    /// A wake-list entry needs a call-function IPI even when the target
+    /// already has TIF_NEED_RESCHED set.  That IPI drains the list; it is not
+    /// the reschedule transition tested by `reschedule_ipi_required`.
+    #[test]
+    fn remote_wake_ipi_is_not_coalesced_with_reschedule_flag() {
+        assert!(remote_wake_ipi_required(2, 0, true));
+        assert!(!remote_wake_ipi_required(0, 0, true));
+        assert!(!remote_wake_ipi_required(2, 0, false));
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:
+    /// __ttwu_queue_wakelist and sched_ttwu_pending
+    ///
+    /// Lupos uses the existing task_struct wake_entry as Linux does. The
+    /// intrusive queue must retain FIFO activation order and reject a second
+    /// link for a task whose first wake is still pending.
+    #[test]
+    fn remote_wake_queue_is_intrusive_ordered_and_deduplicated() {
+        let mut queue = RemoteWakeQueue::new();
+        let mut first = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut second = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let first_ptr = &mut *first as *mut TaskStruct;
+        let second_ptr = &mut *second as *mut TaskStruct;
+
+        unsafe {
+            assert!(queue.push(first_ptr, 2, 0x11));
+            assert!(queue.push(second_ptr, 2, 0x22));
+            assert!(queue.push(first_ptr, 2, 0x33));
+            assert_eq!(queue.pop(), Some((first_ptr, 0x11)));
+            assert_eq!(queue.pop(), Some((second_ptr, 0x22)));
+            assert_eq!(queue.pop(), None);
+            assert!(queue.push(first_ptr, 2, 0x44));
+            assert_eq!(queue.pop(), Some((first_ptr, 0x44)));
+        }
+    }
 
     // test-origin: linux:vendor/linux/kernel/sched/core.c:wake_up_new_task
     // and linux:vendor/linux/kernel/fork.c:kernel_clone
@@ -2979,6 +3367,59 @@ mod tests {
 
         task.m29.on_rq = class::TASK_ON_RQ_QUEUED;
         assert!(unsafe { task_on_rq_queued(task_ptr) });
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:try_to_wake_up
+    ///
+    /// Linux special-cases a wake of `current`: it cannot wait for its own
+    /// `on_cpu` handoff, because the task is the CPU that is executing this
+    /// call.  The generic remote-wakeup path would spin forever in that case.
+    #[test]
+    fn waking_current_does_not_wait_for_own_on_cpu_handoff() {
+        let _guard = legacy_sched_test_guard();
+        rq::init_rqs();
+        PRODUCTION_SCHED_ENABLED.store(true, Ordering::Release);
+
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        task.m29 = M29SchedFields::zeroed();
+        task.m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
+        task.m29.on_cpu.store(1, Ordering::Release);
+        task.__state.store(
+            crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+            Ordering::Release,
+        );
+        let task_ptr = &mut *task as *mut TaskStruct;
+        unsafe {
+            set_current(task_ptr);
+        }
+
+        assert!(unsafe { wake_task_normal(task_ptr) });
+        assert_eq!(
+            task.__state.load(Ordering::Acquire),
+            crate::kernel::task::task_state::TASK_RUNNING
+        );
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:try_to_wake_up
+    ///
+    /// Linux's live task invariant is that `p->sched_class` names a real
+    /// scheduler class.  Lupos keeps an additional stale-task backstop, but
+    /// must validate that invariant by identity rather than by assuming a
+    /// particular kernel link-address range.
+    #[test]
+    fn stale_wakeup_guard_accepts_all_linked_sched_classes() {
+        assert!(valid_sched_class_pointer(&stop::STOP_SCHED_CLASS));
+        assert!(valid_sched_class_pointer(&deadline::DL_SCHED_CLASS));
+        assert!(valid_sched_class_pointer(&rt::RT_SCHED_CLASS));
+        assert!(valid_sched_class_pointer(&fair::FAIR_SCHED_CLASS));
+        assert!(valid_sched_class_pointer(&idle::IDLE_SCHED_CLASS));
+        assert!(!valid_sched_class_pointer(core::ptr::null()));
+        assert!(!valid_sched_class_pointer(
+            0x0010_0000usize as *const class::SchedClass
+        ));
+        assert!(!valid_sched_class_pointer(
+            0xffff_8000_0000_0000usize as *const class::SchedClass
+        ));
     }
 
     /// test-origin: linux:vendor/linux/kernel/sched/core.c:try_to_wake_up
@@ -3805,6 +4246,36 @@ mod tests {
             !unsafe { task_can_switch_to(task_ptr) },
             "Linux idle tasks still need a real task stack before switch-in"
         );
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:prepare_task
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:finish_task
+    ///
+    /// Linux's `on_cpu` handoff bit prevents a second runqueue from selecting
+    /// a task whose stack is active elsewhere.  The local-current exception
+    /// preserves a legal self-pick while a remote rq must reject the same
+    /// runnable frame.
+    #[test]
+    fn task_switch_rejects_task_active_on_a_remote_cpu() {
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut other_current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+        let other_ptr = &mut *other_current as *mut TaskStruct;
+        let stack_top = (KTHREAD_STACK_SIZE * 2) as u64;
+
+        task.__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+        task.stack = stack_top as *mut core::ffi::c_void;
+        task.thread.sp = stack_top - SWITCH_FRAME_BYTES as u64;
+        task.m29.on_cpu.store(1, Ordering::Release);
+
+        assert!(!unsafe { task_can_switch_to_on_rq(task_ptr, other_ptr) });
+        assert!(unsafe { task_can_switch_to_on_rq(task_ptr, task_ptr) });
+
+        task.m29.on_cpu.store(0, Ordering::Release);
+        assert!(unsafe { task_can_switch_to_on_rq(task_ptr, other_ptr) });
     }
 
     #[test]

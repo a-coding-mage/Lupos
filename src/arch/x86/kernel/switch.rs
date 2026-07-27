@@ -40,10 +40,10 @@
 //!   vendor/linux/arch/x86/kernel/asm-offsets_64.c — x86-64 offsets
 
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(any(test, debug_assertions))]
-use core::sync::atomic::{AtomicI32, AtomicU64};
+use core::sync::atomic::AtomicI32;
 
 use crate::kernel::task::TaskStruct;
 use crate::kernel::thread::ThreadStruct;
@@ -264,17 +264,6 @@ pub unsafe fn prepare_switch_to_task(next: *mut TaskStruct) {
         prepare_switch_stack_canaries(current, next);
     }
 
-    // Focused corruption probe for the reproducible post-ALSA fault.  Every
-    // inactive x86 task context has the six callee-saved registers followed
-    // by the kernel continuation that `__switch_to_asm` will return to.  A
-    // return into low user space can never be a valid scheduler continuation;
-    // catching it here preserves the owning task and saved frame before the
-    // CPU attempts the bad instruction fetch.  Keep this probe until the
-    // writer of the slot is identified.
-    unsafe {
-        validate_incoming_switch_frame(next);
-    }
-
     // The incoming stack must exist in the currently loaded PGD until the
     // assembly stub changes RSP. A subsequent user-mm switch synchronizes the
     // complete vmalloc slot into the incoming PGD before loading CR3.
@@ -299,65 +288,6 @@ pub unsafe fn prepare_switch_to_task(next: *mut TaskStruct) {
     // `switch_to()` changes the kernel stack.
     unsafe {
         prepare_switch_mm(current, next);
-    }
-}
-
-#[cfg(not(test))]
-unsafe fn validate_incoming_switch_frame(next: *mut TaskStruct) {
-    let stack_top = unsafe { (*next).stack as u64 };
-    let sp = unsafe { (*next).thread.sp };
-    let stack_bottom = stack_top.saturating_sub(crate::kernel::sched::KTHREAD_STACK_SIZE as u64);
-    let frame_bytes = 7 * core::mem::size_of::<u64>() as u64;
-    if sp < stack_bottom || sp.saturating_add(frame_bytes) > stack_top || sp & 0x7 != 0 {
-        panic!(
-            "switch frame outside task stack: pid={} task={:#018x} sp={:#018x} stack=[{:#018x},{:#018x})",
-            unsafe { (*next).pid },
-            next as usize,
-            sp,
-            stack_bottom,
-            stack_top,
-        );
-    }
-    let continuation = unsafe { ((sp as *const u64).add(6)).read_volatile() };
-    // AP bring-up still executes the identity-mapped boot image.  The
-    // decompressed/staged image extends past 12 MiB in the debug build, so
-    // retain the complete early-image window through 32 MiB.  Once the
-    // higher-half kernel is live, normal
-    // scheduler continuations are at or above the canonical kernel split.
-    // Both are valid; the post-ALSA corrupt value is in neither range.
-    let boot_text = (0x0020_0000..0x0200_0000).contains(&continuation);
-    // Only the top-2 GiB kernel-image alias is executable text in the higher
-    // half. The former `>= 0xffff_8000_0000_0000` bound also whitelisted the
-    // direct map (`PAGE_OFFSET = 0xffff_8880_…`) and vmalloc, so a continuation
-    // corrupted into a reused direct-map page (observed live at
-    // 0xffff_8881_776d_2000) slipped through. Reject those.
-    let higher_half = continuation >= 0xffff_ffff_8000_0000;
-    if !boot_text && !higher_half {
-        let frame = sp as *const u64;
-        let frame_words = [
-            unsafe { frame.read_volatile() },
-            unsafe { frame.add(1).read_volatile() },
-            unsafe { frame.add(2).read_volatile() },
-            unsafe { frame.add(3).read_volatile() },
-            unsafe { frame.add(4).read_volatile() },
-            unsafe { frame.add(5).read_volatile() },
-            unsafe { frame.add(6).read_volatile() },
-        ];
-        panic!(
-            "switch frame has low continuation: pid={} comm={:?} task={:#018x} cpu={} sp={:#018x} stack=[{:#018x},{:#018x}) ret={:#018x} frame={:?} state={:#x} on_cpu={} on_rq={}",
-            unsafe { (*next).pid },
-            unsafe { (*next).comm },
-            next as usize,
-            crate::kernel::sched::current_cpu(),
-            sp,
-            stack_bottom,
-            stack_top,
-            continuation,
-            frame_words,
-            unsafe { (*next).__state.load(Ordering::Acquire) },
-            unsafe { (*next).m29.on_cpu.load(Ordering::Acquire) },
-            unsafe { (*next).m29.on_rq },
-        );
     }
 }
 
