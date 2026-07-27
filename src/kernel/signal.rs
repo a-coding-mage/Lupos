@@ -289,7 +289,6 @@ pub struct SigAltStack {
     pub ss_size: usize,
 }
 
-#[derive(Clone)]
 struct SignalState {
     actions: [RtSigAction; NSIG + 1],
     blocked: SigSet,
@@ -610,19 +609,29 @@ impl SignalTable {
             return false;
         }
 
-        let inherited = self
-            .states
-            .iter()
-            .find(|state| state.pid == parent_pid)
-            .cloned()
-            .unwrap_or_else(|| self.state_for_new_task(parent_pid, child_tgid));
-
         let mut child = SignalState::new(child_pid, child_tgid);
-        child.actions = inherited.actions;
-        child.blocked = inherited.blocked;
-        child.altstack = inherited.altstack;
         child.task_addr = child_task as usize;
-        if inherited.tgid == child_tgid {
+        if let Some(inherited) = self.states.iter().find(|state| state.pid == parent_pid) {
+            // Linux copy_signal() allocates the destination signal_struct and
+            // copies only the fields whose fork semantics require inheritance.
+            // Borrow the source in place: cloning the whole SignalState here
+            // materializes its large action table and queue metadata on the
+            // task's kernel stack, where it can overlap an inactive switch
+            // frame.
+            child.actions = inherited.actions;
+            child.blocked = inherited.blocked;
+            child.altstack = inherited.altstack;
+            if inherited.tgid == child_tgid {
+                child.signalfd_wqh = inherited.signalfd_wqh.clone();
+                child.wait_chldexit = inherited.wait_chldexit.clone();
+            }
+        } else {
+            // Keep the existing late-registration fallback, but retain its
+            // heap ownership boundary as well.
+            let inherited = self.state_for_new_task(parent_pid, child_tgid);
+            child.actions = inherited.actions;
+            child.blocked = inherited.blocked;
+            child.altstack = inherited.altstack;
             child.signalfd_wqh = inherited.signalfd_wqh;
             child.wait_chldexit = inherited.wait_chldexit;
         }
@@ -3688,6 +3697,26 @@ mod tests {
             state_addr.abs_diff(stack_addr) > 64 * 1024,
             "SignalState must be heap-backed, state={state_addr:#x} stack={stack_addr:#x}"
         );
+    }
+
+    #[test]
+    fn clone_signal_inheritance_does_not_clone_whole_signal_struct() {
+        // test-origin: linux:vendor/linux/kernel/fork.c:copy_signal
+        // Linux allocates signal_struct and copies the fork-visible fields
+        // directly.  Keep the source-level guard alongside the runtime clone
+        // test: reintroducing Clone would recreate a large stack temporary
+        // even though the destination object is heap-backed.
+        let source = include_str!("signal.rs");
+        assert!(!source.contains("#[derive(Clone)]\nstruct SignalState"));
+        let clone_body = source
+            .split("fn inherit_for_clone(")
+            .nth(1)
+            .expect("clone inheritance implementation");
+        let clone_body = clone_body
+            .split("\n    fn ")
+            .next()
+            .expect("clone inheritance body");
+        assert!(!clone_body.contains(".cloned()"));
     }
 
     fn syscall_restart_regs(errno: i32) -> crate::kernel::task::PtRegs {
