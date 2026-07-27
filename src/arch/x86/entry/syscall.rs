@@ -476,22 +476,6 @@ pub unsafe extern "C" fn syscall_dispatch_ptregs(
     unsafe { syscall_dispatch_ptregs_inner(regs) }
 }
 
-// Investigation-only hook.  It is deliberately called only for the real-time
-// graphics reproducer's `aplay` task so GDB can arm a hardware watchpoint on
-// that task's kernel-stack return slot without stopping every syscall in the
-// desktop session.  Remove this hook after the first writer is identified.
-#[cfg(not(test))]
-#[unsafe(no_mangle)]
-pub static AUDIO_CORRUPTOR_APLAY_STACK_TOP: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-
-#[cfg(not(test))]
-#[unsafe(no_mangle)]
-#[inline(never)]
-pub extern "C" fn audio_corruptor_aplay_stack_probe(stack_top: u64) {
-    AUDIO_CORRUPTOR_APLAY_STACK_TOP.store(stack_top, core::sync::atomic::Ordering::Relaxed);
-}
-
 /// Last jiffy on which the per-syscall console drain ran (throttle state).
 ///
 /// The common case is a read that observes the current jiffy. Only syscalls
@@ -518,18 +502,6 @@ unsafe fn syscall_dispatch_ptregs_inner(
 
     let nr = unsafe { (*regs).orig_rax } as usize;
     let task = current_task_for_syscall();
-    #[cfg(not(test))]
-    let is_aplay = !task.is_null()
-        && unsafe {
-            core::slice::from_raw_parts(
-                core::ptr::addr_of!((*task).comm) as *const u8,
-                5,
-            ) == b"aplay"
-        };
-    #[cfg(not(test))]
-    if is_aplay {
-        audio_corruptor_aplay_stack_probe(unsafe { (*task).stack as u64 });
-    }
     let hook_state = syscall_enter(unsafe { &*regs }, task);
     trace_udev_syscall_enter(unsafe { &*regs }, task);
     trace_stall_syscall_enter(unsafe { &*regs }, task);

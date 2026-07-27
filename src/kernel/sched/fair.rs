@@ -251,7 +251,7 @@ unsafe fn pick_next_task_fair(rq: &mut Rq) -> *mut TaskStruct {
         let current = rq.cfs.current;
         if !current.is_null()
             && unsafe { (*current).m29.se.on_rq != 0 }
-            && unsafe { super::task_can_switch_to(current) }
+            && unsafe { super::task_can_switch_to_on_rq(current, rq.current) }
         {
             return current;
         }
@@ -260,7 +260,7 @@ unsafe fn pick_next_task_fair(rq: &mut Rq) -> *mut TaskStruct {
         .tasks_timeline
         .iter()
         .find_map(|task| {
-            if unsafe { super::task_can_switch_to(task) } {
+            if unsafe { super::task_can_switch_to_on_rq(task, rq.current) } {
                 Some(task)
             } else {
                 None
@@ -935,15 +935,15 @@ mod tests {
         assert!(!rq.cfs.entity_node_linked(task_ptr));
     }
 
-    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:pick_task_fair
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:pick_next_task
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:prepare_task
     ///
-    /// Linux relies on rq ownership to keep a queued entity from being
-    /// selected twice; its picker does not add an independent `on_cpu` test.
-    /// This Lupos-specific fixture preserves a runnable queued entity with a
-    /// stale handoff bit, the state that made the former invented filter turn
-    /// a non-empty CFS runqueue into an idle pick on SMP.
+    /// Linux's rq ownership invariant means a task with `on_cpu=1` cannot be
+    /// present as a selectable task on a different rq.  Lupos keeps the
+    /// equivalent handoff check at the picker boundary so a stale duplicate
+    /// RT/CFS entry cannot switch a second CPU onto the active task's stack.
     #[test]
-    fn pick_next_task_fair_does_not_filter_runnable_entity_by_on_cpu() {
+    fn pick_next_task_fair_rejects_remote_on_cpu_entity() {
         let mut rq = Rq::new(1);
         let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
@@ -970,12 +970,9 @@ mod tests {
 
         let picked = unsafe { pick_next_task_fair(&mut rq) };
 
-        assert_eq!(picked, task_ptr);
+        assert!(picked.is_null());
         assert_eq!(rq.cfs.tasks_timeline.first(), task_ptr);
-        unsafe {
-            set_next_task_fair(&mut rq, picked, true);
-        }
-        assert_eq!(rq.cfs.current, task_ptr);
+        assert!(rq.cfs.current.is_null());
     }
 
     /// test-origin: linux:vendor/linux/kernel/sched/fair.c:pick_eevdf

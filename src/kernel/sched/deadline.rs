@@ -101,19 +101,26 @@ unsafe fn pick_next_task_dl(rq: &mut Rq) -> *mut TaskStruct {
         .dl
         .root
         .iter()
-        .find_map(|(_, &task)| unsafe { super::task_can_switch_to(task).then_some(task) })
+        .find_map(|(_, &task)| unsafe {
+            super::task_can_switch_to_on_rq(task, rq.current).then_some(task)
+        })
         .unwrap_or(core::ptr::null_mut());
-    if !p.is_null() {
-        rq.dl.current = p;
-        rq.current = p;
-        unsafe {
-            (*p).m29.se.exec_start = rq.clock_task.max(sched_clock_ns());
-        }
-    }
     p
 }
 
 unsafe fn put_prev_task_dl(_rq: &mut Rq, _prev: *mut TaskStruct) {}
+
+/// Linux `set_next_task_dl()` publishes the deadline class's current entity
+/// after generic scheduler selection, not from `pick_task_dl()`.
+unsafe fn set_next_task_dl(rq: &mut Rq, next: *mut TaskStruct, _first: bool) {
+    if next.is_null() {
+        return;
+    }
+    rq.dl.current = next;
+    unsafe {
+        (*next).m29.se.exec_start = rq.clock_task.max(sched_clock_ns());
+    }
+}
 
 unsafe fn task_tick_dl(rq: &mut Rq, p: *mut TaskStruct, _queued: bool) {
     if p.is_null() {
@@ -162,7 +169,7 @@ pub static DL_SCHED_CLASS: SchedClass = SchedClass {
     wakeup_preempt: Some(wakeup_preempt_dl),
     pick_next_task: Some(pick_next_task_dl),
     put_prev_task: Some(put_prev_task_dl),
-    set_next_task: None,
+    set_next_task: Some(set_next_task_dl),
     task_tick: Some(task_tick_dl),
     task_fork: Some(task_fork_dl),
     task_dead: None,

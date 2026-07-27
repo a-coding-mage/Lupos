@@ -79,21 +79,24 @@ unsafe fn dequeue_task_rt(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool {
 }
 
 unsafe fn pick_next_task_rt(rq: &mut Rq) -> *mut TaskStruct {
-    let p = rq
-        .rt
+    rq.rt
         .queues
         .iter()
         .flat_map(|queue| queue.iter().copied())
-        .find(|&task| unsafe { super::task_can_switch_to(task) })
-        .unwrap_or(core::ptr::null_mut());
-    if !p.is_null() {
-        rq.rt.current = p;
-        rq.current = p;
-    }
-    p
+        .find(|&task| unsafe { super::task_can_switch_to_on_rq(task, rq.current) })
+        .unwrap_or(core::ptr::null_mut())
 }
 
 unsafe fn put_prev_task_rt(_rq: &mut Rq, _prev: *mut TaskStruct) {}
+
+/// Linux `set_next_task_rt()` publishes the RT class's current entity only
+/// after the generic scheduler has selected the task and completed the
+/// put-prev/set-next ordering.  The picker must not change `rq.current`.
+unsafe fn set_next_task_rt(rq: &mut Rq, next: *mut TaskStruct, _first: bool) {
+    if !next.is_null() {
+        rq.rt.current = next;
+    }
+}
 
 unsafe fn task_tick_rt(rq: &mut Rq, p: *mut TaskStruct, _queued: bool) {
     if p.is_null() {
@@ -166,7 +169,7 @@ pub static RT_SCHED_CLASS: SchedClass = SchedClass {
     wakeup_preempt: Some(wakeup_preempt_rt),
     pick_next_task: Some(pick_next_task_rt),
     put_prev_task: Some(put_prev_task_rt),
-    set_next_task: None,
+    set_next_task: Some(set_next_task_rt),
     task_tick: Some(task_tick_rt),
     task_fork: Some(task_fork_rt),
     task_dead: None,
@@ -180,6 +183,7 @@ pub static RT_SCHED_CLASS: SchedClass = SchedClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
 
     #[test]
     fn rr_timeslice_is_100ms() {
@@ -190,5 +194,46 @@ mod tests {
     #[test]
     fn rt_class_above_fair() {
         assert!(CLASS_PRIO_RT < super::super::class::CLASS_PRIO_FAIR);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/rt.c:pick_task_rt
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:prepare_task
+    /// test-origin: linux:vendor/linux/kernel/sched/rt.c:set_next_task_rt
+    ///
+    /// Linux's RT picker returns a candidate without publishing `rq->curr`;
+    /// the generic scheduler performs that publication only after the
+    /// on_cpu handoff.  Keeping the local rq current task unchanged here is
+    /// also what makes the remote-on_cpu rejection effective.
+    #[test]
+    fn rt_picker_rejects_remote_active_task_without_mutating_rq_current() {
+        let mut rq = Rq::new(1);
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let current_ptr = &mut *current as *mut TaskStruct;
+        let task_ptr = &mut *task as *mut TaskStruct;
+        let stack_top = (super::super::KTHREAD_STACK_SIZE * 2) as u64;
+
+        rq.current = current_ptr;
+        task.__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+        task.stack = stack_top as *mut core::ffi::c_void;
+        task.thread.sp = stack_top - super::super::SWITCH_FRAME_BYTES as u64;
+        task.m29.sched_class = &RT_SCHED_CLASS as *const SchedClass;
+        task.m29.prio = 10;
+        task.m29.policy = SCHED_FIFO;
+        task.m29.on_cpu.store(1, Ordering::Release);
+
+        unsafe { enqueue_task_rt(&mut rq, task_ptr, 0) };
+        assert!(unsafe { pick_next_task_rt(&mut rq) }.is_null());
+        assert_eq!(rq.current, current_ptr);
+        assert!(rq.rt.current.is_null());
+
+        rq.current = task_ptr;
+        assert_eq!(unsafe { pick_next_task_rt(&mut rq) }, task_ptr);
+        assert_eq!(rq.current, task_ptr);
+        unsafe { set_next_task_rt(&mut rq, task_ptr, true) };
+        assert_eq!(rq.rt.current, task_ptr);
     }
 }

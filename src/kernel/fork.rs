@@ -183,28 +183,6 @@ static HEAP_TASKS: Mutex<HeapTaskTracker> = Mutex::new(HeapTaskTracker {
 });
 static CHILD_SETTID_REGISTRATIONS: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
 
-// Temporary GDB seam for the post-ALSA switch-frame investigation.  The
-// production path stores only the last initialized child frame; it does not
-// alter scheduling or frame contents.  Remove this seam once the first writer
-// is classified.
-#[cfg(not(test))]
-#[unsafe(no_mangle)]
-pub static AUDIO_CORRUPTOR_CHILD_FRAME_TASK: AtomicU64 = AtomicU64::new(0);
-#[cfg(not(test))]
-#[unsafe(no_mangle)]
-pub static AUDIO_CORRUPTOR_CHILD_FRAME_SLOT: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(not(test))]
-#[unsafe(no_mangle)]
-#[inline(never)]
-pub extern "C" fn audio_corruptor_child_frame_probe(
-    task: *mut TaskStruct,
-    continuation_slot: *mut u64,
-) {
-    AUDIO_CORRUPTOR_CHILD_FRAME_TASK.store(task as u64, Ordering::Relaxed);
-    AUDIO_CORRUPTOR_CHILD_FRAME_SLOT.store(continuation_slot as u64, Ordering::Release);
-}
-
 /// Capacity reservation for an allocation which is not visible in the task
 /// registry yet.
 ///
@@ -1391,8 +1369,6 @@ unsafe fn copy_process_unpublished(
             return Err(-4); // EINTR
         }
 
-        #[cfg(not(test))]
-        audio_corruptor_child_frame_probe(child, (initial_sp as *mut u64).add(6));
     }
 
     Ok(child)

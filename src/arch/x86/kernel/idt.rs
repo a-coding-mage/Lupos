@@ -555,7 +555,10 @@ extern "C" fn exception_dispatch(frame: *mut ExceptionFrame, vector: u64) {
     // inside its stack-switch call sequence.  Do not account device IRQs here:
     // doing so leaves the hardirq preempt-count state on the interrupted task
     // stack while the handler itself runs elsewhere.
-    let irq_stack_handler = vector == TIMER_VECTOR || legacy_irq_line(vector).is_some();
+    let irq_stack_handler = vector == TIMER_VECTOR
+        || vector == TLB_SHOOTDOWN_VECTOR
+        || vector == TEXT_POKE_SYNC_VECTOR
+        || legacy_irq_line(vector).is_some();
     if is_irq && !irq_stack_handler {
         crate::kernel::locking::preempt::__irq_enter_raw();
     }
@@ -572,9 +575,10 @@ extern "C" fn exception_dispatch(frame: *mut ExceptionFrame, vector: u64) {
         VEC_MACHINE_CHECK => on_machine_check(frame),
         IPI_PING_VECTOR => on_ipi_ping(),
         TIMER_VECTOR => unsafe { super::irq_64::run_irq_on_irqstack(frame, vector) },
-        TLB_SHOOTDOWN_VECTOR => on_tlb_shootdown_ipi(),
+        TLB_SHOOTDOWN_VECTOR | TEXT_POKE_SYNC_VECTOR => unsafe {
+            super::irq_64::run_sysvec_on_irqstack(frame, vector)
+        },
         RESCHEDULE_VECTOR => on_reschedule_ipi(),
-        TEXT_POKE_SYNC_VECTOR => on_text_poke_sync_ipi(),
         v if legacy_irq_line(v).is_some() => unsafe { super::irq_64::run_irq_on_irqstack(frame, v) },
         v => on_generic(frame, v),
     }
@@ -631,10 +635,32 @@ fn on_tlb_shootdown_ipi() {
     // tlb::on_shootdown_ipi already issues EOI internally.
 }
 
+/// Linux `DEFINE_IDTENTRY_SYSVEC` body for the non-minimal system vectors.
+/// `run_sysvec_on_irqstack()` selects the stack; this wrapper owns raw
+/// irq-entry accounting on both the direct and switched-stack paths.
+pub(crate) unsafe extern "C" fn run_sysvec_handler(
+    frame: *mut ExceptionFrame,
+    vector: u8,
+) {
+    crate::kernel::locking::preempt::__irq_enter_raw();
+    match vector {
+        TLB_SHOOTDOWN_VECTOR => on_tlb_shootdown_ipi(),
+        TEXT_POKE_SYNC_VECTOR => on_text_poke_sync_ipi(),
+        _ => unreachable!("non-system vector sent to sysvec handler"),
+    }
+    let _ = frame;
+    crate::kernel::locking::preempt::__irq_exit_raw();
+}
+
 fn on_reschedule_ipi() {
     unsafe {
         crate::arch::x86::kernel::apic::eoi();
     }
+    // Linux's scheduler/call-function IPI also drains the target CPU's
+    // deferred wake list. Lupos uses the same reschedule vector until the
+    // generic call-function-single vector is wired, so activation must happen
+    // here rather than leaving the waker spinning in try_to_wake_up().
+    crate::kernel::sched::drain_remote_wakes();
 }
 
 fn on_text_poke_sync_ipi() {
@@ -1549,6 +1575,29 @@ mod tests {
         assert!(!is_user_exception(&test_exception_frame(
             sel::KERNEL_CS as u64
         )));
+    }
+
+    /// Linux runs non-minimal system vectors through
+    /// `run_sysvec_on_irqstack_cond()`, while the reschedule IPI is explicitly
+    /// the minimal `DEFINE_IDTENTRY_SYSVEC_SIMPLE` exception. Keeping TLB and
+    /// text-poke work off a task's scheduler stack prevents an IPI frame from
+    /// consuming the same stack space as a deep mm/scheduler continuation.
+    ///
+    /// test-origin: linux:vendor/linux/arch/x86/include/asm/idtentry.h:DEFINE_IDTENTRY_SYSVEC
+    #[test]
+    fn nonminimal_system_vectors_use_the_irq_stack() {
+        let source = include_str!("idt.rs");
+        let dispatch = source
+            .split("fn exception_dispatch(frame: *mut ExceptionFrame, vector: u64)")
+            .nth(1)
+            .expect("exception dispatch must exist")
+            .split("/// The call sequence")
+            .next()
+            .expect("exception dispatch body must end before irq-stack helpers");
+        assert!(dispatch.contains("vector == TLB_SHOOTDOWN_VECTOR"));
+        assert!(dispatch.contains("run_sysvec_on_irqstack"));
+        assert!(dispatch.contains("TLB_SHOOTDOWN_VECTOR | TEXT_POKE_SYNC_VECTOR"));
+        assert!(!dispatch.contains("RESCHEDULE_VECTOR => unsafe {\n            super::irq_64::run_sysvec_on_irqstack"));
     }
 
     /// Linux routes page faults by faulting address first; kernel exception

@@ -99,6 +99,32 @@ pub unsafe fn run_irq_on_irqstack(frame: *mut crate::arch::x86::kernel::idt::Exc
     HARDIRQ_STACK_INUSE[cpu].store(false, Ordering::Release);
 }
 
+/// Linux `run_sysvec_on_irqstack_cond()` for system vectors whose handlers
+/// are deeper than the minimal reschedule IPI. TLB shootdowns can arrive
+/// while the interrupted task is in a deep scheduler or mm path, so their
+/// handler must use the per-CPU IRQ stack just like Linux's
+/// `DEFINE_IDTENTRY_SYSVEC` path.
+///
+/// # Safety
+/// `frame` must be the live IDT frame and interrupts must be disabled.
+pub unsafe fn run_sysvec_on_irqstack(
+    frame: *mut crate::arch::x86::kernel::idt::ExceptionFrame,
+    vector: u8,
+) {
+    let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number()
+        .min(crate::kernel::sched::MAX_CPUS - 1);
+    let user_mode = unsafe { (*frame).cs & 3 != 0 };
+    if user_mode || HARDIRQ_STACK_INUSE[cpu].swap(true, Ordering::AcqRel) {
+        unsafe { crate::arch::x86::kernel::idt::run_sysvec_handler(frame, vector) };
+        return;
+    }
+
+    let base = unsafe { core::ptr::addr_of_mut!(IRQ_STACK_BACKING_STORE[cpu].0) as *mut u8 };
+    let top = unsafe { base.add(IRQ_STACK_SIZE - 8) } as usize;
+    unsafe { irq_stack_call_sysvec(top, frame, vector as usize) };
+    HARDIRQ_STACK_INUSE[cpu].store(false, Ordering::Release);
+}
+
 #[unsafe(naked)]
 unsafe extern "C" fn irq_stack_call(
     _stack_top: usize,
@@ -128,6 +154,28 @@ unsafe extern "C" fn irq_stack_call(
         "pop rsp",
         "ret",
         dispatch = sym crate::arch::x86::kernel::idt::run_hardirq_handler,
+    );
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn irq_stack_call_sysvec(
+    _stack_top: usize,
+    _frame: *mut crate::arch::x86::kernel::idt::ExceptionFrame,
+    _vector: usize,
+) {
+    core::arch::naked_asm!(
+        // Keep the same Linux call_on_stack() link and SysV alignment as the
+        // hardirq adapter above. The handler itself owns irq_enter/exit.
+        "mov [rdi], rsp",
+        "mov rsp, rdi",
+        "mov rdi, rsi",
+        "mov rsi, rdx",
+        "sub rsp, 8",
+        "call {dispatch}",
+        "add rsp, 8",
+        "pop rsp",
+        "ret",
+        dispatch = sym crate::arch::x86::kernel::idt::run_sysvec_handler,
     );
 }
 
