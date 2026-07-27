@@ -615,6 +615,14 @@ unsafe fn set_current_on_cpu(cpu: usize, task: *mut TaskStruct) {
     assert!(cpu < MAX_CPUS, "scheduler logical CPU ID is out of range");
     CURRENT_TASK[cpu].store(task, Ordering::Release);
     crate::arch::x86::kernel::cpu::common::set_linux_current_task_on_cpu(cpu, task);
+    let stack_top = if task.is_null() {
+        0
+    } else {
+        unsafe { (*task).stack as u64 }
+    };
+    if stack_top != 0 {
+        crate::arch::x86::kernel::setup_percpu::set_current_top_of_stack(cpu, stack_top);
+    }
 }
 
 #[inline]

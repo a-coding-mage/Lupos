@@ -45,6 +45,10 @@ pub struct LinuxPerCpuArea {
     /// Linux's cache-hot `current_task` per-CPU variable.  The module-visible
     /// `current_task` and `const_current_task` symbols alias this same slot.
     current_task: AtomicUsize,
+    /// Linux's cache-hot `cpu_current_top_of_stack` variable.  User entry
+    /// paths load this slot after `SWAPGS`; it is updated with `current_task`
+    /// during the architecture context switch.
+    current_top_of_stack: AtomicU64,
     /// Scratch slot used by `entry_SYSCALL_64` while RSP still points into
     /// userspace.  Linux uses `cpu_tss_rw.sp2` for the same purpose.
     syscall_user_rsp: AtomicU64,
@@ -79,6 +83,7 @@ impl LinuxPerCpuArea {
             _cpu_number_pad: 0,
             this_cpu_off: AtomicU64::new(0),
             current_task: AtomicUsize::new(0),
+            current_top_of_stack: AtomicU64::new(0),
             syscall_user_rsp: AtomicU64::new(0),
             syscall_tss: AtomicUsize::new(0),
             preempt_count: AtomicU32::new(0),
@@ -107,6 +112,7 @@ pub const CPU_NUMBER_OFFSET: usize = offset_of!(LinuxPerCpuArea, cpu_number);
 pub const PREEMPT_COUNT_OFFSET: usize = offset_of!(LinuxPerCpuArea, preempt_count);
 pub const SYSCALL_USER_RSP_OFFSET: usize = offset_of!(LinuxPerCpuArea, syscall_user_rsp);
 pub const SYSCALL_TSS_OFFSET: usize = offset_of!(LinuxPerCpuArea, syscall_tss);
+pub const CURRENT_TOP_OF_STACK_OFFSET: usize = offset_of!(LinuxPerCpuArea, current_top_of_stack);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PerCpuLayout {
@@ -253,6 +259,19 @@ pub fn set_current_task(cpu: usize, task: usize) {
         .store(task, Ordering::Release);
 }
 
+/// Install Linux's `cpu_current_top_of_stack` for a logical CPU.
+pub fn set_current_top_of_stack(cpu: usize, stack_top: u64) {
+    LINUX_PER_CPU_AREAS[cpu.min(MAX_CPUS - 1)]
+        .current_top_of_stack
+        .store(stack_top, Ordering::Release);
+}
+
+pub fn current_top_of_stack(cpu: usize) -> u64 {
+    LINUX_PER_CPU_AREAS[cpu.min(MAX_CPUS - 1)]
+        .current_top_of_stack
+        .load(Ordering::Acquire)
+}
+
 pub fn current_task(cpu: usize) -> usize {
     LINUX_PER_CPU_AREAS[cpu.min(MAX_CPUS - 1)]
         .current_task
@@ -350,6 +369,20 @@ mod tests {
         assert_eq!(
             current_task_symbol(),
             core::ptr::addr_of!(LINUX_PER_CPU_AREAS[0].current_task) as usize
+        );
+    }
+
+    /// test-origin: linux:vendor/linux/arch/x86/kernel/process_64.c:__switch_to
+    #[test]
+    fn current_top_of_stack_slots_are_cpu_local() {
+        set_current_top_of_stack(1, 0x1111);
+        set_current_top_of_stack(2, 0x2222);
+
+        assert_eq!(current_top_of_stack(1), 0x1111);
+        assert_eq!(current_top_of_stack(2), 0x2222);
+        assert_eq!(
+            CURRENT_TOP_OF_STACK_OFFSET,
+            core::mem::offset_of!(LinuxPerCpuArea, current_top_of_stack)
         );
     }
 

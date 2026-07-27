@@ -333,12 +333,30 @@ unsafe fn validate_incoming_switch_frame(next: *mut TaskStruct) {
     // 0xffff_8881_776d_2000) slipped through. Reject those.
     let higher_half = continuation >= 0xffff_ffff_8000_0000;
     if !boot_text && !higher_half {
+        let frame = sp as *const u64;
+        let frame_words = [
+            unsafe { frame.read_volatile() },
+            unsafe { frame.add(1).read_volatile() },
+            unsafe { frame.add(2).read_volatile() },
+            unsafe { frame.add(3).read_volatile() },
+            unsafe { frame.add(4).read_volatile() },
+            unsafe { frame.add(5).read_volatile() },
+            unsafe { frame.add(6).read_volatile() },
+        ];
         panic!(
-            "switch frame has low continuation: pid={} task={:#018x} sp={:#018x} ret={:#018x}",
+            "switch frame has low continuation: pid={} comm={:?} task={:#018x} cpu={} sp={:#018x} stack=[{:#018x},{:#018x}) ret={:#018x} frame={:?} state={:#x} on_cpu={} on_rq={}",
             unsafe { (*next).pid },
+            unsafe { (*next).comm },
             next as usize,
+            crate::kernel::sched::current_cpu(),
             sp,
+            stack_bottom,
+            stack_top,
             continuation,
+            frame_words,
+            unsafe { (*next).__state.load(Ordering::Acquire) },
+            unsafe { (*next).m29.on_cpu.load(Ordering::Acquire) },
+            unsafe { (*next).m29.on_rq },
         );
     }
 }
@@ -675,9 +693,10 @@ pub unsafe extern "C" fn __switch_to(
         load_fsgs(prev, next);
     }
 
-    // 1. Update TSS.RSP0 to the top of next's kernel stack so that the next
-    //    ring-3 → ring-0 transition (syscall or interrupt from user) loads
-    //    next's kernel stack pointer instead of prev's.
+    // Linux publishes current_task and cpu_current_top_of_stack together
+    // before reloading the hardware TSS stack. User entry code reads the
+    // per-CPU top-of-stack slot, while privilege-changing hardware entries
+    // still read TSS.RSP0.
     //
     //    `next->stack` points to the top of the task's kernel stack page
     //    (one byte past the highest usable address, since x86 stacks grow down).
@@ -688,16 +707,19 @@ pub unsafe extern "C" fn __switch_to(
         stack_top != 0,
         "__switch_to: next task has null kernel stack"
     );
-    unsafe {
-        crate::arch::x86::kernel::tss::set_rsp0(stack_top);
-    }
-
-    // 2. Update the per-CPU current_task pointer so that `get_current()`
+    // 1. Update the per-CPU current_task pointer so that `get_current()`
     //    returns `next` from this point forward on this CPU.
     //
     //    Ref: Linux process_64.c `raw_cpu_write(current_task, next_p)`
     unsafe {
         crate::kernel::sched::set_current(next);
+    }
+
+    // 2. Update TSS.RSP0 to the top of next's kernel stack so that the next
+    //    ring-3 → ring-0 transition handled by hardware starts on next's
+    //    stack. Ref: Linux process_64.c `update_task_stack()`.
+    unsafe {
+        crate::arch::x86::kernel::tss::set_rsp0(stack_top);
     }
 
     // Linux deliberately carries rq->prev_mm through context_switch() and

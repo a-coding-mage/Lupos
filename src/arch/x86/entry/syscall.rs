@@ -158,12 +158,12 @@ pub unsafe extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
         // Save the user entry context before we touch any registers.
         "swapgs",
-        // Linux uses the per-CPU TSS sp2 slot as scratch here.  Lupos keeps an
-        // equivalent GS-relative scratch slot and a pointer to the CPU-local
-        // TSS, whose RSP0 is maintained by __switch_to().
+        // Linux uses the per-CPU TSS sp2 slot as scratch here, then loads
+        // cpu_current_top_of_stack rather than reading TSS.RSP0.  The TSS
+        // remains the hardware privilege-transition source; this software
+        // entry must follow Linux's current-task stack publication exactly.
         "mov qword ptr gs:[rip + {percpu_base} + {user_rsp_offset}], rsp",
-        "mov rsp, qword ptr gs:[rip + {percpu_base} + {syscall_tss_offset}]",
-        "mov rsp, qword ptr [rsp + 4]",
+        "mov rsp, qword ptr gs:[rip + {percpu_base} + {current_top_of_stack_offset}]",
 
         // Construct a Linux-shaped `struct pt_regs` on the kernel stack.
         "push {user_ds}", // ss
@@ -282,8 +282,7 @@ pub unsafe extern "C" fn syscall_entry() {
         percpu_base = sym crate::arch::x86::kernel::setup_percpu::LINUX_PER_CPU_AREAS,
         user_rsp_offset =
             const crate::arch::x86::kernel::setup_percpu::SYSCALL_USER_RSP_OFFSET,
-        syscall_tss_offset =
-            const crate::arch::x86::kernel::setup_percpu::SYSCALL_TSS_OFFSET,
+        current_top_of_stack_offset = const crate::arch::x86::kernel::setup_percpu::CURRENT_TOP_OF_STACK_OFFSET,
         dispatch_ptregs = sym syscall_dispatch_ptregs,
         exit_slowpath = sym syscall_exit_slowpath,
         should_use_sysret = sym syscall_should_use_sysret,
@@ -477,6 +476,22 @@ pub unsafe extern "C" fn syscall_dispatch_ptregs(
     unsafe { syscall_dispatch_ptregs_inner(regs) }
 }
 
+// Investigation-only hook.  It is deliberately called only for the real-time
+// graphics reproducer's `aplay` task so GDB can arm a hardware watchpoint on
+// that task's kernel-stack return slot without stopping every syscall in the
+// desktop session.  Remove this hook after the first writer is identified.
+#[cfg(not(test))]
+#[unsafe(no_mangle)]
+pub static AUDIO_CORRUPTOR_APLAY_STACK_TOP: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(not(test))]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn audio_corruptor_aplay_stack_probe(stack_top: u64) {
+    AUDIO_CORRUPTOR_APLAY_STACK_TOP.store(stack_top, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Last jiffy on which the per-syscall console drain ran (throttle state).
 ///
 /// The common case is a read that observes the current jiffy. Only syscalls
@@ -503,6 +518,18 @@ unsafe fn syscall_dispatch_ptregs_inner(
 
     let nr = unsafe { (*regs).orig_rax } as usize;
     let task = current_task_for_syscall();
+    #[cfg(not(test))]
+    let is_aplay = !task.is_null()
+        && unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::addr_of!((*task).comm) as *const u8,
+                5,
+            ) == b"aplay"
+        };
+    #[cfg(not(test))]
+    if is_aplay {
+        audio_corruptor_aplay_stack_probe(unsafe { (*task).stack as u64 });
+    }
     let hook_state = syscall_enter(unsafe { &*regs }, task);
     trace_udev_syscall_enter(unsafe { &*regs }, task);
     trace_stall_syscall_enter(unsafe { &*regs }, task);
@@ -1973,7 +2000,8 @@ mod tests {
     }
 
     #[test]
-    fn syscall_entry_uses_cpu_local_scratch_and_tss() {
+    fn syscall_entry_uses_linux_cpu_local_scratch_and_current_stack() {
+        // test-origin: linux:vendor/linux/arch/x86/entry/entry_64.S:entry_SYSCALL_64
         let source = include_str!("syscall.rs");
         let entry = source
             .split("pub unsafe extern \"C\" fn syscall_entry()")
@@ -1984,7 +2012,8 @@ mod tests {
             .expect("syscall entry stub must end before exit slowpath");
 
         assert!(entry.contains("gs:[rip + {percpu_base} + {user_rsp_offset}]"));
-        assert!(entry.contains("gs:[rip + {percpu_base} + {syscall_tss_offset}]"));
+        assert!(entry.contains("gs:[rip + {percpu_base} + {current_top_of_stack_offset}]"));
+        assert!(!entry.contains("{syscall_tss_offset}"));
         assert!(!entry.contains("sym crate::arch::x86::kernel::tss::TSS"));
     }
 
