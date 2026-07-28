@@ -14,8 +14,7 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering, fence};
 
-use spin::Mutex;
-
+use crate::kernel::locking::RawSpinLocked;
 use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::task::{TaskStruct, task_state};
 
@@ -58,10 +57,16 @@ pub fn register_module_exports() {
 }
 
 pub struct WaitQueueHead {
-    waiters: Mutex<Vec<WaitQueueEntry>>,
+    /// Linux `struct wait_queue_head::lock` is a spinlock, not a sleepable
+    /// mutex.  The irqsave acquisition also disables preemption while the
+    /// callback/list walk is in progress.
+    waiters: RawSpinLocked<Vec<WaitQueueEntry>>,
 }
 
-pub type WaitQueueCallback = fn(usize, usize);
+/// Poll wakeups carry Linux's `key_to_poll()` mask to the callback.  A
+/// callback which registered interest in EPOLLIN must not be woken by an
+/// EPOLLOUT-only event on the same waitqueue (eventfd is the common case).
+pub type WaitQueueCallback = fn(usize, usize, u32);
 
 enum WaitQueueEntry {
     Task {
@@ -84,20 +89,19 @@ unsafe impl Sync for WaitQueueHead {}
 impl WaitQueueHead {
     pub const fn new() -> Self {
         Self {
-            waiters: Mutex::new(Vec::new()),
+            waiters: RawSpinLocked::new(Vec::new()),
         }
     }
 
     fn with_waiters<R>(&self, f: impl FnOnce(&mut Vec<WaitQueueEntry>) -> R) -> R {
-        // Linux waitqueue locks are irqsave spinlocks. Every access must mask
-        // local IRQs so an interrupt-side wake cannot spin on a lock held by
-        // the task frame it interrupted.
-        let flags = crate::kernel::locking::irqflags::local_irq_save();
-        let result = {
-            let mut waiters = self.waiters.lock();
-            f(&mut waiters)
-        };
-        crate::kernel::locking::irqflags::local_irq_restore(flags);
+        // Linux `__wake_up_common_lock()` and the waitqueue registration
+        // helpers use `spin_lock_irqsave()`.  In addition to masking local
+        // IRQs, the raw-spin wrapper disables preemption, so a scheduler
+        // transition cannot strand a held waitqueue lock on another task's
+        // stack.
+        let (mut waiters, flags) = self.waiters.lock_irqsave();
+        let result = f(&mut waiters);
+        RawSpinLocked::unlock_irqrestore(waiters, flags);
         result
     }
 
@@ -188,75 +192,58 @@ impl WaitQueueHead {
         if task.is_null() {
             return;
         }
+
+        // Linux `finish_wait()` publishes TASK_RUNNING before it takes the
+        // waitqueue lock.  A concurrent `try_to_wake_up()` must therefore see
+        // that this task has already resumed and return without waiting for an
+        // `on_cpu` handoff while the waiter lock is held elsewhere.
+        // Ref: vendor/linux/kernel/sched/wait.c:375-396.
+        unsafe {
+            (*task)
+                .__state
+                .store(task_state::TASK_RUNNING, Ordering::Release);
+        }
         self.with_waiters(|waiters| {
             if let Some(pos) = waiters.iter().position(|queued| {
                 matches!(queued, WaitQueueEntry::Task { task: queued, .. } if *queued == task)
             }) {
                 waiters.remove(pos);
             }
-            unsafe {
-                (*task)
-                    .__state
-                    .store(task_state::TASK_RUNNING, Ordering::Release);
-            }
         });
     }
 
-    fn wake_callbacks(&self) {
+    fn wake_callbacks_locked(waiters: &mut Vec<WaitQueueEntry>, key: u32) {
         let mut last_id = None;
         loop {
-            let next = self.with_waiters(|waiters| {
-                waiters
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        WaitQueueEntry::Callback {
-                            id,
-                            callback,
-                            data1,
-                            data2,
-                        } if last_id.is_none_or(|last| *id > last) => {
-                            Some((*id, *callback, *data1, *data2))
-                        }
-                        _ => None,
-                    })
-                    .min_by_key(|(id, _, _, _)| *id)
-            });
+            let next = waiters
+                .iter()
+                .filter_map(|entry| match entry {
+                    WaitQueueEntry::Callback {
+                        id,
+                        callback,
+                        data1,
+                        data2,
+                    } if last_id.is_none_or(|last| *id > last) => {
+                        Some((*id, *callback, *data1, *data2))
+                    }
+                    _ => None,
+                })
+                .min_by_key(|(id, _, _, _)| *id);
             let Some((id, callback, data1, data2)) = next else {
                 break;
             };
             last_id = Some(id);
-            callback(data1, data2);
+            callback(data1, data2, key);
         }
     }
 
-    fn take_one_task(&self) -> Option<WaitQueueEntry> {
-        self.with_waiters(|waiters| {
-            waiters
-                .iter()
-                .rposition(|entry| matches!(entry, WaitQueueEntry::Task { .. }))
-                .map(|pos| waiters.remove(pos))
-        })
-    }
-
-    pub fn wake_up_one(&self) -> Option<*mut TaskStruct> {
-        self.wake_callbacks();
-        let entry = self.take_one_task();
-        if let Some(WaitQueueEntry::Task { task, triggered }) = entry {
-            if let Some(triggered) = triggered {
-                triggered.store(true, Ordering::SeqCst);
-            }
-            unsafe {
-                crate::kernel::sched::wake_task_normal(task);
-            }
-            return Some(task);
-        }
-        None
-    }
-
-    pub fn wake_up_all(&self) -> usize {
-        self.wake_callbacks();
+    fn wake_tasks_locked(waiters: &mut Vec<WaitQueueEntry>) -> usize {
         let mut count = 0;
-        while let Some(entry) = self.take_one_task() {
+        while let Some(pos) = waiters
+            .iter()
+            .rposition(|entry| matches!(entry, WaitQueueEntry::Task { .. }))
+        {
+            let entry = waiters.remove(pos);
             if let WaitQueueEntry::Task { task, triggered } = entry {
                 if let Some(triggered) = triggered {
                     triggered.store(true, Ordering::SeqCst);
@@ -269,6 +256,65 @@ impl WaitQueueHead {
         }
         count
     }
+
+    pub fn wake_up_one(&self) -> Option<*mut TaskStruct> {
+        let (mut waiters, flags) = self.waiters.lock_irqsave();
+        Self::wake_callbacks_locked(&mut waiters, u32::MAX);
+        let entry = waiters
+            .iter()
+            .rposition(|entry| matches!(entry, WaitQueueEntry::Task { .. }))
+            .map(|pos| waiters.remove(pos));
+        RawSpinLocked::unlock_irqrestore(waiters, flags);
+        if let Some(WaitQueueEntry::Task { task, triggered }) = entry {
+            if let Some(triggered) = triggered {
+                triggered.store(true, Ordering::SeqCst);
+            }
+            unsafe {
+                crate::kernel::sched::wake_task_normal(task);
+            }
+            return Some(task);
+        }
+        None
+    }
+
+    /// Wake waiters with a Linux poll/event key.  `u32::MAX` is the local
+    /// equivalent of a wakeup without a poll key and preserves the generic
+    /// `wake_up_all()` behavior for queues whose producer has no mask.
+    pub fn wake_up_poll(&self, key: u32) -> usize {
+        let (mut waiters, flags) = self.waiters.lock_irqsave();
+        Self::wake_callbacks_locked(&mut waiters, key);
+        let count = Self::wake_tasks_locked(&mut waiters);
+        RawSpinLocked::unlock_irqrestore(waiters, flags);
+        count
+    }
+
+    /// Apply a producer-side state transition while holding the waitqueue
+    /// lock, then publish the matching poll wake before releasing it.
+    ///
+    /// Linux eventfd keeps `ctx->count` and `wqh` under the same
+    /// `spin_lock_irqsave()` critical section. The boolean says whether the
+    /// transition changed the state and therefore needs a wakeup; returning
+    /// the operation's value keeps this helper useful for both read and write
+    /// paths without exposing the waitqueue storage.
+    pub fn update_and_wake_poll<R>(
+        &self,
+        key: u32,
+        update: impl FnOnce() -> (R, bool),
+    ) -> R {
+        let (mut waiters, flags) = self.waiters.lock_irqsave();
+        let (result, wake) = update();
+        if wake {
+            Self::wake_callbacks_locked(&mut waiters, key);
+            Self::wake_tasks_locked(&mut waiters);
+        }
+        RawSpinLocked::unlock_irqrestore(waiters, flags);
+        result
+    }
+
+    pub fn wake_up_all(&self) -> usize {
+        self.wake_up_poll(u32::MAX)
+    }
+
 }
 
 pub unsafe fn prepare_to_wait(queue: &WaitQueueHead, task: *mut TaskStruct, state: u32) {
@@ -375,6 +421,84 @@ mod tests {
             Some(linux_woken_wake_function as usize)
         );
     }
+
+    /// Linux's waitqueue lock is a `spinlock_t` acquired with IRQ-save
+    /// semantics in `add_wait_queue()`, `remove_wait_queue()`, and
+    /// `__wake_up_common_lock()`.  A sleepable/external mutex here can be
+    /// retained across a scheduler transition and stall unrelated CPUs.
+    ///
+    /// test-origin: linux:vendor/linux/kernel/sched/wait.c:add_wait_queue
+    /// test-origin: linux:vendor/linux/kernel/sched/wait.c:__wake_up_common_lock
+    #[test]
+    fn waitqueue_storage_uses_raw_spin_irqsave_lock() {
+        let source = include_str!("wait.rs");
+        assert!(source.contains("waiters: RawSpinLocked<Vec<WaitQueueEntry>>"));
+        assert!(source.contains("self.waiters.lock_irqsave()"));
+        assert!(source.contains("RawSpinLocked::unlock_irqrestore"));
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/wait.c:finish_wait
+    ///
+    /// Linux changes the task state before taking the waitqueue lock.  The
+    /// ordering is observable: a concurrent wake must see TASK_RUNNING while
+    /// the resumed task is removing its entry, rather than waiting for its
+    /// `on_cpu` handoff while another CPU owns the queue lock.
+    #[test]
+    fn finish_wait_publishes_running_before_locking_the_queue() {
+        let source = include_str!("wait.rs");
+        let body = source
+            .split("pub unsafe fn finish_wait")
+            .nth(1)
+            .and_then(|body| body.split("fn wake_callbacks_locked").next())
+            .expect("finish_wait body must remain present");
+        let publish = body
+            .find(".store(task_state::TASK_RUNNING, Ordering::Release)")
+            .expect("finish_wait must publish TASK_RUNNING");
+        let lock = body
+            .find("self.with_waiters")
+            .expect("finish_wait must remove the wait entry under its lock");
+        assert!(
+            publish < lock,
+            "Linux finish_wait publishes TASK_RUNNING before waitqueue lock acquisition"
+        );
+
+        let mut task = task();
+        task.__state
+            .store(task_state::TASK_INTERRUPTIBLE, Ordering::Release);
+        let queue = WaitQueueHead::new();
+        unsafe { queue.prepare_to_wait(&mut *task, task_state::TASK_INTERRUPTIBLE) };
+        unsafe { queue.finish_wait(&mut *task) };
+        assert_eq!(
+            task.__state.load(Ordering::Acquire),
+            task_state::TASK_RUNNING
+        );
+        assert!(queue.is_empty());
+    }
+
+    static LAST_POLL_WAKE_KEY: AtomicU32 = AtomicU32::new(0);
+
+    fn record_poll_wake_key(_data1: usize, _data2: usize, key: u32) {
+        LAST_POLL_WAKE_KEY.store(key, Ordering::Release);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/wait.c:__wake_up_common
+    /// and vendor/linux/fs/select.c:pollwake
+    ///
+    /// Linux carries the producer's poll mask through a waitqueue callback;
+    /// without it an eventfd EPOLLOUT wake can spuriously requeue an EPOLLIN
+    /// watcher and turn an event loop into a busy loop.
+    #[test]
+    fn poll_wakeup_propagates_linux_event_key() {
+        let queue = WaitQueueHead::new();
+        LAST_POLL_WAKE_KEY.store(0, Ordering::Release);
+        queue.add_callback(17, record_poll_wake_key, 0, 0);
+        queue.wake_up_poll(crate::fs::select::POLLOUT as u32);
+        assert_eq!(
+            LAST_POLL_WAKE_KEY.load(Ordering::Acquire),
+            crate::fs::select::POLLOUT as u32
+        );
+    }
+
 
     #[test]
     fn woken_wake_function_sets_woken_and_wakes_matching_task_state() {

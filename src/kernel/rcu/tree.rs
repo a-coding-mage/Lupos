@@ -21,6 +21,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 use super::segcblist::SegCbList;
 use super::types::RcuHead;
+use crate::kernel::locking::RawSpinLocked;
 use crate::kernel::sched::MAX_CPUS;
 
 /// Global grace-period sequence (Linux `gp_seq`).
@@ -42,8 +43,14 @@ static READ_LOCK_NEST: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX
 
 /// Per-CPU segmented callback list.  Allocated on first call_rcu via the
 /// slab; for M34 we use a static array.
-use spin::Mutex;
-static CB_LISTS: [Mutex<SegCbList>; MAX_CPUS] = [const { Mutex::new(SegCbList::new()) }; MAX_CPUS];
+///
+/// Linux protects the callback list with a raw spinlock and IRQ-save
+/// semantics.  The atomic count lets the scheduler-clock hook decide whether
+/// this CPU needs an RCU softirq without taking that lock from hard IRQ
+/// context.
+static CB_LISTS: [RawSpinLocked<SegCbList>; MAX_CPUS] =
+    [const { RawSpinLocked::new(SegCbList::new()) }; MAX_CPUS];
+static CB_COUNTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 #[inline]
 fn cpu_index() -> usize {
@@ -171,12 +178,42 @@ pub fn call_rcu(head: *mut RcuHead, func: unsafe extern "C" fn(*mut RcuHead)) {
     // Begin a new grace period before publishing the callback. A local timer
     // tick alone must not recycle a vmapped stack another CPU can still see.
     GP_SEQ.fetch_add(1, Ordering::AcqRel);
-    let mut cbs = CB_LISTS[cpu_index()].lock();
+    let cpu = cpu_index();
+    let (mut cbs, flags) = CB_LISTS[cpu].lock_irqsave();
     unsafe {
         cbs.enqueue(head);
     }
-    drop(cbs);
+    CB_COUNTS[cpu].fetch_add(1, Ordering::Release);
+    RawSpinLocked::unlock_irqrestore(cbs, flags);
     crate::kernel::softirq::raise_softirq(crate::kernel::softirq::SoftIrqVec::Rcu);
+}
+
+/// Linux `rcu_sched_clock_irq()` asks RCU core to run when this CPU has
+/// callbacks pending.  Keeping this retry at the scheduler-clock boundary is
+/// important: a grace period can be incomplete when the first RCU softirq
+/// runs, but immediately re-raising the same softirq would monopolize
+/// `__do_softirq()` and starve ordinary work.
+pub fn rcu_sched_clock_irq() {
+    let cpu = cpu_index();
+    if CB_COUNTS[cpu].load(Ordering::Acquire) != 0 {
+        crate::kernel::softirq::raise_softirq(crate::kernel::softirq::SoftIrqVec::Rcu);
+    }
+}
+
+fn dequeue_callback(cpu: usize) -> *mut RcuHead {
+    let (mut cbs, flags) = CB_LISTS[cpu].lock_irqsave();
+    let head = cbs.dequeue();
+    if !head.is_null() {
+        CB_COUNTS[cpu].fetch_sub(1, Ordering::AcqRel);
+    }
+    RawSpinLocked::unlock_irqrestore(cbs, flags);
+    head
+}
+
+unsafe fn invoke_callback(head: *mut RcuHead) {
+    if let Some(func) = unsafe { (*head).func.take() } {
+        unsafe { func(head) };
+    }
 }
 
 /// `rcu_check_callbacks()` — invoked from the Timer softirq once per tick.
@@ -190,17 +227,36 @@ pub fn rcu_check_callbacks() {
             || QS_AT_GP[cpu].load(Ordering::Acquire) >= target
     });
     if !complete {
-        crate::kernel::softirq::raise_softirq(crate::kernel::softirq::SoftIrqVec::Rcu);
+        // Linux leaves the work for the next scheduler-clock/RCU-core pass.
+        // Re-raising here makes __do_softirq() chase a moving grace-period
+        // target indefinitely when task-stack callbacks arrive continuously.
         return;
     }
-    let mut cbs = CB_LISTS[cpu_index()].lock();
-    while let head_ptr = cbs.dequeue() {
+
+    // Linux extracts callbacks under the RCU lock and invokes them after the
+    // lock is released.  Bound one pass so a callback flood cannot monopolize
+    // a softirq; any remainder is picked up by the normal bounded softirq
+    // restart/ksoftirqd path.
+    const MAX_CALLBACKS_PER_PASS: usize = 64;
+    let cpu = cpu_index();
+    // Linux's segmented callback list advances only the callbacks which were
+    // ready at the grace-period boundary.  A callback may legally repost its
+    // rcu_head from inside the callback; that repost belongs to a later grace
+    // period and must not be consumed by this same pass.  Snapshot the count
+    // before invoking anything so the callback loop cannot run into that new
+    // segment.
+    let ready_callbacks = CB_COUNTS[cpu]
+        .load(Ordering::Acquire)
+        .min(MAX_CALLBACKS_PER_PASS as u64) as usize;
+    for _ in 0..ready_callbacks {
+        let head_ptr = dequeue_callback(cpu);
         if head_ptr.is_null() {
             break;
         }
-        if let Some(func) = unsafe { (*head_ptr).func } {
-            unsafe { func(head_ptr) };
-        }
+        unsafe { invoke_callback(head_ptr) };
+    }
+    if CB_COUNTS[cpu].load(Ordering::Acquire) != 0 {
+        crate::kernel::softirq::raise_softirq(crate::kernel::softirq::SoftIrqVec::Rcu);
     }
 }
 
@@ -209,15 +265,13 @@ pub fn rcu_barrier() {
     // Drain every per-CPU list synchronously (grace period guaranteed by
     // synchronize_rcu before the call).
     synchronize_rcu();
-    for slot in CB_LISTS.iter() {
-        let mut cbs = slot.lock();
-        while let head_ptr = cbs.dequeue() {
+    for cpu in 0..MAX_CPUS {
+        while CB_COUNTS[cpu].load(Ordering::Acquire) != 0 {
+            let head_ptr = dequeue_callback(cpu);
             if head_ptr.is_null() {
                 break;
             }
-            if let Some(func) = unsafe { (*head_ptr).func } {
-                unsafe { func(head_ptr) };
-            }
+            unsafe { invoke_callback(head_ptr) };
         }
     }
 }
@@ -230,6 +284,8 @@ pub fn gp_seq_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static RCU_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
     #[test]
     fn rcu_read_lock_unlock_round_trip() {
@@ -278,5 +334,72 @@ mod tests {
         call_rcu(&mut head as *mut RcuHead, cb);
         rcu_check_callbacks();
         assert_eq!(FIRED.load(Ordering::Acquire), 1);
+    }
+
+    /// A callback reposted from inside its callback belongs to the next RCU
+    /// grace period.  Linux's `rcu_segcblist` keeps it out of the current
+    /// `rcu_do_batch()` extraction; a flat FIFO that drains until empty would
+    /// invoke it immediately and can free a late task_struct release early.
+    ///
+    /// test-origin: linux:vendor/linux/kernel/rcu/tree.c:rcu_do_batch
+    /// test-origin: linux:vendor/linux/kernel/rcu/rcu_segcblist.c:
+    /// rcu_segcblist_extract_done_cbs
+    #[test]
+    fn reposted_rcu_callback_waits_for_a_later_batch() {
+        let _guard = RCU_TEST_LOCK.lock();
+        static FIRED: AtomicU32 = AtomicU32::new(0);
+        static mut HEAD: RcuHead = RcuHead::new();
+
+        unsafe extern "C" fn repost_once(head: *mut RcuHead) {
+            let count = FIRED.fetch_add(1, Ordering::AcqRel) + 1;
+            if count == 1 {
+                call_rcu(head, repost_once);
+            }
+        }
+
+        rcu_init();
+        FIRED.store(0, Ordering::Release);
+        unsafe {
+            call_rcu(core::ptr::addr_of_mut!(HEAD), repost_once);
+        }
+
+        rcu_check_callbacks();
+        assert_eq!(FIRED.load(Ordering::Acquire), 1);
+
+        rcu_check_callbacks();
+        assert_eq!(FIRED.load(Ordering::Acquire), 2);
+    }
+
+    /// Linux's RCU core does not immediately requeue RCU softirq work while a
+    /// grace period is incomplete.  The next scheduler/timer pass reports the
+    /// missing quiescent state; an inline self-requeue can consume every
+    /// softirq restart and starve ordinary task progress under callback load.
+    ///
+    /// test-origin: linux:vendor/linux/kernel/rcu/tree.c:rcu_core
+    /// test-origin: linux:vendor/linux/kernel/rcu/tree.c:rcu_sched_clock_irq
+    #[test]
+    fn incomplete_grace_period_does_not_self_requeue_rcu_softirq() {
+        let _guard = RCU_TEST_LOCK.lock();
+        crate::kernel::softirq::do_softirq();
+        rcu_init();
+
+        let next_gp = GP_SEQ.load(Ordering::Acquire) + 1;
+        GP_SEQ.store(next_gp, Ordering::Release);
+        ONLINE_MASK.store(0b11, Ordering::Release);
+        QS_AT_GP[0].store(0, Ordering::Release);
+        QS_AT_GP[1].store(0, Ordering::Release);
+
+        rcu_check_callbacks();
+
+        assert_eq!(
+            crate::kernel::softirq::local_softirq_pending()
+                & crate::kernel::softirq::SoftIrqVec::Rcu.bit(),
+            0,
+            "an incomplete grace period must wait for a later timer/RCU pass"
+        );
+
+        ONLINE_MASK.store(1, Ordering::Release);
+        QS_AT_GP[1].store(0, Ordering::Release);
+        crate::kernel::softirq::do_softirq();
     }
 }

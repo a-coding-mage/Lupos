@@ -310,6 +310,24 @@ impl RemoteWakeQueue {
         entry.flags = 0;
         Some((task, wake_flags))
     }
+
+    /// Return whether the intrusive wake list still owns a scheduler
+    /// reference to `task`.
+    ///
+    /// Linux's `wake_entry.llist` is consumed while the task's scheduler
+    /// lifetime is still protected.  Lupos keeps the calibrated TaskStruct
+    /// layout unchanged, so the equivalent ownership edge is represented by
+    /// queue membership rather than an embedded refcount.
+    unsafe fn contains(&self, task: *mut TaskStruct) -> bool {
+        let mut current = self.head;
+        while !current.is_null() {
+            if current == task {
+                return true;
+            }
+            current = unsafe { (*current).m29.wake_entry.next.cast() };
+        }
+        false
+    }
 }
 
 static REMOTE_WAKE_QUEUES: [RawSpinLocked<RemoteWakeQueue>; MAX_CPUS] =
@@ -692,6 +710,19 @@ pub unsafe fn set_current(task: *mut TaskStruct) {
 #[cfg(not(test))]
 unsafe fn set_current_on_cpu(cpu: usize, task: *mut TaskStruct) {
     assert!(cpu < MAX_CPUS, "scheduler logical CPU ID is out of range");
+    // Temporary corruption probe: Linux's __switch_to() publishes a fully
+    // initialized task_struct here.  The post-ALSA fault reported a current
+    // pointer of 0x3; log only that impossible publication so normal context
+    // switches retain their timing while we distinguish a scheduler writer
+    // from a later overwrite of the per-CPU slot.
+    if !task.is_null() && (task as usize) < 0x100000 {
+        log_error!(
+            "sched",
+            "sched: invalid current_task publication cpu={} task={:#018x}",
+            cpu,
+            task as usize,
+        );
+    }
     CURRENT_TASK[cpu].store(task, Ordering::Release);
     crate::arch::x86::kernel::cpu::common::set_linux_current_task_on_cpu(cpu, task);
     let stack_top = if task.is_null() {
@@ -807,6 +838,20 @@ pub(crate) fn task_has_scheduler_reference(task: *mut TaskStruct) -> bool {
     // migration, while the local rq says nothing about its ownership.
     for cpu in 0..MAX_CPUS {
         if rq::with_rq(cpu as u32, |rq| rq.cfs.contains_task(task)).unwrap_or(false) {
+            return true;
+        }
+    }
+
+    // Linux's __ttwu_queue_wakelist() leaves the task_struct reachable from
+    // the target CPU until sched_ttwu_pending() consumes wake_entry.llist.
+    // Treat that intrusive membership as a scheduler reference as well; a
+    // release racing the IPI must not retire or recycle the task_struct while
+    // the target CPU can still pop it.
+    for queue in REMOTE_WAKE_QUEUES.iter() {
+        let (guard, irq_flags) = queue.lock_irqsave();
+        let present = unsafe { guard.contains(task) };
+        RawSpinLocked::unlock_irqrestore(guard, irq_flags);
+        if present {
             return true;
         }
     }
@@ -1706,6 +1751,19 @@ pub(crate) fn drain_remote_wakes() {
         let Some((task, wake_flags)) = pending else {
             return;
         };
+
+        // A queued wake is a scheduler-owned lifetime edge.  If exit/reap
+        // completed while the entry was pending, consume that edge before
+        // touching any TaskStruct field and retire the allocation instead of
+        // trying to activate an EXIT_DEAD task.  Keep the physical stack free
+        // on the post-switch queue because this drain can run with IRQs
+        // disabled, matching finish_task_switch()'s deferred teardown.
+        if !task_has_scheduler_reference(task)
+            && let Some(stack) = crate::kernel::fork::take_logically_released_heap_task(task)
+        {
+            defer_heap_task_release(task, stack);
+            continue;
+        }
 
         let action = unsafe {
             if task_on_cpu(task) {
@@ -3201,6 +3259,43 @@ mod tests {
             assert!(queue.push(first_ptr, 2, 0x44));
             assert_eq!(queue.pop(), Some((first_ptr, 0x44)));
         }
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:
+    /// __ttwu_queue_wakelist and sched_ttwu_pending
+    ///
+    /// Linux cannot drop the task_struct reference while a wake_entry remains
+    /// on a target CPU's pending list.  Lupos keeps that lifetime edge outside
+    /// the calibrated TaskStruct and must report the same scheduler reference
+    /// until the intrusive entry is consumed.
+    #[test]
+    fn remote_wake_queue_retains_scheduler_reference_until_pop() {
+        let _guard = LEGACY_SCHED_TEST_LOCK.lock().unwrap();
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+        let queue = &REMOTE_WAKE_QUEUES[1];
+
+        let (guard, flags) = queue.lock_irqsave();
+        assert!(guard.head.is_null(), "test wake queue must start empty");
+        RawSpinLocked::unlock_irqrestore(guard, flags);
+
+        assert!(queue_remote_wake(task_ptr, 1, 0x55));
+        assert!(
+            task_has_scheduler_reference(task_ptr),
+            "a pending remote wake must retain its TaskStruct"
+        );
+
+        let popped = {
+            let (mut guard, flags) = queue.lock_irqsave();
+            let popped = unsafe { guard.pop() };
+            RawSpinLocked::unlock_irqrestore(guard, flags);
+            popped
+        };
+        assert_eq!(popped, Some((task_ptr, 0x55)));
+        assert!(
+            !task_has_scheduler_reference(task_ptr),
+            "consuming the wake entry must drop its scheduler reference"
+        );
     }
 
     // test-origin: linux:vendor/linux/kernel/sched/core.c:wake_up_new_task

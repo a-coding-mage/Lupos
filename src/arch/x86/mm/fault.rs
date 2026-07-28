@@ -111,20 +111,34 @@ pub fn do_page_fault(frame: &ExceptionFrame) {
     // Focused return-frame probe for the reproducible post-ALSA supervisor
     // instruction fetch.  This runs before do_user_addr_fault() enables IRQs
     // or touches the mmap state, so it distinguishes a malformed hardware
-    // frame at IDT entry from a later overwrite of the saved frame.
-    if cr2 < TASK_SIZE_MAX && ec & X86_PF_INSTR != 0 && ec & X86_PF_USER == 0 {
+    // frame at IDT entry from a later overwrite of the saved frame.  Keep the
+    // probe for both low targets and vmalloc task-stack targets: a corrupted
+    // RET can fetch from the stack itself, which is still a supervisor
+    // instruction-fetch fault even though CR2 is above TASK_SIZE_MAX.
+    if ec & X86_PF_INSTR != 0 && ec & X86_PF_USER == 0 {
         let raw = frame as *const ExceptionFrame as *const u64;
         let task = unsafe { sched::get_current() };
-        let (pid, task_ptr) = if task.is_null() {
-            (-1, 0usize)
+        let (pid, task_ptr, stack_top, thread_sp, state, on_cpu) = if task.is_null() {
+            (-1, 0usize, 0usize, 0u64, 0u32, false)
         } else {
-            (unsafe { (*task).pid }, task as usize)
+            (
+                unsafe { (*task).pid },
+                task as usize,
+                unsafe { (*task).stack as usize },
+                unsafe { (*task).thread.sp },
+                unsafe { (*task).__state.load(Ordering::Acquire) },
+                unsafe { sched::task_on_cpu(task) },
+            )
         };
         log_error!(
             "cpu",
-            "cpu: #PF entry-frame task-pid={} task={:#018x} ptr={:#018x} orig_ax={:#018x} rip={:#018x} cs={:#018x} flags={:#018x} user_rsp={:#018x}",
+            "cpu: #PF entry-frame task-pid={} task={:#018x} stack={:#018x} thread-sp={:#018x} state={:#010x} on-cpu={} ptr={:#018x} orig_ax={:#018x} rip={:#018x} cs={:#018x} flags={:#018x} user_rsp={:#018x}",
             pid,
             task_ptr,
+            stack_top,
+            thread_sp,
+            state,
+            on_cpu,
             raw as usize,
             unsafe { raw.add(15).read_volatile() },
             unsafe { raw.add(16).read_volatile() },
@@ -766,8 +780,10 @@ fn log_page_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
         {
             log_error!(
                 "cpu",
-                "cpu: #PF interrupted-rsp={:#018x} stack-return-68={:#018x} stack-return-a0={:#018x}",
+                "cpu: #PF interrupted-rsp={:#018x} stack-return-08={:#018x} stack-return-10={:#018x} stack-return-68={:#018x} stack-return-a0={:#018x}",
                 interrupted_rsp,
+                unsafe { core::ptr::read_unaligned((interrupted_rsp - 0x08) as *const u64) },
+                unsafe { core::ptr::read_unaligned((interrupted_rsp - 0x10) as *const u64) },
                 unsafe { core::ptr::read_unaligned((interrupted_rsp + 0x68) as *const u64) },
                 unsafe { core::ptr::read_unaligned((interrupted_rsp + 0xa0) as *const u64) },
             );
