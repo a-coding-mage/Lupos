@@ -151,12 +151,11 @@ pub unsafe fn do_exit(code: i64) -> ! {
     // single-task degenerate case `schedule()` is a no-op and we spin.
     loop {
         unsafe {
-            if (*tsk).m26.exit_state == EXIT_DEAD {
-                // Linux reaches do_task_dead() after exit_notify(); the final
-                // state transition causes finish_task_switch() to drop the
-                // scheduler-owned current reference.
-                (*tsk).__state.store(TASK_DEAD, Ordering::Release);
-            }
+            // Linux reaches do_task_dead() after exit_notify() for both
+            // autoreaped tasks and ordinary zombies.  The scheduler state is
+            // therefore TASK_DEAD even while exit_state remains EXIT_ZOMBIE
+            // until a parent reaps the task.
+            (*tsk).__state.store(TASK_DEAD, Ordering::Release);
             sched::schedule_with_irqs_enabled();
         }
         core::hint::spin_loop();
@@ -571,9 +570,6 @@ pub unsafe fn release_task(p: *mut TaskStruct) {
         // authoritative membership entry, so clear it at exactly that point.
         let removed_group_member = crate::kernel::signal::release_signal_task_binding(p);
 
-        (*p).__state.store(EXIT_DEAD, Ordering::Release);
-        (*p).m26.exit_state = EXIT_DEAD;
-
         // Linux release_task(): the last nonleader publishes the already-dead
         // leader to its parent. Until this point wait/pidfd deliberately hide
         // that EXIT_ZOMBIE leader via delay_group_leader().
@@ -733,6 +729,7 @@ mod tests {
         t.tgid = tgid;
         t.m26 = M26Fields::zeroed();
         t.m26.exit_signal = SIGCHLD;
+        t.m29.sched_class = &crate::kernel::sched::fair::FAIR_SCHED_CLASS;
         t
     }
 
@@ -1263,11 +1260,19 @@ mod tests {
             unsafe { copy_process(&mut *parent as *mut TaskStruct, &args) }.expect("copy_process");
         assert_eq!(parent.m26.children_count, 1);
 
-        unsafe { release_task(child) };
+        unsafe {
+            release_task(child);
+            // The host test target reports IRQs disabled, while production
+            // drains this post-switch queue after restoring local IRQs.
+            sched::finish_deferred_heap_task_releases();
+        }
         // A converging scheduler/wait reaper may retain only the pointer
         // value.  Duplicate release must be rejected before dereferencing the
         // now-freed allocation.
-        unsafe { release_task(child) };
+        unsafe {
+            release_task(child);
+            sched::finish_deferred_heap_task_releases();
+        }
 
         assert_eq!(TASK_FREE_COUNT.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(heap_task_count(), baseline);
@@ -1295,7 +1300,7 @@ mod tests {
 
         unsafe {
             (*child).m26.exit_state = EXIT_ZOMBIE;
-            (*child).__state.store(EXIT_ZOMBIE, Ordering::Release);
+            (*child).__state.store(TASK_DEAD, Ordering::Release);
             (*child).m29.on_cpu.store(1, Ordering::Release);
             sched::set_current(child);
 
@@ -1311,11 +1316,22 @@ mod tests {
             heap_task_allocation_tracked_for_tests(child),
             "release_task must not free the allocation while it is still current"
         );
+        assert_eq!(
+            unsafe { (*child).__state.load(Ordering::Acquire) },
+            TASK_DEAD,
+            "release_task must preserve Linux's already-dead scheduler state"
+        );
+        assert_eq!(
+            unsafe { (*child).m26.exit_state },
+            EXIT_ZOMBIE,
+            "release_task must not rewrite Linux's exit_state"
+        );
 
         unsafe {
             sched::set_current(&mut *parent as *mut TaskStruct);
             (*child).__state.store(TASK_DEAD, Ordering::Release);
             sched::finish_task_switch(child);
+            sched::finish_deferred_heap_task_releases();
             sched::set_current(previous_current);
         }
 
@@ -1323,6 +1339,50 @@ mod tests {
             !heap_task_allocation_tracked_for_tests(child),
             "finish_task_switch must drop the final current-task allocation"
         );
+        assert_eq!(heap_task_count(), baseline);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:finish_task_switch
+    /// and linux:vendor/linux/kernel/fork.c:release_task_stack
+    ///
+    /// Linux drops a dead task's stack in finish_task_switch(), even when the
+    /// process remains an EXIT_ZOMBIE until its parent later reaps it. There
+    /// is no upstream test for Lupos's external heap-task tracker, so this
+    /// focused lifecycle test checks the Linux stack/task_struct split.
+    #[test]
+    fn finish_task_switch_releases_dead_zombie_stack_before_reap() {
+        let baseline = heap_task_count();
+        let previous_current = unsafe { sched::get_current() };
+        let mut parent = make_task(9150, 9150);
+        let args = KernelCloneArgs {
+            kthread: 1,
+            ..KernelCloneArgs::default()
+        };
+        let child =
+            unsafe { copy_process(&mut *parent as *mut TaskStruct, &args) }.expect("copy_process");
+        let child_stack = unsafe { (*child).stack };
+
+        unsafe {
+            (*child).m26.exit_state = EXIT_ZOMBIE;
+            (*child).__state.store(TASK_DEAD, Ordering::Release);
+            (*child).m29.on_cpu.store(1, Ordering::Release);
+            sched::set_current(child);
+            sched::set_current(&mut *parent as *mut TaskStruct);
+            sched::finish_task_switch(child);
+            sched::finish_deferred_heap_task_releases();
+        }
+
+        assert_ne!(child_stack as usize, 0);
+        assert_eq!(unsafe { (*child).stack as usize }, 0);
+        assert!(heap_task_allocation_tracked_for_tests(child));
+        assert_eq!(unsafe { (*child).m26.exit_state }, EXIT_ZOMBIE);
+
+        unsafe {
+            release_task(child);
+            sched::finish_deferred_heap_task_releases();
+            sched::set_current(previous_current);
+        }
+        assert!(!heap_task_allocation_tracked_for_tests(child));
         assert_eq!(heap_task_count(), baseline);
     }
 
@@ -1356,6 +1416,10 @@ mod tests {
 
         unsafe {
             unpin_task_for_mmap_waiter(child);
+            // Host unit tests run with the synthetic IRQ flags disabled. The
+            // production path drains this queue after the scheduler restores
+            // IRQs; do the same explicitly before checking final ownership.
+            sched::finish_deferred_heap_task_releases();
         }
         assert!(
             !heap_task_allocation_tracked_for_tests(child),

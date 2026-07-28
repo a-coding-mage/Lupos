@@ -146,6 +146,7 @@ const TASK_PTR_INDEX_DELETED: usize = usize::MAX - 1;
 struct HeapTaskEntry {
     task: *mut TaskStruct,
     stack: *mut u8,
+    stack_released: bool,
     released: bool,
     release_complete: bool,
     /// Linux's task_struct reference held by a queued rwsem waiter.  The
@@ -218,6 +219,7 @@ impl HeapTaskReservation {
         tracker.entries[slot] = Some(HeapTaskEntry {
             task,
             stack,
+            stack_released: false,
             released: false,
             release_complete: false,
             mmap_waiter_refs: 0,
@@ -503,7 +505,18 @@ fn remove_heap_task_entry(
 /// safely: only the first claimant removes the tracker entry.
 pub(crate) fn begin_heap_task_release(task: *mut TaskStruct) -> Option<*mut u8> {
     let mut tracker = HEAP_TASKS.lock();
-    remove_heap_task_entry(&mut tracker, task).map(|entry| entry.stack)
+    remove_heap_task_entry(&mut tracker, task).map(|entry| {
+        // A task whose stack reference was already dropped by
+        // finish_task_switch() still has a tracker entry until release_task()
+        // reaps it.  Do not return that stale pointer to a second cleanup
+        // path: Linux's put_task_stack() owns the stack reference exactly
+        // once.
+        if entry.stack_released {
+            core::ptr::null_mut()
+        } else {
+            entry.stack
+        }
+    })
 }
 
 /// Claim logical `release_task()` ownership while keeping the allocation alive.
@@ -528,8 +541,56 @@ pub(crate) fn begin_heap_task_logical_release(task: *mut TaskStruct) -> Option<*
         .expect("indexed entry must exist");
     entry.released = true;
     entry.release_complete = false;
-    let stack = entry.stack;
+    let stack = if entry.stack_released {
+        core::ptr::null_mut()
+    } else {
+        entry.stack
+    };
     tracker.len -= 1;
+    Some(stack)
+}
+
+/// Claim the task's kernel stack independently of the task_struct allocation.
+///
+/// Linux drops this reference from `finish_task_switch()` as soon as the
+/// sampled scheduler state is `TASK_DEAD`; an ordinary `EXIT_ZOMBIE` remains
+/// waitable after that point, so its task_struct must stay indexed while its
+/// stack is already reusable.
+pub(crate) fn take_heap_task_stack(task: *mut TaskStruct) -> Option<*mut u8> {
+    let mut tracker = HEAP_TASKS.lock();
+    let slot = find_task_ptr_slot(&tracker, task)?;
+    let entry = tracker.entries[slot]
+        .as_ref()
+        .expect("indexed heap task entry must exist");
+    if entry.stack_released {
+        return None;
+    }
+    let stack = entry.stack;
+    let task_stack = unsafe { (*task).stack as usize };
+    let expected_top = stack as usize + KTHREAD_STACK_SIZE;
+    if task_stack != expected_top {
+        #[cfg(not(test))]
+        crate::linux_driver_abi::tty::serial_println!(
+            "stack-claim-mismatch task={:#018x} pid={} entry-stack={:#018x} task-stack={:#018x} state={:#010x} on_cpu={} released={} release_complete={}",
+            task as usize,
+            unsafe { (*task).pid },
+            stack as usize,
+            task_stack,
+            unsafe { (*task).__state.load(Ordering::Acquire) },
+            unsafe { (*task).m29.on_cpu.load(Ordering::Acquire) },
+            entry.released,
+            entry.release_complete,
+        );
+        // Linux release_task_stack() leaks rather than freeing a stack when
+        // the task no longer presents the stack being retired.  Returning no
+        // claim preserves that safety boundary until the ownership mismatch
+        // is repaired by its real owner.
+        return None;
+    }
+    let entry = tracker.entries[slot]
+        .as_mut()
+        .expect("indexed heap task entry must exist");
+    entry.stack_released = true;
     Some(stack)
 }
 
@@ -557,7 +618,11 @@ pub(crate) fn take_logically_released_heap_task(task: *mut TaskStruct) -> Option
         let entry = tracker.entries[slot].take().expect("entry checked above");
         tracker.occupied -= 1;
         tracker.free_hint = tracker.free_hint.min(slot);
-        return Some(entry.stack);
+        return Some(if entry.stack_released {
+            core::ptr::null_mut()
+        } else {
+            entry.stack
+        });
     }
     None
 }
@@ -852,6 +917,7 @@ unsafe fn defer_task_struct_release(task: *mut TaskStruct) {
 /// release path or the completed logical release path. No scheduler-visible
 /// state may still reference the task.
 pub(crate) unsafe fn finish_heap_task_release(task: *mut TaskStruct, stack: *mut u8) {
+    let mut stack_to_free = stack;
     let can_free = {
         let mut tracker = HEAP_TASKS.lock();
         match find_task_ptr_slot(&tracker, task) {
@@ -860,7 +926,37 @@ pub(crate) unsafe fn finish_heap_task_release(task: *mut TaskStruct, stack: *mut
                 let entry = tracker.entries[slot]
                     .as_mut()
                     .expect("indexed heap task entry must exist");
-                if entry.mmap_waiter_refs != 0 {
+                // The scheduler owns an independent stack reference.  It can
+                // retire that reference before the logical task release
+                // reaches this boundary; in that case the task_struct path
+                // must not free the old stack a second time.
+                let stack_matches = if entry.stack_released {
+                    stack_to_free = core::ptr::null_mut();
+                    true
+                } else if !stack_to_free.is_null() {
+                    let task_stack = unsafe { (*task).stack as usize };
+                    let expected_top = stack_to_free as usize + KTHREAD_STACK_SIZE;
+                    if task_stack != expected_top {
+                        #[cfg(not(test))]
+                        crate::linux_driver_abi::tty::serial_println!(
+                            "stack-release-mismatch task={:#018x} pid={} stack={:#018x} task-stack={:#018x} state={:#010x} on_cpu={}",
+                            task as usize,
+                            unsafe { (*task).pid },
+                            stack_to_free as usize,
+                            task_stack,
+                            unsafe { (*task).__state.load(Ordering::Acquire) },
+                            unsafe { (*task).m29.on_cpu.load(Ordering::Acquire) },
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+                if !stack_matches {
+                    false
+                } else if entry.mmap_waiter_refs != 0 {
                     // Linux keeps the task_struct reference acquired by rwsem
                     // until the waiter leaves the slow path.
                     // `release_task()` has finished all logical teardown, but
@@ -879,10 +975,46 @@ pub(crate) unsafe fn finish_heap_task_release(task: *mut TaskStruct, stack: *mut
         return;
     }
     unsafe {
-        free_kernel_stack(stack);
+        if !stack_to_free.is_null() {
+            (*task).stack = core::ptr::null_mut();
+            free_kernel_stack(stack_to_free);
+        }
         // Linux releases the stack at this boundary but delays the final
         // task_struct slab release through put_task_struct_rcu_user().
         defer_task_struct_release(task);
+    }
+}
+
+/// Finish the Linux `put_task_stack()` half of a dead task switch.
+///
+/// The task_struct remains in the heap tracker until `release_task()` performs
+/// the process-list/PID teardown, so this must not call
+/// `finish_heap_task_release()` or remove the tracker entry.
+pub(crate) unsafe fn finish_heap_task_stack_release(
+    task: *mut TaskStruct,
+    stack: *mut u8,
+) {
+    if task.is_null() || stack.is_null() {
+        return;
+    }
+    unsafe {
+        let task_stack = (*task).stack as usize;
+        let expected_top = stack as usize + KTHREAD_STACK_SIZE;
+        if task_stack != expected_top {
+            #[cfg(not(test))]
+            crate::linux_driver_abi::tty::serial_println!(
+                "stack-finish-mismatch task={:#018x} pid={} stack={:#018x} task-stack={:#018x} state={:#010x} on_cpu={}",
+                task as usize,
+                (*task).pid,
+                stack as usize,
+                task_stack,
+                (*task).__state.load(Ordering::Acquire),
+                (*task).m29.on_cpu.load(Ordering::Acquire),
+            );
+            return;
+        }
+        (*task).stack = core::ptr::null_mut();
+        free_kernel_stack(stack);
     }
 }
 
@@ -2022,6 +2154,54 @@ mod tests {
                 assert_eq!(slot.load(Ordering::Acquire), 0);
             }
         }
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/fork.c:release_task_stack
+    ///
+    /// Linux refuses to release a stack when the task no longer names that
+    /// stack.  The external Lupos tracker must preserve the same ownership
+    /// boundary instead of returning a stale cache entry to the allocator.
+    #[test]
+    fn stale_task_stack_is_not_claimed_for_reuse() {
+        let _test_guard = TEST_LOCK.lock().unwrap();
+        clean_lsm_hooks!();
+
+        let baseline = heap_task_count();
+        let mut parent = make_parent();
+        let child = unsafe {
+            copy_process(
+                &mut *parent as *mut TaskStruct,
+                &KernelCloneArgs {
+                    kthread: 1,
+                    ..KernelCloneArgs::default()
+                },
+            )
+        }
+        .expect("copy_process");
+        let stack_top = unsafe { (*child).stack };
+        let stack_base = unsafe { stack_top.cast::<u8>().sub(KTHREAD_STACK_SIZE) };
+
+        unsafe {
+            // Simulate a stale tracker entry paired with a task_struct whose
+            // stack was already changed by another lifecycle path.
+            (*child).stack = stack_top.cast::<u8>().add(0x1000).cast();
+            assert!(take_heap_task_stack(child).is_none());
+            assert!(heap_task_allocation_tracked_for_tests(child));
+
+            (*child).stack = stack_top;
+            (*child)
+                .__state
+                .store(crate::kernel::task::task_state::TASK_DEAD, Ordering::Release);
+            let claimed = take_heap_task_stack(child).expect("matching stack claim");
+            assert_eq!(claimed, stack_base);
+            finish_heap_task_stack_release(child, claimed);
+            assert_eq!((*child).stack as usize, 0);
+
+            // The stack reference was already dropped; cleanup must only
+            // retire the task_struct and must not free the stack a second time.
+            cleanup_child_fully(child);
+        }
+        assert_eq!(heap_task_count(), baseline);
     }
 
     /// test-origin: linux:vendor/linux/kernel/exit.c:put_task_struct_rcu_user

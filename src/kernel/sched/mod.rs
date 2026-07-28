@@ -112,7 +112,7 @@ pub fn register_module_exports() {
     }
 }
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -339,26 +339,6 @@ static REMOTE_WAKE_QUEUES: [RawSpinLocked<RemoteWakeQueue>; MAX_CPUS] =
 static DEFERRED_TASK_RELEASE: [AtomicPtr<TaskStruct>; MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
 
-// Focused crash evidence for the scheduler-stack canary.  `__schedule()`
-// switches stacks before it returns, so its epilogue reports only that one of
-// its post-switch phases corrupted the incoming task stack.  Keep the last
-// completed phase per CPU until the next scheduler entry; the stack-protector
-// failure path can read this without dereferencing the damaged task stack.
-//
-// This is diagnostic-only and must be removed once the responsible teardown
-// path has been proven.
-static SCHED_STACK_PHASE: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
-
-pub(crate) fn stack_corruption_phase() -> u8 {
-    let cpu = current_cpu_index();
-    SCHED_STACK_PHASE[cpu].load(Ordering::Relaxed)
-}
-
-#[inline]
-fn record_sched_stack_phase(phase: u8) {
-    SCHED_STACK_PHASE[current_cpu_index()].store(phase, Ordering::Relaxed);
-}
-
 /// The lazy active_mm reference is consumed at Linux's finish_task_switch()
 /// boundary, but its Rust page-table destructor is deferred until
 /// `__schedule()` has returned from the incoming task's deep scheduler frames.
@@ -377,6 +357,7 @@ static POST_SWITCH_MM_DROP: [AtomicUsize; MAX_CPUS] =
 struct PostSwitchHeapRelease {
     task: *mut TaskStruct,
     stack: *mut u8,
+    release_task_struct: bool,
 }
 
 // The heap-task tracker grants unique release ownership before this pair is
@@ -710,19 +691,6 @@ pub unsafe fn set_current(task: *mut TaskStruct) {
 #[cfg(not(test))]
 unsafe fn set_current_on_cpu(cpu: usize, task: *mut TaskStruct) {
     assert!(cpu < MAX_CPUS, "scheduler logical CPU ID is out of range");
-    // Temporary corruption probe: Linux's __switch_to() publishes a fully
-    // initialized task_struct here.  The post-ALSA fault reported a current
-    // pointer of 0x3; log only that impossible publication so normal context
-    // switches retain their timing while we distinguish a scheduler writer
-    // from a later overwrite of the per-CPU slot.
-    if !task.is_null() && (task as usize) < 0x100000 {
-        log_error!(
-            "sched",
-            "sched: invalid current_task publication cpu={} task={:#018x}",
-            cpu,
-            task as usize,
-        );
-    }
     CURRENT_TASK[cpu].store(task, Ordering::Release);
     crate::arch::x86::kernel::cpu::common::set_linux_current_task_on_cpu(cpu, task);
     let stack_top = if task.is_null() {
@@ -912,10 +880,27 @@ unsafe fn prepare_task_switch_release(task: *mut TaskStruct) {
 /// restored local IRQs.  The two slots cover the exiting thread plus the
 /// group leader that `release_task()` can reap recursively.
 pub(crate) fn defer_heap_task_release(task: *mut TaskStruct, stack: *mut u8) {
+    defer_heap_release(task, stack, true);
+}
+
+/// Queue only the Linux `put_task_stack()` half of a dead task switch.
+///
+/// An ordinary zombie remains visible to wait/reap code after
+/// `finish_task_switch()` has released its stack, so its TaskStruct must stay
+/// in the heap tracker until `release_task()` runs.
+pub(crate) fn defer_heap_stack_release(task: *mut TaskStruct, stack: *mut u8) {
+    defer_heap_release(task, stack, false);
+}
+
+fn defer_heap_release(task: *mut TaskStruct, stack: *mut u8, release_task_struct: bool) {
     let mut pending = POST_SWITCH_HEAP_RELEASES[current_cpu_index()].lock();
     for slot in &mut pending.entries {
         if slot.is_none() {
-            *slot = Some(PostSwitchHeapRelease { task, stack });
+            *slot = Some(PostSwitchHeapRelease {
+                task,
+                stack,
+                release_task_struct,
+            });
             return;
         }
     }
@@ -941,7 +926,11 @@ pub(crate) unsafe fn finish_deferred_heap_task_releases() {
             slot.take().expect("entry checked above")
         };
         unsafe {
-            crate::kernel::fork::finish_heap_task_release(release.task, release.stack);
+            if release.release_task_struct {
+                crate::kernel::fork::finish_heap_task_release(release.task, release.stack);
+            } else {
+                crate::kernel::fork::finish_heap_task_stack_release(release.task, release.stack);
+            }
         }
     }
 }
@@ -1000,6 +989,14 @@ pub unsafe fn finish_task_switch(prev: *mut TaskStruct) {
         }
         panic!("finish_task_switch must receive the outgoing task");
     }
+    // Linux samples prev->__state before finish_task() clears prev->on_cpu.
+    // The sampled TASK_DEAD value owns the stack release even when
+    // exit_state is still EXIT_ZOMBIE and the task_struct remains waitable.
+    let prev_state = if prev.is_null() {
+        crate::kernel::task::task_state::TASK_RUNNING
+    } else {
+        unsafe { (*prev).__state.load(Ordering::Acquire) }
+    };
     let slot = &DEFERRED_TASK_RELEASE[current_cpu_index()];
     let deferred = slot.swap(core::ptr::null_mut(), Ordering::AcqRel);
     if !deferred.is_null() && deferred != prev {
@@ -1009,14 +1006,11 @@ pub unsafe fn finish_task_switch(prev: *mut TaskStruct) {
     }
 
     // A remote exit_group can publish TASK_DEAD after the outgoing CPU passed
-    // prepare_task_switch_release() but before the physical stack switch. Read
-    // the state again here, exactly where Linux finish_task_switch() samples
-    // prev->__state.
+    // prepare_task_switch_release() but before the physical stack switch. The
+    // sample above is therefore intentionally taken at this Linux boundary.
     let autoreap = !prev.is_null()
-        && unsafe {
-            (*prev).__state.load(Ordering::Acquire) == crate::kernel::task::task_state::TASK_DEAD
-                && (*prev).m26.exit_state == crate::kernel::task::task_state::EXIT_DEAD
-        };
+        && prev_state == crate::kernel::task::task_state::TASK_DEAD
+        && unsafe { (*prev).m26.exit_state == crate::kernel::task::task_state::EXIT_DEAD };
 
     if !prev.is_null() {
         unsafe {
@@ -1047,6 +1041,16 @@ pub unsafe fn finish_task_switch(prev: *mut TaskStruct) {
     // unwinds because it exceeds the remaining 16 KiB task-stack budget here.
     unsafe {
         defer_switch_mm_drop();
+    }
+
+    // Linux `finish_task_switch()` calls `put_task_stack(prev)` for every
+    // TASK_DEAD task, not only autoreaped EXIT_DEAD tasks.  Keep the
+    // task_struct indexed for an ordinary zombie while making its vmapped
+    // stack reusable after the rq/on_cpu handoff is complete.
+    if prev_state == crate::kernel::task::task_state::TASK_DEAD
+        && let Some(kernel_stack) = crate::kernel::fork::take_heap_task_stack(prev)
+    {
+        defer_heap_stack_release(prev, kernel_stack);
     }
 
     if !prev.is_null()
@@ -2045,7 +2049,6 @@ unsafe fn prepare_prev_for_pick(this_rq: &mut rq::Rq, prev: *mut TaskStruct) {
 
 /// Production per-CPU scheduler path used once APs join normal scheduling.
 pub unsafe fn __schedule() {
-    record_sched_stack_phase(1);
     let cpu = current_cpu();
     let current = unsafe { get_current() };
     if current.is_null() {
@@ -2150,7 +2153,6 @@ pub unsafe fn __schedule() {
     crate::kernel::rcu::tasks_rcu_qs();
     crate::kernel::rcu::rcu_qs();
     unsafe {
-        record_sched_stack_phase(2);
         seed_current_task_stack(prev);
         record_switch_attempt(prev, next);
         prepare_switch_to_task(next);
@@ -2159,11 +2161,8 @@ pub unsafe fn __schedule() {
         finish_task_switch(last);
     }
     unsafe {
-        record_sched_stack_phase(3);
         finish_deferred_heap_task_releases();
-        record_sched_stack_phase(4);
         finish_deferred_mm_drops();
-        record_sched_stack_phase(5);
     }
 }
 
@@ -3529,6 +3528,7 @@ mod tests {
     fn try_to_wake_up_serializes_concurrent_wakeups_for_one_task() {
         let _legacy = legacy_sched_test_guard();
         let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        task.m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
         task.__state.store(
             crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
             Ordering::Release,
@@ -4113,6 +4113,7 @@ mod tests {
         let current_ptr = &mut *current as *mut TaskStruct;
         let older_ptr = &mut *older as *mut TaskStruct;
         let waiter_ptr = &mut *waiter as *mut TaskStruct;
+        waiter.m29.sched_class = &fair::FAIR_SCHED_CLASS;
         waiter.__state.store(
             crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
             Ordering::Release,

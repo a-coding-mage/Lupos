@@ -30,7 +30,7 @@ use crate::kernel::exit::release_task;
 use crate::kernel::sched;
 use crate::kernel::signal::{SIGCHLD, has_unblocked_pending_signals};
 use crate::kernel::task::task_state::{
-    __TASK_STOPPED, EXIT_ZOMBIE, TASK_INTERRUPTIBLE, TASK_RUNNING,
+    __TASK_STOPPED, EXIT_ZOMBIE, TASK_DEAD, TASK_INTERRUPTIBLE, TASK_RUNNING,
 };
 use crate::kernel::task::{MAX_CHILDREN, MAX_WAITERS, TaskStruct};
 
@@ -256,8 +256,12 @@ unsafe fn find_zombie_child(
                 return;
             }
             let state = (*c).__state.load(Ordering::Acquire);
+            // Lupos publishes EXIT_ZOMBIE before the exiting task reaches
+            // do_task_dead().  Accept that publication marker and the final
+            // Linux TASK_DEAD state; do not report the interval before the
+            // child-state store, when exit_state is already visible.
             if (*c).m26.exit_state & EXIT_ZOMBIE != 0
-                && state & EXIT_ZOMBIE != 0
+                && (state == EXIT_ZOMBIE || state == TASK_DEAD)
                 && !crate::kernel::signal::delay_group_leader(c)
             {
                 found = c;
@@ -470,13 +474,19 @@ unsafe fn has_reportable_wait_event(
 /// Returns true while a matching child has started zombie publication but is
 /// not yet reapable via `find_zombie_child`.  Waiters must not sleep in this
 /// half-published state because the exiting child may already have snapshotted
-/// its waiter list.
+/// its waiter list.  Linux uses `exit_state` for zombie eligibility; the
+/// scheduler's terminal `__state` is TASK_DEAD and must not be confused with
+/// EXIT_ZOMBIE.  The intermediate EXIT_ZOMBIE value is retained only for the
+/// short publication window before do_exit() reaches do_task_dead().
 unsafe fn has_exiting_wait_target(parent: *mut TaskStruct, target: WaitTarget) -> bool {
     let mut found = false;
     unsafe {
         for_each_real_child(parent, target, |c| {
             let state = (*c).__state.load(Ordering::Acquire);
-            if (*c).m26.exit_state & EXIT_ZOMBIE != 0 && state & EXIT_ZOMBIE == 0 {
+            if (*c).m26.exit_state & EXIT_ZOMBIE != 0
+                && state != TASK_DEAD
+                && state != EXIT_ZOMBIE
+            {
                 found = true;
             }
         });
@@ -485,7 +495,10 @@ unsafe fn has_exiting_wait_target(parent: *mut TaskStruct, target: WaitTarget) -
         }
         for_each_ptrace_wait_match(parent, target, |task| {
             let state = (*task).__state.load(Ordering::Acquire);
-            if (*task).m26.exit_state & EXIT_ZOMBIE != 0 && state & EXIT_ZOMBIE == 0 {
+            if (*task).m26.exit_state & EXIT_ZOMBIE != 0
+                && state != TASK_DEAD
+                && state != EXIT_ZOMBIE
+            {
                 found = true;
             }
         });
@@ -1204,6 +1217,7 @@ mod tests {
         t.pid = pid;
         t.tgid = pid;
         t.m26 = crate::kernel::task::M26Fields::zeroed();
+        t.m29.sched_class = &crate::kernel::sched::fair::FAIR_SCHED_CLASS;
         t
     }
 
@@ -1300,7 +1314,7 @@ mod tests {
         parent.m26.children[0] = &mut *child as *mut TaskStruct;
         parent.m26.children_count = 1;
         child.m26.exit_state = EXIT_ZOMBIE;
-        child.__state.store(EXIT_ZOMBIE, Ordering::Release);
+        child.__state.store(TASK_DEAD, Ordering::Release);
 
         assert!(unsafe {
             has_reportable_wait_event(&mut *parent as *mut TaskStruct, WaitTarget::Any, 0)
