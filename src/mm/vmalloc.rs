@@ -144,6 +144,12 @@ impl VfreeDeferred {
 // here: an interrupt could otherwise spin on a lock interrupted on this CPU.
 static VFREE_DEFERRED: SpinLock<VfreeDeferred> = SpinLock::new(VfreeDeferred::new());
 
+// A deferred-free drain can be reached through a cooperative wait boundary
+// while a softirq callback is still active.  Linux's delayed_vfree_work() is
+// process-context work, so keep the safety diagnostic focused and one-shot
+// instead of allowing that path to synchronously issue a TLB shootdown.
+static DEFERRED_VFREE_INTERRUPT_WARNED: AtomicBool = AtomicBool::new(false);
+
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
         export_symbol(name, addr, gpl_only);
@@ -640,11 +646,43 @@ fn vfree_immediate(ptr: *mut u8) {
 /// worker tasks.  Callers must therefore use this only where sleeping and a
 /// synchronous TLB shootdown are valid; `drain_system_workqueues()` and
 /// `schedule_with_irqs_enabled()` provide those points.
+#[track_caller]
 pub fn drain_deferred_vfree() {
-    debug_assert!(
-        !crate::kernel::softirq::in_interrupt(),
-        "deferred vfree drain must not run in interrupt context"
-    );
+    // Linux `delayed_vfree_work()` runs from a workqueue worker.  A Lupos
+    // wait/schedule boundary can be nested below a softirq callback, so this
+    // function must preserve the queued address until a later task-context
+    // boundary instead of calling vfree_immediate() here.  In particular, the
+    // latter synchronously flushes kernel TLBs and can deadlock against the
+    // interrupted CPU's IRQ path.
+    if crate::kernel::softirq::in_interrupt() {
+        if DEFERRED_VFREE_INTERRUPT_WARNED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let caller = core::panic::Location::caller();
+            let current = unsafe { crate::kernel::sched::get_current() };
+            let (pid, comm) = if current.is_null() {
+                (-1, [0; 16])
+            } else {
+                unsafe { ((*current).pid, (*current).comm) }
+            };
+            crate::log_warn!(
+                "vmalloc",
+                "deferred vfree drain skipped in interrupt context cpu={} preempt_count={:#x} pid={} comm={:?}",
+                crate::kernel::sched::current_cpu(),
+                crate::kernel::locking::preempt::preempt_count(),
+                pid,
+                comm,
+            );
+            crate::log_warn!(
+                "vmalloc",
+                "deferred vfree caller {}:{}",
+                caller.file(),
+                caller.line(),
+            );
+        }
+        return;
+    }
 
     loop {
         let ptr = {
@@ -1228,6 +1266,7 @@ mod tests {
             size: (VMALLOC_END - VMALLOC_START) as usize,
         });
         VMALLOC_READY.store(true, Ordering::Relaxed);
+        DEFERRED_VFREE_INTERRUPT_WARNED.store(false, Ordering::Relaxed);
     }
 
     // ── VA allocator ────────────────────────────────────────────────────
@@ -1342,6 +1381,36 @@ mod tests {
         // schedules delayed_vfree_work; it must not unmap in softirq context.
         vfree_atomic(ptr);
         assert_eq!(virt_to_phys(ptr as u64), Some(0x1000_0000));
+
+        drain_deferred_vfree();
+        assert_eq!(virt_to_phys(ptr as u64), None);
+    }
+
+    /// test-origin: linux:vendor/linux/mm/vmalloc.c:vfree
+    /// test-origin: linux:vendor/linux/mm/vmalloc.c:delayed_vfree_work
+    ///
+    /// Linux refuses to synchronously tear down a vmalloc mapping while a
+    /// hardirq/softirq context is active.  This Lupos runtime regression pins
+    /// the same queue-retention boundary and has no narrower upstream test
+    /// harness for the cooperative workqueue adapter.
+    #[test]
+    fn deferred_vfree_drain_waits_for_process_context() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { setup() };
+
+        let pfns = [0x1000_0000usize / PAGE_SIZE];
+        let ptr = vmap_pfn(pfns.as_ptr(), pfns.len(), PAGE_KERNEL);
+        assert!(!ptr.is_null());
+
+        crate::kernel::locking::preempt::__irq_enter_raw();
+        vfree(ptr);
+        drain_deferred_vfree();
+        assert_eq!(
+            virt_to_phys(ptr as u64),
+            Some(0x1000_0000),
+            "interrupt-context drain must retain the queued mapping"
+        );
+        crate::kernel::locking::preempt::__irq_exit_raw();
 
         drain_deferred_vfree();
         assert_eq!(virt_to_phys(ptr as u64), None);

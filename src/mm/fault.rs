@@ -48,6 +48,7 @@ use crate::mm::vm_flags::{
     VM_DONTDUMP, VM_DONTEXPAND, VM_IO, VM_MAYSHARE, VM_MAYWRITE, VM_MIXEDMAP, VM_PFNMAP, VM_SHARED,
     VM_WRITE, VmFlags,
 };
+use crate::kernel::locking::{RawSpinLock, preempt_disable, preempt_enable};
 
 #[cfg(test)]
 unsafe fn fault_page_kaddr(page: *mut Page) -> *mut u8 {
@@ -87,6 +88,65 @@ unsafe fn free_unmapped_fault_page(page: *mut Page) {
     }
     unsafe {
         with_global_buddy(|b| b.free_pages(page, 0));
+    }
+}
+
+/// Drop one temporary or PTE-owned reference acquired by the COW path.
+///
+/// Linux's `wp_page_copy()` keeps the old folio referenced while it copies
+/// outside the page-table lock and drops that reference only after the PTE
+/// replacement decision. Lupos uses the same `Page` refcount for PTE
+/// ownership and the temporary fault reference; keep the final free in one
+/// helper so every retry/error path follows the same lifetime rule.
+unsafe fn release_cow_page_reference(page: *mut Page) {
+    if page.is_null() {
+        return;
+    }
+    unsafe {
+        let rc = (*page).put_page();
+        if rc <= 0 {
+            crate::mm::lru::remove_lru_page(page);
+            with_global_buddy(|b| b.free_pages(page, 0));
+        }
+    }
+}
+
+/// Linux's generic x86 configuration uses `mm->page_table_lock` when split
+/// PTE locks are disabled. Keep preemption disabled while the lock is held,
+/// but leave interrupts enabled just like Linux's `spin_lock(vmf->ptl)` so a
+/// concurrent TLB shootdown can be serviced.
+///
+/// Ref: Linux `include/linux/mm.h` — `pte_lockptr()` and
+/// `mm/memory.c` — `handle_pte_fault()` / `wp_page_copy()`.
+struct PageTableLockGuard {
+    lock: *mut RawSpinLock,
+    held: bool,
+}
+
+impl PageTableLockGuard {
+    unsafe fn lock(mm: *mut MmStruct) -> Self {
+        let lock = unsafe { core::ptr::addr_of_mut!((*mm).page_table_lock) };
+        preempt_disable();
+        unsafe { (*lock).lock() };
+        Self {
+            lock,
+            held: true,
+        }
+    }
+
+    unsafe fn unlock(&mut self) {
+        if !self.held {
+            return;
+        }
+        unsafe { (*self.lock).unlock() };
+        preempt_enable();
+        self.held = false;
+    }
+}
+
+impl Drop for PageTableLockGuard {
+    fn drop(&mut self) {
+        unsafe { self.unlock() };
     }
 }
 
@@ -386,6 +446,16 @@ fn handle_pte_fault(vmf: &mut VmFault) -> VmFaultFlags {
             return do_swap_page(vmf);
         }
 
+        // Linux takes the fallback mm page-table lock after the lockless PTE
+        // snapshot and revalidates the entry while holding it.  The old Lupos
+        // path read and modified the live PTE without any exclusion, so two
+        // CPUs could both retire the same source page or publish conflicting
+        // COW/access-bit updates.
+        let mut ptl = PageTableLockGuard::lock((*vmf.vma).vm_mm);
+        if ptep_get(vmf.pte) != vmf.orig_pte {
+            return 0;
+        }
+
         // PTE is present.  Write-protect fault → COW.
         let pfn = pte_pfn(vmf.orig_pte) as usize;
         if !pte_special(vmf.orig_pte) && !pfn_valid(pfn) {
@@ -396,6 +466,7 @@ fn handle_pte_fault(vmf: &mut VmFault) -> VmFaultFlags {
             vmf.orig_pte = __pte(0);
             vmf.pte = ptr::null_mut();
             vmf.flags &= !FAULT_FLAG_ORIG_PTE_VALID;
+            ptl.unlock();
             return do_pte_missing(vmf);
         }
 
@@ -416,7 +487,7 @@ fn handle_pte_fault(vmf: &mut VmFault) -> VmFaultFlags {
         }
 
         if (vmf.flags & FAULT_FLAG_WRITE) != 0 && !pte_write(vmf.orig_pte) {
-            return do_wp_page(vmf);
+            return do_wp_page(vmf, &mut ptl);
         }
 
         // Linux x86 `ptep_set_access_flags()` relies on hardware to maintain
@@ -698,7 +769,7 @@ unsafe fn wp_can_reuse_lupos_anon_page(vma: *const VmAreaStruct, page: *const Pa
 /// - `wp_page_copy`: file-backed, raw PFN, or non-exclusive anonymous pages.
 ///
 /// Ref: Linux `mm/memory.c` — `do_wp_page()`
-fn do_wp_page(vmf: &mut VmFault) -> VmFaultFlags {
+fn do_wp_page(vmf: &mut VmFault, ptl: &mut PageTableLockGuard) -> VmFaultFlags {
     unsafe {
         // vm_normal_page() returns NULL for a PTE-special VM_PFNMAP entry.
         // Shared mappings reuse the raw PFN; only a private mapping allocates
@@ -707,7 +778,8 @@ fn do_wp_page(vmf: &mut VmFault) -> VmFaultFlags {
             if (*vmf.vma).vm_flags & (VM_SHARED | VM_MAYSHARE) != 0 {
                 return wp_pfn_shared(vmf);
             }
-            return wp_page_copy(vmf);
+            ptl.unlock();
+            return wp_page_copy(vmf, ptr::null_mut());
         }
 
         let pfn = paging::pte_pfn(vmf.orig_pte) as usize;
@@ -722,7 +794,12 @@ fn do_wp_page(vmf: &mut VmFault) -> VmFaultFlags {
             return 0;
         }
 
-        wp_page_copy(vmf)
+        // Linux holds a temporary folio reference before dropping the PTE
+        // lock.  That reference keeps the source page alive while the copy
+        // path runs with interrupts/preemption enabled.
+        (*page_ptr).get_page();
+        ptl.unlock();
+        wp_page_copy(vmf, page_ptr)
     }
 }
 
@@ -736,33 +813,32 @@ fn do_wp_page(vmf: &mut VmFault) -> VmFaultFlags {
 /// `VM_FAULT_DONE_COW` on success, `VM_FAULT_OOM` if allocation fails.
 ///
 /// Ref: Linux `mm/memory.c` — `wp_page_copy()` line 3758
-fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
+fn wp_page_copy(vmf: &mut VmFault, old_page: *mut Page) -> VmFaultFlags {
     unsafe {
         let vma = vmf.vma;
         let mm = (*vma).vm_mm;
 
         if anon_vma_prepare(vma).is_err() {
+            release_cow_page_reference(old_page);
             return VM_FAULT_OOM;
         }
 
         // 1. Allocate a fresh page for the private copy.
         let new_page = match with_global_buddy(|b| b.alloc_pages(0, GFP_KERNEL)) {
             Some(p) => p,
-            None => return VM_FAULT_OOM,
+            None => {
+                release_cow_page_reference(old_page);
+                return VM_FAULT_OOM;
+            }
         };
 
         // 2. Copy the old mapping's content into the new page. Linux's
         //    __wp_page_copy_user() reads through the userspace address when
         //    vm_normal_page() returned NULL for a special PFN mapping; there
         //    is deliberately no pfn_to_page() in that case.
-        let old_pfn = paging::pte_pfn(vmf.orig_pte) as usize;
-        let old_page = if pte_special(vmf.orig_pte) {
-            core::ptr::null_mut()
-        } else {
-            pfn_to_page(old_pfn)
-        };
         let dst = fault_page_kaddr(new_page);
         if dst.is_null() {
+            release_cow_page_reference(old_page);
             free_unmapped_fault_page(new_page);
             return VM_FAULT_OOM;
         }
@@ -774,10 +850,13 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
             );
             if not_copied != 0 {
                 // Linux retries under the PTL, then zero-fills an unreadable
-                // but still-stable PFN source. Lupos has no per-PTE lock yet;
-                // revalidate the PTE around the retry so a concurrent change
-                // causes a harmless fault retry instead of copying stale data.
-                if ptep_get(vmf.pte) != vmf.orig_pte {
+                // but still-stable PFN source. Revalidate under the same
+                // lock used by the present-fault path.
+                let mut ptl = PageTableLockGuard::lock(mm);
+                let same = ptep_get(vmf.pte) == vmf.orig_pte;
+                ptl.unlock();
+                if !same {
+                    release_cow_page_reference(old_page);
                     free_unmapped_fault_page(new_page);
                     return 0;
                 }
@@ -786,7 +865,11 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
                     vmf.address as *const u8,
                     PAGE_SIZE as usize,
                 );
-                if ptep_get(vmf.pte) != vmf.orig_pte {
+                let mut ptl = PageTableLockGuard::lock(mm);
+                let same = ptep_get(vmf.pte) == vmf.orig_pte;
+                ptl.unlock();
+                if !same {
+                    release_cow_page_reference(old_page);
                     free_unmapped_fault_page(new_page);
                     return 0;
                 }
@@ -797,6 +880,7 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
         } else {
             let src = fault_page_kaddr(old_page);
             if src.is_null() {
+                release_cow_page_reference(old_page);
                 free_unmapped_fault_page(new_page);
                 return VM_FAULT_SIGBUS;
             }
@@ -829,7 +913,10 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
 
         // 5. Replace the old PTE with the new one using Linux's
         //    ptep_clear_flush-before-set ordering.
+        let mut ptl = PageTableLockGuard::lock(mm);
         if ptep_get(vmf.pte) != vmf.orig_pte {
+            ptl.unlock();
+            release_cow_page_reference(old_page);
             crate::mm::lru::remove_lru_page(new_page);
             free_unmapped_fault_page(new_page);
             return 0;
@@ -837,19 +924,19 @@ fn wp_page_copy(vmf: &mut VmFault) -> VmFaultFlags {
         ptep_get_and_clear(mm as *mut (), vmf.address, vmf.pte);
         flush_tlb_page(vmf.address);
         set_pte_at(mm as *mut (), vmf.address, vmf.pte, new_entry);
+        ptl.unlock();
 
         // 6. Release the old page's references from this mm.
         //    mapcount: one fewer PTE maps it.
         if !old_page.is_null() {
             (*old_page)._mapcount().fetch_sub(1, Ordering::Relaxed);
             //    refcount: this mm no longer holds a reference.
-            let rc = (*old_page).put_page();
-            if rc <= 0 {
-                // No remaining references — return the page to the buddy allocator.
-                crate::mm::lru::remove_lru_page(old_page);
-                with_global_buddy(|b| b.free_pages(old_page, 0));
-            }
+            release_cow_page_reference(old_page);
         }
+
+        // Drop the temporary Linux-equivalent fault reference after the PTE
+        // has been switched and the old PTE-owned reference released.
+        release_cow_page_reference(old_page);
 
         VM_FAULT_DONE_COW
     }
@@ -2087,6 +2174,113 @@ mod tests {
             clear < flush && flush < set,
             "Lupos wp_page_copy must mirror Linux ptep_clear_flush before set_pte_at"
         );
+    }
+
+    /// Linux takes a temporary folio reference before dropping the page-table
+    /// lock and copying the old page. The reference must survive both the
+    /// copy and the PTE revalidation, otherwise a concurrent COW can retire
+    /// and reuse the source page while `memcpy` is still reading it.
+    ///
+    /// test-origin: linux:vendor/linux/mm/memory.c:do_wp_page
+    #[test]
+    fn wp_page_copy_retains_source_page_until_replacement_decision() {
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/mm/memory.c"
+        ));
+        let linux_body = linux
+            .split("static vm_fault_t do_wp_page(")
+            .nth(1)
+            .and_then(|body| body.split("static inline void unmap_mapping_range_tree").next())
+            .expect("Linux do_wp_page body must remain present");
+        let linux_hold = linux_body
+            .find("folio_get(folio)")
+            .expect("Linux must hold the source folio before copying");
+        let linux_unlock = linux_body
+            .rfind("pte_unmap_unlock(vmf->pte, vmf->ptl)")
+            .expect("Linux must drop the PTE lock before the copy");
+        assert!(linux_hold < linux_unlock);
+
+        let lupos = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mm/fault.rs"));
+        let do_start = lupos
+            .find("fn do_wp_page(vmf: &mut VmFault, ptl: &mut PageTableLockGuard)")
+            .expect("Lupos do_wp_page must remain present");
+        let do_body = lupos[do_start..]
+            .split("/// Full COW copy path")
+            .next()
+            .expect("Lupos do_wp_page body must remain bounded");
+        let hold = do_body
+            .find("(*page_ptr).get_page();")
+            .expect("Lupos must hold the source page before dropping the PTL");
+        let unlock = do_body[hold..]
+            .find("ptl.unlock();")
+            .map(|offset| hold + offset)
+            .expect("Lupos must drop the PTL before copying");
+
+        let start = lupos
+            .find("fn wp_page_copy(vmf: &mut VmFault, old_page: *mut Page)")
+            .expect("Lupos wp_page_copy must remain present");
+        let body = lupos[start..]
+            .split("// ---------------------------------------------------------------------------")
+            .next()
+            .expect("Lupos wp_page_copy body must remain bounded");
+        let copy = body
+            .find("core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE as usize);")
+            .expect("Lupos source-page copy must remain present");
+        let replacement = body
+            .find("set_pte_at(mm as *mut (), vmf.address, vmf.pte, new_entry);")
+            .expect("Lupos COW replacement must remain present");
+        let release = body
+            .rfind("release_cow_page_reference(old_page);")
+            .expect("Lupos must release the temporary source-page reference");
+        assert!(hold < unlock, "source reference must precede PTL release");
+        assert!(copy < replacement && replacement < release);
+    }
+
+    /// Generic x86 without split PTE locks serializes present-PTE faults with
+    /// `mm->page_table_lock`, then rechecks the lockless snapshot before
+    /// changing the entry.
+    ///
+    /// test-origin: linux:vendor/linux/mm/memory.c:handle_pte_fault
+    #[test]
+    fn present_pte_faults_use_the_mm_page_table_lock() {
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/mm/memory.c"
+        ));
+        let linux_body = linux
+            .split("static vm_fault_t handle_pte_fault(")
+            .nth(1)
+            .and_then(|body| body.split("static vm_fault_t __handle_mm_fault(").next())
+            .expect("Linux handle_pte_fault body must remain present");
+        assert!(linux_body.contains("spin_lock(vmf->ptl);"));
+        assert!(linux_body.contains("pte_same(ptep_get(vmf->pte), entry)"));
+
+        let linux_mm = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/include/linux/mm.h"
+        ));
+        assert!(linux_mm.contains("return &mm->page_table_lock;"));
+
+        let lupos = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mm/fault.rs"));
+        let lock = lupos
+            .find("let mut ptl = PageTableLockGuard::lock((*vmf.vma).vm_mm);")
+            .expect("Lupos present-PTE path must acquire the mm page-table lock");
+        let recheck = lupos[lock..]
+            .find("if ptep_get(vmf.pte) != vmf.orig_pte")
+            .map(|offset| lock + offset)
+            .expect("Lupos must revalidate the PTE under the lock");
+        let dispatch = lupos[recheck..]
+            .find("return do_wp_page(vmf, &mut ptl);")
+            .map(|offset| recheck + offset)
+            .expect("Lupos COW dispatch must retain the page-table lock until do_wp_page");
+        assert!(lock < recheck && recheck < dispatch);
+
+        let mm_types = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/mm/mm_types.rs"
+        ));
+        assert!(mm_types.contains("pub page_table_lock: RawSpinLock"));
     }
 
     // ── Fork PTE policy ──────────────────────────────────────────────────────

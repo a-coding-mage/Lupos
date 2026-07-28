@@ -426,8 +426,12 @@ pub fn ptlock_ptr(page: *mut Page) -> *mut u8 {
     page as *mut u8
 }
 
-pub fn pte_lockptr(_mm: *mut MmStruct, pmd: *mut pmd_t) -> *mut u8 {
-    pmd as *mut u8
+pub fn pte_lockptr(mm: *mut MmStruct, pmd: *mut pmd_t) -> *mut u8 {
+    if mm.is_null() {
+        pmd as *mut u8
+    } else {
+        unsafe { core::ptr::addr_of_mut!((*mm).page_table_lock) as *mut u8 }
+    }
 }
 
 pub fn ptep_lockptr(mm: *mut MmStruct, pmd: *mut pmd_t) -> *mut u8 {
