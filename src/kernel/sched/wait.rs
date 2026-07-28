@@ -12,11 +12,11 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, Ordering, fence};
+use core::sync::atomic::{fence, AtomicBool, Ordering};
 
 use crate::kernel::locking::RawSpinLocked;
 use crate::kernel::module::{export_symbol, find_symbol};
-use crate::kernel::task::{TaskStruct, task_state};
+use crate::kernel::task::{task_state, TaskStruct};
 
 const WQ_FLAG_WOKEN: u32 = 0x02;
 
@@ -237,22 +237,46 @@ impl WaitQueueHead {
         }
     }
 
-    fn wake_tasks_locked(waiters: &mut Vec<WaitQueueEntry>) -> usize {
-        let mut count = 0;
+    /// Remove task entries while the waitqueue lock is held.  Linux's
+    /// `autoremove_wake_function()` makes the corresponding list entry empty
+    /// before the waiter can run `finish_wait()` and use its careful
+    /// lockless-empty check.
+    fn take_tasks_locked(
+        waiters: &mut Vec<WaitQueueEntry>,
+    ) -> Vec<(*mut TaskStruct, Option<Arc<AtomicBool>>)> {
+        let mut pending = Vec::new();
         while let Some(pos) = waiters
             .iter()
             .rposition(|entry| matches!(entry, WaitQueueEntry::Task { .. }))
         {
             let entry = waiters.remove(pos);
             if let WaitQueueEntry::Task { task, triggered } = entry {
-                if let Some(triggered) = triggered {
-                    triggered.store(true, Ordering::SeqCst);
-                }
-                unsafe {
-                    crate::kernel::sched::wake_task_normal(task);
-                }
-                count += 1;
+                pending.push((task, triggered));
             }
+        }
+        pending
+    }
+
+    /// Run scheduler wakeups after releasing the waitqueue lock.
+    ///
+    /// Linux can call `try_to_wake_up()` while `__wake_up_common()` owns the
+    /// queue lock because `finish_wait()` can observe the already-removed
+    /// intrusive list entry without taking that lock again.  The Rust queue
+    /// stores entries in a locked `Vec`, so it cannot safely reproduce that
+    /// lockless list observation.  Deferring the wake until after the locked
+    /// removal is the equivalent lifetime/order boundary and prevents the
+    /// waker from waiting for `on_cpu` while a resumed waiter waits for this
+    /// queue lock.
+    fn wake_tasks(pending: Vec<(*mut TaskStruct, Option<Arc<AtomicBool>>)>) -> usize {
+        let mut count = 0;
+        for (task, triggered) in pending {
+            if let Some(triggered) = triggered {
+                triggered.store(true, Ordering::SeqCst);
+            }
+            unsafe {
+                crate::kernel::sched::wake_task_normal(task);
+            }
+            count += 1;
         }
         count
     }
@@ -283,8 +307,14 @@ impl WaitQueueHead {
     pub fn wake_up_poll(&self, key: u32) -> usize {
         let (mut waiters, flags) = self.waiters.lock_irqsave();
         Self::wake_callbacks_locked(&mut waiters, key);
-        let count = Self::wake_tasks_locked(&mut waiters);
-        RawSpinLocked::unlock_irqrestore(waiters, flags);
+        let pending = Self::take_tasks_locked(&mut waiters);
+        // Keep the irqsave state across the deferred scheduler calls, just
+        // as Linux keeps IRQs disabled while __wake_up_common() invokes its
+        // wake functions.  The queue lock itself must already be released so
+        // finish_wait() cannot deadlock behind a wakeup's on_cpu handoff.
+        drop(waiters);
+        let count = Self::wake_tasks(pending);
+        crate::kernel::locking::local_irq_restore(flags);
         count
     }
 
@@ -296,25 +326,24 @@ impl WaitQueueHead {
     /// transition changed the state and therefore needs a wakeup; returning
     /// the operation's value keeps this helper useful for both read and write
     /// paths without exposing the waitqueue storage.
-    pub fn update_and_wake_poll<R>(
-        &self,
-        key: u32,
-        update: impl FnOnce() -> (R, bool),
-    ) -> R {
+    pub fn update_and_wake_poll<R>(&self, key: u32, update: impl FnOnce() -> (R, bool)) -> R {
         let (mut waiters, flags) = self.waiters.lock_irqsave();
         let (result, wake) = update();
-        if wake {
+        let pending = if wake {
             Self::wake_callbacks_locked(&mut waiters, key);
-            Self::wake_tasks_locked(&mut waiters);
-        }
-        RawSpinLocked::unlock_irqrestore(waiters, flags);
+            Self::take_tasks_locked(&mut waiters)
+        } else {
+            Vec::new()
+        };
+        drop(waiters);
+        Self::wake_tasks(pending);
+        crate::kernel::locking::local_irq_restore(flags);
         result
     }
 
     pub fn wake_up_all(&self) -> usize {
         self.wake_up_poll(u32::MAX)
     }
-
 }
 
 pub unsafe fn prepare_to_wait(queue: &WaitQueueHead, task: *mut TaskStruct, state: u32) {
@@ -376,6 +405,7 @@ mod tests {
     fn task() -> Box<TaskStruct> {
         let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         task.__state = AtomicU32::new(task_state::TASK_RUNNING);
+        task.m29.sched_class = &crate::kernel::sched::fair::FAIR_SCHED_CLASS;
         task
     }
 
@@ -475,6 +505,39 @@ mod tests {
         assert!(queue.is_empty());
     }
 
+    /// test-origin: linux:vendor/linux/kernel/sched/wait.c:finish_wait and
+    /// __wake_up_common
+    ///
+    /// Linux's wake entry is removed before a resumed waiter can observe an
+    /// empty list and skip the waitqueue lock.  The Rust queue must likewise
+    /// finish the list mutation before entering the scheduler wake path; a
+    /// wake path that runs while this lock is held can deadlock with
+    /// `finish_wait()` during an `on_cpu` handoff.
+    #[test]
+    fn waitqueue_wake_removes_tasks_before_scheduler_callback() {
+        let source = include_str!("wait.rs");
+        let marker = ["fn take_", "tasks_locked"].concat();
+        let body = source
+            .split(&marker)
+            .nth(1)
+            .and_then(|body| body.split("fn wake_tasks").next())
+            .expect("waitqueue task extraction must remain present");
+        assert!(
+            !body.contains("wake_task_normal"),
+            "scheduler wakeups must run after the waitqueue lock is released"
+        );
+
+        let queue = WaitQueueHead::new();
+        let mut task = task();
+        unsafe { queue.prepare_to_wait(&mut *task, task_state::TASK_INTERRUPTIBLE) };
+        assert_eq!(queue.wake_up_all(), 1);
+        unsafe { queue.finish_wait(&mut *task) };
+        assert_eq!(
+            task.__state.load(Ordering::Acquire),
+            task_state::TASK_RUNNING
+        );
+    }
+
     static LAST_POLL_WAKE_KEY: AtomicU32 = AtomicU32::new(0);
 
     fn record_poll_wake_key(_data1: usize, _data2: usize, key: u32) {
@@ -498,7 +561,6 @@ mod tests {
             crate::fs::select::POLLOUT as u32
         );
     }
-
 
     #[test]
     fn woken_wake_function_sets_woken_and_wakes_matching_task_state() {

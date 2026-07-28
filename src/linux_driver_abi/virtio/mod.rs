@@ -266,7 +266,8 @@ struct LinuxVirtqueueBackend {
 }
 
 lazy_static! {
-    static ref LINUX_VIRTQUEUE_BACKENDS: Mutex<Vec<LinuxVirtqueueBackend>> = Mutex::new(Vec::new());
+    static ref LINUX_VIRTQUEUE_BACKENDS: Mutex<Vec<Box<LinuxVirtqueueBackend>>> =
+        Mutex::new(Vec::new());
 }
 
 /// `struct virtio_device_id` — `vendor/linux/include/linux/mod_devicetable.h`.
@@ -659,7 +660,7 @@ fn linux_virtqueue_register_backend(
     }
     linux_virtqueue_with_backends_mut(|backends| {
         backends.retain(|backend| backend.vq != vq as usize);
-        backends.push(LinuxVirtqueueBackend {
+        backends.push(Box::new(LinuxVirtqueueBackend {
             vq: vq as usize,
             notify,
             dma_dev: dma_dev as usize,
@@ -679,7 +680,14 @@ fn linux_virtqueue_register_backend(
             event_triggered: false,
             free_list,
             submitted: Vec::new(),
-        });
+        }));
+        let backend = backends
+            .last_mut()
+            .expect("virtqueue backend was just inserted")
+            .as_mut() as *mut LinuxVirtqueueBackend;
+        unsafe {
+            (*vq).priv_ = backend.cast();
+        }
     });
 }
 
@@ -690,6 +698,9 @@ fn linux_virtqueue_remove_backend(vq: *mut LinuxVirtqueue) {
             .position(|backend| backend.vq == vq as usize)
             .map(|pos| backends.remove(pos))
     });
+    unsafe {
+        (*vq).priv_ = core::ptr::null_mut();
+    }
     if let Some(backend) = backend {
         unsafe {
             if backend.use_map_api {
@@ -710,7 +721,9 @@ fn linux_virtqueue_remove_backend(vq: *mut LinuxVirtqueue) {
 /// Serialize access to the split-ring bookkeeping like Linux's virtqueue
 /// spinlock users: the lock cannot be interrupted by a device completion that
 /// re-enters `virtqueue_get_buf()` on the same CPU.
-fn linux_virtqueue_with_backends_mut<R>(f: impl FnOnce(&mut Vec<LinuxVirtqueueBackend>) -> R) -> R {
+fn linux_virtqueue_with_backends_mut<R>(
+    f: impl FnOnce(&mut Vec<Box<LinuxVirtqueueBackend>>) -> R,
+) -> R {
     let flags = local_irq_save();
     preempt_disable();
     let result = {
@@ -733,8 +746,34 @@ fn linux_virtqueue_with_backend_mut<R>(
         backends
             .iter_mut()
             .find(|backend| backend.vq == vq as usize)
-            .map(f)
+            .map(|backend| f(backend))
     })
+}
+
+/// Fast interrupt-context lookup for `vring_interrupt()`.
+///
+/// Linux keeps `last_used_idx` in the virtqueue object and reads it directly
+/// in `more_used()`.  Lupos keeps the Rust-only ring bookkeeping in a separate
+/// backend, so the virtqueue's existing `priv` field carries a stable pointer
+/// to that backend.  The backend is boxed before publication and is removed
+/// only while the virtqueue is being deleted, which keeps this pointer stable.
+/// Interrupts are disabled while the shared backend lock is held, matching
+/// Linux's `START_USE()` serialization without the O(n) vector search.
+fn linux_virtqueue_with_backend_irq_mut<R>(
+    vq: *mut LinuxVirtqueue,
+    f: impl FnOnce(&mut LinuxVirtqueueBackend) -> R,
+) -> Option<R> {
+    if vq.is_null() {
+        return None;
+    }
+    let flags = local_irq_save();
+    let result = {
+        let _backends = LINUX_VIRTQUEUE_BACKENDS.lock();
+        let backend = unsafe { (*vq).priv_.cast::<LinuxVirtqueueBackend>() };
+        (!backend.is_null()).then(|| f(unsafe { &mut *backend }))
+    };
+    local_irq_restore(flags);
+    result
 }
 
 fn poll_virtqueues() -> usize {
@@ -1879,12 +1918,33 @@ pub unsafe extern "C" fn vring_interrupt(_irq: i32, vq: *mut c_void) -> i32 {
         return 0;
     }
     let vq = vq.cast::<LinuxVirtqueue>();
-    let Some(callback) = (unsafe { (*vq).callback }) else {
+
+    // Linux's `vring_interrupt()` first tests `more_used()`.  Shared INTx
+    // lines invoke every registered virtqueue action, so calling the
+    // callback without this check turns an unrelated device interrupt into
+    // fake work for this queue and reports IRQ_HANDLED when the line was not
+    // ours.
+    let Some(more_used) = linux_virtqueue_with_backend_irq_mut(vq, |backend| {
+        backend.ring_ready && unsafe { linux_vring_used_idx(backend) != backend.last_used_idx }
+    }) else {
         return 0;
+    };
+    if !more_used {
+        return 0;
+    }
+
+    // This matches the non-HARDEN_NOTIFICATION Linux branch: a broken queue
+    // consumes the interrupt but does not invoke the queue callback.
+    if unsafe { (*vq).reset.load(Ordering::Acquire) } {
+        return 1;
+    }
+
+    let Some(callback) = (unsafe { (*vq).callback }) else {
+        return 1;
     };
     // "Just a hint for performance: so it's ok that this can be racy!" —
     // lets virtqueue_disable_cb skip the suppression write for this window.
-    let _ = linux_virtqueue_with_backend_mut(vq, |backend| {
+    let _ = linux_virtqueue_with_backend_irq_mut(vq, |backend| {
         if backend.event {
             backend.event_triggered = true;
         }
@@ -3661,6 +3721,50 @@ mod tests {
             assert_eq!(virtio_device_reset_done(core::ptr::null_mut()), -EOPNOTSUPP);
             virtio_break_device(core::ptr::null_mut());
             __virtio_unbreak_device(core::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn vring_interrupt_ignores_empty_used_ring_like_linux() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+
+        static CALLBACKS: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "C" fn callback(_vq: *mut c_void) {
+            CALLBACKS.fetch_add(1, Ordering::AcqRel);
+        }
+
+        unsafe {
+            CALLBACKS.store(0, Ordering::Release);
+            let mut device = core::mem::zeroed::<LinuxVirtioDevice>();
+            linux_list_head_init(core::ptr::addr_of_mut!(device.vqs));
+            let name = b"requests\0";
+            let vq = vring_create_virtqueue(
+                0,
+                8,
+                4096,
+                &mut device,
+                false,
+                false,
+                false,
+                None,
+                Some(callback),
+                name.as_ptr().cast(),
+            );
+            assert!(!vq.is_null());
+
+            // Linux's vring_interrupt() checks more_used() before invoking
+            // the callback. The empty ring must therefore be IRQ_NONE.
+            assert_eq!(vring_interrupt(0, vq.cast()), 0);
+            assert_eq!(CALLBACKS.load(Ordering::Acquire), 0);
+
+            linux_virtqueue_with_backend_mut(vq, |backend| unsafe {
+                linux_vring_set_used_idx(backend, 1);
+            });
+            assert_eq!(vring_interrupt(0, vq.cast()), 1);
+            assert_eq!(CALLBACKS.load(Ordering::Acquire), 1);
+
+            vring_del_virtqueue(vq);
         }
     }
 

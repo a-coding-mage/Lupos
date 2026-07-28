@@ -58,10 +58,9 @@ extern "C" fn stack_chk_fail_impl(caller: usize) -> ! {
         core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, preserves_flags));
         log_error!(
             "stack-protector",
-            "stack-protector: canary caller={:#018x} rsp={:#018x} sched-phase={}",
+            "stack-protector: canary caller={:#018x} rsp={:#018x}",
             caller,
             sp,
-            crate::kernel::sched::stack_corruption_phase(),
         );
         let current = crate::kernel::sched::get_current();
         if !current.is_null() {

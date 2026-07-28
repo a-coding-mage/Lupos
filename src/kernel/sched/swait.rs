@@ -115,6 +115,7 @@ mod tests {
     fn task() -> Box<TaskStruct> {
         let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         task.__state = AtomicU32::new(task_state::TASK_RUNNING);
+        task.m29.sched_class = &crate::kernel::sched::fair::FAIR_SCHED_CLASS;
         task
     }
 

@@ -924,7 +924,11 @@ unsafe fn write_user_value<T: Copy>(ptr: *mut T, value: &T) -> Result<(), i64> {
             core::mem::size_of::<T>(),
         )
     };
-    if not_copied == 0 { Ok(()) } else { Err(-14) }
+    if not_copied == 0 {
+        Ok(())
+    } else {
+        Err(-14)
+    }
 }
 
 pub unsafe fn sys_rt_sigaction(
@@ -2145,7 +2149,11 @@ pub fn send_signal_to_process_group(pgrp: i32, sig: i32) -> i32 {
             sent += 1;
         }
     }
-    if sent == 0 { -3 } else { 0 }
+    if sent == 0 {
+        -3
+    } else {
+        0
+    }
 }
 
 /// User-generated process-group signal used by kill(2). Unlike tty/job-control
@@ -2165,7 +2173,13 @@ pub fn send_user_signal_to_process_group(pgrp: i32, sig: i32) -> i32 {
             return;
         }
         let pid = unsafe { (*task).pid };
-        let tgid = unsafe { if (*task).tgid > 0 { (*task).tgid } else { pid } };
+        let tgid = unsafe {
+            if (*task).tgid > 0 {
+                (*task).tgid
+            } else {
+                pid
+            }
+        };
         if crate::kernel::session::process_group(pid).unwrap_or(pid) != pgrp
             || sent_tgids.contains(&tgid)
         {
@@ -2187,7 +2201,11 @@ pub fn send_user_signal_to_process_group(pgrp: i32, sig: i32) -> i32 {
             sent += 1;
         }
     }
-    if sent == 0 { -3 } else { 0 }
+    if sent == 0 {
+        -3
+    } else {
+        0
+    }
 }
 
 unsafe fn wake_waiters(task: *mut crate::kernel::task::TaskStruct) {
@@ -3168,21 +3186,22 @@ unsafe fn force_sigsegv(task: *mut crate::kernel::task::TaskStruct) -> i32 {
 /// Must be invoked from the syscall entry path with `regs` pointing at the
 /// current task's saved `PtRegs`.
 pub unsafe fn sys_rt_sigreturn_impl(regs: *mut crate::kernel::task::PtRegs) -> i64 {
-    use crate::arch::x86::kernel::signal::SigContext;
     if regs.is_null() {
         return -14; // EFAULT
     }
-    // Linux pops the pretcode pushed by setup_rt_frame, so `rsp` now points at
-    // the ucontext.  Our setup_rt_frame leaves `rsp` at the base of the frame
-    // including pretcode; the user restorer should `add $8, %rsp` before
-    // calling rt_sigreturn.  We tolerate both layouts by re-reading from
-    // the documented offset.
+    // Linux's x86-64 rt_sigreturn always addresses the frame at `regs->sp - 8`:
+    // the signal handler's return has popped the pretcode before entering the
+    // restorer.  Read only the fields consumed by Linux's
+    // `arch/x86/kernel/signal_64.c`; copying the whole `rt_sigframe` into a
+    // kernel-stack local creates an unnecessarily large live stack object and
+    // can overwrite an exception frame during nested signal/scheduler paths.
     let sp = unsafe { (*regs).sp };
-    let Some((_frame_addr, frame)) = (unsafe { rt_sigframe_from_sp(sp) }) else {
+    let Some((_frame_addr, uc_flags, mask, sc)) = (unsafe { read_rt_sigreturn_fields(sp) }) else {
         return unsafe { bad_rt_sigreturn() };
     };
-    let sc: &SigContext = &frame.uc.uc_mcontext;
-    let mask = frame.uc.uc_sigmask;
+    if !rt_sigreturn_context_is_plausible(uc_flags, &sc) {
+        return unsafe { bad_rt_sigreturn() };
+    }
 
     // Linux restores the blocked mask before restore_sigcontext(). A bad
     // fpstate therefore still leaves the mask from the user frame installed.
@@ -3242,61 +3261,96 @@ unsafe fn bad_rt_sigreturn() -> i64 {
 }
 
 unsafe fn rt_sigframe_addr_from_sp(sp: u64) -> u64 {
-    unsafe { rt_sigframe_from_sp(sp).map(|(addr, _)| addr).unwrap_or(0) }
+    let Some(frame_addr) = sp.checked_sub(core::mem::size_of::<u64>() as u64) else {
+        return 0;
+    };
+    if crate::arch::x86::kernel::uaccess::access_ok(
+        frame_addr,
+        core::mem::size_of::<crate::arch::x86::kernel::signal::RtSigFrame>() as u64,
+    ) {
+        frame_addr
+    } else {
+        0
+    }
 }
 
-unsafe fn rt_sigframe_from_sp(
+unsafe fn read_rt_sigreturn_fields(
     sp: u64,
-) -> Option<(u64, crate::arch::x86::kernel::signal::RtSigFrame)> {
-    let popped_restorer = sp.saturating_sub(core::mem::size_of::<u64>() as u64);
-    if let Some(frame) = unsafe { read_rt_sigframe(popped_restorer) } {
-        if rt_sigframe_candidate_is_plausible(&frame) {
-            return Some((popped_restorer, frame));
-        }
-    }
-    if let Some(frame) = unsafe { read_rt_sigframe(sp) } {
-        if rt_sigframe_candidate_is_plausible(&frame) {
-            return Some((sp, frame));
-        }
-    }
-    None
-}
+) -> Option<(
+    u64,
+    u64,
+    SigSet,
+    crate::arch::x86::kernel::signal::SigContext,
+)> {
+    use crate::arch::x86::kernel::signal::{RtSigFrame, SigContext, UContext};
 
-#[cfg(not(test))]
-unsafe fn read_rt_sigframe(addr: u64) -> Option<crate::arch::x86::kernel::signal::RtSigFrame> {
-    use crate::arch::x86::kernel::signal::RtSigFrame;
-    if addr == 0
-        || !crate::arch::x86::kernel::uaccess::access_ok(
-            addr,
-            core::mem::size_of::<RtSigFrame>() as u64,
-        )
-    {
+    let frame_addr = unsafe { rt_sigframe_addr_from_sp(sp) };
+    if frame_addr == 0 {
         return None;
     }
-    let mut frame: RtSigFrame = unsafe { core::mem::zeroed() };
+
+    // Linux first fetches only uc_sigmask and uc_flags, then
+    // restore_sigcontext() copies the register prefix ending before
+    // sigcontext::reserved1.  In particular, do not materialize RtSigFrame
+    // here: it contains ucontext plus siginfo and is over a kilobyte on the
+    // kernel stack.
+    let uc_addr = frame_addr.checked_add(core::mem::offset_of!(RtSigFrame, uc) as u64)?;
+    let uc_flags =
+        unsafe { crate::arch::x86::kernel::uaccess::get_user_u64(uc_addr as *const u64).ok()? };
+    let mask_addr = uc_addr.checked_add(core::mem::offset_of!(UContext, uc_sigmask) as u64)?;
+    let mask = SigSet {
+        bits: unsafe {
+            crate::arch::x86::kernel::uaccess::get_user_u64(mask_addr as *const u64).ok()?
+        },
+    };
+    let sc_addr = uc_addr.checked_add(core::mem::offset_of!(UContext, uc_mcontext) as u64)?;
+    let sc = unsafe { read_user_sigcontext(sc_addr) }?;
+    Some((frame_addr, uc_flags, mask, sc))
+}
+
+unsafe fn read_user_sigcontext(addr: u64) -> Option<crate::arch::x86::kernel::signal::SigContext> {
+    use crate::arch::x86::kernel::signal::SigContext;
+
+    if !crate::arch::x86::kernel::uaccess::access_ok(
+        addr,
+        core::mem::offset_of!(SigContext, reserved1) as u64,
+    ) {
+        return None;
+    }
+
+    // `struct sigcontext sc` in Linux is an uninitialized local populated by
+    // copy_from_user().  Use MaybeUninit for the same bounded prefix copy so
+    // Rust does not emit a whole-object zeroing memset on the task stack.
+    let mut sc = core::mem::MaybeUninit::<SigContext>::uninit();
+    let prefix_len = core::mem::offset_of!(SigContext, reserved1);
     let not_copied = unsafe {
         crate::arch::x86::kernel::uaccess::copy_from_user(
-            (&mut frame as *mut RtSigFrame).cast::<u8>(),
+            sc.as_mut_ptr().cast::<u8>(),
             addr as *const u8,
-            core::mem::size_of::<RtSigFrame>(),
+            prefix_len,
         )
     };
-    if not_copied == 0 { Some(frame) } else { None }
-}
-
-#[cfg(test)]
-unsafe fn read_rt_sigframe(addr: u64) -> Option<crate::arch::x86::kernel::signal::RtSigFrame> {
-    if addr == 0 {
+    if not_copied != 0 {
         return None;
     }
-    Some(unsafe { core::ptr::read(addr as *const crate::arch::x86::kernel::signal::RtSigFrame) })
+    // Linux never consumes reserved1 during restore, but initialize it before
+    // forming a complete Rust value.  This is only the small trailing field,
+    // not the user-visible rt_sigframe.
+    unsafe {
+        core::ptr::write_bytes(
+            sc.as_mut_ptr().cast::<u8>().add(prefix_len),
+            0,
+            core::mem::size_of::<SigContext>() - prefix_len,
+        );
+        Some(sc.assume_init())
+    }
 }
 
-fn rt_sigframe_candidate_is_plausible(
-    frame: &crate::arch::x86::kernel::signal::RtSigFrame,
+fn rt_sigreturn_context_is_plausible(
+    uc_flags: u64,
+    sc: &crate::arch::x86::kernel::signal::SigContext,
 ) -> bool {
-    let uc_flags_known = frame.uc.uc_flags & !0x7 == 0;
-    let sc = &frame.uc.uc_mcontext;
+    let uc_flags_known = uc_flags & !0x7 == 0;
     let ip_user = sc.rip < crate::arch::x86::kernel::uaccess::TASK_SIZE_MAX;
     let sp_user = sc.rsp < crate::arch::x86::kernel::uaccess::TASK_SIZE_MAX;
     let cs_user = (sc.cs & 0x3) == 0x3;
@@ -3327,7 +3381,11 @@ pub fn sigqueue_charge() -> i32 {
     }
     let uid = unsafe {
         let cred = (*task).cred;
-        if cred.is_null() { 0 } else { (*cred).uid.0 }
+        if cred.is_null() {
+            0
+        } else {
+            (*cred).uid.0
+        }
     };
     let user = crate::kernel::user::alloc_uid(crate::kernel::cred::KUid(uid));
     let prev = user
@@ -3359,7 +3417,11 @@ fn sigqueue_release(sig: i32) {
     }
     let uid = unsafe {
         let cred = (*task).cred;
-        if cred.is_null() { 0 } else { (*cred).uid.0 }
+        if cred.is_null() {
+            0
+        } else {
+            (*cred).uid.0
+        }
     };
     if let Some(user) = crate::kernel::user::find_user(crate::kernel::cred::KUid(uid)) {
         let _ = user.sigpending.fetch_update(
@@ -5192,7 +5254,7 @@ mod tests {
     }
 
     #[test]
-    fn rt_sigreturn_accepts_frame_base_or_popped_restorer_sp() {
+    fn rt_sigreturn_uses_linux_popped_restorer_sp() {
         let mut stack = [0u8; 2048];
         let frame_base = unsafe { stack.as_mut_ptr().add(256) as u64 };
         let frame =
@@ -5208,7 +5270,7 @@ mod tests {
             unsafe { rt_sigframe_addr_from_sp(frame_base + core::mem::size_of::<u64>() as u64) },
             frame_base
         );
-        assert_eq!(unsafe { rt_sigframe_addr_from_sp(frame_base) }, frame_base);
+        assert_ne!(unsafe { rt_sigframe_addr_from_sp(frame_base) }, frame_base);
     }
 
     #[test]
