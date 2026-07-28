@@ -5587,7 +5587,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "/usr/bin/sudo -k -p '' /usr/bin/su -c '/usr/bin/id -u' root\n",
         "EOF\n",
         "chmod 0755 /tmp/lupos-sudo-su.sh\n",
-        "rm -f /tmp/lupos-sudo-su.sh /tmp/lupos-sudo-su.log /tmp/lupos-sudo-su-script.rc\n",
+        "rm -f /tmp/lupos-sudo-su.log /tmp/lupos-sudo-su-script.rc\n",
         "if /usr/bin/sudo -n -u lupos /bin/sh -c \"printf '%s\\n' lupos | /usr/bin/timeout -k 2 15 /usr/bin/script -qfec '/bin/sh /tmp/lupos-sudo-su.sh' /dev/null; rc=\\$?; printf '%s\\n' \\\"\\$rc\\\" > /tmp/lupos-sudo-su-script.rc; /usr/bin/sudo -k; exit \\$rc\" >/tmp/lupos-sudo-su.log 2>&1; then sudo_su_outer_rc=0; else sudo_su_outer_rc=$?; fi\n",
         "if [ \"$sudo_su_outer_rc\" -eq 0 ] && grep -qx 0 /tmp/lupos-sudo-su-script.rc 2>/dev/null && tr -d '\\r' </tmp/lupos-sudo-su.log | grep -qx 0; then echo 'graphics-x11: sudo-su ok'; else printf 'graphics-x11: sudo-su failed outer-rc=%s script-rc=%s\\n' \"$sudo_su_outer_rc\" \"$(cat /tmp/lupos-sudo-su-script.rc 2>/dev/null || true)\"; sed 's/^/graphics-x11: sudo-su-log /' /tmp/lupos-sudo-su.log 2>/dev/null || true; fi\n",
         "rm -f /tmp/lupos-sudo-su.sh /tmp/lupos-sudo-su.log /tmp/lupos-sudo-su-script.rc\n",

@@ -638,6 +638,94 @@ pub unsafe fn put_user_u8(dst: *mut u8, val: u8) -> Result<(), i32> {
     Ok(())
 }
 
+/// Write a scalar user value after the caller has performed the Linux
+/// `user_access_begin()` check.
+///
+/// Unlike `put_user_u32()`/`put_user_u64()`, these helpers deliberately do
+/// not fault in the VMA or take `mmap_lock` for every field.  They mirror
+/// Linux `unsafe_put_user()`'s exception-table store; a user page fault is
+/// handled by the normal fault path and a permanently invalid address is
+/// redirected to the local fixup label.
+pub unsafe fn put_user_u16_nofault(dst: *mut u16, val: u16) -> Result<(), i32> {
+    if !access_ok(dst as u64, 2) {
+        return Err(-14);
+    }
+    let mut err: i32 = 0;
+    unsafe {
+        core::arch::asm!(
+            "21: mov word ptr [{dst}], {val:x}",
+            "22: jmp 24f",
+            "23: mov {err:e}, -14",
+            "24:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 4",
+            ".long (21b - .)",
+            ".long (23b - .)",
+            ".long 3",
+            ".popsection",
+            dst = in(reg) dst,
+            val = in(reg) val,
+            err = inout(reg) err,
+            options(nostack),
+        );
+    }
+    if err == 0 { Ok(()) } else { Err(err) }
+}
+
+/// See [`put_user_u16_nofault`].
+pub unsafe fn put_user_u32_nofault(dst: *mut u32, val: u32) -> Result<(), i32> {
+    if !access_ok(dst as u64, 4) {
+        return Err(-14);
+    }
+    let mut err: i32 = 0;
+    unsafe {
+        core::arch::asm!(
+            "21: mov dword ptr [{dst}], {val:e}",
+            "22: jmp 24f",
+            "23: mov {err:e}, -14",
+            "24:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 4",
+            ".long (21b - .)",
+            ".long (23b - .)",
+            ".long 3",
+            ".popsection",
+            dst = in(reg) dst,
+            val = in(reg) val,
+            err = inout(reg) err,
+            options(nostack),
+        );
+    }
+    if err == 0 { Ok(()) } else { Err(err) }
+}
+
+/// See [`put_user_u16_nofault`].
+pub unsafe fn put_user_u64_nofault(dst: *mut u64, val: u64) -> Result<(), i32> {
+    if !access_ok(dst as u64, 8) {
+        return Err(-14);
+    }
+    let mut err: i32 = 0;
+    unsafe {
+        core::arch::asm!(
+            "21: mov qword ptr [{dst}], {val}",
+            "22: jmp 24f",
+            "23: mov {err:e}, -14",
+            "24:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 4",
+            ".long (21b - .)",
+            ".long (23b - .)",
+            ".long 3",
+            ".popsection",
+            dst = in(reg) dst,
+            val = in(reg) val,
+            err = inout(reg) err,
+            options(nostack),
+        );
+    }
+    if err == 0 { Ok(()) } else { Err(err) }
+}
+
 /// Write a `u32` to user space.
 pub unsafe fn put_user_u32(dst: *mut u32, val: u32) -> Result<(), i32> {
     if !access_ok(dst as u64, 4) {
@@ -1201,5 +1289,25 @@ mod tests {
         // The host-test build must allow the copy path to proceed so
         // that callers' fault paths are exercisable.
         assert!(nmi_uaccess_okay());
+    }
+
+    #[test]
+    fn unsafe_scalar_user_stores_match_linux_access_window() {
+        // test-origin: linux:vendor/linux/arch/x86/include/asm/uaccess.h:user_access_begin
+        // test-origin: linux:vendor/linux/include/linux/uaccess.h:unsafe_put_user
+        let mut value16 = 0u16;
+        let mut value32 = 0u32;
+        let mut value64 = 0u64;
+        unsafe {
+            put_user_u16_nofault(&mut value16, 0x1234).unwrap();
+            put_user_u32_nofault(&mut value32, 0x1234_5678).unwrap();
+            put_user_u64_nofault(&mut value64, 0x1234_5678_9abc_def0).unwrap();
+        }
+        assert_eq!(value16, 0x1234);
+        assert_eq!(value32, 0x1234_5678);
+        assert_eq!(value64, 0x1234_5678_9abc_def0);
+
+        let invalid = (1u64 << 47) as *mut u64;
+        assert_eq!(unsafe { put_user_u64_nofault(invalid, 1) }, Err(-14));
     }
 }

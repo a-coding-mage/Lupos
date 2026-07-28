@@ -125,10 +125,62 @@ fn x64_rt_sigframe_layout(
     Some((frame_sp, fpstate_sp))
 }
 
+/// Copy one scalar user-frame field without materializing the complete signal
+/// frame on the current task's kernel stack.
+///
+/// Linux's `unsafe_put_user()` sequence in `x64_setup_rt_frame()` writes each
+/// field directly. Keeping this helper scalar-sized is important: signal
+/// delivery runs on a live task stack and a full `RtSigFrame` temporary can
+/// overlap the entry/return state being protected by that stack.
+#[inline]
+unsafe fn put_user_frame_value<T: Copy>(frame_sp: u64, offset: usize, value: T) -> Result<(), i32> {
+    let Some(dst) = frame_sp.checked_add(offset as u64) else {
+        return Err(-14); // EFAULT
+    };
+    let value_ptr = &value as *const T;
+    match core::mem::size_of::<T>() {
+        2 => crate::arch::x86::kernel::uaccess::put_user_u16_nofault(
+            dst as *mut u16,
+            unsafe { value_ptr.cast::<u16>().read_unaligned() },
+        ),
+        4 => crate::arch::x86::kernel::uaccess::put_user_u32_nofault(
+            dst as *mut u32,
+            unsafe { value_ptr.cast::<u32>().read_unaligned() },
+        ),
+        8 => crate::arch::x86::kernel::uaccess::put_user_u64_nofault(
+            dst as *mut u64,
+            unsafe { value_ptr.cast::<u64>().read_unaligned() },
+        ),
+        _ => Err(-14), // EFAULT: only Linux scalar fields are supported here.
+    }
+}
+
+/// Copy a source object into one user-frame field without creating a kernel
+/// copy of the object. This is used for `siginfo_t`, which is large enough
+/// that a by-value temporary would recreate the problem this path avoids.
+#[inline]
+unsafe fn put_user_frame_bytes(
+    frame_sp: u64,
+    offset: usize,
+    src: *const u8,
+    len: usize,
+) -> Result<(), i32> {
+    let Some(dst) = frame_sp.checked_add(offset as u64) else {
+        return Err(-14); // EFAULT
+    };
+    let not_copied =
+        unsafe { crate::arch::x86::kernel::uaccess::copy_to_user(dst as *mut u8, src, len) };
+    if not_copied == 0 {
+        Ok(())
+    } else {
+        Err(-14) // EFAULT
+    }
+}
+
 /// Set up the signal frame on the user stack.
 ///
-/// Constructs a `RtSigFrame` with the current register state, signal info, and
-/// alternate stack info, then modifies `regs` to point to the signal handler.
+/// Constructs the user-visible `RtSigFrame` in place, then modifies `regs` to
+/// point to the signal handler.
 ///
 /// # Arguments
 /// - `regs` — mutable pointer to the current `PtRegs` (from syscall entry or interrupt).
@@ -164,89 +216,224 @@ pub unsafe fn setup_rt_frame(
 
     // Verify we're not going off the edge of the stack.
     if user_sp == 0
+        || !crate::arch::x86::kernel::uaccess::access_ok(user_sp, frame_size as u64)
         || !unsafe { crate::arch::x86::kernel::fpu_signal::copy_fpstate_to_sigframe(fpstate_sp) }
     {
         return Err(-14); // EFAULT
     }
 
-    // Build the signal frame in kernel memory, then copy to user stack.
-    let mut frame: RtSigFrame = unsafe { core::mem::zeroed() };
+    // Linux writes the user frame in place with unsafe_put_user(). Keep the
+    // same order and do not create a complete RtSigFrame temporary on the
+    // current task's kernel stack.
+    let uc_offset = core::mem::offset_of!(RtSigFrame, uc);
+    let uc_stack_offset = uc_offset + core::mem::offset_of!(UContext, uc_stack);
+    let sc_offset = uc_offset + core::mem::offset_of!(UContext, uc_mcontext);
+    let sigmask_offset = uc_offset + core::mem::offset_of!(UContext, uc_sigmask);
 
-    // 1. Set sa_restorer (the return code address).
-    frame.pretcode = (*action).sa_restorer as u64;
-
-    // 2. Fill in ucontext_t: flags, link, stack, mcontext, sigmask.
-    frame.uc.uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
+    // 1. Create the ucontext: flags, link, and alternate-stack state.
+    let mut uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
     if crate::arch::x86::kernel::fpu::signal_uses_xsave() {
-        frame.uc.uc_flags |= UC_FP_XSTATE;
-    }
-    frame.uc.uc_link = 0; // No linked context
-    // Placeholder: proper stack setup in later work
-    frame.uc.uc_stack = SigAltStack {
-        ss_sp: 0,
-        ss_flags: 0,
-        ss_size: 0,
-    };
-
-    // 3. Copy machine context (SigContext) from current PtRegs.
-    {
-        let regs_ref = unsafe { &*regs };
-        let sc = &mut frame.uc.uc_mcontext;
-        sc.r8 = regs_ref.r8;
-        sc.r9 = regs_ref.r9;
-        sc.r10 = regs_ref.r10;
-        sc.r11 = regs_ref.r11;
-        sc.r12 = regs_ref.r12;
-        sc.r13 = regs_ref.r13;
-        sc.r14 = regs_ref.r14;
-        sc.r15 = regs_ref.r15;
-        sc.rdi = regs_ref.di;
-        sc.rsi = regs_ref.si;
-        sc.rbp = regs_ref.bp;
-        sc.rbx = regs_ref.bx;
-        sc.rdx = regs_ref.dx;
-        sc.rax = regs_ref.ax;
-        sc.rcx = regs_ref.cx;
-        sc.rsp = regs_ref.sp;
-        sc.rip = regs_ref.ip;
-        sc.eflags = regs_ref.flags;
-        sc.cs = regs_ref.cs as u16;
-        sc.ss = regs_ref.ss as u16;
-        sc.gs = 0; // Placeholder
-        sc.fs = 0; // Placeholder
-        sc.err = regs_ref.orig_ax as u64; // Store orig_ax as err temporarily
-        sc.trapno = 0;
-        sc.oldmask = 0;
-        sc.cr2 = 0;
-        sc.fpstate = fpstate_sp;
-        sc.reserved1 = [0; 8];
+        uc_flags |= UC_FP_XSTATE;
     }
 
-    // 4. Copy signal info (siginfo_t).
-    frame.info = unsafe { *info };
-    frame.uc.uc_sigmask = mask;
-    frame.uc.uc_mcontext.oldmask = mask.bits;
+    unsafe {
+        put_user_frame_value(
+            user_sp,
+            uc_offset + core::mem::offset_of!(UContext, uc_flags),
+            uc_flags,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            uc_offset + core::mem::offset_of!(UContext, uc_link),
+            0u64,
+        )?;
+        // Placeholder: proper alternate-stack state remains separate work.
+        put_user_frame_value(
+            user_sp,
+            uc_stack_offset + core::mem::offset_of!(SigAltStack, ss_sp),
+            0usize,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            uc_stack_offset + core::mem::offset_of!(SigAltStack, ss_flags),
+            0u32,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            uc_stack_offset + core::mem::offset_of!(SigAltStack, ss_size),
+            0usize,
+        )?;
 
-    // 5. Write the frame to user stack.
-    let not_copied = unsafe {
-        crate::arch::x86::kernel::uaccess::copy_to_user(
-            user_sp as *mut u8,
-            (&frame as *const RtSigFrame).cast::<u8>(),
-            frame_size,
-        )
-    };
-    if not_copied != 0 {
-        return Err(-14); // EFAULT
+        // 2. Set sa_restorer (the return code address).
+        put_user_frame_value(
+            user_sp,
+            core::mem::offset_of!(RtSigFrame, pretcode),
+            (*action).sa_restorer as u64,
+        )?;
+
+        // 3. Copy machine context from current PtRegs in Linux's field order.
+        let regs_ref = &*regs;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, rdi),
+            regs_ref.di,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, rsi),
+            regs_ref.si,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, rbp),
+            regs_ref.bp,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, rsp),
+            regs_ref.sp,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, rbx),
+            regs_ref.bx,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, rdx),
+            regs_ref.dx,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, rcx),
+            regs_ref.cx,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, rax),
+            regs_ref.ax,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, r8),
+            regs_ref.r8,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, r9),
+            regs_ref.r9,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, r10),
+            regs_ref.r10,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, r11),
+            regs_ref.r11,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, r12),
+            regs_ref.r12,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, r13),
+            regs_ref.r13,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, r14),
+            regs_ref.r14,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, r15),
+            regs_ref.r15,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, err),
+            regs_ref.orig_ax,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, trapno),
+            0u64,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, rip),
+            regs_ref.ip,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, eflags),
+            regs_ref.flags,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, cs),
+            regs_ref.cs as u16,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, gs),
+            0u16,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, fs),
+            0u16,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, ss),
+            regs_ref.ss as u16,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, fpstate),
+            fpstate_sp,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, oldmask),
+            mask.bits,
+        )?;
+        put_user_frame_value(
+            user_sp,
+            sc_offset + core::mem::offset_of!(SigContext, cr2),
+            0u64,
+        )?;
+        put_user_frame_value(user_sp, sigmask_offset, mask.bits)?;
+
+        // Linux copies siginfo only for SA_SIGINFO. RSI still points at the
+        // fixed frame member for traditional handlers.
+        if (*action).sa_flags & crate::kernel::signal::SA_SIGINFO != 0 {
+            put_user_frame_bytes(
+                user_sp,
+                core::mem::offset_of!(RtSigFrame, info),
+                info.cast::<u8>(),
+                core::mem::size_of::<SigInfo>(),
+            )?;
+        }
     }
 
-    // 6. Modify PtRegs to transfer control to the signal handler.
+    // 4. Modify PtRegs to transfer control to the signal handler.
     let regs_mut = unsafe { &mut *regs };
     regs_mut.ip = (*action).sa_handler as u64; // RIP = signal handler entry
     regs_mut.sp = user_sp; // RSP = frame base
     regs_mut.di = signum as u64; // RDI = signal number (arg 0)
     regs_mut.ax = 0; // Linux clears AX in case the handler lacks prototypes.
-    regs_mut.si = user_sp + core::mem::offset_of!(RtSigFrame, info) as u64; // RSI = &siginfo_t
-    regs_mut.dx = user_sp + core::mem::offset_of!(RtSigFrame, uc) as u64; // RDX = &ucontext_t
+    regs_mut.si = user_sp
+        .checked_add(core::mem::offset_of!(RtSigFrame, info) as u64)
+        .ok_or(-14)?; // RSI = &siginfo_t
+    regs_mut.dx = user_sp
+        .checked_add(core::mem::offset_of!(RtSigFrame, uc) as u64)
+        .ok_or(-14)?; // RDX = &ucontext_t
     regs_mut.cs = crate::arch::x86::kernel::gdt::sel::USER_CS as u64;
     if regs_mut.ss & 0x3 != 0x3 {
         regs_mut.ss = crate::arch::x86::kernel::gdt::sel::USER_DS as u64;
@@ -319,7 +506,7 @@ mod tests {
         let mut regs = sample_regs(stack_top);
         let action = RtSigAction {
             sa_handler: 0x5000,
-            sa_flags: 0,
+            sa_flags: crate::kernel::signal::SA_SIGINFO,
             sa_restorer: 0x6000,
             sa_mask: SigSet { bits: 0x55 },
         };
@@ -398,5 +585,38 @@ mod tests {
 
         assert_eq!(frame_sp & 0xF, 8);
         assert!(frame_sp + core::mem::size_of::<RtSigFrame>() as u64 <= stack_top - REDZONE_SIZE);
+    }
+
+    #[test]
+    fn setup_rt_frame_does_not_materialize_full_frame_on_kernel_stack() {
+        // test-origin: linux:vendor/linux/arch/x86/kernel/signal_64.c:x64_setup_rt_frame
+        // Linux's unsafe_put_user sequence writes the user frame in place.  A
+        // full RtSigFrame temporary is both a parity divergence and an
+        // avoidable live-task kernel-stack footprint during signal delivery.
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/arch/x86/kernel/signal_64.c"
+        ));
+        let linux_body = linux
+            .split("int x64_setup_rt_frame(")
+            .nth(1)
+            .and_then(|body| body.split("/* Set up registers for signal handler */").next())
+            .expect("Linux x64_setup_rt_frame body must remain present");
+        assert!(linux_body.contains("user_access_begin(frame, sizeof(*frame))"));
+
+        let source = include_str!("signal.rs");
+        let start = source
+            .find("pub unsafe fn setup_rt_frame(")
+            .expect("setup_rt_frame must remain present");
+        let end = source[start..]
+            .find("\n#[cfg(test)]")
+            .map(|offset| start + offset)
+            .expect("setup_rt_frame body must end before its tests");
+        let body = &source[start..end];
+
+        assert!(!body.contains("let mut frame: RtSigFrame"));
+        assert!(!body.contains("core::mem::zeroed()"));
+        assert!(!body.contains("(&frame as *const RtSigFrame)"));
+        assert!(body.contains("access_ok(user_sp, frame_size as u64)"));
     }
 }

@@ -1768,6 +1768,19 @@ unsafe fn select_impl(
 /// checks the sticky `poll_wqueues.triggered` bit before scheduling; the same
 /// handshake here prevents a wake on an early fd from being overwritten while
 /// a later fd is registered.
+#[inline]
+fn publish_poll_task_running(current: *mut crate::kernel::task::TaskStruct) {
+    if current.is_null() {
+        return;
+    }
+    unsafe {
+        (*current).__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+    }
+}
+
 #[cfg(not(test))]
 fn poll_schedule(
     current: *mut crate::kernel::task::TaskStruct,
@@ -1803,14 +1816,19 @@ fn poll_schedule(
         if let Some(armed) = armed {
             crate::kernel::time::sleep_timeout::cancel_wakeup(armed);
         }
+        // Linux `poll_schedule_timeout()` publishes TASK_RUNNING before
+        // returning to the caller. `poll_freewait()` then removes the
+        // poll-table entries while a concurrent callback may still hold
+        // their source waitqueue lock. Publishing after `table.finish()`
+        // lets that callback treat this already-running task as asleep and
+        // wait on `on_cpu` while this task waits for the same queue lock.
+        publish_poll_task_running(current);
     }
+    // Linux `poll_schedule_timeout()` clears `triggered` with
+    // `smp_store_mb()` after every sleep attempt, including the already-woken
+    // fast path. Keep the next readiness scan from spinning on an old wake.
+    table.clear_triggered();
     table.finish();
-    unsafe {
-        (*current).__state.store(
-            crate::kernel::task::task_state::TASK_RUNNING,
-            Ordering::Release,
-        );
-    }
 }
 
 #[cfg(not(test))]
@@ -5102,6 +5120,44 @@ mod tests {
     ) -> u32 {
         crate::fs::select::poll_wait(file, &INTERRUPTED_POLL_QUEUE, table);
         0
+    }
+
+    /// test-origin: linux:vendor/linux/fs/select.c:poll_schedule_timeout
+    /// and poll_freewait
+    ///
+    /// Linux publishes TASK_RUNNING as soon as the sleep returns, before it
+    /// removes poll-table entries.  This is a source-order contract as well
+    /// as a state transition: a callback may hold the source waitqueue lock
+    /// while waking this task, so cleanup must not make the running task look
+    /// interruptible until after that lock is no longer needed.
+    #[test]
+    fn poll_sleep_publishes_running_before_poll_table_cleanup() {
+        let source = include_str!("syscalls.rs");
+        let body = source
+            .split("fn poll_schedule(")
+            .nth(1)
+            .expect("poll_schedule must remain present");
+        let publish = body
+            .find("publish_poll_task_running(current)")
+            .expect("poll_schedule must publish TASK_RUNNING after sleep");
+        let clear = body
+            .find("table.clear_triggered()")
+            .expect("poll_schedule must clear the observed wakeup before cleanup");
+        assert!(
+            publish < clear && body[clear..].contains("table.finish();"),
+            "poll cleanup must follow TASK_RUNNING publication and trigger clearing"
+        );
+
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        task.__state.store(
+            crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+            Ordering::Release,
+        );
+        publish_poll_task_running(&mut *task);
+        assert_eq!(
+            task.__state.load(Ordering::Acquire),
+            crate::kernel::task::task_state::TASK_RUNNING
+        );
     }
 
     static INTERRUPTED_POLL_OPS: crate::fs::ops::FileOps = crate::fs::ops::FileOps {

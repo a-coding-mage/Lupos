@@ -853,6 +853,7 @@ impl VmAreaStruct {
 /// | `mm_users`      | `mm_users`      | Thread count                   |
 /// | `mm_count`      | `mm_count`      | Structural refcount            |
 /// | `map_count`     | `map_count`     | Number of VMAs                 |
+/// | `page_table_lock` | `page_table_lock` | Fallback PTE/page-table lock |
 /// | `mmap_lock`     | `mmap_lock`     | Per-mm VMA reader/writer lock  |
 /// | `total_vm`      | `total_vm`      | Total mapped pages             |
 /// | `hiwater_rss`   | `hiwater_rss`   | High-water RSS                 |
@@ -878,6 +879,11 @@ pub struct MmStruct {
     // -- VMA accounting --
     /// Number of VMAs currently in the Maple Tree.
     pub map_count: i32,
+
+    /// Fallback page-table lock used when x86 does not split PTE locks.
+    ///
+    /// Ref: Linux `mm_types.h` — `mm_struct::page_table_lock`.
+    pub page_table_lock: RawSpinLock,
 
     /// Per-address-space reader/writer exclusion for VMA mutations.
     pub mmap_lock: MmapLock,
@@ -951,6 +957,7 @@ impl MmStruct {
             mm_users: AtomicI32::new(1),
             mm_count: AtomicI32::new(1),
             map_count: 0,
+            page_table_lock: RawSpinLock::new(),
             mmap_lock: MmapLock::new(),
             hiwater_rss: 0,
             hiwater_vm: 0,

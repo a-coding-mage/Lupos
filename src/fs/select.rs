@@ -58,7 +58,7 @@ pub struct PollTable {
     owner: PollTableOwner,
     entries: Vec<PollTableEntry>,
     /// Linux `poll_wqueues.triggered`: once any registered queue wakes this
-    /// remains set until the sleep cycle has observed it.
+    /// remains set until the sleep cycle has observed and cleared it.
     triggered: Arc<AtomicBool>,
     wait_calls: usize,
     unregistered_sources: bool,
@@ -182,6 +182,16 @@ impl PollTable {
         } else {
             true
         }
+    }
+
+    /// Complete Linux `poll_schedule_timeout()`'s
+    /// `smp_store_mb(pwq->triggered, 0)` step before the next readiness scan.
+    ///
+    /// The sequentially consistent store is the local full-barrier equivalent
+    /// of Linux's atomic store-mb: it prevents a wake observed by this sleep
+    /// cycle from turning every subsequent poll iteration into a busy loop.
+    pub(crate) fn clear_triggered(&self) {
+        self.triggered.store(false, Ordering::SeqCst);
     }
 
     /// Remove all installed wait entries and drop their file pins.
@@ -453,5 +463,20 @@ mod tests {
         assert_eq!(fds[0].revents, POLLIN);
         assert_eq!(fds[1].revents, POLLOUT);
         assert_eq!(fds[2].revents, 0);
+    }
+
+    /// test-origin: linux:vendor/linux/fs/select.c:poll_schedule_timeout
+    ///
+    /// Linux clears `poll_wqueues.triggered` after each sleep attempt so a
+    /// wakeup is consumed by exactly one readiness scan.
+    #[test]
+    fn poll_table_trigger_is_reusable_after_a_wakeup() {
+        let table = PollTable::new(core::ptr::null_mut());
+        table.triggered.store(true, Ordering::SeqCst);
+        assert!(table.triggered.load(Ordering::SeqCst));
+
+        table.clear_triggered();
+
+        assert!(!table.triggered.load(Ordering::SeqCst));
     }
 }
