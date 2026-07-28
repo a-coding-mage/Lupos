@@ -31,7 +31,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -252,7 +252,7 @@ struct LinuxVirtqueueBackend {
     pending_notify: bool,
     // Split-ring indices are u16 and wrap exactly as in
     // `vendor/linux/drivers/virtio/virtio_ring.c::vring_virtqueue`.
-    last_used_idx: u16,
+    last_used_idx: AtomicU16,
     avail_idx_shadow: u16,
     // Queue size plus the interrupt-suppression state of
     // `vring_virtqueue_split`: VIRTIO_RING_F_EVENT_IDX negotiation, the
@@ -260,10 +260,43 @@ struct LinuxVirtqueueBackend {
     num: u16,
     event: bool,
     avail_flags_shadow: u16,
-    event_triggered: bool,
+    // Linux marks this racy hint with data_race(). An atomic keeps the same
+    // lock-free behavior while making the Rust translation defined when an
+    // interrupt races virtqueue_enable_cb_prepare().
+    event_triggered: AtomicBool,
     free_list: Vec<u16>,
     submitted: Vec<LinuxVirtqueueToken>,
 }
+
+// `struct virtqueue::priv` belongs to the Linux transport: virtio-pci stores
+// its queue-notify MMIO address there. Keep the Rust-only interrupt lookup in
+// a separate lock-free side table instead of changing that ABI field.
+const LINUX_VIRTQUEUE_IRQ_BACKEND_SLOTS: usize = 256;
+const LINUX_VIRTQUEUE_IRQ_BACKEND_TOMBSTONE: usize = usize::MAX;
+
+struct LinuxVirtqueueIrqBackendSlot {
+    vq: AtomicUsize,
+    backend: AtomicUsize,
+}
+
+impl LinuxVirtqueueIrqBackendSlot {
+    const fn new() -> Self {
+        Self {
+            vq: AtomicUsize::new(0),
+            backend: AtomicUsize::new(0),
+        }
+    }
+}
+
+static LINUX_VIRTQUEUE_IRQ_BACKENDS: [LinuxVirtqueueIrqBackendSlot;
+    LINUX_VIRTQUEUE_IRQ_BACKEND_SLOTS] =
+    [const { LinuxVirtqueueIrqBackendSlot::new() }; LINUX_VIRTQUEUE_IRQ_BACKEND_SLOTS];
+
+// A queue can be deleted after an idle poller has selected it but before that
+// poller enters `vring_interrupt()`. Hold a short reader section across the
+// whole callback so `vring_del_virtqueue()` can clear the side-table entry and
+// wait before freeing the backend or the virtqueue itself.
+static LINUX_VIRTQUEUE_IRQ_READERS: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
     static ref LINUX_VIRTQUEUE_BACKENDS: Mutex<Vec<Box<LinuxVirtqueueBackend>>> =
@@ -658,6 +691,9 @@ fn linux_virtqueue_register_backend(
     for idx in (0..num).rev() {
         free_list.push(idx);
     }
+    // A re-created queue can reuse the same ABI address. Retire its old
+    // side-table entry before replacing the boxed backend.
+    linux_virtqueue_irq_backend_unregister(vq);
     linux_virtqueue_with_backends_mut(|backends| {
         backends.retain(|backend| backend.vq != vq as usize);
         backends.push(Box::new(LinuxVirtqueueBackend {
@@ -672,12 +708,12 @@ fn linux_virtqueue_register_backend(
             ring_ready: true,
             callbacks_enabled: true,
             pending_notify: false,
-            last_used_idx: 0,
+            last_used_idx: AtomicU16::new(0),
             avail_idx_shadow: 0,
             num,
             event,
             avail_flags_shadow: 0,
-            event_triggered: false,
+            event_triggered: AtomicBool::new(false),
             free_list,
             submitted: Vec::new(),
         }));
@@ -685,22 +721,18 @@ fn linux_virtqueue_register_backend(
             .last_mut()
             .expect("virtqueue backend was just inserted")
             .as_mut() as *mut LinuxVirtqueueBackend;
-        unsafe {
-            (*vq).priv_ = backend.cast();
-        }
+        linux_virtqueue_irq_backend_register(vq, backend);
     });
 }
 
 fn linux_virtqueue_remove_backend(vq: *mut LinuxVirtqueue) {
+    linux_virtqueue_irq_backend_unregister(vq);
     let backend = linux_virtqueue_with_backends_mut(|backends| {
         backends
             .iter()
             .position(|backend| backend.vq == vq as usize)
             .map(|pos| backends.remove(pos))
     });
-    unsafe {
-        (*vq).priv_ = core::ptr::null_mut();
-    }
     if let Some(backend) = backend {
         unsafe {
             if backend.use_map_api {
@@ -750,29 +782,101 @@ fn linux_virtqueue_with_backend_mut<R>(
     })
 }
 
+#[inline]
+fn linux_virtqueue_irq_slot_start(vq: *mut LinuxVirtqueue) -> usize {
+    let key = vq as usize;
+    ((key >> 4) ^ (key >> 12) ^ (key >> 20)) & (LINUX_VIRTQUEUE_IRQ_BACKEND_SLOTS - 1)
+}
+
+fn linux_virtqueue_irq_backend_register(
+    vq: *mut LinuxVirtqueue,
+    backend: *mut LinuxVirtqueueBackend,
+) {
+    let key = vq as usize;
+    let start = linux_virtqueue_irq_slot_start(vq);
+    for offset in 0..LINUX_VIRTQUEUE_IRQ_BACKEND_SLOTS {
+        let slot = &LINUX_VIRTQUEUE_IRQ_BACKENDS
+            [(start + offset) & (LINUX_VIRTQUEUE_IRQ_BACKEND_SLOTS - 1)];
+        let existing = slot.vq.load(Ordering::Acquire);
+        if existing == 0 || existing == LINUX_VIRTQUEUE_IRQ_BACKEND_TOMBSTONE || existing == key {
+            // Publish the backend before the key. Readers that acquire the
+            // key therefore never observe a partially initialized entry.
+            slot.backend.store(backend as usize, Ordering::SeqCst);
+            slot.vq.store(key, Ordering::SeqCst);
+            return;
+        }
+    }
+    panic!("virtio interrupt backend side table is full");
+}
+
+fn linux_virtqueue_irq_backend_unregister(vq: *mut LinuxVirtqueue) {
+    if vq.is_null() {
+        return;
+    }
+    let key = vq as usize;
+    let start = linux_virtqueue_irq_slot_start(vq);
+    let mut found = false;
+    for offset in 0..LINUX_VIRTQUEUE_IRQ_BACKEND_SLOTS {
+        let slot = &LINUX_VIRTQUEUE_IRQ_BACKENDS
+            [(start + offset) & (LINUX_VIRTQUEUE_IRQ_BACKEND_SLOTS - 1)];
+        let existing = slot.vq.load(Ordering::SeqCst);
+        if existing == key {
+            // Turn the entry into a tombstone first so a reader that starts
+            // after this point cannot acquire the old backend pointer.
+            slot.vq
+                .store(LINUX_VIRTQUEUE_IRQ_BACKEND_TOMBSTONE, Ordering::SeqCst);
+            slot.backend.store(0, Ordering::SeqCst);
+            found = true;
+            break;
+        }
+        if existing == 0 {
+            break;
+        }
+    }
+    if found {
+        while LINUX_VIRTQUEUE_IRQ_READERS.load(Ordering::SeqCst) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Fast interrupt-context lookup for `vring_interrupt()`.
 ///
 /// Linux keeps `last_used_idx` in the virtqueue object and reads it directly
-/// in `more_used()`.  Lupos keeps the Rust-only ring bookkeeping in a separate
-/// backend, so the virtqueue's existing `priv` field carries a stable pointer
-/// to that backend.  The backend is boxed before publication and is removed
-/// only while the virtqueue is being deleted, which keeps this pointer stable.
-/// Interrupts are disabled while the shared backend lock is held, matching
-/// Linux's `START_USE()` serialization without the O(n) vector search.
-fn linux_virtqueue_with_backend_irq_mut<R>(
+/// in `more_used()`, without taking the virtqueue operation lock. Lupos keeps
+/// the Rust-only ring bookkeeping in a separate backend, so a side table maps
+/// the virtqueue address to the stable boxed backend. The Linux `priv` field
+/// remains available for the transport's queue-notify address. The interrupt
+/// path remains lock-free like Linux; the fields that can race are represented
+/// atomically.
+fn linux_virtqueue_with_backend_irq<R>(
     vq: *mut LinuxVirtqueue,
-    f: impl FnOnce(&mut LinuxVirtqueueBackend) -> R,
+    f: impl FnOnce(&LinuxVirtqueueBackend) -> R,
 ) -> Option<R> {
     if vq.is_null() {
         return None;
     }
-    let flags = local_irq_save();
-    let result = {
-        let _backends = LINUX_VIRTQUEUE_BACKENDS.lock();
-        let backend = unsafe { (*vq).priv_.cast::<LinuxVirtqueueBackend>() };
-        (!backend.is_null()).then(|| f(unsafe { &mut *backend }))
-    };
-    local_irq_restore(flags);
+    crate::kernel::locking::preempt_disable();
+    LINUX_VIRTQUEUE_IRQ_READERS.fetch_add(1, Ordering::SeqCst);
+
+    let key = vq as usize;
+    let start = linux_virtqueue_irq_slot_start(vq);
+    let backend = (0..LINUX_VIRTQUEUE_IRQ_BACKEND_SLOTS).find_map(|offset| {
+        let slot = &LINUX_VIRTQUEUE_IRQ_BACKENDS
+            [(start + offset) & (LINUX_VIRTQUEUE_IRQ_BACKEND_SLOTS - 1)];
+        let existing = slot.vq.load(Ordering::SeqCst);
+        if existing == key {
+            let backend = slot.backend.load(Ordering::SeqCst) as *mut LinuxVirtqueueBackend;
+            return (!backend.is_null()).then_some(backend);
+        }
+        (existing == 0).then_some(core::ptr::null_mut())
+    });
+    let result = backend
+        .filter(|backend| !backend.is_null())
+        .map(|backend| f(unsafe { &*backend }));
+
+    LINUX_VIRTQUEUE_IRQ_READERS.fetch_sub(1, Ordering::SeqCst);
+    crate::kernel::locking::preempt_enable();
     result
 }
 
@@ -789,7 +893,7 @@ fn poll_virtqueues() -> usize {
                     return None;
                 }
                 let used_idx = unsafe { linux_vring_used_idx(backend) };
-                (used_idx != backend.last_used_idx).then_some(backend.vq)
+                (used_idx != backend.last_used_idx.load(Ordering::Acquire)).then_some(backend.vq)
             })
             .collect::<Vec<_>>()
     });
@@ -1919,40 +2023,42 @@ pub unsafe extern "C" fn vring_interrupt(_irq: i32, vq: *mut c_void) -> i32 {
     }
     let vq = vq.cast::<LinuxVirtqueue>();
 
-    // Linux's `vring_interrupt()` first tests `more_used()`.  Shared INTx
+    // Linux's `vring_interrupt()` first tests `more_used()`. Shared INTx
     // lines invoke every registered virtqueue action, so calling the
     // callback without this check turns an unrelated device interrupt into
     // fake work for this queue and reports IRQ_HANDLED when the line was not
-    // ours.
-    let Some(more_used) = linux_virtqueue_with_backend_irq_mut(vq, |backend| {
-        backend.ring_ready && unsafe { linux_vring_used_idx(backend) != backend.last_used_idx }
-    }) else {
-        return 0;
-    };
-    if !more_used {
-        return 0;
-    }
-
-    // This matches the non-HARDEN_NOTIFICATION Linux branch: a broken queue
-    // consumes the interrupt but does not invoke the queue callback.
-    if unsafe { (*vq).reset.load(Ordering::Acquire) } {
-        return 1;
-    }
-
-    let Some(callback) = (unsafe { (*vq).callback }) else {
-        return 1;
-    };
-    // "Just a hint for performance: so it's ok that this can be racy!" —
-    // lets virtqueue_disable_cb skip the suppression write for this window.
-    let _ = linux_virtqueue_with_backend_irq_mut(vq, |backend| {
-        if backend.event {
-            backend.event_triggered = true;
+    // ours. Keep the reader section around the complete callback: Linux's
+    // transport synchronizes vectors before freeing a virtqueue, and this is
+    // the equivalent lifetime boundary for the Lupos side table.
+    linux_virtqueue_with_backend_irq(vq, |backend| {
+        let more_used = backend.ring_ready
+            && unsafe {
+                linux_vring_used_idx(backend) != backend.last_used_idx.load(Ordering::Acquire)
+            };
+        if !more_used {
+            return 0;
         }
-    });
-    unsafe {
-        callback(vq.cast::<c_void>());
-    }
-    1
+
+        // This matches the non-HARDEN_NOTIFICATION Linux branch: a broken
+        // queue consumes the interrupt but does not invoke the callback.
+        if unsafe { (*vq).reset.load(Ordering::Acquire) } {
+            return 1;
+        }
+
+        // "Just a hint for performance: so it's ok that this can be racy!" —
+        // lets virtqueue_disable_cb skip the suppression write for this
+        // window.
+        if backend.event {
+            backend.event_triggered.store(true, Ordering::Relaxed);
+        }
+        if let Some(callback) = unsafe { (*vq).callback } {
+            unsafe {
+                callback(vq.cast::<c_void>());
+            }
+        }
+        1
+    })
+    .unwrap_or(0)
 }
 
 /// `vring_notification_data` - `vendor/linux/drivers/virtio/virtio_ring.c:3487`.
@@ -2473,11 +2579,12 @@ pub unsafe extern "C" fn virtqueue_get_buf_ctx(
             return None;
         }
         let used_idx = unsafe { linux_vring_used_idx(backend) };
-        if backend.last_used_idx == used_idx {
+        let last_used_idx = backend.last_used_idx.load(Ordering::Acquire);
+        if last_used_idx == used_idx {
             return None;
         }
         core::sync::atomic::fence(Ordering::SeqCst);
-        let slot = backend.last_used_idx as usize % unsafe { (*vq).num_max as usize };
+        let slot = last_used_idx as usize % unsafe { (*vq).num_max as usize };
         let elem = unsafe { linux_vring_used_elem(backend, slot) };
         let Some(pos) = backend
             .submitted
@@ -2491,7 +2598,10 @@ pub unsafe extern "C" fn virtqueue_get_buf_ctx(
         };
         let mut token = backend.submitted.remove(pos);
         token.len = elem.len;
-        backend.last_used_idx = backend.last_used_idx.wrapping_add(1);
+        let next_last_used_idx = last_used_idx.wrapping_add(1);
+        backend
+            .last_used_idx
+            .store(next_last_used_idx, Ordering::Release);
         for desc in token.descriptors.iter().copied() {
             unsafe {
                 linux_vring_write_desc(backend, desc, LinuxVringDesc::default());
@@ -2502,7 +2612,7 @@ pub unsafe extern "C" fn virtqueue_get_buf_ctx(
         // event index so the device keeps interrupting for later buffers
         // (`virtqueue_get_buf_ctx_split`'s trailing `virtio_store_mb`).
         if backend.avail_flags_shadow & VRING_AVAIL_F_NO_INTERRUPT == 0 {
-            unsafe { linux_vring_write_used_event(backend, backend.last_used_idx) };
+            unsafe { linux_vring_write_used_event(backend, next_last_used_idx) };
             core::sync::atomic::fence(Ordering::SeqCst);
         }
         Some(token)
@@ -2551,7 +2661,7 @@ pub unsafe extern "C" fn virtqueue_disable_cb(vq: *mut LinuxVirtqueue) {
             backend.avail_flags_shadow |= VRING_AVAIL_F_NO_INTERRUPT;
             // If the device already triggered an event for this window it
             // won't trigger another: no need to write the suppression.
-            if backend.event_triggered || !backend.ring_ready {
+            if backend.event_triggered.load(Ordering::Relaxed) || !backend.ring_ready {
                 return;
             }
             unsafe {
@@ -2571,8 +2681,8 @@ pub unsafe extern "C" fn virtqueue_disable_cb(vq: *mut LinuxVirtqueue) {
 pub unsafe extern "C" fn virtqueue_enable_cb_prepare(vq: *mut LinuxVirtqueue) -> u32 {
     linux_virtqueue_with_backend_mut(vq, |backend| {
         backend.callbacks_enabled = true;
-        backend.event_triggered = false;
-        let last_used_idx = backend.last_used_idx;
+        backend.event_triggered.store(false, Ordering::Relaxed);
+        let last_used_idx = backend.last_used_idx.load(Ordering::Acquire);
         if backend.avail_flags_shadow & VRING_AVAIL_F_NO_INTERRUPT != 0 {
             backend.avail_flags_shadow &= !VRING_AVAIL_F_NO_INTERRUPT;
             if backend.ring_ready && !backend.event {
@@ -2615,7 +2725,7 @@ pub unsafe extern "C" fn virtqueue_enable_cb(vq: *mut LinuxVirtqueue) -> bool {
 pub unsafe extern "C" fn virtqueue_enable_cb_delayed(vq: *mut LinuxVirtqueue) -> bool {
     linux_virtqueue_with_backend_mut(vq, |backend| {
         backend.callbacks_enabled = true;
-        backend.event_triggered = false;
+        backend.event_triggered.store(false, Ordering::Relaxed);
         if backend.avail_flags_shadow & VRING_AVAIL_F_NO_INTERRUPT != 0 {
             backend.avail_flags_shadow &= !VRING_AVAIL_F_NO_INTERRUPT;
             if backend.ring_ready && !backend.event {
@@ -2626,12 +2736,17 @@ pub unsafe extern "C" fn virtqueue_enable_cb_delayed(vq: *mut LinuxVirtqueue) ->
             return true;
         }
         // TODO: tune this threshold — mirrors the vendor 3/4 heuristic.
-        let bufs =
-            ((backend.avail_idx_shadow.wrapping_sub(backend.last_used_idx) as u32) * 3 / 4) as u16;
-        let used_idx = backend.last_used_idx.wrapping_add(bufs);
+        let bufs = ((backend
+            .avail_idx_shadow
+            .wrapping_sub(backend.last_used_idx.load(Ordering::Acquire))
+            as u32)
+            * 3
+            / 4) as u16;
+        let last_used_idx = backend.last_used_idx.load(Ordering::Acquire);
+        let used_idx = last_used_idx.wrapping_add(bufs);
         unsafe { linux_vring_write_used_event(backend, used_idx) };
         core::sync::atomic::fence(Ordering::SeqCst);
-        let pending = unsafe { linux_vring_used_idx(backend) }.wrapping_sub(backend.last_used_idx);
+        let pending = unsafe { linux_vring_used_idx(backend) }.wrapping_sub(last_used_idx);
         pending <= bufs
     })
     .unwrap_or(true)
@@ -2717,7 +2832,7 @@ pub unsafe extern "C" fn virtqueue_reset(
             (*vq).reset.store(false, Ordering::Release);
         }
         backend.avail_idx_shadow = 0;
-        backend.last_used_idx = 0;
+        backend.last_used_idx.store(0, Ordering::Release);
         backend.callbacks_enabled = true;
         backend.pending_notify = false;
         Ok(tokens)
@@ -3763,6 +3878,52 @@ mod tests {
             });
             assert_eq!(vring_interrupt(0, vq.cast()), 1);
             assert_eq!(CALLBACKS.load(Ordering::Acquire), 1);
+
+            vring_del_virtqueue(vq);
+        }
+    }
+
+    #[test]
+    fn vring_interrupt_keeps_linux_notify_priv_separate_from_backend() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+
+        static CALLBACKS: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "C" fn callback(_vq: *mut c_void) {
+            CALLBACKS.fetch_add(1, Ordering::AcqRel);
+        }
+
+        unsafe {
+            CALLBACKS.store(0, Ordering::Release);
+            let mut device = core::mem::zeroed::<LinuxVirtioDevice>();
+            linux_list_head_init(core::ptr::addr_of_mut!(device.vqs));
+            let name = b"requests\0";
+            let vq = vring_create_virtqueue(
+                0,
+                8,
+                4096,
+                &mut device,
+                false,
+                false,
+                false,
+                None,
+                Some(callback),
+                name.as_ptr().cast(),
+            );
+            assert!(!vq.is_null());
+
+            // Linux virtio-pci publishes its queue-notify MMIO address in
+            // `vq->priv`; the Rust backend must not repurpose that ABI slot.
+            let mut notify_register = 0u64;
+            let notify_priv = core::ptr::addr_of_mut!(notify_register).cast::<c_void>();
+            (*vq).priv_ = notify_priv;
+            linux_virtqueue_with_backend_mut(vq, |backend| {
+                linux_vring_set_used_idx(backend, 1);
+            });
+
+            assert_eq!(vring_interrupt(0, vq.cast()), 1);
+            assert_eq!(CALLBACKS.load(Ordering::Acquire), 1);
+            assert_eq!((*vq).priv_, notify_priv);
 
             vring_del_virtqueue(vq);
         }

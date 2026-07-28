@@ -1085,14 +1085,12 @@ fn try_release_kernel_stack_to_cache(stack: *mut u8) -> bool {
 const NR_CACHED_TASK_STRUCTS: usize = 2;
 
 #[cfg(not(test))]
-struct TaskStructCache {
-    slots: [[usize; NR_CACHED_TASK_STRUCTS]; MAX_CPUS],
-}
-
-#[cfg(not(test))]
-static TASK_STRUCT_CACHE: Mutex<TaskStructCache> = Mutex::new(TaskStructCache {
-    slots: [[0; NR_CACHED_TASK_STRUCTS]; MAX_CPUS],
-});
+// Linux's task_struct cache is a slab cache with per-CPU fast paths. Keep the
+// small Lupos cache per CPU as well: a global spinlock can be re-entered by
+// the RCU softirq while an interrupted clone still owns it, deadlocking every
+// CPU that needs to create or retire a task.
+static TASK_STRUCT_CACHE: [[AtomicUsize; NR_CACHED_TASK_STRUCTS]; MAX_CPUS] =
+    [const { [const { AtomicUsize::new(0) }; NR_CACHED_TASK_STRUCTS] }; MAX_CPUS];
 
 #[cfg(not(test))]
 fn alloc_kernel_stack() -> *mut u8 {
@@ -1149,13 +1147,12 @@ unsafe extern "C" fn thread_stack_free_rcu(head: *mut crate::kernel::rcu::RcuHea
 fn alloc_task_struct_zeroed() -> *mut TaskStruct {
     #[cfg(not(test))]
     {
+        crate::kernel::locking::preempt_disable();
         let cpu = (current_cpu() as usize).min(MAX_CPUS - 1);
-        let mut cache = TASK_STRUCT_CACHE.lock();
-        for slot in &mut cache.slots[cpu] {
-            if *slot != 0 {
-                let task = *slot as *mut TaskStruct;
-                *slot = 0;
-                drop(cache);
+        for slot in &TASK_STRUCT_CACHE[cpu] {
+            let task = slot.swap(0, Ordering::AcqRel) as *mut TaskStruct;
+            if !task.is_null() {
+                crate::kernel::locking::preempt_enable();
                 unsafe {
                     core::ptr::write_bytes(
                         task.cast::<u8>(),
@@ -1166,6 +1163,7 @@ fn alloc_task_struct_zeroed() -> *mut TaskStruct {
                 return task;
             }
         }
+        crate::kernel::locking::preempt_enable();
     }
     unsafe { alloc_zeroed(Layout::new::<TaskStruct>()) as *mut TaskStruct }
 }
@@ -1194,14 +1192,18 @@ unsafe fn free_task_struct_allocation(task: *mut TaskStruct) {
     }
     #[cfg(not(test))]
     {
+        crate::kernel::locking::preempt_disable();
         let cpu = (current_cpu() as usize).min(MAX_CPUS - 1);
-        let mut cache = TASK_STRUCT_CACHE.lock();
-        for slot in &mut cache.slots[cpu] {
-            if *slot == 0 {
-                *slot = task as usize;
+        for slot in &TASK_STRUCT_CACHE[cpu] {
+            if slot
+                .compare_exchange(0, task as usize, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                crate::kernel::locking::preempt_enable();
                 return;
             }
         }
+        crate::kernel::locking::preempt_enable();
     }
     unsafe {
         dealloc(task.cast::<u8>(), Layout::new::<TaskStruct>());
