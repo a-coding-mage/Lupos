@@ -79,10 +79,17 @@ unsafe fn dequeue_task_rt(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool {
 }
 
 unsafe fn pick_next_task_rt(rq: &mut Rq) -> *mut TaskStruct {
-    rq.rt
-        .queues
+    // Linux `pick_next_rt_entity()` first uses the active bitmap to select
+    // the highest-priority bucket, then examines that bucket only. Falling
+    // through to a lower priority when the highest entity is temporarily not
+    // switchable changes the RT class ordering and turns every scheduler pass
+    // into a scan of all 100 FIFO queues.
+    let Some(prio) = rq.rt.highest_prio() else {
+        return core::ptr::null_mut();
+    };
+    rq.rt.queues[prio as usize]
         .iter()
-        .flat_map(|queue| queue.iter().copied())
+        .copied()
         .find(|&task| unsafe { super::task_can_switch_to_on_rq(task, rq.current) })
         .unwrap_or(core::ptr::null_mut())
 }
@@ -235,5 +242,41 @@ mod tests {
         assert_eq!(rq.current, task_ptr);
         unsafe { set_next_task_rt(&mut rq, task_ptr, true) };
         assert_eq!(rq.rt.current, task_ptr);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/rt.c:pick_next_rt_entity
+    ///
+    /// Linux selects from the highest active RT priority only. A task that is
+    /// temporarily owned by another CPU must not make the picker fall through
+    /// to a lower-priority FIFO task and violate RT class ordering.
+    #[test]
+    fn rt_picker_does_not_fall_through_highest_active_priority() {
+        let mut rq = Rq::new(1);
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut high = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut low = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let current_ptr = &mut *current as *mut TaskStruct;
+        let high_ptr = &mut *high as *mut TaskStruct;
+        let low_ptr = &mut *low as *mut TaskStruct;
+
+        rq.current = current_ptr;
+        for (task, task_ptr, prio, on_cpu) in
+            [(&mut *high, high_ptr, 10, 1), (&mut *low, low_ptr, 20, 0)]
+        {
+            task.__state.store(
+                crate::kernel::task::task_state::TASK_RUNNING,
+                Ordering::Release,
+            );
+            task.stack = (super::super::KTHREAD_STACK_SIZE * 2) as *mut core::ffi::c_void;
+            task.thread.sp = task.stack as u64 - super::super::SWITCH_FRAME_BYTES as u64;
+            task.m29.sched_class = &RT_SCHED_CLASS as *const SchedClass;
+            task.m29.prio = prio;
+            task.m29.policy = SCHED_FIFO;
+            task.m29.on_cpu.store(on_cpu, Ordering::Release);
+            unsafe { enqueue_task_rt(&mut rq, task_ptr, 0) };
+        }
+
+        assert!(unsafe { pick_next_task_rt(&mut rq) }.is_null());
+        assert_eq!(rq.rt.highest_prio(), Some(10));
     }
 }
