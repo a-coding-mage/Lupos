@@ -11,7 +11,7 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -89,26 +89,29 @@ impl EventFd {
     /// in EFD_SEMAPHORE mode).  Returns EAGAIN when a read would block.
     /// Linux: vendor/linux/fs/eventfd.c::eventfd_read
     pub fn read(&self) -> Result<u64, i32> {
-        loop {
-            let count = self.count.load(Ordering::Acquire);
-            if count == 0 {
-                return Err(EAGAIN);
+        self.wqh.update_and_wake_poll(POLLOUT as u32, || {
+            loop {
+                let count = self.count.load(Ordering::Acquire);
+                if count == 0 {
+                    return (Err(EAGAIN), false);
+                }
+                let value = if self.flags & EFD_SEMAPHORE != 0 {
+                    1
+                } else {
+                    count
+                };
+                if self
+                    .count
+                    .compare_exchange(count, count - value, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    // eventfd_read() wakes EPOLLOUT after consuming the
+                    // counter while holding the same waitqueue lock as the
+                    // counter transition, matching Linux.
+                    return (Ok(value), true);
+                }
             }
-            let value = if self.flags & EFD_SEMAPHORE != 0 {
-                1
-            } else {
-                count
-            };
-            if self
-                .count
-                .compare_exchange(count, count - value, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                // eventfd_read() wakes EPOLLOUT after consuming the counter.
-                self.wqh.wake_up_all();
-                return Ok(value);
-            }
-        }
+        })
     }
 
     /// Write semantics: adds value to count.  Caps at u64::MAX-1.
@@ -116,22 +119,23 @@ impl EventFd {
         if val == u64::MAX {
             return Err(EINVAL);
         }
-        loop {
-            let count = self.count.load(Ordering::Acquire);
-            if u64::MAX - count <= val {
-                return Err(EAGAIN);
+        self.wqh.update_and_wake_poll(POLLIN as u32, || {
+            loop {
+                let count = self.count.load(Ordering::Acquire);
+                if u64::MAX - count <= val {
+                    return (Err(EAGAIN), false);
+                }
+                if self
+                    .count
+                    .compare_exchange(count, count + val, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    // eventfd_write() wakes EPOLLIN after every successful
+                    // write, including a write of zero, under the same lock.
+                    return (Ok(8), true);
+                }
             }
-            if self
-                .count
-                .compare_exchange(count, count + val, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                // eventfd_write() wakes EPOLLIN after every successful write,
-                // including a write of zero.
-                self.wqh.wake_up_all();
-                return Ok(8);
-            }
-        }
+        })
     }
 
     /// poll() mask — EPOLLIN if readable, EPOLLOUT if writable.
@@ -205,20 +209,22 @@ unsafe extern "C" fn linux_eventfd_signal_mask(ctx: *mut EventFd, _mask: u32) {
     }
 
     let eventfd = unsafe { &*ctx };
-    loop {
-        let count = eventfd.count.load(Ordering::Acquire);
-        if count == u64::MAX {
-            break;
+    eventfd.wqh.update_and_wake_poll((POLLIN as u32) | _mask, || {
+        loop {
+            let count = eventfd.count.load(Ordering::Acquire);
+            if count == u64::MAX {
+                break;
+            }
+            if eventfd
+                .count
+                .compare_exchange(count, count + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
         }
-        if eventfd
-            .count
-            .compare_exchange(count, count + 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            break;
-        }
-    }
-    eventfd.wqh.wake_up_all();
+        ((), true)
+    });
 }
 
 fn eventfd_file_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i32> {
@@ -372,6 +378,28 @@ pub unsafe fn sys_eventfd(initval: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static LAST_WAKE_KEY: AtomicU32 = AtomicU32::new(0);
+
+    fn record_wake_key(_data1: usize, _data2: usize, key: u32) {
+        LAST_WAKE_KEY.store(key, Ordering::Release);
+    }
+
+    /// test-origin: linux:vendor/linux/fs/eventfd.c:eventfd_poll and
+    /// vendor/linux/include/linux/wait.h:wake_up_poll
+    #[test]
+    fn eventfd_read_and_write_publish_directional_poll_keys() {
+        let e = EventFd::new(0, 0);
+        e.wqh.add_callback(1, record_wake_key, 0, 0);
+
+        LAST_WAKE_KEY.store(0, Ordering::Release);
+        e.write(1).unwrap();
+        assert_eq!(LAST_WAKE_KEY.load(Ordering::Acquire), POLLIN as u32);
+
+        LAST_WAKE_KEY.store(0, Ordering::Release);
+        e.read().unwrap();
+        assert_eq!(LAST_WAKE_KEY.load(Ordering::Acquire), POLLOUT as u32);
+    }
 
     #[test]
     fn initial_count_and_read_resets() {

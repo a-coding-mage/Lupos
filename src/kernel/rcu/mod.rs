@@ -22,7 +22,7 @@ pub use srcu::{SrcuStruct, srcu_read_lock, srcu_read_unlock, synchronize_srcu};
 pub use tasks::{call_rcu_tasks, synchronize_rcu_tasks, tasks_rcu_qs};
 pub use tree::{
     call_rcu, rcu_barrier, rcu_check_callbacks, rcu_init, rcu_qs, rcu_read_lock, rcu_read_unlock,
-    synchronize_rcu,
+    rcu_sched_clock_irq, synchronize_rcu,
 };
 pub use types::{RcuHead, rcu_head_init};
 

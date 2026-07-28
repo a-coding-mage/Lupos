@@ -650,12 +650,202 @@ pub fn for_each_heap_task(mut f: impl FnMut(*mut TaskStruct)) {
     }
 }
 
+/// Side metadata for Linux's `task_struct::rcu` release hook.
+///
+/// `TaskStruct` has a calibrated fixed layout, so the RCU head cannot be
+/// added to it without moving the ABI-visible fields.  Batch the equivalent
+/// final releases in a per-CPU queue instead.  One RCU callback protects all
+/// task pointers in the burst, which preserves the lifetime boundary without
+/// turning a process-exit storm into one allocation and softirq wakeup per
+/// task.
+const TASK_STRUCT_RCU_BATCH_CAPACITY: usize = MAX_HEAP_TASKS;
+
+struct TaskStructRcuBatchState {
+    tasks: [*mut TaskStruct; TASK_STRUCT_RCU_BATCH_CAPACITY],
+    len: usize,
+    // A callback drains a snapshot taken at the grace-period boundary.  New
+    // releases stay in `tasks` and are published by a later callback; Linux
+    // gives each rcu_head the grace period which was current when it was
+    // queued.
+    draining: [*mut TaskStruct; TASK_STRUCT_RCU_BATCH_CAPACITY],
+    draining_len: usize,
+    callback_queued: bool,
+}
+
+impl TaskStructRcuBatchState {
+    const fn new() -> Self {
+        Self {
+            tasks: [core::ptr::null_mut(); TASK_STRUCT_RCU_BATCH_CAPACITY],
+            len: 0,
+            draining: [core::ptr::null_mut(); TASK_STRUCT_RCU_BATCH_CAPACITY],
+            draining_len: 0,
+            callback_queued: false,
+        }
+    }
+}
+
+// SAFETY: the batch is protected by its RawSpinLocked wrapper.
+unsafe impl Send for TaskStructRcuBatchState {}
+
+#[repr(C)]
+struct TaskStructRcuBatch {
+    // Keep this first so the callback can recover the batch with
+    // Linux-style container_of semantics from its RcuHead.
+    rcu: crate::kernel::rcu::RcuHead,
+    state: crate::kernel::locking::RawSpinLocked<TaskStructRcuBatchState>,
+}
+
+impl TaskStructRcuBatch {
+    const fn new() -> Self {
+        Self {
+            rcu: crate::kernel::rcu::RcuHead::new(),
+            state: crate::kernel::locking::RawSpinLocked::new(TaskStructRcuBatchState::new()),
+        }
+    }
+}
+
+// SAFETY: the embedded state lock serializes all accesses after callback
+// publication.
+unsafe impl Send for TaskStructRcuBatch {}
+
+static TASK_STRUCT_RCU_BATCHES: [TaskStructRcuBatch; MAX_CPUS] =
+    [const { TaskStructRcuBatch::new() }; MAX_CPUS];
+
+/// Move the releases present at callback publication into the callback's
+/// private snapshot.  Releases arriving after the grace period must remain in
+/// the pending half of the batch and cannot be freed by this callback.
+unsafe fn begin_task_struct_rcu_release(batch: *mut TaskStructRcuBatch) {
+    let (mut state, flags) = unsafe { (*batch).state.lock_irqsave() };
+    debug_assert_eq!(state.draining_len, 0);
+    // Use raw field addresses because the two fixed-size arrays are fields of
+    // the same guard and Rust's borrow checker cannot express this disjoint
+    // swap through the projected `state` value.
+    unsafe {
+        core::ptr::swap(
+            core::ptr::addr_of_mut!(state.tasks),
+            core::ptr::addr_of_mut!(state.draining),
+        );
+    }
+    state.draining_len = state.len;
+    state.len = 0;
+    crate::kernel::locking::RawSpinLocked::unlock_irqrestore(state, flags);
+}
+
+/// Pop one task from the callback snapshot.
+unsafe fn take_task_struct_rcu_release(batch: *mut TaskStructRcuBatch) -> *mut TaskStruct {
+    let (mut state, flags) = unsafe { (*batch).state.lock_irqsave() };
+    let task = if state.draining_len == 0 {
+        core::ptr::null_mut()
+    } else {
+        state.draining_len -= 1;
+        let len = state.draining_len;
+        let task = state.draining[len];
+        state.draining[len] = core::ptr::null_mut();
+        task
+    };
+    crate::kernel::locking::RawSpinLocked::unlock_irqrestore(state, flags);
+    task
+}
+
+/// Publish a follow-up callback when a release arrived while the current
+/// callback was running.  Clearing `callback_queued` and deciding whether to
+/// requeue are one locked transition, so a release cannot be stranded between
+/// those operations.
+unsafe fn finish_task_struct_rcu_release(batch: *mut TaskStructRcuBatch) -> bool {
+    let (mut state, flags) = unsafe { (*batch).state.lock_irqsave() };
+    debug_assert_eq!(state.draining_len, 0);
+    let requeue = state.len != 0;
+    if !requeue {
+        state.callback_queued = false;
+    }
+    crate::kernel::locking::RawSpinLocked::unlock_irqrestore(state, flags);
+    requeue
+}
+
+/// Linux `delayed_put_task_struct()` / `__put_task_struct_rcu_cb()`.
+unsafe extern "C" fn task_struct_free_rcu(head: *mut crate::kernel::rcu::RcuHead) {
+    if head.is_null() {
+        return;
+    }
+    let batch = head.cast::<TaskStructRcuBatch>();
+    unsafe { begin_task_struct_rcu_release(batch) };
+    loop {
+        let task = unsafe { take_task_struct_rcu_release(batch) };
+        if task.is_null() {
+            break;
+        }
+        unsafe { free_task_struct_allocation(task) };
+    }
+    if unsafe { finish_task_struct_rcu_release(batch) } {
+        let head = unsafe { core::ptr::addr_of_mut!((*batch).rcu) };
+        crate::kernel::rcu::call_rcu(head, task_struct_free_rcu);
+    }
+}
+
+/// Overflow fallback for the bounded static batch.  The normal path never
+/// allocates metadata; this path is only needed if more tasks retire during a
+/// single grace period than the tracker can represent at once.
+#[repr(C)]
+struct TaskStructRcuOverflow {
+    rcu: crate::kernel::rcu::RcuHead,
+    task: *mut TaskStruct,
+}
+
+unsafe extern "C" fn task_struct_free_rcu_overflow(
+    head: *mut crate::kernel::rcu::RcuHead,
+) {
+    if head.is_null() {
+        return;
+    }
+    let release = unsafe { Box::from_raw(head.cast::<TaskStructRcuOverflow>()) };
+    unsafe { free_task_struct_allocation(release.task) };
+}
+
+/// Queue the final task-struct allocation release after an RCU grace period.
+///
+/// Linux's `finish_task_switch()` drops the last current-task reference with
+/// `put_task_struct_rcu_user()`, rather than recycling the slab object while
+/// RCU readers can still hold the pointer.  The external metadata keeps the
+/// existing Lupos `TaskStruct` layout unchanged.
+unsafe fn defer_task_struct_release(task: *mut TaskStruct) {
+    if task.is_null() {
+        return;
+    }
+    let cpu = (current_cpu() as usize).min(MAX_CPUS - 1);
+    let batch = &TASK_STRUCT_RCU_BATCHES[cpu];
+    let (mut state, flags) = batch.state.lock_irqsave();
+    if state.len < TASK_STRUCT_RCU_BATCH_CAPACITY {
+        let len = state.len;
+        state.tasks[len] = task;
+        state.len += 1;
+        let queue_callback = !state.callback_queued;
+        state.callback_queued = true;
+        let head = if queue_callback {
+            core::ptr::addr_of!(batch.rcu) as *mut crate::kernel::rcu::RcuHead
+        } else {
+            core::ptr::null_mut()
+        };
+        crate::kernel::locking::RawSpinLocked::unlock_irqrestore(state, flags);
+        if queue_callback {
+            crate::kernel::rcu::call_rcu(head, task_struct_free_rcu);
+        }
+        return;
+    }
+    crate::kernel::locking::RawSpinLocked::unlock_irqrestore(state, flags);
+
+    let release = Box::into_raw(Box::new(TaskStructRcuOverflow {
+        rcu: crate::kernel::rcu::RcuHead::new(),
+        task,
+    }));
+    let head = unsafe { core::ptr::addr_of_mut!((*release).rcu) };
+    crate::kernel::rcu::call_rcu(head, task_struct_free_rcu_overflow);
+}
+
 /// Free task allocations after the caller has unique release ownership.
 ///
-/// Called by `crate::kernel::exit::release_task` for tasks with no scheduler
-/// reference left, or by `finish_task_switch()` after a logically released
-/// current task has switched away. After this call returns, `task` is dangling
-/// and must not be dereferenced.
+/// Called by the RCU callback for a published task.  Unpublished fork-failure
+/// paths also call it directly because no scheduler, PID, or RCU reader can
+/// have observed those allocations.
 ///
 /// # Safety
 /// `task` and `stack` must be the pair claimed by either the immediate heap
@@ -690,8 +880,9 @@ pub(crate) unsafe fn finish_heap_task_release(task: *mut TaskStruct, stack: *mut
     }
     unsafe {
         free_kernel_stack(stack);
-        // Reclaim the TaskStruct allocation last — `task` becomes invalid.
-        free_task_struct_allocation(task);
+        // Linux releases the stack at this boundary but delays the final
+        // task_struct slab release through put_task_struct_rcu_user().
+        defer_task_struct_release(task);
     }
 }
 
@@ -1831,6 +2022,89 @@ mod tests {
                 assert_eq!(slot.load(Ordering::Acquire), 0);
             }
         }
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/exit.c:put_task_struct_rcu_user
+    /// and linux:vendor/linux/kernel/fork.c:__put_task_struct_rcu_cb
+    ///
+    /// Linux keeps a reaped task_struct allocation alive through an RCU grace
+    /// period.  A stale RCU reader or scheduler-side pointer must therefore
+    /// not observe the same address recycled for a new task immediately after
+    /// the final logical release.
+    #[test]
+    fn released_task_struct_is_not_recycled_before_rcu_grace_period() {
+        let _test_guard = TEST_LOCK.lock().unwrap();
+        crate::kernel::rcu::rcu_init();
+
+        let task = unsafe { alloc_zeroed(Layout::new::<TaskStruct>()) as *mut TaskStruct };
+        assert!(!task.is_null());
+        let released = task as usize;
+        unsafe { finish_heap_task_release(task, core::ptr::null_mut()) };
+
+        let mut allocations = Vec::new();
+        let mut reused = false;
+        for _ in 0..8 {
+            let candidate =
+                unsafe { alloc_zeroed(Layout::new::<TaskStruct>()) as *mut TaskStruct };
+            assert!(!candidate.is_null());
+            reused |= candidate as usize == released;
+            allocations.push(candidate);
+        }
+        for candidate in allocations {
+            unsafe { dealloc(candidate.cast::<u8>(), Layout::new::<TaskStruct>()) };
+        }
+        crate::kernel::rcu::rcu_barrier();
+
+        assert!(
+            !reused,
+            "a released task_struct was recycled before its RCU grace period"
+        );
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/exit.c:put_task_struct_rcu_user
+    /// and linux:vendor/linux/kernel/rcu/tree.c:rcu_core
+    ///
+    /// A batched representation may share one callback head, but it must not
+    /// extend that callback's grace-period entitlement to a task released
+    /// after the callback started.  Linux queues the later task's `rcu_head`
+    /// for a subsequent grace period.
+    #[test]
+    fn task_struct_rcu_batch_keeps_late_releases_for_next_grace_period() {
+        let mut batch = TaskStructRcuBatch::new();
+        let first = 0x1000usize as *mut TaskStruct;
+        let second = 0x2000usize as *mut TaskStruct;
+        let late = 0x3000usize as *mut TaskStruct;
+
+        let (mut state, flags) = batch.state.lock_irqsave();
+        state.tasks[0] = first;
+        state.tasks[1] = second;
+        state.len = 2;
+        state.callback_queued = true;
+        crate::kernel::locking::RawSpinLocked::unlock_irqrestore(state, flags);
+
+        unsafe { begin_task_struct_rcu_release(&mut batch) };
+
+        let (mut state, flags) = batch.state.lock_irqsave();
+        state.tasks[0] = late;
+        state.len = 1;
+        crate::kernel::locking::RawSpinLocked::unlock_irqrestore(state, flags);
+
+        assert_eq!(
+            unsafe { take_task_struct_rcu_release(&mut batch) },
+            second
+        );
+        assert_eq!(unsafe { take_task_struct_rcu_release(&mut batch) }, first);
+        assert!(unsafe { take_task_struct_rcu_release(&mut batch) }.is_null());
+
+        let (state, flags) = batch.state.lock_irqsave();
+        assert_eq!(state.len, 1);
+        assert_eq!(state.tasks[0], late);
+        crate::kernel::locking::RawSpinLocked::unlock_irqrestore(state, flags);
+
+        assert!(unsafe { finish_task_struct_rcu_release(&mut batch) });
+        let (state, flags) = batch.state.lock_irqsave();
+        assert!(state.callback_queued);
+        crate::kernel::locking::RawSpinLocked::unlock_irqrestore(state, flags);
     }
 
     #[test]

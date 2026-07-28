@@ -94,6 +94,11 @@ impl EpItem {
     }
 }
 
+#[inline]
+fn epoll_poll_key_matches(events: u32, poll_key: u32) -> bool {
+    poll_key == u32::MAX || poll_key & (events & !EP_PRIVATE_BITS) != 0
+}
+
 impl Drop for EpItem {
     fn drop(&mut self) {
         // Linux unregisters every poll hook before dropping the watched-file
@@ -722,7 +727,7 @@ impl Drop for ActiveEpCallback {
     }
 }
 
-fn ep_poll_callback(ep_token: usize, item_id: usize) {
+fn ep_poll_callback(ep_token: usize, item_id: usize, poll_key: u32) {
     let Some(active) = with_epolls_irqsave(|epolls| {
         let ep = epolls.get(&ep_token)?.clone();
         ep.active_callbacks.fetch_add(1, Ordering::AcqRel);
@@ -741,6 +746,12 @@ fn ep_poll_callback(ep_token: usize, item_id: usize) {
         };
         let item = state.items[idx].item.as_ref();
         if item.events() & !EP_PRIVATE_BITS == 0 {
+            return false;
+        }
+        // Linux `ep_poll_callback()` rejects a keyed wake which does not
+        // intersect the epitem's requested poll mask.  A no-key wake uses
+        // `u32::MAX`, matching waitqueue::wake_up_all().
+        if !epoll_poll_key_matches(item.events(), poll_key) {
             return false;
         }
         EventPoll::enqueue_locked(state, item_id);
@@ -1300,6 +1311,16 @@ mod tests {
     #[test]
     fn epoll_event_size_is_12() {
         assert_eq!(core::mem::size_of::<EpollEvent>(), 12);
+    }
+
+    /// test-origin: linux:vendor/linux/fs/eventpoll.c:ep_poll_callback
+    /// and vendor/linux/fs/select.c:pollwake
+    #[test]
+    fn keyed_epoll_wake_matches_requested_poll_events() {
+        assert!(epoll_poll_key_matches(EPOLLIN, EPOLLIN));
+        assert!(!epoll_poll_key_matches(EPOLLIN, EPOLLOUT));
+        assert!(epoll_poll_key_matches(EPOLLIN, u32::MAX));
+        assert!(epoll_poll_key_matches(EPOLLERR, EPOLLERR));
     }
 
     #[test]

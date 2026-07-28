@@ -313,6 +313,10 @@ pub fn on_tick(frame: Option<&ExceptionFrame>) {
             crate::kernel::time::jiffies::jiffies(),
         );
     }
+    // Linux update_process_times() invokes rcu_sched_clock_irq() from the
+    // scheduler-clock interrupt.  This gives an incomplete grace period a
+    // later retry without making RCU_SOFTIRQ requeue itself indefinitely.
+    crate::kernel::rcu::rcu_sched_clock_irq();
     crate::kernel::watchdog::watchdog_tick(cpu, frame);
     crate::kernel::sched::scheduler_tick();
 }

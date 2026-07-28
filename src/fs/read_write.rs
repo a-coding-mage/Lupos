@@ -218,9 +218,11 @@ pub fn vfs_read(file: &FileRef, buf: &mut [u8]) -> Result<usize, i32> {
     }
     let read = file.fops.read.ok_or(ENOSYS)?;
     note_file_access_for_integrity(None, file);
-    if inode.kind == InodeKind::Chardev {
-        // Character devices such as consoles may wait/yield for input. Do not
-        // hold the per-file position spinlock across that device callback.
+    if inode.kind != InodeKind::Regular {
+        // Linux takes f_pos_lock only for FMODE_ATOMIC_POS files (regular
+        // files and directories). Non-regular operations, including eventfd,
+        // may wait/yield in their callback, so do not hold the per-file
+        // position spinlock across it.
         let mut pos = *file.pos.lock();
         let result = read(file, buf, &mut pos);
         if result.is_ok() {
@@ -246,27 +248,40 @@ pub fn vfs_write(file: &FileRef, buf: &[u8]) -> Result<usize, i32> {
     }
     check_file_write_mount(&file.dentry, inode.kind)?;
     let write = file.fops.write.ok_or(ENOSYS)?;
-    let mut pos = file.pos.lock();
-    if flags & O_APPEND != 0 {
-        *pos = inode.size.load(core::sync::atomic::Ordering::Acquire);
-    }
-    let start = *pos;
-    let result = write(file, buf, &mut *pos);
-    if let Ok(written) = result {
-        unsafe {
-            crate::mm::filemap::filemap_update_cached_range(
-                inode.mapping(),
-                start,
-                &buf[..written.min(buf.len())],
-            );
+    let mut write_at_pos = |pos: &mut u64| {
+        if flags & O_APPEND != 0 {
+            *pos = inode.size.load(core::sync::atomic::Ordering::Acquire);
         }
-        if written != 0 {
-            file.write_seen
-                .store(true, core::sync::atomic::Ordering::Release);
-            crate::fs::inotify::notify_modify(&file.dentry);
+        let start = *pos;
+        let result = write(file, buf, pos);
+        if let Ok(written) = result {
+            unsafe {
+                crate::mm::filemap::filemap_update_cached_range(
+                    inode.mapping(),
+                    start,
+                    &buf[..written.min(buf.len())],
+                );
+            }
+            if written != 0 {
+                file.write_seen
+                    .store(true, core::sync::atomic::Ordering::Release);
+                crate::fs::inotify::notify_modify(&file.dentry);
+            }
         }
+        result
+    };
+
+    if inode.kind == InodeKind::Regular {
+        let mut pos = file.pos.lock();
+        write_at_pos(&mut pos)
+    } else {
+        let mut pos = *file.pos.lock();
+        let result = write_at_pos(&mut pos);
+        if result.is_ok() {
+            *file.pos.lock() = pos;
+        }
+        result
     }
-    result
 }
 
 pub fn vfs_lseek(file: &FileRef, off: i64, whence: i32) -> Result<u64, i32> {
@@ -487,6 +502,66 @@ mod tests {
 
     fn len_write(_file: &FileRef, buf: &[u8], _pos: &mut u64) -> Result<usize, i32> {
         Ok(buf.len())
+    }
+
+    fn reentrant_pos_read(file: &FileRef, buf: &mut [u8], pos: &mut u64) -> Result<usize, i32> {
+        assert!(
+            file.pos.try_lock().is_some(),
+            "non-atomic-position file callback ran while file.pos was locked"
+        );
+        buf[0] = b'R';
+        *pos += 1;
+        Ok(1)
+    }
+
+    fn reentrant_pos_write(file: &FileRef, buf: &[u8], pos: &mut u64) -> Result<usize, i32> {
+        assert!(
+            file.pos.try_lock().is_some(),
+            "non-atomic-position file callback ran while file.pos was locked"
+        );
+        *pos += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    /// test-origin: linux:vendor/linux/fs/file.c:file_needs_f_pos_lock and
+    /// vendor/linux/fs/read_write.c:ksys_read/ksys_write
+    ///
+    /// Linux takes `f_pos_lock` only for files marked `FMODE_ATOMIC_POS`.
+    /// Eventfds and other non-regular file operations may block or schedule
+    /// inside their callbacks, so the callback must not inherit the Lupos
+    /// position lock.  This catches the guest-wide spin observed when an
+    /// eventfd reader slept while holding `file.pos`.
+    #[test]
+    fn non_atomic_position_callbacks_run_without_file_pos_lock() {
+        static NON_ATOMIC_OPS: FileOps = FileOps {
+            name: "non-atomic-position-test",
+            read: Some(reentrant_pos_read),
+            write: Some(reentrant_pos_write),
+            llseek: None,
+            fsync: None,
+            poll: None,
+            ioctl: None,
+            mmap: None,
+            release: None,
+            readdir: None,
+        };
+
+        let inode = Inode::new(
+            102,
+            InodeKind::Socket,
+            0o600,
+            &NOOP_INODE_OPS,
+            &NON_ATOMIC_OPS,
+            InodePrivate::Opaque(0),
+        );
+        let dentry = d_alloc("non-atomic-position");
+        dentry.instantiate(inode);
+        let file = alloc_file(dentry, O_RDWR, 0, &NON_ATOMIC_OPS);
+
+        let mut out = [0u8; 1];
+        assert_eq!(vfs_read(&file, &mut out), Ok(1));
+        assert_eq!(out, [b'R']);
+        assert_eq!(vfs_write(&file, b"W"), Ok(1));
     }
 
     static TEST_WRITE_OPS: FileOps = FileOps {

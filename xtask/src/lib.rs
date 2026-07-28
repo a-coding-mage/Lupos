@@ -5965,8 +5965,17 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    session_runtime=\"$(tr '\\000' '\\n' < \"$session_env\" | sed -n 's/^XDG_RUNTIME_DIR=//p' | head -1)\"\n",
         "    session_home=\"$(awk -F: '$3 == 1000 { print $6; exit }' /etc/passwd)\"\n",
         "    session_cgroup=\"$(sed -n 's/^0:://p' \"/proc/$settings_session_pid/cgroup\" | head -1)\"\n",
-        "    [ -n \"$session_display\" ] || session_display=:0\n",
+        // xfce4-session is launched by dbus-run-session and may not retain
+        // the X variables even though its child desktop owns the live X11
+        // session.  Do not replace the known-good probe authority with an
+        // empty value: use the LightDM :0 authority and the already-proven
+        // session bus from early-session-bus-probe.
+        "    [ -n \"$session_display\" ] || session_display=\"${DISPLAY:-:0}\"\n",
+        "    [ -n \"$session_xauthority\" ] || session_xauthority=\"${XAUTHORITY:-/run/lightdm/root/:0}\"\n",
+        "    [ -n \"$session_dbus\" ] || session_dbus=\"${early_bus:-unix:path=/run/user/1000/bus}\"\n",
+        "    [ -n \"$session_runtime\" ] || session_runtime=/run/user/1000\n",
         "    [ -n \"$session_home\" ] || session_home=/home/lupos\n",
+        "    printf 'graphics-x11: session-env display=%s xauthority=%s dbus=%s runtime=%s source=proc-or-fallback\n' \"$session_display\" \"$session_xauthority\" \"$session_dbus\" \"$session_runtime\"\n",
         "    rm -f /tmp/lupos-settings-manager.log /tmp/lupos-settings-windows.log\n",
         "    sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none /usr/bin/xfce4-settings-manager >/tmp/lupos-settings-manager.log 2>&1 &\n",
         "    settings_launcher_pid=$!\n",
@@ -6173,7 +6182,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user --no-pager --full status pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service >/tmp/lupos-pipewire-status.log 2>&1 || true ) &\n",
         "    : > /tmp/lupos-pipewire-credentials.log\n",
         "    for unit in pipewire.service wireplumber.service; do\n",
-        "        media_pid=\"$(sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" /usr/bin/systemctl --user show --property=MainPID --value \"$unit\" 2>/dev/null || true)\"\n",
+        "        media_pid=\"$(sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user show --property=MainPID --value \"$unit\" 2>/dev/null || true)\"\n",
         "        printf 'unit=%s pid=%s\\n' \"$unit\" \"$media_pid\" >> /tmp/lupos-pipewire-credentials.log\n",
         "        if [ -n \"$media_pid\" ] && [ \"$media_pid\" != 0 ]; then\n",
         "            sed -n '/^Name:/p;/^State:/p;/^Pid:/p;/^PPid:/p;/^Uid:/p;/^Gid:/p;/^Groups:/p;/^CapEff:/p;/^NoNewPrivs:/p;/^Seccomp:/p' \"/proc/$media_pid/status\" >> /tmp/lupos-pipewire-credentials.log 2>&1 || true\n",
@@ -6260,10 +6269,13 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    firefox_http_pid=$!\n",
         "    rm -f /tmp/lupos-firefox.log /tmp/lupos-firefox-windows.log /tmp/lupos-firefox-maps.log /tmp/lupos-firefox-status.log\n",
         "    firefox_fb_before=\"$(cksum </dev/fb0 2>/dev/null || true)\"\n",
+        "    printf 'graphics-x11: firefox-launch begin cgroup=%s display=%s dbus=%s runtime=%s\\n' \"$session_cgroup\" \"$session_display\" \"$session_dbus\" \"$session_runtime\"\n",
         "    ( run_in_session_cgroup \"$session_cgroup\" sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none /usr/bin/firefox --no-remote --profile /tmp/lupos-firefox-profile 'http://127.0.0.1:8765/zzzzlupossuggestion.html' ) >/tmp/lupos-firefox.log 2>&1 &\n",
         "    firefox_launcher_pid=$!\n",
+        "    printf 'graphics-x11: firefox-launcher-pid=%s\\n' \"$firefox_launcher_pid\"\n",
         "    firefox_pid=; firefox_history_seeded=0; i=0\n",
         "    while [ \"$i\" -lt 90 ] && [ \"$firefox_history_seeded\" -eq 0 ]; do\n",
+        "        if [ $((i % 10)) -eq 0 ]; then printf 'graphics-x11: firefox-launch-progress iteration=%s launcher-alive=%s\\n' \"$i\" \"$(kill -0 \"$firefox_launcher_pid\" 2>/dev/null; echo $?)\"; tail -40 /tmp/lupos-firefox.log 2>/dev/null | sed 's/^/graphics-x11: firefox-launch-log /'; fi\n",
         "        [ -n \"$firefox_pid\" ] || firefox_pid=\"$(process_pid_named_uid firefox 1000 2>/dev/null || true)\"\n",
         "        if [ -n \"$firefox_pid\" ] && [ ! -s /tmp/lupos-firefox-maps.log ]; then\n",
         "            echo 'graphics-x11: firefox-proc-maps begin'\n",
@@ -6309,6 +6321,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "        kill -0 \"$firefox_launcher_pid\" 2>/dev/null || break\n",
         "        i=$((i + 1)); sleep 1\n",
         "    done\n",
+        "    if [ ! -s /tmp/lupos-firefox-log ]; then echo 'graphics-x11: firefox-launch-log empty'; fi\n",
         "    if [ \"$firefox_history_seeded\" -eq 1 ] && [ -n \"$firefox_pid\" ]; then\n",
         "        sleep 2; echo 'graphics-x11: firefox-window-ready'\n",
         "        cjk_suggestion_selected=0; cjk_i=0\n",
@@ -26709,6 +26722,10 @@ failed command output\n";
         assert!(probe.contains("graphics-x11: settings-manager-probe begin"));
         assert!(probe.contains("/usr/bin/xfce4-settings-manager"));
         assert!(probe.contains("process_pid_named_uid_with_bus xfce4-session 1000"));
+        assert!(probe.contains("session_display=\"${DISPLAY:-:0}\""));
+        assert!(probe.contains("session_xauthority=\"${XAUTHORITY:-/run/lightdm/root/:0}\""));
+        assert!(probe.contains("session_dbus=\"${early_bus:-unix:path=/run/user/1000/bus}\""));
+        assert!(probe.contains("graphics-x11: session-env display="));
         assert!(probe.contains("DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\""));
         assert!(probe.contains("xprop -root _NET_CLIENT_LIST"));
         assert!(probe.contains("graphics-x11: settings-manager ok"));
