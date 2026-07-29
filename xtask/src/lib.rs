@@ -6083,6 +6083,13 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // the stock per-user PipeWire/WirePlumber graph, and real-time PCM
         // consumption by the emulated playback stream.
         "echo 'graphics-x11: audio-probe begin'\n",
+        // Investigation-only escape hatch: the Firefox syscall trace needs to
+        // reach the browser even when the long HDA replay is the independent
+        // source of a liveness stall.  It is selected through the kernel
+        // command line and is removed with the temporary trace after capture.
+        "if grep -qw 'lupos.skip_audio=1' /proc/cmdline 2>/dev/null; then\n",
+        "    echo 'graphics-x11: audio-probe skipped-for-investigation'\n",
+        "else\n",
         // Snapshot the live IRQ counters around playback. A device whose
         // interrupt never fires shows a flat count here, which is what
         // separates "HDA IRQ never delivered" from "delivered but mishandled"
@@ -6225,6 +6232,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    timeout -k 2 10 /usr/bin/journalctl --no-pager -b _UID=1000 _SYSTEMD_USER_UNIT=wireplumber.service -n 500 >/tmp/lupos-wireplumber-journal.log 2>&1 || true\n",
         "fi\n",
         "for f in /tmp/lupos-alsa-udev.log /tmp/lupos-udev-card.log /tmp/lupos-pipewire-env.log /tmp/lupos-pipewire-start.log /tmp/lupos-wpctl.log /tmp/lupos-wpctl-playing.log /tmp/lupos-pactl.log /tmp/lupos-pw-play.log /tmp/lupos-pipewire-status.log /tmp/lupos-pipewire-credentials.log /tmp/lupos-aplay-service-unfiltered.log /tmp/lupos-aplay-service-unfiltered-launcher.log /tmp/lupos-aplay-service-filtered.log /tmp/lupos-aplay-service-filtered-launcher.log /tmp/lupos-pipewire-journal.log /tmp/lupos-pipewire-service-journal.log /tmp/lupos-wireplumber-journal.log /tmp/lupos-pipewire-runtime.log; do [ -s \"$f\" ] && printf 'graphics-x11: audio-log %s begin\\n' \"$f\" && tail -500 \"$f\" && printf 'graphics-x11: audio-log %s end\\n' \"$f\"; done\n",
+        "fi\n",
         "echo 'graphics-x11: audio-probe end'\n",
         // Firefox discovers its installation directory from
         // readlink("/proc/self/exe") before it loads XPCOM. Verify the PATH
@@ -6309,7 +6317,17 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "                    printf 'graphics-x11: firefox-thread pid=%s tid=%s comm=%s wchan=%s\\n' \"$proc\" \"$tid\" \"$comm\" \"$wchan\"\n",
         "                done\n",
         "            done\n",
-        "            ps -eo pid,ppid,stat,comm,args 2>/dev/null | grep -E 'firefox|Socket Process|RDD Process|GPU Process|Web Content' | grep -v grep | sed 's/^/graphics-x11: firefox-ps /' || true\n",
+        "            ps -eo pid,ppid,stat,comm,args 2>/dev/null | grep -E 'firefox|glxtest|Socket Process|RDD Process|GPU Process|Web Content' | grep -v grep | sed 's/^/graphics-x11: firefox-ps /' || true\n",
+        "            for glx_proc in /proc/[0-9]*; do\n",
+        "                [ -r \"$glx_proc/comm\" ] || continue\n",
+        "                [ \"$(cat \"$glx_proc/comm\" 2>/dev/null)\" = glxtest ] || continue\n",
+        "                glx_pid=\"${glx_proc##*/}\"\n",
+        "                printf 'graphics-x11: glxtest-state pid=%s status=' \"$glx_pid\"; sed -n '/^State:/p;/^Pid:/p;/^PPid:/p;/^Uid:/p;/^Seccomp:/p;/^NoNewPrivs:/p' \"$glx_proc/status\" 2>/dev/null | tr '\\n' ';'; echo\n",
+        "                printf 'graphics-x11: glxtest-state pid=%s wchan=' \"$glx_pid\"; cat \"$glx_proc/wchan\" 2>/dev/null || true; echo\n",
+        "                printf 'graphics-x11: glxtest-state pid=%s syscall=' \"$glx_pid\"; timeout 1 cat \"$glx_proc/syscall\" 2>/dev/null || true; echo\n",
+        "                printf 'graphics-x11: glxtest-state pid=%s children=' \"$glx_pid\"; cat \"$glx_proc/task/$glx_pid/children\" 2>/dev/null || true; echo\n",
+        "                printf 'graphics-x11: glxtest-state pid=%s cmdline=' \"$glx_pid\"; tr '\\000' ' ' < \"$glx_proc/cmdline\" 2>/dev/null || true; echo\n",
+        "            done\n",
         "            DISPLAY=:0 timeout 2 /usr/bin/xprop -root _NET_CLIENT_LIST 2>&1 | sed 's/^/graphics-x11: firefox-xprop-root /' || true\n",
         "            if [ -r /proc/net/unix ]; then echo 'graphics-x11: firefox-unix-sockets begin'; tail -80 /proc/net/unix; echo 'graphics-x11: firefox-unix-sockets end'; fi\n",
         "            echo 'graphics-x11: firefox-process-state end'\n",

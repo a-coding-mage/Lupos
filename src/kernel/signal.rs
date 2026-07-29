@@ -101,8 +101,11 @@ const X86_64_NR_RESTART_SYSCALL: u64 = 219;
 const X86_64_SYSCALL_INSN_LEN: u64 = 2;
 const NO_SYSCALL: u64 = u64::MAX;
 
-const SS_ONSTACK: u32 = 1;
-const SS_DISABLE: u32 = 2;
+pub(crate) const SS_ONSTACK: u32 = 1;
+pub(crate) const SS_DISABLE: u32 = 2;
+pub(crate) const SS_AUTODISARM: u32 = 1 << 31;
+const SS_FLAG_BITS: u32 = SS_AUTODISARM;
+const MIN_SIGALTSTACK_SIZE: usize = 2048;
 
 fn export_symbol_once(name: &'static str, addr: usize, gpl_only: bool) {
     if find_symbol(name).is_none() {
@@ -282,11 +285,21 @@ impl Default for SigInfo {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct SigAltStack {
     pub ss_sp: usize,
     pub ss_flags: u32,
     pub ss_size: usize,
+}
+
+impl Default for SigAltStack {
+    fn default() -> Self {
+        Self {
+            ss_sp: 0,
+            ss_flags: SS_DISABLE,
+            ss_size: 0,
+        }
+    }
 }
 
 struct SignalState {
@@ -593,6 +606,7 @@ impl SignalTable {
         child_pid: i32,
         child_tgid: i32,
         child_task: *mut crate::kernel::task::TaskStruct,
+        _clone_flags: u64,
     ) -> bool {
         let parent_tgid = self
             .states
@@ -621,6 +635,11 @@ impl SignalTable {
             child.actions = inherited.actions;
             child.blocked = inherited.blocked;
             child.altstack = inherited.altstack;
+            if _clone_flags & crate::kernel::clone::CLONE_CLEAR_SIGHAND != 0 {
+                // Linux copy_sighand(): CLONE_CLEAR_SIGHAND is applied after
+                // copying the parent's table and preserves only SIG_IGN.
+                flush_signal_handlers_in_place(&mut child.actions, false);
+            }
             if inherited.tgid == child_tgid {
                 child.signalfd_wqh = inherited.signalfd_wqh.clone();
                 child.wait_chldexit = inherited.wait_chldexit.clone();
@@ -632,8 +651,24 @@ impl SignalTable {
             child.actions = inherited.actions;
             child.blocked = inherited.blocked;
             child.altstack = inherited.altstack;
+            if _clone_flags & crate::kernel::clone::CLONE_CLEAR_SIGHAND != 0 {
+                flush_signal_handlers_in_place(&mut child.actions, false);
+            }
             child.signalfd_wqh = inherited.signalfd_wqh;
             child.wait_chldexit = inherited.wait_chldexit;
+        }
+
+        // vendor/linux/kernel/fork.c:sas_ss_reset(): a child which shares the
+        // parent's VM but is not a vfork child must not retain the parent's
+        // alternate signal-stack address.
+        if _clone_flags & crate::kernel::clone::CLONE_VM != 0
+            && _clone_flags & crate::kernel::clone::CLONE_VFORK == 0
+        {
+            child.altstack = SigAltStack {
+                ss_sp: 0,
+                ss_flags: SS_DISABLE,
+                ss_size: 0,
+            };
         }
 
         if let Some(existing) = self.states.iter_mut().find(|state| state.pid == child_pid) {
@@ -1566,18 +1601,18 @@ pub unsafe fn sys_rt_sigtimedwait(
     candidate.info.signo as i64
 }
 
-pub unsafe fn sys_sigaltstack(new_ss: *const SigAltStack, old_ss: *mut SigAltStack) -> i64 {
+pub unsafe fn sys_sigaltstack(
+    new_ss: *const SigAltStack,
+    old_ss: *mut SigAltStack,
+    user_sp: u64,
+) -> i64 {
     let next = if new_ss.is_null() {
         None
     } else {
-        let next = match unsafe { read_user_value(new_ss) } {
+        Some(match unsafe { read_user_value(new_ss) } {
             Ok(stack) => stack,
             Err(e) => return e,
-        };
-        if next.ss_flags & !(SS_DISABLE) != 0 {
-            return -22;
-        }
-        Some(next)
+        })
     };
 
     let old = {
@@ -1586,9 +1621,35 @@ pub unsafe fn sys_sigaltstack(new_ss: *const SigAltStack, old_ss: *mut SigAltSta
             Ok(s) => s,
             Err(e) => return e as i64,
         };
-        let old = state.altstack;
         if let Some(stack) = next {
-            state.altstack = stack;
+            // Linux do_sigaltstack(): the SS_AUTODISARM bit is metadata, while
+            // the remaining mode is limited to disabled, on-stack, or normal.
+            let mode = stack.ss_flags & !SS_FLAG_BITS;
+            if mode != 0 && mode != SS_ONSTACK && mode != SS_DISABLE {
+                return -22;
+            }
+            if altstack_on_sig_stack(state.altstack, user_sp) {
+                return -1; // EPERM: changing an active alternate stack is forbidden.
+            }
+            if mode != SS_DISABLE && stack.ss_size < MIN_SIGALTSTACK_SIZE {
+                return -12; // ENOMEM, matching Linux's minimum-size rejection.
+            }
+        }
+        let old = SigAltStack {
+            ss_sp: state.altstack.ss_sp,
+            ss_flags: sigaltstack_flags(state.altstack, user_sp),
+            ss_size: state.altstack.ss_size,
+        };
+        if let Some(stack) = next {
+            state.altstack = if stack.ss_flags & !SS_FLAG_BITS == SS_DISABLE {
+                SigAltStack {
+                    ss_sp: 0,
+                    ss_flags: stack.ss_flags,
+                    ss_size: 0,
+                }
+            } else {
+                stack
+            };
         }
         old
     };
@@ -1599,6 +1660,83 @@ pub unsafe fn sys_sigaltstack(new_ss: *const SigAltStack, old_ss: *mut SigAltSta
         }
     }
     0
+}
+
+/// Return the current task's configured alternate signal stack for the
+/// architecture signal-frame builder.  Linux reads `current->sas_ss_*` from
+/// `__save_altstack()` while constructing `ucontext.uc_stack`; keep the table
+/// lookup here so the architecture layer does not reach into signal-state
+/// storage directly.
+pub(crate) fn current_altstack_for_signal() -> SigAltStack {
+    let task = unsafe { sched::get_current() };
+    if task.is_null() {
+        return SigAltStack::default();
+    }
+    let pid = unsafe { (*task).pid };
+    let table = SIGNAL_TABLE.lock();
+    table
+        .states
+        .iter()
+        .find(|state| state.pid == pid)
+        .map(|state| state.altstack)
+        .unwrap_or_default()
+}
+
+/// Restore the configured alternate signal stack from a signal frame.
+///
+/// Linux `rt_sigreturn` calls `restore_altstack()`, which deliberately ignores
+/// validation errors other than a bad user pointer.  The frame has already
+/// been copied successfully by the caller, so mirror that behavior by
+/// applying only a valid, non-racing configuration and continuing otherwise.
+pub(crate) fn restore_altstack_for_sigreturn(stack: SigAltStack, user_sp: u64) {
+    let mode = stack.ss_flags & !SS_FLAG_BITS;
+    if mode != 0 && mode != SS_ONSTACK && mode != SS_DISABLE {
+        return;
+    }
+    if mode != SS_DISABLE && stack.ss_size < MIN_SIGALTSTACK_SIZE {
+        return;
+    }
+
+    let mut table = SIGNAL_TABLE.lock();
+    let Ok(state) = table.get_or_create_current() else {
+        return;
+    };
+
+    // do_sigaltstack() returns -EPERM while the current user stack pointer is
+    // already on the active alternate stack.  That is normally the case for
+    // a handler entered with SA_ONSTACK, and ignoring the error leaves the
+    // live configuration unchanged just like Linux.
+    if altstack_on_sig_stack(state.altstack, user_sp) {
+        return;
+    }
+    state.altstack = if mode == SS_DISABLE {
+        SigAltStack {
+            ss_sp: 0,
+            ss_flags: stack.ss_flags,
+            ss_size: 0,
+        }
+    } else {
+        stack
+    };
+}
+
+pub(crate) fn altstack_contains(stack: SigAltStack, sp: u64) -> bool {
+    stack.ss_size != 0
+        && sp > stack.ss_sp as u64
+        && sp - stack.ss_sp as u64 <= stack.ss_size as u64
+}
+
+pub(crate) fn altstack_on_sig_stack(stack: SigAltStack, sp: u64) -> bool {
+    stack.ss_flags & SS_AUTODISARM == 0 && altstack_contains(stack, sp)
+}
+
+fn sigaltstack_flags(stack: SigAltStack, sp: u64) -> u32 {
+    if stack.ss_size == 0 {
+        SS_DISABLE | (stack.ss_flags & SS_FLAG_BITS)
+    } else {
+        (altstack_on_sig_stack(stack, sp).then_some(SS_ONSTACK).unwrap_or(0))
+            | (stack.ss_flags & SS_FLAG_BITS)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2931,6 +3069,23 @@ fn handler_kind(action: &RtSigAction) -> HandlerKind {
     }
 }
 
+/// Reset caught signal dispositions in place, matching Linux
+/// `flush_signal_handlers(tsk, force_default)`. `CLONE_CLEAR_SIGHAND` passes
+/// `force_default = false`, so an explicit SIG_IGN survives while every
+/// caught handler loses its flags, restorer, and mask as well as its entry
+/// point.
+fn flush_signal_handlers_in_place(actions: &mut [RtSigAction], force_default: bool) {
+    for action in actions.iter_mut().skip(1) {
+        let keep_ignored = !force_default && handler_kind(action) == HandlerKind::Ignore;
+        *action = RtSigAction {
+            sa_handler: if keep_ignored { 1 } else { 0 },
+            sa_flags: 0,
+            sa_restorer: 0,
+            sa_mask: SigSet::default(),
+        };
+    }
+}
+
 #[inline]
 fn neg_errno(errno: i32) -> u64 {
     (-(errno as i64)) as u64
@@ -3144,6 +3299,12 @@ pub unsafe fn do_signal(regs: *mut crate::kernel::task::PtRegs) -> bool {
                         if action.sa_flags & SA_RESETHAND != 0 {
                             state.actions[info.signo as usize] = RtSigAction::default();
                         }
+                        // Linux signal_delivered(): SS_AUTODISARM disables
+                        // the live alternate stack until rt_sigreturn restores
+                        // the saved uc_stack from this frame.
+                        if state.altstack.ss_flags & SS_AUTODISARM != 0 {
+                            state.altstack = SigAltStack::default();
+                        }
                     }
                 }
                 clear_restore_sigmask(task);
@@ -3196,7 +3357,9 @@ pub unsafe fn sys_rt_sigreturn_impl(regs: *mut crate::kernel::task::PtRegs) -> i
     // kernel-stack local creates an unnecessarily large live stack object and
     // can overwrite an exception frame during nested signal/scheduler paths.
     let sp = unsafe { (*regs).sp };
-    let Some((_frame_addr, uc_flags, mask, sc)) = (unsafe { read_rt_sigreturn_fields(sp) }) else {
+    let Some((_frame_addr, uc_flags, mask, altstack, sc)) =
+        (unsafe { read_rt_sigreturn_fields(sp) })
+    else {
         return unsafe { bad_rt_sigreturn() };
     };
     if !rt_sigreturn_context_is_plausible(uc_flags, &sc) {
@@ -3216,6 +3379,7 @@ pub unsafe fn sys_rt_sigreturn_impl(regs: *mut crate::kernel::task::PtRegs) -> i
     }
     let task = unsafe { crate::kernel::sched::get_current() };
     recalc_tif_sigpending(task);
+    restore_altstack_for_sigreturn(altstack, sp);
 
     let regs_mut = unsafe { &mut *regs };
     const FIX_EFLAGS: u64 = 0x50dd5;
@@ -3280,6 +3444,7 @@ unsafe fn read_rt_sigreturn_fields(
     u64,
     u64,
     SigSet,
+    crate::kernel::signal::SigAltStack,
     crate::arch::x86::kernel::signal::SigContext,
 )> {
     use crate::arch::x86::kernel::signal::{RtSigFrame, SigContext, UContext};
@@ -3304,8 +3469,35 @@ unsafe fn read_rt_sigreturn_fields(
         },
     };
     let sc_addr = uc_addr.checked_add(core::mem::offset_of!(UContext, uc_mcontext) as u64)?;
+    let stack_addr = uc_addr.checked_add(core::mem::offset_of!(UContext, uc_stack) as u64)?;
+    let altstack = crate::kernel::signal::SigAltStack {
+        ss_sp: unsafe {
+            crate::arch::x86::kernel::uaccess::get_user_u64(
+                stack_addr
+                    .checked_add(core::mem::offset_of!(crate::kernel::signal::SigAltStack, ss_sp) as u64)?
+                    as *const u64,
+            )
+            .ok()?
+        } as usize,
+        ss_flags: unsafe {
+            crate::arch::x86::kernel::uaccess::get_user_u32(
+                stack_addr
+                    .checked_add(core::mem::offset_of!(crate::kernel::signal::SigAltStack, ss_flags) as u64)?
+                    as *const u32,
+            )
+            .ok()?
+        },
+        ss_size: unsafe {
+            crate::arch::x86::kernel::uaccess::get_user_u64(
+                stack_addr
+                    .checked_add(core::mem::offset_of!(crate::kernel::signal::SigAltStack, ss_size) as u64)?
+                    as *const u64,
+            )
+            .ok()?
+        } as usize,
+    };
     let sc = unsafe { read_user_sigcontext(sc_addr) }?;
-    Some((frame_addr, uc_flags, mask, sc))
+    Some((frame_addr, uc_flags, mask, altstack, sc))
 }
 
 unsafe fn read_user_sigcontext(addr: u64) -> Option<crate::arch::x86::kernel::signal::SigContext> {
@@ -3486,10 +3678,17 @@ pub(crate) fn inherit_signal_state_for_clone(
     child_pid: i32,
     child_tgid: i32,
     child_task: *mut crate::kernel::task::TaskStruct,
+    clone_flags: u64,
 ) -> bool {
     SIGNAL_TABLE
         .lock()
-        .inherit_for_clone(parent_pid, child_pid, child_tgid, child_task)
+        .inherit_for_clone(
+            parent_pid,
+            child_pid,
+            child_tgid,
+            child_task,
+            clone_flags,
+        )
 }
 
 /// Reparent every live task in a child process, matching Linux
@@ -3712,15 +3911,7 @@ pub(crate) fn flush_signal_handlers_for_exec(force_default: bool) {
         return;
     };
 
-    for action in state.actions.iter_mut().skip(1) {
-        let keep_ignored = !force_default && handler_kind(action) == HandlerKind::Ignore;
-        *action = RtSigAction {
-            sa_handler: if keep_ignored { 1 } else { 0 },
-            sa_flags: 0,
-            sa_restorer: 0,
-            sa_mask: SigSet::default(),
-        };
-    }
+    flush_signal_handlers_in_place(&mut state.actions, force_default);
 }
 
 #[cfg(test)]
@@ -4101,7 +4292,8 @@ mod tests {
             100,
             101,
             100,
-            core::ptr::null_mut()
+            core::ptr::null_mut(),
+            0,
         ));
 
         let table = SIGNAL_TABLE.lock();
@@ -4130,7 +4322,8 @@ mod tests {
             100,
             102,
             102,
-            core::ptr::null_mut()
+            core::ptr::null_mut(),
+            0,
         ));
         let table = SIGNAL_TABLE.lock();
         let process_child = table
@@ -4142,6 +4335,193 @@ mod tests {
             &process_child.wait_chldexit,
             &parent_wait_chldexit
         ));
+    }
+
+    #[test]
+    fn clone3_clear_sighand_resets_caught_handlers_but_keeps_ignored() {
+        // test-origin: linux:vendor/linux/tools/testing/selftests/clone3/clone3_clear_sighand.c
+        // Linux copy_sighand() copies the action table, then
+        // flush_signal_handlers(tsk, 0) resets every caught disposition while
+        // preserving SIG_IGN. This is the exact CLONE_CLEAR_SIGHAND contract
+        // used by Firefox's separate-process clone3 children.
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        register_test_task(130, 130);
+        {
+            let mut table = SIGNAL_TABLE.lock();
+            let parent = table.get_by_pid_mut(130).expect("parent signal state");
+            parent.actions[SIGUSR1 as usize] = RtSigAction {
+                sa_handler: 0xfeed_cafe,
+                sa_flags: SA_RESTART,
+                sa_restorer: 0x1234,
+                sa_mask: SigSet {
+                    bits: sig_bit(SIGTERM),
+                },
+            };
+            parent.actions[SIGUSR2 as usize] = RtSigAction {
+                sa_handler: 1,
+                sa_flags: SA_RESTART,
+                sa_restorer: 0x5678,
+                sa_mask: SigSet {
+                    bits: sig_bit(SIGTERM),
+                },
+            };
+            parent.altstack = SigAltStack {
+                ss_sp: 0x7fff_0000,
+                ss_flags: 0,
+                ss_size: 8192,
+            };
+        }
+
+        assert!(inherit_signal_state_for_clone(
+            130,
+            131,
+            131,
+            core::ptr::null_mut(),
+            crate::kernel::clone::CLONE_VM | crate::kernel::clone::CLONE_CLEAR_SIGHAND,
+        ));
+
+        let table = SIGNAL_TABLE.lock();
+        let child = table
+            .states
+            .iter()
+            .find(|state| state.pid == 131)
+            .expect("clear-sighand child signal state");
+        assert_eq!(child.actions[SIGUSR1 as usize].sa_handler, 0);
+        assert_eq!(child.actions[SIGUSR1 as usize].sa_flags, 0);
+        assert_eq!(child.actions[SIGUSR1 as usize].sa_restorer, 0);
+        assert_eq!(child.actions[SIGUSR1 as usize].sa_mask, SigSet::default());
+        assert_eq!(child.actions[SIGUSR2 as usize].sa_handler, 1);
+        assert_eq!(child.actions[SIGUSR2 as usize].sa_flags, 0);
+        assert_eq!(child.actions[SIGUSR2 as usize].sa_restorer, 0);
+        assert_eq!(child.actions[SIGUSR2 as usize].sa_mask, SigSet::default());
+        assert_eq!(child.altstack.ss_sp, 0);
+        assert_eq!(child.altstack.ss_flags, SS_DISABLE);
+        assert_eq!(child.altstack.ss_size, 0);
+        drop(table);
+        reset_for_tests();
+    }
+
+    #[test]
+    fn rt_sigframe_saves_linux_altstack_state() {
+        // test-origin: linux:vendor/linux/arch/x86/kernel/signal_64.c:x64_setup_rt_frame
+        // test-origin: linux:vendor/linux/kernel/signal.c:__save_altstack
+        // Linux stores the task's configured alternate signal stack in
+        // frame->uc.uc_stack.  A zero placeholder breaks handlers which use
+        // SA_ONSTACK and makes rt_sigreturn restore the wrong stack state.
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 132;
+        current.tgid = 132;
+        current.cred = &raw const INIT_CRED;
+        unsafe { sched::set_current(&mut *current) };
+        register_test_task(132, 132);
+        {
+            let mut table = SIGNAL_TABLE.lock();
+            table
+                .get_by_pid_mut(132)
+                .expect("current signal state")
+                .altstack = SigAltStack {
+                ss_sp: 0x7000,
+                ss_flags: 0,
+                ss_size: 8192,
+            };
+        }
+
+        let mut stack = [0u8; 4096];
+        let stack_top = unsafe { stack.as_mut_ptr().add(stack.len()) as u64 };
+        let mut regs = crate::kernel::task::PtRegs {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            bp: 0,
+            bx: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            ax: 0,
+            cx: 0,
+            dx: 0,
+            si: 0,
+            di: 0,
+            orig_ax: 39,
+            ip: 0x401000,
+            cs: 0x33,
+            flags: 0x202,
+            sp: stack_top,
+            ss: 0x2b,
+        };
+        let action = RtSigAction {
+            sa_handler: 0x5000,
+            sa_flags: SA_SIGINFO,
+            sa_restorer: 0x6000,
+            sa_mask: SigSet::default(),
+        };
+        let info = SigInfo::new(SIGUSR1, 0);
+
+        let result = unsafe {
+            crate::arch::x86::kernel::signal::setup_rt_frame(
+                &mut regs,
+                SIGUSR1,
+                &action,
+                &info,
+                SigSet::default(),
+            )
+        };
+        assert_eq!(result, Ok(()));
+        let frame = unsafe {
+            &*(regs.sp as *const crate::arch::x86::kernel::signal::RtSigFrame)
+        };
+        assert_eq!(frame.uc.uc_stack.ss_sp, 0x7000);
+        assert_eq!(frame.uc.uc_stack.ss_flags, 0);
+        assert_eq!(frame.uc.uc_stack.ss_size, 8192);
+
+        unsafe { sched::set_current(previous) };
+        reset_for_tests();
+    }
+
+    #[test]
+    fn sigaltstack_accepts_linux_autodisarm_and_reports_saved_flags() {
+        // test-origin: linux:vendor/linux/include/uapi/linux/signal.h:SS_AUTODISARM
+        // test-origin: linux:vendor/linux/kernel/signal.c:do_sigaltstack
+        // Linux accepts SS_AUTODISARM as a flag bit, preserves it in the
+        // reported stack, and returns SS_DISABLE for the initially empty
+        // stack. Rejecting the bit makes Firefox's signal setup observe EINVAL.
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 133;
+        current.tgid = 133;
+        current.cred = &raw const INIT_CRED;
+        unsafe { sched::set_current(&mut *current) };
+        register_test_task(133, 133);
+
+        let new_ss = SigAltStack {
+            ss_sp: 0x8000,
+            ss_flags: SS_AUTODISARM,
+            ss_size: 8192,
+        };
+        let mut old_ss = SigAltStack::default();
+        assert_eq!(unsafe { sys_sigaltstack(&new_ss, &mut old_ss, 0) }, 0);
+        assert_eq!(old_ss.ss_sp, 0);
+        assert_eq!(old_ss.ss_flags, SS_DISABLE);
+        assert_eq!(old_ss.ss_size, 0);
+
+        let mut reported = SigAltStack::default();
+        assert_eq!(unsafe { sys_sigaltstack(core::ptr::null(), &mut reported, 0) }, 0);
+        assert_eq!(reported.ss_sp, new_ss.ss_sp);
+        assert_eq!(reported.ss_flags, SS_AUTODISARM);
+        assert_eq!(reported.ss_size, new_ss.ss_size);
+
+        unsafe { sched::set_current(previous) };
+        reset_for_tests();
     }
 
     #[test]
@@ -4175,7 +4555,7 @@ mod tests {
             );
         }
         assert!(
-            !inherit_signal_state_for_clone(200, 202, 200, core::ptr::null_mut()),
+            !inherit_signal_state_for_clone(200, 202, 200, core::ptr::null_mut(), 0),
             "a clone racing SIGNAL_GROUP_EXIT must be rejected"
         );
         reset_for_tests();
@@ -4202,6 +4582,7 @@ mod tests {
                 peer.pid,
                 leader.tgid,
                 &mut *peer as *mut TaskStruct,
+                0,
             ));
             assert_eq!(
                 synchronize_group_exit(&mut *leader as *mut TaskStruct, 9),
@@ -4589,10 +4970,10 @@ mod tests {
                 -14
             );
             assert_eq!(
-                sys_sigaltstack(bad_stack.cast_const(), core::ptr::null_mut()),
+                sys_sigaltstack(bad_stack.cast_const(), core::ptr::null_mut(), 0),
                 -14
             );
-            assert_eq!(sys_sigaltstack(core::ptr::null(), bad_stack), -14);
+            assert_eq!(sys_sigaltstack(core::ptr::null(), bad_stack, 0), -14);
 
             sched::set_current(previous);
         }
@@ -5238,15 +5619,19 @@ mod tests {
                 ss_size: 8192,
             };
             let mut old_ss = SigAltStack::default();
-            assert_eq!(sys_sigaltstack(&new_ss, &mut old_ss), 0);
-            assert_eq!(sys_sigaltstack(core::ptr::null(), &mut old_ss), 0);
-            assert_eq!(old_ss.ss_sp, new_ss.ss_sp);
+            assert_eq!(sys_sigaltstack(&new_ss, &mut old_ss, 0), 0);
+            assert_eq!(sys_sigaltstack(core::ptr::null(), &mut old_ss, 0), 0);
+            // Linux do_sigaltstack() normalizes a disabled stack to a null
+            // base and zero size before storing it.
+            assert_eq!(old_ss.ss_sp, 0);
+            assert_eq!(old_ss.ss_flags, SS_DISABLE);
+            assert_eq!(old_ss.ss_size, 0);
             let bad_ss = SigAltStack {
                 ss_sp: 0,
                 ss_flags: 4,
                 ss_size: 0,
             };
-            assert_eq!(sys_sigaltstack(&bad_ss, core::ptr::null_mut()), -22);
+            assert_eq!(sys_sigaltstack(&bad_ss, core::ptr::null_mut(), 0), -22);
             assert_eq!(sys_rt_sigreturn(), 0);
 
             sched::set_current(previous);
