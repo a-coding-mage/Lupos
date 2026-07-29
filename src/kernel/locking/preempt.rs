@@ -55,6 +55,13 @@ pub const NMI_MASK: u32 = ((1u32 << NMI_BITS) - 1) << NMI_SHIFT;
 /// [`preempt_count`] must continue to expose only the context-count fields.
 pub const PREEMPT_NEED_RESCHED: u32 = 0x8000_0000;
 
+/// Linux's x86 idle-task baseline (`PREEMPT_DISABLED`).
+///
+/// Lupos keeps the inverted `PREEMPT_NEED_RESCHED` bit out of the raw
+/// per-CPU word, so the equivalent visible baseline is one ordinary
+/// `PREEMPT_OFFSET` level rather than Linux's `0x8000_0001` encoding.
+pub const PREEMPT_DISABLED: u32 = PREEMPT_OFFSET;
+
 #[inline(always)]
 const fn visible_preempt_count(raw: u32) -> u32 {
     raw & !PREEMPT_NEED_RESCHED
@@ -158,6 +165,19 @@ pub fn preempt_count() -> u32 {
     {
         visible_preempt_count(counter().load(Ordering::Acquire))
     }
+}
+
+/// Linux `init_idle_preempt_count()` from
+/// `vendor/linux/arch/x86/include/asm/preempt.h`.
+///
+/// Idle tasks call `schedule_idle()` without the normal outer
+/// `__schedule_loop()` preempt-disable.  Their baseline therefore has to be
+/// installed before the first rq lock is carried into a new task; otherwise
+/// `schedule_tail()` would decrement zero and wrap the counter.
+#[inline]
+pub fn init_idle_preempt_count(cpu: usize) {
+    crate::arch::x86::kernel::setup_percpu::preempt_count_slot(cpu)
+        .store(PREEMPT_DISABLED, Ordering::Release);
 }
 
 /// Increment the preempt-disable counter.

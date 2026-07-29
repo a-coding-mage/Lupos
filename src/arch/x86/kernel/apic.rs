@@ -142,7 +142,7 @@ pub const LVT_DELIVERY_MODE_EXTINT: u32 = 0x7 << 8;
 pub const LVT_TIMER_PERIODIC: u32 = 1 << 17;
 
 /// ICR_LOW bit 12: delivery status — set while the IPI is pending delivery.
-/// Poll this bit after writing ICR_LOW; spin until it clears before the next IPI.
+/// Poll this bit before issuing the next IPI.
 /// Reference: Intel SDM Vol. 3A §10.6.1 "Interrupt Command Register (ICR)"
 pub const ICR_DELIVERY_PENDING: u32 = 1 << 12;
 
@@ -326,6 +326,13 @@ pub unsafe fn enable_lint0_extint() {
 /// # Safety
 /// LAPIC MMIO must be accessible; `vector` should correspond to an installed IDT entry.
 pub unsafe fn send_ipi(target_id: u8, vector: u8) {
+    // Linux's `default_send_IPI_single_phys()` wraps the complete
+    // destination/trigger sequence in `local_irq_save()`.  ICR_HIGH and
+    // ICR_LOW are one logical command: an interrupt that sends another IPI
+    // between these writes would replace the destination selected by this
+    // command before its trigger is issued.
+    let irq_flags = crate::kernel::locking::local_irq_save();
+
     // Wait for any in-flight IPI to be accepted before sending another.
     unsafe {
         wait_for_icr_idle();
@@ -343,9 +350,7 @@ pub unsafe fn send_ipi(target_id: u8, vector: u8) {
         lapic_write(REG_ICR_LOW, fixed_ipi_icr_low(vector));
     }
 
-    unsafe {
-        wait_for_icr_idle();
-    }
+    crate::kernel::locking::local_irq_restore(irq_flags);
 }
 
 /// Send an INIT IPI to the target AP.
@@ -560,6 +565,40 @@ mod tests {
         assert_eq!((icr >> 8) & 0x7, 0, "fixed delivery mode");
         assert_eq!(icr & (1 << 14), 0, "normal fixed IPI must not set ASSERT");
         assert_eq!(icr & (1 << 15), 0, "normal fixed IPI is edge-triggered");
+    }
+
+    #[test]
+    fn fixed_ipi_waits_before_send_without_post_send_stall() {
+        // Linux `vendor/linux/arch/x86/kernel/apic/ipi.c::__default_send_IPI_dest_field`
+        // waits for the previous ICR command, writes ICR2/ICR, and returns.  A
+        // post-write wait makes every scheduler reschedule synchronous with
+        // delivery and was the observed source of the graphics boot stall.
+        let source = include_str!("apic.rs");
+        let body = source
+            .split("pub unsafe fn send_ipi(target_id: u8, vector: u8) {")
+            .nth(1)
+            .and_then(|tail| tail.split("/// Send an INIT IPI to the target AP.").next())
+            .expect("fixed IPI implementation body");
+        let wait = body
+            .find("wait_for_icr_idle();")
+            .expect("fixed IPI must wait before issuing a command");
+        let write = body
+            .find("lapic_write(REG_ICR_LOW")
+            .expect("fixed IPI must issue ICR_LOW");
+        assert!(wait < write, "ICR idle wait must precede ICR_LOW write");
+        assert_eq!(
+            body.matches("wait_for_icr_idle();").count(),
+            1,
+            "normal fixed IPI must not wait again after the ICR write"
+        );
+        let save = body
+            .find("local_irq_save()")
+            .expect("fixed IPI must close the ICR destination/trigger window");
+        let restore = body
+            .find("local_irq_restore(irq_flags)")
+            .expect("fixed IPI must restore the caller's IRQ state");
+        assert!(save < wait, "IRQ state must be saved before the ICR wait");
+        assert!(write < restore, "IRQ state must be restored after ICR_LOW");
     }
 
     #[test]

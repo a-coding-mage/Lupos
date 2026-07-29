@@ -117,7 +117,8 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsiz
 use spin::Mutex;
 
 use crate::arch::x86::kernel::switch::{
-    __switch_to_asm, prepare_switch_to_task, record_switch_attempt,
+    __switch_to_asm, prepare_switch_to_task, record_pipewire_switch_diagnostic,
+    record_switch_attempt,
 };
 use crate::kernel::locking::RawSpinLocked;
 use crate::kernel::pid::{INIT_PID_NS, alloc_pid};
@@ -381,6 +382,13 @@ impl PostSwitchHeapReleases {
 
 static POST_SWITCH_HEAP_RELEASES: [Mutex<PostSwitchHeapReleases>; MAX_CPUS] =
     [const { Mutex::new(PostSwitchHeapReleases::new()) }; MAX_CPUS];
+
+// Host-only completion seam for the scheduler policy migration regression.
+// The test consumes it only after the real policy path has dropped p->pi_lock
+// and the runqueue lock, which models move_queued_task() publishing the end
+// of its handoff without introducing host-thread races into a kernel test.
+#[cfg(test)]
+pub(crate) static POLICY_CHANGE_TEST_COMPLETE_MIGRATION: AtomicBool = AtomicBool::new(false);
 
 // Lupos-specific runtime instrumentation for the Linux rq-lock handoff race:
 // stop one self-pick after rq unlock so another CPU can enqueue work in the
@@ -689,7 +697,7 @@ pub unsafe fn set_current(task: *mut TaskStruct) {
 /// CPU online.  It cannot discover the slot through the online mask at that
 /// point, so `sched_init_ap()` passes the already-known logical CPU directly.
 #[cfg(not(test))]
-unsafe fn set_current_on_cpu(cpu: usize, task: *mut TaskStruct) {
+pub(crate) unsafe fn set_current_on_cpu(cpu: usize, task: *mut TaskStruct) {
     assert!(cpu < MAX_CPUS, "scheduler logical CPU ID is out of range");
     CURRENT_TASK[cpu].store(task, Ordering::Release);
     crate::arch::x86::kernel::cpu::common::set_linux_current_task_on_cpu(cpu, task);
@@ -1030,10 +1038,11 @@ pub unsafe fn finish_task_switch(prev: *mut TaskStruct) {
         rq::unlock_rq_after_switch(current_cpu());
     }
 
-    // Linux's sched_ttwu_pending() runs after the target CPU has completed
-    // finish_task() and released rq->lock. This is the first safe point at
-    // which a queued remote wake whose task was `prev` can be activated.
-    drain_remote_wakes();
+    // Linux's sched_ttwu_pending() runs from the scheduler/call-function IPI,
+    // after the target CPU has completed finish_task() and released rq->lock.
+    // Keep that activation on the IPI side of this boundary: running the full
+    // wake/migration path here would consume the incoming task's small kernel
+    // stack and permits nested interrupt work immediately after IRQ restore.
 
     // Linux `finish_task_switch()` consumes `rq->prev_mm` only after
     // finish_task() has cleared prev->on_cpu and completed the scheduler's
@@ -1076,6 +1085,11 @@ pub unsafe extern "C" fn schedule_tail(prev: *mut TaskStruct) {
         finish_deferred_heap_task_releases();
         finish_deferred_mm_drops();
     }
+    // Linux `schedule_tail()` calls `preempt_enable()` after the carried rq
+    // lock and switch-side cleanup are complete.  A freshly forked task does
+    // not return through the caller's `schedule()` frame, so this is the
+    // matching drop for the outer level held by `__schedule_loop()`.
+    crate::kernel::locking::preempt::preempt_enable();
 }
 
 #[inline]
@@ -1217,20 +1231,28 @@ unsafe fn task_can_switch_to(task: *mut TaskStruct) -> bool {
     unsafe { task_runnable(task) && task_has_switch_frame(task) }
 }
 
-/// Linux's scheduler only switches to a task that is inactive on another
-/// CPU.  `task_on_cpu` is the cross-CPU handoff bit published by
+/// Linux's class pickers return only tasks that remain queued on their owner
+/// runqueue.  `task_on_cpu` is the cross-CPU handoff bit published by
 /// `prepare_task()` and cleared by `finish_task()`; the local runqueue's
 /// `current` task is the one legitimate exception because it may be selected
-/// for a self-pick.  Lupos keeps this ownership check at the class-picker
-/// boundary as a backstop for a stale/duplicate queue entry: otherwise an RT
-/// task present on two runqueues can make both CPUs enter the same task stack.
+/// for a self-pick.  Lupos keeps both invariants at the class-picker boundary
+/// as a backstop for stale/duplicate queue entries: otherwise an entity whose
+/// intrusive node survived dequeue, or an RT task present on two runqueues,
+/// can make a CPU enter a task stack that Linux would never select.
 ///
 /// Ref: `vendor/linux/kernel/sched/core.c::prepare_task`,
-/// `finish_task`, and `pick_next_task`.
+/// `finish_task`, and `pick_task_fair`/`pick_next_task`.
 #[inline]
-unsafe fn task_can_switch_to_on_rq(task: *mut TaskStruct, rq_current: *mut TaskStruct) -> bool {
+unsafe fn task_can_switch_to_on_rq(
+    task: *mut TaskStruct,
+    rq_current: *mut TaskStruct,
+    rq_cpu: u32,
+) -> bool {
     unsafe {
-        task_can_switch_to(task) && (!task_on_cpu(task) || task == rq_current)
+        task_on_rq_queued(task)
+            && (*task).thread_info.cpu == rq_cpu
+            && task_can_switch_to(task)
+            && (!task_on_cpu(task) || task == rq_current)
     }
 }
 
@@ -1390,11 +1412,23 @@ unsafe fn change_task_scheduler(
     mut apply_fields: impl FnMut(*mut TaskStruct),
 ) {
     loop {
+        // Linux task_rq_lock() serializes scheduler-parameter changes with
+        // wakeups and priority inheritance by taking p->pi_lock before the
+        // owning runqueue lock.  The lock is reacquired for every retry so a
+        // migration handoff cannot be bridged while this transaction waits.
+        let (pi_guard, pi_flags) = unsafe { (*p).pi_lock.lock_irqsave() };
         let cpu = unsafe { (*p).thread_info.cpu };
         let result = rq::with_rq(cpu, |rq| unsafe {
             // Linux task_rq_lock() retries if migration changed task_rq(p)
             // before the selected rq lock was acquired.
-            if (*p).thread_info.cpu != cpu {
+            if (*p).thread_info.cpu != cpu
+                || (*p).m29.on_rq == class::TASK_ON_RQ_MIGRATING
+            {
+                // Linux task_rq_lock() never crosses the migration handoff:
+                // TASK_ON_RQ_MIGRATING means the task is detached from the
+                // source class queue while move_queued_task() owns the CPU
+                // transfer.  Drop both locks and retry after migration
+                // publishes TASK_ON_RQ_QUEUED or zero on the destination.
                 return None;
             }
 
@@ -1465,14 +1499,30 @@ unsafe fn change_task_scheduler(
 
         match result {
             Some(Some(newly_rescheduled)) => {
+                crate::kernel::locking::RawSpinLock::unlock_irqrestore(pi_guard, pi_flags);
                 send_reschedule_ipi_for_transition(cpu, newly_rescheduled);
                 return;
             }
-            Some(None) => continue,
+            Some(None) => {
+                crate::kernel::locking::RawSpinLock::unlock_irqrestore(pi_guard, pi_flags);
+                #[cfg(test)]
+                if POLICY_CHANGE_TEST_COMPLETE_MIGRATION.swap(false, Ordering::AcqRel) {
+                    // This is the host-only migration owner used by the
+                    // focused regression. It runs after both locks are
+                    // released, exactly where Linux's move_queued_task()
+                    // can publish the completed handoff.
+                    unsafe {
+                        (*p).m29.on_rq = 0;
+                    }
+                }
+                core::hint::spin_loop();
+                continue;
+            }
             None => {
                 // Early single-CPU initialization has no class runqueue yet.
                 // Such a task cannot be queued in a class-specific structure.
                 apply_fields(p);
+                crate::kernel::locking::RawSpinLock::unlock_irqrestore(pi_guard, pi_flags);
                 return;
             }
         }
@@ -1990,6 +2040,7 @@ pub unsafe fn legacy_schedule() -> bool {
         record_switch_attempt(prev, next);
         prepare_switch_to_task(next);
         prepare_task_switch_release(prev);
+        record_pipewire_switch_diagnostic(prev, next);
         let last = __switch_to_asm(prev, next);
         finish_task_switch(last);
         finish_deferred_heap_task_releases();
@@ -2083,10 +2134,12 @@ pub unsafe fn __schedule() {
             prepare_prev_for_pick(this_rq, prev);
 
             let picked = pick_next_task(this_rq);
-            let next = if !picked.is_null() && task_can_switch_to_on_rq(picked, this_rq.current) {
+            let next = if !picked.is_null()
+                && task_can_switch_to_on_rq(picked, this_rq.current, this_rq.cpu)
+            {
                 picked
             } else if this_rq.idle != prev
-                && task_can_switch_to_on_rq(this_rq.idle, this_rq.current)
+                && task_can_switch_to_on_rq(this_rq.idle, this_rq.current, this_rq.cpu)
             {
                 this_rq.idle
             } else {
@@ -2115,6 +2168,13 @@ pub unsafe fn __schedule() {
                 }
             }
             clear_need_resched(prev);
+            // Capture the ownership state before publishing the selected task
+            // as current on this CPU.  The failure-only probe is intentionally
+            // before this Linux prepare_task() publication boundary; otherwise
+            // every valid incoming task would appear on_cpu=1.
+            if !next.is_null() && next != prev {
+                record_pipewire_switch_diagnostic(prev, next);
+            }
             if !next.is_null() && next != prev {
                 (*next).thread_info.cpu = cpu;
                 (*next).m29.recent_used_cpu = cpu as i32;
@@ -2178,7 +2238,15 @@ pub unsafe fn __schedule() {
 pub unsafe fn schedule() -> bool {
     crate::kernel::watchdog::touch_softlockup_watchdog_sched();
     if production_smp_scheduler_enabled() {
+        // Linux `__schedule_loop()` holds the caller's preemption level
+        // across `__schedule()`.  The rq lock adds a second level and is
+        // carried across the physical stack switch; `finish_task_switch()`
+        // drops only that scheduler-owned level before its post-switch work.
+        // Restore the caller's level only after the incoming task has
+        // returned from that boundary.
+        crate::kernel::locking::preempt::preempt_disable();
         unsafe { __schedule() };
+        crate::kernel::locking::preempt::preempt_enable_no_resched();
         false
     } else {
         unsafe { legacy_schedule() }
@@ -2601,6 +2669,10 @@ pub unsafe fn sched_init() {
         rq0.idle = bsp_task;
         rq0.current = bsp_task;
     });
+    // Linux `init_idle_preempt_count()` sets the BSP idle task's baseline
+    // outside rq locks. `schedule_idle()` does not add the normal outer
+    // preempt-disable level, so the baseline must already be one.
+    crate::kernel::locking::preempt::init_idle_preempt_count(0);
     SCHED_ONLINE_CPUS.store(1, Ordering::Release);
     SMP_SCHED_PREPARED.store(false, Ordering::Release);
     PRODUCTION_SCHED_ENABLED.store(false, Ordering::Release);
@@ -2729,6 +2801,9 @@ pub unsafe fn sched_init_ap(cpu: u32, exact_stack_top: usize) -> *mut TaskStruct
         this_rq.idle = idle_task;
         this_rq.current = idle_task;
     });
+    // Linux `init_idle_preempt_count()` is per-CPU and runs after the AP's
+    // runqueue is initialized, before that idle task can call schedule_idle.
+    crate::kernel::locking::preempt::init_idle_preempt_count(cpu);
     idle_task
 }
 
@@ -3203,6 +3278,31 @@ mod tests {
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
 
     static LEGACY_SCHED_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:finish_task_switch
+    /// and `sched_ttwu_pending`, plus vendor/linux/arch/x86/kernel/smp.c:
+    /// `sysvec_reschedule_ipi`.
+    ///
+    /// Linux does not run the remote wake-list drain from the incoming task's
+    /// `finish_task_switch()` stack frame.  It releases the rq lock first and
+    /// lets the scheduler/call-function IPI consume the list after the switch
+    /// boundary.  Keeping the drain inline makes the post-switch frame carry
+    /// the entire wake/migration path and permits nested IRQ work while the
+    /// stack is still in its smallest scheduler budget.
+    #[test]
+    fn finish_task_switch_does_not_drain_remote_wakes_inline() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split("pub unsafe fn finish_task_switch")
+            .nth(1)
+            .and_then(|tail| tail.split("pub unsafe extern \"C\" fn schedule_tail").next())
+            .expect("finish_task_switch body must exist");
+
+        assert!(
+            !body.lines().any(|line| line.trim() == "drain_remote_wakes();"),
+            "remote wake activation must remain on the IPI side of the Linux switch boundary"
+        );
+    }
 
     /// test-origin: linux:vendor/linux/kernel/sched/core.c:ttwu_queue_cond
     /// and __ttwu_queue_wakelist
@@ -3864,6 +3964,102 @@ mod tests {
         assert!(schedule < enable_after);
     }
 
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:__schedule_loop
+    ///
+    /// Linux enters every normal `__schedule()` call with the caller's
+    /// preemption level held and drops only the scheduler-owned level after
+    /// the incoming task has completed `finish_task_switch()`.  This source
+    /// guard keeps the stack-switch boundary from silently losing that
+    /// ownership level in the Rust translation.
+    #[test]
+    fn schedule_wraps_production_switch_in_linux_preempt_guard() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split("pub unsafe fn schedule()")
+            .nth(1)
+            .expect("schedule must exist")
+            .split("/// Schedule from a per-CPU idle task.")
+            .next()
+            .expect("schedule body must end before schedule_idle");
+        let production = body
+            .split("if production_smp_scheduler_enabled()")
+            .nth(1)
+            .expect("schedule must have a production SMP branch");
+
+        assert!(
+            production.contains("preempt_disable()"),
+            "Linux __schedule_loop disables preemption before __schedule"
+        );
+        assert!(
+            production.contains("preempt_enable_no_resched()"),
+            "Linux __schedule_loop restores the caller's preemption level"
+        );
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:schedule_tail
+    ///
+    /// A newly forked task enters through its synthetic stack rather than
+    /// returning through the caller's `schedule()` frame.  Linux therefore
+    /// drops the caller-held preemption level in `schedule_tail()` after the
+    /// carried rq lock has been released by `finish_task_switch()`.
+    #[test]
+    fn schedule_tail_reenables_the_new_task_after_switch_cleanup() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split("pub unsafe extern \"C\" fn schedule_tail")
+            .nth(1)
+            .expect("schedule_tail must exist")
+            .split("fn task_allowed_on_cpu")
+            .next()
+            .expect("schedule_tail body must end before task placement helpers");
+        let finish = body
+            .find("finish_task_switch(prev)")
+            .expect("schedule_tail must finish the carried task switch");
+        let deferred = body
+            .find("finish_deferred_mm_drops()")
+            .expect("schedule_tail must finish deferred switch cleanup");
+        let enable = body
+            .find("preempt_enable()")
+            .expect("Linux schedule_tail must re-enable the new task");
+
+        assert!(finish < deferred);
+        assert!(deferred < enable);
+    }
+
+    /// test-origin: linux:vendor/linux/arch/x86/include/asm/preempt.h:init_idle_preempt_count
+    ///
+    /// Linux gives every idle CPU its disabled-preemption baseline before
+    /// `schedule_idle()` can carry an rq lock into a newly selected task.
+    /// Without it, `schedule_tail()` decrements zero on the first AP switch
+    /// and wraps the per-CPU counter to `0xffffffff`.
+    #[test]
+    fn idle_tasks_install_linux_preempt_baseline_before_scheduling() {
+        let source = include_str!("mod.rs");
+        let bsp = source
+            .split("pub unsafe fn sched_init()")
+            .nth(1)
+            .expect("BSP scheduler initialization must exist")
+            .split("/// Transfer the BSP's legacy queue")
+            .next()
+            .expect("BSP scheduler initialization body must end");
+        let ap = source
+            .split("pub unsafe fn sched_init_ap")
+            .nth(1)
+            .expect("AP scheduler initialization must exist")
+            .split("/// Publish a fully initialized AP")
+            .next()
+            .expect("AP scheduler initialization body must end");
+
+        assert!(
+            bsp.contains("init_idle_preempt_count(0)"),
+            "BSP idle must receive Linux's disabled-preemption baseline"
+        );
+        assert!(
+            ap.contains("init_idle_preempt_count(cpu)"),
+            "AP idle must receive Linux's disabled-preemption baseline"
+        );
+    }
+
     #[test]
     fn bsp_idle_loop_only_schedules_when_linux_need_resched_is_set() {
         let source = include_str!("../../init/main.rs");
@@ -4365,13 +4561,14 @@ mod tests {
         );
         task.stack = stack_top as *mut core::ffi::c_void;
         task.thread.sp = stack_top - SWITCH_FRAME_BYTES as u64;
+        task.m29.on_rq = class::TASK_ON_RQ_QUEUED;
         task.m29.on_cpu.store(1, Ordering::Release);
 
-        assert!(!unsafe { task_can_switch_to_on_rq(task_ptr, other_ptr) });
-        assert!(unsafe { task_can_switch_to_on_rq(task_ptr, task_ptr) });
+        assert!(!unsafe { task_can_switch_to_on_rq(task_ptr, other_ptr, 0) });
+        assert!(unsafe { task_can_switch_to_on_rq(task_ptr, task_ptr, 0) });
 
         task.m29.on_cpu.store(0, Ordering::Release);
-        assert!(unsafe { task_can_switch_to_on_rq(task_ptr, other_ptr) });
+        assert!(unsafe { task_can_switch_to_on_rq(task_ptr, other_ptr, 0) });
     }
 
     #[test]

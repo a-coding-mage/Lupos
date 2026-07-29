@@ -351,6 +351,21 @@ impl<T> RawSpinLocked<T> {
         preempt_enable();
     }
 
+    /// Release a raw lock carried across a context switch with Linux's
+    /// `raw_spin_unlock_irq()` ordering.
+    ///
+    /// The scheduler enters `finish_task_switch()` with local IRQs disabled
+    /// and an rq lock transferred from the outgoing stack. Linux releases the
+    /// lock, enables IRQs, and only then drops the preemption level. The
+    /// ordinary stack-switch unlock cannot be used at that boundary because
+    /// it drops preemption while IRQs are still masked.
+    #[inline]
+    pub unsafe fn unlock_after_stack_switch_irq(&self) {
+        self.lock.unlock();
+        local_irq_enable();
+        preempt_enable();
+    }
+
     /// Acquire with IRQ-save semantics: saves EFLAGS, disables interrupts,
     /// and disables preemption.
     pub fn lock_irqsave(&self) -> (RawSpinGuard<'_, T>, IrqFlags) {

@@ -45,11 +45,26 @@ unsafe fn enqueue_task_rt(rq: &mut Rq, p: *mut TaskStruct, flags: u32) {
     if p.is_null() {
         return;
     }
+    let already_on_rt_list = unsafe { (*p).m29.rt.on_list != 0 };
+    if already_on_rt_list {
+        // Linux's `sched_rt_entity::on_list` is task-owned state, so this
+        // rejects a duplicate insertion even when a stale caller names a
+        // different CPU's rt_rq.  `on_rq` is deliberately not used here: it
+        // remains set for a running RT entity, and Linux distinguishes that
+        // state from list membership.
+        return;
+    }
     let prio = unsafe { (*p).m29.prio };
-    rq.rt.enqueue(p, prio, flags & ENQUEUE_HEAD != 0);
+    if !rq.rt.enqueue(p, prio, flags & ENQUEUE_HEAD != 0) {
+        // Linux's `on_list` guard rejects a duplicate intrusive insertion;
+        // preserve the existing task/rq accounting when a stale caller
+        // reaches this boundary.
+        return;
+    }
     unsafe {
         (*p).m29.on_rq = TASK_ON_RQ_QUEUED;
         (*p).m29.rt.on_rq = 1;
+        (*p).m29.rt.on_list = 1;
         if (*p).m29.rt.time_slice == 0 {
             (*p).m29.rt.time_slice = RR_TIMESLICE_TICKS;
         }
@@ -71,6 +86,7 @@ unsafe fn dequeue_task_rt(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool {
                 0
             };
             (*p).m29.rt.on_rq = 0;
+            (*p).m29.rt.on_list = 0;
         }
         rq.nr_running = rq.nr_running.saturating_sub(1);
     }
@@ -90,7 +106,7 @@ unsafe fn pick_next_task_rt(rq: &mut Rq) -> *mut TaskStruct {
     rq.rt.queues[prio as usize]
         .iter()
         .copied()
-        .find(|&task| unsafe { super::task_can_switch_to_on_rq(task, rq.current) })
+        .find(|&task| unsafe { super::task_can_switch_to_on_rq(task, rq.current, rq.cpu) })
         .unwrap_or(core::ptr::null_mut())
 }
 
@@ -278,5 +294,44 @@ mod tests {
 
         assert!(unsafe { pick_next_task_rt(&mut rq) }.is_null());
         assert_eq!(rq.rt.highest_prio(), Some(10));
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/rt.c:__enqueue_rt_entity
+    ///
+    /// Linux's `sched_rt_entity::on_list` prevents a second insertion of the
+    /// same intrusive RT entity.  A duplicate queue entry lets two CPUs pick
+    /// one task while its saved kernel stack still belongs to the first
+    /// switch, so the compact VecDeque translation must preserve the same
+    /// membership invariant.
+    #[test]
+    fn rt_enqueue_does_not_duplicate_an_entity() {
+        let mut rq = Rq::new(1);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+        task.__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+        task.stack = (super::super::KTHREAD_STACK_SIZE * 2) as *mut core::ffi::c_void;
+        task.thread.sp = task.stack as u64 - super::super::SWITCH_FRAME_BYTES as u64;
+        task.m29.sched_class = &RT_SCHED_CLASS as *const SchedClass;
+        task.m29.prio = 10;
+        task.m29.policy = SCHED_FIFO;
+
+        unsafe { enqueue_task_rt(&mut rq, task_ptr, 0) };
+        unsafe { enqueue_task_rt(&mut rq, task_ptr, 0) };
+
+        assert_eq!(rq.rt.queues[10].len(), 1);
+        assert_eq!(rq.rt.nr_running, 1);
+        assert_eq!(rq.nr_running, 1);
+        assert_eq!(task.m29.on_rq, TASK_ON_RQ_QUEUED);
+        assert_eq!(task.m29.rt.on_rq, 1);
+        assert_eq!(task.m29.rt.on_list, 1);
+
+        let mut other_rq = Rq::new(2);
+        unsafe { enqueue_task_rt(&mut other_rq, task_ptr, 0) };
+        assert!(other_rq.rt.queues[10].is_empty());
+        assert_eq!(other_rq.rt.nr_running, 0);
+        assert_eq!(other_rq.nr_running, 0);
     }
 }

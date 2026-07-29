@@ -244,6 +244,7 @@ pub unsafe fn sys_sched_yield() -> i32 {
 mod tests {
     use super::*;
     use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn sched_attr_is_56_bytes() {
@@ -413,9 +414,10 @@ mod tests {
     /// test-origin: linux:vendor/linux/kernel/sched/core.c:sched_change_begin
     ///
     /// A migrating task carries a nonzero `on_rq` handoff token but is already
-    /// detached from its old class queue.  Linux does not dequeue or enqueue
-    /// it during a policy change; doing so would let this CPU mutate a queue
-    /// still owned by the migration path.
+    /// detached from its old class queue.  Linux waits for the migration
+    /// owner to clear that token before it applies the policy transaction;
+    /// doing the dequeue/enqueue work earlier would let this CPU mutate a
+    /// queue still owned by the migration path.
     #[test]
     fn migrating_policy_change_does_not_touch_class_runqueues() {
         const TEST_CPU: u32 = (super::super::MAX_CPUS - 2) as u32;
@@ -453,9 +455,12 @@ mod tests {
             sched_priority: 88,
             ..SchedAttr::default()
         };
+        super::super::POLICY_CHANGE_TEST_COMPLETE_MIGRATION.store(true, Ordering::Release);
         assert_eq!(unsafe { sys_sched_setattr(task_ptr, &attr) }, 0);
+        super::super::POLICY_CHANGE_TEST_COMPLETE_MIGRATION.store(false, Ordering::Release);
 
-        assert_eq!(task.m29.on_rq, super::super::class::TASK_ON_RQ_MIGRATING);
+        assert_eq!(task.m29.on_rq, 0);
+        assert_eq!(task.m29.policy, SCHED_FIFO);
         assert_eq!(task.m29.se.on_rq, 0);
         assert_eq!(task.m29.rt.on_rq, 0);
         super::super::rq::with_rq(TEST_CPU, |rq| {
@@ -464,5 +469,93 @@ mod tests {
             assert_eq!(rq.nr_running, 0);
         })
         .expect("test runqueue exists");
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:task_rq_lock
+    ///
+    /// Linux does not apply a scheduler-parameter transaction while the task
+    /// carries TASK_ON_RQ_MIGRATING.  The migration owner must first reacquire
+    /// p->pi_lock, clear the handoff token, and publish the completed CPU
+    /// placement; task_rq_lock() then retries the transaction.  The two host
+    /// threads make the ordering observable: the policy-change closure is
+    /// held at its first invocation while a migration completion waits for
+    /// the same task lock.
+    #[test]
+    fn policy_change_waits_for_migration_before_applying_fields() {
+        const TEST_CPU: u32 = (super::super::MAX_CPUS - 4) as u32;
+
+        struct ResetRunqueue(u32);
+        impl Drop for ResetRunqueue {
+            fn drop(&mut self) {
+                let _ = super::super::rq::with_rq(self.0, |rq| {
+                    *rq = super::super::rq::Rq::new(self.0);
+                });
+            }
+        }
+
+        super::super::rq::init_rqs();
+        super::super::rq::with_rq(TEST_CPU, |rq| {
+            *rq = super::super::rq::Rq::new(TEST_CPU);
+        })
+        .expect("test runqueue exists");
+        let _reset_runqueue = ResetRunqueue(TEST_CPU);
+
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        task.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        task.m29.sched_class = &super::super::fair::FAIR_SCHED_CLASS;
+        task.m29.policy = SCHED_NORMAL;
+        task.thread_info.cpu = TEST_CPU;
+        task.m29.on_rq = super::super::class::TASK_ON_RQ_MIGRATING;
+        let task_addr = (&mut *task as *mut TaskStruct) as usize;
+
+        let applied_during_migration = AtomicBool::new(false);
+        super::super::POLICY_CHANGE_TEST_COMPLETE_MIGRATION.store(true, Ordering::Release);
+        unsafe {
+            super::super::change_task_scheduler(
+                task_addr as *mut TaskStruct,
+                &super::super::fair::FAIR_SCHED_CLASS,
+                DEFAULT_PRIO,
+                |p| {
+                    applied_during_migration.store(
+                        (*p).m29.on_rq == super::super::class::TASK_ON_RQ_MIGRATING,
+                        Ordering::Release,
+                    );
+                },
+            );
+        }
+        super::super::POLICY_CHANGE_TEST_COMPLETE_MIGRATION.store(false, Ordering::Release);
+        assert!(
+            !applied_during_migration.load(Ordering::Acquire),
+            "scheduler parameters must wait for Linux's migration handoff"
+        );
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:task_rq_lock
+    ///
+    /// Policy changes must take the task PI lock before taking the owning
+    /// runqueue lock.  Keep this structural check alongside the runtime
+    /// queue-transaction tests above; the latter cannot observe the lock
+    /// ordering directly.
+    #[test]
+    fn policy_change_has_linux_task_rq_lock_boundary() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split("unsafe fn change_task_scheduler(")
+            .nth(1)
+            .expect("scheduler policy-change helper exists");
+        let pi_lock = body
+            .find("(*p).pi_lock.lock_irqsave()")
+            .expect("policy changes acquire the task PI lock");
+        let runqueue = body
+            .find("rq::with_rq(cpu")
+            .expect("policy changes acquire the owning runqueue");
+        assert!(
+            pi_lock < runqueue,
+            "task PI lock must precede the runqueue lock"
+        );
+        assert!(
+            body.contains("(*p).m29.on_rq == class::TASK_ON_RQ_MIGRATING"),
+            "policy changes must retry across Linux's migration handoff"
+        );
     }
 }

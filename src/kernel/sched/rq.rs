@@ -21,9 +21,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::kernel::locking::raw_spinlock::RawSpinLocked;
-use crate::kernel::locking::{
-    local_irq_disable, local_irq_enable, local_irq_restore, local_irq_save,
-};
+use crate::kernel::locking::{local_irq_disable, local_irq_restore, local_irq_save};
 use crate::kernel::task::{M29SchedFields, TaskStruct};
 use crate::lib::rbtree::{
     LinuxRbNode, LinuxRbRoot, linux_rb_erase, linux_rb_insert_color, linux_rb_next,
@@ -621,8 +619,18 @@ impl RtRq {
         None
     }
 
-    pub fn enqueue(&mut self, p: *mut TaskStruct, prio: i32, head: bool) {
+    /// Insert an RT entity only when it is not already linked in this
+    /// priority bucket.
+    ///
+    /// Linux's `__enqueue_rt_entity()` tests `sched_rt_entity::on_list`
+    /// before `list_add[_tail]`.  The Rust queue is the same intrusive
+    /// membership boundary even though its storage is a `VecDeque`; callers
+    /// must not create a second entry for one task.
+    pub fn enqueue(&mut self, p: *mut TaskStruct, prio: i32, head: bool) -> bool {
         let prio = prio.clamp(0, super::prio::MAX_RT_PRIO - 1) as usize;
+        if self.queues[prio].contains(&p) {
+            return false;
+        }
         if head {
             self.queues[prio].push_front(p);
         } else {
@@ -630,6 +638,7 @@ impl RtRq {
         }
         self.active_bitmap[prio / 64] |= 1u64 << (prio % 64);
         self.nr_running += 1;
+        true
     }
 
     pub fn dequeue(&mut self, p: *mut TaskStruct, prio: i32) -> bool {
@@ -843,9 +852,8 @@ pub unsafe fn with_rq_lock_held_for_switch<R>(cpu: u32, f: impl FnOnce(&mut Rq) 
     let rq = unsafe { RQS[cpu].get_mut_for_stack_switch() };
     let Some(rq) = rq.as_mut() else {
         unsafe {
-            RQS[cpu].unlock_after_stack_switch();
+            RQS[cpu].unlock_after_stack_switch_irq();
         }
-        local_irq_enable();
         return None;
     };
     let result = f(rq);
@@ -856,15 +864,15 @@ pub unsafe fn with_rq_lock_held_for_switch<R>(cpu: u32, f: impl FnOnce(&mut Rq) 
 /// Finish Linux's `finish_lock_switch()` ownership transfer.
 ///
 /// The matching acquisition is [`with_rq_lock_held_for_switch`].  Linux uses
-/// `raw_spin_rq_unlock_irq()` here, so this enables local interrupts instead
-/// of restoring the outgoing task's saved RFLAGS.
+/// `raw_spin_rq_unlock_irq()` here, so this releases the lock, enables local
+/// interrupts, and only then drops the carried preemption level instead of
+/// restoring the outgoing task's saved RFLAGS.
 pub unsafe fn unlock_rq_after_switch(cpu: u32) {
     let cpu = cpu as usize;
     debug_assert!(cpu < MAX_RQ_CPUS);
     unsafe {
-        RQS[cpu].unlock_after_stack_switch();
+        RQS[cpu].unlock_after_stack_switch_irq();
     }
-    local_irq_enable();
 }
 
 /// Run a closure while holding two runqueue locks in logical-CPU order.
@@ -990,6 +998,35 @@ mod tests {
         }
         assert_eq!(preempt_count(), before);
         assert_eq!(with_rq(cpu, |rq| rq.cpu), Some(cpu));
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/sched.h:finish_lock_switch
+    /// and linux:vendor/linux/include/linux/spinlock_api_smp.h:
+    /// __raw_spin_unlock_irq
+    ///
+    /// The incoming task must release the carried rq lock before restoring
+    /// preemptibility. This source-backed assertion complements the runtime
+    /// handoff test above: the ordering is the Linux lock/IRQ ABI, not merely
+    /// a final preempt-count value.
+    #[test]
+    fn context_switch_unlock_enables_irqs_before_preempt() {
+        let source = include_str!("../locking/raw_spinlock.rs");
+        let body = source
+            .split("pub unsafe fn unlock_after_stack_switch_irq")
+            .nth(1)
+            .and_then(|body| body.split("pub fn lock_irqsave").next())
+            .expect("irq-aware stack-switch unlock must exist");
+        let unlock = body
+            .find("self.lock.unlock()")
+            .expect("stack-switch unlock must release the raw lock");
+        let irq = body
+            .find("local_irq_enable()")
+            .expect("stack-switch unlock must enable local IRQs");
+        let preempt = body
+            .find("preempt_enable()")
+            .expect("stack-switch unlock must restore preemption");
+        assert!(unlock < irq);
+        assert!(irq < preempt);
     }
 
     #[test]
