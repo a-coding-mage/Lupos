@@ -208,7 +208,16 @@ unsafe fn dequeue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool
         // has no timeline node, while keeping the current fast path when the
         // invariant holds.
         let in_timeline = rq.cfs.contains_task(p);
-        let removed = if rq.cfs.current == p && !in_timeline {
+        // Linux reaches the current-entity fast path only while holding the
+        // task's owning rq lock (`task_rq_lock()`); `cfs_rq->curr` alone is
+        // not an ownership proof in this compact translation.  Requiring
+        // both task_rq(p) and rq->curr to agree prevents a stale current
+        // cache from clearing a task whose intrusive node belongs to another
+        // CPU's timeline.
+        let current_on_this_rq = rq.cfs.current == p
+            && rq.current == p
+            && (*p).thread_info.cpu == rq.cpu;
+        let removed = if current_on_this_rq && !in_timeline {
             // Linux dequeue_entities() succeeds for the currently running
             // entity, which is intentionally not present in the rb-tree.
             true
@@ -251,7 +260,7 @@ unsafe fn pick_next_task_fair(rq: &mut Rq) -> *mut TaskStruct {
         let current = rq.cfs.current;
         if !current.is_null()
             && unsafe { (*current).m29.se.on_rq != 0 }
-            && unsafe { super::task_can_switch_to_on_rq(current, rq.current) }
+            && unsafe { super::task_can_switch_to_on_rq(current, rq.current, rq.cpu) }
         {
             return current;
         }
@@ -260,7 +269,7 @@ unsafe fn pick_next_task_fair(rq: &mut Rq) -> *mut TaskStruct {
         .tasks_timeline
         .iter()
         .find_map(|task| {
-            if unsafe { super::task_can_switch_to_on_rq(task, rq.current) } {
+            if unsafe { super::task_can_switch_to_on_rq(task, rq.current, rq.cpu) } {
                 Some(task)
             } else {
                 None
@@ -656,6 +665,44 @@ mod tests {
 
     /// test-origin: linux:vendor/linux/kernel/sched/fair.c:dequeue_entities
     ///
+    /// Linux's `cfs_rq->curr` is owned by the runqueue selected by
+    /// `task_rq_lock()`.  A stale Lupos current cache must not make the
+    /// current-entity fast path clear `on_rq` on a different runqueue while
+    /// the entity's intrusive node remains owned by its actual rq.
+    #[test]
+    fn dequeue_current_fast_path_rejects_a_different_runqueue_owner() {
+        let mut owner = Rq::new(0);
+        let mut wrong_rq = Rq::new(1);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let ptr = &mut *task as *mut TaskStruct;
+        task.thread_info.cpu = owner.cpu;
+        task.m29.static_prio = DEFAULT_PRIO;
+        task.m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
+        task.m29.se.load.weight = NICE_0_LOAD;
+        task.m29.se.on_rq = 1;
+        task.m29.on_rq = TASK_ON_RQ_QUEUED;
+
+        assert!(owner.cfs.insert(ptr, task.m29.se.vruntime));
+        owner.cfs.nr_running = 1;
+        owner.cfs.load_weight = NICE_0_LOAD;
+        owner.nr_running = 1;
+
+        // The wrong rq has a stale current cache but does not own the task's
+        // run_node.  The pre-fix fast path treated this as a successful
+        // dequeue and cleared both membership flags.
+        wrong_rq.cfs.current = ptr;
+        let dequeued = unsafe { dequeue_task_fair(&mut wrong_rq, ptr, DEQUEUE_SLEEP) };
+
+        assert!(!dequeued);
+        assert_eq!(task.m29.se.on_rq, 1);
+        assert_eq!(task.m29.on_rq, TASK_ON_RQ_QUEUED);
+        assert_eq!(owner.cfs.nr_running, 1);
+        assert_eq!(owner.nr_running, 1);
+        assert_eq!(owner.cfs.tasks_timeline.first(), ptr);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:dequeue_entities
+    ///
     /// Linux relies on `cfs_rq->curr` never being present in
     /// `tasks_timeline`. If a stale current cache violates that invariant,
     /// Lupos must still detach the embedded node before clearing `on_rq`; task
@@ -670,6 +717,7 @@ mod tests {
         task.m29.se.load.weight = NICE_0_LOAD;
         task.m29.se.on_rq = 1;
         task.m29.on_rq = TASK_ON_RQ_QUEUED;
+        rq.current = ptr;
         rq.cfs.current = ptr;
         assert!(rq.cfs.insert(ptr, task.m29.se.vruntime));
         rq.cfs.nr_running = 1;
@@ -973,6 +1021,82 @@ mod tests {
         assert!(picked.is_null());
         assert_eq!(rq.cfs.tasks_timeline.first(), task_ptr);
         assert!(rq.cfs.current.is_null());
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:pick_task_fair
+    ///
+    /// Linux's fair picker walks entities that are still queued.  A stale
+    /// timeline node whose task membership was already cleared must not be
+    /// promoted to `rq->curr`, or the CPU can run a task with `task_on_rq ==
+    /// 0` and leave wakeups waiting on its `on_cpu` handoff forever.
+    #[test]
+    fn pick_next_task_fair_rejects_a_dequeued_timeline_entity() {
+        let mut rq = Rq::new(0);
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let mut stale = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let current_ptr = &mut *current as *mut TaskStruct;
+        let stale_ptr = &mut *stale as *mut TaskStruct;
+
+        rq.current = current_ptr;
+        stale.__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+        let stack_top = crate::kernel::sched::KTHREAD_STACK_SIZE * 2;
+        stale.stack = stack_top as *mut core::ffi::c_void;
+        stale.thread.sp = stack_top as u64 - 64;
+        stale.m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
+        stale.m29.se.vruntime = 1;
+        stale.m29.se.on_rq = 0;
+        stale.m29.on_rq = 0;
+
+        assert!(rq.cfs.insert(stale_ptr, stale.m29.se.vruntime));
+        rq.cfs.nr_running = 1;
+        rq.nr_running = 1;
+
+        let picked = unsafe { pick_next_task_fair(&mut rq) };
+
+        assert!(picked.is_null());
+        assert_eq!(rq.cfs.tasks_timeline.first(), stale_ptr);
+        assert!(rq.cfs.current.is_null());
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:task_rq
+    /// and vendor/linux/kernel/sched/fair.c:pick_task_fair
+    ///
+    /// A queued entity is owned by the rq named by `task_cpu(p)`.  Linux's
+    /// rq lock/task_rq boundary prevents another CPU from selecting that
+    /// entity while a migration is publishing the destination.  A stale
+    /// Lupos timeline node must therefore be rejected rather than entering
+    /// the same kernel stack on two CPUs.
+    #[test]
+    fn pick_next_task_fair_rejects_entity_owned_by_another_cpu() {
+        let mut rq = Rq::new(0);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+
+        task.__state.store(
+            crate::kernel::task::task_state::TASK_RUNNING,
+            Ordering::Release,
+        );
+        let stack_top = crate::kernel::sched::KTHREAD_STACK_SIZE * 2;
+        task.stack = stack_top as *mut core::ffi::c_void;
+        task.thread.sp = stack_top as u64 - 64;
+        task.thread_info.cpu = 1;
+        task.m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
+        task.m29.se.vruntime = 1;
+        task.m29.se.on_rq = 1;
+        task.m29.on_rq = TASK_ON_RQ_QUEUED;
+
+        assert!(rq.cfs.insert(task_ptr, task.m29.se.vruntime));
+        rq.cfs.nr_running = 1;
+        rq.nr_running = 1;
+
+        assert!(
+            unsafe { pick_next_task_fair(&mut rq) }.is_null(),
+            "a task owned by CPU1 must not be selected from CPU0's rq"
+        );
+        assert_eq!(rq.cfs.tasks_timeline.first(), task_ptr);
     }
 
     /// test-origin: linux:vendor/linux/kernel/sched/fair.c:pick_eevdf

@@ -5975,6 +5975,12 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    [ -n \"$session_dbus\" ] || session_dbus=\"${early_bus:-unix:path=/run/user/1000/bus}\"\n",
         "    [ -n \"$session_runtime\" ] || session_runtime=/run/user/1000\n",
         "    [ -n \"$session_home\" ] || session_home=/home/lupos\n",
+        // Xfce is launched by dbus-run-session, so its private session bus
+        // is not the bus owned by the per-user systemd manager.  Keep the
+        // former for desktop clients and use the runtime-dir bus for
+        // systemctl/systemd-run --user, exactly like the earlier desktop
+        // readiness probe does.
+        "    user_manager_bus=\"unix:path=$session_runtime/bus\"\n",
         "    printf 'graphics-x11: session-env display=%s xauthority=%s dbus=%s runtime=%s source=proc-or-fallback\n' \"$session_display\" \"$session_xauthority\" \"$session_dbus\" \"$session_runtime\"\n",
         "    rm -f /tmp/lupos-settings-manager.log /tmp/lupos-settings-windows.log\n",
         "    sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none /usr/bin/xfce4-settings-manager >/tmp/lupos-settings-manager.log 2>&1 &\n",
@@ -6163,14 +6169,14 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "pipewire_start_rc=125\n",
         "pipewire_ready=0; i=0\n",
         "if [ \"$aplay_direct_rc\" -eq 0 ]; then\n",
-        "    sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user set-environment PIPEWIRE_DEBUG=4 WIREPLUMBER_DEBUG=4 >/tmp/lupos-pipewire-env.log 2>&1 || true\n",
+        "    sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$user_manager_bus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user set-environment PIPEWIRE_DEBUG=4 WIREPLUMBER_DEBUG=4 >/tmp/lupos-pipewire-env.log 2>&1 || true\n",
         "    rm -f /tmp/lupos-pipewire-start.rc\n",
-        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 30 /usr/bin/systemctl --user start --no-block pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service >/tmp/lupos-pipewire-start.log 2>&1; printf '%s\\n' \"$?\" > /tmp/lupos-pipewire-start.rc ) &\n",
+        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$user_manager_bus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 30 /usr/bin/systemctl --user start --no-block pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service >/tmp/lupos-pipewire-start.log 2>&1; printf '%s\\n' \"$?\" > /tmp/lupos-pipewire-start.rc ) &\n",
         "    pipewire_start_pid=$!\n",
         "    rm -f /tmp/lupos-pipewire-ready\n",
-        "    ( sleep 5; sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" PIPEWIRE_DEBUG=4 /usr/bin/wpctl status -n >/tmp/lupos-wpctl.log 2>&1 && grep -q 'alsa_output' /tmp/lupos-wpctl.log && sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" /usr/bin/pactl info >/tmp/lupos-pactl.log 2>&1 && touch /tmp/lupos-pipewire-ready ) &\n",
-        "    pipewire_probe_pid=$!\n",
-        "    while [ \"$i\" -lt 30 ] && [ ! -e /tmp/lupos-pipewire-ready ]; do i=$((i + 1)); sleep 1; done\n",
+        "    while [ \"$i\" -lt 30 ] && [ ! -e /tmp/lupos-pipewire-ready ]; do\n",
+        "        if sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$user_manager_bus\" XDG_RUNTIME_DIR=\"$session_runtime\" PIPEWIRE_DEBUG=4 /usr/bin/wpctl status -n >/tmp/lupos-wpctl.log 2>&1 && grep -q 'alsa_output' /tmp/lupos-wpctl.log && sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$user_manager_bus\" XDG_RUNTIME_DIR=\"$session_runtime\" /usr/bin/pactl info >/tmp/lupos-pactl.log 2>&1 && grep -q 'Server Name: PulseAudio (on PipeWire' /tmp/lupos-pactl.log; then touch /tmp/lupos-pipewire-ready; else i=$((i + 1)); sleep 1; fi\n",
+        "    done\n",
         "    [ -e /tmp/lupos-pipewire-ready ] && pipewire_ready=1\n",
         "    if [ -s /tmp/lupos-pipewire-start.rc ]; then pipewire_start_rc=\"$(cat /tmp/lupos-pipewire-start.rc)\"; elif kill -0 \"$pipewire_start_pid\" 2>/dev/null; then pipewire_start_rc=124; else pipewire_start_rc=125; fi\n",
         "fi\n",
@@ -6179,10 +6185,10 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "if [ \"$pipewire_ready\" -ne 1 ]; then\n",
         "    for media_name in pipewire pipewire-pulse wireplumber systemctl wpctl timeout; do for media_proc in /proc/[0-9]*; do [ \"$(cat \"$media_proc/comm\" 2>/dev/null)\" = \"$media_name\" ] || continue; printf 'name=%s pid=%s wchan=' \"$media_name\" \"${media_proc##*/}\" >> /tmp/lupos-pipewire-credentials.log; cat \"$media_proc/wchan\" >> /tmp/lupos-pipewire-credentials.log 2>/dev/null || true; sed -n '/^State:/p;/^Pid:/p;/^PPid:/p;/^Uid:/p;/^Gid:/p;/^Groups:/p;/^NoNewPrivs:/p;/^Seccomp:/p' \"$media_proc/status\" >> /tmp/lupos-pipewire-credentials.log 2>&1 || true; done; done\n",
         "    echo 'graphics-x11: audio-live-credentials begin'; cat /tmp/lupos-pipewire-credentials.log 2>/dev/null || true; echo 'graphics-x11: audio-live-credentials end'\n",
-        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user --no-pager --full status pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service >/tmp/lupos-pipewire-status.log 2>&1 || true ) &\n",
+        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$user_manager_bus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user --no-pager --full status pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service >/tmp/lupos-pipewire-status.log 2>&1 || true ) &\n",
         "    : > /tmp/lupos-pipewire-credentials.log\n",
         "    for unit in pipewire.service wireplumber.service; do\n",
-        "        media_pid=\"$(sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user show --property=MainPID --value \"$unit\" 2>/dev/null || true)\"\n",
+        "        media_pid=\"$(sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$user_manager_bus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user show --property=MainPID --value \"$unit\" 2>/dev/null || true)\"\n",
         "        printf 'unit=%s pid=%s\\n' \"$unit\" \"$media_pid\" >> /tmp/lupos-pipewire-credentials.log\n",
         "        if [ -n \"$media_pid\" ] && [ \"$media_pid\" != 0 ]; then\n",
         "            sed -n '/^Name:/p;/^State:/p;/^Pid:/p;/^PPid:/p;/^Uid:/p;/^Gid:/p;/^Groups:/p;/^CapEff:/p;/^NoNewPrivs:/p;/^Seccomp:/p' \"/proc/$media_pid/status\" >> /tmp/lupos-pipewire-credentials.log 2>&1 || true\n",
@@ -6194,8 +6200,8 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // user's manager, credentials, mount namespace and hardening; only
         // the second installs the exact stock syscall filter. This separates
         // path/device errors from seccomp cBPF evaluation errors.
-        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 30 /usr/bin/systemd-run --user --wait --collect --unit=lupos-alsa-unfiltered -p Type=exec -p NoNewPrivileges=yes -p LockPersonality=yes -p MemoryDenyWriteExecute=yes -p SystemCallArchitectures=native /bin/sh -c 'exec /usr/bin/aplay -l >/tmp/lupos-aplay-service-unfiltered.log 2>&1' >/tmp/lupos-aplay-service-unfiltered-launcher.log 2>&1 || true ) &\n",
-        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 30 /usr/bin/systemd-run --user --wait --collect --unit=lupos-alsa-filtered -p Type=exec -p NoNewPrivileges=yes -p LockPersonality=yes -p MemoryDenyWriteExecute=yes -p SystemCallArchitectures=native -p 'SystemCallFilter=@system-service mincore' /bin/sh -c 'exec /usr/bin/aplay -l >/tmp/lupos-aplay-service-filtered.log 2>&1' >/tmp/lupos-aplay-service-filtered-launcher.log 2>&1 || true ) &\n",
+        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$user_manager_bus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 30 /usr/bin/systemd-run --user --wait --collect --unit=lupos-alsa-unfiltered -p Type=exec -p NoNewPrivileges=yes -p LockPersonality=yes -p MemoryDenyWriteExecute=yes -p SystemCallArchitectures=native /bin/sh -c 'exec /usr/bin/aplay -l >/tmp/lupos-aplay-service-unfiltered.log 2>&1' >/tmp/lupos-aplay-service-unfiltered-launcher.log 2>&1 || true ) &\n",
+        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$user_manager_bus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 30 /usr/bin/systemd-run --user --wait --collect --unit=lupos-alsa-filtered -p Type=exec -p NoNewPrivileges=yes -p LockPersonality=yes -p MemoryDenyWriteExecute=yes -p SystemCallArchitectures=native -p 'SystemCallFilter=@system-service mincore' /bin/sh -c 'exec /usr/bin/aplay -l >/tmp/lupos-aplay-service-filtered.log 2>&1' >/tmp/lupos-aplay-service-filtered-launcher.log 2>&1 || true ) &\n",
         "    timeout -k 2 10 /usr/bin/journalctl --no-pager -b _UID=1000 -n 200 >/tmp/lupos-pipewire-journal.log 2>&1 || true\n",
         "    timeout -k 2 10 /usr/bin/journalctl --no-pager -b _UID=1000 _SYSTEMD_USER_UNIT=pipewire.service -n 500 >/tmp/lupos-pipewire-service-journal.log 2>&1 || true\n",
         "    timeout -k 2 10 /usr/bin/journalctl --no-pager -b _UID=1000 _SYSTEMD_USER_UNIT=wireplumber.service -n 200 >/tmp/lupos-wireplumber-journal.log 2>&1 || true\n",
@@ -6204,7 +6210,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "audio_pcm_running=0; audio_play_rc=125; audio_elapsed=-1\n",
         "if [ \"$pipewire_ready\" -eq 1 ] && [ -s /tmp/lupos-audio.wav ]; then\n",
         "    audio_start=\"$(date +%s 2>/dev/null || true)\"\n",
-        "    sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 15 /usr/bin/pw-play /tmp/lupos-audio.wav >/tmp/lupos-pw-play.log 2>&1 &\n",
+        "    sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$user_manager_bus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 15 /usr/bin/pw-play /tmp/lupos-audio.wav >/tmp/lupos-pw-play.log 2>&1 &\n",
         "    audio_play_pid=$!\n",
         "    i=0; while [ \"$i\" -lt 150 ] && kill -0 \"$audio_play_pid\" 2>/dev/null; do if grep -q 'alsa_output' /tmp/lupos-wpctl.log 2>/dev/null; then audio_pcm_running=1; fi; i=$((i + 1)); sleep 0.1; done\n",
         "    if kill -0 \"$audio_play_pid\" 2>/dev/null; then audio_play_rc=124; else wait \"$audio_play_pid\"; audio_play_rc=$?; fi\n",
@@ -6214,7 +6220,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "printf 'graphics-x11: audio-playback rc=%s elapsed=%s pcm-running=%s\\n' \"$audio_play_rc\" \"$audio_elapsed\" \"$audio_pcm_running\"\n",
         "if [ \"$audio_play_rc\" -eq 0 ] && [ \"$audio_elapsed\" -ge 4 ] && [ \"$audio_elapsed\" -le 12 ] && [ \"$audio_pcm_running\" -eq 1 ]; then echo 'graphics-x11: audio-realtime-playback ok'; else echo 'graphics-x11: audio-realtime-playback failed'; fi\n",
         "if [ \"$audio_play_rc\" -ne 0 ] || [ \"$audio_pcm_running\" -ne 1 ]; then\n",
-        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user --no-pager --full status pipewire.service wireplumber.service >/tmp/lupos-pipewire-status.log 2>&1 || true ) &\n",
+        "    ( sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$user_manager_bus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user --no-pager --full status pipewire.service wireplumber.service >/tmp/lupos-pipewire-status.log 2>&1 || true ) &\n",
         "    timeout -k 2 10 /usr/bin/journalctl --no-pager -b _UID=1000 _SYSTEMD_USER_UNIT=pipewire.service -n 500 >/tmp/lupos-pipewire-service-journal.log 2>&1 || true\n",
         "    timeout -k 2 10 /usr/bin/journalctl --no-pager -b _UID=1000 _SYSTEMD_USER_UNIT=wireplumber.service -n 500 >/tmp/lupos-wireplumber-journal.log 2>&1 || true\n",
         "fi\n",
@@ -26705,6 +26711,8 @@ failed command output\n";
         assert!(probe.contains("graphics-x11: proc-pid-root ok"));
         assert!(probe.contains("/usr/bin/wpctl status"));
         assert!(probe.contains("/usr/bin/pactl info"));
+        assert!(probe.contains("while [ \"$i\" -lt 30 ] && [ ! -e /tmp/lupos-pipewire-ready ]; do"));
+        assert!(probe.contains("Server Name: PulseAudio (on PipeWire"));
         assert!(probe.contains("sine=frequency=440:sample_rate=48000 -t 6 -ac 2 -c:a pcm_s16le"));
         assert!(probe.contains("/usr/bin/pw-play /tmp/lupos-audio.wav"));
         assert!(probe.contains("graphics-x11: audio-realtime-playback ok"));
@@ -26736,7 +26744,9 @@ failed command output\n";
         assert!(probe.contains("session_xauthority=\"${XAUTHORITY:-/run/lightdm/root/:0}\""));
         assert!(probe.contains("session_dbus=\"${early_bus:-unix:path=/run/user/1000/bus}\""));
         assert!(probe.contains("graphics-x11: session-env display="));
+        assert!(probe.contains("user_manager_bus=\"unix:path=$session_runtime/bus\""));
         assert!(probe.contains("DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\""));
+        assert!(probe.contains("DBUS_SESSION_BUS_ADDRESS=\"$user_manager_bus\""));
         assert!(probe.contains("xprop -root _NET_CLIENT_LIST"));
         assert!(probe.contains("graphics-x11: settings-manager ok"));
         assert!(probe.contains("graphics-x11: appfinder-probe begin"));

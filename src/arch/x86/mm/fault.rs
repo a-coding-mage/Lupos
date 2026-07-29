@@ -118,6 +118,8 @@ pub fn do_page_fault(frame: &ExceptionFrame) {
     if ec & X86_PF_INSTR != 0 && ec & X86_PF_USER == 0 {
         let raw = frame as *const ExceptionFrame as *const u64;
         let task = unsafe { sched::get_current() };
+        let pipewire_current = !task.is_null()
+            && unsafe { (*task).comm.starts_with(b"pipewire") };
         let (pid, task_ptr, stack_top, thread_sp, state, on_cpu) = if task.is_null() {
             (-1, 0usize, 0usize, 0u64, 0u32, false)
         } else {
@@ -132,13 +134,14 @@ pub fn do_page_fault(frame: &ExceptionFrame) {
         };
         log_error!(
             "cpu",
-            "cpu: #PF entry-frame task-pid={} task={:#018x} stack={:#018x} thread-sp={:#018x} state={:#010x} on-cpu={} ptr={:#018x} orig_ax={:#018x} rip={:#018x} cs={:#018x} flags={:#018x} user_rsp={:#018x}",
+            "cpu: #PF entry-frame task-pid={} task={:#018x} stack={:#018x} thread-sp={:#018x} state={:#010x} on-cpu={} addr={:#018x} ptr={:#018x} orig_ax={:#018x} rip={:#018x} cs={:#018x} flags={:#018x} user_rsp={:#018x}",
             pid,
             task_ptr,
             stack_top,
             thread_sp,
             state,
             on_cpu,
+            cr2,
             raw as usize,
             unsafe { raw.add(15).read_volatile() },
             unsafe { raw.add(16).read_volatile() },
@@ -157,6 +160,14 @@ pub fn do_page_fault(frame: &ExceptionFrame) {
             frame.rdi,
             frame.rbp,
         );
+        if pipewire_current {
+            // The malformed return target is already in the exception frame;
+            // dump the last PipeWire-involved switch decisions before the
+            // normal kernel-fault path can unwind or schedule.  This is a
+            // failure-only probe and keeps the ordinary IRQ/scheduler path
+            // free of serial I/O.
+            crate::arch::x86::kernel::switch::dump_pipewire_switch_diagnostics();
+        }
     }
 
     if cr2 >= TASK_SIZE_MAX {

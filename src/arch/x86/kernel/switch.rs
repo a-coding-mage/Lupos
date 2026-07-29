@@ -107,6 +107,58 @@ static SWITCH_ATTEMPT_NEXT_STACK: AtomicU64 = AtomicU64::new(0);
 static PREV_MM_TO_DROP: [AtomicUsize; crate::kernel::sched::MAX_CPUS] =
     [const { AtomicUsize::new(0) }; crate::kernel::sched::MAX_CPUS];
 
+// TEMPORARY INVESTIGATION INSTRUMENTATION (audio-corruptor-20260726).
+// Removed after the overlapping context-switch writer is classified.
+#[cfg(not(test))]
+const PIPEWIRE_DIAG_SLOTS_PER_CPU: usize = 16;
+
+#[cfg(not(test))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PipewireSwitchDiagnostic {
+    pub sequence: u64,
+    pub cpu: u32,
+    pub _pad: u32,
+    pub prev: u64,
+    pub next: u64,
+    pub prev_sp: u64,
+    pub next_sp: u64,
+    pub current_sp: u64,
+    pub prev_on_cpu: i32,
+    pub next_on_cpu: i32,
+    pub prev_on_rq: i32,
+    pub next_on_rq: i32,
+    pub prev_cpu: i32,
+    pub next_cpu: i32,
+}
+
+#[cfg(not(test))]
+#[unsafe(no_mangle)]
+pub static mut LUPOS_PIPEWIRE_SWITCH_DIAGNOSTICS: [PipewireSwitchDiagnostic;
+    crate::kernel::sched::MAX_CPUS * PIPEWIRE_DIAG_SLOTS_PER_CPU] =
+    [const {
+        PipewireSwitchDiagnostic {
+            sequence: 0,
+            cpu: 0,
+            _pad: 0,
+            prev: 0,
+            next: 0,
+            prev_sp: 0,
+            next_sp: 0,
+            current_sp: 0,
+            prev_on_cpu: 0,
+            next_on_cpu: 0,
+            prev_on_rq: 0,
+            next_on_rq: 0,
+            prev_cpu: -1,
+            next_cpu: -1,
+        }
+    }; crate::kernel::sched::MAX_CPUS * PIPEWIRE_DIAG_SLOTS_PER_CPU];
+
+#[cfg(not(test))]
+static PIPEWIRE_DIAG_SEQUENCE: [AtomicU64; crate::kernel::sched::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::kernel::sched::MAX_CPUS];
+
 // Linux resolves X86_BUG_NULL_SEG during CPU identification and turns the
 // context-switch check into a static CPU capability branch. Lupos' current
 // partial CPU-bug model approximates that flag by vendor, but must still cache
@@ -213,6 +265,118 @@ pub unsafe fn record_switch_attempt(prev: *mut TaskStruct, next: *mut TaskStruct
 #[cfg(not(any(test, debug_assertions)))]
 #[inline(always)]
 pub unsafe fn record_switch_attempt(_prev: *mut TaskStruct, _next: *mut TaskStruct) {}
+
+/// TEMPORARY: retain the last PipeWire-involved switch decisions per CPU.
+///
+/// This is intentionally recorded before `__switch_to_asm` writes
+/// `prev->thread.sp`.  If the same task is switched on two CPUs, or if a
+/// remote switch rewrites a live task's saved stack pointer, the ring shows
+/// the competing `(cpu, prev, next, sp)` records without serializing every
+/// context switch to the console.
+#[cfg(not(test))]
+#[inline(never)]
+pub unsafe fn record_pipewire_switch_diagnostic(
+    prev: *mut TaskStruct,
+    next: *mut TaskStruct,
+) {
+    let prev_is_pipewire = !prev.is_null() && unsafe { (*prev).comm.starts_with(b"pipewire") };
+    let next_is_pipewire = !next.is_null() && unsafe { (*next).comm.starts_with(b"pipewire") };
+    if !prev_is_pipewire && !next_is_pipewire {
+        return;
+    }
+
+    let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number()
+        .min(crate::kernel::sched::MAX_CPUS - 1);
+    let sequence = PIPEWIRE_DIAG_SEQUENCE[cpu].fetch_add(1, Ordering::Relaxed);
+    let slot = cpu * PIPEWIRE_DIAG_SLOTS_PER_CPU
+        + (sequence as usize % PIPEWIRE_DIAG_SLOTS_PER_CPU);
+    let current_sp: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, rsp",
+            out(reg) current_sp,
+            options(nomem, preserves_flags)
+        );
+    }
+
+    let record = unsafe { &raw mut LUPOS_PIPEWIRE_SWITCH_DIAGNOSTICS[slot] };
+    unsafe {
+        (*record).cpu = cpu as u32;
+        (*record)._pad = 0;
+        (*record).prev = prev as u64;
+        (*record).next = next as u64;
+        (*record).prev_sp = if prev.is_null() { 0 } else { (*prev).thread.sp };
+        (*record).next_sp = if next.is_null() { 0 } else { (*next).thread.sp };
+        (*record).current_sp = current_sp;
+        (*record).prev_on_cpu = if prev.is_null() {
+            0
+        } else {
+            (*prev).m29.on_cpu.load(Ordering::Relaxed)
+        };
+        (*record).next_on_cpu = if next.is_null() {
+            0
+        } else {
+            (*next).m29.on_cpu.load(Ordering::Relaxed)
+        };
+        (*record).prev_on_rq = if prev.is_null() { 0 } else { (*prev).m29.on_rq };
+        (*record).next_on_rq = if next.is_null() { 0 } else { (*next).m29.on_rq };
+        (*record).prev_cpu = if prev.is_null() {
+            -1
+        } else {
+            (*prev).thread_info.cpu as i32
+        };
+        (*record).next_cpu = if next.is_null() {
+            -1
+        } else {
+            (*next).thread_info.cpu as i32
+        };
+        core::sync::atomic::compiler_fence(Ordering::Release);
+        (*record).sequence = sequence + 1;
+    }
+}
+
+#[cfg(test)]
+pub unsafe fn record_pipewire_switch_diagnostic(
+    _prev: *mut TaskStruct,
+    _next: *mut TaskStruct,
+) {
+}
+
+/// TEMPORARY: dump the focused PipeWire switch ring when the stack protector
+/// has already proven that this task's continuation is damaged.  Keeping the
+/// dump on the failure path avoids serializing the normal scheduler while
+/// still retaining the last writer/owner evidence in a no-GDB reproduction.
+#[cfg(not(test))]
+pub fn dump_pipewire_switch_diagnostics() {
+    for cpu in 0..crate::kernel::sched::MAX_CPUS {
+        for offset in 0..PIPEWIRE_DIAG_SLOTS_PER_CPU {
+            let slot = cpu * PIPEWIRE_DIAG_SLOTS_PER_CPU + offset;
+            let record = unsafe { &*core::ptr::addr_of!(LUPOS_PIPEWIRE_SWITCH_DIAGNOSTICS[slot]) };
+            if record.sequence == 0 {
+                continue;
+            }
+            crate::linux_driver_abi::tty::serial_println!(
+                "pipewire-switch-diagnostic seq={} cpu={} prev={:#018x} next={:#018x} prev_sp={:#018x} next_sp={:#018x} current_sp={:#018x} prev_on_cpu={} next_on_cpu={} prev_on_rq={} next_on_rq={} prev_cpu={} next_cpu={}",
+                record.sequence,
+                record.cpu,
+                record.prev,
+                record.next,
+                record.prev_sp,
+                record.next_sp,
+                record.current_sp,
+                record.prev_on_cpu,
+                record.next_on_cpu,
+                record.prev_on_rq,
+                record.next_on_rq,
+                record.prev_cpu,
+                record.next_cpu,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn dump_pipewire_switch_diagnostics() {}
 
 #[cfg(any(test, debug_assertions))]
 pub fn last_switch_attempt() -> SwitchAttempt {
@@ -600,6 +764,12 @@ pub unsafe extern "C" fn __switch_to(
     prev: *mut TaskStruct,
     next: *mut TaskStruct,
 ) -> *mut TaskStruct {
+    // Linux samples smp_processor_id() before switch_fpu(), save_fsgs(), and
+    // all incoming segment restoration.  Keep one CPU identity for every
+    // per-CPU publication below; do not rediscover it through a GS-relative
+    // lookup after the incoming task's segment state is live.
+    let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number();
+
     // Linux process_64.c starts __switch_to() with switch_fpu(). The outgoing
     // hardware image is still live even though __switch_to_asm already changed
     // the kernel stack.
@@ -617,7 +787,6 @@ pub unsafe extern "C" fn __switch_to(
 
     // Linux must install next->thread.tls_array before any segment selector is
     // restored, because selectors 0x63/0x6b/0x73 resolve through these slots.
-    let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number();
     unsafe {
         crate::arch::x86::kernel::gdt::load_tls(&(*next).thread, cpu);
         load_fsgs(prev, next);
@@ -640,7 +809,21 @@ pub unsafe extern "C" fn __switch_to(
     // 1. Update the per-CPU current_task pointer so that `get_current()`
     //    returns `next` from this point forward on this CPU.
     //
-    //    Ref: Linux process_64.c `raw_cpu_write(current_task, next_p)`
+    //    Linux samples `cpu = smp_processor_id()` before restoring the
+    //    incoming task's segment state and then uses that same per-CPU
+    //    context for `raw_cpu_write(current_task, next_p)`.  Re-reading the
+    //    CPU number through GS after `load_fsgs()` is not equivalent: a task's
+    //    inactive GS selector/base transition can make the second lookup
+    //    name a different logical CPU, publishing one task into two current
+    //    slots and causing both CPUs to enter the same kernel stack.
+    //
+    //    Ref: Linux process_64.c `int cpu = smp_processor_id()` and
+    //    `raw_cpu_write(current_task, next_p)`.
+    #[cfg(not(test))]
+    unsafe {
+        crate::kernel::sched::set_current_on_cpu(cpu, next);
+    }
+    #[cfg(test)]
     unsafe {
         crate::kernel::sched::set_current(next);
     }
@@ -977,6 +1160,40 @@ mod tests {
             classify_mm_switch(kernel, kernel),
             MmSwitchKind::KernelToKernel
         );
+    }
+
+    /// test-origin: linux:vendor/linux/arch/x86/kernel/process_64.c:__switch_to
+    ///
+    /// Linux keeps the CPU sampled at the start of __switch_to through the
+    /// TLS/segment restore and uses that identity for raw_cpu_write().  A
+    /// second GS-relative lookup can publish the incoming task to a remote
+    /// current_task slot when the inactive GS state is non-default.
+    #[test]
+    fn context_switch_publishes_current_task_on_the_sampled_cpu() {
+        let source = include_str!("switch.rs");
+        let body = source
+            .split("pub unsafe extern \"C\" fn __switch_to(")
+            .nth(1)
+            .expect("__switch_to must exist")
+            .split("// ── Unit tests")
+            .next()
+            .expect("__switch_to body must end before unit tests");
+        let sampled_cpu = body
+            .find("let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number()")
+            .expect("__switch_to must sample the CPU before segment restore");
+        let fpu_switch = body
+            .find("crate::arch::x86::kernel::fpu::switch_fpu(prev, next)")
+            .expect("__switch_to must switch the outgoing/incoming FPU state");
+        let segment_restore = body
+            .find("load_fsgs(prev, next)")
+            .expect("__switch_to must restore the incoming task's segment state");
+        let publication = body
+            .find("set_current_on_cpu(cpu, next)")
+            .expect("__switch_to must publish current_task with the sampled CPU");
+
+        assert!(sampled_cpu < fpu_switch);
+        assert!(fpu_switch < segment_restore);
+        assert!(segment_restore < publication);
     }
 
     /// test-origin: linux:vendor/linux/kernel/sched/core.c:finish_task_switch

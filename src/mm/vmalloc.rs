@@ -119,29 +119,121 @@ static VMALLOC_LOCK: spin::Mutex<VmallocState> = spin::Mutex::new(VmallocState::
 /// Linux `struct vfree_deferred` is an llist of addresses queued by
 /// `vfree_atomic()` and serviced later by `delayed_vfree_work()`.
 ///
-/// Lupos has at most `NR_VM_STRUCTS` live vmalloc allocations.  Keeping the
-/// same bound here means an interrupt-context free never needs dynamic
-/// allocation and each address can remain queued until a cooperative worker
-/// reaches a process-context drain point.
+/// The address itself is the intrusive list node, just as it is in Linux:
+/// `vfree_atomic()` stores the next pointer in the first machine word of the
+/// allocation before publishing it.  `NR_VM_STRUCTS` describes the compact
+/// VA free-list metadata, not the number of live vmalloc allocations, so it
+/// cannot be used as a bound for this deferred list.
 struct VfreeDeferred {
-    entries: [usize; NR_VM_STRUCTS],
+    head: usize,
     len: usize,
+    // Host unit tests model vmalloc addresses in the page-table mock; those
+    // canonical kernel addresses are not mapped in the test process and
+    // therefore cannot hold the intrusive next word.  Keep that harness-only
+    // side table for the simulated pointers.  Production uses only `head`.
+    #[cfg(test)]
+    test_entries: [usize; NR_VM_STRUCTS],
+    #[cfg(test)]
+    test_queue_len: usize,
 }
 
 impl VfreeDeferred {
     const fn new() -> Self {
         Self {
-            entries: [0; NR_VM_STRUCTS],
+            head: 0,
             len: 0,
+            #[cfg(test)]
+            test_entries: [0; NR_VM_STRUCTS],
+            #[cfg(test)]
+            test_queue_len: 0,
         }
+    }
+
+    /// Queue an allocation using its first mapped word as Linux's
+    /// `llist_node.next`.
+    ///
+    /// The caller holds the queue lock.  The `unsafe` contract is the same as
+    /// Linux's cast to `struct llist_node`: `node` must be the base of a live,
+    /// writable vmalloc allocation and remain mapped until `pop()` returns it.
+    /// `node` may be one page above `base` for a Lupos vmapped stack whose
+    /// leading guard is part of the compact allocator reservation.
+    unsafe fn enqueue(&mut self, node: usize, base: usize) -> bool {
+        if node == 0 || base == 0 {
+            return false;
+        }
+
+        #[cfg(test)]
+        if is_vmalloc_addr(base as *const u8) {
+            for &entry in &self.test_entries[..self.test_queue_len] {
+                if entry == base {
+                    return false;
+                }
+            }
+            if self.test_queue_len == self.test_entries.len() {
+                return false;
+            }
+            self.test_entries[self.test_queue_len] = base;
+            self.test_queue_len += 1;
+            self.len += 1;
+            return true;
+        }
+
+        // Keep the existing malformed-double-free protection.  Linux callers
+        // must not add one intrusive node twice; silently retaining one entry
+        // is safer for this compact allocator than making the list cyclic.
+        let mut cursor = self.head;
+        for _ in 0..self.len {
+            if cursor == node {
+                return false;
+            }
+            if cursor == 0 {
+                break;
+            }
+            cursor = unsafe { *(cursor as *const usize) };
+        }
+
+        unsafe {
+            *(node as *mut usize) = self.head;
+            *((node + core::mem::size_of::<usize>()) as *mut usize) = base;
+        }
+        self.head = node;
+        self.len = self.len.saturating_add(1);
+        true
+    }
+
+    /// Remove and return one queued allocation.
+    ///
+    /// The caller holds the queue lock.  The returned allocation is no longer
+    /// reachable from this list and may be unmapped after the lock is dropped.
+    unsafe fn pop(&mut self) -> Option<usize> {
+        #[cfg(test)]
+        if self.test_queue_len != 0 {
+            self.test_queue_len -= 1;
+            let ptr = self.test_entries[self.test_queue_len];
+            self.test_entries[self.test_queue_len] = 0;
+            self.len = self.len.saturating_sub(1);
+            return Some(ptr);
+        }
+
+        if self.head == 0 {
+            debug_assert_eq!(self.len, 0);
+            return None;
+        }
+
+        let node = self.head;
+        self.head = unsafe { *(node as *const usize) };
+        let base = unsafe {
+            *((node + core::mem::size_of::<usize>()) as *const usize)
+        };
+        self.len = self.len.saturating_sub(1);
+        Some(base)
     }
 }
 
 // Linux uses an llist because vfree_atomic() may run in interrupt context.
-// The compact Rust allocator needs out-of-line queue records rather than an
-// intrusive node in the allocation itself, so its fixed queue is protected by
-// an IRQ-save kernel spinlock.  Never use a sleepable or bare library mutex
-// here: an interrupt could otherwise spin on a lock interrupted on this CPU.
+// The compact Rust allocator protects the intrusive list with an IRQ-save
+// kernel spinlock.  Never use a sleepable or bare library mutex here: an
+// interrupt could otherwise spin on a lock interrupted on this CPU.
 static VFREE_DEFERRED: SpinLock<VfreeDeferred> = SpinLock::new(VfreeDeferred::new());
 
 // A deferred-free drain can be reached through a cooperative wait boundary
@@ -687,15 +779,11 @@ pub fn drain_deferred_vfree() {
     loop {
         let ptr = {
             let (mut deferred, flags) = VFREE_DEFERRED.lock_irqsave();
-            if deferred.len == 0 {
-                SpinLock::unlock_irqrestore(deferred, flags);
-                return;
-            }
-            deferred.len -= 1;
-            let index = deferred.len;
-            let ptr = deferred.entries[index];
-            deferred.entries[index] = 0;
+            let ptr = unsafe { deferred.pop() };
             SpinLock::unlock_irqrestore(deferred, flags);
+            let Some(ptr) = ptr else {
+                return;
+            };
             ptr as *mut u8
         };
         vfree_immediate(ptr);
@@ -971,6 +1059,43 @@ pub fn vrealloc_node_align_noprof(
     new_ptr
 }
 
+/// Find storage for Linux's intrusive `vfree_atomic()` list node.
+///
+/// Ordinary vmalloc regions start with a mapped page, so the node and the
+/// teardown base are identical.  `vmalloc_stack()` reserves an unmapped guard
+/// page below its usable stack; for those allocations the node must live at
+/// the first mapped page while the original reservation base is retained for
+/// `vfree_immediate()`.
+fn vfree_atomic_node(ptr: *mut u8) -> Option<usize> {
+    if ptr.is_null() || !VMALLOC_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let base = ptr as u64;
+    if !is_vmalloc_addr(ptr) || base & (PAGE_SIZE as u64 - 1) != 0 {
+        return None;
+    }
+
+    let window_offset = ((base - VMALLOC_START) as usize) / PAGE_SIZE;
+    let n_pages = {
+        let state = VMALLOC_LOCK.lock();
+        state.nr_pages[window_offset] as usize
+    };
+    if n_pages == 0 {
+        return None;
+    }
+
+    if virt_to_phys(base).is_some() {
+        Some(base as usize)
+    } else if n_pages > 1 && virt_to_phys(base + PAGE_SIZE as u64).is_some() {
+        Some((base + PAGE_SIZE as u64) as usize)
+    } else {
+        // A live allocation must have at least one mapped payload page.  A
+        // missing mapping here is a stale/invalid free; do not fault while
+        // trying to publish an intrusive node for it.
+        None
+    }
+}
+
 pub fn vfree_atomic(ptr: *mut u8) {
     if ptr.is_null() {
         return;
@@ -981,24 +1106,15 @@ pub fn vfree_atomic(ptr: *mut u8) {
     );
 
     // Linux uses `llist_add()` and schedules a work item only for the first
-    // insertion.  The fixed queue has the same one-entry-per-live-allocation
-    // bound; deduplicate malformed repeated frees so they cannot consume the
-    // complete reserve before the process-context worker observes them.
-    let (mut deferred, flags) = VFREE_DEFERRED.lock_irqsave();
-    if deferred.entries[..deferred.len]
-        .iter()
-        .any(|&entry| entry == ptr as usize)
-    {
-        SpinLock::unlock_irqrestore(deferred, flags);
+    // insertion.  The allocation is the intrusive list node, so this remains
+    // allocation-free and valid in hardirq/softirq context.
+    let Some(node) = vfree_atomic_node(ptr) else {
         return;
+    };
+    let (mut deferred, flags) = VFREE_DEFERRED.lock_irqsave();
+    unsafe {
+        deferred.enqueue(node, ptr as usize);
     }
-    assert!(
-        deferred.len < deferred.entries.len(),
-        "vfree_atomic queue exceeds live vmalloc allocation bound"
-    );
-    let index = deferred.len;
-    deferred.entries[index] = ptr as usize;
-    deferred.len = index + 1;
     SpinLock::unlock_irqrestore(deferred, flags);
 }
 
@@ -1236,6 +1352,8 @@ mod tests {
     use super::*;
     use crate::arch::x86::mm::paging::test_pool;
     use crate::mm::test_lock::GLOBAL_HW_TEST_LOCK as TEST_LOCK;
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
 
     /// Re-initialise the vmalloc subsystem for a clean test.
     ///
@@ -1245,8 +1363,13 @@ mod tests {
         unsafe { test_pool::reset() };
 
         let (mut deferred, flags) = VFREE_DEFERRED.lock_irqsave();
-        deferred.entries.fill(0);
+        deferred.head = 0;
         deferred.len = 0;
+        #[cfg(test)]
+        {
+            deferred.test_entries.fill(0);
+            deferred.test_queue_len = 0;
+        }
         SpinLock::unlock_irqrestore(deferred, flags);
 
         let mut state = VMALLOC_LOCK.lock();
@@ -1384,6 +1507,40 @@ mod tests {
 
         drain_deferred_vfree();
         assert_eq!(virt_to_phys(ptr as u64), None);
+    }
+
+    /// test-origin: linux:vendor/linux/mm/vmalloc.c:vfree_atomic
+    /// test-origin: linux:vendor/linux/lib/llist.c:llist_add
+    ///
+    /// Linux links the freed allocation itself into the deferred list, so the
+    /// queue is not limited by the compact allocator's 256 free-range
+    /// descriptors.  A fixed descriptor-indexed queue would reject this
+    /// valid burst before the cooperative workqueue gets a process-context
+    /// drain opportunity.
+    #[test]
+    fn deferred_vfree_intrusive_list_is_not_limited_to_metadata_slots() {
+        let mut deferred = VfreeDeferred::new();
+        let mut allocations = Vec::with_capacity(NR_VM_STRUCTS + 32);
+
+        for _ in 0..(NR_VM_STRUCTS + 32) {
+            let ptr = Box::into_raw(Box::new([0usize; 2])) as usize;
+            assert!(unsafe { deferred.enqueue(ptr, ptr) });
+            allocations.push(ptr);
+        }
+
+        assert_eq!(deferred.len, NR_VM_STRUCTS + 32);
+        assert!(!unsafe { deferred.enqueue(allocations[0], allocations[0]) });
+
+        let mut popped = 0;
+        while unsafe { deferred.pop() }.is_some() {
+            popped += 1;
+        }
+        assert_eq!(popped, NR_VM_STRUCTS + 32);
+        assert_eq!(deferred.len, 0);
+
+        for ptr in allocations {
+            unsafe { drop(Box::from_raw(ptr as *mut [usize; 2])) };
+        }
     }
 
     /// test-origin: linux:vendor/linux/mm/vmalloc.c:vfree

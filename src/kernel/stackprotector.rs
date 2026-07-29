@@ -73,6 +73,9 @@ extern "C" fn stack_chk_fail_impl(caller: usize) -> ! {
                 stack_top,
                 sp.saturating_sub(stack_bottom),
             );
+            if (*current).comm.starts_with(b"pipewire") {
+                crate::arch::x86::kernel::switch::dump_pipewire_switch_diagnostics();
+            }
         }
     }
     panic!("stack-protector: Kernel stack is corrupted")
