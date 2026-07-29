@@ -1900,6 +1900,7 @@ pub unsafe extern "C" fn __x64_sys_sigaltstack(regs: *mut PtRegs) -> i64 {
         signal::sys_sigaltstack(
             r.arg0() as *const signal::SigAltStack,
             r.arg1() as *mut signal::SigAltStack,
+            r.rsp,
         )
     }
 }

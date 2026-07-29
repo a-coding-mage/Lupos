@@ -1619,7 +1619,10 @@ unsafe fn copy_process_unpublished(
             args.flags & crate::kernel::clone::CLONE_FS != 0,
         );
 
-        // ── 10. copy_signal / copy_sighand (pointer copy; full dup in M25) ──
+        // ── 10. copy_signal / copy_sighand ─────────────────────────────────
+        // The ABI-shaped TaskStruct::signal pointer is not the live Lupos
+        // signal table; signal.rs performs Linux's copy_sighand semantics on
+        // its heap-backed per-task state, including CLONE_CLEAR_SIGHAND.
         (*child).signal = if args.flags & CLONE_SIGHAND != 0 {
             (*parent).signal
         } else {
@@ -1686,6 +1689,7 @@ unsafe fn copy_process_unpublished(
             nr,
             (*child).tgid,
             child,
+            args.flags,
         ) {
             // vendor/linux copy_process() aborts a clone which races a
             // process-wide fatal exit. Otherwise the new thread can miss

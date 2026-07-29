@@ -1075,22 +1075,22 @@ fn vfree_atomic_node(ptr: *mut u8) -> Option<usize> {
         return None;
     }
 
-    let window_offset = ((base - VMALLOC_START) as usize) / PAGE_SIZE;
-    let n_pages = {
-        let state = VMALLOC_LOCK.lock();
-        state.nr_pages[window_offset] as usize
-    };
-    if n_pages == 0 {
-        return None;
-    }
-
+    // Linux `vfree_atomic()` is safe in hardirq/softirq context because it
+    // only publishes the address to the per-CPU llist.  Do not inspect the
+    // vmalloc allocator metadata here: a process-context `vfree()` may hold
+    // VMALLOC_LOCK while waiting for a TLB shootdown, and an interrupt on that
+    // CPU must never spin on the interrupted lock holder.  The mapping walk
+    // is sufficient to select the intrusive word: ordinary allocations use
+    // their base page, while vmapped task stacks keep a leading guard page and
+    // use their first mapped payload page.
     if virt_to_phys(base).is_some() {
         Some(base as usize)
-    } else if n_pages > 1 && virt_to_phys(base + PAGE_SIZE as u64).is_some() {
+    } else if base + (PAGE_SIZE as u64) < VMALLOC_END
+        && virt_to_phys(base + PAGE_SIZE as u64).is_some()
+    {
         Some((base + PAGE_SIZE as u64) as usize)
     } else {
-        // A live allocation must have at least one mapped payload page.  A
-        // missing mapping here is a stale/invalid free; do not fault while
+        // A missing mapping is a stale/invalid free; do not fault while
         // trying to publish an intrusive node for it.
         None
     }
@@ -1507,6 +1507,28 @@ mod tests {
 
         drain_deferred_vfree();
         assert_eq!(virt_to_phys(ptr as u64), None);
+    }
+
+    /// Linux `vfree_atomic()` only links the address into the per-CPU llist;
+    /// it does not take the vmalloc-area allocator lock.  Holding that lock
+    /// here models an interrupted process-context `vfree()` and makes the
+    /// regression fail by deadlock when the implementation inspects the
+    /// allocation metadata under `VMALLOC_LOCK`.
+    ///
+    /// test-origin: linux:vendor/linux/mm/vmalloc.c:vfree_atomic
+    #[test]
+    fn vfree_atomic_node_can_inspect_mapping_while_allocator_lock_is_held() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { setup() };
+
+        let pfns = [0x1000_0000usize / PAGE_SIZE];
+        let ptr = vmap_pfn(pfns.as_ptr(), pfns.len(), PAGE_KERNEL);
+        assert!(!ptr.is_null());
+
+        let allocator_guard = VMALLOC_LOCK.lock();
+        assert_eq!(vfree_atomic_node(ptr), Some(ptr as usize));
+        drop(allocator_guard);
+        vfree(ptr);
     }
 
     /// test-origin: linux:vendor/linux/mm/vmalloc.c:vfree_atomic

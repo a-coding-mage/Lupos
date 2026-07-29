@@ -836,6 +836,7 @@ mod tests {
                 child_thread.pid,
                 child.tgid,
                 &mut *child_thread as *mut TaskStruct,
+                0,
             ));
 
             exit_notify(&mut *parent as *mut TaskStruct);
@@ -1174,6 +1175,7 @@ mod tests {
                 peer.pid,
                 leader.tgid,
                 &mut *peer as *mut TaskStruct,
+                0,
             ));
             sched::set_current(previous);
 

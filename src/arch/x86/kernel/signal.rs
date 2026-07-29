@@ -209,10 +209,32 @@ pub unsafe fn setup_rt_frame(
     // then leaves `%rsp % 16 == 8` for function-entry ABI alignment.
     let frame_size = core::mem::size_of::<RtSigFrame>();
     let fpstate_size = crate::arch::x86::kernel::fpu_signal::signal_fpstate_size();
-    let Some((user_sp, fpstate_sp)) = x64_rt_sigframe_layout((*regs).sp, frame_size, fpstate_size)
+    let saved_altstack = crate::kernel::signal::current_altstack_for_signal();
+    let nested_altstack = crate::kernel::signal::altstack_on_sig_stack(saved_altstack, (*regs).sp);
+    let entering_altstack = (*action).sa_flags & crate::kernel::signal::SA_ONSTACK != 0
+        && !nested_altstack
+        && saved_altstack.ss_size != 0;
+    let frame_input_sp = if entering_altstack {
+        saved_altstack
+            .ss_sp
+            .checked_add(saved_altstack.ss_size)
+            .ok_or(-14)? as u64
+    } else {
+        (*regs).sp
+    };
+    let Some((user_sp, fpstate_sp)) =
+        x64_rt_sigframe_layout(frame_input_sp, frame_size, fpstate_size)
     else {
         return Err(-14); // EFAULT
     };
+
+    // Linux rejects a frame which would overflow an entered alternate stack
+    // after the red-zone/math-frame allocation.
+    if entering_altstack
+        && !crate::kernel::signal::altstack_contains(saved_altstack, user_sp)
+    {
+        return Err(-14);
+    }
 
     // Verify we're not going off the edge of the stack.
     if user_sp == 0
@@ -247,21 +269,20 @@ pub unsafe fn setup_rt_frame(
             uc_offset + core::mem::offset_of!(UContext, uc_link),
             0u64,
         )?;
-        // Placeholder: proper alternate-stack state remains separate work.
         put_user_frame_value(
             user_sp,
             uc_stack_offset + core::mem::offset_of!(SigAltStack, ss_sp),
-            0usize,
+            saved_altstack.ss_sp,
         )?;
         put_user_frame_value(
             user_sp,
             uc_stack_offset + core::mem::offset_of!(SigAltStack, ss_flags),
-            0u32,
+            saved_altstack.ss_flags,
         )?;
         put_user_frame_value(
             user_sp,
             uc_stack_offset + core::mem::offset_of!(SigAltStack, ss_size),
-            0usize,
+            saved_altstack.ss_size,
         )?;
 
         // 2. Set sa_restorer (the return code address).
