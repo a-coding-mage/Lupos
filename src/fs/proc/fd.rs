@@ -71,7 +71,7 @@ fn fd_dir_lookup(dir: &InodeRef, name: &str) -> Result<InodeRef, i32> {
     let fd = parse_fd_name(name)?;
     let task = task_from_fd_dir_inode(dir)?;
     task_fd_file(task, fd).map_err(|_| ENOENT)?;
-    let pid = unsafe { (*task).pid };
+    let pid = crate::kernel::pid_namespace::task_pid_vnr(task);
     let inode = Inode::new(
         proc_fd_ino(fd),
         InodeKind::Symlink,

@@ -47,8 +47,8 @@ use spin::Mutex;
 use crate::arch::x86::kernel::ptrace::PtRegs;
 use crate::arch::x86::kernel::uaccess;
 use crate::kernel::clone::{
-    CLONE_EMPTY_MNTNS, CLONE_FILES, CLONE_INTO_CGROUP, CLONE_NEWNS, CLONE_NEWUSER, CLONE_NNP,
-    CLONE_PIDFD, CLONE_SETTLS, CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM,
+    CLONE_EMPTY_MNTNS, CLONE_FILES, CLONE_INTO_CGROUP, CLONE_NEWNS, CLONE_NNP, CLONE_PIDFD,
+    CLONE_SETTLS, CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM,
 };
 use crate::kernel::pid::{INIT_PID_NS, alloc_pid};
 use crate::kernel::sched::{
@@ -1312,8 +1312,26 @@ pub unsafe extern "C" fn user_fork_child_return() -> ! {
         "call {schedule_tail}",
         "call {set_child_tid}",
         "add rsp, 8",
+        // Linux ret_from_fork() finishes every newly-created user task through
+        // syscall_exit_to_user_mode(regs).  The child frame is the same
+        // pt_regs layout used by the ordinary syscall entry path, so run the
+        // equivalent slowpath before choosing SYSRET versus IRET.  In
+        // particular, a pending signal or syscall restart must not be skipped
+        // for a namespace-sandbox child.
+        "mov rdi, rsp",
+        "sub rsp, 16",
+        "and rsp, -16",
+        "mov [rsp], rdi",
+        "call {exit_slowpath}",
+        "mov rdi, [rsp]",
+        "call {should_use_sysret}",
+        "mov [rsp + 8], al",
         // Close the interrupt window before switching RSP to the user stack.
         "cli",
+        "mov al, [rsp + 8]",
+        "mov rsp, [rsp]",
+        "test al, al",
+        "jz 3f",
         "mov r15, [rsp + 0]",
         "mov r14, [rsp + 8]",
         "mov r13, [rsp + 16]",
@@ -1333,8 +1351,31 @@ pub unsafe extern "C" fn user_fork_child_return() -> ! {
         "mov rsp, [rsp + 152]",
         "swapgs",
         "sysretq",
+        // IRET restores the complete user frame when signal delivery or
+        // ptrace-like state made SYSRET unsafe, matching syscall_entry.
+        "3:",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rax",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "add rsp, 8",
+        "swapgs",
+        "iretq",
         schedule_tail = sym crate::kernel::sched::schedule_tail,
         set_child_tid = sym user_fork_child_set_tid,
+        exit_slowpath = sym crate::arch::x86::entry::syscall::syscall_exit_slowpath,
+        should_use_sysret = sym crate::arch::x86::entry::syscall::syscall_should_use_sysret,
     );
 }
 
@@ -1666,6 +1707,18 @@ unsafe fn copy_process_unpublished(
             cleanup_failed_child(parent, child, stack_ptr, task_allocated);
             return Err(e);
         }
+        // Linux allocates the task's PID from the namespace selected by the
+        // copied nsproxy.  The existing M22 allocator still owns the global
+        // PID in `TaskStruct::pid`; M28 records the namespace-visible PID for
+        // CLONE_NEWPID children (and their descendants) here.
+        if let Err(e) = crate::kernel::pid_namespace::register_child_pid(
+            parent,
+            child,
+            clone_thread,
+        ) {
+            cleanup_failed_child(parent, child, stack_ptr, task_allocated);
+            return Err(e);
+        }
 
         // ── 12. Copy comm from parent ────────────────────────────────────────
         // Linux copy_process() runs sched_cgroup_fork() before making the
@@ -1737,6 +1790,7 @@ pub(crate) unsafe fn cleanup_task_shared_state(task: *mut TaskStruct) {
     unsafe {
         clear_child_set_tid_registration((*task).pid);
         crate::fs::fs_struct::exit_fs(task);
+        crate::kernel::pid_namespace::unregister_task_pid(task);
 
         let seccomp_filter = (*task)
             .m27_seccomp
@@ -1924,21 +1978,10 @@ pub unsafe fn kernel_clone(args: &KernelCloneArgs) -> i64 {
     }
 
     let mut effective_args = *args;
+    // Linux expands CLONE_EMPTY_MNTNS before copy_process() so the normal
+    // CLONE_NEWNS validation and namespace construction see the implied flag.
     if effective_args.flags & CLONE_EMPTY_MNTNS != 0 {
         effective_args.flags |= CLONE_NEWNS;
-    }
-    if effective_args.flags & CLONE_NEWUSER != 0 {
-        // User namespaces grant capabilities that are meant to be scoped to
-        // the new namespace. Keep CLONE_NEWUSER fail-closed until capability
-        // checks are namespace-aware; otherwise those bits satisfy global
-        // capable() gates.
-        return -1; // EPERM
-    }
-    if effective_args.flags & CLONE_NEWNS != 0 {
-        // Keep the privileged systemd mount-namespace capability probe on
-        // its established container fallback until every service-manager
-        // propagation operation is modeled.
-        return -1; // EPERM
     }
     // Reserve ownership without publishing a child pointer. Linux likewise
     // allocates all task resources before tasklist publication.

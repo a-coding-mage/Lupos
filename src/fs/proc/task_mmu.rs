@@ -411,7 +411,7 @@ fn current_pid() -> Option<i32> {
     if task.is_null() {
         None
     } else {
-        Some(unsafe { (*task).pid })
+        Some(crate::kernel::pid_namespace::task_pid_vnr(task))
     }
 }
 
@@ -478,6 +478,17 @@ unsafe fn task_cred_or_init(task: *mut TaskStruct) -> *const Cred {
 
 fn task_by_pid(pid: i32) -> *mut crate::kernel::task::TaskStruct {
     let current = unsafe { crate::kernel::sched::get_current() };
+    let active_ns = crate::kernel::pid_namespace::task_active_pid_ns(current);
+    let scoped = crate::kernel::pid_namespace::find_task_by_pid_ns(pid, active_ns);
+    if !scoped.is_null() {
+        return scoped;
+    }
+    if !core::ptr::eq(
+        active_ns,
+        &raw const crate::kernel::pid_namespace::INIT_PID_NS_M28,
+    ) {
+        return core::ptr::null_mut();
+    }
     if !current.is_null() && unsafe { (*current).pid == pid } {
         return current;
     }

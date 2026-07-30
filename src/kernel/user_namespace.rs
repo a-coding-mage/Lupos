@@ -21,6 +21,9 @@ use crate::kernel::cred::{KGid, KUid};
 /// 5 because every consumer in-kernel uses the inline path.
 pub const UID_GID_MAP_MAX_EXTENTS: usize = 5;
 
+/// Linux: `MAX_USER_NS_LEVEL`.
+pub const MAX_USER_NS_LEVEL: u32 = 32;
+
 /// One range entry in a uid/gid map.  Linux: `struct uid_gid_extent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -187,6 +190,14 @@ unsafe fn user_ns_get(ns: *mut core::ffi::c_void) {
     }
 }
 
+/// Take a reference to a user namespace held by a credential or namespace
+/// object.
+pub(crate) fn get_user_ns(ns: *const UserNamespace) {
+    if !ns.is_null() {
+        unsafe { (*ns).ns.get() };
+    }
+}
+
 unsafe fn user_ns_put(ns: *mut core::ffi::c_void) {
     let ns = ns as *mut UserNamespace;
     if ns.is_null() {
@@ -202,11 +213,20 @@ unsafe fn user_ns_put(ns: *mut core::ffi::c_void) {
             }
             return;
         }
+        let parent = unsafe { (*ns).parent };
+        if !parent.is_null() {
+            unsafe { user_ns_put(parent as *mut core::ffi::c_void) };
+        }
         extern crate alloc;
         unsafe {
             drop(alloc::boxed::Box::from_raw(ns));
         }
     }
+}
+
+/// Drop a credential's reference to a user namespace.
+pub(crate) unsafe fn put_user_ns(ns: *const UserNamespace) {
+    unsafe { user_ns_put(ns as *mut core::ffi::c_void) };
 }
 
 unsafe fn user_ns_owner(ns: *const core::ffi::c_void) -> *const core::ffi::c_void {
@@ -249,7 +269,7 @@ pub fn create_user_ns(parent: *const UserNamespace) -> Result<*mut UserNamespace
     } else {
         unsafe { (*parent).level }
     };
-    if parent_level >= 32 {
+    if parent_level >= MAX_USER_NS_LEVEL {
         return Err(-87); // EUSERS
     }
 

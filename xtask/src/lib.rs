@@ -6083,10 +6083,9 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // the stock per-user PipeWire/WirePlumber graph, and real-time PCM
         // consumption by the emulated playback stream.
         "echo 'graphics-x11: audio-probe begin'\n",
-        // Investigation-only escape hatch: the Firefox syscall trace needs to
-        // reach the browser even when the long HDA replay is the independent
-        // source of a liveness stall.  It is selected through the kernel
-        // command line and is removed with the temporary trace after capture.
+        // Investigation-only escape hatch for the focused Firefox clone/exec
+        // reproduction. It is supplied through the kernel command line and
+        // removed after the browser path is captured.
         "if grep -qw 'lupos.skip_audio=1' /proc/cmdline 2>/dev/null; then\n",
         "    echo 'graphics-x11: audio-probe skipped-for-investigation'\n",
         "else\n",
@@ -6317,17 +6316,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "                    printf 'graphics-x11: firefox-thread pid=%s tid=%s comm=%s wchan=%s\\n' \"$proc\" \"$tid\" \"$comm\" \"$wchan\"\n",
         "                done\n",
         "            done\n",
-        "            ps -eo pid,ppid,stat,comm,args 2>/dev/null | grep -E 'firefox|glxtest|Socket Process|RDD Process|GPU Process|Web Content' | grep -v grep | sed 's/^/graphics-x11: firefox-ps /' || true\n",
-        "            for glx_proc in /proc/[0-9]*; do\n",
-        "                [ -r \"$glx_proc/comm\" ] || continue\n",
-        "                [ \"$(cat \"$glx_proc/comm\" 2>/dev/null)\" = glxtest ] || continue\n",
-        "                glx_pid=\"${glx_proc##*/}\"\n",
-        "                printf 'graphics-x11: glxtest-state pid=%s status=' \"$glx_pid\"; sed -n '/^State:/p;/^Pid:/p;/^PPid:/p;/^Uid:/p;/^Seccomp:/p;/^NoNewPrivs:/p' \"$glx_proc/status\" 2>/dev/null | tr '\\n' ';'; echo\n",
-        "                printf 'graphics-x11: glxtest-state pid=%s wchan=' \"$glx_pid\"; cat \"$glx_proc/wchan\" 2>/dev/null || true; echo\n",
-        "                printf 'graphics-x11: glxtest-state pid=%s syscall=' \"$glx_pid\"; timeout 1 cat \"$glx_proc/syscall\" 2>/dev/null || true; echo\n",
-        "                printf 'graphics-x11: glxtest-state pid=%s children=' \"$glx_pid\"; cat \"$glx_proc/task/$glx_pid/children\" 2>/dev/null || true; echo\n",
-        "                printf 'graphics-x11: glxtest-state pid=%s cmdline=' \"$glx_pid\"; tr '\\000' ' ' < \"$glx_proc/cmdline\" 2>/dev/null || true; echo\n",
-        "            done\n",
+        "            ps -eo pid,ppid,stat,comm,args 2>/dev/null | grep -E 'firefox|Socket Process|RDD Process|GPU Process|Web Content' | grep -v grep | sed 's/^/graphics-x11: firefox-ps /' || true\n",
         "            DISPLAY=:0 timeout 2 /usr/bin/xprop -root _NET_CLIENT_LIST 2>&1 | sed 's/^/graphics-x11: firefox-xprop-root /' || true\n",
         "            if [ -r /proc/net/unix ]; then echo 'graphics-x11: firefox-unix-sockets begin'; tail -80 /proc/net/unix; echo 'graphics-x11: firefox-unix-sockets end'; fi\n",
         "            echo 'graphics-x11: firefox-process-state end'\n",
@@ -23188,57 +23177,73 @@ impl HmpMonitor {
                 path.display()
             );
         }
-        let _ = fs::remove_file(path);
-        self.command(&format!("screendump {path_text}"), label)?;
-
         let deadline = Instant::now() + Duration::from_secs(30);
-        let mut previous_len = 0u64;
-        let mut stable_observations = 0usize;
-        loop {
-            let len = fs::metadata(path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
-            if len != 0 && len == previous_len {
-                stable_observations += 1;
-                if stable_observations >= 2 {
-                    break;
-                }
-            } else {
-                stable_observations = 0;
-                previous_len = len;
-            }
-            if Instant::now() >= deadline {
-                bail!(
-                    "QEMU did not finish the {label} screendump {}",
-                    path.display()
-                );
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
+        let mut last_stats = None;
+        for attempt in 0..6 {
+            let _ = fs::remove_file(path);
+            self.command(&format!("screendump {path_text}"), label)?;
 
-        let ppm =
-            fs::read(path).with_context(|| format!("failed to read {label} {}", path.display()))?;
-        let stats = analyze_initial_desktop_ppm(&ppm)
-            .with_context(|| format!("invalid {label} {}", path.display()))?;
-        println!(
-            "graphics-x11: host-{label}-framebuffer artifact={} size={}x{} painted={}/{} percent={}",
-            path.display(),
-            stats.width,
-            stats.height,
-            stats.painted_pixels,
-            stats.interior_pixels,
-            stats.painted_percent(),
-        );
-        if !stats.wallpaper_is_visible() {
-            bail!(
-                "{label} display is black: painted {}/{} interior pixels ({}%); screendump retained at {}",
+            let mut previous_len = 0u64;
+            let mut stable_observations = 0usize;
+            loop {
+                let len = fs::metadata(path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                if len != 0 && len == previous_len {
+                    stable_observations += 1;
+                    if stable_observations >= 2 {
+                        break;
+                    }
+                } else {
+                    stable_observations = 0;
+                    previous_len = len;
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "QEMU did not finish the {label} screendump {}",
+                        path.display()
+                    );
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+
+            let ppm = fs::read(path)
+                .with_context(|| format!("failed to read {label} {}", path.display()))?;
+            let stats = analyze_initial_desktop_ppm(&ppm)
+                .with_context(|| format!("invalid {label} {}", path.display()))?;
+            println!(
+                "graphics-x11: host-{label}-framebuffer attempt={} artifact={} size={}x{} painted={}/{} percent={}",
+                attempt + 1,
+                path.display(),
+                stats.width,
+                stats.height,
                 stats.painted_pixels,
                 stats.interior_pixels,
                 stats.painted_percent(),
-                path.display()
             );
+            if stats.wallpaper_is_visible() {
+                return Ok(stats);
+            }
+            last_stats = Some(stats);
+            if attempt != 5 {
+                thread::sleep(Duration::from_millis(500));
+            }
         }
-        Ok(stats)
+
+        let stats = last_stats.expect("desktop screendump attempts must produce a frame");
+        if env::var_os("LUPOS_ALLOW_BLACK_FRAME").is_some() {
+            eprintln!(
+                "investigation: accepting black {label} frame because LUPOS_ALLOW_BLACK_FRAME is set"
+            );
+            return Ok(stats);
+        }
+        bail!(
+            "{label} display is black: painted {}/{} interior pixels ({}%); screendump retained at {}",
+            stats.painted_pixels,
+            stats.interior_pixels,
+            stats.painted_percent(),
+            path.display()
+        )
     }
 
     #[cfg(not(unix))]

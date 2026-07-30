@@ -134,8 +134,9 @@ pub struct Cred {
     pub user_ns: *const core::ffi::c_void,
 }
 
-// SAFETY: Cred is shared between tasks via refcount; raw pointer fields are
-// either null (in M27) or point to long-lived statics.
+// SAFETY: Cred is shared between tasks via refcount; `user_ns` is held for the
+// lifetime of the credential and is released when the final cred reference is
+// dropped.
 unsafe impl Send for Cred {}
 unsafe impl Sync for Cred {}
 
@@ -166,6 +167,11 @@ impl Cred {
         }
         let prev = unsafe { (*cred).usage.fetch_sub(1, Ordering::Release) };
         if prev == 1 {
+            let user_ns = unsafe { (*cred).user_ns }
+                as *const crate::kernel::user_namespace::UserNamespace;
+            if !user_ns.is_null() {
+                unsafe { crate::kernel::user_namespace::put_user_ns(user_ns) };
+            }
             unsafe { drop(Box::from_raw(cred as *mut Cred)) };
         }
     }
@@ -175,8 +181,8 @@ impl Cred {
 
 /// The init task's credential block.
 ///
-/// Root (uid=0, gid=0) with the full capability set raised, owning a static
-/// init_user_ns pointer (NULL for M27 — populated by M28's `INIT_USER_NS`).
+/// Root (uid=0, gid=0) with the full capability set raised, owning the static
+/// init user namespace.
 pub static INIT_CRED: Cred = Cred {
     usage: AtomicUsize::new(usize::MAX / 2), // sticky — never freed
     uid: KUid(0),
@@ -198,7 +204,8 @@ pub static INIT_CRED: Cred = Cred {
         ngroups: 0,
         gid: [KGid(0); NGROUPS_MAX_INLINE],
     },
-    user_ns: core::ptr::null(),
+    user_ns: core::ptr::addr_of!(crate::kernel::user_namespace::INIT_USER_NS)
+        as *const core::ffi::c_void,
 };
 
 // ── current_cred / prepare_creds / commit_creds / override_creds ─────────────
@@ -225,6 +232,12 @@ pub fn prepare_creds() -> Option<*mut Cred> {
     if cur.is_null() {
         return None;
     }
+    let user_ns = if unsafe { (*cur).user_ns.is_null() } {
+        core::ptr::addr_of!(crate::kernel::user_namespace::INIT_USER_NS)
+    } else {
+        unsafe { (*cur).user_ns as *const crate::kernel::user_namespace::UserNamespace }
+    };
+    crate::kernel::user_namespace::get_user_ns(user_ns);
     // Box-allocate and copy.
     let new = unsafe {
         let mut c: Box<Cred> = Box::new(core::mem::zeroed());
@@ -245,7 +258,7 @@ pub fn prepare_creds() -> Option<*mut Cred> {
             cap_ambient: (*cur).cap_ambient,
             securebits: (*cur).securebits,
             group_info: (*cur).group_info,
-            user_ns: (*cur).user_ns,
+            user_ns: user_ns as *const core::ffi::c_void,
         };
         Box::into_raw(c)
     };
@@ -320,6 +333,8 @@ pub fn revert_creds(old: *const Cred) {
 /// Linux `copy_creds(p, clone_flags)` from `kernel/cred.c`:
 /// - With `CLONE_THREAD`: the child shares the parent's cred (no copy).
 /// - Without `CLONE_THREAD`: a fresh COW copy is allocated.
+/// - With `CLONE_NEWUSER`: the fresh cred owns a newly-created user
+///   namespace and receives the capabilities Linux grants in that namespace.
 ///
 /// # Safety
 /// `child` and `parent` must be valid TaskStruct pointers.
@@ -345,13 +360,21 @@ pub unsafe fn copy_creds(
             (*child).m27.real_cred = cred_to_use;
         }
     } else {
-        // COW — allocate a private copy.
-        if clone_flags & CLONE_NEWUSER != 0 {
-            // Defense in depth for callers that bypass kernel_clone(): do not
-            // create user namespaces while capable()/ns_capable() are still
-            // global bitmask checks.
-            return Err(-1);
-        }
+        // COW — allocate a private copy. Linux's copy_creds() performs the
+        // CLONE_NEWUSER transition here, before copy_namespaces().
+        let parent_user_ns = if unsafe { (*cred_to_use).user_ns.is_null() } {
+            core::ptr::addr_of!(crate::kernel::user_namespace::INIT_USER_NS)
+        } else {
+            unsafe {
+                (*cred_to_use).user_ns as *const crate::kernel::user_namespace::UserNamespace
+            }
+        };
+        let user_ns = if clone_flags & CLONE_NEWUSER != 0 {
+            crate::kernel::user_namespace::create_user_ns(parent_user_ns)?
+        } else {
+            crate::kernel::user_namespace::get_user_ns(parent_user_ns);
+            parent_user_ns as *mut crate::kernel::user_namespace::UserNamespace
+        };
         let new = unsafe {
             let mut c: Box<Cred> = Box::new(core::mem::zeroed());
             *c = Cred {
@@ -364,14 +387,38 @@ pub unsafe fn copy_creds(
                 egid: (*cred_to_use).egid,
                 fsuid: (*cred_to_use).fsuid,
                 fsgid: (*cred_to_use).fsgid,
-                cap_inheritable: (*cred_to_use).cap_inheritable,
-                cap_permitted: (*cred_to_use).cap_permitted,
-                cap_effective: (*cred_to_use).cap_effective,
-                cap_bset: (*cred_to_use).cap_bset,
-                cap_ambient: (*cred_to_use).cap_ambient,
-                securebits: (*cred_to_use).securebits,
+                cap_inheritable: if clone_flags & CLONE_NEWUSER != 0 {
+                    KernelCapT::empty()
+                } else {
+                    (*cred_to_use).cap_inheritable
+                },
+                cap_permitted: if clone_flags & CLONE_NEWUSER != 0 {
+                    KernelCapT::full()
+                } else {
+                    (*cred_to_use).cap_permitted
+                },
+                cap_effective: if clone_flags & CLONE_NEWUSER != 0 {
+                    KernelCapT::full()
+                } else {
+                    (*cred_to_use).cap_effective
+                },
+                cap_bset: if clone_flags & CLONE_NEWUSER != 0 {
+                    KernelCapT::full()
+                } else {
+                    (*cred_to_use).cap_bset
+                },
+                cap_ambient: if clone_flags & CLONE_NEWUSER != 0 {
+                    KernelCapT::empty()
+                } else {
+                    (*cred_to_use).cap_ambient
+                },
+                securebits: if clone_flags & CLONE_NEWUSER != 0 {
+                    0
+                } else {
+                    (*cred_to_use).securebits
+                },
                 group_info: (*cred_to_use).group_info,
-                user_ns: (*cred_to_use).user_ns,
+                user_ns: user_ns as *const core::ffi::c_void,
             };
             Box::into_raw(c)
         };
@@ -389,6 +436,8 @@ pub unsafe fn copy_creds(
 mod tests {
     use super::*;
     use crate::kernel::capability::CAP_SYS_ADMIN;
+    use crate::kernel::clone::CLONE_NEWUSER;
+    use crate::kernel::task::TaskStruct;
 
     #[test]
     fn init_cred_is_root_with_full_caps() {
@@ -397,6 +446,32 @@ mod tests {
         assert!(INIT_CRED.cap_effective.raised(CAP_SYS_ADMIN));
         assert!(INIT_CRED.cap_permitted.raised(CAP_SYS_ADMIN));
         assert!(!INIT_CRED.cap_inheritable.raised(CAP_SYS_ADMIN));
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/cred.c:copy_creds
+    ///
+    /// Linux creates the child user namespace in `copy_creds()` and grants
+    /// that namespace a fresh root capability set. Firefox's content sandbox
+    /// relies on the legacy `clone(CLONE_NEWUSER, ...)` path.
+    #[test]
+    fn copy_creds_clone_newuser_creates_scoped_root_cred() {
+        let mut parent = unsafe { core::mem::zeroed::<TaskStruct>() };
+        let mut child = unsafe { core::mem::zeroed::<TaskStruct>() };
+        parent.cred = &raw const INIT_CRED;
+
+        unsafe { copy_creds(&mut child, &mut parent, CLONE_NEWUSER) }
+            .expect("CLONE_NEWUSER should create the child credential");
+
+        let child_cred = child.cred;
+        assert!(!child_cred.is_null());
+        assert_ne!(child_cred, &raw const INIT_CRED);
+        unsafe {
+            assert_ne!((*child_cred).user_ns, INIT_CRED.user_ns);
+            assert!((*child_cred).cap_effective.raised(CAP_SYS_ADMIN));
+            assert!((*child_cred).cap_permitted.raised(CAP_SYS_ADMIN));
+            Cred::put(child_cred);
+            Cred::put(child.m27.real_cred);
+        }
     }
 
     #[test]

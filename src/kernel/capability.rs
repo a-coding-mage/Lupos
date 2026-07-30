@@ -174,11 +174,51 @@ pub fn capable(cap: u32) -> bool {
     unsafe { (*cred).cap_effective.raised(cap) }
 }
 
+/// Return `true` if `cred` has `cap` in `user_ns`.
+///
+/// Linux capabilities are effective in the credential's user namespace and
+/// in each ancestor namespace, but not in a descendant namespace.  This is
+/// the relationship needed by `ns_capable()` and by `unshare()`: a temporary
+/// credential whose `user_ns` is the namespace it just created must be able
+/// to create the other namespaces in the same unshare operation.
+pub fn cred_ns_capable(
+    cred: *const Cred,
+    user_ns: *const core::ffi::c_void,
+    cap: u32,
+) -> bool {
+    if cred.is_null() {
+        return true;
+    }
+    let target = user_ns as *const crate::kernel::user_namespace::UserNamespace;
+    if target.is_null() {
+        return false;
+    }
+    unsafe {
+        if !(*cred).cap_effective.raised(cap) {
+            return false;
+        }
+        let mut cursor = (*cred).user_ns
+            as *const crate::kernel::user_namespace::UserNamespace;
+        if cursor.is_null() {
+            cursor = &raw const crate::kernel::user_namespace::INIT_USER_NS;
+        }
+        for _ in 0..=crate::kernel::user_namespace::MAX_USER_NS_LEVEL {
+            if core::ptr::eq(cursor, target) {
+                return true;
+            }
+            cursor = (*cursor).parent;
+            if cursor.is_null() {
+                break;
+            }
+        }
+    }
+    false
+}
+
 /// Return `true` if the current task has `cap` raised relative to a user
-/// namespace.  Stub that matches `capable(cap)` until the namespace owner
-/// hierarchy is wired in M28.
-pub fn ns_capable(_user_ns: *const core::ffi::c_void, cap: u32) -> bool {
-    capable(cap)
+/// namespace.  Linux: `ns_capable()`.
+pub fn ns_capable(user_ns: *const core::ffi::c_void, cap: u32) -> bool {
+    cred_ns_capable(current_cred(), user_ns, cap)
 }
 
 /// `capable` - `vendor/linux/kernel/capability.c`.
