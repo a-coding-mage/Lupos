@@ -304,28 +304,13 @@ pub unsafe fn sys_unshare(flags: u64) -> i64 {
         // duplication that lands with M39 / M52.  Reject them for now.
         return -22;
     }
-    if flags & CLONE_NEWUSER != 0 {
-        // User namespaces grant capabilities that must be scoped to the new
-        // namespace. Keep unshare(CLONE_NEWUSER) fail-closed until capability
-        // checks are namespace-aware; otherwise the new effective bits pass
-        // global capable() checks such as CAP_SYS_ADMIN.
-        return -1;
-    }
     if flags & CLONE_NEWNS != 0 {
-        // The mount tree itself is private, but systemd's bare root mount-
-        // namespace path also relies on the full shared/slave propagation
-        // graph. Keep that capability probe fail-closed until propagation is
-        // complete.
+        // The mount tree itself is private, but systemd's mount-namespace
+        // setup also depends on the shared/slave propagation graph. Keep
+        // this incomplete path fail-closed; Firefox's bwrap path uses the
+        // independent CLONE_NEWUSER operation below.
         return -1;
     }
-    // Creating namespaces owned by the current user namespace requires
-    // CAP_SYS_ADMIN there.
-    if flags & NSPROXY_FLAGS != 0
-        && !crate::kernel::capability::capable(crate::kernel::capability::CAP_SYS_ADMIN)
-    {
-        return -1;
-    }
-
     let parent_cred = crate::kernel::cred::current_cred();
     let parent_user_ns = if parent_cred.is_null() || unsafe { (*parent_cred).user_ns.is_null() } {
         &raw const INIT_USER_NS
@@ -340,37 +325,70 @@ pub unsafe fn sys_unshare(flags: u64) -> i64 {
     } else {
         None
     };
+    // Linux prepares the replacement credential before checking the owner of
+    // the namespaces requested in the same unshare.  In particular,
+    // unshare(CLONE_NEWUSER | CLONE_NEWNS) is authorised in the newly-created
+    // user namespace, not by the old namespace's capability set.
+    let mut new_cred = None;
+    if let Some(user_ns) = new_user_ns {
+        let Some(cred) = crate::kernel::cred::prepare_creds() else {
+            unsafe { crate::kernel::user_namespace::put_user_ns(user_ns) };
+            return -12;
+        };
+        unsafe {
+            // prepare_creds() retained the old user namespace.  Replacing
+            // that pointer transfers the credential's namespace ownership to
+            // the freshly-created namespace.
+            crate::kernel::user_namespace::put_user_ns(parent_user_ns);
+            (*cred).user_ns = user_ns as *const core::ffi::c_void;
+            // Linux grants the creator all capabilities in the namespace it
+            // owns; uid/gid maps remain empty until procfs accepts the writes.
+            (*cred).cap_permitted = crate::kernel::capability::KernelCapT::full();
+            (*cred).cap_effective = crate::kernel::capability::KernelCapT::full();
+            (*cred).cap_bset = crate::kernel::capability::KernelCapT::full();
+            (*cred).cap_ambient = crate::kernel::capability::KernelCapT::empty();
+        }
+        new_cred = Some(cred);
+    }
     let namespace_owner = new_user_ns
         .map(|ns| ns as *const UserNamespace)
         .unwrap_or(parent_user_ns);
+
+    // Linux: unshare_nsproxy_namespaces() checks CAP_SYS_ADMIN in the
+    // temporary credential's user namespace, after unshare_userns().
+    let capability_cred = new_cred
+        .map(|cred| cred as *const crate::kernel::cred::Cred)
+        .unwrap_or(parent_cred);
+    if flags & NSPROXY_FLAGS != 0
+        && !crate::kernel::capability::cred_ns_capable(
+            capability_cred,
+            namespace_owner as *const core::ffi::c_void,
+            crate::kernel::capability::CAP_SYS_ADMIN,
+        )
+    {
+        if let Some(cred) = new_cred {
+            unsafe { crate::kernel::cred::Cred::put(cred) };
+        }
+        return -1;
+    }
 
     let parent_nsproxy = unsafe { (*task).m28_nsproxy.nsproxy };
     let new = if flags & NSPROXY_FLAGS != 0 {
         match create_new_namespaces(flags, parent_nsproxy, namespace_owner) {
             Ok(p) => Some(p),
-            Err(e) => return e as i64,
+            Err(e) => {
+                if let Some(cred) = new_cred {
+                    unsafe { crate::kernel::cred::Cred::put(cred) };
+                }
+                return e as i64;
+            }
         }
     } else {
         None
     };
 
-    if let Some(user_ns) = new_user_ns {
-        let Some(new_cred) = crate::kernel::cred::prepare_creds() else {
-            if let Some(new_nsproxy) = new {
-                unsafe { put_nsproxy(new_nsproxy) };
-            }
-            return -12;
-        };
-        unsafe {
-            (*new_cred).user_ns = user_ns as *const core::ffi::c_void;
-            // Linux grants the creator all capabilities in the namespace it
-            // owns; uid/gid maps remain empty until procfs accepts the writes.
-            (*new_cred).cap_permitted = crate::kernel::capability::KernelCapT::full();
-            (*new_cred).cap_effective = crate::kernel::capability::KernelCapT::full();
-            (*new_cred).cap_bset = crate::kernel::capability::KernelCapT::full();
-            (*new_cred).cap_ambient = crate::kernel::capability::KernelCapT::empty();
-        }
-        crate::kernel::cred::commit_creds(new_cred);
+    if let Some(cred) = new_cred {
+        crate::kernel::cred::commit_creds(cred);
     }
 
     let Some(new) = new else {
@@ -454,7 +472,15 @@ mod tests {
     }
 
     #[test]
-    fn bare_unshare_mount_namespace_stays_fail_closed() {
+    /// test-origin: linux:vendor/linux/kernel/fork.c:ksys_unshare
+    ///
+    /// Linux prepares a new user credential before asking
+    /// `unshare_nsproxy_namespaces()` to create the other namespaces.  A
+    /// user-namespace-only unshare must not be rejected by a local
+    /// fail-closed gate. Lupos keeps the incomplete mount-namespace path
+    /// fail-closed because systemd depends on propagation semantics that are
+    /// not implemented yet.
+    fn unshare_user_and_mount_namespaces_follow_linux_order() {
         use crate::kernel::sched;
         use crate::kernel::task::TaskStruct;
         use alloc::boxed::Box;
@@ -465,20 +491,63 @@ mod tests {
         unsafe { sched::set_current(&mut *task as *mut TaskStruct) };
 
         assert_eq!(unsafe { sys_unshare(CLONE_NEWNS) }, -1);
-        assert_eq!(unsafe { sys_unshare(CLONE_NEWUSER) }, -1);
+        assert_eq!(unsafe { sys_unshare(CLONE_NEWUSER) }, 0);
+        assert_ne!(task.cred, core::ptr::null());
         assert_eq!(unsafe { sys_unshare(CLONE_NEWUSER | CLONE_NEWNS) }, -1);
 
-        // Other namespace families remain available independently.
-        assert_eq!(unsafe { sys_unshare(CLONE_NEWUTS) }, 0);
         let final_nsproxy = task.m28_nsproxy.nsproxy;
         assert_eq!(unsafe { (*final_nsproxy).mnt_ns }, INIT_NSPROXY.mnt_ns);
 
+        let source = include_str!("nsproxy.rs");
+        let create_user = source
+            .find("create_user_ns(parent_user_ns)")
+            .expect("unshare must create the user namespace first");
+        let check_cap = source
+            .find("cred_ns_capable(")
+            .expect("unshare must check capabilities in the replacement cred");
+        let create_namespaces = source
+            .find("create_new_namespaces(flags, parent_nsproxy, namespace_owner)")
+            .expect("unshare must create the nsproxy after authorization");
+        assert!(create_user < check_cap && check_cap < create_namespaces);
+
+        let final_cred = task.cred;
+        let final_real_cred = task.m27.real_cred;
+        task.cred = core::ptr::null();
+        task.m27.real_cred = core::ptr::null();
         unsafe { sched::set_current(previous) };
         unsafe { put_nsproxy(final_nsproxy) };
+        unsafe {
+            crate::kernel::cred::Cred::put(final_cred);
+            crate::kernel::cred::Cred::put(final_real_cred);
+        }
     }
 
     #[test]
-    fn clone_mount_namespace_without_owning_user_namespace_is_refused() {
+    /// test-origin: linux:vendor/linux/kernel/fork.c:kernel_clone
+    ///
+    /// Linux does not reject namespace flags in `kernel_clone()`.  It passes
+    /// them to `copy_process()`, where `copy_creds()` creates the user
+    /// namespace before `copy_namespaces()` builds the nsproxy.  Keeping the
+    /// early local EPERM gate would prevent Firefox's sandbox clone from ever
+    /// reaching that Linux-equivalent path.
+    fn clone_namespace_flags_reach_copy_process_like_linux() {
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/kernel/fork.c"
+        ));
+        let linux_kernel_clone = linux
+            .split("pid_t kernel_clone(struct kernel_clone_args *args)")
+            .nth(1)
+            .expect("Linux kernel_clone must exist")
+            .split("/*\n * Create a kernel thread")
+            .next()
+            .expect("Linux kernel_clone body must end before the next helper");
+        assert!(
+            linux_kernel_clone.contains("p = copy_process")
+                && !linux_kernel_clone.contains("return -EPERM"),
+            "Linux kernel_clone delegates namespace creation to copy_process"
+        );
+
         let source = include_str!("fork.rs");
         let gate = source
             .split("pub unsafe fn kernel_clone")
@@ -488,10 +557,8 @@ mod tests {
             .next()
             .expect("kernel_clone preamble");
         assert!(
-            gate.contains("CLONE_NEWUSER")
-                && gate.contains("CLONE_NEWNS")
-                && gate.contains("EPERM"),
-            "kernel_clone must keep CLONE_NEWNS and CLONE_NEWUSER fail-closed"
+            !gate.contains("CLONE_NEWNS") && !gate.contains("CLONE_NEWUSER"),
+            "kernel_clone must not reject namespace flags before copy_process"
         );
     }
 

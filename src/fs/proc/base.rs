@@ -142,6 +142,17 @@ fn read_string_at(text: &str, buf: &mut [u8], pos: &mut u64) -> Result<usize, i3
 
 pub(crate) fn task_by_pid(pid: i32) -> *mut TaskStruct {
     let current = unsafe { crate::kernel::sched::get_current() };
+    let active_ns = crate::kernel::pid_namespace::task_active_pid_ns(current);
+    let scoped = crate::kernel::pid_namespace::find_task_by_pid_ns(pid, active_ns);
+    if !scoped.is_null() {
+        return scoped;
+    }
+    if !core::ptr::eq(
+        active_ns,
+        &raw const crate::kernel::pid_namespace::INIT_PID_NS_M28,
+    ) {
+        return core::ptr::null_mut();
+    }
     if !current.is_null() && unsafe { (*current).pid == pid } {
         return current;
     }
@@ -158,7 +169,7 @@ fn parse_proc_pid_file(path: &str) -> Option<(i32, &str)> {
         let pid = if task.is_null() {
             1
         } else {
-            unsafe { (*task).pid }
+            crate::kernel::pid_namespace::task_tgid_vnr(task)
         };
         return Some((pid, name));
     }
@@ -525,7 +536,7 @@ fn proc_pid_from_node(node: &Arc<KernfsNode>) -> Result<i32, i32> {
         return if task.is_null() {
             Err(ENOENT)
         } else {
-            Ok(unsafe { (*task).pid })
+            Ok(crate::kernel::pid_namespace::task_tgid_vnr(task))
         };
     }
     parent.name.parse::<i32>().map_err(|_| ENOENT)

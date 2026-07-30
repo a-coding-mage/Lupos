@@ -147,16 +147,23 @@ fn parse_pid_name(name: &str) -> Result<i32, i32> {
 
 fn live_pids() -> Vec<i32> {
     let mut pids = Vec::new();
+    let ns = crate::kernel::pid_namespace::task_active_pid_ns(unsafe {
+        crate::kernel::sched::get_current()
+    });
     let current = unsafe { crate::kernel::sched::get_current() };
-    push_live_pid(&mut pids, current);
-    crate::kernel::fork::for_each_heap_task(|task| push_live_pid(&mut pids, task));
-    crate::kernel::sched::for_each_pool_task(|task| push_live_pid(&mut pids, task));
+    push_live_pid(&mut pids, current, ns);
+    crate::kernel::fork::for_each_heap_task(|task| push_live_pid(&mut pids, task, ns));
+    crate::kernel::sched::for_each_pool_task(|task| push_live_pid(&mut pids, task, ns));
     pids.sort_unstable();
     pids.dedup();
     pids
 }
 
-fn push_live_pid(pids: &mut Vec<i32>, task: *mut TaskStruct) {
+fn push_live_pid(
+    pids: &mut Vec<i32>,
+    task: *mut TaskStruct,
+    ns: *mut crate::kernel::pid_namespace::PidNamespace,
+) {
     if task.is_null() {
         return;
     }
@@ -166,13 +173,12 @@ fn push_live_pid(pids: &mut Vec<i32>, task: *mut TaskStruct) {
         // (and under `/proc/<tgid>/task/<tid>`), but it must not appear in
         // getdents(2).  Process managers rely on this distinction and would
         // otherwise treat every pthread as a separate process.
-        if (*task).pid <= 0
-            || (*task).pid != (*task).tgid
-            || ((*task).m26.exit_state & EXIT_DEAD) != 0
-        {
+        let pid = crate::kernel::pid_namespace::task_pid_nr_ns(task, ns);
+        let tgid = crate::kernel::pid_namespace::task_tgid_nr_ns(task, ns);
+        if pid <= 0 || pid != tgid || ((*task).m26.exit_state & EXIT_DEAD) != 0 {
             return;
         }
-        pids.push((*task).pid);
+        pids.push(pid);
     }
 }
 
@@ -276,8 +282,9 @@ mod tests {
         thread.tgid = 32_003;
 
         let mut pids = Vec::new();
-        push_live_pid(&mut pids, &mut *leader);
-        push_live_pid(&mut pids, &mut *thread);
+        let ns = &raw const crate::kernel::pid_namespace::INIT_PID_NS_M28 as *mut _;
+        push_live_pid(&mut pids, &mut *leader, ns);
+        push_live_pid(&mut pids, &mut *thread, ns);
 
         assert_eq!(pids.as_slice(), &[32_003]);
         // Direct lookup of a TID is intentionally still supported by

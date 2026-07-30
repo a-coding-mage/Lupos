@@ -558,7 +558,7 @@ fn mutate_current_cred(f: impl FnOnce(&mut cred::Cred)) -> i64 {
 /// `getpid(2)` — Linux x86-64 syscall 39.
 pub unsafe fn sys_getpid() -> i64 {
     match current_task() {
-        Ok(task) => unsafe { (*task).tgid as i64 },
+        Ok(task) => crate::kernel::pid_namespace::task_tgid_vnr(task) as i64,
         Err(errno) => -(errno as i64),
     }
 }
@@ -566,7 +566,7 @@ pub unsafe fn sys_getpid() -> i64 {
 /// `gettid(2)` — Linux x86-64 syscall 186.
 pub unsafe fn sys_gettid() -> i64 {
     match current_task() {
-        Ok(task) => unsafe { (*task).pid as i64 },
+        Ok(task) => crate::kernel::pid_namespace::task_pid_vnr(task) as i64,
         Err(errno) => -(errno as i64),
     }
 }
@@ -581,7 +581,8 @@ pub unsafe fn sys_getppid() -> i64 {
     if parent.is_null() {
         0
     } else {
-        unsafe { (*parent).tgid as i64 }
+        let ns = crate::kernel::pid_namespace::task_active_pid_ns(task);
+        crate::kernel::pid_namespace::task_tgid_nr_ns(parent, ns) as i64
     }
 }
 
