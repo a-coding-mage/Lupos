@@ -1583,6 +1583,11 @@ unsafe fn poll_impl(fds: *mut PollFd, nfds: usize, timeout_ns: Option<u64>) -> i
         Err(errno) => return -(errno as i64),
     };
     let deadline_ns = timeout_ns.map(|ns| crate::kernel::time::ktime_get().saturating_add(ns));
+    // Linux poll_initwait() allocates one poll_wqueues object around the
+    // complete do_poll() loop. Keep the wait registrations alive across each
+    // sleep/wakeup and readiness rescan; poll_freewait() runs only on return.
+    let current = unsafe { sched::get_current() };
+    let mut poll_table = select::PollTable::new(current);
     #[cfg(not(test))]
     let mut wait_state = ConsoleWaitState::default();
 
@@ -1592,8 +1597,6 @@ unsafe fn poll_impl(fds: *mut PollFd, nfds: usize, timeout_ns: Option<u64>) -> i
         #[cfg(not(test))]
         crate::init::rootfs::drain_console_control_bytes();
 
-        let current = unsafe { sched::get_current() };
-        let mut poll_table = select::PollTable::new(current);
         let ready = match unsafe {
             select::poll_once_with_table(ft.as_ref(), fds, nfds, Some(&mut poll_table))
         } {
@@ -1633,7 +1636,7 @@ unsafe fn poll_impl(fds: *mut PollFd, nfds: usize, timeout_ns: Option<u64>) -> i
         }
         #[cfg(test)]
         {
-            poll_table.finish();
+            poll_table.clear_triggered();
             crate::kernel::time::timekeeping::tick_advance_walltime();
             crate::kernel::time::hrtimer_run_queues();
         }
@@ -1689,6 +1692,10 @@ unsafe fn select_impl(
     };
     #[cfg(not(test))]
     let mut wait_state = ConsoleWaitState::default();
+    // Linux do_select() also keeps one poll_wqueues object for the whole scan
+    // loop and frees it only after the final result/error decision.
+    let current = unsafe { sched::get_current() };
+    let mut poll_table = select::PollTable::new(current);
 
     loop {
         #[cfg(not(test))]
@@ -1700,8 +1707,6 @@ unsafe fn select_impl(
         let read_ptr = fdset_kernel_ptr(readfds, &mut read_ready);
         let write_ptr = fdset_kernel_ptr(writefds, &mut write_ready);
         let except_ptr = fdset_kernel_ptr(exceptfds, &mut except_ready);
-        let current = unsafe { sched::get_current() };
-        let mut poll_table = select::PollTable::new(current);
         let ready = match unsafe {
             select::select_once_with_table(
                 ft.as_ref(),
@@ -1755,7 +1760,7 @@ unsafe fn select_impl(
         }
         #[cfg(test)]
         {
-            poll_table.finish();
+            poll_table.clear_triggered();
             crate::kernel::time::timekeeping::tick_advance_walltime();
             crate::kernel::time::hrtimer_run_queues();
         }
@@ -1828,7 +1833,6 @@ fn poll_schedule(
     // `smp_store_mb()` after every sleep attempt, including the already-woken
     // fast path. Keep the next readiness scan from spinning on an old wake.
     table.clear_triggered();
-    table.finish();
 }
 
 #[cfg(not(test))]
@@ -7662,6 +7666,79 @@ mod tests {
             files::drop_task_files(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
+    }
+
+    /// test-origin: linux:vendor/linux/fs/select.c:poll_initwait,
+    /// do_poll, and poll_freewait
+    ///
+    /// Linux allocates one poll_wqueues object around the complete scan loop.
+    /// The wait entries therefore remain installed between a sleep/wakeup and
+    /// the next readiness scan; only the final return path frees them.  The
+    /// runtime half below verifies that a PollTable preserves one registration
+    /// across repeated scans, while the source contract catches callers that
+    /// accidentally recreate it inside their loop.
+    #[test]
+    fn poll_and_select_reuse_linux_poll_table_until_return() {
+        let source = include_str!("syscalls.rs");
+        for (function, end_marker) in [
+            ("unsafe fn poll_impl(", "pub unsafe fn sys_select("),
+            ("unsafe fn select_impl(", "/// Sleep after a poll/select scan"),
+        ] {
+            let body = source
+                .split(function)
+                .nth(1)
+                .and_then(|body| body.split(end_marker).next())
+                .expect("poll/select implementation must exist");
+            let loop_start = body.find("loop {").expect("poll/select must have a scan loop");
+            let table = body
+                .find("let mut poll_table = select::PollTable::new(current);")
+                .expect("poll/select must create a persistent poll table");
+            assert!(
+                table < loop_start,
+                "Linux poll_wqueues must be created before the scan loop"
+            );
+            assert!(
+                !body[loop_start..].contains("let mut poll_table = select::PollTable::new(current);")
+            );
+        }
+
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 31_204;
+        current.tgid = 31_204;
+        let ft = FilesStruct::new();
+        let file = crate::fs::file::alloc_file(
+            crate::fs::dcache::d_alloc("persistent-poll-file"),
+            0,
+            0,
+            &INTERRUPTED_POLL_OPS,
+        );
+        let fd = ft.install(file, false).expect("install poll file");
+        let mut pfd = PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        let mut table = select::PollTable::new(&mut *current);
+        assert_eq!(
+            unsafe {
+                select::poll_once_with_table(ft.as_ref(), &mut pfd, 1, Some(&mut table))
+            },
+            Ok(0)
+        );
+        assert_eq!(table.registration_count(), 1);
+        assert_eq!(
+            unsafe {
+                select::poll_once_with_table(ft.as_ref(), &mut pfd, 1, Some(&mut table))
+            },
+            Ok(0)
+        );
+        assert_eq!(
+            table.registration_count(),
+            1,
+            "repeated scans must not duplicate or discard the persistent wait entry"
+        );
+        table.finish();
+        assert!(INTERRUPTED_POLL_QUEUE.is_empty());
     }
 
     #[test]

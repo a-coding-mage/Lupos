@@ -885,13 +885,36 @@ fn on_general_protection(frame: &ExceptionFrame) {
     if is_user_exception(frame) {
         let task = unsafe { crate::kernel::sched::get_current() };
         if !task.is_null() {
-            let pid = unsafe { (*task).pid };
+            let (pid, tgid, comm) = unsafe { ((*task).pid, (*task).tgid, (*task).comm) };
+            log_error!(
+                "cpu",
+                "cpu: #GP user-task pid={} tgid={} task={:#018x} comm={:?}",
+                pid,
+                tgid,
+                task as usize,
+                comm,
+            );
             if pid == 1 {
                 panic!(
                     "init died from SIGSEGV on #GP: error={:#010x} rip={:#018x}",
                     frame.error_code, frame.rip
                 );
             }
+        }
+        // Linux exc_general_protection() enables IRQs and force_sig(SIGSEGV)
+        // for a user-mode #GP. Route the fault through the same signal-frame
+        // path as a user page fault so Firefox and other handlers can recover
+        // or produce their normal crash report before the default action.
+        crate::kernel::locking::local_irq_enable();
+        if !task.is_null()
+            && crate::arch::x86::mm::fault::deliver_user_sigsegv(
+                frame,
+                task,
+                frame.rip,
+                crate::arch::x86::mm::fault::SEGV_MAPERR,
+            )
+        {
+            return;
         }
         unsafe {
             crate::kernel::exit::do_exit(segv_exit_code() as i64);
@@ -1643,6 +1666,35 @@ mod tests {
 
         assert!(extable < first_log);
         assert!(body[..extable].contains("!is_user_exception(frame)"));
+    }
+
+    /// Linux's user `exc_general_protection()` enables IRQs and forces
+    /// SIGSEGV through normal signal delivery; it does not call do_exit()
+    /// before giving an installed handler a chance to run.
+    ///
+    /// test-origin: linux:vendor/linux/arch/x86/kernel/traps.c:exc_general_protection
+    #[test]
+    fn general_protection_user_fault_uses_signal_delivery_before_exit() {
+        let source = include_str!("idt.rs");
+        let body = source
+            .split("fn on_general_protection(frame: &ExceptionFrame)")
+            .nth(1)
+            .and_then(|body| body.split("fn on_control_protection").next())
+            .expect("general protection handler must exist");
+        let user_branch = body
+            .split("if is_user_exception(frame)")
+            .nth(1)
+            .expect("user #GP branch must exist");
+        let enable = user_branch
+            .find("crate::kernel::locking::local_irq_enable();")
+            .expect("user #GP must enable IRQs before signal delivery");
+        let deliver = user_branch
+            .find("deliver_user_sigsegv(")
+            .expect("user #GP must use the normal SIGSEGV delivery path");
+        let exit = user_branch
+            .find("crate::kernel::exit::do_exit(segv_exit_code()")
+            .expect("unhandled user #GP must retain the SIGSEGV default exit");
+        assert!(enable < deliver && deliver < exit);
     }
 
     #[test]

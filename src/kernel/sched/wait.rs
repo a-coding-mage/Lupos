@@ -376,7 +376,9 @@ unsafe extern "C" fn linux_default_wake_function(
     if state & mode == 0 {
         return 0;
     }
-    unsafe { crate::kernel::sched::try_to_wake_up(task, wake_flags as u32) as i32 }
+    unsafe {
+        crate::kernel::sched::wake_task_with_state(task, mode, wake_flags as u32) as i32
+    }
 }
 
 /// `woken_wake_function` - `vendor/linux/kernel/sched/wait.c:457`.

@@ -47,6 +47,17 @@ pub const TASK_ON_RQ_MIGRATING: i32 = 2;
 /// This is a wake flag, not an `ENQUEUE_*` flag.
 pub const WF_FORK: u32 = 0x04;
 
+/// Wakeup flag added by Linux `try_to_wake_up()` before task placement.
+/// `WF_TTWU` maps to the scheduler-domain wake-balance decision and must be
+/// present even when the caller supplied no optional wake modifier.
+pub const WF_TTWU: u32 = 0x08;
+
+/// Linux wake flags carried through `select_task_rq()` and wakeup-preemption.
+pub const WF_SYNC: u32 = 0x10;
+pub const WF_MIGRATED: u32 = 0x20;
+pub const WF_CURRENT_CPU: u32 = 0x40;
+pub const WF_RQ_SELECTED: u32 = 0x80;
+
 /// Forward declaration — concrete `Rq` lives in `rq.rs`.
 pub type Rq = crate::kernel::sched::rq::Rq;
 
@@ -136,6 +147,11 @@ mod tests {
     #[test]
     fn new_task_flags_match_linux_sched_h() {
         assert_eq!(WF_FORK, 0x04);
+        assert_eq!(WF_TTWU, 0x08);
+        assert_eq!(WF_SYNC, 0x10);
+        assert_eq!(WF_MIGRATED, 0x20);
+        assert_eq!(WF_CURRENT_CPU, 0x40);
+        assert_eq!(WF_RQ_SELECTED, 0x80);
         assert_eq!(ENQUEUE_NOCLOCK, 0x0008);
         assert_eq!(ENQUEUE_INITIAL, 0x0008_0000);
         assert_eq!(WF_FORK & ENQUEUE_INITIAL, 0);

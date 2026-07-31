@@ -468,6 +468,14 @@ static WAKE_SERIALIZATION_TEST_SECOND_WHILE_HELD: AtomicBool = AtomicBool::new(f
 #[cfg(test)]
 static WAKE_SERIALIZATION_TEST_RELEASE: AtomicBool = AtomicBool::new(false);
 
+// Test-only capture for the Linux `try_to_wake_up()` -> `select_task_rq()`
+// wake-flag boundary. The production path does not branch on this unless a
+// host regression explicitly arms it.
+#[cfg(test)]
+static WAKE_SELECT_FLAGS_TEST_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static WAKE_SELECT_FLAGS_TEST_CAPTURE: AtomicU32 = AtomicU32::new(0);
+
 #[cfg(test)]
 fn wake_serialization_test_hook() {
     if !WAKE_SERIALIZATION_TEST_ARMED.load(Ordering::Acquire) {
@@ -1033,9 +1041,10 @@ pub unsafe fn finish_task_switch(prev: *mut TaskStruct) {
     // `context_switch()` carried across the physical stack switch.  It must
     // happen after finish_task()'s on_cpu publication and before mmdrop or
     // TASK_DEAD reclamation, whose paths may take locks or issue TLB IPIs.
-    #[cfg(not(test))]
-    unsafe {
-        rq::unlock_rq_after_switch(current_cpu());
+    if production_smp_scheduler_enabled() {
+        unsafe {
+            rq::unlock_rq_after_switch(current_cpu());
+        }
     }
 
     // Linux's sched_ttwu_pending() runs from the scheduler/call-function IPI,
@@ -1089,7 +1098,14 @@ pub unsafe extern "C" fn schedule_tail(prev: *mut TaskStruct) {
     // lock and switch-side cleanup are complete.  A freshly forked task does
     // not return through the caller's `schedule()` frame, so this is the
     // matching drop for the outer level held by `__schedule_loop()`.
-    crate::kernel::locking::preempt::preempt_enable();
+    //
+    // The cooperative one-CPU scheduler does not carry an rq lock or the
+    // production scheduler's outer preemption level across its switch.  Its
+    // child-return path must therefore retain the legacy baseline instead of
+    // decrementing an ownership level it never acquired.
+    if production_smp_scheduler_enabled() {
+        crate::kernel::locking::preempt::preempt_enable();
+    }
 }
 
 #[inline]
@@ -1797,9 +1813,9 @@ fn should_queue_remote_wake(owner_cpu: u32) -> bool {
     )
 }
 
-/// Activate pending remote wakes on this CPU without waiting in interrupt
-/// context. If the owner is still in `on_cpu` handoff, the entry is retained
-/// until `finish_task_switch()` clears it with release ordering.
+/// Activate pending remote wakes on this CPU. Linux's
+/// `sched_ttwu_pending()` waits for an in-flight `on_cpu` handoff while the
+/// target rq is locked, then activates the entry in the same drain.
 pub(crate) fn drain_remote_wakes() {
     if !production_smp_scheduler_enabled() {
         return;
@@ -1834,37 +1850,50 @@ pub(crate) fn drain_remote_wakes() {
         }
 
         let action = unsafe {
-            if task_on_cpu(task) {
-                RemoteWakeDrain::Requeue((*task).thread_info.cpu)
-            } else if (*task).thread_info.cpu != cpu {
-                RemoteWakeDrain::Requeue((*task).thread_info.cpu)
-            } else {
-                rq::with_rq(cpu, |rq| {
-                    if task_on_cpu(task) {
-                        return RemoteWakeDrain::Requeue((*task).thread_info.cpu);
+            // Linux sched_ttwu_pending() holds the target rq lock while it
+            // waits for finish_task() to publish p->on_cpu=0.  Requeueing and
+            // returning here is not equivalent: on the local target CPU the
+            // replacement IPI can be coalesced with an already-set
+            // NEED_RESCHED bit, leaving this wake entry asleep indefinitely.
+            rq::with_rq(cpu, |rq| {
+                while task_on_cpu(task) {
+                    core::hint::spin_loop();
+                }
+
+                // Match Linux's defensive set_task_cpu() in
+                // sched_ttwu_pending(). A pending entry is owned by this
+                // target rq even if a concurrent migration changed the
+                // saved CPU before the IPI was consumed.
+                if (*task).thread_info.cpu != cpu {
+                    (*task).m29.recent_used_cpu = (*task).thread_info.cpu as i32;
+                    (*task).thread_info.cpu = cpu;
+                    (*task).m29.wake_cpu = cpu as i32;
+                }
+                if (*task).m29.on_rq == class::TASK_ON_RQ_MIGRATING {
+                    return RemoteWakeDrain::Requeue((*task).thread_info.cpu);
+                }
+                let sched_class = task_class(task);
+                if sched_class.is_null() {
+                    return RemoteWakeDrain::Drop;
+                }
+                if (*task).m29.on_rq == 0 {
+                    if let Some(enqueue) = (*sched_class).enqueue_task {
+                        enqueue(
+                            rq,
+                            task,
+                            class::ENQUEUE_WAKEUP | class::ENQUEUE_NOCLOCK | wake_flags,
+                        );
                     }
-                    if (*task).m29.on_rq == class::TASK_ON_RQ_MIGRATING {
-                        return RemoteWakeDrain::Requeue((*task).thread_info.cpu);
-                    }
-                    let sched_class = task_class(task);
-                    if sched_class.is_null() {
-                        return RemoteWakeDrain::Drop;
-                    }
-                    if (*task).m29.on_rq == 0 {
-                        if let Some(enqueue) = (*sched_class).enqueue_task {
-                            enqueue(rq, task, class::ENQUEUE_WAKEUP | wake_flags);
-                        }
-                    }
-                    if (*task).m29.on_rq != class::TASK_ON_RQ_QUEUED {
-                        return RemoteWakeDrain::Drop;
-                    }
-                    (*task)
-                        .__state
-                        .store(crate::kernel::task::task_state::TASK_RUNNING, Ordering::Release);
-                    RemoteWakeDrain::Activate(wakeup_preempt_locked(rq, task, wake_flags))
-                })
-                .unwrap_or(RemoteWakeDrain::Drop)
-            }
+                }
+                if (*task).m29.on_rq != class::TASK_ON_RQ_QUEUED {
+                    return RemoteWakeDrain::Drop;
+                }
+                (*task)
+                    .__state
+                    .store(crate::kernel::task::task_state::TASK_RUNNING, Ordering::Release);
+                RemoteWakeDrain::Activate(wakeup_preempt_locked(rq, task, wake_flags))
+            })
+            .unwrap_or(RemoteWakeDrain::Drop)
         };
 
         match action {
@@ -2092,7 +2121,7 @@ unsafe fn prepare_prev_for_pick(this_rq: &mut rq::Rq, prev: *mut TaskStruct) {
     let prev_class = unsafe { task_class(prev) };
     let mut prev_state = unsafe { (*prev).__state.load(Ordering::Acquire) };
     if prev_state & crate::kernel::task::task_state::TASK_INTERRUPTIBLE != 0
-        && crate::kernel::signal::has_pending_signals(prev)
+        && crate::kernel::signal::has_unblocked_pending_signals(prev)
     {
         unsafe {
             (*prev).__state.store(
@@ -2258,13 +2287,35 @@ pub unsafe fn schedule() -> bool {
         // drops only that scheduler-owned level before its post-switch work.
         // Restore the caller's level only after the incoming task has
         // returned from that boundary.
-        crate::kernel::locking::preempt::preempt_disable();
-        unsafe { __schedule() };
-        crate::kernel::locking::preempt::preempt_enable_no_resched();
+        loop {
+            crate::kernel::locking::preempt::preempt_disable();
+            unsafe { __schedule() };
+            crate::kernel::locking::preempt::preempt_enable_no_resched();
+            // Linux __schedule_loop() retries when the task which resumed
+            // from the stack switch still carries TIF_NEED_RESCHED.  A
+            // remote wake or timer tick can set this after __schedule()
+            // cleared the outgoing task's request; returning here would
+            // leave that request pending until an unrelated entry boundary.
+            if !current_needs_resched() {
+                break;
+            }
+        }
         false
     } else {
         unsafe { legacy_schedule() }
     }
+}
+
+/// Linux `schedule_preempt_disabled()`: make the first scheduler handoff from
+/// `rest_init()` with preemption temporarily enabled, then restore the idle
+/// task's disabled-preemption baseline before entering `do_idle()`.
+///
+/// Source parity: `vendor/linux/kernel/sched/core.c:schedule_preempt_disabled`
+/// and `vendor/linux/init/main.c:rest_init`.
+pub unsafe fn schedule_preempt_disabled() {
+    crate::kernel::locking::preempt::preempt_enable_no_resched();
+    unsafe { schedule(); }
+    crate::kernel::locking::preempt::preempt_disable();
 }
 
 /// Schedule from a per-CPU idle task.
@@ -3017,6 +3068,10 @@ pub fn select_task_rq(p: *mut TaskStruct, prev_cpu: u32, flags: u32) -> u32 {
     if p.is_null() {
         return prev_cpu;
     }
+    #[cfg(test)]
+    if WAKE_SELECT_FLAGS_TEST_ARMED.load(Ordering::Acquire) {
+        WAKE_SELECT_FLAGS_TEST_CAPTURE.store(flags, Ordering::Release);
+    }
     let eligible = task_placement_mask(p);
     let class = unsafe { task_class(p) };
     if !class.is_null() {
@@ -3062,6 +3117,11 @@ unsafe fn try_to_wake_up_with_state(p: *mut TaskStruct, state_mask: u32, wake_fl
     if p.is_null() {
         return false;
     }
+    // Linux `try_to_wake_up()` adds WF_TTWU before the current-task fast path
+    // and before `select_task_rq()`.  The bit is a scheduler-domain wake hint,
+    // not an ENQUEUE_* flag; retain it through remote queues, placement, and
+    // wakeup-preemption exactly as Linux does.
+    let wake_flags = wake_flags | class::WF_TTWU;
     // Linux special-cases a wake of current before taking p->pi_lock.  The
     // task is already executing on this CPU, so the remote-wakeup path's
     // `while task_on_cpu(p)` handoff cannot make progress for it.  Keep the
@@ -3245,7 +3305,14 @@ unsafe fn try_to_wake_up_locked(p: *mut TaskStruct, state_mask: u32, wake_flags:
         if (*p).m29.on_rq == 0
             && let Some(enqueue) = (*class).enqueue_task
         {
-            enqueue(target_rq, p, class::ENQUEUE_WAKEUP | wake_flags);
+            // Linux ttwu_do_activate() always suppresses the second rq-clock
+            // update here; wake_flags are scheduler wake flags, not enqueue
+            // flags, and must remain separate until this activation boundary.
+            enqueue(
+                target_rq,
+                p,
+                class::ENQUEUE_WAKEUP | class::ENQUEUE_NOCLOCK | wake_flags,
+            );
         }
         (*p).__state.store(
             crate::kernel::task::task_state::TASK_RUNNING,
@@ -3267,7 +3334,32 @@ unsafe fn try_to_wake_up_locked(p: *mut TaskStruct, state_mask: u32, wake_flags:
 }
 
 pub unsafe fn wake_task(p: *mut TaskStruct) -> bool {
-    unsafe { try_to_wake_up(p, class::ENQUEUE_WAKEUP) }
+    // Linux wake_up_process() is try_to_wake_up(p, TASK_NORMAL, 0).  The
+    // enqueue-side ENQUEUE_WAKEUP bit is added only after CPU selection, so
+    // passing it as wake_flags would mix the two Linux flag namespaces and
+    // alter select_task_rq()/wakeup_preempt() decisions.
+    unsafe {
+        try_to_wake_up_with_state(
+            p,
+            crate::kernel::task::task_state::TASK_NORMAL,
+            0,
+        )
+    }
+}
+
+/// Wake `p` only when its Linux task state matches `state_mask`.
+///
+/// This is the scheduler-facing equivalent of Linux
+/// `try_to_wake_up(p, state_mask, wake_flags)`. Waitqueues and signal paths
+/// must retain the state mask through the task's `pi_lock`; a racy state check
+/// followed by the unrestricted `try_to_wake_up()` wrapper can resurrect a
+/// task after it has entered a different sleep/stop state.
+pub unsafe fn wake_task_with_state(
+    p: *mut TaskStruct,
+    state_mask: u32,
+    wake_flags: u32,
+) -> bool {
+    unsafe { try_to_wake_up_with_state(p, state_mask, wake_flags) }
 }
 
 /// Normal waitqueue/timer wake, equivalent to Linux
@@ -3278,7 +3370,7 @@ pub unsafe fn wake_task_normal(p: *mut TaskStruct) -> bool {
         try_to_wake_up_with_state(
             p,
             crate::kernel::task::task_state::TASK_NORMAL,
-            class::ENQUEUE_WAKEUP,
+            0,
         )
     }
 }
@@ -3346,6 +3438,37 @@ mod tests {
         assert!(remote_wake_ipi_required(2, 0, true));
         assert!(!remote_wake_ipi_required(0, 0, true));
         assert!(!remote_wake_ipi_required(2, 0, false));
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:sched_ttwu_pending
+    ///
+    /// Linux consumes a pending wake on the target CPU, waits for
+    /// `p->on_cpu` to clear, and then activates that same entry while holding
+    /// the target rq lock. Requeueing and returning from the drain is not an
+    /// equivalent fallback: on the local target CPU it can coalesce with an
+    /// already-set reschedule request and leave the wake pending indefinitely.
+    #[test]
+    fn remote_wake_drain_activates_after_on_cpu_handoff() {
+        let source = include_str!("mod.rs");
+        let drain = source
+            .split("pub(crate) fn drain_remote_wakes")
+            .nth(1)
+            .and_then(|body| body.split("/// Add a task to the global run queue").next())
+            .expect("remote wake drain must exist");
+        let wait_start = drain
+            .find("while task_on_cpu(task)")
+            .expect("drain must account for the Linux on_cpu handoff");
+        let migration_check = drain[wait_start..]
+            .find("if (*task).m29.on_rq")
+            .map(|offset| wait_start + offset)
+            .expect("drain must retain the migration check after the handoff wait");
+        let on_cpu_branch = &drain[wait_start..migration_check];
+        assert!(
+            !on_cpu_branch
+                .lines()
+                .any(|line| line.contains("RemoteWakeDrain::Requeue")),
+            "sched_ttwu_pending must wait for on_cpu to clear and activate the entry"
+        );
     }
 
     /// test-origin: linux:vendor/linux/kernel/sched/core.c:
@@ -3608,6 +3731,203 @@ mod tests {
         );
     }
 
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:wake_up_process
+    /// and wake_up_state
+    ///
+    /// Linux keeps wake flags separate from ENQUEUE_* flags.  The latter is
+    /// added by ttwu_do_activate after CPU selection; passing it to
+    /// try_to_wake_up would change the scheduler-class inputs before that
+    /// boundary.  The runtime wake test above covers the wrapper path; this
+    /// contract check keeps both Linux entry-point translations explicit.
+    #[test]
+    fn wake_wrappers_keep_linux_wake_flags_separate_from_enqueue_flags() {
+        let source = include_str!("mod.rs");
+        let wake_task = source
+            .split("pub unsafe fn wake_task")
+            .nth(1)
+            .and_then(|body| body.split("/// Normal waitqueue/timer wake").next())
+            .expect("wake_task wrapper must remain present");
+        assert!(
+            wake_task.contains("TASK_NORMAL") && wake_task.contains("0,\n        )"),
+            "wake_up_process() must pass TASK_NORMAL and wake_flags=0"
+        );
+
+        let wake_task_normal = source
+            .split("pub unsafe fn wake_task_normal")
+            .nth(1)
+            .and_then(|body| body.split("// ── Unit tests").next())
+            .expect("wake_task_normal wrapper must remain present");
+        assert!(
+            wake_task_normal.contains("TASK_NORMAL,\n            0"),
+            "wake_up_state(TASK_NORMAL) must pass Linux wake_flags=0"
+        );
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:try_to_wake_up
+    /// and vendor/linux/kernel/sched/sched.h:WF_TTWU
+    ///
+    /// Linux marks every ordinary `try_to_wake_up()` with WF_TTWU before
+    /// `select_task_rq()`. This host fixture drives the actual production
+    /// wake path far enough to observe the flags received by placement.
+    #[test]
+    fn normal_wakeup_marks_wf_ttwu_before_cpu_selection() {
+        let _legacy = legacy_sched_test_guard();
+        rq::init_rqs();
+        PRODUCTION_SCHED_ENABLED.store(true, Ordering::Release);
+
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.m29 = M29SchedFields::zeroed();
+        current.m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
+        current.m29.se.load.weight = prio::NICE_0_LOAD;
+        current.thread_info.cpu = 0;
+        let current_ptr = &mut *current as *mut TaskStruct;
+
+        let mut target = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        target.m29 = M29SchedFields::zeroed();
+        target.m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
+        target.m29.se.load.weight = prio::NICE_0_LOAD;
+        target.thread_info.cpu = 0;
+        target.__state.store(
+            crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+            Ordering::Release,
+        );
+        let target_ptr = &mut *target as *mut TaskStruct;
+
+        unsafe {
+            set_current(current_ptr);
+        }
+        rq::with_rq(0, |this_rq| {
+            this_rq.current = current_ptr;
+            this_rq.idle = core::ptr::null_mut();
+        })
+        .expect("CPU0 runqueue must be initialized");
+
+        WAKE_SELECT_FLAGS_TEST_CAPTURE.store(0, Ordering::Release);
+        WAKE_SELECT_FLAGS_TEST_ARMED.store(true, Ordering::Release);
+        let woken = unsafe {
+            try_to_wake_up_with_state(
+                target_ptr,
+                crate::kernel::task::task_state::TASK_NORMAL,
+                0,
+            )
+        };
+        WAKE_SELECT_FLAGS_TEST_ARMED.store(false, Ordering::Release);
+
+        assert!(
+            woken,
+            "normal wake must complete before checking placement flags (captured={:#x})",
+            WAKE_SELECT_FLAGS_TEST_CAPTURE.load(Ordering::Acquire)
+        );
+        assert_ne!(
+            WAKE_SELECT_FLAGS_TEST_CAPTURE.load(Ordering::Acquire) & class::WF_TTWU,
+            0,
+            "normal try_to_wake_up must pass WF_TTWU to select_task_rq"
+        );
+        assert_eq!(
+            target.__state.load(Ordering::Acquire),
+            crate::kernel::task::task_state::TASK_RUNNING
+        );
+
+        // Retire the test enqueue before the heap-backed task objects leave
+        // scope; the production scheduler owns the intrusive CFS node until
+        // this explicit dequeue.
+        rq::with_rq(0, |this_rq| unsafe {
+            if let Some(dequeue) = (*target.m29.sched_class).dequeue_task {
+                let _ = dequeue(this_rq, target_ptr, class::DEQUEUE_SLEEP);
+            }
+            this_rq.current = core::ptr::null_mut();
+            this_rq.idle = core::ptr::null_mut();
+        })
+        .expect("CPU0 runqueue must remain initialized");
+    }
+
+    /// test-origin: linux:vendor/linux/include/linux/sched/signal.h:
+    /// signal_wake_up and vendor/linux/kernel/signal.c:signal_wake_up_state
+    ///
+    /// A fatal signal wakes stopped/traced tasks through TASK_WAKEKILL. The
+    /// generic TASK_NORMAL wake mask is insufficient for TASK_STOPPED, so this
+    /// exercises the signal path with the production runqueue enabled.
+    #[test]
+    fn fatal_signal_wakes_stopped_task_through_wakekill_state() {
+        let _legacy = legacy_sched_test_guard();
+        let _signals = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        rq::init_rqs();
+        PRODUCTION_SCHED_ENABLED.store(true, Ordering::Release);
+
+        let mut sender = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        sender.m29 = M29SchedFields::zeroed();
+        sender.m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
+        sender.m29.se.load.weight = prio::NICE_0_LOAD;
+        sender.thread_info.cpu = 0;
+        let sender_ptr = &mut *sender as *mut TaskStruct;
+
+        let mut target = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        target.m29 = M29SchedFields::zeroed();
+        target.m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
+        target.m29.se.load.weight = prio::NICE_0_LOAD;
+        target.thread_info.cpu = 0;
+        target.pid = 31_203;
+        target.tgid = 31_203;
+        target.cred = &raw const crate::kernel::cred::INIT_CRED;
+        target.__state.store(
+            crate::kernel::task::task_state::TASK_STOPPED,
+            Ordering::Release,
+        );
+        let target_ptr = &mut *target as *mut TaskStruct;
+
+        unsafe {
+            set_current(sender_ptr);
+        }
+        rq::with_rq(0, |this_rq| {
+            this_rq.current = sender_ptr;
+            this_rq.idle = core::ptr::null_mut();
+        })
+        .expect("CPU0 runqueue must be initialized");
+
+        assert_eq!(
+            unsafe { crate::kernel::signal::send_signal_to_task(target_ptr, crate::kernel::signal::SIGKILL) },
+            0
+        );
+        assert_eq!(
+            target.__state.load(Ordering::Acquire),
+            crate::kernel::task::task_state::TASK_RUNNING,
+            "SIGKILL must wake TASK_STOPPED through Linux TASK_WAKEKILL"
+        );
+
+        rq::with_rq(0, |this_rq| unsafe {
+            if target.m29.on_rq != 0
+                && let Some(dequeue) = (*target.m29.sched_class).dequeue_task
+            {
+                let _ = dequeue(this_rq, target_ptr, class::DEQUEUE_SLEEP);
+            }
+            this_rq.current = core::ptr::null_mut();
+            this_rq.idle = core::ptr::null_mut();
+        })
+        .expect("CPU0 runqueue must remain initialized");
+        crate::kernel::signal::reset_for_tests();
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:ttwu_do_activate
+    ///
+    /// Every full wakeup activation in Linux adds ENQUEUE_NOCLOCK before the
+    /// scheduler class hook. The remote wake-list path already mirrors that
+    /// flag; keep the synchronous path from silently taking the clock-update
+    /// branch instead.
+    #[test]
+    fn synchronous_wake_activation_keeps_linux_no_clock_flag() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split("// Same-CPU wakeups and remote queues")
+            .nth(1)
+            .and_then(|body| body.split("let Some((true, newly_set)) = enqueued").next())
+            .expect("synchronous wake activation body must exist");
+        assert!(
+            body.contains("class::ENQUEUE_WAKEUP | class::ENQUEUE_NOCLOCK | wake_flags"),
+            "Linux ttwu_do_activate() passes ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK to enqueue_task"
+        );
+    }
+
     /// test-origin: linux:vendor/linux/kernel/sched/core.c:try_to_wake_up
     ///
     /// Linux's live task invariant is that `p->sched_class` names a real
@@ -3817,18 +4137,29 @@ mod tests {
         // scheduler race window, so exercise the production class boundary:
         // signal_pending_state() must restore TASK_RUNNING and leave the
         // current entity runnable instead of calling dequeue_task().
+        let _legacy = legacy_sched_test_guard();
+        let _signals = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
         let mut rq = rq::Rq::new(0);
         let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         task.m29 = M29SchedFields::zeroed();
         let task_ptr = &mut *task as *mut TaskStruct;
+        task.pid = 31_201;
+        task.tgid = 31_201;
+        task.cred = &raw const crate::kernel::cred::INIT_CRED;
 
         task.m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
         task.m29.on_rq = 1;
         task.m29.se.on_rq = 1;
         task.m29.se.load.weight = prio::NICE_0_LOAD;
-        task.thread_info
-            .flags
-            .store(crate::kernel::task::TIF_SIGPENDING, Ordering::Release);
+        unsafe {
+            set_current(task_ptr);
+            crate::kernel::signal::register_test_task(task.pid, task.tgid);
+            assert_eq!(
+                crate::kernel::signal::send_signal_to_task(task_ptr, crate::kernel::signal::SIGUSR1),
+                0
+            );
+        }
         task.__state.store(
             crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
             Ordering::Release,
@@ -3852,6 +4183,84 @@ mod tests {
         assert_eq!(task.m29.se.on_rq, 1, "the FAIR entity must stay queued");
         assert_eq!(rq.nr_running, 1);
         assert_eq!(rq.cfs.nr_running, 1);
+
+        crate::kernel::signal::reset_for_tests();
+    }
+
+    #[test]
+    fn blocked_pending_signal_does_not_cancel_interruptible_block() {
+        // test-origin: linux:vendor/linux/include/linux/sched/signal.h:
+        // signal_pending_state
+        //
+        // Lupos must distinguish the raw pending bit from Linux's
+        // signal_pending() result, which excludes signals blocked by the
+        // current task. A blocked pending signal must remain pending while
+        // the scheduler dequeues the interruptible task.
+        let _legacy = legacy_sched_test_guard();
+        let _signals = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
+        crate::kernel::signal::reset_for_tests();
+        let mut rq = rq::Rq::new(0);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        task.m29 = M29SchedFields::zeroed();
+        let task_ptr = &mut *task as *mut TaskStruct;
+        task.pid = 31_202;
+        task.tgid = 31_202;
+        task.cred = &raw const crate::kernel::cred::INIT_CRED;
+        task.m29.sched_class = &fair::FAIR_SCHED_CLASS as *const class::SchedClass;
+        task.m29.on_rq = 1;
+        task.m29.se.on_rq = 1;
+        task.m29.se.load.weight = prio::NICE_0_LOAD;
+
+        unsafe {
+            set_current(task_ptr);
+            crate::kernel::signal::register_test_task(task.pid, task.tgid);
+            let blocked = crate::kernel::signal::SigSet {
+                bits: 1u64 << (crate::kernel::signal::SIGUSR1 - 1),
+            };
+            assert_eq!(
+                crate::kernel::signal::sys_rt_sigprocmask(
+                    crate::kernel::signal::SIG_BLOCK,
+                    &blocked,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<crate::kernel::signal::SigSet>(),
+                ),
+                0
+            );
+            assert_eq!(
+                crate::kernel::signal::send_signal_to_task(
+                    task_ptr,
+                    crate::kernel::signal::SIGUSR1,
+                ),
+                0
+            );
+        }
+        task.__state.store(
+            crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+            Ordering::Release,
+        );
+        rq.current = task_ptr;
+        rq.cfs.current = task_ptr;
+        rq.nr_running = 1;
+        rq.cfs.nr_running = 1;
+        rq.cfs.load_weight = prio::NICE_0_LOAD;
+
+        assert!(crate::kernel::signal::has_pending_signals(task_ptr));
+        assert!(!crate::kernel::signal::has_unblocked_pending_signals(task_ptr));
+        unsafe {
+            prepare_prev_for_pick(&mut rq, task_ptr);
+        }
+
+        assert_eq!(
+            task.__state.load(Ordering::Acquire),
+            crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
+            "a blocked pending signal must not cancel the interruptible sleep"
+        );
+        assert_eq!(task.m29.on_rq, 0);
+        assert_eq!(task.m29.se.on_rq, 0);
+        assert_eq!(rq.nr_running, 0);
+        assert_eq!(rq.cfs.nr_running, 0);
+
+        crate::kernel::signal::reset_for_tests();
     }
 
     #[test]
@@ -4010,6 +4419,31 @@ mod tests {
         );
     }
 
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:__schedule_loop
+    ///
+    /// Linux repeats the normal scheduling handoff while the resumed task
+    /// still carries TIF_NEED_RESCHED. A single __schedule() call is not an
+    /// equivalent translation: a request raised during the handoff remains
+    /// pending until a later unrelated entry boundary.
+    #[test]
+    fn normal_schedule_repeats_until_need_resched_is_consumed() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split("pub unsafe fn schedule()")
+            .nth(1)
+            .expect("schedule must exist")
+            .split("/// Linux `schedule_preempt_disabled`")
+            .next()
+            .expect("schedule body must end before first-handoff helper");
+        let production = body
+            .split("if production_smp_scheduler_enabled()")
+            .nth(1)
+            .expect("schedule must have a production SMP branch");
+        assert!(production.contains("loop {"));
+        assert!(production.contains("unsafe { __schedule() };"));
+        assert!(production.contains("if !current_needs_resched() {"));
+    }
+
     /// test-origin: linux:vendor/linux/kernel/sched/core.c:schedule_tail
     ///
     /// A newly forked task enters through its synthetic stack rather than
@@ -4099,6 +4533,13 @@ mod tests {
     fn login_stack_pid1_handoff_enters_linux_bsp_idle_after_first_schedule() {
         // test-origin: linux:vendor/linux/init/main.c:rest_init
         let source = include_str!("../../init/main.rs");
+        let first_handoff = source
+            .split("pid1-handoff: init affinity widened before first handoff")
+            .nth(1)
+            .expect("PID1 affinity handoff marker must exist")
+            .split("#[cfg(feature = \"test-login-stack\")]")
+            .next()
+            .expect("first scheduler handoff must precede login-stack branch");
         let body = source
             .split("#[cfg(feature = \"test-login-stack\")]")
             .nth(1)
@@ -4108,7 +4549,7 @@ mod tests {
             .expect("login-stack PID1 handoff block must precede non-login fallback");
 
         assert!(
-            body.contains("unsafe { kernel::sched::schedule_with_irqs_enabled() };"),
+            first_handoff.contains("unsafe { kernel::sched::schedule_preempt_disabled() }"),
             "Linux rest_init() calls schedule_preempt_disabled() once before idle"
         );
         assert!(
@@ -4118,6 +4559,32 @@ mod tests {
         assert!(
             !body.contains("loop {"),
             "login-stack images must not keep CPU0 in a private scheduler loop"
+        );
+    }
+
+    #[test]
+    fn child_switch_cleanup_only_drops_production_scheduler_ownership() {
+        // test-origin: linux:vendor/linux/kernel/sched/core.c:finish_task_switch
+        // and schedule_tail
+        let source = include_str!("mod.rs");
+        let finish = source
+            .split("pub unsafe fn finish_task_switch")
+            .nth(1)
+            .and_then(|body| body.split("/// Linux `schedule_tail(prev)`").next())
+            .expect("finish_task_switch body must exist");
+        assert!(
+            finish.contains("if production_smp_scheduler_enabled()"),
+            "legacy cooperative switches must not unlock a production rq"
+        );
+
+        let tail = source
+            .split("pub unsafe extern \"C\" fn schedule_tail")
+            .nth(1)
+            .and_then(|body| body.split("#[inline]").next())
+            .expect("schedule_tail body must exist");
+        assert!(
+            tail.contains("if production_smp_scheduler_enabled()"),
+            "legacy child return must not decrement production preemption state"
         );
     }
 
