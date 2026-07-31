@@ -5981,11 +5981,16 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
             "pid1-handoff: init affinity widened before first handoff"
         );
 
+        // Linux rest_init() gives the bootstrap idle task one initial
+        // schedule_preempt_disabled() handoff before entering do_idle().
+        // This also lets the newly forked PID1 run through its normal child
+        // return path while the scheduler's preemption baseline is balanced.
+        unsafe { kernel::sched::schedule_preempt_disabled() };
+
         #[cfg(feature = "test-login-stack")]
         {
             init::rootfs::drain_console_control_bytes();
             kernel::console::maintenance_budgeted();
-            unsafe { kernel::sched::schedule_with_irqs_enabled() };
             halt_loop_with_softirq();
         }
 
@@ -6009,9 +6014,11 @@ pub extern "C" fn kernel_main(boot_params: *const bootparams::BootParams) -> ! {
                 kernel::console::maintenance_budgeted();
                 unsafe { kernel::sched::schedule_with_irqs_enabled() };
             }
-            let state = unsafe { (*init).__state.load(Ordering::Acquire) };
+            // Linux keeps the scheduler state at TASK_DEAD after do_exit()
+            // while the wait-visible task_struct exit_state remains
+            // EXIT_ZOMBIE until a parent reaps it.
             assert!(
-                (state & EXIT_ZOMBIE) != 0,
+                (unsafe { (*init).m26.exit_state } & EXIT_ZOMBIE) != 0,
                 "pid1-handoff: PID1 did not exit"
             );
 

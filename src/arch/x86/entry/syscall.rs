@@ -505,6 +505,10 @@ unsafe fn syscall_dispatch_ptregs_inner(
     let hook_state = syscall_enter(unsafe { &*regs }, task);
     trace_udev_syscall_enter(unsafe { &*regs }, task);
     trace_stall_syscall_enter(unsafe { &*regs }, task);
+    // Focused Firefox startup evidence: keep the existing opt-in probe on the
+    // clone3 boundary while the browser process-creation path is compared
+    // with Linux.  The probe itself filters to nr=435 below.
+    trace_firefox_syscall_enter(unsafe { &*regs }, task);
     // Draining the console here delivers terminal signals (Ctrl-C) promptly, but
     // `try_console_input` probes the i8042 status port (`inb 0x64`) when its
     // queue is empty — a port-I/O access that is a VM-exit under VirtualBox/KVM
@@ -584,6 +588,7 @@ unsafe fn syscall_dispatch_ptregs_inner(
     syscall_exit(unsafe { &*regs }, ret, task, hook_state);
     trace_systemd_service_syscall(unsafe { &*regs }, ret, task);
     trace_udev_syscall_exit(unsafe { &*regs }, ret, task);
+    trace_firefox_syscall_exit(unsafe { &*regs }, ret, task);
     ret
 }
 
@@ -1334,6 +1339,350 @@ fn trace_bwrap_syscall_enter(
         regs.arg3(),
         regs.arg4(),
         regs.arg5()
+    );
+}
+
+#[cfg(not(test))]
+static TRACE_FIREFOX_SYSCALL_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(not(test))]
+static TRACE_FIREFOX_POLL_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(not(test))]
+static TRACE_FIREFOX_RECVMSG_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(not(test))]
+static TRACE_FIREFOX_FUTEX_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(not(test))]
+static TRACE_FIREFOX_CLONE_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(not(test))]
+static TRACE_FIREFOX_NAMESPACE_CLONE_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Trace the small set of process, IPC, blocking, and sandbox syscalls that
+/// determines whether Firefox can create its content process and publish its
+/// first X11 window.  The flag is intentionally separate from TRACE_SYSCALL:
+/// a full syscall stream changes the desktop schedule enough to hide the
+/// liveness bug this probe is meant to locate.
+#[cfg(not(test))]
+fn trace_firefox_syscall_enter(
+    regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    task: *mut crate::kernel::task::TaskStruct,
+) {
+    if task.is_null() || !crate::kernel::debug_trace::firefox_enabled() {
+        return;
+    }
+    let comm = unsafe { &(*task).comm };
+    if !firefox_trace_comm(comm) {
+        return;
+    }
+    let nr = regs.orig_rax;
+    if !firefox_trace_syscall_is_interesting(nr, 0) {
+        return;
+    }
+    // Firefox's sandbox can use a process clone with namespace flags after
+    // its large thread-clone burst.  Keep that boundary visible even after
+    // the ordinary clone3 budget is exhausted.
+    let namespace_clone_flags = if nr == 435 && regs.arg0() != 0 && regs.arg1() <= 4096 {
+        let clone_args = unsafe { *(regs.arg0() as *const crate::kernel::clone::CloneArgs) };
+        clone_args.flags
+            & (crate::kernel::clone::CLONE_NEWUSER
+                | crate::kernel::clone::CLONE_NEWPID
+                | crate::kernel::clone::CLONE_NEWNS
+                | crate::kernel::clone::CLONE_NEWNET
+                | crate::kernel::clone::CLONE_NEWIPC
+                | crate::kernel::clone::CLONE_NEWUTS
+                | crate::kernel::clone::CLONE_NEWCGROUP)
+    } else if nr == 56 {
+        regs.arg0()
+            & (crate::kernel::clone::CLONE_NEWUSER
+                | crate::kernel::clone::CLONE_NEWPID
+                | crate::kernel::clone::CLONE_NEWNS
+                | crate::kernel::clone::CLONE_NEWNET
+                | crate::kernel::clone::CLONE_NEWIPC
+                | crate::kernel::clone::CLONE_NEWUTS
+                | crate::kernel::clone::CLONE_NEWCGROUP)
+    } else {
+        0
+    };
+    if namespace_clone_flags != 0 {
+        let namespace_seq = TRACE_FIREFOX_NAMESPACE_CLONE_COUNT
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        if namespace_seq < 64 {
+            crate::linux_driver_abi::tty::serial_println!(
+                "trace-firefox-namespace-clone seq={} pid={} nr={} flags={:#x} a0={:#x} a1={:#x}",
+                namespace_seq,
+                unsafe { (*task).pid },
+                nr,
+                namespace_clone_flags,
+                regs.arg0(),
+                regs.arg1()
+            );
+        }
+    }
+    // Memory-management probes are useful only when they fail.  Do not print
+    // the successful mmap/mprotect/munmap stream: Firefox performs thousands
+    // of those during startup and the serial traffic changes the scheduler
+    // boundary being investigated.
+    if matches!(nr, 9 | 10 | 11 | 12 | 28) {
+        return;
+    }
+    // Successful pathname probes are not relevant to the process-boundary
+    // question and can dominate the serial stream during Firefox startup.
+    if nr == 257 {
+        return;
+    }
+    if !firefox_trace_event_allowed(nr) {
+        return;
+    }
+    let seq = TRACE_FIREFOX_SYSCALL_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    if seq >= 6_000 {
+        return;
+    }
+    let pid = unsafe { (*task).pid };
+    let tgid = unsafe { (*task).tgid };
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-firefox-enter seq={} pid={} tgid={} comm={} nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+        seq,
+        pid,
+        tgid,
+        comm_for_trace(comm),
+        nr,
+        regs.arg0(),
+        regs.arg1(),
+        regs.arg2(),
+        regs.arg3(),
+        regs.arg4(),
+        regs.arg5()
+    );
+    trace_firefox_scheduler_state(task, seq, "enter");
+    if nr == 435 && regs.arg1() <= 4096 && regs.arg0() != 0 {
+        let clone_args = unsafe {
+            *(regs.arg0() as *const crate::kernel::clone::CloneArgs)
+        };
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-firefox-clone3-args pid={} flags={:#x} stack={:#x} stack-size={:#x} tls={:#x} pidfd={:#x} child-tid={:#x} parent-tid={:#x} size={}",
+            pid,
+            clone_args.flags,
+            clone_args.stack,
+            clone_args.stack_size,
+            clone_args.tls,
+            clone_args.pidfd,
+            clone_args.child_tid,
+            clone_args.parent_tid,
+            regs.arg1()
+        );
+    }
+    if matches!(nr, 59 | 322) {
+        let path_ptr = if nr == 322 { regs.arg1() } else { regs.arg0() };
+        trace_firefox_user_path(pid, nr, path_ptr);
+    }
+}
+
+#[cfg(test)]
+fn trace_firefox_syscall_enter(
+    _regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    _task: *mut crate::kernel::task::TaskStruct,
+) {
+}
+
+#[cfg(not(test))]
+fn trace_firefox_syscall_exit(
+    regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    ret: i64,
+    task: *mut crate::kernel::task::TaskStruct,
+) {
+    if task.is_null() || !crate::kernel::debug_trace::firefox_enabled() {
+        return;
+    }
+    let comm = unsafe { &(*task).comm };
+    if !firefox_trace_comm(comm) {
+        return;
+    }
+    let nr = regs.orig_rax;
+    if !firefox_trace_syscall_is_interesting(nr, ret) {
+        return;
+    }
+    if matches!(nr, 9 | 10 | 11 | 12 | 28) && ret >= 0 {
+        return;
+    }
+    if nr == 257 && ret >= 0 {
+        return;
+    }
+    if !firefox_trace_event_allowed(nr) {
+        return;
+    }
+    let seq = TRACE_FIREFOX_SYSCALL_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    if seq >= 6_000 {
+        return;
+    }
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-firefox-exit seq={} pid={} tgid={} comm={} nr={} ret={}",
+        seq,
+        unsafe { (*task).pid },
+        unsafe { (*task).tgid },
+        comm_for_trace(comm),
+        nr,
+        ret
+    );
+    trace_firefox_scheduler_state(task, seq, "exit");
+}
+
+#[cfg(test)]
+fn trace_firefox_syscall_exit(
+    _regs: &crate::arch::x86::kernel::ptrace::PtRegs,
+    _ret: i64,
+    _task: *mut crate::kernel::task::TaskStruct,
+) {
+}
+
+#[cfg(not(test))]
+fn firefox_trace_comm(comm: &[u8; 16]) -> bool {
+    comm_starts_with(comm, b"firefox")
+        || comm_starts_with(comm, b"glxtest")
+        || comm_starts_with(comm, b"Socket Process")
+        || comm_starts_with(comm, b"forkserver")
+        || comm_starts_with(comm, b"Web Content")
+        || comm_starts_with(comm, b"RDD Process")
+        || comm_starts_with(comm, b"GPU Process")
+        || comm_starts_with(comm, b"Utility")
+        || comm_starts_with(comm, b"crashhelper")
+}
+
+fn firefox_trace_syscall_is_interesting(nr: u64, ret: i64) -> bool {
+    let _ = ret;
+    // Keep this replay bounded enough that serial output does not change the
+    // scheduler boundary being investigated.  Process creation plus the
+    // blocking wait boundaries identify the first unmatched Firefox wait.
+    matches!(
+        nr,
+        7     // poll
+        | 23  // select
+        | 202 // futex
+        | 232 // epoll_wait
+        | 270 // pselect6
+        | 281 // epoll_pwait
+        | 441 // epoll_pwait2
+        | 20  // writev: X11 request framing
+        | 45  // recvfrom: X11 reply/event reads
+        | 46  // sendmsg: Unix IPC writes
+        | 47  // recvmsg: X11 reply/event reads
+        | 56  // clone
+        | 57  // fork
+        | 58  // vfork
+        | 59  // execve
+        | 231 // exit_group
+        | 322 // execveat
+        | 435 // clone3
+    )
+}
+
+#[cfg(not(test))]
+fn firefox_trace_event_allowed(nr: u64) -> bool {
+    let (counter, limit) = match nr {
+        7 | 23 | 35 | 230 | 232 | 233 | 234 | 270 | 271 | 281 | 441 => {
+            (&TRACE_FIREFOX_POLL_COUNT, 120)
+        }
+        202 => (&TRACE_FIREFOX_FUTEX_COUNT, 400),
+        435 => (&TRACE_FIREFOX_CLONE_COUNT, 120),
+        20 | 45..=47 => (&TRACE_FIREFOX_RECVMSG_COUNT, 160),
+        _ => return true,
+    };
+    counter.fetch_add(1, core::sync::atomic::Ordering::AcqRel) < limit
+}
+
+/// Capture scheduler ownership at the Firefox syscall boundary without
+/// taking an rq lock.  The diagnostic is intentionally read-only: a Firefox
+/// process reported `R` while all four CPUs were idle in the no-window replay,
+/// so the relevant distinction is TASK_RUNNING versus actual runqueue/current
+/// ownership.  The fields mirror Linux's task_struct::on_cpu/on_rq and
+/// sched_entity::on_rq checks used by `try_to_wake_up()` and `__schedule()`.
+#[cfg(not(test))]
+fn trace_firefox_scheduler_state(
+    task: *mut crate::kernel::task::TaskStruct,
+    seq: u32,
+    point: &str,
+) {
+    if task.is_null() {
+        return;
+    }
+    let cpu = crate::kernel::sched::current_cpu();
+    let current = unsafe { crate::kernel::sched::get_current() };
+    let state = unsafe {
+        (*task)
+            .__state
+            .load(core::sync::atomic::Ordering::Acquire)
+    };
+    let on_cpu = unsafe {
+        (*task)
+            .m29
+            .on_cpu
+            .load(core::sync::atomic::Ordering::Acquire)
+    };
+    let on_rq = unsafe { (*task).m29.on_rq };
+    let se_on_rq = unsafe { (*task).m29.se.on_rq };
+    let task_cpu = unsafe { (*task).thread_info.cpu };
+    let current_pid = if current.is_null() {
+        -1
+    } else {
+        unsafe { (*current).pid }
+    };
+    let current_match = u8::from(current == task);
+    let need_resched = u8::from(unsafe {
+        (*task)
+            .thread_info
+            .flags
+            .load(core::sync::atomic::Ordering::Acquire)
+            & crate::kernel::task::TIF_NEED_RESCHED
+            != 0
+    });
+    let rq_running = crate::kernel::sched::rq::rq_nr_running(cpu).unwrap_or(u32::MAX);
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-firefox-state seq={} point={} pid={} cpu={} task-cpu={} state={:#x} on-cpu={} on-rq={} se-on-rq={} current-pid={} current-match={} need-resched={} rq-running={}",
+        seq,
+        point,
+        unsafe { (*task).pid },
+        cpu,
+        task_cpu,
+        state,
+        on_cpu,
+        on_rq,
+        se_on_rq,
+        current_pid,
+        current_match,
+        need_resched,
+        rq_running,
+    );
+}
+
+#[cfg(not(test))]
+fn trace_firefox_user_path(pid: i32, nr: u64, ptr: u64) {
+    let mut bytes = [0u8; 192];
+    let copied = unsafe {
+        crate::arch::x86::kernel::uaccess::strncpy_from_user(
+            bytes.as_mut_ptr(),
+            ptr as *const u8,
+            bytes.len(),
+        )
+    };
+    if copied < 0 {
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-firefox-path pid={} nr={} path=<fault:{}>",
+            pid,
+            nr,
+            copied
+        );
+        return;
+    }
+    let len = (copied as usize).min(bytes.len());
+    let path = core::str::from_utf8(&bytes[..len]).unwrap_or("<non-utf8>");
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-firefox-path pid={} nr={} path={}",
+        pid,
+        nr,
+        path
     );
 }
 

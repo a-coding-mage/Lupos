@@ -65,8 +65,8 @@ pub const X86_PF_SHSTK: u64 = 1 << 6;
 // Addresses >= TASK_SIZE_MAX are in kernel space.
 // Ref: arch/x86/include/asm/processor.h — TASK_SIZE_MAX
 const TASK_SIZE_MAX: u64 = 0x0000_8000_0000_0000;
-const SEGV_MAPERR: i32 = 1;
-const SEGV_ACCERR: i32 = 2;
+pub(crate) const SEGV_MAPERR: i32 = 1;
+pub(crate) const SEGV_ACCERR: i32 = 2;
 
 // ---------------------------------------------------------------------------
 // M12 placeholder: current mm_struct pointer.
@@ -678,7 +678,7 @@ unsafe fn write_ptregs_to_exception_frame(
     }
 }
 
-fn deliver_user_sigsegv(
+pub(crate) fn deliver_user_sigsegv(
     frame: &ExceptionFrame,
     task: *mut crate::kernel::task::TaskStruct,
     addr: u64,

@@ -54,12 +54,12 @@ impl WakeQHead {
     pub fn wake_all(&mut self) {
         if !self.first.is_null() {
             unsafe {
-                crate::kernel::sched::wake_task(self.first);
+                crate::kernel::sched::wake_task_normal(self.first);
             }
         }
         for &t in self.extras.iter() {
             unsafe {
-                crate::kernel::sched::wake_task(t);
+                crate::kernel::sched::wake_task_normal(t);
             }
         }
         self.first = core::ptr::null_mut();

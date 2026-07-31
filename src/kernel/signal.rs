@@ -1403,20 +1403,23 @@ unsafe fn wake_signal_task(task: *mut crate::kernel::task::TaskStruct, sig: i32)
     if task.is_null() {
         return;
     }
-    let state = unsafe { (*task).__state.load(core::sync::atomic::Ordering::Acquire) };
     set_tif_sigpending(task);
-    if state & crate::kernel::task::task_state::TASK_INTERRUPTIBLE != 0
-        || state == crate::kernel::task::task_state::TASK_RUNNING
-        || sig == SIGKILL
-    {
-        let woken = unsafe { crate::kernel::sched::wake_task(task) };
-        // Linux signal_wake_up_state() calls kick_process() when TTWU reports
-        // that the task was already running. Force a remote kernel entry so
-        // the published TIF_SIGPENDING is observed promptly.
-        if !woken && crate::kernel::sched::task_on_cpu(task) {
-            let cpu = unsafe { (*task).thread_info.cpu };
-            crate::kernel::sched::request_reschedule(cpu);
-        }
+    let mut state_mask = crate::kernel::task::task_state::TASK_INTERRUPTIBLE;
+    if sig == SIGKILL {
+        // Linux signal_wake_up(t, true) adds TASK_WAKEKILL | __TASK_TRACED
+        // before the common TASK_INTERRUPTIBLE mask.
+        state_mask |= crate::kernel::task::task_state::TASK_WAKEKILL
+            | crate::kernel::task::task_state::__TASK_TRACED;
+    }
+    let woken = unsafe {
+        crate::kernel::sched::wake_task_with_state(task, state_mask, 0)
+    };
+    // Linux signal_wake_up_state() calls kick_process() when TTWU reports
+    // that the task was already running. Force a remote kernel entry so the
+    // published TIF_SIGPENDING is observed promptly.
+    if !woken && crate::kernel::sched::task_on_cpu(task) {
+        let cpu = unsafe { (*task).thread_info.cpu };
+        crate::kernel::sched::request_reschedule(cpu);
     }
 }
 
@@ -1899,9 +1902,11 @@ pub fn queue_posix_timer_signal_noalloc(pid: i32, tgid: i32, sig: i32, timer_id:
                     || state == crate::kernel::task::task_state::TASK_STOPPED
                 {
                     (*target).m26.ptrace_stop_signal = 0;
-                    (*target).__state.store(
-                        crate::kernel::task::task_state::TASK_RUNNING,
-                        core::sync::atomic::Ordering::Release,
+                    set_tif_sigpending(target);
+                    let _ = crate::kernel::sched::wake_task_with_state(
+                        target,
+                        crate::kernel::task::task_state::__TASK_STOPPED,
+                        0,
                     );
                 }
             }
@@ -2026,7 +2031,11 @@ pub(crate) fn send_signal_info_to_process_for_target(
                 // fatal signal bash queues before SIGCONT on a stopped job
                 // (`kill %1`) is never delivered — the job stays "Stopped".
                 set_tif_sigpending(target);
-                let _ = crate::kernel::sched::wake_task(target);
+                let _ = crate::kernel::sched::wake_task_with_state(
+                    target,
+                    crate::kernel::task::task_state::__TASK_STOPPED,
+                    0,
+                );
             }
         }
     }
@@ -2193,7 +2202,11 @@ unsafe fn send_signal_to_task_scoped(
                 // try_to_wake_up() so the task is re-enqueued and rechecks
                 // its pending set (see send_signal_info_to_process_for_target).
                 set_tif_sigpending(target);
-                let _ = crate::kernel::sched::wake_task(target);
+                let _ = crate::kernel::sched::wake_task_with_state(
+                    target,
+                    crate::kernel::task::task_state::__TASK_STOPPED,
+                    0,
+                );
             }
         }
     }

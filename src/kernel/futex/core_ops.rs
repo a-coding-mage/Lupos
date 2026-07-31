@@ -968,7 +968,9 @@ pub unsafe fn futex_wake(uaddr: u64, nr: i32, bitset: u32, private: bool) -> i64
     drop(b);
     for task in wake_tasks {
         unsafe {
-            crate::kernel::sched::wake_task(task);
+            // Linux futex_wake() drains a wake_q, and wake_up_q() calls
+            // wake_up_process(), which is try_to_wake_up(TASK_NORMAL).
+            crate::kernel::sched::wake_task_normal(task);
         }
     }
     woken
@@ -1065,7 +1067,9 @@ pub unsafe fn futex_requeue(
 
     for task in wake_tasks {
         unsafe {
-            crate::kernel::sched::wake_task(task);
+            // Plain requeue wakeups use the same Linux wake_up_q() path as
+            // futex_wake(); stopped/traced tasks must remain stopped/traced.
+            crate::kernel::sched::wake_task_normal(task);
         }
     }
 
@@ -1207,7 +1211,8 @@ pub unsafe fn futex_requeue_pi_checked(
     }
     if !wake_task.is_null() {
         unsafe {
-            crate::kernel::sched::wake_task(wake_task);
+            // Linux requeue_pi_wake_futex() uses wake_up_state(TASK_NORMAL).
+            crate::kernel::sched::wake_task_normal(wake_task);
         }
     }
     selected_count
@@ -1250,7 +1255,7 @@ pub unsafe fn futex_pi_wake_next(uaddr: u64, private: bool) -> bool {
     }
     if !wake_task.is_null() {
         unsafe {
-            crate::kernel::sched::wake_task(wake_task);
+            crate::kernel::sched::wake_task_normal(wake_task);
         }
     }
     true
@@ -1665,6 +1670,58 @@ mod tests {
                 )
             };
             assert_eq!(woken, 0);
+            _flush_for_tests();
+        });
+    }
+
+    #[test]
+    fn normal_futex_wake_does_not_resume_stopped_task() {
+        // test-origin: linux:vendor/linux/kernel/futex/waitwake.c:futex_wake
+        // and vendor/linux/kernel/sched/core.c:wake_up_process
+        _with_test_lock(|| {
+            _flush_for_tests();
+            with_test_current(31_010, |_current| {
+                let futex_word = AtomicU32::new(0);
+                let mut waiter = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+                waiter.pid = 31_011;
+                waiter.tgid = 31_011;
+                waiter.m29.sched_class = &sched::fair::FAIR_SCHED_CLASS;
+                waiter.__state.store(
+                    crate::kernel::task::task_state::TASK_STOPPED,
+                    Ordering::Release,
+                );
+                let waiter_ptr = &mut *waiter as *mut TaskStruct;
+                let uaddr = &futex_word as *const AtomicU32 as u64;
+                let mm_id = mm_for(true);
+                let bucket_idx = hash_key(mm_id, uaddr);
+                BUCKETS[bucket_idx].lock().waiters.push(FutexQ {
+                    uaddr,
+                    mm_id,
+                    bitset: super::super::FUTEX_BITSET_MATCH_ANY,
+                    task: waiter_ptr,
+                    task_pid: waiter.pid,
+                    waitv_id: 0,
+                    waitv_index: 0,
+                    requeue_pi: false,
+                    awoken: false,
+                });
+
+                let woken = unsafe {
+                    futex_wake(
+                        uaddr,
+                        1,
+                        super::super::FUTEX_BITSET_MATCH_ANY,
+                        true,
+                    )
+                };
+
+                assert_eq!(woken, 1);
+                assert_eq!(
+                    waiter.__state.load(Ordering::Acquire),
+                    crate::kernel::task::task_state::TASK_STOPPED,
+                    "normal futex wake must not resume a stopped task"
+                );
+            });
             _flush_for_tests();
         });
     }
