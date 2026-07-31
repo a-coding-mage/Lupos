@@ -1410,7 +1410,7 @@ unsafe fn change_task_scheduler(
     next_class: *const class::SchedClass,
     new_prio: i32,
     mut apply_fields: impl FnMut(*mut TaskStruct),
-) {
+) -> bool {
     loop {
         // Linux task_rq_lock() serializes scheduler-parameter changes with
         // wakeups and priority inheritance by taking p->pi_lock before the
@@ -1436,7 +1436,7 @@ unsafe fn change_task_scheduler(
             let previous_class = (*p).m29.sched_class;
             if previous_class.is_null() {
                 apply_fields(p);
-                return Some(false);
+                return Some(Ok(false));
             }
 
             let class_changed = previous_class != next_class;
@@ -1456,7 +1456,17 @@ unsafe fn change_task_scheduler(
                 dequeue_flags |= class::DEQUEUE_CLASS;
             }
             if queued && let Some(dequeue) = (*previous_class).dequeue_task {
-                debug_assert!(dequeue(rq, p, dequeue_flags));
+                let dequeued = dequeue(rq, p, dequeue_flags);
+                if !dequeued {
+                    // Linux's class transaction cannot continue after a
+                    // non-sleep dequeue failure: doing so changes
+                    // p->sched_class while the old class may still own an
+                    // intrusive entity.  The Linux implementation treats
+                    // this as impossible; Lupos' ownership-checked CFS tree
+                    // can detect the mismatch, so preserve the old class and
+                    // let the caller retry rather than corrupting both queues.
+                    return Some(Err(()));
+                }
             }
             if running && let Some(put_prev) = (*previous_class).put_prev_task {
                 put_prev(rq, p);
@@ -1492,16 +1502,16 @@ unsafe fn change_task_scheduler(
                 prio_changed(rq, p, old_prio);
             }
 
-            Some(
+            Some(Ok(
                 !already_rescheduled && !resched_task.is_null() && task_needs_resched(resched_task),
-            )
+            ))
         });
 
         match result {
-            Some(Some(newly_rescheduled)) => {
+            Some(Some(Ok(newly_rescheduled))) => {
                 crate::kernel::locking::RawSpinLock::unlock_irqrestore(pi_guard, pi_flags);
                 send_reschedule_ipi_for_transition(cpu, newly_rescheduled);
-                return;
+                return true;
             }
             Some(None) => {
                 crate::kernel::locking::RawSpinLock::unlock_irqrestore(pi_guard, pi_flags);
@@ -1518,12 +1528,16 @@ unsafe fn change_task_scheduler(
                 core::hint::spin_loop();
                 continue;
             }
+            Some(Some(Err(()))) => {
+                crate::kernel::locking::RawSpinLock::unlock_irqrestore(pi_guard, pi_flags);
+                return false;
+            }
             None => {
                 // Early single-CPU initialization has no class runqueue yet.
                 // Such a task cannot be queued in a class-specific structure.
                 apply_fields(p);
                 crate::kernel::locking::RawSpinLock::unlock_irqrestore(pi_guard, pi_flags);
-                return;
+                return true;
             }
         }
     }
@@ -1560,7 +1574,7 @@ pub unsafe fn rt_mutex_setprio(p: *mut TaskStruct, pi_task: *mut TaskStruct) {
     };
 
     unsafe {
-        change_task_scheduler(p, next_class, new_prio, |task| {
+        let _ = change_task_scheduler(p, next_class, new_prio, |task| {
             (*task).m29.sched_class = next_class;
             (*task).m29.prio = new_prio;
         });

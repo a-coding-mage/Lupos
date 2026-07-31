@@ -14,7 +14,7 @@ use core::sync::atomic::Ordering;
 use crate::kernel::task::TaskStruct;
 
 use super::class::{
-    CLASS_PRIO_RT, DEQUEUE_MIGRATING, DEQUEUE_SLEEP, ENQUEUE_HEAD, SchedClass,
+    CLASS_PRIO_RT, DEQUEUE_CLASS, DEQUEUE_MIGRATING, DEQUEUE_SLEEP, ENQUEUE_HEAD, SchedClass,
     TASK_ON_RQ_MIGRATING, TASK_ON_RQ_QUEUED,
 };
 use super::prio::{MAX_RT_PRIO, SCHED_FIFO, SCHED_RR};
@@ -76,15 +76,24 @@ unsafe fn dequeue_task_rt(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool {
     if p.is_null() {
         return false;
     }
+    // Linux's sched_rt_entity is independent of fair's sched_entity. A stale
+    // fair entity means the previous class transaction did not detach its
+    // intrusive node, so do not remove the RT entity and switch classes on
+    // top of that inconsistent state.
+    if flags & DEQUEUE_CLASS != 0 && unsafe { (*p).m29.se.on_rq != 0 } {
+        return false;
+    }
     let prio = unsafe { (*p).m29.prio };
     let removed = rq.rt.dequeue(p, prio);
     if removed {
         unsafe {
-            (*p).m29.on_rq = if flags & DEQUEUE_MIGRATING != 0 {
-                TASK_ON_RQ_MIGRATING
-            } else {
-                0
-            };
+            if flags & DEQUEUE_CLASS == 0 {
+                (*p).m29.on_rq = if flags & DEQUEUE_MIGRATING != 0 {
+                    TASK_ON_RQ_MIGRATING
+                } else {
+                    0
+                };
+            }
             (*p).m29.rt.on_rq = 0;
             (*p).m29.rt.on_list = 0;
         }

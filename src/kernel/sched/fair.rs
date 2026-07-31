@@ -17,8 +17,9 @@
 //! ```
 
 use super::class::{
-    CLASS_PRIO_FAIR, DEQUEUE_MIGRATING, DEQUEUE_SLEEP, ENQUEUE_HEAD, ENQUEUE_INITIAL,
-    ENQUEUE_MIGRATED, ENQUEUE_WAKEUP, SchedClass, TASK_ON_RQ_MIGRATING, TASK_ON_RQ_QUEUED,
+    CLASS_PRIO_FAIR, DEQUEUE_CLASS, DEQUEUE_MIGRATING, DEQUEUE_SLEEP, ENQUEUE_CLASS, ENQUEUE_HEAD,
+    ENQUEUE_INITIAL, ENQUEUE_MIGRATED, ENQUEUE_WAKEUP, SchedClass, TASK_ON_RQ_MIGRATING,
+    TASK_ON_RQ_QUEUED,
 };
 use super::entity::{SchedEntity, sched_clock_ns};
 use super::prio::calc_delta_fair;
@@ -159,8 +160,11 @@ unsafe fn enqueue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) {
         // Accept that one state for ENQUEUE_MIGRATED; every other nonzero
         // value still means this entity is already queued.
         let migrating = (*m).on_rq == TASK_ON_RQ_MIGRATING && flags & ENQUEUE_MIGRATED != 0;
-        if (*se).on_rq != 0 || ((*m).on_rq != 0 && !migrating) {
-            debug_assert_eq!((*se).on_rq != 0, (*m).on_rq != 0);
+        let class_change = flags & ENQUEUE_CLASS != 0;
+        if (*se).on_rq != 0 || ((*m).on_rq != 0 && !migrating && !class_change) {
+            if !class_change {
+                debug_assert_eq!((*se).on_rq != 0, (*m).on_rq != 0);
+            }
             return;
         }
         if rq.cfs.entity_node_linked(p) {
@@ -214,9 +218,15 @@ unsafe fn dequeue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool
         // both task_rq(p) and rq->curr to agree prevents a stale current
         // cache from clearing a task whose intrusive node belongs to another
         // CPU's timeline.
+        let node_linked = rq.cfs.entity_node_linked(p);
         let current_on_this_rq = rq.cfs.current == p
             && rq.current == p
-            && (*p).thread_info.cpu == rq.cpu;
+            && (*p).thread_info.cpu == rq.cpu
+            // `contains_task()` is local to this rq.  A node linked into a
+            // different CFS tree must not enter Linux's current-entity fast
+            // path merely because a stale local current cache and task_cpu()
+            // happen to agree.
+            && !node_linked;
         let removed = if current_on_this_rq && !in_timeline {
             // Linux dequeue_entities() succeeds for the currently running
             // entity, which is intentionally not present in the rb-tree.
@@ -232,11 +242,18 @@ unsafe fn dequeue_task_fair(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool
             return false;
         }
         (*se).on_rq = 0;
-        (*m).on_rq = if flags & DEQUEUE_MIGRATING != 0 {
-            TASK_ON_RQ_MIGRATING
-        } else {
-            0
-        };
+        // Linux's generic deactivate_task()/block_task() owns task_struct's
+        // on_rq. sched_change_begin() calls only this class hook, so a class
+        // change must leave the queued token set until the new class is
+        // enqueued. Migration similarly keeps TASK_ON_RQ_MIGRATING until the
+        // destination activate_task() completes.
+        if flags & DEQUEUE_CLASS == 0 {
+            (*m).on_rq = if flags & DEQUEUE_MIGRATING != 0 {
+                TASK_ON_RQ_MIGRATING
+            } else {
+                0
+            };
+        }
         rq.cfs.load_weight = rq.cfs.load_weight.saturating_sub((*se).load.weight);
     }
     rq.cfs.nr_running = rq.cfs.nr_running.saturating_sub(1);
@@ -691,6 +708,43 @@ mod tests {
         // run_node.  The pre-fix fast path treated this as a successful
         // dequeue and cleared both membership flags.
         wrong_rq.cfs.current = ptr;
+        let dequeued = unsafe { dequeue_task_fair(&mut wrong_rq, ptr, DEQUEUE_SLEEP) };
+
+        assert!(!dequeued);
+        assert_eq!(task.m29.se.on_rq, 1);
+        assert_eq!(task.m29.on_rq, TASK_ON_RQ_QUEUED);
+        assert_eq!(owner.cfs.nr_running, 1);
+        assert_eq!(owner.nr_running, 1);
+        assert_eq!(owner.cfs.tasks_timeline.first(), ptr);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/fair.c:dequeue_entities
+    /// and vendor/linux/kernel/sched/core.c:task_rq
+    ///
+    /// A migration can publish `task_cpu(p)` before a stale current cache is
+    /// repaired.  If the task's embedded node is still owned by another CFS
+    /// runqueue, the local current fast path must not treat it as a running
+    /// entity and clear the task-level `on_rq` token.
+    #[test]
+    fn dequeue_current_fast_path_rejects_a_linked_node_on_another_rq() {
+        let mut owner = Rq::new(1);
+        let mut wrong_rq = Rq::new(0);
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let ptr = &mut *task as *mut TaskStruct;
+        task.thread_info.cpu = wrong_rq.cpu;
+        task.m29.static_prio = DEFAULT_PRIO;
+        task.m29.sched_class = &FAIR_SCHED_CLASS as *const SchedClass;
+        task.m29.se.load.weight = NICE_0_LOAD;
+        task.m29.se.on_rq = 1;
+        task.m29.on_rq = TASK_ON_RQ_QUEUED;
+
+        assert!(owner.cfs.insert(ptr, task.m29.se.vruntime));
+        owner.cfs.nr_running = 1;
+        owner.cfs.load_weight = NICE_0_LOAD;
+        owner.nr_running = 1;
+        wrong_rq.current = ptr;
+        wrong_rq.cfs.current = ptr;
+
         let dequeued = unsafe { dequeue_task_fair(&mut wrong_rq, ptr, DEQUEUE_SLEEP) };
 
         assert!(!dequeued);
