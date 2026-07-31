@@ -54,6 +54,10 @@ pub const EINVAL: i32 = 22;
 pub const EPERM: i32 = 1;
 pub const ESRCH: i32 = 3;
 pub const E2BIG: i32 = 7;
+/// Internal scheduler queue ownership changed while a policy transaction was
+/// being prepared. Linux treats this as unreachable; Lupos returns the
+/// retryable error instead of changing class with a live old-class entity.
+pub const EAGAIN: i32 = 11;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -147,12 +151,12 @@ pub unsafe fn sys_sched_setattr(p: *mut TaskStruct, attr: &SchedAttr) -> i32 {
 
     let next_class = class_for_policy(policy).unwrap() as *const SchedClass;
     let new_prio = effective_prio(policy, attr.sched_priority, attr.sched_nice);
-    unsafe {
+    let changed = unsafe {
         super::change_task_scheduler(p, next_class, new_prio, |task| {
             apply_sched_attr_fields(task, attr, policy, next_class, new_prio);
-        });
-    }
-    0
+        })
+    };
+    if changed { 0 } else { -EAGAIN }
 }
 
 /// Read the current sched_attr of a task into `out`.
@@ -409,6 +413,82 @@ mod tests {
             assert_eq!(rq.nr_running, 1);
         })
         .expect("test runqueue exists");
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:sched_change_begin
+    /// and vendor/linux/kernel/sched/fair.c:dequeue_task_fair
+    ///
+    /// Linux never publishes a new scheduler class when the old class cannot
+    /// detach its entity from the runqueue selected by task_rq().  The local
+    /// ownership-checked CFS tree exposes that otherwise-unreachable failure;
+    /// return a retryable error and leave both the class and intrusive node
+    /// unchanged rather than switching an entity still owned by another rq.
+    #[test]
+    fn policy_change_rejects_a_cfs_node_owned_by_another_rq() {
+        const WRONG_CPU: u32 = (super::super::MAX_CPUS - 2) as u32;
+        const OWNER_CPU: u32 = (super::super::MAX_CPUS - 1) as u32;
+
+        struct ResetRunqueues([u32; 2]);
+        impl Drop for ResetRunqueues {
+            fn drop(&mut self) {
+                for &cpu in &self.0 {
+                    let _ = super::super::rq::with_rq(cpu, |rq| {
+                        *rq = super::super::rq::Rq::new(cpu);
+                    });
+                }
+            }
+        }
+
+        super::super::rq::init_rqs();
+        for &cpu in &[WRONG_CPU, OWNER_CPU] {
+            super::super::rq::with_rq(cpu, |rq| {
+                *rq = super::super::rq::Rq::new(cpu);
+            })
+            .expect("test runqueue exists");
+        }
+        let _reset_runqueues = ResetRunqueues([WRONG_CPU, OWNER_CPU]);
+
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        let task_ptr = &mut *task as *mut TaskStruct;
+        task.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        task.m29.sched_class = &FAIR_SCHED_CLASS;
+        task.m29.policy = SCHED_NORMAL;
+        task.m29.cpus_mask = super::super::entity::CpuMask::one(WRONG_CPU);
+        task.m29.cpus_ptr = &task.m29.cpus_mask;
+        task.m29.nr_cpus_allowed = 1;
+        task.thread_info.cpu = WRONG_CPU;
+        task.m29.se.load.weight = super::super::prio::NICE_0_LOAD;
+        task.m29.se.on_rq = 1;
+        task.m29.on_rq = super::super::class::TASK_ON_RQ_QUEUED;
+
+        super::super::rq::with_rq(OWNER_CPU, |rq| unsafe {
+            assert!(rq.cfs.insert(task_ptr, (*task_ptr).m29.se.vruntime));
+            rq.cfs.nr_running = 1;
+            rq.cfs.load_weight = super::super::prio::NICE_0_LOAD;
+            rq.nr_running = 1;
+        })
+        .expect("owner runqueue exists");
+
+        let attr = SchedAttr {
+            size: SCHED_ATTR_SIZE_VER1,
+            sched_policy: SCHED_FIFO,
+            sched_priority: 88,
+            ..SchedAttr::default()
+        };
+        assert_eq!(unsafe { sys_sched_setattr(task_ptr, &attr) }, -EAGAIN);
+        assert_eq!(task.m29.policy, SCHED_NORMAL);
+        assert!(core::ptr::eq(
+            task.m29.sched_class,
+            &FAIR_SCHED_CLASS as *const SchedClass
+        ));
+        assert_eq!(task.m29.se.on_rq, 1);
+        assert_eq!(task.m29.on_rq, super::super::class::TASK_ON_RQ_QUEUED);
+        super::super::rq::with_rq(OWNER_CPU, |rq| {
+            assert_eq!(rq.cfs.nr_running, 1);
+            assert_eq!(rq.nr_running, 1);
+            assert_eq!(rq.cfs.tasks_timeline.first(), task_ptr);
+        })
+        .expect("owner runqueue exists");
     }
 
     /// test-origin: linux:vendor/linux/kernel/sched/core.c:sched_change_begin

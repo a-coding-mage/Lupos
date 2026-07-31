@@ -1665,6 +1665,14 @@ pub fn sendmsg_with_fds_meta_cred(
         drop_file_refs(fds);
         return Err(disconnected);
     }
+    // Linux `unix_stream_sendmsg()` only allocates and queues an skb inside
+    // its `while (sent < len)` loop. An ordinary zero-byte stream send
+    // therefore returns zero without creating a readable empty chunk. Keep
+    // zero-byte SCM_RIGHTS messages on the queue: they carry observable
+    // ancillary data and are handled by the existing stream receive path.
+    if sock_type == SOCK_STREAM && bytes.is_empty() && fds.is_empty() {
+        return Ok(0);
+    }
     if let Some(peer_socket) = peer_socket {
         {
             let mut target = peer_socket.lock();
@@ -7395,6 +7403,23 @@ mod tests {
         for file in fds {
             fput(file);
         }
+    }
+
+    /// test-origin: linux:vendor/linux/net/unix/af_unix.c:unix_stream_sendmsg
+    ///
+    /// Linux does not create a receive-queue skb for an ordinary zero-byte
+    /// stream send: its enqueue loop is guarded by `sent < len`.  A zero-byte
+    /// queue entry makes `unix_poll()` report EPOLLIN even though the next
+    /// stream receive has no data, which is an observable busy-loop and
+    /// readiness/receive mismatch for X11 clients.
+    #[test]
+    fn unix_stream_zero_length_send_does_not_make_peer_readable() {
+        let (left, right) = socketpair(AF_UNIX, SOCK_STREAM, 0).unwrap();
+
+        assert_eq!(sendmsg(&left, b""), Ok(0));
+        assert!(!socket_recv_ready_locked(&right.lock()));
+        let mut out = [0u8; 1];
+        assert_eq!(recvmsg(&right, &mut out), Err(EAGAIN));
     }
 
     #[test]

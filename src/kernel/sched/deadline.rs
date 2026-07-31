@@ -18,7 +18,7 @@ use core::sync::atomic::Ordering;
 use crate::kernel::task::TaskStruct;
 
 use super::class::{
-    CLASS_PRIO_DL, DEQUEUE_MIGRATING, DEQUEUE_SLEEP, ENQUEUE_WAKEUP, SchedClass,
+    CLASS_PRIO_DL, DEQUEUE_CLASS, DEQUEUE_MIGRATING, DEQUEUE_SLEEP, ENQUEUE_WAKEUP, SchedClass,
     TASK_ON_RQ_MIGRATING, TASK_ON_RQ_QUEUED,
 };
 use super::entity::sched_clock_ns;
@@ -77,6 +77,9 @@ unsafe fn dequeue_task_dl(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool {
     if p.is_null() {
         return false;
     }
+    if flags & DEQUEUE_CLASS != 0 && unsafe { (*p).m29.se.on_rq != 0 } {
+        return false;
+    }
     unsafe {
         let dl = (*p).m29.dl.deadline;
         rq.dl.remove(p, dl);
@@ -84,11 +87,13 @@ unsafe fn dequeue_task_dl(rq: &mut Rq, p: *mut TaskStruct, flags: u32) -> bool {
             .dl
             .running_bw
             .saturating_sub(to_ratio((*p).m29.dl.dl_runtime, (*p).m29.dl.dl_period));
-        (*p).m29.on_rq = if flags & DEQUEUE_MIGRATING != 0 {
-            TASK_ON_RQ_MIGRATING
-        } else {
-            0
-        };
+        if flags & DEQUEUE_CLASS == 0 {
+            (*p).m29.on_rq = if flags & DEQUEUE_MIGRATING != 0 {
+                TASK_ON_RQ_MIGRATING
+            } else {
+                0
+            };
+        }
     }
     rq.dl.nr_running = rq.dl.nr_running.saturating_sub(1);
     rq.nr_running = rq.nr_running.saturating_sub(1);

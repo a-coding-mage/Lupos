@@ -731,10 +731,12 @@ impl core::ops::DerefMut for SignalTableGuard<'_> {
 
 impl Drop for SignalTableGuard<'_> {
     fn drop(&mut self) {
-        // The protected state must be unlocked before the saved IF bit is
-        // restored, matching spin_unlock_irqrestore().
-        drop(self.guard.take());
-        crate::kernel::locking::local_irq_restore(self.flags);
+        // Linux spin_unlock_irqrestore() releases the lock, restores the
+        // saved IRQ state, and only then enables preemption.  Do not let the
+        // SpinGuard Drop implementation reorder those operations.
+        if let Some(guard) = self.guard.take() {
+            crate::kernel::locking::SpinLock::unlock_irqrestore(guard, self.flags);
+        }
     }
 }
 
@@ -3970,6 +3972,46 @@ mod tests {
             .next()
             .expect("clone inheritance body");
         assert!(!clone_body.contains(".cloned()"));
+    }
+
+    #[test]
+    fn signal_table_guard_matches_linux_irqrestore_unlock_order() {
+        // test-origin: linux:vendor/linux/include/linux/spinlock_api_smp.h
+        // Linux's irqsave guard restores IF before enabling preemption.  The
+        // signal-table wrapper must call the parity primitive directly rather
+        // than allowing SpinGuard::drop to reorder those operations.
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/include/linux/spinlock_api_smp.h"
+        ));
+        let linux_unlock = linux
+            .split("static inline void __raw_spin_unlock_irqrestore")
+            .nth(1)
+            .expect("Linux irqrestore helper");
+        assert!(
+            linux_unlock.find("do_raw_spin_unlock").unwrap()
+                < linux_unlock.find("local_irq_restore").unwrap()
+        );
+        assert!(
+            linux_unlock.find("local_irq_restore").unwrap()
+                < linux_unlock.find("preempt_enable").unwrap()
+        );
+
+        let local = include_str!("signal.rs");
+        let local_drop = local
+            .split("impl Drop for SignalTableGuard")
+            .nth(1)
+            .and_then(|body| body.split("static SIGNAL_TABLE").next())
+            .expect("signal-table guard drop implementation");
+        assert!(local_drop.contains("SpinLock::unlock_irqrestore"));
+        assert!(!local_drop.contains("drop(self.guard.take())"));
+
+        let lock = SignalTableLock::new(SignalTable { states: Vec::new() });
+        {
+            let mut guard = lock.lock();
+            guard.states.push(SignalState::new(31_171, 31_171));
+        }
+        assert_eq!(lock.lock().states.len(), 1);
     }
 
     fn syscall_restart_regs(errno: i32) -> crate::kernel::task::PtRegs {
