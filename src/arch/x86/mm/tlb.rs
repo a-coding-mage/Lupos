@@ -369,10 +369,55 @@ fn queue_tlb_call(source: usize, target: usize, mm: *mut MmStruct, start: u64, e
     slot.state.store(TLB_CALL_QUEUED, Ordering::Release);
 }
 
+/// Spin iterations tolerated before a pending call slot is treated as stalled.
+///
+/// A serviced shootdown acknowledges within microseconds, so this threshold is
+/// several orders of magnitude above the normal completion time while still
+/// being short enough to recover the machine rather than wedge it.
+const TLB_CALL_STALL_SPINS: u64 = 1 << 23;
+
+/// Maximum number of stall reports emitted for one waiting CPU pair.
+///
+/// The resend itself is unbounded; only the logging is capped so a genuinely
+/// unresponsive target cannot flood the console from a lock-holding spin.
+const TLB_CALL_STALL_REPORTS: u64 = 4;
+
 fn wait_tlb_call(source: usize, target: usize) {
     let slot = &TLB_CALL_SLOTS[source.min(MAX_CPUS - 1)][target.min(MAX_CPUS - 1)];
+    let mut spins: u64 = 0;
+    let mut resends: u64 = 0;
     while slot.state.load(Ordering::Acquire) != TLB_CALL_IDLE {
         core::hint::spin_loop();
+        spins += 1;
+        if spins % TLB_CALL_STALL_SPINS != 0 {
+            continue;
+        }
+        // Linux's `csd_lock_wait_toolong()` reports an unresponsive
+        // call-function target and re-sends its IPI rather than spinning
+        // forever. A dropped TLB shootdown IPI is otherwise unrecoverable:
+        // this CPU holds the page-table lock the target is waiting for.
+        resends += 1;
+        if resends <= TLB_CALL_STALL_REPORTS {
+            crate::kernel::printk::log_warn!(
+                "tlb",
+                "tlb: shootdown stall source={} target={} state={} spins={} resend={}",
+                source,
+                target,
+                slot.state.load(Ordering::Relaxed),
+                spins,
+                resends,
+            );
+        }
+        let _ = unsafe { send_shootdown_ipi(target as u32) };
+    }
+    if resends != 0 {
+        crate::kernel::printk::log_warn!(
+            "tlb",
+            "tlb: shootdown stall cleared source={} target={} resends={}",
+            source,
+            target,
+            resends,
+        );
     }
 }
 

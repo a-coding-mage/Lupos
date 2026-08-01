@@ -16,7 +16,10 @@ use crate::include::uapi::errno::EINVAL;
 use crate::mm::oom::{OOM_SCORE_ADJ_MAX, OOM_SCORE_ADJ_MIN};
 use crate::{
     kernel::task::TaskStruct,
-    kernel::task::task_state::{EXIT_DEAD, EXIT_ZOMBIE},
+    kernel::task::task_state::{
+        EXIT_DEAD, EXIT_ZOMBIE, TASK_INTERRUPTIBLE, TASK_NOLOAD, TASK_PARKED, TASK_RUNNING,
+        TASK_UNINTERRUPTIBLE, __TASK_STOPPED, __TASK_TRACED,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,26 +160,74 @@ fn task_tty_stat(pid: i32) -> (i32, i32) {
     }
 }
 
-fn task_state_char(task: *mut TaskStruct) -> char {
-    if task.is_null() {
-        return 'R';
+/// Linux `include/linux/sched.h:TASK_REPORT`.
+const TASK_REPORT: u32 = TASK_RUNNING
+    | TASK_INTERRUPTIBLE
+    | TASK_UNINTERRUPTIBLE
+    | __TASK_STOPPED
+    | __TASK_TRACED
+    | EXIT_DEAD
+    | EXIT_ZOMBIE
+    | TASK_PARKED;
+
+/// Linux `include/linux/sched.h:TASK_REPORT_IDLE`.
+const TASK_REPORT_IDLE: u32 = TASK_REPORT + 1;
+
+/// Linux `include/linux/sched.h:TASK_IDLE`.
+const TASK_IDLE: u32 = TASK_UNINTERRUPTIBLE | TASK_NOLOAD;
+
+/// Linux `fs/proc/array.c:task_state_array`.
+const TASK_STATE_ARRAY: [&str; 9] = [
+    "R (running)",
+    "S (sleeping)",
+    "D (disk sleep)",
+    "T (stopped)",
+    "t (tracing stop)",
+    "X (dead)",
+    "Z (zombie)",
+    "P (parked)",
+    "I (idle)",
+];
+
+/// Linux `include/linux/sched.h:task_index_to_char()`.
+const TASK_STATE_CHARS: [u8; 9] = *b"RSDTtXZPI";
+
+/// Linux `include/linux/sched.h:__task_state_index()`.
+///
+/// `fls()` on the `TASK_REPORT`-masked state selects the reporting slot;
+/// `TASK_RUNNING` is zero, so `fls(0) == 0` yields the running entry.
+///
+/// Lupos has no `TASK_RTLOCK_WAIT` or `TASK_FROZEN` state yet. Linux folds
+/// both into `TASK_UNINTERRUPTIBLE` here; once those states exist they must be
+/// added to this function rather than to the callers.
+fn task_state_index(tsk_state: u32, tsk_exit_state: u32) -> usize {
+    let mut state = (tsk_state | tsk_exit_state) & TASK_REPORT;
+    if tsk_state & TASK_IDLE == TASK_IDLE {
+        state = TASK_REPORT_IDLE;
     }
-    let exit_state = unsafe {
-        (*task).m26.exit_state | (*task).__state.load(core::sync::atomic::Ordering::Acquire)
-    };
-    if exit_state & (EXIT_ZOMBIE | EXIT_DEAD) != 0 {
-        'Z'
-    } else {
-        'R'
-    }
+    // fls(): 1-based index of the most significant set bit, 0 when no bit set.
+    (u32::BITS - state.leading_zeros()) as usize
 }
 
-fn task_state_text(task: *mut TaskStruct) -> &'static str {
-    if task_state_char(task) == 'Z' {
-        "Z (zombie)"
-    } else {
-        "R (running)"
+fn task_report_index(task: *mut TaskStruct) -> usize {
+    if task.is_null() {
+        return 0;
     }
+    let (state, exit_state) = unsafe {
+        (
+            (*task).__state.load(core::sync::atomic::Ordering::Acquire),
+            (*task).m26.exit_state,
+        )
+    };
+    task_state_index(state, exit_state).min(TASK_STATE_ARRAY.len() - 1)
+}
+
+pub(super) fn task_state_char(task: *mut TaskStruct) -> char {
+    TASK_STATE_CHARS[task_report_index(task)] as char
+}
+
+pub(super) fn task_state_text(task: *mut TaskStruct) -> &'static str {
+    TASK_STATE_ARRAY[task_report_index(task)]
 }
 
 pub fn self_comm_show(_node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {

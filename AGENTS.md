@@ -14,6 +14,13 @@
 - Before editing a kernel file, locate and read its `vendor/linux` equivalent.
   After editing it, compare the relevant control flow, constants, layouts,
   errors, ordering, locking, and side effects again.
+- **Port Linux's implementation; never design a replacement.** If Linux solves
+  the problem, the only acceptable implementation is a translation of Linux's
+  data structures and algorithm. "Write it from scratch in Rust because it is
+  simpler/easier/bounded" is not permitted, even when the result passes tests.
+  Matching observable behavior is not sufficient — the mechanism must match too,
+  because Linux's mechanism is what carries its performance and its
+  memory/stack/latency guarantees. See "Fall back to Linux by default" below.
 - Always report the truth. Never claim parity, a passing test, a benchmark
   result, or a root cause without evidence.
 - Agents must not create branches or commit code without explicit approval.
@@ -21,6 +28,66 @@
   independent areas to focused sub-agents and evaluate their work as it
   arrives. Sub-agents must not run builds; the main agent owns all builds,
   integration, and final validation.
+
+## Fall back to Linux by default
+
+Lupos exists to be Linux, not to be an alternative kernel that behaves like it.
+Whenever you are about to write a mechanism, stop and find Linux's first.
+
+### The rule
+
+1. Before writing any new mechanism, locate the `vendor/linux` equivalent and
+   name it in a comment (`Ref:` / `linux-source:`). If you cannot find one, say
+   so explicitly in the code and the handoff — do not silently invent.
+2. Port Linux's **data structure and algorithm**, not just its outward
+   behavior. `llist`, `list_head`, `rbtree`, `xarray`, `radix tree`, per-CPU
+   areas, RCU-protected lists, and refcounts are part of the contract.
+3. Prefer the Linux code path even when it looks like overkill for Lupos's
+   current scale. Linux's structures are what make its costs bounded; a
+   "simpler" substitute usually moves the cost somewhere invisible.
+4. A Lupos-specific design requires **all** of: a documented reason a faithful
+   translation is impossible, evidence of equivalent behavior, and a
+   `linux-deviation:` marker in the file header naming the Linux function it
+   replaces. Convenience, "Rust is different", and "we only support N CPUs" are
+   not reasons.
+5. When you find an existing Lupos-specific substitute while working nearby,
+   report it as a finding even if it is not your bug.
+
+### Known-bad substitution patterns
+
+These have each caused a real, expensive Lupos defect. Treat them as defects on
+sight:
+
+- **Fixed-size arrays replacing Linux's intrusive lists.** Linux moves lists by
+  pointer in O(1); a fixed array forces an O(n) copy, and a by-value move of a
+  large array allocates a stack temporary of that size. The release kernel
+  stack is Linux's x86-64 `THREAD_SIZE` (16 KiB, `KTHREAD_STACK_ORDER = 2`), so
+  an 8 KiB temporary is half the stack. This is exactly how
+  `begin_task_struct_rcu_release()`'s `core::ptr::swap` on
+  `[*mut TaskStruct; 1024]` produced a `#DF` that then wedged every other CPU
+  in the TLB shootdown wait. Linux's `rcu_do_batch()` moves the callback list
+  by pointer (`rcu_cblist_flush_enqueue()`).
+- **`ptr::swap` / `mem::swap` / `mem::replace` / by-value assignment of large
+  arrays or large structs.** Every one allocates a full-size stack temporary.
+  Budget against 16 KiB, not against what fits.
+- **Static `MAX_*` matrices replacing Linux's dynamic per-CPU queues.** The TLB
+  shootdown `[source][target]` slot matrix replaces
+  `smp_call_function_many_cond()`'s per-CPU `llist` and loses its
+  empty-to-non-empty IPI arming and whole-queue `llist_del_all()` drain.
+- **Polling where Linux is interrupt-driven.** Any idle-loop pump that exists
+  because a driver "has no IRQ path yet" is a latency bug with a deadline, not
+  a design.
+- **Reporting a constant where Linux computes a value.** `/proc` fields that
+  return a fixed answer (for example a hardcoded `R (running)` task state) do
+  not merely lose information — they actively mislead every later
+  investigation.
+
+### Stub and constant audit
+
+A field, file, or syscall that returns a fixed value is a parity gap even when
+nothing currently fails. When you touch such code, either implement Linux's
+computation or record it in the handoff with the Linux function it should call.
+Never let a stub be mistaken for working behavior in a report.
 
 ## Required investigation workflow
 

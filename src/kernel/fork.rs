@@ -782,16 +782,23 @@ static TASK_STRUCT_RCU_BATCHES: [TaskStructRcuBatch; MAX_CPUS] =
 unsafe fn begin_task_struct_rcu_release(batch: *mut TaskStructRcuBatch) {
     let (mut state, flags) = unsafe { (*batch).state.lock_irqsave() };
     debug_assert_eq!(state.draining_len, 0);
-    // Use raw field addresses because the two fixed-size arrays are fields of
-    // the same guard and Rust's borrow checker cannot express this disjoint
-    // swap through the projected `state` value.
-    unsafe {
-        core::ptr::swap(
-            core::ptr::addr_of_mut!(state.tasks),
-            core::ptr::addr_of_mut!(state.draining),
-        );
+    // Move only the live prefix.  `draining` is entirely null here because
+    // `take_task_struct_rcu_release()` nulls each slot as it pops and drains to
+    // zero, so exchanging the whole arrays is unnecessary.
+    //
+    // It is also unsafe to do: `core::ptr::swap` on
+    // `[*mut TaskStruct; MAX_HEAP_TASKS]` materializes an 8 KiB `MaybeUninit`
+    // stack temporary, and a release build's kernel stack is Linux's x86-64
+    // `THREAD_SIZE` of 16 KiB (`KTHREAD_STACK_ORDER == 2`).  Spending half the
+    // stack inside an RCU callback that already runs on a non-empty stack
+    // overflows it and raises #DF.  Linux never copies the payload here: it
+    // moves its callback list by pointer in `rcu_cblist_flush_enqueue()`.
+    let len = state.len;
+    for index in 0..len {
+        state.draining[index] = state.tasks[index];
+        state.tasks[index] = core::ptr::null_mut();
     }
-    state.draining_len = state.len;
+    state.draining_len = len;
     state.len = 0;
     crate::kernel::locking::RawSpinLocked::unlock_irqrestore(state, flags);
 }
