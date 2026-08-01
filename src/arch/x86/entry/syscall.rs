@@ -1360,6 +1360,9 @@ static TRACE_FIREFOX_CLONE_COUNT: core::sync::atomic::AtomicU32 =
 #[cfg(not(test))]
 static TRACE_FIREFOX_NAMESPACE_CLONE_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
+#[cfg(not(test))]
+static TRACE_FIREFOX_TGID: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(-1);
 
 /// Trace the small set of process, IPC, blocking, and sandbox syscalls that
 /// determines whether Firefox can create its content process and publish its
@@ -1371,13 +1374,10 @@ fn trace_firefox_syscall_enter(
     regs: &crate::arch::x86::kernel::ptrace::PtRegs,
     task: *mut crate::kernel::task::TaskStruct,
 ) {
-    if task.is_null() || !crate::kernel::debug_trace::firefox_enabled() {
+    if !firefox_trace_task(task) {
         return;
     }
     let comm = unsafe { &(*task).comm };
-    if !firefox_trace_comm(comm) {
-        return;
-    }
     let nr = regs.orig_rax;
     if !firefox_trace_syscall_is_interesting(nr, 0) {
         return;
@@ -1494,13 +1494,10 @@ fn trace_firefox_syscall_exit(
     ret: i64,
     task: *mut crate::kernel::task::TaskStruct,
 ) {
-    if task.is_null() || !crate::kernel::debug_trace::firefox_enabled() {
+    if !firefox_trace_task(task) {
         return;
     }
     let comm = unsafe { &(*task).comm };
-    if !firefox_trace_comm(comm) {
-        return;
-    }
     let nr = regs.orig_rax;
     if !firefox_trace_syscall_is_interesting(nr, ret) {
         return;
@@ -1549,6 +1546,30 @@ fn firefox_trace_comm(comm: &[u8; 16]) -> bool {
         || comm_starts_with(comm, b"GPU Process")
         || comm_starts_with(comm, b"Utility")
         || comm_starts_with(comm, b"crashhelper")
+}
+
+/// Trace the whole Firefox thread group once its leader has been observed.
+/// X11 requests commonly run on `IPC I/O Parent`, `Compositor`, or `gmain`
+/// rather than the leader named `firefox`; filtering only by `comm` therefore
+/// made a missing-window replay look like a syscall-free user-mode stall.
+#[cfg(not(test))]
+fn firefox_trace_task(task: *mut crate::kernel::task::TaskStruct) -> bool {
+    if task.is_null() || !crate::kernel::debug_trace::firefox_enabled() {
+        return false;
+    }
+    let comm = unsafe { &(*task).comm };
+    let tgid = unsafe { (*task).tgid };
+    if comm_starts_with(comm, b"firefox") {
+        let _ = TRACE_FIREFOX_TGID.compare_exchange(
+            -1,
+            tgid,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        );
+        return true;
+    }
+    firefox_trace_comm(comm)
+        || TRACE_FIREFOX_TGID.load(core::sync::atomic::Ordering::Acquire) == tgid
 }
 
 fn firefox_trace_syscall_is_interesting(nr: u64, ret: i64) -> bool {
