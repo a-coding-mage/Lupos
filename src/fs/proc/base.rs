@@ -182,16 +182,13 @@ fn parse_proc_pid_file(path: &str) -> Option<(i32, &str)> {
 }
 
 unsafe fn task_stat_text(task: *mut TaskStruct) -> alloc::string::String {
-    let (pid, ppid, state, comm) = unsafe {
+    // `ps` reads this field. Reporting every non-zombie task as 'R' makes a
+    // fully idle machine look busy and hides where a task is blocked.
+    let state = super::array::task_state_char(task);
+    let (pid, ppid, comm) = unsafe {
         let parent = (*task).m26.real_parent;
         let ppid = if parent.is_null() { 0 } else { (*parent).pid };
-        let exit_state = (*task).m26.exit_state | (*task).__state.load(Ordering::Acquire);
-        let state = if exit_state & (EXIT_ZOMBIE | EXIT_DEAD) != 0 {
-            'Z'
-        } else {
-            'R'
-        };
-        ((*task).pid, ppid, state, super::util::task_comm(task))
+        ((*task).pid, ppid, super::util::task_comm(task))
     };
     let ids = super::array::task_stat_ids_for_pid(pid, ppid);
     super::array::stat_text_with_ids(pid, &comm, state, ids)
@@ -558,16 +555,14 @@ fn proc_pid_status_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize,
     if task.is_null() {
         return Err(ENOENT);
     }
-    let (tgid, ppid, state, comm) = unsafe {
+    // Report the full Linux `TASK_REPORT` set, not just running/zombie: a
+    // hardcoded "R (running)" makes every sleeping task look runnable and
+    // hides exactly the stalls this file exists to diagnose.
+    let state = super::array::task_state_text(task);
+    let (tgid, ppid, comm) = unsafe {
         let parent = (*task).m26.real_parent;
         let ppid = if parent.is_null() { 0 } else { (*parent).pid };
-        let exit_state = (*task).m26.exit_state | (*task).__state.load(Ordering::Acquire);
-        let state = if exit_state & (EXIT_ZOMBIE | EXIT_DEAD) != 0 {
-            "Z (zombie)"
-        } else {
-            "R (running)"
-        };
-        ((*task).tgid, ppid, state, super::util::task_comm(task))
+        ((*task).tgid, ppid, super::util::task_comm(task))
     };
     let text = super::util::format_status(&super::util::ProcStatusView {
         name: &comm,

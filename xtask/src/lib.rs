@@ -4929,6 +4929,20 @@ fn graphics_x11_desktop_ready_relay_script() -> Vec<u8> {
         "    ' /var/log/lightdm/lightdm.log\n",
         "}\n",
         "lightdm_restarted_before_user_session() {\n",
+        // A restarted display manager truncates /var/log/lightdm/lightdm.log,
+        // so the previous instance's own evidence is gone by the time this
+        // runs and the awk scan below cannot see it.  systemd still counts the
+        // restart.  Treat a counted restart as a failure only when the
+        // surviving instance has not itself reached the user session, so a
+        // benign restart that still produced a desktop is not reported.
+        "    restarts=\"$(systemctl show display-manager.service -p NRestarts --value 2>/dev/null)\"\n",
+        "    case \"$restarts\" in\n",
+        "        ''|0) : ;;\n",
+        "        *)\n",
+        "            grep -q 'Running command /etc/lightdm/Xsession startxfce4' \\\n",
+        "                /var/log/lightdm/lightdm.log 2>/dev/null || return 0\n",
+        "            ;;\n",
+        "    esac\n",
         "    [ -s /var/log/lightdm/lightdm.log ] || return 1\n",
         "    awk '\n",
         "        /Seat seat0: Greeter stopped, running session/ { pending = 1 }\n",
@@ -26537,6 +26551,25 @@ failed command output\n";
         assert!(
             desktop_relay.contains("graphics-x11: lightdm-restarted-before-user-session"),
             "desktop relay must classify a LightDM daemon restart before Xsession"
+        );
+        // A restarted LightDM truncates its own log, so the awk scan alone
+        // cannot see the previous instance.  The restart counter must be
+        // consulted, and only count as a failure while the surviving instance
+        // has not reached the Xsession command itself.
+        assert!(
+            desktop_relay.contains("systemctl show display-manager.service -p NRestarts --value"),
+            "desktop relay must detect a LightDM restart that truncated its log"
+        );
+        let restart_check = desktop_relay
+            .split("lightdm_restarted_before_user_session() {")
+            .nth(1)
+            .and_then(|body| body.split("\ndump_desktop_wait_diagnostics").next())
+            .expect("relay defines the LightDM restart check");
+        assert!(
+            restart_check.contains("NRestarts")
+                && restart_check
+                    .contains("Running command /etc/lightdm/Xsession startxfce4"),
+            "restart counter must be qualified by the surviving instance's session state"
         );
         assert!(
             desktop_relay.contains("graphics-x11: xsession-errors begin"),
