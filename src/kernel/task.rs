@@ -293,7 +293,8 @@ const PAD_SIGNAL_TO_THREAD: usize = PAD_SIGNAL_TO_THREAD_TOTAL
     - core::mem::size_of::<crate::arch::x86::kernel::fpu::TaskFpuState>()
     - core::mem::size_of::<u64>()
     - core::mem::size_of::<*mut SignalState>()
-    - core::mem::size_of::<usize>();
+    - core::mem::size_of::<usize>()
+    - core::mem::size_of::<AtomicU32>();
 
 // ── M26 fields (parent / children / exit / ptrace) ───────────────────────────
 //
@@ -849,6 +850,11 @@ pub struct TaskStruct {
     /// when `Vec::swap_remove` retires a task, so ordinary signal syscalls can
     /// reach their state without a PID scan.
     pub(crate) signal_state_index: usize,
+    /// Linux's task-local effective pending-signal decision.  The signal
+    /// table publishes this under its IRQ-safe lock; scheduler and waitqueue
+    /// checks can then read the result without serialising on every process's
+    /// signal state.
+    pub(crate) signal_unblocked_pending: AtomicU32,
     /// Linux `task_struct::pi_lock`: serializes wakeups and task-state/CPU
     /// transitions for this task before the runqueue lock is taken. It lives
     /// in the same reserved signal-to-thread span as the other unmodelled
@@ -941,6 +947,7 @@ const _: () = {
     assert!(offset_of!(TaskStruct, pi_lock) > offset_of!(TaskStruct, m27_seccomp));
     assert!(offset_of!(TaskStruct, pi_lock) < offset_of!(TaskStruct, thread));
     assert!(offset_of!(TaskStruct, signal_state) < offset_of!(TaskStruct, pi_lock));
+    assert!(offset_of!(TaskStruct, signal_unblocked_pending) < offset_of!(TaskStruct, pi_lock));
     assert!(offset_of!(TaskStruct, signal_state) < offset_of!(TaskStruct, thread));
     assert!(size_of::<crate::kernel::locking::RawSpinLock>() == size_of::<u32>());
     assert!(core::mem::align_of::<crate::arch::x86::kernel::fpu::TaskFpuState>() <= 8);

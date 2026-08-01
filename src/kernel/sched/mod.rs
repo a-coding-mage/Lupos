@@ -4201,10 +4201,11 @@ mod tests {
         // test-origin: linux:vendor/linux/include/linux/sched/signal.h:
         // signal_pending_state
         //
-        // Lupos must distinguish the raw pending bit from Linux's
-        // signal_pending() result, which excludes signals blocked by the
-        // current task. A blocked pending signal must remain pending while
-        // the scheduler dequeues the interruptible task.
+        // Lupos's signal-generation path publishes TIF_SIGPENDING for every
+        // queued signal, while its scheduler-facing effective-pending helper
+        // excludes signals blocked by the task.  Keep that observable sleep
+        // behavior while the task-local snapshot removes the global-table
+        // lock from the decision.
         let _legacy = legacy_sched_test_guard();
         let _signals = crate::kernel::signal::SIGNAL_TEST_LOCK.lock();
         crate::kernel::signal::reset_for_tests();
