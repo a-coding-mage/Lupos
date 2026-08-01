@@ -1310,7 +1310,6 @@ pub unsafe extern "C" fn user_fork_child_return() -> ! {
         "mov rdi, rax",
         "sub rsp, 8",
         "call {schedule_tail}",
-        "call {set_child_tid}",
         "add rsp, 8",
         // Linux ret_from_fork() finishes every newly-created user task through
         // syscall_exit_to_user_mode(regs).  The child frame is the same
@@ -1373,7 +1372,6 @@ pub unsafe extern "C" fn user_fork_child_return() -> ! {
         "swapgs",
         "iretq",
         schedule_tail = sym crate::kernel::sched::schedule_tail,
-        set_child_tid = sym user_fork_child_set_tid,
         exit_slowpath = sym crate::arch::x86::entry::syscall::syscall_exit_slowpath,
         should_use_sysret = sym crate::arch::x86::entry::syscall::syscall_should_use_sysret,
     );

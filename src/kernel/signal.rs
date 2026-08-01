@@ -302,7 +302,7 @@ impl Default for SigAltStack {
     }
 }
 
-struct SignalState {
+pub(crate) struct SignalState {
     actions: [RtSigAction; NSIG + 1],
     blocked: SigSet,
     /// Linux `saved_sigmask` plus the restore-sigmask flag.  `sigsuspend(2)`
@@ -345,6 +345,11 @@ struct SignalState {
     /// Bound task address, protected by SIGNAL_TABLE.  Timer callbacks use
     /// this existing binding instead of taking the process registry lock.
     task_addr: usize,
+    /// Linux stores process-directed pending bits once in
+    /// `signal_struct::shared_pending`. Every Lupos thread state points at
+    /// the stable heap allocation that owns those bits so scheduler checks do
+    /// not rescan the entire thread group.
+    shared_pending_owner: usize,
 }
 
 impl SignalState {
@@ -370,6 +375,7 @@ impl SignalState {
             tgid,
             group_exit_code: None,
             task_addr: 0,
+            shared_pending_owner: 0,
         });
         state.actions[SIGCHLD as usize].sa_handler = 0; // SIG_DFL
         state
@@ -541,6 +547,78 @@ struct SignalTable {
 }
 
 impl SignalTable {
+    fn bound_index_for_task(
+        &self,
+        task: *mut crate::kernel::task::TaskStruct,
+    ) -> Option<usize> {
+        if task.is_null() {
+            return None;
+        }
+        let (pid, tgid, state_ptr, index) = unsafe {
+            (
+                (*task).pid,
+                (*task).tgid,
+                (*task).signal_state,
+                (*task).signal_state_index,
+            )
+        };
+        if state_ptr.is_null() {
+            return None;
+        }
+        let state = self.states.get(index)?;
+        let expected = (&**state) as *const SignalState as *mut SignalState;
+        (expected == state_ptr
+            && state.pid == pid
+            && state.tgid == tgid
+            && state.task_addr == task as usize)
+            .then_some(index)
+    }
+
+    fn bind_task(&mut self, index: usize, task: *mut crate::kernel::task::TaskStruct) {
+        let state = self.states.get_mut(index).expect("signal state index valid");
+        state.task_addr = task as usize;
+        let state_ptr = &mut **state as *mut SignalState;
+        if !task.is_null() {
+            unsafe {
+                (*task).signal_state = state_ptr;
+                (*task).signal_state_index = index;
+            }
+        }
+    }
+
+    fn group_owner_ptr(&self, tgid: i32) -> usize {
+        self.states
+            .iter()
+            .find(|state| state.tgid == tgid && state.pid == tgid)
+            .or_else(|| self.states.iter().find(|state| state.tgid == tgid))
+            .map(|state| (&**state) as *const SignalState as usize)
+            .unwrap_or(0)
+    }
+
+    fn rebind_group_owner(&mut self, tgid: i32) {
+        let owner = self.group_owner_ptr(tgid);
+        for state in self.states.iter_mut().filter(|state| state.tgid == tgid) {
+            state.shared_pending_owner = if owner == 0 {
+                &mut **state as *mut SignalState as usize
+            } else {
+                owner
+            };
+        }
+    }
+
+    fn push_state(
+        &mut self,
+        state: Box<SignalState>,
+        task: *mut crate::kernel::task::TaskStruct,
+    ) -> usize {
+        let tgid = state.tgid;
+        self.states.push(state);
+        let index = self.states.len() - 1;
+        self.bind_task(index, task);
+        self.rebind_group_owner(tgid);
+        index
+    }
+
     fn state_for_new_task(&self, pid: i32, tgid: i32) -> Box<SignalState> {
         let mut state = SignalState::new(pid, tgid);
         if let Some(source) = self
@@ -562,14 +640,16 @@ impl SignalTable {
             return Err(-3); // ESRCH
         }
         let (pid, tgid) = unsafe { ((*task).pid, (*task).tgid) };
+        if let Some(index) = self.bound_index_for_task(task) {
+            return Ok(index);
+        }
         if let Some(pos) = self.states.iter().position(|s| s.pid == pid) {
-            self.states[pos].task_addr = task as usize;
+            self.bind_task(pos, task);
             return Ok(pos);
         }
         let mut state = self.state_for_new_task(pid, tgid);
         state.task_addr = task as usize;
-        self.states.push(state);
-        Ok(self.states.len() - 1)
+        Ok(self.push_state(state, task))
     }
 
     fn get_or_create_current(&mut self) -> Result<&mut SignalState, i32> {
@@ -588,16 +668,19 @@ impl SignalTable {
         tgid: i32,
         task: *mut crate::kernel::task::TaskStruct,
     ) -> usize {
+        if let Some(index) = self
+            .bound_index_for_task(task)
+            .filter(|index| self.states[*index].pid == pid && self.states[*index].tgid == tgid)
+        {
+            return index;
+        }
         if let Some(pos) = self.states.iter().position(|s| s.pid == pid) {
-            if !task.is_null() {
-                self.states[pos].task_addr = task as usize;
-            }
+            self.bind_task(pos, task);
             return pos;
         }
         let mut state = self.state_for_new_task(pid, tgid);
         state.task_addr = task as usize;
-        self.states.push(state);
-        self.states.len() - 1
+        self.push_state(state, task)
     }
 
     fn inherit_for_clone(
@@ -671,10 +754,12 @@ impl SignalTable {
             };
         }
 
-        if let Some(existing) = self.states.iter_mut().find(|state| state.pid == child_pid) {
-            *existing = child;
+        if let Some(index) = self.states.iter().position(|state| state.pid == child_pid) {
+            self.states[index] = child;
+            self.bind_task(index, child_task);
+            self.rebind_group_owner(child_tgid);
         } else {
-            self.states.push(child);
+            self.push_state(child, child_task);
         }
         true
     }
@@ -1160,6 +1245,20 @@ pub unsafe fn set_user_sigmask(umask: *const SigSet, sigsetsize: usize) -> i64 {
     // Linux sets current->restore_sigmask before saving and replacing the
     // mask. State creation cannot fail for a live current task here.
     set_restore_sigmask(task);
+
+    // Linux __set_current_blocked() is deliberately lockless when the mask is
+    // unchanged.  The current task is the only writer of its blocked mask, so
+    // its live SignalState binding is the same task-local read Linux performs
+    // from current->blocked.  Keep sigsuspend_saved empty in this case: the
+    // saved mask equals the temporary mask, so both signal-frame construction
+    // and restore_saved_sigmask() observe the same value without taking the
+    // process-wide signal lock.
+    if current_task_signal_state(task).is_some_and(|state| unsafe {
+        (*state).blocked.bits == next.bits && (*state).sigsuspend_saved.is_none()
+    }) {
+        return 0;
+    }
+
     {
         let mut table = SIGNAL_TABLE.lock();
         let idx = match table.get_or_create_current_index() {
@@ -1193,6 +1292,17 @@ pub fn restore_saved_sigmask_unless(interrupted: bool) {
     if !test_and_clear_restore_sigmask(task) {
         return;
     }
+
+    // This is the matching half of set_user_sigmask()'s Linux equal-mask
+    // fast path.  No saved mask was materialized because restoring it would
+    // be a no-op; in particular, pselect/ppoll return does not reacquire the
+    // global signal-table lock for this common case.
+    if current_task_signal_state(task)
+        .is_some_and(|state| unsafe { (*state).sigsuspend_saved.is_none() })
+    {
+        return;
+    }
+
     let pid = if task.is_null() {
         -1
     } else {
@@ -1200,7 +1310,13 @@ pub fn restore_saved_sigmask_unless(interrupted: bool) {
     };
     {
         let mut table = SIGNAL_TABLE.lock();
-        let Some(idx) = table.states.iter().position(|state| state.pid == pid) else {
+        // Linux addresses current->saved_sigmask directly.  The PID search is
+        // retained only for host fixtures and late-registration compatibility;
+        // every live runtime task reaches the bound index first.
+        let Some(idx) = table
+            .bound_index_for_task(task)
+            .or_else(|| table.states.iter().position(|state| state.pid == pid))
+        else {
             return;
         };
         let Some(saved) = table.states[idx].sigsuspend_saved.take() else {
@@ -2489,6 +2605,19 @@ pub fn has_pending_signals(task: *const crate::kernel::task::TaskStruct) -> bool
 }
 
 fn group_shared_pending_bits(table: &SignalTable, tgid: i32) -> u64 {
+    if let Some(owner) = table
+        .states
+        .iter()
+        .find(|state| state.tgid == tgid)
+        .map(|state| state.shared_pending_owner)
+        .filter(|owner| *owner != 0)
+    {
+        // The owner is a Box allocation retained by `table.states`; the
+        // signal-table IRQ lock prevents removal while this borrowed view is
+        // used. This is the Lupos equivalent of Linux's direct
+        // `current->signal->shared_pending` access.
+        return unsafe { (*(owner as *const SignalState)).shared_pending.bits };
+    }
     table
         .states
         .iter()
@@ -2605,6 +2734,10 @@ fn state_has_unblocked_pending_signal(table: &SignalTable, idx: usize) -> bool {
     let Some(state) = table.states.get(idx) else {
         return false;
     };
+    state_has_unblocked_pending_signal_ref(table, state)
+}
+
+fn state_has_unblocked_pending_signal_ref(table: &SignalTable, state: &SignalState) -> bool {
     select_pending_signal(
         state,
         state.pending.bits,
@@ -2764,11 +2897,45 @@ fn task_has_unblocked_pending_signal_state(task: *const crate::kernel::task::Tas
     }
     let pid = unsafe { (*task).pid };
     let table = SIGNAL_TABLE.lock();
+    let bound = unsafe { (*task).signal_state };
+    if !bound.is_null() {
+        let state = unsafe { &*bound };
+        if state.task_addr == task as usize && state.pid == pid {
+            return state_has_unblocked_pending_signal_ref(&table, state);
+        }
+    }
     table
         .states
         .iter()
         .position(|state| state.pid == pid)
         .is_some_and(|idx| state_has_unblocked_pending_signal(&table, idx))
+}
+
+/// Return the current task's live signal state without taking SIGNAL_TABLE.
+///
+/// Linux keeps `blocked` and `pending` in task/signal objects whose lifetime
+/// is protected by the current task reference.  Lupos owns the equivalent
+/// heap allocation from SIGNAL_TABLE, so this helper validates the stable
+/// task binding before exposing the same direct path.  Callers must only use
+/// it for the currently executing task; release_task() clears the binding
+/// before the allocation can be removed.
+fn current_task_signal_state(
+    task: *mut crate::kernel::task::TaskStruct,
+) -> Option<*mut SignalState> {
+    if task.is_null() {
+        return None;
+    }
+    unsafe {
+        let state_ptr = (*task).signal_state;
+        if state_ptr.is_null() {
+            return None;
+        }
+        let state = &*state_ptr;
+        (state.task_addr == task as usize
+            && state.pid == (*task).pid
+            && state.tgid == (*task).tgid)
+            .then_some(state_ptr)
+    }
 }
 
 fn update_tif_sigpending(task: *mut crate::kernel::task::TaskStruct, pending: bool) -> bool {
@@ -3670,7 +3837,17 @@ unsafe fn do_coredump(task: *mut crate::kernel::task::TaskStruct, info: &SigInfo
 
 #[cfg(test)]
 pub fn reset_for_tests() {
-    SIGNAL_TABLE.lock().states.clear();
+    let mut table = SIGNAL_TABLE.lock();
+    for state in &table.states {
+        if state.task_addr != 0 {
+            unsafe {
+                let task = &mut *(state.task_addr as *mut crate::kernel::task::TaskStruct);
+                task.signal_state = core::ptr::null_mut();
+                task.signal_state_index = 0;
+            }
+        }
+    }
+    table.states.clear();
     clear_restore_sigmask(unsafe { sched::get_current() });
 }
 
@@ -3684,7 +3861,7 @@ pub fn register_test_task(pid: i32, tgid: i32) {
     let mut table = SIGNAL_TABLE.lock();
     if table.states.iter().all(|s| s.pid != pid) {
         let state = table.state_for_new_task(pid, tgid);
-        table.states.push(state);
+        table.push_state(state, core::ptr::null_mut());
     }
 }
 
@@ -3909,7 +4086,23 @@ pub(crate) unsafe fn release_signal_task_binding(
         .iter()
         .position(|state| state.pid == pid && state.task_addr == task as usize)
     {
+        let tgid = table.states[index].tgid;
+        let moved_index = table.states.len() - 1;
+        unsafe {
+            (*task).signal_state = core::ptr::null_mut();
+            (*task).signal_state_index = 0;
+        }
         table.states.swap_remove(index);
+        if index != moved_index {
+            let moved_task_addr = table.states[index].task_addr;
+            if moved_task_addr != 0 {
+                unsafe {
+                    (*(moved_task_addr as *mut crate::kernel::task::TaskStruct))
+                        .signal_state_index = index;
+                }
+            }
+        }
+        table.rebind_group_owner(tgid);
         return true;
     }
     false
@@ -3965,6 +4158,79 @@ mod tests {
             state_addr.abs_diff(stack_addr) > 64 * 1024,
             "SignalState must be heap-backed, state={state_addr:#x} stack={stack_addr:#x}"
         );
+    }
+
+    #[test]
+    fn live_signal_state_has_a_task_local_linux_pending_binding() {
+        // test-origin: linux:vendor/linux/include/linux/sched.h:task_struct
+        // Linux evaluates task_sigpending() from task-local pending state and
+        // signal->shared_pending.  The Lupos global table remains the owning
+        // allocation, but a live task must carry the equivalent stable binding
+        // so scheduler checks do not linearly scan every process.
+        let task_source = include_str!("task.rs");
+        assert!(task_source.contains("pub(crate) signal_state: *mut SignalState"));
+    }
+
+    #[test]
+    fn task_local_signal_binding_reaches_pending_lookup_without_table_scan() {
+        // test-origin: linux:vendor/linux/kernel/signal.c:recalc_sigpending_tsk
+        let _test_lock = TEST_LOCK.lock();
+        reset_for_tests();
+
+        let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        task.pid = 31_173;
+        task.tgid = 31_173;
+        let task_ptr = &mut *task as *mut TaskStruct;
+        let state_ptr = {
+            let mut table = SIGNAL_TABLE.lock();
+            table.get_or_create_task_index(task.pid, task.tgid, task_ptr);
+            task.signal_state
+        };
+        assert!(!state_ptr.is_null());
+
+        unsafe {
+            (*state_ptr).pending.add(SIGUSR1);
+        }
+        assert!(task_has_unblocked_pending_signal_state(task_ptr));
+
+        unsafe {
+            (*state_ptr).blocked.add(SIGUSR1);
+        }
+        assert!(!task_has_unblocked_pending_signal_state(task_ptr));
+
+        reset_for_tests();
+    }
+
+    #[test]
+    fn task_signal_binding_index_tracks_linux_task_retirement() {
+        // test-origin: linux:vendor/linux/kernel/signal.c:__exit_signal
+        let _test_lock = TEST_LOCK.lock();
+        reset_for_tests();
+
+        let mut first = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        first.pid = 31_174;
+        first.tgid = 31_174;
+        let first_ptr = &mut *first as *mut TaskStruct;
+        let mut second = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        second.pid = 31_175;
+        second.tgid = 31_175;
+        let second_ptr = &mut *second as *mut TaskStruct;
+
+        {
+            let mut table = SIGNAL_TABLE.lock();
+            assert_eq!(table.get_or_create_task_index(first.pid, first.tgid, first_ptr), 0);
+            assert_eq!(table.get_or_create_task_index(second.pid, second.tgid, second_ptr), 1);
+        }
+        assert_eq!(second.signal_state_index, 1);
+
+        assert!(unsafe { release_signal_task_binding(first_ptr) });
+        assert_eq!(second.signal_state_index, 0);
+        {
+            let mut table = SIGNAL_TABLE.lock();
+            assert_eq!(table.get_or_create_task_index(second.pid, second.tgid, second_ptr), 0);
+        }
+
+        reset_for_tests();
     }
 
     #[test]
@@ -4100,6 +4366,88 @@ mod tests {
             sched::set_current(previous);
         }
         reset_for_tests();
+    }
+
+    #[test]
+    fn equal_user_sigmask_uses_linux_current_task_fast_path() {
+        // test-origin: linux:vendor/linux/kernel/signal.c:__set_current_blocked
+        // Linux returns before taking sighand->siglock when the temporary
+        // mask equals current->blocked.  The saved mask is unnecessary in
+        // that case because restoring it cannot change the task state.
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+        let previous = unsafe { sched::get_current() };
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 31_162;
+        current.tgid = 31_162;
+        let current_ptr = &mut *current as *mut TaskStruct;
+        let unchanged = SigSet::default();
+
+        unsafe {
+            sched::set_current(current_ptr);
+            assert_eq!(
+                sys_rt_sigprocmask(
+                    SIG_SETMASK,
+                    &unchanged,
+                    core::ptr::null_mut(),
+                    core::mem::size_of::<SigSet>(),
+                ),
+                0
+            );
+            assert_eq!(
+                set_user_sigmask(&unchanged, core::mem::size_of::<SigSet>()),
+                0
+            );
+        }
+
+        {
+            let table = SIGNAL_TABLE.lock();
+            let state = table
+                .states
+                .iter()
+                .find(|state| state.pid == current.pid)
+                .expect("current signal state");
+            assert_eq!(state.blocked, unchanged);
+            assert_eq!(state.sigsuspend_saved, None);
+        }
+        assert_ne!(
+            current
+                .unserialized_flags
+                .load(core::sync::atomic::Ordering::Acquire)
+                & crate::kernel::task::TASK_RESTORE_SIGMASK,
+            0
+        );
+
+        restore_saved_sigmask_unless(false);
+        assert_eq!(
+            current
+                .unserialized_flags
+                .load(core::sync::atomic::Ordering::Acquire)
+                & crate::kernel::task::TASK_RESTORE_SIGMASK,
+            0
+        );
+
+        unsafe {
+            sched::set_current(previous);
+        }
+        reset_for_tests();
+    }
+
+    #[test]
+    fn user_sigmask_source_retains_linux_equal_mask_ordering() {
+        // test-origin: linux:vendor/linux/kernel/signal.c:__set_current_blocked
+        // The runtime test above checks the observable restore behavior; this
+        // guard keeps the parity-critical lockless branch from being replaced
+        // by an unconditional global-table lookup.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/kernel/signal.rs"));
+        let body = source
+            .split("pub unsafe fn set_user_sigmask")
+            .nth(1)
+            .and_then(|body| body.split("/// Linux `restore_saved_sigmask_unless").next())
+            .expect("set_user_sigmask body must remain present");
+        assert!(body.contains("current_task_signal_state(task)"));
+        assert!(body.contains("sigsuspend_saved.is_none()"));
+        assert!(body.contains("set_restore_sigmask(task)"));
     }
 
     #[test]
@@ -4249,6 +4597,10 @@ mod tests {
         let mut target = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
         target.pid = 189;
         target.tgid = 189;
+        target.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        target.m29.sched_class =
+            &crate::kernel::sched::fair::FAIR_SCHED_CLASS as *const _;
+        target.m29.se.load.weight = crate::kernel::sched::prio::NICE_0_LOAD;
         let target_ptr = &mut *target as *mut TaskStruct;
         unsafe {
             sched::set_current(&mut *shell as *mut TaskStruct);
@@ -5995,6 +6347,9 @@ mod tests {
         child.pid = 102;
         child.tgid = 102;
         child.cred = &raw const INIT_CRED;
+        child.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        child.m29.sched_class = &crate::kernel::sched::fair::FAIR_SCHED_CLASS as *const _;
+        child.m29.se.load.weight = crate::kernel::sched::prio::NICE_0_LOAD;
         child.m26.real_parent = &mut *current as *mut TaskStruct;
 
         unsafe {

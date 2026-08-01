@@ -1106,6 +1106,15 @@ pub unsafe extern "C" fn schedule_tail(prev: *mut TaskStruct) {
     if production_smp_scheduler_enabled() {
         crate::kernel::locking::preempt::preempt_enable();
     }
+
+    // Linux `schedule_tail()` completes the child-side tid write and then
+    // recalculates TIF_SIGPENDING before the new task reaches its first
+    // userspace boundary.  Keep these operations on the common switch tail so
+    // kernel-thread and user-child return paths observe the same ordering.
+    unsafe {
+        crate::kernel::fork::user_fork_child_set_tid();
+        crate::kernel::signal::linux_recalc_sigpending();
+    }
 }
 
 #[inline]
@@ -4472,6 +4481,36 @@ mod tests {
 
         assert!(finish < deferred);
         assert!(deferred < enable);
+    }
+
+    /// test-origin: linux:vendor/linux/kernel/sched/core.c:schedule_tail
+    ///
+    /// Linux completes the newly-created task's child-tid write and pending
+    /// signal recomputation in `schedule_tail()`, after the first preemption
+    /// enable.  Keeping those operations on the common return path matters
+    /// for both fork children and kernel threads that later enter userspace.
+    #[test]
+    fn schedule_tail_finishes_child_tid_and_signal_state_after_enable() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split("pub unsafe extern \"C\" fn schedule_tail")
+            .nth(1)
+            .expect("schedule_tail must exist")
+            .split("fn task_allowed_on_cpu")
+            .next()
+            .expect("schedule_tail body must end before task placement helpers");
+        let enable = body
+            .find("preempt_enable()")
+            .expect("schedule_tail must enable preemption first");
+        let child_tid = body
+            .find("user_fork_child_set_tid()")
+            .expect("schedule_tail must finish the Linux child-tid write");
+        let recalc = body
+            .find("linux_recalc_sigpending()")
+            .expect("schedule_tail must recalculate pending signals");
+
+        assert!(enable < child_tid);
+        assert!(child_tid < recalc);
     }
 
     /// test-origin: linux:vendor/linux/arch/x86/include/asm/preempt.h:init_idle_preempt_count
