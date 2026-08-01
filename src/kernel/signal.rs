@@ -612,10 +612,23 @@ impl SignalTable {
         task: *mut crate::kernel::task::TaskStruct,
     ) -> usize {
         let tgid = state.tgid;
+        // Linux copy_signal() creates one signal_struct per process, while a
+        // CLONE_THREAD child keeps the parent's signal_struct pointer.  The
+        // Lupos table stores a small per-task wrapper, so retain the existing
+        // group's shared-pending owner in the new wrapper instead of walking
+        // every thread in the group after each clone.  That walk made Firefox
+        // startup quadratic while holding the global IRQ-safe signal lock.
+        let owner = self
+            .states
+            .iter()
+            .find(|state| state.tgid == tgid && state.pid == tgid)
+            .or_else(|| self.states.iter().find(|state| state.tgid == tgid))
+            .map(|state| (&**state) as *const SignalState as usize);
         self.states.push(state);
         let index = self.states.len() - 1;
         self.bind_task(index, task);
-        self.rebind_group_owner(tgid);
+        let owner = owner.unwrap_or_else(|| (&*self.states[index]) as *const SignalState as usize);
+        self.states[index].shared_pending_owner = owner;
         index
     }
 
@@ -2581,6 +2594,14 @@ pub fn set_tif_sigpending(task: *mut crate::kernel::task::TaskStruct) {
         return;
     }
     unsafe {
+        // Signal generation may call this while SIGNAL_TABLE is held (the
+        // timer and process-directed paths do), so publish the effective
+        // decision from the already-mutated task-local state instead of
+        // reacquiring the table lock here.
+        let pending = task_has_unblocked_pending_signal_without_table(task);
+        (*task)
+            .signal_unblocked_pending
+            .store(pending as u32, core::sync::atomic::Ordering::Release);
         let thread_info = &mut (*task).thread_info;
         thread_info.flags.fetch_or(
             crate::kernel::task::TIF_SIGPENDING,
@@ -2866,7 +2887,12 @@ pub fn has_unblocked_pending_signals(task: *const crate::kernel::task::TaskStruc
     if task.is_null() || !has_pending_signals(task) {
         return false;
     }
-    task_has_unblocked_pending_signal_state(task)
+    unsafe {
+        (*task)
+            .signal_unblocked_pending
+            .load(core::sync::atomic::Ordering::Acquire)
+            != 0
+    }
 }
 
 /// Linux `is_ignored()` — `drivers/tty/tty_jobctrl.c`. Used by
@@ -2943,6 +2969,9 @@ fn update_tif_sigpending(task: *mut crate::kernel::task::TaskStruct, pending: bo
         return false;
     }
     unsafe {
+        (*task)
+            .signal_unblocked_pending
+            .store(pending as u32, core::sync::atomic::Ordering::Release);
         if pending {
             (*task).thread_info.flags.fetch_or(
                 crate::kernel::task::TIF_SIGPENDING,
@@ -2964,6 +2993,36 @@ fn recalc_tif_sigpending(task: *mut crate::kernel::task::TaskStruct) -> bool {
     }
     let pending = task_has_unblocked_pending_signal_state(task);
     update_tif_sigpending(task, pending)
+}
+
+/// Compute the effective pending decision from a task's stable signal-state
+/// binding without taking SIGNAL_TABLE.  Signal generation calls this while
+/// the table lock is held, after it has queued the signal; the resulting bool
+/// is then published in `TaskStruct::signal_unblocked_pending` for scheduler
+/// and waitqueue readers.
+///
+/// This is the Lupos representation of Linux's task-local `pending` plus the
+/// thread-group `shared_pending` check in `recalc_sigpending_tsk()`.
+unsafe fn task_has_unblocked_pending_signal_without_table(
+    task: *const crate::kernel::task::TaskStruct,
+) -> bool {
+    if task.is_null() {
+        return false;
+    }
+    let state_ptr = unsafe { (*task).signal_state };
+    if state_ptr.is_null() {
+        return false;
+    }
+    let state = unsafe { &*state_ptr };
+    if state.task_addr != task as usize || state.pid != unsafe { (*task).pid } {
+        return false;
+    }
+    let shared = if state.shared_pending_owner != 0 {
+        unsafe { (*(state.shared_pending_owner as *const SignalState)).shared_pending.bits }
+    } else {
+        state.shared_pending.bits
+    };
+    ((state.pending.bits | shared) & !state.blocked.bits) != 0
 }
 
 /// `recalc_sigpending` - `vendor/linux/kernel/signal.c`.
@@ -3037,6 +3096,9 @@ pub fn clear_tif_sigpending(task: *mut crate::kernel::task::TaskStruct) {
         return;
     }
     unsafe {
+        (*task)
+            .signal_unblocked_pending
+            .store(0, core::sync::atomic::Ordering::Release);
         let thread_info = &mut (*task).thread_info;
         thread_info.flags.fetch_and(
             !crate::kernel::task::TIF_SIGPENDING,
@@ -3844,6 +3906,8 @@ pub fn reset_for_tests() {
                 let task = &mut *(state.task_addr as *mut crate::kernel::task::TaskStruct);
                 task.signal_state = core::ptr::null_mut();
                 task.signal_state_index = 0;
+                task.signal_unblocked_pending
+                    .store(0, core::sync::atomic::Ordering::Release);
             }
         }
     }
@@ -4091,6 +4155,9 @@ pub(crate) unsafe fn release_signal_task_binding(
         unsafe {
             (*task).signal_state = core::ptr::null_mut();
             (*task).signal_state_index = 0;
+            (*task)
+                .signal_unblocked_pending
+                .store(0, core::sync::atomic::Ordering::Release);
         }
         table.states.swap_remove(index);
         if index != moved_index {
@@ -4169,6 +4236,21 @@ mod tests {
         // so scheduler checks do not linearly scan every process.
         let task_source = include_str!("task.rs");
         assert!(task_source.contains("pub(crate) signal_state: *mut SignalState"));
+    }
+
+    #[test]
+    fn effective_pending_check_reads_task_local_snapshot_without_table_lock() {
+        // test-origin: linux:vendor/linux/kernel/signal.c:
+        // recalc_sigpending_tsk and vendor/linux/include/linux/sched/signal.h:
+        // task_sigpending
+        let source = include_str!("signal.rs");
+        let body = source
+            .split("pub fn has_unblocked_pending_signals")
+            .nth(1)
+            .and_then(|tail| tail.split("/// Linux `is_ignored()`").next())
+            .expect("effective pending helper body must exist");
+        assert!(body.contains("signal_unblocked_pending"));
+        assert!(!body.contains("SIGNAL_TABLE.lock()"));
     }
 
     #[test]
@@ -4742,6 +4824,36 @@ mod tests {
             &process_child.wait_chldexit,
             &parent_wait_chldexit
         ));
+    }
+
+    #[test]
+    fn cloned_thread_keeps_one_linux_shared_pending_owner() {
+        // test-origin: linux:vendor/linux/kernel/fork.c:copy_signal
+        // CLONE_THREAD does not allocate a new signal_struct in Linux.  The
+        // Lupos per-task wrappers must therefore keep the first group's
+        // shared-pending owner without rebinding every sibling after each
+        // clone; otherwise Firefox thread creation becomes quadratic under
+        // the signal-table lock.
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+
+        let mut table = SIGNAL_TABLE.lock();
+        let leader = SignalState::new(31_180, 31_180);
+        let leader_ptr = (&*leader) as *const SignalState as usize;
+        let leader_idx = table.push_state(leader, core::ptr::null_mut());
+        assert_eq!(table.states[leader_idx].shared_pending_owner, leader_ptr);
+
+        let sibling = SignalState::new(31_181, 31_180);
+        let sibling_idx = table.push_state(sibling, core::ptr::null_mut());
+        assert_eq!(table.states[sibling_idx].shared_pending_owner, leader_ptr);
+
+        let second_sibling = SignalState::new(31_182, 31_180);
+        let second_idx = table.push_state(second_sibling, core::ptr::null_mut());
+        assert_eq!(table.states[second_idx].shared_pending_owner, leader_ptr);
+        assert_eq!(table.states[sibling_idx].shared_pending_owner, leader_ptr);
+
+        drop(table);
+        reset_for_tests();
     }
 
     #[test]
