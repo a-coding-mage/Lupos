@@ -6369,8 +6369,22 @@ mod tests {
         // Declared after `current`, so it drops first and unbinds even if an
         // assertion below panics.
         let _unbind = super::UnbindCurrentTaskOnDrop;
+        // A `zeroed()` task has a NULL `sched_class`, which
+        // `try_to_wake_up_with_state()` treats as a stale/freed task_struct and
+        // refuses to wake.
+        current.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        current.m29.sched_class = &crate::kernel::sched::fair::FAIR_SCHED_CLASS as *const _;
+        current.m29.se.load.weight = crate::kernel::sched::prio::NICE_0_LOAD;
+        // Linux wakes an *uninterruptible* sleeper on a fatal signal only when
+        // it slept killably: `signal_wake_up(t, true)` calls
+        // `wake_up_state(t, TASK_WAKEKILL | __TASK_TRACED | TASK_INTERRUPTIBLE)`
+        // (vendor/linux/include/linux/sched/signal.h:444), which plain
+        // TASK_UNINTERRUPTIBLE (0x2) cannot match -- only TASK_KILLABLE
+        // (TASK_WAKEKILL | TASK_UNINTERRUPTIBLE) does. Sleep killably, which is
+        // the state this test's name describes and the one SIGKILL is defined
+        // to interrupt.
         current.__state.store(
-            crate::kernel::task::task_state::TASK_UNINTERRUPTIBLE,
+            crate::kernel::task::task_state::TASK_KILLABLE,
             core::sync::atomic::Ordering::Release,
         );
 
@@ -6441,6 +6455,13 @@ mod tests {
         // Declared after `current`, so it drops first and unbinds even if an
         // assertion below panics.
         let _unbind = super::UnbindCurrentTaskOnDrop;
+        // A `zeroed()` task has a NULL `sched_class`, which
+        // `try_to_wake_up_with_state()` treats as a stale/freed task_struct and
+        // refuses to wake. Give it the real fair class, as the sibling
+        // stop/continue test does, so the wake path is actually exercised.
+        current.m29 = crate::kernel::task::M29SchedFields::zeroed();
+        current.m29.sched_class = &crate::kernel::sched::fair::FAIR_SCHED_CLASS as *const _;
+        current.m29.se.load.weight = crate::kernel::sched::prio::NICE_0_LOAD;
         current.__state.store(
             crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
             core::sync::atomic::Ordering::Release,

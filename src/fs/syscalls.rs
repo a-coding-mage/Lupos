@@ -5137,10 +5137,16 @@ mod tests {
     #[test]
     fn poll_sleep_publishes_running_before_poll_table_cleanup() {
         let source = include_str!("syscalls.rs");
+        // Bound the slice to poll_schedule's own body. The previous form ran
+        // from the definition all the way to this test's own split literal.
         let body = source
             .split("fn poll_schedule(")
             .nth(1)
             .expect("poll_schedule must remain present");
+        let body = body
+            .split("\n}\n")
+            .next()
+            .expect("poll_schedule body must terminate");
         let publish = body
             .find("publish_poll_task_running(current)")
             .expect("poll_schedule must publish TASK_RUNNING after sleep");
@@ -5148,8 +5154,28 @@ mod tests {
             .find("table.clear_triggered()")
             .expect("poll_schedule must clear the observed wakeup before cleanup");
         assert!(
-            publish < clear && body[clear..].contains("table.finish();"),
+            publish < clear,
             "poll cleanup must follow TASK_RUNNING publication and trigger clearing"
+        );
+        // Linux frees the poll table from `do_select()`/`do_poll()` via
+        // `poll_freewait()`, not from `poll_schedule_timeout()`
+        // (vendor/linux/fs/select.c), and Lupos matches that: `poll_schedule`
+        // only publishes TASK_RUNNING and clears `triggered`, while the callers
+        // own `finish()`. Assert that split rather than requiring the teardown
+        // inside the sleep helper, which is where this check used to look.
+        // (The `current.is_null()` early return above the sleep does free the
+        // table; only the post-sleep path must leave it to the caller.)
+        assert!(
+            !body[clear..].contains("table.finish();"),
+            "poll table teardown belongs to the caller, as Linux poll_freewait does"
+        );
+        let callers = source
+            .split("fn poll_schedule(")
+            .next()
+            .expect("poll_schedule callers precede its definition");
+        assert!(
+            callers.contains("poll_table.finish();"),
+            "do_select()/do_poll() must still free the poll table after the sleep"
         );
 
         let mut task = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
