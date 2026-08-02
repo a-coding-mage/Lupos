@@ -2171,16 +2171,7 @@ pub(crate) fn send_signal_info_to_process_for_target(
 
     if stop_now {
         unsafe {
-            (*target).m26.ptrace_stop_signal = sig;
-            (*target).__state.store(
-                crate::kernel::task::task_state::__TASK_STOPPED,
-                core::sync::atomic::Ordering::Release,
-            );
-            let parent = (*target).m26.real_parent;
-            if !parent.is_null() {
-                let _ = send_signal_to_task(parent, SIGCHLD);
-            }
-            wake_waiters(target);
+            apply_remote_stop(target, sig);
         }
         return 0;
     }
@@ -2342,16 +2333,7 @@ unsafe fn send_signal_to_task_scoped(
 
     if stop_now {
         unsafe {
-            (*target).m26.ptrace_stop_signal = sig;
-            (*target).__state.store(
-                crate::kernel::task::task_state::__TASK_STOPPED,
-                core::sync::atomic::Ordering::Release,
-            );
-            let parent = (*target).m26.real_parent;
-            if !parent.is_null() {
-                let _ = send_signal_to_task(parent, SIGCHLD);
-            }
-            wake_waiters(target);
+            apply_remote_stop(target, sig);
         }
         return 0;
     }
@@ -2508,9 +2490,70 @@ unsafe fn wake_waiters(task: *mut crate::kernel::task::TaskStruct) {
     }
 }
 
+/// Apply a stop signal that was sent to a *different* task.
+///
+/// Linux's sender side (`prepare_signal()`/`complete_signal()`) never writes
+/// the target's `__state`: it flushes SIGCONT, leaves the signal pending, and
+/// calls `signal_wake_up()`, so the target stops **itself** in `get_signal()`
+/// -> `do_signal_stop()`.
+///
+/// Writing `__TASK_STOPPED` onto a target that is asleep destroys the sleep
+/// state it was waiting in. The eventual wakeup then arrives as
+/// `wake_task_with_state(target, TASK_INTERRUPTIBLE, ..)`, no longer matches
+/// `__TASK_STOPPED`, and is lost forever — the task stays `T` and the machine
+/// goes idle with an empty runqueue. Only a task that is already running may
+/// have its state published this way; a sleeping task is instead marked
+/// pending and woken so it reaches its own signal-delivery path.
+unsafe fn apply_remote_stop(target: *mut crate::kernel::task::TaskStruct, sig: i32) {
+    if target.is_null() {
+        return;
+    }
+    unsafe {
+        (*target).m26.ptrace_stop_signal = sig;
+        let state = (*target)
+            .__state
+            .load(core::sync::atomic::Ordering::Acquire);
+        if state == crate::kernel::task::task_state::TASK_RUNNING {
+            (*target).__state.store(
+                crate::kernel::task::task_state::__TASK_STOPPED,
+                core::sync::atomic::Ordering::Release,
+            );
+        } else {
+            // Asleep: preserve the wait state and let the target stop itself.
+            set_tif_sigpending(target);
+            wake_signal_task(target, sig);
+        }
+        let parent = (*target).m26.real_parent;
+        if !parent.is_null() {
+            let _ = send_signal_to_task(parent, SIGCHLD);
+        }
+        wake_waiters(target);
+    }
+}
+
 unsafe fn stop_current_for_signal(task: *mut crate::kernel::task::TaskStruct, sig: i32) -> bool {
     if task.is_null() {
         return false;
+    }
+    // Focused probe: which signal actually stops a task, and who it hits.
+    // Lupos has no `SIGNAL_STOP_STOPPED`/`group_stop_count` bookkeeping, so a
+    // task stopped here is only resumed by an explicit SIGCONT; a spurious
+    // stop is therefore permanent. Capped so a stop storm cannot flood serial.
+    #[cfg(not(test))]
+    {
+        static STOP_REPORTS: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        if STOP_REPORTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 40 {
+            let comm = unsafe { &(*task).comm };
+            let len = comm.iter().position(|&c| c == 0).unwrap_or(comm.len());
+            crate::linux_driver_abi::tty::serial_println!(
+                "signal: group-stop pid={} tgid={} sig={} comm={}",
+                unsafe { (*task).pid },
+                unsafe { (*task).tgid },
+                sig,
+                core::str::from_utf8(&comm[..len]).unwrap_or("?"),
+            );
+        }
     }
     unsafe {
         (*task).m26.ptrace_stop_signal = sig;

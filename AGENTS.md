@@ -131,25 +131,66 @@ continue without rediscovering the setup.
 
 ## Bug investigation loop
 
-When the user hands you a bug, work this loop.
+**Parity first, debugging second.** Do not debug Lupos code that is not yet a
+faithful translation of its `vendor/linux` counterpart. Divergent code cannot
+be expected to behave or perform like Linux, so any conclusion drawn from it is
+a conclusion about a Lupos invention, not about a real defect. Debugging a
+non-parity implementation wastes the effort twice: once to explain behavior
+that only exists because the code is different, and again after the code is
+made correct and the explanation no longer applies.
 
-1. Troubleshoot and analyze until you can name where the root cause most
-   likely lives — a specific file and code path, not a symptom.
-2. Compare that code against its `vendor/linux` C implementation directly:
-   control flow, ordering, locking, error paths, constants, and layouts.
-3. Fix every inconsistency found there, then test.
-4. If the bug survives, repeat from step 1 with what the pass taught you. Each
-   iteration must eliminate candidates rather than restate the hypothesis.
-5. Add unit tests covering each divergence so it cannot come back.
-6. Keep every parity fix that did not cause a regression, including fixes that
-   turn out not to be the reported bug's cause. Never revert a correct fix
-   merely because it was not the culprit; report it as a separate finding.
+Work these phases strictly in order.
 
-Prefer this loop over waiting for an intermittent failure to reproduce.
-Observation only locates the suspect area; the comparison against
-`vendor/linux` is what identifies the defect. Lupos is largely machine-written,
-so assume a divergence exists and go find it rather than assuming the Rust side
-is already faithful.
+### Phase 1 — Localize
+
+Analyze until you can name where the issue most likely lives: a specific file
+and code path, not a symptom. Use observation (serial logs, the QEMU monitor,
+GDB, existing detectors) only to narrow the suspect area. Do not fix anything
+in this phase, and do not form a root-cause theory from Lupos-only reasoning.
+
+### Phase 2 — Bring that area to 1:1 parity
+
+Before any debugging, read the matching `vendor/linux` source for every file
+the suspect path touches and close every divergence you find:
+
+- data structures and their invariants, not just function behavior;
+- control flow, ordering, and locking;
+- error paths, return values, and errno;
+- constants, layouts, and ABI;
+- the mechanism itself — see "Fall back to Linux by default".
+
+Fix all of them, including divergences that plainly are not the reported bug.
+Then re-test. Frequently the bug disappears here, because it *was* the
+divergence. Record each divergence separately, with its Linux function, so the
+list survives even when the symptom does not.
+
+### Phase 3 — Debug only what survives
+
+Only once the suspect path is a faithful translation, debug the remaining
+behavior. Anything still failing is now a genuine defect worth deep
+investigation, and its evidence is meaningful because the code under it matches
+Linux.
+
+### Phase 4 — Iterate
+
+If the bug survives Phase 3, return to Phase 1 with what you learned and widen
+the suspect area. Each iteration must eliminate candidates rather than restate
+the hypothesis.
+
+### Rules that apply across all phases
+
+- Add or select a regression test covering each divergence so it cannot come
+  back, following "Regression tests are part of every fix".
+- Keep every parity fix that did not cause a regression, including fixes that
+  turn out not to be the reported bug's cause. Never revert a correct fix
+  merely because it was not the culprit; report it as a separate finding.
+- Prefer this loop over waiting for an intermittent failure to reproduce.
+  Observation only locates the suspect area; the comparison against
+  `vendor/linux` is what identifies the defect.
+- Lupos is largely machine-written, so assume a divergence exists and go find
+  it rather than assuming the Rust side is already faithful. "I read it and it
+  looked correct" is not a parity check; cite the Linux function you compared
+  against.
 
 ## GDB-first debugging
 

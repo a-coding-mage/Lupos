@@ -182,6 +182,33 @@ fn report(idle_jiffies: u64) {
             unsafe { (*task).tgid },
             sigchld as u8
         );
+        // For an uninterruptible sleeper, name *where* it is blocked. Lupos has
+        // no `/proc/<pid>/wchan` and no `kallsyms`, but neither is needed: dump
+        // the raw return addresses from the saved kernel stack and symbolize
+        // them on the host with
+        //   addr2line -f -C -e target/xtask/cargo-graphics-x11/x86_64-lupos/release/lupos <addr>
+        //
+        // A `D` task is descheduled, so `thread.sp` is stable and its stack is
+        // quiescent. Only kernel-text-looking words are printed, and the count
+        // is capped, so this stays a few lines per stalled task.
+        if state & task_state::TASK_UNINTERRUPTIBLE != 0 {
+            let sp = unsafe { (*task).thread.sp };
+            if sp != 0 {
+                let mut shown = 0u32;
+                for slot in 0..64u64 {
+                    if shown >= 8 {
+                        break;
+                    }
+                    let addr = sp + slot * 8;
+                    // SAFETY: reading the descheduled task's own kernel stack.
+                    let word = unsafe { core::ptr::read_volatile(addr as *const u64) };
+                    if (0x20_0000..0x100_0000).contains(&word) {
+                        serial_println!("      blocked-at pid:{} retaddr:{:#x}", pid, word);
+                        shown += 1;
+                    }
+                }
+            }
+        }
     });
 }
 

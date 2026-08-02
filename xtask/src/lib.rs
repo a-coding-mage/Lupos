@@ -5080,6 +5080,50 @@ fn gtk3_settings_ini() -> Vec<u8> {
 /// whole session.  Staged into the per-user xfconf layer (`root/` and
 /// `home/lupos/`) because the package-owned system default under `/etc/xdg`
 /// must remain untouched and the user layer overrides it regardless.
+/// Point xfdesktop at a **raster** backdrop instead of its compiled-in SVG.
+///
+/// xfdesktop 4.20.2 ships no `xfce4-desktop.xml`, so it falls back to the
+/// stock `xfce-x.svg`. Staged `gdk-pixbuf2` delegates SVG decode to the
+/// out-of-process `glycin-svg` loader (see `gtk3_settings_ini`), and that
+/// bridge is the one image path no probe covers — the desktop backdrop is
+/// black in every measured run while `glycin-thumbnailer` decodes the same
+/// file successfully on its own.
+///
+/// The staged JPEG login wallpaper renders through `glycin-image-rs`, the
+/// loader the icon theme was already switched to PNG in order to use, and
+/// which `pixbuf-bridge-pixels ok` verifies each run. `image-style` 5 is
+/// xfdesktop's "zoomed" fit.
+fn xfce_desktop_xml() -> Vec<u8> {
+    concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+        "<channel name=\"xfce4-desktop\" version=\"1.0\">\n",
+        "  <property name=\"backdrop\" type=\"empty\">\n",
+        "    <property name=\"screen0\" type=\"empty\">\n",
+        "      <property name=\"monitor0\" type=\"empty\">\n",
+        "        <property name=\"workspace0\" type=\"empty\">\n",
+        "          <property name=\"image-style\" type=\"int\" value=\"5\"/>\n",
+        "          <property name=\"last-image\" type=\"string\" ",
+        "value=\"/usr/share/backgrounds/lupos-login.jpg\"/>\n",
+        "        </property>\n",
+        "      </property>\n",
+        // The fbdev output name is not known ahead of time; xfdesktop looks up
+        // `monitor<name>` before falling back, so publish the generic default
+        // too rather than depending on which one it resolves.
+        "      <property name=\"monitordefault\" type=\"empty\">\n",
+        "        <property name=\"workspace0\" type=\"empty\">\n",
+        "          <property name=\"image-style\" type=\"int\" value=\"5\"/>\n",
+        "          <property name=\"last-image\" type=\"string\" ",
+        "value=\"/usr/share/backgrounds/lupos-login.jpg\"/>\n",
+        "        </property>\n",
+        "      </property>\n",
+        "    </property>\n",
+        "  </property>\n",
+        "</channel>\n",
+    )
+    .as_bytes()
+    .to_vec()
+}
+
 fn xfce_xsettings_xml() -> Vec<u8> {
     concat!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
@@ -15693,6 +15737,11 @@ fn direct_stage_login_root_disk_overlay_files(
                 &format!("{account}/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml"),
                 0o100644,
                 xfce_xsettings_xml(),
+            ));
+            files.push(initramfs_file(
+                &format!("{account}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"),
+                0o100644,
+                xfce_desktop_xml(),
             ));
         }
         files.push(initramfs_file(

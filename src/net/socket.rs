@@ -970,17 +970,20 @@ pub(crate) fn autobind_inet(socket: &mut KernelSocket) {
     }
 }
 
+/// Linux `task_tgid_vnr(current)`, as used by `init_peercred()` when it stores
+/// `get_pid(task_tgid(current))`.
+///
+/// This must be a *namespace-relative* number: `task_tgid_nr_ns()` yields 0
+/// when the task is not visible in the namespace, which is what
+/// `cred_to_ucred()` -> `pid_vnr()` reports to `SO_PEERCRED` readers. Returning
+/// the raw global `tgid` here made every `bwrap`-sandboxed peer report a
+/// number that is meaningless outside the init namespace.
 fn current_tgid_vnr() -> i32 {
     let task = unsafe { crate::kernel::sched::get_current() };
     if task.is_null() {
         return 0;
     }
-    let tgid = unsafe { (*task).tgid };
-    if tgid > 0 {
-        tgid
-    } else {
-        unsafe { (*task).pid }
-    }
+    crate::kernel::pid_namespace::task_tgid_vnr(task)
 }
 
 fn current_pid_ref(pid: i32) -> Option<SocketPidRef> {
