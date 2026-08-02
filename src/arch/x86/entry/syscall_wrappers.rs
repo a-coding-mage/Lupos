@@ -4039,6 +4039,16 @@ mod tests {
             assert_eq!(__x64_sys_clock_adjtime(&mut r), 0);
 
             files::drop_task_files(&mut *current as *mut TaskStruct);
+            // The sleep/timer syscalls above materialize this task's private
+            // signal state, which stores `task_addr` in the global
+            // SIGNAL_TABLE. `current` is a Box, so it is freed when this scope
+            // ends; without unbinding first, that entry dangles and the next
+            // `signal::reset_for_tests()` writes through it. Linux never frees
+            // a task_struct while signal_struct still references it --
+            // `release_task()` runs `__exit_signal()` first -- and every
+            // non-test path here does the same (kernel/exit.rs:366,
+            // kernel/exit.rs:571, kernel/fork.rs:1866).
+            crate::kernel::signal::release_signal_task_binding(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
     }
