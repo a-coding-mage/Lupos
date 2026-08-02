@@ -1,218 +1,279 @@
-# Lupos agent rules
+Lupos agent rules
 
-## Non-negotiable parity rules
+Mission and execution order
 
-- The current target is the generic x86_64 configuration.
-- `vendor/linux` is the source of truth. Lupos ABI and observable behavior must
-  exactly match the corresponding Linux implementation.
-- Keep implementation structure one-to-one with the corresponding
-  `vendor/linux` C source whenever Rust can express it. A Rust-specific design
-  is allowed only when a faithful translation is impossible; document the
-  reason and prove equivalent behavior.
-- Drivers are built from the original Linux C source and loaded by Lupos. Do
-  not replace them with Rust rewrites.
-- Before editing a kernel file, locate and read its `vendor/linux` equivalent.
-  After editing it, compare the relevant control flow, constants, layouts,
-  errors, ordering, locking, and side effects again.
-- **Port Linux's implementation; never design a replacement.** If Linux solves
-  the problem, the only acceptable implementation is a translation of Linux's
-  data structures and algorithm. "Write it from scratch in Rust because it is
-  simpler/easier/bounded" is not permitted, even when the result passes tests.
-  Matching observable behavior is not sufficient — the mechanism must match too,
-  because Linux's mechanism is what carries its performance and its
-  memory/stack/latency guarantees. See "Fall back to Linux by default" below.
-- Always report the truth. Never claim parity, a passing test, a benchmark
-  result, or a root cause without evidence.
-- Agents must not create branches or commit code without explicit approval.
-- If a task has independent changes across multiple kernel areas, delegate the
-  independent areas to focused sub-agents and evaluate their work as it
-  arrives. Sub-agents must not run builds; the main agent owns all builds,
-  integration, and final validation.
+Lupos exists to reproduce Linux on the current generic x86_64 target. The taskis not to design a Linux-like kernel or to make a failing build pass by anyconvenient means. The task is to port Linux faithfully.
 
-## Fall back to Linux by default
+Every task must follow this order:
 
-Lupos exists to be Linux, not to be an alternative kernel that behaves like it.
-Whenever you are about to write a mechanism, stop and find Linux's first.
+Preserve the user's worktree and capture the environment.
 
-### The rule
+Define the exact parity scope.
 
-1. Before writing any new mechanism, locate the `vendor/linux` equivalent and
-   name it in a comment (`Ref:` / `linux-source:`). If you cannot find one, say
-   so explicitly in the code and the handoff — do not silently invent.
-2. Port Linux's **data structure and algorithm**, not just its outward
-   behavior. `llist`, `list_head`, `rbtree`, `xarray`, `radix tree`, per-CPU
-   areas, RCU-protected lists, and refcounts are part of the contract.
-3. Prefer the Linux code path even when it looks like overkill for Lupos's
-   current scale. Linux's structures are what make its costs bounded; a
-   "simpler" substitute usually moves the cost somewhere invisible.
-4. A Lupos-specific design requires **all** of: a documented reason a faithful
-   translation is impossible, evidence of equivalent behavior, and a
-   `linux-deviation:` marker in the file header naming the Linux function it
-   replaces. Convenience, "Rust is different", and "we only support N CPUs" are
-   not reasons.
-5. When you find an existing Lupos-specific substitute while working nearby,
-   report it as a finding even if it is not your bug.
+Audit that complete scope against vendor/linux.
 
-### Known-bad substitution patterns
+Close every parity gap in scope before debugging or diagnosing the build.
 
-These have each caused a real, expensive Lupos defect. Treat them as defects on
-sight:
+Build the parity-settled tree.
 
-- **Fixed-size arrays replacing Linux's intrusive lists.** Linux moves lists by
-  pointer in O(1); a fixed array forces an O(n) copy, and a by-value move of a
-  large array allocates a stack temporary of that size. The release kernel
-  stack is Linux's x86-64 `THREAD_SIZE` (16 KiB, `KTHREAD_STACK_ORDER = 2`), so
-  an 8 KiB temporary is half the stack. This is exactly how
-  `begin_task_struct_rcu_release()`'s `core::ptr::swap` on
-  `[*mut TaskStruct; 1024]` produced a `#DF` that then wedged every other CPU
-  in the TLB shootdown wait. Linux's `rcu_do_batch()` moves the callback list
-  by pointer (`rcu_cblist_flush_enqueue()`).
-- **`ptr::swap` / `mem::swap` / `mem::replace` / by-value assignment of large
-  arrays or large structs.** Every one allocates a full-size stack temporary.
-  Budget against 16 KiB, not against what fits.
-- **Static `MAX_*` matrices replacing Linux's dynamic per-CPU queues.** The TLB
-  shootdown `[source][target]` slot matrix replaces
-  `smp_call_function_many_cond()`'s per-CPU `llist` and loses its
-  empty-to-non-empty IPI arming and whole-queue `llist_del_all()` drain.
-- **Polling where Linux is interrupt-driven.** Any idle-loop pump that exists
-  because a driver "has no IRQ path yet" is a latency bug with a deadline, not
-  a design.
-- **Reporting a constant where Linux computes a value.** `/proc` fields that
-  return a fixed answer (for example a hardcoded `R (running)` task state) do
-  not merely lose information — they actively mislead every later
-  investigation.
+If the build, boot, test, or runtime path still fails, debug only thatsurviving failure.
 
-### Stub and constant audit
+Fix the failure by preserving Linux's ABI, data structures, algorithm,invariants, ordering, error behavior, side effects, and subsystem intent.
 
-A field, file, or syscall that returns a fixed value is a parity gap even when
-nothing currently fails. When you touch such code, either implement Linux's
-computation or record it in the handoff with the Linux function it should call.
-Never let a stub be mistaken for working behavior in a report.
+Rebuild, run the regression and compatibility gates, and measure the affectedperformance-sensitive path.
 
-## Required investigation workflow
+Report only claims supported by retained evidence.
 
-Make every issue reproducible and leave enough evidence for the next person to
-continue without rediscovering the setup.
+A failure observed before parity is settled is only a locator. It is not yet avalid root cause. Do not spend time explaining, instrumenting, or repairingbehavior produced by a Lupos-specific divergence.
 
-1. Reproduce the problem before changing code. Record the smallest reproducer,
-   exact command, expected result, actual result, `.config`, relevant
-   environment overrides, current revision, and dirty-worktree state. Do not
-   erase or overwrite the user's existing changes.
-2. Create `target/xtask/investigations/<issue>/` and retain raw evidence there:
-   commands, serial logs, GDB transcripts, screenshots when relevant,
-   benchmark samples, and a short `notes.md` containing the current hypothesis
-   and eliminated causes. `target/` is ignored, so explicitly mention these
-   paths in the handoff.
-3. Capture enough environment information to reproduce tool-sensitive issues:
+Non-negotiable parity rules
 
-   ```bash
-   git rev-parse HEAD
-   git status --short
-   rustc -Vv
-   cargo -V
-   qemu-system-x86_64 --version
-   gdb --version
-   uname -a
-   ```
+The current target is the generic x86_64 configuration.
 
-4. Read the matching Linux implementation and its tests before forming the
-   fix. Trace inputs through the first point where Lupos diverges from Linux;
-   do not stop at the first visible symptom.
-5. For boot failures, keep the unique serial log printed by `cargo xtask` and
-   run:
+vendor/linux is the source of truth. Lupos must match the correspondingLinux implementation's ABI, observable behavior, and implementationmechanism.
 
-   ```bash
-   cargo xtask boot-triage target/xtask/serial-<mode>-<run-id>.log
-   ```
+Port Linux's implementation; never design a replacement when Linux alreadyprovides one.
 
-6. Reduce temporary instrumentation to focused probes. Remove noisy probes
-   after the cause is proven, but retain the reproducer, regression test, and
-   useful failure diagnostics.
+Preserve the purpose of the Linux code, not merely its output. Determine thatpurpose from the implementation, data-structure invariants, comments,callers, callees, tests, error paths, locking, memory ordering, lifetime andreference rules, and performance constraints.
 
-## Bug investigation loop
+Keep the Rust structure one-to-one with the corresponding vendor/linux Csource whenever Rust can express it.
 
-**Parity first, debugging second.** Do not debug Lupos code that is not yet a
-faithful translation of its `vendor/linux` counterpart. Divergent code cannot
-be expected to behave or perform like Linux, so any conclusion drawn from it is
-a conclusion about a Lupos invention, not about a real defect. Debugging a
-non-parity implementation wastes the effort twice: once to explain behavior
-that only exists because the code is different, and again after the code is
-made correct and the explanation no longer applies.
+A Rust-specific structure is permitted only when a faithful translation isgenuinely impossible. It requires:
 
-Work these phases strictly in order.
+a documented technical reason;
 
-### Phase 1 — Localize
+a linux-deviation: marker naming the Linux function or mechanism;
 
-Analyze until you can name where the issue most likely lives: a specific file
-and code path, not a symptom. Use observation (serial logs, the QEMU monitor,
-GDB, existing detectors) only to narrow the suspect area. Do not fix anything
-in this phase, and do not form a root-cause theory from Lupos-only reasoning.
+evidence of equivalent ABI and behavior;
 
-### Phase 2 — Bring that area to 1:1 parity
+evidence that Linux's ordering, boundedness, stack, latency, locking, andmemory-safety properties remain intact.
 
-Before any debugging, read the matching `vendor/linux` source for every file
-the suspect path touches and close every divergence you find:
+Convenience, reduced current scale, a fixed CPU limit, or "Rust is different"are not valid reasons for deviation.
 
-- data structures and their invariants, not just function behavior;
-- control flow, ordering, and locking;
-- error paths, return values, and errno;
-- constants, layouts, and ABI;
-- the mechanism itself — see "Fall back to Linux by default".
+Drivers are built from the original Linux C source and loaded by Lupos. Donot replace them with Rust rewrites.
 
-Fix all of them, including divergences that plainly are not the reported bug.
-Then re-test. Frequently the bug disappears here, because it *was* the
-divergence. Record each divergence separately, with its Linux function, so the
-list survives even when the symptom does not.
+Before editing any kernel file, locate and read its vendor/linuxcounterpart. After editing, compare the relevant Linux source again.
 
-### Phase 3 — Debug only what survives
+Always report the truth. Never claim parity, a passing build or test, abenchmark result, or a root cause without evidence.
 
-Only once the suspect path is a faithful translation, debug the remaining
-behavior. Anything still failing is now a genuine defect worth deep
-investigation, and its evidence is meaningful because the code under it matches
-Linux.
+Do not create branches or commit code without explicit user approval.
 
-### Phase 4 — Iterate
+Do not overwrite, discard, reformat away, or silently absorb the user'sexisting changes.
 
-If the bug survives Phase 3, return to Phase 1 with what you learned and widen
-the suspect area. Each iteration must eliminate candidates rather than restate
-the hypothesis.
+Tasks must be atomic and deterministic. Do not create background work thatruns indefinitely.
 
-### Rules that apply across all phases
+Independent parity work across separate kernel areas may be delegated tofocused sub-agents. Sub-agents may inspect and edit only their assignedscope; they must not run builds. The main agent owns integration, all builds,all runtime execution, and final validation.
 
-- Add or select a regression test covering each divergence so it cannot come
-  back, following "Regression tests are part of every fix".
-- Keep every parity fix that did not cause a regression, including fixes that
-  turn out not to be the reported bug's cause. Never revert a correct fix
-  merely because it was not the culprit; report it as a separate finding.
-- Prefer this loop over waiting for an intermittent failure to reproduce.
-  Observation only locates the suspect area; the comparison against
-  `vendor/linux` is what identifies the defect.
-- Lupos is largely machine-written, so assume a divergence exists and go find
-  it rather than assuming the Rust side is already faithful. "I read it and it
-  looked correct" is not a parity check; cite the Linux function you compared
-  against.
+Define the parity scope before editing
 
-## GDB-first debugging
+The parity scope is not merely the file named in the task. It includes:
 
-Use GDB whenever the failing path can run under QEMU. This is mandatory for
-crashes, panics, hangs, boot failures, corrupt state, and unexpected control
-flow when a symbolized QEMU reproduction is possible; serial-log speculation
-alone is not sufficient.
+every Lupos file directly changed by the task;
 
-Start the smallest relevant mode in a symbolized debug build:
+the complete call path needed to compile or execute the affected behavior;
 
-```bash
+every shared type, constant, layout, macro equivalent, helper, error path,synchronization primitive, and ABI boundary used by that path;
+
+the corresponding vendor/linux files and upstream tests;
+
+any additional area implicated by a later build or runtime failure.
+
+Create a parity ledger before editing. For each relevant item, record:
+
+Lupos file, symbol, type, or ABI surface;
+
+corresponding vendor/linux file and symbol;
+
+whether the data structure matches;
+
+whether the algorithm and control flow match;
+
+whether constants, layouts, flags, errno, and return values match;
+
+whether locking, barriers, ordering, ownership, reference handling, and sideeffects match;
+
+the Linux or upstream test that proves the contract;
+
+the divergence found and its correction status.
+
+Do not claim that the whole kernel is at parity unless the whole kernel wasactually audited. The mandatory requirement is to close every gap in thecomplete task scope. Record unrelated out-of-scope gaps as findings. If abuild or runtime failure implicates a new area, expand the scope, audit thatarea, and close all of its parity gaps before resuming debugging.
+
+Phase 0 — Preserve state and evidence
+
+Before making changes, record:
+
+git rev-parse HEAD
+git status --short
+rustc -Vv
+cargo -V
+qemu-system-x86_64 --version
+gdb --version
+uname -a
+
+Also retain:
+
+the exact task or reported symptom;
+
+the exact command that exposed it, when one was provided;
+
+expected and actual results;
+
+.config and relevant environment overrides;
+
+the current revision and dirty-worktree state.
+
+Create:
+
+target/xtask/investigations/<issue>/
+
+Store the parity ledger, commands, compiler output, serial logs, GDBtranscripts, QMP or strace output when applicable, benchmark samples, and ashort notes.md there. Because target/ is ignored, mention the exact pathsin the handoff.
+
+At this stage, an existing failure may be captured to identify the affectedscope. Do not yet diagnose its root cause or implement a failure-specificworkaround.
+
+Phase 1 — Settle all vendor/linux parity gaps
+
+This phase must finish before build debugging begins.
+
+For every item in the parity scope, read the matching vendor/linux source,its surrounding definitions, relevant callers and callees, and its upstreamLinux tests. Compare and correct all of the following:
+
+data structures and invariants;
+
+algorithm and mechanism, not just final output;
+
+control flow and operation ordering;
+
+locking, interrupt state, preemption rules, atomics, and memory barriers;
+
+lifetime, ownership, RCU, reference counting, and destruction order;
+
+success and error paths;
+
+return values and exact errno behavior;
+
+constants, flags, masks, limits, and computed values;
+
+C-compatible type layout, alignment, padding, signedness, width, and callingconvention;
+
+syscall, ioctl, procfs, sysfs, module, driver, and userspace ABI;
+
+externally visible side effects and their order;
+
+stack, allocation, latency, scalability, and boundedness properties;
+
+comments or tests that reveal why Linux uses that mechanism.
+
+Fix every discovered gap in scope, including one that is clearly unrelated tothe originally reported symptom. A correct parity fix must not be revertedmerely because it was not the symptom's cause.
+
+Each ported implementation must name its Linux source with the repository'saccepted Ref: or linux-source: convention. If no Linux equivalent can befound, say so explicitly in the source and handoff; never silently invent amechanism.
+
+The Linux mechanism is part of the contract
+
+Port Linux's data structure and algorithm. Matching visible results with asubstitute is insufficient. Linux mechanisms such as llist, list_head,enumerated state machines, rbtree, xarray, radix trees, per-CPU areas,RCU-protected lists, wait queues, work queues, refcounts, and interrupt-drivenpaths carry performance, ordering, stack, and latency guarantees.
+
+Prefer the Linux path even when it appears excessive for Lupos's currentscale. A simpler replacement usually shifts cost or risk into an unmeasuredpath.
+
+Known-bad substitution patterns
+
+Treat these as parity defects on sight:
+
+Fixed-size arrays replacing Linux intrusive lists. Linux can detach orsplice a list in O(1). An array commonly introduces O(n) copying and maycreate a large by-value stack temporary.
+
+ptr::swap, mem::swap, mem::replace, or by-value assignment of largearrays or structures. Budget against Linux x86-64 THREAD_SIZE of 16 KiB.A full-size temporary can exhaust the kernel stack.
+
+Static MAX_* matrices replacing Linux dynamic per-CPU queues. These canlose Linux's queue-drain, empty-to-non-empty notification, and scalabilitysemantics.
+
+Polling where Linux is interrupt-driven. An idle-loop pump is a latencydefect, not a permanent implementation strategy.
+
+A constant where Linux computes a value. A hardcoded procfs, sysfs,scheduler, memory, or task-state result is a parity gap and can mislead laterdebugging.
+
+A local container replacing the Linux container. A Vec, array, map, orcustom queue is not equivalent merely because tests currently pass.
+
+A local lock or atomic protocol replacing Linux ordering. Equivalentfinal values do not prove equivalent memory visibility or race behavior.
+
+The historical begin_task_struct_rcu_release() failure is the model warning:using core::ptr::swap on [*mut TaskStruct; 1024] created a large stackcopy, caused #DF, and left other CPUs waiting in TLB shootdown. Linux'srcu_do_batch() instead moves the callback list by pointer throughrcu_cblist_flush_enqueue().
+
+Stub and constant audit
+
+A field, syscall, procfs entry, sysfs entry, helper, or file that returns afixed value where Linux computes one is a parity gap even when nothing fails.When such code is in scope, implement the Linux computation. When it is outsidescope, record it with the Linux function it should use. Never report a stub asworking behavior.
+
+Parity phase exit criteria
+
+Do not proceed to the build phase until:
+
+every parity-ledger entry in scope is resolved or explicitly documented as ajustified linux-deviation:;
+
+every changed file has been re-compared with its Linux counterpart;
+
+the relevant ABI layouts and constants have explicit checks where practical;
+
+an upstream regression test or the closest valid oracle has been selectedfor every corrected contract;
+
+no known Lupos-specific substitute remains in the execution path beinghanded to the build.
+
+Phase 2 — Build the parity-settled tree
+
+Only now run the exact build command requested by the task or the repository'scanonical documented build command. Preserve the complete output in theinvestigation directory.
+
+A successful build does not prove parity; it only allows validation tocontinue. A failed build does not permit a workaround that changes Linux's ABIor intent.
+
+For each build error:
+
+Identify the first real compiler, linker, layout, symbol, or generated-codefailure rather than reacting to downstream cascades.
+
+Add the newly implicated files and symbols to the parity scope.
+
+Stop build debugging and compare that expanded scope with vendor/linux.
+
+Close every newly discovered parity gap there.
+
+Re-run the same build command.
+
+Repeat until the parity-settled tree builds or an external environmentblocker is proven with exact evidence.
+
+When adapting C semantics to Rust, preserve Linux's ABI and intendedmechanism. Do not make the build pass by:
+
+changing a public type, layout, calling convention, flag, or symbol contract;
+
+deleting or bypassing code paths;
+
+weakening type or bounds checks that represent a Linux invariant;
+
+replacing a Linux algorithm with a simpler Rust implementation;
+
+suppressing an error without proving it is spurious;
+
+hardcoding a value Linux derives;
+
+weakening or altering a test's expected Linux behavior.
+
+Phase 3 — Reproduce and debug only surviving failures
+
+After the parity-settled tree builds, run the smallest relevant boot, test, orruntime gate. If it passes, continue to the broader validation gates. If itfails, the surviving failure is now a valid debugging target.
+
+Record the smallest reproducer, exact command, expected result, actual result,configuration, environment, and unique logs. Trace inputs to the first pointwhere actual execution diverges from the corresponding Linux decision orinvariant. Do not stop at the first visible symptom.
+
+For boot failures, retain the unique serial log printed by cargo xtask andrun:
+
+cargo xtask boot-triage target/xtask/serial-<mode>-<run-id>.log
+
+Use focused probes only. Remove noisy temporary instrumentation after the causeis proven, while retaining the reproducer, useful diagnostics, and regressiontest.
+
+GDB-first runtime debugging
+
+Use GDB whenever the failing path can run under QEMU. It is mandatory forcrashes, panics, hangs, boot failures, corrupt state, and unexpected controlflow when a symbolized QEMU reproduction is possible. Serial-log speculationalone is not sufficient.
+
+Start the smallest relevant symbolized debug mode:
+
 LUPOS_PROFILE=debug cargo xtask run --terminal --gdb
 LUPOS_PROFILE=debug cargo xtask run --mode <mode> --gdb
 LUPOS_PROFILE=debug cargo xtask run --gui --gdb
-```
 
-`--gdb` starts QEMU paused and exposes the stub on `localhost:1234`. In a
-second terminal, run the exact `gdb <kernel-elf> -ex "target remote :1234"`
-command printed by `xtask`. Set breakpoints or watchpoints before `continue`.
-At minimum, capture the following when applicable:
+--gdb starts QEMU paused and exposes the stub on localhost:1234. In asecond terminal, run the exact command printed by xtask:
 
-```gdb
+gdb <kernel-elf> -ex "target remote :1234"
+
+Set breakpoints or watchpoints before continue. Capture, when applicable:
+
 set pagination off
 set logging file target/xtask/investigations/<issue>/gdb.txt
 set logging enabled on
@@ -220,95 +281,147 @@ info registers
 x/16i $pc
 bt
 thread apply all bt full
-```
 
-For a hang, interrupt GDB and collect all CPU backtraces, registers, the
-current instruction stream, and relevant memory or lock state. For corruption,
-prefer a watchpoint at the earliest known-good state. Break at both the Lupos
-and corresponding Linux decision points when comparing behavior.
+For a hang, interrupt GDB and collect every CPU's backtrace, registers, currentinstructions, and relevant lock or memory state. For corruption, prefer awatchpoint at the earliest known-good state. Compare the Lupos execution pointwith the corresponding Linux decision point and invariant.
 
-If GDB genuinely cannot be used (for example, the issue is host-only, the
-failure disappears under the stub, or the required environment is not QEMU),
-record the concrete reason in the investigation notes and use the closest
-available evidence such as a core dump, `strace`, QMP capture, or serial trace.
-"GDB would be inconvenient" is not a reason to skip it.
+If GDB genuinely cannot be used—for example, the defect is host-only, vanishesunder the stub, or requires a non-QEMU environment—record the concrete reasonand use the closest available evidence, such as a core dump, strace, QMPcapture, or serial trace. Inconvenience is not a valid reason to skip GDB.
 
-## Regression tests are part of every fix
+Phase 4 — Fix the surviving defect without violating Linux
 
-- Add or select a regression test before implementing the fix and demonstrate
-  that it fails for the reported behavior. Demonstrate that the same test
-  passes after the fix.
-- Prefer the original test from `vendor/linux`: KUnit, kselftest, LTP, the
-  subsystem test tool, or the original reproducer. Port/adapt only the harness
-  needed to run it on Lupos. Do not invent a local unit test when an upstream
-  behavioral test exists.
-- Every test-bearing Rust file must retain the repository's required
-  `test-origin` provenance. Explain why a Lupos-specific test is necessary when
-  no suitable Linux test exists.
-- Match the test layer to the bug. Pure host logic may use a host unit test;
-  syscalls, boot, interrupts, SMP, memory ordering, devices, modules, and
-  userspace ABI behavior require the relevant QEMU/runtime gate. A
-  source-text assertion is not runtime evidence and cannot be the sole
-  regression test.
-- Run the narrow failing test while iterating. Before handoff, always run
-  `cargo xtask test`, the relevant `cargo xtask test --mode <mode>` (or
-  `--boot`), and any original Linux test used as the oracle. Use
-  `cargo xtask test --all` for cross-cutting, module, release, or broad ABI
-  changes. Repeat timing-, SMP-, or race-sensitive tests enough to expose
-  flakes.
-- Never weaken, delete, ignore, or change a test's expected Linux behavior just
-  to make a change pass. Report pre-existing and environment-blocked failures
-  separately with their exact output.
+A post-parity fix must still be a Linux-faithful correction. Before editing:
 
-## Performance regression gate
+identify the violated Linux invariant or contract;
 
-Every implementation change must identify the performance-sensitive path it
-touches and use a relevant benchmark. If no benchmark exercises that path,
-create one as part of the change. Documentation-only changes are exempt.
+identify the corresponding Linux function, type, test, or call path;
 
-- Prefer the corresponding benchmark from `vendor/linux` or an upstream Linux
-  test tool. When none exists, add the smallest reproducible benchmark that
-  drives the real path, checks correctness, reports machine-readable samples,
-  and documents why a Lupos-specific benchmark is necessary. Do not benchmark
-  a mock in place of kernel behavior.
-- Run a baseline before editing and the candidate after editing with the exact
-  same workload, optimized profile, `.config`, QEMU version, accelerator, CPU
-  model, machine, RAM, SMP count, disk image, host load policy, and warm-up
-  state. Example fixed settings:
+explain why the parity-settled Rust translation still diverges in execution;
 
-  ```bash
-  LUPOS_PROFILE=release LUPOS_QEMU_ACCEL=tcg \
-    LUPOS_QEMU_CPU=max LUPOS_QEMU_MEMORY=1024M \
-    cargo xtask run --mode <benchmark-mode>
-  ```
+select or add the regression test that demonstrates the failure.
 
-  Use KVM instead of TCG when the benchmark is intended to measure native CPU
-  behavior, but never compare a KVM sample with a TCG sample.
-- Collect raw per-iteration output under
-  `target/xtask/benchmarks/<name>/{baseline,candidate}/`. Include warm-ups and
-  enough measured repetitions to characterize noise (normally at least 10);
-  compare median and tail latency or throughput, not a single wall-clock run.
-- Correctness must pass before timing is considered. Boot time alone is not a
-  proxy for the changed subsystem unless boot performance is the stated
-  workload.
-- A candidate must not be materially slower than baseline beyond the measured
-  noise threshold. Do not hide a regression in averages. Any accepted
-  performance trade-off requires explicit user approval and must be documented
-  with raw numbers and rationale.
-- Keep checked-in benchmarks runnable with one documented command and give
-  their parsing/setup logic a correctness smoke test where practical. Avoid
-  flaky timing thresholds in uncontrolled CI; preserve samples and evaluate
-  thresholds in a controlled benchmark environment.
+Then implement the smallest correction that restores Linux's behavior andmechanism. Preserve:
 
-## Completion checklist
+ABI and layout;
 
-Before claiming an issue is complete, provide evidence for all of the
-following:
+upstream algorithm and data structure;
 
-- the original reproducer now passes;
-- the regression test failed before the fix and passes after it;
-- Linux source, ABI, errors, ordering, and behavior were re-compared;
-- GDB was used, or the specific reason it could not be used was recorded;
-- focused tests and the required broader gates passed;
-- benchmark baseline and candidate samples show no material regression;
-- investigation artifact paths and any remaining uncertainty are handed off.
+return values and errno;
+
+ordering, barriers, locks, and side effects;
+
+ownership, lifetime, RCU, and refcount semantics;
+
+stack and allocation bounds;
+
+interrupt, preemption, and per-CPU behavior;
+
+the subsystem purpose demonstrated by Linux's callers and tests.
+
+Rebuild after each focused correction. If the new evidence implicates anotherarea, return to the parity phase for that expanded scope before continuing todebug.
+
+Regression tests are part of every parity correction and defect fix
+
+Select or add the regression oracle before implementing each correction.
+
+Demonstrate that it fails against the relevant pre-correction behavior whenthat state is buildable and executable, and that it passes afterward.
+
+Prefer the original Linux test from vendor/linux: KUnit, kselftest, LTP,the subsystem test tool, or the original reproducer. Port or adapt only theharness required to execute it on Lupos.
+
+Do not invent a local unit test when an upstream behavioral test alreadydefines the contract.
+
+Every test-bearing Rust file must retain the repository's requiredtest-origin provenance. Explain why a Lupos-specific test is necessary whenno suitable Linux test exists.
+
+Match the test layer to the defect. Pure host logic may use a host unit test.Syscalls, boot, interrupts, SMP, memory ordering, devices, modules, anduserspace ABI require the relevant QEMU or runtime gate.
+
+A source-text assertion is not runtime evidence and cannot be the soleregression test.
+
+Never weaken, delete, ignore, or change a test's expected Linux behavior tomake a change pass.
+
+Report pre-existing and environment-blocked failures separately with exactoutput.
+
+While iterating, run the narrowest valid test. Before handoff, run:
+
+cargo xtask test
+cargo xtask test --mode <relevant-mode>
+
+Use --boot where appropriate, run any original Linux test used as the oracle,and use:
+
+cargo xtask test --all
+
+for cross-cutting, module, release, or broad ABI changes. Repeat timing-, SMP-,or race-sensitive tests enough times to expose flakes.
+
+Performance regression gate
+
+Every implementation change must identify the performance-sensitive real pathit touches and exercise it with a relevant benchmark. Documentation-onlychanges are exempt.
+
+Prefer the corresponding vendor/linux benchmark or an upstream Linux testtool. When none exists, add the smallest reproducible benchmark that:
+
+drives the real kernel path rather than a mock;
+
+checks correctness;
+
+emits machine-readable samples;
+
+documents why a Lupos-specific benchmark is necessary.
+
+For a post-parity defect fix, the baseline is the parity-settled tree before thespecific fix, and the candidate is the corrected tree. A faster non-parityimplementation is never a valid reason to preserve a Linux divergence. When apre-correction state cannot build or execute, record that fact and compare thecandidate against the closest valid parity baseline and Linux's intendedcomplexity and boundedness guarantees.
+
+Use the same workload, optimized profile, .config, QEMU version,accelerator, CPU model, machine, RAM, SMP count, disk image, host-load policy,and warm-up state. Example fixed settings:
+
+LUPOS_PROFILE=release LUPOS_QEMU_ACCEL=tcg \
+  LUPOS_QEMU_CPU=max LUPOS_QEMU_MEMORY=1024M \
+  cargo xtask run --mode <benchmark-mode>
+
+Use KVM instead of TCG when measuring native CPU behavior, but never compare aKVM sample with a TCG sample.
+
+Store raw per-iteration output under:
+
+target/xtask/benchmarks/<name>/baseline/
+target/xtask/benchmarks/<name>/candidate/
+
+Include warm-ups and enough measured repetitions to characterize noise,normally at least ten. Compare median and tail latency or throughput, not asingle wall-clock run. Correctness must pass before timing is considered. Boottime is not a proxy for a subsystem unless boot performance is the statedworkload.
+
+The candidate must not be materially slower than the valid baseline beyond themeasured noise threshold. Do not hide regressions in averages. Any acceptedperformance trade-off requires explicit user approval and retained raw numbersand rationale.
+
+Keep checked-in benchmarks runnable with one documented command. Wherepractical, give their setup and parsing logic a correctness smoke test. Avoidflaky timing thresholds in uncontrolled CI; preserve samples and evaluate themin a controlled environment.
+
+Completion checklist
+
+Do not claim completion until evidence proves all applicable items:
+
+the exact task scope and any later expansions were recorded;
+
+every parity gap in that scope was closed or documented with an approvedlinux-deviation: and proof;
+
+every changed file was re-compared with its vendor/linux counterpart;
+
+Linux's data structures, algorithm, invariants, ABI, layouts, constants,errors, ordering, locking, barriers, lifetimes, and side effects match;
+
+the parity-settled tree builds successfully;
+
+the original reproducer passes, when one exists;
+
+each regression test failed before the relevant correction when demonstrableand passes afterward;
+
+GDB was used for an applicable runtime failure, or the concrete reason itcould not be used was recorded;
+
+focused tests and all required broader gates passed;
+
+benchmark samples show no material regression against a valid paritybaseline;
+
+raw evidence and investigation paths were handed off;
+
+remaining uncertainty, environment blockers, pre-existing failures, andout-of-scope parity findings were reported explicitly;
+
+no branch or commit was created without approval.
+
+The final report must distinguish clearly between:
+
+parity gaps corrected before the build;
+
+build errors that survived the parity sweep and how they were fixed;
+
+runtime or test defects that survived a successful build;
+
+validation and benchmark evidence;
+
+unresolved or out-of-scope findings.

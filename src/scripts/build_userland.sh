@@ -199,6 +199,9 @@ ARCH_GRAPHICS_PACKAGES=(
     wireplumber
     pavucontrol
     xfce4-pulseaudio-plugin
+    # Power/battery status area.  Supplies both the xfce4-power-manager daemon
+    # and its panel plugin, which is what draws the battery indicator.
+    xfce4-power-manager
     # Keep browser and standalone playback codec coverage explicit instead of
     # relying on Firefox's current transitive dependency closure.
     ffmpeg
@@ -499,6 +502,7 @@ graphics_stage_ready() {
         && [ -x "$1/usr/bin/xfsettingsd" ] \
         && [ -x "$1/usr/bin/xfce4-settings-manager" ] \
         && [ -x "$1/usr/bin/xfce4-terminal" ] \
+        && [ -x "$1/usr/bin/xfce4-power-manager" ] \
         && [ -x "$1/usr/bin/nano" ] \
         && [ -x "$1/usr/bin/firefox" ] \
         && [ -x "$1/usr/bin/dbus-launch" ] \
@@ -514,6 +518,7 @@ graphics_stage_ready() {
         && [ -d "$1/var/lib/pacman/local/xterm-410-1" ] \
         && [ -d "$1/var/lib/pacman/local/nano-9.0-1" ] \
         && [ -d "$1/var/lib/pacman/local/firefox-151.0.2-1" ] \
+        && [ -d "$1/var/lib/pacman/local/xfce4-power-manager-4.20.0-3" ] \
         && [ -e "$1/usr/share/fonts/misc/6x13-ISO8859-1.pcf.gz" ] \
         && [ -d "$1/var/lib/pacman/local/xorg-fonts-misc-1.0.4-2" ] \
         && find "$1/var/lib/pacman/local" -maxdepth 1 -type d -name 'noto-fonts-cjk-*' -print -quit \
@@ -1185,9 +1190,139 @@ EOF
             "$S/etc/systemd/system/multi-user.target.wants/${svc}.service"
     done
 
+    enable_arch_systemd_user_units "$S"
+    configure_arch_panel_status_plugins "$S"
+
     stage_arch_pacman_keyring
     write_lupos_pacman_config
     : > "$VENDOR_POLICY_STAMP"
+}
+
+# pacman runs with `--noscriptlet`, so packaged post_install scriptlets never
+# execute.  wireplumber's is the one that matters for the desktop:
+#
+#     # wireplumber .INSTALL
+#     post_install() {
+#       systemctl --global enable wireplumber.service
+#     }
+#
+# Without it nothing in the image references the PipeWire user units, so a real
+# session starts no sound server at all and PulseAudio clients (pavucontrol,
+# the XFCE volume plugin) fail to connect.  The Arch packages do not ship the
+# enabling symlinks either -- verified against pacman's mtree, which lists only
+# the unit files themselves.
+#
+# Reproduce `systemctl --global enable`, which materialises each unit's
+# [Install] section under /etc/systemd/user.  The vendor [Install] stanzas are:
+#
+#   pipewire.socket        WantedBy=sockets.target
+#   pipewire.service       WantedBy=default.target, Also=pipewire.socket
+#   pipewire-pulse.socket  WantedBy=sockets.target
+#   pipewire-pulse.service WantedBy=default.target, Also=pipewire-pulse.socket
+#   wireplumber.service    WantedBy=pipewire.service,
+#                          Alias=pipewire-session-manager.service
+#
+# The wireplumber alias is required, not cosmetic: pipewire-pulse.service has
+# `Wants=pipewire-session-manager.service`.
+enable_arch_systemd_user_units() {
+    if ! graphics_enabled; then
+        return 0
+    fi
+    local root="$1"
+    local user_units="$root/usr/lib/systemd/user"
+    local enable_root="$root/etc/systemd/user"
+
+    # unit:target pairs, mirroring each unit's own WantedBy=.
+    local pair unit target
+    for pair in \
+        pipewire.socket:sockets.target \
+        pipewire.service:default.target \
+        pipewire-pulse.socket:sockets.target \
+        pipewire-pulse.service:default.target \
+        wireplumber.service:pipewire.service
+    do
+        unit="${pair%%:*}"
+        target="${pair##*:}"
+        [ -f "$user_units/$unit" ] || continue
+        mkdir -p "$enable_root/${target}.wants"
+        ln -sfn "/usr/lib/systemd/user/$unit" \
+            "$enable_root/${target}.wants/$unit"
+    done
+
+    # Alias=pipewire-session-manager.service from wireplumber.service.
+    if [ -f "$user_units/wireplumber.service" ]; then
+        ln -sfn /usr/lib/systemd/user/wireplumber.service \
+            "$enable_root/pipewire-session-manager.service"
+    fi
+}
+
+# The stock xfce4-panel layout (etc/xdg/xfce4/panel/default.xml) wires up only
+# `systray` (id 6) and `actions` (id 10) in the status area; upstream XFCE
+# leaves it to the user to add the volume and power indicators.  Confirmed at
+# runtime: the panel spawns exactly two plugin wrappers, libsystray.so and
+# libactions.so.  So no volume or battery icon can ever appear, however healthy
+# PipeWire and upower are.
+#
+# Add `pulseaudio` and `power-manager-plugin` immediately after the systray, so
+# the status area holds the notification tray, volume, battery and clock in the
+# usual order.  Both plugins are shipped by packages this image already
+# installs (xfce4-pulseaudio-plugin, xfce4-power-manager); a plugin whose
+# .desktop is absent is silently skipped by the panel, so this stays inert if
+# either package is dropped.
+#
+# `etc/xdg/xfce4/panel/default.xml` is owned by xfce4-panel and is checked by
+# `vendor_package_files_pristine`, so it must not be edited.  Instead derive a
+# Lupos-owned xfconf system default from it.  xfconf resolves the `xfce4-panel`
+# channel from `xfce4/xfconf/xfce-perchannel-xml/` across $XDG_CONFIG_DIRS, and
+# the panel only falls back to `panel/default.xml` when that channel is empty,
+# so the derived copy wins while the vendor file stays byte-identical.
+# `xfce4-panel.xml` is not shipped by any installed package (the directory
+# holds only xfce4-keyboard-shortcuts.xml, xfce4-session.xml and xsettings.xml).
+#
+# Deriving instead of hand-forking keeps the rest of the vendor layout -- dock,
+# launchers, clock -- tracking upstream automatically.  ids 19/20 are new, so
+# no existing plugin id is renumbered.
+configure_arch_panel_status_plugins() {
+    if ! graphics_enabled; then
+        return 0
+    fi
+    local root="$1"
+    local layout="$root/etc/xdg/xfce4/panel/default.xml"
+    local channel_dir="$root/etc/xdg/xfce4/xfconf/xfce-perchannel-xml"
+    local channel="$channel_dir/xfce4-panel.xml"
+    [ -f "$layout" ] || return 0
+
+    local id_anchor='        <value type="int" value="6"/>'
+    local plugins_anchor='  <property name="plugins" type="empty">'
+    if [ "$(grep -Fxc "$id_anchor" "$layout")" != "1" ]; then
+        echo "unexpected xfce4-panel layout: no unique systray plugin-id in $layout" >&2
+        return 1
+    fi
+    if [ "$(grep -Fxc "$plugins_anchor" "$layout")" != "1" ]; then
+        echo "unexpected xfce4-panel layout: no unique plugins property in $layout" >&2
+        return 1
+    fi
+
+    mkdir -p "$channel_dir"
+    awk -v id_anchor="$id_anchor" -v plugins_anchor="$plugins_anchor" '
+        { print }
+        # Order inside panel-1s plugin-ids array is the on-screen order, so the
+        # new indicators go directly after the systray (id 6).
+        $0 == id_anchor {
+            print "        <value type=\"int\" value=\"19\"/>"
+            print "        <value type=\"int\" value=\"20\"/>"
+        }
+        # Definitions live in the flat <plugins> map; order there is irrelevant.
+        $0 == plugins_anchor {
+            print "    <property name=\"plugin-19\" type=\"string\" value=\"pulseaudio\">"
+            print "      <property name=\"show-notifications\" type=\"bool\" value=\"true\"/>"
+            print "      <property name=\"enable-keyboard-shortcuts\" type=\"bool\" value=\"true\"/>"
+            print "    </property>"
+            print "    <property name=\"plugin-20\" type=\"string\" value=\"power-manager-plugin\"/>"
+        }
+    ' "$layout" > "$channel.lupos-tmp"
+    mv -f "$channel.lupos-tmp" "$channel"
+    chmod 644 "$channel"
 }
 
 copy_to_stage() {

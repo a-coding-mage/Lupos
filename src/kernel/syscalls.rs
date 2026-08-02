@@ -3821,6 +3821,11 @@ mod tests {
         parent.pid = 3100;
         parent.tgid = 3100;
         parent.cred = &raw const INIT_CRED;
+        // Declared after `parent`, so it drops first and unbinds even if an
+        // assertion below panics. Without it a failing assertion leaves a
+        // SIGNAL_TABLE entry pointing at this freed Box, and the next test's
+        // `reset_for_tests()` writes through it.
+        let _unbind = crate::kernel::signal::UnbindCurrentTaskOnDrop;
 
         unsafe {
             crate::kernel::signal::reset_for_tests();

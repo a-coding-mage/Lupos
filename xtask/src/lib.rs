@@ -5987,6 +5987,39 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "        for p in xfce4-session xfwm4 xfsettingsd xfce4-panel xfdesktop; do\n",
         "            printf 'graphics-x11: xfce-proc %s uid=1000\\n' \"$p\"\n",
         "        done\n",
+        // The status-area indicators (notification tray, volume, battery) are
+        // external xfce4-panel plugins, so each runs as its own wrapper-2.0
+        // process with the plugin name on the command line. Checking for the
+        // wrapper is what distinguishes \"the plugin is drawing an icon\" from
+        // \"the package happens to be installed\" -- the stock panel layout
+        // referenced neither pulseaudio nor power-manager-plugin, so both were
+        // silently absent while every audio probe passed.
+        "        panel_plugin_loaded() {\n",
+        "            for panel_proc in /proc/[0-9]*; do\n",
+        "                [ \"$(cat \"$panel_proc/comm\" 2>/dev/null)\" = 'wrapper-2.0' ] || continue\n",
+        "                case \" $(tr '\\000' ' ' < \"$panel_proc/cmdline\" 2>/dev/null) \" in\n",
+        "                    *\" $1 \"*) return 0 ;;\n",
+        "                esac\n",
+        "            done\n",
+        "            return 1\n",
+        "        }\n",
+        "        panel_wait=0\n",
+        "        while [ \"$panel_wait\" -lt 30 ]; do\n",
+        "            panel_plugin_loaded systray && panel_plugin_loaded pulseaudio \\\n",
+        "                && panel_plugin_loaded power-manager-plugin && break\n",
+        "            panel_wait=$((panel_wait + 1)); sleep 1\n",
+        "        done\n",
+        "        printf 'graphics-x11: panel-plugin-wait %s\\n' \"$panel_wait\"\n",
+        "        for panel_plugin in systray pulseaudio power-manager-plugin; do\n",
+        "            if panel_plugin_loaded \"$panel_plugin\"; then\n",
+        "                printf 'graphics-x11: panel-plugin %s ok\\n' \"$panel_plugin\"\n",
+        "            else\n",
+        "                printf 'graphics-x11: panel-plugin %s failed\\n' \"$panel_plugin\"\n",
+        "            fi\n",
+        "        done\n",
+        "        echo 'graphics-x11: panel-wrappers begin'\n",
+        "        for panel_proc in /proc/[0-9]*; do [ \"$(cat \"$panel_proc/comm\" 2>/dev/null)\" = 'wrapper-2.0' ] || continue; printf 'graphics-x11: panel-wrapper pid=%s cmd=%s\\n' \"${panel_proc##*/}\" \"$(tr '\\000' ' ' < \"$panel_proc/cmdline\" 2>/dev/null)\"; done\n",
+        "        echo 'graphics-x11: panel-wrappers end'\n",
         "    else\n",
         "        echo 'graphics-x11: xfce failed'\n",
         "        printf 'graphics-x11: xfce-final procs=['\n",
@@ -6255,6 +6288,26 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // Linux's systemctl --user start waits for all jobs. Use --no-block so
         // the acceptance script remains able to print service diagnostics if
         // a newly-started media process stops yielding.
+        // Observe whether the session brought the audio stack up on its own,
+        // BEFORE the explicit start below. The explicit start is a diagnostic
+        // aid, and for a long time it silently masked the real defect: the
+        // image never enabled the PipeWire user units, so `pipewire-session
+        // ok` proved only that the units *can* run, never that a real desktop
+        // session has sound. These markers are the regression signal; the
+        // start below stays so that a failure still produces diagnostics.
+        "for unit in pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service; do\n",
+        "    printf 'graphics-x11: audio-autostart-unit %s %s\\n' \"$unit\" \"$(sudo -n -u lupos env HOME=\"$session_home\" DBUS_SESSION_BUS_ADDRESS=\"$user_manager_bus\" XDG_RUNTIME_DIR=\"$session_runtime\" timeout -k 2 10 /usr/bin/systemctl --user is-enabled \"$unit\" 2>&1 | tr -d '\\n')\"\n",
+        "done\n",
+        "autostart_procs=0\n",
+        "for media_name in pipewire pipewire-pulse wireplumber; do\n",
+        "    media_running=0\n",
+        "    for media_proc in /proc/[0-9]*; do [ \"$(cat \"$media_proc/comm\" 2>/dev/null)\" = \"$media_name\" ] && media_running=1 && break; done\n",
+        "    [ \"$media_running\" -eq 1 ] && autostart_procs=$((autostart_procs + 1))\n",
+        "    printf 'graphics-x11: audio-autostart-proc %s %s\\n' \"$media_name\" \"$media_running\"\n",
+        "done\n",
+        "if [ -S \"$session_runtime/pulse/native\" ]; then autostart_socket=1; else autostart_socket=0; fi\n",
+        "printf 'graphics-x11: audio-autostart-socket %s\\n' \"$autostart_socket\"\n",
+        "if [ \"$autostart_procs\" -eq 3 ] && [ \"$autostart_socket\" -eq 1 ]; then echo 'graphics-x11: audio-autostart ok'; else echo 'graphics-x11: audio-autostart failed'; fi\n",
         "pipewire_start_rc=125\n",
         "pipewire_ready=0; i=0\n",
         "if [ \"$aplay_direct_rc\" -eq 0 ]; then\n",
@@ -17175,7 +17228,16 @@ pub fn run_graphics_x11_tests() -> Result<()> {
         "graphics-x11: proc-pid-root ok",
         "graphics-x11: audio-pcm-generated ok",
         "graphics-x11: alsa-direct-realtime ok",
+        // The session must bring the audio stack up by itself. Asserted
+        // separately from `pipewire-session ok`, which only proves the units
+        // run once something starts them.
+        "graphics-x11: audio-autostart ok",
         "graphics-x11: pipewire-session ok",
+        // Status-area indicators: the panel must actually load the volume and
+        // battery plugins, not merely have the packages installed.
+        "graphics-x11: panel-plugin pulseaudio ok",
+        "graphics-x11: panel-plugin power-manager-plugin ok",
+        "graphics-x11: panel-plugin systray ok",
         "graphics-x11: audio-realtime-playback ok",
         "graphics-x11: firefox-path /usr/bin/firefox",
         "graphics-x11: firefox-proc-exe ok",
@@ -34763,6 +34825,113 @@ CONFIG_MODULES=y
                 "graphics profile must stay on the lean X11/fbdev stack, found {forbidden}"
             );
         }
+    }
+
+    /// pacman runs with `--noscriptlet`, so wireplumber's packaged
+    /// `post_install` (`systemctl --global enable wireplumber.service`) never
+    /// runs and the Arch packages ship no `.wants` symlinks of their own.
+    /// Without a replacement the image starts no sound server in a real
+    /// session: every PulseAudio client fails to connect, and the graphics
+    /// probe only ever saw a working stack because it started the units by
+    /// hand. The runtime regression signal is `graphics-x11: audio-autostart
+    /// ok`; this guards the provisioning that produces it.
+    #[test]
+    fn xfce_image_enables_pipewire_systemd_user_units() {
+        let root = repo_root().expect("repo root");
+        let script = fs::read_to_string(root.join(USERLAND_BUILD_SCRIPT)).expect("build script");
+        let installer = script
+            .split_once("enable_arch_systemd_user_units() {")
+            .expect("systemd user unit enabler")
+            .1
+            .split_once("\n}")
+            .expect("end of systemd user unit enabler")
+            .0;
+
+        // Each unit paired with the target named by its own [Install] WantedBy=.
+        for pair in [
+            "pipewire.socket:sockets.target",
+            "pipewire.service:default.target",
+            "pipewire-pulse.socket:sockets.target",
+            "pipewire-pulse.service:default.target",
+            "wireplumber.service:pipewire.service",
+        ] {
+            assert!(
+                installer.contains(pair),
+                "the image must enable the PipeWire user unit {pair}"
+            );
+        }
+
+        // pipewire-pulse.service has Wants=pipewire-session-manager.service,
+        // which only resolves through wireplumber's Alias=.
+        assert!(
+            installer.contains("pipewire-session-manager.service"),
+            "wireplumber's pipewire-session-manager.service alias must be created"
+        );
+        assert!(
+            installer.contains("/etc/systemd/user"),
+            "systemctl --global enable materialises [Install] under /etc/systemd/user"
+        );
+    }
+
+    /// The stock xfce4-panel layout wires up only `systray` and `actions`, so
+    /// the volume and battery indicators can never appear no matter how
+    /// healthy PipeWire and upower are. `etc/xdg/xfce4/panel/default.xml` is
+    /// package-owned and sha256-checked by `vendor_package_files_pristine`, so
+    /// the override has to be a derived, Lupos-owned xfconf channel file.
+    #[test]
+    fn xfce_image_adds_volume_and_battery_panel_plugins() {
+        let root = repo_root().expect("repo root");
+        let script = fs::read_to_string(root.join(USERLAND_BUILD_SCRIPT)).expect("build script");
+        let configurator = script
+            .split_once("configure_arch_panel_status_plugins() {")
+            .expect("panel status plugin configurator")
+            .1
+            .split_once("\ncopy_to_stage()")
+            .expect("end of panel status plugin configurator")
+            .0;
+
+        for needle in [
+            // Read the vendor layout, write the derived channel override.
+            "etc/xdg/xfce4/panel/default.xml",
+            "etc/xdg/xfce4/xfconf/xfce-perchannel-xml",
+            "xfce4-panel.xml",
+            "value=\\\"pulseaudio\\\"",
+            "value=\\\"power-manager-plugin\\\"",
+        ] {
+            assert!(
+                configurator.contains(needle),
+                "panel status-area configuration missing {needle}"
+            );
+        }
+
+        // The vendor file must be read, never rewritten in place: doing so
+        // fails the build's own vendor-pristine manifest check.
+        assert!(
+            !configurator.contains("mv -f \"$layout"),
+            "the package-owned panel default.xml must not be modified in place"
+        );
+
+        // The battery indicator needs the daemon and plugin package, and the
+        // stage check is what forces the incremental pacman install.
+        let package_array = script
+            .split_once("ARCH_GRAPHICS_PACKAGES=(")
+            .expect("graphics package array")
+            .1
+            .split_once("\n)")
+            .expect("end of graphics package array")
+            .0;
+        assert!(
+            package_array
+                .lines()
+                .map(str::trim)
+                .any(|line| line == "xfce4-power-manager"),
+            "the battery indicator requires the xfce4-power-manager package"
+        );
+        assert!(
+            script.contains("var/lib/pacman/local/xfce4-power-manager-"),
+            "graphics_stage_ready must require xfce4-power-manager so an \
+             existing stage is refreshed instead of silently reused"
+        );
     }
 
     #[test]

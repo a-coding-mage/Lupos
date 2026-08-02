@@ -782,6 +782,13 @@ mod tests {
 
     #[test]
     fn exit_notify_reparents_children_to_real_parent() {
+        // `exit_notify` binds tasks into the global SIGNAL_TABLE by raw
+        // `task_addr`. These tasks are Boxes freed at scope end, so the
+        // bindings must be dropped here; otherwise the next
+        // `reset_for_tests()` writes through freed memory.
+        let _signal_guard = signal::SIGNAL_TEST_LOCK.lock();
+        signal::reset_for_tests();
+
         let mut grand = make_task(1, 1);
         let mut parent = make_task(2, 2);
         let mut child = make_task(3, 3);
@@ -800,6 +807,8 @@ mod tests {
             assert_eq!(child.m26.real_parent, &mut *grand as *mut TaskStruct);
             assert_eq!(child.m26.parent, &mut *grand as *mut TaskStruct);
         }
+
+        signal::reset_for_tests();
     }
 
     /// test-origin: linux:vendor/linux/kernel/exit.c:forget_original_parent
@@ -875,10 +884,25 @@ mod tests {
                 "PR_SET_PDEATHSIG must become pending when the parent exits"
             );
         }
+
+        // `exit_notify` binds these tasks into the global SIGNAL_TABLE, which
+        // stores each `task_addr` as a raw pointer. They are Boxes, so they are
+        // freed when this scope ends; leaving the bindings behind makes the
+        // next `reset_for_tests()` write through freed memory. Linux never
+        // frees a task_struct while signal_struct still references it. Unbind
+        // here, while all three tasks are still live -- it cannot be done from
+        // a Drop guard, because `_signal_guard` is declared first and so drops
+        // *after* the tasks it would need to still be alive.
+        signal::reset_for_tests();
     }
 
     #[test]
     fn exit_notify_reparents_orphans_to_nearest_child_subreaper() {
+        // Same SIGNAL_TABLE binding lifetime as
+        // `exit_notify_reparents_children_to_real_parent` above.
+        let _signal_guard = signal::SIGNAL_TEST_LOCK.lock();
+        signal::reset_for_tests();
+
         let mut init = make_task(1, 1);
         let mut subreaper = make_task(2, 2);
         let mut middle = make_task(3, 3);
@@ -912,6 +936,8 @@ mod tests {
             assert_eq!(subreaper.m26.children[0], &mut *child as *mut TaskStruct);
             assert_eq!(subreaper.m26.children_count, 1);
         }
+
+        signal::reset_for_tests();
     }
 
     #[test]
@@ -1015,6 +1041,8 @@ mod tests {
                 "exit notification must still signal the real parent before wake"
             );
         }
+
+        signal::reset_for_tests();
     }
 
     /// Linux `do_notify_parent()` returns autoreap when the parent explicitly

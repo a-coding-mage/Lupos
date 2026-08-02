@@ -1585,6 +1585,13 @@ mod tests {
         }
         let ret = f(task);
         unsafe {
+            // `f` may deliver signals to this task, which binds it into the
+            // global SIGNAL_TABLE by raw `task_addr`. `current` is a Box freed
+            // when this helper returns, so the binding has to go first --
+            // otherwise the next `reset_for_tests()` writes through freed
+            // memory. Linux runs `__exit_signal()` from `release_task()`
+            // before a task_struct can be freed, for the same reason.
+            crate::kernel::signal::release_signal_task_binding(task);
             sched::set_current(previous);
         }
         ret

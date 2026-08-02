@@ -3958,6 +3958,46 @@ pub fn reset_for_tests() {
     clear_restore_sigmask(unsafe { sched::get_current() });
 }
 
+/// Unbind the currently-installed test task from SIGNAL_TABLE.
+///
+/// Tests build a `TaskStruct` in a `Box`, install it with `sched::set_current`,
+/// exercise a path that binds it into SIGNAL_TABLE by raw `task_addr`, then let
+/// the `Box` drop at the end of the test. `reset_for_tests()` writes through
+/// every non-null `task_addr`, so a binding left behind becomes a
+/// use-after-free the moment the next test resets.
+///
+/// Linux never frees a `task_struct` while `signal_struct` still refers to it:
+/// `release_task()` runs `__exit_signal()` first. This is the teardown
+/// equivalent for tests that never go through the exit path. It is a no-op when
+/// the current task was never bound, so it is safe to call unconditionally
+/// before restoring the previous current task.
+#[cfg(test)]
+pub(crate) fn unbind_current_task_for_tests() {
+    let current = unsafe { sched::get_current() };
+    if !current.is_null() {
+        unsafe {
+            release_signal_task_binding(current);
+        }
+    }
+}
+
+/// Panic-safe form of [`unbind_current_task_for_tests`].
+///
+/// Declare this *after* the task `Box` it protects: locals drop in reverse
+/// declaration order, so the guard runs while the task is still alive, and it
+/// runs on the unwind path too. A test that fails its assertions must still not
+/// leave a dangling SIGNAL_TABLE binding behind, otherwise one failing test
+/// turns into heap corruption that aborts the whole run at an unrelated test.
+#[cfg(test)]
+pub(crate) struct UnbindCurrentTaskOnDrop;
+
+#[cfg(test)]
+impl Drop for UnbindCurrentTaskOnDrop {
+    fn drop(&mut self) {
+        unbind_current_task_for_tests();
+    }
+}
+
 #[cfg(test)]
 pub fn signal_state_count_for_tests() -> usize {
     SIGNAL_TABLE.lock().states.len()
@@ -4488,6 +4528,8 @@ mod tests {
         );
 
         unsafe {
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
         reset_for_tests();
@@ -4553,6 +4595,8 @@ mod tests {
         );
 
         unsafe {
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
         reset_for_tests();
@@ -4634,6 +4678,8 @@ mod tests {
             assert_eq!(regs.ax, regs.orig_ax);
             assert_eq!(regs.ip, 0x400100);
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
         reset_for_tests();
@@ -4699,6 +4745,8 @@ mod tests {
                     != 0
             );
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
         reset_for_tests();
@@ -4770,6 +4818,8 @@ mod tests {
         );
 
         unsafe {
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
         reset_for_tests();
@@ -5210,6 +5260,12 @@ mod tests {
                 0x5555_aaaa
             );
         }
+        drop(table);
+
+        // `sys_rt_sigaction` bound `current` into SIGNAL_TABLE by raw
+        // `task_addr`, and it is a Box freed when this test returns. Clear the
+        // table while it is still live, as the sibling tests above do.
+        reset_for_tests();
     }
 
     #[test]
@@ -5269,6 +5325,12 @@ mod tests {
             !signal_is_default_fatal(thread, SIGRTMIN + 1),
             "late-created thread must not treat NPTL realtime signal as default fatal"
         );
+        drop(table);
+
+        // `sys_rt_sigaction` bound this task into SIGNAL_TABLE by raw
+        // `task_addr`, and it is a Box freed when this test returns. Unbind it
+        // last, after the inspection above and once the table lock is dropped.
+        unsafe { release_signal_task_binding(&mut *current as *mut TaskStruct) };
     }
 
     #[test]
@@ -5297,6 +5359,8 @@ mod tests {
                 u32::from_ne_bytes(info._sifields[4..8].try_into().unwrap()),
                 0
             );
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
         reset_for_tests();
@@ -5447,6 +5511,8 @@ mod tests {
             assert_eq!(state.actions[SIGPIPE as usize].sa_mask.bits, 0);
             drop(table);
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
     }
@@ -5537,6 +5603,8 @@ mod tests {
             );
             assert_eq!(sys_sigaltstack(core::ptr::null(), bad_stack, 0), -14);
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
     }
@@ -5670,6 +5738,8 @@ mod tests {
                 0
             );
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
         reset_for_tests();
@@ -5748,6 +5818,8 @@ mod tests {
         );
 
         unsafe {
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
         reset_for_tests();
@@ -5842,6 +5914,8 @@ mod tests {
                 &mut *leader as *mut TaskStruct
             ));
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
         reset_for_tests();
@@ -5892,6 +5966,8 @@ mod tests {
             assert!(!has_pending_signal_for_pid(123, SIGUSR1));
             assert!(dequeue_current_pending_signal_mask(sig_bit(SIGUSR1)).is_none());
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
         reset_for_tests();
@@ -6004,6 +6080,8 @@ mod tests {
                 0
             );
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
         reset_for_tests();
@@ -6196,6 +6274,8 @@ mod tests {
             assert_eq!(sys_sigaltstack(&bad_ss, core::ptr::null_mut(), 0), -22);
             assert_eq!(sys_rt_sigreturn(), 0);
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
     }
@@ -6286,6 +6366,9 @@ mod tests {
         current.pid = 91;
         current.tgid = 91;
         current.cred = &raw const INIT_CRED;
+        // Declared after `current`, so it drops first and unbinds even if an
+        // assertion below panics.
+        let _unbind = super::UnbindCurrentTaskOnDrop;
         current.__state.store(
             crate::kernel::task::task_state::TASK_UNINTERRUPTIBLE,
             core::sync::atomic::Ordering::Release,
@@ -6305,6 +6388,8 @@ mod tests {
             assert_eq!(take_current_fatal_signal(), Some(SIGKILL));
             assert!(!has_pending_signal_for_pid(91, SIGKILL));
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
     }
@@ -6337,6 +6422,8 @@ mod tests {
                 zombie.__state.load(core::sync::atomic::Ordering::Acquire),
                 crate::kernel::task::task_state::EXIT_ZOMBIE
             );
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
         reset_for_tests();
@@ -6351,6 +6438,9 @@ mod tests {
         current.pid = 92;
         current.tgid = 92;
         current.cred = &raw const INIT_CRED;
+        // Declared after `current`, so it drops first and unbinds even if an
+        // assertion below panics.
+        let _unbind = super::UnbindCurrentTaskOnDrop;
         current.__state.store(
             crate::kernel::task::task_state::TASK_INTERRUPTIBLE,
             core::sync::atomic::Ordering::Release,
@@ -6369,6 +6459,8 @@ mod tests {
             );
             assert!(has_pending_signal_for_pid(92, SIGTERM));
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
     }
@@ -6393,6 +6485,8 @@ mod tests {
             assert_eq!(take_current_fatal_signal(), Some(SIGTERM));
             assert!(!has_pending_signal_for_pid(94, SIGTERM));
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
     }
@@ -6426,6 +6520,8 @@ mod tests {
                 &mut *current as *mut TaskStruct
             ));
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
     }
@@ -6459,6 +6555,8 @@ mod tests {
                 &mut *current as *mut TaskStruct
             ));
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
     }
@@ -6485,6 +6583,8 @@ mod tests {
                 &mut *current as *mut TaskStruct
             ));
 
+            // Drop this task's SIGNAL_TABLE binding before the Box is freed.
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
     }
@@ -6540,6 +6640,11 @@ mod tests {
             assert_eq!(child.m26.ptrace_stop_signal, 0);
             assert!(!has_pending_signal_for_pid(102, SIGTSTP));
 
+            // Both Boxes are freed at the end of this test, and `child` was
+            // bound by the `send_signal_to_task` calls above, so unbinding only
+            // the current task is not enough here.
+            release_signal_task_binding(&mut *child as *mut TaskStruct);
+            super::unbind_current_task_for_tests();
             sched::set_current(previous);
         }
     }
