@@ -256,6 +256,14 @@ mod tests {
         task.m29.prio = 10;
         task.m29.policy = SCHED_FIFO;
         task.m29.on_cpu.store(1, Ordering::Release);
+        // The picker only considers tasks queued on *this* rq's CPU
+        // (`task_can_switch_to_on_rq`: `task->thread_info.cpu == rq_cpu`,
+        // mirroring Linux's `task_cpu(p) == cpu_of(rq)`). The rq is CPU 1 while
+        // a zeroed task_struct reports CPU 0, so without this the first
+        // assertion below passed for the wrong reason -- a CPU mismatch rather
+        // than the remote-on_cpu rejection it is meant to prove -- and the
+        // second could never pick the task at all.
+        task.thread_info.cpu = 1;
 
         unsafe { enqueue_task_rt(&mut rq, task_ptr, 0) };
         assert!(unsafe { pick_next_task_rt(&mut rq) }.is_null());

@@ -519,7 +519,12 @@ mod tests {
         let ft = FilesStruct::new();
         let d = d_alloc("x");
         let f = alloc_file(d, 0, 0, &NOOP_FILE_OPS);
-        let fd0 = ft.install(f.clone(), false).unwrap();
+        // Installing one file into two descriptors needs two *logical* file
+        // references: Linux's dup path does `get_file()` before `fd_install()`.
+        // An `Arc::clone` is not a Linux file reference (see `fput`), so
+        // without `fget` both slots share a single count and the second `fput`
+        // at teardown underflows.
+        let fd0 = ft.install(crate::fs::file::fget(&f), false).unwrap();
         assert_eq!(fd0, 0);
 
         let fd5 = ft.install_at_or_above(f, 5, true).unwrap();

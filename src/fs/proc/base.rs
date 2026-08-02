@@ -776,7 +776,12 @@ mod tests {
             cap_ambient: KernelCapT::empty(),
             securebits: 0,
             group_info: GroupInfo::default(),
-            user_ns: core::ptr::null(),
+            // Linux creds always carry a user namespace -- `init_cred` starts
+            // at `&init_user_ns` and `prepare_creds()` copies it -- and
+            // `cred_ns_capable()` fails closed on a NULL target namespace. A
+            // NULL here made every `ns_capable()` check return false, so no
+            // fixture could ever exercise a privileged path.
+            user_ns: (&raw const crate::kernel::user_namespace::INIT_USER_NS).cast(),
         })
     }
 

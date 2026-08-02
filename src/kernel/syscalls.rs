@@ -3810,6 +3810,9 @@ mod tests {
             assert_eq!(cpu, 0);
             assert_eq!(node, 0);
 
+            // The signal syscalls above bound this task into SIGNAL_TABLE, and
+            // the Box is freed at the end of this test; unbind before it goes.
+            crate::kernel::signal::release_signal_task_binding(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
         }
     }
@@ -3838,6 +3841,15 @@ mod tests {
                 &crate::kernel::fork::KernelCloneArgs::default(),
             )
             .expect("copy_process");
+            // `copy_process()` leaves the child in TASK_NEW; Linux's
+            // `kernel_clone()` makes it runnable with `wake_up_new_task()`
+            // before anything can signal it
+            // (vendor/linux/kernel/fork.c:kernel_clone), and so does Lupos's
+            // `kernel_clone` (src/kernel/fork.rs:2109). This test drives
+            // `copy_process()` directly, so it has to do the same or the child
+            // stays TASK_NEW and no stop/continue transition can be observed.
+            crate::kernel::sched::wake_up_new_task(child);
+
             let child_pid = (*child).pid;
             assert_eq!(
                 crate::kernel::session::process_group(child_pid),
@@ -4463,6 +4475,12 @@ mod tests {
                 .expect("files");
             files.close(fd).expect("close pidfd");
             crate::kernel::files::drop_task_files(&mut *current as *mut TaskStruct);
+            // Both Boxes are freed at the end of this test and both were bound
+            // into SIGNAL_TABLE by the signal sends above; drop the bindings
+            // first so the next test's `reset_for_tests()` does not write
+            // through freed memory.
+            crate::kernel::signal::release_signal_task_binding(&mut *target as *mut TaskStruct);
+            crate::kernel::signal::release_signal_task_binding(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
             target.m26.thread_pid = core::ptr::null_mut();
         }
@@ -4504,6 +4522,12 @@ mod tests {
                 .expect("files");
             files.close(fd).expect("close pidfd");
             crate::kernel::files::drop_task_files(&mut *current as *mut TaskStruct);
+            // Both Boxes are freed at the end of this test and both were bound
+            // into SIGNAL_TABLE by the signal sends above; drop the bindings
+            // first so the next test's `reset_for_tests()` does not write
+            // through freed memory.
+            crate::kernel::signal::release_signal_task_binding(&mut *target as *mut TaskStruct);
+            crate::kernel::signal::release_signal_task_binding(&mut *current as *mut TaskStruct);
             sched::set_current(previous);
             target.m26.thread_pid = core::ptr::null_mut();
             target.mm = core::ptr::null_mut();
