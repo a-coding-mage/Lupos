@@ -166,10 +166,18 @@ const LUPOS_QEMU_ROOT_DISK_ENV: &str = "LUPOS_QEMU_ROOT_DISK";
 const LUPOS_QEMU_ROOT_DISK_SNAPSHOT_ENV: &str = "LUPOS_QEMU_ROOT_DISK_SNAPSHOT";
 const LUPOS_QEMU_MACHINE_ENV: &str = "LUPOS_QEMU_MACHINE";
 /// Selects the QEMU `-audiodev` backend that the Intel HDA codec and the
-/// PC speaker (`pcspk-audiodev`) feed into. Defaults to `none` (a null sink,
-/// safe for headless/CI). Set e.g. `LUPOS_QEMU_AUDIODEV=pa` (PulseAudio),
-/// `pipewire`, or `alsa` to actually hear the console bell on the host.
+/// PC speaker (`pcspk-audiodev`) feed into. Overrides everything below; set
+/// e.g. `LUPOS_QEMU_AUDIODEV=pa`, `pipewire`, `alsa`, or `none`.
+///
+/// Unset, interactive boots (`-display` other than `none`) auto-detect a host
+/// backend so `cargo xtask run --gui` is audible, and headless gates stay on
+/// the null sink unless they ask for a capture (see below).
 const LUPOS_QEMU_AUDIODEV_ENV: &str = "LUPOS_QEMU_AUDIODEV";
+/// Host path for QEMU's `wav` audio backend. When set, the guest's audio output
+/// is written to this file instead of a host device, which is what lets an
+/// automated gate assert that real, non-silent samples left the machine rather
+/// than trusting a playback exit code.
+const LUPOS_QEMU_AUDIO_CAPTURE_ENV: &str = "LUPOS_QEMU_AUDIO_CAPTURE";
 /// Stable QEMU id shared by the audio backend, the HDA codec, and the PC
 /// speaker routing.
 const QEMU_AUDIODEV_ID: &str = "luposaudio";
@@ -4570,7 +4578,16 @@ fn lupos_sysusers_config() -> Vec<u8> {
 }
 
 fn lupos_user_tmpfiles_config() -> Vec<u8> {
-    b"d /home/lupos 0755 lupos lupos -\n".to_vec()
+    // Music/ carries a link to the shipped test tone so the desktop has
+    // something obvious to open when checking whether audio works; the file
+    // itself lives in /usr/share/sounds/lupos and is generated at image build.
+    concat!(
+        "d /home/lupos 0755 lupos lupos -\n",
+        "d /home/lupos/Music 0755 lupos lupos -\n",
+        "L /home/lupos/Music/lupos-test-tone.wav - - - - /usr/share/sounds/lupos/lupos-test-tone.wav\n",
+    )
+    .as_bytes()
+    .to_vec()
 }
 
 fn lupos_user_provision_script() -> Vec<u8> {
@@ -6253,6 +6270,21 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // completion enables were never armed. azx exposes both through its own
         // procfs nodes, so this needs no new kernel code.
         "( sleep 2; echo '--- t=2s ---'; cat /proc/lupos_hda 2>&1; sleep 3; echo '--- t=5s ---'; cat /proc/lupos_hda 2>&1; ) >/tmp/lupos-hda-state.log 2>&1 &\n",
+        // The codec's own amps decide whether any of this is audible. QEMU's
+        // hda-duplex honours AC_VERB_SET_AMP_GAIN_MUTE, so a card left at its
+        // reset-default mute emits digital silence while every playback marker
+        // below still reports success. Dump the mixer, then unmute/raise the
+        // playback controls the way `alsactl init` would on a fresh card.
+        "echo 'graphics-x11: alsa-mixer-before begin'\n",
+        "/usr/bin/amixer -c0 scontents 2>&1 | sed 's/^/graphics-x11: mixer /'\n",
+        "echo 'graphics-x11: alsa-mixer-before end'\n",
+        "for mixer_ctl in Master PCM Speaker Headphone Front; do\n",
+        "    /usr/bin/amixer -c0 -q sset \"$mixer_ctl\" 100% unmute >/dev/null 2>&1 || true\n",
+        "done\n",
+        "echo 'graphics-x11: alsa-mixer-after begin'\n",
+        "/usr/bin/amixer -c0 scontents 2>&1 | sed 's/^/graphics-x11: mixer /'\n",
+        "echo 'graphics-x11: alsa-mixer-after end'\n",
+        "if /usr/bin/amixer -c0 scontents 2>/dev/null | grep -q '\\[on\\]'; then echo 'graphics-x11: alsa-mixer-unmuted ok'; else echo 'graphics-x11: alsa-mixer-unmuted failed'; fi\n",
         "aplay_direct_start=\"$(date +%s 2>/dev/null || true)\"\n",
         // -v dumps the negotiated hw_params (period_size/buffer_size). The
         // measured underruns sit on a near-constant ~68 ms period, so the
@@ -17022,6 +17054,21 @@ pub fn run_graphics_x11_tests() -> Result<()> {
     // Use a relative PS/2 mouse (the pointer Lupos drives) rather than the
     // absolute usb-tablet, so the X pointer actually moves.
     let _tablet_guard = EnvVarGuard::set(LUPOS_QEMU_USB_TABLET_ENV, "0");
+    // Record the guest's audio output to a host file. Every audio assertion in
+    // this gate used to be a guest-side exit code (`aplay` returned 0, the PCM
+    // reported running), none of which can distinguish real output from a
+    // silent stream into QEMU's null sink. The capture is what makes the
+    // playback assertion below meaningful.
+    let audio_capture = xtask_target_dir()?.join(format!(
+        "graphics-x11-audio-{}.wav",
+        artifact_run_id()
+    ));
+    let audio_capture_text = audio_capture
+        .to_str()
+        .ok_or_else(|| anyhow!("audio capture path is not UTF-8"))?
+        .to_string();
+    let _audio_capture_guard =
+        EnvVarGuard::set(LUPOS_QEMU_AUDIO_CAPTURE_ENV, &audio_capture_text);
     ensure_userland_stage()?;
 
     let _stage_guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
@@ -17134,6 +17181,29 @@ pub fn run_graphics_x11_tests() -> Result<()> {
             "graphics-x11 serial log did not contain input marker {:?}\nserial log:\n{}",
             input_marker,
             run.serial_output
+        );
+    }
+
+    // Host-side proof that audio actually left the machine. The guest markers
+    // above only show that playback syscalls succeeded; with QEMU's null sink
+    // they stayed green while the desktop was completely silent.
+    let captured_audio = fs::read(&audio_capture).with_context(|| {
+        format!(
+            "failed to read the QEMU audio capture at {}",
+            audio_capture.display()
+        )
+    })?;
+    let audio_stats = analyze_captured_audio(&captured_audio)
+        .context("failed to analyze the QEMU audio capture")?;
+    if !audio_stats.is_audible() {
+        bail!(
+            "graphics-x11 produced no audible audio: path={} samples={} nonzero={} ({}%) peak={}\n\
+             the guest reported successful playback, so look at the HDA/PCM path rather than PipeWire",
+            audio_capture.display(),
+            audio_stats.samples,
+            audio_stats.nonzero_samples,
+            audio_stats.nonzero_percent(),
+            audio_stats.peak_amplitude,
         );
     }
 
@@ -20641,7 +20711,7 @@ fn add_qemu_iso_base_args(command: &mut Command, iso_path: &Path, display: &str,
             command.arg("-qmp").arg(format!("unix:{qmp},server,nowait"));
         }
     }
-    add_qemu_default_devices(command);
+    add_qemu_default_devices(command, display);
     add_qemu_cpu_if_requested(command);
     add_qemu_root_disk_if_requested(command);
     add_qemu_gdb_args(command);
@@ -20775,7 +20845,10 @@ fn default_gui_shell_memory_guard() -> Option<EnvVarGuard> {
     ))
 }
 
-fn add_qemu_default_devices(command: &mut Command) {
+/// `display` is the `-display` value for this boot; it selects the default
+/// audio backend (interactive boots become audible, headless gates stay
+/// silent). See `qemu_audiodev_spec`.
+fn add_qemu_default_devices(command: &mut Command, display: &str) {
     command
         .arg("-device")
         .arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
@@ -20794,24 +20867,79 @@ fn add_qemu_default_devices(command: &mut Command) {
     }
     command
         .arg("-audiodev")
-        .arg(qemu_audiodev_spec())
+        .arg(qemu_audiodev_spec(display))
         .arg("-device")
         .arg("intel-hda")
         .arg("-device")
         .arg(format!("hda-duplex,audiodev={QEMU_AUDIODEV_ID}"));
 }
 
-/// Build the `-audiodev` value. Defaults to the null backend (`none`), which
-/// keeps headless and CI runs silent and dependency-free; override the driver
-/// with `LUPOS_QEMU_AUDIODEV` (e.g. `pa`, `pipewire`, `alsa`) to hear the
-/// console bell on the host.
-fn qemu_audiodev_spec() -> String {
-    let driver = env::var(LUPOS_QEMU_AUDIODEV_ENV)
+/// Host audio backends to try for an interactive boot, most preferred first.
+///
+/// Only drivers QEMU actually reports in `-audiodev help` are used: naming a
+/// backend that was compiled out makes QEMU refuse to start, which would break
+/// every GUI run on such a host.
+const QEMU_HOST_AUDIO_DRIVERS: [&str; 3] = ["pipewire", "pa", "alsa"];
+
+/// Return the audio drivers this QEMU build supports, parsed once from
+/// `qemu-system-x86_64 -audiodev help`.
+fn qemu_available_audio_drivers() -> &'static [String] {
+    static DRIVERS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    DRIVERS.get_or_init(|| {
+        let Ok(output) = Command::new(QEMU_BINARY).arg("-audiodev").arg("help").output() else {
+            return Vec::new();
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.lines()
+            .map(str::trim)
+            // The header line ("Available audio drivers:") is the only entry
+            // with whitespace; every driver is a bare single token.
+            .filter(|line| !line.is_empty() && !line.contains(char::is_whitespace))
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+/// Build the `-audiodev` value.
+///
+/// Precedence:
+/// 1. `LUPOS_QEMU_AUDIODEV` — explicit driver, always wins.
+/// 2. `LUPOS_QEMU_AUDIO_CAPTURE` — a host path; uses QEMU's `wav` backend so an
+///    automated gate can assert on the samples the guest actually emitted
+///    rather than on a syscall return code.
+/// 3. Interactive boots (any `-display` other than `none`) auto-detect a real
+///    host backend, so `cargo xtask run --gui` is audible without the caller
+///    knowing about the env var.
+/// 4. Everything else stays on the null sink, keeping headless gates silent and
+///    dependency-free.
+fn qemu_audiodev_spec(display: &str) -> String {
+    if let Some(driver) = env::var(LUPOS_QEMU_AUDIODEV_ENV)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "none".to_string());
-    format!("{driver},id={QEMU_AUDIODEV_ID}")
+    {
+        return format!("{driver},id={QEMU_AUDIODEV_ID}");
+    }
+
+    if let Some(path) = env::var(LUPOS_QEMU_AUDIO_CAPTURE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return format!("wav,id={QEMU_AUDIODEV_ID},path={path}");
+    }
+
+    if display.trim() != "none" {
+        let available = qemu_available_audio_drivers();
+        if let Some(driver) = QEMU_HOST_AUDIO_DRIVERS
+            .iter()
+            .find(|candidate| available.iter().any(|have| have == *candidate))
+        {
+            return format!("{driver},id={QEMU_AUDIODEV_ID}");
+        }
+    }
+
+    format!("none,id={QEMU_AUDIODEV_ID}")
 }
 
 fn add_qemu_root_disk_if_requested(command: &mut Command) {
@@ -23501,6 +23629,100 @@ fn ppm_changed_pixels_in_suggestion_roi(baseline: &[u8], candidate: &[u8]) -> Re
     Ok(changed)
 }
 
+/// Sample statistics for a QEMU `wav`-backend capture of the guest's audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AudioCaptureStats {
+    pub(crate) samples: usize,
+    pub(crate) nonzero_samples: usize,
+    pub(crate) peak_amplitude: i32,
+}
+
+impl AudioCaptureStats {
+    /// Percentage of samples that are not digital silence.
+    fn nonzero_percent(&self) -> usize {
+        if self.samples == 0 {
+            return 0;
+        }
+        self.nonzero_samples * 100 / self.samples
+    }
+
+    /// A real playback produces sustained, clearly audible output.
+    ///
+    /// Both halves matter: a stuck-DC or single-click stream can be loud but
+    /// almost entirely zero, while a dithered-silence stream can be busy but
+    /// inaudible. The thresholds are deliberately slack — this separates
+    /// "audio reached the host" from "nothing came out", not a fidelity check.
+    fn is_audible(&self) -> bool {
+        self.samples > 0 && self.nonzero_percent() >= 10 && self.peak_amplitude >= 1024
+    }
+}
+
+/// Parse a 16-bit PCM RIFF/WAVE capture and summarise its samples.
+///
+/// QEMU patches the RIFF/data lengths when it closes the file, so a run that is
+/// killed leaves a header claiming zero bytes. The payload is therefore sized
+/// from what actually follows the `data` chunk rather than from the header.
+fn analyze_captured_audio(wav: &[u8]) -> Result<AudioCaptureStats> {
+    if wav.len() < 12 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        bail!("audio capture is not a RIFF/WAVE file");
+    }
+
+    let mut offset = 12usize;
+    let mut bits_per_sample = 16u16;
+    let mut payload: Option<&[u8]> = None;
+    while offset + 8 <= wav.len() {
+        let id = &wav[offset..offset + 4];
+        let declared = u32::from_le_bytes([
+            wav[offset + 4],
+            wav[offset + 5],
+            wav[offset + 6],
+            wav[offset + 7],
+        ]) as usize;
+        let body = offset + 8;
+        match id {
+            b"fmt " if body + 16 <= wav.len() => {
+                bits_per_sample = u16::from_le_bytes([wav[body + 14], wav[body + 15]]);
+            }
+            b"data" => {
+                let available = wav.len() - body;
+                let len = if declared == 0 || declared > available {
+                    available
+                } else {
+                    declared
+                };
+                payload = Some(&wav[body..body + len]);
+                break;
+            }
+            _ => {}
+        }
+        // Chunks are word-aligned; an unparsable length would loop forever.
+        let advance = declared.max(1).next_multiple_of(2);
+        offset = body.saturating_add(advance);
+    }
+
+    let payload = payload.ok_or_else(|| anyhow!("audio capture has no data chunk"))?;
+    if bits_per_sample != 16 {
+        bail!("audio capture is {bits_per_sample}-bit; expected 16-bit PCM");
+    }
+
+    let mut nonzero_samples = 0usize;
+    let mut peak_amplitude = 0i32;
+    let samples = payload.len() / 2;
+    for chunk in payload.chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+        if sample != 0 {
+            nonzero_samples += 1;
+        }
+        peak_amplitude = peak_amplitude.max(sample.abs());
+    }
+
+    Ok(AudioCaptureStats {
+        samples,
+        nonzero_samples,
+        peak_amplitude,
+    })
+}
+
 fn analyze_initial_desktop_ppm(ppm: &[u8]) -> Result<DesktopFrameStats> {
     let (width, height, pixels) = ppm_pixels(ppm)?;
 
@@ -25416,6 +25638,7 @@ failed command output\n";
         let _root_disk = EnvVarGuard::set(LUPOS_QEMU_ROOT_DISK_ENV, "");
         let _machine = EnvVarGuard::set(LUPOS_QEMU_MACHINE_ENV, "");
         let _audiodev = EnvVarGuard::set(LUPOS_QEMU_AUDIODEV_ENV, "");
+        let _capture = EnvVarGuard::set(LUPOS_QEMU_AUDIO_CAPTURE_ENV, "");
         let iso = Path::new(r"C:\tmp\lupos.iso");
         let serial_log = Path::new(r"C:\tmp\serial.log");
         let command = build_qemu_iso_command(iso, serial_log, 1);
@@ -25451,10 +25674,132 @@ failed command output\n";
     #[test]
     fn qemu_audiodev_spec_defaults_to_null_and_honors_override() {
         let _audiodev = EnvVarGuard::set(LUPOS_QEMU_AUDIODEV_ENV, "");
-        assert_eq!(qemu_audiodev_spec(), "none,id=luposaudio");
+        let _capture = EnvVarGuard::set(LUPOS_QEMU_AUDIO_CAPTURE_ENV, "");
+        // Headless gates stay on the null sink.
+        assert_eq!(qemu_audiodev_spec("none"), "none,id=luposaudio");
 
         let _override = EnvVarGuard::set(LUPOS_QEMU_AUDIODEV_ENV, "  pa  ");
-        assert_eq!(qemu_audiodev_spec(), "pa,id=luposaudio");
+        assert_eq!(qemu_audiodev_spec("none"), "pa,id=luposaudio");
+        // The explicit override also wins for an interactive display, so a
+        // caller can force silence on a machine with working host audio.
+        assert_eq!(qemu_audiodev_spec("gtk,zoom-to-fit=on"), "pa,id=luposaudio");
+    }
+
+    /// An interactive boot must be audible without the caller knowing about
+    /// `LUPOS_QEMU_AUDIODEV`. Before this, `cargo xtask run --gui` always got
+    /// the null sink, so no guest audio could ever reach the host and the
+    /// desktop mixer appeared broken no matter how healthy PipeWire was.
+    #[test]
+    fn qemu_audiodev_spec_auto_detects_host_backend_for_interactive_display() {
+        let _audiodev = EnvVarGuard::set(LUPOS_QEMU_AUDIODEV_ENV, "");
+        let _capture = EnvVarGuard::set(LUPOS_QEMU_AUDIO_CAPTURE_ENV, "");
+        let spec = qemu_audiodev_spec("gtk,zoom-to-fit=on");
+
+        assert!(
+            spec.ends_with(&format!(",id={QEMU_AUDIODEV_ID}")),
+            "audiodev must keep the shared id so hda-duplex/pcspk stay wired: {spec}"
+        );
+        let driver = spec.split(',').next().expect("driver");
+        let available = qemu_available_audio_drivers();
+        if available.is_empty() {
+            // No usable QEMU on this host: the probe must fail closed rather
+            // than naming a driver that would stop QEMU from starting.
+            assert_eq!(driver, "none", "unknown backends must fall back to none");
+            return;
+        }
+        let expected = QEMU_HOST_AUDIO_DRIVERS
+            .iter()
+            .find(|candidate| available.iter().any(|have| have == *candidate))
+            .copied()
+            .unwrap_or("none");
+        assert_eq!(driver, expected);
+        assert!(
+            driver == "none" || available.iter().any(|have| have == driver),
+            "must only select a driver this QEMU actually supports: {driver}"
+        );
+    }
+
+    /// Build a 16-bit PCM RIFF/WAVE body from `samples`.
+    ///
+    /// `declared_data_len` models QEMU patching (or failing to patch) the
+    /// `data` chunk length when it closes the file.
+    fn wav_fixture(samples: &[i16], declared_data_len: Option<u32>) -> Vec<u8> {
+        let payload: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + payload.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&2u16.to_le_bytes()); // stereo
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&192_000u32.to_le_bytes());
+        wav.extend_from_slice(&4u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(
+            &declared_data_len
+                .unwrap_or(payload.len() as u32)
+                .to_le_bytes(),
+        );
+        wav.extend_from_slice(&payload);
+        wav
+    }
+
+    /// The whole point of the capture: a run against QEMU's null sink writes
+    /// digital silence, and that must fail the gate. Before this, the guest's
+    /// `aplay`/PCM markers reported success for exactly that case.
+    #[test]
+    fn captured_audio_rejects_silence_and_accepts_real_playback() {
+        let silence = wav_fixture(&[0i16; 4096], None);
+        let stats = analyze_captured_audio(&silence).expect("parse silence");
+        assert_eq!(stats.samples, 4096);
+        assert_eq!(stats.nonzero_samples, 0);
+        assert_eq!(stats.peak_amplitude, 0);
+        assert!(!stats.is_audible(), "digital silence must not pass");
+
+        // A 440 Hz-ish full-scale tone: loud and continuously non-zero.
+        let tone: Vec<i16> = (0..4096)
+            .map(|n| ((n as f32 * 0.06).sin() * 16_384.0) as i16)
+            .collect();
+        let stats = analyze_captured_audio(&wav_fixture(&tone, None)).expect("parse tone");
+        assert!(
+            stats.is_audible(),
+            "real playback must pass: nonzero={} peak={}",
+            stats.nonzero_samples,
+            stats.peak_amplitude
+        );
+
+        // Loud but almost entirely silent (a single click) is not playback.
+        let mut click = vec![0i16; 4096];
+        click[0] = i16::MAX;
+        let stats = analyze_captured_audio(&wav_fixture(&click, None)).expect("parse click");
+        assert!(stats.peak_amplitude > 1024);
+        assert!(!stats.is_audible(), "a lone click is not sustained output");
+    }
+
+    /// A killed QEMU never patches the header, leaving `data` claiming zero
+    /// bytes; the payload must still be measured from the file itself.
+    #[test]
+    fn captured_audio_sizes_payload_from_file_when_header_is_unpatched() {
+        let tone: Vec<i16> = (0..2048).map(|n| ((n % 97) as i16 - 48) * 400).collect();
+        let stats = analyze_captured_audio(&wav_fixture(&tone, Some(0)))
+            .expect("parse unpatched capture");
+        assert_eq!(stats.samples, 2048);
+        assert!(stats.peak_amplitude > 1024);
+    }
+
+    /// The capture backend is what turns "the playback syscall returned 0" into
+    /// "these samples left the machine".
+    #[test]
+    fn qemu_audiodev_spec_captures_to_wav_for_automated_gates() {
+        let _audiodev = EnvVarGuard::set(LUPOS_QEMU_AUDIODEV_ENV, "");
+        let _capture = EnvVarGuard::set(LUPOS_QEMU_AUDIO_CAPTURE_ENV, "/tmp/lupos-capture.wav");
+        assert_eq!(
+            qemu_audiodev_spec("none"),
+            "wav,id=luposaudio,path=/tmp/lupos-capture.wav"
+        );
     }
 
     #[test]
@@ -34931,6 +35276,69 @@ CONFIG_MODULES=y
             script.contains("var/lib/pacman/local/xfce4-power-manager-"),
             "graphics_stage_ready must require xfce4-power-manager so an \
              existing stage is refreshed instead of silently reused"
+        );
+    }
+
+    /// Without a shipped audio file there is no way to answer "is sound
+    /// working?" from inside the running desktop: the probe's tone lives in
+    /// /tmp only during a gate run, and the image otherwise carries just
+    /// alsa-utils' one-second channel blips.
+    #[test]
+    fn xfce_image_ships_a_playable_audio_test_asset() {
+        let root = repo_root().expect("repo root");
+        let script = fs::read_to_string(root.join(USERLAND_BUILD_SCRIPT)).expect("build script");
+        let generator = script
+            .split_once("generate_lupos_audio_test_assets() {")
+            .expect("audio asset generator")
+            .1
+            .split_once("\n}\n")
+            .expect("end of audio asset generator")
+            .0;
+
+        for needle in [
+            "usr/share/sounds/lupos",
+            "lupos-test-tone.wav",
+            "usr/local/bin/lupos-audio-test",
+            // Generated with the image's own ffmpeg so no binary blob lands in
+            // git and the host needs no extra tooling.
+            "usr/bin/ffmpeg",
+            "ld-linux-x86-64.so.2",
+            "pcm_s16le",
+        ] {
+            assert!(
+                generator.contains(needle),
+                "audio test asset generation missing {needle}"
+            );
+        }
+
+        assert!(
+            script.contains("generate_lupos_audio_test_assets \"$STAGE\""),
+            "the generator must run against the staged root like its siblings"
+        );
+        assert!(
+            script.contains("usr/share/sounds/lupos/lupos-test-tone.wav")
+                && script.contains("usr/local/bin/lupos-audio-test\" ]"),
+            "graphics_runtime_cache_ready must require the audio assets so an \
+             existing stage is refreshed instead of silently reused"
+        );
+
+        // The helper must exercise the desktop stack and the raw device, so a
+        // failure distinguishes a broken sound server from a broken PCM path.
+        assert!(
+            generator.contains("pw-play") && generator.contains("aplay -D hw:0,0"),
+            "the test helper must try PipeWire and direct ALSA"
+        );
+    }
+
+    /// The tone has to be reachable from the desktop, not just present on disk.
+    #[test]
+    fn lupos_home_exposes_the_audio_test_asset() {
+        let tmpfiles = String::from_utf8(lupos_user_tmpfiles_config()).expect("utf-8");
+        assert!(tmpfiles.contains("d /home/lupos/Music"));
+        assert!(
+            tmpfiles.contains("L /home/lupos/Music/lupos-test-tone.wav")
+                && tmpfiles.contains("/usr/share/sounds/lupos/lupos-test-tone.wav"),
+            "the shipped tone must be linked into the user's Music directory"
         );
     }
 

@@ -558,6 +558,8 @@ graphics_runtime_cache_ready() {
         return 0
     fi
     [ -x "$1/usr/bin/glycin-thumbnailer" ] \
+        && [ -s "$1/usr/share/sounds/lupos/lupos-test-tone.wav" ] \
+        && [ -x "$1/usr/local/bin/lupos-audio-test" ] \
         && [ -s "$1/usr/lib/libgdk_pixbuf-2.0.so.0.4400.6" ] \
         && [ "$(readlink "$1/usr/lib/libgdk_pixbuf-2.0.so.0" 2>/dev/null || true)" = "libgdk_pixbuf-2.0.so.0.4400.6" ] \
         && [ -x "$1/usr/lib/glycin-loaders/2+/glycin-image-rs" ] \
@@ -1334,6 +1336,87 @@ copy_to_stage() {
     generate_arch_fontconfig "$STAGE"
     generate_arch_font_indexes "$STAGE"
     generate_arch_gtk_caches "$STAGE"
+    generate_lupos_audio_test_assets "$STAGE"
+}
+
+# Ship something to actually play, plus a one-command way to play it.
+#
+# The graphics probe synthesises /tmp/lupos-audio.wav at test time and deletes
+# it again, and the only audio the image otherwise carries is alsa-utils'
+# one-second channel-check blips and freedesktop event sounds. That leaves a
+# desktop user with nothing obvious to open, so "is audio working?" could not be
+# answered from inside the running system.
+#
+# The tone is generated with the image's *own* ffmpeg, run against the staged
+# libraries the way `generate_arch_gtk_caches` runs the GTK tools. That keeps a
+# binary asset out of git and adds no host-side dependency.
+generate_lupos_audio_test_assets() {
+    if ! graphics_enabled; then
+        return 0
+    fi
+    local root="$1"
+    local ld="$root/usr/lib/ld-linux-x86-64.so.2"
+    local ffmpeg="$root/usr/bin/ffmpeg"
+    local sounds="$root/usr/share/sounds/lupos"
+    local tone="$sounds/lupos-test-tone.wav"
+
+    if [ -x "$ld" ] && [ -x "$ffmpeg" ]; then
+        mkdir -p "$sounds"
+        if [ ! -s "$tone" ]; then
+            log "Generating $tone"
+            # 20 s is long enough to hear, seek within, and watch a level meter
+            # move in pavucontrol. Stereo 48 kHz s16le matches the HDA codec's
+            # native rate, so nothing has to resample it.
+            # ffmpeg links libpulse, whose libpulsecommon lives in a private
+            # subdirectory that the package resolves through an RPATH the
+            # explicit --library-path overrides. Name it too.
+            "$ld" --library-path "$root/usr/lib:$root/usr/lib/pulseaudio" "$ffmpeg" \
+                -nostdin -hide_banner -loglevel error -y \
+                -f lavfi -i sine=frequency=440:sample_rate=48000 \
+                -t 20 -ac 2 -c:a pcm_s16le "$tone" \
+                || die "failed to generate $tone"
+        fi
+        chmod 644 "$tone"
+    fi
+
+    mkdir -p "$root/usr/local/bin"
+    write_file "$root/usr/local/bin/lupos-audio-test" <<'EOF'
+#!/bin/sh
+# Play the shipped test tone and report which path produced it.
+#
+# Tries the desktop stack first (pw-play -> PipeWire -> ALSA) and falls back to
+# talking to the HDA device directly, which isolates "the sound server is
+# broken" from "the kernel's audio path is broken".
+set -u
+
+tone="${1:-/usr/share/sounds/lupos/lupos-test-tone.wav}"
+if [ ! -s "$tone" ]; then
+    echo "lupos-audio-test: no such audio file: $tone" >&2
+    exit 2
+fi
+
+echo "lupos-audio-test: playing $tone"
+
+if command -v pw-play >/dev/null 2>&1; then
+    if pw-play "$tone"; then
+        echo "lupos-audio-test: ok via pw-play (PipeWire)"
+        exit 0
+    fi
+    echo "lupos-audio-test: pw-play failed, falling back to ALSA" >&2
+fi
+
+if command -v aplay >/dev/null 2>&1; then
+    if aplay -D hw:0,0 "$tone"; then
+        echo "lupos-audio-test: ok via aplay hw:0,0 (direct ALSA)"
+        exit 0
+    fi
+    echo "lupos-audio-test: aplay hw:0,0 failed" >&2
+fi
+
+echo "lupos-audio-test: no working playback path" >&2
+exit 1
+EOF
+    chmod 755 "$root/usr/local/bin/lupos-audio-test"
 }
 
 # pacman runs with `--noscriptlet`, so fontconfig's packaged post_install does
