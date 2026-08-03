@@ -299,6 +299,10 @@ pub fn add_task_common(dir: &Arc<KernfsNode>) {
     );
     add_child(
         dir,
+        KernfsNode::new_file("syscall", 0o400, Some(proc_pid_syscall_show), None),
+    );
+    add_child(
+        dir,
         KernfsNode::new_file(
             "oom_score_adj",
             0o644,
@@ -524,6 +528,86 @@ fn proc_pid_fs_path_readlink(
     let n = target.len().min(buf.len());
     buf[..n].copy_from_slice(&target.as_bytes()[..n]);
     Ok(n)
+}
+
+/// `task_pt_regs()` — `vendor/linux/arch/x86/include/asm/processor.h`.
+///
+/// ```c
+/// #define task_pt_regs(task) \
+///         ((struct pt_regs *)(task_stack_page(task) + THREAD_SIZE) - 1)
+/// ```
+///
+/// `TaskStruct::stack` already holds the top of the kernel stack (it is what is
+/// programmed into `TSS.RSP0`), so the saved user frame sits one `PtRegs` below
+/// it.
+///
+/// # Safety
+/// `task` must be a live task whose kernel stack is allocated.
+unsafe fn task_pt_regs(task: *mut TaskStruct) -> *const crate::kernel::task::PtRegs {
+    let stack_top = unsafe { (*task).stack } as usize;
+    if stack_top == 0 {
+        return core::ptr::null();
+    }
+    (stack_top - core::mem::size_of::<crate::kernel::task::PtRegs>())
+        as *const crate::kernel::task::PtRegs
+}
+
+/// `/proc/<pid>/syscall` — `vendor/linux/fs/proc/base.c:proc_pid_syscall`.
+///
+/// Reports the syscall a task is currently blocked in, with its six arguments,
+/// stack pointer and instruction pointer. Linux prints `running` for a task on
+/// a CPU and `-1 <sp> <pc>` when the task is not in a syscall.
+///
+/// This is the instrument for "process X is asleep and nobody knows why":
+/// without it a stalled task shows only `State: S` with no indication of what
+/// it is waiting on.
+fn proc_pid_syscall_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize, i32> {
+    let pid = proc_pid_from_node(node)?;
+    let task = task_by_pid(pid);
+    if task.is_null() {
+        return Err(ENOENT);
+    }
+
+    // Linux reports `running` rather than a stale frame for a task that is
+    // currently executing; its saved frame is not stable to read.
+    if unsafe { crate::kernel::sched::task_on_cpu(task) } {
+        return super::util::copy_into(buf, "running\n");
+    }
+
+    let regs = unsafe { task_pt_regs(task) };
+    if regs.is_null() {
+        return Err(ENOENT);
+    }
+    let (nr, a0, a1, a2, a3, a4, a5, sp, pc) = unsafe {
+        (
+            // Linux syscall ABI: nr in orig_ax, args in di/si/dx/r10/r8/r9.
+            (*regs).orig_ax as i64,
+            (*regs).di,
+            (*regs).si,
+            (*regs).dx,
+            (*regs).r10,
+            (*regs).r8,
+            (*regs).r9,
+            (*regs).sp,
+            (*regs).ip,
+        )
+    };
+
+    let mut out = alloc::string::String::new();
+    if nr < 0 {
+        let _ = core::fmt::write(
+            &mut out,
+            format_args!("{nr} {sp:#x} {pc:#x}\n"),
+        );
+    } else {
+        let _ = core::fmt::write(
+            &mut out,
+            format_args!(
+                "{nr} {a0:#x} {a1:#x} {a2:#x} {a3:#x} {a4:#x} {a5:#x} {sp:#x} {pc:#x}\n"
+            ),
+        );
+    }
+    super::util::copy_into(buf, &out)
 }
 
 fn proc_pid_from_node(node: &Arc<KernfsNode>) -> Result<i32, i32> {

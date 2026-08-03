@@ -7976,6 +7976,27 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     if let Some((file, line)) = mm::buddy::duplicate_free_caller() {
         serial_println!("  buddy: last duplicate caller {}:{}", file, line);
     }
+    // A rejected bad free means some path released a page it did not own.
+    // Reason 1 on a slab page is the double-ownership that corrupts
+    // KmemCache::alloc; the caller below is the code that did it.
+    let (bad_frees, bad_pfn, bad_reason, bad_mapping) = mm::buddy::bad_free_snapshot();
+    serial_println!(
+        "  buddy: bad_frees={} last_pfn={:#x} reason={} mapping={:#x}",
+        bad_frees,
+        bad_pfn,
+        bad_reason,
+        bad_mapping
+    );
+    if let Some((file, line)) = mm::buddy::bad_free_caller() {
+        serial_println!("  buddy: last bad-free caller {}:{}", file, line);
+    }
+    let (typed_allocs, typed_pfn, typed_tag) = mm::buddy::alloc_typed_page_snapshot();
+    serial_println!(
+        "  buddy: typed_allocs={} last_pfn={:#x} tag={:#x}",
+        typed_allocs,
+        typed_pfn,
+        typed_tag
+    );
     let (slab_rejections, slab_ptr, slab_head_pfn, slab_reason) =
         mm::slab::slab_free_rejection_snapshot();
     serial_println!(
@@ -7994,6 +8015,15 @@ fn panic(info: &PanicInfo<'_>) -> ! {
         slab_slot_size,
         slab_inuse,
         slab_cursor
+    );
+    // Non-zero means a page a slab cache still owned was overwritten by another
+    // owner; the freelist head recorded here is that foreign data.
+    let (corrupt_slabs, corrupt_pfn, corrupt_freelist) = mm::slab::slab_corruption_stats_for_tests();
+    serial_println!(
+        "  slab: corrupt_slabs={} last_corrupt_pfn={:#x} last_corrupt_freelist={:#x}",
+        corrupt_slabs,
+        corrupt_pfn,
+        corrupt_freelist
     );
     dump_panic_stack();
     serial_println!("====================");

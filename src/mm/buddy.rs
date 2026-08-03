@@ -28,7 +28,8 @@ use crate::arch::x86::mm::paging::phys_to_virt;
 use crate::mm::frame::{PAGE_SIZE, PhysFrame};
 use crate::mm::page::Page;
 use crate::mm::page_flags::{
-    __GFP_ZERO, GfpFlags, MAX_NR_ZONES, MigrateType, PAGE_TYPE_NONE, ZoneType, gfp_zone,
+    __GFP_ZERO, GfpFlags, MAX_NR_ZONES, MigrateType, PAGE_TYPE_NONE, PGTY_BUDDY, PGTY_SLAB,
+    ZoneType, decode_page_type, gfp_zone,
 };
 use crate::mm::region::MemoryMap;
 use crate::mm::zone::{MAX_PAGE_ORDER, NR_PAGE_ORDERS, ZONE_DMA_MAX_PFN, Zone};
@@ -45,6 +46,109 @@ const BOOT_DIRECT_MAP_BYTES_U64: u64 = BOOT_DIRECT_MAP_BYTES as u64;
 // block; this bit marks every page so a duplicate free of a coalesced tail
 // cannot insert an overlapping block into the free lists.
 const PG_BUDDY_FREE_TRACK: u64 = 1 << 63;
+
+/// Frees of pages that were not in Linux's expected free state
+/// (`page_expected_state()`), counted but — as in Linux — not rejected.
+/// Non-zero means some path released a page without running its destructor;
+/// the recorded caller is that path.
+static BAD_FREE_REJECTIONS: AtomicUsize = AtomicUsize::new(0);
+static LAST_BAD_FREE_PFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// 1 = still typed (e.g. a live slab page), 2 = non-zero `mapping`,
+/// 3 = non-zero refcount, 4 = mapcount != -1, 5 = still on an LRU list.
+static LAST_BAD_FREE_REASON: AtomicUsize = AtomicUsize::new(0);
+static LAST_BAD_FREE_MAPPING: AtomicUsize = AtomicUsize::new(0);
+static LAST_BAD_FREE_FILE: AtomicUsize = AtomicUsize::new(0);
+static LAST_BAD_FREE_FILE_LEN: AtomicUsize = AtomicUsize::new(0);
+static LAST_BAD_FREE_LINE: AtomicUsize = AtomicUsize::new(0);
+
+/// Pages handed out by `alloc_pages()` that were still typed (owned by another
+/// subsystem, e.g. a live slab page). Non-zero proves the allocator gave away a
+/// page somebody else still owns.
+static ALLOC_TYPED_PAGE_HITS: AtomicUsize = AtomicUsize::new(0);
+static LAST_ALLOC_TYPED_PFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static LAST_ALLOC_TYPED_TAG: AtomicUsize = AtomicUsize::new(0);
+
+/// Snapshot of typed pages handed out by the allocator: (count, pfn, tag).
+pub fn alloc_typed_page_snapshot() -> (usize, usize, usize) {
+    (
+        ALLOC_TYPED_PAGE_HITS.load(Ordering::Acquire),
+        LAST_ALLOC_TYPED_PFN.load(Ordering::Acquire),
+        LAST_ALLOC_TYPED_TAG.load(Ordering::Acquire),
+    )
+}
+
+/// `page_bad_reason()` — `vendor/linux/mm/page_alloc.c:1047`.
+///
+/// # Safety
+/// `page` must point into the mem_map.
+unsafe fn page_bad_reason(page: *const Page) -> usize {
+    unsafe {
+        // `_mapcount` and `page_type` are the same union word, exactly as in
+        // Linux, so one check covers both: `-1` (== PAGE_TYPE_NONE) is the only
+        // releasable value. Split the reason afterwards purely for diagnostics.
+        let raw = (*page).page_type.load(Ordering::Relaxed);
+        if raw != PAGE_TYPE_NONE {
+            // Page types occupy the top byte from PGTY_BUDDY (0xf0) upwards;
+            // anything below that is a real mapcount (>= 0), i.e. the page is
+            // still mapped into a process.
+            let tag = decode_page_type(raw);
+            if tag < PGTY_BUDDY {
+                return 4;
+            }
+            // A free block's head legitimately carries PGTY_BUDDY; a genuine
+            // double free is already rejected by PG_BUDDY_FREE_TRACK above.
+            if tag != PGTY_BUDDY {
+                // Owned by a subsystem — a live slab page lands here.
+                return 1;
+            }
+        }
+        if (*page)._refcount.load(Ordering::Relaxed) != 0 {
+            return 3;
+        }
+        // Linux treats PG_lru at free time as a bad page
+        // (`PAGE_FLAGS_CHECK_AT_FREE`). A page freed while still linked into an
+        // LRU list leaves that list pointing at it; once the page is handed out
+        // again -- e.g. as a slab page, which reuses the very same `Page::lru`
+        // field -- the stale LRU link and the new owner's list corrupt each
+        // other.
+        if (*page).flags.load(Ordering::Relaxed) & crate::mm::page_flags::PG_LRU != 0 {
+            return 5;
+        }
+        // NOTE: a non-zero `mapping` is deliberately *not* a bad reason. An
+        // anon page reaches the allocator carrying its anon_vma back-pointer,
+        // and Linux clears it while preparing the free
+        // (`vendor/linux/mm/page_alloc.c:1174` `page->mapping = NULL`) rather
+        // than refusing. Rejecting it starves the machine: an earlier version
+        // of this check turned 913_481 legitimate frees into leaks and OOMed
+        // the desktop.
+    }
+    0
+}
+
+/// Snapshot of rejected bad frees: (count, pfn, reason, mapping).
+///
+/// A non-zero count means a page was released while still owned. Reason 1 with
+/// a slab page is the double-ownership that corrupts `KmemCache::alloc`.
+pub fn bad_free_snapshot() -> (usize, usize, usize, usize) {
+    (
+        BAD_FREE_REJECTIONS.load(Ordering::Acquire),
+        LAST_BAD_FREE_PFN.load(Ordering::Acquire),
+        LAST_BAD_FREE_REASON.load(Ordering::Acquire),
+        LAST_BAD_FREE_MAPPING.load(Ordering::Acquire),
+    )
+}
+
+/// Source location of the last rejected bad free, if one has been recorded.
+pub fn bad_free_caller() -> Option<(&'static str, usize)> {
+    let ptr = LAST_BAD_FREE_FILE.load(Ordering::Acquire);
+    let len = LAST_BAD_FREE_FILE_LEN.load(Ordering::Acquire);
+    if ptr == 0 || len == 0 {
+        return None;
+    }
+    let file = unsafe { core::str::from_utf8(core::slice::from_raw_parts(ptr as *const u8, len)) };
+    file.ok()
+        .map(|file| (file, LAST_BAD_FREE_LINE.load(Ordering::Acquire)))
+}
 
 // ---------------------------------------------------------------------------
 // Global mem_map — a flat array of Page structs for all physical frames.
@@ -483,6 +587,26 @@ impl BuddyAllocator {
                         }
                     }
 
+                    // A page handed out here must not still be owned by a slab
+                    // cache. `free_pages()` resets `page_type`, so anything
+                    // still typed reached the free lists without being released
+                    // — the double-ownership that lets a userspace write land
+                    // on kernel metadata. Record it before
+                    // `prepare_allocated_block()` wipes the evidence.
+                    for idx in 0..(1usize << order) {
+                        let current = unsafe { page.add(idx) };
+                        let raw = unsafe { (*current).page_type.load(Ordering::Relaxed) };
+                        if raw != PAGE_TYPE_NONE && decode_page_type(raw) >= PGTY_BUDDY {
+                            let tag = decode_page_type(raw);
+                            if tag != PGTY_BUDDY {
+                                ALLOC_TYPED_PAGE_HITS.fetch_add(1, Ordering::AcqRel);
+                                LAST_ALLOC_TYPED_PFN
+                                    .store(page_to_pfn(current), Ordering::Release);
+                                LAST_ALLOC_TYPED_TAG.store(tag as usize, Ordering::Release);
+                            }
+                        }
+                    }
+
                     unsafe {
                         Self::prepare_allocated_block(page, order);
                     }
@@ -563,8 +687,79 @@ impl BuddyAllocator {
             DUPLICATE_FREE_REJECTIONS.fetch_add(1, Ordering::AcqRel);
             return;
         }
+        // `free_page_is_bad()` — `vendor/linux/mm/page_alloc.c:1072`.
+        //
+        // Linux refuses to free a page that is still in use, checking
+        // `page_expected_state()`: `_mapcount == -1`, `mapping == NULL` and
+        // `page_ref_count() == 0`. Lupos previously validated only its private
+        // double-free bit, so a page freed behind its owner's back was accepted
+        // and immediately handed to the next caller.
+        //
+        // That is not hypothetical: a slab page carries its freelist head in
+        // `page->mapping`, so a stray free of one leaves the cache with a page
+        // that the allocator has already given to somebody else. It surfaced as
+        // a #GP in `KmemCache::alloc` whose freelist head was a GTK pixel fill.
         for idx in 0..nr_pages {
-            unsafe { (*page.add(idx)).set_flag(PG_BUDDY_FREE_TRACK) };
+            let current = unsafe { page.add(idx) };
+            unsafe {
+                // Record, but do not reject: Linux clears both fields here and
+                // only validates under `is_check_pages_enabled()`. Rejecting
+                // instead starves the machine — an earlier attempt turned
+                // ~941k legitimate page-table and anon frees into leaks and
+                // OOMed the desktop.
+                let reason = page_bad_reason(current);
+                if reason != 0 {
+                    BAD_FREE_REJECTIONS.fetch_add(1, Ordering::AcqRel);
+                    LAST_BAD_FREE_PFN.store(page_to_pfn(current), Ordering::Release);
+                    LAST_BAD_FREE_REASON.store(reason, Ordering::Release);
+                    LAST_BAD_FREE_MAPPING.store((*current).mapping, Ordering::Release);
+                    let caller = core::panic::Location::caller();
+                    LAST_BAD_FREE_FILE.store(caller.file().as_ptr() as usize, Ordering::Release);
+                    LAST_BAD_FREE_FILE_LEN.store(caller.file().len(), Ordering::Release);
+                    LAST_BAD_FREE_LINE.store(caller.line() as usize, Ordering::Release);
+                }
+
+                // `free_pages_prepare()` — `vendor/linux/mm/page_alloc.c:1388`.
+                //
+                //     if (folio_test_anon(folio))
+                //             folio->mapping = NULL;
+                //     if (unlikely(page_has_type(page)))
+                //             page->page_type = UINT_MAX;
+                //
+                // Lupos previously left both fields stale on a freed page, so a
+                // page sitting in the free lists still looked like a live slab
+                // page (`PGTY_SLAB` plus a freelist head in `mapping`) to
+                // anything that inspected it.
+                // Unlink a page that is still on an LRU list before it enters
+                // the buddy free lists. `Page::lru` is shared between the mm
+                // LRU and the slab caches' partial/full lists, so a stale LRU
+                // link survives into the page's next owner: once the page is
+                // handed out as a slab page and linked into a cache's partial
+                // list, an LRU walk rewrites the same node and the cache's list
+                // ends up pointing at garbage. That is exactly how
+                // `KmemCache::alloc` came to walk a `head_page` with a nonsense
+                // PFN.
+                //
+                // `list_del` is used rather than `lru::remove_lru_page()` on
+                // purpose: callers such as `release_cow_page_reference()` take
+                // the LRU lock *before* the buddy lock, so acquiring it here
+                // would invert the lock order and deadlock. Unlinking the node
+                // fixes up its neighbours without needing that lock.
+                if (*current).flags.load(Ordering::Relaxed) & crate::mm::page_flags::PG_LRU != 0 {
+                    crate::mm::list::ListHead::list_del(&mut (*current).lru);
+                    (*current).clear_flag(crate::mm::page_flags::PG_LRU);
+                }
+
+                (*current).mapping = 0;
+                let raw = (*current).page_type.load(Ordering::Relaxed);
+                if raw != PAGE_TYPE_NONE && decode_page_type(raw) >= PGTY_BUDDY {
+                    (*current)
+                        .page_type
+                        .store(PAGE_TYPE_NONE, Ordering::Relaxed);
+                }
+
+                (*current).set_flag(PG_BUDDY_FREE_TRACK);
+            }
         }
         let pfn = page_to_pfn(page);
         let zone_idx = self.pfn_to_zone_idx(pfn);
@@ -996,7 +1191,7 @@ pub mod tests {
 
     use super::*;
     use crate::mm::page::Page;
-    use crate::mm::page_flags::{GFP_DMA, GFP_KERNEL};
+    use crate::mm::page_flags::{GFP_DMA, GFP_KERNEL, encode_page_type};
     use crate::mm::test_lock::GLOBAL_HW_TEST_LOCK;
 
     // -----------------------------------------------------------------------
@@ -1245,6 +1440,80 @@ pub mod tests {
             assert_eq!(alloc.free_count(), free);
             assert!((*page).is_buddy());
             assert!(duplicate_free_snapshot().0 > rejected_before);
+        }
+    }
+
+    /// A freed page must not keep stale ownership metadata.
+    ///
+    /// Linux clears `page->mapping` and resets `page->page_type` in
+    /// `free_pages_prepare()` (`vendor/linux/mm/page_alloc.c:1388`). Lupos left
+    /// both stale, so a page sitting in the free lists still looked like a live
+    /// slab page — `PGTY_SLAB` with a freelist head in `mapping` — to anything
+    /// that inspected it. That is the shape of the live `#GP` in
+    /// `KmemCache::alloc` whose freelist head held a GTK pixel fill.
+    ///
+    /// test-origin: linux:vendor/linux/mm/page_alloc.c:free_pages_prepare
+    #[test]
+    fn freeing_a_page_clears_stale_ownership_metadata() {
+        let _g = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let (mut alloc, _pages) = make_test_env();
+            let free_before = alloc.free_count();
+
+            // A page still carrying slab metadata: typed, with a freelist head.
+            let page = pfn_to_page(9);
+            (*page)
+                .page_type
+                .store(encode_page_type(PGTY_SLAB), Ordering::Relaxed);
+            (*page).mapping = 0xffff_8880_1234_5000;
+
+            alloc.free_pages(page, 0);
+
+            assert_eq!(
+                alloc.free_count(),
+                free_before + 1,
+                "the free must still succeed, as it does in Linux"
+            );
+            assert_eq!((*page).mapping, 0, "page->mapping must be cleared");
+            assert!(
+                !crate::mm::page_flags::page_type_has_type(
+                    (*page).page_type.load(Ordering::Relaxed)
+                ) || decode_page_type((*page).page_type.load(Ordering::Relaxed)) == PGTY_BUDDY,
+                "a stale page type must not survive the free"
+            );
+
+            // The unexpected state is still reported, so the path that skipped
+            // its destructor can be found.
+            let (count, pfn, reason, mapping) = bad_free_snapshot();
+            assert!(count > 0);
+            assert_eq!(pfn, 9);
+            assert_eq!(reason, 1, "reason 1 = still typed (live slab page)");
+            assert_eq!(mapping, 0xffff_8880_1234_5000);
+            assert!(bad_free_caller().is_some(), "the culprit must be recorded");
+        }
+    }
+
+    /// An anon page arrives carrying its anon_vma back-pointer; that must not
+    /// block the free, and the field must be cleared.
+    #[test]
+    fn freeing_an_anon_page_clears_its_mapping() {
+        let _g = GLOBAL_HW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let (mut alloc, _pages) = make_test_env();
+            let anon = pfn_to_page(13);
+            (*anon).page_type.store(PAGE_TYPE_NONE, Ordering::Relaxed);
+            (*anon).mapping = 0xffff_8880_dead_0000;
+            (*anon)._refcount.store(0, Ordering::Relaxed);
+
+            let free_before = alloc.free_count();
+            alloc.free_pages(anon, 0);
+
+            assert_eq!(alloc.free_count(), free_before + 1);
+            assert_eq!((*anon).mapping, 0, "the free must clear page->mapping");
         }
     }
 
