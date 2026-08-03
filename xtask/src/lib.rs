@@ -6531,18 +6531,16 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "                    printf 'graphics-x11: firefox-syscall-thread tid=%s comm=%s nr=%s\\n' \"${ff_task##*/}\" \"$(cat \"$ff_task/comm\" 2>/dev/null)\" \"$(cat \"$ff_task/syscall\" 2>/dev/null || echo unavailable)\"\n",
         "                done\n",
         "            done\n",
-        // Is it bwrap or the loader binary that fails? Run each directly.
-        "            echo 'graphics-x11: glycin-probe begin'\n",
-        "            sudo -n -u lupos /usr/bin/bwrap --unshare-all --die-with-parent --chdir / --ro-bind /usr /usr --dev /dev --ro-bind /etc /etc --proc /proc /usr/bin/true >/tmp/lupos-glycin-bwrap.log 2>&1; printf 'graphics-x11: glycin-probe bwrap-true rc=%s\\n' \"$?\"\n",
-        "            sed 's/^/graphics-x11: glycin-probe bwrap-out /' /tmp/lupos-glycin-bwrap.log 2>/dev/null | head -5\n",
-        "            sudo -n -u lupos timeout -k 2 10 /usr/lib/glycin-loaders/2+/glycin-image-rs >/tmp/lupos-glycin-direct.log 2>&1; printf 'graphics-x11: glycin-probe loader-direct rc=%s\\n' \"$?\"\n",
-        "            sed 's/^/graphics-x11: glycin-probe loader-out /' /tmp/lupos-glycin-direct.log 2>/dev/null | head -8\n",
-        "            sudo -n -u lupos /usr/bin/bwrap --unshare-all --die-with-parent --chdir / --ro-bind /usr /usr --dev /dev --ro-bind /etc /etc --proc /proc /usr/lib/glycin-loaders/2+/glycin-image-rs >/tmp/lupos-glycin-sbx.log 2>&1; printf 'graphics-x11: glycin-probe loader-sandboxed rc=%s\\n' \"$?\"\n",
-        "            sed 's/^/graphics-x11: glycin-probe sbx-out /' /tmp/lupos-glycin-sbx.log 2>/dev/null | head -8\n",
-        "            echo 'graphics-x11: glycin-probe end'\n",
         "            echo 'graphics-x11: firefox-glycin begin'\n",
         "            /usr/bin/ps -eo pid,ppid,stat,comm,args 2>/dev/null | grep -E 'glycin|bwrap' | grep -v grep | sed 's/^/graphics-x11: firefox-glycin /' | cut -c1-150 || true\n",
         "            echo 'graphics-x11: firefox-glycin end'\n",
+        // The loaders now exec; are they replying, or blocked themselves?
+        "            echo 'graphics-x11: glycin-state begin'\n",
+        "            for gp in $(/usr/bin/ps -eo pid,comm 2>/dev/null | grep -E 'glycin' | awk '{print $1}'); do\n",
+        "              printf 'graphics-x11: glycin-state pid=%s comm=%s state=%s syscall=%s\\n' \"$gp\" \"$(cat /proc/$gp/comm 2>/dev/null)\" \"$(awk '{print $3}' /proc/$gp/stat 2>/dev/null)\" \"$(cat /proc/$gp/syscall 2>/dev/null | head -c 50)\"\n",
+        "              ls -l /proc/$gp/fd 2>/dev/null | sed \"s|^|graphics-x11: glycin-state fd$gp |\" | head -12\n",
+        "            done\n",
+        "            echo 'graphics-x11: glycin-state end'\n",
         "            echo 'graphics-x11: firefox-syscall end'\n",
         // Walk the stuck main thread's user stack via /proc/<pid>/mem and
         // attribute each 8-byte word to a mapping, so the libraries on the

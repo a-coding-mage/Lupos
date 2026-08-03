@@ -1,4 +1,15 @@
-//! linux-parity: complete
+//! linux-parity: partial
+//! linux-deviation: Linux publishes `/proc/self` as an `S_IFLNK` inode whose
+//! target is regenerated from `current` on every path walk
+//! (`proc_self_get_link`).  Lupos publishes it as a directory
+//! (`new_self_dir()`), so the model in `proc_self_get_link()` below is not
+//! wired to the live filesystem and `readlink("/proc/self")` returns EINVAL
+//! instead of the caller's tgid.  Consumers compensate by re-resolving against
+//! `current` at access time whenever the containing directory is named `self`
+//! (`base.rs::proc_pid_from_node`, `namespaces.rs::proc_user_ns_path_pid`,
+//! `fd.rs::fd_dir_owner`).  Anything that caches a pid at lookup time under
+//! this directory is a bug: one inode is shared by every process, so it goes
+//! stale as soon as the task that instantiated it exits.
 //! linux-source: vendor/linux/fs/proc/self.c
 //! test-origin: linux:vendor/linux/fs/proc/self.c
 //! `/proc/self`.

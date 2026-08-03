@@ -3301,7 +3301,7 @@ unsafe fn copy_readlink_to_user(target: &str, buf: *mut u8, bufsiz: usize) -> Re
 
 #[cfg(not(test))]
 fn trace_run_readlinkat(dirfd: i32, path: &str, ret: i64) {
-    if !crate::kernel::debug_trace::fs_enabled() {
+    if !crate::kernel::debug_trace::fs_enabled() && !crate::kernel::debug_trace::glycin_enabled() {
         return;
     }
     if !(ret < 0 || path.is_empty() || path.contains("/proc/self/fd") || path.contains("systemd")) {

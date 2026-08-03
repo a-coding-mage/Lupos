@@ -26,11 +26,68 @@ pub fn current_fd_path(fd: i32) -> Result<String, i32> {
     task_fd_path(task, fd)
 }
 
+#[cfg(not(test))]
+macro_rules! trace_procfd {
+    ($($arg:tt)*) => {
+        if crate::kernel::debug_trace::fs_enabled()
+            || crate::kernel::debug_trace::glycin_enabled()
+        {
+            crate::linux_driver_abi::tty::serial_println!($($arg)*);
+        }
+    };
+}
+
+#[cfg(test)]
+macro_rules! trace_procfd {
+    ($($arg:tt)*) => {};
+}
+
 fn task_fd_path(task: *mut TaskStruct, fd: i32) -> Result<String, i32> {
     let file = task_fd_file(task, fd)?;
     Ok(crate::fs::file::path_hint(&file)
         .or_else(|| crate::fs::mount::stable_path_for_dentry(&file.dentry))
+        .or_else(|| pseudo_file_dname(&file))
         .unwrap_or_else(|| file_path(&file)))
+}
+
+/// Linux `d_path()` equivalent for files that live on a pseudo filesystem.
+///
+/// Sockets, pipes and anon-inode files hang off an unparented dentry, so
+/// `dentry_path()` walks straight past the name and reports `/` for every one
+/// of them.  Linux instead routes these through per-filesystem `d_dname`
+/// callbacks, so `/proc/<pid>/fd/N` reads back as `socket:[<ino>]`,
+/// `pipe:[<ino>]` or `anon_inode:<name>`
+/// (`vendor/linux/net/socket.c::sockfs_dname`,
+/// `vendor/linux/fs/pipe.c::pipefs_dname`,
+/// `vendor/linux/fs/anon_inodes.c::anon_inodefs_dname`).
+///
+/// Reporting `/` here is not just cosmetic: gdk-pixbuf resolves descriptors by
+/// readlinking `/proc/<pid>/fd/<n>`, and bubblewrap canonicalizes its `O_PATH`
+/// bind destinations the same way, so a bogus `/` silently redirects them at a
+/// directory.  Returns `None` for files that really do have a path, leaving the
+/// normal `dentry_path()` walk in charge.
+fn pseudo_file_dname(file: &FileRef) -> Option<String> {
+    // A dentry with a parent is reachable in the tree; let d_path handle it.
+    if file.dentry.parent.lock().is_some() {
+        return None;
+    }
+    let name = file.dentry.name.clone();
+    if name.is_empty() || name == "/" {
+        return None;
+    }
+    let ino = file.inode().map(|inode| inode.ino).unwrap_or(0);
+    // memfd files carry their own "memfd:<name>" spelling and read back from
+    // Linux as a deleted shmem path.
+    if let Some(rest) = name.strip_prefix("memfd:") {
+        return Some(format!("/memfd:{rest} (deleted)"));
+    }
+    if name.starts_with("pipe:") {
+        return Some(format!("pipe:[{ino}]"));
+    }
+    if file.fops.name == "socket" || name == "socket" {
+        return Some(format!("socket:[{ino}]"));
+    }
+    Some(format!("anon_inode:{name}"))
 }
 
 pub fn current_fd_file(fd: i32) -> Result<FileRef, i32> {
@@ -69,9 +126,15 @@ fn parse_fd_name(name: &str) -> Result<i32, i32> {
 
 fn fd_dir_lookup(dir: &InodeRef, name: &str) -> Result<InodeRef, i32> {
     let fd = parse_fd_name(name)?;
-    let task = task_from_fd_dir_inode(dir)?;
-    task_fd_file(task, fd).map_err(|_| ENOENT)?;
-    let pid = crate::kernel::pid_namespace::task_pid_vnr(task);
+    let (task, pid) = fd_dir_owner(dir)?;
+    if let Err(errno) = task_fd_file(task, fd) {
+        trace_procfd!(
+            "trace-procfd lookup fd={} step=task_fd_file errno={}",
+            fd,
+            errno
+        );
+        return Err(ENOENT);
+    }
     let inode = Inode::new(
         proc_fd_ino(fd),
         InodeKind::Symlink,
@@ -136,14 +199,43 @@ fn proc_fd_readlink(inode: &InodeRef, buf: &mut [u8]) -> Result<usize, i32> {
         InodePrivate::Opaque(value) => unpack_proc_fd(value),
         _ => return Err(EINVAL),
     };
-    let task = crate::fs::proc::base::task_by_pid(pid);
+    let task = task_for_proc_fd_pid(pid);
     if task.is_null() {
+        trace_procfd!(
+            "trace-procfd readlink pid={} fd={} step=task_by_pid null",
+            pid,
+            fd
+        );
         return Err(ENOENT);
     }
-    let target = task_fd_path(task, fd).map_err(|_| ENOENT)?;
+    let target = match task_fd_path(task, fd) {
+        Ok(target) => target,
+        Err(errno) => {
+            trace_procfd!(
+                "trace-procfd readlink pid={} fd={} step=task_fd_path errno={}",
+                pid,
+                fd,
+                errno
+            );
+            return Err(ENOENT);
+        }
+    };
     let n = target.len().min(buf.len());
     buf[..n].copy_from_slice(&target.as_bytes()[..n]);
     Ok(n)
+}
+
+/// Recorded in place of a pid when the `fd` directory is `/proc/self`, meaning
+/// "resolve against `current` on every access".  Never a valid task pid.
+pub(crate) const PROC_FD_PID_SELF: i32 = 0;
+
+/// Task owning a `/proc/<pid>/fd/N` symlink, honouring [`PROC_FD_PID_SELF`].
+fn task_for_proc_fd_pid(pid: i32) -> *mut TaskStruct {
+    if pid == PROC_FD_PID_SELF {
+        unsafe { sched::get_current() }
+    } else {
+        crate::fs::proc::base::task_by_pid(pid)
+    }
 }
 
 fn pack_proc_fd(pid: i32, fd: i32) -> usize {
@@ -173,9 +265,40 @@ fn task_from_proc_pid_name(name: &str) -> Result<*mut TaskStruct, i32> {
 }
 
 fn task_from_fd_dir_inode(dir: &InodeRef) -> Result<*mut TaskStruct, i32> {
+    Ok(fd_dir_owner(dir)?.0)
+}
+
+/// Resolve the task owning an `fd` directory, plus the pid to record in the
+/// symlink inodes below it.
+///
+/// Linux keeps `/proc/self` as a symlink whose target is regenerated from
+/// `current` on every path walk
+/// (`vendor/linux/fs/proc/self.c::proc_self_get_link`), so `/proc/self/fd/N`
+/// always instantiates under the *calling* process's `/proc/<pid>` directory
+/// and `proc_fd_link()` reads that process's file table.  Lupos models
+/// `/proc/self` as a directory instead, so a single `fd/N` inode is cached and
+/// shared by every process that walks it.  Recording a concrete pid there binds
+/// the symlink to whichever task looked it up first; once that task exits,
+/// `task_by_pid()` returns NULL and readlink fails with ENOENT even though the
+/// caller's own fd is open.  That is what broke bubblewrap: it opens the bind
+/// destination with `O_PATH` and canonicalizes it through
+/// `readlink("/proc/self/fd/N")`, so every sandboxed glycin image loader died
+/// before it could reply and Firefox blocked forever waiting for one.
+///
+/// Store the sentinel for `/proc/self` and re-resolve against `current` at
+/// access time, matching the way the other `/proc/self` consumers in this tree
+/// already handle it (`base.rs::proc_pid_from_node`,
+/// `namespaces.rs::proc_user_ns_path_pid`).
+fn fd_dir_owner(dir: &InodeRef) -> Result<(*mut TaskStruct, i32), i32> {
     let node = crate::fs::kernfs::node_from_inode(dir);
     let parent = node.parent.lock().upgrade().ok_or(EINVAL)?;
-    task_from_proc_pid_name(&parent.name)
+    let task = task_from_proc_pid_name(&parent.name)?;
+    let pid = if parent.name == "self" {
+        PROC_FD_PID_SELF
+    } else {
+        crate::kernel::pid_namespace::task_pid_vnr(task)
+    };
+    Ok((task, pid))
 }
 
 static FDINFO_FILE_OPS: FileOps = FileOps {
@@ -457,6 +580,132 @@ mod tests {
             sched::set_current(previous);
             put_pid(target.m26.thread_pid);
             target.m26.thread_pid = core::ptr::null_mut();
+        }
+    }
+
+    /// Pseudo-filesystem fds must read back with their Linux `d_dname`
+    /// spelling, not as `/`.
+    ///
+    /// test-origin: linux:vendor/linux/net/socket.c::sockfs_dname,
+    /// linux:vendor/linux/fs/pipe.c::pipefs_dname,
+    /// linux:vendor/linux/fs/anon_inodes.c::anon_inodefs_dname
+    #[test]
+    fn proc_fd_links_report_linux_pseudo_filesystem_names() {
+        let sockfs = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/net/socket.c"
+        ));
+        assert!(sockfs.contains("\"socket:[%llu]\""));
+        let pipefs = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/fs/pipe.c"
+        ));
+        assert!(pipefs.contains("\"pipe:[%llu]\""));
+        let anonfs = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/fs/anon_inodes.c"
+        ));
+        assert!(anonfs.contains("\"anon_inode:%s\""));
+
+        let previous = unsafe { sched::get_current() };
+
+        let mut current = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        current.pid = 4410;
+        current.tgid = 4410;
+        current.cred = &raw const INIT_CRED;
+
+        unsafe {
+            let fdt = FilesStruct::new();
+            let sock = crate::fs::anon_inode::alloc_anon_file_with_ino(
+                "socket",
+                &NOOP_FILE_OPS,
+                0,
+                4242,
+            );
+            assert_eq!(fdt.install_at_or_above(sock, 3, false), Ok(3));
+            // Same dentry name pipe.rs gives its read end.
+            let pipe_r = alloc_anon_file("pipe:[read]", &NOOP_FILE_OPS, 0);
+            assert_eq!(fdt.install_at_or_above(pipe_r, 4, false), Ok(4));
+            let ev = alloc_anon_file("[eventfd]", &NOOP_FILE_OPS, 0);
+            assert_eq!(fdt.install_at_or_above(ev, 5, false), Ok(5));
+            files::set_task_files(&mut *current as *mut TaskStruct, fdt);
+            sched::set_current(&mut *current as *mut TaskStruct);
+
+            let task = &mut *current as *mut TaskStruct;
+            assert_eq!(task_fd_path(task, 3).unwrap(), "socket:[4242]");
+            assert!(
+                task_fd_path(task, 4).unwrap().starts_with("pipe:["),
+                "pipe fd read back as {:?}",
+                task_fd_path(task, 4)
+            );
+            assert_eq!(task_fd_path(task, 5).unwrap(), "anon_inode:[eventfd]");
+
+            files::drop_task_files(&mut *current as *mut TaskStruct);
+            sched::set_current(previous);
+        }
+    }
+
+    /// A cached `/proc/self/fd/N` inode must follow whoever is reading it.
+    ///
+    /// Linux regenerates `/proc/self` from `current` on every path walk
+    /// (`vendor/linux/fs/proc/self.c::proc_self_get_link`), so `proc_fd_link()`
+    /// always reads the calling task's file table.  Lupos shares one cached
+    /// `self/fd/N` inode between processes, so it must not bind to the pid that
+    /// instantiated it: bubblewrap canonicalizes its `O_PATH` bind destination
+    /// through `readlink("/proc/self/fd/N")`, and a stale pid there made every
+    /// sandboxed glycin loader fail with ENOENT.
+    #[test]
+    fn proc_self_fd_link_follows_the_reading_task_not_the_one_that_cached_it() {
+        let previous = unsafe { sched::get_current() };
+
+        let mut first = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        first.pid = 4401;
+        first.tgid = 4401;
+        first.cred = &raw const INIT_CRED;
+
+        let mut second = Box::new(unsafe { core::mem::zeroed::<TaskStruct>() });
+        second.pid = 4402;
+        second.tgid = 4402;
+        second.cred = &raw const INIT_CRED;
+
+        unsafe {
+            let fdt = FilesStruct::new();
+            let held = alloc_anon_file("held", &NOOP_FILE_OPS, 0);
+            set_path_hint(&held, String::from("/newroot"));
+            assert_eq!(fdt.install_at_or_above(held, 4, false), Ok(4));
+            files::set_task_files(&mut *first as *mut TaskStruct, fdt);
+            sched::set_current(&mut *first as *mut TaskStruct);
+
+            let sb = SuperBlock::alloc("proc", 0x9fa0, &crate::fs::proc::PROCFS_SUPER_OPS);
+            let self_dir = KernfsNode::new_dir("self", 0o555);
+            crate::fs::proc::base::add_tgid_base(&self_dir);
+            let fd_dir = lookup(&self_dir, "fd").expect("/proc/self/fd");
+            let dir_inode = crate::fs::kernfs::inode_for_node(&sb, fd_dir);
+
+            // The first task instantiates (and caches) the fd symlink inode.
+            let link = fd_dir_lookup(&dir_inode, "4").expect("fd link");
+            let mut buf = [0u8; 64];
+            let n = proc_fd_readlink(&link, &mut buf).expect("readlink");
+            assert_eq!(&buf[..n], b"/newroot");
+
+            // The first task goes away, exactly as a finished bwrap child does.
+            files::drop_task_files(&mut *first as *mut TaskStruct);
+
+            // A different task reads the same cached inode.  It must see its
+            // own fd 4, not ENOENT from a lookup of the departed pid.
+            let fdt = FilesStruct::new();
+            let held = alloc_anon_file("held", &NOOP_FILE_OPS, 0);
+            set_path_hint(&held, String::from("/newroot/usr"));
+            assert_eq!(fdt.install_at_or_above(held, 4, false), Ok(4));
+            files::set_task_files(&mut *second as *mut TaskStruct, fdt);
+            sched::set_current(&mut *second as *mut TaskStruct);
+
+            let mut buf = [0u8; 64];
+            let n = proc_fd_readlink(&link, &mut buf).expect("readlink after task switch");
+            assert_eq!(&buf[..n], b"/newroot/usr");
+
+            files::drop_task_files(&mut *second as *mut TaskStruct);
+            sched::set_current(previous);
         }
     }
 
