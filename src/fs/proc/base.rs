@@ -12,7 +12,7 @@ use crate::fs::anon_inode::alloc_anon_file_with_kind;
 use crate::fs::kernfs::{KernfsNode, add_child};
 use crate::fs::ops::FileOps;
 use crate::fs::types::{FileRef, InodeKind, InodeRef};
-use crate::include::uapi::errno::{EACCES, EFAULT, EINVAL, ENOENT};
+use crate::include::uapi::errno::{EACCES, EFAULT, EINVAL, EIO, ENOENT};
 use crate::kernel::capability::{CAP_SYS_PTRACE, ns_capable};
 use crate::kernel::cred::{Cred, INIT_CRED};
 use crate::kernel::task::{
@@ -24,6 +24,23 @@ use crate::kernel::task::{
 static PROC_PID_STAT_FILE_OPS: FileOps = FileOps {
     name: "proc-pid-stat",
     read: Some(proc_pid_stat_read),
+    write: None,
+    llseek: None,
+    fsync: None,
+    poll: None,
+    ioctl: None,
+    mmap: None,
+    release: None,
+    readdir: None,
+};
+
+/// `/proc/<pid>/mem` — `vendor/linux/fs/proc/base.c:mem_rw`.
+///
+/// The file offset *is* the virtual address in the target's address space, and
+/// reads go through `access_remote_vm()` exactly as Linux's `mem_rw()` does.
+static PROC_PID_MEM_FILE_OPS: FileOps = FileOps {
+    name: "proc-pid-mem",
+    read: Some(proc_pid_mem_read),
     write: None,
     llseek: None,
     fsync: None,
@@ -105,6 +122,64 @@ pub fn process_cgroup_file_from_proc_path(
         return None;
     }
     Some(process_cgroup_file(pid, flags, mode))
+}
+
+pub fn process_mem_file(pid: i32, flags: u32, mode: u32) -> Result<FileRef, i32> {
+    if pid <= 0 || task_by_pid(pid).is_null() {
+        return Err(ENOENT);
+    }
+    let _ = mode;
+    let file = alloc_anon_file_with_kind(
+        "mem",
+        &PROC_PID_MEM_FILE_OPS,
+        pid as usize,
+        InodeKind::Regular,
+        0o600,
+    );
+    file.flags.store(flags, Ordering::Release);
+    Ok(file)
+}
+
+pub fn process_mem_file_from_proc_path(
+    path: &str,
+    flags: u32,
+    mode: u32,
+) -> Option<Result<FileRef, i32>> {
+    let (pid, name) = parse_proc_pid_file(path)?;
+    if name != "mem" {
+        return None;
+    }
+    Some(process_mem_file(pid, flags, mode))
+}
+
+/// `mem_rw()` read side. `*pos` is the target virtual address.
+fn proc_pid_mem_read(file: &FileRef, buf: &mut [u8], pos: &mut u64) -> Result<usize, i32> {
+    let pid = *file.private.lock() as i32;
+    let task = task_by_pid(pid);
+    if task.is_null() {
+        return Err(ENOENT);
+    }
+    // Linux gates this on `mm_access()`/PTRACE_MODE_ATTACH; reuse the same
+    // dumpability + CAP_SYS_PTRACE decision the other /proc readers use.
+    if !unsafe { proc_pid_ptrace_may_read_fscreds(task) } {
+        return Err(EACCES);
+    }
+    let mm = unsafe { (*task).mm };
+    if mm.is_null() {
+        return Ok(0);
+    }
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let copied = unsafe {
+        crate::mm::mm_public::access_remote_vm(mm, *pos, buf.as_mut_ptr(), buf.len(), false)
+    };
+    if copied <= 0 {
+        return Err(EIO);
+    }
+    let copied = copied as usize;
+    *pos += copied as u64;
+    Ok(copied)
 }
 
 fn proc_pid_stat_read(file: &FileRef, buf: &mut [u8], pos: &mut u64) -> Result<usize, i32> {
