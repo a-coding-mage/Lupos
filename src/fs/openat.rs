@@ -584,6 +584,10 @@ fn proc_special_open_result(path: &str, flags: u32, mode: u32) -> Option<Result<
     {
         return Some(read_only_proc_open_result(result, flags));
     }
+    if let Some(result) = crate::fs::proc::base::process_mem_file_from_proc_path(path, flags, mode)
+    {
+        return Some(read_only_proc_open_result(result, flags));
+    }
     if let Some(result) =
         crate::fs::proc::task_mmu::process_task_mmu_file_from_proc_path(path, flags, mode)
     {
