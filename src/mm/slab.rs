@@ -107,6 +107,12 @@ const KMALLOC_NAMES: [&str; NR_KMALLOC_SIZES] = [
 /// True after `slab_init()` has completed; guards GlobalAlloc bootstrap.
 static SLAB_READY: AtomicBool = AtomicBool::new(false);
 static SLAB_FREE_REJECTIONS: AtomicUsize = AtomicUsize::new(0);
+/// Slabs dropped by `check_valid_pointer()` because their freelist head no
+/// longer pointed inside the slab. Non-zero means a page this cache still owned
+/// was written by something else; see `isolate_corrupt_slab`.
+static SLAB_CORRUPT_SLABS: AtomicUsize = AtomicUsize::new(0);
+static SLAB_LAST_CORRUPT_PFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SLAB_LAST_CORRUPT_FREELIST: AtomicUsize = AtomicUsize::new(0);
 static LAST_REJECTED_FREE_PTR: AtomicUsize = AtomicUsize::new(0);
 static LAST_REJECTED_FREE_HEAD_PFN: AtomicUsize = AtomicUsize::new(usize::MAX);
 static LAST_REJECTED_FREE_REASON: AtomicUsize = AtomicUsize::new(0);
@@ -395,6 +401,80 @@ impl KmemCache {
         Some(head_page)
     }
 
+    /// `check_valid_pointer()` — `vendor/linux/mm/slub.c:1005`.
+    ///
+    /// A freelist entry must lie inside this slab's own page range and sit on
+    /// an exact object boundary. Linux uses this before trusting any freelist
+    /// pointer under `CONFIG_SLUB_DEBUG`; without it a slab whose page has been
+    /// recycled underneath us sends the allocator through a wild pointer.
+    ///
+    /// # Safety
+    /// `head_page` must be the head page of a slab belonging to this cache.
+    unsafe fn check_valid_pointer(&self, head_page: *mut Page, object: usize) -> bool {
+        if object == 0 {
+            return true;
+        }
+        let base = unsafe { slab_page_virt(head_page) } as usize;
+        if base == 0 {
+            return false;
+        }
+        let Some(span) = self.objects_per_slab.checked_mul(self.size) else {
+            return false;
+        };
+        let Some(end) = base.checked_add(span) else {
+            return false;
+        };
+        object >= base && object < end && (object - base) % self.size == 0
+    }
+
+    /// Drop a slab whose freelist no longer describes this cache.
+    ///
+    /// Linux isolates a corrupted slab rather than continuing through it
+    /// (`vendor/linux/mm/slub.c` — `slab_fix(s, "Isolate corrupted slab")`).
+    /// The page is unlinked and deliberately *not* returned to the buddy
+    /// allocator: its contents show it is already owned by someone else, so
+    /// freeing it again would compound the damage.
+    ///
+    /// # Safety
+    /// `head_page` must currently be linked into `self.partial`.
+    unsafe fn isolate_corrupt_slab(&mut self, head_page: *mut Page, freelist: usize) {
+        let pfn = unsafe { page_to_pfn_for_slab(head_page) };
+        // Rate-limit: this fires per corrupted slab and a corrupted system
+        // produces thousands, which drowns the serial log.
+        let seen = SLAB_CORRUPT_SLABS.load(Ordering::Relaxed);
+        // Keep a periodic heartbeat so the true scale is visible without a
+        // panic, while still not drowning the serial log.
+        if seen >= 16 && seen % 4096 == 0 {
+            crate::log_error!("slab", "isolated {} corrupted slabs so far", seen);
+        }
+        if seen >= 16 {
+            SLAB_CORRUPT_SLABS.fetch_add(1, Ordering::Relaxed);
+            SLAB_LAST_CORRUPT_PFN.store(pfn, Ordering::Relaxed);
+            SLAB_LAST_CORRUPT_FREELIST.store(freelist, Ordering::Relaxed);
+            unsafe {
+                ListHead::list_del(&mut (*head_page).lru);
+            }
+            self.nr_partial.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        crate::log_error!(
+            "slab",
+            "isolating corrupted slab: cache={} object_size={} slot={} pfn={:#x} freelist={:#x}",
+            self.name,
+            self.object_size,
+            self.size,
+            pfn,
+            freelist,
+        );
+        unsafe {
+            ListHead::list_del(&mut (*head_page).lru);
+        }
+        self.nr_partial.fetch_sub(1, Ordering::Relaxed);
+        SLAB_CORRUPT_SLABS.fetch_add(1, Ordering::Relaxed);
+        SLAB_LAST_CORRUPT_PFN.store(pfn, Ordering::Relaxed);
+        SLAB_LAST_CORRUPT_FREELIST.store(freelist, Ordering::Relaxed);
+    }
+
     /// Pop one object from the given slab page's freelist.
     ///
     /// Moves the page from `partial` to `full` when the last slot is taken.
@@ -435,9 +515,22 @@ impl KmemCache {
     /// Ref: Linux `mm/slub.c` — `slab_alloc_node()`
     pub unsafe fn alloc(&mut self, gfp: GfpFlags) -> *mut u8 {
         // Fast path: pop from a partial slab.
-        if let Some(lru_ptr) = unsafe { ListHead::first_entry(&self.partial) } {
+        //
+        // Validate the freelist head before dereferencing it. A slab page that
+        // has been recycled out from under this cache holds whatever its new
+        // owner wrote — observed in practice as a userspace pixel fill — and
+        // following that word is an immediate #GP on a non-canonical address.
+        // Linux checks the same invariant in `check_valid_pointer()` and
+        // isolates the slab instead of walking it.
+        while let Some(lru_ptr) = unsafe { ListHead::first_entry(&self.partial) } {
             let head_page = container_of!(lru_ptr, Page, lru);
-            return unsafe { self.alloc_object(head_page) };
+            let freelist = unsafe { (*head_page).mapping };
+            if unsafe { self.check_valid_pointer(head_page, freelist) } {
+                return unsafe { self.alloc_object(head_page) };
+            }
+            // Unlink and retry with the next partial slab; if none remain the
+            // loop falls through to allocating a fresh one.
+            unsafe { self.isolate_corrupt_slab(head_page, freelist) };
         }
         // Slow path: allocate a new slab.
         match unsafe { self.new_slab(gfp) } {
@@ -696,6 +789,47 @@ fn slab_page_to_pfn(page: *const Page) -> usize {
 #[inline]
 fn slab_page_to_pfn(page: *const Page) -> usize {
     page_to_pfn(page)
+}
+
+/// `slab_address()` — `vendor/linux/mm/slub.c`.
+///
+/// First byte of the memory this slab hands out, used to bound-check freelist
+/// entries.
+#[inline]
+unsafe fn slab_page_virt(page: *const Page) -> *mut u8 {
+    #[cfg(test)]
+    {
+        if let Some(idx) = test_pool_page_index(page) {
+            let base = TEST_MEM_PTR.load(Ordering::SeqCst);
+            if base == 0 {
+                return core::ptr::null_mut();
+            }
+            return (base + idx * PAGE_SIZE) as *mut u8;
+        }
+        return core::ptr::null_mut();
+    }
+    #[cfg(not(test))]
+    {
+        phys_to_virt((page_to_pfn(page) * PAGE_SIZE) as u64)
+    }
+}
+
+/// PFN of a slab head page, for diagnostics.
+#[inline]
+unsafe fn page_to_pfn_for_slab(page: *const Page) -> usize {
+    slab_page_to_pfn(page)
+}
+
+/// Number of slabs isolated by `check_valid_pointer()`, plus the last offender.
+///
+/// Zero on a healthy system; any non-zero value means a page owned by a slab
+/// cache was overwritten by another owner.
+pub fn slab_corruption_stats_for_tests() -> (usize, usize, usize) {
+    (
+        SLAB_CORRUPT_SLABS.load(Ordering::Acquire),
+        SLAB_LAST_CORRUPT_PFN.load(Ordering::Acquire),
+        SLAB_LAST_CORRUPT_FREELIST.load(Ordering::Acquire),
+    )
 }
 
 /// Test-only slab page allocator.
@@ -2180,6 +2314,62 @@ mod tests {
     }
 
     /// `ceil_log2_pages` rounds up to the next power-of-two order.
+    /// A slab page whose freelist head has been overwritten must be isolated,
+    /// not walked.
+    ///
+    /// Observed live: a `--gui` session died with
+    /// `#GP rip=…KmemCache::alloc` because `page->mapping` (the freelist head)
+    /// held `0xfff6f5f4fff6f5f4` — the same 32-bit ARGB word twice, i.e. a
+    /// userspace pixel fill. Dereferencing that non-canonical address faults
+    /// immediately. Linux bounds-checks the pointer first
+    /// (`vendor/linux/mm/slub.c:1005` `check_valid_pointer`) and isolates the
+    /// slab.
+    ///
+    /// test-origin: linux:vendor/linux/mm/slub.c:check_valid_pointer
+    #[test]
+    fn corrupted_freelist_head_isolates_the_slab_instead_of_faulting() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            setup();
+            let (before, _, _) = slab_corruption_stats_for_tests();
+
+            // Take one object so the cache owns a partial slab, then scribble
+            // the exact value seen in the crash over its freelist head.
+            let idx = kmalloc_cache_index(192);
+            let cache = &raw mut KMALLOC_CACHES[idx];
+            let live = (*cache).alloc(GFP_KERNEL);
+            assert!(!live.is_null());
+
+            let lru = ListHead::first_entry(&(*cache).partial).expect("partial slab");
+            let head_page = container_of!(lru, Page, lru);
+            const PIXEL_FILL: usize = 0xfff6_f5f4_fff6_f5f4;
+            (*head_page).mapping = PIXEL_FILL;
+
+            assert!(
+                !(*cache).check_valid_pointer(head_page, PIXEL_FILL),
+                "a pixel fill must not pass the freelist bounds check"
+            );
+
+            // Must not fault, and must not hand back the corrupt slab.
+            let ptr = (*cache).alloc(GFP_KERNEL);
+            assert!(!ptr.is_null(), "allocation must recover onto a fresh slab");
+
+            let (after, pfn, freelist) = slab_corruption_stats_for_tests();
+            assert_eq!(after, before + 1, "the corrupt slab must be counted");
+            assert_eq!(freelist, PIXEL_FILL, "the offending value must be recorded");
+            assert_eq!(pfn, slab_page_to_pfn(head_page));
+
+            // A valid freelist head still allocates normally.
+            let base = slab_page_virt(head_page) as usize;
+            assert!((*cache).check_valid_pointer(head_page, base));
+            assert!((*cache).check_valid_pointer(head_page, base + (*cache).size));
+            assert!(
+                !(*cache).check_valid_pointer(head_page, base + 1),
+                "a mid-object pointer is not a valid freelist entry"
+            );
+        }
+    }
+
     #[test]
     fn test_ceil_log2_pages() {
         assert_eq!(ceil_log2_pages(1), 0);

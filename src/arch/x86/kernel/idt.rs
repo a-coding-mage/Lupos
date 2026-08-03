@@ -894,6 +894,33 @@ fn on_general_protection(frame: &ExceptionFrame) {
                 task as usize,
                 comm,
             );
+            // A user-mode #GP with no error code is almost always an aligned
+            // SSE/AVX access (MOVAPS/MOVDQA/VMOVAP*) on an operand that is not
+            // 16/32-byte aligned. Dump the opcode bytes so the instruction is
+            // identified rather than inferred from register values.
+            let mut insn = [0u8; 16];
+            let copied = unsafe {
+                crate::arch::x86::kernel::uaccess::copy_from_user(
+                    insn.as_mut_ptr(),
+                    frame.rip as *const u8,
+                    insn.len(),
+                )
+            };
+            if copied == 0 {
+                log_error!(
+                    "cpu",
+                    "cpu: #GP insn rip={:#018x} bytes={:02x?}",
+                    frame.rip,
+                    insn
+                );
+            } else {
+                log_error!(
+                    "cpu",
+                    "cpu: #GP insn rip={:#018x} unreadable (missing={})",
+                    frame.rip,
+                    copied
+                );
+            }
             if pid == 1 {
                 panic!(
                     "init died from SIGSEGV on #GP: error={:#010x} rip={:#018x}",

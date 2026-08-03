@@ -6037,6 +6037,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "        echo 'graphics-x11: panel-wrappers begin'\n",
         "        for panel_proc in /proc/[0-9]*; do [ \"$(cat \"$panel_proc/comm\" 2>/dev/null)\" = 'wrapper-2.0' ] || continue; printf 'graphics-x11: panel-wrapper pid=%s cmd=%s\\n' \"${panel_proc##*/}\" \"$(tr '\\000' ' ' < \"$panel_proc/cmdline\" 2>/dev/null)\"; done\n",
         "        echo 'graphics-x11: panel-wrappers end'\n",
+
         "    else\n",
         "        echo 'graphics-x11: xfce failed'\n",
         "        printf 'graphics-x11: xfce-final procs=['\n",
@@ -6088,6 +6089,36 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    [ -n \"$session_dbus\" ] || session_dbus=\"${early_bus:-unix:path=/run/user/1000/bus}\"\n",
         "    [ -n \"$session_runtime\" ] || session_runtime=/run/user/1000\n",
         "    [ -n \"$session_home\" ] || session_home=/home/lupos\n",
+        // Actually *run* the mixer. Checking that /usr/bin/pavucontrol exists
+        // proved nothing about whether it survives being opened, which is the
+        // reported failure. Capture its own stderr and whether it is still
+        // alive, so a crash is attributable instead of invisible.
+        "echo 'graphics-x11: mixer-gui-probe begin'\n",
+        "rm -f /tmp/lupos-pavucontrol.log\n",
+        "( sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 timeout -k 2 40 /usr/bin/pavucontrol >/tmp/lupos-pavucontrol.log 2>&1; printf '%s\\n' \"$?\" > /tmp/lupos-pavucontrol.rc ) &\n",
+        "mixer_wait=0\n",
+        "while [ \"$mixer_wait\" -lt 20 ]; do process_named_uid pavucontrol 1000 && break; mixer_wait=$((mixer_wait + 1)); sleep 1; done\n",
+        "printf 'graphics-x11: mixer-gui-start wait=%s\\n' \"$mixer_wait\"\n",
+        // Give it time to build its window and talk to PipeWire, then check it
+        // is still there. A crash shows up as the process being gone with a
+        // non-zero rc, plus whatever it printed on the way out.
+        "sleep 6\n",
+        "if process_named_uid pavucontrol 1000; then echo 'graphics-x11: mixer-gui alive'; else echo 'graphics-x11: mixer-gui gone'; fi\n",
+        // xdotool is not in the image; use the same xprop/_NET_CLIENT_LIST walk
+        // the Firefox window check uses.
+        "mixer_window=0\n",
+        "for win in $(DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" timeout 5 /usr/bin/xprop -root _NET_CLIENT_LIST 2>/dev/null | sed 's/.*# //; s/,//g'); do\n",
+        "    case \"$(DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" timeout 5 /usr/bin/xprop -id \"$win\" WM_CLASS 2>/dev/null)\" in\n",
+        "        *avucontrol*) mixer_window=1 ;;\n",
+        "    esac\n",
+        "done\n",
+        "printf 'graphics-x11: mixer-gui-windows %s\\n' \"$mixer_window\"\n",
+        "if [ \"$mixer_window\" -eq 1 ]; then echo 'graphics-x11: mixer-gui-window ok'; else echo 'graphics-x11: mixer-gui-window failed'; fi\n",
+        "if [ -s /tmp/lupos-pavucontrol.log ]; then echo 'graphics-x11: mixer-gui-log begin'; tail -40 /tmp/lupos-pavucontrol.log | sed 's/^/graphics-x11: mixer /'; echo 'graphics-x11: mixer-gui-log end'; else echo 'graphics-x11: mixer-gui-log empty'; fi\n",
+        "if [ -s /tmp/lupos-pavucontrol.rc ]; then printf 'graphics-x11: mixer-gui-rc %s\\n' \"$(cat /tmp/lupos-pavucontrol.rc)\"; fi\n",
+        "pkill -u lupos pavucontrol 2>/dev/null || true\n",
+        "echo 'graphics-x11: mixer-gui-probe end'\n",
+
         // Prefer the active window, and only walk the bounded client list when
         // the active window is not the target.  Walking every client on every
         // poll made a slow guest perform hundreds of synchronous X requests
@@ -6450,7 +6481,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    firefox_http_pid=$!\n",
         "    rm -f /tmp/lupos-firefox.log /tmp/lupos-firefox-windows.log /tmp/lupos-firefox-maps.log /tmp/lupos-firefox-status.log\n",
         "    firefox_fb_before=\"$(cksum </dev/fb0 2>/dev/null || true)\"\n",
-        "    ( run_in_session_cgroup \"$session_cgroup\" sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none GDK_BACKEND=x11 MOZ_ENABLE_WAYLAND=0 MOZ_WEBRENDER=0 MOZ_X11_EGL=0 LIBGL_ALWAYS_SOFTWARE=1 /usr/bin/firefox --no-remote --profile /tmp/lupos-firefox-profile 'http://127.0.0.1:8765/zzzzlupossuggestion.html' ) >/tmp/lupos-firefox.log 2>&1 &\n",
+        "    ( run_in_session_cgroup \"$session_cgroup\" sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none GDK_BACKEND=x11 MOZ_ENABLE_WAYLAND=0 MOZ_WEBRENDER=0 MOZ_X11_EGL=0 LIBGL_ALWAYS_SOFTWARE=1 MOZ_LOG='sync,timestamp,ForkServer:5,ProcessHangMonitor:5,IPCLog:4,SandboxBroker:5,Widget:4' MOZ_LOG_FILE=/tmp/lupos-moz /usr/bin/firefox --no-remote --profile /tmp/lupos-firefox-profile 'http://127.0.0.1:8765/zzzzlupossuggestion.html' ) >/tmp/lupos-firefox.log 2>&1 &\n",
         "    firefox_launcher_pid=$!\n",
         "    firefox_pid=; firefox_history_seeded=0; i=0\n",
         "    while [ \"$i\" -lt 90 ] && [ \"$firefox_history_seeded\" -eq 0 ]; do\n",
@@ -6488,6 +6519,29 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "            DISPLAY=:0 timeout 2 /usr/bin/xprop -root _NET_CLIENT_LIST 2>&1 | sed 's/^/graphics-x11: firefox-xprop-root /' || true\n",
         "            if [ -r /proc/net/unix ]; then echo 'graphics-x11: firefox-unix-sockets begin'; tail -80 /proc/net/unix; echo 'graphics-x11: firefox-unix-sockets end'; fi\n",
         "            echo 'graphics-x11: firefox-process-state end'\n",
+        // Firefox prints nothing when it stalls, so the only way to see what it
+        // is waiting on is the blocked syscall of each of its threads.
+        "            echo 'graphics-x11: firefox-syscall begin'\n",
+        "            for ff_proc in /proc/[0-9]*; do\n",
+        "                ff_comm=\"$(cat \"$ff_proc/comm\" 2>/dev/null)\"\n",
+        "                case \"$ff_comm\" in firefox|*Content*|Socket*|crashhelper|forkserver|blocking*|*GPU*) ;; *) continue ;; esac\n",
+        "                printf 'graphics-x11: firefox-syscall pid=%s comm=%s state=%s nr=%s\\n' \"${ff_proc##*/}\" \"$ff_comm\" \"$(awk '/^State:/ { print $2; exit }' \"$ff_proc/status\" 2>/dev/null)\" \"$(cat \"$ff_proc/syscall\" 2>/dev/null || echo unavailable)\"\n",
+        "                for ff_task in \"$ff_proc\"/task/[0-9]*; do\n",
+        "                    [ -d \"$ff_task\" ] || continue\n",
+        "                    printf 'graphics-x11: firefox-syscall-thread tid=%s comm=%s nr=%s\\n' \"${ff_task##*/}\" \"$(cat \"$ff_task/comm\" 2>/dev/null)\" \"$(cat \"$ff_task/syscall\" 2>/dev/null || echo unavailable)\"\n",
+        "                done\n",
+        "            done\n",
+        "            echo 'graphics-x11: firefox-syscall end'\n",
+        // Which syscalls the fork-server path is actually missing, by name.
+        "            echo 'graphics-x11: firefox-enosys begin'\n",
+        "            dmesg 2>/dev/null | grep -oE 'enosys pid=[0-9]+ nr=[0-9]+' | sort | uniq -c | sed 's/^/graphics-x11: firefox-enosys /' || true\n",
+        "            echo 'graphics-x11: firefox-enosys end'\n",
+        // Firefox's own startup log: MOZ_LOG_FILE writes <name>.<pid>.moz_log.
+        "            echo 'graphics-x11: firefox-mozlog begin'\n",
+        "            ls -la /tmp/lupos-moz* 2>&1 | sed 's/^/graphics-x11: firefox-moz-file /' || true\n",
+        "            for moz in /tmp/lupos-moz*; do [ -f \"$moz\" ] || continue; printf 'graphics-x11: firefox-moz --- %s ---\\n' \"$moz\"; tail -40 \"$moz\" | sed 's/^/graphics-x11: firefox-moz /'; done\n",
+        "            echo 'graphics-x11: firefox-mozlog end'\n",
+
         "        fi\n",
         "        : > /tmp/lupos-firefox-windows.log\n",
         "        firefox_xprop_root_start=\"$(date +%s%N 2>/dev/null || true)\"\n",
@@ -6577,6 +6631,11 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    printf 'graphics-x11: firefox-exe %s\\n' \"$firefox_exe\"\n",
         "    if [ \"$firefox_alive\" -eq 1 ] && [ \"$firefox_exe\" = /usr/lib/firefox/firefox ]; then echo 'graphics-x11: firefox-proc-exe ok'; else echo 'graphics-x11: firefox-proc-exe failed'; fi\n",
         "    if [ \"$firefox_window\" -eq 1 ]; then echo 'graphics-x11: firefox-window ok'; else echo 'graphics-x11: firefox-window failed'; fi\n",
+        // Firefox's own stdout/stderr was captured to /tmp/lupos-firefox.log
+        // from the very first launch but never surfaced, so every
+        // `firefox-window failed` was reported with the one artefact that
+        // explains it left on the guest's disk.
+        "    if [ -s /tmp/lupos-firefox.log ]; then echo 'graphics-x11: firefox-log begin'; tail -60 /tmp/lupos-firefox.log | sed 's/^/graphics-x11: firefox-out /'; echo 'graphics-x11: firefox-log end'; else echo 'graphics-x11: firefox-log empty'; fi\n",
         "    if [ \"$firefox_window\" -eq 1 ]; then echo 'graphics-x11: firefox-google-https ok'; else echo 'graphics-x11: firefox-google-https failed'; fi\n",
         "    if [ -s /tmp/lupos-firefox-maps.log ]; then echo 'graphics-x11: firefox-maps begin'; cat /tmp/lupos-firefox-maps.log; echo 'graphics-x11: firefox-maps end'; fi\n",
         "    if [ -s /tmp/lupos-firefox-status.log ]; then echo 'graphics-x11: firefox-status begin'; cat /tmp/lupos-firefox-status.log; echo 'graphics-x11: firefox-status end'; fi\n",

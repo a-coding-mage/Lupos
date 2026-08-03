@@ -624,9 +624,37 @@ fn do_anonymous_page(vmf: &mut VmFault) -> VmFaultFlags {
             entry = pte_mkdirty(entry);
         }
 
-        // Install the PTE.
-        // No invlpg needed — the PTE was absent, so there is no stale TLB entry.
+        // Install the PTE under the page-table lock, re-checking that the entry
+        // is still missing.
+        //
+        // Linux takes `pte_offset_map_lock()` and bails via `vmf_pte_changed()`
+        // (`vendor/linux/mm/memory.c:5316`) precisely because two threads can
+        // fault the same address at once. This path used to allocate a page and
+        // `set_pte_at()` with no exclusion at all, so both racers installed a
+        // PTE and the loser's page was orphaned: still refcounted, still on the
+        // anon LRU, still carrying `anon_vma` in `page->mapping`, but mapped by
+        // nothing. Whichever thread had already written to the orphan lost its
+        // data, which is how a heavily threaded client (llvmpipe, Firefox) ends
+        // up reading a pointer that is no longer 16-byte aligned and dies on a
+        // user-mode #GP.
+        //
+        // No invlpg is needed on the success path: the PTE was absent, so there
+        // is no stale TLB entry to shoot down.
+        let mut ptl = PageTableLockGuard::lock(mm);
+        if pte_present(ptep_get(ptep)) {
+            // Another thread won the race and its PTE is already live. Drop the
+            // page we speculatively prepared, mirroring Linux's `release:`
+            // path, and report success — the mapping the fault wanted exists.
+            ptl.unlock();
+            crate::mm::lru::remove_lru_page(page_ptr);
+            (*page_ptr).mapping = 0;
+            (*page_ptr)._refcount.store(0, Ordering::Relaxed);
+            (*page_ptr)._mapcount().store(-1, Ordering::Relaxed);
+            free_unmapped_fault_page(page_ptr);
+            return 0;
+        }
         set_pte_at(mm as *mut (), vmf.address, ptep, entry);
+        ptl.unlock();
 
         // Update RSS (resident set size).
         add_mm_rss(mm, 1);
@@ -674,15 +702,36 @@ fn do_shared_anonymous_page(vmf: &mut VmFault) -> VmFaultFlags {
             (*page).index = index as usize;
             (*page).set_flag(PG_SWAPBACKED);
 
-            let inserted = (*mapping)
+            // Insert-if-absent, not store-and-replace.
+            //
+            // `xa_store()` overwrites, so when two threads faulted the same
+            // shared-anon index the loser replaced the winner's entry with its
+            // own page, got the winner's page back as "existing", and then
+            // freed *its own page — the one now published in the xarray*. The
+            // shared mapping was left pointing at freed memory, which is a
+            // straight double-ownership: the page is handed to the next
+            // allocation while the mapping still reads and writes it. The
+            // duplicate frees that followed showed up as
+            // `buddy: duplicate_frees=45 ... caller src/mm/fault.rs:709`.
+            //
+            // Linux's filemap uses insert semantics (`xa_insert()` returns
+            // `-EBUSY` on collision) precisely so the winner's entry stands.
+            match (*mapping)
                 .i_pages
-                .xa_store(index, core::ptr::NonNull::new(page).unwrap());
-            if let Some(existing) = inserted {
-                with_global_buddy(|b| b.free_pages(page, 0));
-                existing.as_ptr()
-            } else {
-                crate::mm::lru::lru_cache_add(page);
-                page
+                .xa_insert(index, core::ptr::NonNull::new(page).unwrap())
+            {
+                Ok(_) => {
+                    crate::mm::lru::lru_cache_add(page);
+                    page
+                }
+                Err(existing) => {
+                    // The winner's entry stays published; discard ours.
+                    (*page).mapping = 0;
+                    (*page)._refcount.store(0, Ordering::Relaxed);
+                    (*page)._mapcount().store(-1, Ordering::Relaxed);
+                    with_global_buddy(|b| b.free_pages(page, 0));
+                    existing.as_ptr()
+                }
             }
         };
 
@@ -703,7 +752,19 @@ fn do_shared_anonymous_page(vmf: &mut VmFault) -> VmFaultFlags {
             }
         }
 
+        // Same page-table-lock requirement as `do_anonymous_page()`. Both
+        // racers resolve to the same shared page here, so the PTE value is
+        // identical, but installing twice double-counts the reference, the
+        // mapcount and the RSS — the page then never reaches a zero refcount.
+        let mut ptl = PageTableLockGuard::lock(mm);
+        if pte_present(ptep_get(ptep)) {
+            ptl.unlock();
+            (*page_ptr)._mapcount().fetch_sub(1, Ordering::Relaxed);
+            release_cow_page_reference(page_ptr);
+            return 0;
+        }
         set_pte_at(mm as *mut (), vmf.address, ptep, entry);
+        ptl.unlock();
         add_mm_rss(mm, 1);
 
         vmf.pte = ptep;
@@ -2235,6 +2296,98 @@ mod tests {
             .expect("Lupos must release the temporary source-page reference");
         assert!(hold < unlock, "source reference must precede PTL release");
         assert!(copy < replacement && replacement < release);
+    }
+
+    /// A missing-PTE anonymous fault must install its PTE under the page-table
+    /// lock, after re-checking that the entry is still absent.
+    ///
+    /// Linux does this with `pte_offset_map_lock()` plus `vmf_pte_changed()`
+    /// (`vendor/linux/mm/memory.c:5316`). Lupos allocated a page and called
+    /// `set_pte_at()` with no exclusion, so two threads faulting the same
+    /// address both installed a PTE; the loser's page stayed refcounted, on the
+    /// anon LRU and carrying `anon_vma` in `page->mapping` while nothing mapped
+    /// it, and any data already written to it was lost. That is the shape of
+    /// the intermittent userspace corruption that killed llvmpipe threads with
+    /// a user-mode #GP on a no-longer-aligned pointer.
+    ///
+    /// test-origin: linux:vendor/linux/mm/memory.c:do_anonymous_page
+    #[test]
+    fn missing_pte_anon_faults_install_under_the_page_table_lock() {
+        let linux = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/mm/memory.c"
+        ));
+        // Linux's contract: map+lock the PTE, bail if it changed, then install.
+        assert!(linux.contains("if (vmf_pte_changed(vmf)) {"));
+
+        let lupos = include_str!("fault.rs");
+        for (name, terminator) in [
+            ("fn do_anonymous_page(vmf: &mut VmFault)", "\nfn do_shared_anonymous_page"),
+            ("fn do_shared_anonymous_page(vmf: &mut VmFault)", "\n// ---"),
+        ] {
+            let start = lupos
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} must remain present"));
+            let body = lupos[start..]
+                .split(terminator)
+                .next()
+                .unwrap_or_else(|| panic!("{name} body must remain bounded"));
+
+            let lock = body
+                .find("PageTableLockGuard::lock(mm)")
+                .unwrap_or_else(|| panic!("{name} must take the page-table lock"));
+            let recheck = body
+                .find("pte_present(ptep_get(ptep))")
+                .unwrap_or_else(|| panic!("{name} must recheck the entry under the lock"));
+            let install = body
+                .find("set_pte_at(mm as *mut (), vmf.address, ptep, entry);")
+                .unwrap_or_else(|| panic!("{name} must install the PTE"));
+
+            assert!(
+                lock < recheck && recheck < install,
+                "{name} must lock, then recheck, then install"
+            );
+        }
+    }
+
+    /// A shared-anon fault must publish its page with insert-if-absent
+    /// semantics, never store-and-replace.
+    ///
+    /// `xa_store()` overwrites, so a losing racer replaced the winner's entry
+    /// with its own page, received the winner's page back, and then freed the
+    /// page it had just published — leaving the shared mapping pointing at
+    /// memory the allocator had already handed to somebody else. Linux's
+    /// filemap uses `xa_insert()` (`-EBUSY` on collision) for exactly this.
+    ///
+    /// test-origin: linux:vendor/linux/mm/filemap.c:__filemap_add_folio
+    #[test]
+    fn shared_anon_faults_publish_with_insert_not_store() {
+        let lupos = include_str!("fault.rs");
+        let start = lupos
+            .find("fn do_shared_anonymous_page(vmf: &mut VmFault)")
+            .expect("do_shared_anonymous_page must remain present");
+        let body = lupos[start..]
+            .split("\n// ---")
+            .next()
+            .expect("body must remain bounded");
+
+        assert!(
+            body.contains(".xa_insert(index,"),
+            "the shared page must be published with insert-if-absent semantics"
+        );
+        assert!(
+            !body.contains(".xa_store(index,"),
+            "xa_store overwrites the winner's entry and orphans its page"
+        );
+        // On collision the loser must discard its own page, not the winner's.
+        let collision = body
+            .find("Err(existing)")
+            .expect("the collision arm must remain present");
+        let tail = &body[collision..];
+        assert!(
+            tail.contains("b.free_pages(page, 0)") && tail.contains("existing.as_ptr()"),
+            "the loser must free its own page and adopt the published one"
+        );
     }
 
     /// Generic x86 without split PTE locks serializes present-PTE faults with
