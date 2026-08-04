@@ -47,8 +47,8 @@ use crate::arch::x86::mm::paging::{
     PAGE_KERNEL, map_kernel_page, pgprot_t, unmap_kernel_page, virt_to_phys,
 };
 use crate::include::uapi::errno::EINVAL;
-use crate::kernel::module::{export_symbol, find_symbol};
 use crate::kernel::locking::SpinLock;
+use crate::kernel::module::{export_symbol, find_symbol};
 use crate::mm::buddy::{page_to_pfn, with_global_buddy};
 use crate::mm::frame::PAGE_SIZE;
 use crate::mm::page_flags::GFP_KERNEL;
@@ -222,9 +222,7 @@ impl VfreeDeferred {
 
         let node = self.head;
         self.head = unsafe { *(node as *const usize) };
-        let base = unsafe {
-            *((node + core::mem::size_of::<usize>()) as *const usize)
-        };
+        let base = unsafe { *((node + core::mem::size_of::<usize>()) as *const usize) };
         self.len = self.len.saturating_sub(1);
         Some(base)
     }
@@ -713,10 +711,7 @@ fn vfree_immediate(ptr: *mut u8) {
             unsafe { unmap_kernel_page(va) };
             assert!(
                 unsafe {
-                    crate::arch::x86::mm::tlb::flush_tlb_kernel_range(
-                        va,
-                        va + PAGE_SIZE as u64,
-                    )
+                    crate::arch::x86::mm::tlb::flush_tlb_kernel_range(va, va + PAGE_SIZE as u64)
                 },
                 "kernel TLB shootdown failed before vmalloc backing-page reuse"
             );

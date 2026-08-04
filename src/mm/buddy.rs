@@ -600,8 +600,7 @@ impl BuddyAllocator {
                             let tag = decode_page_type(raw);
                             if tag != PGTY_BUDDY {
                                 ALLOC_TYPED_PAGE_HITS.fetch_add(1, Ordering::AcqRel);
-                                LAST_ALLOC_TYPED_PFN
-                                    .store(page_to_pfn(current), Ordering::Release);
+                                LAST_ALLOC_TYPED_PFN.store(page_to_pfn(current), Ordering::Release);
                                 LAST_ALLOC_TYPED_TAG.store(tag as usize, Ordering::Release);
                             }
                         }

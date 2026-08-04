@@ -669,16 +669,11 @@ fn proc_pid_syscall_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize
 
     let mut out = alloc::string::String::new();
     if nr < 0 {
-        let _ = core::fmt::write(
-            &mut out,
-            format_args!("{nr} {sp:#x} {pc:#x}\n"),
-        );
+        let _ = core::fmt::write(&mut out, format_args!("{nr} {sp:#x} {pc:#x}\n"));
     } else {
         let _ = core::fmt::write(
             &mut out,
-            format_args!(
-                "{nr} {a0:#x} {a1:#x} {a2:#x} {a3:#x} {a4:#x} {a5:#x} {sp:#x} {pc:#x}\n"
-            ),
+            format_args!("{nr} {a0:#x} {a1:#x} {a2:#x} {a3:#x} {a4:#x} {a5:#x} {sp:#x} {pc:#x}\n"),
         );
     }
     super::util::copy_into(buf, &out)

@@ -518,14 +518,16 @@ unsafe fn has_reportable_wait_event(
 /// scheduler's terminal `__state` is TASK_DEAD and must not be confused with
 /// EXIT_ZOMBIE.  The intermediate EXIT_ZOMBIE value is retained only for the
 /// short publication window before do_exit() reaches do_task_dead().
-unsafe fn has_exiting_wait_target(parent: *mut TaskStruct, target: WaitTarget, options: i32) -> bool {
+unsafe fn has_exiting_wait_target(
+    parent: *mut TaskStruct,
+    target: WaitTarget,
+    options: i32,
+) -> bool {
     let mut found = false;
     unsafe {
         for_each_real_child(parent, target, options, |c| {
             let state = (*c).__state.load(Ordering::Acquire);
-            if (*c).m26.exit_state & EXIT_ZOMBIE != 0
-                && state != TASK_DEAD
-                && state != EXIT_ZOMBIE
+            if (*c).m26.exit_state & EXIT_ZOMBIE != 0 && state != TASK_DEAD && state != EXIT_ZOMBIE
             {
                 found = true;
             }
@@ -576,8 +578,13 @@ fn wait_block_action(reportable: bool, exiting: bool, matching: bool) -> WaitBlo
 /// window where `m26.exit_state` advertises exit in progress before `__state`
 /// becomes `EXIT_ZOMBIE`; don't let SIGCHLD escape as EINTR in that window or
 /// a parent can miss the child that is about to become reapable.
-unsafe fn wait_interrupted_by_signal(parent: *mut TaskStruct, target: WaitTarget, options: i32) -> bool {
-    has_unblocked_pending_signals(parent) && !unsafe { has_exiting_wait_target(parent, target, options) }
+unsafe fn wait_interrupted_by_signal(
+    parent: *mut TaskStruct,
+    target: WaitTarget,
+    options: i32,
+) -> bool {
+    has_unblocked_pending_signals(parent)
+        && !unsafe { has_exiting_wait_target(parent, target, options) }
 }
 
 /// Returns true iff `parent` has at least one child matching `pid_filter`
@@ -1341,7 +1348,8 @@ mod tests {
             Ordering::Release,
         );
 
-        let found = unsafe { find_stopped_child(&mut *parent as *mut TaskStruct, WaitTarget::Any, 0) };
+        let found =
+            unsafe { find_stopped_child(&mut *parent as *mut TaskStruct, WaitTarget::Any, 0) };
 
         assert_eq!(found, Some(&mut *child as *mut TaskStruct));
         assert_eq!(w_stopped(5), (5 << 8) | 0x7f);

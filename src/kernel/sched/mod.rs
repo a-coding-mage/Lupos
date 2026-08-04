@@ -346,8 +346,7 @@ static DEFERRED_TASK_RELEASE: [AtomicPtr<TaskStruct>; MAX_CPUS] =
 /// Linux's C `__mmdrop()` fits the 16 KiB task stack at that boundary; the
 /// faithful Rust translation does not. The reference remains owned and cannot
 /// be observed or reused during this short handoff.
-static POST_SWITCH_MM_DROP: [AtomicUsize; MAX_CPUS] =
-    [const { AtomicUsize::new(0) }; MAX_CPUS];
+static POST_SWITCH_MM_DROP: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 
 /// A physical task allocation cannot be released from `finish_task_switch()`.
 /// Linux's `finish_lock_switch()` drops the rq lock and restores IRQs before
@@ -1446,9 +1445,7 @@ unsafe fn change_task_scheduler(
         let result = rq::with_rq(cpu, |rq| unsafe {
             // Linux task_rq_lock() retries if migration changed task_rq(p)
             // before the selected rq lock was acquired.
-            if (*p).thread_info.cpu != cpu
-                || (*p).m29.on_rq == class::TASK_ON_RQ_MIGRATING
-            {
+            if (*p).thread_info.cpu != cpu || (*p).m29.on_rq == class::TASK_ON_RQ_MIGRATING {
                 // Linux task_rq_lock() never crosses the migration handoff:
                 // TASK_ON_RQ_MIGRATING means the task is detached from the
                 // source class queue while move_queued_task() owns the CPU
@@ -1527,9 +1524,9 @@ unsafe fn change_task_scheduler(
                 prio_changed(rq, p, old_prio);
             }
 
-            Some(Ok(
-                !already_rescheduled && !resched_task.is_null() && task_needs_resched(resched_task),
-            ))
+            Some(Ok(!already_rescheduled
+                && !resched_task.is_null()
+                && task_needs_resched(resched_task)))
         });
 
         match result {
@@ -1897,9 +1894,10 @@ pub(crate) fn drain_remote_wakes() {
                 if (*task).m29.on_rq != class::TASK_ON_RQ_QUEUED {
                     return RemoteWakeDrain::Drop;
                 }
-                (*task)
-                    .__state
-                    .store(crate::kernel::task::task_state::TASK_RUNNING, Ordering::Release);
+                (*task).__state.store(
+                    crate::kernel::task::task_state::TASK_RUNNING,
+                    Ordering::Release,
+                );
                 RemoteWakeDrain::Activate(wakeup_preempt_locked(rq, task, wake_flags))
             })
             .unwrap_or(RemoteWakeDrain::Drop)
@@ -2323,7 +2321,9 @@ pub unsafe fn schedule() -> bool {
 /// and `vendor/linux/init/main.c:rest_init`.
 pub unsafe fn schedule_preempt_disabled() {
     crate::kernel::locking::preempt::preempt_enable_no_resched();
-    unsafe { schedule(); }
+    unsafe {
+        schedule();
+    }
     crate::kernel::locking::preempt::preempt_disable();
 }
 
@@ -3141,21 +3141,22 @@ unsafe fn try_to_wake_up_with_state(p: *mut TaskStruct, state_mask: u32, wake_fl
         if state_mask != 0 && state & state_mask == 0 {
             return false;
         }
-        let exit_mask =
-            crate::kernel::task::task_state::EXIT_ZOMBIE | crate::kernel::task::task_state::EXIT_DEAD;
+        let exit_mask = crate::kernel::task::task_state::EXIT_ZOMBIE
+            | crate::kernel::task::task_state::EXIT_DEAD;
         if unsafe { (*p).m26.exit_state } & exit_mask != 0
             || state
                 & (exit_mask
                     | crate::kernel::task::task_state::TASK_DEAD
                     | crate::kernel::task::task_state::TASK_NEW)
-                    != 0
+                != 0
         {
             return false;
         }
         unsafe {
-            (*p)
-                .__state
-                .store(crate::kernel::task::task_state::TASK_RUNNING, Ordering::Release);
+            (*p).__state.store(
+                crate::kernel::task::task_state::TASK_RUNNING,
+                Ordering::Release,
+            );
         }
         return true;
     }
@@ -3347,13 +3348,7 @@ pub unsafe fn wake_task(p: *mut TaskStruct) -> bool {
     // enqueue-side ENQUEUE_WAKEUP bit is added only after CPU selection, so
     // passing it as wake_flags would mix the two Linux flag namespaces and
     // alter select_task_rq()/wakeup_preempt() decisions.
-    unsafe {
-        try_to_wake_up_with_state(
-            p,
-            crate::kernel::task::task_state::TASK_NORMAL,
-            0,
-        )
-    }
+    unsafe { try_to_wake_up_with_state(p, crate::kernel::task::task_state::TASK_NORMAL, 0) }
 }
 
 /// Wake `p` only when its Linux task state matches `state_mask`.
@@ -3363,11 +3358,7 @@ pub unsafe fn wake_task(p: *mut TaskStruct) -> bool {
 /// must retain the state mask through the task's `pi_lock`; a racy state check
 /// followed by the unrestricted `try_to_wake_up()` wrapper can resurrect a
 /// task after it has entered a different sleep/stop state.
-pub unsafe fn wake_task_with_state(
-    p: *mut TaskStruct,
-    state_mask: u32,
-    wake_flags: u32,
-) -> bool {
+pub unsafe fn wake_task_with_state(p: *mut TaskStruct, state_mask: u32, wake_flags: u32) -> bool {
     unsafe { try_to_wake_up_with_state(p, state_mask, wake_flags) }
 }
 
@@ -3375,13 +3366,7 @@ pub unsafe fn wake_task_with_state(
 /// `try_to_wake_up(p, TASK_NORMAL, WF_*)`. Unlike signal/ptrace-specific wake
 /// paths this must never resume a stopped or traced task.
 pub unsafe fn wake_task_normal(p: *mut TaskStruct) -> bool {
-    unsafe {
-        try_to_wake_up_with_state(
-            p,
-            crate::kernel::task::task_state::TASK_NORMAL,
-            0,
-        )
-    }
+    unsafe { try_to_wake_up_with_state(p, crate::kernel::task::task_state::TASK_NORMAL, 0) }
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
@@ -3410,11 +3395,16 @@ mod tests {
         let body = source
             .split("pub unsafe fn finish_task_switch")
             .nth(1)
-            .and_then(|tail| tail.split("pub unsafe extern \"C\" fn schedule_tail").next())
+            .and_then(|tail| {
+                tail.split("pub unsafe extern \"C\" fn schedule_tail")
+                    .next()
+            })
             .expect("finish_task_switch body must exist");
 
         assert!(
-            !body.lines().any(|line| line.trim() == "drain_remote_wakes();"),
+            !body
+                .lines()
+                .any(|line| line.trim() == "drain_remote_wakes();"),
             "remote wake activation must remain on the IPI side of the Linux switch boundary"
         );
     }
@@ -3814,11 +3804,7 @@ mod tests {
         WAKE_SELECT_FLAGS_TEST_CAPTURE.store(0, Ordering::Release);
         WAKE_SELECT_FLAGS_TEST_ARMED.store(true, Ordering::Release);
         let woken = unsafe {
-            try_to_wake_up_with_state(
-                target_ptr,
-                crate::kernel::task::task_state::TASK_NORMAL,
-                0,
-            )
+            try_to_wake_up_with_state(target_ptr, crate::kernel::task::task_state::TASK_NORMAL, 0)
         };
         WAKE_SELECT_FLAGS_TEST_ARMED.store(false, Ordering::Release);
 
@@ -3895,7 +3881,12 @@ mod tests {
         .expect("CPU0 runqueue must be initialized");
 
         assert_eq!(
-            unsafe { crate::kernel::signal::send_signal_to_task(target_ptr, crate::kernel::signal::SIGKILL) },
+            unsafe {
+                crate::kernel::signal::send_signal_to_task(
+                    target_ptr,
+                    crate::kernel::signal::SIGKILL,
+                )
+            },
             0
         );
         assert_eq!(
@@ -4165,7 +4156,10 @@ mod tests {
             set_current(task_ptr);
             crate::kernel::signal::register_test_task(task.pid, task.tgid);
             assert_eq!(
-                crate::kernel::signal::send_signal_to_task(task_ptr, crate::kernel::signal::SIGUSR1),
+                crate::kernel::signal::send_signal_to_task(
+                    task_ptr,
+                    crate::kernel::signal::SIGUSR1
+                ),
                 0
             );
         }
@@ -4255,7 +4249,9 @@ mod tests {
         rq.cfs.load_weight = prio::NICE_0_LOAD;
 
         assert!(crate::kernel::signal::has_pending_signals(task_ptr));
-        assert!(!crate::kernel::signal::has_unblocked_pending_signals(task_ptr));
+        assert!(!crate::kernel::signal::has_unblocked_pending_signals(
+            task_ptr
+        ));
         unsafe {
             prepare_prev_for_pick(&mut rq, task_ptr);
         }

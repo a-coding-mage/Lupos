@@ -579,7 +579,9 @@ extern "C" fn exception_dispatch(frame: *mut ExceptionFrame, vector: u64) {
             super::irq_64::run_sysvec_on_irqstack(frame, vector)
         },
         RESCHEDULE_VECTOR => on_reschedule_ipi(),
-        v if legacy_irq_line(v).is_some() => unsafe { super::irq_64::run_irq_on_irqstack(frame, v) },
+        v if legacy_irq_line(v).is_some() => unsafe {
+            super::irq_64::run_irq_on_irqstack(frame, v)
+        },
         v => on_generic(frame, v),
     }
     if is_irq {
@@ -638,10 +640,7 @@ fn on_tlb_shootdown_ipi() {
 /// Linux `DEFINE_IDTENTRY_SYSVEC` body for the non-minimal system vectors.
 /// `run_sysvec_on_irqstack()` selects the stack; this wrapper owns raw
 /// irq-entry accounting on both the direct and switched-stack paths.
-pub(crate) unsafe extern "C" fn run_sysvec_handler(
-    frame: *mut ExceptionFrame,
-    vector: u8,
-) {
+pub(crate) unsafe extern "C" fn run_sysvec_handler(frame: *mut ExceptionFrame, vector: u8) {
     crate::kernel::locking::preempt::__irq_enter_raw();
     match vector {
         TLB_SHOOTDOWN_VECTOR => on_tlb_shootdown_ipi(),
@@ -1647,7 +1646,9 @@ mod tests {
         assert!(dispatch.contains("vector == TLB_SHOOTDOWN_VECTOR"));
         assert!(dispatch.contains("run_sysvec_on_irqstack"));
         assert!(dispatch.contains("TLB_SHOOTDOWN_VECTOR | TEXT_POKE_SYNC_VECTOR"));
-        assert!(!dispatch.contains("RESCHEDULE_VECTOR => unsafe {\n            super::irq_64::run_sysvec_on_irqstack"));
+        assert!(!dispatch.contains(
+            "RESCHEDULE_VECTOR => unsafe {\n            super::irq_64::run_sysvec_on_irqstack"
+        ));
     }
 
     /// Linux routes page faults by faulting address first; kernel exception
@@ -1740,7 +1741,9 @@ mod tests {
         );
         assert!(source.contains("macro_rules! isr_entry"));
         assert!(source.contains("isr_entry!(isr0, VEC_DIVIDE_ERROR, \"push -1\")"));
-        assert!(source.contains("isr_entry!(isr_legacy_irq0, LEGACY_IRQ_VECTOR_BASE, \"push {v}\")"));
+        assert!(
+            source.contains("isr_entry!(isr_legacy_irq0, LEGACY_IRQ_VECTOR_BASE, \"push {v}\")")
+        );
         assert!(body.contains("\"mov esi, {v}\""));
         assert!(body.contains("\"sub rsp, 16\""));
         assert!(body.contains("\"call {dispatch}\""));

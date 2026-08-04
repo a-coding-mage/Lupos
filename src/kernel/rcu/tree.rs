@@ -223,8 +223,7 @@ pub fn rcu_check_callbacks() {
     let target = GP_SEQ.load(Ordering::Acquire);
     let online = ONLINE_MASK.load(Ordering::Acquire);
     let complete = (0..MAX_CPUS).all(|cpu| {
-        online & (1u64 << (cpu & 63)) == 0
-            || QS_AT_GP[cpu].load(Ordering::Acquire) >= target
+        online & (1u64 << (cpu & 63)) == 0 || QS_AT_GP[cpu].load(Ordering::Acquire) >= target
     });
     if !complete {
         // Linux leaves the work for the next scheduler-clock/RCU-core pass.

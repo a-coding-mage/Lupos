@@ -209,22 +209,24 @@ unsafe extern "C" fn linux_eventfd_signal_mask(ctx: *mut EventFd, _mask: u32) {
     }
 
     let eventfd = unsafe { &*ctx };
-    eventfd.wqh.update_and_wake_poll((POLLIN as u32) | _mask, || {
-        loop {
-            let count = eventfd.count.load(Ordering::Acquire);
-            if count == u64::MAX {
-                break;
+    eventfd
+        .wqh
+        .update_and_wake_poll((POLLIN as u32) | _mask, || {
+            loop {
+                let count = eventfd.count.load(Ordering::Acquire);
+                if count == u64::MAX {
+                    break;
+                }
+                if eventfd
+                    .count
+                    .compare_exchange(count, count + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
             }
-            if eventfd
-                .count
-                .compare_exchange(count, count + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-        }
-        ((), true)
-    });
+            ((), true)
+        });
 }
 
 fn eventfd_file_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i32> {

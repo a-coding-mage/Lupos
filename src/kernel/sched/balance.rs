@@ -15,9 +15,7 @@ use super::class::{
 use super::rq::{MAX_RQ_CPUS, Rq, rq_nr_running, with_double_rq};
 use crate::kernel::sched;
 use crate::kernel::task::TaskStruct;
-use crate::kernel::task::task_state::{
-    EXIT_DEAD, EXIT_ZOMBIE, NON_RUNNABLE_MASK, TASK_WAKING,
-};
+use crate::kernel::task::task_state::{EXIT_DEAD, EXIT_ZOMBIE, NON_RUNNABLE_MASK, TASK_WAKING};
 
 /// Linux `sysctl_sched_balance_interval` defaults to one tick at MC level.
 pub const DEFAULT_BALANCE_INTERVAL_TICKS: u64 = 1;
@@ -164,8 +162,8 @@ fn pick_migratable_task(rq: &Rq, dst_cpu: u32) -> Option<*mut TaskStruct> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::boxed::Box;
     use crate::kernel::task::task_state::TASK_WAKING;
+    use alloc::boxed::Box;
     #[test]
     fn balance_interval_default_is_one_tick() {
         assert_eq!(DEFAULT_BALANCE_INTERVAL_TICKS, 1);

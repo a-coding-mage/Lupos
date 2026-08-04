@@ -616,12 +616,8 @@ mod tests {
 
         unsafe {
             let fdt = FilesStruct::new();
-            let sock = crate::fs::anon_inode::alloc_anon_file_with_ino(
-                "socket",
-                &NOOP_FILE_OPS,
-                0,
-                4242,
-            );
+            let sock =
+                crate::fs::anon_inode::alloc_anon_file_with_ino("socket", &NOOP_FILE_OPS, 0, 4242);
             assert_eq!(fdt.install_at_or_above(sock, 3, false), Ok(3));
             // Same dentry name pipe.rs gives its read end.
             let pipe_r = alloc_anon_file("pipe:[read]", &NOOP_FILE_OPS, 0);

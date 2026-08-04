@@ -118,8 +118,7 @@ pub fn do_page_fault(frame: &ExceptionFrame) {
     if ec & X86_PF_INSTR != 0 && ec & X86_PF_USER == 0 {
         let raw = frame as *const ExceptionFrame as *const u64;
         let task = unsafe { sched::get_current() };
-        let pipewire_current = !task.is_null()
-            && unsafe { (*task).comm.starts_with(b"pipewire") };
+        let pipewire_current = !task.is_null() && unsafe { (*task).comm.starts_with(b"pipewire") };
         let (pid, task_ptr, stack_top, thread_sp, state, on_cpu) = if task.is_null() {
             (-1, 0usize, 0usize, 0u64, 0u32, false)
         } else {
@@ -569,7 +568,8 @@ fn bad_area(frame: &ExceptionFrame, ec: u64, addr: u64) {
             // corrupted context that was restored by the scheduler.
             let saved_sp = (*task).thread.sp;
             let stack_top = (*task).stack as u64;
-            let stack_bottom = stack_top.saturating_sub(crate::kernel::sched::KTHREAD_STACK_SIZE as u64);
+            let stack_bottom =
+                stack_top.saturating_sub(crate::kernel::sched::KTHREAD_STACK_SIZE as u64);
             if saved_sp >= stack_bottom && saved_sp.saturating_add(7 * 8) < stack_top {
                 for slot in 0..7u64 {
                     log_error!(
@@ -844,12 +844,12 @@ mod tests {
             .nth(1)
             .and_then(|body| body.split("/* kprobes").next())
             .expect("Linux do_user_addr_fault early body must exist");
-        assert!(linux_body.contains(
-            "(error_code & (X86_PF_USER | X86_PF_INSTR)) == X86_PF_INSTR"
-        ));
+        assert!(linux_body.contains("(error_code & (X86_PF_USER | X86_PF_INSTR)) == X86_PF_INSTR"));
         assert!(linux_body.contains("page_fault_oops(regs, error_code, address);"));
 
-        assert!(is_supervisor_instruction_fetch_from_user_address(X86_PF_INSTR));
+        assert!(is_supervisor_instruction_fetch_from_user_address(
+            X86_PF_INSTR
+        ));
         assert!(!is_supervisor_instruction_fetch_from_user_address(
             X86_PF_INSTR | X86_PF_USER
         ));

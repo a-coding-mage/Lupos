@@ -107,8 +107,7 @@ unsafe fn pick_next_task_dl(rq: &mut Rq) -> *mut TaskStruct {
         .root
         .iter()
         .find_map(|(_, &task)| unsafe {
-            super::task_can_switch_to_on_rq(task, rq.current, rq.cpu)
-                .then_some(task)
+            super::task_can_switch_to_on_rq(task, rq.current, rq.cpu).then_some(task)
         })
         .unwrap_or(core::ptr::null_mut());
     p

@@ -8018,7 +8018,8 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     );
     // Non-zero means a page a slab cache still owned was overwritten by another
     // owner; the freelist head recorded here is that foreign data.
-    let (corrupt_slabs, corrupt_pfn, corrupt_freelist) = mm::slab::slab_corruption_stats_for_tests();
+    let (corrupt_slabs, corrupt_pfn, corrupt_freelist) =
+        mm::slab::slab_corruption_stats_for_tests();
     serial_println!(
         "  slab: corrupt_slabs={} last_corrupt_pfn={:#x} last_corrupt_freelist={:#x}",
         corrupt_slabs,

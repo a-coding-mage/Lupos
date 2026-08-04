@@ -863,9 +863,7 @@ struct TaskStructRcuOverflow {
     task: *mut TaskStruct,
 }
 
-unsafe extern "C" fn task_struct_free_rcu_overflow(
-    head: *mut crate::kernel::rcu::RcuHead,
-) {
+unsafe extern "C" fn task_struct_free_rcu_overflow(head: *mut crate::kernel::rcu::RcuHead) {
     if head.is_null() {
         return;
     }
@@ -997,10 +995,7 @@ pub(crate) unsafe fn finish_heap_task_release(task: *mut TaskStruct, stack: *mut
 /// The task_struct remains in the heap tracker until `release_task()` performs
 /// the process-list/PID teardown, so this must not call
 /// `finish_heap_task_release()` or remove the tracker entry.
-pub(crate) unsafe fn finish_heap_task_stack_release(
-    task: *mut TaskStruct,
-    stack: *mut u8,
-) {
+pub(crate) unsafe fn finish_heap_task_stack_release(task: *mut TaskStruct, stack: *mut u8) {
     if task.is_null() || stack.is_null() {
         return;
     }
@@ -1716,11 +1711,9 @@ unsafe fn copy_process_unpublished(
         // copied nsproxy.  The existing M22 allocator still owns the global
         // PID in `TaskStruct::pid`; M28 records the namespace-visible PID for
         // CLONE_NEWPID children (and their descendants) here.
-        if let Err(e) = crate::kernel::pid_namespace::register_child_pid(
-            parent,
-            child,
-            clone_thread,
-        ) {
+        if let Err(e) =
+            crate::kernel::pid_namespace::register_child_pid(parent, child, clone_thread)
+        {
             cleanup_failed_child(parent, child, stack_ptr, task_allocated);
             return Err(e);
         }
@@ -1755,7 +1748,6 @@ unsafe fn copy_process_unpublished(
             cleanup_failed_child(parent, child, stack_ptr, task_allocated);
             return Err(-4); // EINTR
         }
-
     }
 
     Ok(child)
@@ -2243,9 +2235,10 @@ mod tests {
             assert!(heap_task_allocation_tracked_for_tests(child));
 
             (*child).stack = stack_top;
-            (*child)
-                .__state
-                .store(crate::kernel::task::task_state::TASK_DEAD, Ordering::Release);
+            (*child).__state.store(
+                crate::kernel::task::task_state::TASK_DEAD,
+                Ordering::Release,
+            );
             let claimed = take_heap_task_stack(child).expect("matching stack claim");
             assert_eq!(claimed, stack_base);
             finish_heap_task_stack_release(child, claimed);
@@ -2278,8 +2271,7 @@ mod tests {
         let mut allocations = Vec::new();
         let mut reused = false;
         for _ in 0..8 {
-            let candidate =
-                unsafe { alloc_zeroed(Layout::new::<TaskStruct>()) as *mut TaskStruct };
+            let candidate = unsafe { alloc_zeroed(Layout::new::<TaskStruct>()) as *mut TaskStruct };
             assert!(!candidate.is_null());
             reused |= candidate as usize == released;
             allocations.push(candidate);
@@ -2323,10 +2315,7 @@ mod tests {
         state.len = 1;
         crate::kernel::locking::RawSpinLocked::unlock_irqrestore(state, flags);
 
-        assert_eq!(
-            unsafe { take_task_struct_rcu_release(&mut batch) },
-            second
-        );
+        assert_eq!(unsafe { take_task_struct_rcu_release(&mut batch) }, second);
         assert_eq!(unsafe { take_task_struct_rcu_release(&mut batch) }, first);
         assert!(unsafe { take_task_struct_rcu_release(&mut batch) }.is_null());
 

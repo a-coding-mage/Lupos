@@ -547,10 +547,7 @@ struct SignalTable {
 }
 
 impl SignalTable {
-    fn bound_index_for_task(
-        &self,
-        task: *mut crate::kernel::task::TaskStruct,
-    ) -> Option<usize> {
+    fn bound_index_for_task(&self, task: *mut crate::kernel::task::TaskStruct) -> Option<usize> {
         if task.is_null() {
             return None;
         }
@@ -575,7 +572,10 @@ impl SignalTable {
     }
 
     fn bind_task(&mut self, index: usize, task: *mut crate::kernel::task::TaskStruct) {
-        let state = self.states.get_mut(index).expect("signal state index valid");
+        let state = self
+            .states
+            .get_mut(index)
+            .expect("signal state index valid");
         state.task_addr = task as usize;
         let state_ptr = &mut **state as *mut SignalState;
         if !task.is_null() {
@@ -1059,11 +1059,7 @@ unsafe fn write_user_value<T: Copy>(ptr: *mut T, value: &T) -> Result<(), i64> {
             core::mem::size_of::<T>(),
         )
     };
-    if not_copied == 0 {
-        Ok(())
-    } else {
-        Err(-14)
-    }
+    if not_copied == 0 { Ok(()) } else { Err(-14) }
 }
 
 pub unsafe fn sys_rt_sigaction(
@@ -1540,9 +1536,7 @@ unsafe fn wake_signal_task(task: *mut crate::kernel::task::TaskStruct, sig: i32)
         state_mask |= crate::kernel::task::task_state::TASK_WAKEKILL
             | crate::kernel::task::task_state::__TASK_TRACED;
     }
-    let woken = unsafe {
-        crate::kernel::sched::wake_task_with_state(task, state_mask, 0)
-    };
+    let woken = unsafe { crate::kernel::sched::wake_task_with_state(task, state_mask, 0) };
     // Linux signal_wake_up_state() calls kick_process() when TTWU reports
     // that the task was already running. Force a remote kernel entry so the
     // published TIF_SIGPENDING is observed promptly.
@@ -1855,9 +1849,7 @@ pub(crate) fn restore_altstack_for_sigreturn(stack: SigAltStack, user_sp: u64) {
 }
 
 pub(crate) fn altstack_contains(stack: SigAltStack, sp: u64) -> bool {
-    stack.ss_size != 0
-        && sp > stack.ss_sp as u64
-        && sp - stack.ss_sp as u64 <= stack.ss_size as u64
+    stack.ss_size != 0 && sp > stack.ss_sp as u64 && sp - stack.ss_sp as u64 <= stack.ss_size as u64
 }
 
 pub(crate) fn altstack_on_sig_stack(stack: SigAltStack, sp: u64) -> bool {
@@ -1868,7 +1860,9 @@ fn sigaltstack_flags(stack: SigAltStack, sp: u64) -> u32 {
     if stack.ss_size == 0 {
         SS_DISABLE | (stack.ss_flags & SS_FLAG_BITS)
     } else {
-        (altstack_on_sig_stack(stack, sp).then_some(SS_ONSTACK).unwrap_or(0))
+        (altstack_on_sig_stack(stack, sp)
+            .then_some(SS_ONSTACK)
+            .unwrap_or(0))
             | (stack.ss_flags & SS_FLAG_BITS)
     }
 }
@@ -2413,11 +2407,7 @@ pub fn send_signal_to_process_group(pgrp: i32, sig: i32) -> i32 {
             sent += 1;
         }
     }
-    if sent == 0 {
-        -3
-    } else {
-        0
-    }
+    if sent == 0 { -3 } else { 0 }
 }
 
 /// User-generated process-group signal used by kill(2). Unlike tty/job-control
@@ -2437,13 +2427,7 @@ pub fn send_user_signal_to_process_group(pgrp: i32, sig: i32) -> i32 {
             return;
         }
         let pid = unsafe { (*task).pid };
-        let tgid = unsafe {
-            if (*task).tgid > 0 {
-                (*task).tgid
-            } else {
-                pid
-            }
-        };
+        let tgid = unsafe { if (*task).tgid > 0 { (*task).tgid } else { pid } };
         if crate::kernel::session::process_group(pid).unwrap_or(pid) != pgrp
             || sent_tgids.contains(&tgid)
         {
@@ -2465,11 +2449,7 @@ pub fn send_user_signal_to_process_group(pgrp: i32, sig: i32) -> i32 {
             sent += 1;
         }
     }
-    if sent == 0 {
-        -3
-    } else {
-        0
-    }
+    if sent == 0 { -3 } else { 0 }
 }
 
 unsafe fn wake_waiters(task: *mut crate::kernel::task::TaskStruct) {
@@ -2541,8 +2521,7 @@ unsafe fn stop_current_for_signal(task: *mut crate::kernel::task::TaskStruct, si
     // stop is therefore permanent. Capped so a stop storm cannot flood serial.
     #[cfg(not(test))]
     {
-        static STOP_REPORTS: core::sync::atomic::AtomicU32 =
-            core::sync::atomic::AtomicU32::new(0);
+        static STOP_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         if STOP_REPORTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 40 {
             let comm = unsafe { &(*task).comm };
             let len = comm.iter().position(|&c| c == 0).unwrap_or(comm.len());
@@ -3000,9 +2979,7 @@ fn current_task_signal_state(
             return None;
         }
         let state = &*state_ptr;
-        (state.task_addr == task as usize
-            && state.pid == (*task).pid
-            && state.tgid == (*task).tgid)
+        (state.task_addr == task as usize && state.pid == (*task).pid && state.tgid == (*task).tgid)
             .then_some(state_ptr)
     }
 }
@@ -3061,7 +3038,11 @@ unsafe fn task_has_unblocked_pending_signal_without_table(
         return false;
     }
     let shared = if state.shared_pending_owner != 0 {
-        unsafe { (*(state.shared_pending_owner as *const SignalState)).shared_pending.bits }
+        unsafe {
+            (*(state.shared_pending_owner as *const SignalState))
+                .shared_pending
+                .bits
+        }
     } else {
         state.shared_pending.bits
     };
@@ -3759,27 +3740,21 @@ unsafe fn read_rt_sigreturn_fields(
     let stack_addr = uc_addr.checked_add(core::mem::offset_of!(UContext, uc_stack) as u64)?;
     let altstack = crate::kernel::signal::SigAltStack {
         ss_sp: unsafe {
-            crate::arch::x86::kernel::uaccess::get_user_u64(
-                stack_addr
-                    .checked_add(core::mem::offset_of!(crate::kernel::signal::SigAltStack, ss_sp) as u64)?
-                    as *const u64,
-            )
+            crate::arch::x86::kernel::uaccess::get_user_u64(stack_addr.checked_add(
+                core::mem::offset_of!(crate::kernel::signal::SigAltStack, ss_sp) as u64,
+            )? as *const u64)
             .ok()?
         } as usize,
         ss_flags: unsafe {
-            crate::arch::x86::kernel::uaccess::get_user_u32(
-                stack_addr
-                    .checked_add(core::mem::offset_of!(crate::kernel::signal::SigAltStack, ss_flags) as u64)?
-                    as *const u32,
-            )
+            crate::arch::x86::kernel::uaccess::get_user_u32(stack_addr.checked_add(
+                core::mem::offset_of!(crate::kernel::signal::SigAltStack, ss_flags) as u64,
+            )? as *const u32)
             .ok()?
         },
         ss_size: unsafe {
-            crate::arch::x86::kernel::uaccess::get_user_u64(
-                stack_addr
-                    .checked_add(core::mem::offset_of!(crate::kernel::signal::SigAltStack, ss_size) as u64)?
-                    as *const u64,
-            )
+            crate::arch::x86::kernel::uaccess::get_user_u64(stack_addr.checked_add(
+                core::mem::offset_of!(crate::kernel::signal::SigAltStack, ss_size) as u64,
+            )? as *const u64)
             .ok()?
         } as usize,
     };
@@ -3860,11 +3835,7 @@ pub fn sigqueue_charge() -> i32 {
     }
     let uid = unsafe {
         let cred = (*task).cred;
-        if cred.is_null() {
-            0
-        } else {
-            (*cred).uid.0
-        }
+        if cred.is_null() { 0 } else { (*cred).uid.0 }
     };
     let user = crate::kernel::user::alloc_uid(crate::kernel::cred::KUid(uid));
     let prev = user
@@ -3896,11 +3867,7 @@ fn sigqueue_release(sig: i32) {
     }
     let uid = unsafe {
         let cred = (*task).cred;
-        if cred.is_null() {
-            0
-        } else {
-            (*cred).uid.0
-        }
+        if cred.is_null() { 0 } else { (*cred).uid.0 }
     };
     if let Some(user) = crate::kernel::user::find_user(crate::kernel::cred::KUid(uid)) {
         let _ = user.sigpending.fetch_update(
@@ -4019,15 +3986,13 @@ pub(crate) fn inherit_signal_state_for_clone(
     child_task: *mut crate::kernel::task::TaskStruct,
     clone_flags: u64,
 ) -> bool {
-    SIGNAL_TABLE
-        .lock()
-        .inherit_for_clone(
-            parent_pid,
-            child_pid,
-            child_tgid,
-            child_task,
-            clone_flags,
-        )
+    SIGNAL_TABLE.lock().inherit_for_clone(
+        parent_pid,
+        child_pid,
+        child_tgid,
+        child_task,
+        clone_flags,
+    )
 }
 
 /// Reparent every live task in a child process, matching Linux
@@ -4383,8 +4348,14 @@ mod tests {
 
         {
             let mut table = SIGNAL_TABLE.lock();
-            assert_eq!(table.get_or_create_task_index(first.pid, first.tgid, first_ptr), 0);
-            assert_eq!(table.get_or_create_task_index(second.pid, second.tgid, second_ptr), 1);
+            assert_eq!(
+                table.get_or_create_task_index(first.pid, first.tgid, first_ptr),
+                0
+            );
+            assert_eq!(
+                table.get_or_create_task_index(second.pid, second.tgid, second_ptr),
+                1
+            );
         }
         assert_eq!(second.signal_state_index, 1);
 
@@ -4392,7 +4363,10 @@ mod tests {
         assert_eq!(second.signal_state_index, 0);
         {
             let mut table = SIGNAL_TABLE.lock();
-            assert_eq!(table.get_or_create_task_index(second.pid, second.tgid, second_ptr), 0);
+            assert_eq!(
+                table.get_or_create_task_index(second.pid, second.tgid, second_ptr),
+                0
+            );
         }
 
         reset_for_tests();
@@ -4771,8 +4745,7 @@ mod tests {
         target.pid = 189;
         target.tgid = 189;
         target.m29 = crate::kernel::task::M29SchedFields::zeroed();
-        target.m29.sched_class =
-            &crate::kernel::sched::fair::FAIR_SCHED_CLASS as *const _;
+        target.m29.sched_class = &crate::kernel::sched::fair::FAIR_SCHED_CLASS as *const _;
         target.m29.se.load.weight = crate::kernel::sched::prio::NICE_0_LOAD;
         let target_ptr = &mut *target as *mut TaskStruct;
         unsafe {
@@ -5086,9 +5059,7 @@ mod tests {
             )
         };
         assert_eq!(result, Ok(()));
-        let frame = unsafe {
-            &*(regs.sp as *const crate::arch::x86::kernel::signal::RtSigFrame)
-        };
+        let frame = unsafe { &*(regs.sp as *const crate::arch::x86::kernel::signal::RtSigFrame) };
         assert_eq!(frame.uc.uc_stack.ss_sp, 0x7000);
         assert_eq!(frame.uc.uc_stack.ss_flags, 0);
         assert_eq!(frame.uc.uc_stack.ss_size, 8192);
@@ -5127,7 +5098,10 @@ mod tests {
         assert_eq!(old_ss.ss_size, 0);
 
         let mut reported = SigAltStack::default();
-        assert_eq!(unsafe { sys_sigaltstack(core::ptr::null(), &mut reported, 0) }, 0);
+        assert_eq!(
+            unsafe { sys_sigaltstack(core::ptr::null(), &mut reported, 0) },
+            0
+        );
         assert_eq!(reported.ss_sp, new_ss.ss_sp);
         assert_eq!(reported.ss_flags, SS_AUTODISARM);
         assert_eq!(reported.ss_size, new_ss.ss_size);

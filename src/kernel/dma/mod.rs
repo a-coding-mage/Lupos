@@ -32,7 +32,9 @@ use crate::mm::buddy::{is_buddy_ready, page_in_mem_map, page_to_pfn, with_global
 use crate::mm::frame::PAGE_SIZE;
 use crate::mm::mm_types::VmAreaStruct;
 use crate::mm::page::Page;
-use crate::mm::page_flags::{__GFP_COMP, __GFP_DMA, __GFP_DMA32, __GFP_HIGHMEM, GFP_KERNEL, GfpFlags};
+use crate::mm::page_flags::{
+    __GFP_COMP, __GFP_DMA, __GFP_DMA32, __GFP_HIGHMEM, GFP_KERNEL, GfpFlags,
+};
 
 pub mod buf;
 pub mod dummy;
@@ -339,9 +341,8 @@ pub unsafe extern "C" fn dma_alloc_attrs(
         return core::ptr::null_mut();
     };
     let mut dma = DMA_MAPPING_ERROR;
-    let page = unsafe {
-        dma_alloc_pages(dev, size, &mut dma, DmaDirection::Bidirectional, GFP_KERNEL)
-    };
+    let page =
+        unsafe { dma_alloc_pages(dev, size, &mut dma, DmaDirection::Bidirectional, GFP_KERNEL) };
     if page.is_null() {
         return core::ptr::null_mut();
     }
@@ -843,19 +844,19 @@ pub fn dma_alloc_coherent(size: usize) -> Option<(*mut u8, DmaAddr)> {
 
     #[cfg(not(test))]
     {
-    let order = dma_order_for_size(size)?;
-    let bytes = dma_page_align(size)?;
-    let page = crate::mm::page_alloc::alloc_pages_noprof(GFP_KERNEL, order);
-    if page.is_null() || !page_in_mem_map(page) {
-        return None;
-    }
-    let ptr = dma_page_virt(page);
-    let Some(dma_addr) = dma_page_dma_addr(page) else {
-        crate::mm::page_alloc::__free_pages(page, order);
-        return None;
-    };
-    unsafe { core::ptr::write_bytes(ptr, 0, bytes) };
-    Some((ptr, dma_addr))
+        let order = dma_order_for_size(size)?;
+        let bytes = dma_page_align(size)?;
+        let page = crate::mm::page_alloc::alloc_pages_noprof(GFP_KERNEL, order);
+        if page.is_null() || !page_in_mem_map(page) {
+            return None;
+        }
+        let ptr = dma_page_virt(page);
+        let Some(dma_addr) = dma_page_dma_addr(page) else {
+            crate::mm::page_alloc::__free_pages(page, order);
+            return None;
+        };
+        unsafe { core::ptr::write_bytes(ptr, 0, bytes) };
+        Some((ptr, dma_addr))
     }
 }
 
@@ -870,14 +871,20 @@ pub unsafe fn dma_free_coherent(ptr: *mut u8, size: usize) {
     }
     #[cfg(test)]
     {
-        let Ok(layout) = Layout::from_size_align(size, PAGE_SIZE) else { return };
+        let Ok(layout) = Layout::from_size_align(size, PAGE_SIZE) else {
+            return;
+        };
         unsafe { dealloc(ptr, layout) };
         return;
     }
     #[cfg(not(test))]
-    let Some(order) = dma_order_for_size(size) else { return };
+    let Some(order) = dma_order_for_size(size) else {
+        return;
+    };
     #[cfg(not(test))]
-    let Some(phys) = crate::arch::x86::mm::paging::virt_to_phys(ptr as u64) else { return };
+    let Some(phys) = crate::arch::x86::mm::paging::virt_to_phys(ptr as u64) else {
+        return;
+    };
     #[cfg(not(test))]
     let page = crate::mm::buddy::pfn_to_page((phys as usize) / PAGE_SIZE);
     #[cfg(not(test))]

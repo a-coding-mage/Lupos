@@ -38,6 +38,7 @@ use crate::arch::x86::mm::paging::{
     pte_offset_kernel, pte_pfn, pte_present, pte_special, pte_t, pte_write, pte_wrprotect,
     ptep_get, ptep_get_and_clear, pud_alloc, pud_huge, pud_none, pud_offset, pud_t, set_pte_at,
 };
+use crate::kernel::locking::{RawSpinLock, preempt_disable, preempt_enable};
 use crate::mm::address_space::{AS_SHARED_ANON, AddressSpace, wait_on_page_writeback};
 use crate::mm::buddy::{page_to_pfn, pfn_to_page, pfn_valid, with_global_buddy};
 use crate::mm::mm_types::{MmStruct, VmAreaStruct};
@@ -48,7 +49,6 @@ use crate::mm::vm_flags::{
     VM_DONTDUMP, VM_DONTEXPAND, VM_IO, VM_MAYSHARE, VM_MAYWRITE, VM_MIXEDMAP, VM_PFNMAP, VM_SHARED,
     VM_WRITE, VmFlags,
 };
-use crate::kernel::locking::{RawSpinLock, preempt_disable, preempt_enable};
 
 #[cfg(test)]
 unsafe fn fault_page_kaddr(page: *mut Page) -> *mut u8 {
@@ -128,10 +128,7 @@ impl PageTableLockGuard {
         let lock = unsafe { core::ptr::addr_of_mut!((*mm).page_table_lock) };
         preempt_disable();
         unsafe { (*lock).lock() };
-        Self {
-            lock,
-            held: true,
-        }
+        Self { lock, held: true }
     }
 
     unsafe fn unlock(&mut self) {
@@ -2252,7 +2249,10 @@ mod tests {
         let linux_body = linux
             .split("static vm_fault_t do_wp_page(")
             .nth(1)
-            .and_then(|body| body.split("static inline void unmap_mapping_range_tree").next())
+            .and_then(|body| {
+                body.split("static inline void unmap_mapping_range_tree")
+                    .next()
+            })
             .expect("Linux do_wp_page body must remain present");
         let linux_hold = linux_body
             .find("folio_get(folio)")
@@ -2322,7 +2322,10 @@ mod tests {
 
         let lupos = include_str!("fault.rs");
         for (name, terminator) in [
-            ("fn do_anonymous_page(vmf: &mut VmFault)", "\nfn do_shared_anonymous_page"),
+            (
+                "fn do_anonymous_page(vmf: &mut VmFault)",
+                "\nfn do_shared_anonymous_page",
+            ),
             ("fn do_shared_anonymous_page(vmf: &mut VmFault)", "\n// ---"),
         ] {
             let start = lupos
@@ -2429,10 +2432,7 @@ mod tests {
             .expect("Lupos COW dispatch must retain the page-table lock until do_wp_page");
         assert!(lock < recheck && recheck < dispatch);
 
-        let mm_types = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/mm/mm_types.rs"
-        ));
+        let mm_types = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mm/mm_types.rs"));
         assert!(mm_types.contains("pub page_table_lock: RawSpinLock"));
     }
 

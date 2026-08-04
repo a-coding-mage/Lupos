@@ -167,8 +167,8 @@ impl Cred {
         }
         let prev = unsafe { (*cred).usage.fetch_sub(1, Ordering::Release) };
         if prev == 1 {
-            let user_ns = unsafe { (*cred).user_ns }
-                as *const crate::kernel::user_namespace::UserNamespace;
+            let user_ns =
+                unsafe { (*cred).user_ns } as *const crate::kernel::user_namespace::UserNamespace;
             if !user_ns.is_null() {
                 unsafe { crate::kernel::user_namespace::put_user_ns(user_ns) };
             }
@@ -365,9 +365,7 @@ pub unsafe fn copy_creds(
         let parent_user_ns = if unsafe { (*cred_to_use).user_ns.is_null() } {
             core::ptr::addr_of!(crate::kernel::user_namespace::INIT_USER_NS)
         } else {
-            unsafe {
-                (*cred_to_use).user_ns as *const crate::kernel::user_namespace::UserNamespace
-            }
+            unsafe { (*cred_to_use).user_ns as *const crate::kernel::user_namespace::UserNamespace }
         };
         let user_ns = if clone_flags & CLONE_NEWUSER != 0 {
             crate::kernel::user_namespace::create_user_ns(parent_user_ns)?

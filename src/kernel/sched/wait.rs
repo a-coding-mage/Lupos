@@ -12,11 +12,11 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::sync::atomic::{fence, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering, fence};
 
 use crate::kernel::locking::RawSpinLocked;
 use crate::kernel::module::{export_symbol, find_symbol};
-use crate::kernel::task::{task_state, TaskStruct};
+use crate::kernel::task::{TaskStruct, task_state};
 
 const WQ_FLAG_WOKEN: u32 = 0x02;
 
@@ -376,9 +376,7 @@ unsafe extern "C" fn linux_default_wake_function(
     if state & mode == 0 {
         return 0;
     }
-    unsafe {
-        crate::kernel::sched::wake_task_with_state(task, mode, wake_flags as u32) as i32
-    }
+    unsafe { crate::kernel::sched::wake_task_with_state(task, mode, wake_flags as u32) as i32 }
 }
 
 /// `woken_wake_function` - `vendor/linux/kernel/sched/wait.c:457`.

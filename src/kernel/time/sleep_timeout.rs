@@ -526,7 +526,8 @@ mod tests {
         ));
         assert!(linux_timeout.contains("schedule();\n\ttimer_delete_sync"));
         let linux_sched = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"), "/vendor/linux/kernel/sched/core.c"
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/linux/kernel/sched/core.c"
         ));
         assert!(linux_sched.contains("void __sched io_schedule(void)"));
         assert!(linux_sched.contains("\ttoken = io_schedule_prepare();\n\tschedule();"));

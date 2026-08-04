@@ -5602,6 +5602,101 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // read remains useful diagnostics for fbdev implementations whose
         // read(2) and mmap views are coherent.  Take only one sample so a later
         // repaint can never turn an initial failure into success.
+        // Minimal reproducer for the defect that blocks Firefox: a child of a
+        // multithreaded process disagrees with its parent about an inherited
+        // COW page.  Measured in-guest (firefox-forkchild): a glibc lock word
+        // read 2 in the pre-execve child and 0 in the parent at the same
+        // address, so the child slept in FUTEX_WAIT forever and glycin's
+        // loader never reached execve().
+        //
+        // Test A uses only mmap slice stores in the child — no malloc, no
+        // Python-level locks — so a failure is a kernel COW/TLB property and
+        // not a fork-in-threaded-interpreter hazard.  Test B is the real
+        // glycin shape: fork+exec from a threaded process.  Each runs a
+        // single-threaded control first, so "threads matter" is measured
+        // rather than assumed.
+        "echo 'graphics-x11: forkstorm begin'\n",
+        "timeout -k 5 180 /usr/bin/python3 - <<'PYEOF' 2>&1 | sed 's/^/graphics-x11: forkstorm /'\n",
+        "import mmap, os, sys, threading, time\n",
+        "PAGES, ITERS = 8, 400\n",
+        "buf = mmap.mmap(-1, 4096 * PAGES)\n",
+        "for p in range(PAGES):\n",
+        "    buf[p * 4096:p * 4096 + 8] = b'\\xaa' * 8\n",
+        "stop = False\n",
+        "def churn():\n",
+        "    while not stop:\n",
+        "        for p in range(PAGES):\n",
+        "            buf[p * 4096 + 64:p * 4096 + 72] = b'\\x5a' * 8\n",
+        "        x = bytearray(8192)\n",
+        "        del x\n",
+        "def cow_round(iters):\n",
+        "    lost = 0\n",
+        "    for i in range(iters):\n",
+        "        pid = os.fork()\n",
+        "        if pid == 0:\n",
+        "            bad = 0\n",
+        "            for p in range(PAGES):\n",
+        "                buf[p * 4096:p * 4096 + 8] = b'\\x00' * 8\n",
+        "            for p in range(PAGES):\n",
+        "                if bytes(buf[p * 4096:p * 4096 + 8]) != b'\\x00' * 8:\n",
+        "                    bad = 1\n",
+        "            os._exit(2 if bad else 0)\n",
+        "        code = wait_child(pid, i, 'cow')\n",
+        "        if code != 0:\n",
+        "            lost += 1\n",
+        "            break\n",
+        "    return lost\n",
+        "def wait_child(pid, i, tag):\n",
+        "    deadline = time.time() + 10\n",
+        "    while time.time() < deadline:\n",
+        "        w, st = os.waitpid(pid, os.WNOHANG)\n",
+        "        if w == pid:\n",
+        "            code = os.waitstatus_to_exitcode(st)\n",
+        "            if code != 0:\n",
+        "                print('%s FAIL iter=%d exit=%s' % (tag, i, code))\n",
+        "            return code\n",
+        "        time.sleep(0.005)\n",
+        "    try:\n",
+        "        sc = open('/proc/%d/syscall' % pid).read().strip()\n",
+        "    except Exception as e:\n",
+        "        sc = 'unreadable(%s)' % e\n",
+        "    print('%s HUNG iter=%d pid=%d syscall=%s' % (tag, i, pid, sc))\n",
+        "    try:\n",
+        "        cw = open('/proc/%d/mem' % pid, 'rb', 0)\n",
+        "        pw = open('/proc/self/mem', 'rb', 0)\n",
+        "        ua = int(sc.split()[1], 16)\n",
+        "        cw.seek(ua); pw.seek(ua)\n",
+        "        print('%s HUNG futex uaddr=%#x child=%s parent=%s'\n",
+        "              % (tag, ua, cw.read(8).hex(), pw.read(8).hex()))\n",
+        "    except Exception as e:\n",
+        "        print('%s HUNG futex-compare unavailable %s' % (tag, e))\n",
+        "    os.kill(pid, 9)\n",
+        "    os.waitpid(pid, 0)\n",
+        "    return -1\n",
+        "def exec_round(iters):\n",
+        "    for i in range(iters):\n",
+        "        pid = os.fork()\n",
+        "        if pid == 0:\n",
+        "            try:\n",
+        "                os.execv('/usr/bin/true', ['true'])\n",
+        "            except BaseException:\n",
+        "                pass\n",
+        "            os._exit(3)\n",
+        "        if wait_child(pid, i, 'exec') != 0:\n",
+        "            return 1\n",
+        "    return 0\n",
+        "print('cow-single lost=%d' % cow_round(50))\n",
+        "print('exec-single rc=%d' % exec_round(50))\n",
+        "ths = [threading.Thread(target=churn, daemon=True) for _ in range(6)]\n",
+        "for t in ths:\n",
+        "    t.start()\n",
+        "time.sleep(0.5)\n",
+        "print('cow-threaded lost=%d' % cow_round(ITERS))\n",
+        "print('exec-threaded rc=%d' % exec_round(ITERS))\n",
+        "stop = True\n",
+        "print('done')\n",
+        "PYEOF\n",
+        "echo 'graphics-x11: forkstorm end'\n",
         "echo 'graphics-x11: initial-framebuffer-probe begin'\n",
         "initial_desktop_wait=0\n",
         "while [ \"$initial_desktop_wait\" -lt 240 ] && ! user_xfce_desktop_ready; do initial_desktop_wait=$((initial_desktop_wait + 1)); sleep 1; done\n",
@@ -6559,6 +6654,67 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "            echo 'graphics-x11: firefox-glycin begin'\n",
         "            /usr/bin/ps -eo pid,ppid,stat,comm,args 2>/dev/null | grep -E 'glycin|bwrap' | grep -v grep | sed 's/^/graphics-x11: firefox-glycin /' | cut -c1-150 || true\n",
         "            echo 'graphics-x11: firefox-glycin end'\n",
+        // glycin spawns its loader from a `blocking-N` worker thread, so the
+        // child inherits that thread's comm and, until it execs, the parent's
+        // /proc/<pid>/cmdline.  A child of the Firefox parent that still shows
+        // the parent's cmdline is therefore a spawn that never reached
+        // execve().  Dump the futex word it sleeps on *and the same address in
+        // the parent*: a child-only value is a fork/COW visibility defect,
+        // a value that matches the parent is a genuinely held lock.
+        "            echo 'graphics-x11: firefox-forkchild begin'\n",
+        "            for cp in /proc/[0-9]*; do\n",
+        "                cpid=\"${cp##*/}\"; [ \"$cpid\" = \"$firefox_pid\" ] && continue\n",
+        "                cppid=\"$(awk '/^PPid:/ { print $2; exit }' \"$cp/status\" 2>/dev/null)\"\n",
+        "                [ \"$cppid\" = \"$firefox_pid\" ] || continue\n",
+        "                ccmd=\"$(tr '\\000' ' ' < \"$cp/cmdline\" 2>/dev/null || true)\"\n",
+        "                case \"$ccmd\" in *--no-remote*) ;; *) continue ;; esac\n",
+        "                csys=\"$(cat \"$cp/syscall\" 2>/dev/null || echo unavailable)\"\n",
+        "                printf 'graphics-x11: firefox-forkchild pid=%s comm=%s state=%s exe=%s syscall=%s\\n' \"$cpid\" \"$(cat \"$cp/comm\" 2>/dev/null)\" \"$(awk '/^State:/ { print $2; exit }' \"$cp/status\" 2>/dev/null)\" \"$(readlink \"$cp/exe\" 2>/dev/null)\" \"$csys\"\n",
+        "                printf 'graphics-x11: firefox-forkchild pid=%s cmdline=%s\\n' \"$cpid\" \"$ccmd\"\n",
+        "                case \"$csys\" in '202 '*) ;; *) continue ;; esac\n",
+        "                cuaddr=\"$(printf '%s' \"$csys\" | awk '{print $2}')\"; csp=\"$(printf '%s' \"$csys\" | awk '{print $(NF-1)}')\"\n",
+        "                case \"$cuaddr\" in 0x*) ;; *) continue ;; esac\n",
+        "                /usr/bin/python3 - \"$cpid\" \"$firefox_pid\" \"$cuaddr\" \"$csp\" <<'PYEOF' 2>&1 | sed 's/^/graphics-x11: firefox-forkchild /'\n",
+        "import sys, re\n",
+        "cpid, ppid = sys.argv[1], sys.argv[2]\n",
+        "uaddr = int(sys.argv[3], 16)\n",
+        "sp = int(sys.argv[4], 16) if sys.argv[4].startswith('0x') else 0\n",
+        "def load(pid):\n",
+        "    out = []\n",
+        "    try:\n",
+        "        for line in open('/proc/%s/maps' % pid):\n",
+        "            m = re.match(r'([0-9a-f]+)-([0-9a-f]+) (\\S+) \\S+ \\S+ \\S+\\s*(.*)', line)\n",
+        "            if m: out.append((int(m.group(1),16), int(m.group(2),16), m.group(3), m.group(4).strip()))\n",
+        "    except Exception as e: print('maps %s unreadable %s' % (pid, e))\n",
+        "    return out\n",
+        "def owner(maps, v, exec_only=False):\n",
+        "    for a,b,perm,name in maps:\n",
+        "        if a <= v < b and (not exec_only or 'x' in perm):\n",
+        "            return '%s+%#x %s' % (name or 'anon', v - a, perm)\n",
+        "    return None\n",
+        "cm, pm = load(cpid), load(ppid)\n",
+        "print('maps-count child=%d parent=%d identical=%s' % (len(cm), len(pm), cm == pm))\n",
+        "def word(pid, addr):\n",
+        "    try:\n",
+        "        f = open('/proc/%s/mem' % pid, 'rb', 0); f.seek(addr); return f.read(8).hex()\n",
+        "    except Exception as e: return 'unreadable(%s)' % e\n",
+        "print('futex uaddr %#x child-owner %s parent-owner %s' % (uaddr, owner(cm, uaddr), owner(pm, uaddr)))\n",
+        "print('futex word child=%s parent=%s' % (word(cpid, uaddr), word(ppid, uaddr)))\n",
+        "if sp:\n",
+        "    try:\n",
+        "        f = open('/proc/%s/mem' % cpid, 'rb', 0)\n",
+        "        seen = []\n",
+        "        for i in range(0, 512):\n",
+        "            f.seek(sp + i*8); w = f.read(8)\n",
+        "            if len(w) < 8: break\n",
+        "            v = int.from_bytes(w, 'little')\n",
+        "            o = owner(cm, v, True)\n",
+        "            if o and (not seen or seen[-1][1] != o): seen.append((v, o))\n",
+        "        for v, o in seen[:24]: print('stack %#018x %s' % (v, o))\n",
+        "    except Exception as e: print('stack unreadable', e)\n",
+        "PYEOF\n",
+        "            done\n",
+        "            echo 'graphics-x11: firefox-forkchild end'\n",
         // The GTK icon path inside the Firefox parent goes gdk-pixbuf ->
         // libglycin -> a bubblewrap-sandboxed `glycin-*` loader, and the
         // parent's main thread blocks on that loader's reply.  A loader that
@@ -17280,16 +17436,13 @@ pub fn run_graphics_x11_tests() -> Result<()> {
     // reported running), none of which can distinguish real output from a
     // silent stream into QEMU's null sink. The capture is what makes the
     // playback assertion below meaningful.
-    let audio_capture = xtask_target_dir()?.join(format!(
-        "graphics-x11-audio-{}.wav",
-        artifact_run_id()
-    ));
+    let audio_capture =
+        xtask_target_dir()?.join(format!("graphics-x11-audio-{}.wav", artifact_run_id()));
     let audio_capture_text = audio_capture
         .to_str()
         .ok_or_else(|| anyhow!("audio capture path is not UTF-8"))?
         .to_string();
-    let _audio_capture_guard =
-        EnvVarGuard::set(LUPOS_QEMU_AUDIO_CAPTURE_ENV, &audio_capture_text);
+    let _audio_capture_guard = EnvVarGuard::set(LUPOS_QEMU_AUDIO_CAPTURE_ENV, &audio_capture_text);
     ensure_userland_stage()?;
 
     let _stage_guard = EnvVarGuard::set(STAGE_REAL_USERLAND_ENV, "1");
@@ -21107,7 +21260,11 @@ const QEMU_HOST_AUDIO_DRIVERS: [&str; 3] = ["pipewire", "pa", "alsa"];
 fn qemu_available_audio_drivers() -> &'static [String] {
     static DRIVERS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     DRIVERS.get_or_init(|| {
-        let Ok(output) = Command::new(QEMU_BINARY).arg("-audiodev").arg("help").output() else {
+        let Ok(output) = Command::new(QEMU_BINARY)
+            .arg("-audiodev")
+            .arg("help")
+            .output()
+        else {
             return Vec::new();
         };
         let text = String::from_utf8_lossy(&output.stdout);
@@ -26005,8 +26162,8 @@ failed command output\n";
     #[test]
     fn captured_audio_sizes_payload_from_file_when_header_is_unpatched() {
         let tone: Vec<i16> = (0..2048).map(|n| ((n % 97) as i16 - 48) * 400).collect();
-        let stats = analyze_captured_audio(&wav_fixture(&tone, Some(0)))
-            .expect("parse unpatched capture");
+        let stats =
+            analyze_captured_audio(&wav_fixture(&tone, Some(0))).expect("parse unpatched capture");
         assert_eq!(stats.samples, 2048);
         assert!(stats.peak_amplitude > 1024);
     }
@@ -27244,8 +27401,7 @@ failed command output\n";
             .expect("relay defines the LightDM restart check");
         assert!(
             restart_check.contains("NRestarts")
-                && restart_check
-                    .contains("Running command /etc/lightdm/Xsession startxfce4"),
+                && restart_check.contains("Running command /etc/lightdm/Xsession startxfce4"),
             "restart counter must be qualified by the surviving instance's session state"
         );
         assert!(
@@ -27452,7 +27608,9 @@ failed command output\n";
         assert!(probe.contains("graphics-x11: proc-pid-root ok"));
         assert!(probe.contains("/usr/bin/wpctl status"));
         assert!(probe.contains("/usr/bin/pactl info"));
-        assert!(probe.contains("while [ \"$i\" -lt 30 ] && [ ! -e /tmp/lupos-pipewire-ready ]; do"));
+        assert!(
+            probe.contains("while [ \"$i\" -lt 30 ] && [ ! -e /tmp/lupos-pipewire-ready ]; do")
+        );
         assert!(probe.contains("Server Name: PulseAudio (on PipeWire"));
         assert!(probe.contains("sine=frequency=440:sample_rate=48000 -t 6 -ac 2 -c:a pcm_s16le"));
         assert!(probe.contains("/usr/bin/pw-play /tmp/lupos-audio.wav"));

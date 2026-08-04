@@ -135,25 +135,25 @@ pub struct PipewireSwitchDiagnostic {
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
 pub static mut LUPOS_PIPEWIRE_SWITCH_DIAGNOSTICS: [PipewireSwitchDiagnostic;
-    crate::kernel::sched::MAX_CPUS * PIPEWIRE_DIAG_SLOTS_PER_CPU] =
-    [const {
-        PipewireSwitchDiagnostic {
-            sequence: 0,
-            cpu: 0,
-            _pad: 0,
-            prev: 0,
-            next: 0,
-            prev_sp: 0,
-            next_sp: 0,
-            current_sp: 0,
-            prev_on_cpu: 0,
-            next_on_cpu: 0,
-            prev_on_rq: 0,
-            next_on_rq: 0,
-            prev_cpu: -1,
-            next_cpu: -1,
-        }
-    }; crate::kernel::sched::MAX_CPUS * PIPEWIRE_DIAG_SLOTS_PER_CPU];
+    crate::kernel::sched::MAX_CPUS * PIPEWIRE_DIAG_SLOTS_PER_CPU] = [const {
+    PipewireSwitchDiagnostic {
+        sequence: 0,
+        cpu: 0,
+        _pad: 0,
+        prev: 0,
+        next: 0,
+        prev_sp: 0,
+        next_sp: 0,
+        current_sp: 0,
+        prev_on_cpu: 0,
+        next_on_cpu: 0,
+        prev_on_rq: 0,
+        next_on_rq: 0,
+        prev_cpu: -1,
+        next_cpu: -1,
+    }
+};
+    crate::kernel::sched::MAX_CPUS * PIPEWIRE_DIAG_SLOTS_PER_CPU];
 
 #[cfg(not(test))]
 static PIPEWIRE_DIAG_SEQUENCE: [AtomicU64; crate::kernel::sched::MAX_CPUS] =
@@ -275,10 +275,7 @@ pub unsafe fn record_switch_attempt(_prev: *mut TaskStruct, _next: *mut TaskStru
 /// context switch to the console.
 #[cfg(not(test))]
 #[inline(never)]
-pub unsafe fn record_pipewire_switch_diagnostic(
-    prev: *mut TaskStruct,
-    next: *mut TaskStruct,
-) {
+pub unsafe fn record_pipewire_switch_diagnostic(prev: *mut TaskStruct, next: *mut TaskStruct) {
     let prev_is_pipewire = !prev.is_null() && unsafe { (*prev).comm.starts_with(b"pipewire") };
     let next_is_pipewire = !next.is_null() && unsafe { (*next).comm.starts_with(b"pipewire") };
     if !prev_is_pipewire && !next_is_pipewire {
@@ -288,8 +285,8 @@ pub unsafe fn record_pipewire_switch_diagnostic(
     let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number()
         .min(crate::kernel::sched::MAX_CPUS - 1);
     let sequence = PIPEWIRE_DIAG_SEQUENCE[cpu].fetch_add(1, Ordering::Relaxed);
-    let slot = cpu * PIPEWIRE_DIAG_SLOTS_PER_CPU
-        + (sequence as usize % PIPEWIRE_DIAG_SLOTS_PER_CPU);
+    let slot =
+        cpu * PIPEWIRE_DIAG_SLOTS_PER_CPU + (sequence as usize % PIPEWIRE_DIAG_SLOTS_PER_CPU);
     let current_sp: u64;
     unsafe {
         core::arch::asm!(
@@ -336,11 +333,7 @@ pub unsafe fn record_pipewire_switch_diagnostic(
 }
 
 #[cfg(test)]
-pub unsafe fn record_pipewire_switch_diagnostic(
-    _prev: *mut TaskStruct,
-    _next: *mut TaskStruct,
-) {
-}
+pub unsafe fn record_pipewire_switch_diagnostic(_prev: *mut TaskStruct, _next: *mut TaskStruct) {}
 
 /// TEMPORARY: dump the focused PipeWire switch ring when the stack protector
 /// has already proven that this task's continuation is damaged.  Keeping the

@@ -228,7 +228,10 @@ mod tests {
         unsafe {
             let mut buf = [0i8; 16];
             let fmt = b"avq.%u\0";
-            assert_eq!(sprintf_symbol()(buf.as_mut_ptr(), fmt.as_ptr().cast(), 12), 6);
+            assert_eq!(
+                sprintf_symbol()(buf.as_mut_ptr(), fmt.as_ptr().cast(), 12),
+                6
+            );
             assert_eq!(as_str(&buf, 6), "avq.12");
         }
     }
