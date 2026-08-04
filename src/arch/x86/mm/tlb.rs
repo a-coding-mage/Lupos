@@ -354,7 +354,14 @@ fn service_tlb_call_queue_irqs_off(target: usize) -> bool {
     serviced
 }
 
-fn queue_tlb_call(source: usize, target: usize, mm: *mut MmStruct, start: u64, end: u64, full: bool) {
+fn queue_tlb_call(
+    source: usize,
+    target: usize,
+    mm: *mut MmStruct,
+    start: u64,
+    end: u64,
+    full: bool,
+) {
     let slot = &TLB_CALL_SLOTS[source.min(MAX_CPUS - 1)][target.min(MAX_CPUS - 1)];
     assert_eq!(
         slot.state.load(Ordering::Acquire),

@@ -1713,14 +1713,8 @@ mod tests {
                     awoken: false,
                 });
 
-                let woken = unsafe {
-                    futex_wake(
-                        uaddr,
-                        1,
-                        super::super::FUTEX_BITSET_MATCH_ANY,
-                        true,
-                    )
-                };
+                let woken =
+                    unsafe { futex_wake(uaddr, 1, super::super::FUTEX_BITSET_MATCH_ANY, true) };
 
                 assert_eq!(woken, 1);
                 assert_eq!(

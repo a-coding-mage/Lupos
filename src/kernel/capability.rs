@@ -189,11 +189,7 @@ pub fn capable(cap: u32) -> bool {
 /// bubblewrap/container user namespace.  Walking the other way (from the
 /// credential's namespace up to the target) inverts the relationship and
 /// stripped init-namespace root of its capabilities over any sandbox.
-pub fn cred_ns_capable(
-    cred: *const Cred,
-    user_ns: *const core::ffi::c_void,
-    cap: u32,
-) -> bool {
+pub fn cred_ns_capable(cred: *const Cred, user_ns: *const core::ffi::c_void, cap: u32) -> bool {
     if cred.is_null() {
         return true;
     }

@@ -1361,8 +1361,7 @@ static TRACE_FIREFOX_CLONE_COUNT: core::sync::atomic::AtomicU32 =
 static TRACE_FIREFOX_NAMESPACE_CLONE_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 #[cfg(not(test))]
-static TRACE_FIREFOX_TGID: core::sync::atomic::AtomicI32 =
-    core::sync::atomic::AtomicI32::new(-1);
+static TRACE_FIREFOX_TGID: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
 
 /// Trace the small set of process, IPC, blocking, and sandbox syscalls that
 /// determines whether Firefox can create its content process and publish its
@@ -1408,8 +1407,8 @@ fn trace_firefox_syscall_enter(
         0
     };
     if namespace_clone_flags != 0 {
-        let namespace_seq = TRACE_FIREFOX_NAMESPACE_CLONE_COUNT
-            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        let namespace_seq =
+            TRACE_FIREFOX_NAMESPACE_CLONE_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         if namespace_seq < 64 {
             crate::linux_driver_abi::tty::serial_println!(
                 "trace-firefox-namespace-clone seq={} pid={} nr={} flags={:#x} a0={:#x} a1={:#x}",
@@ -1459,9 +1458,7 @@ fn trace_firefox_syscall_enter(
     );
     trace_firefox_scheduler_state(task, seq, "enter");
     if nr == 435 && regs.arg1() <= 4096 && regs.arg0() != 0 {
-        let clone_args = unsafe {
-            *(regs.arg0() as *const crate::kernel::clone::CloneArgs)
-        };
+        let clone_args = unsafe { *(regs.arg0() as *const crate::kernel::clone::CloneArgs) };
         crate::linux_driver_abi::tty::serial_println!(
             "trace-firefox-clone3-args pid={} flags={:#x} stack={:#x} stack-size={:#x} tls={:#x} pidfd={:#x} child-tid={:#x} parent-tid={:#x} size={}",
             pid,
@@ -1631,11 +1628,7 @@ fn trace_firefox_scheduler_state(
     }
     let cpu = crate::kernel::sched::current_cpu();
     let current = unsafe { crate::kernel::sched::get_current() };
-    let state = unsafe {
-        (*task)
-            .__state
-            .load(core::sync::atomic::Ordering::Acquire)
-    };
+    let state = unsafe { (*task).__state.load(core::sync::atomic::Ordering::Acquire) };
     let on_cpu = unsafe {
         (*task)
             .m29

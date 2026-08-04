@@ -143,8 +143,7 @@ fn pipe_read(file: &FileRef, buf: &mut [u8], _pos: &mut u64) -> Result<usize, i3
             }
         };
         if let Some(n) = read {
-            pipe.write_wait
-                .wake_up_poll((POLLOUT | POLLWRNORM) as u32);
+            pipe.write_wait.wake_up_poll((POLLOUT | POLLWRNORM) as u32);
             return Ok(n);
         }
 
@@ -205,8 +204,7 @@ fn pipe_write(file: &FileRef, buf: &[u8], _pos: &mut u64) -> Result<usize, i32> 
             }
         };
         if let Some(n) = written {
-            pipe.read_wait
-                .wake_up_poll((POLLIN | POLLRDNORM) as u32);
+            pipe.read_wait.wake_up_poll((POLLIN | POLLRDNORM) as u32);
             return Ok(n);
         }
 

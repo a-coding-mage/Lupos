@@ -139,18 +139,15 @@ unsafe fn put_user_frame_value<T: Copy>(frame_sp: u64, offset: usize, value: T) 
     };
     let value_ptr = &value as *const T;
     match core::mem::size_of::<T>() {
-        2 => crate::arch::x86::kernel::uaccess::put_user_u16_nofault(
-            dst as *mut u16,
-            unsafe { value_ptr.cast::<u16>().read_unaligned() },
-        ),
-        4 => crate::arch::x86::kernel::uaccess::put_user_u32_nofault(
-            dst as *mut u32,
-            unsafe { value_ptr.cast::<u32>().read_unaligned() },
-        ),
-        8 => crate::arch::x86::kernel::uaccess::put_user_u64_nofault(
-            dst as *mut u64,
-            unsafe { value_ptr.cast::<u64>().read_unaligned() },
-        ),
+        2 => crate::arch::x86::kernel::uaccess::put_user_u16_nofault(dst as *mut u16, unsafe {
+            value_ptr.cast::<u16>().read_unaligned()
+        }),
+        4 => crate::arch::x86::kernel::uaccess::put_user_u32_nofault(dst as *mut u32, unsafe {
+            value_ptr.cast::<u32>().read_unaligned()
+        }),
+        8 => crate::arch::x86::kernel::uaccess::put_user_u64_nofault(dst as *mut u64, unsafe {
+            value_ptr.cast::<u64>().read_unaligned()
+        }),
         _ => Err(-14), // EFAULT: only Linux scalar fields are supported here.
     }
 }
@@ -230,9 +227,7 @@ pub unsafe fn setup_rt_frame(
 
     // Linux rejects a frame which would overflow an entered alternate stack
     // after the red-zone/math-frame allocation.
-    if entering_altstack
-        && !crate::kernel::signal::altstack_contains(saved_altstack, user_sp)
-    {
+    if entering_altstack && !crate::kernel::signal::altstack_contains(saved_altstack, user_sp) {
         return Err(-14);
     }
 
@@ -621,7 +616,10 @@ mod tests {
         let linux_body = linux
             .split("int x64_setup_rt_frame(")
             .nth(1)
-            .and_then(|body| body.split("/* Set up registers for signal handler */").next())
+            .and_then(|body| {
+                body.split("/* Set up registers for signal handler */")
+                    .next()
+            })
             .expect("Linux x64_setup_rt_frame body must remain present");
         assert!(linux_body.contains("user_access_begin(frame, sizeof(*frame))"));
 

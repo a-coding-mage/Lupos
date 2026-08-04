@@ -7708,14 +7708,19 @@ mod tests {
         let source = include_str!("syscalls.rs");
         for (function, end_marker) in [
             ("unsafe fn poll_impl(", "pub unsafe fn sys_select("),
-            ("unsafe fn select_impl(", "/// Sleep after a poll/select scan"),
+            (
+                "unsafe fn select_impl(",
+                "/// Sleep after a poll/select scan",
+            ),
         ] {
             let body = source
                 .split(function)
                 .nth(1)
                 .and_then(|body| body.split(end_marker).next())
                 .expect("poll/select implementation must exist");
-            let loop_start = body.find("loop {").expect("poll/select must have a scan loop");
+            let loop_start = body
+                .find("loop {")
+                .expect("poll/select must have a scan loop");
             let table = body
                 .find("let mut poll_table = select::PollTable::new(current);")
                 .expect("poll/select must create a persistent poll table");
@@ -7724,7 +7729,8 @@ mod tests {
                 "Linux poll_wqueues must be created before the scan loop"
             );
             assert!(
-                !body[loop_start..].contains("let mut poll_table = select::PollTable::new(current);")
+                !body[loop_start..]
+                    .contains("let mut poll_table = select::PollTable::new(current);")
             );
         }
 
@@ -7746,16 +7752,12 @@ mod tests {
         };
         let mut table = select::PollTable::new(&mut *current);
         assert_eq!(
-            unsafe {
-                select::poll_once_with_table(ft.as_ref(), &mut pfd, 1, Some(&mut table))
-            },
+            unsafe { select::poll_once_with_table(ft.as_ref(), &mut pfd, 1, Some(&mut table)) },
             Ok(0)
         );
         assert_eq!(table.registration_count(), 1);
         assert_eq!(
-            unsafe {
-                select::poll_once_with_table(ft.as_ref(), &mut pfd, 1, Some(&mut table))
-            },
+            unsafe { select::poll_once_with_table(ft.as_ref(), &mut pfd, 1, Some(&mut table)) },
             Ok(0)
         );
         assert_eq!(

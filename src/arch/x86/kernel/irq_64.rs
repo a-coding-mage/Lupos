@@ -80,7 +80,10 @@ pub const fn irq_init_percpu_irqstack(
 ///
 /// # Safety
 /// `frame` must be the live IDT frame and interrupts must be disabled.
-pub unsafe fn run_irq_on_irqstack(frame: *mut crate::arch::x86::kernel::idt::ExceptionFrame, vector: u8) {
+pub unsafe fn run_irq_on_irqstack(
+    frame: *mut crate::arch::x86::kernel::idt::ExceptionFrame,
+    vector: u8,
+) {
     let cpu = crate::arch::x86::kernel::setup_percpu::current_cpu_number()
         .min(crate::kernel::sched::MAX_CPUS - 1);
     let user_mode = unsafe { (*frame).cs & 3 != 0 };
