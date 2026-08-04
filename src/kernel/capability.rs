@@ -17,6 +17,11 @@
 //! `[u32; 2]`, indexed by `CAP_TO_INDEX(cap)` and masked by `CAP_TO_MASK(cap)`.
 //!
 //! Reference: Linux `include/linux/capability.h`, `kernel/capability.c`.
+//!
+//! The namespace-relative decision (`cred_ns_capable` / `ns_capable`) is not in
+//! `kernel/capability.c` at all — Linux routes it through the LSM hook to
+//! `vendor/linux/security/commoncap.c::cap_capable_helper()`, and that walk is
+//! what this file reproduces.
 
 use crate::kernel::cred::{Cred, current_cred};
 use crate::kernel::module::{export_symbol, find_symbol};
@@ -176,11 +181,14 @@ pub fn capable(cap: u32) -> bool {
 
 /// Return `true` if `cred` has `cap` in `user_ns`.
 ///
-/// Linux capabilities are effective in the credential's user namespace and
-/// in each ancestor namespace, but not in a descendant namespace.  This is
-/// the relationship needed by `ns_capable()` and by `unshare()`: a temporary
-/// credential whose `user_ns` is the namespace it just created must be able
-/// to create the other namespaces in the same unshare operation.
+/// `vendor/linux/security/commoncap.c::cap_capable_helper()`: the walk starts
+/// at the *target* namespace and climbs towards the root looking for the
+/// credential's own namespace.  A capability held in a parent user namespace
+/// therefore applies to every descendant namespace as well — which is how root
+/// in the initial namespace retains authority over processes inside a
+/// bubblewrap/container user namespace.  Walking the other way (from the
+/// credential's namespace up to the target) inverts the relationship and
+/// stripped init-namespace root of its capabilities over any sandbox.
 pub fn cred_ns_capable(
     cred: *const Cred,
     user_ns: *const core::ffi::c_void,
@@ -194,20 +202,25 @@ pub fn cred_ns_capable(
         return false;
     }
     unsafe {
-        if !(*cred).cap_effective.raised(cap) {
-            return false;
+        let mut cred_ns = (*cred).user_ns as *const crate::kernel::user_namespace::UserNamespace;
+        if cred_ns.is_null() {
+            cred_ns = &raw const crate::kernel::user_namespace::INIT_USER_NS;
         }
-        let mut cursor = (*cred).user_ns
-            as *const crate::kernel::user_namespace::UserNamespace;
-        if cursor.is_null() {
-            cursor = &raw const crate::kernel::user_namespace::INIT_USER_NS;
-        }
+        let mut ns = target;
         for _ in 0..=crate::kernel::user_namespace::MAX_USER_NS_LEVEL {
-            if core::ptr::eq(cursor, target) {
+            if core::ptr::eq(ns, cred_ns) {
+                return (*cred).cap_effective.raised(cap);
+            }
+            if (*ns).level <= (*cred_ns).level {
+                return false;
+            }
+            // The owner of a user namespace holds every capability in it, as
+            // seen from the namespace's parent.
+            if core::ptr::eq((*ns).parent, cred_ns) && (*ns).owner == (*cred).euid {
                 return true;
             }
-            cursor = (*cursor).parent;
-            if cursor.is_null() {
+            ns = (*ns).parent;
+            if ns.is_null() {
                 break;
             }
         }

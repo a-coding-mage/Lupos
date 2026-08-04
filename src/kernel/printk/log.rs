@@ -318,13 +318,24 @@ pub fn timestamp_msecs() -> u64 {
 }
 
 fn emit_record(record: &LogRecord) {
+    emit_message(record.jiffies, record.module_str(), record.msg_str());
+}
+
+/// Console half of `emit_record`, taking the fields directly.
+///
+/// `_log()` must not stage a `LogRecord` on the stack just to print: that type
+/// embeds `[u8; MSG_CAP]`, which together with the formatting buffer gave
+/// `_log()` a ~4.3 KiB frame on a 16 KiB kernel stack.  Linux keeps printk off
+/// the stack for exactly this reason — `vprintk_store()` formats into per-CPU
+/// `printk_buffers` rather than an on-stack record
+/// (`vendor/linux/kernel/printk/printk.c`).  A fat frame here is reachable from
+/// the fault-logging path, so it can turn any deep-stack exception into a
+/// double fault.
+fn emit_message(us: u64, module: &str, msg: &str) {
     // Linux print_time() — vendor/linux/kernel/printk/printk.c:1355.
     //   printf("[%5lu.%06lu] ", seconds, microseconds)
-    let us = record.jiffies;
     let secs = us / 1_000_000;
     let micros = us % 1_000_000;
-    let module = record.module_str();
-    let msg = record.msg_str();
 
     if module.is_empty() {
         crate::linux_driver_abi::tty::serial::_print(format_args!(
@@ -385,19 +396,13 @@ pub fn _log(msg_level: Level, module: &str, args: fmt::Arguments<'_>) {
         message,
     );
 
-    let mut record = LogRecord::empty();
-    record.level = msg_level;
-    record.jiffies = ts_us;
-
+    // Print straight from the formatting buffer.  Staging a LogRecord here
+    // would put a second [u8; MSG_CAP] on the stack for no benefit; see
+    // emit_message().
     let mod_len = module.len().min(MODULE_CAP);
-    record.module[..mod_len].copy_from_slice(&module.as_bytes()[..mod_len]);
-    record.mod_len = mod_len as u8;
-
-    let msg_len = message.len().min(MSG_CAP);
-    record.msg[..msg_len].copy_from_slice(&message[..msg_len]);
-    record.msg_len = msg_len as u16;
-
-    emit_record(&record);
+    let module = core::str::from_utf8(&module.as_bytes()[..mod_len]).unwrap_or("?");
+    let msg = core::str::from_utf8(message).unwrap_or("?");
+    emit_message(ts_us, module, msg);
 }
 
 fn dump_record(record: &LogRecord) {

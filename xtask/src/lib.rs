@@ -6504,7 +6504,9 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "                printf 'graphics-x11: firefox-process pid=%s syscall=' \"$proc\"; timeout 1 cat \"/proc/$proc/syscall\" 2>/dev/null || true\n",
         "                printf 'graphics-x11: firefox-process pid=%s children=' \"$proc\"; cat \"/proc/$proc/task/$proc/children\" 2>/dev/null || true\n",
         "                for fd in \"$proc\"/fd/[0-9]*; do\n",
-        "                    [ -e \"$fd\" ] || continue\n",
+        // A socket/pipe fd symlink has no resolvable target, so `-e` (which
+        // follows the link) skipped exactly the fds worth reporting.
+        "                    [ -L \"$fd\" ] || continue\n",
         "                    target=; target=\"$(readlink \"$fd\" 2>/dev/null || true)\"\n",
         "                    case \"$target\" in socket:*|pipe:*|anon_inode:*|*/.X11-unix/*) printf 'graphics-x11: firefox-fd pid=%s fd=%s target=%s\\n' \"$proc\" \"${fd##*/}\" \"$target\" ;; esac\n",
         "                done\n",
@@ -6534,13 +6536,61 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "            echo 'graphics-x11: firefox-glycin begin'\n",
         "            /usr/bin/ps -eo pid,ppid,stat,comm,args 2>/dev/null | grep -E 'glycin|bwrap' | grep -v grep | sed 's/^/graphics-x11: firefox-glycin /' | cut -c1-150 || true\n",
         "            echo 'graphics-x11: firefox-glycin end'\n",
-        // The loaders now exec; are they replying, or blocked themselves?
-        "            echo 'graphics-x11: glycin-state begin'\n",
-        "            for gp in $(/usr/bin/ps -eo pid,comm 2>/dev/null | grep -E 'glycin' | awk '{print $1}'); do\n",
-        "              printf 'graphics-x11: glycin-state pid=%s comm=%s state=%s syscall=%s\\n' \"$gp\" \"$(cat /proc/$gp/comm 2>/dev/null)\" \"$(awk '{print $3}' /proc/$gp/stat 2>/dev/null)\" \"$(cat /proc/$gp/syscall 2>/dev/null | head -c 50)\"\n",
-        "              ls -l /proc/$gp/fd 2>/dev/null | sed \"s|^|graphics-x11: glycin-state fd$gp |\" | head -12\n",
+        // The GTK icon path inside the Firefox parent goes gdk-pixbuf ->
+        // libglycin -> a bubblewrap-sandboxed `glycin-*` loader, and the
+        // parent's main thread blocks on that loader's reply.  A loader that
+        // is still alive while Firefox is stuck is the head of the dependency
+        // chain, so dump it in full: which mapping owns the futex word it
+        // sleeps on, its stack, and its fds.
+        "            echo 'graphics-x11: glycin-stuck begin'\n",
+        "            for gp in /proc/[0-9]*; do\n",
+        "                gcomm=\"$(cat \"$gp/comm\" 2>/dev/null)\"; case \"$gcomm\" in glycin*) ;; *) continue ;; esac\n",
+        "                gstate=\"$(awk '/^State:/ { print $2; exit }' \"$gp/status\" 2>/dev/null)\"\n",
+        "                [ \"$gstate\" = Z ] && continue\n",
+        "                gpid=\"${gp##*/}\"; gsys=\"$(cat \"$gp/syscall\" 2>/dev/null)\"\n",
+        "                printf 'graphics-x11: glycin-stuck pid=%s comm=%s state=%s threads=%s syscall=%s\\n' \"$gpid\" \"$gcomm\" \"$gstate\" \"$(ls \"$gp/task\" 2>/dev/null | wc -l)\" \"$gsys\"\n",
+        "                for gt in \"$gp\"/task/*; do [ -d \"$gt\" ] || continue; printf 'graphics-x11: glycin-stuck-thread tid=%s comm=%s syscall=%s\\n' \"${gt##*/}\" \"$(cat \"$gt/comm\" 2>/dev/null)\" \"$(cat \"$gt/syscall\" 2>/dev/null)\"; done\n",
+        "                for gfd in \"$gp\"/fd/*; do [ -L \"$gfd\" ] || continue; printf 'graphics-x11: glycin-stuck-fd pid=%s fd=%s target=%s\\n' \"$gpid\" \"${gfd##*/}\" \"$(readlink \"$gfd\" 2>/dev/null)\"; done\n",
+        "                grep -E 'r-xp|rw-p' \"$gp/maps\" 2>/dev/null | head -40 | sed \"s|^|graphics-x11: glycin-stuck-map $gpid |\"\n",
+        // Attribute both the futex word and the return addresses on the
+        // stack, using the same reader the Firefox walk uses.
+        "                gsp=\"$(printf '%s' \"$gsys\" | awk '{print $(NF-1)}')\"; guaddr=\"$(printf '%s' \"$gsys\" | awk '{print $2}')\"\n",
+        "                case \"$gsp\" in 0x*) ;; *) continue ;; esac\n",
+        "                /usr/bin/python3 - \"$gpid\" \"$gsp\" \"$guaddr\" <<'PYEOF' 2>&1 | sed 's/^/graphics-x11: glycin-stuck-stack /'\n",
+        "import sys, re\n",
+        "pid, sp = sys.argv[1], int(sys.argv[2], 16)\n",
+        "uaddr = int(sys.argv[3], 16) if sys.argv[3].startswith('0x') else 0\n",
+        "maps = []\n",
+        "for line in open('/proc/%s/maps' % pid):\n",
+        "    m = re.match(r'([0-9a-f]+)-([0-9a-f]+) (\\S+) \\S+ \\S+ \\S+\\s*(.*)', line)\n",
+        "    if m:\n",
+        "        maps.append((int(m.group(1),16), int(m.group(2),16), m.group(3), m.group(4).strip()))\n",
+        "def owner(v, exec_only):\n",
+        "    for a,b,perm,name in maps:\n",
+        "        if a <= v < b and (not exec_only or 'x' in perm):\n",
+        "            return '%s+%#x %s' % (name or 'anon', v - a, perm)\n",
+        "    return None\n",
+        "f = open('/proc/%s/mem' % pid, 'rb', 0)\n",
+        "if uaddr:\n",
+        "    print('futex uaddr %#x in %s' % (uaddr, owner(uaddr, False)))\n",
+        "    try:\n",
+        "        f.seek(uaddr); print('futex word', f.read(8).hex())\n",
+        "    except Exception as e: print('futex word unreadable', e)\n",
+        "seen = []\n",
+        "for i in range(0, 512):\n",
+        "    try:\n",
+        "        f.seek(sp + i*8); w = f.read(8)\n",
+        "    except Exception as e:\n",
+        "        print('read stopped at', i, e); break\n",
+        "    if len(w) < 8: break\n",
+        "    v = int.from_bytes(w, 'little')\n",
+        "    o = owner(v, True)\n",
+        "    if o and (not seen or seen[-1][1] != o):\n",
+        "        seen.append((v, o))\n",
+        "for v, o in seen[:24]: print('%#018x %s' % (v, o))\n",
+        "PYEOF\n",
         "            done\n",
-        "            echo 'graphics-x11: glycin-state end'\n",
+        "            echo 'graphics-x11: glycin-stuck end'\n",
         "            echo 'graphics-x11: firefox-syscall end'\n",
         // Walk the stuck main thread's user stack via /proc/<pid>/mem and
         // attribute each 8-byte word to a mapping, so the libraries on the
@@ -6602,6 +6652,42 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "        kill -0 \"$firefox_launcher_pid\" 2>/dev/null || break\n",
         "        i=$((i + 1)); sleep 1\n",
         "    done\n",
+        // The image already declares GLYCIN_SANDBOX_MECHANISM=not-sandboxed,
+        // but `sudo -n -u lupos env ...` starts no login shell and no systemd
+        // user manager, so neither /etc/profile.d nor /usr/lib/environment.d
+        // reaches this launch and glycin falls back to its bubblewrap
+        // sandbox.  When the first attempt never mapped a window, retry once
+        // with the image's declared policy applied: that isolates the stuck
+        // sandboxed loader from the rest of Firefox's startup.
+        "    if [ \"$firefox_history_seeded\" -ne 1 ]; then\n",
+        "        echo 'graphics-x11: firefox-nosandbox begin'\n",
+        // The first attempt still holds the profile lock, and a second
+        // `--no-remote` start against a locked profile exits at once.  Tear the
+        // first instance down for real and hand the retry its own profile.
+        "        kill \"$firefox_launcher_pid\" 2>/dev/null || true\n",
+        "        for ffk in $(for p in /proc/[0-9]*; do case \"$(cat \"$p/comm\" 2>/dev/null)\" in firefox|crashhelper|Socket*|forkserver) echo \"${p##*/}\" ;; esac; done); do kill -9 \"$ffk\" 2>/dev/null || true; done\n",
+        "        i=0; while [ \"$i\" -lt 20 ] && process_pid_named_uid firefox 1000 >/dev/null 2>&1; do i=$((i + 1)); sleep 1; done\n",
+        "        rm -rf /tmp/lupos-firefox-profile-ns /tmp/lupos-firefox-nosandbox.log\n",
+        "        install -d -m 700 -o lupos -g lupos /tmp/lupos-firefox-profile-ns\n",
+        "        cp /tmp/lupos-firefox-profile/user.js /tmp/lupos-firefox-profile-ns/user.js 2>/dev/null || true\n",
+        "        chown lupos:lupos /tmp/lupos-firefox-profile-ns/user.js 2>/dev/null || true\n",
+        "        printf 'graphics-x11: firefox-nosandbox residual-firefox=%s\\n' \"$(process_pid_named_uid firefox 1000 2>/dev/null || echo none)\"\n",
+        "        ( run_in_session_cgroup \"$session_cgroup\" sudo -n -u lupos env HOME=\"$session_home\" DISPLAY=\"$session_display\" XAUTHORITY=\"$session_xauthority\" DBUS_SESSION_BUS_ADDRESS=\"$session_dbus\" XDG_RUNTIME_DIR=\"$session_runtime\" NO_AT_BRIDGE=1 GTK_A11Y=none GDK_BACKEND=x11 MOZ_ENABLE_WAYLAND=0 MOZ_WEBRENDER=0 MOZ_X11_EGL=0 LIBGL_ALWAYS_SOFTWARE=1 GLYCIN_SANDBOX_MECHANISM=not-sandboxed /usr/bin/firefox --no-remote --profile /tmp/lupos-firefox-profile-ns 'http://127.0.0.1:8765/zzzzlupossuggestion.html' ) >/tmp/lupos-firefox-nosandbox.log 2>&1 &\n",
+        "        firefox_launcher_pid=$!\n",
+        "        ns_i=0\n",
+        "        while [ \"$ns_i\" -lt 120 ] && [ \"$firefox_history_seeded\" -eq 0 ]; do\n",
+        "            : > /tmp/lupos-firefox-windows.log\n",
+        "            if active_window_probe /tmp/lupos-firefox-windows.log 'Navigator|firefox|LUPOS Firefox suggestion probe'; then\n",
+        "                if grep -qiE 'WM_CLASS.*(Navigator|firefox)' /tmp/lupos-firefox-windows.log 2>/dev/null && grep -Fq 'LUPOS Firefox suggestion probe' /tmp/lupos-firefox-windows.log 2>/dev/null; then firefox_history_seeded=1; break; fi\n",
+        "            fi\n",
+        "            kill -0 \"$firefox_launcher_pid\" 2>/dev/null || break\n",
+        "            ns_i=$((ns_i + 1)); sleep 1\n",
+        "        done\n",
+        "        firefox_pid=\"$(process_pid_named_uid firefox 1000 2>/dev/null || true)\"\n",
+        "        if [ \"$firefox_history_seeded\" -eq 1 ]; then echo 'graphics-x11: firefox-nosandbox ok'; else echo 'graphics-x11: firefox-nosandbox failed'; fi\n",
+        "        tail -40 /tmp/lupos-firefox-nosandbox.log 2>/dev/null | sed 's/^/graphics-x11: firefox-nosandbox-log /' || true\n",
+        "        echo 'graphics-x11: firefox-nosandbox end'\n",
+        "    fi\n",
         "    if [ \"$firefox_history_seeded\" -eq 1 ] && [ -n \"$firefox_pid\" ]; then\n",
         "        sleep 2; echo 'graphics-x11: firefox-window-ready'\n",
         "        cjk_suggestion_selected=0; cjk_i=0\n",
@@ -35027,6 +35113,9 @@ CONFIG_MODULES=y
             "curl -L --fail --progress-bar \"$BOOTSTRAP_URL\" -o \"$tmp\"",
             "STAGE_STAMP=\"$STAGE/.lupos-userland-ok\"",
             "safe_clean_dir",
+            "flock 9",
+            ".userland-build.lock",
+            "Serialize refreshes because extract_bootstrap() removes ARCH_ROOTFS",
             "tar --warning=no-unknown-keyword --no-same-owner --delay-directory-restore",
             "chmod -R u+rwX \"$ARCH_ROOTFS\"",
             "cp -a \"$ARCH_ROOTFS/.\" \"$STAGE/\"",

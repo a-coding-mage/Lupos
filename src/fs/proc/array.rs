@@ -107,12 +107,7 @@ fn task_ppid(task: *mut TaskStruct) -> i32 {
     if task.is_null() {
         return 0;
     }
-    let parent = unsafe { (*task).m26.real_parent };
-    if parent.is_null() {
-        0
-    } else {
-        unsafe { (*parent).pid }
-    }
+    crate::kernel::pid_namespace::task_ppid_vnr(task)
 }
 
 pub fn task_stat_ids_for_pid(pid: i32, ppid: i32) -> ProcStatIds {

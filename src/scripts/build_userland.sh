@@ -1569,6 +1569,16 @@ main() {
     [ "$LUPOS_DISTRO" = "arch" ] || die "build_userland.sh now stages Arch; got LUPOS_DISTRO=$LUPOS_DISTRO"
     [ "$(uname -s)" = "Linux" ] || die "Arch bootstrap requires a Linux host"
 
+    # linux-source: no kernel equivalent; this is host-side userland staging.
+    # Serialize refreshes because extract_bootstrap() removes ARCH_ROOTFS while
+    # download_arch_repo_file() writes into it. Without one lock around the
+    # complete transaction, a second build can remove curl's output directory
+    # between mkdir -p and curl -o, producing curl error 23.
+    require_command flock
+    mkdir -p "$TARGET"
+    exec 9>"$TARGET/.userland-build.lock"
+    flock 9
+
     if [ "${LUPOS_ARCH_REFRESH:-0}" != "1" ] && stage_ready; then
         log "Stage already present at $STAGE (set LUPOS_ARCH_REFRESH=1 to rebuild)"
         return

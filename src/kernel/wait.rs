@@ -248,10 +248,11 @@ fn pid_matches(parent: *mut TaskStruct, target: WaitTarget, child_pid: i32) -> b
 unsafe fn find_zombie_child(
     parent: *mut TaskStruct,
     target: WaitTarget,
+    options: i32,
 ) -> Option<*mut TaskStruct> {
     let mut found: *mut TaskStruct = core::ptr::null_mut();
     unsafe {
-        for_each_real_child(parent, target, |c| {
+        for_each_real_child(parent, target, options, |c| {
             if !found.is_null() {
                 return;
             }
@@ -274,10 +275,11 @@ unsafe fn find_zombie_child(
 unsafe fn find_stopped_child(
     parent: *mut TaskStruct,
     target: WaitTarget,
+    options: i32,
 ) -> Option<*mut TaskStruct> {
     let mut found: *mut TaskStruct = core::ptr::null_mut();
     unsafe {
-        for_each_real_child(parent, target, |c| {
+        for_each_real_child(parent, target, options, |c| {
             if !found.is_null() {
                 return;
             }
@@ -311,32 +313,68 @@ unsafe fn child_is_ptrace_stopped(child: *mut TaskStruct) -> bool {
     }
 }
 
+/// Linux `same_thread_group()` (`include/linux/sched/signal.h`): two tasks are
+/// in one thread group when they share a `signal_struct`, which Lupos
+/// represents by an identical `tgid`.
+unsafe fn same_thread_group(p1: *mut TaskStruct, p2: *mut TaskStruct) -> bool {
+    if p1.is_null() || p2.is_null() {
+        return false;
+    }
+    p1 == p2 || unsafe { (*p1).tgid == (*p2).tgid }
+}
+
+/// Linux `is_effectively_child()` (`kernel/exit.c`).
+///
+/// Children belong to the *process*, not to the thread that called `fork()`:
+/// unless `__WNOTHREAD` was requested, any thread of the caller's thread group
+/// may reap a child forked by any other thread.  Matching only `current`
+/// stranded every child forked off a worker thread as an unreapable zombie —
+/// the shape async runtimes (glycin/`async-process`, and anything else that
+/// spawns from a pool thread and reaps from a dedicated SIGCHLD thread) rely
+/// on, which then blocks their caller forever.
+unsafe fn is_effectively_child(
+    current: *mut TaskStruct,
+    parent: *mut TaskStruct,
+    options: i32,
+) -> bool {
+    if current.is_null() || parent.is_null() {
+        return false;
+    }
+    current == parent
+        || (options & __WNOTHREAD == 0 && unsafe { same_thread_group(current, parent) })
+}
+
 unsafe fn ptrace_task_matches_parent(
     parent: *mut TaskStruct,
     target: WaitTarget,
     task: *mut TaskStruct,
+    options: i32,
 ) -> bool {
     if parent.is_null() || task.is_null() {
         return false;
     }
-    unsafe { (*task).m26.tracer == parent && pid_matches(parent, target, (*task).pid) }
+    unsafe {
+        is_effectively_child(parent, (*task).m26.tracer, options)
+            && pid_matches(parent, target, (*task).pid)
+    }
 }
 
 unsafe fn for_each_ptrace_wait_match(
     parent: *mut TaskStruct,
     target: WaitTarget,
+    options: i32,
     mut f: impl FnMut(*mut TaskStruct),
 ) {
     match target {
         WaitTarget::Pid(pid) => {
             let task = lookup_task_by_pid(pid);
-            if unsafe { ptrace_task_matches_parent(parent, target, task) } {
+            if unsafe { ptrace_task_matches_parent(parent, target, task, options) } {
                 f(task);
             }
         }
         _ => {
             let mut visit = |task: *mut TaskStruct| unsafe {
-                if ptrace_task_matches_parent(parent, target, task) {
+                if ptrace_task_matches_parent(parent, target, task, options) {
                     f(task);
                 }
             };
@@ -372,6 +410,7 @@ unsafe fn child_in_array(parent: *mut TaskStruct, task: *mut TaskStruct) -> bool
 unsafe fn for_each_real_child(
     parent: *mut TaskStruct,
     target: WaitTarget,
+    options: i32,
     mut f: impl FnMut(*mut TaskStruct),
 ) {
     if parent.is_null() {
@@ -396,7 +435,7 @@ unsafe fn for_each_real_child(
             let task = lookup_task_by_pid(pid);
             if !task.is_null()
                 && task != parent
-                && unsafe { (*task).m26.real_parent } == parent
+                && unsafe { is_effectively_child(parent, (*task).m26.real_parent, options) }
                 // Linux never links CLONE_THREAD members on the natural
                 // parent's children list. Its negative exit_signal is the
                 // thread_group_leader() discriminator; ptrace wait traversal
@@ -411,7 +450,7 @@ unsafe fn for_each_real_child(
             let mut visit = |task: *mut TaskStruct| unsafe {
                 if !task.is_null()
                     && task != parent
-                    && (*task).m26.real_parent == parent
+                    && is_effectively_child(parent, (*task).m26.real_parent, options)
                     && (*task).m26.exit_signal >= 0
                     && pid_matches(parent, target, (*task).pid)
                     && !child_in_array(parent, task)
@@ -428,10 +467,11 @@ unsafe fn for_each_real_child(
 unsafe fn find_ptrace_wait_task(
     parent: *mut TaskStruct,
     target: WaitTarget,
+    options: i32,
 ) -> Option<*mut TaskStruct> {
     let mut found: *mut TaskStruct = core::ptr::null_mut();
     unsafe {
-        for_each_ptrace_wait_match(parent, target, |task| {
+        for_each_ptrace_wait_match(parent, target, options, |task| {
             if found.is_null() && should_report_stopped_child(task, WUNTRACED) {
                 found = task;
             }
@@ -455,15 +495,15 @@ unsafe fn has_reportable_wait_event(
     target: WaitTarget,
     options: i32,
 ) -> bool {
-    if unsafe { find_zombie_child(parent, target) }.is_some() {
+    if unsafe { find_zombie_child(parent, target, options) }.is_some() {
         return true;
     }
-    if let Some(child) = unsafe { find_stopped_child(parent, target) } {
+    if let Some(child) = unsafe { find_stopped_child(parent, target, options) } {
         if unsafe { should_report_stopped_child(child, options) } {
             return true;
         }
     }
-    if let Some(task) = unsafe { find_ptrace_wait_task(parent, target) } {
+    if let Some(task) = unsafe { find_ptrace_wait_task(parent, target, options) } {
         if unsafe { should_report_stopped_child(task, options) } {
             return true;
         }
@@ -478,10 +518,10 @@ unsafe fn has_reportable_wait_event(
 /// scheduler's terminal `__state` is TASK_DEAD and must not be confused with
 /// EXIT_ZOMBIE.  The intermediate EXIT_ZOMBIE value is retained only for the
 /// short publication window before do_exit() reaches do_task_dead().
-unsafe fn has_exiting_wait_target(parent: *mut TaskStruct, target: WaitTarget) -> bool {
+unsafe fn has_exiting_wait_target(parent: *mut TaskStruct, target: WaitTarget, options: i32) -> bool {
     let mut found = false;
     unsafe {
-        for_each_real_child(parent, target, |c| {
+        for_each_real_child(parent, target, options, |c| {
             let state = (*c).__state.load(Ordering::Acquire);
             if (*c).m26.exit_state & EXIT_ZOMBIE != 0
                 && state != TASK_DEAD
@@ -493,7 +533,7 @@ unsafe fn has_exiting_wait_target(parent: *mut TaskStruct, target: WaitTarget) -
         if found {
             return true;
         }
-        for_each_ptrace_wait_match(parent, target, |task| {
+        for_each_ptrace_wait_match(parent, target, options, |task| {
             let state = (*task).__state.load(Ordering::Acquire);
             if (*task).m26.exit_state & EXIT_ZOMBIE != 0
                 && state != TASK_DEAD
@@ -536,22 +576,22 @@ fn wait_block_action(reportable: bool, exiting: bool, matching: bool) -> WaitBlo
 /// window where `m26.exit_state` advertises exit in progress before `__state`
 /// becomes `EXIT_ZOMBIE`; don't let SIGCHLD escape as EINTR in that window or
 /// a parent can miss the child that is about to become reapable.
-unsafe fn wait_interrupted_by_signal(parent: *mut TaskStruct, target: WaitTarget) -> bool {
-    has_unblocked_pending_signals(parent) && !unsafe { has_exiting_wait_target(parent, target) }
+unsafe fn wait_interrupted_by_signal(parent: *mut TaskStruct, target: WaitTarget, options: i32) -> bool {
+    has_unblocked_pending_signals(parent) && !unsafe { has_exiting_wait_target(parent, target, options) }
 }
 
 /// Returns true iff `parent` has at least one child matching `pid_filter`
 /// (zombie or otherwise).
-unsafe fn has_matching_child(parent: *mut TaskStruct, target: WaitTarget) -> bool {
+unsafe fn has_matching_child(parent: *mut TaskStruct, target: WaitTarget, options: i32) -> bool {
     let mut found = false;
     unsafe {
-        for_each_real_child(parent, target, |_| {
+        for_each_real_child(parent, target, options, |_| {
             found = true;
         });
         if found {
             return true;
         }
-        for_each_ptrace_wait_match(parent, target, |_| {
+        for_each_ptrace_wait_match(parent, target, options, |_| {
             found = true;
         });
     }
@@ -809,7 +849,7 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
             wait_chldexit_guard.prepare();
         }
         // Fast path: zombie child already available?
-        if let Some(child) = unsafe { find_zombie_child(parent, target) } {
+        if let Some(child) = unsafe { find_zombie_child(parent, target, options) } {
             let child_pid = unsafe { (*child).pid };
             let exit_code = unsafe { (*child).m26.exit_code };
             if let Err(errno) = unsafe { copy_wait_status_to_user(stat_addr, exit_code) } {
@@ -834,20 +874,20 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
             return child_pid as i64;
         }
 
-        if let Some(child) = unsafe { find_stopped_child(parent, target) } {
+        if let Some(child) = unsafe { find_stopped_child(parent, target, options) } {
             if unsafe { should_report_stopped_child(child, options) } {
                 return unsafe { report_stopped_task(child, stat_addr, options) };
             }
         }
 
-        if let Some(task) = unsafe { find_ptrace_wait_task(parent, target) } {
+        if let Some(task) = unsafe { find_ptrace_wait_task(parent, target, options) } {
             if unsafe { should_report_stopped_child(task, options) } {
                 return unsafe { report_stopped_task(task, stat_addr, options) };
             }
         }
 
         // No zombie ready.  Bail out if no matching children at all.
-        if !unsafe { has_matching_child(parent, target) } {
+        if !unsafe { has_matching_child(parent, target, options) } {
             #[cfg(not(test))]
             if crate::kernel::debug_trace::proc_enabled() {
                 crate::linux_driver_abi::tty::serial_println!(
@@ -873,7 +913,7 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
         // Linux `do_wait()` breaks out with -ERESTARTSYS once an interruptible
         // child wait observes a pending signal. The arch signal-exit path then
         // turns it into EINTR or rewinds the syscall for SA_RESTART handlers.
-        if unsafe { wait_interrupted_by_signal(parent, target) } {
+        if unsafe { wait_interrupted_by_signal(parent, target, options) } {
             return ERESTARTSYS;
         }
 
@@ -881,10 +921,10 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
         // wait queue, set self interruptible, yield.  When a child exits its
         // `exit_notify` flips us back to TASK_RUNNING.
         unsafe {
-            for_each_real_child(parent, target, |c| {
+            for_each_real_child(parent, target, options, |c| {
                 wait_registration_guard.register(c);
             });
-            for_each_ptrace_wait_match(parent, target, |task| {
+            for_each_ptrace_wait_match(parent, target, options, |task| {
                 wait_registration_guard.register(task);
             });
             (*parent)
@@ -892,8 +932,8 @@ pub unsafe fn sys_wait4(pid: i32, stat_addr: *mut i32, options: i32, _rusage: *m
                 .store(TASK_INTERRUPTIBLE, Ordering::Release);
             let action = wait_block_action(
                 has_reportable_wait_event(parent, target, options),
-                has_exiting_wait_target(parent, target),
-                has_matching_child(parent, target),
+                has_exiting_wait_target(parent, target, options),
+                has_matching_child(parent, target, options),
             );
             match action {
                 WaitBlockAction::Recheck => {}
@@ -997,7 +1037,7 @@ pub unsafe fn sys_waitid(
         unsafe {
             wait_chldexit_guard.prepare();
         }
-        if let Some(child) = unsafe { find_zombie_child(parent, target) } {
+        if let Some(child) = unsafe { find_zombie_child(parent, target, options) } {
             let child_pid = unsafe { (*child).pid };
             let exit_code = unsafe { (*child).m26.exit_code };
             let (si_code, si_status) = waitid_code_status(exit_code);
@@ -1035,7 +1075,7 @@ pub unsafe fn sys_waitid(
             return 0;
         }
 
-        if let Some(child) = unsafe { find_stopped_child(parent, target) } {
+        if let Some(child) = unsafe { find_stopped_child(parent, target, options) } {
             if unsafe { should_report_stopped_child(child, options) } {
                 let child_pid = unsafe { (*child).pid };
                 let sig = unsafe { (*child).m26.ptrace_stop_signal };
@@ -1064,7 +1104,7 @@ pub unsafe fn sys_waitid(
             }
         }
 
-        if let Some(task) = unsafe { find_ptrace_wait_task(parent, target) } {
+        if let Some(task) = unsafe { find_ptrace_wait_task(parent, target, options) } {
             if unsafe { should_report_stopped_child(task, options) } {
                 let task_pid = unsafe { (*task).pid };
                 let sig = unsafe { (*task).m26.ptrace_stop_signal };
@@ -1093,7 +1133,7 @@ pub unsafe fn sys_waitid(
             }
         }
 
-        if !unsafe { has_matching_child(parent, target) } {
+        if !unsafe { has_matching_child(parent, target, options) } {
             #[cfg(not(test))]
             if crate::kernel::debug_trace::proc_enabled() {
                 crate::linux_driver_abi::tty::serial_println!(
@@ -1116,15 +1156,15 @@ pub unsafe fn sys_waitid(
 
         // See `sys_wait4`: Linux's child wait is interruptible by any
         // unblocked pending signal after immediate child events are exhausted.
-        if unsafe { wait_interrupted_by_signal(parent, target) } {
+        if unsafe { wait_interrupted_by_signal(parent, target, options) } {
             return ERESTARTSYS;
         }
 
         unsafe {
-            for_each_real_child(parent, target, |c| {
+            for_each_real_child(parent, target, options, |c| {
                 wait_registration_guard.register(c);
             });
-            for_each_ptrace_wait_match(parent, target, |task| {
+            for_each_ptrace_wait_match(parent, target, options, |task| {
                 wait_registration_guard.register(task);
             });
             (*parent)
@@ -1132,8 +1172,8 @@ pub unsafe fn sys_waitid(
                 .store(TASK_INTERRUPTIBLE, Ordering::Release);
             let action = wait_block_action(
                 has_reportable_wait_event(parent, target, options),
-                has_exiting_wait_target(parent, target),
-                has_matching_child(parent, target),
+                has_exiting_wait_target(parent, target, options),
+                has_matching_child(parent, target, options),
             );
             match action {
                 WaitBlockAction::Recheck => {}
@@ -1301,7 +1341,7 @@ mod tests {
             Ordering::Release,
         );
 
-        let found = unsafe { find_stopped_child(&mut *parent as *mut TaskStruct, WaitTarget::Any) };
+        let found = unsafe { find_stopped_child(&mut *parent as *mut TaskStruct, WaitTarget::Any, 0) };
 
         assert_eq!(found, Some(&mut *child as *mut TaskStruct));
         assert_eq!(w_stopped(5), (5 << 8) | 0x7f);
@@ -1438,7 +1478,8 @@ mod tests {
 
             assert!(has_exiting_wait_target(
                 &mut *parent as *mut TaskStruct,
-                WaitTarget::Any
+                WaitTarget::Any,
+                0
             ));
             assert!(!has_reportable_wait_event(
                 &mut *parent as *mut TaskStruct,
@@ -1447,13 +1488,14 @@ mod tests {
             ));
             assert!(has_matching_child(
                 &mut *parent as *mut TaskStruct,
-                WaitTarget::Any
+                WaitTarget::Any,
+                0
             ));
             assert_eq!(
                 wait_block_action(
                     has_reportable_wait_event(&mut *parent as *mut TaskStruct, WaitTarget::Any, 0),
-                    has_exiting_wait_target(&mut *parent as *mut TaskStruct, WaitTarget::Any),
-                    has_matching_child(&mut *parent as *mut TaskStruct, WaitTarget::Any),
+                    has_exiting_wait_target(&mut *parent as *mut TaskStruct, WaitTarget::Any, 0),
+                    has_matching_child(&mut *parent as *mut TaskStruct, WaitTarget::Any, 0),
                 ),
                 WaitBlockAction::Yield,
                 "the parent must remain runnable and yield while zombie publication finishes"
@@ -1503,10 +1545,12 @@ mod tests {
             assert!(has_exiting_wait_target(
                 &mut *parent as *mut TaskStruct,
                 WaitTarget::Any,
+                0,
             ));
             assert!(!wait_interrupted_by_signal(
                 &mut *parent as *mut TaskStruct,
                 WaitTarget::Any,
+                0,
             ));
 
             sched::set_current(previous);
