@@ -127,7 +127,7 @@ unsafe impl Send for TaskPidInfo {}
 static TASK_PID_INFOS: Mutex<Vec<TaskPidInfo>> = Mutex::new(Vec::new());
 
 #[inline]
-fn is_init_pid_ns(ns: *const PidNamespace) -> bool {
+pub fn is_init_pid_ns(ns: *const PidNamespace) -> bool {
     core::ptr::eq(ns, &raw const INIT_PID_NS_M28)
 }
 
