@@ -31,6 +31,7 @@ use crate::kernel::sched;
 use crate::kernel::signal::{self, SIGCHLD};
 use crate::kernel::task::task_state::{EXIT_DEAD, EXIT_ZOMBIE, TASK_DEAD};
 use crate::kernel::task::{MAX_CHILDREN, TaskStruct};
+use alloc::vec::Vec;
 
 /// Linux serializes exit-state publication, `__exit_signal()`, and the
 /// last-nonleader leader notification with `tasklist_lock` held for write.
@@ -225,29 +226,199 @@ unsafe fn add_child_link(parent: *mut TaskStruct, child: *mut TaskStruct) {
     }
 }
 
+/// Linux `find_alive_thread()` (`kernel/exit.c`): the first thread of `p`'s
+/// group that is not already exiting.
+unsafe fn find_alive_thread(p: *mut TaskStruct) -> *mut TaskStruct {
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
+    let tgid = unsafe { (*p).tgid };
+    let mut found: *mut TaskStruct = core::ptr::null_mut();
+    {
+        let mut visit = |t: *mut TaskStruct| unsafe {
+            if !found.is_null() || t.is_null() || t == p {
+                return;
+            }
+            if (*t).tgid == tgid && (*t).m26.exit_state == 0 {
+                found = t;
+            }
+        };
+        crate::kernel::fork::for_each_heap_task(&mut visit);
+        sched::for_each_pool_task(&mut visit);
+    }
+    found
+}
+
+/// The PID namespace's `child_reaper`, i.e. its `init`.
+///
+/// `register_task_pid()` only records a `child_reaper` for *nested* namespaces,
+/// so the initial namespace's slot starts NULL.  Resolve PID 1 on first use and
+/// cache it, mirroring the invariant Linux establishes when `init` is forked.
+unsafe fn pid_ns_child_reaper(tsk: *mut TaskStruct) -> *mut TaskStruct {
+    let ns = crate::kernel::pid_namespace::task_active_pid_ns(tsk);
+    if ns.is_null() {
+        return core::ptr::null_mut();
+    }
+    let cached = unsafe { (*ns).child_reaper };
+    if !cached.is_null() {
+        return cached;
+    }
+    // Only the *initial* namespace may be resolved by looking up global PID 1.
+    // A nested namespace records its own init in `register_task_pid()`; falling
+    // back to global PID 1 for one of those would hand a sandboxed orphan to
+    // the host's systemd and poison that namespace's cached reaper with a task
+    // from outside it.
+    if !crate::kernel::pid_namespace::is_init_pid_ns(ns) {
+        return core::ptr::null_mut();
+    }
+    let init = crate::kernel::fork::find_heap_task_by_pid(1);
+    let init = if init.is_null() {
+        sched::find_pool_task_by_pid(1)
+    } else {
+        init
+    };
+    if !init.is_null() {
+        unsafe { (*ns).child_reaper = init };
+    }
+    init
+}
+
+/// Linux `find_child_reaper()` (`kernel/exit.c`).
+///
+/// The base reaper is the PID namespace's `init`, **not** the dying task's own
+/// parent.  Returning `real_parent` here (as this used to) walks the wrong
+/// direction: an orphaned grandchild inherits a parent that may itself already
+/// be dead, and once one generation reparents to NULL every descendant below it
+/// is stranded as a permanently unreapable zombie.
+/// The nearest init of an *ancestor* PID namespace, ending at the initial
+/// namespace's PID 1.
+///
+/// Linux never needs this: when a namespace's init dies,
+/// `zap_pid_ns_processes()` kills and reaps everything left inside that
+/// namespace, so no survivor ever needs an adopter outside it.  Lupos has no
+/// zapper yet, so the survivors must escape upwards — handing them to the dying
+/// init itself (which is about to be freed) is what left `bwrap`'s sandboxed
+/// `glycin-*` children as unreapable `ppid 0` zombies.
+unsafe fn ancestor_ns_child_reaper(tsk: *mut TaskStruct) -> *mut TaskStruct {
+    let mut ns = crate::kernel::pid_namespace::task_active_pid_ns(tsk);
+    for _ in 0..=crate::kernel::pid_namespace::MAX_PID_NS_LEVEL {
+        if ns.is_null() {
+            break;
+        }
+        let candidate = unsafe { (*ns).child_reaper };
+        if !candidate.is_null() && candidate != tsk {
+            return candidate;
+        }
+        ns = unsafe { (*ns).parent } as *mut _;
+    }
+    let init = crate::kernel::fork::find_heap_task_by_pid(1);
+    if init.is_null() {
+        sched::find_pool_task_by_pid(1)
+    } else {
+        init
+    }
+}
+
 unsafe fn find_child_reaper(tsk: *mut TaskStruct) -> *mut TaskStruct {
     if tsk.is_null() {
         return core::ptr::null_mut();
     }
+    let reaper = unsafe { pid_ns_child_reaper(tsk) };
+    if !reaper.is_null() && reaper != tsk {
+        return reaper;
+    }
+    if reaper == tsk {
+        // `father` is itself this namespace's init: hand the namespace to
+        // another live thread of its group, as Linux does before giving up.
+        let alive = unsafe { find_alive_thread(tsk) };
+        if !alive.is_null() {
+            let ns = crate::kernel::pid_namespace::task_active_pid_ns(tsk);
+            if !ns.is_null() {
+                unsafe { (*ns).child_reaper = alive };
+            }
+            return alive;
+        }
+    }
+    // Either this namespace has no init recorded, or its init is the task that
+    // is dying right now.  Both must resolve outside the dying task.
+    unsafe { ancestor_ns_child_reaper(tsk) }
+}
 
-    let fallback = unsafe { (*tsk).m26.real_parent };
-    if fallback.is_null()
-        || unsafe {
-            (*tsk).m27.mdwe_flags & crate::kernel::task::TASK_CTRL_HAS_CHILD_SUBREAPER == 0
+/// Linux `find_new_reaper()` (`kernel/exit.c`): prefer a surviving thread of
+/// the dying task's own group — so a *thread* exit never detaches the process's
+/// children — then the nearest `child_subreaper` ancestor, then the namespace's
+/// init.
+unsafe fn find_new_reaper(
+    father: *mut TaskStruct,
+    child_reaper: *mut TaskStruct,
+) -> *mut TaskStruct {
+    let thread = unsafe { find_alive_thread(father) };
+    if !thread.is_null() {
+        return thread;
+    }
+
+    if !father.is_null()
+        && unsafe {
+            (*father).m27.mdwe_flags & crate::kernel::task::TASK_CTRL_HAS_CHILD_SUBREAPER != 0
         }
     {
-        return fallback;
+        let mut reaper = unsafe { (*father).m26.real_parent };
+        while !reaper.is_null() && reaper != child_reaper {
+            if unsafe {
+                (*reaper).m27.mdwe_flags & crate::kernel::task::TASK_CTRL_CHILD_SUBREAPER != 0
+            } {
+                let thread = unsafe { find_alive_thread(reaper) };
+                if !thread.is_null() {
+                    return thread;
+                }
+            }
+            reaper = unsafe { (*reaper).m26.real_parent };
+        }
     }
 
-    let mut reaper = fallback;
-    while !reaper.is_null() {
-        if unsafe { (*reaper).m27.mdwe_flags & crate::kernel::task::TASK_CTRL_CHILD_SUBREAPER != 0 }
-        {
-            return reaper;
-        }
-        reaper = unsafe { (*reaper).m26.real_parent };
+    child_reaper
+}
+
+/// Every task whose `real_parent` is `father`.
+///
+/// The fixed-size `m26.children` cache only holds `MAX_CHILDREN` entries and
+/// silently drops the rest, so reparenting off that array alone left the
+/// overflow children pointing at a task about to be freed — they became zombies
+/// no one could ever wait for.  glycin alone spawns dozens of loaders, well past
+/// the cache bound.
+unsafe fn collect_real_children(father: *mut TaskStruct) -> Vec<*mut TaskStruct> {
+    let mut children: Vec<*mut TaskStruct> = Vec::new();
+    if father.is_null() {
+        return children;
     }
-    fallback
+    let saturated = unsafe {
+        let n = (*father).m26.children_count as usize;
+        for i in 0..n.min(MAX_CHILDREN) {
+            let c = (*father).m26.children[i];
+            if !c.is_null() && !children.contains(&c) {
+                children.push(c);
+            }
+        }
+        n >= MAX_CHILDREN
+    };
+    // Linux walks `father->children`, an O(children) list.  Lupos has no such
+    // list, so the authoritative sweep is a scan of every task — far too
+    // expensive to run on every exit while `exit_notify()` holds TASKLIST_LOCK
+    // with interrupts off.  The cache array is complete unless it filled up, so
+    // only pay for the sweep in exactly the overflow case it exists for.
+    if saturated {
+        let mut visit = |task: *mut TaskStruct| unsafe {
+            if task.is_null() || task == father {
+                return;
+            }
+            if (*task).m26.real_parent == father && !children.contains(&task) {
+                children.push(task);
+            }
+        };
+        crate::kernel::fork::for_each_heap_task(&mut visit);
+        sched::for_each_pool_task(&mut visit);
+    }
+    children
 }
 
 /// Drop the task's fd-table reference.
@@ -467,13 +638,15 @@ unsafe fn exit_notify_locked(tsk: *mut TaskStruct, notify_parent: bool) {
         return;
     }
     unsafe {
-        // Reparent children to the closest child subreaper, falling back
-        // to our real_parent when no subreaper ancestor exists.
-        let new_parent = find_child_reaper(tsk);
-        let n = (*tsk).m26.children_count as usize;
-        for i in 0..n.min(MAX_CHILDREN) {
-            let c = (*tsk).m26.children[i];
-            if !c.is_null() {
+        // Linux `forget_original_parent()`: resolve the namespace's reaper
+        // first, then narrow it to a surviving group thread or subreaper, then
+        // move *every* real child over — not just the ones that fit in the
+        // fixed-size cache array.
+        let child_reaper = find_child_reaper(tsk);
+        let children = collect_real_children(tsk);
+        if !children.is_empty() {
+            let new_parent = find_new_reaper(tsk, child_reaper);
+            for c in children {
                 signal::reparent_thread_group(c, tsk, new_parent);
                 add_child_link(new_parent, c);
             }
