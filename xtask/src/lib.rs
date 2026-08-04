@@ -5616,9 +5616,13 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // single-threaded control first, so "threads matter" is measured
         // rather than assumed.
         "echo 'graphics-x11: forkstorm begin'\n",
-        "timeout -k 5 180 /usr/bin/python3 - <<'PYEOF' 2>&1 | sed 's/^/graphics-x11: forkstorm /'\n",
+        // `-u` is load-bearing: stdout here is a pipe, so CPython block-buffers
+        // it and a hang loses every progress line written before the hang —
+        // the first attempt reported only `timeout: ... dumped core` with no
+        // phase results at all.
+        "timeout -k 5 300 /usr/bin/python3 -u - <<'PYEOF' 2>&1 | sed 's/^/graphics-x11: forkstorm /'\n",
         "import mmap, os, sys, threading, time\n",
-        "PAGES, ITERS = 8, 400\n",
+        "PAGES, ITERS = 8, 150\n",
         "buf = mmap.mmap(-1, 4096 * PAGES)\n",
         "for p in range(PAGES):\n",
         "    buf[p * 4096:p * 4096 + 8] = b'\\xaa' * 8\n",
@@ -5685,14 +5689,14 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "        if wait_child(pid, i, 'exec') != 0:\n",
         "            return 1\n",
         "    return 0\n",
-        "print('cow-single lost=%d' % cow_round(50))\n",
-        "print('exec-single rc=%d' % exec_round(50))\n",
+        "print('phase cow-single'); print('cow-single lost=%d' % cow_round(25))\n",
+        "print('phase exec-single'); print('exec-single rc=%d' % exec_round(25))\n",
         "ths = [threading.Thread(target=churn, daemon=True) for _ in range(6)]\n",
         "for t in ths:\n",
         "    t.start()\n",
         "time.sleep(0.5)\n",
-        "print('cow-threaded lost=%d' % cow_round(ITERS))\n",
-        "print('exec-threaded rc=%d' % exec_round(ITERS))\n",
+        "print('phase cow-threaded'); print('cow-threaded lost=%d' % cow_round(ITERS))\n",
+        "print('phase exec-threaded'); print('exec-threaded rc=%d' % exec_round(ITERS))\n",
         "stop = True\n",
         "print('done')\n",
         "PYEOF\n",
