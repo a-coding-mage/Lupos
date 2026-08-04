@@ -261,8 +261,7 @@ unsafe fn task_stat_text(task: *mut TaskStruct) -> alloc::string::String {
     // fully idle machine look busy and hides where a task is blocked.
     let state = super::array::task_state_char(task);
     let (pid, ppid, comm) = unsafe {
-        let parent = (*task).m26.real_parent;
-        let ppid = if parent.is_null() { 0 } else { (*parent).pid };
+        let ppid = crate::kernel::pid_namespace::task_ppid_vnr(task);
         ((*task).pid, ppid, super::util::task_comm(task))
     };
     let ids = super::array::task_stat_ids_for_pid(pid, ppid);
@@ -719,8 +718,7 @@ fn proc_pid_status_show(node: &Arc<KernfsNode>, buf: &mut [u8]) -> Result<usize,
     // hides exactly the stalls this file exists to diagnose.
     let state = super::array::task_state_text(task);
     let (tgid, ppid, comm) = unsafe {
-        let parent = (*task).m26.real_parent;
-        let ppid = if parent.is_null() { 0 } else { (*parent).pid };
+        let ppid = crate::kernel::pid_namespace::task_ppid_vnr(task);
         ((*task).tgid, ppid, super::util::task_comm(task))
     };
     let text = super::util::format_status(&super::util::ProcStatusView {

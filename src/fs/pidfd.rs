@@ -228,12 +228,9 @@ fn pidfd_ioctl(file: &FileRef, cmd: u32, arg: u64) -> Result<i64, i32> {
     let ppid = if state.task.is_null() || state.exited {
         0
     } else {
-        let parent = unsafe { (*state.task).m26.real_parent };
-        if parent.is_null() {
-            0
-        } else {
-            unsafe { (*parent).pid }
-        }
+        // `fs/pidfs.c::pidfd_info()` reports `task_ppid_vnr(task)`, i.e. the
+        // parent thread group's ID, not the forking thread's TID.
+        crate::kernel::pid_namespace::task_ppid_vnr(state.task)
     };
     let mut info = PidfdInfo::default();
     let _ = requested_mask;

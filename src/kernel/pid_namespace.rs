@@ -211,6 +211,32 @@ pub fn task_tgid_vnr(task: *mut TaskStruct) -> i32 {
     task_tgid_nr_ns(task, ns)
 }
 
+/// Linux `pid_alive()` (`include/linux/pid.h`): a task structure is stale once
+/// `release_task()` has detached its `thread_pid`, and pointers inside it must
+/// not be dereferenced after that.
+pub fn pid_alive(task: *mut TaskStruct) -> bool {
+    !task.is_null() && !unsafe { (*task).m26.thread_pid }.is_null()
+}
+
+/// Linux `task_ppid_nr_ns()` (`include/linux/pid.h`).
+///
+/// The reported parent is the parent's **thread-group** ID, never the raw TID
+/// of the thread that happened to call `fork()`.  A process forked from a
+/// non-leader thread must still report the parent process, otherwise `ps`,
+/// `pkill -P` and every process-tree walker see a parent that does not exist.
+pub fn task_ppid_nr_ns(task: *mut TaskStruct, ns: *mut PidNamespace) -> i32 {
+    if !pid_alive(task) {
+        return 0;
+    }
+    let parent = unsafe { (*task).m26.real_parent };
+    task_tgid_nr_ns(parent, ns)
+}
+
+pub fn task_ppid_vnr(task: *mut TaskStruct) -> i32 {
+    let ns = task_active_pid_ns(task);
+    task_ppid_nr_ns(task, ns)
+}
+
 fn alloc_visible_pid(ns: *mut PidNamespace) -> Result<i32, i32> {
     let nr = unsafe { (*ns).next_pid.fetch_add(1, Ordering::AcqRel) };
     if nr == 0 || nr >= PID_MAX_LIMIT {

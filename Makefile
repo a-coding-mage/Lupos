@@ -79,6 +79,11 @@ help:
 	@echo "  make test                 - run the public cargo xtask test gate"
 	@echo "  make test-boot            - run cargo xtask test --boot"
 	@echo "  make ping-smoke           - run cargo xtask run --ping-smoke"
+	@echo "  make clean                - remove Cargo and xtask build artifacts"
+
+.PHONY: clean
+clean:
+	@$(CARGO) clean
 
 .PHONY: all
 all: image
