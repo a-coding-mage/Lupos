@@ -129,6 +129,15 @@ impl PollTable {
             file: fget(file),
             queue: queue_ptr,
         });
+        // An eventpoll-owned entry keeps this pin for the whole watch, so it
+        // must be discounted by the final-close test in
+        // `eventpoll::notify_fd_closed()`.  A task-owned table belongs to an
+        // in-flight select/poll syscall and is torn down before that syscall
+        // returns, which is why Linux's `poll_freewait()` needs no accounting
+        // and why these are deliberately not counted.
+        if matches!(self.owner, PollTableOwner::Callback { .. }) {
+            file.f_ep_pins.fetch_add(1, Ordering::AcqRel);
+        }
         match self.owner {
             PollTableOwner::Task(task) => unsafe {
                 queue.add_poll_wait(task, self.triggered.clone());
@@ -207,6 +216,9 @@ impl PollTable {
                 PollTableOwner::Callback { id, .. } => unsafe {
                     (&*entry.queue).remove_callback(id);
                 },
+            }
+            if matches!(self.owner, PollTableOwner::Callback { .. }) {
+                entry.file.f_ep_pins.fetch_sub(1, Ordering::AcqRel);
             }
             fput(entry.file);
         }

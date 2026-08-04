@@ -22,7 +22,7 @@ use crate::fs::fdtable::FilesStruct;
 use crate::fs::file::{fget, fput};
 use crate::fs::ops::FileOps;
 use crate::fs::select;
-use crate::fs::types::FileRef;
+use crate::fs::types::{EpollHook, FileRef};
 use crate::include::uapi::errno::{EBADF, EEXIST, EFAULT, EINTR, EINVAL, ENOENT, EPERM};
 use crate::kernel::locking::{Mutex, SpinLock};
 use crate::kernel::sched::wait::WaitQueueHead;
@@ -466,6 +466,11 @@ impl EventPoll {
             callback_driven: AtomicBool::new(false),
         });
         self.insert_item_locked(item.clone());
+        // Linux `attach_epitem()` links the new epitem into `file->f_ep` under
+        // `file->f_lock` while `ep->mtx` is held, so a concurrent
+        // `eventpoll_release_file()` either sees the complete hook or none of
+        // it.  Ref: vendor/linux/fs/eventpoll.c:attach_epitem.
+        attach_epitem(item.file(), self.token, id);
 
         // Register before sampling readiness, as ep_insert()/ep_item_poll() do.
         // The item is already published, so a racing callback either queues it
@@ -489,8 +494,25 @@ impl EventPoll {
         Ok(())
     }
 
-    fn remove_matching(&self, mut matches: impl FnMut(&EpItem) -> bool) -> usize {
+    fn remove_matching(&self, matches: impl FnMut(&EpItem) -> bool) -> usize {
         let _mtx = self.mtx.lock();
+        self.remove_matching_locked(matches)
+    }
+
+    /// Remove one epitem named by a `file->f_ep` hook.
+    ///
+    /// Linux's `eventpoll_release_file()` already holds `ep->mtx` around
+    /// `ep_unregister_pollwait()` / `ep_remove_file()` / `ep_remove_epi()`, so
+    /// this must not retake it.  Returns whether an epitem was found.
+    ///
+    /// Ref: vendor/linux/fs/eventpoll.c:1419-1426.
+    fn remove_hooked_item(&self, item_id: usize, file: &FileRef) -> bool {
+        self.remove_matching_locked(|item| item.id == item_id && Arc::ptr_eq(item.file(), file))
+            != 0
+    }
+
+    /// Body of [`Self::remove_matching`] with `ep->mtx` already held.
+    fn remove_matching_locked(&self, mut matches: impl FnMut(&EpItem) -> bool) -> usize {
         let mut count = 0;
         loop {
             let removed = self.with_state_irqsave(|state| {
@@ -510,6 +532,10 @@ impl EventPoll {
             // watched-file reference.  This is Linux ep_unregister_pollwait()
             // followed by the epitem fput ordering.
             item.poll_table.lock().finish();
+            // Linux `ep_remove_file()` unlinks `epi->fllink` from
+            // `file->f_ep` under `file->f_lock`, with `ep->mtx` already held.
+            // Ref: vendor/linux/fs/eventpoll.c:1096.
+            detach_epitem(item.file(), self.token, item.id);
             drop(item);
             count += 1;
         }
@@ -553,10 +579,6 @@ impl EventPoll {
 
     pub fn remove_closed_file(&self, fd: i32, file: &FileRef) {
         self.remove_matching(|item| item.fd == fd && Arc::ptr_eq(item.file(), file));
-    }
-
-    fn remove_file(&self, file: &FileRef) {
-        self.remove_matching(|item| Arc::ptr_eq(item.file(), file));
     }
 
     pub fn clear(&self) {
@@ -855,37 +877,108 @@ fn nested_graph_accepts(source_token: usize, target_token: usize) -> bool {
         .all(|root| nested_path_valid(&graph, root, 0, &mut BTreeSet::new()))
 }
 
+/// Link one epitem into `file->f_ep`.
+///
+/// Ref: vendor/linux/fs/eventpoll.c — `attach_epitem()`.
+fn attach_epitem(file: &FileRef, ep_token: usize, item_id: usize) {
+    file.f_ep.lock().push(EpollHook { ep_token, item_id });
+    file.f_ep_pins.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Unlink one epitem from `file->f_ep`.
+///
+/// Ref: vendor/linux/fs/eventpoll.c:1096 — `ep_remove_file()`, which takes
+/// `file->f_lock`, drops the `epi->fllink` node and returns with it released.
+/// The caller holds `ep->mtx`, matching `lockdep_assert_held(&ep->mtx)`.
+fn detach_epitem(file: &FileRef, ep_token: usize, item_id: usize) {
+    let hook = EpollHook { ep_token, item_id };
+    let removed = {
+        let mut hooks = file.f_ep.lock();
+        match hooks.iter().position(|entry| *entry == hook) {
+            Some(idx) => {
+                hooks.remove(idx);
+                true
+            }
+            None => false,
+        }
+    };
+    if removed {
+        file.f_ep_pins.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Linux `eventpoll_release_file()` — drop every epoll watch on a file that is
+/// going away.
+///
+/// Ref: vendor/linux/fs/eventpoll.c:1397.
+///
+/// The structure of the loop is the contract, not an implementation detail.
+/// Linux re-reads `file->f_ep` each pass and holds **one** `ep->mtx` at a
+/// time, never while `f_lock` is held:
+///
+/// ```text
+/// again:
+///     spin_lock(&file->f_lock);
+///     if (file->f_ep && file->f_ep->first) {
+///             epi = hlist_entry(file->f_ep->first, struct epitem, fllink);
+///             spin_unlock(&file->f_lock);
+///             ep = epi->ep;
+///             mutex_lock(&ep->mtx);
+///             ...
+///             mutex_unlock(&ep->mtx);
+///             goto again;
+///     }
+///     spin_unlock(&file->f_lock);
+/// ```
+///
+/// The previous Lupos version instead snapshotted **every** eventpoll instance
+/// in the system and, for each, took that instance's `mtx` and then every
+/// matching epitem's poll-table mutex, purely to count internal references.
+/// That is the "global scan replacing a Linux intrusive list" substitution:
+/// besides being O(instances x watches) on every single close, it made one
+/// close serialize on locks belonging to unrelated processes.  Measured
+/// in-guest with `lupos.trace=stall`: 4367 samples of tasks parked in
+/// `Mutex<PollTable>::lock` under `notify_fd_closed`, with systemd, udevd,
+/// journald, NetworkManager, logind, xfce4-session and every bwrap/glycin
+/// task in `D` state and no runnable task left on any CPU.
 pub fn notify_fd_closed(file: &FileRef) {
-    if file.fops.poll.is_none() {
+    // Linux's `eventpoll_release()` fast path: a file no epoll watches is the
+    // overwhelmingly common case and costs one test.
+    // Ref: vendor/linux/include/linux/eventpoll.h — `eventpoll_release()`.
+    if file.fops.poll.is_none() || file.f_ep.lock().is_empty() {
         return;
     }
-    // File::f_count is Lupos' logical Linux file reference count: dup/fork and
-    // SCM_RIGHTS use fget(), while FilesStruct::get() Arc clones are temporary
-    // Rust lifetime pins and deliberately do not change it. Each epitem owns
-    // one artificial fget, and each PollTableEntry owns one more to keep its
-    // raw waitqueue pointer alive. Discount exactly those implementation pins;
-    // the closing fd's not-yet-fput reference must then be the sole remainder.
-    let epolls: Vec<_> = epolls_snapshot().into_iter().map(|(_, ep)| ep).collect();
-    let internal_refs = epolls
-        .iter()
-        .map(|ep| {
-            let _mtx = ep.mtx.lock();
-            ep.items_snapshot_locked()
-                .into_iter()
-                .filter(|item| Arc::ptr_eq(item.file(), file))
-                .map(|item| 1usize.saturating_add(item.poll_table.lock().registration_count()))
-                .sum::<usize>()
-        })
-        .sum::<usize>();
-    if file.f_count.load(Ordering::Acquire) != internal_refs.saturating_add(1) {
+    // Linux runs this from `__fput()`, i.e. only once the last reference is
+    // gone.  Lupos calls it before `fput()` from the close paths, so the
+    // final-close test lives here instead; `f_ep_pins` counts exactly the
+    // references eventpoll itself owns (see `File::f_ep_pins`).
+    if file.f_count.load(Ordering::Acquire)
+        != file.f_ep_pins.load(Ordering::Acquire).saturating_add(1)
+    {
         return;
     }
 
-    // Linux eventpoll_release_file() walks file->f_ep and removes this open-file
-    // description from every watching epoll, including inherited epoll objects
-    // which are not present in the closing task's FilesStruct.
-    for ep in epolls {
-        ep.remove_file(file);
+    loop {
+        let Some(hook) = file.f_ep.lock().first().copied() else {
+            break;
+        };
+        let ep = with_epolls_irqsave(|epolls| epolls.get(&hook.ep_token).cloned());
+        let Some(ep) = ep else {
+            // The watching instance was released between the two lookups.
+            // Linux cannot reach this state because `epi->ep` pins the
+            // eventpoll; drop the stale hook so the walk still terminates.
+            detach_epitem(file, hook.ep_token, hook.item_id);
+            continue;
+        };
+        let removed = {
+            let _mtx = ep.mtx.lock();
+            ep.remove_hooked_item(hook.item_id, file)
+        };
+        if !removed {
+            // The epitem is already gone but its hook survived; retiring it
+            // here keeps the `again:` loop finite.
+            detach_epitem(file, hook.ep_token, hook.item_id);
+        }
     }
 }
 

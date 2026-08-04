@@ -298,6 +298,44 @@ pub struct File {
     pub poll_event: AtomicU64,
     /// FS-private file state (e.g., readdir cursor).
     pub private: Mutex<usize>,
+    /// Linux `struct file::f_ep` — every epoll hook watching this open file
+    /// description.  `eventpoll_release_file()` walks exactly this list, so a
+    /// close touches only the epoll instances that actually watch the file.
+    ///
+    /// Ref: vendor/linux/include/linux/fs.h:1285 (`struct hlist_head *f_ep`);
+    /// line 1229 documents its guard: "Protects f_ep, f_flags. Must not be
+    /// taken from IRQ context."
+    pub f_ep: Mutex<Vec<EpollHook>>,
+    /// Count of file references that exist only because eventpoll pins this
+    /// file internally (one per epitem, one per persistent poll-table entry).
+    ///
+    /// linux-deviation: Linux's `struct epitem` stores `ffd.file` *without* a
+    /// counted reference and upgrades it opportunistically through
+    /// `epi_fget()` (vendor/linux/fs/eventpoll.c:1083), so `__fput()` runs as
+    /// soon as the last userspace reference goes away and
+    /// `eventpoll_release()` needs no arithmetic at all.  Lupos's epitem holds
+    /// a real `fget`, so the final-close test has to discount those pins.
+    /// Keeping the count in one atomic makes that test a single load instead
+    /// of a walk that locks every epoll instance and every poll table.
+    pub f_ep_pins: AtomicUsize,
+}
+
+/// One entry of Linux's `file->f_ep` list: the eventpoll instance watching
+/// this file and the epitem inside it.
+///
+/// linux-deviation: Linux links `struct epitem` itself through `epi->fllink`
+/// (vendor/linux/fs/eventpoll.c:1122 `hlist_del_rcu(&epi->fllink)`).  An
+/// owning back-pointer is not expressible here because the epitem is held by
+/// an `Arc` inside its eventpoll and it also holds a reference to this file,
+/// which would form a cycle Linux avoids precisely by not counting
+/// `epi->ffd.file`.  Tokens preserve the lookup without the cycle, and a stale
+/// token resolves to `None` exactly as `epi_fget()` returns NULL.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EpollHook {
+    /// Registry token of the watching `EventPoll`.
+    pub ep_token: usize,
+    /// Identity of the epitem inside that `EventPoll`.
+    pub item_id: usize,
 }
 
 impl File {
@@ -313,6 +351,8 @@ impl File {
             f_count: AtomicUsize::new(1),
             poll_event: AtomicU64::new(0),
             private: Mutex::new(0),
+            f_ep: Mutex::new(Vec::new()),
+            f_ep_pins: AtomicUsize::new(0),
         });
         if fops.name == "kernfs_file" {
             crate::fs::kernfs::initialize_poll_event(&file);

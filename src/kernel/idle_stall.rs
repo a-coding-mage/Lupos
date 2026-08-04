@@ -188,10 +188,16 @@ fn report(idle_jiffies: u64) {
         // them on the host with
         //   addr2line -f -C -e target/xtask/cargo-graphics-x11/x86_64-lupos/release/lupos <addr>
         //
-        // A `D` task is descheduled, so `thread.sp` is stable and its stack is
-        // quiescent. Only kernel-text-looking words are printed, and the count
-        // is capped, so this stays a few lines per stalled task.
-        if state & task_state::TASK_UNINTERRUPTIBLE != 0 {
+        // A blocked task is descheduled, so `thread.sp` is stable and its
+        // stack is quiescent. Only kernel-text-looking words are printed, and
+        // the count is capped, so this stays a few lines per stalled task.
+        //
+        // Linux `show_state_filter(0)` dumps every blocked task, not just the
+        // uninterruptible ones, and that breadth is what identifies a *lock
+        // holder*: the tasks piled on a contended mutex show up as `D`, but
+        // whoever owns it is frequently asleep in `S` somewhere else entirely
+        // and would otherwise be the one task with no stack in the report.
+        if state & (task_state::TASK_UNINTERRUPTIBLE | task_state::TASK_INTERRUPTIBLE) != 0 {
             let sp = unsafe { (*task).thread.sp };
             if sp != 0 {
                 let mut shown = 0u32;
