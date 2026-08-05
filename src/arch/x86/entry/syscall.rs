@@ -1476,8 +1476,15 @@ fn trace_firefox_syscall_enter(
     } else if !firefox_trace_event_allowed(nr) {
         return;
     }
+    // The global cap must not silence spawn children. Firefox starts late in a
+    // graphics run, so by the time *its* glycin loaders fork, 6000 unrelated
+    // events have already been spent and the interesting children print
+    // nothing — which is why earlier captures only ever showed loader forks
+    // from other processes (their reads of the per-process sample address were
+    // plain text, e.g. 0x6361623a646c6968 == "hild:cac"). Spawn children have
+    // their own bounded budget already.
     let seq = TRACE_FIREFOX_SYSCALL_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    if seq >= 6_000 {
+    if seq >= 6_000 && !spawn_child {
         return;
     }
     let pid = unsafe { (*task).pid };
@@ -1516,6 +1523,15 @@ fn trace_firefox_syscall_enter(
         let path_ptr = if nr == 322 { regs.arg1() } else { regs.arg0() };
         trace_firefox_user_path(pid, nr, path_ptr);
     }
+    // A glycin loader spawn is `fork()` from a `blocking-N`/`gly-*` thread, and
+    // whether the child survives is decided entirely by whether some *other*
+    // thread of this process held an allocator lock at this instant. Dump the
+    // siblings' blocked syscalls right here: a holder parked in a kernel path
+    // is a kernel-side contribution we can fix, whereas holders that are merely
+    // running mean the window is pure userspace.
+    if nr == 56 && firefox_trace_spawn_child_comm(comm) {
+        trace_firefox_sibling_threads(task, pid);
+    }
     // The stuck spawn child blocks on a futex immediately after one
     // `openat(AT_FDCWD, ..., O_CLOEXEC)`, and the healthy child makes the same
     // call and proceeds. Naming that file names the code path holding the
@@ -1537,6 +1553,37 @@ fn trace_firefox_syscall_enter(
     if spawn_child && nr == 202 {
         trace_firefox_user_pte(pid, regs.arg0());
         trace_firefox_user_word(pid, "futex", regs.arg0());
+    }
+    // Two samples of the contended lock word bracket glibc's child-side reset:
+    //
+    //   nr=273 set_robust_list -- inside `_Fork()`, BEFORE
+    //          `__run_fork_handlers(atfork_run_child)`. A non-zero reading here
+    //          is expected either way and proves nothing on its own.
+    //   nr=14  rt_sigprocmask  -- the first syscall *after* those handlers ran.
+    //
+    // Still non-zero at nr=14 means the reset did not clear it, so the lock is
+    // not one glibc owns (userspace fork-safety bug). Zero at nr=14 but 2 at
+    // the futex would mean the reset landed and the value was lost afterwards,
+    // which in a single-threaded child could only be a kernel defect.
+    //
+    // Diagnostic constant: this address has been byte-identical across every
+    // captured run. Removed once the question is settled.
+    // Only Firefox's own children: the sampled address is a per-process
+    // location, and another app's glycin loader reads plain text there
+    // (observed: 0x6361623a646c6968 == "hild:cac"), which is meaningless noise.
+    let firefox_spawn_child = spawn_child
+        && unsafe {
+            let parent = (*task).m26.real_parent;
+            !parent.is_null()
+                && (*parent).tgid == TRACE_FIREFOX_TGID.load(core::sync::atomic::Ordering::Acquire)
+        };
+    if firefox_spawn_child && matches!(nr, 273 | 14 | 257) {
+        let tag = match nr {
+            273 => "pre-atfork",
+            14 => "post-atfork",
+            _ => "pre-openat",
+        };
+        trace_firefox_user_word(pid, tag, 0x10000700038);
     }
     if spawn_child && matches!(nr, 257 | 2) {
         let path_ptr = if nr == 257 { regs.arg1() } else { regs.arg0() };
@@ -1834,6 +1881,46 @@ fn trace_firefox_user_word(pid: i32, tag: &str, addr: u64) {
             errno
         ),
     }
+}
+
+/// Dump every other thread of this task's process with the syscall it is
+/// currently blocked in, using the same saved frame `/proc/<pid>/syscall` reads.
+#[cfg(not(test))]
+fn trace_firefox_sibling_threads(task: *mut crate::kernel::task::TaskStruct, pid: i32) {
+    let tgid = unsafe { (*task).tgid };
+    let mut reported = 0u32;
+    let mut running = 0u32;
+    crate::kernel::fork::for_each_heap_task(&mut |other: *mut crate::kernel::task::TaskStruct| {
+        if other.is_null() || other == task || reported >= 24 {
+            return;
+        }
+        if unsafe { (*other).tgid } != tgid {
+            return;
+        }
+        if crate::kernel::sched::task_on_cpu(other) {
+            running += 1;
+            return;
+        }
+        let regs = unsafe { crate::fs::proc::base::task_pt_regs(other) };
+        if regs.is_null() {
+            return;
+        }
+        reported += 1;
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-firefox-sibling forker={} tid={} comm={} nr={} ip={:#x}",
+            pid,
+            unsafe { (*other).pid },
+            comm_for_trace(unsafe { &(*other).comm }),
+            unsafe { (*regs).orig_ax } as i64,
+            unsafe { (*regs).ip }
+        );
+    });
+    crate::linux_driver_abi::tty::serial_println!(
+        "trace-firefox-sibling-summary forker={} blocked={} on_cpu={}",
+        pid,
+        reported,
+        running
+    );
 }
 
 #[cfg(not(test))]

@@ -337,6 +337,46 @@ fn do_user_addr_fault(frame: &ExceptionFrame, ec: u64, addr: u64) {
     let (mmap_guard, vma) = match lock_mm_and_find_vma(mm, addr) {
         Some(locked) => locked,
         None => {
+            // A *present* PTE (X86_PF_PROT) with no VMA covering it means the
+            // page tables and the VMA tree disagree: hardware has a mapping the
+            // mm no longer describes. That is an mm-consistency bug, not a
+            // userspace error, and it kills the process with SIGSEGV — observed
+            // taking down PID 1 during boot. Record the neighbourhood so the
+            // divergence can be attributed to whichever path dropped the VMA
+            // without tearing down its mapping.
+            // Narrow to the signature that actually indicates mm inconsistency:
+            // a *write* protection violation at a plausibly-mapped address.
+            // Without the write and address filters this also fires on ordinary
+            // userspace crashes -- near-NULL reads (addr=0x10) and wild jumps
+            // -- which are correct SIGSEGV deliveries, not kernel bugs.
+            if ec & X86_PF_PROT != 0 && ec & X86_PF_WRITE != 0 && addr >= 0x10000 {
+                let (count, prev_end, next_start) = unsafe {
+                    let guard = MmapReadGuard::lock(mm);
+                    let mut count = 0usize;
+                    let mut prev_end = 0u64;
+                    let mut next_start = u64::MAX;
+                    for (vstart, vend, _entry) in (*mm).mm_mt.collect_entries() {
+                        count += 1;
+                        if vend <= addr && vend > prev_end {
+                            prev_end = vend;
+                        }
+                        if vstart > addr && vstart < next_start {
+                            next_start = vstart;
+                        }
+                    }
+                    drop(guard);
+                    (count, prev_end, next_start)
+                };
+                log_error!(
+                    "cpu",
+                    "cpu: present PTE without VMA addr={:#018x} ec={:#x} vmas={} prev_end={:#018x} next_start={:#018x}",
+                    addr,
+                    ec,
+                    count,
+                    prev_end,
+                    next_start,
+                );
+            }
             bad_area_or_kernelmode_fixup(frame, ec, addr);
             return;
         }

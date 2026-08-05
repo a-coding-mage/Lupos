@@ -67,6 +67,21 @@ impl ListHead {
         (*this).prev = this;
     }
 
+    /// True when the node is an empty list *or* was never initialized.
+    ///
+    /// `TaskStruct` is created by zeroing, so a task that never joined a list
+    /// carries null pointers rather than the self-referential empty ring.
+    /// Treating both as "not linked" lets callers stay allocation-free without
+    /// a separate initialization pass over every task.
+    ///
+    /// # Safety
+    /// `head` must be a valid, readable pointer.
+    #[inline]
+    pub unsafe fn is_empty_or_uninit(head: *const ListHead) -> bool {
+        let next = (*head).next;
+        next.is_null() || next as *const ListHead == head
+    }
+
     /// Check if the list is empty (head points to itself).
     ///
     /// Equivalent to Linux's `list_empty()`.

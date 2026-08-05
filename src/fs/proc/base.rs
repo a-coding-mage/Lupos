@@ -617,7 +617,7 @@ fn proc_pid_fs_path_readlink(
 ///
 /// # Safety
 /// `task` must be a live task whose kernel stack is allocated.
-unsafe fn task_pt_regs(task: *mut TaskStruct) -> *const crate::kernel::task::PtRegs {
+pub(crate) unsafe fn task_pt_regs(task: *mut TaskStruct) -> *const crate::kernel::task::PtRegs {
     let stack_top = unsafe { (*task).stack } as usize;
     if stack_top == 0 {
         return core::ptr::null();
