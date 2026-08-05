@@ -2869,11 +2869,52 @@ pub unsafe fn sys_recvfrom(
     }
 }
 
+/// Linux `copy_msghdr_from_user()` — bring a userspace `struct user_msghdr`
+/// into kernel memory through the fault-tolerant accessor.
+///
+/// A raw `*msg` dereference is not equivalent. Linux never touches a user
+/// pointer without an exception-table fixup, so a fault on one returns
+/// `-EFAULT`; the raw read instead takes a #PF at a kernel RIP with no fixup
+/// entry, which `do_user_addr_fault()` can only route to `bad_area()` when it
+/// cannot resolve the fault (pagefault-disabled or atomic context), and that
+/// panics the machine. Observed in-guest: a Firefox `PSBroker` thread paniced
+/// the kernel from `sys_recvmsg` with
+/// `#PF cr2=0x1003823eb78 error=0x3 rip=<sys_recvmsg>` — error `0x3` is
+/// present+write+supervisor, i.e. a kernel store to a *present* user page that
+/// was write-protected, exactly what a post-`fork()` COW `msghdr` looks like.
+///
+/// Ref: vendor/linux/net/socket.c — `copy_msghdr_from_user()`.
+unsafe fn copy_msghdr_from_user(msg: *const LinuxMsghdr) -> Result<LinuxMsghdr, i32> {
+    let mut msgval = LinuxMsghdr {
+        name: core::ptr::null_mut(),
+        namelen: 0,
+        iov: core::ptr::null_mut(),
+        iovlen: 0,
+        control: core::ptr::null_mut(),
+        controllen: 0,
+        flags: 0,
+    };
+    let not_copied = unsafe {
+        uaccess::copy_from_user(
+            (&raw mut msgval).cast::<u8>(),
+            msg.cast::<u8>(),
+            core::mem::size_of::<LinuxMsghdr>(),
+        )
+    };
+    if not_copied != 0 {
+        return Err(EFAULT);
+    }
+    Ok(msgval)
+}
+
 pub unsafe fn sys_sendmsg(fd: i32, msg: *const LinuxMsghdr, flags: i32) -> i64 {
     if msg.is_null() {
         return -(EFAULT as i64);
     }
-    let msg = unsafe { *msg };
+    let msg = match unsafe { copy_msghdr_from_user(msg) } {
+        Ok(msgval) => msgval,
+        Err(errno) => return -(errno as i64),
+    };
     let bytes = match copy_iov_bytes(msg.iov, msg.iovlen) {
         Ok(bytes) => bytes,
         Err(errno) => return -(errno as i64),
@@ -2994,7 +3035,10 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
     if msg.is_null() {
         return -(EFAULT as i64);
     }
-    let mut msgval = unsafe { *msg };
+    let mut msgval = match unsafe { copy_msghdr_from_user(msg) } {
+        Ok(msgval) => msgval,
+        Err(errno) => return -(errno as i64),
+    };
     let (file, sock) = match socket_file_from_fd(fd) {
         Ok(pair) => pair,
         Err(errno) => return -(errno as i64),
@@ -3334,8 +3378,17 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
             );
         }
     }
-    unsafe {
-        (*msg).controllen = control_written;
+    // Linux `___sys_recvmsg()` publishes msg_controllen with `__put_user()`.
+    // Ref: vendor/linux/net/socket.c.
+    if unsafe {
+        uaccess::put_user_u64(
+            (&raw mut (*msg).controllen).cast::<u64>(),
+            control_written as u64,
+        )
+    }
+    .is_err()
+    {
+        return -(EFAULT as i64);
     }
 
     // If the user's iov is shorter than the real packet, set MSG_TRUNC in
@@ -3349,9 +3402,19 @@ pub unsafe fn sys_recvmsg(fd: i32, msg: *mut LinuxMsghdr, flags: i32) -> i64 {
     }
     match scatter_iov_bytes(msgval.iov, msgval.iovlen, &tmp[..n]) {
         Ok(copied) => {
-            unsafe {
-                (*msg).namelen = msgval.namelen;
-                (*msg).flags = out_flags;
+            // Linux `___sys_recvmsg()` writes msg_namelen through
+            // `move_addr_to_user()` and msg_flags through `__put_user()`.
+            let published = unsafe {
+                uaccess::put_user_u32((&raw mut (*msg).namelen).cast::<u32>(), msgval.namelen)
+                    .and_then(|()| {
+                        uaccess::put_user_u32(
+                            (&raw mut (*msg).flags).cast::<u32>(),
+                            out_flags as u32,
+                        )
+                    })
+            };
+            if published.is_err() {
+                return -(EFAULT as i64);
             }
             if flags & MSG_TRUNC != 0 {
                 real_len as i64
@@ -3402,12 +3465,19 @@ pub unsafe fn sys_sendmmsg(fd: i32, msgvec: *mut LinuxMmsghdr, vlen: u32, flags:
     }
     let mut sent = 0i64;
     for idx in 0..vlen as usize {
-        let entry = unsafe { &mut *msgvec.add(idx) };
-        let ret = unsafe { sys_sendmsg(fd, &entry.msg_hdr, flags) };
+        // Linux `__sys_sendmmsg()` keeps the user array as a pointer and
+        // writes msg_len back with `put_user()`.
+        // Ref: vendor/linux/net/socket.c.
+        let entry = unsafe { msgvec.add(idx) };
+        let ret = unsafe { sys_sendmsg(fd, (&raw const (*entry).msg_hdr), flags) };
         if ret < 0 {
             return if sent > 0 { sent } else { ret };
         }
-        entry.msg_len = ret as u32;
+        if unsafe { uaccess::put_user_u32((&raw mut (*entry).msg_len).cast::<u32>(), ret as u32) }
+            .is_err()
+        {
+            return if sent > 0 { sent } else { -(EFAULT as i64) };
+        }
         sent += 1;
     }
     sent
@@ -3425,12 +3495,23 @@ pub unsafe fn sys_recvmmsg(
     }
     let mut received = 0i64;
     for idx in 0..vlen as usize {
-        let entry = unsafe { &mut *msgvec.add(idx) };
-        let ret = unsafe { sys_recvmsg(fd, &mut entry.msg_hdr, flags) };
+        // Linux `__sys_recvmmsg()` addresses `&entry->msg_hdr` without ever
+        // forming a reference to user memory and publishes msg_len through
+        // `put_user()`.  Ref: vendor/linux/net/socket.c.
+        let entry = unsafe { msgvec.add(idx) };
+        let ret = unsafe { sys_recvmsg(fd, (&raw mut (*entry).msg_hdr), flags) };
         if ret < 0 {
             return if received > 0 { received } else { ret };
         }
-        entry.msg_len = ret as u32;
+        if unsafe { uaccess::put_user_u32((&raw mut (*entry).msg_len).cast::<u32>(), ret as u32) }
+            .is_err()
+        {
+            return if received > 0 {
+                received
+            } else {
+                -(EFAULT as i64)
+            };
+        }
         received += 1;
     }
     received

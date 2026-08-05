@@ -188,16 +188,20 @@ fn report(idle_jiffies: u64) {
         // them on the host with
         //   addr2line -f -C -e target/xtask/cargo-graphics-x11/x86_64-lupos/release/lupos <addr>
         //
-        // A blocked task is descheduled, so `thread.sp` is stable and its
-        // stack is quiescent. Only kernel-text-looking words are printed, and
-        // the count is capped, so this stays a few lines per stalled task.
+        // A `D` task is descheduled, so `thread.sp` is stable and its stack is
+        // quiescent. Only kernel-text-looking words are printed, and the count
+        // is capped, so this stays a few lines per stalled task.
         //
-        // Linux `show_state_filter(0)` dumps every blocked task, not just the
-        // uninterruptible ones, and that breadth is what identifies a *lock
-        // holder*: the tasks piled on a contended mutex show up as `D`, but
-        // whoever owns it is frequently asleep in `S` somewhere else entirely
-        // and would otherwise be the one task with no stack in the report.
-        if state & (task_state::TASK_UNINTERRUPTIBLE | task_state::TASK_INTERRUPTIBLE) != 0 {
+        // Deliberately `D`-only, even though Linux's `show_state_filter(0)`
+        // also dumps `S` tasks. Widening it to `TASK_INTERRUPTIBLE` was tried
+        // and reverted: an idle desktop has ~100 interruptible sleepers, so
+        // one report became ~470 serial lines and a run produced 53 299 of
+        // them. That much serial traffic is not free instrumentation — it
+        // keeps the CPUs awake and supplies the very wakeups whose absence is
+        // being measured, and it slowed the graphics gate past its poweroff
+        // deadline. Same trap this file's header documents for
+        // `lupos.trace=syscall`.
+        if state & task_state::TASK_UNINTERRUPTIBLE != 0 {
             let sp = unsafe { (*task).thread.sp };
             if sp != 0 {
                 let mut shown = 0u32;

@@ -317,6 +317,52 @@ pub fn on_shootdown_ipi() {
     }
 }
 
+/// Run this CPU's pending TLB shootdown work from a spin that cannot take the
+/// shootdown IPI.
+///
+/// Linux's own call-function wait loop does exactly this: `csd_lock_wait()`
+/// runs under `flush_smp_call_function_queue()` so a CPU spinning with
+/// interrupts disabled still executes requests aimed at it, which is what
+/// keeps `smp_call_function_many()` from deadlocking against a peer.
+///
+/// The scheduler's `on_cpu` handoff spins hold `pi_lock`/`rq->lock` with IRQs
+/// disabled, so without this the target of a shootdown can sit in one of them
+/// and never reach `on_shootdown_ipi()`. Measured in-guest during a fork
+/// storm: `tlb: shootdown stall source=0 target=2 state=1` (state 1 is
+/// `TLB_CALL_QUEUED` — never even picked up) repeating with rising resend
+/// counts until the machine stopped producing output entirely.
+///
+/// # Safety contract
+/// Caller must have local IRQs disabled, matching the IPI-handler context this
+/// substitutes for.
+/// Drain this CPU's pending shootdowns, but only when interrupts are disabled
+/// and it therefore cannot receive the IPI on its own.
+///
+/// For spin-wait loops that may run in either interrupt state: with interrupts
+/// enabled the IPI arrives normally and this is a cheap load, so the check
+/// keeps the common path free.
+pub fn service_local_tlb_shootdowns_if_irqs_off() -> bool {
+    if !crate::kernel::locking::irqs_disabled() {
+        return false;
+    }
+    service_local_tlb_shootdowns_irqs_off()
+}
+
+/// [`service_local_tlb_shootdowns_irqs_off`] for callers that may still have
+/// interrupts enabled, such as the `flush_tlb_mm_range()` wait loop.
+fn service_local_tlb_calls(cpu: usize) -> bool {
+    let irq_flags = crate::kernel::locking::local_irq_save();
+    let serviced = service_tlb_call_queue_irqs_off(cpu);
+    crate::kernel::locking::local_irq_restore(irq_flags);
+    serviced
+}
+
+pub fn service_local_tlb_shootdowns_irqs_off() -> bool {
+    let cpu = cpu_index();
+    let serviced = service_tlb_call_queue_irqs_off(cpu);
+    serviced | service_pending_for_cpu_irqs_off(cpu)
+}
+
 /// Linux `__flush_smp_call_function_queue()` specialized to TLB callbacks.
 ///
 /// The target owns execution after changing QUEUED to RUNNING.  Its release
@@ -394,6 +440,19 @@ fn wait_tlb_call(source: usize, target: usize) {
     let mut spins: u64 = 0;
     let mut resends: u64 = 0;
     while slot.state.load(Ordering::Acquire) != TLB_CALL_IDLE {
+        // A CPU waiting for one shootdown acknowledgement must keep executing
+        // shootdowns aimed at *it*, or two CPUs that shoot each other down
+        // both spin forever with their requests stuck at TLB_CALL_QUEUED and
+        // neither ever reaching its IPI handler. Linux has this property
+        // because `smp_call_function_many_cond()` runs the local queue via
+        // `flush_smp_call_function_queue()` rather than only waiting.
+        //
+        // Measured in-guest before this drain existed: two independent
+        // sources, `source=1 target=3` and `source=2 target=3`, both parked at
+        // `state=1` through all four resends, never clearing, and the machine
+        // stopped producing output. Resending the IPI cannot help when the
+        // target is itself spinning here with interrupts disabled.
+        service_local_tlb_calls(cpu_index());
         core::hint::spin_loop();
         spins += 1;
         if spins % TLB_CALL_STALL_SPINS != 0 {

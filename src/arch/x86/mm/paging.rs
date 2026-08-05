@@ -826,10 +826,26 @@ pub fn ptep_get_and_clear(_mm: *mut (), _addr: u64, ptep: *mut pte_t) -> pte_t {
 }
 
 /// Linux `ptep_set_wrprotect` — clear `_PAGE_RW` on a live PTE.
+///
+/// Ref: vendor/linux/arch/x86/include/asm/pgtable.h:1271. Upstream spells this
+/// as a `try_cmpxchg` retry loop and says why in the comment above it: the
+/// hardware can set Dirty=1 concurrently, and a non-atomic read-modify-write
+/// would drop that update — on shadow-stack hardware it can even manufacture a
+/// bogus Write=0,Dirty=1 encoding. The mmap write lock held across
+/// `dup_mmap()` excludes *software* PTE writers but not the CPU's own A/D
+/// updates, so the atomic is load-bearing rather than defensive.
 #[inline]
 pub fn ptep_set_wrprotect(_mm: *mut (), _addr: u64, ptep: *mut pte_t) {
-    unsafe {
-        (*ptep).0 &= !_PAGE_RW;
+    // `pte_t` is repr(transparent) over the PTE word, so the pointer already
+    // has AtomicU64's size and alignment.
+    let word = unsafe { AtomicU64::from_ptr(ptep.cast::<u64>()) };
+    let mut old = word.load(Ordering::Relaxed);
+    loop {
+        let new = pte_wrprotect(pte_t(old)).0;
+        match word.compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(current) => old = current,
+        }
     }
 }
 

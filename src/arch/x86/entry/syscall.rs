@@ -1362,6 +1362,17 @@ static TRACE_FIREFOX_NAMESPACE_CLONE_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 #[cfg(not(test))]
 static TRACE_FIREFOX_TGID: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+#[cfg(not(test))]
+static TRACE_FIREFOX_SPAWN_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Comms a spawn child carries between `fork()` and `execve()`: it inherits
+/// the forking thread's name, so glycin's loader spawn shows up as
+/// `gly-hdl-loader` or `blocking-N` until the exec renames it.
+#[cfg(not(test))]
+fn firefox_trace_spawn_child_comm(comm: &[u8; 16]) -> bool {
+    comm_starts_with(comm, b"gly-hdl-loader") || comm_starts_with(comm, b"blocking-")
+}
 
 /// Trace the small set of process, IPC, blocking, and sandbox syscalls that
 /// determines whether Firefox can create its content process and publish its
@@ -1378,7 +1389,15 @@ fn trace_firefox_syscall_enter(
     }
     let comm = unsafe { &(*task).comm };
     let nr = regs.orig_rax;
-    if !firefox_trace_syscall_is_interesting(nr, 0) {
+    // A forked-but-not-yet-exec'd spawn child gets *every* syscall traced.
+    // Which calls it makes between fork() and the futex it dies on is the
+    // whole question, and the ordinary filters below hide most of them: with
+    // them applied the stuck child produced exactly one line. It is only a
+    // handful of syscalls per child, on its own budget, so the volume stays
+    // negligible.
+    let spawn_child =
+        unsafe { (*task).pid == (*task).tgid } && firefox_trace_spawn_child_comm(comm);
+    if !spawn_child && !firefox_trace_syscall_is_interesting(nr, 0) {
         return;
     }
     // Firefox's sandbox can use a process clone with namespace flags after
@@ -1425,15 +1444,36 @@ fn trace_firefox_syscall_enter(
     // the successful mmap/mprotect/munmap stream: Firefox performs thousands
     // of those during startup and the serial traffic changes the scheduler
     // boundary being investigated.
-    if matches!(nr, 9 | 10 | 11 | 12 | 28) {
+    if !spawn_child && matches!(nr, 9 | 10 | 11 | 12 | 28) {
         return;
     }
     // Successful pathname probes are not relevant to the process-boundary
     // question and can dominate the serial stream during Firefox startup.
-    if nr == 257 {
+    if !spawn_child && nr == 257 {
         return;
     }
-    if !firefox_trace_event_allowed(nr) {
+    // A forked-but-not-yet-exec'd spawn child inherits the forking thread's
+    // comm and becomes its own thread-group leader. Those few syscalls are the
+    // entire question when a loader spawn hangs before execve(), and the
+    // shared per-category budgets are exhausted by the parent's ordinary futex
+    // traffic long before the interesting child ever runs -- measured: the one
+    // child that never exec'd produced *no* trace lines at all. Give it its
+    // own budget so it cannot be starved by unrelated events.
+    // Everything that is not a spawn child is restricted to process-lifecycle
+    // syscalls. Tracing the Firefox thread group's full futex/poll/recvmsg
+    // stream produced ~10 000 serial lines and slowed the guest enough that
+    // the graphics gate timed out before the probe finished -- the same
+    // perturbation trap this file documents for `lupos.trace=syscall`. The
+    // spawn child's own syscalls are the question; its parent's matter only at
+    // the clone/exec boundary.
+    if !spawn_child && !matches!(nr, 56 | 57 | 58 | 59 | 231 | 322 | 435) {
+        return;
+    }
+    if spawn_child {
+        if TRACE_FIREFOX_SPAWN_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel) >= 4000 {
+            return;
+        }
+    } else if !firefox_trace_event_allowed(nr) {
         return;
     }
     let seq = TRACE_FIREFOX_SYSCALL_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -1474,6 +1514,32 @@ fn trace_firefox_syscall_enter(
     }
     if matches!(nr, 59 | 322) {
         let path_ptr = if nr == 322 { regs.arg1() } else { regs.arg0() };
+        trace_firefox_user_path(pid, nr, path_ptr);
+    }
+    // The stuck spawn child blocks on a futex immediately after one
+    // `openat(AT_FDCWD, ..., O_CLOEXEC)`, and the healthy child makes the same
+    // call and proceeds. Naming that file names the code path holding the
+    // lock, so capture it for spawn children only (their `openat` traffic is a
+    // handful of calls, unlike the parent's).
+    // Decisive discriminator for the glycin loader deadlock. The child blocks
+    // in FUTEX_WAIT on an inherited lock word that reads 2. Two explanations
+    // remain and they have opposite fixes:
+    //
+    //   * glibc's fork() child-side reset never ran, so the child inherited a
+    //     held lock -- a userspace fork-safety problem; or
+    //   * the reset *did* run and the child's store was lost -- a kernel COW
+    //     defect.
+    //
+    // The page tables tell them apart without any userspace cooperation: a
+    // store by the child would have taken a write fault and left this page as
+    // a private, writable copy. Still-write-protected with the page shared
+    // means the child never wrote to it at all.
+    if spawn_child && nr == 202 {
+        trace_firefox_user_pte(pid, regs.arg0());
+        trace_firefox_user_word(pid, "futex", regs.arg0());
+    }
+    if spawn_child && matches!(nr, 257 | 2) {
+        let path_ptr = if nr == 257 { regs.arg1() } else { regs.arg0() };
         trace_firefox_user_path(pid, nr, path_ptr);
     }
 }
@@ -1543,6 +1609,14 @@ fn firefox_trace_comm(comm: &[u8; 16]) -> bool {
         || comm_starts_with(comm, b"GPU Process")
         || comm_starts_with(comm, b"Utility")
         || comm_starts_with(comm, b"crashhelper")
+        // glycin spawns its sandboxed image loader from these threads, and
+        // that spawn is the one that never reaches execve(). They are threads
+        // of the Firefox tgid, but keep them here too so a loader that already
+        // left the group is still traced.
+        || comm_starts_with(comm, b"blocking-")
+        || comm_starts_with(comm, b"gly-")
+        || comm_starts_with(comm, b"glycin")
+        || comm_starts_with(comm, b"bwrap")
 }
 
 /// Trace the whole Firefox thread group once its leader has been observed.
@@ -1669,6 +1743,97 @@ fn trace_firefox_scheduler_state(
         need_resched,
         rq_running,
     );
+}
+
+/// Report the PTE backing a user address: whether it is present, writable
+/// (i.e. already COW-copied for this task) and how many mappings share it.
+#[cfg(not(test))]
+fn trace_firefox_user_pte(pid: i32, addr: u64) {
+    use crate::arch::x86::mm::paging::{
+        p4d_offset, pgd_offset_pgd, pmd_offset, pte_offset_kernel, pud_offset,
+    };
+    let task = unsafe { crate::kernel::sched::get_current() };
+    if task.is_null() {
+        return;
+    }
+    let mm = unsafe { (*task).mm };
+    if mm.is_null() {
+        return;
+    }
+    let pgd = unsafe { (*mm).pgd } as *mut crate::arch::x86::mm::paging::pgd_t;
+    if pgd.is_null() {
+        return;
+    }
+    unsafe {
+        let pgdp = pgd_offset_pgd(pgd, addr);
+        if crate::arch::x86::mm::paging::pgd_none(*pgdp) {
+            crate::linux_driver_abi::tty::serial_println!(
+                "trace-firefox-pte pid={} addr={:#x} pgd=none",
+                pid,
+                addr
+            );
+            return;
+        }
+        let pudp = pud_offset(p4d_offset(pgdp, addr), addr);
+        if crate::arch::x86::mm::paging::pud_none(*pudp) {
+            return;
+        }
+        let pmdp = pmd_offset(pudp, addr);
+        if crate::arch::x86::mm::paging::pmd_none(*pmdp) {
+            return;
+        }
+        let ptep = pte_offset_kernel(pmdp, addr);
+        let pte = *ptep;
+        let present = crate::arch::x86::mm::paging::pte_present(pte);
+        let writable = crate::arch::x86::mm::paging::pte_write(pte);
+        let pfn = crate::arch::x86::mm::paging::pte_pfn(pte) as usize;
+        let (refcount, mapcount) = if present && crate::mm::buddy::pfn_valid(pfn) {
+            let page = crate::mm::buddy::pfn_to_page(pfn);
+            if page.is_null() {
+                (-1i64, -1i64)
+            } else {
+                (
+                    (*page).refcount() as i64,
+                    (*page)
+                        ._mapcount()
+                        .load(core::sync::atomic::Ordering::Relaxed) as i64,
+                )
+            }
+        } else {
+            (-1i64, -1i64)
+        };
+        crate::linux_driver_abi::tty::serial_println!(
+            "trace-firefox-pte pid={} addr={:#x} present={} writable={} pfn={:#x} refcount={} mapcount={}",
+            pid,
+            addr,
+            present as u8,
+            writable as u8,
+            pfn,
+            refcount,
+            mapcount
+        );
+    }
+}
+
+/// Read one 64-bit user word through the fault-tolerant accessor and log it.
+#[cfg(not(test))]
+fn trace_firefox_user_word(pid: i32, tag: &str, addr: u64) {
+    match unsafe { crate::arch::x86::kernel::uaccess::get_user_u64(addr as *const u64) } {
+        Ok(value) => crate::linux_driver_abi::tty::serial_println!(
+            "trace-firefox-word pid={} at={} addr={:#x} value={:#x}",
+            pid,
+            tag,
+            addr,
+            value
+        ),
+        Err(errno) => crate::linux_driver_abi::tty::serial_println!(
+            "trace-firefox-word pid={} at={} addr={:#x} unreadable={}",
+            pid,
+            tag,
+            addr,
+            errno
+        ),
+    }
 }
 
 #[cfg(not(test))]

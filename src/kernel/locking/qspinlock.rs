@@ -41,7 +41,16 @@ impl QSpinLock {
     }
 
     pub fn lock(&self) {
+        // See `RawSpinLock::lock()`: a CPU spinning here with interrupts
+        // disabled must still execute TLB shootdowns aimed at it, or it
+        // deadlocks against a holder that is waiting for its acknowledgement.
+        let mut spins: u32 = 0;
         while !self.try_lock() {
+            spins = spins.wrapping_add(1);
+            #[cfg(not(test))]
+            if spins % 256 == 0 {
+                crate::arch::x86::mm::tlb::service_local_tlb_shootdowns_if_irqs_off();
+            }
             core::hint::spin_loop();
         }
     }

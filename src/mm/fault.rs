@@ -36,7 +36,8 @@ use crate::arch::x86::mm::paging::{
     pgd_offset_pgd, pgd_t, pgprot_t, pmd_alloc, pmd_huge, pmd_none, pmd_offset, pmd_t, pte_alloc,
     pte_mkclean, pte_mkdirty, pte_mkold, pte_mkspecial, pte_mkwrite, pte_mkyoung, pte_none,
     pte_offset_kernel, pte_pfn, pte_present, pte_special, pte_t, pte_write, pte_wrprotect,
-    ptep_get, ptep_get_and_clear, pud_alloc, pud_huge, pud_none, pud_offset, pud_t, set_pte_at,
+    ptep_get, ptep_get_and_clear, ptep_set_wrprotect, pud_alloc, pud_huge, pud_none, pud_offset,
+    pud_t, set_pte_at,
 };
 use crate::kernel::locking::{RawSpinLock, preempt_disable, preempt_enable};
 use crate::mm::address_space::{AS_SHARED_ANON, AddressSpace, wait_on_page_writeback};
@@ -1155,8 +1156,14 @@ unsafe fn copy_pte_range(
             }
 
             let (source_update, child_pte) = fork_present_pte(src_pte, vm_flags);
-            if let Some(source_pte) = source_update {
-                set_pte_at(src_mm as *mut (), cur, src_ptep, source_pte);
+            if source_update.is_some() {
+                // Linux `__copy_present_ptes()` write-protects the parent with
+                // `wrprotect_ptes()` -> `ptep_set_wrprotect()`, an atomic bit
+                // clear, and only the *child's* copy is derived from the value
+                // read earlier. Storing the pre-read word back over the parent
+                // entry instead would discard any Dirty bit the CPU set since
+                // that read.
+                ptep_set_wrprotect(src_mm as *mut (), cur, src_ptep);
             }
 
             // Install the Linux-adjusted PTE in the destination. Parent
