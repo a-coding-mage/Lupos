@@ -1,427 +1,820 @@
-Lupos agent rules
+# AGENTS.md — Lupos bounded Bun-like Linux-to-Rust rewrite protocol
 
-Mission and execution order
+> **Required branch:** `feat/bun-like-rewrite-test`
+>
+> **Public project name:** **Lupos — A Rust rewrite of the GNU/Linux project.**
+>
+> **Engineering scope:** a fresh Rust rewrite of the Linux kernel files selected
+> by the frozen x86_64 and AArch64 configuration union. GNU and other userspace
+> projects remain external and unmodified.
 
-Lupos exists to reproduce Linux on the current generic x86_64 target. The taskis not to design a Linux-like kernel or to make a failing build pass by anyconvenient means. The task is to port Linux faithfully.
+The words **MUST**, **MUST NOT**, **SHOULD**, and **SHOULD NOT** are normative.
 
-Every task must follow this order:
+## 1. Mission and branch boundary
 
-Preserve the user's worktree and capture the environment.
+Lupos must reproduce the pinned upstream Linux implementation for the approved
+x86_64 and AArch64 (`arch/arm64`) configuration subset with **zero intentional
+semantic differences**, except for explicitly allowlisted project branding.
 
-Define the exact parity scope.
+All work governed by this file MUST happen on:
 
-Audit that complete scope against vendor/linux.
+```text
+feat/bun-like-rewrite-test
+```
 
-Close every parity gap in scope before debugging or diagnosing the build.
+Before any mutating action, verify:
 
-Build the parity-settled tree.
+```bash
+test "$(git branch --show-current)" = "feat/bun-like-rewrite-test"
+```
+
+If the branch does not match, stop. Agents MUST NOT create, switch, reset,
+rebase, merge, or delete branches on their own.
 
-If the build, boot, test, or runtime path still fails, debug only thatsurviving failure.
+### 1.1 Fresh-rewrite rule
 
-Fix the failure by preserving Linux's ABI, data structures, algorithm,invariants, ordering, error behavior, side effects, and subsystem intent.
+This branch does not continue the previous Lupos translation. Historical Rust
+kernel source is contamination, not an input.
 
-Rebuild, run the regression and compatibility gates, and measure the affectedperformance-sensitive path.
+Agents MUST NOT:
 
-Report only claims supported by retained evidence.
+- read, copy, adapt, paraphrase, or import an earlier Lupos Rust implementation;
+- inspect historical `src/` files through another branch, tag, commit, worktree,
+  archive, patch, dashboard, or generated report;
+- run `git show`, `git diff <old-branch>`, `git log -p`, or similar commands to
+  recover prior Rust translation source;
+- use old `linux-parity` headers, coverage estimates, implementation-unit
+  counts, boot claims, or previous test results as evidence for this rewrite;
+- preserve an existing Rust file merely because its destination path already
+  exists.
 
-A failure observed before parity is settled is only a locator. It is not yet avalid root cause. Do not spend time explaining, instrumenting, or repairingbehavior produced by a Lupos-specific divergence.
-
-Non-negotiable parity rules
-
-The current target is the generic x86_64 configuration.
-
-vendor/linux is the source of truth. Lupos must match the correspondingLinux implementation's ABI, observable behavior, and implementationmechanism.
-
-Port Linux's implementation; never design a replacement when Linux alreadyprovides one.
-
-Preserve the purpose of the Linux code, not merely its output. Determine thatpurpose from the implementation, data-structure invariants, comments,callers, callees, tests, error paths, locking, memory ordering, lifetime andreference rules, and performance constraints.
-
-Keep the Rust structure one-to-one with the corresponding vendor/linux Csource whenever Rust can express it.
-
-A Rust-specific structure is permitted only when a faithful translation isgenuinely impossible. It requires:
-
-a documented technical reason;
-
-a linux-deviation: marker naming the Linux function or mechanism;
-
-evidence of equivalent ABI and behavior;
-
-evidence that Linux's ordering, boundedness, stack, latency, locking, andmemory-safety properties remain intact.
-
-Convenience, reduced current scale, a fixed CPU limit, or "Rust is different"are not valid reasons for deviation.
-
-Drivers are built from the original Linux C source and loaded by Lupos. Donot replace them with Rust rewrites.
-
-Before editing any kernel file, locate and read its vendor/linuxcounterpart. After editing, compare the relevant Linux source again.
-
-Always report the truth. Never claim parity, a passing build or test, abenchmark result, or a root cause without evidence.
-
-Do not create branches or commit code without explicit user approval.
-
-Do not overwrite, discard, reformat away, or silently absorb the user'sexisting changes.
-
-Tasks must be atomic and deterministic. Do not create background work thatruns indefinitely.
-
-Independent parity work across separate kernel areas may be delegated tofocused sub-agents. Sub-agents may inspect and edit only their assignedscope; they must not run builds. The main agent owns integration, all builds,all runtime execution, and final validation.
-
-Define the parity scope before editing
-
-The parity scope is not merely the file named in the task. It includes:
-
-every Lupos file directly changed by the task;
-
-the complete call path needed to compile or execute the affected behavior;
-
-every shared type, constant, layout, macro equivalent, helper, error path,synchronization primitive, and ABI boundary used by that path;
-
-the corresponding vendor/linux files and upstream tests;
-
-any additional area implicated by a later build or runtime failure.
-
-Create a parity ledger before editing. For each relevant item, record:
-
-Lupos file, symbol, type, or ABI surface;
-
-corresponding vendor/linux file and symbol;
-
-whether the data structure matches;
-
-whether the algorithm and control flow match;
-
-whether constants, layouts, flags, errno, and return values match;
-
-whether locking, barriers, ordering, ownership, reference handling, and sideeffects match;
-
-the Linux or upstream test that proves the contract;
-
-the divergence found and its correction status.
-
-Do not claim that the whole kernel is at parity unless the whole kernel wasactually audited. The mandatory requirement is to close every gap in thecomplete task scope. Record unrelated out-of-scope gaps as findings. If abuild or runtime failure implicates a new area, expand the scope, audit thatarea, and close all of its parity gaps before resuming debugging.
-
-Phase 0 — Preserve state and evidence
-
-Before making changes, record:
-
-git rev-parse HEAD
-git status --short
-rustc -Vv
-cargo -V
-qemu-system-x86_64 --version
-gdb --version
-uname -a
-
-Also retain:
-
-the exact task or reported symptom;
-
-the exact command that exposed it, when one was provided;
-
-expected and actual results;
-
-.config and relevant environment overrides;
-
-the current revision and dirty-worktree state.
-
-Create:
-
-target/xtask/investigations/<issue>/
-
-Store the parity ledger, commands, compiler output, serial logs, GDBtranscripts, QMP or strace output when applicable, benchmark samples, and ashort notes.md there. Because target/ is ignored, mention the exact pathsin the handoff.
-
-At this stage, an existing failure may be captured to identify the affectedscope. Do not yet diagnose its root cause or implement a failure-specificworkaround.
-
-Phase 1 — Settle all vendor/linux parity gaps
-
-This phase must finish before build debugging begins.
-
-For every item in the parity scope, read the matching vendor/linux source,its surrounding definitions, relevant callers and callees, and its upstreamLinux tests. Compare and correct all of the following:
-
-data structures and invariants;
-
-algorithm and mechanism, not just final output;
-
-control flow and operation ordering;
-
-locking, interrupt state, preemption rules, atomics, and memory barriers;
-
-lifetime, ownership, RCU, reference counting, and destruction order;
-
-success and error paths;
-
-return values and exact errno behavior;
-
-constants, flags, masks, limits, and computed values;
-
-C-compatible type layout, alignment, padding, signedness, width, and callingconvention;
-
-syscall, ioctl, procfs, sysfs, module, driver, and userspace ABI;
-
-externally visible side effects and their order;
-
-stack, allocation, latency, scalability, and boundedness properties;
-
-comments or tests that reveal why Linux uses that mechanism.
-
-Fix every discovered gap in scope, including one that is clearly unrelated tothe originally reported symptom. A correct parity fix must not be revertedmerely because it was not the symptom's cause.
-
-Each ported implementation must name its Linux source with the repository'saccepted Ref: or linux-source: convention. If no Linux equivalent can befound, say so explicitly in the source and handoff; never silently invent amechanism.
-
-The Linux mechanism is part of the contract
-
-Port Linux's data structure and algorithm. Matching visible results with asubstitute is insufficient. Linux mechanisms such as llist, list_head,enumerated state machines, rbtree, xarray, radix trees, per-CPU areas,RCU-protected lists, wait queues, work queues, refcounts, and interrupt-drivenpaths carry performance, ordering, stack, and latency guarantees.
-
-Prefer the Linux path even when it appears excessive for Lupos's currentscale. A simpler replacement usually shifts cost or risk into an unmeasuredpath.
-
-Known-bad substitution patterns
-
-Treat these as parity defects on sight:
-
-Fixed-size arrays replacing Linux intrusive lists. Linux can detach orsplice a list in O(1). An array commonly introduces O(n) copying and maycreate a large by-value stack temporary.
-
-ptr::swap, mem::swap, mem::replace, or by-value assignment of largearrays or structures. Budget against Linux x86-64 THREAD_SIZE of 16 KiB.A full-size temporary can exhaust the kernel stack.
-
-Static MAX_* matrices replacing Linux dynamic per-CPU queues. These canlose Linux's queue-drain, empty-to-non-empty notification, and scalabilitysemantics.
-
-Polling where Linux is interrupt-driven. An idle-loop pump is a latencydefect, not a permanent implementation strategy.
-
-A constant where Linux computes a value. A hardcoded procfs, sysfs,scheduler, memory, or task-state result is a parity gap and can mislead laterdebugging.
-
-A local container replacing the Linux container. A Vec, array, map, orcustom queue is not equivalent merely because tests currently pass.
-
-A local lock or atomic protocol replacing Linux ordering. Equivalentfinal values do not prove equivalent memory visibility or race behavior.
-
-The historical begin_task_struct_rcu_release() failure is the model warning:using core::ptr::swap on [*mut TaskStruct; 1024] created a large stackcopy, caused #DF, and left other CPUs waiting in TLB shootdown. Linux'srcu_do_batch() instead moves the callback list by pointer throughrcu_cblist_flush_enqueue().
-
-Stub and constant audit
-
-A field, syscall, procfs entry, sysfs entry, helper, or file that returns afixed value where Linux computes one is a parity gap even when nothing fails.When such code is in scope, implement the Linux computation. When it is outsidescope, record it with the Linux function it should use. Never report a stub asworking behavior.
-
-Parity phase exit criteria
-
-Do not proceed to the build phase until:
-
-every parity-ledger entry in scope is resolved or explicitly documented as ajustified linux-deviation:;
-
-every changed file has been re-compared with its Linux counterpart;
-
-the relevant ABI layouts and constants have explicit checks where practical;
-
-an upstream regression test or the closest valid oracle has been selectedfor every corrected contract;
-
-no known Lupos-specific substitute remains in the execution path beinghanded to the build.
-
-Phase 2 — Build the parity-settled tree
-
-Only now run the exact build command requested by the task or the repository'scanonical documented build command. Preserve the complete output in theinvestigation directory.
-
-A successful build does not prove parity; it only allows validation tocontinue. A failed build does not permit a workaround that changes Linux's ABIor intent.
-
-For each build error:
-
-Identify the first real compiler, linker, layout, symbol, or generated-codefailure rather than reacting to downstream cascades.
-
-Add the newly implicated files and symbols to the parity scope.
-
-Stop build debugging and compare that expanded scope with vendor/linux.
-
-Close every newly discovered parity gap there.
-
-Re-run the same build command.
-
-Repeat until the parity-settled tree builds or an external environmentblocker is proven with exact evidence.
-
-When adapting C semantics to Rust, preserve Linux's ABI and intendedmechanism. Do not make the build pass by:
-
-changing a public type, layout, calling convention, flag, or symbol contract;
-
-deleting or bypassing code paths;
-
-weakening type or bounds checks that represent a Linux invariant;
-
-replacing a Linux algorithm with a simpler Rust implementation;
-
-suppressing an error without proving it is spurious;
-
-hardcoding a value Linux derives;
-
-weakening or altering a test's expected Linux behavior.
-
-Phase 3 — Reproduce and debug only surviving failures
-
-After the parity-settled tree builds, run the smallest relevant boot, test, orruntime gate. If it passes, continue to the broader validation gates. If itfails, the surviving failure is now a valid debugging target.
-
-Record the smallest reproducer, exact command, expected result, actual result,configuration, environment, and unique logs. Trace inputs to the first pointwhere actual execution diverges from the corresponding Linux decision orinvariant. Do not stop at the first visible symptom.
-
-For boot failures, retain the unique serial log printed by cargo xtask andrun:
-
-cargo xtask boot-triage target/xtask/serial-<mode>-<run-id>.log
-
-Use focused probes only. Remove noisy temporary instrumentation after the causeis proven, while retaining the reproducer, useful diagnostics, and regressiontest.
-
-GDB-first runtime debugging
-
-Use GDB whenever the failing path can run under QEMU. It is mandatory forcrashes, panics, hangs, boot failures, corrupt state, and unexpected controlflow when a symbolized QEMU reproduction is possible. Serial-log speculationalone is not sufficient.
-
-Start the smallest relevant symbolized debug mode:
-
-LUPOS_PROFILE=debug cargo xtask run --terminal --gdb
-LUPOS_PROFILE=debug cargo xtask run --mode <mode> --gdb
-LUPOS_PROFILE=debug cargo xtask run --gui --gdb
-
---gdb starts QEMU paused and exposes the stub on localhost:1234. In asecond terminal, run the exact command printed by xtask:
-
-gdb <kernel-elf> -ex "target remote :1234"
-
-Set breakpoints or watchpoints before continue. Capture, when applicable:
-
-set pagination off
-set logging file target/xtask/investigations/<issue>/gdb.txt
-set logging enabled on
-info registers
-x/16i $pc
-bt
-thread apply all bt full
-
-For a hang, interrupt GDB and collect every CPU's backtrace, registers, currentinstructions, and relevant lock or memory state. For corruption, prefer awatchpoint at the earliest known-good state. Compare the Lupos execution pointwith the corresponding Linux decision point and invariant.
-
-If GDB genuinely cannot be used—for example, the defect is host-only, vanishesunder the stub, or requires a non-QEMU environment—record the concrete reasonand use the closest available evidence, such as a core dump, strace, QMPcapture, or serial trace. Inconvenience is not a valid reason to skip GDB.
-
-Phase 4 — Fix the surviving defect without violating Linux
-
-A post-parity fix must still be a Linux-faithful correction. Before editing:
-
-identify the violated Linux invariant or contract;
-
-identify the corresponding Linux function, type, test, or call path;
-
-explain why the parity-settled Rust translation still diverges in execution;
-
-select or add the regression test that demonstrates the failure.
-
-Then implement the smallest correction that restores Linux's behavior andmechanism. Preserve:
-
-ABI and layout;
-
-upstream algorithm and data structure;
-
-return values and errno;
-
-ordering, barriers, locks, and side effects;
-
-ownership, lifetime, RCU, and refcount semantics;
-
-stack and allocation bounds;
-
-interrupt, preemption, and per-CPU behavior;
-
-the subsystem purpose demonstrated by Linux's callers and tests.
-
-Rebuild after each focused correction. If the new evidence implicates anotherarea, return to the parity phase for that expanded scope before continuing todebug.
-
-Regression tests are part of every parity correction and defect fix
-
-Select or add the regression oracle before implementing each correction.
-
-Demonstrate that it fails against the relevant pre-correction behavior whenthat state is buildable and executable, and that it passes afterward.
-
-Prefer the original Linux test from vendor/linux: KUnit, kselftest, LTP,the subsystem test tool, or the original reproducer. Port or adapt only theharness required to execute it on Lupos.
-
-Do not invent a local unit test when an upstream behavioral test alreadydefines the contract.
-
-Every test-bearing Rust file must retain the repository's requiredtest-origin provenance. Explain why a Lupos-specific test is necessary whenno suitable Linux test exists.
-
-Match the test layer to the defect. Pure host logic may use a host unit test.Syscalls, boot, interrupts, SMP, memory ordering, devices, modules, anduserspace ABI require the relevant QEMU or runtime gate.
-
-A source-text assertion is not runtime evidence and cannot be the soleregression test.
-
-Never weaken, delete, ignore, or change a test's expected Linux behavior tomake a change pass.
-
-Report pre-existing and environment-blocked failures separately with exactoutput.
-
-While iterating, run the narrowest valid test. Before handoff, run:
-
-cargo xtask test
-cargo xtask test --mode <relevant-mode>
-
-Use --boot where appropriate, run any original Linux test used as the oracle,and use:
-
-cargo xtask test --all
-
-for cross-cutting, module, release, or broad ABI changes. Repeat timing-, SMP-,or race-sensitive tests enough times to expose flakes.
-
-Performance regression gate
-
-Every implementation change must identify the performance-sensitive real pathit touches and exercise it with a relevant benchmark. Documentation-onlychanges are exempt.
-
-Prefer the corresponding vendor/linux benchmark or an upstream Linux testtool. When none exists, add the smallest reproducible benchmark that:
-
-drives the real kernel path rather than a mock;
-
-checks correctness;
-
-emits machine-readable samples;
-
-documents why a Lupos-specific benchmark is necessary.
-
-For a post-parity defect fix, the baseline is the parity-settled tree before thespecific fix, and the candidate is the corrected tree. A faster non-parityimplementation is never a valid reason to preserve a Linux divergence. When apre-correction state cannot build or execute, record that fact and compare thecandidate against the closest valid parity baseline and Linux's intendedcomplexity and boundedness guarantees.
-
-Use the same workload, optimized profile, .config, QEMU version,accelerator, CPU model, machine, RAM, SMP count, disk image, host-load policy,and warm-up state. Example fixed settings:
-
-LUPOS_PROFILE=release LUPOS_QEMU_ACCEL=tcg \
-  LUPOS_QEMU_CPU=max LUPOS_QEMU_MEMORY=1024M \
-  cargo xtask run --mode <benchmark-mode>
-
-Use KVM instead of TCG when measuring native CPU behavior, but never compare aKVM sample with a TCG sample.
-
-Store raw per-iteration output under:
-
-target/xtask/benchmarks/<name>/baseline/
-target/xtask/benchmarks/<name>/candidate/
-
-Include warm-ups and enough measured repetitions to characterize noise,normally at least ten. Compare median and tail latency or throughput, not asingle wall-clock run. Correctness must pass before timing is considered. Boottime is not a proxy for a subsystem unless boot performance is the statedworkload.
-
-The candidate must not be materially slower than the valid baseline beyond themeasured noise threshold. Do not hide regressions in averages. Any acceptedperformance trade-off requires explicit user approval and retained raw numbersand rationale.
-
-Keep checked-in benchmarks runnable with one documented command. Wherepractical, give their setup and parsing logic a correctness smoke test. Avoidflaky timing thresholds in uncontrolled CI; preserve samples and evaluate themin a controlled environment.
-
-Completion checklist
-
-Do not claim completion until evidence proves all applicable items:
-
-the exact task scope and any later expansions were recorded;
-
-every parity gap in that scope was closed or documented with an approvedlinux-deviation: and proof;
-
-every changed file was re-compared with its vendor/linux counterpart;
-
-Linux's data structures, algorithm, invariants, ABI, layouts, constants,errors, ordering, locking, barriers, lifetimes, and side effects match;
-
-the parity-settled tree builds successfully;
-
-the original reproducer passes, when one exists;
-
-each regression test failed before the relevant correction when demonstrableand passes afterward;
-
-GDB was used for an applicable runtime failure, or the concrete reason itcould not be used was recorded;
-
-focused tests and all required broader gates passed;
-
-benchmark samples show no material regression against a valid paritybaseline;
-
-raw evidence and investigation paths were handed off;
-
-remaining uncertainty, environment blockers, pre-existing failures, andout-of-scope parity findings were reported explicitly;
-
-no branch or commit was created without approval.
-
-The final report must distinguish clearly between:
-
-parity gaps corrected before the build;
-
-build errors that survived the parity sweep and how they were fixed;
-
-runtime or test defects that survived a successful build;
-
-validation and benchmark evidence;
-
-unresolved or out-of-scope findings.
+Before Phase 1 opens, the human-controlled branch bootstrap MUST leave no prior
+translated Rust kernel files under `src/`. The old implementation remains
+recoverable from Git history outside this branch, so it does not belong in this
+worktree.
+
+The only implementation oracle is `vendor/linux` at the exact revision recorded
+in `vendor/linux.SHA`.
+
+## 2. Zero-difference contract
+
+This is not a Linux-like redesign, a simplification exercise, a compatibility
+facade, or a chance to replace Linux mechanisms with convenient Rust code.
+Preserve Linux's:
+
+- ABI, exported symbols, calling conventions, and layouts;
+- algorithms, data structures, state machines, and asymptotic behavior;
+- control flow, cleanup paths, operation ordering, and side effects;
+- locking, barriers, atomics, RCU, refcounting, and lifetime rules;
+- interrupt, preemption, per-CPU, scheduler, and asynchronous behavior;
+- exact return values, partial-success behavior, flags, and `errno` values;
+- allocation, stack, latency, boundedness, and scalability properties;
+- compile-time behavior for the approved configuration union.
+
+Build success, convenience, a smaller current machine, and idiomatic style never
+override Linux semantics.
+
+If exact behavior cannot be established from the pinned source, local headers,
+callers, callees, Kconfig/Kbuild, and original tests, the task becomes
+`BLOCKED`. Guessing is forbidden.
+
+## 3. Authority order
+
+When sources conflict, use this order:
+
+1. the exact commit in `vendor/linux.SHA`;
+2. the frozen x86_64/AArch64 configurations;
+3. `rewrite/SCOPE.tsv` and its Kconfig/Kbuild evidence;
+4. pinned Linux headers, callers, callees, generated definitions, and tests;
+5. `rewrite/PORTING.md`, `rewrite/LIFETIMES.tsv`, and `rewrite/ABI.tsv`;
+6. accepted findings from independent reviewers;
+7. Rust style preferences.
+
+Translation MUST NOT begin when the Linux revision is moving, mixed with
+mainline backfills, or inconsistent with the checked-out `vendor/linux` tree.
+No web page, model memory, or previous Lupos source may replace local pinned
+upstream evidence.
+
+## 4. Frozen configuration-derived subset
+
+The authoritative subset is the union of checked-in configurations under:
+
+```text
+rewrite/configs/x86_64/
+rewrite/configs/aarch64/
+```
+
+A Linux file or conditional branch is in scope only when the frozen manifests
+record that it is selected by at least one approved configuration or is a
+required transitive dependency of selected code.
+
+The scope architect MUST finish the complete inventory before any translation
+pipeline claims a file. During Phase 1, pipelines may not discover and silently
+add work. An unlisted dependency blocks the task and reopens the scope gate.
+All pipelines pause while a new scope and task-queue fingerprint is reviewed.
+
+### 4.1 Source classes
+
+Every considered Linux file MUST receive exactly one class in
+`rewrite/SCOPE.tsv`:
+
+| Class | Required treatment |
+| --- | --- |
+| `RUST_TRANSLATE` | Create a fresh path-preserving Rust translation under `src/`. |
+| `LINUX_ARCH_ASM` | Preserve required x86_64/AArch64 assembly mechanically; do not redesign it. |
+| `LINUX_DRIVER_OBJECT` | Do not translate. Build original Linux source later into its Kbuild object form and link or load it through the Linux-compatible ABI. |
+| `ORACLE_ONLY` | Keep original KUnit, in-tree test, kselftest, test data, and vectors in `vendor/linux`. |
+| `BUILD_METADATA` | Retain only the configuration/build metadata needed for the frozen subset. |
+| `REFERENCE_ONLY` | Read for intent; do not import into `src/`. |
+| `OUT_OF_SCOPE` | Do not translate, edit, stub, or claim. |
+
+Driver ownership is determined by Kbuild target and subsystem role, not merely
+by directory name. Driver-owned code in `drivers/`, `sound/`, architecture
+platform directories, or elsewhere remains original Linux C/assembly objects.
+
+## 5. Linux-shaped fresh source tree
+
+The new Rust source tree mirrors relevant Linux paths:
+
+```text
+vendor/linux/kernel/sched/core.c       -> src/kernel/sched/core.rs
+vendor/linux/arch/x86/kernel/apic/*.c  -> src/arch/x86/kernel/apic/*.rs
+vendor/linux/arch/arm64/kernel/*.c     -> src/arch/arm64/kernel/*.rs
+vendor/linux/include/linux/*.h         -> src/include/linux/*.rs
+```
+
+Rules:
+
+- Map each selected implementation-bearing `.c` or `.h` file one-to-one where
+  Rust permits it.
+- Do not flatten directories or combine unrelated Linux files.
+- Do not split one Linux file unless Rust makes it unavoidable and
+  `rewrite/FILE_MAP.tsv` records every destination fragment.
+- Do not create or update shared `mod.rs` indexes from parallel pipelines.
+  Generate module indexes deterministically only after all file tasks are
+  `DONE` and before the separate compile phase.
+- Do not mirror Linux documentation, original tests, or driver sources under
+  `src/`.
+- Retain SPDX identifiers and relevant upstream copyright notices.
+
+Every translated file begins with immutable provenance only:
+
+```rust
+// SPDX-License-Identifier: GPL-2.0-only
+//! linux-source: kernel/example.c
+//! linux-revision: <exact SHA from vendor/linux.SHA>
+//! architectures: x86_64,aarch64
+//! rewrite-task: <stable task id>
+```
+
+Do not place mutable claims such as `complete`, `FULL`, `parity`, `tested`, or
+`working` in source headers.
+
+## 6. Phase 0 artifacts and complete task inventory
+
+Before the first file is claimed, Phase 0 MUST create and review:
+
+- `vendor/linux.SHA` — one exact commit;
+- `rewrite/configs/**` — frozen x86_64 and AArch64 configurations;
+- `rewrite/SCOPE.tsv` — all considered Linux files and their class/evidence;
+- `rewrite/FILE_MAP.tsv` — exact source-to-destination mapping;
+- `rewrite/SYMBOLS.tsv` — selected functions, types, statics, operative macros,
+  and configuration branches for every `RUST_TRANSLATE` file;
+- `rewrite/PORTING.md` — mechanical Linux C/assembly to Rust rules;
+- `rewrite/LIFETIMES.tsv` — ownership/lifetime decisions derived from Linux;
+- `rewrite/ABI.tsv` — layouts, alignment, linkage, symbols, and calling
+  conventions;
+- `rewrite/DRIVER_ABI.tsv` — contracts required by original Linux driver
+  objects;
+- `rewrite/BRANDING_ALLOWLIST.tsv` — every permitted Linux-to-Lupos name delta;
+- `rewrite/TRANSLATION_TASKS.tsv` — the complete Phase 1 file queue;
+- `rewrite/TRANSLATION_TASKS.sha256` — fingerprint of immutable queue fields;
+- `rewrite/events.jsonl` — append-only workflow event log;
+- `rewrite/logs/tasks/` — one evidence directory per task;
+- `rewrite/BLOCKERS.tsv` — unresolved scope/source/lifetime/ABI questions.
+
+`rewrite/SCOPE.tsv` MUST expose at least:
+
+```text
+id	linux_path	destination_path	class	architectures	kconfig_evidence	kbuild_target	cluster	weight	risk	dependencies
+```
+
+All `RUST_TRANSLATE` rows are converted into task rows before Phase 1 begins.
+No pipeline may start while the queue is incomplete or unfingerprinted.
+
+## 7. Canonical translation queue
+
+### 7.1 Required TSV schema
+
+`rewrite/TRANSLATION_TASKS.tsv` is the canonical mutable snapshot. Its exact
+header is:
+
+```text
+id	path	created_at	work_started_at	done_at	status	linux_path	architectures	cluster	weight	risk	dependencies	recommended_implementer	pipeline_id	attempt	lease_owner	lease_expires_at	implement_done_at	review_started_at	review_1_done_at	review_2_done_at	apply_started_at	updated_at	resume_status	last_error
+```
+
+Column rules:
+
+- `id` is stable and unique for the Linux-path/destination-path pair.
+- `path` is the destination Rust path and is unique across the queue.
+- `created_at` is written when the complete queue is generated.
+- `work_started_at` is written exactly once, on the first successful claim.
+- `done_at` is empty until the final applier closes the file.
+- `status` is one of the states in §7.3.
+- `linux_path` resolves inside the pinned `vendor/linux` tree.
+- `architectures` is a comma-separated subset of `common,x86_64,aarch64`.
+- `dependencies` is a semicolon-separated list of task IDs.
+- `weight` is a deterministic scheduling estimate, not a completion claim.
+- `risk` is `low`, `medium`, or `high` and controls model escalation.
+- `recommended_implementer` is `luna` or `spark`; it is advisory and every
+  actual model invocation is also logged in `events.jsonl`.
+- all timestamps use UTC RFC 3339 with milliseconds and a `Z` suffix.
+
+The immutable columns are:
+
+```text
+id path created_at linux_path architectures cluster weight risk dependencies recommended_implementer
+```
+
+After the queue fingerprint is written, only status, lease, attempt, error, and
+timestamp fields may change. Rows may not be appended, removed, reordered, or
+repurposed during Phase 1. The fingerprint also binds the queue to the exact
+commit in `vendor/linux.SHA`; changing the pinned revision reopens Phase 0.
+
+### 7.2 Atomic queue updates
+
+Agents MUST NOT hand-edit the queue. Every mutation goes through the checked-in
+queue tool, which MUST:
+
+- take an OS-level exclusive lock;
+- verify the current branch;
+- verify the immutable-field fingerprint;
+- read the complete TSV;
+- validate the requested state transition;
+- write a temporary file in the same directory;
+- `fsync` and atomically replace the TSV;
+- append the corresponding event while holding the same lock.
+
+The reference command surface is:
+
+```bash
+python3 tools/rewrite_queue.py init --scope rewrite/SCOPE.tsv
+python3 tools/rewrite_queue.py freeze
+python3 tools/rewrite_queue.py claim --pipeline P01 --worker <id>
+python3 tools/rewrite_queue.py mark-implemented --id <task> --pipeline P01
+python3 tools/rewrite_queue.py start-review --id <task> --pipeline P01
+python3 tools/rewrite_queue.py mark-review --id <task> --slot 1 --pipeline P01
+python3 tools/rewrite_queue.py mark-review --id <task> --slot 2 --pipeline P01
+python3 tools/rewrite_queue.py start-apply --id <task> --pipeline P01
+python3 tools/rewrite_queue.py done --id <task> --pipeline P01
+python3 tools/rewrite_queue.py block --id <task> --pipeline P01 --reason <text>
+python3 tools/rewrite_queue.py pause --id <task> --pipeline <Pxx> --reason <text>
+python3 tools/rewrite_queue.py resume --id <task> --pipeline <Pxx> --worker <id>
+python3 tools/rewrite_queue.py stats
+python3 tools/rewrite_queue.py verify
+```
+
+A pipeline may hold at most one unresolved task. `claim` MUST refuse a second
+task while that pipeline owns an active or `PAUSED` row. Only `DONE`,
+`BLOCKED`, or an explicit `requeue` releases the pipeline for fresh work.
+
+### 7.3 Status vocabulary
+
+Use only these Phase 1 states:
+
+| State | Meaning |
+| --- | --- |
+| `TODO` | Inventoried and ready when dependencies allow. |
+| `IN_PROGRESS` | Exclusively leased to one pipeline; implementation is active. |
+| `IMPLEMENTED` | Candidate written; no independent source review is complete. |
+| `REVIEWING` | Two independent adversarial reviews are in progress or awaiting completion. |
+| `APPLYING` | Both reviews are complete and the applier is resolving them. |
+| `DONE` | Final source was rechecked by the applier; both review reports and a resolution exist. It has not been compiled or tested. |
+| `BLOCKED` | Exact source/scope/ABI/lifetime behavior cannot be established. No placeholder is allowed. |
+| `PAUSED` | An active stage stopped cleanly because of quota or interruption. `resume_status` preserves the exact stage and the task must be explicitly resumed. |
+
+The normal transition is:
+
+```text
+TODO -> IN_PROGRESS -> IMPLEMENTED -> REVIEWING -> APPLYING -> DONE
+```
+
+`DONE` is the burn-chart event. It means only **source translation pipeline
+complete**. It does not mean compiled, linked, booted, tested, compatible, or
+parity-proven.
+
+### 7.4 Event and evidence logs
+
+Every stage start, finish, block, pause, retry, lease renewal, and completion
+MUST append one JSON object to `rewrite/events.jsonl` containing at least:
+
+```text
+ts phase task_id path pipeline_id role event from_status to_status model reasoning_effort attempt detail
+```
+
+Each task uses:
+
+```text
+rewrite/logs/tasks/<id>/
+  implementation.md
+  candidate.diff
+  parity-review.md
+  rust-review.md
+  resolution.md
+```
+
+The queue tool MUST refuse `DONE` unless all five files exist. Logs are evidence,
+not implementation. Do not put source code copies in them beyond focused diff
+snippets needed to explain findings. `IMPLEMENTED` and `DONE` also require a
+non-empty destination file with exact task/source/revision/architecture
+provenance and no `todo!`, `unimplemented!`, or Rust test configuration.
+
+## 8. Quota-aware pipeline topology
+
+The Bun-style idea is preserved—one implementer, two independent reviewers, one
+applier—but concurrency is bounded for a personal Codex account.
+
+### 8.1 Deterministic scheduler, not an LLM dispatcher
+
+Task inventory, dependency checks, weighted selection, leases, timestamps, and
+status updates are deterministic local tooling. Do not spend model tokens asking
+an agent to choose the next row or count progress.
+
+The scheduler claims only frozen `RUST_TRANSLATE` tasks whose dependencies are
+`DONE`. It selects by dependency readiness, then highest remaining weight, then
+higher review risk, then stable task ID. Atomic claims prevent duplicate work.
+
+### 8.2 Default concurrency
+
+Default operating limits:
+
+```text
+active file pipelines: 2
+active task per pipeline: 1
+maximum spawned subagents in one coordinator session: 4
+reviewers per task: 2, concurrently
+```
+
+The queue permits only `P01` and `P02`; do not create additional pipeline IDs.
+This is an intentional quota boundary for the personal-account experiment, not
+a throughput target copied from Bun's 64-agent peak.
+
+A pipeline must finish or block its current file before claiming another. A
+`PAUSED` task retains the pipeline reservation until it is resumed, blocked, or
+requeued, so that pipeline cannot claim fresh work in the meantime. Do not
+prefetch tasks into model contexts.
+
+Close completed spawned-agent threads as soon as their required artifact has
+been captured. Completed implementers and reviewers must not remain open and
+consume the four-thread cap while a later stage starts.
+
+When a usage warning or interruption is imminent:
+
+1. stop editing at a coherent point;
+2. write the current task evidence;
+3. transition it to `PAUSED` with a concrete reason and its owning pipeline;
+4. leave the destination file, stage timestamps, and logs intact;
+5. later use `resume` to restore the exact saved stage without repeating completed work;
+6. do not let another pipeline claim it while it remains `PAUSED`.
+
+## 9. Codex roles and model policy
+
+Project-scoped custom agents live under `.codex/agents/`. Role separation is
+mandatory even when roles use the same model family.
+
+| Role | Default model | Effort | Purpose |
+| --- | --- | --- | --- |
+| scope architect | `gpt-5.6-sol` | `xhigh` | One-time pinned-source/config scope, mapping, ABI, and lifetime decisions. |
+| pipeline coordinator | `gpt-5.6-terra` | `medium` | Runs the deterministic queue commands and spawns role-isolated agents; it does not translate. |
+| implementer | `gpt-5.6-luna` | `medium` | Fast mechanical translation of exactly one leased file. |
+| optional Spark implementer | `gpt-5.3-codex-spark` | `medium` | Low-risk, well-specified files only when the model is available and its separate preview limit has capacity. |
+| parity reviewer | `gpt-5.6-terra` | `high` | Adversarial comparison with the pinned Linux implementation. |
+| Rust reviewer | `gpt-5.6-terra` | `high` | Adversarial ownership, unsafe, FFI, layout, and Rust-semantics review. |
+| applier | `gpt-5.6-terra` | `high` | Reopens Linux and resolves both reviews. |
+| deep adjudicator / phase gatekeeper | `gpt-5.6-sol` | `xhigh` | High-risk conflicts, blockers, and whole-phase closure only. |
+
+The implementer always uses less reasoning than reviewers and the applier.
+Lower implementer effort never lowers the acceptance standard.
+
+### 9.1 Spark policy
+
+Spark is optional, never mandatory. It may be used only for `risk=low` tasks
+with complete symbol/lifetime/ABI guidance. Before broad use, run a small trial
+with matched Luna tasks and compare:
+
+- elapsed implementation time;
+- reviewer finding count and severity;
+- rework/block rate;
+- missing-symbol rate.
+
+Record the actual model and effort in every event. Disable Spark when it causes
+more omissions or rework, when its separate preview limit is exhausted, or when
+it is unavailable. Fall back to Luna without creating a duplicate task.
+
+Do not use Spark for high-risk concurrency, RCU, scheduler, interrupt, memory
+management, ABI adjudication, final application, or phase-gate decisions.
+
+### 9.2 Context separation
+
+- The implementer does not review its own work.
+- Reviewers run in separate contexts from the implementer and from each other.
+- Reviewers receive the pinned Linux file, frozen manifests, relevant local
+  headers/callers/callees, and the candidate diff. They do not receive the
+  implementer's private rationale.
+- Reviewers are source-read-only and assume the candidate is wrong; each may
+  write only its assigned task report under `rewrite/logs/tasks/<id>/`.
+- The applier receives the original source, candidate, both review reports, and
+  frozen guidance; it independently adjudicates findings.
+- A semantic conflict between reviewers escalates to the deep adjudicator or
+  becomes `BLOCKED`.
+
+## 10. Per-file pipeline
+
+For each claimed row:
+
+```text
+atomic claim
+    |
+    v
+implementer writes one fresh destination file
+    |
+    v
+candidate snapshot + IMPLEMENTED
+    |
+    v
+parity reviewer  ||  Rust reviewer
+    |                    |
+    +---------+----------+
+              v
+high-effort applier resolves every finding
+              |
+      +-------+-------+
+      |               |
+      v               v
+    DONE        BLOCKED / PAUSED
+```
+
+### 10.1 Implementer
+
+The implementer MUST:
+
+1. verify task ID, lease, branch, Linux SHA, source path, destination path,
+   architecture membership, selected symbols, and conditions;
+2. read the complete Linux source file;
+3. read every local pinned header, macro definition, type, caller, callee,
+   Kconfig, and Kbuild rule needed to understand it;
+4. translate every selected symbol and branch into the fresh destination file;
+5. preserve control flow, cleanup, locking, ordering, errors, side effects,
+   complexity, and ABI before considering style;
+6. use safe Rust where exact semantics permit and minimal documented `unsafe`
+   where the kernel contract requires it;
+7. write `implementation.md` and `candidate.diff`;
+8. transition the task to `IMPLEMENTED`;
+9. block rather than guess.
+
+The implementer MUST NOT:
+
+- read historical Lupos Rust source;
+- edit another task's destination;
+- edit shared module indexes or global manifests by hand;
+- add stubs, placeholders, fake success, hardcoded computed state, or future
+  work comments in place of implementation;
+- add Rust tests or copy Linux tests;
+- port a driver;
+- compile, format, link, execute, test, boot, debug, or benchmark;
+- approve its own output.
+
+### 10.2 Parity reviewer
+
+The parity reviewer MUST compare the candidate exhaustively with the pinned
+Linux source and selected inventory, including:
+
+- all functions, types, statics, operative macros, and selected branches;
+- algorithms, state machines, and data structures;
+- success, retry, cleanup, and error paths;
+- exact values, widths, signs, overflow, flags, masks, and errno;
+- lock order, interrupt/preemption state, atomics, barriers, RCU, refcounts,
+  wait/work queues, callbacks, and destruction order;
+- stack/allocation/boundedness/scalability behavior;
+- linkage, visibility, symbols, calling conventions, layouts, and Kconfig
+  behavior;
+- branding changes against the allowlist;
+- omissions disguised as traits, wrappers, plans, reports, constants, or mocks.
+
+Every finding names the Linux symbol and local evidence. The reviewer may write
+only the leased task's `parity-review.md`; it MUST NOT edit source or any other
+file, and it records review completion atomically.
+
+### 10.3 Rust reviewer
+
+The Rust reviewer MUST inspect:
+
+- ownership and borrow duration against actual Linux lifetimes;
+- pointer provenance, aliasing, pinning, and interior mutability;
+- `Send`/`Sync` and cross-CPU access;
+- `Drop` timing across callbacks, interrupts, work queues, RCU, and refcounts;
+- `#[repr(C)]`, alignment, packing, unions, bitfields, endian behavior, and FFI;
+- casts, truncation, sign extension, wrapping, shifts, C promotions, and pointer
+  arithmetic;
+- eager/lazy evaluation and debug/release semantic differences;
+- panic, allocation failure, bounds-check, and unwind behavior;
+- necessity and scope of every `unsafe` block.
+
+It rejects idiomatic substitutions that change Linux behavior. It may write
+only the leased task's `rust-review.md`; it MUST NOT edit source or any other
+file, and it records completion atomically.
+
+### 10.4 Applier
+
+The applier MUST:
+
+1. reopen the complete pinned Linux file and relevant context;
+2. resolve every finding or disprove it with specific upstream evidence;
+3. implement missing logic rather than documenting it as future work;
+4. preserve the frozen task scope and destination path;
+5. avoid introducing a new unreviewed design;
+6. write `resolution.md` with one disposition per finding;
+7. mark `DONE` only when no finding remains and all evidence files exist;
+8. mark `BLOCKED` when exact parity cannot be established.
+
+The applier MUST NOT compile, format, link, run, test, benchmark, add tests, add
+stubs, port drivers, or weaken Linux behavior.
+
+## 11. Translation-only hard gate
+
+The trusted project-local `.codex/rules/rewrite-safety.rules` is an additional
+mechanical guard against direct compiler/runtime commands, destructive Git, and
+historical-source recovery. Rules do not replace this protocol and may not cover
+every possible shell wrapper; agents remain responsible for the complete ban.
+
+
+The rule file is Phase-1-specific. After the whole-subset gate is approved, a
+human—not an agent—must move it outside `.codex/rules/`, install the later
+compile-workflow guardrails, and restart Codex. No translation agent may disable
+or bypass its own command policy.
+
+Phase 1 performs source translation and source review only.
+
+Allowed:
+
+- read-only inspection/search of pinned local source;
+- deterministic scope and queue tooling;
+- editing the one leased destination file;
+- writing the task's unique evidence files;
+- read-only `git status` and focused `git diff -- <leased-path>`;
+- atomic queue/event updates.
+
+Forbidden directly or through wrappers:
+
+```text
+cargo build
+cargo check
+cargo test
+cargo fmt
+cargo clippy
+rustc
+make
+ninja
+cmake
+cc / gcc / clang
+ld / lld
+objcopy / objdump as validation
+qemu-system-*
+gdb / lldb
+KUnit
+kselftest
+benchmarks
+boot or userspace commands against Lupos
+```
+
+Do not use compiler errors as a Phase 1 work queue. The expected state is that
+none of the fresh source works yet. As in the Bun rewrite workflow, source is
+translated and adversarially reviewed first; compilation becomes a separate
+later workflow only after every translation task is `DONE`.
+
+## 12. Rust translation rules
+
+Use this priority:
+
+1. exact Linux semantics and ABI;
+2. Rust soundness and explicit unsafe boundaries;
+3. idiomatic Rust where it changes neither item 1 nor 2.
+
+### 12.1 Mechanism is part of behavior
+
+Preserve intrusive lists, rbtrees, xarrays, radix trees, per-CPU storage, wait
+queues, work queues, RCU, seqlocks, refcounts, interrupt-driven paths, and state
+machines. Do not replace them with convenient `Vec`, maps, fixed arrays,
+polling, mock-only traits, or local protocols.
+
+Reject on sight unless Linux does the same:
+
+- a constant where Linux computes state;
+- an errno stub where Linux performs work;
+- a trait with no production backend;
+- a `Plan`/`Report` object that omits side effects;
+- constants/structs/helpers standing in for the operative file;
+- a different container, algorithm, lock protocol, or complexity class;
+- a large by-value copy where Linux moves pointers/list links;
+- polling where Linux is interrupt-driven;
+- simplification justified by current hardware limits;
+- a paragraph-long workaround comment instead of a faithful port.
+
+### 12.2 Unsafe
+
+Use safe Rust when it can express the exact contract. Every `unsafe` block MUST
+be minimal and include a local `// SAFETY:` comment naming the invariant and who
+owns it. Every `unsafe fn` documents caller obligations. Do not create Rust
+references whose exclusivity or lifetime is stronger than Linux guarantees.
+
+### 12.3 Layout, linkage, errors, and cleanup
+
+- Use `#[repr(C)]`, explicit widths, alignment, packing, unions, and exact
+  exported names where required.
+- Preserve padding and reserved fields.
+- Preserve exact error signs, retry behavior, and partial success.
+- Do not use `unwrap`, `expect`, or panic for recoverable Linux paths.
+- RAII and `Drop` are allowed only when cleanup occurs at the same point and
+  under the same synchronization as Linux.
+- Preserve evaluation order and side effects; do not hide them in assertions,
+  eager fallback expressions, or unconsumed iterators.
+
+## 13. Branding
+
+The Linux-to-Lupos name change is allowed only in
+`rewrite/BRANDING_ALLOWLIST.tsv`. There is no global replacement.
+
+Preserve Linux names by default, including UAPI names, exported symbols,
+`CONFIG_*`, magic values, filesystem/protocol identifiers, driver KAPI names,
+test names, and expected values.
+
+## 14. No Rust unit tests
+
+The rewritten kernel contains zero project-authored Rust unit tests. Do not add:
+
+- `#[test]` or `#[cfg(test)]` modules;
+- mock-only parity tests;
+- copied/translated KUnit tests;
+- `include_str!` assertions over `vendor/linux`;
+- source-text pins presented as behavioral evidence;
+- replacement vectors or expectations.
+
+Original Linux tests are built later from the pinned Linux tree. A minimal
+external harness may be added outside `src/` only to link, launch, and collect
+those original tests without changing their logic or expected behavior.
+
+## 15. Original Linux drivers remain objects
+
+Drivers are not translated. For each selected driver:
+
+1. classify it `LINUX_DRIVER_OBJECT`;
+2. record required core ABI in `rewrite/DRIVER_ABI.tsv`;
+3. expose the same Linux-facing contracts from the Rust core;
+4. compile the original Linux driver source only in the later build phase;
+5. link built-in objects or load `.ko` files according to the frozen config;
+6. never create a Rust shell or fake driver in its place.
+
+A later driver compile/link failure is a core ABI or build-integration task, not
+permission to port the driver.
+
+## 16. Git and shared-worktree safety
+
+During Phase 1, the recommended personal-machine layout is one shared worktree
+on `feat/bun-like-rewrite-test` with two pipelines. This avoids disk-heavy
+worktrees while remaining safe because:
+
+- the queue grants exclusive destination-file leases;
+- workers never edit shared indexes/manifests directly;
+- queue/event writes are locked and atomic;
+- worker agents run no Git mutations.
+
+Workers MUST NOT run `git stash`, `git reset`, `git clean`, checkout, restore,
+rebase, merge, commit, push, or any command that discards or combines work.
+
+A single human or dedicated integration process may commit completed files and
+their evidence serially on the required branch. Never run concurrent commits.
+Do not mix unrelated or non-`DONE` files into a completion commit.
+
+## 17. Later phase queues
+
+Only after every translation task is `DONE` and the phase gatekeeper verifies
+the complete frozen queue may Phase 2 begin.
+
+Later phases use separate TSV queues with the same base timestamp fields and the
+same append-only event log:
+
+- `rewrite/COMPILE_TASKS.tsv` — compiler/linker errors grouped by owning file or
+  dependency cluster;
+- `rewrite/TEST_TASKS.tsv` — failures from original Linux tests;
+- `rewrite/RUNTIME_TASKS.tsv` — boot, ABI, compatibility, and performance
+  failures.
+
+### Phase 2 — compile and link
+
+Generate compiler tasks only after one whole-subset compile attempt. Fix each
+with one implementer/fixer, two reviewers, and one applier. Never use stubs,
+deleted paths, altered ABI, or substitute algorithms to make the build pass.
+Compile original Linux driver objects under the frozen configurations and link
+both architectures.
+
+### Phase 3 — original Linux tests
+
+Build original KUnit/in-tree unit sources and kselftests from the pinned Linux
+tree against Lupos. Preserve original test source, names, vectors, expected
+values, and skip rules. Do not weaken or replace a failing test.
+
+### Phase 4 — runtime and performance
+
+Boot both approved architectures, run applicable original userspace/selftests,
+compare Linux-visible behavior, debug only failures surviving earlier gates,
+and retain exact commands/logs/traces/raw benchmark samples.
+
+## 18. Progress charts and reporting
+
+The canonical completion curve is derived from `done_at` or `event="done"`, not
+from line counts, commits, or source headers.
+
+Generate charts with:
+
+```bash
+python3 tools/plot_translation_burn.py \
+  --queue rewrite/TRANSLATION_TASKS.tsv \
+  --events rewrite/events.jsonl \
+  --out-dir rewrite/plots
+```
+
+Required outputs:
+
+- cumulative files `DONE` over time;
+- files completed per hour;
+- cumulative weight completed over time;
+- machine-readable hourly metrics;
+- per-attempt implementation, review, apply, and end-to-end durations, including
+  archived/requeued attempts;
+- per-model implementation counts, durations, blockers, pauses, review-report
+  counts, and requeue summaries;
+- a machine-readable JSON summary.
+
+`translation_task_durations.tsv` and `translation_model_performance.tsv` are the
+canonical evidence for comparing eligible implementer models. Raw speed alone
+is insufficient: compare duration with reviewer findings, requeues, blockers,
+pauses, and missing-symbol failures before changing the default implementer.
+Attempt timing is derived from the append-only event log so retries are measured
+separately rather than merged into one misleading wall-clock interval.
+
+Every handoff reports:
+
+- total tasks and status counts;
+- completed count and weight;
+- active pipelines and task IDs;
+- blocked/paused tasks and reasons;
+- per-model implementation counts and review-rejection rates when available;
+- exact queue fingerprint and event-log path;
+- no build/test claim during Phase 1.
+
+## 19. Automatic rejection rules
+
+Reviewers and appliers MUST reject candidates containing:
+
+- historical Lupos translation source or copied old code;
+- `todo!()`, `unimplemented!()`, placeholder panics, or fake success;
+- hardcoded state where Linux computes or queries it;
+- Rust tests, copied Linux tests, or source-text assertions;
+- partial shells presented as a whole-file translation;
+- a Rust driver rewrite;
+- out-of-scope architecture/feature work;
+- unauthorized branding;
+- changed ABI names, layouts, flags, errno, or calling conventions;
+- mock-only seams or convenient replacement mechanisms;
+- unexplained/broad unsafe;
+- compiler-driven changes during Phase 1;
+- manual queue edits or missing timestamp events;
+- multiple active tasks assigned to one pipeline;
+- a `DONE` transition without both reviews and an applier resolution.
+
+## 20. Phase 1 completion gate
+
+Do not permit the first build until all are true:
+
+- the branch is `feat/bun-like-rewrite-test`;
+- no previous translated Rust kernel source was used;
+- one Linux SHA and the x86_64/AArch64 config union are frozen;
+- every selected file has one scope class and exact path mapping;
+- every `RUST_TRANSLATE` file was listed in the TSV before work began;
+- the immutable queue fingerprint verifies;
+- every task is `DONE`; none is `TODO`, active, `BLOCKED`, or `PAUSED`;
+- every task has implementation evidence, two independent reviews, and one
+  resolution;
+- every selected symbol and branch has a final mapping;
+- every unsafe boundary is documented;
+- every selected driver remains original Linux source/object;
+- no Linux docs/tests/drivers were copied into `src/`;
+- the Rust kernel contains zero project-authored unit tests;
+- only allowlisted branding differs intentionally;
+- no compiler, linker, formatter, test, emulator, debugger, or benchmark ran in
+  Phase 1;
+- progress logs and charts can be regenerated from checked-in evidence.
+
+The governing rule is: **inventory every file first, atomically burn one file
+per pipeline through implement/review/review/apply, mark it `DONE`, and compile
+nothing until the entire frozen queue is done.**

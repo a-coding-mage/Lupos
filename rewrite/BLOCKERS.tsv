@@ -1,0 +1,3 @@
+id	phase	category	status	detail	required_resolution
+B000001	Phase 0	pinned-source	RESOLVED	Initial run lacked vendor/linux.SHA. The pin was created and verified against vendor/linux HEAD 425f94c2954b1fe80ebdbf9b29854e89750355df.	Resolved on 2026-08-05; retain as historical blocker evidence.
+B000002	Phase 0	frozen-config	RESOLVED	Initial run lacked the frozen configuration directories. x86_64 and AArch64 defconfig.config inputs and metadata were generated and verified against the pinned Linux commit.	Resolved on 2026-08-05; retain as historical blocker evidence.

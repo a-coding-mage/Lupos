@@ -1,0 +1,117 @@
+# Always-on safety guardrails for the fresh Lupos rewrite branch.
+# Project-local rules load only after the repository is trusted in Codex.
+
+prefix_rule(
+    pattern = [[
+        "cargo",
+        "rustc",
+        "rustfmt",
+        "clippy-driver",
+        "cc",
+        "gcc",
+        "g++",
+        "c++",
+        "clang",
+        "clang++",
+        "ld",
+        "ld.lld",
+        "lld",
+        "ninja",
+        "cmake",
+    ]],
+    decision = "forbidden",
+    justification = "The source-translation workflow must not compile, format, or link. Finish and gate every TSV translation task before opening a separate compile workflow.",
+    match = [
+        "cargo check",
+        "cargo fmt",
+        "rustc --version",
+        "gcc -c kernel/example.c",
+        "clang++ -c example.cc",
+        "ld -r a.o b.o",
+        "ninja",
+        "cmake --build build",
+    ],
+    not_match = [
+        "python3 tools/rewrite_queue.py stats",
+        "git status --short",
+    ],
+)
+
+prefix_rule(
+    pattern = [[
+        "qemu-system-x86_64",
+        "qemu-system-aarch64",
+        "qemu-system-arm",
+        "gdb",
+        "gdb-multiarch",
+        "lldb",
+        "kgdb",
+    ]],
+    decision = "forbidden",
+    justification = "Execution and debugging are later phases. During source translation, use pinned source evidence and the TSV pipeline only.",
+    match = [
+        "qemu-system-x86_64 -kernel target/kernel",
+        "qemu-system-aarch64 -M virt",
+        "gdb target/kernel",
+        "lldb target/kernel",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", [
+        "stash",
+        "reset",
+        "clean",
+        "checkout",
+        "switch",
+        "restore",
+        "rebase",
+        "merge",
+        "cherry-pick",
+        "revert",
+        "pull",
+        "worktree",
+    ]],
+    decision = "forbidden",
+    justification = "Parallel rewrite workers must never alter branch state or discard/combine another worker's files. Use read-only git status/diff commands and let the human integrate DONE files serially.",
+    match = [
+        "git stash",
+        "git reset --hard HEAD",
+        "git clean -fd",
+        "git checkout main",
+        "git switch main",
+        "git restore src/kernel/example.rs",
+        "git rebase main",
+        "git merge main",
+        "git worktree add ../other main",
+    ],
+    not_match = [
+        "git status --short",
+        "git branch --show-current",
+        "git rev-parse HEAD",
+        "git diff -- src/kernel/example.rs",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", ["show", "log", "archive", "format-patch"]],
+    decision = "forbidden",
+    justification = "Historical Lupos Rust source is not an input to this fresh rewrite. Read only the pinned vendor/linux tree and current fresh branch.",
+    match = [
+        "git show main:src/kernel/example.rs",
+        "git log -p -- src",
+        "git archive main src",
+        "git format-patch main -- src",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", ["add", "commit", "push"]],
+    decision = "prompt",
+    justification = "Only a human or dedicated serial integration step may commit/push completed task files and evidence; never let parallel workers do this silently.",
+    match = [
+        "git add src/kernel/example.rs",
+        "git commit -m done",
+        "git push origin feat/bun-like-rewrite-test",
+    ],
+)

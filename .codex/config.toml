@@ -1,0 +1,17 @@
+# AGENTS.md is comprehensive; keep the whole protocol in project context.
+project_doc_max_bytes = 65536
+
+# Pinned vendor/linux is the only source oracle during this workflow.
+web_search = "disabled"
+
+[sandbox_workspace_write]
+network_access = false
+
+[agents]
+enabled = true
+# Two file pipelines can each place two reviewers in flight, while the primary
+# coordinator remains outside this spawned-thread count.
+max_concurrent_threads_per_session = 4
+default_subagent_model = "gpt-5.6-luna"
+default_subagent_reasoning_effort = "medium"
+interrupt_message = true

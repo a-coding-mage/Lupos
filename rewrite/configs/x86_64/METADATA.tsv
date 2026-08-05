@@ -1,0 +1,7 @@
+key	value
+architecture	x86_64
+linux_arch	x86_64
+configuration	defconfig
+linux_commit	425f94c2954b1fe80ebdbf9b29854e89750355df
+generated_at	2026-08-05T07:45:35Z
+generation_command	make -C vendor/linux O=rewrite/configs/x86_64/build ARCH=x86_64 defconfig

@@ -1,0 +1,2 @@
+id	path	created_at	work_started_at	done_at	status	linux_path	architectures	cluster	weight	risk	dependencies	recommended_implementer	pipeline_id	attempt	lease_owner	lease_expires_at	implement_done_at	review_started_at	review_1_done_at	review_2_done_at	apply_started_at	updated_at	resume_status	last_error
+T000001	src/kernel/example.rs	2026-08-05T00:00:00.000Z			TODO	kernel/example.c	common	kernel	5	medium		luna		0								2026-08-05T00:00:00.000Z		

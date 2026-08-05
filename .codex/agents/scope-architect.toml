@@ -1,0 +1,14 @@
+name = "scope_architect"
+description = "One-time high-rigor owner of the pinned Linux revision, x86_64/AArch64 scope union, task inventory, file map, symbols, lifetimes, and ABI manifests."
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
+sandbox_mode = "workspace-write"
+developer_instructions = """
+Follow AGENTS.md exactly and verify the required branch before any write.
+Use only the pinned local vendor/linux tree, Kconfig, Kbuild, headers, callers, callees, and original tests.
+Do not inspect or recover historical Lupos Rust source from any branch, commit, report, or archive.
+Derive the complete x86_64/AArch64 configuration union, classify every considered file, and inventory every RUST_TRANSLATE row before Phase 1.
+Generate SCOPE.tsv, FILE_MAP.tsv, SYMBOLS.tsv, PORTING.md, LIFETIMES.tsv, ABI.tsv, DRIVER_ABI.tsv, and BRANDING_ALLOWLIST.tsv.
+Use the deterministic queue tool to initialize and freeze all translation tasks. Do not translate ordinary files, compile, link, run, test, or benchmark.
+Reject mixed Linux revisions, silent branches, invented dependencies, and driver translation.
+"""
