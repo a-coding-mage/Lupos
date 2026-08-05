@@ -5617,39 +5617,66 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         // rather than assumed.
         "echo 'graphics-x11: forkstorm begin'\n",
         // `-u` is load-bearing: stdout here is a pipe, so CPython block-buffers
-        // it and a hang loses every progress line written before the hang —
-        // the first attempt reported only `timeout: ... dumped core` with no
-        // phase results at all.
+        // it and a hang loses every progress line written before the hang.
         "timeout -k 5 300 /usr/bin/python3 -u - <<'PYEOF' 2>&1 | sed 's/^/graphics-x11: forkstorm /'\n",
-        "import mmap, os, sys, threading, time\n",
+        "import faulthandler, mmap, os, sys, threading, time\n",
+        // A hang here must diagnose itself: the parent is the thing that stops
+        // making progress, and without this the run reports only the outer
+        // `timeout` killing the interpreter.
+        "faulthandler.dump_traceback_later(60, exit=False, repeat=True)\n",
         "PAGES, ITERS = 8, 150\n",
-        "buf = mmap.mmap(-1, 4096 * PAGES)\n",
+        // MAP_PRIVATE is the whole point. `mmap.mmap(-1, n)` defaults to
+        // MAP_SHARED, which has no copy-on-write at all: an earlier version of
+        // this probe used the default and was therefore not testing COW.
+        "priv = mmap.mmap(-1, 4096 * PAGES, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)\n",
+        // The child cannot report through its own private page, so results
+        // travel over a deliberately shared one.
+        "shared = mmap.mmap(-1, 4096, flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS)\n",
+        "mvp, mvs = memoryview(priv), memoryview(shared)\n",
+        "ZERO, MARK = b'\\x00' * 8, b'\\xaa' * 8\n",
         "for p in range(PAGES):\n",
-        "    buf[p * 4096:p * 4096 + 8] = b'\\xaa' * 8\n",
+        "    mvp[p * 4096:p * 4096 + 8] = MARK\n",
         "stop = False\n",
         "def churn():\n",
         "    while not stop:\n",
         "        for p in range(PAGES):\n",
-        "            buf[p * 4096 + 64:p * 4096 + 72] = b'\\x5a' * 8\n",
+        "            mvp[p * 4096 + 64:p * 4096 + 72] = MARK\n",
         "        x = bytearray(8192)\n",
         "        del x\n",
+        // The COW check runs in the *parent*, not the child. `dup_mmap()`
+        // write-protects the parent's PTEs and then flushes; if that flush is
+        // lost on some CPU, a parent thread keeps writing through a stale
+        // writable TLB entry into a page now shared with the child. Verifying
+        // from the parent exercises exactly that window and needs no
+        // fork-unsafe code in the child, which only ever calls execv().
+        //
+        // An earlier version verified inside the child. That was unsound:
+        // every way of touching a buffer from Python allocates (even
+        // memoryview slicing builds an object), and allocating in the child of
+        // a threaded fork is a documented deadlock hazard that stock Linux
+        // reproduces too -- CPython says so in the DeprecationWarning above.
         "def cow_round(iters):\n",
-        "    lost = 0\n",
         "    for i in range(iters):\n",
+        "        val = bytes([i & 0xff]) * 8\n",
         "        pid = os.fork()\n",
         "        if pid == 0:\n",
-        "            bad = 0\n",
-        "            for p in range(PAGES):\n",
-        "                buf[p * 4096:p * 4096 + 8] = b'\\x00' * 8\n",
-        "            for p in range(PAGES):\n",
-        "                if bytes(buf[p * 4096:p * 4096 + 8]) != b'\\x00' * 8:\n",
-        "                    bad = 1\n",
-        "            os._exit(2 if bad else 0)\n",
-        "        code = wait_child(pid, i, 'cow')\n",
-        "        if code != 0:\n",
-        "            lost += 1\n",
-        "            break\n",
-        "    return lost\n",
+        "            try:\n",
+        "                os.execv('/usr/bin/true', ['true'])\n",
+        "            except BaseException:\n",
+        "                pass\n",
+        "            os._exit(3)\n",
+        "        for p in range(PAGES):\n",
+        "            mvp[p * 4096:p * 4096 + 8] = val\n",
+        "        for p in range(PAGES):\n",
+        "            got = bytes(mvp[p * 4096:p * 4096 + 8])\n",
+        "            if got != val:\n",
+        "                print('cow LOST-WRITE iter=%d page=%d wrote=%s read=%s'\n",
+        "                      % (i, p, val.hex(), got.hex()))\n",
+        "                wait_child(pid, i, 'cow')\n",
+        "                return 1\n",
+        "        if wait_child(pid, i, 'cow') != 0:\n",
+        "            return 1\n",
+        "    return 0\n",
         "def wait_child(pid, i, tag):\n",
         "    deadline = time.time() + 10\n",
         "    while time.time() < deadline:\n",
@@ -5662,21 +5689,15 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "        time.sleep(0.005)\n",
         "    try:\n",
         "        sc = open('/proc/%d/syscall' % pid).read().strip()\n",
+        "        stt = open('/proc/%d/stat' % pid).read().split()[2]\n",
         "    except Exception as e:\n",
-        "        sc = 'unreadable(%s)' % e\n",
-        "    print('%s HUNG iter=%d pid=%d syscall=%s' % (tag, i, pid, sc))\n",
-        "    try:\n",
-        "        cw = open('/proc/%d/mem' % pid, 'rb', 0)\n",
-        "        pw = open('/proc/self/mem', 'rb', 0)\n",
-        "        ua = int(sc.split()[1], 16)\n",
-        "        cw.seek(ua); pw.seek(ua)\n",
-        "        print('%s HUNG futex uaddr=%#x child=%s parent=%s'\n",
-        "              % (tag, ua, cw.read(8).hex(), pw.read(8).hex()))\n",
-        "    except Exception as e:\n",
-        "        print('%s HUNG futex-compare unavailable %s' % (tag, e))\n",
+        "        sc, stt = 'unreadable(%s)' % e, '?'\n",
+        "    print('%s HUNG iter=%d pid=%d state=%s syscall=%s' % (tag, i, pid, stt, sc))\n",
         "    os.kill(pid, 9)\n",
         "    os.waitpid(pid, 0)\n",
         "    return -1\n",
+        // execv is async-signal-safe, so this child is legitimate after a
+        // threaded fork; it is the exact shape glycin uses to spawn a loader.
         "def exec_round(iters):\n",
         "    for i in range(iters):\n",
         "        pid = os.fork()\n",
@@ -5689,13 +5710,13 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "        if wait_child(pid, i, 'exec') != 0:\n",
         "            return 1\n",
         "    return 0\n",
-        "print('phase cow-single'); print('cow-single lost=%d' % cow_round(25))\n",
+        "print('phase cow-single'); print('cow-single rc=%d' % cow_round(25))\n",
         "print('phase exec-single'); print('exec-single rc=%d' % exec_round(25))\n",
         "ths = [threading.Thread(target=churn, daemon=True) for _ in range(6)]\n",
         "for t in ths:\n",
         "    t.start()\n",
         "time.sleep(0.5)\n",
-        "print('phase cow-threaded'); print('cow-threaded lost=%d' % cow_round(ITERS))\n",
+        "print('phase cow-threaded'); print('cow-threaded rc=%d' % cow_round(ITERS))\n",
         "print('phase exec-threaded'); print('exec-threaded rc=%d' % exec_round(ITERS))\n",
         "stop = True\n",
         "print('done')\n",
@@ -6679,7 +6700,7 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "                cuaddr=\"$(printf '%s' \"$csys\" | awk '{print $2}')\"; csp=\"$(printf '%s' \"$csys\" | awk '{print $(NF-1)}')\"\n",
         "                case \"$cuaddr\" in 0x*) ;; *) continue ;; esac\n",
         "                /usr/bin/python3 - \"$cpid\" \"$firefox_pid\" \"$cuaddr\" \"$csp\" <<'PYEOF' 2>&1 | sed 's/^/graphics-x11: firefox-forkchild /'\n",
-        "import sys, re\n",
+        "import sys, re, time\n",
         "cpid, ppid = sys.argv[1], sys.argv[2]\n",
         "uaddr = int(sys.argv[3], 16)\n",
         "sp = int(sys.argv[4], 16) if sys.argv[4].startswith('0x') else 0\n",
@@ -6698,12 +6719,31 @@ fn graphics_x11_probe_script() -> Vec<u8> {
         "    return None\n",
         "cm, pm = load(cpid), load(ppid)\n",
         "print('maps-count child=%d parent=%d identical=%s' % (len(cm), len(pm), cm == pm))\n",
-        "def word(pid, addr):\n",
+        "def word(pid, addr, n=8):\n",
         "    try:\n",
-        "        f = open('/proc/%s/mem' % pid, 'rb', 0); f.seek(addr); return f.read(8).hex()\n",
+        "        f = open('/proc/%s/mem' % pid, 'rb', 0); f.seek(addr); return f.read(n).hex()\n",
         "    except Exception as e: return 'unreadable(%s)' % e\n",
         "print('futex uaddr %#x child-owner %s parent-owner %s' % (uaddr, owner(cm, uaddr), owner(pm, uaddr)))\n",
         "print('futex word child=%s parent=%s' % (word(cpid, uaddr), word(ppid, uaddr)))\n",
+        // One diverged word is a targeted write divergence; a wholly different
+        // 64-byte line is a stale page snapshot. The two have different causes,
+        // so measure which one this is instead of inferring it.
+        "base = uaddr & ~63\n",
+        "cl_c, cl_p = word(cpid, base, 64), word(ppid, base, 64)\n",
+        "print('futex line base=%#x identical=%s' % (base, cl_c == cl_p))\n",
+        "print('futex line child =%s' % cl_c)\n",
+        "print('futex line parent=%s' % cl_p)\n",
+        // Is the lock *held persistently* by some parent thread, or did the
+        // fork merely land inside a brief critical section? Sampling the
+        // parent's own copy separates "a thread is stuck holding a GLib/Pango
+        // static lock" from "a narrow race we keep losing", and those need
+        // completely different fixes.
+        "held = 0\n",
+        "for _ in range(200):\n",
+        "    w = word(ppid, uaddr)\n",
+        "    if not w.startswith('unreadable') and int(w[:8], 16) != 0: held += 1\n",
+        "    time.sleep(0.01)\n",
+        "print('futex parent-held-samples %d/200' % held)\n",
         "if sp:\n",
         "    try:\n",
         "        f = open('/proc/%s/mem' % cpid, 'rb', 0)\n",

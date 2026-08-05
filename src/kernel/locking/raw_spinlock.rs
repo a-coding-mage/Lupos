@@ -199,11 +199,31 @@ impl RawSpinLock {
         let ticket_word = self.state.fetch_add(1u32 << 16, Ordering::AcqRel);
         let our_ticket = (ticket_word >> 16) as u16;
 
+        let mut spins: u32 = 0;
         loop {
             let cur = self.state.load(Ordering::Acquire);
             let owner = (cur & 0xFFFF) as u16;
             if owner == our_ticket {
                 return;
+            }
+            // Linux's invariant is that no CPU keeps interrupts disabled for an
+            // unbounded time, so a TLB shootdown IPI always lands. Lupos breaks
+            // that here: `lock_irqsave()` spins with IF clear, and the CPU
+            // holding this lock may be inside `flush_tlb_mm_range()` waiting
+            // for *our* acknowledgement — a cycle neither side can leave.
+            //
+            // Measured in-guest: `tlb: shootdown stall source=1 target=0
+            // state=1` (TLB_CALL_QUEUED — never picked up) through all four
+            // resends with no `stall cleared`, and the machine stopped
+            // producing output. Draining here is safe because the shootdown
+            // service path takes no locks: it only does invlpg/CR3 writes and
+            // atomic stores.
+            //
+            // Rate-limited so an uncontended-ish acquire keeps its tight loop.
+            spins = spins.wrapping_add(1);
+            #[cfg(not(test))]
+            if spins % 256 == 0 {
+                crate::arch::x86::mm::tlb::service_local_tlb_shootdowns_if_irqs_off();
             }
             core::hint::spin_loop();
         }

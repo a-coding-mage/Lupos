@@ -1862,7 +1862,13 @@ pub(crate) fn drain_remote_wakes() {
             // replacement IPI can be coalesced with an already-set
             // NEED_RESCHED bit, leaving this wake entry asleep indefinitely.
             rq::with_rq(cpu, |rq| {
+                // Runs from the reschedule IPI with IRQs disabled and the rq
+                // lock held, so the TLB shootdown IPI cannot be taken here
+                // either; drain it inline for the same reason as the
+                // `try_to_wake_up()` handoff above.
                 while task_on_cpu(task) {
+                    #[cfg(not(test))]
+                    crate::arch::x86::mm::tlb::service_local_tlb_shootdowns_irqs_off();
                     core::hint::spin_loop();
                 }
 
@@ -3069,6 +3075,21 @@ pub unsafe fn wake_up_new_task(p: *mut TaskStruct) {
         if let Some(newly_set) = newly_set {
             send_reschedule_ipi_for_transition(cpu, newly_set);
         }
+        // Linux reaches the idle case through `wakeup_preempt()`, which routes
+        // a fair task waking an idle `rq->curr` to `resched_curr()` because
+        // `sched_class_above(fair, idle)` holds. Lupos's
+        // `wakeup_preempt_locked()` is the class-vs-class comparison only, and
+        // the idle task is outside every runnable class, so it returns false
+        // for an idle target and no IPI is sent — the identical reason
+        // `try_to_wake_up()` already pairs its enqueue with this call.
+        //
+        // Without it a freshly forked child could be enqueued on a CPU parked
+        // in `sti; hlt` and stay runnable-but-unrun until an unrelated
+        // interrupt happened to reschedule that CPU. Measured in-guest with
+        // `lupos.trace=stall`: repeated reports of `runnable=1..3` with
+        // `runnable_off_rq=0` — i.e. tasks TASK_RUNNING *and* on a runqueue —
+        // while all four CPUs sat idle for seconds.
+        wake_up_idle_cpu(cpu);
     }
     crate::kernel::locking::RawSpinLock::unlock_irqrestore(pi_guard, pi_flags);
 }
@@ -3299,7 +3320,16 @@ unsafe fn try_to_wake_up_locked(p: *mut TaskStruct, state_mask: u32, wake_flags:
     // Same-CPU wakeups and remote queues that are not in Linux's deferred
     // activation condition retain the synchronous handoff. The acquire load
     // pairs with finish_task_switch()'s release store.
+    //
+    // `pi_lock` is held with IRQs disabled here, so this CPU cannot take the
+    // TLB shootdown IPI while it spins. A peer in `dup_mmap()` waiting for our
+    // acknowledgement would then spin forever against us spinning for a task
+    // that peer is responsible for switching out. Service our own shootdown
+    // queue inline, exactly as Linux's `csd_lock_wait()` runs the
+    // call-function queue from inside its wait.
     while task_on_cpu(p) {
+        #[cfg(not(test))]
+        crate::arch::x86::mm::tlb::service_local_tlb_shootdowns_irqs_off();
         core::hint::spin_loop();
     }
     let owner_cpu = unsafe { (*p).thread_info.cpu };
