@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! linux-source: net/wireless/nl80211.c
 //! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
-//! architectures: x86_64,aarch64
+//! architectures: common
 //! rewrite-task: S009463
 
 use core::ffi::c_int;

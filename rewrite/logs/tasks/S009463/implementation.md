@@ -49,6 +49,25 @@ or ABI contract has been inferred in this preflight.
 
 ## Translation progress
 
+## Blocked before implementation completion
+
+This task cannot truthfully be marked `IMPLEMENTED`. The destination contains
+only the small validation-helper subset (23 Rust functions) while the pinned
+23,459-line source exposes approximately 140 C function definitions plus
+policy tables, generic-netlink operation tables, multicast groups, dumps,
+notifications, command handlers, cfg80211/rdev dispatch, and init/exit
+lifecycle code. The frozen `SYMBOLS.tsv`, `LIFETIMES.tsv`, and `ABI.tsv` rows
+for this task are each only a mechanical file record with `PENDING_REVIEW`;
+they provide no selected-symbol mapping or ownership/locking/ABI records from
+which the omitted interface and callback contracts can be established.
+
+The task is therefore blocked, rather than represented as a complete
+translation. The existing partial candidate is retained for the eventual
+scope/ABI resolution but is not an implementation-complete artifact. The
+provenance architecture field was corrected to the queue's required `common`.
+No compiler, formatter, linker, test, emulator, debugger, or runtime command
+was run.
+
 The destination now contains the provenance header and the first translated
 validator, `validate_supported_selectors` (Linux lines 301-313). The
 translation preserves the C `u8` length conversion, payload offset, high-bit

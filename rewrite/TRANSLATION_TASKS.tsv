@@ -1129,7 +1129,7 @@ S008313	src/kernel/bpf/tcx.rs	2026-08-05T14:34:39.049Z			TODO	kernel/bpf/tcx.c	a
 S008314	src/kernel/bpf/tnum.rs	2026-08-05T14:34:39.049Z			TODO	kernel/bpf/tnum.c	aarch64	kernel	31.9	high		luna		0								2026-08-05T14:34:39.049Z		
 S008315	src/kernel/bpf/token.rs	2026-08-05T14:34:39.049Z			TODO	kernel/bpf/token.c	aarch64	kernel	26.2	high		luna		0								2026-08-05T14:34:39.049Z		
 S008316	src/kernel/bpf/trampoline.rs	2026-08-05T14:34:39.049Z			TODO	kernel/bpf/trampoline.c	aarch64	kernel	176.2	high		luna		0								2026-08-05T14:34:39.049Z		
-S008317	src/kernel/bpf/verifier.rs	2026-08-05T14:34:39.049Z			TODO	kernel/bpf/verifier.c	aarch64	kernel	2006.6	high		luna		0								2026-08-05T14:34:39.049Z		
+S008317	src/kernel/bpf/verifier.rs	2026-08-05T14:34:39.049Z	2026-08-05T15:00:52.117Z		TODO	kernel/bpf/verifier.c	aarch64	kernel	2006.6	high		luna		1								2026-08-05T15:01:39.098Z		
 S008318	src/kernel/capability.rs	2026-08-05T14:34:39.049Z			TODO	kernel/capability.c	common	kernel	50.3	high		luna		0								2026-08-05T14:34:39.049Z		
 S008319	src/kernel/cgroup/cgroup-v1.rs	2026-08-05T14:34:39.049Z			TODO	kernel/cgroup/cgroup-v1.c	common	kernel	137.2	high		luna		0								2026-08-05T14:34:39.049Z		
 S008320	src/kernel/cgroup/cgroup.rs	2026-08-05T14:34:39.049Z			TODO	kernel/cgroup/cgroup.c	common	kernel	752.3	high		luna		0								2026-08-05T14:34:39.049Z		
@@ -1770,7 +1770,7 @@ S008986	src/net/can/raw.rs	2026-08-05T14:34:39.049Z			TODO	net/can/raw.c	aarch64
 S008987	src/net/compat.rs	2026-08-05T14:34:39.049Z			TODO	net/compat.c	common	net	51.8	medium		luna		0								2026-08-05T14:34:39.049Z		
 S008988	src/net/core/bpf_sk_storage.rs	2026-08-05T14:34:39.049Z			TODO	net/core/bpf_sk_storage.c	aarch64	net	92.0	medium		luna		0								2026-08-05T14:34:39.049Z		
 S008989	src/net/core/datagram.rs	2026-08-05T14:34:39.049Z			TODO	net/core/datagram.c	common	net	100.5	medium		luna		0								2026-08-05T14:34:39.049Z		
-S008990	src/net/core/dev.rs	2026-08-05T14:34:39.049Z			TODO	net/core/dev.c	common	net	1334.0	medium		luna		0								2026-08-05T14:34:39.049Z		
+S008990	src/net/core/dev.rs	2026-08-05T14:34:39.049Z	2026-08-05T15:01:43.429Z		PAUSED	net/core/dev.c	common	net	1334.0	medium		luna	P02	1								2026-08-05T15:02:32.239Z	IN_PROGRESS	Paused for Phase 0 scope audit: required selected-symbol and semantic-contract inventory is absent; only mechanical PENDING_REVIEW file records exist.
 S008991	src/net/core/dev_addr_lists.rs	2026-08-05T14:34:39.049Z			TODO	net/core/dev_addr_lists.c	common	net	141.2	medium		luna		0								2026-08-05T14:34:39.049Z		
 S008992	src/net/core/dev_api.rs	2026-08-05T14:34:39.049Z			TODO	net/core/dev_api.c	common	net	38.5	medium		luna		0								2026-08-05T14:34:39.049Z		
 S008993	src/net/core/dev_ioctl.rs	2026-08-05T14:34:39.049Z			TODO	net/core/dev_ioctl.c	common	net	84.9	medium		luna		0								2026-08-05T14:34:39.049Z		
@@ -2243,7 +2243,7 @@ S009459	src/net/wireless/ibss.rs	2026-08-05T14:34:39.049Z			TODO	net/wireless/ib
 S009460	src/net/wireless/mesh.rs	2026-08-05T14:34:39.049Z			TODO	net/wireless/mesh.c	common	net	28.9	medium		luna		0								2026-08-05T14:34:39.049Z		
 S009461	src/net/wireless/michael-mic.rs	2026-08-05T14:34:39.049Z			TODO	net/wireless/michael-mic.c	common	net	8.7	medium		luna		0								2026-08-05T14:34:39.049Z		
 S009462	src/net/wireless/mlme.rs	2026-08-05T14:34:39.049Z			TODO	net/wireless/mlme.c	common	net	147.7	medium		luna		0								2026-08-05T14:34:39.049Z		
-S009463	src/net/wireless/nl80211.rs	2026-08-05T14:34:39.049Z	2026-08-05T14:41:19.086Z		IN_PROGRESS	net/wireless/nl80211.c	common	net	2345.9	medium		luna	P01	1	codex-p01	2026-08-05T16:11:19.086Z						2026-08-05T14:41:19.086Z		
+S009463	src/net/wireless/nl80211.rs	2026-08-05T14:34:39.049Z	2026-08-05T14:41:19.086Z		BLOCKED	net/wireless/nl80211.c	common	net	2345.9	medium		luna	P01	1								2026-08-05T15:01:41.939Z		Incomplete 23,459-line nl80211.c translation: frozen symbol, lifetime, and ABI manifests provide only PENDING_REVIEW mechanical file records, so omitted generic-netlink/cfg80211 callback, locking, ownership, and ABI contracts cannot be established without guessing.
 S009464	src/net/wireless/ocb.rs	2026-08-05T14:34:39.049Z			TODO	net/wireless/ocb.c	common	net	6.5	medium		luna		0								2026-08-05T14:34:39.049Z		
 S009465	src/net/wireless/of.rs	2026-08-05T14:34:39.049Z			TODO	net/wireless/of.c	aarch64	net	12.7	medium		luna		0								2026-08-05T14:34:39.049Z		
 S009466	src/net/wireless/pmsr.rs	2026-08-05T14:34:39.049Z			TODO	net/wireless/pmsr.c	common	net	88.6	medium		luna		0								2026-08-05T14:34:39.049Z		
