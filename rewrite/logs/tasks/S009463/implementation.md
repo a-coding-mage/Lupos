@@ -90,3 +90,8 @@ The `validate_ie_attr` block (Linux lines 274-289) is now translated using the
 pinned `struct element` iteration rules from `include/linux/ieee80211.h`. It
 preserves the two-byte header requirement, element payload bound, completion
 condition, extack message, and `-EINVAL` result for malformed trailing data.
+
+The `validate_beacon_head` block (Linux lines 226-271) is now translated with
+the pinned S1G frame-control predicates, optional-field lengths, management and
+S1G packed offsets, Linux `ieee80211_hdrlen` call, and trailing element parser.
+All malformed-head paths use the Linux diagnostic and `-EINVAL` result.

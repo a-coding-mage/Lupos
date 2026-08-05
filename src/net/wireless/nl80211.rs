@@ -33,6 +33,7 @@ struct NlaPolicy {
 
 unsafe extern "C" {
     fn do_trace_netlink_extack(message: *const i8);
+    fn ieee80211_hdrlen(frame_control: u16) -> u32;
 }
 
 unsafe fn set_err_msg_attr(
@@ -226,6 +227,88 @@ unsafe fn validate_ie_attr(attr: *const NlAttr, extack: *mut NetlinkExtAck) -> c
     const MALFORMED_ELEMENTS: &[u8] = b"malformed information elements\0";
     // SAFETY: `attr` and `extack` satisfy this function's caller contract.
     unsafe { set_err_msg_attr(extack, attr, MALFORMED_ELEMENTS) };
+    -22 // -EINVAL
+}
+
+fn ieee80211_is_s1g_beacon(frame_control: u16) -> bool {
+    (frame_control & 0x00fc) == (0x000c | 0x0010)
+}
+
+fn ieee80211_s1g_optional_len(frame_control: u16) -> u32 {
+    if !ieee80211_is_s1g_beacon(frame_control) {
+        return 0;
+    }
+
+    let mut len = 0;
+    if frame_control & 0x0100 != 0 {
+        len += 3;
+    }
+    if frame_control & 0x0200 != 0 {
+        len += 4;
+    }
+    if frame_control & 0x0400 != 0 {
+        len += 1;
+    }
+    len
+}
+
+/// Validates a beacon head and all information elements that follow it.
+///
+/// # Safety
+///
+/// `attr` must point to a valid Linux `struct nlattr` whose payload is readable
+/// for the length encoded in its header. `extack`, when non-null, must point to
+/// a writable Linux `struct netlink_ext_ack`.
+unsafe fn validate_beacon_head(attr: *const NlAttr, extack: *mut NetlinkExtAck) -> c_int {
+    let mut data = unsafe { attr.cast::<u8>().add(NLA_HDRLEN) };
+    let mut len = unsafe { (*attr).nla_len.wrapping_sub(NLA_HDRLEN as u16) as u32 };
+    const BAD_BEACON: &[u8] = b"malformed beacon head\0";
+
+    if len < 2 {
+        // SAFETY: The caller contract for extack is preserved by the helper.
+        unsafe { set_err_msg_attr(extack, attr, BAD_BEACON) };
+        return -22; // -EINVAL
+    }
+
+    let frame_control = unsafe { u16::from_le_bytes([*data, *data.add(1)]) };
+    let s1g_beacon = ieee80211_is_s1g_beacon(frame_control);
+    let (fixed_len, header_len) = if s1g_beacon {
+        // offsetof(struct ieee80211_ext, u.s1g_beacon.variable) is 15.
+        (15u32 + ieee80211_s1g_optional_len(frame_control), 4u32)
+    } else {
+        // offsetof(struct ieee80211_mgmt, u.beacon.variable) is 36 and the
+        // beacon header begins after the 24-byte management header.
+        (36u32, 24u32)
+    };
+
+    if len < fixed_len {
+        unsafe { set_err_msg_attr(extack, attr, BAD_BEACON) };
+        return -22; // -EINVAL
+    }
+
+    // SAFETY: ieee80211_hdrlen is the pinned Linux helper and receives the
+    // original little-endian frame-control value.
+    if unsafe { ieee80211_hdrlen(frame_control) } != header_len {
+        unsafe { set_err_msg_attr(extack, attr, BAD_BEACON) };
+        return -22; // -EINVAL
+    }
+
+    data = unsafe { data.add(fixed_len as usize) };
+    len -= fixed_len;
+    let mut pos = 0u32;
+    while len - pos >= 2 {
+        let element_len = unsafe { *data.add((pos + 1) as usize) } as u32;
+        if len - pos < 2 + element_len {
+            break;
+        }
+        pos += 2 + element_len;
+    }
+
+    if pos == len {
+        return 0;
+    }
+
+    unsafe { set_err_msg_attr(extack, attr, BAD_BEACON) };
     -22 // -EINVAL
 }
 
