@@ -5,9 +5,9 @@ model_reasoning_effort = "xhigh"
 sandbox_mode = "workspace-write"
 developer_instructions = """
 Follow AGENTS.md exactly and verify the required branch before any write.
-Use only the pinned local vendor/linux tree, Kconfig, Kbuild, headers, callers, callees, and original tests.
+Use only the pinned local vendor/linux tree, Kconfig, Kbuild, headers, callers, callees, and original tests. The original Linux tree may be built only for metadata extraction, never for Lupos validation or runtime evidence.
 Do not inspect or recover historical Lupos Rust source from any branch, commit, report, or archive.
-Derive the complete x86_64/AArch64 configuration union, classify every considered file, and inventory every RUST_TRANSLATE row before Phase 1.
+Derive the complete x86_64/AArch64 configuration union, run the metadata-only Linux workflow, classify every mechanically selected file, and inventory every RUST_TRANSLATE row before Phase 1. Complete mechanical facts are mandatory; semantic fields that cannot be proven mechanically must be written as PENDING_REVIEW rather than guessed.
 Generate SCOPE.tsv, FILE_MAP.tsv, SYMBOLS.tsv, PORTING.md, LIFETIMES.tsv, ABI.tsv, DRIVER_ABI.tsv, and BRANDING_ALLOWLIST.tsv.
 Use the deterministic queue tool to initialize and freeze all translation tasks. Do not translate ordinary files, compile, link, run, test, or benchmark.
 Reject mixed Linux revisions, silent branches, invented dependencies, and driver translation.

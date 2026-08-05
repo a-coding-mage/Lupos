@@ -97,6 +97,30 @@ Phase 4: boot, compare behavior, debug, and benchmark
 
 No Phase 2 command may run while any Phase 1 task is not `DONE`.
 
+Phase 0 has two deliberate layers. The mechanical layer is closed before the
+queue is frozen: original Linux Kbuild/configuration metadata establishes the
+complete selected source, object, module/built-in, generated-source, command,
+depfile, header, subsystem, and architecture inventory. The semantic layer is
+progressive: symbols, call/ownership/lifetime contracts, ABI intent, locking,
+RCU, refcounting, and semantic dependencies are initialized as
+`PENDING_REVIEW` when metadata cannot prove them, then resolved by the
+implementer, two reviewers, and applier before `DONE`.
+
+The frozen configurations are inseparable from their toolchain environment.
+Phase 0 records exact tool paths, versions, architecture variables, LLVM/IAS
+settings, and material Kbuild environment in `rewrite/toolchain/`, and binds
+them with `rewrite/PHASE0_IDENTITY.tsv`. Configuration synchronization is
+allowed only in Phase 0, must be diffed on every pass, and must converge to a
+stable fixed point. Changing the Linux commit, toolchain, or configuration
+invalidates the identity, all manifests, the queue, and its fingerprint.
+
+The canonical Phase 0 toolchain is the complete LLVM 19 suite at
+`/usr/lib/llvm-19/bin/`. All Kconfig, Kbuild, metadata, and validation commands
+use `LLVM=/usr/lib/llvm-19/bin/` with its trailing slash and `LLVM_IAS=1`.
+Rust-distributed LLD is recorded only as rejected evidence and is never a
+kernel build tool.
+Invalidated provisional runs are archived rather than reused.
+
 ### Per-file Phase 1 pipeline
 
 ```text

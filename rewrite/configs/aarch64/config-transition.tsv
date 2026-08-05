@@ -1,0 +1,2 @@
+symbol	before	after	reason_when_mechanically_known	source_kconfig	status
+__SUMMARY__	0_changed_symbols	0_changed_symbols	second identical olddefconfig pass was byte-identical to the first stabilized configuration	Kconfig/Kbuild metadata	STABLE

@@ -1,0 +1,15 @@
+key	value	status	evidence
+linux_commit	425f94c2954b1fe80ebdbf9b29854e89750355df	VERIFIED	vendor/linux.SHA and vendor/linux HEAD
+x86_64_config_sha256	UNAVAILABLE	BLOCKED	rewrite/kbuild/x86_64/configure.log
+aarch64_config_sha256	UNAVAILABLE	BLOCKED	rewrite/kbuild/aarch64/configure.log
+toolchain_sha256	5f5d7f18d40e9ed54f2fbd939b8f432a81a32c760a1988516933fd961e0aa01f	RECORDED	rewrite/toolchain/TOOLCHAIN.sha256
+x86_64_arch_value	x86_64	RECORDED	rewrite/toolchain/ENVIRONMENT.tsv
+aarch64_arch_value	arm64	RECORDED	rewrite/toolchain/ENVIRONMENT.tsv
+llvm_value	1	ATTEMPTED	rewrite/toolchain/ENVIRONMENT.tsv
+llvm_ias_value	1	ATTEMPTED	rewrite/toolchain/ENVIRONMENT.tsv
+cross_compile_value	(empty)	RECORDED	rewrite/toolchain/ENVIRONMENT.tsv
+extractor_version	UNAVAILABLE	BLOCKED	canonical metadata extraction did not start
+scope_schema_version	mechanical-phase0-v2	RECORDED	AGENTS.md and tools/rewrite_queue.py
+queue_schema_version	translation-queue-v1	RECORDED	tools/rewrite_queue.py
+created_at	2026-08-05T13:59:00Z	RECORDED	Phase 0 attempt
+identity_status	BLOCKED	BLOCKED	matching ld.lld is required before configuration stabilization

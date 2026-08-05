@@ -56,6 +56,24 @@ worktree.
 The only implementation oracle is `vendor/linux` at the exact revision recorded
 in `vendor/linux.SHA`.
 
+Phase 0 freezes the Linux revision together with the compiler/toolchain family,
+exact executable paths and versions, architecture variables, and material
+Kbuild environment. A configuration generated under GCC MUST NOT be reused for
+an LLVM metadata extraction, or vice versa. Configuration synchronization is
+permitted only during Phase 0; every synchronization pass MUST be diffed and
+logged, and the accepted configuration MUST be a stable fixed point under the
+pinned source and pinned toolchain. Any toolchain or configuration change
+invalidates the Phase 0 identity, manifests, scope, queue, and queue
+fingerprint. Invalidated provisional runs remain archived as evidence.
+
+The canonical Phase 0 toolchain is the complete LLVM 19 suite under
+`/usr/lib/llvm-19/bin/`. Every Phase 0 Kconfig, Kbuild, metadata, preparation,
+and validation invocation MUST pass `LLVM=/usr/lib/llvm-19/bin/` (including
+the trailing slash) and `LLVM_IAS=1`. Rust's bundled `rust-lld`, any `.rustup`
+linker, and PATH-resolved LLVM tools outside that directory MUST NOT be used.
+Changing any selected tool or resolved path invalidates the Phase 0 identity
+and queue.
+
 ## 2. Zero-difference contract
 
 This is not a Linux-like redesign, a simplification exercise, a compatibility
@@ -75,8 +93,10 @@ Build success, convenience, a smaller current machine, and idiomatic style never
 override Linux semantics.
 
 If exact behavior cannot be established from the pinned source, local headers,
-callers, callees, Kconfig/Kbuild, and original tests, the task becomes
-`BLOCKED`. Guessing is forbidden.
+callers, callees, Kconfig/Kbuild, and original tests, the affected semantic
+record is `PENDING_REVIEW` during Phase 0 and the affected translation task is
+`BLOCKED` only when its implementer/reviewers/applier reach that question.
+Guessing is forbidden.
 
 ## 3. Authority order
 
@@ -104,9 +124,12 @@ rewrite/configs/x86_64/
 rewrite/configs/aarch64/
 ```
 
-A Linux file or conditional branch is in scope only when the frozen manifests
-record that it is selected by at least one approved configuration or is a
-required transitive dependency of selected code.
+A Linux file or conditional branch is in scope only when mechanically generated
+metadata records that it is selected by at least one approved configuration or
+is a required transitive dependency of selected code. Mechanical selection is
+the Phase 0 gate. Semantic call graphs, ownership, locking, RCU, refcount,
+lifetime, ABI intent, and translation notes are progressive records and do not
+block queue creation; unknown semantic values are recorded as `PENDING_REVIEW`.
 
 The scope architect MUST finish the complete inventory before any translation
 pipeline claims a file. During Phase 1, pipelines may not discover and silently
@@ -193,6 +216,17 @@ Before the first file is claimed, Phase 0 MUST create and review:
 - `rewrite/logs/tasks/` — one evidence directory per task;
 - `rewrite/BLOCKERS.tsv` — unresolved scope/source/lifetime/ABI questions.
 
+Phase 0 also retains the mechanically generated Linux evidence under
+`rewrite/metadata/`, including selected translation units, generated sources,
+built-in/module object lists, source-to-object mappings, compile commands,
+`.cmd`/depfile inventories, generated headers, and configuration selection
+evidence. The exact filenames are recorded in the metadata manifest.
+
+`SYMBOLS.tsv`, `LIFETIMES.tsv`, `ABI.tsv`, and `DRIVER_ABI.tsv` are initialized
+from mechanically provable facts. A field that requires semantic interpretation
+uses `PENDING_REVIEW`; it is completed by the implementer, both independent
+reviewers, and the applier before that task can become `DONE`.
+
 `rewrite/SCOPE.tsv` MUST expose at least:
 
 ```text
@@ -201,6 +235,23 @@ id	linux_path	destination_path	class	architectures	kconfig_evidence	kbuild_targe
 
 All `RUST_TRANSLATE` rows are converted into task rows before Phase 1 begins.
 No pipeline may start while the queue is incomplete or unfingerprinted.
+
+The canonical Phase 0 identity is recorded in `rewrite/PHASE0_IDENTITY.tsv`
+and its hash. It binds the Linux commit, both stabilized configuration hashes,
+the toolchain hash, architecture invocation parameters, and extractor/schema
+versions to every authoritative manifest and queue. Translation agents MUST
+NOT modify the toolchain, frozen configurations, or Phase 0 identity.
+
+### 6.1 Mechanical Phase 0 gate
+
+Before queue creation, the original pinned Linux metadata workflow MUST produce
+and validate the complete selected source inventory for both configurations.
+At minimum it records each selected C/assembly/generated source, its object,
+Kbuild target, built-in/module disposition, architecture membership, subsystem,
+Kconfig evidence, and metadata evidence path. It also records generated
+headers, compile commands, `.cmd` files, depfiles, and module/object lists when
+the pinned Kbuild workflow emits them. Missing or contradictory mechanical
+evidence blocks the scope gate. Semantic `PENDING_REVIEW` values do not.
 
 ## 7. Canonical translation queue
 
@@ -537,6 +588,11 @@ The applier MUST:
 7. mark `DONE` only when no finding remains and all evidence files exist;
 8. mark `BLOCKED` when exact parity cannot be established.
 
+Before `DONE`, the applier also closes every `PENDING_REVIEW` semantic record
+for the task, including symbols, ABI intent, ownership/lifetime, locking/RCU,
+refcounting, and semantic dependencies. Phase 0 pending values are not an
+approval or a substitute for this review.
+
 The applier MUST NOT compile, format, link, run, test, benchmark, add tests, add
 stubs, port drivers, or weaken Linux behavior.
 
@@ -806,6 +862,8 @@ Do not permit the first build until all are true:
 - every task has implementation evidence, two independent reviews, and one
   resolution;
 - every selected symbol and branch has a final mapping;
+- every Phase 0 mechanical metadata record is complete and auditable;
+- no `PENDING_REVIEW` semantic record remains for a `DONE` task;
 - every unsafe boundary is documented;
 - every selected driver remains original Linux source/object;
 - no Linux docs/tests/drivers were copied into `src/`;

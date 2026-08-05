@@ -46,12 +46,30 @@ Never inspect old Lupos Rust source through Git history, another branch,
 worktree, archive, dashboard, report, or patch. The pinned local Linux tree is
 the only implementation oracle.
 
-## Phase 0 — complete inventory before the first translation
+## Phase 0 — complete mechanical inventory before the first translation
+
+Freeze the Linux commit together with one explicit toolchain policy before
+generating metadata. Record exact executable paths, versions, `ARCH`/`SRCARCH`,
+`LLVM`/`LLVM_IAS`, cross-prefix, compiler/binutils selections, and material
+Kbuild environment. A configuration generated under another compiler family is
+not an input to this run. Synchronize configurations only in Phase 0, diff each
+pass, and accept only a stable fixed point. Any toolchain or configuration
+change invalidates the Phase 0 identity, manifests, queue, and fingerprint;
+archive invalidated provisional outputs and record the queue invalidation event.
+
+The canonical environment is the complete LLVM 19 suite under
+`/usr/lib/llvm-19/bin/`. Every Phase 0 invocation must use the absolute
+`LLVM=/usr/lib/llvm-19/bin/` value, including its trailing slash, and
+`LLVM_IAS=1`. Do not use Rust LLD or any PATH-resolved LLVM executable outside
+that directory.
 
 Use the `scope_architect` role for the one-time scope pass. Derive the file set
 from the checked-in x86_64/AArch64 configurations and the pinned Linux Kconfig
-and Kbuild dependency closure. Do not choose files from model memory and do not
-silently broaden the subset.
+and Kbuild dependency closure. The original pinned Linux tree may be built
+only for metadata extraction: generated headers/sources, object and module
+lists, source-to-object mappings, compile commands, `.cmd` files, depfiles, and
+selection evidence. Do not choose files from model memory and do not silently
+broaden the subset.
 
 Create and review every Phase 0 artifact required by `AGENTS.md`, including:
 
@@ -66,6 +84,11 @@ rewrite/DRIVER_ABI.tsv
 rewrite/BRANDING_ALLOWLIST.tsv
 rewrite/BLOCKERS.tsv
 ```
+
+Initialize semantic fields in `SYMBOLS.tsv`, `LIFETIMES.tsv`, `ABI.tsv`, and
+`DRIVER_ABI.tsv` with `PENDING_REVIEW` when they cannot be proven by the
+mechanical metadata pass. Do not block queue creation for those semantic
+records; the per-file pipeline must resolve them before `DONE`.
 
 Classify original Linux drivers as `LINUX_DRIVER_OBJECT`; do not translate
 them. Keep original Linux tests as `ORACLE_ONLY`; do not copy them into Rust.

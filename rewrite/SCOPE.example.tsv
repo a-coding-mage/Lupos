@@ -1,2 +1,2 @@
-id	linux_path	destination_path	class	architectures	kconfig_evidence	kbuild_target	cluster	weight	risk	dependencies	recommended_implementer
-T000001	kernel/example.c	src/kernel/example.rs	RUST_TRANSLATE	common	CONFIG_EXAMPLE=y	kernel/example.o	kernel	5	medium		luna
+id	linux_path	destination_path	class	architectures	kconfig_evidence	kbuild_target	cluster	weight	risk	dependencies	recommended_implementer	metadata_status	metadata_evidence	semantic_status
+T000001	kernel/example.c	src/kernel/example.rs	RUST_TRANSLATE	common	CONFIG_EXAMPLE=y	kernel/example.o	kernel	5	medium		luna	COMPLETE	rewrite/metadata/manifest.tsv	PENDING_REVIEW

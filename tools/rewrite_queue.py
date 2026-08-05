@@ -114,6 +114,19 @@ SCOPE_REQUIRED_FIELDS = {
     "weight",
     "risk",
     "dependencies",
+    "metadata_status",
+    "metadata_evidence",
+    "semantic_status",
+}
+
+SCOPE_CLASSES = {
+    "RUST_TRANSLATE",
+    "LINUX_ARCH_ASM",
+    "LINUX_DRIVER_OBJECT",
+    "ORACLE_ONLY",
+    "BUILD_METADATA",
+    "REFERENCE_ONLY",
+    "OUT_OF_SCOPE",
 }
 
 
@@ -577,6 +590,7 @@ def task_by_id(rows: list[dict[str, str]], task_id: str) -> dict[str, str]:
 def event_payload(
     row: Mapping[str, str] | None,
     *,
+    phase: str = "translation",
     event: str,
     role: str,
     model: str,
@@ -595,7 +609,7 @@ def event_payload(
         die(f"event {event!r} has invalid reasoning effort {effort!r}")
     return {
         "ts": now_utc(),
-        "phase": "translation",
+        "phase": phase,
         "task_id": row.get("id", "") if row else "",
         "path": row.get("path", "") if row else "",
         "pipeline_id": pipeline_id or (row.get("pipeline_id", "") if row else ""),
@@ -608,6 +622,32 @@ def event_payload(
         "attempt": int(row.get("attempt", "0") or 0) if row else 0,
         "detail": detail,
     }
+
+
+def cmd_invalidate(args: argparse.Namespace) -> None:
+    """Record a Phase 0 invalidation without changing task state."""
+    ensure_branch(args.skip_branch_check)
+    queue, fingerprint, events, _ = common_paths(args)
+    with QueueLock(queue):
+        rows = read_tsv(queue)
+        validate_rows(rows)
+        verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file))
+        active = [row for row in rows if row["status"] != "TODO"]
+        if active:
+            die("queue invalidation requires every task to remain TODO")
+        append_event(
+            events,
+            event_payload(
+                None,
+                phase="phase0",
+                event="queue_invalidated",
+                role=args.role,
+                model=args.model,
+                effort=args.effort,
+                detail=f"archive={args.archive}; {args.reason}",
+            ),
+        )
+    print(json.dumps({"event": "queue_invalidated", "archive": args.archive}))
 
 
 def parse_dependencies(row: Mapping[str, str]) -> list[str]:
@@ -708,6 +748,35 @@ def validate_scope_translation_row(source: Mapping[str, str], linux_root: Path) 
     )
 
 
+def validate_scope_mechanical_row(source: Mapping[str, str], scope: Path) -> None:
+    row_id = source.get("id", "")
+    source_class = source.get("class", "")
+    if source_class not in SCOPE_CLASSES:
+        die(f"scope row {row_id} has invalid class {source_class!r}")
+    if source.get("metadata_status", "") != "COMPLETE":
+        die(
+            f"scope row {row_id} is not mechanically complete: "
+            f"metadata_status={source.get('metadata_status', '')!r}"
+        )
+    if not source.get("metadata_evidence", "").strip():
+        die(f"scope row {row_id} has no metadata_evidence")
+    semantic_status = source.get("semantic_status", "")
+    if semantic_status not in {"PENDING_REVIEW", "COMPLETE", "NOT_APPLICABLE"}:
+        die(
+            f"scope row {row_id} has invalid semantic_status "
+            f"{semantic_status!r}; use PENDING_REVIEW until reviewed"
+        )
+    try:
+        validate_relative_posix_path(
+            source.get("linux_path", ""), context=f"scope row {row_id} Linux path"
+        )
+    except SystemExit:
+        # Generated Linux inputs may be represented only by metadata evidence;
+        # RUST_TRANSLATE rows are checked strictly below.
+        if source_class == "RUST_TRANSLATE":
+            raise
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     ensure_branch(args.skip_branch_check)
     queue, fingerprint, events, logs_root = common_paths(args)
@@ -727,6 +796,10 @@ def cmd_init(args: argparse.Namespace) -> None:
             if missing:
                 die(f"scope file is missing required columns: {', '.join(missing)}")
             scope_rows = [dict(row) for row in reader]
+        if not scope_rows:
+            die(f"scope contains no rows: {scope}")
+        for source in scope_rows:
+            validate_scope_mechanical_row(source, scope)
         selected = [row for row in scope_rows if row["class"] == "RUST_TRANSLATE"]
         if not selected:
             die("scope contains no RUST_TRANSLATE rows")
@@ -1482,6 +1555,18 @@ def build_parser() -> argparse.ArgumentParser:
     freeze = sub.add_parser("freeze", help="Fingerprint immutable queue fields before Phase 1")
     add_common_files(freeze)
     freeze.set_defaults(func=cmd_freeze)
+
+    invalidate = sub.add_parser(
+        "invalidate",
+        help="Record invalidation of an untouched provisional Phase 0 queue",
+    )
+    add_common_files(invalidate)
+    invalidate.add_argument("--archive", required=True)
+    invalidate.add_argument("--reason", required=True)
+    invalidate.add_argument("--role", default="scope_architect")
+    invalidate.add_argument("--model", default="gpt-5.6-sol")
+    invalidate.add_argument("--effort", default="xhigh")
+    invalidate.set_defaults(func=cmd_invalidate)
 
     verify = sub.add_parser("verify", help="Validate schema, identities, and immutable-field fingerprint")
     add_common_files(verify)
