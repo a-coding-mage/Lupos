@@ -1,0 +1,149 @@
+{
+  "checks": {
+    "aarch64_build_config": {
+      "detail": "/home/fenhir/Projects/lupos/rewrite/kbuild/aarch64/.config",
+      "ok": true
+    },
+    "aarch64_compiler_binding": {
+      "detail": "compiler/linker evidence",
+      "ok": true
+    },
+    "aarch64_config_hash": {
+      "detail": "expected=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578; actual=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578",
+      "ok": true
+    },
+    "aarch64_metadata_complete": {
+      "detail": "8963",
+      "ok": true
+    },
+    "aarch64_stable_transition": {
+      "detail": "[{'symbol': '__SUMMARY__', 'before': '0_changed_symbols', 'after': '0_changed_symbols', 'reason_when_mechanically_known': 'second identical olddefconfig pass was byte-identical to the first stabilized configuration', 'source_kconfig': 'Kconfig/Kbuild metadata', 'status': 'STABLE'}]",
+      "ok": true
+    },
+    "all_todo": {
+      "detail": "queue lifecycle fields",
+      "ok": true
+    },
+    "branch": {
+      "detail": "feat/bun-like-rewrite-test",
+      "ok": true
+    },
+    "driver_exclusion": {
+      "detail": "driver paths are not queued",
+      "ok": true
+    },
+    "identity_hash": {
+      "detail": "PHASE0_IDENTITY.sha256",
+      "ok": true
+    },
+    "identity_queue_binding": {
+      "detail": "identity=0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742; queue=0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742",
+      "ok": true
+    },
+    "linux_clean": {
+      "detail": "clean",
+      "ok": true
+    },
+    "linux_pin": {
+      "detail": "HEAD=425f94c2954b1fe80ebdbf9b29854e89750355df; pinned=425f94c2954b1fe80ebdbf9b29854e89750355df",
+      "ok": true
+    },
+    "object_source_mapping": {
+      "detail": "rows=11930",
+      "ok": true
+    },
+    "queue_verify": {
+      "detail": "{\"ok\": true, \"tasks\": 2321, \"sha256\": \"0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742\"}\n",
+      "ok": true
+    },
+    "rust_linker_rejected": {
+      "detail": "LINKER_INVENTORY.tsv",
+      "ok": true
+    },
+    "rust_task_bijection": {
+      "detail": "scope=2321 tasks=2321",
+      "ok": true
+    },
+    "scope_classified": {
+      "detail": "rows=9955",
+      "ok": true
+    },
+    "scope_in_file_map": {
+      "detail": "missing=[]",
+      "ok": true
+    },
+    "selected_linker": {
+      "detail": "[{'requested_path': '/usr/lib/llvm-19/bin/ld.lld', 'resolved_path': '/usr/lib/llvm-19/bin/lld', 'version': 'Debian LLD 19.1.7', 'selected': 'YES', 'reason': 'canonical Phase 0 linker', 'captured_at': '2026-08-05T14:03:47.223Z'}]",
+      "ok": true
+    },
+    "src_empty": {
+      "detail": "src",
+      "ok": true
+    },
+    "tool:clang": {
+      "detail": "requested=/usr/lib/llvm-19/bin/clang; resolved=/usr/lib/llvm-19/bin/clang; recorded_major=19",
+      "ok": true
+    },
+    "tool:clang++": {
+      "detail": "requested=/usr/lib/llvm-19/bin/clang++; resolved=/usr/lib/llvm-19/bin/clang; recorded_major=19",
+      "ok": true
+    },
+    "tool:ld.lld": {
+      "detail": "requested=/usr/lib/llvm-19/bin/ld.lld; resolved=/usr/lib/llvm-19/bin/lld; recorded_major=19",
+      "ok": true
+    },
+    "tool:llvm-ar": {
+      "detail": "requested=/usr/lib/llvm-19/bin/llvm-ar; resolved=/usr/lib/llvm-19/bin/llvm-ar; recorded_major=19",
+      "ok": true
+    },
+    "tool:llvm-nm": {
+      "detail": "requested=/usr/lib/llvm-19/bin/llvm-nm; resolved=/usr/lib/llvm-19/bin/llvm-nm; recorded_major=19",
+      "ok": true
+    },
+    "tool:llvm-objcopy": {
+      "detail": "requested=/usr/lib/llvm-19/bin/llvm-objcopy; resolved=/usr/lib/llvm-19/bin/llvm-objcopy; recorded_major=19",
+      "ok": true
+    },
+    "tool:llvm-objdump": {
+      "detail": "requested=/usr/lib/llvm-19/bin/llvm-objdump; resolved=/usr/lib/llvm-19/bin/llvm-objdump; recorded_major=19",
+      "ok": true
+    },
+    "tool:llvm-readelf": {
+      "detail": "requested=/usr/lib/llvm-19/bin/llvm-readelf; resolved=/usr/lib/llvm-19/bin/llvm-readobj; recorded_major=19",
+      "ok": true
+    },
+    "tool:llvm-strip": {
+      "detail": "requested=/usr/lib/llvm-19/bin/llvm-strip; resolved=/usr/lib/llvm-19/bin/llvm-objcopy; recorded_major=19",
+      "ok": true
+    },
+    "toolchain_file_hash": {
+      "detail": "TOOLCHAIN.sha256",
+      "ok": true
+    },
+    "unique_task_ids_paths": {
+      "detail": "queue IDs and paths",
+      "ok": true
+    },
+    "x86_64_build_config": {
+      "detail": "/home/fenhir/Projects/lupos/rewrite/kbuild/x86_64/.config",
+      "ok": true
+    },
+    "x86_64_compiler_binding": {
+      "detail": "compiler/linker evidence",
+      "ok": true
+    },
+    "x86_64_config_hash": {
+      "detail": "expected=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4; actual=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4",
+      "ok": true
+    },
+    "x86_64_metadata_complete": {
+      "detail": "2967",
+      "ok": true
+    },
+    "x86_64_stable_transition": {
+      "detail": "[{'symbol': '__SUMMARY__', 'before': '0_changed_symbols', 'after': '0_changed_symbols', 'reason_when_mechanically_known': 'second identical olddefconfig pass was byte-identical to the first stabilized configuration', 'source_kconfig': 'Kconfig/Kbuild metadata', 'status': 'STABLE'}]",
+      "ok": true
+    }
+  },
+  "ok": true
+}

@@ -1,7 +1,15 @@
 key	value
 architecture	aarch64
 linux_arch	arm64
-configuration	defconfig
+configuration_target	defconfig
 linux_commit	425f94c2954b1fe80ebdbf9b29854e89750355df
-generated_at	2026-08-05T07:45:35Z
-generation_command	make -C vendor/linux O=rewrite/configs/aarch64/build ARCH=arm64 defconfig
+toolchain	/usr/lib/llvm-19/bin/
+llvm_ias	1
+config_sha256	b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578
+sync1_changed_symbols	0
+sync1_changed_bytes	0
+sync2_changed_symbols	0
+sync2_changed_bytes	0
+generation_command	LLVM=/usr/lib/llvm-19/bin/ LLVM_IAS=1 make -C vendor/linux O=rewrite/kbuild/aarch64 ARCH=arm64 defconfig
+sync_command	LLVM=/usr/lib/llvm-19/bin/ LLVM_IAS=1 make -C vendor/linux O=rewrite/kbuild/aarch64 ARCH=arm64 olddefconfig
+metadata_command	LLVM=/usr/lib/llvm-19/bin/ LLVM_IAS=1 make -C vendor/linux O=rewrite/kbuild/aarch64 ARCH=arm64 -j16

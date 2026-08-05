@@ -1,0 +1,38 @@
+check	status	detail
+branch	PASS	feat/bun-like-rewrite-test
+linux_pin	PASS	HEAD=425f94c2954b1fe80ebdbf9b29854e89750355df; pinned=425f94c2954b1fe80ebdbf9b29854e89750355df
+linux_clean	PASS	clean
+tool:clang	PASS	requested=/usr/lib/llvm-19/bin/clang; resolved=/usr/lib/llvm-19/bin/clang; recorded_major=19
+tool:clang++	PASS	requested=/usr/lib/llvm-19/bin/clang++; resolved=/usr/lib/llvm-19/bin/clang; recorded_major=19
+tool:ld.lld	PASS	requested=/usr/lib/llvm-19/bin/ld.lld; resolved=/usr/lib/llvm-19/bin/lld; recorded_major=19
+tool:llvm-ar	PASS	requested=/usr/lib/llvm-19/bin/llvm-ar; resolved=/usr/lib/llvm-19/bin/llvm-ar; recorded_major=19
+tool:llvm-nm	PASS	requested=/usr/lib/llvm-19/bin/llvm-nm; resolved=/usr/lib/llvm-19/bin/llvm-nm; recorded_major=19
+tool:llvm-objcopy	PASS	requested=/usr/lib/llvm-19/bin/llvm-objcopy; resolved=/usr/lib/llvm-19/bin/llvm-objcopy; recorded_major=19
+tool:llvm-objdump	PASS	requested=/usr/lib/llvm-19/bin/llvm-objdump; resolved=/usr/lib/llvm-19/bin/llvm-objdump; recorded_major=19
+tool:llvm-readelf	PASS	requested=/usr/lib/llvm-19/bin/llvm-readelf; resolved=/usr/lib/llvm-19/bin/llvm-readobj; recorded_major=19
+tool:llvm-strip	PASS	requested=/usr/lib/llvm-19/bin/llvm-strip; resolved=/usr/lib/llvm-19/bin/llvm-objcopy; recorded_major=19
+toolchain_file_hash	PASS	TOOLCHAIN.sha256
+selected_linker	PASS	[{'requested_path': '/usr/lib/llvm-19/bin/ld.lld', 'resolved_path': '/usr/lib/llvm-19/bin/lld', 'version': 'Debian LLD 19.1.7', 'selected': 'YES', 'reason': 'canonical Phase 0 linker', 'captured_at': '2026-08-05T14:03:47.223Z'}]
+rust_linker_rejected	PASS	LINKER_INVENTORY.tsv
+x86_64_config_hash	PASS	expected=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4; actual=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4
+x86_64_build_config	PASS	/home/fenhir/Projects/lupos/rewrite/kbuild/x86_64/.config
+x86_64_stable_transition	PASS	[{'symbol': '__SUMMARY__', 'before': '0_changed_symbols', 'after': '0_changed_symbols', 'reason_when_mechanically_known': 'second identical olddefconfig pass was byte-identical to the first stabilized configuration', 'source_kconfig': 'Kconfig/Kbuild metadata', 'status': 'STABLE'}]
+aarch64_config_hash	PASS	expected=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578; actual=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578
+aarch64_build_config	PASS	/home/fenhir/Projects/lupos/rewrite/kbuild/aarch64/.config
+aarch64_stable_transition	PASS	[{'symbol': '__SUMMARY__', 'before': '0_changed_symbols', 'after': '0_changed_symbols', 'reason_when_mechanically_known': 'second identical olddefconfig pass was byte-identical to the first stabilized configuration', 'source_kconfig': 'Kconfig/Kbuild metadata', 'status': 'STABLE'}]
+identity_hash	PASS	PHASE0_IDENTITY.sha256
+scope_classified	PASS	rows=9955
+object_source_mapping	PASS	rows=11930
+scope_in_file_map	PASS	missing=[]
+rust_task_bijection	PASS	scope=2321 tasks=2321
+driver_exclusion	PASS	driver paths are not queued
+unique_task_ids_paths	PASS	queue IDs and paths
+all_todo	PASS	queue lifecycle fields
+src_empty	PASS	src
+x86_64_metadata_complete	PASS	2967
+x86_64_compiler_binding	PASS	compiler/linker evidence
+aarch64_metadata_complete	PASS	8963
+aarch64_compiler_binding	PASS	compiler/linker evidence
+queue_verify	PASS	{"ok": true, "tasks": 2321, "sha256": "0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742"}
+
+identity_queue_binding	PASS	identity=0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742; queue=0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742

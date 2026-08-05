@@ -1,15 +1,24 @@
 key	value	status	evidence
 linux_commit	425f94c2954b1fe80ebdbf9b29854e89750355df	VERIFIED	vendor/linux.SHA and vendor/linux HEAD
-x86_64_config_sha256	UNAVAILABLE	BLOCKED	rewrite/kbuild/x86_64/configure.log
-aarch64_config_sha256	UNAVAILABLE	BLOCKED	rewrite/kbuild/aarch64/configure.log
-toolchain_sha256	5f5d7f18d40e9ed54f2fbd939b8f432a81a32c760a1988516933fd961e0aa01f	RECORDED	rewrite/toolchain/TOOLCHAIN.sha256
-x86_64_arch_value	x86_64	RECORDED	rewrite/toolchain/ENVIRONMENT.tsv
-aarch64_arch_value	arm64	RECORDED	rewrite/toolchain/ENVIRONMENT.tsv
-llvm_value	1	ATTEMPTED	rewrite/toolchain/ENVIRONMENT.tsv
-llvm_ias_value	1	ATTEMPTED	rewrite/toolchain/ENVIRONMENT.tsv
-cross_compile_value	(empty)	RECORDED	rewrite/toolchain/ENVIRONMENT.tsv
-extractor_version	UNAVAILABLE	BLOCKED	canonical metadata extraction did not start
-scope_schema_version	mechanical-phase0-v2	RECORDED	AGENTS.md and tools/rewrite_queue.py
-queue_schema_version	translation-queue-v1	RECORDED	tools/rewrite_queue.py
-created_at	2026-08-05T13:59:00Z	RECORDED	Phase 0 attempt
-identity_status	BLOCKED	BLOCKED	matching ld.lld is required before configuration stabilization
+x86_64_config_sha256	a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4	VERIFIED	rewrite/configs/x86_64/frozen.config
+aarch64_config_sha256	b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578	VERIFIED	rewrite/configs/aarch64/frozen.config
+toolchain_sha256	cfb4e6fbb9b5281b15f0e09cb6d4f7f1866bf9bc1c69ae72715992b76c9bd670	VERIFIED	rewrite/toolchain/TOOLCHAIN.sha256
+tool_clang_sha256	0a3c55936ac43954fbe4914e6e73b577ca9e35e75d89ef13d3e28c187f41ca1a	VERIFIED	/usr/lib/llvm-19/bin/clang
+tool_ld_lld_sha256	7a2fd87d82662beac4371a1a21067b37cd4b7d43777aa61c089d85c45f772f6e	VERIFIED	/usr/lib/llvm-19/bin/ld.lld
+tool_llvm_ar_sha256	e15ccf58a2db49c1d9589a515bebc191abee12db35c809f092a70ed8e1ea2f8e	VERIFIED	/usr/lib/llvm-19/bin/llvm-ar
+tool_llvm_nm_sha256	ed2427f2e14ac235a12fc3ca878f3621dd347e1e0dba7a316824f4d2a5e78403	VERIFIED	/usr/lib/llvm-19/bin/llvm-nm
+tool_llvm_objcopy_sha256	8723d4539a1c621fbaa2f0bc9f6a5268ccb7cf93bac6b4fc8f1d6aed1b77201e	VERIFIED	/usr/lib/llvm-19/bin/llvm-objcopy
+tool_llvm_objdump_sha256	c904a20cf0caeb812b542b69488e5c79738951a92ca99098fbb8941505eb789d	VERIFIED	/usr/lib/llvm-19/bin/llvm-objdump
+tool_llvm_readelf_sha256	e513bd45eb2b0f4d3740dfa312416a250c2e95c5dd5d4713c0e04d253c89b4eb	VERIFIED	/usr/lib/llvm-19/bin/llvm-readelf
+tool_llvm_strip_sha256	8723d4539a1c621fbaa2f0bc9f6a5268ccb7cf93bac6b4fc8f1d6aed1b77201e	VERIFIED	/usr/lib/llvm-19/bin/llvm-strip
+x86_64_arch_value	x86_64	VERIFIED	rewrite/toolchain/ENVIRONMENT.tsv
+aarch64_arch_value	arm64	VERIFIED	rewrite/toolchain/ENVIRONMENT.tsv
+llvm_value	/usr/lib/llvm-19/bin/	VERIFIED	rewrite/toolchain/ENVIRONMENT.tsv
+llvm_ias_value	1	VERIFIED	rewrite/toolchain/ENVIRONMENT.tsv
+cross_compile_value	(empty)	VERIFIED	rewrite/toolchain/ENVIRONMENT.tsv
+extractor_version	phase0_extract.py:c932488bf4fa85fa9d5d4752905a1c2c72cb595618b89781b1b7d4dc16540d06	VERIFIED	tools/phase0_extract.py
+scope_schema_version	mechanical-phase0-v2	VERIFIED	AGENTS.md and rewrite/SCOPE.tsv
+queue_schema_version	translation-queue-v1	VERIFIED	tools/rewrite_queue.py
+queue_fingerprint	0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742	VERIFIED	rewrite/TRANSLATION_TASKS.sha256
+created_at	2026-08-05T14:32:37.477Z	VERIFIED	Phase 0 authoritative run
+identity_status	RESOLVED	VERIFIED	tools/phase0_validate.py passed all checks
