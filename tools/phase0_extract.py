@@ -399,9 +399,22 @@ def selected_lines(
         logical, end_line = directive
         conditional = CONDITIONAL_RE.match(logical)
         if conditional:
-            kind, argument = conditional.group(1), conditional.group(2).strip()
+            kind = conditional.group(1)
+            # Directives commonly carry explanatory C comments (for example,
+            # ``#ifndef CONFIG_ZISOFS /* No flag ... */``).  They are not part
+            # of the preprocessor condition and must not reach the restricted
+            # expression evaluator below.
+            argument = re.sub(r"/\\*.*?\\*/", "", conditional.group(2), flags=re.S)
+            argument = argument.split("//", 1)[0].strip()
             if kind in {"if", "ifdef", "ifndef"}:
                 parent_active = active
+                if kind in {"ifdef", "ifndef"}:
+                    identifier = IDENTIFIER.match(argument)
+                    if identifier is None:
+                        raise ValueError(
+                            f"{arch}:{config_path}:{line_number}: invalid #{kind} operand {argument!r}"
+                        )
+                    argument = identifier.group(0)
                 expression = argument if kind == "if" else f"defined({argument})"
                 if kind == "ifndef":
                     expression = f"!defined({argument})"
