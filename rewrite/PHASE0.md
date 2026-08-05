@@ -23,3 +23,29 @@ The canonical toolchain is the complete LLVM 19 suite under
 `/usr/lib/llvm-19/bin/`. Every invocation uses the absolute
 `LLVM=/usr/lib/llvm-19/bin/` value and `LLVM_IAS=1`; Rust-distributed linkers
 are rejected even when visible on `PATH`.
+
+## Compiler predicate inventory
+
+Compiler builtins used by mechanically selected source or its selected headers
+are Phase 0 inputs, not semantic notes. `tools/compiler_predicates.py --execute`
+discovers `__has_attribute`, `__has_builtin`, `__has_feature`,
+`__has_extension`, `__has_c_attribute`, `__has_declspec_attribute`, and
+`__has_warning` expressions from the selected source/header closure. It takes
+the authoritative per-architecture Kbuild command, replaces its source/output
+operation with a generated direct predicate probe, and requests preprocessing
+only. It never compiles an object or executes generated code.
+
+The canonical evidence is `rewrite/compiler-predicates/`: its TSV, fingerprint,
+command records, probes, raw stdout/stderr, and `VALIDATION.tsv`. Every row
+records compiler identity, target, configuration and toolchain hashes, the
+original command identity, probe/result hashes, exit status, timestamps, source
+locations, and architecture. `tools/validate_compiler_predicates.py --execute`
+reconstructs the probe and Kbuild context independently and replays each
+proven row. Compiler documentation, parsing an attributed declaration, and a
+generic host-only `clang -E` invocation are insufficient.
+
+`PHASE0_IDENTITY.tsv` binds the inventory fingerprint, schema, row counts, and
+independent-validation status. A changed predicate set/result, compiler or
+compiler hash, relevant flags, target, or configuration invalidates Phase 0 and
+requires a fresh manifest and queue. A predicate affecting selected code may
+not remain `PENDING_REVIEW`.

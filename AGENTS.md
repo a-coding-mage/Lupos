@@ -74,6 +74,21 @@ linker, and PATH-resolved LLVM tools outside that directory MUST NOT be used.
 Changing any selected tool or resolved path invalidates the Phase 0 identity
 and queue.
 
+Compiler feature-test predicates that influence mechanically selected code are
+also Phase 0 mechanical inputs. This includes `__has_attribute`,
+`__has_builtin`, `__has_feature`, `__has_extension`, `__has_c_attribute`,
+`__has_declspec_attribute`, and `__has_warning`. Each result MUST be obtained
+by preprocessing a generated direct predicate probe with the frozen compiler,
+architecture target, frozen configuration, and relevant original Kbuild command
+flags. Compiler documentation, a host-only invocation, and an attribute parse
+are not predicate evidence. The inventory retains the original and transformed
+commands, raw stdout/stderr, executable and input hashes, timestamps, source
+locations, and architecture; it is independently replayed and bound to the
+Phase 0 identity. A changed predicate set/result/command/compiler/hash/target
+or configuration invalidates the identity, manifests, and queue. Unlike
+semantic interpretation, a mechanically relevant compiler-predicate result
+MUST NOT remain `PENDING_REVIEW`.
+
 ## 2. Zero-difference contract
 
 This is not a Linux-like redesign, a simplification exercise, a compatibility
@@ -215,6 +230,8 @@ Before the first file is claimed, Phase 0 MUST create and review:
 - `rewrite/events.jsonl` — append-only workflow event log;
 - `rewrite/logs/tasks/` — one evidence directory per task;
 - `rewrite/BLOCKERS.tsv` — unresolved scope/source/lifetime/ABI questions.
+- `rewrite/compiler-predicates/COMPILER_PREDICATES.tsv` and its fingerprint,
+  commands, probes, raw output, and independent validation evidence.
 
 Phase 0 also retains the mechanically generated Linux evidence under
 `rewrite/metadata/`, including selected translation units, generated sources,

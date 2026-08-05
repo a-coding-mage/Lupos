@@ -121,6 +121,20 @@ Rust-distributed LLD is recorded only as rejected evidence and is never a
 kernel build tool.
 Invalidated provisional runs are archived rather than reused.
 
+Compiler feature-test predicates are equally frozen mechanical inputs when
+they affect selected source, generated declarations, ABI, attributes, section
+placement, stack protection, code generation, or architecture behavior. The
+canonical inventory in `rewrite/compiler-predicates/` probes each discovered
+predicate directly with the frozen LLVM compiler, architecture-specific target
+and configuration, and a relevant Kbuild command transformed to preprocessing
+only. It preserves the exact original and probe commands, raw stdout/stderr,
+hashes, timestamps, source locations, and architecture, then independently
+replays every proven result. Documentation or a generic host-only probe is not
+evidence. The inventory fingerprint is part of `PHASE0_IDENTITY`; any changed
+compiler, compiler hash, flags, target, configuration, predicate set, or result
+invalidates the inventory, Phase 0 manifests, and queue. These mechanical
+predicate values cannot be left `PENDING_REVIEW`.
+
 ### Per-file Phase 1 pipeline
 
 ```text

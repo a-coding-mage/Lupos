@@ -632,9 +632,25 @@ def cmd_invalidate(args: argparse.Namespace) -> None:
         rows = read_tsv(queue)
         validate_rows(rows)
         verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file))
-        active = [row for row in rows if row["status"] != "TODO"]
-        if active:
-            die("queue invalidation requires every task to remain TODO")
+        # A failed Phase 0 may already have produced a provisional queue and
+        # even locally paused/blocked rows before the scope gate exposes its
+        # defect.  It is still safe to record an invalidation provided no
+        # source pipeline reached a terminal acceptance state and no lease is
+        # active.  The command deliberately preserves the TSV unchanged; the
+        # caller must archive it and create a brand-new queue from regenerated
+        # Phase 0 scope rather than rewriting its rows.
+        disallowed = [
+            row for row in rows
+            if row["status"] not in {"TODO", "BLOCKED", "PAUSED"}
+        ]
+        if disallowed:
+            details = ", ".join(
+                f"{row['id']}={row['status']}" for row in disallowed[:10]
+            )
+            die(
+                "queue invalidation requires no active, IMPLEMENTED, REVIEWING, "
+                f"APPLYING, or DONE rows; found {details}"
+            )
         append_event(
             events,
             event_payload(
