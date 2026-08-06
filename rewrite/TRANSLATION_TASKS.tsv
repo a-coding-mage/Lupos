@@ -2782,7 +2782,7 @@ S014585	src/include/linux/pci-acpi.rs	2026-08-06T15:10:15.496Z			TODO	include/li
 S014593	src/include/linux/pci-p2pdma.rs	2026-08-06T15:10:15.496Z			TODO	include/linux/pci-p2pdma.h	common	include	21.5	low	S014584	luna		0								2026-08-06T15:10:15.496Z		
 S014595	src/include/linux/pci-tph.rs	2026-08-06T15:10:15.496Z			TODO	include/linux/pci-tph.h	common	include	4.6	low	S014593	luna		0								2026-08-06T15:10:15.496Z		
 S014596	src/include/linux/pci.rs	2026-08-06T15:10:15.496Z			TODO	include/linux/pci.h	common	include	291.2	low	S014595	luna		0								2026-08-06T15:10:15.496Z		
-S014598	src/include/linux/pci_ids.rs	2026-08-06T15:10:15.496Z			TODO	include/linux/pci_ids.h	common	include	327.0	low		luna		0								2026-08-06T15:10:15.496Z		
+S014598	src/include/linux/pci_ids.rs	2026-08-06T15:10:15.496Z	2026-08-06T15:21:49.324Z		IN_PROGRESS	include/linux/pci_ids.h	common	include	327.0	low		luna	P01	2	codex-root-postgate-retry-20260806-p01	2026-08-06T16:54:09.313Z						2026-08-06T15:24:09.313Z		
 S014603	src/include/linux/pe.rs	2026-08-06T15:10:15.496Z			TODO	include/linux/pe.h	aarch64	include	55.1	low	S018290	luna		0								2026-08-06T15:10:15.496Z		
 S014604	src/include/linux/percpu-defs.rs	2026-08-06T15:10:15.496Z			TODO	include/linux/percpu-defs.h	common	include	51.8	low	S014596	luna		0								2026-08-06T15:10:15.496Z		
 S014605	src/include/linux/percpu-refcount.rs	2026-08-06T15:10:15.496Z			TODO	include/linux/percpu-refcount.h	common	include	36.8	low	S014604	luna		0								2026-08-06T15:10:15.496Z		
@@ -3869,7 +3869,7 @@ S016273	src/include/uapi/linux/netfilter/nf_conntrack_tcp.rs	2026-08-06T15:10:15
 S016274	src/include/uapi/linux/netfilter/nf_conntrack_tuple_common.rs	2026-08-06T15:10:15.496Z			TODO	include/uapi/linux/netfilter/nf_conntrack_tuple_common.h	common	include	4.6	low	S016273	luna		0								2026-08-06T15:10:15.496Z		
 S016275	src/include/uapi/linux/netfilter/nf_log.rs	2026-08-06T15:10:15.496Z			TODO	include/uapi/linux/netfilter/nf_log.h	common	include	1.5	low		luna		0								2026-08-06T15:10:15.496Z		
 S016276	src/include/uapi/linux/netfilter/nf_nat.rs	2026-08-06T15:10:15.496Z			TODO	include/uapi/linux/netfilter/nf_nat.h	common	include	5.5	low	S016274	luna		0								2026-08-06T15:10:15.496Z		
-S016277	src/include/uapi/linux/netfilter/nf_tables.rs	2026-08-06T15:10:15.496Z			TODO	include/uapi/linux/netfilter/nf_tables.h	common	include	202.2	low		luna		0								2026-08-06T15:10:15.496Z		
+S016277	src/include/uapi/linux/netfilter/nf_tables.rs	2026-08-06T15:10:15.496Z	2026-08-06T15:21:49.760Z		IN_PROGRESS	include/uapi/linux/netfilter/nf_tables.h	common	include	202.2	low		luna	P02	1	codex-root-postgate-20260806-p02	2026-08-06T16:51:49.760Z						2026-08-06T15:21:49.760Z		
 S016278	src/include/uapi/linux/netfilter/nfnetlink.rs	2026-08-06T15:10:15.496Z			TODO	include/uapi/linux/netfilter/nfnetlink.h	x86_64	include	8.2	low	S018290	luna		0								2026-08-06T15:10:15.496Z		
 S016279	src/include/uapi/linux/netfilter/nfnetlink_compat.rs	2026-08-06T15:10:15.496Z			TODO	include/uapi/linux/netfilter/nfnetlink_compat.h	x86_64	include	6.4	low	S016278	luna		0								2026-08-06T15:10:15.496Z		
 S016280	src/include/uapi/linux/netfilter/nfnetlink_conntrack.rs	2026-08-06T15:10:15.496Z			TODO	include/uapi/linux/netfilter/nfnetlink_conntrack.h	x86_64	include	29.2	low	S014494	luna		0								2026-08-06T15:10:15.496Z		

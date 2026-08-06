@@ -1,3 +1,14 @@
-Candidate: `src/include/uapi/linux/netfilter/nf_tables.rs`
+# S016277 candidate summary
 
-The candidate maps every selected `nf_tables.h` C enum enumerator and object-like macro to a Rust public integer constant with its exact evaluated UAPI value. There are no structs, functions, tests, or driver code in the upstream header.
+Fresh replacement candidate:
+
+- destination: `src/include/uapi/linux/netfilter/nf_tables.rs`
+- source: `vendor/linux/include/uapi/linux/netfilter/nf_tables.h`
+- task/source/revision/architecture provenance is present and immutable.
+- translated surface: 95 enum tags, 778 enum constants, and 89 object-like
+  macros (962 source identifiers total).
+
+The candidate intentionally uses source-visible global constants rather than
+Rust scoped enums so the UAPI enumerator namespace and C integer-expression
+semantics remain available to callers. This is an implementation evidence
+summary, not a comparison against the invalidated prior destination.

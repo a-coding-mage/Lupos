@@ -24,18 +24,21 @@ compiler_predicate_validation_schema	PASS	rows=72; missing_fields=[]
 compiler_predicates_proven	PASS	[]
 compiler_predicate_raw_evidence	PASS	[]
 compiler_predicate_binding_schema	PASS	rows=7; missing_fields=[]
-compiler_predicate_binding	PASS	{'compiler_predicates_aarch64_count': '36', 'compiler_predicates_count': '72', 'compiler_predicates_schema_version': 'compiler-predicates-v1', 'compiler_predicates_sha256': 'b4ba9a920520dc7b6f36d24347a9e3bf520b848aaf2843d84c31d521d5a23866', 'compiler_predicates_validation_sha256': 'e6886508cb99db02e8498285746815b3d817987a97de544ab4fbaa563db3db8b', 'compiler_predicates_validation_status': 'PASS', 'compiler_predicates_x86_64_count': '36'}
+compiler_predicate_binding	PASS	{'compiler_predicates_aarch64_count': '36', 'compiler_predicates_count': '72', 'compiler_predicates_schema_version': 'compiler-predicates-v1', 'compiler_predicates_sha256': 'b4ba9a920520dc7b6f36d24347a9e3bf520b848aaf2843d84c31d521d5a23866', 'compiler_predicates_validation_sha256': 'f6f4ffb20d3e0fbc54463676a25b878008c14a55c921f68373df412daaa726a9', 'compiler_predicates_validation_status': 'PASS', 'compiler_predicates_x86_64_count': '36'}
 scope_schema	PASS	rows=18957; missing_fields=[]
 file_map_schema	PASS	rows=23810; missing_fields=[]
-symbols_schema	PASS	rows=558960; missing_fields=[]
+symbols_schema	PASS	rows=613184; missing_fields=[]
 abi_schema	PASS	rows=351403; missing_fields=[]
 lifetimes_schema	PASS	rows=336623; missing_fields=[]
 driver_abi_schema	PASS	rows=8252; missing_fields=[]
+branding_allowlist_schema	PASS	rows=0; missing_fields=[]
+branding_allowlist_complete	PASS	rows=0
+porting_guidance_present	PASS	/home/fenhir/Projects/lupos/rewrite/PORTING.md
 header_closure_schema	PASS	rows=11880; missing_fields=[]
 header_include_edges_schema	PASS	rows=18385; missing_fields=[]
-header_context_edges_schema	PASS	rows=8181; missing_fields=[]
+header_context_edges_schema	PASS	rows=8212; missing_fields=[]
 header_components_schema	PASS	rows=3479; missing_fields=[]
-task_dependencies_schema	PASS	rows=137740; missing_fields=[]
+task_dependencies_schema	PASS	rows=137339; missing_fields=[]
 oracle_classification_schema	PASS	rows=16; missing_fields=[]
 scope_classified	PASS	rows=18957 ids=18957 paths=18957
 scope_arch_config_evidence	PASS	[]
@@ -54,42 +57,47 @@ oracle_classification_exact	PASS	expected=16 manifest_errors=[] scope_errors=[]
 oracle_file_map_inventory_nonrust	PASS	oracle=16 missing=[]
 oracle_excluded_from_semantic_manifests	PASS	[]
 header_literal_include_resolution_exact	PASS	expected=18385 actual=18385 resolver_errors=[] edge_errors=[]
-header_context_provider_edges_exact	PASS	expected=8181 actual=8181 errors=[]
-task_dependency_records	PASS	scope=137740 metadata=137740 field_errors=[] metadata_errors=[] delta=[]
+header_context_provider_edges_exact	PASS	expected=8212 actual=8212 errors=[]
+xt_state_conntrack_enum_provider	PASS	{'architecture': 'x86_64', 'header_path': 'include/uapi/linux/netfilter/xt_state.h', 'provider_header': 'include/uapi/linux/netfilter/nf_conntrack_common.h', 'relationship': 'lexical_identifier_provider', 'consumer_source': 'net/netfilter/xt_state.c', 'consumer_object': 'net/netfilter/xt_state.o', 'header_position': '791', 'provider_position': '623', 'provided_identifiers': 'identifier:IP_CT_IS_REPLY,identifier:IP_CT_NUMBER', 'provider_origin': 'dependency_order', 'evidence': 'rewrite/kbuild/x86_64/net/netfilter/.xt_state.o.cmd;ordered_dependency_positions=623<791'}
+task_dependency_records	PASS	scope=137339 metadata=137339 field_errors=[] metadata_errors=[] delta=[]
+xt_state_conntrack_task_dependency	PASS	('S016294', 'S016270')
 header_components_complete	PASS	rust_headers=3479 component_members=3479 delta=[] errors=[]
 header_include_dependency_graph	PASS	projected_edges=11077 errors=[]
-header_context_dependency_graph	PASS	provider_pairs=5478 errors=[]
+header_context_dependency_graph	PASS	provider_pairs=5497 errors=[]
 generated_wrapper_bridge_reachability	PASS	bridged_pairs=120 errors=[]
-header_provider_resolver_readiness	PASS	rust_headers=3479 provider_edges=16555 errors=[]
+header_provider_resolver_readiness	PASS	rust_headers=3479 provider_edges=16574 errors=[]
 source_header_dependency_reachability	PASS	rust_sources=2313 errors=[]
 task_dependency_acyclic	PASS	[]
 semantic_no_file_placeholders	PASS	[]
 symbols_mechanical_fields	PASS	[]
+header_enum_constant_inventory_exact	PASS	expected=50614 errors=[]
+ip_ct_number_mechanical_value	PASS	{'x86_64': '5', 'aarch64': '5'}
 symbols_category_arch_coverage	PASS	[]
 abi_entity_coverage	PASS	[]
 lifetime_entity_coverage	PASS	[]
 driver_abi_mechanical_coverage	PASS	[]
-authoritative_manifest_index_schema	PASS	rows=6; missing_fields=[]
+authoritative_manifest_index_schema	PASS	rows=8; missing_fields=[]
 authoritative_manifest_hashes	PASS	[]
 metadata_manifest_schema	PASS	rows=39; missing_fields=[]
 metadata_manifest_hashes	PASS	[]
-src_empty_at_first_init	PASS	/home/fenhir/Projects/lupos/src
+phase_gate_reopen_authorized	PASS	events=1 event_errors=[] active=[]
+src_preserved_during_phase_gate_reopen	PASS	/home/fenhir/Projects/lupos/src
 identity_hash	PASS	/home/fenhir/Projects/lupos/rewrite/PHASE0_IDENTITY.sha256
 x86_64_config_hash	PASS	identity=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4 actual=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4
 aarch64_config_hash	PASS	identity=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578 actual=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578
-extractor_identity	PASS	identity=phase0_extract.py:823a608deea6baa6e41eb3a19b669b9eba3455d9c296c267afd0df647918f430 actual=phase0_extract.py:823a608deea6baa6e41eb3a19b669b9eba3455d9c296c267afd0df647918f430
-scope_schema_identity	PASS	source-header-context-oracle-phase0-v6
-header_dependency_schema_identity	PASS	header-provider-graph-v2
+extractor_identity	PASS	identity=phase0_extract.py:75704df1c2478336a7f4f968ee3f81b55595ba0294a96a5a50a7eed20eed4a3e actual=phase0_extract.py:75704df1c2478336a7f4f968ee3f81b55595ba0294a96a5a50a7eed20eed4a3e
+scope_schema_identity	PASS	source-header-context-oracle-phase0-v7
+header_dependency_schema_identity	PASS	header-provider-enumerator-graph-v3
 oracle_classification_schema_identity	PASS	oracle-classification-v1
 compiler_predicate_identity	PASS	{}
-authoritative_manifests_identity	PASS	1e0084ce21de84590abe1e22ad986bd26e5d6aa25cc380873f039ee5cb5936fa
-metadata_manifest_identity	PASS	8ad06688353f64b818c2c176c6fff347982cd9170396473908581ebcca7af4eb
+authoritative_manifests_identity	PASS	ea75b2acb61cf50a62e73098ca777cd4c4eaf73f907e9427c3a23bc6527bd0c8
+metadata_manifest_identity	PASS	d4ca8c0dbfac80a024f104647669720cf5b8fa77023aa2aec018b5aad70059c8
 queue_schema	PASS	rows=5792; missing_fields=[]
 rust_task_bijection	PASS	scope=5792 tasks=5792 mismatches=[]
 queue_initial_state	PASS	all rows TODO, attempt zero, unleased, and without work-stage timestamps
 driver_exclusion	PASS	driver rows must not be queued
 oracle_excluded_from_queue	PASS	[]
-queue_verify	PASS	{"ok": true, "tasks": 5792, "sha256": "af93adda6e7845ec178dc63a9462f88384392f78353165ea5a583ef78fcf423c"}
+queue_verify	PASS	{"ok": true, "tasks": 5792, "sha256": "d6c01f29edd048c73608fff2ed65f2485755023f85ffc0fec01e9f511fd6a72c"}
 
-identity_queue_binding	PASS	identity=af93adda6e7845ec178dc63a9462f88384392f78353165ea5a583ef78fcf423c queue=af93adda6e7845ec178dc63a9462f88384392f78353165ea5a583ef78fcf423c
-queue_phase0_identity_binding	PASS	queue=8f8f2ac1b867f4ba89f00ff5812de9dc6eedd9929724ccce928a604c0301de3f identity=8f8f2ac1b867f4ba89f00ff5812de9dc6eedd9929724ccce928a604c0301de3f
+identity_queue_binding	PASS	identity=d6c01f29edd048c73608fff2ed65f2485755023f85ffc0fec01e9f511fd6a72c queue=d6c01f29edd048c73608fff2ed65f2485755023f85ffc0fec01e9f511fd6a72c
+queue_phase0_identity_binding	PASS	queue=1c793a8db8b4971fdfc15cd7b9e5f503d6b4399893cb0cb5ab171f95c9e46a23 identity=1c793a8db8b4971fdfc15cd7b9e5f503d6b4399893cb0cb5ab171f95c9e46a23

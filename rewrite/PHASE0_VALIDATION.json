@@ -29,19 +29,27 @@
       "ok": true
     },
     "authoritative_manifest_index_schema": {
-      "detail": "rows=6; missing_fields=[]",
+      "detail": "rows=8; missing_fields=[]",
       "ok": true
     },
     "authoritative_manifests_identity": {
-      "detail": "1e0084ce21de84590abe1e22ad986bd26e5d6aa25cc380873f039ee5cb5936fa",
+      "detail": "ea75b2acb61cf50a62e73098ca777cd4c4eaf73f907e9427c3a23bc6527bd0c8",
       "ok": true
     },
     "branch": {
       "detail": "feat/bun-like-rewrite-test",
       "ok": true
     },
+    "branding_allowlist_complete": {
+      "detail": "rows=0",
+      "ok": true
+    },
+    "branding_allowlist_schema": {
+      "detail": "rows=0; missing_fields=[]",
+      "ok": true
+    },
     "compiler_predicate_binding": {
-      "detail": "{'compiler_predicates_aarch64_count': '36', 'compiler_predicates_count': '72', 'compiler_predicates_schema_version': 'compiler-predicates-v1', 'compiler_predicates_sha256': 'b4ba9a920520dc7b6f36d24347a9e3bf520b848aaf2843d84c31d521d5a23866', 'compiler_predicates_validation_sha256': 'e6886508cb99db02e8498285746815b3d817987a97de544ab4fbaa563db3db8b', 'compiler_predicates_validation_status': 'PASS', 'compiler_predicates_x86_64_count': '36'}",
+      "detail": "{'compiler_predicates_aarch64_count': '36', 'compiler_predicates_count': '72', 'compiler_predicates_schema_version': 'compiler-predicates-v1', 'compiler_predicates_sha256': 'b4ba9a920520dc7b6f36d24347a9e3bf520b848aaf2843d84c31d521d5a23866', 'compiler_predicates_validation_sha256': 'f6f4ffb20d3e0fbc54463676a25b878008c14a55c921f68373df412daaa726a9', 'compiler_predicates_validation_status': 'PASS', 'compiler_predicates_x86_64_count': '36'}",
       "ok": true
     },
     "compiler_predicate_binding_schema": {
@@ -89,7 +97,7 @@
       "ok": true
     },
     "extractor_identity": {
-      "detail": "identity=phase0_extract.py:823a608deea6baa6e41eb3a19b669b9eba3455d9c296c267afd0df647918f430 actual=phase0_extract.py:823a608deea6baa6e41eb3a19b669b9eba3455d9c296c267afd0df647918f430",
+      "detail": "identity=phase0_extract.py:75704df1c2478336a7f4f968ee3f81b55595ba0294a96a5a50a7eed20eed4a3e actual=phase0_extract.py:75704df1c2478336a7f4f968ee3f81b55595ba0294a96a5a50a7eed20eed4a3e",
       "ok": true
     },
     "file_map_schema": {
@@ -121,15 +129,15 @@
       "ok": true
     },
     "header_context_dependency_graph": {
-      "detail": "provider_pairs=5478 errors=[]",
+      "detail": "provider_pairs=5497 errors=[]",
       "ok": true
     },
     "header_context_edges_schema": {
-      "detail": "rows=8181; missing_fields=[]",
+      "detail": "rows=8212; missing_fields=[]",
       "ok": true
     },
     "header_context_provider_edges_exact": {
-      "detail": "expected=8181 actual=8181 errors=[]",
+      "detail": "expected=8212 actual=8212 errors=[]",
       "ok": true
     },
     "header_dependency_replay": {
@@ -137,7 +145,11 @@
       "ok": true
     },
     "header_dependency_schema_identity": {
-      "detail": "header-provider-graph-v2",
+      "detail": "header-provider-enumerator-graph-v3",
+      "ok": true
+    },
+    "header_enum_constant_inventory_exact": {
+      "detail": "expected=50614 errors=[]",
       "ok": true
     },
     "header_include_dependency_graph": {
@@ -153,7 +165,7 @@
       "ok": true
     },
     "header_provider_resolver_readiness": {
-      "detail": "rust_headers=3479 provider_edges=16555 errors=[]",
+      "detail": "rust_headers=3479 provider_edges=16574 errors=[]",
       "ok": true
     },
     "header_scope_complete": {
@@ -165,7 +177,11 @@
       "ok": true
     },
     "identity_queue_binding": {
-      "detail": "identity=af93adda6e7845ec178dc63a9462f88384392f78353165ea5a583ef78fcf423c queue=af93adda6e7845ec178dc63a9462f88384392f78353165ea5a583ef78fcf423c",
+      "detail": "identity=d6c01f29edd048c73608fff2ed65f2485755023f85ffc0fec01e9f511fd6a72c queue=d6c01f29edd048c73608fff2ed65f2485755023f85ffc0fec01e9f511fd6a72c",
+      "ok": true
+    },
+    "ip_ct_number_mechanical_value": {
+      "detail": "{'x86_64': '5', 'aarch64': '5'}",
       "ok": true
     },
     "kbuild_disposition_consistent": {
@@ -193,7 +209,7 @@
       "ok": true
     },
     "metadata_manifest_identity": {
-      "detail": "8ad06688353f64b818c2c176c6fff347982cd9170396473908581ebcca7af4eb",
+      "detail": "d4ca8c0dbfac80a024f104647669720cf5b8fa77023aa2aec018b5aad70059c8",
       "ok": true
     },
     "metadata_manifest_schema": {
@@ -228,12 +244,20 @@
       "detail": "oracle=16 missing=[]",
       "ok": true
     },
+    "phase_gate_reopen_authorized": {
+      "detail": "events=1 event_errors=[] active=[]",
+      "ok": true
+    },
+    "porting_guidance_present": {
+      "detail": "/home/fenhir/Projects/lupos/rewrite/PORTING.md",
+      "ok": true
+    },
     "queue_initial_state": {
       "detail": "all rows TODO, attempt zero, unleased, and without work-stage timestamps",
       "ok": true
     },
     "queue_phase0_identity_binding": {
-      "detail": "queue=8f8f2ac1b867f4ba89f00ff5812de9dc6eedd9929724ccce928a604c0301de3f identity=8f8f2ac1b867f4ba89f00ff5812de9dc6eedd9929724ccce928a604c0301de3f",
+      "detail": "queue=1c793a8db8b4971fdfc15cd7b9e5f503d6b4399893cb0cb5ab171f95c9e46a23 identity=1c793a8db8b4971fdfc15cd7b9e5f503d6b4399893cb0cb5ab171f95c9e46a23",
       "ok": true
     },
     "queue_schema": {
@@ -241,7 +265,7 @@
       "ok": true
     },
     "queue_verify": {
-      "detail": "{\"ok\": true, \"tasks\": 5792, \"sha256\": \"af93adda6e7845ec178dc63a9462f88384392f78353165ea5a583ef78fcf423c\"}\n",
+      "detail": "{\"ok\": true, \"tasks\": 5792, \"sha256\": \"d6c01f29edd048c73608fff2ed65f2485755023f85ffc0fec01e9f511fd6a72c\"}\n",
       "ok": true
     },
     "rust_destination_unique": {
@@ -273,7 +297,7 @@
       "ok": true
     },
     "scope_schema_identity": {
-      "detail": "source-header-context-oracle-phase0-v6",
+      "detail": "source-header-context-oracle-phase0-v7",
       "ok": true
     },
     "selected_linker": {
@@ -288,7 +312,7 @@
       "detail": "rust_sources=2313 errors=[]",
       "ok": true
     },
-    "src_empty_at_first_init": {
+    "src_preserved_during_phase_gate_reopen": {
       "detail": "/home/fenhir/Projects/lupos/src",
       "ok": true
     },
@@ -301,11 +325,11 @@
       "ok": true
     },
     "symbols_schema": {
-      "detail": "rows=558960; missing_fields=[]",
+      "detail": "rows=613184; missing_fields=[]",
       "ok": true
     },
     "task_dependencies_schema": {
-      "detail": "rows=137740; missing_fields=[]",
+      "detail": "rows=137339; missing_fields=[]",
       "ok": true
     },
     "task_dependency_acyclic": {
@@ -313,7 +337,7 @@
       "ok": true
     },
     "task_dependency_records": {
-      "detail": "scope=137740 metadata=137740 field_errors=[] metadata_errors=[] delta=[]",
+      "detail": "scope=137339 metadata=137339 field_errors=[] metadata_errors=[] delta=[]",
       "ok": true
     },
     "tool:clang": {
@@ -370,6 +394,14 @@
     },
     "x86_64_stable_transition": {
       "detail": "[{'symbol': '__SUMMARY__', 'before': '0_changed_symbols', 'after': '0_changed_symbols', 'reason_when_mechanically_known': 'second identical olddefconfig pass was byte-identical to the first stabilized configuration', 'source_kconfig': 'Kconfig/Kbuild metadata', 'status': 'STABLE'}]",
+      "ok": true
+    },
+    "xt_state_conntrack_enum_provider": {
+      "detail": "{'architecture': 'x86_64', 'header_path': 'include/uapi/linux/netfilter/xt_state.h', 'provider_header': 'include/uapi/linux/netfilter/nf_conntrack_common.h', 'relationship': 'lexical_identifier_provider', 'consumer_source': 'net/netfilter/xt_state.c', 'consumer_object': 'net/netfilter/xt_state.o', 'header_position': '791', 'provider_position': '623', 'provided_identifiers': 'identifier:IP_CT_IS_REPLY,identifier:IP_CT_NUMBER', 'provider_origin': 'dependency_order', 'evidence': 'rewrite/kbuild/x86_64/net/netfilter/.xt_state.o.cmd;ordered_dependency_positions=623<791'}",
+      "ok": true
+    },
+    "xt_state_conntrack_task_dependency": {
+      "detail": "('S016294', 'S016270')",
       "ok": true
     }
   },
