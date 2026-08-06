@@ -119,7 +119,10 @@ The canonical Phase 0 toolchain is the complete LLVM 19 suite at
 use `LLVM=/usr/lib/llvm-19/bin/` with its trailing slash and `LLVM_IAS=1`.
 Rust-distributed LLD is recorded only as rejected evidence and is never a
 kernel build tool.
-Invalidated provisional runs are archived rather than reused.
+Invalidated provisional runs are archived rather than reused.  The archive retains
+the per-run README and a compact append-only prune ledger; it does not retain
+duplicated generated TSV payloads.  Authoritative Phase 0 manifests and metadata
+remain under `rewrite/`, not `rewrite/archive/`.
 
 Compiler feature-test predicates are equally frozen mechanical inputs when
 they affect selected source, generated declarations, ABI, attributes, section

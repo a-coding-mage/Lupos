@@ -66,6 +66,11 @@ pinned source and pinned toolchain. Any toolchain or configuration change
 invalidates the Phase 0 identity, manifests, scope, queue, and queue
 fingerprint. Invalidated provisional runs remain archived as evidence.
 
+Invalidated provisional runs retain a compact per-run README and one append-only
+prune-ledger entry as evidence; generated TSV payloads from invalidated runs
+MUST NOT be retained as duplicate archive snapshots.  The authoritative current
+metadata remains under `rewrite/`.
+
 The canonical Phase 0 toolchain is the complete LLVM 19 suite under
 `/usr/lib/llvm-19/bin/`. Every Phase 0 Kconfig, Kbuild, metadata, preparation,
 and validation invocation MUST pass `LLVM=/usr/lib/llvm-19/bin/` (including

@@ -1,0 +1,12 @@
+# S016003 candidate diff record
+
+New path: `src/include/uapi/asm-generic/errno.rs` (112 added lines).
+
+The new file carries the required immutable SPDX, source-path, Linux-revision,
+architecture, and task provenance.  It re-exports the completed `errno-base`
+provider and adds the complete 102-macro body of the pinned generic errno UAPI
+header as `core::ffi::c_int` constants, retaining every source alias relation.
+
+Focused inspection found no `todo!`, `unimplemented!`, panic placeholder, or
+Rust test configuration in the candidate.  This record is source-review
+evidence only; it makes no build or test claim.

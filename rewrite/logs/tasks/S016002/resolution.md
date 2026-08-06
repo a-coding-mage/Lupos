@@ -34,11 +34,12 @@ is required.
 
 ## Semantic-record closure
 
-- The 74 `SYMBOLS.tsv` S016002 records cover the include-guard condition and
-  all 34 operative macros for each frozen architecture.  Their pending
-  selection/semantic facts are resolved by the identical unconditional source
-  definitions at `vendor/linux/include/uapi/asm-generic/errno-base.h:2-40` and
-  the direct one-to-one Rust declarations described above.
+- All 74 task-local `SYMBOLS.tsv` records are now `COMPLETE`.  They cover the
+  include-guard condition and all 34 operative macros for each frozen
+  architecture; each cites the identical unconditional source definitions at
+  `vendor/linux/include/uapi/asm-generic/errno-base.h:2-40`, its exact macro
+  value or no-Rust-item guard treatment, and this applier adjudication.  The
+  S016002 `SCOPE.tsv` semantic-status record is likewise `COMPLETE`.
 - `ABI.tsv`, `LIFETIMES.tsv`, `DRIVER_ABI.tsv`, and `BLOCKERS.tsv` contain no
   S016002 row.  Those record families are not applicable to this constant-only
   declaration header; no unresolved ABI, ownership, locking, RCU, refcount, or
