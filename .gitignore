@@ -19,6 +19,7 @@ core.*
 /rewrite/DRIVER_ABI.tsv
 /rewrite/metadata/*
 /rewrite/phase0-staging/
+/rewrite/kbuild/
 
 # Invalidated Phase 0 runs retain one compact prune ledger, never snapshots.
 /rewrite/archive/*

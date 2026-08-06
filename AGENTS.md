@@ -75,6 +75,12 @@ verify them with `tools/phase0_materialize.py` before a workflow needs the raw
 files. The identity, frozen configurations, compiler-predicate evidence, queue,
 and task evidence remain directly tracked.
 
+Full Kbuild output trees under `rewrite/kbuild/` are transient Phase 0 inputs,
+not archival evidence. They MUST remain ignored, MUST NOT be bundled or copied
+to `rewrite/archive/`, and may be deleted once their selected metadata has been
+captured and verified. A fresh authorized Phase 0 pass recreates them from the
+pinned Linux source and frozen toolchain when required.
+
 The canonical Phase 0 toolchain is the complete LLVM 19 suite under
 `/usr/lib/llvm-19/bin/`. Every Phase 0 Kconfig, Kbuild, metadata, preparation,
 and validation invocation MUST pass `LLVM=/usr/lib/llvm-19/bin/` (including

@@ -27,12 +27,15 @@ or after a fresh Phase 0 extraction:
 ```bash
 python3 tools/phase0_materialize.py materialize --rewrite rewrite
 python3 tools/phase0_materialize.py verify --rewrite rewrite
+python3 tools/phase0_materialize.py dematerialize --rewrite rewrite
 python3 tools/phase0_materialize.py bundle --rewrite rewrite
 ```
 
 `materialize` restores only the bundled raw Phase 0 paths and rejects a
 conflicting local file. `verify` checks both compressed bundle hashes and every
-raw member hash. `bundle` replaces the bundles atomically from an already
+raw member hash. `dematerialize` removes only already-verified local cache
+members, never identity, queue, predicate, task, `vendor/linux`, or `src`
+paths. `bundle` replaces the bundles atomically from an already
 materialized Phase 0 result; it neither reads nor modifies `vendor/linux` or
 `src/`. It is an artifact-storage operation, not a Phase 0 execution. A fresh
 extraction remains the authoritative way to derive new metadata from the frozen
@@ -41,6 +44,11 @@ Linux/Kbuild inputs.
 Provisional invalidation appends one compact row to
 `rewrite/archive/PRUNED_TSVS.tsv`. Per-run copies of manifests, metadata, logs,
 or README files are not retained.
+
+The full Kbuild trees under `rewrite/kbuild/` are transient extraction inputs.
+They are ignored, never bundled, and never archived. Once the retained metadata
+has passed validation, remove them to avoid preserving generated object/image
+output; a fresh authorized Phase 0 run regenerates them when needed.
 
 The canonical toolchain is the complete LLVM 19 suite under
 `/usr/lib/llvm-19/bin/`. Every invocation uses the absolute

@@ -335,9 +335,25 @@ def materialize(root: Path, replace: bool) -> None:
     verify(root, require_materialized=True)
 
 
+def dematerialize(root: Path) -> None:
+    """Remove only cache files that already verify against committed bundles."""
+
+    _, members = expected(root)
+    verify(root, require_materialized=True)
+    paths = [root / safe_rel(relative) for relative in members]
+    for path in sorted(paths, key=lambda item: len(item.parts), reverse=True):
+        path.unlink()
+    for directory in sorted({path.parent for path in paths}, key=lambda item: len(item.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    print(f"dematerialized {len(paths)} verified Phase 0 cache files")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("bundle", "materialize", "verify"))
+    parser.add_argument("action", choices=("bundle", "materialize", "verify", "dematerialize"))
     parser.add_argument("--rewrite", default="rewrite", help="path to the rewrite directory")
     parser.add_argument("--replace", action="store_true", help="allow materialize to replace conflicting local cache files")
     args = parser.parse_args()
@@ -348,6 +364,8 @@ def main() -> None:
         build(root)
     elif args.action == "materialize":
         materialize(root, args.replace)
+    elif args.action == "dematerialize":
+        dematerialize(root)
     else:
         verify(root, require_materialized=False)
 

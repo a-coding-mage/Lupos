@@ -130,12 +130,33 @@ ordinary Git blobs. Their deterministic, checksummed gzip bundles live in
 ```bash
 python3 tools/phase0_materialize.py materialize --rewrite rewrite
 python3 tools/phase0_materialize.py verify --rewrite rewrite
+python3 tools/phase0_materialize.py dematerialize --rewrite rewrite
 ```
 
 This does not rerun Phase 0, alter `vendor/linux`, or touch `src/`; it restores
 the exact raw bytes represented by the committed bundle hashes. A fresh Phase 0
 run regenerates those raw files from the pinned Linux source and Kbuild metadata,
 then refreshes the bundles through the same deterministic tool.
+
+The full temporary Kbuild output tree at `rewrite/kbuild/` is ignored and never
+archived or bundled. Once the selected metadata is verified, it can be deleted;
+an authorized fresh Phase 0 run recreates it from the pinned source and frozen
+toolchain if needed.
+
+The no-AI extractor is `tools/phase0_extract.py`; it deterministically consumes
+the frozen Kbuild output directories and pinned Linux source, for example:
+
+```bash
+python3 tools/phase0_extract.py \
+  --linux vendor/linux \
+  --x86-build <frozen-x86-kbuild-output> \
+  --arm-build <frozen-aarch64-kbuild-output> \
+  --out rewrite
+```
+
+That remains a Phase 0 operation. It is not a generic host-only grep and is not
+run during Phase 1. `dematerialize` only deletes locally cached files after
+their hashes have verified against the bundles; `materialize` restores them.
 
 Compiler feature-test predicates are equally frozen mechanical inputs when
 they affect selected source, generated declarations, ABI, attributes, section
