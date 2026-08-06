@@ -1,0 +1,19 @@
+## Attempt 2 candidate summary
+
+`src/include/asm-generic/mcs_spinlock.rs` freshly maps the sole selected
+declaration from `include/asm-generic/mcs_spinlock.h`:
+
+```diff
++#[repr(C)]
++pub struct mcs_spinlock {
++    pub next: UnsafeCell<*mut mcs_spinlock>,
++    pub locked: UnsafeCell<c_int>,
++    pub count: UnsafeCell<c_int>,
++}
++unsafe impl Send for mcs_spinlock {}
++unsafe impl Sync for mcs_spinlock {}
+```
+
+The field ordering and C-compatible element layouts are unchanged. `UnsafeCell`
+is layout-transparent and records the source-required mutable shared-memory
+access discipline without adding locking or changing the MCS protocol.

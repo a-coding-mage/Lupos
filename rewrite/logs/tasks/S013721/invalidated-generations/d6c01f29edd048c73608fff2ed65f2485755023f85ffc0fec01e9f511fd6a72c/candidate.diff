@@ -1,0 +1,8 @@
+# Candidate summary — S013721
+
+Added `src/include/linux/device-id/mhi.rs` as the fresh path-preserving translation of `include/linux/device-id/mhi.h`.
+
+- Retained the source SPDX identifier and immutable task provenance.
+- Preserved both modalias macro literals as NUL-terminated static byte storage and exposed their C-compatible pointer views.
+- Preserved `MHI_NAME_SIZE == 32`, the kernel `unsigned long` driver-data type for both frozen 64-bit architectures, and the exact `mhi_device_id` field order in a `#[repr(C)]` record.
+- Kept the channel field as 32 unsigned bytes, matching the frozen C `-funsigned-char` command family.

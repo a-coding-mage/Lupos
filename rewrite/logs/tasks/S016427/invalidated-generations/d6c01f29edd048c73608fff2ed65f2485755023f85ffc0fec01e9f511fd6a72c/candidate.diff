@@ -1,0 +1,9 @@
+# Candidate summary: S016427
+
+Added `src/include/uapi/linux/tty.rs` with immutable provenance for
+`include/uapi/linux/tty.h` at Linux revision
+`425f94c2954b1fe80ebdbf9b29854e89750355df`.
+
+The candidate exports exactly `N_TTY` through `N_CAN327` with values `0`
+through `30`, respectively, plus `NR_LDISCS = 31`, all as `c_int`. There are
+no conditional branches beyond the C header guard, which has no Rust analogue.

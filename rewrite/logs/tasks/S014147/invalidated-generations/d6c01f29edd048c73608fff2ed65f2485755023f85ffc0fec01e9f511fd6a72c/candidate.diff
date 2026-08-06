@@ -1,0 +1,12 @@
+S014147 candidate summary
+
+New destination: src/include/linux/irqreturn.rs
+Oracle: vendor/linux/include/linux/irqreturn.h
+
+Mapped declarations:
+- enum irqreturn -> C-int-compatible `irqreturn` alias and three constants
+- typedef enum irqreturn irqreturn_t -> `irqreturn_t` alias
+- IRQ_RETVAL(x) -> single-evaluation `IRQ_RETVAL(c_int)` const function
+
+The alias intentionally permits the IRQ core's `IRQ_HANDLED | IRQ_WAKE_THREAD`
+aggregate result, matching `kernel/irq/handle.c::__handle_irq_event_percpu`.

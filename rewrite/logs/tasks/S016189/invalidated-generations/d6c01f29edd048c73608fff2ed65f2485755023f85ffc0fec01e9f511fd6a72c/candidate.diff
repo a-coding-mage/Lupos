@@ -1,0 +1,6 @@
+# Candidate snapshot — S016189
+
+Fresh replacement candidate for `src/include/uapi/linux/input-event-codes.rs`.
+
+The candidate preserves all 795 operative object-like UAPI macros from the pinned header as public `u32` constants, in source order. The C-only include guard is intentionally not represented. No historical destination source or prior task evidence was used.
+

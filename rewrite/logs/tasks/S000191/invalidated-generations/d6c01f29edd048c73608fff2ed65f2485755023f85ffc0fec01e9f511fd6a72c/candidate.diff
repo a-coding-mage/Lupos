@@ -1,0 +1,7 @@
+# S000191 candidate summary
+
+Destination: `src/arch/arm64/include/asm/vdso.rs`
+
+- Added immutable provenance for `arch/arm64/include/asm/vdso.h` at the frozen Linux revision.
+- Mapped `__VDSO_PAGES`, all four linker-image boundary declarations, and the `VDSO_SYMBOL` address calculation.
+- Preserved address-only linker-symbol semantics with zero-length foreign anchors; no image bytes, substitute vDSO, or generated offset values were introduced.

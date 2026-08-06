@@ -1,0 +1,17 @@
+S014373 candidate summary (initial fresh destination)
+
+Added src/include/linux/migrate_mode.rs.
+
+- Added immutable task provenance for the pinned Linux header and both frozen
+  architectures.
+- Translated enum migrate_mode as a public #[repr(C)] enum with, in source
+  order: MIGRATE_ASYNC, MIGRATE_SYNC_LIGHT, MIGRATE_SYNC.
+- Translated enum migrate_reason as a public #[repr(C)] enum with, in source
+  order: MR_COMPACTION through the MR_TYPES sentinel.
+- Preserved C's implicit sequential discriminants by omitting explicit values.
+
+Applier update: restored the pinned `GPL-2.0` SPDX identifier and retained the
+three upstream migration blocking invariants in the `migrate_mode`
+documentation. The candidate remains blocked on the separate, unresolved
+C-enum ABI and invalid-value contract; this snapshot is not an accepted
+translation.

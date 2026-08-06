@@ -1,0 +1,9 @@
+S016002 candidate summary
+
+Source:      vendor/linux/include/uapi/asm-generic/errno-base.h
+Destination: src/include/uapi/asm-generic/errno-base.rs
+
+The Rust destination preserves all 34 unconditional errno constants and their
+C `int` values exactly: EPERM=1 through ERANGE=34.  The C include guard is
+intentionally omitted because this one Rust module provides its declarations
+once.  The destination includes the required immutable source provenance.

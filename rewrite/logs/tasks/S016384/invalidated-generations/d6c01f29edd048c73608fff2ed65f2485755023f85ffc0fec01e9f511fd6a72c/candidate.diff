@@ -1,0 +1,334 @@
+diff --git a/src/include/uapi/linux/snmp.rs b/src/include/uapi/linux/snmp.rs
+new file mode 100644
+index 0000000..442b0f4
+--- /dev/null
++++ b/src/include/uapi/linux/snmp.rs
+@@ -0,0 +1,328 @@
++// SPDX-License-Identifier: GPL-2.0-only
++//! linux-source: include/uapi/linux/snmp.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: common
++//! rewrite-task: S016384
++//!
++//! Definitions for MIBs.
++//!
++//! Upstream author: Hideaki YOSHIFUJI <yoshfuji@linux-ipv6.org>
++
++use core::ffi::c_int;
++
++// Anonymous C enum 1; its enumerator identifiers have C int type.
++pub const IPSTATS_MIB_NUM: c_int = 0;
++pub const IPSTATS_MIB_INPKTS: c_int = 1;
++pub const IPSTATS_MIB_INOCTETS: c_int = 2;
++pub const IPSTATS_MIB_INDELIVERS: c_int = 3;
++pub const IPSTATS_MIB_NOECTPKTS: c_int = 4;
++pub const IPSTATS_MIB_ECT1PKTS: c_int = 5;
++pub const IPSTATS_MIB_ECT0PKTS: c_int = 6;
++pub const IPSTATS_MIB_CEPKTS: c_int = 7;
++pub const IPSTATS_MIB_OUTREQUESTS: c_int = 8;
++pub const IPSTATS_MIB_OUTPKTS: c_int = 9;
++pub const IPSTATS_MIB_OUTOCTETS: c_int = 10;
++pub const IPSTATS_MIB_OUTFORWDATAGRAMS: c_int = 11;
++pub const IPSTATS_MIB_INHDRERRORS: c_int = 12;
++pub const IPSTATS_MIB_INTOOBIGERRORS: c_int = 13;
++pub const IPSTATS_MIB_INNOROUTES: c_int = 14;
++pub const IPSTATS_MIB_INADDRERRORS: c_int = 15;
++pub const IPSTATS_MIB_INUNKNOWNPROTOS: c_int = 16;
++pub const IPSTATS_MIB_INTRUNCATEDPKTS: c_int = 17;
++pub const IPSTATS_MIB_INDISCARDS: c_int = 18;
++pub const IPSTATS_MIB_OUTDISCARDS: c_int = 19;
++pub const IPSTATS_MIB_OUTNOROUTES: c_int = 20;
++pub const IPSTATS_MIB_REASMTIMEOUT: c_int = 21;
++pub const IPSTATS_MIB_REASMREQDS: c_int = 22;
++pub const IPSTATS_MIB_REASMOKS: c_int = 23;
++pub const IPSTATS_MIB_REASMFAILS: c_int = 24;
++pub const IPSTATS_MIB_FRAGOKS: c_int = 25;
++pub const IPSTATS_MIB_FRAGFAILS: c_int = 26;
++pub const IPSTATS_MIB_FRAGCREATES: c_int = 27;
++pub const IPSTATS_MIB_INMCASTPKTS: c_int = 28;
++pub const IPSTATS_MIB_OUTMCASTPKTS: c_int = 29;
++pub const IPSTATS_MIB_INBCASTPKTS: c_int = 30;
++pub const IPSTATS_MIB_OUTBCASTPKTS: c_int = 31;
++pub const IPSTATS_MIB_INMCASTOCTETS: c_int = 32;
++pub const IPSTATS_MIB_OUTMCASTOCTETS: c_int = 33;
++pub const IPSTATS_MIB_INBCASTOCTETS: c_int = 34;
++pub const IPSTATS_MIB_OUTBCASTOCTETS: c_int = 35;
++pub const IPSTATS_MIB_CSUMERRORS: c_int = 36;
++pub const IPSTATS_MIB_REASM_OVERLAPS: c_int = 37;
++pub const __IPSTATS_MIB_MAX: c_int = 38;
++
++// Anonymous C enum 2; its enumerator identifiers have C int type.
++pub const ICMP_MIB_NUM: c_int = 0;
++pub const ICMP_MIB_INMSGS: c_int = 1;
++pub const ICMP_MIB_INERRORS: c_int = 2;
++pub const ICMP_MIB_INDESTUNREACHS: c_int = 3;
++pub const ICMP_MIB_INTIMEEXCDS: c_int = 4;
++pub const ICMP_MIB_INPARMPROBS: c_int = 5;
++pub const ICMP_MIB_INSRCQUENCHS: c_int = 6;
++pub const ICMP_MIB_INREDIRECTS: c_int = 7;
++pub const ICMP_MIB_INECHOS: c_int = 8;
++pub const ICMP_MIB_INECHOREPS: c_int = 9;
++pub const ICMP_MIB_INTIMESTAMPS: c_int = 10;
++pub const ICMP_MIB_INTIMESTAMPREPS: c_int = 11;
++pub const ICMP_MIB_INADDRMASKS: c_int = 12;
++pub const ICMP_MIB_INADDRMASKREPS: c_int = 13;
++pub const ICMP_MIB_OUTMSGS: c_int = 14;
++pub const ICMP_MIB_OUTERRORS: c_int = 15;
++pub const ICMP_MIB_OUTDESTUNREACHS: c_int = 16;
++pub const ICMP_MIB_OUTTIMEEXCDS: c_int = 17;
++pub const ICMP_MIB_OUTPARMPROBS: c_int = 18;
++pub const ICMP_MIB_OUTSRCQUENCHS: c_int = 19;
++pub const ICMP_MIB_OUTREDIRECTS: c_int = 20;
++pub const ICMP_MIB_OUTECHOS: c_int = 21;
++pub const ICMP_MIB_OUTECHOREPS: c_int = 22;
++pub const ICMP_MIB_OUTTIMESTAMPS: c_int = 23;
++pub const ICMP_MIB_OUTTIMESTAMPREPS: c_int = 24;
++pub const ICMP_MIB_OUTADDRMASKS: c_int = 25;
++pub const ICMP_MIB_OUTADDRMASKREPS: c_int = 26;
++pub const ICMP_MIB_CSUMERRORS: c_int = 27;
++pub const ICMP_MIB_RATELIMITGLOBAL: c_int = 28;
++pub const ICMP_MIB_RATELIMITHOST: c_int = 29;
++pub const __ICMP_MIB_MAX: c_int = 30;
++
++pub const __ICMPMSG_MIB_MAX: c_int = 512;
++
++// Anonymous C enum 3; its enumerator identifiers have C int type.
++pub const ICMP6_MIB_NUM: c_int = 0;
++pub const ICMP6_MIB_INMSGS: c_int = 1;
++pub const ICMP6_MIB_INERRORS: c_int = 2;
++pub const ICMP6_MIB_OUTMSGS: c_int = 3;
++pub const ICMP6_MIB_OUTERRORS: c_int = 4;
++pub const ICMP6_MIB_CSUMERRORS: c_int = 5;
++pub const ICMP6_MIB_RATELIMITHOST: c_int = 6;
++pub const __ICMP6_MIB_MAX: c_int = 7;
++
++pub const __ICMP6MSG_MIB_MAX: c_int = 512;
++
++// Anonymous C enum 4; its enumerator identifiers have C int type.
++pub const TCP_MIB_NUM: c_int = 0;
++pub const TCP_MIB_RTOALGORITHM: c_int = 1;
++pub const TCP_MIB_RTOMIN: c_int = 2;
++pub const TCP_MIB_RTOMAX: c_int = 3;
++pub const TCP_MIB_MAXCONN: c_int = 4;
++pub const TCP_MIB_ACTIVEOPENS: c_int = 5;
++pub const TCP_MIB_PASSIVEOPENS: c_int = 6;
++pub const TCP_MIB_ATTEMPTFAILS: c_int = 7;
++pub const TCP_MIB_ESTABRESETS: c_int = 8;
++pub const TCP_MIB_CURRESTAB: c_int = 9;
++pub const TCP_MIB_INSEGS: c_int = 10;
++pub const TCP_MIB_OUTSEGS: c_int = 11;
++pub const TCP_MIB_RETRANSSEGS: c_int = 12;
++pub const TCP_MIB_INERRS: c_int = 13;
++pub const TCP_MIB_OUTRSTS: c_int = 14;
++pub const TCP_MIB_CSUMERRORS: c_int = 15;
++pub const __TCP_MIB_MAX: c_int = 16;
++
++// Anonymous C enum 5; its enumerator identifiers have C int type.
++pub const UDP_MIB_NUM: c_int = 0;
++pub const UDP_MIB_INDATAGRAMS: c_int = 1;
++pub const UDP_MIB_NOPORTS: c_int = 2;
++pub const UDP_MIB_INERRORS: c_int = 3;
++pub const UDP_MIB_OUTDATAGRAMS: c_int = 4;
++pub const UDP_MIB_RCVBUFERRORS: c_int = 5;
++pub const UDP_MIB_SNDBUFERRORS: c_int = 6;
++pub const UDP_MIB_CSUMERRORS: c_int = 7;
++pub const UDP_MIB_IGNOREDMULTI: c_int = 8;
++pub const UDP_MIB_MEMERRORS: c_int = 9;
++pub const __UDP_MIB_MAX: c_int = 10;
++
++// Anonymous C enum 6; its enumerator identifiers have C int type.
++pub const LINUX_MIB_NUM: c_int = 0;
++pub const LINUX_MIB_SYNCOOKIESSENT: c_int = 1;
++pub const LINUX_MIB_SYNCOOKIESRECV: c_int = 2;
++pub const LINUX_MIB_SYNCOOKIESFAILED: c_int = 3;
++pub const LINUX_MIB_EMBRYONICRSTS: c_int = 4;
++pub const LINUX_MIB_PRUNECALLED: c_int = 5;
++pub const LINUX_MIB_RCVPRUNED: c_int = 6;
++pub const LINUX_MIB_OFOPRUNED: c_int = 7;
++pub const LINUX_MIB_OUTOFWINDOWICMPS: c_int = 8;
++pub const LINUX_MIB_LOCKDROPPEDICMPS: c_int = 9;
++pub const LINUX_MIB_ARPFILTER: c_int = 10;
++pub const LINUX_MIB_TIMEWAITED: c_int = 11;
++pub const LINUX_MIB_TIMEWAITRECYCLED: c_int = 12;
++pub const LINUX_MIB_TIMEWAITKILLED: c_int = 13;
++pub const LINUX_MIB_PAWSACTIVEREJECTED: c_int = 14;
++pub const LINUX_MIB_PAWSESTABREJECTED: c_int = 15;
++pub const LINUX_MIB_BEYOND_WINDOW: c_int = 16;
++pub const LINUX_MIB_TSECRREJECTED: c_int = 17;
++pub const LINUX_MIB_PAWS_OLD_ACK: c_int = 18;
++pub const LINUX_MIB_PAWS_TW_REJECTED: c_int = 19;
++pub const LINUX_MIB_DELAYEDACKS: c_int = 20;
++pub const LINUX_MIB_DELAYEDACKLOCKED: c_int = 21;
++pub const LINUX_MIB_DELAYEDACKLOST: c_int = 22;
++pub const LINUX_MIB_LISTENOVERFLOWS: c_int = 23;
++pub const LINUX_MIB_LISTENDROPS: c_int = 24;
++pub const LINUX_MIB_TCPHPHITS: c_int = 25;
++pub const LINUX_MIB_TCPPUREACKS: c_int = 26;
++pub const LINUX_MIB_TCPHPACKS: c_int = 27;
++pub const LINUX_MIB_TCPRENORECOVERY: c_int = 28;
++pub const LINUX_MIB_TCPSACKRECOVERY: c_int = 29;
++pub const LINUX_MIB_TCPSACKRENEGING: c_int = 30;
++pub const LINUX_MIB_TCPSACKREORDER: c_int = 31;
++pub const LINUX_MIB_TCPRENOREORDER: c_int = 32;
++pub const LINUX_MIB_TCPTSREORDER: c_int = 33;
++pub const LINUX_MIB_TCPFULLUNDO: c_int = 34;
++pub const LINUX_MIB_TCPPARTIALUNDO: c_int = 35;
++pub const LINUX_MIB_TCPDSACKUNDO: c_int = 36;
++pub const LINUX_MIB_TCPLOSSUNDO: c_int = 37;
++pub const LINUX_MIB_TCPLOSTRETRANSMIT: c_int = 38;
++pub const LINUX_MIB_TCPRENOFAILURES: c_int = 39;
++pub const LINUX_MIB_TCPSACKFAILURES: c_int = 40;
++pub const LINUX_MIB_TCPLOSSFAILURES: c_int = 41;
++pub const LINUX_MIB_TCPFASTRETRANS: c_int = 42;
++pub const LINUX_MIB_TCPSLOWSTARTRETRANS: c_int = 43;
++pub const LINUX_MIB_TCPTIMEOUTS: c_int = 44;
++pub const LINUX_MIB_TCPLOSSPROBES: c_int = 45;
++pub const LINUX_MIB_TCPLOSSPROBERECOVERY: c_int = 46;
++pub const LINUX_MIB_TCPRENORECOVERYFAIL: c_int = 47;
++pub const LINUX_MIB_TCPSACKRECOVERYFAIL: c_int = 48;
++pub const LINUX_MIB_TCPRCVCOLLAPSED: c_int = 49;
++pub const LINUX_MIB_TCPDSACKOLDSENT: c_int = 50;
++pub const LINUX_MIB_TCPDSACKOFOSENT: c_int = 51;
++pub const LINUX_MIB_TCPDSACKRECV: c_int = 52;
++pub const LINUX_MIB_TCPDSACKOFORECV: c_int = 53;
++pub const LINUX_MIB_TCPABORTONDATA: c_int = 54;
++pub const LINUX_MIB_TCPABORTONCLOSE: c_int = 55;
++pub const LINUX_MIB_TCPABORTONMEMORY: c_int = 56;
++pub const LINUX_MIB_TCPABORTONTIMEOUT: c_int = 57;
++pub const LINUX_MIB_TCPABORTONLINGER: c_int = 58;
++pub const LINUX_MIB_TCPABORTFAILED: c_int = 59;
++pub const LINUX_MIB_TCPMEMORYPRESSURES: c_int = 60;
++pub const LINUX_MIB_TCPMEMORYPRESSURESCHRONO: c_int = 61;
++pub const LINUX_MIB_TCPSACKDISCARD: c_int = 62;
++pub const LINUX_MIB_TCPDSACKIGNOREDOLD: c_int = 63;
++pub const LINUX_MIB_TCPDSACKIGNOREDNOUNDO: c_int = 64;
++pub const LINUX_MIB_TCPSPURIOUSRTOS: c_int = 65;
++pub const LINUX_MIB_TCPMD5NOTFOUND: c_int = 66;
++pub const LINUX_MIB_TCPMD5UNEXPECTED: c_int = 67;
++pub const LINUX_MIB_TCPMD5FAILURE: c_int = 68;
++pub const LINUX_MIB_SACKSHIFTED: c_int = 69;
++pub const LINUX_MIB_SACKMERGED: c_int = 70;
++pub const LINUX_MIB_SACKSHIFTFALLBACK: c_int = 71;
++pub const LINUX_MIB_TCPBACKLOGDROP: c_int = 72;
++pub const LINUX_MIB_PFMEMALLOCDROP: c_int = 73;
++pub const LINUX_MIB_TCPMINTTLDROP: c_int = 74;
++pub const LINUX_MIB_TCPDEFERACCEPTDROP: c_int = 75;
++pub const LINUX_MIB_IPRPFILTER: c_int = 76;
++pub const LINUX_MIB_TCPTIMEWAITOVERFLOW: c_int = 77;
++pub const LINUX_MIB_TCPREQQFULLDOCOOKIES: c_int = 78;
++pub const LINUX_MIB_TCPREQQFULLDROP: c_int = 79;
++pub const LINUX_MIB_TCPRETRANSFAIL: c_int = 80;
++pub const LINUX_MIB_TCPRCVCOALESCE: c_int = 81;
++pub const LINUX_MIB_TCPBACKLOGCOALESCE: c_int = 82;
++pub const LINUX_MIB_TCPOFOQUEUE: c_int = 83;
++pub const LINUX_MIB_TCPOFODROP: c_int = 84;
++pub const LINUX_MIB_TCPOFOMERGE: c_int = 85;
++pub const LINUX_MIB_TCPCHALLENGEACK: c_int = 86;
++pub const LINUX_MIB_TCPSYNCHALLENGE: c_int = 87;
++pub const LINUX_MIB_TCPFASTOPENACTIVE: c_int = 88;
++pub const LINUX_MIB_TCPFASTOPENACTIVEFAIL: c_int = 89;
++pub const LINUX_MIB_TCPFASTOPENPASSIVE: c_int = 90;
++pub const LINUX_MIB_TCPFASTOPENPASSIVEFAIL: c_int = 91;
++pub const LINUX_MIB_TCPFASTOPENLISTENOVERFLOW: c_int = 92;
++pub const LINUX_MIB_TCPFASTOPENCOOKIEREQD: c_int = 93;
++pub const LINUX_MIB_TCPFASTOPENBLACKHOLE: c_int = 94;
++pub const LINUX_MIB_TCPSPURIOUS_RTX_HOSTQUEUES: c_int = 95;
++pub const LINUX_MIB_BUSYPOLLRXPACKETS: c_int = 96;
++pub const LINUX_MIB_TCPAUTOCORKING: c_int = 97;
++pub const LINUX_MIB_TCPFROMZEROWINDOWADV: c_int = 98;
++pub const LINUX_MIB_TCPTOZEROWINDOWADV: c_int = 99;
++pub const LINUX_MIB_TCPWANTZEROWINDOWADV: c_int = 100;
++pub const LINUX_MIB_TCPSYNRETRANS: c_int = 101;
++pub const LINUX_MIB_TCPORIGDATASENT: c_int = 102;
++pub const LINUX_MIB_TCPHYSTARTTRAINDETECT: c_int = 103;
++pub const LINUX_MIB_TCPHYSTARTTRAINCWND: c_int = 104;
++pub const LINUX_MIB_TCPHYSTARTDELAYDETECT: c_int = 105;
++pub const LINUX_MIB_TCPHYSTARTDELAYCWND: c_int = 106;
++pub const LINUX_MIB_TCPACKSKIPPEDSYNRECV: c_int = 107;
++pub const LINUX_MIB_TCPACKSKIPPEDPAWS: c_int = 108;
++pub const LINUX_MIB_TCPACKSKIPPEDSEQ: c_int = 109;
++pub const LINUX_MIB_TCPACKSKIPPEDFINWAIT2: c_int = 110;
++pub const LINUX_MIB_TCPACKSKIPPEDTIMEWAIT: c_int = 111;
++pub const LINUX_MIB_TCPACKSKIPPEDCHALLENGE: c_int = 112;
++pub const LINUX_MIB_TCPWINPROBE: c_int = 113;
++pub const LINUX_MIB_TCPKEEPALIVE: c_int = 114;
++pub const LINUX_MIB_TCPMTUPFAIL: c_int = 115;
++pub const LINUX_MIB_TCPMTUPSUCCESS: c_int = 116;
++pub const LINUX_MIB_TCPDELIVERED: c_int = 117;
++pub const LINUX_MIB_TCPDELIVEREDCE: c_int = 118;
++pub const LINUX_MIB_TCPACKCOMPRESSED: c_int = 119;
++pub const LINUX_MIB_TCPZEROWINDOWDROP: c_int = 120;
++pub const LINUX_MIB_TCPRCVQDROP: c_int = 121;
++pub const LINUX_MIB_TCPWQUEUETOOBIG: c_int = 122;
++pub const LINUX_MIB_TCPFASTOPENPASSIVEALTKEY: c_int = 123;
++pub const LINUX_MIB_TCPTIMEOUTREHASH: c_int = 124;
++pub const LINUX_MIB_TCPDUPLICATEDATAREHASH: c_int = 125;
++pub const LINUX_MIB_TCPDSACKRECVSEGS: c_int = 126;
++pub const LINUX_MIB_TCPDSACKIGNOREDDUBIOUS: c_int = 127;
++pub const LINUX_MIB_TCPMIGRATEREQSUCCESS: c_int = 128;
++pub const LINUX_MIB_TCPMIGRATEREQFAILURE: c_int = 129;
++pub const LINUX_MIB_TCPPLBREHASH: c_int = 130;
++pub const LINUX_MIB_TCPAOREQUIRED: c_int = 131;
++pub const LINUX_MIB_TCPAOBAD: c_int = 132;
++pub const LINUX_MIB_TCPAOKEYNOTFOUND: c_int = 133;
++pub const LINUX_MIB_TCPAOGOOD: c_int = 134;
++pub const LINUX_MIB_TCPAODROPPEDICMPS: c_int = 135;
++pub const __LINUX_MIB_MAX: c_int = 136;
++
++// Anonymous C enum 7; its enumerator identifiers have C int type.
++pub const LINUX_MIB_XFRMNUM: c_int = 0;
++pub const LINUX_MIB_XFRMINERROR: c_int = 1;
++pub const LINUX_MIB_XFRMINBUFFERERROR: c_int = 2;
++pub const LINUX_MIB_XFRMINHDRERROR: c_int = 3;
++pub const LINUX_MIB_XFRMINNOSTATES: c_int = 4;
++pub const LINUX_MIB_XFRMINSTATEPROTOERROR: c_int = 5;
++pub const LINUX_MIB_XFRMINSTATEMODEERROR: c_int = 6;
++pub const LINUX_MIB_XFRMINSTATESEQERROR: c_int = 7;
++pub const LINUX_MIB_XFRMINSTATEEXPIRED: c_int = 8;
++pub const LINUX_MIB_XFRMINSTATEMISMATCH: c_int = 9;
++pub const LINUX_MIB_XFRMINSTATEINVALID: c_int = 10;
++pub const LINUX_MIB_XFRMINTMPLMISMATCH: c_int = 11;
++pub const LINUX_MIB_XFRMINNOPOLS: c_int = 12;
++pub const LINUX_MIB_XFRMINPOLBLOCK: c_int = 13;
++pub const LINUX_MIB_XFRMINPOLERROR: c_int = 14;
++pub const LINUX_MIB_XFRMOUTERROR: c_int = 15;
++pub const LINUX_MIB_XFRMOUTBUNDLEGENERROR: c_int = 16;
++pub const LINUX_MIB_XFRMOUTBUNDLECHECKERROR: c_int = 17;
++pub const LINUX_MIB_XFRMOUTNOSTATES: c_int = 18;
++pub const LINUX_MIB_XFRMOUTSTATEPROTOERROR: c_int = 19;
++pub const LINUX_MIB_XFRMOUTSTATEMODEERROR: c_int = 20;
++pub const LINUX_MIB_XFRMOUTSTATESEQERROR: c_int = 21;
++pub const LINUX_MIB_XFRMOUTSTATEEXPIRED: c_int = 22;
++pub const LINUX_MIB_XFRMOUTPOLBLOCK: c_int = 23;
++pub const LINUX_MIB_XFRMOUTPOLDEAD: c_int = 24;
++pub const LINUX_MIB_XFRMOUTPOLERROR: c_int = 25;
++pub const LINUX_MIB_XFRMFWDHDRERROR: c_int = 26;
++pub const LINUX_MIB_XFRMOUTSTATEINVALID: c_int = 27;
++pub const LINUX_MIB_XFRMACQUIREERROR: c_int = 28;
++pub const LINUX_MIB_XFRMOUTSTATEDIRERROR: c_int = 29;
++pub const LINUX_MIB_XFRMINSTATEDIRERROR: c_int = 30;
++pub const LINUX_MIB_XFRMINIPTFSERROR: c_int = 31;
++pub const LINUX_MIB_XFRMOUTNOQSPACE: c_int = 32;
++pub const __LINUX_MIB_XFRMMAX: c_int = 33;
++
++// Anonymous C enum 8; its enumerator identifiers have C int type.
++pub const LINUX_MIB_TLSNUM: c_int = 0;
++pub const LINUX_MIB_TLSCURRTXSW: c_int = 1;
++pub const LINUX_MIB_TLSCURRRXSW: c_int = 2;
++pub const LINUX_MIB_TLSCURRTXDEVICE: c_int = 3;
++pub const LINUX_MIB_TLSCURRRXDEVICE: c_int = 4;
++pub const LINUX_MIB_TLSTXSW: c_int = 5;
++pub const LINUX_MIB_TLSRXSW: c_int = 6;
++pub const LINUX_MIB_TLSTXDEVICE: c_int = 7;
++pub const LINUX_MIB_TLSRXDEVICE: c_int = 8;
++pub const LINUX_MIB_TLSDECRYPTERROR: c_int = 9;
++pub const LINUX_MIB_TLSRXDEVICERESYNC: c_int = 10;
++pub const LINUX_MIB_TLSDECRYPTRETRY: c_int = 11;
++pub const LINUX_MIB_TLSRXNOPADVIOL: c_int = 12;
++pub const LINUX_MIB_TLSRXREKEYOK: c_int = 13;
++pub const LINUX_MIB_TLSRXREKEYERROR: c_int = 14;
++pub const LINUX_MIB_TLSTXREKEYOK: c_int = 15;
++pub const LINUX_MIB_TLSTXREKEYERROR: c_int = 16;
++pub const LINUX_MIB_TLSRXREKEYRECEIVED: c_int = 17;
++pub const __LINUX_MIB_TLSMAX: c_int = 18;
++

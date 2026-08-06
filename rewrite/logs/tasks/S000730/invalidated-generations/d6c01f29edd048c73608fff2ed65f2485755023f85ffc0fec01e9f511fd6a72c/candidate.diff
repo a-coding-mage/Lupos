@@ -1,0 +1,13 @@
+# Candidate summary — S000730
+
+Added `src/arch/x86/include/asm/trapnr.rs` with required immutable provenance
+and a one-for-one mapping of every operative macro from
+`arch/x86/include/asm/trapnr.h`:
+
+- `EVENT_TYPE_EXTINT` through `EVENT_TYPE_OTHER`: `i32` values `0..=7`.
+- `X86_TRAP_DE` through `X86_TRAP_CP`: `i32` values `0..=21`, preserving each
+  original symbolic name.
+- `X86_TRAP_VC = 29` and `X86_TRAP_IRET = 32` preserved exactly.
+
+No executable code, ABI object, unsafe block, test, runtime substitution, or
+configuration-dependent declaration was introduced.

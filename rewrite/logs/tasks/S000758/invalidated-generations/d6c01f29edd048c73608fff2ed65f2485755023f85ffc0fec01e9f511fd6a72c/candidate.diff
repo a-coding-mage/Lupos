@@ -1,0 +1,9 @@
+# Candidate diff — S000758
+
+Added `src/arch/x86/include/asm/vmxfeatures.rs` as the path-preserving fresh
+translation of `arch/x86/include/asm/vmxfeatures.h`.
+
+The candidate has immutable provenance for task S000758 and exposes
+`NVMXINTS` plus all 64 selected `VMX_FEATURE_*` feature indices as public
+`u32` constants.  No symbols were omitted or renamed; no executable logic,
+FFI, layout, or synchronization behavior is present in the source header.

@@ -1,0 +1,18 @@
+--- /dev/null
++++ b/src/include/linux/device-id/auxiliary.rs
+@@
++// SPDX-License-Identifier: GPL-2.0-only
++//! linux-source: include/linux/device-id/auxiliary.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: common
++//! rewrite-task: S013698
++
++pub type kernel_ulong_t = core::ffi::c_ulong;
++pub const AUXILIARY_NAME_SIZE: usize = 40;
++pub const AUXILIARY_MODULE_PREFIX: &str = "auxiliary:";
++
++#[repr(C)]
++pub struct auxiliary_device_id {
++    pub name: [core::ffi::c_char; AUXILIARY_NAME_SIZE],
++    pub driver_data: kernel_ulong_t,
++}

@@ -1,0 +1,11 @@
+Candidate: `src/include/linux/device-id/rpmsg.rs`
+
+- `RPMSG_NAME_SIZE` retains C `int` literal semantics as `i32 = 32`.
+- `RPMSG_DEVICE_MODALIAS_FMT!()` is an object-like macro lowering whose
+  expansion is the exact fixed-size byte-string literal `b"rpmsg:%s\\0"`.
+  This has array extent and, unlike a slice, a thin pointer representation for
+  FFI through `as_ptr()`.
+- `rpmsg_device_id` has `#[repr(C)]`, derives `Clone, Copy`, and retains the
+  C field order and widths. Its `name` is `[u8; 32]`: all frozen x86_64 and
+  AArch64 kernel compile-command records pass `-funsigned-char`.
+- The upstream source identifier is retained exactly as `GPL-2.0`.

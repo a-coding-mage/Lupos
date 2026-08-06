@@ -13,12 +13,12 @@ compiler_requested_path	/usr/lib/llvm-19/bin/clang	VERIFIED	Phase 0 frozen input
 compiler_resolved_path	/usr/lib/llvm-19/bin/clang	VERIFIED	Phase 0 frozen input
 compiler_sha256	0a3c55936ac43954fbe4914e6e73b577ca9e35e75d89ef13d3e28c187f41ca1a	VERIFIED	Phase 0 frozen input
 compiler_version	Debian clang version 19.1.7 (3+b1)	VERIFIED	Phase 0 frozen input
-created_at	2026-08-06T15:55:56.132Z	VERIFIED	Phase 0 frozen input
+created_at	2026-08-06T15:56:36.030Z	VERIFIED	Phase 0 frozen input
 cross_compile_value	(empty)	VERIFIED	Phase 0 frozen input
 extractor_version	phase0_extract.py:75704df1c2478336a7f4f968ee3f81b55595ba0294a96a5a50a7eed20eed4a3e	VERIFIED	Phase 0 frozen input
 header_dependency_schema_version	header-provider-enumerator-graph-v3	VERIFIED	Phase 0 frozen input
 identity_schema_version	phase0-identity-v2	VERIFIED	Phase 0 frozen input
-identity_status	PRE_QUEUE	VERIFIED	Phase 0 frozen input
+identity_status	RESOLVED	VERIFIED	Phase 0 frozen input
 linker_requested_path	/usr/lib/llvm-19/bin/ld.lld	VERIFIED	Phase 0 frozen input
 linker_resolved_path	/usr/lib/llvm-19/bin/lld	VERIFIED	Phase 0 frozen input
 linker_sha256	7a2fd87d82662beac4371a1a21067b37cd4b7d43777aa61c089d85c45f772f6e	VERIFIED	Phase 0 frozen input
@@ -31,7 +31,7 @@ oracle_classification_schema_version	oracle-classification-v1	VERIFIED	Phase 0 f
 phase0_identity_binding_sha256	69a74b3e665cefce78c3e92cfcbca7e035fda30b1e435f151d205c163da34d87	VERIFIED	canonical non-queue Phase 0 input digest
 predicate_extractor_version	compiler_predicates.py:7bbff87daefcf123ab5a1dc0a1a59111402f71f5ffbc7fc2180fe6b094936938	VERIFIED	Phase 0 frozen input
 predicate_validator_version	validate_compiler_predicates.py:0ab59f937878905dd6832d7e349ce973db52d8d1d86343f62fc0af6f7ecc317b	VERIFIED	Phase 0 frozen input
-queue_fingerprint		VERIFIED	pending queue freeze
+queue_fingerprint	9fb31be9d78d9923c9541c26a34efe1502a66e5d0cca06dbd4776a756592cdc9	VERIFIED	rewrite/TRANSLATION_TASKS.sha256
 queue_tool_version	rewrite_queue.py:c572d2a5c57df96c1841b25a46f6df697d6ab8be7de236d3db989d37517f3aa1	VERIFIED	Phase 0 frozen input
 scope_schema_version	source-header-context-oracle-phase0-v7	VERIFIED	Phase 0 frozen input
 toolchain_sha256	cfb4e6fbb9b5281b15f0e09cb6d4f7f1866bf9bc1c69ae72715992b76c9bd670	VERIFIED	Phase 0 frozen input

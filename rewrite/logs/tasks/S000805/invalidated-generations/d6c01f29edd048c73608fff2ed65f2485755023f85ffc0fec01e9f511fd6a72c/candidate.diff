@@ -1,0 +1,18 @@
+# S000805 candidate summary
+
+Destination added: `src/arch/x86/include/uapi/asm/vmx.rs`.
+
+The file contains the required immutable provenance for
+`arch/x86/include/uapi/asm/vmx.h` at Linux revision
+`425f94c2954b1fe80ebdbf9b29854e89750355df`, then:
+
+- 72 public constants preserving all direct source macro names and values;
+- `VMX_EXIT_REASONS`, an ordered 65-element `(i32, &str)` mapping matching the
+  source initializer-list macro exactly;
+- `VMX_EXIT_REASON_FLAGS`, its ordered one-element `(u32, &str)` mapping.
+
+Focused representation changes: C decimal integer macros are explicit `i32`
+constants; C hexadecimal flag macros are explicit `u32` constants; C
+initializer-list macros are immutable Rust arrays because Rust has no
+preprocessor initializer-list equivalent.  No operational behavior, control
+flow, ABI-bearing type, or conditional compilation exists in this source.

@@ -1,0 +1,10 @@
+# S016105 candidate diff
+
+Added `src/include/uapi/linux/dpll.rs` as the path-preserving fresh translation
+of `include/uapi/linux/dpll.h`.
+
+- Added distinct transparent `c_int` wrappers for all fourteen named C enum
+  tags, with every enumerator and maximum value preserved.
+- Added all numeric macros with their C `int` expression type.
+- Added both C string-literal macros as NUL-terminated byte arrays.
+- Added immutable source/revision/architecture/task provenance.

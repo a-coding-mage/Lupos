@@ -1,0 +1,48 @@
+diff --git a/src/arch/arm64/include/asm/compiler.rs b/src/arch/arm64/include/asm/compiler.rs
+new file mode 100644
+--- /dev/null
++++ b/src/arch/arm64/include/asm/compiler.rs
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: GPL-2.0-only
++//! linux-source: arch/arm64/include/asm/compiler.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: aarch64
++//! rewrite-task: S000046
++
++#[macro_export]
++macro_rules! arm64_asm_preamble {
++    () => {
++        ".arch armv8.5-a\n"
++    };
++}
++
++#[macro_export]
++macro_rules! xpaclri {
++    ($ptr:expr) => {{
++        let mut __xpaclri_ptr: usize = ($ptr) as usize;
++        // SAFETY: x30 is the explicit read/write operand for XPACLRI.
++        unsafe {
++            core::arch::asm!(
++                $crate::arm64_asm_preamble!(),
++                "hint #7",
++                inout("x30") __xpaclri_ptr,
++                options(nomem, nostack, preserves_flags),
++            );
++        }
++        __xpaclri_ptr
++    }};
++}
++
++#[macro_export]
++macro_rules! ptrauth_strip_kernel_insn_pac {
++    ($ptr:expr) => {
++        $crate::xpaclri!($ptr)
++    };
++}
++
++#[macro_export]
++macro_rules! ptrauth_strip_user_insn_pac {
++    ($ptr:expr) => {
++        $crate::xpaclri!($ptr)
++    };
++}

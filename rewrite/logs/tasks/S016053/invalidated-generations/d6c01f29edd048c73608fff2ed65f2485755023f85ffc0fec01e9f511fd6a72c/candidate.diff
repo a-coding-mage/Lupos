@@ -1,0 +1,6 @@
+Candidate: `src/include/uapi/linux/arm_sdei.rs`
+
+Fresh path-preserving translation of `include/uapi/linux/arm_sdei.h` at Linux
+revision `425f94c2954b1fe80ebdbf9b29854e89750355df`. The candidate maps every
+selected macro to a public Rust constant or `const fn`, preserving UAPI names,
+values, 32-bit SMCCC-function arithmetic, and 64-bit version-field extraction.

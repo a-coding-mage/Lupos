@@ -1,0 +1,9 @@
+# Candidate diff: S016464
+
+Added `src/include/uapi/linux/virtio_ids.rs`.
+
+The candidate contains immutable source provenance and one public `c_int`
+constant for every selected `VIRTIO_ID_*` and `VIRTIO_TRANS_ID_*` object-like
+macro in `include/uapi/linux/virtio_ids.h`; literal values are preserved,
+including the sparse normal IDs 13 -> 16 and 41 -> 45 and the transitional
+range `0x1000` through `0x1005` plus `0x1009`.

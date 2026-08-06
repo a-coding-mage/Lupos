@@ -1,0 +1,7 @@
+# S016215 candidate summary
+
+New destination file: `src/include/uapi/linux/kernel-page-flags.rs`.
+
+- Adds immutable source/revision/architecture/task provenance.
+- Adds the complete `KPF_LOCKED` through `KPF_PGTABLE` UAPI bit-position sequence, with values 0 through 26 exactly matching the pinned header.
+- No symbols outside the selected source header were added or changed.

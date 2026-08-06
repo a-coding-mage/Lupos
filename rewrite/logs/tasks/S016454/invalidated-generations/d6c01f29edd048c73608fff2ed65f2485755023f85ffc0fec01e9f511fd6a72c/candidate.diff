@@ -1,0 +1,7 @@
+# Candidate summary — S016454 (attempt 2)
+
+Fresh source: `src/include/uapi/linux/vesa.rs`
+
+- preserves blanking values 0, 1, 2, and `1 | 2`;
+- preserves the `VESA_BLANK_MAX` alias of powerdown;
+- exposes C macro-equivalent integer constants for `VESA_NO_BLANKING`, `VESA_VSYNC_SUSPEND`, `VESA_HSYNC_SUSPEND`, and `VESA_POWERDOWN`.

@@ -1,0 +1,5 @@
+Added `src/arch/x86/include/asm/audit.rs` with immutable provenance and C-ABI
+declarations for `ia32_classify_syscall` plus the five IA32 audit class-table
+symbols.  The C incomplete-array declarations are represented by mutable
+external `u32` first-element bindings, retaining their externally linked
+addresses for pointer-style table consumers.

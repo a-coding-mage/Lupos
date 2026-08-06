@@ -1,0 +1,21 @@
+diff --git a/src/include/linux/device-id/i2c.rs b/src/include/linux/device-id/i2c.rs
+new file mode 100644
+--- /dev/null
++++ b/src/include/linux/device-id/i2c.rs
+@@
++// SPDX-License-Identifier: GPL-2.0
++//! linux-source: include/linux/device-id/i2c.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: common
++//! rewrite-task: S013711
++
++pub type kernel_ulong_t = u64;
++
++pub const I2C_NAME_SIZE: usize = 20;
++pub const I2C_MODULE_PREFIX: &[u8; 5] = b"i2c:\0";
++
++#[repr(C)]
++pub struct i2c_device_id {
++    pub name: [u8; I2C_NAME_SIZE],
++    pub driver_data: kernel_ulong_t,
++}

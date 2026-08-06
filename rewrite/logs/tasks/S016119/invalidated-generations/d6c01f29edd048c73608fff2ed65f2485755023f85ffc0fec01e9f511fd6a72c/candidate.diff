@@ -1,0 +1,3 @@
+# S016119 focused candidate record
+
+The destination begins with immutable task provenance and retains the source SPDX expression. The generated string macros retain their terminating NUL bytes as `&[u8; 8]`; `ETHTOOL_GENL_VERSION` retains value `1`. Representative generated ordinal and derived values are retained directly, including `ETHTOOL_UDP_TUNNEL_TYPE_VXLAN = 0`, `ETHTOOL_A_HEADER_MAX = (__ETHTOOL_A_HEADER_CNT - 1)`, and `ETHTOOL_MSG_KERNEL_MAX = (__ETHTOOL_MSG_KERNEL_CNT - 1)`.

@@ -1,0 +1,15 @@
+S015671 fresh translation candidate
+
+Destination: src/include/net/tls_prot.rs
+Source: vendor/linux/include/net/tls_prot.h
+
+Mapping summary:
+- C anonymous enum at source lines 16-24 -> seven public i32 constants.
+- C anonymous enum at source lines 29-32 -> two public i32 constants.
+- C anonymous enum at source lines 37-66 -> twenty-eight public i32 constants.
+- The C include guard has no Rust runtime or ABI equivalent; Rust module
+  inclusion supplies the corresponding one-definition boundary.
+
+No source definitions were omitted. The candidate introduces no functions,
+storage, FFI declarations, layout-bearing representations, unsafe code,
+tests, placeholders, or configuration branches absent from the source.

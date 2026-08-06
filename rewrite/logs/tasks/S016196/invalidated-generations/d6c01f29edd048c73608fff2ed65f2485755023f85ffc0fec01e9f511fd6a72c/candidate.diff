@@ -1,0 +1,15 @@
+# S016196 final candidate summary
+
+Added `src/include/uapi/linux/ioam6_genl.rs`, a complete fresh representation
+of pinned `include/uapi/linux/ioam6_genl.h`.
+
+- Every anonymous- and named-enum enumerator is a `c_int` constant expression,
+  including each private maximum sentinel and public subtraction expression.
+  The named C enum tags remain documented `c_int` aliases with the frozen
+  signed-`int`, four-byte ABI on both selected targets.
+- `IOAM6_GENL_NAME` and `IOAM6_GENL_EV_GRP_NAME` are NUL-terminated `c_char`
+  array constants, not static objects. This keeps the C literal-macro value
+  usable for the pinned `char name[GENL_NAMSIZ]` initializers at
+  `net/ipv6/ioam6.c:614,674`.
+- `IOAM6_GENL_VERSION` and `IOAM6_MAX_SCHEMA_DATA_LEN` retain their C `int`
+  expression values, 1 and `255 * 4`, respectively.

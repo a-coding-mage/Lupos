@@ -1,0 +1,13 @@
+--- /dev/null
++++ b/src/include/linux/irqhandler.rs
+@@
++// SPDX-License-Identifier: GPL-2.0-only
++//! linux-source: include/linux/irqhandler.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: common
++//! rewrite-task: S014145
++
++use crate::include::linux::irqdesc::irq_desc;
++
++#[allow(non_camel_case_types)]
++pub type irq_flow_handler_t = Option<unsafe extern "C" fn(desc: *mut irq_desc)>;

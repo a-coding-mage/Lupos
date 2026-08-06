@@ -1,0 +1,10 @@
+Candidate: `src/include/uapi/linux/kdev_t.rs`
+
+Added immutable source provenance and the complete non-kernel UAPI surface:
+
+* `MAJOR!(dev)` expands to `((dev) >> 8)`.
+* `MINOR!(dev)` expands to `((dev) & 0xff)`.
+* `MKDEV!(ma, mi)` expands to `((ma) << 8 | (mi))`.
+
+No device-number type, conversion helper, layout, exported object, test, or
+out-of-scope kernel-only definition was added.

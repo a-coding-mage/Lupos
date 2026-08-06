@@ -1,0 +1,11 @@
+# Candidate summary — S016342
+
+Added `src/include/uapi/linux/psample.rs` with immutable provenance for the
+pinned UAPI header. The final source provides all 18 packet-sample attributes
+(including its sentinel), all 4 generic-netlink commands, all 18 tunnel-key
+attributes (including its sentinel), the derived maximum attribute expression,
+and all four UAPI macros. The two named C enum tags are distinct transparent
+`i32` wrappers; every unscoped enumerator remains an `i32` constant expression.
+The three string-literal macros are by-value `[u8; N]` arrays with their
+terminating NUL, not references or statics. It adds no tests, runtime behavior,
+driver code, or shared module index changes.

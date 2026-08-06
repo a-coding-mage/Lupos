@@ -1,0 +1,5 @@
+# S015088 candidate summary
+
+Added the path-preserving Rust translation at `src/include/linux/sunrpc/gss_err.rs`.
+
+The candidate provides the complete `OM_uint32` GSS status-word namespace: 9 context-service flags, 3 credential-usage values, 2 display-status code values, indefinite lifetime and complete-status values, 6 offset/mask values, 18 routine errors, 3 calling errors, 5 supplementary flags, the credential-unavailable alias, and six one-evaluation status extraction/error helpers.

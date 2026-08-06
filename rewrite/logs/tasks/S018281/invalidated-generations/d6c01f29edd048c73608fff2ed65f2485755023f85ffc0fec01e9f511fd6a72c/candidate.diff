@@ -1,0 +1,15 @@
+# Candidate summary for S018281
+
+Added `src/security/selinux/include/initcalls.rs` as a fresh translation of
+the pinned `security/selinux/include/initcalls.h`.
+
+- Preserves all eight externally linked C function declarations with their
+  original identifiers, empty parameter lists, and `int` return ABI as
+  `unsafe extern "C"` functions returning `c_int`.
+- Retains the source declaration order: filesystem, netport, netnode, netif,
+  netlink, InfiniBand pkey, netfilter, then the aggregate SELinux initcall.
+- Does not turn the source include guard or the consumer-only configuration
+  branches into Rust runtime behavior.
+
+The destination contains only immutable provenance and this declaration
+mapping. No other source file, module index, manifest, or queue row was edited.

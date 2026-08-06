@@ -1,0 +1,11 @@
+# Candidate diff — S013801 attempt 2
+
+Fresh translation candidate for `include/linux/dqblk_v1.h`:
+
+- `V1_INIT_ALLOC`: C `int` expression `1` -> `core::ffi::c_int = 1`
+- `V1_INIT_REWRITE`: C `int` expression `1` -> `core::ffi::c_int = 1`
+- `V1_DEL_ALLOC`: C `int` expression `0` -> `core::ffi::c_int = 0`
+- `V1_DEL_REWRITE`: C `int` expression `2` -> `core::ffi::c_int = 2`
+
+No declarations, structures, functions, or executable paths exist in the
+pinned source header.

@@ -1,0 +1,15 @@
+S014648 final candidate summary
+
+New path: `src/include/linux/pinctrl/pinctrl-state.rs`
+Pinned source: `include/linux/pinctrl/pinctrl-state.h`
+
+- `PINCTRL_STATE_DEFAULT` -> `[c_char; 8]` value array `"default\\0"`
+- `PINCTRL_STATE_INIT` -> `[c_char; 5]` value array `"init\\0"`
+- `PINCTRL_STATE_IDLE` -> `[c_char; 5]` value array `"idle\\0"`
+- `PINCTRL_STATE_SLEEP` -> `[c_char; 6]` value array `"sleep\\0"`
+
+The public items are literal-array equivalents, not raw pointers or backing
+objects. A consumer translating a C adjacent-literal use lowers the full
+preprocessor-expanded literal to one NUL-terminated value array at that call
+site. The destination contains no executable control flow, FFI entry point, or
+layout-bearing declaration.

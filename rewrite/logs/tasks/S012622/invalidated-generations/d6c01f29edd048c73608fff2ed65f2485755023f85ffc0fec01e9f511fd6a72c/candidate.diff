@@ -1,0 +1,8 @@
+# S012622 candidate summary
+
+Added `src/include/crypto/ecdh.rs` as the path-preserving Rust translation of
+`include/crypto/ecdh.h`.  The candidate contains immutable provenance, the
+four curve identifiers, `#[repr(C)] struct ecdh`, and C ABI declarations for
+`crypto_ecdh_key_len`, `crypto_ecdh_encode_key`, and
+`crypto_ecdh_decode_key`.  Pointer ownership and decode-buffer aliasing are
+documented at the ABI boundary.
