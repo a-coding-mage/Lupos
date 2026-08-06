@@ -1,0 +1,10 @@
+# Candidate summary — S013801
+
+Added `src/include/linux/dqblk_v1.rs` as the fresh path-preserving translation
+of `include/linux/dqblk_v1.h` at pinned revision
+`425f94c2954b1fe80ebdbf9b29854e89750355df`.
+
+- Retained the upstream SPDX identifier and the old quota-format description.
+- Added immutable source, revision, architecture, and task provenance.
+- Represented every selected update-block macro as an exported zero-argument
+  Rust expression macro with its exact C `int` literal value: 1, 1, 0, and 2.

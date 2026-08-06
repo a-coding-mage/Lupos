@@ -1,0 +1,9 @@
+New leased file `src/arch/x86/include/asm/syscalls.rs`:
+
+```diff
++unsafe extern "C" {
++    pub fn ksys_ioperm(from: c_ulong, num: c_ulong, turn_on: c_int) -> c_long;
++}
+```
+
+This is the sole operative declaration in the pinned source header.

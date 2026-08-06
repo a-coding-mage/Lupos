@@ -1,0 +1,28 @@
+--- /dev/null
++++ b/src/include/linux/pid_types.rs
+@@ -0,0 +1,35 @@
++// SPDX-License-Identifier: GPL-2.0-only
++//! linux-source: include/linux/pid_types.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: common
++//! rewrite-task: S014640
++
++#[repr(C)]
++#[allow(non_camel_case_types)]
++pub enum pid_type {
++    PIDTYPE_PID = 0,
++    PIDTYPE_TGID = 1,
++    PIDTYPE_PGID = 2,
++    PIDTYPE_SID = 3,
++    PIDTYPE_MAX = 4,
++}
++
++#[repr(C)]
++#[allow(non_camel_case_types)]
++pub struct pid_namespace {
++    _private: [u8; 0],
++}
++
++unsafe extern "C" {
++    pub static mut init_pid_ns: pid_namespace;
++}
