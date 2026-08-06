@@ -1,8 +1,0 @@
-S000182 candidate summary
-
-+ #[repr(C)]
-+ #[derive(Copy, Clone)]
-+ pub struct arch_tlbflush_unmap_batch {}
-
-The C header has the same empty struct body. `repr(C)` retains its role as an
-embedded ABI type; the derivations add no storage or runtime behavior.

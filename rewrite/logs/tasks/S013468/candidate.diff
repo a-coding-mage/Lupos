@@ -1,8 +1,0 @@
-# Candidate diff: S013468
-
-Added `src/include/linux/asn1.rs` as the fresh path-preserving translation of `include/linux/asn1.h`.
-
-- Defines C-`int` aliases for `asn1_class`, `asn1_method`, and `asn1_tag`.
-- Defines every `ASN1_*` enumerator with its upstream value and preserves the reserved tag values 14 and 15 as gaps.
-- Defines `ASN1_CLASS_BITS`, `ASN1_CONS_BIT`, and `ASN1_INDEFINITE_LENGTH` with their upstream integer values.
-- Carries immutable source/revision/architecture/task provenance and upstream SPDX/copyright notices.

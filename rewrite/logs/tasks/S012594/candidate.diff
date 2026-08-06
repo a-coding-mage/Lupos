@@ -1,8 +1,0 @@
-# S012594 candidate summary
-
-Fresh candidate added at `src/include/asm-generic/trace_clock.rs`.
-
-- Retains SPDX and required task/source/revision/architecture provenance.
-- Represents the selected generic-header fallback as an empty Rust module, matching the empty `ARCH_TRACE_CLOCKS` expansion for AArch64.
-- No functions, types, statics, tests, FFI, allocation, or unsafe code are introduced.
-

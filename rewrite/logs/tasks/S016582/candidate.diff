@@ -1,6 +1,0 @@
-S016582 candidate summary
-
-Added the path-preserving Xenbus interface header translation. It supplies the
-ABI-preserving `xenbus_state` C-int wrapper and all nine source enumerator
-names with their explicit values. The source SPDX/copyright notice and
-immutable task provenance are retained.

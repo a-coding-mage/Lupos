@@ -1,8 +1,0 @@
-# S012503 candidate summary
-
-`src/include/asm-generic/audit_write.rs` is a fresh source translation of the
-pinned initializer fragment. It provides four exported consumer macros for
-the frozen x86_64 native/IA32 and AArch64 native/AArch32-compat inclusion
-contexts. Each expansion contains the preceding audit-directory entries and
-the exact selected write syscall entries in upstream order; the AArch64 native
-duplicate 32/64 syscall-number entries are preserved.

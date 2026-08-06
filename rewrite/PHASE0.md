@@ -140,9 +140,16 @@ After regenerated manifests pass staged pre-queue validation, the matching
 recorded invalidation is consumed by `rewrite_queue.py init
 --phase-gate-reopen --archive <recorded-path> --reopen-reason <reason>`. The
 tool verifies the superseded immutable fingerprint without trusting a replaced
-identity, writes exactly one prune-ledger row, retains no per-run archive
-directory, preserves the append-only event and task evidence, and initializes
-every regenerated task at `TODO`/attempt zero without reusing terminal state.
+identity, writes exactly one prune-ledger row, and retains no per-run archive
+directory. Before replacing the queue, it moves every canonical root acceptance
+file into
+`rewrite/logs/tasks/<id>/invalidated-generations/<superseded-fingerprint>/`,
+records deterministic file hashes and the superseded queue state in
+`QUARANTINE.tsv`, and appends one task-specific quarantine event while holding
+the queue lock. Existing `attempts/` evidence and destination source files are
+preserved, but neither receives carryover acceptance credit. Every regenerated
+task begins at `TODO`/attempt zero, and a fresh claim fails closed if a canonical
+acceptance filename unexpectedly remains at the task root.
 
 ## Oracle-only test classification
 

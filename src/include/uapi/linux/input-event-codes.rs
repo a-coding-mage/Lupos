@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! linux-source: include/uapi/linux/input-event-codes.h
 //! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
-//! architectures: x86_64,aarch64
+//! architectures: common
 //! rewrite-task: S016189
 
 /*
@@ -806,4 +806,3 @@ pub const SND_CNT: u32 = (SND_MAX+1);
 pub const SND_PROFILE_SILENT: u32 = 0x00;
 pub const SND_PROFILE_VIBRATE: u32 = 0x01;
 pub const SND_PROFILE_RING: u32 = 0x02;
-

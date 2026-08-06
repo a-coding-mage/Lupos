@@ -1,9 +1,0 @@
-# S014598 candidate snapshot
-
-Destination: `src/include/linux/pci_ids.rs`
-
-The candidate is a direct, line-preserving conversion of the pinned header's
-2,902 literal `#define` identifiers into public `i32` constants. Names and
-numeric spellings are retained; the only structural omission is the C include
-guard. The destination carries the required task, revision, source, and
-architecture provenance.

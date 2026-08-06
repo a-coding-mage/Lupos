@@ -1,7 +1,0 @@
-# S000496 candidate summary
-
-New path: `src/arch/x86/include/asm/cpufeatures.rs`.
-
-The source header's selected public capability and bug-index macro surface is represented one-for-one as Rust `u32` constants, retaining every source identifier and word/bit arithmetic expression. The sole function-like macro, `X86_BUG(x)`, is represented as a `const fn` with equivalent arithmetic. The source's `CONFIG_X86_32`-only `X86_BUG_ESPFIX` definition is not emitted for frozen x86_64.
-
-The destination has the required immutable provenance for task `S000496`, source revision `425f94c2954b1fe80ebdbf9b29854e89750355df`, and architecture `x86_64`.

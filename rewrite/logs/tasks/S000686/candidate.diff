@@ -1,5 +1,0 @@
-# S000686 candidate summary
-
-Added `src/arch/x86/include/asm/shared/tdx_errno.rs` with required immutable provenance.
-
-The candidate maps all 24 operative C macros from `tdx_errno.h` to same-named public Rust constants: 20 `u64` values for the `ULL` RAX status mask/status codes and 4 `i32` values for the unsuffixed C-`int` operand IDs. Hex digit separators are lexical only; every numeric value is unchanged.

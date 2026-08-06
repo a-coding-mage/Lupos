@@ -1,4 +1,0 @@
-Candidate S016124 adds `src/include/uapi/linux/falloc.rs` for the pinned source
-`include/uapi/linux/falloc.h`.  It exposes all nine source macros with their
-unchanged integer values: 0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, and
-0x80.  No additional symbols or behavior are introduced.

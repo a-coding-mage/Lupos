@@ -1,7 +1,0 @@
-# S013716 candidate summary
-
-Added `src/include/linux/device-id/isapnp.rs` as a fresh, path-preserving
-translation of the complete pinned `include/linux/device-id/isapnp.h` header.
-The candidate contains the kernel-only `kernel_ulong_t` alias, the selected
-`ISAPNP_ANY_ID` constant, and the C-layout `isapnp_device_id` record with all
-five original fields in source order.

@@ -1,5 +1,0 @@
-Candidate: `src/include/uapi/linux/bpf_common.rs`
-
-Fresh path-preserving Rust translation of `include/uapi/linux/bpf_common.h`.
-It contains the provenance header, all selected BPF constants, and typed
-equivalents of `BPF_CLASS`, `BPF_SIZE`, `BPF_MODE`, `BPF_OP`, and `BPF_SRC`.

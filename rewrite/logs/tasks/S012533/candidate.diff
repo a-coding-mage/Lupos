@@ -1,8 +1,0 @@
-Added `src/include/asm-generic/device.rs` as the fresh path-preserving Rust
-translation of `include/asm-generic/device.h`.
-
-* `struct dev_archdata { };` -> `#[repr(C)] pub struct dev_archdata {}`
-* `struct pdev_archdata { };` -> `#[repr(C)] pub struct pdev_archdata {}`
-
-No executable logic, configuration conditional, linkage declaration, or
-allowlisted branding change exists in the source.

@@ -1,9 +1,0 @@
-Candidate created at `src/include/uapi/linux/hsr_netlink.rs` for the complete
-pinned source header `include/uapi/linux/hsr_netlink.h`.
-
-Mapping summary:
-
-* `HSR_A_UNSPEC` through `__HSR_A_MAX`: public `c_int` constants 0 through 11.
-* `HSR_A_MAX`: `__HSR_A_MAX - 1`.
-* `HSR_C_UNSPEC` through `__HSR_C_MAX`: public `c_int` constants 0 through 7.
-* `HSR_C_MAX`: `__HSR_C_MAX - 1`.

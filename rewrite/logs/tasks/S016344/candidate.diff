@@ -1,7 +1,0 @@
-S016344 candidate: added src/include/uapi/linux/psp.rs.
-
-The fresh, path-preserving file carries immutable provenance for the pinned
-Linux source and represents all four macros plus the 51 named C enumerators:
-the `psp_version` C-int enum, five attribute enum namespaces, statistics
-attributes, and generic-netlink commands.  It preserves the C sequential
-numbering and every MAX calculation without substituting protocol behavior.

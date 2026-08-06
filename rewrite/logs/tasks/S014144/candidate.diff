@@ -1,9 +1,0 @@
-# S014144 candidate summary
-
-New destination: `src/include/linux/irqflags_types.rs`.
-
-The candidate contains no Rust declaration because the sole upstream type is
-preprocessor-elided for both frozen configurations. It retains source,
-revision, architecture, and task provenance and records the exact conditional
-reason without introducing a substitute type, ABI, test, or configuration
-mechanism.

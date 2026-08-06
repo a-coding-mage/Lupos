@@ -1,9 +1,0 @@
-# Candidate summary — S014944
-
-Added `src/include/linux/sem_types.rs` as the fresh, path-preserving translation of `include/linux/sem_types.h`.
-
-Focused change:
-
-- Retained immutable SPDX, source, revision, architecture, and task provenance.
-- Declared `sem_undo_list` as an opaque zero-sized C-representation type, matching the header's C forward declaration and its pointer-only use.
-- Declared `#[repr(C)] pub struct sysv_sem` with `undo_list: *mut sem_undo_list`, the sole member selected by `CONFIG_SYSVIPC=y` in both frozen architectures.

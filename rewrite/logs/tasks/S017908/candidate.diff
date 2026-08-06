@@ -1,9 +1,0 @@
-## Candidate summary
-
-`src/net/ipv6/ip6_offload_h.rs` is newly created from
-`vendor/linux/net/ipv6/ip6_offload.h`.
-
-- C include guard → Rust module identity.
-- All four C declarations → `unsafe extern "C"` declarations retaining their
-  exact names and returning `core::ffi::c_int`.
-- Source SPDX identifier and immutable task provenance are retained.

@@ -18,6 +18,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -104,6 +105,23 @@ EVIDENCE_FILES = [
     "rust-review.md",
     "resolution.md",
 ]
+
+QUARANTINE_SCHEMA_VERSION = "task-evidence-quarantine-v1"
+QUARANTINE_METADATA = "QUARANTINE.tsv"
+QUARANTINE_FIELDS = [
+    "schema_version",
+    "superseded_fingerprint",
+    "task_id",
+    "original_status",
+    "original_attempt",
+    "original_resume_status",
+    "provenance_state",
+    "file_set_state",
+    "file_name",
+    "sha256",
+    "bytes",
+]
+QUARANTINE_PROVENANCE_STATE = "UNPROVEN_MIXED_OR_UNKNOWN"
 
 SCOPE_REQUIRED_FIELDS = {
     "id",
@@ -285,6 +303,232 @@ def fsync_directory(path: Path) -> None:
         os.fsync(dir_fd)
     finally:
         os.close(dir_fd)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def root_evidence_file_set_state(
+    row: Mapping[str, str], observed_names: set[str]
+) -> str:
+    """Classify only the mechanically known queue/file-set relationship.
+
+    This deliberately does not infer artifact provenance from timestamps or
+    contents.  Even a file set matching the old queue stage remains unproven
+    and is quarantined with ``UNPROVEN_MIXED_OR_UNKNOWN`` provenance.
+    """
+
+    status = row.get("status", "")
+    if status == "PAUSED":
+        status = row.get("resume_status", "")
+    implementation = {"implementation.md", "candidate.diff"}
+    reviews = implementation | {"parity-review.md", "rust-review.md"}
+    complete = set(EVIDENCE_FILES)
+    matches = False
+    if status == "TODO":
+        matches = not observed_names
+    elif status == "IN_PROGRESS":
+        matches = observed_names <= implementation
+    elif status == "IMPLEMENTED":
+        matches = observed_names == implementation
+    elif status == "REVIEWING":
+        matches = implementation <= observed_names <= reviews
+    elif status == "APPLYING":
+        matches = reviews <= observed_names <= complete
+    elif status == "DONE":
+        matches = observed_names == complete
+    elif status == "BLOCKED":
+        return "QUEUE_STAGE_FILESET_UNSPECIFIED"
+    return "QUEUE_STAGE_FILESET_MATCH" if matches else "QUEUE_STAGE_FILESET_MISMATCH"
+
+
+def copy_regular_file_exact(
+    source: Path, destination: Path, *, expected_sha256: str, expected_bytes: int
+) -> None:
+    """Copy one non-symlink evidence file and fsync the quarantined payload."""
+
+    source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            die(f"canonical task evidence is not a regular file: {source}")
+        destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            digest = hashlib.sha256()
+            copied = 0
+            while True:
+                block = os.read(source_fd, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+                copied += len(block)
+                view = memoryview(block)
+                while view:
+                    written = os.write(destination_fd, view)
+                    view = view[written:]
+            os.fsync(destination_fd)
+        finally:
+            os.close(destination_fd)
+    finally:
+        os.close(source_fd)
+    if copied != expected_bytes or digest.hexdigest() != expected_sha256:
+        die(f"canonical task evidence changed during quarantine: {source}")
+
+
+def write_quarantine_metadata(path: Path, records: list[dict[str, str]]) -> None:
+    with path.open("x", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=QUARANTINE_FIELDS,
+            delimiter="\t",
+            lineterminator="\n",
+            extrasaction="raise",
+        )
+        writer.writeheader()
+        writer.writerows(records)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def quarantine_generation_evidence(
+    logs_root: Path,
+    old_rows: list[dict[str, str]],
+    superseded_fingerprint: str,
+) -> list[dict[str, object]]:
+    """Quarantine root acceptance evidence before replacing a reopened queue.
+
+    Each task-local generation directory becomes visible with one atomic rename.
+    Its payload and deterministic metadata are fsynced first; only then are the
+    superseded root files removed.  The caller holds the canonical queue lock.
+    """
+
+    if logs_root.is_symlink():
+        die(f"task logs root must not be a symlink: {logs_root}")
+    if not logs_root.exists():
+        return []
+    if not logs_root.is_dir():
+        die(f"task logs root is not a directory: {logs_root}")
+
+    rows_by_id = {row["id"]: row for row in old_rows}
+    plans: list[dict[str, object]] = []
+    for task_dir in sorted(logs_root.iterdir(), key=lambda item: item.name):
+        candidates = [task_dir / name for name in EVIDENCE_FILES]
+        existing = [path for path in candidates if path.exists() or path.is_symlink()]
+        if not existing:
+            continue
+        if task_dir.is_symlink() or not task_dir.is_dir():
+            die(f"task evidence parent must be a real directory: {task_dir}")
+        row = rows_by_id.get(task_dir.name)
+        if row is None:
+            die(
+                "canonical task evidence has no row in the superseded queue: "
+                f"{task_dir}"
+            )
+        inventory: list[dict[str, object]] = []
+        for source in sorted(existing, key=lambda item: item.name):
+            if source.is_symlink() or not source.is_file():
+                die(f"canonical task evidence must be a non-symlink regular file: {source}")
+            inventory.append(
+                {
+                    "source": source,
+                    "file_name": source.name,
+                    "sha256": sha256_file(source),
+                    "bytes": source.stat().st_size,
+                }
+            )
+        generation_root = task_dir / "invalidated-generations"
+        if generation_root.is_symlink():
+            die(f"invalidated generation root must not be a symlink: {generation_root}")
+        destination = generation_root / superseded_fingerprint
+        if destination.exists() or destination.is_symlink():
+            die(f"superseded evidence generation already exists: {destination}")
+        names = {str(item["file_name"]) for item in inventory}
+        plans.append(
+            {
+                "row": row,
+                "task_dir": task_dir,
+                "generation_root": generation_root,
+                "destination": destination,
+                "inventory": inventory,
+                "file_set_state": root_evidence_file_set_state(row, names),
+            }
+        )
+
+    completed: list[dict[str, object]] = []
+    for plan in plans:
+        row = plan["row"]
+        assert isinstance(row, dict)
+        task_dir = plan["task_dir"]
+        generation_root = plan["generation_root"]
+        destination = plan["destination"]
+        inventory = plan["inventory"]
+        assert isinstance(task_dir, Path)
+        assert isinstance(generation_root, Path)
+        assert isinstance(destination, Path)
+        assert isinstance(inventory, list)
+        generation_root.mkdir(parents=True, exist_ok=True)
+        fsync_directory(task_dir)
+        temporary = Path(
+            tempfile.mkdtemp(
+                prefix=f".{superseded_fingerprint}.", dir=generation_root
+            )
+        )
+        try:
+            metadata_rows: list[dict[str, str]] = []
+            for item in inventory:
+                source = item["source"]
+                assert isinstance(source, Path)
+                copy_regular_file_exact(
+                    source,
+                    temporary / str(item["file_name"]),
+                    expected_sha256=str(item["sha256"]),
+                    expected_bytes=int(item["bytes"]),
+                )
+                metadata_rows.append(
+                    {
+                        "schema_version": QUARANTINE_SCHEMA_VERSION,
+                        "superseded_fingerprint": superseded_fingerprint,
+                        "task_id": row["id"],
+                        "original_status": row["status"],
+                        "original_attempt": row.get("attempt", "0") or "0",
+                        "original_resume_status": row.get("resume_status", ""),
+                        "provenance_state": QUARANTINE_PROVENANCE_STATE,
+                        "file_set_state": str(plan["file_set_state"]),
+                        "file_name": str(item["file_name"]),
+                        "sha256": str(item["sha256"]),
+                        "bytes": str(item["bytes"]),
+                    }
+                )
+            write_quarantine_metadata(temporary / QUARANTINE_METADATA, metadata_rows)
+            fsync_directory(temporary)
+            os.rename(temporary, destination)
+            fsync_directory(generation_root)
+        finally:
+            if temporary.exists():
+                for child in temporary.iterdir():
+                    if child.is_file() and not child.is_symlink():
+                        child.unlink()
+                temporary.rmdir()
+
+        for item in inventory:
+            source = item["source"]
+            assert isinstance(source, Path)
+            if source.is_symlink() or not source.is_file():
+                die(f"canonical task evidence changed before root removal: {source}")
+            if (
+                source.stat().st_size != int(item["bytes"])
+                or sha256_file(source) != str(item["sha256"])
+            ):
+                die(f"canonical task evidence changed before root removal: {source}")
+            source.unlink()
+        fsync_directory(task_dir)
+        completed.append(plan)
+    return completed
 
 
 def read_pinned_linux_sha(path: Path) -> str:
@@ -1120,11 +1364,54 @@ def cmd_init(args: argparse.Namespace) -> None:
             rows.append(row)
         rows.sort(key=lambda row: row["id"])
         validate_rows(rows)
+        quarantined: list[dict[str, object]] = []
+        if reopening:
+            quarantined = quarantine_generation_evidence(
+                logs_root, old_rows, old_digest
+            )
         atomic_write_tsv(queue, rows)
         if reopening and fingerprint.exists():
             fingerprint.unlink()
             fsync_directory(fingerprint.parent)
-        initialization_events = [
+        initialization_events = []
+        for plan in quarantined:
+            old_row = plan["row"]
+            destination = plan["destination"]
+            inventory = plan["inventory"]
+            assert isinstance(old_row, dict)
+            assert isinstance(destination, Path)
+            assert isinstance(inventory, list)
+            hashes = {
+                str(item["file_name"]): str(item["sha256"])
+                for item in inventory
+            }
+            initialization_events.append(
+                event_payload(
+                    old_row,
+                    phase="phase0",
+                    event="task_evidence_quarantined",
+                    role="queue_tool",
+                    model="none",
+                    effort="none",
+                    detail=(
+                        f"superseded_fingerprint={old_digest}; "
+                        f"original_status={old_row['status']}; "
+                        f"original_attempt={old_row.get('attempt', '0') or '0'}; "
+                        f"provenance_state={QUARANTINE_PROVENANCE_STATE}; "
+                        f"file_set_state={plan['file_set_state']}; "
+                        f"files={json.dumps(hashes, sort_keys=True, separators=(',', ':'))}; "
+                        f"quarantine={destination}"
+                    ),
+                    from_status=old_row["status"],
+                    to_status="TODO",
+                )
+            )
+        superseded_non_todo = [
+            f"{row['id']}:{row['status']}"
+            for row in old_rows
+            if row["status"] != "TODO"
+        ]
+        initialization_events.append(
             event_payload(
                 None,
                 phase="phase0" if reopening else "translation",
@@ -1135,12 +1422,16 @@ def cmd_init(args: argparse.Namespace) -> None:
                 detail=(
                     f"phase-gate-reopen; archive={args.archive}; old_queue_sha256={old_digest}; "
                     f"created {len(rows)} all-TODO tasks from {scope}; linux_sha={linux_sha}; "
-                    "prior terminal and stage states were not reused"
+                    f"quarantined_tasks={len(quarantined)}; "
+                    f"quarantined_files={sum(len(plan['inventory']) for plan in quarantined)}; "
+                    f"superseded_non_todo={','.join(superseded_non_todo) or 'none'}; "
+                    "prior terminal and stage states were not reused; retained destination "
+                    "source files receive no carryover acceptance credit"
                     if reopening else
                     f"created {len(rows)} tasks from {scope}; linux_sha={linux_sha}"
                 ),
             )
-        ]
+        )
         initialization_events.extend(
             event_payload(
                 row,
@@ -1208,7 +1499,9 @@ def cmd_verify(args: argparse.Namespace) -> None:
         rows = read_tsv(queue, FIELDS)
         validate_rows(rows)
         verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file), Path(args.phase0_identity))
+        require_no_unknown_root_evidence(rows, logs_root)
         for row in rows:
+            require_queue_root_evidence_state(row, logs_root)
             if row["status"] == "DONE":
                 require_done_evidence(row, logs_root, Path(args.linux_sha_file))
     fingerprint_digest, _, _, _ = read_fingerprint(fingerprint)
@@ -1246,6 +1539,13 @@ def cmd_claim(args: argparse.Namespace) -> None:
             print(json.dumps({"claimed": False, "reason": "no ready tasks"}))
             return
         row = ready[0]
+        require_root_evidence_state(
+            row,
+            logs_root,
+            required=set(),
+            allowed=set(),
+            stage="fresh claim",
+        )
         timestamp = now_utc()
         old_status, new_status = update_status(row, "IN_PROGRESS", timestamp)
         if not row["work_started_at"]:
@@ -1340,17 +1640,95 @@ def mutate_simple(
     print(json.dumps({"id": row["id"], "status": row["status"], "updated_at": row["updated_at"]}))
 
 
-def require_evidence_files(
-    row: Mapping[str, str], logs_root: Path, names: Iterable[str], *, stage: str
+def require_root_evidence_state(
+    row: Mapping[str, str],
+    logs_root: Path,
+    *,
+    required: set[str],
+    allowed: set[str],
+    stage: str,
 ) -> None:
+    unknown = sorted((required | allowed) - set(EVIDENCE_FILES))
+    if unknown:
+        die(f"internal error: unknown canonical evidence names for {stage}: {unknown}")
     task_dir = logs_root / row["id"]
-    missing = [
-        str(task_dir / name)
-        for name in names
-        if not (task_dir / name).is_file() or (task_dir / name).stat().st_size == 0
-    ]
-    if missing:
-        die(f"cannot complete {stage}; missing or empty evidence files: " + ", ".join(missing))
+    present: set[str] = set()
+    for name in EVIDENCE_FILES:
+        path = task_dir / name
+        if not (path.exists() or path.is_symlink()):
+            continue
+        if path.is_symlink() or not path.is_file():
+            die(f"cannot enter {stage}; canonical evidence is not a regular file: {path}")
+        if path.stat().st_size == 0:
+            die(f"cannot enter {stage}; canonical evidence is empty: {path}")
+        present.add(name)
+    missing = sorted(required - present)
+    unexpected = sorted(present - allowed)
+    if missing or unexpected:
+        detail = []
+        if missing:
+            detail.append("missing=" + ",".join(missing))
+        if unexpected:
+            detail.append("unexpected=" + ",".join(unexpected))
+        die(
+            f"cannot enter {stage} for task {row['id']}; root evidence state rejected: "
+            + "; ".join(detail)
+        )
+
+
+def require_no_unknown_root_evidence(
+    rows: list[dict[str, str]], logs_root: Path
+) -> None:
+    if not logs_root.exists():
+        return
+    if logs_root.is_symlink() or not logs_root.is_dir():
+        die(f"task logs root must be a real directory: {logs_root}")
+    known = {row["id"] for row in rows}
+    for task_dir in sorted(logs_root.iterdir(), key=lambda item: item.name):
+        present = [
+            name
+            for name in EVIDENCE_FILES
+            if (task_dir / name).exists() or (task_dir / name).is_symlink()
+        ]
+        if present and task_dir.name not in known:
+            die(
+                f"unknown task directory has canonical root evidence: {task_dir}; "
+                f"files={','.join(present)}"
+            )
+
+
+def require_queue_root_evidence_state(
+    row: Mapping[str, str], logs_root: Path
+) -> None:
+    status = row.get("status", "")
+    if status == "PAUSED":
+        status = row.get("resume_status", "")
+    implementation = {"implementation.md", "candidate.diff"}
+    reports = implementation | {"parity-review.md", "rust-review.md"}
+    complete = set(EVIDENCE_FILES)
+    if status == "TODO":
+        required, allowed = set(), set()
+    elif status == "IN_PROGRESS":
+        required, allowed = set(), implementation
+    elif status == "IMPLEMENTED":
+        required = allowed = implementation
+    elif status == "REVIEWING":
+        required, allowed = implementation, reports
+    elif status == "APPLYING":
+        required, allowed = reports, complete
+    elif status == "DONE":
+        required = allowed = complete
+    elif status == "BLOCKED":
+        required, allowed = set(), complete
+    else:
+        die(f"task {row['id']} has no evidence policy for status {status!r}")
+    require_root_evidence_state(
+        row,
+        logs_root,
+        required=required,
+        allowed=allowed,
+        stage=f"queue verification ({row.get('status', '')})",
+    )
 
 
 def require_destination_translation(row: Mapping[str, str], sha_file: Path) -> None:
@@ -1402,8 +1780,13 @@ def require_destination_translation(row: Mapping[str, str], sha_file: Path) -> N
 def require_implementation_evidence(
     row: Mapping[str, str], logs_root: Path, sha_file: Path
 ) -> None:
-    require_evidence_files(
-        row, logs_root, ["implementation.md", "candidate.diff"], stage="implementation"
+    implementation = {"implementation.md", "candidate.diff"}
+    require_root_evidence_state(
+        row,
+        logs_root,
+        required=implementation,
+        allowed=implementation,
+        stage="implementation",
     )
     require_destination_translation(row, sha_file)
 
@@ -1426,6 +1809,9 @@ def cmd_start_review(args: argparse.Namespace) -> None:
         to_status="REVIEWING",
         event="review_started",
         timestamp_field="review_started_at",
+        prerequisite=lambda row, logs_root: require_implementation_evidence(
+            row, logs_root, Path(args.linux_sha_file)
+        ),
     )
 
 
@@ -1441,8 +1827,14 @@ def cmd_mark_review(args: argparse.Namespace) -> None:
         report = "parity-review.md" if args.slot == 1 else "rust-review.md"
         if row[field]:
             die(f"review slot {args.slot} already completed for task {row['id']}")
-        require_evidence_files(
-            row, logs_root, [report], stage=f"review slot {args.slot}"
+        implementation = {"implementation.md", "candidate.diff"}
+        review_reports = {"parity-review.md", "rust-review.md"}
+        require_root_evidence_state(
+            row,
+            logs_root,
+            required=implementation | {report},
+            allowed=implementation | review_reports,
+            stage=f"review slot {args.slot}",
         )
         timestamp = now_utc()
         row[field] = timestamp
@@ -1468,9 +1860,23 @@ def cmd_mark_review(args: argparse.Namespace) -> None:
     print(json.dumps({"id": row["id"], "slot": args.slot, "completed_at": row[field]}))
 
 
-def require_reviews(row: Mapping[str, str], _logs_root: Path | None = None) -> None:
+def require_reviews(row: Mapping[str, str], logs_root: Path | None = None) -> None:
     if not row.get("review_1_done_at") or not row.get("review_2_done_at"):
         die(f"task {row['id']} cannot enter APPLYING until both reviews are done")
+    if logs_root is not None:
+        reviews = {
+            "implementation.md",
+            "candidate.diff",
+            "parity-review.md",
+            "rust-review.md",
+        }
+        require_root_evidence_state(
+            row,
+            logs_root,
+            required=reviews,
+            allowed=reviews,
+            stage="application",
+        )
 
 
 def cmd_start_apply(args: argparse.Namespace) -> None:
@@ -1484,7 +1890,13 @@ def cmd_start_apply(args: argparse.Namespace) -> None:
 
 
 def require_done_evidence(row: Mapping[str, str], logs_root: Path, sha_file: Path) -> None:
-    require_evidence_files(row, logs_root, EVIDENCE_FILES, stage="DONE")
+    require_root_evidence_state(
+        row,
+        logs_root,
+        required=set(EVIDENCE_FILES),
+        allowed=set(EVIDENCE_FILES),
+        stage="DONE",
+    )
     require_reviews(row)
     require_destination_translation(row, sha_file)
 
@@ -1586,6 +1998,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
         target = row["resume_status"]
         if target not in ACTIVE_STATUSES:
             die(f"task {row['id']} has invalid resume_status {target!r}")
+        require_queue_root_evidence_state(row, Path(args.logs_root))
         conflicts = [
             item
             for item in rows

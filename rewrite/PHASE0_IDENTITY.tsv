@@ -13,12 +13,12 @@ compiler_requested_path	/usr/lib/llvm-19/bin/clang	VERIFIED	Phase 0 frozen input
 compiler_resolved_path	/usr/lib/llvm-19/bin/clang	VERIFIED	Phase 0 frozen input
 compiler_sha256	0a3c55936ac43954fbe4914e6e73b577ca9e35e75d89ef13d3e28c187f41ca1a	VERIFIED	Phase 0 frozen input
 compiler_version	Debian clang version 19.1.7 (3+b1)	VERIFIED	Phase 0 frozen input
-created_at	2026-08-06T15:10:23.845Z	VERIFIED	Phase 0 frozen input
+created_at	2026-08-06T15:55:56.132Z	VERIFIED	Phase 0 frozen input
 cross_compile_value	(empty)	VERIFIED	Phase 0 frozen input
 extractor_version	phase0_extract.py:75704df1c2478336a7f4f968ee3f81b55595ba0294a96a5a50a7eed20eed4a3e	VERIFIED	Phase 0 frozen input
 header_dependency_schema_version	header-provider-enumerator-graph-v3	VERIFIED	Phase 0 frozen input
 identity_schema_version	phase0-identity-v2	VERIFIED	Phase 0 frozen input
-identity_status	RESOLVED	VERIFIED	Phase 0 frozen input
+identity_status	PRE_QUEUE	VERIFIED	Phase 0 frozen input
 linker_requested_path	/usr/lib/llvm-19/bin/ld.lld	VERIFIED	Phase 0 frozen input
 linker_resolved_path	/usr/lib/llvm-19/bin/lld	VERIFIED	Phase 0 frozen input
 linker_sha256	7a2fd87d82662beac4371a1a21067b37cd4b7d43777aa61c089d85c45f772f6e	VERIFIED	Phase 0 frozen input
@@ -28,14 +28,14 @@ llvm_ias_value	1	VERIFIED	Phase 0 frozen input
 llvm_value	/usr/lib/llvm-19/bin/	VERIFIED	Phase 0 frozen input
 metadata_manifest_sha256	d4ca8c0dbfac80a024f104647669720cf5b8fa77023aa2aec018b5aad70059c8	VERIFIED	Phase 0 frozen input
 oracle_classification_schema_version	oracle-classification-v1	VERIFIED	Phase 0 frozen input
-phase0_identity_binding_sha256	1c793a8db8b4971fdfc15cd7b9e5f503d6b4399893cb0cb5ab171f95c9e46a23	VERIFIED	canonical non-queue Phase 0 input digest
+phase0_identity_binding_sha256	69a74b3e665cefce78c3e92cfcbca7e035fda30b1e435f151d205c163da34d87	VERIFIED	canonical non-queue Phase 0 input digest
 predicate_extractor_version	compiler_predicates.py:7bbff87daefcf123ab5a1dc0a1a59111402f71f5ffbc7fc2180fe6b094936938	VERIFIED	Phase 0 frozen input
 predicate_validator_version	validate_compiler_predicates.py:0ab59f937878905dd6832d7e349ce973db52d8d1d86343f62fc0af6f7ecc317b	VERIFIED	Phase 0 frozen input
-queue_fingerprint	d6c01f29edd048c73608fff2ed65f2485755023f85ffc0fec01e9f511fd6a72c	VERIFIED	rewrite/TRANSLATION_TASKS.sha256
-queue_tool_version	rewrite_queue.py:12e38514c931f951af0019dd66e7b3f83ebbcd027c5eaf26ccdea46434ca970c	VERIFIED	Phase 0 frozen input
+queue_fingerprint		VERIFIED	pending queue freeze
+queue_tool_version	rewrite_queue.py:c572d2a5c57df96c1841b25a46f6df697d6ab8be7de236d3db989d37517f3aa1	VERIFIED	Phase 0 frozen input
 scope_schema_version	source-header-context-oracle-phase0-v7	VERIFIED	Phase 0 frozen input
 toolchain_sha256	cfb4e6fbb9b5281b15f0e09cb6d4f7f1866bf9bc1c69ae72715992b76c9bd670	VERIFIED	Phase 0 frozen input
-validator_version	phase0_validate.py:ceba633b18ae509cbc004aa9616d506daf0b95b95a41a9f2a57e2ebd7f8824b7	VERIFIED	Phase 0 frozen input
+validator_version	phase0_validate.py:5f17060e25ad8fc56131228cf736e61348cb60ffcadf96c29194f9782ce69cbd	VERIFIED	Phase 0 frozen input
 x86_64_arch_value	x86_64	VERIFIED	Phase 0 frozen input
 x86_64_config_sha256	a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4	VERIFIED	Phase 0 frozen input
 x86_64_target_triple	x86_64-linux-gnu	VERIFIED	Phase 0 frozen input

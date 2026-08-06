@@ -1,8 +1,0 @@
-# S014173 candidate summary
-
-New destination file: `src/include/linux/kernel-page-flags.rs`.
-
-- Adds immutable source/revision/architecture/task provenance and preserves the source `GPL-2.0` SPDX identifier.
-- Re-exports the completed UAPI page-flag bit positions, corresponding to the source header's UAPI inclusion.
-- Adds the complete kernel-only `KPF_RESERVED` through `KPF_ARCH_3` sequence with exact values 32, 33, 34, 35, 36, 37, 38, 40, 41, and 42.
-- No symbols outside the selected source header were added or changed.

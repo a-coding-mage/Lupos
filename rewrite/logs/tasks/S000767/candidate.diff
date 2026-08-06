@@ -1,6 +1,0 @@
---- /dev/null
-+++ b/src/arch/x86/include/asm/xen/trace_types.rs
-@@
-+#[repr(C)] pub enum xen_mc_flush_reason { XEN_MC_FL_NONE = 0, XEN_MC_FL_BATCH = 1, XEN_MC_FL_ARGS = 2, XEN_MC_FL_CALLBACK = 3 }
-+#[repr(C)] pub enum xen_mc_extend_args { XEN_MC_XE_OK = 0, XEN_MC_XE_BAD_OP = 1, XEN_MC_XE_NO_SPACE = 2 }
-+pub type xen_mc_callback_fn_t = Option<unsafe extern "C" fn(*mut core::ffi::c_void)>;

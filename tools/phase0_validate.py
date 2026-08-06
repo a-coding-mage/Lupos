@@ -47,6 +47,17 @@ HEADER_CONTEXT_EDGE_FIELDS = {
 ORACLE_CLASSIFICATION_FIELDS = {
     "linux_path", "source_kind", "reason", "evidence",
 }
+CANONICAL_TASK_EVIDENCE = {
+    "implementation.md", "candidate.diff", "parity-review.md",
+    "rust-review.md", "resolution.md",
+}
+QUARANTINE_METADATA_FIELDS = [
+    "schema_version", "superseded_fingerprint", "task_id",
+    "original_status", "original_attempt", "original_resume_status",
+    "provenance_state", "file_set_state", "file_name", "sha256", "bytes",
+]
+QUARANTINE_SCHEMA_VERSION = "task-evidence-quarantine-v1"
+QUARANTINE_PROVENANCE_STATE = "UNPROVEN_MIXED_OR_UNKNOWN"
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s*([<"])([^>"\n]+)[>"]', re.M)
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -617,6 +628,137 @@ def queue_matches_scope(scope_rows: list[dict[str, str]], task_rows: list[dict[s
         if changed:
             mismatches.append(f"{task_id}:{','.join(changed)}")
     return not mismatches, f"scope={len(selected)} tasks={len(tasks)} mismatches={mismatches[:10]}"
+
+
+def quarantine_file_set_state(
+    status: str, resume_status: str, observed: set[str]
+) -> str:
+    if status == "PAUSED":
+        status = resume_status
+    implementation = {"implementation.md", "candidate.diff"}
+    reviews = implementation | {"parity-review.md", "rust-review.md"}
+    complete = set(CANONICAL_TASK_EVIDENCE)
+    matches = False
+    if status == "TODO":
+        matches = not observed
+    elif status == "IN_PROGRESS":
+        matches = observed <= implementation
+    elif status == "IMPLEMENTED":
+        matches = observed == implementation
+    elif status == "REVIEWING":
+        matches = implementation <= observed <= reviews
+    elif status == "APPLYING":
+        matches = reviews <= observed <= complete
+    elif status == "DONE":
+        matches = observed == complete
+    elif status == "BLOCKED":
+        return "QUEUE_STAGE_FILESET_UNSPECIFIED"
+    return "QUEUE_STAGE_FILESET_MATCH" if matches else "QUEUE_STAGE_FILESET_MISMATCH"
+
+
+def validate_task_evidence_quarantine(
+    logs_root: Path,
+) -> tuple[list[str], list[str], dict[str, dict[str, object]]]:
+    """Validate root isolation and every task-local invalidated generation."""
+
+    root_files: list[str] = []
+    errors: list[str] = []
+    generations: dict[str, dict[str, object]] = {}
+    if not logs_root.exists():
+        return root_files, errors, generations
+    if logs_root.is_symlink() or not logs_root.is_dir():
+        return root_files, [f"invalid-logs-root:{logs_root}"], generations
+
+    for task_dir in sorted(logs_root.iterdir(), key=lambda item: item.name):
+        if task_dir.is_symlink() or not task_dir.is_dir():
+            continue
+        for name in sorted(CANONICAL_TASK_EVIDENCE):
+            path = task_dir / name
+            if path.exists() or path.is_symlink():
+                root_files.append(path.relative_to(logs_root).as_posix())
+        invalidated = task_dir / "invalidated-generations"
+        if not invalidated.exists():
+            continue
+        if invalidated.is_symlink() or not invalidated.is_dir():
+            errors.append(f"invalid-generation-root:{invalidated}")
+            continue
+        for generation in sorted(invalidated.iterdir(), key=lambda item: item.name):
+            fingerprint = generation.name
+            prefix = f"{task_dir.name}:{fingerprint}"
+            if (
+                generation.is_symlink()
+                or not generation.is_dir()
+                or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+            ):
+                errors.append(f"invalid-generation-directory:{generation}")
+                continue
+            metadata = generation / "QUARANTINE.tsv"
+            if not metadata.is_file() or metadata.is_symlink():
+                errors.append(f"{prefix}:missing-metadata")
+                continue
+            fields, records = read_tsv(metadata)
+            if fields != QUARANTINE_METADATA_FIELDS or not records:
+                errors.append(f"{prefix}:metadata-schema-or-empty")
+                continue
+            names = [record.get("file_name", "") for record in records]
+            observed = set(names)
+            if names != sorted(names) or len(observed) != len(names):
+                errors.append(f"{prefix}:nondeterministic-or-duplicate-files")
+            common = records[0]
+            expected_state = quarantine_file_set_state(
+                common.get("original_status", ""),
+                common.get("original_resume_status", ""),
+                observed,
+            )
+            repeated = {
+                "schema_version": QUARANTINE_SCHEMA_VERSION,
+                "superseded_fingerprint": fingerprint,
+                "task_id": task_dir.name,
+                "original_status": common.get("original_status", ""),
+                "original_attempt": common.get("original_attempt", ""),
+                "original_resume_status": common.get("original_resume_status", ""),
+                "provenance_state": QUARANTINE_PROVENANCE_STATE,
+                "file_set_state": expected_state,
+            }
+            if not common.get("original_attempt", "").isdigit():
+                errors.append(f"{prefix}:invalid-attempt")
+            for record in records:
+                if any(record.get(key, "") != value for key, value in repeated.items()):
+                    errors.append(f"{prefix}:inconsistent-metadata:{record.get('file_name', '')}")
+                    break
+            payload_names = {
+                item.name for item in generation.iterdir()
+                if item.name != "QUARANTINE.tsv"
+            }
+            if payload_names != observed or not observed <= CANONICAL_TASK_EVIDENCE:
+                errors.append(f"{prefix}:payload-set-mismatch")
+            for record in records:
+                payload = generation / record.get("file_name", "")
+                try:
+                    expected_bytes = int(record.get("bytes", ""))
+                except ValueError:
+                    errors.append(f"{prefix}:invalid-bytes:{record.get('file_name', '')}")
+                    continue
+                if (
+                    payload.is_symlink()
+                    or not payload.is_file()
+                    or payload.stat().st_size != expected_bytes
+                    or digest(payload) != record.get("sha256", "")
+                ):
+                    errors.append(f"{prefix}:payload-hash:{record.get('file_name', '')}")
+            summary = generations.setdefault(
+                fingerprint,
+                {"tasks": set(), "files": 0, "bytes": 0, "states": defaultdict(int)},
+            )
+            summary["tasks"].add(task_dir.name)
+            summary["files"] += len(records)
+            summary["bytes"] += sum(
+                int(record["bytes"])
+                for record in records
+                if record.get("bytes", "").isdigit()
+            )
+            summary["states"][expected_state] += 1
+    return root_files, errors, generations
 
 
 def main() -> int:
@@ -2036,7 +2178,7 @@ def main() -> int:
         except (OSError, json.JSONDecodeError) as exc:
             event_errors.append(f"{type(exc).__name__}:{exc}")
         reopen_events = [
-            record for record in event_records
+            (index, record) for index, record in enumerate(event_records)
             if record.get("phase") == "phase0"
             and record.get("event") == "queue_invalidated"
             and "mode=phase-gate-reopen" in str(record.get("detail", ""))
@@ -2050,11 +2192,37 @@ def main() -> int:
             if row.get("status") in {"IN_PROGRESS", "IMPLEMENTED", "REVIEWING", "APPLYING"}
             or row.get("lease_owner") or row.get("lease_expires_at")
         ]
+        archives: list[str] = []
+        for _, record in reopen_events:
+            match = re.search(
+                r"(?:^|; )archive=(rewrite/archive/phase0-[^;]+);",
+                str(record.get("detail", "")),
+            )
+            archives.append(match.group(1) if match else "")
+        latest_index, latest_reopen = reopen_events[-1] if reopen_events else (-1, {})
+        latest_archive = archives[-1] if archives else ""
+        consuming = [
+            (index, record) for index, record in enumerate(event_records)
+            if index > latest_index
+            and record.get("phase") == "phase0"
+            and record.get("event") == "queue_reinitialized"
+            and f"archive={latest_archive};" in str(record.get("detail", ""))
+        ]
+        consumed_as_expected = (
+            len(consuming) == 1 if args.stage == "frozen" else not consuming
+        )
         check(
             checks,
             "phase_gate_reopen_authorized",
-            len(reopen_events) == 1 and not event_errors and not active_rows,
-            f"events={len(reopen_events)} event_errors={event_errors[:5]} active={active_rows[:10]}",
+            bool(reopen_events)
+            and all(archives)
+            and len(archives) == len(set(archives))
+            and not event_errors
+            and not active_rows
+            and consumed_as_expected,
+            f"events={len(reopen_events)} archives={archives[-3:]} "
+            f"latest_consumers={len(consuming)} event_errors={event_errors[:5]} "
+            f"active={active_rows[:10]}",
         )
         check(
             checks,
@@ -2062,6 +2230,59 @@ def main() -> int:
             not any(path.is_symlink() for path in (root / "src").rglob("*")),
             root / "src",
         )
+        if args.stage == "frozen":
+            root_evidence, quarantine_errors, generations = (
+                validate_task_evidence_quarantine(canonical / "logs/tasks")
+            )
+            check(
+                checks,
+                "task_evidence_root_isolation",
+                not root_evidence,
+                f"unexpected_root_files={root_evidence[:20]}",
+            )
+            check(
+                checks,
+                "task_evidence_quarantine_integrity",
+                not quarantine_errors,
+                quarantine_errors[:20],
+            )
+            latest_fingerprint = ""
+            quarantine_events: list[dict[str, object]] = []
+            if consuming:
+                reinitialized_index, reinitialized = consuming[0]
+                match = re.search(
+                    r"old_queue_sha256=([0-9a-f]{64});",
+                    str(reinitialized.get("detail", "")),
+                )
+                latest_fingerprint = match.group(1) if match else ""
+                quarantine_events = [
+                    record for index, record in enumerate(event_records)
+                    if latest_index < index < reinitialized_index
+                    and record.get("phase") == "phase0"
+                    and record.get("event") == "task_evidence_quarantined"
+                    and f"superseded_fingerprint={latest_fingerprint};"
+                    in str(record.get("detail", ""))
+                ]
+            summary = generations.get(latest_fingerprint, {})
+            quarantined_tasks = summary.get("tasks", set())
+            event_tasks = {str(record.get("task_id", "")) for record in quarantine_events}
+            detail_matches = all(
+                f"quarantine=rewrite/logs/tasks/{record.get('task_id', '')}/"
+                f"invalidated-generations/{latest_fingerprint}"
+                in str(record.get("detail", ""))
+                for record in quarantine_events
+            )
+            check(
+                checks,
+                "task_evidence_quarantine_events",
+                bool(latest_fingerprint)
+                and bool(quarantined_tasks)
+                and event_tasks == quarantined_tasks
+                and len(quarantine_events) == len(quarantined_tasks)
+                and detail_matches,
+                f"fingerprint={latest_fingerprint} metadata_tasks={len(quarantined_tasks)} "
+                f"event_tasks={len(event_tasks)} files={summary.get('files', 0)}",
+            )
     else:
         check(
             checks,
@@ -2099,6 +2320,20 @@ def main() -> int:
             "extractor_identity",
             identity.get("extractor_version", {}).get("value") == extractor_identity,
             f"identity={identity.get('extractor_version', {}).get('value')} actual={extractor_identity}",
+        )
+        validator_identity = f"phase0_validate.py:{digest(root / 'tools/phase0_validate.py')}"
+        check(
+            checks,
+            "validator_identity",
+            identity.get("validator_version", {}).get("value") == validator_identity,
+            f"identity={identity.get('validator_version', {}).get('value')} actual={validator_identity}",
+        )
+        queue_tool_identity = f"rewrite_queue.py:{digest(root / 'tools/rewrite_queue.py')}"
+        check(
+            checks,
+            "queue_tool_identity",
+            identity.get("queue_tool_version", {}).get("value") == queue_tool_identity,
+            f"identity={identity.get('queue_tool_version', {}).get('value')} actual={queue_tool_identity}",
         )
         check(
             checks,

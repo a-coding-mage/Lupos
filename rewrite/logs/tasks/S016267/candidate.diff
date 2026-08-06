@@ -1,3 +1,0 @@
-Candidate: `src/include/uapi/linux/netdev.rs`
-
-The candidate is a fresh, path-preserving Rust representation of the complete selected netdev generic-netlink UAPI numeric namespace. It exposes the tagged enum ABI as transparent C-integer newtypes, preserves every anonymous-enum evaluated constant (including the explicit numbering gaps), and retains string macro NUL terminators. The upstream header has no functions, structs, conditional selected branches, or driver implementation.

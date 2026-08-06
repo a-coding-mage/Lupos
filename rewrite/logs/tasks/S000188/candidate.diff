@@ -1,8 +1,0 @@
-# Candidate diff — S000188
-
-Added `src/arch/arm64/include/asm/unistd.rs` as the path-preserving fresh Rust
-translation of `arch/arm64/include/asm/unistd.h`.
-
-The file includes immutable task provenance, twelve `CONFIG_COMPAT` selection
-markers, four ARM-private compatibility SVC constants, two unconditional
-selection markers, and the `NR_syscalls` alias with frozen generated value 472.

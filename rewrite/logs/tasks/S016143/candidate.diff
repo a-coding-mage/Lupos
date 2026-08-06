@@ -1,9 +1,0 @@
-# Candidate summary — S016143
-
-Added `src/include/uapi/linux/hash_info.rs` as the fresh, path-preserving translation of `include/uapi/linux/hash_info.h`.
-
-Focused change:
-
-- Retained SPDX/copyright and immutable source, revision, architecture, and task provenance.
-- Represented the sole C UAPI enum as `#[repr(C)] pub enum hash_algo`.
-- Preserved every enumerator spelling and its implicit C sequence as explicit values: `HASH_ALGO_MD4 = 0` through `HASH_ALGO_SHA3_512 = 22`, followed by `HASH_ALGO__LAST = 23`.
