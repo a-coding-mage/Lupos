@@ -156,7 +156,8 @@ def main() -> int:
     require(binding.get("compiler_predicates_sha256") == sha256(predicate_root / "COMPILER_PREDICATES.tsv"), "staged predicate binding mismatch")
 
     manifest_paths = [
-        "SCOPE.tsv", "FILE_MAP.tsv", "SYMBOLS.tsv", "ABI.tsv", "LIFETIMES.tsv", "DRIVER_ABI.tsv",
+        "SCOPE.tsv", "FILE_MAP.tsv", "SYMBOLS.tsv", "ABI.tsv", "LIFETIMES.tsv",
+        "DRIVER_ABI.tsv", "PORTING.md", "BRANDING_ALLOWLIST.tsv",
     ]
     for name in manifest_paths:
         require((artifacts / name).is_file(), f"missing authoritative manifest: {name}")
@@ -190,8 +191,8 @@ def main() -> int:
         "queue_tool_version": f"rewrite_queue.py:{sha256(root / 'tools/rewrite_queue.py')}",
         "predicate_extractor_version": f"compiler_predicates.py:{sha256(root / 'tools/compiler_predicates.py')}",
         "predicate_validator_version": f"validate_compiler_predicates.py:{sha256(root / 'tools/validate_compiler_predicates.py')}",
-        "scope_schema_version": "source-header-context-oracle-phase0-v6",
-        "header_dependency_schema_version": "header-provider-graph-v2",
+        "scope_schema_version": "source-header-context-oracle-phase0-v7",
+        "header_dependency_schema_version": "header-provider-enumerator-graph-v3",
         "oracle_classification_schema_version": "oracle-classification-v1",
         "compiler_predicates_sha256": sha256(predicate_root / "COMPILER_PREDICATES.tsv"),
         "compiler_predicates_schema_version": "compiler-predicates-v1",

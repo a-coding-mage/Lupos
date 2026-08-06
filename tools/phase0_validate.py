@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from collections import defaultdict
 import csv
 import hashlib
@@ -378,6 +379,98 @@ def code_only(text: str) -> str:
     return text
 
 
+def independent_integer_expression(expression: str, values: dict[str, int]) -> int | None:
+    """Independently evaluate the small enum-expression subset Phase 0 proves."""
+
+    candidate = re.sub(r"\b(0[xX][0-9A-Fa-f]+|[0-9]+)[uUlL]+\b", r"\1", expression)
+    for name in sorted(set(IDENTIFIER.findall(candidate)), key=len, reverse=True):
+        if name not in values:
+            return None
+        candidate = re.sub(rf"\b{re.escape(name)}\b", str(values[name]), candidate)
+    try:
+        tree = ast.parse(candidate.strip(), mode="eval")
+    except SyntaxError:
+        return None
+    permitted = (
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+        ast.Invert, ast.UAdd, ast.USub, ast.Add, ast.Sub, ast.Mult,
+        ast.Mod, ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr, ast.BitXor,
+    )
+    if any(not isinstance(node, permitted) for node in ast.walk(tree)):
+        return None
+    try:
+        value = eval(compile(tree, "<phase0-enum-validation>", "eval"), {"__builtins__": {}}, {})
+    except (ArithmeticError, ValueError):
+        return None
+    return value if isinstance(value, int) else None
+
+
+def independent_enum_constants(path: Path) -> list[tuple[str, int, str]]:
+    """Recover C enumerator names, lines, and provable values from source."""
+
+    original = path.read_text(errors="replace")
+    masked = code_only(original)
+    lines: list[str] = []
+    in_directive = False
+    for line in masked.splitlines(keepends=True):
+        directive = in_directive or re.match(r"^\s*#", line) is not None
+        in_directive = directive and line.rstrip().endswith("\\")
+        lines.append("".join("\n" if char == "\n" else " " for char in line) if directive else line)
+    text = "".join(lines)
+    enum_open = re.compile(r"\benum(?:\s+[A-Za-z_][A-Za-z0-9_]*)?\s*\{")
+    result: list[tuple[str, int, str]] = []
+    for match in enum_open.finditer(text):
+        start = match.end()
+        depth = 1
+        end = start
+        while end < len(text) and depth:
+            if text[end] == "{":
+                depth += 1
+            elif text[end] == "}":
+                depth -= 1
+            end += 1
+        if depth:
+            continue
+        body_end = end - 1
+        boundaries: list[tuple[int, int]] = []
+        segment_start = start
+        nesting = 0
+        for cursor in range(start, body_end):
+            char = text[cursor]
+            if char in "([":
+                nesting += 1
+            elif char in ")]" and nesting:
+                nesting -= 1
+            elif char == "," and nesting == 0:
+                boundaries.append((segment_start, cursor))
+                segment_start = cursor + 1
+        boundaries.append((segment_start, body_end))
+        values: dict[str, int] = {}
+        previous: int | None = -1
+        for segment_start, segment_end in boundaries:
+            segment = text[segment_start:segment_end]
+            item = re.match(
+                r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:=\s*(.*?))?\s*$",
+                segment,
+                flags=re.S,
+            )
+            if item is None:
+                previous = None
+                continue
+            name, expression = item.groups()
+            line = text.count("\n", 0, segment_start + item.start(1)) + 1
+            value = (
+                previous + 1 if expression is None and previous is not None
+                else independent_integer_expression(expression, values) if expression is not None
+                else None
+            )
+            if value is not None:
+                values[name] = value
+            previous = value
+            result.append((name, line, str(value) if value is not None else "PENDING_REVIEW"))
+    return result
+
+
 def header_reference_identifiers(text: str, definition_names: set[str]) -> set[str]:
     masked = code_only(text)
     masked = re.sub(r"^\s*#\s*include\b[^\n]*", "", masked, flags=re.M)
@@ -531,6 +624,11 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--artifacts", type=Path, default=Path("rewrite"))
     parser.add_argument("--stage", choices=("pre-queue", "frozen"), default="frozen")
+    parser.add_argument(
+        "--phase-gate-reopen",
+        action="store_true",
+        help="validate a recorded post-translation Phase 0 gate recovery without requiring src/ to be empty",
+    )
     parser.add_argument("--no-write-report", action="store_true")
     args = parser.parse_args()
     root = args.root.resolve()
@@ -727,7 +825,7 @@ def main() -> int:
         checks,
         "symbols_schema",
         artifacts / "SYMBOLS.tsv",
-        {"scope_id", "linux_path", "architectures", "record_kind", "symbol_name", "source_line", "selection_expression", "config_evidence", "linkage", "declaration", "evidence", "status"},
+        {"scope_id", "linux_path", "architectures", "record_kind", "symbol_name", "source_line", "selection_expression", "config_evidence", "linkage", "declaration", "mechanical_value", "evidence", "status"},
     )
     abi = required_fields(
         checks,
@@ -746,6 +844,31 @@ def main() -> int:
         "driver_abi_schema",
         artifacts / "DRIVER_ABI.tsv",
         {"scope_id", "linux_path", "architectures", "object_path", "kbuild_owner", "module_or_builtin", "record_kind", "abi_item", "evidence", "status"},
+    )
+    branding_allowlist = required_fields(
+        checks,
+        "branding_allowlist_schema",
+        artifacts / "BRANDING_ALLOWLIST.tsv",
+        {"linux_name", "lupos_name", "reason", "evidence"},
+    )
+    check(
+        checks,
+        "branding_allowlist_complete",
+        len({row.get("linux_name", "") for row in branding_allowlist})
+        == len(branding_allowlist)
+        and all(
+            row.get("linux_name") and row.get("lupos_name")
+            and row.get("reason") and row.get("evidence")
+            for row in branding_allowlist
+        ),
+        f"rows={len(branding_allowlist)}",
+    )
+    check(
+        checks,
+        "porting_guidance_present",
+        (artifacts / "PORTING.md").is_file()
+        and (artifacts / "PORTING.md").stat().st_size > 0,
+        artifacts / "PORTING.md",
     )
     header_closure = required_fields(
         checks,
@@ -1288,6 +1411,10 @@ def main() -> int:
     definitions_by_header: dict[str, set[str]] = {
         path: set() for path in rust_header_paths
     }
+    expected_enum_constants_by_header = {
+        path: independent_enum_constants(linux_root / path)
+        for path in sorted(rust_header_paths)
+    }
     for row in symbols:
         path = row.get("linux_path", "")
         if path not in definitions_by_header:
@@ -1306,6 +1433,10 @@ def main() -> int:
                 definitions_by_header[path].add(
                     f"{name.split(None, 1)[0]}:{tag.group(1)}"
                 )
+    for path, constants in expected_enum_constants_by_header.items():
+        definitions_by_header[path].update(
+            f"identifier:{name}" for name, _, _ in constants
+        )
     definition_names = set().union(*definitions_by_header.values())
     unresolved_references_by_arch: dict[str, dict[str, set[str]]] = {
         arch: {} for arch in ARCHES
@@ -1435,6 +1566,24 @@ def main() -> int:
         f"expected={len(expected_context_rows)} actual={len(actual_context_rows)} "
         f"errors={context_edge_errors[:20]}",
     )
+    netfilter_provider_edge = actual_context_rows.get((
+        "x86_64",
+        "include/uapi/linux/netfilter/xt_state.h",
+        "include/uapi/linux/netfilter/nf_conntrack_common.h",
+    ), {})
+    netfilter_provider_identifiers = set(
+        value for value in netfilter_provider_edge.get("provided_identifiers", "").split(",")
+        if value
+    )
+    check(
+        checks,
+        "xt_state_conntrack_enum_provider",
+        {
+            "identifier:IP_CT_IS_REPLY",
+            "identifier:IP_CT_NUMBER",
+        } <= netfilter_provider_identifiers,
+        netfilter_provider_edge,
+    )
 
     rust_scope_ids = {
         row.get("id", "") for row in scope if row.get("class") == "RUST_TRANSLATE"
@@ -1483,6 +1632,21 @@ def main() -> int:
         f"scope={len(dependency_pairs_from_scope)} metadata={len(dependency_pairs_from_metadata)} "
         f"field_errors={dependency_field_errors[:20]} metadata_errors={dependency_metadata_errors[:20]} "
         f"delta={sorted(dependency_pairs_from_scope ^ dependency_pairs_from_metadata)[:20]}",
+    )
+    xt_state_scope = scope_by_path.get("include/uapi/linux/netfilter/xt_state.h", {})
+    conntrack_scope = scope_by_path.get(
+        "include/uapi/linux/netfilter/nf_conntrack_common.h", {}
+    )
+    required_netfilter_pair = (
+        xt_state_scope.get("id", ""), conntrack_scope.get("id", "")
+    )
+    check(
+        checks,
+        "xt_state_conntrack_task_dependency",
+        required_netfilter_pair == ("S016294", "S016270")
+        and required_netfilter_pair in dependency_pairs_from_scope
+        and required_netfilter_pair in dependency_pairs_from_metadata,
+        required_netfilter_pair,
     )
     task_reachability_cache: dict[str, set[str]] = {}
 
@@ -1693,12 +1857,64 @@ def main() -> int:
             or row.get("config_evidence") != expected_config
             or not row.get("evidence")
             or row.get("status") != expected_status
-            or row.get("record_kind") not in {"function", "function_macro", "type", "static", "global", "export", "operative_macro", "conditional"}
+            or row.get("record_kind") not in {"function", "function_macro", "type", "static", "global", "export", "operative_macro", "conditional", "enum_constant"}
             or (row.get("record_kind") == "conditional" and "selected=" not in row.get("evidence", ""))
         ):
             malformed_symbol_rows.append((key, row.get("record_kind"), row.get("symbol_name")))
     check(checks, "semantic_no_file_placeholders", not placeholder_rows, placeholder_rows[:20])
     check(checks, "symbols_mechanical_fields", not malformed_symbol_rows, malformed_symbol_rows[:20])
+
+    enum_inventory_errors: list[str] = []
+    actual_enum_rows: dict[tuple[str, str, str, int], str] = {}
+    for row in symbols:
+        if row.get("record_kind") != "enum_constant":
+            continue
+        try:
+            line = int(row.get("source_line", ""))
+        except ValueError:
+            enum_inventory_errors.append(f"{row.get('scope_id')}:invalid-line")
+            continue
+        key = (
+            row.get("linux_path", ""), row.get("architectures", ""),
+            row.get("symbol_name", ""), line,
+        )
+        if key in actual_enum_rows:
+            enum_inventory_errors.append(f"{key}:duplicate")
+        actual_enum_rows[key] = row.get("mechanical_value", "")
+    expected_enum_rows: dict[tuple[str, str, str, int], str] = {}
+    for path, constants in expected_enum_constants_by_header.items():
+        scope_row = scope_by_path[path]
+        for arch in expected_arches(scope_row.get("architectures", "")):
+            for name, line, value in constants:
+                expected_enum_rows[(path, arch, name, line)] = value
+    for key in sorted(set(expected_enum_rows) | {
+        item for item in actual_enum_rows if item[0] in rust_header_paths
+    }):
+        if expected_enum_rows.get(key) != actual_enum_rows.get(key):
+            enum_inventory_errors.append(
+                f"{key}:expected={expected_enum_rows.get(key)}:actual={actual_enum_rows.get(key)}"
+            )
+    check(
+        checks,
+        "header_enum_constant_inventory_exact",
+        not enum_inventory_errors,
+        f"expected={len(expected_enum_rows)} errors={enum_inventory_errors[:20]}",
+    )
+    ip_ct_number_values = {
+        arch: actual_enum_rows.get((
+            "include/uapi/linux/netfilter/nf_conntrack_common.h",
+            arch,
+            "IP_CT_NUMBER",
+            27,
+        ))
+        for arch in ARCHES
+    }
+    check(
+        checks,
+        "ip_ct_number_mechanical_value",
+        ip_ct_number_values == {"x86_64": "5", "aarch64": "5"},
+        ip_ct_number_values,
+    )
 
     coverage_errors = []
     rust_scope = [row for row in scope if row.get("class") == "RUST_TRANSLATE"]
@@ -1779,7 +1995,11 @@ def main() -> int:
         {"path", "sha256"},
     )
     indexed = {row.get("path", ""): row.get("sha256", "") for row in hash_index}
-    required_manifests = {"SCOPE.tsv", "FILE_MAP.tsv", "SYMBOLS.tsv", "ABI.tsv", "LIFETIMES.tsv", "DRIVER_ABI.tsv"}
+    required_manifests = {
+        "SCOPE.tsv", "FILE_MAP.tsv", "SYMBOLS.tsv", "ABI.tsv",
+        "LIFETIMES.tsv", "DRIVER_ABI.tsv", "PORTING.md",
+        "BRANDING_ALLOWLIST.tsv",
+    }
     manifest_hash_errors = [
         name for name in sorted(required_manifests)
         if not (artifacts / name).is_file() or indexed.get(name) != digest(artifacts / name)
@@ -1799,12 +2019,56 @@ def main() -> int:
             metadata_hash_errors.append(row.get("path", ""))
     check(checks, "metadata_manifest_hashes", not metadata_hash_errors, metadata_hash_errors[:20])
 
-    check(
-        checks,
-        "src_empty_at_first_init",
-        not any(path.is_file() for path in (root / "src").rglob("*")),
-        root / "src",
-    )
+    if args.phase_gate_reopen:
+        event_records: list[dict[str, object]] = []
+        event_errors: list[str] = []
+        try:
+            for line_number, line in enumerate(
+                (canonical / "events.jsonl").read_text(encoding="utf-8").splitlines(), 1
+            ):
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    event_errors.append(f"line={line_number}:not-object")
+                    continue
+                event_records.append(record)
+        except (OSError, json.JSONDecodeError) as exc:
+            event_errors.append(f"{type(exc).__name__}:{exc}")
+        reopen_events = [
+            record for record in event_records
+            if record.get("phase") == "phase0"
+            and record.get("event") == "queue_invalidated"
+            and "mode=phase-gate-reopen" in str(record.get("detail", ""))
+        ]
+        current_queue_rows = (
+            rows(canonical / "TRANSLATION_TASKS.tsv")
+            if (canonical / "TRANSLATION_TASKS.tsv").is_file() else []
+        )
+        active_rows = [
+            row.get("id", "") for row in current_queue_rows
+            if row.get("status") in {"IN_PROGRESS", "IMPLEMENTED", "REVIEWING", "APPLYING"}
+            or row.get("lease_owner") or row.get("lease_expires_at")
+        ]
+        check(
+            checks,
+            "phase_gate_reopen_authorized",
+            len(reopen_events) == 1 and not event_errors and not active_rows,
+            f"events={len(reopen_events)} event_errors={event_errors[:5]} active={active_rows[:10]}",
+        )
+        check(
+            checks,
+            "src_preserved_during_phase_gate_reopen",
+            not any(path.is_symlink() for path in (root / "src").rglob("*")),
+            root / "src",
+        )
+    else:
+        check(
+            checks,
+            "src_empty_at_first_init",
+            not any(path.is_file() for path in (root / "src").rglob("*")),
+            root / "src",
+        )
 
     if args.stage == "pre-queue":
         queue_absent = not (artifacts / "TRANSLATION_TASKS.tsv").exists() and not (artifacts / "TRANSLATION_TASKS.sha256").exists()
@@ -1840,14 +2104,14 @@ def main() -> int:
             checks,
             "scope_schema_identity",
             identity.get("scope_schema_version", {}).get("value")
-            == "source-header-context-oracle-phase0-v6",
+            == "source-header-context-oracle-phase0-v7",
             identity.get("scope_schema_version", {}).get("value"),
         )
         check(
             checks,
             "header_dependency_schema_identity",
             identity.get("header_dependency_schema_version", {}).get("value")
-            == "header-provider-graph-v2",
+            == "header-provider-enumerator-graph-v3",
             identity.get("header_dependency_schema_version", {}).get("value"),
         )
         check(

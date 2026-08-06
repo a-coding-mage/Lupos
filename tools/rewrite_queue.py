@@ -833,7 +833,9 @@ def ensure_clean_initial_artifacts(
             )
 
 
-def validate_scope_translation_row(source: Mapping[str, str], linux_root: Path) -> None:
+def validate_scope_translation_row(
+    source: Mapping[str, str], linux_root: Path, *, allow_existing: bool = False
+) -> None:
     task_id = source.get("id", "")
     linux_value = source.get("linux_path", "")
     destination_value = source.get("destination_path", "")
@@ -860,10 +862,16 @@ def validate_scope_translation_row(source: Mapping[str, str], linux_root: Path) 
         )
     destination_file = Path(*destination.parts)
     if destination_file.exists() or destination_file.is_symlink():
-        die(
-            f"fresh rewrite destination already exists for task {task_id}: "
-            f"{destination_file}; remove historical translation contamination before init"
-        )
+        if not allow_existing:
+            die(
+                f"fresh rewrite destination already exists for task {task_id}: "
+                f"{destination_file}; remove historical translation contamination before init"
+            )
+        if destination_file.is_symlink() or not destination_file.is_file():
+            die(
+                f"phase-gate reopen destination must be an existing regular file or absent: "
+                f"{destination_file}"
+            )
     validate_architectures(
         source.get("architectures", ""), context=f"scope task {task_id}"
     )
@@ -898,6 +906,120 @@ def validate_scope_mechanical_row(source: Mapping[str, str], scope: Path) -> Non
             raise
 
 
+def verify_invalidated_snapshot(
+    rows: list[dict[str, str]], fingerprint: Path, linux_sha_file: Path
+) -> tuple[str, str]:
+    """Verify an invalidated queue without requiring its superseded identity file."""
+
+    expected_digest, expected_count, expected_linux_sha, expected_binding = read_fingerprint(
+        fingerprint
+    )
+    current_linux_sha = read_pinned_linux_sha(linux_sha_file)
+    if current_linux_sha != expected_linux_sha:
+        die(
+            "phase-gate reopen rejects a changed Linux revision: "
+            f"expected {expected_linux_sha}, found {current_linux_sha}"
+        )
+    actual_digest = immutable_digest(rows, current_linux_sha, expected_binding)
+    if len(rows) != expected_count or actual_digest != expected_digest:
+        die(
+            "invalidated queue immutable fields no longer match their frozen fingerprint; "
+            "refusing Phase 0 recovery"
+        )
+    return expected_digest, expected_binding
+
+
+def require_reopen_event(events: Path, archive: str) -> dict[str, object]:
+    if not events.is_file():
+        die(f"phase-gate reopen requires the append-only event log: {events}")
+    records: list[dict[str, object]] = []
+    for line_number, line in enumerate(events.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            die(f"malformed event JSON at {events}:{line_number}: {exc}")
+        if not isinstance(record, dict):
+            die(f"event record is not an object at {events}:{line_number}")
+        records.append(record)
+    token = f"mode=phase-gate-reopen; archive={archive};"
+    matches = [
+        (index, record) for index, record in enumerate(records)
+        if record.get("phase") == "phase0"
+        and record.get("event") == "queue_invalidated"
+        and token in str(record.get("detail", ""))
+    ]
+    if len(matches) != 1:
+        die(
+            f"expected exactly one phase-gate-reopen invalidation event for {archive}, "
+            f"found {len(matches)}"
+        )
+    index, record = matches[0]
+    if any(
+        later.get("event") in {"queue_reinitialized", "queue_frozen"}
+        and f"archive={archive}" in str(later.get("detail", ""))
+        for later in records[index + 1:]
+    ):
+        die(f"phase-gate reopen archive was already consumed: {archive}")
+    return record
+
+
+def append_prune_ledger(ledger: Path, archive: str, reason: str) -> None:
+    fields = ["pruned_at", "root", "file_count", "bytes", "policy", "reason"]
+    existing: list[dict[str, str]] = []
+    if ledger.exists():
+        with ledger.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            if reader.fieldnames != fields:
+                die(f"unexpected prune-ledger schema: {ledger}")
+            existing = [dict(row) for row in reader]
+    if any(row.get("root") == archive for row in existing):
+        die(f"phase-gate reopen already has a prune-ledger row: {archive}")
+
+    members_path = Path("rewrite/phase0-bundles/MEMBERS.tsv")
+    member_count = 0
+    member_bytes = 0
+    if members_path.is_file():
+        with members_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            if reader.fieldnames is None or not {"path", "bytes"} <= set(reader.fieldnames):
+                die(f"invalid Phase 0 bundle member index: {members_path}")
+            for row in reader:
+                try:
+                    member_bytes += int(row.get("bytes", "0"))
+                except ValueError:
+                    die(f"invalid member byte count in {members_path}: {row.get('bytes')!r}")
+                member_count += 1
+    existing.append({
+        "pruned_at": now_utc(),
+        "root": archive,
+        "file_count": str(member_count),
+        "bytes": str(member_bytes),
+        "policy": (
+            "retain one append-only prune-ledger row only; do not retain per-run "
+            "directories, copied READMEs, Kbuild artifacts, or generated payloads"
+        ),
+        "reason": reason,
+    })
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{ledger.name}.", dir=ledger.parent, text=True)
+    temporary = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=fields, delimiter="\t", lineterminator="\n"
+            )
+            writer.writeheader()
+            writer.writerows(existing)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, ledger)
+        fsync_directory(ledger.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     ensure_branch(args.skip_branch_check)
     queue, fingerprint, events, logs_root = common_paths(args)
@@ -905,7 +1027,43 @@ def cmd_init(args: argparse.Namespace) -> None:
     linux_root = Path(args.linux_root)
     linux_sha_file = Path(args.linux_sha_file)
     with QueueLock(queue):
-        ensure_clean_initial_artifacts(queue, fingerprint, events, logs_root)
+        reopening = bool(args.phase_gate_reopen)
+        old_rows: list[dict[str, str]] = []
+        old_digest = ""
+        if reopening:
+            if not args.archive or not args.reopen_reason:
+                die("--phase-gate-reopen requires --archive and --reopen-reason")
+            archive_path = PurePosixPath(args.archive)
+            if (
+                archive_path.is_absolute()
+                or ".." in archive_path.parts
+                or not archive_path.as_posix().startswith("rewrite/archive/phase0-")
+            ):
+                die("phase-gate reopen archive must be a relative rewrite/archive/phase0-* path")
+            if Path(args.archive).exists():
+                die(
+                    "prune-ledger-only policy forbids retaining the invalidated per-run "
+                    f"archive directory: {args.archive}"
+                )
+            old_rows = read_tsv(queue, FIELDS)
+            validate_rows(old_rows)
+            old_digest, _ = verify_invalidated_snapshot(
+                old_rows, fingerprint, linux_sha_file
+            )
+            active_or_leased = [
+                row for row in old_rows
+                if row["status"] in ACTIVE_STATUSES
+                or row.get("lease_owner")
+                or row.get("lease_expires_at")
+            ]
+            if active_or_leased:
+                die(
+                    "phase-gate reopen requires no active task or lease: "
+                    + ", ".join(f"{row['id']}={row['status']}" for row in active_or_leased[:10])
+                )
+            require_reopen_event(events, args.archive)
+        else:
+            ensure_clean_initial_artifacts(queue, fingerprint, events, logs_root)
         if not scope.is_file():
             die(f"missing scope file: {scope}")
         linux_sha = verify_linux_checkout(linux_root, linux_sha_file)
@@ -927,7 +1085,9 @@ def cmd_init(args: argparse.Namespace) -> None:
         created = now_utc()
         rows: list[dict[str, str]] = []
         for source in selected:
-            validate_scope_translation_row(source, linux_root)
+            validate_scope_translation_row(
+                source, linux_root, allow_existing=reopening
+            )
             risk = source.get("risk", "medium") or "medium"
             if risk not in {"low", "medium", "high"}:
                 die(f"invalid risk for scope row {source['id']}: {risk!r}")
@@ -961,14 +1121,24 @@ def cmd_init(args: argparse.Namespace) -> None:
         rows.sort(key=lambda row: row["id"])
         validate_rows(rows)
         atomic_write_tsv(queue, rows)
+        if reopening and fingerprint.exists():
+            fingerprint.unlink()
+            fsync_directory(fingerprint.parent)
         initialization_events = [
             event_payload(
                 None,
-                event="queue_initialized",
+                phase="phase0" if reopening else "translation",
+                event="queue_reinitialized" if reopening else "queue_initialized",
                 role="queue_tool",
                 model="none",
                 effort="none",
-                detail=f"created {len(rows)} tasks from {scope}; linux_sha={linux_sha}",
+                detail=(
+                    f"phase-gate-reopen; archive={args.archive}; old_queue_sha256={old_digest}; "
+                    f"created {len(rows)} all-TODO tasks from {scope}; linux_sha={linux_sha}; "
+                    "prior terminal and stage states were not reused"
+                    if reopening else
+                    f"created {len(rows)} tasks from {scope}; linux_sha={linux_sha}"
+                ),
             )
         ]
         initialization_events.extend(
@@ -983,6 +1153,10 @@ def cmd_init(args: argparse.Namespace) -> None:
             )
             for row in rows
         )
+        if reopening:
+            append_prune_ledger(
+                Path(args.prune_ledger), args.archive, args.reopen_reason
+            )
         append_events(events, initialization_events)
     print(json.dumps({"queue": str(queue), "tasks": len(rows), "created_at": created}))
 
@@ -1680,6 +1854,10 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init", help="Create all RUST_TRANSLATE task rows from frozen SCOPE.tsv")
     add_common_files(init)
     init.add_argument("--scope", default="rewrite/SCOPE.tsv")
+    init.add_argument("--phase-gate-reopen", action="store_true")
+    init.add_argument("--archive", default="")
+    init.add_argument("--reopen-reason", default="")
+    init.add_argument("--prune-ledger", default="rewrite/archive/PRUNED_TSVS.tsv")
     init.set_defaults(func=cmd_init)
 
     freeze = sub.add_parser("freeze", help="Fingerprint immutable queue fields before Phase 1")

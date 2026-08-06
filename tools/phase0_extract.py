@@ -37,7 +37,7 @@ FILE_MAP_FIELDS = [
 SYMBOL_FIELDS = [
     "scope_id", "linux_path", "architectures", "record_kind", "symbol_name",
     "source_line", "selection_expression", "config_evidence", "linkage",
-    "declaration", "evidence", "status",
+    "declaration", "mechanical_value", "evidence", "status",
 ]
 ABI_FIELDS = [
     "scope_id", "linux_path", "architectures", "record_kind", "symbol_name",
@@ -1228,6 +1228,119 @@ def typedef_identity(declaration: str) -> str | None:
     return terminal.group(1) if terminal else None
 
 
+def mechanical_enum_value(expression: str, values: dict[str, int]) -> int | None:
+    """Evaluate a deliberately small, mechanically auditable C enum subset.
+
+    Unsupported casts, macros, calls, ternaries, and identifiers remain
+    ``PENDING_REVIEW``.  This is sufficient to prove ordinary implicit C enum
+    sequences and expressions over preceding enumerators without pretending to
+    be a C compiler.
+    """
+
+    candidate = re.sub(r"\b(0[xX][0-9A-Fa-f]+|[0-9]+)[uUlL]+\b", r"\1", expression)
+
+    def replace_identifier(match: re.Match[str]) -> str:
+        name = match.group(0)
+        if name not in values:
+            raise KeyError(name)
+        return str(values[name])
+
+    try:
+        candidate = IDENTIFIER.sub(replace_identifier, candidate)
+        tree = ast.parse(candidate.strip(), mode="eval")
+    except (KeyError, SyntaxError):
+        return None
+    allowed = (
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+        ast.Invert, ast.UAdd, ast.USub, ast.Add, ast.Sub, ast.Mult,
+        ast.Mod, ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr, ast.BitXor,
+    )
+    if any(not isinstance(node, allowed) for node in ast.walk(tree)):
+        return None
+    try:
+        result = eval(compile(tree, "<phase0-enumerator>", "eval"), {"__builtins__": {}}, {})
+    except (ArithmeticError, ValueError):
+        return None
+    return result if isinstance(result, int) else None
+
+
+def enum_constant_entities(
+    masked: str, selected_text: str, selection: dict[int, str]
+) -> list[dict[str, str]]:
+    """Inventory named C enumerators and mechanically provable values.
+
+    Enumerators are ordinary identifiers visible to later headers even though
+    they are not macros or tagged types.  Omitting them from the header provider
+    graph can hide real cross-header task dependencies.
+    """
+
+    result: list[dict[str, str]] = []
+    enum_open = re.compile(r"\benum(?:\s+[A-Za-z_][A-Za-z0-9_]*)?\s*\{")
+    for match in enum_open.finditer(masked):
+        body_start = match.end()
+        depth = 1
+        index = body_start
+        while index < len(masked) and depth:
+            if masked[index] == "{":
+                depth += 1
+            elif masked[index] == "}":
+                depth -= 1
+            index += 1
+        if depth:
+            continue
+        body_end = index - 1
+        segments: list[tuple[int, int]] = []
+        segment_start = body_start
+        nesting = 0
+        cursor = body_start
+        while cursor < body_end:
+            char = masked[cursor]
+            if char in "([":
+                nesting += 1
+            elif char in ")]" and nesting:
+                nesting -= 1
+            elif char == "," and nesting == 0:
+                segments.append((segment_start, cursor))
+                segment_start = cursor + 1
+            cursor += 1
+        segments.append((segment_start, body_end))
+
+        values: dict[str, int] = {}
+        previous_value: int | None = -1
+        for start, end in segments:
+            segment = masked[start:end]
+            enumerator = re.match(
+                r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:=\s*(.*?))?\s*$",
+                segment,
+                flags=re.S,
+            )
+            if enumerator is None:
+                previous_value = None
+                continue
+            name, expression = enumerator.groups()
+            name_offset = start + enumerator.start(1)
+            line = masked.count("\n", 0, name_offset) + 1
+            if expression is None:
+                value = previous_value + 1 if previous_value is not None else None
+            else:
+                value = mechanical_enum_value(expression, values)
+            if value is not None:
+                values[name] = value
+            previous_value = value
+            declaration = normalize_declaration(selected_text[start:end])
+            result.append({
+                "record_kind": "enum_constant",
+                "symbol_name": name,
+                "source_line": str(line),
+                "selection_expression": selection.get(line, "1"),
+                "linkage": "NOT_APPLICABLE",
+                "declaration": declaration,
+                "mechanical_value": str(value) if value is not None else "PENDING_REVIEW",
+                "status": "COMPLETE",
+            })
+    return result
+
+
 def translation_source_units(
     source: Path, linux_root: Path, generated_root: Path
 ) -> list[tuple[Path, str, str]]:
@@ -1405,6 +1518,7 @@ def source_entities(text: str, active_lines: set[int], selection: dict[int, str]
         for number, (raw, line) in enumerate(zip(lines, fully_masked), 1)
     )
     entities: list[dict[str, str]] = []
+    entities.extend(enum_constant_entities(masked, selected_text, selection))
     depth = 0
     segment_start = 0
     function_depth: int | None = None
@@ -2191,7 +2305,9 @@ def main() -> None:
         kind = row["record_kind"]
         if IDENTIFIER.fullmatch(name) and kind == "operative_macro":
             definitions_by_header[path].add(f"macro:{name}")
-        elif IDENTIFIER.fullmatch(name) and kind in {"type", "function", "function_macro"}:
+        elif IDENTIFIER.fullmatch(name) and kind in {
+            "type", "function", "function_macro", "enum_constant",
+        }:
             definitions_by_header[path].add(f"identifier:{name}")
         else:
             tag = re.fullmatch(r"(?:struct|union|enum)\s+([A-Za-z_][A-Za-z0-9_]*)", name)
@@ -2490,7 +2606,11 @@ def main() -> None:
     )
     authoritative_manifest_rows = [
         {"path": name, "sha256": sha256(args.out / name)}
-        for name in ("SCOPE.tsv", "FILE_MAP.tsv", "SYMBOLS.tsv", "ABI.tsv", "LIFETIMES.tsv", "DRIVER_ABI.tsv")
+        for name in (
+            "SCOPE.tsv", "FILE_MAP.tsv", "SYMBOLS.tsv", "ABI.tsv",
+            "LIFETIMES.tsv", "DRIVER_ABI.tsv", "PORTING.md",
+            "BRANDING_ALLOWLIST.tsv",
+        )
     ]
     write_tsv(
         args.out / "metadata" / "authoritative_manifests.tsv",

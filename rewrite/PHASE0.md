@@ -123,12 +123,26 @@ lexical definition/reference matching, forced-include ancestry, components,
 task reachability, and acyclicity from retained Kbuild evidence; it does not
 accept the extractor's graph on trust.
 
+Named C enumerators are provider definitions and must be inventoried with a
+mechanically evaluated value whenever their implicit sequence or restricted
+integer expression over earlier enumerators permits it. The independent
+validator reconstructs both the enumerator inventory and those values directly
+from pinned source before accepting any enum-dependent context edge.
+
 A phase-gate defect discovered after source review is invalidated only with
 `rewrite_queue.py invalidate --phase-gate-reopen`. That explicit mode still
 requires a valid branch and fingerprint, rejects every active stage or lease,
 records prior terminal rows in the append-only event log, and never rewrites
 the invalid queue TSV. Ordinary provisional invalidation remains stricter and
 continues to reject `DONE` rows.
+
+After regenerated manifests pass staged pre-queue validation, the matching
+recorded invalidation is consumed by `rewrite_queue.py init
+--phase-gate-reopen --archive <recorded-path> --reopen-reason <reason>`. The
+tool verifies the superseded immutable fingerprint without trusting a replaced
+identity, writes exactly one prune-ledger row, retains no per-run archive
+directory, preserves the append-only event and task evidence, and initializes
+every regenerated task at `TODO`/attempt zero without reusing terminal state.
 
 ## Oracle-only test classification
 
