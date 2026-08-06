@@ -1,0 +1,11 @@
+Candidate created: `src/include/uapi/linux/sunrpc_netlink.rs`.
+
+Scope summary:
+
+- UAPI provenance and dual-architecture header added.
+- `sunrpc_cache_type` retains a transparent C `int` ABI representation.
+- Every source enum enumerator is represented as a typed Rust constant with
+  the same explicit or implicit integer value; each `*_MAX` remains derived
+  from its corresponding hidden maximum constant.
+- `SUNRPC_FAMILY_NAME`, `SUNRPC_MCGRP_NONE`, and `SUNRPC_MCGRP_EXPORTD` retain
+  NUL-terminated static literal storage and C-pointer decay semantics.

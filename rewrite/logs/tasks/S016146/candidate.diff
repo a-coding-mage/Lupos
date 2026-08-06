@@ -1,0 +1,7 @@
+# Candidate summary — S016146
+
+- Added the path-preserving Rust destination `src/include/uapi/linux/hid.rs`.
+- Preserved the upstream SPDX expression, source/revision/architecture/task
+  provenance, UAPI constant names, C `int` enum ABI aliases, enumerators,
+  requests, class descriptor values, and descriptor limit.
+- No files outside this task's destination and evidence directory were edited.

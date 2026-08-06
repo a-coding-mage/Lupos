@@ -1,0 +1,5 @@
+#if __has_attribute(__no_stack_protector__)
+LUPOS_COMPILER_PREDICATE_CP296129678ebdf8969faf2ca9_1
+#else
+LUPOS_COMPILER_PREDICATE_CP296129678ebdf8969faf2ca9_0
+#endif

@@ -1,0 +1,9 @@
+# S016011 candidate summary
+
+New destination: `src/include/uapi/asm-generic/mman-common.rs`
+
+The candidate faithfully exports all 53 source macros as `pub const` `i32`
+definitions: protection flags, mapping flags, `MLOCK_ONFAULT`, `msync` flags,
+all memory-advice selectors, `MAP_FILE`, and protection-key flags. It preserves
+the source SPDX expression, author attribution, immutable provenance, and the
+computed `PKEY_ACCESS_MASK` expression.

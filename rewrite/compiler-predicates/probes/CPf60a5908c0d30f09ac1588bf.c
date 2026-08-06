@@ -1,0 +1,5 @@
+#if __has_attribute(__preserve_most__)
+LUPOS_COMPILER_PREDICATE_CPf60a5908c0d30f09ac1588bf_1
+#else
+LUPOS_COMPILER_PREDICATE_CPf60a5908c0d30f09ac1588bf_0
+#endif

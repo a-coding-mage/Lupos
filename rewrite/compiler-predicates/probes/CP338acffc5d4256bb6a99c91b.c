@@ -1,0 +1,5 @@
+#if __has_feature(memory_sanitizer)
+LUPOS_COMPILER_PREDICATE_CP338acffc5d4256bb6a99c91b_1
+#else
+LUPOS_COMPILER_PREDICATE_CP338acffc5d4256bb6a99c91b_0
+#endif

@@ -1,0 +1,5 @@
+#if __has_attribute(no_sanitize)
+LUPOS_COMPILER_PREDICATE_CP857eb3b63af1ce26813330c4_1
+#else
+LUPOS_COMPILER_PREDICATE_CP857eb3b63af1ce26813330c4_0
+#endif

@@ -1,0 +1,5 @@
+# S016234 candidate summary
+
+New destination: `src/include/uapi/linux/major.rs`.
+
+The candidate adds immutable provenance for the pinned source and revision and a faithful Rust declaration for each of the 139 upstream UAPI device-major macros. No unrelated source, module index, manifest, test, or driver was changed.

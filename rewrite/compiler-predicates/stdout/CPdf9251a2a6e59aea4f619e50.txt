@@ -1,0 +1,22 @@
+static inline void _context_unsafe_alias(void **p) { }
+struct ftrace_branch_data {
+ const char *func;
+ const char *file;
+ unsigned line;
+ union {
+  struct {
+   unsigned long correct;
+   unsigned long incorrect;
+  };
+  struct {
+   unsigned long miss;
+   unsigned long hit;
+  };
+  unsigned long miss_hit[2];
+ };
+};
+struct ftrace_likely_data {
+ struct ftrace_branch_data data;
+ unsigned long constant;
+};
+LUPOS_COMPILER_PREDICATE_CPdf9251a2a6e59aea4f619e50_0

@@ -1,0 +1,5 @@
+#if __has_attribute(__uninitialized__)
+LUPOS_COMPILER_PREDICATE_CP4085abb1c0d8e59ef6b18a91_1
+#else
+LUPOS_COMPILER_PREDICATE_CP4085abb1c0d8e59ef6b18a91_0
+#endif

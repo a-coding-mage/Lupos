@@ -1,0 +1,5 @@
+#if __has_feature(hwaddress_sanitizer)
+LUPOS_COMPILER_PREDICATE_CP3046dba367b6a6afa43c1749_1
+#else
+LUPOS_COMPILER_PREDICATE_CP3046dba367b6a6afa43c1749_0
+#endif

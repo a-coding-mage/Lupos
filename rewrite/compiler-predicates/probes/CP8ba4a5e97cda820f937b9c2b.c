@@ -1,0 +1,5 @@
+#if __has_builtin(__builtin_dynamic_object_size)
+LUPOS_COMPILER_PREDICATE_CP8ba4a5e97cda820f937b9c2b_1
+#else
+LUPOS_COMPILER_PREDICATE_CP8ba4a5e97cda820f937b9c2b_0
+#endif

@@ -1,0 +1,5 @@
+#if __has_builtin(__builtin_has_attribute)
+LUPOS_COMPILER_PREDICATE_CP48d8a1081efc5a19cc03d4a8_1
+#else
+LUPOS_COMPILER_PREDICATE_CP48d8a1081efc5a19cc03d4a8_0
+#endif

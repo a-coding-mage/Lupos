@@ -1,0 +1,5 @@
+#if __has_attribute(__overloadable__)
+LUPOS_COMPILER_PREDICATE_CPc7ae18abc306431f383fa45f_1
+#else
+LUPOS_COMPILER_PREDICATE_CPc7ae18abc306431f383fa45f_0
+#endif

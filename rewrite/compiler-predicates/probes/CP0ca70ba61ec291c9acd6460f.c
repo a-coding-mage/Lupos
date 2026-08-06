@@ -1,0 +1,5 @@
+#if __has_attribute(__no_caller_saved_registers__)
+LUPOS_COMPILER_PREDICATE_CP0ca70ba61ec291c9acd6460f_1
+#else
+LUPOS_COMPILER_PREDICATE_CP0ca70ba61ec291c9acd6460f_0
+#endif

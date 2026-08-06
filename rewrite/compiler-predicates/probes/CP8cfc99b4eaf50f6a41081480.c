@@ -1,0 +1,5 @@
+#if __has_builtin(__builtin_counted_by_ref)
+LUPOS_COMPILER_PREDICATE_CP8cfc99b4eaf50f6a41081480_1
+#else
+LUPOS_COMPILER_PREDICATE_CP8cfc99b4eaf50f6a41081480_0
+#endif

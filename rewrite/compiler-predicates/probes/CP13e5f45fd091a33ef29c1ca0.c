@@ -1,0 +1,5 @@
+#if __has_feature(address_sanitizer)
+LUPOS_COMPILER_PREDICATE_CP13e5f45fd091a33ef29c1ca0_1
+#else
+LUPOS_COMPILER_PREDICATE_CP13e5f45fd091a33ef29c1ca0_0
+#endif

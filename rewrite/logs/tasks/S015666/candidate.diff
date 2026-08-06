@@ -1,0 +1,19 @@
+S015666 fresh translation candidate
+
+Destination: src/include/net/tcp_states.rs
+Source: vendor/linux/include/net/tcp_states.h
+Architectures: common (selected by both frozen x86_64 and AArch64 configurations)
+
+Mapping summary:
+- C anonymous enum at source lines 12-27 -> fourteen public `i32` state
+  constants, retaining the explicit first value and every implicit successor.
+- C macro at source line 30 -> public `i32` `TCP_STATE_MASK` constant.
+- C macro at source line 32 -> public `i32` `TCP_ACTION_FIN` shift expression.
+- C anonymous enum at source lines 34-48 -> thirteen public `i32` `TCPF_*`
+  shift expressions.
+- The C include guard has no Rust runtime or ABI equivalent; Rust module
+  inclusion supplies the corresponding one-definition boundary.
+
+No source definitions were omitted. The candidate introduces no functions,
+storage, FFI declarations, layout-bearing representations, unsafe code, tests,
+placeholders, configuration branches, or synchronization behavior.

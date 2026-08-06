@@ -1,0 +1,11 @@
+New file `src/kernel/locking/lock_events_list.rs` translates the selected
+`LOCK_EVENT` expansions from `kernel/locking/lock_events_list.h`.
+
+The candidate contains:
+
+- `#[repr(i32)] enum lock_events` with the 38 selected `LOCKEVENT_*`
+  discriminants in their upstream declaration order, 0 through 37.
+- `LOCK_EVENT_NAMES`, the corresponding ordered source-name expansion used by
+  the string-table include site in `kernel/locking/lock_events.c`.
+- no PV qspinlock entries, because `CONFIG_PARAVIRT_SPINLOCKS` is unset in both
+  frozen configurations.

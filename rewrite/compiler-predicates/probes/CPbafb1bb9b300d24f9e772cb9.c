@@ -1,0 +1,5 @@
+#if __has_attribute(__fallthrough__)
+LUPOS_COMPILER_PREDICATE_CPbafb1bb9b300d24f9e772cb9_1
+#else
+LUPOS_COMPILER_PREDICATE_CPbafb1bb9b300d24f9e772cb9_0
+#endif

@@ -1,0 +1,5 @@
+#if __has_builtin(__builtin_isdigit)
+LUPOS_COMPILER_PREDICATE_CP6efce7d6d706e70300c1196a_1
+#else
+LUPOS_COMPILER_PREDICATE_CP6efce7d6d706e70300c1196a_0
+#endif

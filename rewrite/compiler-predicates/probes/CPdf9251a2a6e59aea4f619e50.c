@@ -1,0 +1,5 @@
+#if __has_attribute(__nonstring__)
+LUPOS_COMPILER_PREDICATE_CPdf9251a2a6e59aea4f619e50_1
+#else
+LUPOS_COMPILER_PREDICATE_CPdf9251a2a6e59aea4f619e50_0
+#endif

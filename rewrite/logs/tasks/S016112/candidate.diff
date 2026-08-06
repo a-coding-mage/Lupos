@@ -1,0 +1,7 @@
+# Candidate diff summary: S016112
+
+Added `src/include/uapi/linux/elf-em.rs` as the path-preserving translation of `include/uapi/linux/elf-em.h`.
+
+- Preserves the source SPDX license, immutable provenance, all 49 public machine-ID constants, exact numeric values (including hexadecimal spellings), duplicate values, and comments describing historical/interim identifiers.
+- Uses `i32` because each source macro is an unsuffixed C integer constant representable as `int`.
+- Adds no behavior, tests, ABI objects, or architecture-specific branch.

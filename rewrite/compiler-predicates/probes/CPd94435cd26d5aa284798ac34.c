@@ -1,0 +1,5 @@
+#if __has_feature(coverage_sanitizer)
+LUPOS_COMPILER_PREDICATE_CPd94435cd26d5aa284798ac34_1
+#else
+LUPOS_COMPILER_PREDICATE_CPd94435cd26d5aa284798ac34_0
+#endif

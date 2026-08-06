@@ -1,0 +1,5 @@
+#if __has_builtin(__builtin_unreachable)
+LUPOS_COMPILER_PREDICATE_CPb7ca462e63c1290abceb03c4_1
+#else
+LUPOS_COMPILER_PREDICATE_CPb7ca462e63c1290abceb03c4_0
+#endif

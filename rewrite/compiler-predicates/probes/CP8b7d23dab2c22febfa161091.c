@@ -1,0 +1,5 @@
+#if __has_feature(undefined_behavior_sanitizer)
+LUPOS_COMPILER_PREDICATE_CP8b7d23dab2c22febfa161091_1
+#else
+LUPOS_COMPILER_PREDICATE_CP8b7d23dab2c22febfa161091_0
+#endif

@@ -1,0 +1,7 @@
+# S000200 candidate summary
+
+Added `src/arch/arm64/include/asm/vncr_mapping.rs` with immutable provenance and the complete `VNCR_*` byte-displacement map from `arch/arm64/include/asm/vncr_mapping.h`.
+
+- 104 source macros map one-to-one to 104 public `i32` constants.
+- Values, gaps, ordering, and uppercase exported names are retained exactly; hexadecimal spelling is normalized only in case.
+- The C include guard has no runtime or ABI analogue in the one-to-one Rust module.

@@ -1,0 +1,5 @@
+#if __has_attribute(btf_type_tag)
+LUPOS_COMPILER_PREDICATE_CPc724ac27ed83feb28613831c_1
+#else
+LUPOS_COMPILER_PREDICATE_CPc724ac27ed83feb28613831c_0
+#endif

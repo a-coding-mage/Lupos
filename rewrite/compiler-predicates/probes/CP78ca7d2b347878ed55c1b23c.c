@@ -1,0 +1,5 @@
+#if __has_feature(thread_sanitizer)
+LUPOS_COMPILER_PREDICATE_CP78ca7d2b347878ed55c1b23c_1
+#else
+LUPOS_COMPILER_PREDICATE_CP78ca7d2b347878ed55c1b23c_0
+#endif

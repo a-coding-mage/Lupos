@@ -1,0 +1,5 @@
+#if __has_attribute(__warning__)
+LUPOS_COMPILER_PREDICATE_CP25b6ea69749f06e16e9e6ab0_1
+#else
+LUPOS_COMPILER_PREDICATE_CP25b6ea69749f06e16e9e6ab0_0
+#endif

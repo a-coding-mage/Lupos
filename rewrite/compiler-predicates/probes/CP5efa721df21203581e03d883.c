@@ -1,0 +1,5 @@
+#if __has_attribute(__pass_dynamic_object_size__)
+LUPOS_COMPILER_PREDICATE_CP5efa721df21203581e03d883_1
+#else
+LUPOS_COMPILER_PREDICATE_CP5efa721df21203581e03d883_0
+#endif

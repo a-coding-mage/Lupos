@@ -1,24 +1,41 @@
 key	value	status	evidence
+aarch64_arch_value	arm64	VERIFIED	Phase 0 frozen input
+aarch64_config_sha256	b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578	VERIFIED	Phase 0 frozen input
+aarch64_target_triple	aarch64-linux-gnu	VERIFIED	Phase 0 frozen input
+authoritative_manifests_sha256	1e0084ce21de84590abe1e22ad986bd26e5d6aa25cc380873f039ee5cb5936fa	VERIFIED	Phase 0 frozen input
+compiler_predicates_aarch64_count	36	VERIFIED	Phase 0 frozen input
+compiler_predicates_count	72	VERIFIED	Phase 0 frozen input
+compiler_predicates_schema_version	compiler-predicates-v1	VERIFIED	Phase 0 frozen input
+compiler_predicates_sha256	b4ba9a920520dc7b6f36d24347a9e3bf520b848aaf2843d84c31d521d5a23866	VERIFIED	rewrite/compiler-predicates/COMPILER_PREDICATES.tsv
+compiler_predicates_validation_status	PASS	VERIFIED	Phase 0 frozen input
+compiler_predicates_x86_64_count	36	VERIFIED	Phase 0 frozen input
+compiler_requested_path	/usr/lib/llvm-19/bin/clang	VERIFIED	Phase 0 frozen input
+compiler_resolved_path	/usr/lib/llvm-19/bin/clang	VERIFIED	Phase 0 frozen input
+compiler_sha256	0a3c55936ac43954fbe4914e6e73b577ca9e35e75d89ef13d3e28c187f41ca1a	VERIFIED	Phase 0 frozen input
+compiler_version	Debian clang version 19.1.7 (3+b1)	VERIFIED	Phase 0 frozen input
+created_at	2026-08-05T21:26:52.464Z	VERIFIED	Phase 0 frozen input
+cross_compile_value	(empty)	VERIFIED	Phase 0 frozen input
+extractor_version	phase0_extract.py:823a608deea6baa6e41eb3a19b669b9eba3455d9c296c267afd0df647918f430	VERIFIED	Phase 0 frozen input
+header_dependency_schema_version	header-provider-graph-v2	VERIFIED	Phase 0 frozen input
+identity_schema_version	phase0-identity-v2	VERIFIED	Phase 0 frozen input
+identity_status	RESOLVED	VERIFIED	Phase 0 frozen input
+linker_requested_path	/usr/lib/llvm-19/bin/ld.lld	VERIFIED	Phase 0 frozen input
+linker_resolved_path	/usr/lib/llvm-19/bin/lld	VERIFIED	Phase 0 frozen input
+linker_sha256	7a2fd87d82662beac4371a1a21067b37cd4b7d43777aa61c089d85c45f772f6e	VERIFIED	Phase 0 frozen input
+linker_version	Debian LLD 19.1.7 (compatible with GNU linkers)	VERIFIED	Phase 0 frozen input
 linux_commit	425f94c2954b1fe80ebdbf9b29854e89750355df	VERIFIED	vendor/linux.SHA and vendor/linux HEAD
-x86_64_config_sha256	a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4	VERIFIED	rewrite/configs/x86_64/frozen.config
-aarch64_config_sha256	b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578	VERIFIED	rewrite/configs/aarch64/frozen.config
-toolchain_sha256	cfb4e6fbb9b5281b15f0e09cb6d4f7f1866bf9bc1c69ae72715992b76c9bd670	VERIFIED	rewrite/toolchain/TOOLCHAIN.sha256
-tool_clang_sha256	0a3c55936ac43954fbe4914e6e73b577ca9e35e75d89ef13d3e28c187f41ca1a	VERIFIED	/usr/lib/llvm-19/bin/clang
-tool_ld_lld_sha256	7a2fd87d82662beac4371a1a21067b37cd4b7d43777aa61c089d85c45f772f6e	VERIFIED	/usr/lib/llvm-19/bin/ld.lld
-tool_llvm_ar_sha256	e15ccf58a2db49c1d9589a515bebc191abee12db35c809f092a70ed8e1ea2f8e	VERIFIED	/usr/lib/llvm-19/bin/llvm-ar
-tool_llvm_nm_sha256	ed2427f2e14ac235a12fc3ca878f3621dd347e1e0dba7a316824f4d2a5e78403	VERIFIED	/usr/lib/llvm-19/bin/llvm-nm
-tool_llvm_objcopy_sha256	8723d4539a1c621fbaa2f0bc9f6a5268ccb7cf93bac6b4fc8f1d6aed1b77201e	VERIFIED	/usr/lib/llvm-19/bin/llvm-objcopy
-tool_llvm_objdump_sha256	c904a20cf0caeb812b542b69488e5c79738951a92ca99098fbb8941505eb789d	VERIFIED	/usr/lib/llvm-19/bin/llvm-objdump
-tool_llvm_readelf_sha256	e513bd45eb2b0f4d3740dfa312416a250c2e95c5dd5d4713c0e04d253c89b4eb	VERIFIED	/usr/lib/llvm-19/bin/llvm-readelf
-tool_llvm_strip_sha256	8723d4539a1c621fbaa2f0bc9f6a5268ccb7cf93bac6b4fc8f1d6aed1b77201e	VERIFIED	/usr/lib/llvm-19/bin/llvm-strip
-x86_64_arch_value	x86_64	VERIFIED	rewrite/toolchain/ENVIRONMENT.tsv
-aarch64_arch_value	arm64	VERIFIED	rewrite/toolchain/ENVIRONMENT.tsv
-llvm_value	/usr/lib/llvm-19/bin/	VERIFIED	rewrite/toolchain/ENVIRONMENT.tsv
-llvm_ias_value	1	VERIFIED	rewrite/toolchain/ENVIRONMENT.tsv
-cross_compile_value	(empty)	VERIFIED	rewrite/toolchain/ENVIRONMENT.tsv
-extractor_version	phase0_extract.py:c932488bf4fa85fa9d5d4752905a1c2c72cb595618b89781b1b7d4dc16540d06	VERIFIED	tools/phase0_extract.py
-scope_schema_version	mechanical-phase0-v2	VERIFIED	AGENTS.md and rewrite/SCOPE.tsv
-queue_schema_version	translation-queue-v1	VERIFIED	tools/rewrite_queue.py
-queue_fingerprint	0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742	VERIFIED	rewrite/TRANSLATION_TASKS.sha256
-created_at	2026-08-05T14:32:37.477Z	VERIFIED	Phase 0 authoritative run
-identity_status	RESOLVED	VERIFIED	tools/phase0_validate.py passed all checks
+llvm_ias_value	1	VERIFIED	Phase 0 frozen input
+llvm_value	/usr/lib/llvm-19/bin/	VERIFIED	Phase 0 frozen input
+metadata_manifest_sha256	8ad06688353f64b818c2c176c6fff347982cd9170396473908581ebcca7af4eb	VERIFIED	Phase 0 frozen input
+oracle_classification_schema_version	oracle-classification-v1	VERIFIED	Phase 0 frozen input
+phase0_identity_binding_sha256	8f8f2ac1b867f4ba89f00ff5812de9dc6eedd9929724ccce928a604c0301de3f	VERIFIED	canonical non-queue Phase 0 input digest
+predicate_extractor_version	compiler_predicates.py:7bbff87daefcf123ab5a1dc0a1a59111402f71f5ffbc7fc2180fe6b094936938	VERIFIED	Phase 0 frozen input
+predicate_validator_version	validate_compiler_predicates.py:0ab59f937878905dd6832d7e349ce973db52d8d1d86343f62fc0af6f7ecc317b	VERIFIED	Phase 0 frozen input
+queue_fingerprint	af93adda6e7845ec178dc63a9462f88384392f78353165ea5a583ef78fcf423c	VERIFIED	rewrite/TRANSLATION_TASKS.sha256
+queue_tool_version	rewrite_queue.py:23d0618a5b95db5d4d1418b294c1ce7d1d50c35ebdb6a3851694cec6ace57afd	VERIFIED	Phase 0 frozen input
+scope_schema_version	source-header-context-oracle-phase0-v6	VERIFIED	Phase 0 frozen input
+toolchain_sha256	cfb4e6fbb9b5281b15f0e09cb6d4f7f1866bf9bc1c69ae72715992b76c9bd670	VERIFIED	Phase 0 frozen input
+validator_version	phase0_validate.py:2c0ab13f1551ff24c6af194a5d5da3b4dee05a8f14773f2a36ad6fd1c62c0592	VERIFIED	Phase 0 frozen input
+x86_64_arch_value	x86_64	VERIFIED	Phase 0 frozen input
+x86_64_config_sha256	a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4	VERIFIED	Phase 0 frozen input
+x86_64_target_triple	x86_64-linux-gnu	VERIFIED	Phase 0 frozen input

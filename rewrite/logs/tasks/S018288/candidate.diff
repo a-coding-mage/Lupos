@@ -1,0 +1,16 @@
+Candidate S018288
+
+Added `src/security/selinux/include/policycap.rs` as a fresh translation of
+the pinned `security/selinux/include/policycap.h`.
+
+Mapping:
+
+- anonymous enum → sequential `i32` constants `POLICYDB_CAP_NETPEER` through
+  `__POLICYDB_CAP_MAX` (0 through 15);
+- `#define POLICYDB_CAP_MAX (__POLICYDB_CAP_MAX - 1)` → matching derived `i32`
+  constant;
+- `extern const char *const selinux_policycap_names[__POLICYDB_CAP_MAX]` →
+  `unsafe extern "C"` immutable static `[ *const c_char; 15 ]` declaration.
+
+The destination includes the required immutable provenance. No other source
+file, module index, manifest, or queue row was edited.

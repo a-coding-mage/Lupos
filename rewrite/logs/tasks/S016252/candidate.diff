@@ -1,0 +1,19 @@
+# S016252 candidate summary
+
+Candidate: `src/include/uapi/linux/mptcp_pm.rs`
+
+Focused translation mapping:
+
+```diff
++pub type mptcp_event_type = c_int;
++pub const MPTCP_EVENT_ANNOUNCED: mptcp_event_type = 6;
++pub const MPTCP_EVENT_SUB_ESTABLISHED: mptcp_event_type = 10;
++pub const MPTCP_EVENT_SUB_PRIORITY: mptcp_event_type = 13;
++pub const MPTCP_EVENT_LISTENER_CREATED: mptcp_event_type = 15;
++pub const MPTCP_EVENT_LISTENER_CLOSED: mptcp_event_type = 16;
+```
+
+The candidate also supplies the complete source-order sets of address,
+subflow, endpoint, PM-attribute, event-attribute, and PM-command constants,
+including each source `__...MAX` sentinel and public `...MAX` subtraction.
+It contains no functions, structures, tests, stubs, or conditional Rust code.

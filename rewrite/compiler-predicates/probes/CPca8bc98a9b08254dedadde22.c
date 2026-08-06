@@ -1,0 +1,5 @@
+#if __has_attribute(__diagnose_as_builtin__)
+LUPOS_COMPILER_PREDICATE_CPca8bc98a9b08254dedadde22_1
+#else
+LUPOS_COMPILER_PREDICATE_CPca8bc98a9b08254dedadde22_0
+#endif

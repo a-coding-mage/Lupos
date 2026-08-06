@@ -1,0 +1,8 @@
+# S016189 candidate summary
+
+Added `src/include/uapi/linux/input-event-codes.rs` as the path-preserving translation of `include/uapi/linux/input-event-codes.h`.
+
+- Immutable provenance identifies task S016189, the pinned revision, and the canonical `common` architecture class.
+- The 795 object-like UAPI definitions are represented as public `u16` constants, retaining their source identifiers, literal spellings, alias targets, and count expressions.
+- The C include guard is intentionally absent because Rust module inclusion provides that role; no source logic, types, or callable interface exists in this header.
+- Representative retained mappings: `EV_SYN = 0x00`, `KEY_HANGUEL = KEY_HANGEUL`, `KEY_CNT = (KEY_MAX+1)`, and `SND_PROFILE_RING = 0x02`.

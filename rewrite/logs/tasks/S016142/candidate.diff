@@ -1,0 +1,14 @@
+# Candidate mapping — S016142
+
+`src/include/uapi/linux/handshake.rs` is a fresh path-preserving translation
+of `include/uapi/linux/handshake.h`.
+
+- `HANDSHAKE_FAMILY_NAME`, `HANDSHAKE_MCGRP_NONE`, and
+  `HANDSHAKE_MCGRP_TLSHD` retain NUL-terminated static `c_char` storage.
+- `HANDSHAKE_FAMILY_VERSION`, all three tagged C enums, all anonymous enum
+  values, and their derived maximum values retain their original integer
+  values and C `int` representation.
+- No functions, structures, conditional declarations, or configuration
+  branches exist in the source header.
+
+No source was compiled, formatted, or tested.

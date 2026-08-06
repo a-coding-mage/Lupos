@@ -1,0 +1,10 @@
+# S016028 candidate summary
+
+New destination: `src/include/uapi/asm-generic/termbits-common.rs`
+
+The candidate adds the two fixed-width UAPI aliases and all 45 selected source
+macros. It preserves the source names and values for the input and output flags,
+the sixteen common baud selectors, `EXTA`/`EXTB`, the three high c_cflag bits,
+`IBSHIFT`, all four tcflow selectors, and all three tcflush selectors. The
+file is unconditional for the frozen x86_64/aarch64 union and carries the
+source SPDX expression plus immutable provenance.

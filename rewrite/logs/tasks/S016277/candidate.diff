@@ -1,0 +1,3 @@
+Candidate: `src/include/uapi/linux/netfilter/nf_tables.rs`
+
+The candidate maps every selected `nf_tables.h` C enum enumerator and object-like macro to a Rust public integer constant with its exact evaluated UAPI value. There are no structs, functions, tests, or driver code in the upstream header.

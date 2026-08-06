@@ -4,40 +4,180 @@
       "detail": "/home/fenhir/Projects/lupos/rewrite/kbuild/aarch64/.config",
       "ok": true
     },
-    "aarch64_compiler_binding": {
-      "detail": "compiler/linker evidence",
-      "ok": true
-    },
     "aarch64_config_hash": {
-      "detail": "expected=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578; actual=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578",
+      "detail": "identity=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578 actual=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578",
       "ok": true
     },
-    "aarch64_metadata_complete": {
-      "detail": "8963",
+    "aarch64_object_inventory_schema": {
+      "detail": "rows=8963; missing_fields=[]",
       "ok": true
     },
     "aarch64_stable_transition": {
       "detail": "[{'symbol': '__SUMMARY__', 'before': '0_changed_symbols', 'after': '0_changed_symbols', 'reason_when_mechanically_known': 'second identical olddefconfig pass was byte-identical to the first stabilized configuration', 'source_kconfig': 'Kconfig/Kbuild metadata', 'status': 'STABLE'}]",
       "ok": true
     },
-    "all_todo": {
-      "detail": "queue lifecycle fields",
+    "abi_entity_coverage": {
+      "detail": "[]",
+      "ok": true
+    },
+    "abi_schema": {
+      "detail": "rows=351403; missing_fields=[]",
+      "ok": true
+    },
+    "authoritative_manifest_hashes": {
+      "detail": "[]",
+      "ok": true
+    },
+    "authoritative_manifest_index_schema": {
+      "detail": "rows=6; missing_fields=[]",
+      "ok": true
+    },
+    "authoritative_manifests_identity": {
+      "detail": "1e0084ce21de84590abe1e22ad986bd26e5d6aa25cc380873f039ee5cb5936fa",
       "ok": true
     },
     "branch": {
       "detail": "feat/bun-like-rewrite-test",
       "ok": true
     },
+    "compiler_predicate_binding": {
+      "detail": "{'compiler_predicates_aarch64_count': '36', 'compiler_predicates_count': '72', 'compiler_predicates_schema_version': 'compiler-predicates-v1', 'compiler_predicates_sha256': 'b4ba9a920520dc7b6f36d24347a9e3bf520b848aaf2843d84c31d521d5a23866', 'compiler_predicates_validation_sha256': 'e6886508cb99db02e8498285746815b3d817987a97de544ab4fbaa563db3db8b', 'compiler_predicates_validation_status': 'PASS', 'compiler_predicates_x86_64_count': '36'}",
+      "ok": true
+    },
+    "compiler_predicate_binding_schema": {
+      "detail": "rows=7; missing_fields=[]",
+      "ok": true
+    },
+    "compiler_predicate_fingerprint": {
+      "detail": "/home/fenhir/Projects/lupos/rewrite/compiler-predicates/COMPILER_PREDICATES.sha256",
+      "ok": true
+    },
+    "compiler_predicate_identity": {
+      "detail": "{}",
+      "ok": true
+    },
+    "compiler_predicate_raw_evidence": {
+      "detail": "[]",
+      "ok": true
+    },
+    "compiler_predicate_schema": {
+      "detail": "rows=72; missing_fields=[]",
+      "ok": true
+    },
+    "compiler_predicate_validation_schema": {
+      "detail": "rows=72; missing_fields=[]",
+      "ok": true
+    },
+    "compiler_predicates_proven": {
+      "detail": "[]",
+      "ok": true
+    },
+    "direct_oracle_classification_exact": {
+      "detail": "expected=3 errors=[]",
+      "ok": true
+    },
+    "driver_abi_mechanical_coverage": {
+      "detail": "[]",
+      "ok": true
+    },
+    "driver_abi_schema": {
+      "detail": "rows=8252; missing_fields=[]",
+      "ok": true
+    },
     "driver_exclusion": {
-      "detail": "driver paths are not queued",
+      "detail": "driver rows must not be queued",
+      "ok": true
+    },
+    "extractor_identity": {
+      "detail": "identity=phase0_extract.py:823a608deea6baa6e41eb3a19b669b9eba3455d9c296c267afd0df647918f430 actual=phase0_extract.py:823a608deea6baa6e41eb3a19b669b9eba3455d9c296c267afd0df647918f430",
+      "ok": true
+    },
+    "file_map_schema": {
+      "detail": "rows=23810; missing_fields=[]",
+      "ok": true
+    },
+    "file_map_unique": {
+      "detail": "rows=23810 keys=23810",
+      "ok": true
+    },
+    "generated_wrapper_bridge_reachability": {
+      "detail": "bridged_pairs=120 errors=[]",
+      "ok": true
+    },
+    "header_closure_exact": {
+      "detail": "expected=11880 actual=11880 duplicates=[] errors=[]",
+      "ok": true
+    },
+    "header_closure_schema": {
+      "detail": "rows=11880; missing_fields=[]",
+      "ok": true
+    },
+    "header_components_complete": {
+      "detail": "rust_headers=3479 component_members=3479 delta=[] errors=[]",
+      "ok": true
+    },
+    "header_components_schema": {
+      "detail": "rows=3479; missing_fields=[]",
+      "ok": true
+    },
+    "header_context_dependency_graph": {
+      "detail": "provider_pairs=5478 errors=[]",
+      "ok": true
+    },
+    "header_context_edges_schema": {
+      "detail": "rows=8181; missing_fields=[]",
+      "ok": true
+    },
+    "header_context_provider_edges_exact": {
+      "detail": "expected=8181 actual=8181 errors=[]",
+      "ok": true
+    },
+    "header_dependency_replay": {
+      "detail": "direct_contexts=11930 headers=9002 errors=[]",
+      "ok": true
+    },
+    "header_dependency_schema_identity": {
+      "detail": "header-provider-graph-v2",
+      "ok": true
+    },
+    "header_include_dependency_graph": {
+      "detail": "projected_edges=11077 errors=[]",
+      "ok": true
+    },
+    "header_include_edges_schema": {
+      "detail": "rows=18385; missing_fields=[]",
+      "ok": true
+    },
+    "header_literal_include_resolution_exact": {
+      "detail": "expected=18385 actual=18385 resolver_errors=[] edge_errors=[]",
+      "ok": true
+    },
+    "header_provider_resolver_readiness": {
+      "detail": "rust_headers=3479 provider_edges=16555 errors=[]",
+      "ok": true
+    },
+    "header_scope_complete": {
+      "detail": "expected=9002 scoped=9002 errors=[]",
       "ok": true
     },
     "identity_hash": {
-      "detail": "PHASE0_IDENTITY.sha256",
+      "detail": "/home/fenhir/Projects/lupos/rewrite/PHASE0_IDENTITY.sha256",
       "ok": true
     },
     "identity_queue_binding": {
-      "detail": "identity=0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742; queue=0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742",
+      "detail": "identity=af93adda6e7845ec178dc63a9462f88384392f78353165ea5a583ef78fcf423c queue=af93adda6e7845ec178dc63a9462f88384392f78353165ea5a583ef78fcf423c",
+      "ok": true
+    },
+    "kbuild_disposition_consistent": {
+      "detail": "[]",
+      "ok": true
+    },
+    "lifetime_entity_coverage": {
+      "detail": "[]",
+      "ok": true
+    },
+    "lifetimes_schema": {
+      "detail": "rows=336623; missing_fields=[]",
       "ok": true
     },
     "linux_clean": {
@@ -48,12 +188,64 @@
       "detail": "HEAD=425f94c2954b1fe80ebdbf9b29854e89750355df; pinned=425f94c2954b1fe80ebdbf9b29854e89750355df",
       "ok": true
     },
-    "object_source_mapping": {
-      "detail": "rows=11930",
+    "metadata_manifest_hashes": {
+      "detail": "[]",
+      "ok": true
+    },
+    "metadata_manifest_identity": {
+      "detail": "8ad06688353f64b818c2c176c6fff347982cd9170396473908581ebcca7af4eb",
+      "ok": true
+    },
+    "metadata_manifest_schema": {
+      "detail": "rows=39; missing_fields=[]",
+      "ok": true
+    },
+    "object_inventory_matches_file_map": {
+      "detail": "[]",
+      "ok": true
+    },
+    "oracle_classification_exact": {
+      "detail": "expected=16 manifest_errors=[] scope_errors=[]",
+      "ok": true
+    },
+    "oracle_classification_schema": {
+      "detail": "rows=16; missing_fields=[]",
+      "ok": true
+    },
+    "oracle_classification_schema_identity": {
+      "detail": "oracle-classification-v1",
+      "ok": true
+    },
+    "oracle_excluded_from_queue": {
+      "detail": "[]",
+      "ok": true
+    },
+    "oracle_excluded_from_semantic_manifests": {
+      "detail": "[]",
+      "ok": true
+    },
+    "oracle_file_map_inventory_nonrust": {
+      "detail": "oracle=16 missing=[]",
+      "ok": true
+    },
+    "queue_initial_state": {
+      "detail": "all rows TODO, attempt zero, unleased, and without work-stage timestamps",
+      "ok": true
+    },
+    "queue_phase0_identity_binding": {
+      "detail": "queue=8f8f2ac1b867f4ba89f00ff5812de9dc6eedd9929724ccce928a604c0301de3f identity=8f8f2ac1b867f4ba89f00ff5812de9dc6eedd9929724ccce928a604c0301de3f",
+      "ok": true
+    },
+    "queue_schema": {
+      "detail": "rows=5792; missing_fields=[]",
       "ok": true
     },
     "queue_verify": {
-      "detail": "{\"ok\": true, \"tasks\": 2321, \"sha256\": \"0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742\"}\n",
+      "detail": "{\"ok\": true, \"tasks\": 5792, \"sha256\": \"af93adda6e7845ec178dc63a9462f88384392f78353165ea5a583ef78fcf423c\"}\n",
+      "ok": true
+    },
+    "rust_destination_unique": {
+      "detail": "rows=5792 unique=5792 malformed=[]",
       "ok": true
     },
     "rust_linker_rejected": {
@@ -61,83 +253,119 @@
       "ok": true
     },
     "rust_task_bijection": {
-      "detail": "scope=2321 tasks=2321",
+      "detail": "scope=5792 tasks=5792 mismatches=[]",
+      "ok": true
+    },
+    "scope_arch_config_evidence": {
+      "detail": "[]",
       "ok": true
     },
     "scope_classified": {
-      "detail": "rows=9955",
+      "detail": "rows=18957 ids=18957 paths=18957",
       "ok": true
     },
     "scope_in_file_map": {
-      "detail": "missing=[]",
+      "detail": "[]",
+      "ok": true
+    },
+    "scope_schema": {
+      "detail": "rows=18957; missing_fields=[]",
+      "ok": true
+    },
+    "scope_schema_identity": {
+      "detail": "source-header-context-oracle-phase0-v6",
       "ok": true
     },
     "selected_linker": {
       "detail": "[{'requested_path': '/usr/lib/llvm-19/bin/ld.lld', 'resolved_path': '/usr/lib/llvm-19/bin/lld', 'version': 'Debian LLD 19.1.7', 'selected': 'YES', 'reason': 'canonical Phase 0 linker', 'captured_at': '2026-08-05T14:03:47.223Z'}]",
       "ok": true
     },
-    "src_empty": {
-      "detail": "src",
+    "semantic_no_file_placeholders": {
+      "detail": "[]",
+      "ok": true
+    },
+    "source_header_dependency_reachability": {
+      "detail": "rust_sources=2313 errors=[]",
+      "ok": true
+    },
+    "src_empty_at_first_init": {
+      "detail": "/home/fenhir/Projects/lupos/src",
+      "ok": true
+    },
+    "symbols_category_arch_coverage": {
+      "detail": "[]",
+      "ok": true
+    },
+    "symbols_mechanical_fields": {
+      "detail": "[]",
+      "ok": true
+    },
+    "symbols_schema": {
+      "detail": "rows=558960; missing_fields=[]",
+      "ok": true
+    },
+    "task_dependencies_schema": {
+      "detail": "rows=137740; missing_fields=[]",
+      "ok": true
+    },
+    "task_dependency_acyclic": {
+      "detail": "[]",
+      "ok": true
+    },
+    "task_dependency_records": {
+      "detail": "scope=137740 metadata=137740 field_errors=[] metadata_errors=[] delta=[]",
       "ok": true
     },
     "tool:clang": {
-      "detail": "requested=/usr/lib/llvm-19/bin/clang; resolved=/usr/lib/llvm-19/bin/clang; recorded_major=19",
+      "detail": "requested=/usr/lib/llvm-19/bin/clang; resolved=/usr/lib/llvm-19/bin/clang; major=19",
       "ok": true
     },
     "tool:clang++": {
-      "detail": "requested=/usr/lib/llvm-19/bin/clang++; resolved=/usr/lib/llvm-19/bin/clang; recorded_major=19",
+      "detail": "requested=/usr/lib/llvm-19/bin/clang++; resolved=/usr/lib/llvm-19/bin/clang; major=19",
       "ok": true
     },
     "tool:ld.lld": {
-      "detail": "requested=/usr/lib/llvm-19/bin/ld.lld; resolved=/usr/lib/llvm-19/bin/lld; recorded_major=19",
+      "detail": "requested=/usr/lib/llvm-19/bin/ld.lld; resolved=/usr/lib/llvm-19/bin/lld; major=19",
       "ok": true
     },
     "tool:llvm-ar": {
-      "detail": "requested=/usr/lib/llvm-19/bin/llvm-ar; resolved=/usr/lib/llvm-19/bin/llvm-ar; recorded_major=19",
+      "detail": "requested=/usr/lib/llvm-19/bin/llvm-ar; resolved=/usr/lib/llvm-19/bin/llvm-ar; major=19",
       "ok": true
     },
     "tool:llvm-nm": {
-      "detail": "requested=/usr/lib/llvm-19/bin/llvm-nm; resolved=/usr/lib/llvm-19/bin/llvm-nm; recorded_major=19",
+      "detail": "requested=/usr/lib/llvm-19/bin/llvm-nm; resolved=/usr/lib/llvm-19/bin/llvm-nm; major=19",
       "ok": true
     },
     "tool:llvm-objcopy": {
-      "detail": "requested=/usr/lib/llvm-19/bin/llvm-objcopy; resolved=/usr/lib/llvm-19/bin/llvm-objcopy; recorded_major=19",
+      "detail": "requested=/usr/lib/llvm-19/bin/llvm-objcopy; resolved=/usr/lib/llvm-19/bin/llvm-objcopy; major=19",
       "ok": true
     },
     "tool:llvm-objdump": {
-      "detail": "requested=/usr/lib/llvm-19/bin/llvm-objdump; resolved=/usr/lib/llvm-19/bin/llvm-objdump; recorded_major=19",
+      "detail": "requested=/usr/lib/llvm-19/bin/llvm-objdump; resolved=/usr/lib/llvm-19/bin/llvm-objdump; major=19",
       "ok": true
     },
     "tool:llvm-readelf": {
-      "detail": "requested=/usr/lib/llvm-19/bin/llvm-readelf; resolved=/usr/lib/llvm-19/bin/llvm-readobj; recorded_major=19",
+      "detail": "requested=/usr/lib/llvm-19/bin/llvm-readelf; resolved=/usr/lib/llvm-19/bin/llvm-readobj; major=19",
       "ok": true
     },
     "tool:llvm-strip": {
-      "detail": "requested=/usr/lib/llvm-19/bin/llvm-strip; resolved=/usr/lib/llvm-19/bin/llvm-objcopy; recorded_major=19",
+      "detail": "requested=/usr/lib/llvm-19/bin/llvm-strip; resolved=/usr/lib/llvm-19/bin/llvm-objcopy; major=19",
       "ok": true
     },
     "toolchain_file_hash": {
-      "detail": "TOOLCHAIN.sha256",
-      "ok": true
-    },
-    "unique_task_ids_paths": {
-      "detail": "queue IDs and paths",
+      "detail": "/home/fenhir/Projects/lupos/rewrite/toolchain/TOOLCHAIN.sha256",
       "ok": true
     },
     "x86_64_build_config": {
       "detail": "/home/fenhir/Projects/lupos/rewrite/kbuild/x86_64/.config",
       "ok": true
     },
-    "x86_64_compiler_binding": {
-      "detail": "compiler/linker evidence",
-      "ok": true
-    },
     "x86_64_config_hash": {
-      "detail": "expected=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4; actual=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4",
+      "detail": "identity=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4 actual=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4",
       "ok": true
     },
-    "x86_64_metadata_complete": {
-      "detail": "2967",
+    "x86_64_object_inventory_schema": {
+      "detail": "rows=2967; missing_fields=[]",
       "ok": true
     },
     "x86_64_stable_transition": {
@@ -145,5 +373,6 @@
       "ok": true
     }
   },
-  "ok": true
+  "ok": true,
+  "stage": "frozen"
 }

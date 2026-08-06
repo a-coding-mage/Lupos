@@ -2,37 +2,94 @@ check	status	detail
 branch	PASS	feat/bun-like-rewrite-test
 linux_pin	PASS	HEAD=425f94c2954b1fe80ebdbf9b29854e89750355df; pinned=425f94c2954b1fe80ebdbf9b29854e89750355df
 linux_clean	PASS	clean
-tool:clang	PASS	requested=/usr/lib/llvm-19/bin/clang; resolved=/usr/lib/llvm-19/bin/clang; recorded_major=19
-tool:clang++	PASS	requested=/usr/lib/llvm-19/bin/clang++; resolved=/usr/lib/llvm-19/bin/clang; recorded_major=19
-tool:ld.lld	PASS	requested=/usr/lib/llvm-19/bin/ld.lld; resolved=/usr/lib/llvm-19/bin/lld; recorded_major=19
-tool:llvm-ar	PASS	requested=/usr/lib/llvm-19/bin/llvm-ar; resolved=/usr/lib/llvm-19/bin/llvm-ar; recorded_major=19
-tool:llvm-nm	PASS	requested=/usr/lib/llvm-19/bin/llvm-nm; resolved=/usr/lib/llvm-19/bin/llvm-nm; recorded_major=19
-tool:llvm-objcopy	PASS	requested=/usr/lib/llvm-19/bin/llvm-objcopy; resolved=/usr/lib/llvm-19/bin/llvm-objcopy; recorded_major=19
-tool:llvm-objdump	PASS	requested=/usr/lib/llvm-19/bin/llvm-objdump; resolved=/usr/lib/llvm-19/bin/llvm-objdump; recorded_major=19
-tool:llvm-readelf	PASS	requested=/usr/lib/llvm-19/bin/llvm-readelf; resolved=/usr/lib/llvm-19/bin/llvm-readobj; recorded_major=19
-tool:llvm-strip	PASS	requested=/usr/lib/llvm-19/bin/llvm-strip; resolved=/usr/lib/llvm-19/bin/llvm-objcopy; recorded_major=19
-toolchain_file_hash	PASS	TOOLCHAIN.sha256
+tool:clang	PASS	requested=/usr/lib/llvm-19/bin/clang; resolved=/usr/lib/llvm-19/bin/clang; major=19
+tool:clang++	PASS	requested=/usr/lib/llvm-19/bin/clang++; resolved=/usr/lib/llvm-19/bin/clang; major=19
+tool:ld.lld	PASS	requested=/usr/lib/llvm-19/bin/ld.lld; resolved=/usr/lib/llvm-19/bin/lld; major=19
+tool:llvm-ar	PASS	requested=/usr/lib/llvm-19/bin/llvm-ar; resolved=/usr/lib/llvm-19/bin/llvm-ar; major=19
+tool:llvm-nm	PASS	requested=/usr/lib/llvm-19/bin/llvm-nm; resolved=/usr/lib/llvm-19/bin/llvm-nm; major=19
+tool:llvm-objcopy	PASS	requested=/usr/lib/llvm-19/bin/llvm-objcopy; resolved=/usr/lib/llvm-19/bin/llvm-objcopy; major=19
+tool:llvm-objdump	PASS	requested=/usr/lib/llvm-19/bin/llvm-objdump; resolved=/usr/lib/llvm-19/bin/llvm-objdump; major=19
+tool:llvm-readelf	PASS	requested=/usr/lib/llvm-19/bin/llvm-readelf; resolved=/usr/lib/llvm-19/bin/llvm-readobj; major=19
+tool:llvm-strip	PASS	requested=/usr/lib/llvm-19/bin/llvm-strip; resolved=/usr/lib/llvm-19/bin/llvm-objcopy; major=19
+toolchain_file_hash	PASS	/home/fenhir/Projects/lupos/rewrite/toolchain/TOOLCHAIN.sha256
 selected_linker	PASS	[{'requested_path': '/usr/lib/llvm-19/bin/ld.lld', 'resolved_path': '/usr/lib/llvm-19/bin/lld', 'version': 'Debian LLD 19.1.7', 'selected': 'YES', 'reason': 'canonical Phase 0 linker', 'captured_at': '2026-08-05T14:03:47.223Z'}]
 rust_linker_rejected	PASS	LINKER_INVENTORY.tsv
-x86_64_config_hash	PASS	expected=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4; actual=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4
 x86_64_build_config	PASS	/home/fenhir/Projects/lupos/rewrite/kbuild/x86_64/.config
 x86_64_stable_transition	PASS	[{'symbol': '__SUMMARY__', 'before': '0_changed_symbols', 'after': '0_changed_symbols', 'reason_when_mechanically_known': 'second identical olddefconfig pass was byte-identical to the first stabilized configuration', 'source_kconfig': 'Kconfig/Kbuild metadata', 'status': 'STABLE'}]
-aarch64_config_hash	PASS	expected=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578; actual=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578
 aarch64_build_config	PASS	/home/fenhir/Projects/lupos/rewrite/kbuild/aarch64/.config
 aarch64_stable_transition	PASS	[{'symbol': '__SUMMARY__', 'before': '0_changed_symbols', 'after': '0_changed_symbols', 'reason_when_mechanically_known': 'second identical olddefconfig pass was byte-identical to the first stabilized configuration', 'source_kconfig': 'Kconfig/Kbuild metadata', 'status': 'STABLE'}]
-identity_hash	PASS	PHASE0_IDENTITY.sha256
-scope_classified	PASS	rows=9955
-object_source_mapping	PASS	rows=11930
-scope_in_file_map	PASS	missing=[]
-rust_task_bijection	PASS	scope=2321 tasks=2321
-driver_exclusion	PASS	driver paths are not queued
-unique_task_ids_paths	PASS	queue IDs and paths
-all_todo	PASS	queue lifecycle fields
-src_empty	PASS	src
-x86_64_metadata_complete	PASS	2967
-x86_64_compiler_binding	PASS	compiler/linker evidence
-aarch64_metadata_complete	PASS	8963
-aarch64_compiler_binding	PASS	compiler/linker evidence
-queue_verify	PASS	{"ok": true, "tasks": 2321, "sha256": "0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742"}
+compiler_predicate_schema	PASS	rows=72; missing_fields=[]
+compiler_predicate_fingerprint	PASS	/home/fenhir/Projects/lupos/rewrite/compiler-predicates/COMPILER_PREDICATES.sha256
+compiler_predicate_validation_schema	PASS	rows=72; missing_fields=[]
+compiler_predicates_proven	PASS	[]
+compiler_predicate_raw_evidence	PASS	[]
+compiler_predicate_binding_schema	PASS	rows=7; missing_fields=[]
+compiler_predicate_binding	PASS	{'compiler_predicates_aarch64_count': '36', 'compiler_predicates_count': '72', 'compiler_predicates_schema_version': 'compiler-predicates-v1', 'compiler_predicates_sha256': 'b4ba9a920520dc7b6f36d24347a9e3bf520b848aaf2843d84c31d521d5a23866', 'compiler_predicates_validation_sha256': 'e6886508cb99db02e8498285746815b3d817987a97de544ab4fbaa563db3db8b', 'compiler_predicates_validation_status': 'PASS', 'compiler_predicates_x86_64_count': '36'}
+scope_schema	PASS	rows=18957; missing_fields=[]
+file_map_schema	PASS	rows=23810; missing_fields=[]
+symbols_schema	PASS	rows=558960; missing_fields=[]
+abi_schema	PASS	rows=351403; missing_fields=[]
+lifetimes_schema	PASS	rows=336623; missing_fields=[]
+driver_abi_schema	PASS	rows=8252; missing_fields=[]
+header_closure_schema	PASS	rows=11880; missing_fields=[]
+header_include_edges_schema	PASS	rows=18385; missing_fields=[]
+header_context_edges_schema	PASS	rows=8181; missing_fields=[]
+header_components_schema	PASS	rows=3479; missing_fields=[]
+task_dependencies_schema	PASS	rows=137740; missing_fields=[]
+oracle_classification_schema	PASS	rows=16; missing_fields=[]
+scope_classified	PASS	rows=18957 ids=18957 paths=18957
+scope_arch_config_evidence	PASS	[]
+file_map_unique	PASS	rows=23810 keys=23810
+scope_in_file_map	PASS	[]
+direct_oracle_classification_exact	PASS	expected=3 errors=[]
+rust_destination_unique	PASS	rows=5792 unique=5792 malformed=[]
+kbuild_disposition_consistent	PASS	[]
+x86_64_object_inventory_schema	PASS	rows=2967; missing_fields=[]
+aarch64_object_inventory_schema	PASS	rows=8963; missing_fields=[]
+object_inventory_matches_file_map	PASS	[]
+header_dependency_replay	PASS	direct_contexts=11930 headers=9002 errors=[]
+header_closure_exact	PASS	expected=11880 actual=11880 duplicates=[] errors=[]
+header_scope_complete	PASS	expected=9002 scoped=9002 errors=[]
+oracle_classification_exact	PASS	expected=16 manifest_errors=[] scope_errors=[]
+oracle_file_map_inventory_nonrust	PASS	oracle=16 missing=[]
+oracle_excluded_from_semantic_manifests	PASS	[]
+header_literal_include_resolution_exact	PASS	expected=18385 actual=18385 resolver_errors=[] edge_errors=[]
+header_context_provider_edges_exact	PASS	expected=8181 actual=8181 errors=[]
+task_dependency_records	PASS	scope=137740 metadata=137740 field_errors=[] metadata_errors=[] delta=[]
+header_components_complete	PASS	rust_headers=3479 component_members=3479 delta=[] errors=[]
+header_include_dependency_graph	PASS	projected_edges=11077 errors=[]
+header_context_dependency_graph	PASS	provider_pairs=5478 errors=[]
+generated_wrapper_bridge_reachability	PASS	bridged_pairs=120 errors=[]
+header_provider_resolver_readiness	PASS	rust_headers=3479 provider_edges=16555 errors=[]
+source_header_dependency_reachability	PASS	rust_sources=2313 errors=[]
+task_dependency_acyclic	PASS	[]
+semantic_no_file_placeholders	PASS	[]
+symbols_mechanical_fields	PASS	[]
+symbols_category_arch_coverage	PASS	[]
+abi_entity_coverage	PASS	[]
+lifetime_entity_coverage	PASS	[]
+driver_abi_mechanical_coverage	PASS	[]
+authoritative_manifest_index_schema	PASS	rows=6; missing_fields=[]
+authoritative_manifest_hashes	PASS	[]
+metadata_manifest_schema	PASS	rows=39; missing_fields=[]
+metadata_manifest_hashes	PASS	[]
+src_empty_at_first_init	PASS	/home/fenhir/Projects/lupos/src
+identity_hash	PASS	/home/fenhir/Projects/lupos/rewrite/PHASE0_IDENTITY.sha256
+x86_64_config_hash	PASS	identity=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4 actual=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4
+aarch64_config_hash	PASS	identity=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578 actual=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578
+extractor_identity	PASS	identity=phase0_extract.py:823a608deea6baa6e41eb3a19b669b9eba3455d9c296c267afd0df647918f430 actual=phase0_extract.py:823a608deea6baa6e41eb3a19b669b9eba3455d9c296c267afd0df647918f430
+scope_schema_identity	PASS	source-header-context-oracle-phase0-v6
+header_dependency_schema_identity	PASS	header-provider-graph-v2
+oracle_classification_schema_identity	PASS	oracle-classification-v1
+compiler_predicate_identity	PASS	{}
+authoritative_manifests_identity	PASS	1e0084ce21de84590abe1e22ad986bd26e5d6aa25cc380873f039ee5cb5936fa
+metadata_manifest_identity	PASS	8ad06688353f64b818c2c176c6fff347982cd9170396473908581ebcca7af4eb
+queue_schema	PASS	rows=5792; missing_fields=[]
+rust_task_bijection	PASS	scope=5792 tasks=5792 mismatches=[]
+queue_initial_state	PASS	all rows TODO, attempt zero, unleased, and without work-stage timestamps
+driver_exclusion	PASS	driver rows must not be queued
+oracle_excluded_from_queue	PASS	[]
+queue_verify	PASS	{"ok": true, "tasks": 5792, "sha256": "af93adda6e7845ec178dc63a9462f88384392f78353165ea5a583ef78fcf423c"}
 
-identity_queue_binding	PASS	identity=0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742; queue=0a15e377fc1d41e5eff1322a9424ad6d4e82a00bfe7274cfe57e846986119742
+identity_queue_binding	PASS	identity=af93adda6e7845ec178dc63a9462f88384392f78353165ea5a583ef78fcf423c queue=af93adda6e7845ec178dc63a9462f88384392f78353165ea5a583ef78fcf423c
+queue_phase0_identity_binding	PASS	queue=8f8f2ac1b867f4ba89f00ff5812de9dc6eedd9929724ccce928a604c0301de3f identity=8f8f2ac1b867f4ba89f00ff5812de9dc6eedd9929724ccce928a604c0301de3f

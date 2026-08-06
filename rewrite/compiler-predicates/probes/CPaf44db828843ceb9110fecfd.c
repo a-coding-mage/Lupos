@@ -1,0 +1,5 @@
+#if __has_attribute(__externally_visible__)
+LUPOS_COMPILER_PREDICATE_CPaf44db828843ceb9110fecfd_1
+#else
+LUPOS_COMPILER_PREDICATE_CPaf44db828843ceb9110fecfd_0
+#endif

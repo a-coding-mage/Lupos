@@ -1,0 +1,5 @@
+#if __has_builtin(__builtin_alloca_uninitialized)
+LUPOS_COMPILER_PREDICATE_CPac53fb43352f193c2fe5353a_1
+#else
+LUPOS_COMPILER_PREDICATE_CPac53fb43352f193c2fe5353a_0
+#endif

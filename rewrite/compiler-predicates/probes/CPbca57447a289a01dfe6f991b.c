@@ -1,0 +1,5 @@
+#if __has_feature(shadow_call_stack)
+LUPOS_COMPILER_PREDICATE_CPbca57447a289a01dfe6f991b_1
+#else
+LUPOS_COMPILER_PREDICATE_CPbca57447a289a01dfe6f991b_0
+#endif

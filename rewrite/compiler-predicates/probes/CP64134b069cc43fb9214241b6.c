@@ -1,0 +1,5 @@
+#if __has_attribute(disable_sanitizer_instrumentation)
+LUPOS_COMPILER_PREDICATE_CP64134b069cc43fb9214241b6_1
+#else
+LUPOS_COMPILER_PREDICATE_CP64134b069cc43fb9214241b6_0
+#endif

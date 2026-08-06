@@ -1,0 +1,9 @@
+Candidate: new `src/include/uapi/linux/netfilter/nf_conntrack_common.rs`
+
+- Adds immutable S016270 provenance for Linux revision
+  `425f94c2954b1fe80ebdbf9b29854e89750355df` and common architecture scope.
+- Maps `ip_conntrack_info`, `ip_conntrack_status`,
+  `ip_conntrack_events`, and `ip_conntrack_expect_events` to C-compatible
+  `i32` aliases with all original enumerator values and aliases.
+- Maps all selected `NF_CT_STATE_*` and `NF_CT_EXPECT_*` macros plus every
+  status bit/mask, including the frozen `__KERNEL__`-only definitions.

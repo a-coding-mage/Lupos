@@ -30,6 +30,7 @@ DEFAULT_EVENTS = Path("rewrite/events.jsonl")
 DEFAULT_LOGS_ROOT = Path("rewrite/logs/tasks")
 DEFAULT_LINUX_SHA_FILE = Path("vendor/linux.SHA")
 DEFAULT_LINUX_ROOT = Path("vendor/linux")
+DEFAULT_PHASE0_IDENTITY = Path("rewrite/PHASE0_IDENTITY.tsv")
 
 FIELDS = [
     "id",
@@ -263,11 +264,17 @@ def append_event(path: Path, payload: Mapping[str, object]) -> None:
     append_events(path, [payload])
 
 
-def immutable_digest(rows: list[dict[str, str]]) -> str:
-    canonical = [
-        {field: row.get(field, "") for field in IMMUTABLE_FIELDS}
-        for row in rows
-    ]
+def immutable_digest(
+    rows: list[dict[str, str]], linux_sha: str, phase0_identity_binding: str
+) -> str:
+    canonical = {
+        "immutable_rows": [
+            {field: row.get(field, "") for field in IMMUTABLE_FIELDS}
+            for row in rows
+        ],
+        "linux_sha": linux_sha,
+        "phase0_identity_binding_sha256": phase0_identity_binding,
+    }
     data = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(data).hexdigest()
 
@@ -326,13 +333,40 @@ def verify_linux_checkout(linux_root: Path, sha_file: Path) -> str:
     return expected
 
 
-def write_fingerprint(path: Path, rows: list[dict[str, str]], linux_sha: str) -> str:
-    digest = immutable_digest(rows)
+def read_phase0_identity_binding(path: Path) -> str:
+    """Read the stable, pre-queue Phase 0 identity binding.
+
+    The final identity records the queue fingerprint, so the queue cannot bind
+    to that final file hash without a circular digest.  This field is instead
+    a digest of the frozen non-queue Phase 0 inputs; it is retained unchanged
+    when the final queue fingerprint is added to the identity.
+    """
+
+    if not path.is_file():
+        die(f"missing Phase 0 identity: {path}")
+    values: dict[str, str] = {}
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if reader.fieldnames != ["key", "value", "status", "evidence"]:
+            die(f"invalid Phase 0 identity schema: {path}")
+        for row in reader:
+            values[row.get("key", "")] = row.get("value", "")
+    binding = values.get("phase0_identity_binding_sha256", "").lower()
+    if len(binding) != 64 or any(character not in "0123456789abcdef" for character in binding):
+        die(f"invalid phase0_identity_binding_sha256 in {path}: {binding!r}")
+    return binding
+
+
+def write_fingerprint(
+    path: Path, rows: list[dict[str, str]], linux_sha: str, phase0_identity_binding: str
+) -> str:
+    digest = immutable_digest(rows, linux_sha, phase0_identity_binding)
     path.parent.mkdir(parents=True, exist_ok=True)
     content = (
         f"sha256\t{digest}\n"
         f"tasks\t{len(rows)}\n"
         f"linux_sha\t{linux_sha}\n"
+        f"phase0_identity_binding_sha256\t{phase0_identity_binding}\n"
         f"created_at\t{now_utc()}\n"
     )
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
@@ -350,7 +384,7 @@ def write_fingerprint(path: Path, rows: list[dict[str, str]], linux_sha: str) ->
     return digest
 
 
-def read_fingerprint(path: Path) -> tuple[str, int, str]:
+def read_fingerprint(path: Path) -> tuple[str, int, str, str]:
     if not path.exists():
         die(f"missing queue fingerprint: {path}; run freeze first")
     values: dict[str, str] = {}
@@ -367,20 +401,33 @@ def read_fingerprint(path: Path) -> tuple[str, int, str]:
             character not in "0123456789abcdef" for character in linux_sha
         ):
             raise ValueError(f"invalid linux_sha {linux_sha!r}")
-        return values["sha256"], int(values["tasks"]), linux_sha
+        phase0_binding = values["phase0_identity_binding_sha256"].lower()
+        if len(phase0_binding) != 64 or any(
+            character not in "0123456789abcdef" for character in phase0_binding
+        ):
+            raise ValueError(f"invalid phase0_identity_binding_sha256 {phase0_binding!r}")
+        return values["sha256"], int(values["tasks"]), linux_sha, phase0_binding
     except (KeyError, ValueError) as exc:
         die(f"malformed fingerprint file {path}: {exc}")
 
 
-def verify_fingerprint(rows: list[dict[str, str]], path: Path, sha_file: Path) -> None:
-    expected_digest, expected_count, expected_linux_sha = read_fingerprint(path)
+def verify_fingerprint(
+    rows: list[dict[str, str]], path: Path, sha_file: Path, phase0_identity: Path
+) -> None:
+    expected_digest, expected_count, expected_linux_sha, expected_binding = read_fingerprint(path)
     current_linux_sha = read_pinned_linux_sha(sha_file)
     if current_linux_sha != expected_linux_sha:
         die(
             "pinned Linux SHA changed after queue freeze; stop all pipelines and reopen "
             f"the scope gate (expected {expected_linux_sha}, found {current_linux_sha})"
         )
-    actual_digest = immutable_digest(rows)
+    current_binding = read_phase0_identity_binding(phase0_identity)
+    if current_binding != expected_binding:
+        die(
+            "Phase 0 identity binding changed after queue freeze; stop all pipelines and "
+            f"reopen the scope gate (expected {expected_binding}, found {current_binding})"
+        )
+    actual_digest = immutable_digest(rows, current_linux_sha, current_binding)
     if len(rows) != expected_count:
         die(f"queue task count changed: expected {expected_count}, found {len(rows)}")
     if actual_digest != expected_digest:
@@ -434,27 +481,33 @@ def validate_dependencies(rows: list[dict[str, str]]) -> None:
         graph[row["id"]] = deps
 
     state: dict[str, int] = {task_id: 0 for task_id in graph}
-    stack: list[str] = []
-
-    def visit(task_id: str) -> None:
-        if state[task_id] == 2:
-            return
-        if state[task_id] == 1:
-            try:
-                index = stack.index(task_id)
-            except ValueError:
-                index = 0
-            cycle = stack[index:] + [task_id]
-            die("dependency cycle: " + " -> ".join(cycle))
-        state[task_id] = 1
-        stack.append(task_id)
-        for dependency in graph[task_id]:
-            visit(dependency)
-        stack.pop()
-        state[task_id] = 2
-
     for task_id in sorted(graph):
-        visit(task_id)
+        if state[task_id] != 0:
+            continue
+        state[task_id] = 1
+        trail = [task_id]
+        traversal: list[tuple[str, int]] = [(task_id, 0)]
+        while traversal:
+            node, index = traversal[-1]
+            if index == len(graph[node]):
+                state[node] = 2
+                traversal.pop()
+                trail.pop()
+                continue
+            dependency = graph[node][index]
+            traversal[-1] = (node, index + 1)
+            if state[dependency] == 2:
+                continue
+            if state[dependency] == 1:
+                try:
+                    cycle_index = trail.index(dependency)
+                except ValueError:
+                    cycle_index = 0
+                cycle = trail[cycle_index:] + [dependency]
+                die("dependency cycle: " + " -> ".join(cycle))
+            state[dependency] = 1
+            trail.append(dependency)
+            traversal.append((dependency, 0))
 
 
 def validate_rows(rows: list[dict[str, str]]) -> None:
@@ -631,26 +684,64 @@ def cmd_invalidate(args: argparse.Namespace) -> None:
     with QueueLock(queue):
         rows = read_tsv(queue)
         validate_rows(rows)
-        verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file))
-        # A failed Phase 0 may already have produced a provisional queue and
-        # even locally paused/blocked rows before the scope gate exposes its
-        # defect.  It is still safe to record an invalidation provided no
-        # source pipeline reached a terminal acceptance state and no lease is
-        # active.  The command deliberately preserves the TSV unchanged; the
-        # caller must archive it and create a brand-new queue from regenerated
-        # Phase 0 scope rather than rewriting its rows.
-        disallowed = [
+        verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file), Path(args.phase0_identity))
+        queue_before = queue.read_bytes()
+        active_or_leased = [
             row for row in rows
-            if row["status"] not in {"TODO", "BLOCKED", "PAUSED"}
+            if row["status"] in ACTIVE_STATUSES
+            or bool(row.get("lease_owner"))
+            or bool(row.get("lease_expires_at"))
         ]
+        if active_or_leased:
+            details = ", ".join(
+                f"{row['id']}={row['status']}:owner={row.get('lease_owner', '')}:"
+                f"expires={row.get('lease_expires_at', '')}"
+                for row in active_or_leased[:10]
+            )
+            die(f"queue invalidation requires no active stage or lease; found {details}")
+
+        if args.phase_gate_reopen:
+            archive = PurePosixPath(args.archive)
+            archive_text = archive.as_posix()
+            if (
+                archive.is_absolute()
+                or ".." in archive.parts
+                or not archive_text.startswith("rewrite/archive/phase0-")
+            ):
+                die(
+                    "--phase-gate-reopen requires a relative archive path under "
+                    "rewrite/archive/phase0-*"
+                )
+            if Path(archive_text).exists():
+                die(
+                    "--phase-gate-reopen requires a not-yet-created archive path so "
+                    "the invalidation event precedes snapshot movement"
+                )
+            disallowed = [
+                row for row in rows
+                if row["status"] not in {"TODO", "BLOCKED", "PAUSED", "DONE"}
+            ]
+            mode = "phase-gate-reopen"
+        else:
+            # Ordinary provisional invalidation remains deliberately stricter:
+            # no source task may have reached a terminal acceptance state.
+            disallowed = [
+                row for row in rows
+                if row["status"] not in {"TODO", "BLOCKED", "PAUSED"}
+            ]
+            mode = "provisional"
         if disallowed:
             details = ", ".join(
                 f"{row['id']}={row['status']}" for row in disallowed[:10]
             )
             die(
-                "queue invalidation requires no active, IMPLEMENTED, REVIEWING, "
-                f"APPLYING, or DONE rows; found {details}"
+                f"{mode} queue invalidation rejects current task states; found {details}"
             )
+        status_counts = {
+            status: sum(row["status"] == status for row in rows)
+            for status in sorted(ALL_STATUSES)
+        }
+        accepted_ids = [row["id"] for row in rows if row["status"] == "DONE"]
         append_event(
             events,
             event_payload(
@@ -660,10 +751,24 @@ def cmd_invalidate(args: argparse.Namespace) -> None:
                 role=args.role,
                 model=args.model,
                 effort=args.effort,
-                detail=f"archive={args.archive}; {args.reason}",
+                detail=(
+                    f"mode={mode}; archive={args.archive}; rows={len(rows)}; "
+                    f"status_counts={json.dumps(status_counts, sort_keys=True, separators=(',', ':'))}; "
+                    f"previously_done={','.join(accepted_ids) or 'none'}; "
+                    f"queue_tsv_unchanged=true; {args.reason}"
+                ),
             ),
         )
-    print(json.dumps({"event": "queue_invalidated", "archive": args.archive}))
+        if queue.read_bytes() != queue_before:
+            die("internal error: invalidation changed the queue TSV")
+        queue_sha256 = hashlib.sha256(queue_before).hexdigest()
+    print(json.dumps({
+        "event": "queue_invalidated",
+        "mode": mode,
+        "archive": args.archive,
+        "queue_tsv_sha256": queue_sha256,
+        "status_counts": status_counts,
+    }, sort_keys=True))
 
 
 def parse_dependencies(row: Mapping[str, str]) -> list[str]:
@@ -892,8 +997,8 @@ def cmd_freeze(args: argparse.Namespace) -> None:
             die("queue can be frozen only before any task leaves TODO")
         linux_sha = verify_linux_checkout(Path(args.linux_root), Path(args.linux_sha_file))
         if fingerprint.exists():
-            verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file))
-            digest, _, _ = read_fingerprint(fingerprint)
+            verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file), Path(args.phase0_identity))
+            digest, _, _, _ = read_fingerprint(fingerprint)
             print(
                 json.dumps(
                     {
@@ -905,7 +1010,8 @@ def cmd_freeze(args: argparse.Namespace) -> None:
                 )
             )
             return
-        digest = write_fingerprint(fingerprint, rows, linux_sha)
+        phase0_binding = read_phase0_identity_binding(Path(args.phase0_identity))
+        digest = write_fingerprint(fingerprint, rows, linux_sha, phase0_binding)
         append_event(
             events,
             event_payload(
@@ -914,7 +1020,8 @@ def cmd_freeze(args: argparse.Namespace) -> None:
                 role="queue_tool",
                 model="none",
                 effort="none",
-                detail=f"tasks={len(rows)} sha256={digest} linux_sha={linux_sha}",
+                detail=(f"tasks={len(rows)} sha256={digest} linux_sha={linux_sha}; "
+                        f"phase0_identity_binding_sha256={phase0_binding}"),
             ),
         )
     print(json.dumps({"tasks": len(rows), "sha256": digest, "fingerprint": str(fingerprint)}))
@@ -926,11 +1033,12 @@ def cmd_verify(args: argparse.Namespace) -> None:
         verify_linux_checkout(Path(args.linux_root), Path(args.linux_sha_file))
         rows = read_tsv(queue, FIELDS)
         validate_rows(rows)
-        verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file))
+        verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file), Path(args.phase0_identity))
         for row in rows:
             if row["status"] == "DONE":
                 require_done_evidence(row, logs_root, Path(args.linux_sha_file))
-    print(json.dumps({"ok": True, "tasks": len(rows), "sha256": immutable_digest(rows)}))
+    fingerprint_digest, _, _, _ = read_fingerprint(fingerprint)
+    print(json.dumps({"ok": True, "tasks": len(rows), "sha256": fingerprint_digest}))
 
 
 def cmd_claim(args: argparse.Namespace) -> None:
@@ -945,7 +1053,7 @@ def cmd_claim(args: argparse.Namespace) -> None:
         verify_linux_checkout(Path(args.linux_root), Path(args.linux_sha_file))
         rows = read_tsv(queue, FIELDS)
         validate_rows(rows)
-        verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file))
+        verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file), Path(args.phase0_identity))
         reserved = [
             row
             for row in rows
@@ -999,7 +1107,7 @@ def load_mutable(args: argparse.Namespace) -> tuple[Path, Path, Path, Path, list
     queue, fingerprint, events, logs_root = common_paths(args)
     rows = read_tsv(queue, FIELDS)
     validate_rows(rows)
-    verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file))
+    verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file), Path(args.phase0_identity))
     row = task_by_id(rows, args.id)
     return queue, fingerprint, events, logs_root, rows, row
 
@@ -1450,7 +1558,7 @@ def cmd_stats(args: argparse.Namespace) -> None:
         fingerprint = Path(args.fingerprint)
         fingerprint_ok = False
         if fingerprint.exists():
-            verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file))
+            verify_fingerprint(rows, fingerprint, Path(args.linux_sha_file), Path(args.phase0_identity))
             fingerprint_ok = True
         counts = {status: 0 for status in sorted(ALL_STATUSES)}
         weights = {status: 0.0 for status in sorted(ALL_STATUSES)}
@@ -1509,7 +1617,7 @@ def cmd_stale(args: argparse.Namespace) -> None:
     with QueueLock(queue):
         rows = read_tsv(queue, FIELDS)
         validate_rows(rows)
-        verify_fingerprint(rows, Path(args.fingerprint), Path(args.linux_sha_file))
+        verify_fingerprint(rows, Path(args.fingerprint), Path(args.linux_sha_file), Path(args.phase0_identity))
         now = dt.datetime.now(dt.timezone.utc)
         stale = []
         for row in rows:
@@ -1541,6 +1649,11 @@ def add_common_files(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--logs-root", default=str(DEFAULT_LOGS_ROOT))
     parser.add_argument("--linux-sha-file", default=str(DEFAULT_LINUX_SHA_FILE))
     parser.add_argument("--linux-root", default=str(DEFAULT_LINUX_ROOT))
+    parser.add_argument(
+        "--phase0-identity",
+        default=str(DEFAULT_PHASE0_IDENTITY),
+        help="identity carrying the stable pre-queue Phase 0 binding",
+    )
     parser.add_argument("--skip-branch-check", action="store_true", help=argparse.SUPPRESS)
 
 
@@ -1579,6 +1692,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_files(invalidate)
     invalidate.add_argument("--archive", required=True)
     invalidate.add_argument("--reason", required=True)
+    invalidate.add_argument(
+        "--phase-gate-reopen",
+        action="store_true",
+        help=(
+            "explicitly invalidate a source-reviewed snapshot after a Phase 0 gate "
+            "defect; permits terminal DONE rows but still rejects every active stage "
+            "or lease and leaves the queue TSV unchanged"
+        ),
+    )
     invalidate.add_argument("--role", default="scope_architect")
     invalidate.add_argument("--model", default="gpt-5.6-sol")
     invalidate.add_argument("--effort", default="xhigh")

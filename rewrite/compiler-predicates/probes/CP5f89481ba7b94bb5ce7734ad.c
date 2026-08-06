@@ -1,0 +1,5 @@
+#if __has_attribute(__target__)
+LUPOS_COMPILER_PREDICATE_CP5f89481ba7b94bb5ce7734ad_1
+#else
+LUPOS_COMPILER_PREDICATE_CP5f89481ba7b94bb5ce7734ad_0
+#endif

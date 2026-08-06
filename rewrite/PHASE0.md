@@ -49,3 +49,75 @@ independent-validation status. A changed predicate set/result, compiler or
 compiler hash, relevant flags, target, or configuration invalidates Phase 0 and
 requires a fresh manifest and queue. A predicate affecting selected code may
 not remain `PENDING_REVIEW`.
+
+The repeatable capture and independent replay invocations are:
+
+```bash
+LLVM=/usr/lib/llvm-19/bin/ LLVM_IAS=1 \
+  python3 tools/compiler_predicates.py --execute
+LLVM=/usr/lib/llvm-19/bin/ LLVM_IAS=1 \
+  python3 tools/validate_compiler_predicates.py --execute
+```
+
+The capture tool refuses to replace existing evidence. Archive an invalidated
+run first, then regenerate the compiler predicates before regenerating the
+Phase 0 manifests and queue.
+
+## Header provider graph
+
+Header task ordering is derived from each architecture's retained Kbuild
+dependency assignment and exact include search path. Literal include edges are
+resolved for both pinned Linux headers and generated headers. Generated and
+other non-translated headers remain vertices while their paths are projected to
+the first translated header task, so wrappers such as generated `asm/types.h`
+cannot erase the `asm-generic/types.h` prerequisite.
+
+Some Linux headers intentionally rely on definitions established earlier by a
+consumer rather than including every provider themselves. For every retained
+Rust translation-unit context, Phase 0 therefore intersects the header's
+lexical type, tag, function, and operative-macro references with the selected
+definition inventory. It records the nearest preceding defining header for
+references not supplied by the header's architecture-specific direct include
+closure, and collapses nested defining headers to the outer sufficient
+provider. These architecture-specific relationships and the exact identifiers
+they provide live in `metadata/header_context_edges.tsv`. Providers reached
+from an explicit frozen `-include` root are distinguished from ordinary
+dependency-order providers.
+
+The union of projected literal includes and ordered context providers is
+condensed into deterministic strongly connected components. Components are
+then linearized into an acyclic task DAG. The independent validator reconstructs
+literal resolution, generated-wrapper projection, ordered dependency replay,
+lexical definition/reference matching, forced-include ancestry, components,
+task reachability, and acyclicity from retained Kbuild evidence; it does not
+accept the extractor's graph on trust.
+
+A phase-gate defect discovered after source review is invalidated only with
+`rewrite_queue.py invalidate --phase-gate-reopen`. That explicit mode still
+requires a valid branch and fingerprint, rejects every active stage or lease,
+records prior terminal rows in the append-only event log, and never rewrites
+the invalid queue TSV. Ordinary provisional invalidation remains stricter and
+continues to reject `DONE` rows.
+
+## Oracle-only test classification
+
+Selected original test material remains inventoried but never becomes a Rust
+mapping or queue task. `metadata/oracle_classification.tsv` records the exact
+set and the mechanical reason for every `ORACLE_ONLY` row.
+
+Explicit `include/kunit/`, `lib/kunit/`, `tools/testing/`, KUnit-named paths,
+and directory components named `test`, `tests`, `testing`, or `selftests` are
+oracle structure. Boundary-delimited `test`, `selftest`, and `selftests`
+basename tokens identify in-tree test sources outside driver-owned Kbuild
+targets. Driver-owned diagnostics with such generic names remain original
+Linux driver objects; unrelated production names such as `testmgr`, `memtest`,
+`testmode`, and `cabletest` are not test tokens. A selected header used only by
+oracle compilation units is retained as oracle support, while a header shared
+with production Rust consumers remains production unless its own path is
+explicit oracle structure.
+
+Independent validation reconstructs this set from pinned paths, Kbuild owners,
+and compiler dependency consumers. It rejects an oracle path in
+`RUST_TRANSLATE`, a non-empty `src/` destination, semantic manifests, or the
+translation queue, while requiring the selected path to remain represented in
+`FILE_MAP.tsv` as inventory evidence.

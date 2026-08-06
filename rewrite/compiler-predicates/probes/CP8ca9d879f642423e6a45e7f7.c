@@ -1,0 +1,5 @@
+#if __has_attribute(__no_profile_instrument_function__)
+LUPOS_COMPILER_PREDICATE_CP8ca9d879f642423e6a45e7f7_1
+#else
+LUPOS_COMPILER_PREDICATE_CP8ca9d879f642423e6a45e7f7_0
+#endif

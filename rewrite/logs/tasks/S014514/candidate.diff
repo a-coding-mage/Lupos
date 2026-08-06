@@ -1,0 +1,11 @@
+Candidate mapping for `include/linux/nfs_iostat.h`:
+
+- `NFS_IOSTAT_VERS` -> immutable `b"1.1\0"` storage and a named thin
+  `*const core::ffi::c_char` view, preserving the C string literal's NUL and
+  selected `%s` argument contract.
+- `enum nfs_stat_bytecounters` -> `nfs_stat_bytecounters = core::ffi::c_int` plus the nine
+  original enumerator constants (`0` through `8`).
+- `enum nfs_stat_eventcounters` -> `nfs_stat_eventcounters = core::ffi::c_int` plus the
+  twenty-eight original enumerator constants (`0` through `27`).
+- No functions, statics, structures, include dependencies, or configuration
+  branches are present in the source header.

@@ -1,0 +1,5 @@
+#if __has_attribute(__noclone__)
+LUPOS_COMPILER_PREDICATE_CPc5f00436955ffde889c26c51_1
+#else
+LUPOS_COMPILER_PREDICATE_CPc5f00436955ffde889c26c51_0
+#endif
