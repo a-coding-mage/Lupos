@@ -1,0 +1,17 @@
+Candidate summary for `S013735`:
+
+```diff
++pub type kernel_ulong_t = u64;
++
++macro_rules! SPI_NAME_SIZE { () => { 32i32 }; }
++macro_rules! SPI_MODULE_PREFIX { () => { b"spi:\0" }; }
++
++#[repr(C)]
++pub struct spi_device_id {
++    pub name: [u8; SPI_NAME_SIZE!() as usize],
++    pub driver_data: kernel_ulong_t,
++}
+```
+
+The complete candidate is `src/include/linux/device-id/spi.rs`; this focused
+snippet covers every selected declaration and macro from the source header.

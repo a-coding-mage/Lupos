@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//! linux-source: arch/arm64/include/asm/gpr-num.h
+//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
+//! architectures: aarch64
+//! rewrite-task: S000071
+
+/// Assembly source emitted at each inline-assembly use site to map AArch64
+/// `x0`–`x30` and `w0`–`w30`, plus `xzr` and `wzr`, to their architectural
+/// register numbers.
+pub const __DEFINE_ASM_GPR_NUMS: &str = "\t.irp\tnum,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30\n\t.equ\t.L__gpr_num_x\\num, \\num\n\t.equ\t.L__gpr_num_w\\num, \\num\n\t.endr\n\t.equ\t.L__gpr_num_xzr, 31\n\t.equ\t.L__gpr_num_wzr, 31\n";

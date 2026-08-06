@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-2.0
+//! linux-source: include/linux/irqdomain_defs.h
+//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
+//! architectures: common
+//! rewrite-task: S014142
+
+use core::ffi::c_int;
+
+/*
+ * Should several domains have the same device node, but serve different
+ * purposes (for example one domain is for PCI/MSI, and the other for wired
+ * IRQs), they can be distinguished using a bus-specific token. Most domains
+ * are expected to only carry DOMAIN_BUS_ANY.
+ */
+
+/*
+ * C `enum irq_domain_bus_token` has the frozen signed-`int` ABI. A transparent
+ * wrapper preserves that object representation, including values that are not
+ * named enumerators, while retaining the distinct C enum tag for structure
+ * fields and function parameters.
+ */
+#[repr(transparent)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct irq_domain_bus_token(pub c_int);
+
+// C enumerators are unscoped `int` constant expressions.
+pub const DOMAIN_BUS_ANY: c_int = 0;
+pub const DOMAIN_BUS_WIRED: c_int = 1;
+pub const DOMAIN_BUS_GENERIC_MSI: c_int = 2;
+pub const DOMAIN_BUS_PCI_MSI: c_int = 3;
+pub const DOMAIN_BUS_PLATFORM_MSI: c_int = 4;
+pub const DOMAIN_BUS_NEXUS: c_int = 5;
+pub const DOMAIN_BUS_IPI: c_int = 6;
+pub const DOMAIN_BUS_TI_SCI_INTA_MSI: c_int = 7;
+pub const DOMAIN_BUS_WAKEUP: c_int = 8;
+pub const DOMAIN_BUS_VMD_MSI: c_int = 9;
+pub const DOMAIN_BUS_PCI_DEVICE_MSI: c_int = 10;
+pub const DOMAIN_BUS_PCI_DEVICE_MSIX: c_int = 11;
+pub const DOMAIN_BUS_DMAR: c_int = 12;
+pub const DOMAIN_BUS_AMDVI: c_int = 13;
+pub const DOMAIN_BUS_DEVICE_MSI: c_int = 14;
+pub const DOMAIN_BUS_WIRED_TO_MSI: c_int = 15;

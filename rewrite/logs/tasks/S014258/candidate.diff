@@ -1,0 +1,15 @@
+# Candidate diff: S014258
+
+Added `src/include/linux/lsm/apparmor.rs` as the path-preserving fresh Rust
+translation of `include/linux/lsm/apparmor.h`.
+
+Focused mapping:
+
+```text
+struct lsm_prop_apparmor { #ifdef CONFIG_SECURITY_APPARMOR ... #endif }
+    -> #[repr(C)] pub struct lsm_prop_apparmor {}
+```
+
+The member is excluded because `CONFIG_SECURITY_APPARMOR` is absent from both
+frozen configuration files.  No other selected declarations occur in the
+source header.

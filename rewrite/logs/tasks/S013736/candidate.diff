@@ -1,0 +1,7 @@
+New file: `src/include/linux/device-id/spmi.rs`
+
+- Maps `kernel_ulong_t` to `core::ffi::c_ulong` for both frozen LP64 targets.
+- Represents `SPMI_NAME_SIZE` as an `i32` macro expression and
+  `SPMI_MODULE_PREFIX` as the original NUL-terminated byte string expression.
+- Represents `struct spmi_device_id` with `#[repr(C)]`, preserving field order:
+  `char name[32]`, then `kernel_ulong_t driver_data`.

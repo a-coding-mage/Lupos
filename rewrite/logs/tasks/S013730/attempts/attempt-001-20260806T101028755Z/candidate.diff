@@ -1,0 +1,20 @@
+diff --git a/src/include/linux/device-id/rpmsg.rs b/src/include/linux/device-id/rpmsg.rs
+new file mode 100644
+--- /dev/null
++++ b/src/include/linux/device-id/rpmsg.rs
+@@
++// SPDX-License-Identifier: GPL-2.0-only
++//! linux-source: include/linux/device-id/rpmsg.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: common
++//! rewrite-task: S013730
++
++pub type kernel_ulong_t = u64;
++pub const RPMSG_NAME_SIZE: usize = 32;
++pub const RPMSG_DEVICE_MODALIAS_FMT: &[u8; 9] = b"rpmsg:%s\0";
++
++#[repr(C)]
++pub struct rpmsg_device_id {
++    pub name: [u8; RPMSG_NAME_SIZE],
++    pub driver_data: kernel_ulong_t,
++}

@@ -1,0 +1,11 @@
+# S012503 candidate summary
+
+Added `src/include/asm-generic/audit_write.rs` as the fresh translation of the
+selected reincludable audit-write array initializer fragment.
+
+- Preserves SPDX/provenance for `include/asm-generic/audit_write.h` at the
+  frozen Linux revision.
+- Represents all four frozen macro-expansion contexts with ordered `u32`
+  syscall-number expansions, including the preceding `audit_dir_write.h`
+  fragment and excluding each consumer-owned `~0U` terminator.
+- Adds no storage, FFI surface, unsafe code, tests, stubs, or runtime logic.

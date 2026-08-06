@@ -11,6 +11,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import re
 from collections import Counter, defaultdict
 import statistics
 from pathlib import Path
@@ -168,14 +169,47 @@ def chart_cumulative_weight(
     plt.close(figure)
 
 
+def corrected_implementer_models(events: list[dict[str, object]]) -> dict[tuple[str, int], str]:
+    """Apply append-only, adjudicated model-attribution corrections.
+
+    Lifecycle events are immutable.  An incident-review event may therefore
+    correct only the attribution of a specific implementation attempt without
+    synthesizing another ``implementation_done`` event (which would corrupt
+    duration/count accounting).
+    """
+    corrections: dict[tuple[str, int], str] = {}
+    for event in events:
+        if str(event.get("event", "")) != "INCIDENT_REVIEW_COMPLETED":
+            continue
+        detail = str(event.get("detail", "") or "")
+        if "correction_scope=model_attribution_only" not in detail:
+            continue
+        task_id = str(event.get("task_id", "") or "")
+        try:
+            attempt = int(event.get("attempt", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        match = re.search(r"(?:^|;\\s*)actual_model=([^;\\s]+)", detail)
+        if task_id and attempt > 0 and match:
+            corrections[(task_id, attempt)] = match.group(1)
+    return corrections
+
+
 def write_model_metrics(path: Path, events: list[dict[str, object]]) -> None:
     implementations = Counter()
     reviews = Counter()
     completions = Counter()
+    corrections = corrected_implementer_models(events)
     for event in events:
         model = str(event.get("model", "") or "unknown")
         name = str(event.get("event", ""))
         if name == "implementation_done":
+            task_id = str(event.get("task_id", "") or "")
+            try:
+                attempt = int(event.get("attempt", 0) or 0)
+            except (TypeError, ValueError):
+                attempt = 0
+            model = corrections.get((task_id, attempt), model)
             implementations[model] += 1
         elif name in {"review_1_done", "review_2_done"}:
             reviews[model] += 1
@@ -234,6 +268,7 @@ def write_task_durations(
     """
 
     rows_by_id = {row["id"]: row for row in rows}
+    model_corrections = corrected_implementer_models(events)
     grouped: dict[tuple[str, int], list[dict[str, object]]] = defaultdict(list)
     for event in events:
         task_id = str(event.get("task_id", "") or "")
@@ -310,7 +345,9 @@ def write_task_durations(
                     None,
                 )
             implementer_model = (
-                str(model_event.get("model", "") or "unknown")
+                model_corrections.get(
+                    (task_id, attempt), str(model_event.get("model", "") or "unknown")
+                )
                 if model_event
                 else "unknown"
             )

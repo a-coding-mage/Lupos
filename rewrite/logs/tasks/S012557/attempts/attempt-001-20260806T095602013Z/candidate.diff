@@ -1,0 +1,9 @@
+--- /dev/null
++++ b/src/include/asm-generic/mcs_spinlock.rs
+@@
++#[repr(C)]
++pub struct mcs_spinlock {
++    pub next: *mut mcs_spinlock,
++    pub locked: core::ffi::c_int,
++    pub count: core::ffi::c_int,
++}

@@ -1,0 +1,12 @@
+S014788 candidate summary
+
+New destination: src/include/linux/rational.rs
+Oracle: vendor/linux/include/linux/rational.h
+
+Mapped declaration:
+- rational_best_approximation(unsigned long, unsigned long, unsigned long,
+  unsigned long, unsigned long *, unsigned long *) -> unsafe extern "C"
+  declaration with c_ulong scalar values and *mut c_ulong outputs
+
+The C include guard has no Rust counterpart. No implementation arithmetic was
+added: it belongs solely to the separately queued lib/math/rational.c task.

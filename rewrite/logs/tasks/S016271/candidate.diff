@@ -1,0 +1,7 @@
+# Candidate snapshot — S016271
+
+Destination: `src/include/uapi/linux/netfilter/nf_conntrack_ftp.rs`
+
+The fresh UAPI translation adds the immutable provenance header, the C-`int` transparent `nf_ct_ftp_type` ABI wrapper, and the four source-order constants `NF_CT_FTP_PORT=0`, `NF_CT_FTP_PASV=1`, `NF_CT_FTP_EPRT=2`, and `NF_CT_FTP_EPSV=3`.
+
+No other source file was edited by this implementation stage.

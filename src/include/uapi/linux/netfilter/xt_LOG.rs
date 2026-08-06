@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
+//! linux-source: include/uapi/linux/netfilter/xt_LOG.h
+//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
+//! architectures: common
+//! rewrite-task: S016284
+
+/* Keep these synchronized with the corresponding NF_LOG_* values. */
+pub const XT_LOG_TCPSEQ: core::ffi::c_int = 0x01;
+pub const XT_LOG_TCPOPT: core::ffi::c_int = 0x02;
+pub const XT_LOG_IPOPT: core::ffi::c_int = 0x04;
+pub const XT_LOG_UID: core::ffi::c_int = 0x08;
+pub const XT_LOG_NFLOG: core::ffi::c_int = 0x10;
+pub const XT_LOG_MACDECODE: core::ffi::c_int = 0x20;
+pub const XT_LOG_MASK: core::ffi::c_int = 0x2f;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct xt_log_info {
+    pub level: u8,
+    pub logflags: u8,
+    /* The frozen kernel builds this `char` field with -funsigned-char. */
+    pub prefix: [u8; 30],
+}

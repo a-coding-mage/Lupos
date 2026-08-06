@@ -1,0 +1,13 @@
+S016151 candidate summary
+
+Source: vendor/linux/include/uapi/linux/hw_breakpoint.h
+Destination: src/include/uapi/linux/hw_breakpoint.rs
+
+Added the exact eight hardware-breakpoint length values (1 through 8), and
+the six breakpoint access constants. The composite values remain expressed as
+the corresponding bitwise ORs:
+
+- HW_BREAKPOINT_RW = HW_BREAKPOINT_R | HW_BREAKPOINT_W
+- HW_BREAKPOINT_INVALID = HW_BREAKPOINT_RW | HW_BREAKPOINT_X
+
+The destination contains only immutable provenance and these UAPI constants.

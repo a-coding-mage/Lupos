@@ -1,0 +1,22 @@
+--- /dev/null
++++ b/src/include/uapi/linux/limits.rs
+@@
++// SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
++//! linux-source: include/uapi/linux/limits.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: common
++//! rewrite-task: S016224
++
++pub const NR_OPEN: i32 = 1024;
++pub const NGROUPS_MAX: i32 = 65_536;
++pub const ARG_MAX: i32 = 131_072;
++pub const LINK_MAX: i32 = 127;
++pub const MAX_CANON: i32 = 255;
++pub const MAX_INPUT: i32 = 255;
++pub const NAME_MAX: i32 = 255;
++pub const PATH_MAX: i32 = 4096;
++pub const PIPE_BUF: i32 = 4096;
++pub const XATTR_NAME_MAX: i32 = 255;
++pub const XATTR_SIZE_MAX: i32 = 65_536;
++pub const XATTR_LIST_MAX: i32 = 65_536;
++pub const RTSIG_MAX: i32 = 32;

@@ -1,0 +1,7 @@
+Candidate: `src/include/linux/device-id/rpmsg.rs`
+
+- `RPMSG_NAME_SIZE` is the C `int` literal `32`.
+- `RPMSG_DEVICE_MODALIAS_FMT` is `b"rpmsg:%s\\0"`, preserving the C string
+  literal's trailing NUL byte.
+- `rpmsg_device_id` uses `#[repr(C)]`, `Clone`, and `Copy`, with `name` before
+  `driver_data` as in the pinned header.

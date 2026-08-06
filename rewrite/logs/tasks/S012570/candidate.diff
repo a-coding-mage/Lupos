@@ -1,0 +1,20 @@
+--- /dev/null
++++ b/src/include/asm-generic/percpu_types.rs
+@@
++// SPDX-License-Identifier: GPL-2.0
++//! linux-source: include/asm-generic/percpu_types.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: common
++//! rewrite-task: S012570
++
++/*
++ * The upstream header contributes only the `__percpu_qual` preprocessor
++ * qualifier.  Its generic definition expands to no tokens when an
++ * architecture has not already supplied a qualifier.  Rust has no
++ * corresponding named-address-space qualifier at this source boundary, so
++ * the selected generic fallback has no Rust item or runtime/ABI effect.
++ *
++ * The x86-specific header remains the upstream conditional owner of a
++ * segment-address-space qualifier; this generic fallback neither overrides
++ * nor represents that architecture-specific preprocessor state.
++ */

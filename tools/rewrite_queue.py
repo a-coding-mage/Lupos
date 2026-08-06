@@ -1140,6 +1140,19 @@ def mutate_simple(
         assert_owner(row, getattr(args, "pipeline", None))
         if prerequisite:
             prerequisite(row, logs_root)
+        # Validate actor metadata before changing durable task state.  An
+        # append-only event is part of the transition, so a missing actor must
+        # fail closed rather than leave a row advanced without its event.
+        payload = event_payload(
+            row,
+            event=event,
+            role=args.role,
+            model=args.model,
+            effort=args.effort,
+            detail=args.message,
+            from_status=row["status"],
+            to_status=to_status,
+        )
         timestamp = now_utc()
         old_status, new_status = update_status(row, to_status, timestamp)
         if timestamp_field:
@@ -1149,19 +1162,7 @@ def mutate_simple(
             row["lease_expires_at"] = ""
         validate_rows(rows)
         atomic_write_tsv(queue, rows)
-        append_event(
-            events,
-            event_payload(
-                row,
-                event=event,
-                role=args.role,
-                model=args.model,
-                effort=args.effort,
-                detail=args.message,
-                from_status=old_status,
-                to_status=new_status,
-            ),
-        )
+        append_event(events, payload)
     print(json.dumps({"id": row["id"], "status": row["status"], "updated_at": row["updated_at"]}))
 
 
@@ -1727,7 +1728,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_actor_args(
         implemented,
         default_role="implementer",
-        default_model="gpt-5.6-luna",
+        # Attribution is evidence, not a model preference.  A fallback agent
+        # must name its actual model explicitly; silently recording Luna here
+        # corrupts the append-only performance history.
+        default_model="",
         default_effort="medium",
     )
     implemented.set_defaults(func=cmd_mark_implemented)

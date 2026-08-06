@@ -1,0 +1,8 @@
+New destination file `src/arch/x86/include/uapi/asm/unistd.rs`:
+
+```diff
++pub const __X32_SYSCALL_BIT: i32 = 0x4000_0000;
+```
+
+This is the selected kernel-visible operative macro from
+`arch/x86/include/uapi/asm/unistd.h`.

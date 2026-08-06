@@ -1,0 +1,10 @@
+Candidate: `src/include/linux/device-id/platform.rs`
+
+- Preserves `PLATFORM_NAME_SIZE` as the C `int` literal `24` and
+  `PLATFORM_MODULE_PREFIX` as the NUL-terminated `"platform:"` literal
+  expansion.
+- Preserves the `__KERNEL__` `kernel_ulong_t` alias as C `unsigned long` on
+  both frozen LP64 targets.
+- Preserves `struct platform_device_id` field order and C representation:
+  `unsigned char name[24]` under the frozen `-funsigned-char` commands,
+  followed by `kernel_ulong_t driver_data`.

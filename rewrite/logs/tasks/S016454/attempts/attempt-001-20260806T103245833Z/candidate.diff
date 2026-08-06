@@ -1,0 +1,7 @@
+# Candidate mapping — S016454
+
+`include/uapi/linux/vesa.h` → `src/include/uapi/linux/vesa.rs`
+
+- `enum vesa_blank_mode` is a `#[repr(C)]` Rust enum with the same ordered enumerators and C-int expressions.
+- `VESA_NO_BLANKING`, `VESA_VSYNC_SUSPEND`, `VESA_HSYNC_SUSPEND`, and `VESA_POWERDOWN` remain public C-int macro-equivalent constants.
+- `VESA_BLANK_MAX` is retained as the final enum sentinel; Linux does not define a same-named macro alias.

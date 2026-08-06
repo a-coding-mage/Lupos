@@ -1,0 +1,20 @@
+# S000426 candidate summary
+
+New path: `src/arch/x86/events/amd/iommu_h.rs`.
+
+The candidate adds immutable provenance and the eight direct translations:
+
+```text
+IOMMU_PC_COUNTER_REG          = 0x00  (i32)
+IOMMU_PC_COUNTER_SRC_REG      = 0x08  (i32)
+IOMMU_PC_PASID_MATCH_REG      = 0x10  (i32)
+IOMMU_PC_DOMID_MATCH_REG      = 0x18  (i32)
+IOMMU_PC_DEVID_MATCH_REG      = 0x20  (i32)
+IOMMU_PC_COUNTER_REPORT_REG   = 0x28  (i32)
+PC_MAX_SPEC_BNKS              = 64    (i32)
+PC_MAX_SPEC_CNTRS             = 16    (i32)
+```
+
+No symbols, state, callbacks, allocation, synchronization, ABI objects, or
+conditional implementation branches exist in the upstream header beyond the
+C include guard.

@@ -1,0 +1,9 @@
+diff --git a/src/include/asm-generic/trace_clock.rs b/src/include/asm-generic/trace_clock.rs
+new file mode 100644
+--- /dev/null
++++ b/src/include/asm-generic/trace_clock.rs
+@@
++#[macro_export]
++macro_rules! ARCH_TRACE_CLOCKS {
++    () => {};
++}

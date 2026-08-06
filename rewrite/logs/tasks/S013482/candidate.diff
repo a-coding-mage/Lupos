@@ -1,0 +1,29 @@
+--- /dev/null
++++ b/src/include/linux/audit_arch.rs
+@@
++// SPDX-License-Identifier: GPL-2.0-only
++//! linux-source: include/linux/audit_arch.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: common
++//! rewrite-task: S013482
++
++#[repr(C)]
++pub enum auditsc_class_t {
++    AUDITSC_NATIVE = 0,
++    AUDITSC_COMPAT,
++    AUDITSC_OPEN,
++    AUDITSC_OPENAT,
++    AUDITSC_SOCKETCALL,
++    AUDITSC_EXECVE,
++    AUDITSC_OPENAT2,
++    AUDITSC_NVALS,
++}
++
++unsafe extern "C" {
++    pub fn audit_classify_compat_syscall(abi: i32, syscall: u32) -> i32;
++    pub static mut compat_write_class: u32;
++    pub static mut compat_read_class: u32;
++    pub static mut compat_dir_class: u32;
++    pub static mut compat_chattr_class: u32;
++    pub static mut compat_signal_class: u32;
++}

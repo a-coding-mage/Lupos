@@ -1,0 +1,11 @@
+S013730 attempt 2 candidate summary
+
+- Added Linux-path-preserving Rust mapping for
+  `include/linux/device-id/rpmsg.h`.
+- Maps the two operative macros: C integer literal `32`, and the exact
+  NUL-terminated `"rpmsg:%s"` byte literal.
+- Maps `kernel_ulong_t` to C `unsigned long` and maps the C-layout
+  `rpmsg_device_id` with an inline 32-byte unsigned-character name field and
+  trailing driver data field.
+- The struct has C representation and copy semantics to preserve C
+  initialization/table-copy usage.
