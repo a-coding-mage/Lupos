@@ -209,6 +209,10 @@ Rules:
 - Do not mirror Linux documentation, original tests, or driver sources under
   `src/`.
 - Retain SPDX identifiers and relevant upstream copyright notices.
+- If compiler output was not used to change the implementation, invalidate and rerun the affected review/application stages.
+- If compiler output influenced source changes, requeue every affected task to IMPLEMENTED or TODO, depending on whether the original candidate can be recovered.
+- Do not invalidate unrelated tasks without evidence of contamination.
+- Do not reopen Phase 0 unless the toolchain, configs, extractor, manifests, identity, or frozen queue inputs changed.
 
 Every translated file begins with immutable provenance only:
 
