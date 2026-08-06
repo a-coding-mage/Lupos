@@ -1,0 +1,15 @@
+# S016294 candidate summary
+
+Adds the path-preserving translation of
+`include/uapi/linux/netfilter/xt_state.h`.
+
+The candidate exposes exactly the selected public UAPI items:
+
+- `XT_STATE_BIT`, preserving `(1 << ((ctinfo) % IP_CT_IS_REPLY + 1))` through
+  the translated `ip_conntrack_info` wrapper and `IP_CT_IS_REPLY` constant;
+- `XT_STATE_INVALID` as `1 << 0`;
+- `XT_STATE_UNTRACKED` as `1 << (IP_CT_NUMBER + 1)`; and
+- `#[repr(C)] struct xt_state_info { statemask: c_uint }`.
+
+No substitute netfilter API, padding, packing, tests, runtime behavior, or
+extra selected items were added.
