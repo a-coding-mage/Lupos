@@ -1,0 +1,6 @@
+Candidate created: `src/include/linux/circ_buf.rs`.
+
+The translation adds the C-layout `circ_buf` type and exported Rust expression
+macros `CIRC_CNT`, `CIRC_SPACE`, `CIRC_CNT_TO_END`, and
+`CIRC_SPACE_TO_END`. It introduces no Rust tests, stubs, drivers, or module
+index changes.
