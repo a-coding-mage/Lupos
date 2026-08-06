@@ -32,11 +32,13 @@ pub type decompress_fn = Option<
 >;
 
 unsafe extern "C" {
-    /// Detects the decompression method represented by the input magic.
+    /// Detects the decompression method from the first two input bytes.
     ///
-    /// `inbuf` must designate `len` readable bytes.  When non-null, `name`
-    /// receives the matching compression-name pointer, or null when fewer
-    /// than two bytes are available; the returned decompressor is nullable.
+    /// With `len < 2`, this neither reads `inbuf` nor requires it to be
+    /// non-null; it stores null through a non-null `name` and returns null.
+    /// With `len >= 2`, `inbuf` must designate at least two readable bytes.
+    /// A non-null `name` receives the matched format name, or null when the
+    /// two-byte magic is unknown; the returned decompressor is nullable.
     pub fn decompress_method(
         inbuf: *const c_uchar,
         len: c_long,
