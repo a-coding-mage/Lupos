@@ -7,3 +7,18 @@ src/include/config/
 src/include/generated/
 core
 core.*
+
+# Phase 0 raw manifests and Kbuild metadata are materialized local caches.
+# Their deterministic, checksummed gzip bundles are tracked in
+# rewrite/phase0-bundles/ and are restored with tools/phase0_materialize.py.
+/rewrite/SCOPE.tsv
+/rewrite/FILE_MAP.tsv
+/rewrite/SYMBOLS.tsv
+/rewrite/ABI.tsv
+/rewrite/LIFETIMES.tsv
+/rewrite/DRIVER_ABI.tsv
+/rewrite/metadata/*
+
+# Invalidated Phase 0 runs retain one compact prune ledger, never snapshots.
+/rewrite/archive/*
+!/rewrite/archive/PRUNED_TSVS.tsv

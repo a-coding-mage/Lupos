@@ -119,10 +119,23 @@ The canonical Phase 0 toolchain is the complete LLVM 19 suite at
 use `LLVM=/usr/lib/llvm-19/bin/` with its trailing slash and `LLVM_IAS=1`.
 Rust-distributed LLD is recorded only as rejected evidence and is never a
 kernel build tool.
-Invalidated provisional runs are archived rather than reused.  The archive retains
-the per-run README and a compact append-only prune ledger; it does not retain
-duplicated generated TSV payloads.  Authoritative Phase 0 manifests and metadata
-remain under `rewrite/`, not `rewrite/archive/`.
+Invalidated provisional runs are never reused. `rewrite/archive/PRUNED_TSVS.tsv`
+is the sole compact, append-only invalidation/prune ledger; per-run directories,
+README copies, and generated payload snapshots are deliberately not retained.
+
+Raw Phase 0 manifests and Kbuild metadata are reproducible local caches, not
+ordinary Git blobs. Their deterministic, checksummed gzip bundles live in
+`rewrite/phase0-bundles/`. Restore and verify them without AI with:
+
+```bash
+python3 tools/phase0_materialize.py materialize --rewrite rewrite
+python3 tools/phase0_materialize.py verify --rewrite rewrite
+```
+
+This does not rerun Phase 0, alter `vendor/linux`, or touch `src/`; it restores
+the exact raw bytes represented by the committed bundle hashes. A fresh Phase 0
+run regenerates those raw files from the pinned Linux source and Kbuild metadata,
+then refreshes the bundles through the same deterministic tool.
 
 Compiler feature-test predicates are equally frozen mechanical inputs when
 they affect selected source, generated declarations, ABI, attributes, section

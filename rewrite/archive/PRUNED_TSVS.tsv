@@ -1,2 +1,3 @@
 pruned_at	root	file_count	bytes	policy	reason
 2026-08-06T02:44:34Z	rewrite/archive	464	54871713516	retain per-run README and one append-only prune-ledger row; do not retain generated TSV payloads	failed and provisional Phase 0 snapshots duplicated generated metadata without adding independent evidence
+2026-08-06T03:46:54Z	rewrite/archive	254380	39649277759	retain one append-only prune-ledger row only; do not retain per-run directories, copied READMEs, Kbuild artifacts, or generated payloads	all invalidated Phase 0 snapshots duplicated reproducible artifacts; current canonical material is retained as checksummed gzip bundles under rewrite/phase0-bundles

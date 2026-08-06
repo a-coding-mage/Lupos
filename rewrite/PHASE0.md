@@ -15,9 +15,32 @@ change invalidates the identity, scope, manifests, queue, and fingerprint.
 
 The metadata-only Linux pass may produce generated headers/sources, Kbuild
 `.cmd` files, depfiles, object/module membership, compile commands, and related
-selection evidence. It must not compile or execute Lupos. Provisional invalid
-runs are archived under `rewrite/archive/` and invalidated through the queue
-tool before authoritative outputs are regenerated.
+selection evidence. It must not compile or execute Lupos. Raw Phase 0 manifests
+and Kbuild metadata are local materialized caches: their deterministic,
+checksummed gzip bundles are committed under `rewrite/phase0-bundles/`, while the
+uncompressed files are ignored. This avoids duplicating multi-gigabyte generated
+data in Git without weakening reproducibility or Phase 0 identity binding.
+
+Use the following deterministic, no-AI commands after obtaining the repository
+or after a fresh Phase 0 extraction:
+
+```bash
+python3 tools/phase0_materialize.py materialize --rewrite rewrite
+python3 tools/phase0_materialize.py verify --rewrite rewrite
+python3 tools/phase0_materialize.py bundle --rewrite rewrite
+```
+
+`materialize` restores only the bundled raw Phase 0 paths and rejects a
+conflicting local file. `verify` checks both compressed bundle hashes and every
+raw member hash. `bundle` replaces the bundles atomically from an already
+materialized Phase 0 result; it neither reads nor modifies `vendor/linux` or
+`src/`. It is an artifact-storage operation, not a Phase 0 execution. A fresh
+extraction remains the authoritative way to derive new metadata from the frozen
+Linux/Kbuild inputs.
+
+Provisional invalidation appends one compact row to
+`rewrite/archive/PRUNED_TSVS.tsv`. Per-run copies of manifests, metadata, logs,
+or README files are not retained.
 
 The canonical toolchain is the complete LLVM 19 suite under
 `/usr/lib/llvm-19/bin/`. Every invocation uses the absolute
