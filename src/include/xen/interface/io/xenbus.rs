@@ -16,15 +16,23 @@
 #[allow(non_camel_case_types)]
 pub struct xenbus_state(pub i32);
 
+// C places enumerators in the including translation unit's ordinary
+// identifier namespace, independently of the `enum xenbus_state` tag.
 #[allow(non_upper_case_globals)]
-impl xenbus_state {
-    pub const XenbusStateUnknown: Self = Self(0);
-    pub const XenbusStateInitialising: Self = Self(1);
-    pub const XenbusStateInitWait: Self = Self(2);
-    pub const XenbusStateInitialised: Self = Self(3);
-    pub const XenbusStateConnected: Self = Self(4);
-    pub const XenbusStateClosing: Self = Self(5);
-    pub const XenbusStateClosed: Self = Self(6);
-    pub const XenbusStateReconfiguring: Self = Self(7);
-    pub const XenbusStateReconfigured: Self = Self(8);
-}
+pub const XenbusStateUnknown: xenbus_state = xenbus_state(0);
+#[allow(non_upper_case_globals)]
+pub const XenbusStateInitialising: xenbus_state = xenbus_state(1);
+#[allow(non_upper_case_globals)]
+pub const XenbusStateInitWait: xenbus_state = xenbus_state(2);
+#[allow(non_upper_case_globals)]
+pub const XenbusStateInitialised: xenbus_state = xenbus_state(3);
+#[allow(non_upper_case_globals)]
+pub const XenbusStateConnected: xenbus_state = xenbus_state(4);
+#[allow(non_upper_case_globals)]
+pub const XenbusStateClosing: xenbus_state = xenbus_state(5);
+#[allow(non_upper_case_globals)]
+pub const XenbusStateClosed: xenbus_state = xenbus_state(6);
+#[allow(non_upper_case_globals)]
+pub const XenbusStateReconfiguring: xenbus_state = xenbus_state(7);
+#[allow(non_upper_case_globals)]
+pub const XenbusStateReconfigured: xenbus_state = xenbus_state(8);
