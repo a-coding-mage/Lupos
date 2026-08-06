@@ -1,50 +1,56 @@
-# Resolution — S016277
+# S016277 applier resolution
 
-Pinned source reviewed: `vendor/linux/include/uapi/linux/netfilter/nf_tables.h`
-at `425f94c2954b1fe80ebdbf9b29854e89750355df`.
+Task `S016277` remains the pinned, common-architecture mapping
+`include/uapi/linux/netfilter/nf_tables.h` to
+`src/include/uapi/linux/netfilter/nf_tables.rs`.  I independently reopened the
+complete 2,022-line upstream header at Linux revision
+`425f94c2954b1fe80ebdbf9b29854e89750355df`, the fresh Phase 0 identity and
+task records, the candidate, and both fresh review reports.  The branch is
+`feat/bun-like-rewrite-test`; the verified immutable queue fingerprint is
+`d6c01f29edd048c73608fff2ed65f2485755023f85ffc0fec01e9f511fd6a72c` and the
+Phase 0 identity binding is
+`1c793a8db8b4971fdfc15cd7b9e5f503d6b4399893cb0cb5ab171f95c9e46a23`.
 
-## Review finding dispositions
+## Review dispositions
 
-1. **Parity P1 / Rust HIGH — omitted C enum tags: resolved.**  The Rust file
-   now declares every one of the 115 named upstream enum tags, in the same
-   source order, through 115 `nft_uapi_enum!` invocations.  That macro expands
-   each listed tag to a public `#[repr(transparent)]` tuple struct, preserving
-   its distinct C tag namespace and the 32-bit integer object representation.
-   `nft_verdicts` is the signed `i32` representation required by its
-   `-1` through `-5` source values; the other tags, including
-   `nft_data_types` with `NFT_DATA_VERDICT = 0xffffff00U`, use `u32`.
-   Transparent integer wrappers are used instead of closed Rust enums because
-   a C enum object can carry an integer outside the enumerators listed in the
-   declaration.  The pre-existing 847 global enumerator/object-macro
-   identifiers and their reviewed numeric mappings remain intact; the 115
-   adjacent `// enum <tag>` group markers retain each identifier's source-tag
-   association.
+1. Parity review: accepted.  A separate identifier extraction gives the same
+   962 contract identifiers in source and candidate: 115 enum tags and 847
+   public constants (730 enumerators plus 117 object-like macros).  There are
+   no missing or extra contract names.  I confirmed the signed verdicts,
+   explicit flag values, aliases, mask and `*_MAX` relationships, the
+   compatibility alias `NFT_META_IIFTYPE`, and the unsigned
+   `0xffffff00U` data range.
+2. Rust review: accepted.  The source has no function, extern declaration,
+   struct, union, field, bitfield, packing, alignment, or call-convention
+   declaration.  The candidate is likewise declarations/constants only, with
+   no `unsafe`, pointer, reference, allocation, panic, test, or FFI surface.
+3. No source change is required.  The candidate retains the exact SPDX
+   expression and required immutable provenance and introduces no branding
+   change.
 
-   Independent static reconciliation: the upstream `^enum <tag> {` inventory
-   has 115 names and the Rust `nft_uapi_enum!` inventory has 115 names; sorted
-   name comparison has no differences.  This covers the first source tag
-   `nft_registers` (line 22) through `nft_tunnel_attributes` (line 2013).
+## Semantic-record closure
 
-2. **Parity P1 / Rust MEDIUM — widened `NFT_REG32_MAX`: resolved.**  Upstream
-   exposes it only between `#ifdef __KERNEL__` at lines 49--51.  The Rust
-   declaration is now gated by `#[cfg(feature = "__KERNEL__")]`, the
-   compile-time Rust configuration corresponding directly to that source
-   define.  There is no runtime condition or fallback symbol, so a build
-   without the source kernel define does not receive this API.
+The fresh Phase 0 rows for this header deliberately retain their mechanical
+`PENDING_REVIEW` status; this resolution closes their semantic content for both
+frozen targets, rather than changing frozen Phase 0 artifacts.
 
-3. **Parity P1 / Rust LOW — SPDX mismatch: resolved.**  The file now starts
-   with the exact upstream expression
-   `SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note`; immutable
-   task/source/revision/architecture provenance remains present immediately
-   below it.
+- All 115 enum-type ABI/lifetime rows for each of x86_64 and AArch64 are
+  resolved as 32-bit scalar enum contracts with 4-byte alignment: `i32` for
+  every tag except `nft_data_types`, which is `u32` because its enumerator and
+  `NFT_DATA_RESERVED_MASK` are `0xffffff00U`.  The header declares no linked
+  object or callable symbol, so linkage and calling convention are not
+  applicable.
+- All 730 enumerator rows and 117 object-like macro rows are resolved as
+  compile-time integer contracts only: no storage duration, allocation,
+  ownership, lifetime, locking, RCU, refcount, or cleanup behavior exists.
+  The candidate preserves the C source values/aliases and operator relations.
+- The header guard is preprocessor-only.  The only non-guard conditional,
+  `#ifdef __KERNEL__` at source lines 49--51, is selected in both frozen
+  kernel contexts; its `NFT_REG32_MAX` alias is present.  No other
+  architecture or configuration branch exists.
+- Therefore all task-scoped `PENDING_REVIEW` semantic questions in
+  `SYMBOLS.tsv`, `ABI.tsv`, and `LIFETIMES.tsv` have a final disposition here;
+  none remains unresolved for this task.
 
-## Final source-only checks
-
-- The candidate contains no `todo!`, `unimplemented!`, Rust unit-test
-  configuration, unsafe code, runtime substitution, or driver code.
-- No source outside the leased destination and no queue/manifest/index was
-  edited by this applier.  No compiler, formatter, build, test, linker,
-  emulator, debugger, or benchmark command was run.
-
-All reviewer findings are resolved with the pinned header as the implementation
-oracle.
+No compiler, formatter, rust-analyzer diagnostic, build, test, linker,
+debugger, or runtime command was used.

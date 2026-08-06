@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
 //! linux-source: include/uapi/linux/netfilter/nf_tables.h
 //! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
-//! architectures: x86_64,aarch64
+//! architectures: common
 //! rewrite-task: S016277
 
 #![allow(non_camel_case_types, non_upper_case_globals)]
@@ -1086,4 +1086,3 @@ pub const NFTA_TUNNEL_KEY_MAX: i32 = (__NFTA_TUNNEL_KEY_MAX - 1);
 pub const NFT_TUNNEL_MAX: i32 = (__NFT_TUNNEL_MAX - 1);
 pub const NFT_TUNNEL_MODE_MAX: i32 = (__NFT_TUNNEL_MODE_MAX - 1);
 pub const NFTA_TUNNEL_MAX: i32 = (__NFTA_TUNNEL_MAX - 1);
-

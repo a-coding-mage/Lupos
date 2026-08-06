@@ -5,7 +5,7 @@ Fresh replacement candidate:
 - destination: `src/include/uapi/linux/netfilter/nf_tables.rs`
 - source: `vendor/linux/include/uapi/linux/netfilter/nf_tables.h`
 - task/source/revision/architecture provenance is present and immutable.
-- translated surface: 95 enum tags, 778 enum constants, and 89 object-like
+- translated surface: 115 enum tags, 730 enum constants, and 117 object-like
   macros (962 source identifiers total).
 
 The candidate intentionally uses source-visible global constants rather than
