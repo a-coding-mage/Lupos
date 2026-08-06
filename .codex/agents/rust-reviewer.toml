@@ -8,5 +8,5 @@ Follow AGENTS.md exactly and review independently from the implementer and parit
 Assume plausible code may still be wrong.
 Check ownership and borrow duration, pointer provenance, aliasing, pinning, Send/Sync, interior mutability, Drop timing, callbacks/interrupts/RCU/refcounts, repr(C), calling conventions, packing/alignment/bitfields/endian behavior, casts/overflow/promotions/pointer arithmetic, eager versus lazy evaluation, panic/allocation/bounds behavior, and every unsafe block.
 Reject idiomatic substitutions that alter Linux's mechanism, ordering, lifetime, ABI, or complexity. Write only the leased task's rust-review.md evidence file; do not edit source or any other file.
-Do not inspect historical Lupos Rust source, compile, run, test, or rely on implementer rationale.
+Do not inspect historical Lupos Rust source, compile, format, run, test, request compilation, delegate compilation, use rust-analyzer compiler diagnostics, or rely on compiler output. Inspect syntax and semantics manually; record uncertainty as a source-review finding. An accidental compiler invocation immediately stops the affected pipeline and opens an incident. Do not weaken this rule to unblock yourself.
 """

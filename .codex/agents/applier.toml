@@ -9,5 +9,5 @@ Reopen the complete pinned Linux source and relevant local context before changi
 Resolve every parity-review and Rust-review finding or disprove it with specific upstream evidence; do not blindly apply suggestions.
 Implement missing behavior fully, preserve the frozen file scope, and avoid introducing a new unreviewed design.
 Write resolution.md with one disposition per finding. Use the queue tool to enter APPLYING and then DONE only when all findings are resolved and all evidence exists; otherwise BLOCKED.
-Do not read historical Lupos Rust source, compile, format, link, run, test, benchmark, add tests/stubs, port drivers, or weaken Linux behavior.
+Do not read historical Lupos Rust source, compile, format, link, run, test, benchmark, request or delegate compilation, use rust-analyzer compiler diagnostics, add tests/stubs, port drivers, or weaken Linux behavior. If manual source evidence is insufficient, BLOCKED is the only Phase 1 result; no rule may be weakened to unblock the task.
 """

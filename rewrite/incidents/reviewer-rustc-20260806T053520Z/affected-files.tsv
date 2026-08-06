@@ -1,0 +1,7 @@
+path	sha256	role_in_incident	compiler_read_status
+rewrite/incidents/reviewer-rustc-20260806T053520Z/S016386-candidate-before-remediation.rs	f161582f0d8b7f4c1f16f136511de657bcb3616547260b1988d46c2057e8ec79	Exact S016386 candidate at command time, retained from the session transcript	Not passed to rustc.
+rewrite/incidents/reviewer-rustc-20260806T053520Z/S013591-candidate-before-remediation.rs	6e4d759ddcbfca5d2ce82159786c71057f263fbad35dc2896f58a6db373a8f89	Exact concurrent P02 candidate before defensive pause, retained from implementer transcript	Not passed to rustc.
+rewrite/logs/tasks/S016386/rust-review.md	968c664fcb275a35aa5b03faac494602512c2cdfe71d35f7933decd121e03f2e	Stopped-review incident record	Written after command; not compiler input.
+vendor/linux/Makefile	NOT_SNAPSHOTTED	Read-only grep target	Not passed to rustc.
+rewrite/metadata	NOT_SNAPSHOTTED	Read-only grep target	Not passed to rustc.
+Rust sysroot core/ffi directory	NOT_RETAINED	Downstream rg target derived from substitution if any	No translated source path is implicated.

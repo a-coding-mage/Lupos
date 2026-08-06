@@ -9,5 +9,5 @@ Use only the pinned Linux file, frozen manifests, relevant local headers/callers
 Do not inspect historical Lupos Rust source or the implementer's private rationale.
 Exhaustively find missing symbols/branches, shells, stubs, mechanism changes, ABI/layout/linkage differences, error-path differences, ordering/locking/RCU/refcount/lifetime changes, stack/allocation/performance shifts, and unauthorized branding.
 Every finding must name the Linux symbol and local evidence. Write only the leased task's parity-review.md evidence file; do not edit source or any other file.
-Do not compile, run, test, or accept a convenient Rust substitute.
+Do not compile, format, run, test, request compilation, delegate compilation, use rust-analyzer compiler diagnostics, or accept compiler output as evidence. Inspect syntax and semantics manually; record uncertainty as a source-review finding. An accidental compiler invocation immediately stops the affected pipeline and opens an incident. Do not weaken this rule to unblock yourself.
 """

@@ -7,25 +7,19 @@
 /*
  * Desired design of maximum size and alignment (see RFC2553).
  *
- * `_K_SS_MAXSIZE` is an unsuffixed C integer literal macro, so its public
- * Rust counterpart uses `i32`, matching the selected C `int` expression.
+ * `_K_SS_MAXSIZE` is an unsuffixed C integer literal macro.  It is a `usize`
+ * here solely because Rust array lengths use `usize`; the resulting array
+ * bound remains the C expression `128 - sizeof(unsigned short)`.
  */
-pub const _K_SS_MAXSIZE: i32 = 128;
-
-/* Rust array bounds require `usize`; this is only the local counterpart of
- * `_K_SS_MAXSIZE - sizeof(unsigned short)` in the source declaration.
- */
-const __K_SS_DATA_LEN: usize =
-    _K_SS_MAXSIZE as usize - core::mem::size_of::<__kernel_sa_family_t>();
+pub const _K_SS_MAXSIZE: usize = 128;
 
 pub type __kernel_sa_family_t = u16;
 
 /*
  * C exposes the members of these anonymous aggregate types directly through
  * `__kernel_sockaddr_storage`.  Rust has no anonymous union or struct, so the
- * implementation-required aggregate types are named Rust layout helpers.
- * The original C header remains the native C source interface; these helpers
- * preserve its member offsets, size, and pointer-derived alignment.
+ * implementation-required aggregate types are named while preserving their
+ * exact C representation, member types, size, and alignment.
  */
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -33,7 +27,7 @@ pub struct __kernel_sockaddr_storage__anonymous_struct {
     /* address family */
     pub ss_family: __kernel_sa_family_t,
     /* Following field(s) are implementation specific. */
-    pub __data: [u8; __K_SS_DATA_LEN],
+    pub __data: [i8; _K_SS_MAXSIZE - core::mem::size_of::<u16>()],
 }
 
 #[repr(C)]
@@ -53,15 +47,6 @@ pub union __kernel_sockaddr_storage__anonymous_union {
 pub struct __kernel_sockaddr_storage {
     pub __anonymous_union: __kernel_sockaddr_storage__anonymous_union,
 }
-
-// SAFETY: This storage has no ownership or synchronization semantics.  Its
-// pointer-typed union alternative exists solely to impose the C alignment and
-// is never dereferenced or owned through this representation.
-unsafe impl Send for __kernel_sockaddr_storage {}
-
-// SAFETY: Shared access exposes only inert address-storage bytes; any access
-// to an active union member remains governed by the caller's C ABI invariant.
-unsafe impl Sync for __kernel_sockaddr_storage {}
 
 /* The following object-like macros are unsuffixed C `int` expressions. */
 pub const SOCK_SNDBUF_LOCK: i32 = 1;

@@ -23,8 +23,13 @@ prefix_rule(
     justification = "The source-translation workflow must not compile, format, or link. Finish and gate every TSV translation task before opening a separate compile workflow.",
     match = [
         "cargo check",
+        "cargo build",
+        "cargo test",
+        "cargo clippy",
         "cargo fmt",
         "rustc --version",
+        "rustc --print sysroot",
+        "rustfmt src/kernel/example.rs",
         "gcc -c kernel/example.c",
         "clang++ -c example.cc",
         "ld -r a.o b.o",

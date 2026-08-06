@@ -56,19 +56,18 @@ macro_rules! CIRC_SPACE {
  * underneath us without returning inconsistent results. */
 //
 // Upstream's GNU statement expression stores both temporaries as C `int`.
-// Each use of `size` remains an expression use: unlike `head` and `tail`, it
-// is deliberately not cached because the C macro evaluates it once for `end`
-// and again for the mask.  The casts occur after the same target-width counter
-// arithmetic; casting `end` back to the caller's counter type models C's
-// usual arithmetic conversion when `head` is an unsigned long.
+// The casts therefore occur after the same target-width counter arithmetic;
+// casting `end` back to the caller's counter type models C's usual arithmetic
+// conversion when `head` is an unsigned long.
 #[macro_export]
 macro_rules! CIRC_CNT_TO_END {
     ($head:expr, $tail:expr, $size:expr) => {{
-        let __circ_tail = $tail;
-        let end = ($size).wrapping_sub(__circ_tail) as core::ffi::c_int;
         let __circ_head = $head;
+        let __circ_tail = $tail;
+        let __circ_size = $size;
+        let end = __circ_size.wrapping_sub(__circ_tail) as core::ffi::c_int;
         let n = (__circ_head.wrapping_add(end as _)
-            & ($size).wrapping_sub(1)) as core::ffi::c_int;
+            & __circ_size.wrapping_sub(1)) as core::ffi::c_int;
         if n < end { n } else { end }
     }};
 }
@@ -78,12 +77,13 @@ macro_rules! CIRC_CNT_TO_END {
 macro_rules! CIRC_SPACE_TO_END {
     ($head:expr, $tail:expr, $size:expr) => {{
         let __circ_head = $head;
-        let end = ($size)
+        let __circ_tail = $tail;
+        let __circ_size = $size;
+        let end = __circ_size
             .wrapping_sub(1)
             .wrapping_sub(__circ_head) as core::ffi::c_int;
-        let __circ_tail = $tail;
         let n = ((end as _).wrapping_add(__circ_tail)
-            & ($size).wrapping_sub(1)) as core::ffi::c_int;
+            & __circ_size.wrapping_sub(1)) as core::ffi::c_int;
         if n <= end { n } else { end.wrapping_add(1) }
     }};
 }

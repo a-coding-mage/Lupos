@@ -514,6 +514,13 @@ management, ABI adjudication, final application, or phase-gate decisions.
   frozen guidance; it independently adjudicates findings.
 - A semantic conflict between reviewers escalates to the deep adjudicator or
   becomes `BLOCKED`.
+- Reviewers and appliers are source-inspection roles during Phase 1. They MUST
+  NOT run, request, delegate, or obtain compiler, formatter, linker, test, or
+  rust-analyzer diagnostics as acceptance evidence. They may inspect Rust
+  syntax and semantics manually; uncertainty is a source-review finding, not a
+  reason to test it. An accidental compiler invocation immediately stops the
+  affected pipeline and opens an incident. A reviewer may not weaken this rule
+  to unblock itself.
 
 ## 10. Per-file pipeline
 
@@ -590,7 +597,10 @@ Linux source and selected inventory, including:
 
 Every finding names the Linux symbol and local evidence. The reviewer may write
 only the leased task's `parity-review.md`; it MUST NOT edit source or any other
-file, and it records review completion atomically.
+file, and it records review completion atomically. It MUST NOT run or delegate
+compilation, use rust-analyzer/compiler diagnostics, or treat compiler output
+as a finding or acceptance argument; record any uncertainty from source
+inspection instead.
 
 ### 10.3 Rust reviewer
 
@@ -609,7 +619,10 @@ The Rust reviewer MUST inspect:
 
 It rejects idiomatic substitutions that change Linux behavior. It may write
 only the leased task's `rust-review.md`; it MUST NOT edit source or any other
-file, and it records completion atomically.
+file, and it records completion atomically. It MUST NOT run or delegate
+compilation, use rust-analyzer/compiler diagnostics, or treat compiler output
+as a finding or acceptance argument; record any uncertainty from source
+inspection instead.
 
 ### 10.4 Applier
 
@@ -630,7 +643,9 @@ refcounting, and semantic dependencies. Phase 0 pending values are not an
 approval or a substitute for this review.
 
 The applier MUST NOT compile, format, link, run, test, benchmark, add tests, add
-stubs, port drivers, or weaken Linux behavior.
+stubs, port drivers, or weaken Linux behavior. It MUST NOT request, delegate,
+or use compiler or rust-analyzer diagnostics during Phase 1. If source-level
+evidence is insufficient, it marks the task `BLOCKED` for the later workflow.
 
 ## 11. Translation-only hard gate
 
@@ -683,6 +698,15 @@ Do not use compiler errors as a Phase 1 work queue. The expected state is that
 none of the fresh source works yet. As in the Bun rewrite workflow, source is
 translated and adversarially reviewed first; compilation becomes a separate
 later workflow only after every translation task is `DONE`.
+
+Phase-1 reviewer and applier rule: `rustc`, every `cargo` build/check/test/fmt/
+clippy command, `rustfmt`, compiler-backed rust-analyzer diagnostics, and
+delegation of any such action are forbidden. Manual source inspection remains
+allowed. Any accidental invocation is an incident: stop the affected pipeline,
+retain the evidence, and do not accept compiler-influenced review or source.
+Compilation begins only in the separately queued later workflow after the
+whole-source translation gate passes; no agent may weaken these rules to
+unblock itself.
 
 ## 12. Rust translation rules
 

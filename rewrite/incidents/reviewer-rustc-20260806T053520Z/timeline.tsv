@@ -1,0 +1,9 @@
+utc_timestamp	event	evidence	note
+2026-08-06T03:15:51.890Z	S016386 implementation complete	rewrite/events.jsonl:6330	Candidate existed before the prohibited command.
+2026-08-06T03:15:58.737Z	S016386 review started	rewrite/events.jsonl:6331	P01 entered REVIEWING.
+2026-08-06T03:17:19.188Z	prohibited command submitted	Codex session call_zCBFbgVmmHOfbmMNaWCPD8Uz	Rust reviewer submitted a shell command containing the substitution.
+2026-08-06T03:17:33.319Z	parity review complete	rewrite/events.jsonl:6334	Parity review was a separate context and predated incident acknowledgement.
+2026-08-06T03:18:04.774Z	S016386 paused	rewrite/events.jsonl:6335	P01 paused awaiting adjudication.
+2026-08-06T03:18:05.042Z	S013591 defensively paused	rewrite/events.jsonl:6336	P02 was paused by coordinator; it is not a direct incident task.
+2026-08-06T03:18:40.528Z	stopped-review record written	Codex session call_wOTM77fZzNvssNFDiG97Sthx	Only rust-review.md was written after the prohibited command; no disposition was accepted.
+2026-08-06T05:35:20.000Z	incident evidence opened	this directory	B000009 created as BLOCKED.

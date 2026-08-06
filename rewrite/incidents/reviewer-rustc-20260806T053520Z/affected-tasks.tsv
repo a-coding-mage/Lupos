@@ -1,0 +1,3 @@
+task_id	pipeline	status_at_incident	affectedness	evidence_action	queue_action
+S016386	P01	REVIEWING	Direct: stopped Rust reviewer invoked prohibited command; no accepted Rust review or application existed.	Stopped report retained as incident evidence; fresh isolated source-only Rust review completed, then source-only application completed.	PAUSED -> REVIEWING -> APPLYING -> DONE through rewrite_queue.py; attempt remains 1.
+S013591	P02	REVIEWING	Defensive pause only: no session evidence ties it to the command or its output.	No evidence invalidation; its ordinary independent reviews and application completed.	PAUSED -> REVIEWING -> APPLYING -> DONE through rewrite_queue.py; attempt remains 1.
