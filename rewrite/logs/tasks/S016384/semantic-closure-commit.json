@@ -1,0 +1,32 @@
+{
+  "attempt": 4,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "7205d69dff6be77d4d63d9011f2103fcf9c9704b9f52019c8af2f72d219a0323",
+  "committed_at": "2026-08-07T14:43:43.618Z",
+  "destination_sha256": "a6c5462dfe4a4f7795fde9289c98b41f0d428cc69d6291654f0f485b7661d9e3",
+  "dispositions_sha256": "b746d6e48d2d041ca86eca8510ccfa588c885eaa8e5560073b4d7d20510aef6d",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "2da148aa1bb631c6d6e58f131ba25d60213d66bce2fef8935a53a74a364a291a",
+  "finding_count": 0,
+  "implementation_sha256": "ef361e55b87acc19f18fd7aeba449dc6d98af2bf022eee53e40d455f93f20164",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "7c9d03115460e00253a410aef5168c19fc1dbb97b3aefa1853ddc9bcc518e45f",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P02",
+  "prepare_sha256": "df97f1696694b70979f1d3166b4469acae8c6d92bbf12f0c9670259e7f413a0e",
+  "proposal_sha256": "2da148aa1bb631c6d6e58f131ba25d60213d66bce2fef8935a53a74a364a291a",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 1361,
+  "resolution_sha256": "f4f4221b25ea196d58889564dfb7a919ebc0373fce6f006b4b9c2f1ef8a6934b",
+  "review_1_sha256": "10d0434bb16683255a361ad4a6a255d298ed4b2be5d9f1cfc502942fc861ea30",
+  "review_2_sha256": "d687cb70c5b1dc6d775f5d23f9997677d0d1908003346cd8c6a6000728e6f41b",
+  "rust_report_sha256": "4b2b5fc05a420c76c1c73817d3754de379b23ec202611286623112ec5c12a556",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S016384",
+  "transaction_id": "SCTX-f0bf6f555e437f4aedf67dfcaa85b6bfa8c3c31c37ec3459c638e44c7ffb2061"
+}

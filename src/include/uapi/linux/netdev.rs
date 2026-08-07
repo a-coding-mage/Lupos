@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! linux-source: include/uapi/linux/netdev.h
 //! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
-//! architectures: x86_64,aarch64
+//! architectures: common
 //! rewrite-task: S016267
 
 pub const NETDEV_FAMILY_NAME: &str = "netdev";

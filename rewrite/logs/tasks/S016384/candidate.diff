@@ -1,5 +1,9 @@
-Candidate scope: `src/include/uapi/linux/snmp.rs`
+# Candidate summary — S016384, attempt 4
 
-Fresh replacement translation of pinned `include/uapi/linux/snmp.h`.  The candidate contains the required immutable provenance, all eight anonymous-enum enumerator sequences as public `i32` constants, including their terminal maxima, and the two source macro constants (`__ICMPMSG_MIB_MAX` and `__ICMP6MSG_MIB_MAX`) with value 512.
+Fresh replacement of `src/include/uapi/linux/snmp.rs` from the pinned source at `425f94c2954b1fe80ebdbf9b29854e89750355df`.
 
-Manual source inventory: 296 enum constants + 2 macro constants = 298 Rust constants.  No tests, stubs, runtime code, or configuration guards were added.
+- Added immutable provenance for `include/uapi/linux/snmp.h`, both approved architectures, and task `S016384`.
+- Mapped the eight anonymous C enum declarations to 296 public `i32` constants, in declaration order and with their C implicit values.
+- Preserved all eight trailing `__*MAX` constants.
+- Mapped `__ICMPMSG_MIB_MAX` and `__ICMP6MSG_MIB_MAX` to public `i32` constants with value `512`.
+- Total Rust constants: 298.
