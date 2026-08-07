@@ -1,0 +1,1 @@
+Fresh destination replacement for S016277 from the pinned `nf_tables.h`; the candidate contains the full UAPI enum/macro surface and immutable provenance header. No unrelated files were changed.

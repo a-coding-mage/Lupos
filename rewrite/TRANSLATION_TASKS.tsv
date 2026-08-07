@@ -2782,7 +2782,7 @@ S014585	src/include/linux/pci-acpi.rs	2026-08-06T15:56:05.299Z			TODO	include/li
 S014593	src/include/linux/pci-p2pdma.rs	2026-08-06T15:56:05.299Z			TODO	include/linux/pci-p2pdma.h	common	include	21.5	low	S014584	luna		0								2026-08-06T15:56:05.299Z		
 S014595	src/include/linux/pci-tph.rs	2026-08-06T15:56:05.299Z			TODO	include/linux/pci-tph.h	common	include	4.6	low	S014593	luna		0								2026-08-06T15:56:05.299Z		
 S014596	src/include/linux/pci.rs	2026-08-06T15:56:05.299Z			TODO	include/linux/pci.h	common	include	291.2	low	S014595	luna		0								2026-08-06T15:56:05.299Z		
-S014598	src/include/linux/pci_ids.rs	2026-08-06T15:56:05.299Z			TODO	include/linux/pci_ids.h	common	include	327.0	low		luna		0								2026-08-06T15:56:05.299Z		
+S014598	src/include/linux/pci_ids.rs	2026-08-06T15:56:05.299Z	2026-08-07T01:43:50.227Z	2026-08-07T01:52:45.503Z	DONE	include/linux/pci_ids.h	common	include	327.0	low		luna	P01	1			2026-08-07T01:46:08.409Z	2026-08-07T01:46:30.459Z	2026-08-07T01:49:09.052Z	2026-08-07T01:48:37.210Z	2026-08-07T01:49:26.625Z	2026-08-07T01:52:45.503Z		
 S014603	src/include/linux/pe.rs	2026-08-06T15:56:05.299Z			TODO	include/linux/pe.h	aarch64	include	55.1	low	S018290	luna		0								2026-08-06T15:56:05.299Z		
 S014604	src/include/linux/percpu-defs.rs	2026-08-06T15:56:05.299Z			TODO	include/linux/percpu-defs.h	common	include	51.8	low	S014596	luna		0								2026-08-06T15:56:05.299Z		
 S014605	src/include/linux/percpu-refcount.rs	2026-08-06T15:56:05.299Z			TODO	include/linux/percpu-refcount.h	common	include	36.8	low	S014604	luna		0								2026-08-06T15:56:05.299Z		
@@ -3734,7 +3734,7 @@ S016115	src/include/uapi/linux/errqueue.rs	2026-08-06T15:56:05.299Z			TODO	inclu
 S016116	src/include/uapi/linux/erspan.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/erspan.h	common	include	5.2	low	S018290	luna		0								2026-08-06T15:56:05.299Z		
 S016117	src/include/uapi/linux/ethtool.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/ethtool.h	common	include	261.2	low	S016115	luna		0								2026-08-06T15:56:05.299Z		
 S016118	src/include/uapi/linux/ethtool_netlink.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/ethtool_netlink.h	common	include	21.1	low	S016119;S018290	luna		0								2026-08-06T15:56:05.299Z		
-S016119	src/include/uapi/linux/ethtool_netlink_generated.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/ethtool_netlink_generated.h	common	include	96.4	low		luna		0								2026-08-06T15:56:05.299Z		
+S016119	src/include/uapi/linux/ethtool_netlink_generated.rs	2026-08-06T15:56:05.299Z	2026-08-07T01:53:20.876Z		REVIEWING	include/uapi/linux/ethtool_netlink_generated.h	common	include	96.4	low		luna	P02	1	codex-root-phase1-20260807-p02a2	2026-08-07T03:23:20.876Z	2026-08-07T01:55:06.553Z	2026-08-07T01:56:33.133Z				2026-08-07T01:56:33.133Z		
 S016120	src/include/uapi/linux/eventfd.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/eventfd.h	common	include	1.1	low	S016117	luna		0								2026-08-06T15:56:05.299Z		
 S016121	src/include/uapi/linux/eventpoll.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/eventpoll.h	common	include	10.1	low	S016120	luna		0								2026-08-06T15:56:05.299Z		
 S016122	src/include/uapi/linux/ext4.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/ext4.h	common	include	17.0	low	S016121	luna		0								2026-08-06T15:56:05.299Z		
@@ -3793,7 +3793,7 @@ S016185	src/include/uapi/linux/in6.rs	2026-08-06T15:56:05.299Z			TODO	include/ua
 S016186	src/include/uapi/linux/in_route.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/in_route.h	common	include	3.3	low	S016185	luna		0								2026-08-06T15:56:05.299Z		
 S016187	src/include/uapi/linux/inet_diag.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/inet_diag.h	common	include	24.8	low	S016186	luna		0								2026-08-06T15:56:05.299Z		
 S016188	src/include/uapi/linux/inotify.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/inotify.h	common	include	8.4	low	S018290	luna		0								2026-08-06T15:56:05.299Z		
-S016189	src/include/uapi/linux/input-event-codes.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/input-event-codes.h	common	include	101.6	low		luna		0								2026-08-06T15:56:05.299Z		
+S016189	src/include/uapi/linux/input-event-codes.rs	2026-08-06T15:56:05.299Z	2026-08-07T01:53:20.521Z		REVIEWING	include/uapi/linux/input-event-codes.h	common	include	101.6	low		luna	P01	1	codex-root-phase1-20260807-p01a2	2026-08-07T03:23:20.521Z	2026-08-07T01:54:40.647Z	2026-08-07T01:56:32.754Z				2026-08-07T01:56:32.754Z		
 S016190	src/include/uapi/linux/input.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/input.h	common	include	53.9	low	S016189;S018290	luna		0								2026-08-06T15:56:05.299Z		
 S016191	src/include/uapi/linux/io_uring.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/io_uring.h	common	include	106.5	low	S016187	luna		0								2026-08-06T15:56:05.299Z		
 S016192	src/include/uapi/linux/io_uring/bpf_filter.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/io_uring/bpf_filter.h	common	include	8.4	low	S018290	luna		0								2026-08-06T15:56:05.299Z		
@@ -3869,7 +3869,7 @@ S016273	src/include/uapi/linux/netfilter/nf_conntrack_tcp.rs	2026-08-06T15:56:05
 S016274	src/include/uapi/linux/netfilter/nf_conntrack_tuple_common.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/netfilter/nf_conntrack_tuple_common.h	common	include	4.6	low	S016273	luna		0								2026-08-06T15:56:05.299Z		
 S016275	src/include/uapi/linux/netfilter/nf_log.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/netfilter/nf_log.h	common	include	1.5	low		luna		0								2026-08-06T15:56:05.299Z		
 S016276	src/include/uapi/linux/netfilter/nf_nat.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/netfilter/nf_nat.h	common	include	5.5	low	S016274	luna		0								2026-08-06T15:56:05.299Z		
-S016277	src/include/uapi/linux/netfilter/nf_tables.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/netfilter/nf_tables.h	common	include	202.2	low		luna		0								2026-08-06T15:56:05.299Z		
+S016277	src/include/uapi/linux/netfilter/nf_tables.rs	2026-08-06T15:56:05.299Z	2026-08-07T01:43:50.554Z	2026-08-07T01:52:47.165Z	DONE	include/uapi/linux/netfilter/nf_tables.h	common	include	202.2	low		luna	P02	1			2026-08-07T01:46:53.463Z	2026-08-07T01:47:23.925Z	2026-08-07T01:50:10.900Z	2026-08-07T01:50:01.837Z	2026-08-07T01:50:24.538Z	2026-08-07T01:52:47.165Z		
 S016278	src/include/uapi/linux/netfilter/nfnetlink.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/netfilter/nfnetlink.h	x86_64	include	8.2	low	S018290	luna		0								2026-08-06T15:56:05.299Z		
 S016279	src/include/uapi/linux/netfilter/nfnetlink_compat.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/netfilter/nfnetlink_compat.h	x86_64	include	6.4	low	S016278	luna		0								2026-08-06T15:56:05.299Z		
 S016280	src/include/uapi/linux/netfilter/nfnetlink_conntrack.rs	2026-08-06T15:56:05.299Z			TODO	include/uapi/linux/netfilter/nfnetlink_conntrack.h	x86_64	include	29.2	low	S014494	luna		0								2026-08-06T15:56:05.299Z		

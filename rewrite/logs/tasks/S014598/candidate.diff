@@ -1,0 +1,6 @@
+S014598 candidate diff evidence
+
+Fresh destination created from the complete pinned include/linux/pci_ids.h.
+All 2898 numeric definitions are mapped one-for-one, preserving identifiers,
+hexadecimal values, duplicate definitions, ordering, and trailing comments.
+Preprocessor include-guard directives are represented by Rust module scope.

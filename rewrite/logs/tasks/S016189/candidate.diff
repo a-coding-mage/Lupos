@@ -1,0 +1,6 @@
+S016189 candidate snapshot
+source=vendor/linux/include/uapi/linux/input-event-codes.h
+destination=src/include/uapi/linux/input-event-codes.rs
+revision=425f94c2954b1fe80ebdbf9b29854e89750355df
+symbols=795 active defines translated in source order
+representation=pub const NAME: i32, preserving literal/alias/expression semantics

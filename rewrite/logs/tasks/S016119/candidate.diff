@@ -1,0 +1,3 @@
+Source-backed candidate replaces the stale destination with a fresh translation.
+The translation mechanically covers every enum constant and macro in the pinned
+header, including implicit values and `*_CNT`/`*_MAX` aliases.

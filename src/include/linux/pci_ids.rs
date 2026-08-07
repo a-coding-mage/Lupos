@@ -3,7 +3,6 @@
 //! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
 //! architectures: common
 //! rewrite-task: S014598
-
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  *	PCI Class, Vendor and Device IDs
