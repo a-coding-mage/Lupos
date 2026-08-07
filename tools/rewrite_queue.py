@@ -32,6 +32,8 @@ DEFAULT_LOGS_ROOT = Path("rewrite/logs/tasks")
 DEFAULT_LINUX_SHA_FILE = Path("vendor/linux.SHA")
 DEFAULT_LINUX_ROOT = Path("vendor/linux")
 DEFAULT_PHASE0_IDENTITY = Path("rewrite/PHASE0_IDENTITY.tsv")
+DEFAULT_SEMANTIC_ROOT = Path("rewrite/semantic-closure")
+DEFAULT_SEMANTIC_LEDGER = DEFAULT_SEMANTIC_ROOT / "LEDGER.jsonl"
 
 FIELDS = [
     "id",
@@ -104,9 +106,26 @@ EVIDENCE_FILES = [
     "parity-review.md",
     "rust-review.md",
     "resolution.md",
+    "semantic-closure-proposal.tsv",
+    "semantic-closure-proposal.sha256",
+    "semantic-closure-parity-review.tsv",
+    "semantic-closure-rust-review.tsv",
+    "semantic-closure-final.tsv",
+    "semantic-closure-dispositions.tsv",
+    "semantic-closure-commit.json",
 ]
 
-QUARANTINE_SCHEMA_VERSION = "task-evidence-quarantine-v1"
+IMPLEMENTATION_EVIDENCE = {
+    "implementation.md", "candidate.diff",
+    "semantic-closure-proposal.tsv", "semantic-closure-proposal.sha256",
+}
+REVIEW_EVIDENCE = IMPLEMENTATION_EVIDENCE | {
+    "parity-review.md", "rust-review.md",
+    "semantic-closure-parity-review.tsv", "semantic-closure-rust-review.tsv",
+}
+COMPLETE_EVIDENCE = set(EVIDENCE_FILES)
+
+QUARANTINE_SCHEMA_VERSION = "task-evidence-quarantine-v2"
 QUARANTINE_METADATA = "QUARANTINE.tsv"
 QUARANTINE_FIELDS = [
     "schema_version",
@@ -326,9 +345,9 @@ def root_evidence_file_set_state(
     status = row.get("status", "")
     if status == "PAUSED":
         status = row.get("resume_status", "")
-    implementation = {"implementation.md", "candidate.diff"}
-    reviews = implementation | {"parity-review.md", "rust-review.md"}
-    complete = set(EVIDENCE_FILES)
+    implementation = IMPLEMENTATION_EVIDENCE
+    reviews = REVIEW_EVIDENCE
+    complete = COMPLETE_EVIDENCE
     matches = False
     if status == "TODO":
         matches = not observed_names
@@ -1055,6 +1074,16 @@ def common_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
     return Path(args.queue), Path(args.fingerprint), Path(args.events), Path(args.logs_root)
 
 
+def semantic_tool():
+    """Load the one-way semantic gate without creating an import cycle."""
+
+    try:
+        import semantic_closure
+    except ImportError as exc:
+        die(f"cannot load semantic closure gate: {exc}")
+    return semantic_closure
+
+
 def ensure_clean_initial_artifacts(
     queue: Path, fingerprint: Path, events: Path, logs_root: Path
 ) -> None:
@@ -1477,6 +1506,15 @@ def cmd_freeze(args: argparse.Namespace) -> None:
             return
         phase0_binding = read_phase0_identity_binding(Path(args.phase0_identity))
         digest = write_fingerprint(fingerprint, rows, linux_sha, phase0_binding)
+        closure = semantic_tool()
+        closure.validate_phase0_artifacts(Path("rewrite"))
+        closure.initialize_generation(
+            rows,
+            fingerprint,
+            Path(args.phase0_identity),
+            Path(args.semantic_ledger),
+            events,
+        )
         append_event(
             events,
             event_payload(
@@ -1504,6 +1542,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
             require_queue_root_evidence_state(row, logs_root)
             if row["status"] == "DONE":
                 require_done_evidence(row, logs_root, Path(args.linux_sha_file))
+                require_done_semantic_closure(row, logs_root, args)
     fingerprint_digest, _, _, _ = read_fingerprint(fingerprint)
     print(json.dumps({"ok": True, "tasks": len(rows), "sha256": fingerprint_digest}))
 
@@ -1703,9 +1742,9 @@ def require_queue_root_evidence_state(
     status = row.get("status", "")
     if status == "PAUSED":
         status = row.get("resume_status", "")
-    implementation = {"implementation.md", "candidate.diff"}
-    reports = implementation | {"parity-review.md", "rust-review.md"}
-    complete = set(EVIDENCE_FILES)
+    implementation = IMPLEMENTATION_EVIDENCE
+    reports = REVIEW_EVIDENCE
+    complete = COMPLETE_EVIDENCE
     if status == "TODO":
         required, allowed = set(), set()
     elif status == "IN_PROGRESS":
@@ -1780,7 +1819,7 @@ def require_destination_translation(row: Mapping[str, str], sha_file: Path) -> N
 def require_implementation_evidence(
     row: Mapping[str, str], logs_root: Path, sha_file: Path
 ) -> None:
-    implementation = {"implementation.md", "candidate.diff"}
+    implementation = IMPLEMENTATION_EVIDENCE
     require_root_evidence_state(
         row,
         logs_root,
@@ -1789,6 +1828,13 @@ def require_implementation_evidence(
         stage="implementation",
     )
     require_destination_translation(row, sha_file)
+    semantic_tool().require_sealed_proposal_for_queue(
+        row,
+        logs_root,
+        Path("rewrite"),
+        DEFAULT_PHASE0_IDENTITY,
+        DEFAULT_FINGERPRINT,
+    )
 
 
 def cmd_mark_implemented(args: argparse.Namespace) -> None:
@@ -1827,14 +1873,26 @@ def cmd_mark_review(args: argparse.Namespace) -> None:
         report = "parity-review.md" if args.slot == 1 else "rust-review.md"
         if row[field]:
             die(f"review slot {args.slot} already completed for task {row['id']}")
-        implementation = {"implementation.md", "candidate.diff"}
-        review_reports = {"parity-review.md", "rust-review.md"}
+        implementation = IMPLEMENTATION_EVIDENCE
+        review_reports = {
+            "parity-review.md", "rust-review.md",
+            "semantic-closure-parity-review.tsv",
+            "semantic-closure-rust-review.tsv",
+        }
         require_root_evidence_state(
             row,
             logs_root,
             required=implementation | {report},
             allowed=implementation | review_reports,
             stage=f"review slot {args.slot}",
+        )
+        semantic_tool().require_review_attestation_for_queue(
+            row,
+            args.slot,
+            logs_root,
+            Path("rewrite"),
+            Path(args.phase0_identity),
+            Path(args.fingerprint),
         )
         timestamp = now_utc()
         row[field] = timestamp
@@ -1864,12 +1922,7 @@ def require_reviews(row: Mapping[str, str], logs_root: Path | None = None) -> No
     if not row.get("review_1_done_at") or not row.get("review_2_done_at"):
         die(f"task {row['id']} cannot enter APPLYING until both reviews are done")
     if logs_root is not None:
-        reviews = {
-            "implementation.md",
-            "candidate.diff",
-            "parity-review.md",
-            "rust-review.md",
-        }
+        reviews = REVIEW_EVIDENCE
         require_root_evidence_state(
             row,
             logs_root,
@@ -1901,6 +1954,20 @@ def require_done_evidence(row: Mapping[str, str], logs_root: Path, sha_file: Pat
     require_destination_translation(row, sha_file)
 
 
+def require_done_semantic_closure(
+    row: Mapping[str, str], logs_root: Path, args: argparse.Namespace
+) -> None:
+    semantic_tool().require_committed_closure_for_queue(
+        row,
+        logs_root,
+        Path("rewrite"),
+        Path(args.phase0_identity),
+        Path(args.fingerprint),
+        Path(args.semantic_ledger),
+        Path(args.events),
+    )
+
+
 def cmd_done(args: argparse.Namespace) -> None:
     ensure_branch(args.skip_branch_check)
     queue = Path(args.queue)
@@ -1910,6 +1977,7 @@ def cmd_done(args: argparse.Namespace) -> None:
         if row["status"] != "APPLYING":
             die(f"task {row['id']} must be APPLYING, found {row['status']}")
         require_done_evidence(row, logs_root, Path(args.linux_sha_file))
+        require_done_semantic_closure(row, logs_root, args)
         timestamp = now_utc()
         old_status, new_status = update_status(row, "DONE", timestamp)
         row["done_at"] = timestamp
@@ -2241,6 +2309,11 @@ def add_common_files(parser: argparse.ArgumentParser) -> None:
         "--phase0-identity",
         default=str(DEFAULT_PHASE0_IDENTITY),
         help="identity carrying the stable pre-queue Phase 0 binding",
+    )
+    parser.add_argument(
+        "--semantic-ledger",
+        default=str(DEFAULT_SEMANTIC_LEDGER),
+        help="append-only effective semantic closure ledger",
     )
     parser.add_argument("--skip-branch-check", action="store_true", help=argparse.SUPPRESS)
 

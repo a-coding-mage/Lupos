@@ -29,11 +29,11 @@
       "ok": true
     },
     "authoritative_manifest_index_schema": {
-      "detail": "rows=8; missing_fields=[]",
+      "detail": "rows=10; missing_fields=[]",
       "ok": true
     },
     "authoritative_manifests_identity": {
-      "detail": "ea75b2acb61cf50a62e73098ca777cd4c4eaf73f907e9427c3a23bc6527bd0c8",
+      "detail": "b933417a15b0c1c516b7feb7ecefee304c9ab0815f814a1cf332df5c3361cbc6",
       "ok": true
     },
     "branch": {
@@ -49,7 +49,7 @@
       "ok": true
     },
     "compiler_predicate_binding": {
-      "detail": "{'compiler_predicates_aarch64_count': '36', 'compiler_predicates_count': '72', 'compiler_predicates_schema_version': 'compiler-predicates-v1', 'compiler_predicates_sha256': 'b4ba9a920520dc7b6f36d24347a9e3bf520b848aaf2843d84c31d521d5a23866', 'compiler_predicates_validation_sha256': 'f6f4ffb20d3e0fbc54463676a25b878008c14a55c921f68373df412daaa726a9', 'compiler_predicates_validation_status': 'PASS', 'compiler_predicates_x86_64_count': '36'}",
+      "detail": "{'compiler_predicates_aarch64_count': '36', 'compiler_predicates_count': '72', 'compiler_predicates_schema_version': 'compiler-predicates-v1', 'compiler_predicates_sha256': 'b4ba9a920520dc7b6f36d24347a9e3bf520b848aaf2843d84c31d521d5a23866', 'compiler_predicates_validation_sha256': 'a6cc44115dd5b2989cc989004bbf6aeff8ab3ae421c3c560c168f81c0898422c', 'compiler_predicates_validation_status': 'PASS', 'compiler_predicates_x86_64_count': '36'}",
       "ok": true
     },
     "compiler_predicate_binding_schema": {
@@ -97,7 +97,7 @@
       "ok": true
     },
     "extractor_identity": {
-      "detail": "identity=phase0_extract.py:75704df1c2478336a7f4f968ee3f81b55595ba0294a96a5a50a7eed20eed4a3e actual=phase0_extract.py:75704df1c2478336a7f4f968ee3f81b55595ba0294a96a5a50a7eed20eed4a3e",
+      "detail": "identity=phase0_extract.py:bc35ee9345e2d9386d866fece3f679cd8087ea870560e1fb3d6c05b57e9967d9 actual=phase0_extract.py:bc35ee9345e2d9386d866fece3f679cd8087ea870560e1fb3d6c05b57e9967d9",
       "ok": true
     },
     "file_map_schema": {
@@ -177,7 +177,7 @@
       "ok": true
     },
     "identity_queue_binding": {
-      "detail": "identity=9fb31be9d78d9923c9541c26a34efe1502a66e5d0cca06dbd4776a756592cdc9 queue=9fb31be9d78d9923c9541c26a34efe1502a66e5d0cca06dbd4776a756592cdc9",
+      "detail": "identity=943e5f2626a4c95a4f0d2e83171907bf6a5b5b86611106cd497ee846f13da0c0 queue=943e5f2626a4c95a4f0d2e83171907bf6a5b5b86611106cd497ee846f13da0c0",
       "ok": true
     },
     "ip_ct_number_mechanical_value": {
@@ -209,7 +209,7 @@
       "ok": true
     },
     "metadata_manifest_identity": {
-      "detail": "d4ca8c0dbfac80a024f104647669720cf5b8fa77023aa2aec018b5aad70059c8",
+      "detail": "9e0b180eeafe78ea90ad45fff7759a1acf5a0dbdb6e785f48e6f78952eee9b2e",
       "ok": true
     },
     "metadata_manifest_schema": {
@@ -245,7 +245,7 @@
       "ok": true
     },
     "phase_gate_reopen_authorized": {
-      "detail": "events=2 archives=['rewrite/archive/phase0-s016270-s016294-dependency-defect-20260806T1414Z', 'rewrite/archive/phase0-evidence-isolation-defect-20260806T1539Z'] latest_consumers=1 event_errors=[] active=[]",
+      "detail": "events=7 archives=['rewrite/archive/phase0-quarantine-schema-v1-defect-20260807T0247Z', 'rewrite/archive/phase0-zero-quarantine-validation-defect-20260807T0354Z', 'rewrite/archive/phase0-semantic-closure-seal-defect-20260807T0410Z'] latest_consumers=1 event_errors=[] active=[]",
       "ok": true
     },
     "porting_guidance_present": {
@@ -257,7 +257,7 @@
       "ok": true
     },
     "queue_phase0_identity_binding": {
-      "detail": "queue=69a74b3e665cefce78c3e92cfcbca7e035fda30b1e435f151d205c163da34d87 identity=69a74b3e665cefce78c3e92cfcbca7e035fda30b1e435f151d205c163da34d87",
+      "detail": "queue=2e2117b1c1c14e3dbdb6b4ebde7459fd44c41dbcef33a7aeea1a1c730a28d303 identity=2e2117b1c1c14e3dbdb6b4ebde7459fd44c41dbcef33a7aeea1a1c730a28d303",
       "ok": true
     },
     "queue_schema": {
@@ -265,11 +265,11 @@
       "ok": true
     },
     "queue_tool_identity": {
-      "detail": "identity=rewrite_queue.py:c572d2a5c57df96c1841b25a46f6df697d6ab8be7de236d3db989d37517f3aa1 actual=rewrite_queue.py:c572d2a5c57df96c1841b25a46f6df697d6ab8be7de236d3db989d37517f3aa1",
+      "detail": "identity=rewrite_queue.py:fbceca5ca1362743d8bad4d7dbbf2f541631730a19d4a86a0b76a6d711698400 actual=rewrite_queue.py:fbceca5ca1362743d8bad4d7dbbf2f541631730a19d4a86a0b76a6d711698400",
       "ok": true
     },
     "queue_verify": {
-      "detail": "{\"ok\": true, \"tasks\": 5792, \"sha256\": \"9fb31be9d78d9923c9541c26a34efe1502a66e5d0cca06dbd4776a756592cdc9\"}\n",
+      "detail": "{\"ok\": true, \"tasks\": 5792, \"sha256\": \"943e5f2626a4c95a4f0d2e83171907bf6a5b5b86611106cd497ee846f13da0c0\"}\n",
       "ok": true
     },
     "rust_destination_unique": {
@@ -301,11 +301,43 @@
       "ok": true
     },
     "scope_schema_identity": {
-      "detail": "source-header-context-oracle-phase0-v7",
+      "detail": "source-header-context-oracle-semantic-closure-phase0-v8",
       "ok": true
     },
     "selected_linker": {
       "detail": "[{'requested_path': '/usr/lib/llvm-19/bin/ld.lld', 'resolved_path': '/usr/lib/llvm-19/bin/lld', 'version': 'Debian LLD 19.1.7', 'selected': 'YES', 'reason': 'canonical Phase 0 linker', 'captured_at': '2026-08-05T14:03:47.223Z'}]",
+      "ok": true
+    },
+    "semantic_base_pending_permitted": {
+      "detail": "frozen_pending=2745400",
+      "ok": true
+    },
+    "semantic_closure_base_schema": {
+      "detail": "rows=17; missing_fields=[]",
+      "ok": true
+    },
+    "semantic_closure_identity_binding": {
+      "detail": "{}",
+      "ok": true
+    },
+    "semantic_closure_new_generation_initial_state": {
+      "detail": "{'ok': True, 'opens': 1, 'prepares': 0, 'commits': 0, 'todo_zero': True}",
+      "ok": true
+    },
+    "semantic_closure_proposal_seal_contract": {
+      "detail": "{'task_id': 'S000013', 'records': 5, 'proposal_sha256': 'ea69f62685ae09c8723f8116e48542b261e87128e4b89b062b874e69db1744f2', 'complete_bound': True, 'partial_rejected': True, 'mutated_rejected': True}",
+      "ok": true
+    },
+    "semantic_closure_schema": {
+      "detail": "rows=20; missing_fields=[]",
+      "ok": true
+    },
+    "semantic_closure_stable_keys_and_base": {
+      "detail": "tasks=5792; pending_fields=2745400; keyset=9348fd13ca44935e847cb943d8f69a5c3f13fef8bc8d8ecaf44cc142e80e3a4c",
+      "ok": true
+    },
+    "semantic_closure_tool_identity": {
+      "detail": "identity=semantic_closure.py:09ba07529d2e8cb7a892777925bac374283624b3d8abbf7c520f6f57ae8fe788 actual=semantic_closure.py:09ba07529d2e8cb7a892777925bac374283624b3d8abbf7c520f6f57ae8fe788",
       "ok": true
     },
     "semantic_no_file_placeholders": {
@@ -345,7 +377,7 @@
       "ok": true
     },
     "task_evidence_quarantine_events": {
-      "detail": "fingerprint=d6c01f29edd048c73608fff2ed65f2485755023f85ffc0fec01e9f511fd6a72c metadata_tasks=153 event_tasks=153 files=760",
+      "detail": "fingerprint=dfb44135cbf69ccfb20f517c86810d3ff21add81a2dd130eeb19b94b8268af9c metadata_tasks=2 event_tasks=2 files=6 declared_tasks=2 declared_files=6",
       "ok": true
     },
     "task_evidence_quarantine_integrity": {
@@ -397,7 +429,7 @@
       "ok": true
     },
     "validator_identity": {
-      "detail": "identity=phase0_validate.py:5f17060e25ad8fc56131228cf736e61348cb60ffcadf96c29194f9782ce69cbd actual=phase0_validate.py:5f17060e25ad8fc56131228cf736e61348cb60ffcadf96c29194f9782ce69cbd",
+      "detail": "identity=phase0_validate.py:c4205754ed3ca1378b0bb6995d281bc49af6fe31443520163901621b22ea2fbf actual=phase0_validate.py:c4205754ed3ca1378b0bb6995d281bc49af6fe31443520163901621b22ea2fbf",
       "ok": true
     },
     "x86_64_build_config": {

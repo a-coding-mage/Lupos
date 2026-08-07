@@ -50,6 +50,66 @@ They are ignored, never bundled, and never archived. Once the retained metadata
 has passed validation, remove them to avoid preserving generated object/image
 output; a fresh authorized Phase 0 run regenerates them when needed.
 
+## Immutable semantic base and effective closure ledger
+
+`SCOPE.tsv`, `SYMBOLS.tsv`, `ABI.tsv`, and `LIFETIMES.tsv` remain immutable
+mechanical Phase 0 inputs.  Their mechanically unprovable fields begin as
+`PENDING_REVIEW`; Phase 1 MUST NOT substitute values directly into those TSVs.
+`rewrite/semantic-closure/SCHEMA.tsv` freezes the field-level key formula and
+transaction schemas.  `BASE.tsv` binds each base manifest hash, row count,
+pending-field count, the complete deterministic task-key-set digest, and the
+schema hash.  Both files are authoritative Phase 0 manifests and are bound by
+`PHASE0_IDENTITY.tsv`.  `LEDGER.jsonl` is append-only mutable Phase 1 state; its
+schema/tool are identity-bound, but its contents are deliberately excluded so
+a valid task commit does not invalidate the queue.
+
+For each task, a stable closure key is derived from the key-schema version,
+manifest name and hash, one-based TSV data-row position, field name, and task
+ID.  Every task-owned base field exactly equal to `PENDING_REVIEW` must appear
+once in the implementation proposal.  The exact canonical evidence names are:
+
+```text
+semantic-closure-proposal.tsv
+semantic-closure-proposal.sha256
+semantic-closure-parity-review.tsv
+semantic-closure-rust-review.tsv
+semantic-closure-final.tsv
+semantic-closure-dispositions.tsv
+semantic-closure-commit.json
+```
+
+The implementer creates and seals the complete proposal against the current
+task, attempt, pipeline, queue fingerprint, Phase 0 identity, four base hashes,
+Linux SHA, candidate diff, and implementation evidence.  Each independent
+review command reads only that proposal and its own fixed report, records any
+finding IDs and affected closure keys, and binds its attestation to the same
+proposal hash.  The seal is created only after the complete ordered proposal
+passes validation, hashes the proposal TSV bytes rather than the seal output,
+and is rejected after any proposal-byte change.  A partial or reordered
+proposal cannot create an acceptance seal.  The applier receives both
+attestations, produces the final
+same-key/same-order record set and one structured disposition per finding, and
+may change proposed semantic values only for keys authorized by a
+`RESOLVED_CHANGED` finding.
+
+`tools/semantic_closure.py commit` takes the existing queue lock, revalidates
+all base and evidence hashes, appends a complete `PREPARE` record to the
+ledger, fsyncs it, appends `semantic_closure_committed` to `events.jsonl`, then
+appends the matching ledger `COMMIT` and writes the task receipt.  Effective
+values exist only after the matching commit and event.  A retry finishes an
+identical prepared transaction; mismatched attempts, hashes, key sets,
+cross-task records, reordered records, unresolved findings, and any remaining
+effective `PENDING_REVIEW` are rejected.  `rewrite_queue.py done` requires this
+current-attempt committed closure in addition to the ordinary five reports.
+
+`rewrite_queue.py freeze` opens exactly one clean ledger generation for the new
+queue fingerprint.  A Phase-gate reopen quarantines all seven semantic evidence
+files together with the ordinary task evidence, preserves historical ledger
+records as append-only data, and grants no current-generation acceptance
+credit.  The validator requires one clean generation, zero current task
+commits, all rows `TODO` at attempt zero, and no canonical task-root evidence
+before Phase 1 may reopen.
+
 The canonical toolchain is the complete LLVM 19 suite under
 `/usr/lib/llvm-19/bin/`. Every invocation uses the absolute
 `LLVM=/usr/lib/llvm-19/bin/` value and `LLVM_IAS=1`; Rust-distributed linkers

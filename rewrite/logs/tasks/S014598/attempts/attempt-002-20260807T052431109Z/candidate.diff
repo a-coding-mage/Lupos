@@ -1,0 +1,2 @@
+Fresh candidate created from vendor/linux/include/linux/pci_ids.h at pinned revision 425f94c2954b1fe80ebdbf9b29854e89750355df.
+The destination contains one public Rust constant for every operative numeric #define, with exact macro names and literal values; source include-guard behavior is represented by module scope.

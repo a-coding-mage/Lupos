@@ -1,0 +1,18 @@
+key	value	status	evidence
+abi_pending_fields	728182	FROZEN	mechanical base manifest scan
+abi_rows	351403	FROZEN	mechanical base manifest scan
+abi_sha256	ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39	FROZEN	mechanical base manifest scan
+base_schema_version	semantic-base-v1	FROZEN	mechanical base manifest scan
+lifetimes_pending_fields	1346492	FROZEN	mechanical base manifest scan
+lifetimes_rows	336623	FROZEN	mechanical base manifest scan
+lifetimes_sha256	0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8	FROZEN	mechanical base manifest scan
+pending_field_count	2745400	FROZEN	mechanical base manifest scan
+scope_pending_fields	5792	FROZEN	mechanical base manifest scan
+scope_rows	18957	FROZEN	mechanical base manifest scan
+scope_sha256	b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a	FROZEN	mechanical base manifest scan
+semantic_schema_sha256	d4217408de5a1cd609d92bebbd04b07a4f2d2f3354fb6d86512891c4ec67b6fd	FROZEN	mechanical base manifest scan
+symbols_pending_fields	664934	FROZEN	mechanical base manifest scan
+symbols_rows	613184	FROZEN	mechanical base manifest scan
+symbols_sha256	7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf	FROZEN	mechanical base manifest scan
+task_count	5792	FROZEN	mechanical base manifest scan
+task_keyset_sha256	9348fd13ca44935e847cb943d8f69a5c3f13fef8bc8d8ecaf44cc142e80e3a4c	FROZEN	mechanical base manifest scan

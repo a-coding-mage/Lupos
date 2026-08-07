@@ -15,6 +15,8 @@ import shlex
 import subprocess
 import tempfile
 
+import semantic_closure
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BRANCH = "feat/bun-like-rewrite-test"
@@ -514,6 +516,22 @@ def main() -> int:
         report_lines.extend(f"- `{row['predicate_id']}`: {row['checks_failed']}" for row in failures)
         report_lines.append("")
     write_atomic(evidence_root / "validation-report.md", ("\n".join(report_lines) + "\n").encode())
+    binding_path = rewrite / "metadata/compiler-predicates-binding.tsv"
+    if binding_path.is_file():
+        binding_fields, binding_rows = read_tsv(binding_path)
+        if binding_fields != ["key", "value"]:
+            raise SystemExit(f"predicate binding schema mismatch: {binding_path}")
+        binding = {row["key"]: row["value"] for row in binding_rows}
+        binding["compiler_predicates_validation_sha256"] = sha256_bytes(validation_bytes)
+        binding["compiler_predicates_validation_status"] = "PASS" if overall_ok else "FAIL"
+        write_atomic(
+            binding_path,
+            tsv_bytes(
+                ["key", "value"],
+                [{"key": key, "value": value} for key, value in sorted(binding.items())],
+            ),
+        )
+        semantic_closure.refresh_manifest_indexes(rewrite)
     print(json.dumps({"ok": overall_ok, "rows": len(inventory), "failures": len(failures)}, sort_keys=True))
     return 0 if overall_ok else 1
 

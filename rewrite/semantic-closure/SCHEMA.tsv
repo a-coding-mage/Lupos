@@ -1,0 +1,21 @@
+key	value	status	evidence
+base_manifests	SCOPE.tsv;SYMBOLS.tsv;ABI.tsv;LIFETIMES.tsv	FROZEN	tools/semantic_closure.py
+base_schema_version	semantic-base-v1	FROZEN	tools/semantic_closure.py
+commit_schema_version	semantic-commit-v1	FROZEN	tools/semantic_closure.py
+disposition_fields	finding_id;source_slot;record_keys;disposition;source_citations;detail	FROZEN	tools/semantic_closure.py
+disposition_schema_version	semantic-dispositions-v1	FROZEN	tools/semantic_closure.py
+effective_rule	a field is closed only by a PREPARE record followed by matching event and COMMIT in the current queue generation	FROZEN	tools/semantic_closure.py
+key_algorithm	SC1- + sha256(canonical-json(key_schema_version,manifest,base_manifest_sha256,base_row,field,task_id))	FROZEN	tools/semantic_closure.py
+key_schema_version	semantic-field-key-v1	FROZEN	tools/semantic_closure.py
+ledger_schema_version	semantic-ledger-v1	FROZEN	tools/semantic_closure.py
+mutable_layer	LEDGER.jsonl contents are append-only and excluded from Phase 0 identity hashes	FROZEN	tools/semantic_closure.py
+pending_rule	one required closure record for every task-owned allowed field exactly equal to PENDING_REVIEW	FROZEN	tools/semantic_closure.py
+proposal_fields	schema_version;record_key;task_id;attempt;pipeline_id;manifest;base_row;field;architecture;linux_path;record_kind;symbol_name;source_line;old_value;final_value;decision_status;source_citations;linux_sha;candidate_sha256;implementation_sha256;phase0_identity_sha256;queue_fingerprint;base_manifest_sha256	FROZEN	tools/semantic_closure.py
+proposal_schema_version	semantic-proposal-v1	FROZEN	tools/semantic_closure.py
+proposal_seal_fields	schema_version;sha256;task_id;attempt;pipeline_id;records;queue_fingerprint;phase0_identity_sha256;sealed_at	FROZEN	tools/semantic_closure.py
+review_fields	schema_version;task_id;attempt;pipeline_id;slot;proposal_sha256;report_path;report_sha256;review_status;reviewer;model;reasoning_effort;reviewed_at;finding_id;record_keys	FROZEN	tools/semantic_closure.py
+review_isolation	each review command reads only the sealed proposal and its own fixed report	FROZEN	tools/semantic_closure.py
+review_schema_version	semantic-review-attestation-v1	FROZEN	tools/semantic_closure.py
+schema_version	semantic-closure-v1	FROZEN	tools/semantic_closure.py
+semantic_evidence_files	semantic-closure-proposal.tsv;semantic-closure-proposal.sha256;semantic-closure-parity-review.tsv;semantic-closure-rust-review.tsv;semantic-closure-final.tsv;semantic-closure-dispositions.tsv;semantic-closure-commit.json	FROZEN	tools/semantic_closure.py
+task_ownership	SCOPE.id=queue.id; semantic manifest scope_id=queue.id	FROZEN	tools/semantic_closure.py

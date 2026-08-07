@@ -22,6 +22,8 @@ import shutil
 import tarfile
 from typing import Iterable
 
+import semantic_closure
+
 
 SCOPE_FIELDS = [
     "id", "linux_path", "destination_path", "class", "architectures",
@@ -2604,12 +2606,17 @@ def main() -> None:
         ["key", "value"],
         [{"key": key, "value": value} for key, value in sorted(predicate_binding.items())],
     )
+    # Freeze deterministic task-owned field keys only after all four mechanical
+    # base manifests exist.  The generated ledger is empty; Phase 1 decisions
+    # are intentionally outside the immutable manifest hashes.
+    semantic_closure.initialize_phase0(args.out, phase_gate_reopen=False)
     authoritative_manifest_rows = [
         {"path": name, "sha256": sha256(args.out / name)}
         for name in (
             "SCOPE.tsv", "FILE_MAP.tsv", "SYMBOLS.tsv", "ABI.tsv",
             "LIFETIMES.tsv", "DRIVER_ABI.tsv", "PORTING.md",
-            "BRANDING_ALLOWLIST.tsv",
+            "BRANDING_ALLOWLIST.tsv", "semantic-closure/SCHEMA.tsv",
+            "semantic-closure/BASE.tsv",
         )
     ]
     write_tsv(

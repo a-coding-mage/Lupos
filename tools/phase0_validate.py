@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import ast
 from collections import defaultdict
+import contextlib
 import csv
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,9 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
+
+import semantic_closure
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,13 +55,20 @@ ORACLE_CLASSIFICATION_FIELDS = {
 CANONICAL_TASK_EVIDENCE = {
     "implementation.md", "candidate.diff", "parity-review.md",
     "rust-review.md", "resolution.md",
+    *semantic_closure.SEMANTIC_EVIDENCE_FILES,
 }
 QUARANTINE_METADATA_FIELDS = [
     "schema_version", "superseded_fingerprint", "task_id",
     "original_status", "original_attempt", "original_resume_status",
     "provenance_state", "file_set_state", "file_name", "sha256", "bytes",
 ]
-QUARANTINE_SCHEMA_VERSION = "task-evidence-quarantine-v1"
+QUARANTINE_SCHEMA_VERSION = "task-evidence-quarantine-v2"
+LEGACY_QUARANTINE_SCHEMA_VERSION = "task-evidence-quarantine-v1"
+QUARANTINE_FILE_SET_STATES = {
+    "QUEUE_STAGE_FILESET_MATCH",
+    "QUEUE_STAGE_FILESET_MISMATCH",
+    "QUEUE_STAGE_FILESET_UNSPECIFIED",
+}
 QUARANTINE_PROVENANCE_STATE = "UNPROVEN_MIXED_OR_UNKNOWN"
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s*([<"])([^>"\n]+)[>"]', re.M)
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -187,6 +199,107 @@ def dependency_headers(build: Path, linux: Path, arch: str, object_path: str) ->
         seen.add(normalized[0])
         result.append(normalized)
     return result
+
+
+def validate_semantic_proposal_seal_contract(
+    artifacts: Path,
+) -> tuple[bool, dict[str, object]]:
+    """Exercise the source-only proposal validation and seal boundary."""
+
+    task_id = "S000013"
+    expected = semantic_closure.expected_closure_records(artifacts, task_id)
+    if not expected:
+        return False, {"error": f"{task_id} has no semantic closure records"}
+    metadata = {
+        "schema_version": semantic_closure.PROPOSAL_SCHEMA_VERSION,
+        "task_id": task_id,
+        "attempt": "1",
+        "pipeline_id": "P01",
+        "linux_sha": (ROOT / "vendor/linux.SHA").read_text(encoding="utf-8").strip(),
+        "candidate_sha256": "1" * 64,
+        "implementation_sha256": "2" * 64,
+        "phase0_identity_sha256": "3" * 64,
+        "queue_fingerprint": "4" * 64,
+    }
+    records: list[dict[str, str]] = []
+    for expected_record in expected:
+        record = {field: "" for field in semantic_closure.PROPOSAL_FIELDS}
+        record.update(metadata)
+        record.update(expected_record)
+        record["decision_status"] = "COMPLETE"
+        record["final_value"] = (
+            "COMPLETE"
+            if record["field"] == "status"
+            or (record["manifest"] == "SCOPE.tsv" and record["field"] == "semantic_status")
+            else "SOURCE_REVIEWED_VALUE"
+        )
+        records.append(record)
+
+    with tempfile.TemporaryDirectory(prefix="lupos-semantic-seal-") as directory:
+        root = Path(directory)
+        proposal = root / "semantic-closure-proposal.tsv"
+        seal = root / "semantic-closure-proposal.sha256"
+        partial = root / "partial.tsv"
+        partial_seal = root / "partial.sha256"
+        semantic_closure.atomic_write_tsv(
+            proposal, semantic_closure.PROPOSAL_FIELDS, records
+        )
+        validated = semantic_closure.seal_validated_proposal(
+            proposal, seal,
+            rewrite=artifacts,
+            task_id=task_id,
+            attempt=1,
+            pipeline="P01",
+            identity_hash=metadata["phase0_identity_sha256"],
+            fingerprint=metadata["queue_fingerprint"],
+            candidate_hash=metadata["candidate_sha256"],
+            implementation_hash=metadata["implementation_sha256"],
+        )
+        seal_values = semantic_closure.read_proposal_seal(proposal, seal)
+        expected_hash = semantic_closure.sha256_file(proposal)
+        complete_bound = (
+            seal_values.get("sha256") == expected_hash
+            and seal_values.get("records") == str(len(records))
+            and len(validated) == len(records)
+        )
+
+        semantic_closure.atomic_write_tsv(
+            partial, semantic_closure.PROPOSAL_FIELDS, records[:-1]
+        )
+        partial_rejected = False
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                semantic_closure.seal_validated_proposal(
+                    partial, partial_seal,
+                    rewrite=artifacts,
+                    task_id=task_id,
+                    attempt=1,
+                    pipeline="P01",
+                    identity_hash=metadata["phase0_identity_sha256"],
+                    fingerprint=metadata["queue_fingerprint"],
+                    candidate_hash=metadata["candidate_sha256"],
+                    implementation_hash=metadata["implementation_sha256"],
+                )
+            except SystemExit:
+                partial_rejected = True
+        partial_rejected = partial_rejected and not partial_seal.exists()
+
+        original = proposal.read_bytes()
+        proposal.write_bytes(original + b"\n")
+        mutated_rejected = False
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                semantic_closure.read_proposal_seal(proposal, seal)
+            except SystemExit:
+                mutated_rejected = True
+        return complete_bound and partial_rejected and mutated_rejected, {
+            "task_id": task_id,
+            "records": len(records),
+            "proposal_sha256": expected_hash,
+            "complete_bound": complete_bound,
+            "partial_rejected": partial_rejected,
+            "mutated_rejected": mutated_rejected,
+        }
 
 
 def include_search_directories(command: str, directory: Path) -> list[Path]:
@@ -635,8 +748,14 @@ def quarantine_file_set_state(
 ) -> str:
     if status == "PAUSED":
         status = resume_status
-    implementation = {"implementation.md", "candidate.diff"}
-    reviews = implementation | {"parity-review.md", "rust-review.md"}
+    implementation = {
+        "implementation.md", "candidate.diff",
+        "semantic-closure-proposal.tsv", "semantic-closure-proposal.sha256",
+    }
+    reviews = implementation | {
+        "parity-review.md", "rust-review.md",
+        "semantic-closure-parity-review.tsv", "semantic-closure-rust-review.tsv",
+    }
     complete = set(CANONICAL_TASK_EVIDENCE)
     matches = False
     if status == "TODO":
@@ -705,13 +824,26 @@ def validate_task_evidence_quarantine(
             if names != sorted(names) or len(observed) != len(names):
                 errors.append(f"{prefix}:nondeterministic-or-duplicate-files")
             common = records[0]
-            expected_state = quarantine_file_set_state(
-                common.get("original_status", ""),
-                common.get("original_resume_status", ""),
-                observed,
-            )
+            schema_version = common.get("schema_version", "")
+            if schema_version == LEGACY_QUARANTINE_SCHEMA_VERSION:
+                # v1 pre-dates the semantic-closure evidence files.  Its
+                # file_set_state was computed against the five original
+                # evidence names, so recomputing it against today's expanded
+                # set would rewrite the meaning of immutable history.
+                expected_state = common.get("file_set_state", "")
+                if expected_state not in QUARANTINE_FILE_SET_STATES:
+                    errors.append(f"{prefix}:invalid-legacy-file-set-state")
+            elif schema_version == QUARANTINE_SCHEMA_VERSION:
+                expected_state = quarantine_file_set_state(
+                    common.get("original_status", ""),
+                    common.get("original_resume_status", ""),
+                    observed,
+                )
+            else:
+                errors.append(f"{prefix}:unsupported-schema:{schema_version}")
+                continue
             repeated = {
-                "schema_version": QUARANTINE_SCHEMA_VERSION,
+                "schema_version": schema_version,
                 "superseded_fingerprint": fingerprint,
                 "task_id": task_dir.name,
                 "original_status": common.get("original_status", ""),
@@ -939,6 +1071,8 @@ def main() -> int:
         checks,
         "compiler_predicate_binding",
         predicate_binding.get("compiler_predicates_sha256") == digest(inventory_path)
+        and predicate_binding.get("compiler_predicates_validation_sha256")
+        == digest(predicate_validation_path)
         and predicate_binding.get("compiler_predicates_schema_version") == "compiler-predicates-v1"
         and predicate_binding.get("compiler_predicates_count") == str(len(predicate_rows))
         and predicate_binding.get("compiler_predicates_x86_64_count") == str(predicate_counts["x86_64"])
@@ -992,6 +1126,64 @@ def main() -> int:
         "branding_allowlist_schema",
         artifacts / "BRANDING_ALLOWLIST.tsv",
         {"linux_name", "lupos_name", "reason", "evidence"},
+    )
+    semantic_schema = required_fields(
+        checks,
+        "semantic_closure_schema",
+        artifacts / "semantic-closure/SCHEMA.tsv",
+        set(semantic_closure.SCHEMA_FIELDS),
+    )
+    semantic_base = required_fields(
+        checks,
+        "semantic_closure_base_schema",
+        artifacts / "semantic-closure/BASE.tsv",
+        set(semantic_closure.BASE_FIELDS),
+    )
+    semantic_validation_error = ""
+    semantic_values: dict[str, str] = {}
+    try:
+        semantic_values = semantic_closure.validate_phase0_artifacts(artifacts)
+    except SystemExit as exc:
+        semantic_validation_error = str(exc)
+    check(
+        checks,
+        "semantic_closure_stable_keys_and_base",
+        bool(semantic_schema) and bool(semantic_base) and not semantic_validation_error,
+        semantic_validation_error or (
+            f"tasks={semantic_values.get('task_count')}; "
+            f"pending_fields={semantic_values.get('pending_field_count')}; "
+            f"keyset={semantic_values.get('task_keyset_sha256')}"
+        ),
+    )
+    seal_contract_ok = False
+    seal_contract_detail: object = "not run"
+    try:
+        seal_contract_ok, seal_contract_detail = (
+            validate_semantic_proposal_seal_contract(artifacts)
+        )
+    except (OSError, ValueError, SystemExit) as exc:
+        seal_contract_detail = f"{type(exc).__name__}: {exc}"
+    check(
+        checks,
+        "semantic_closure_proposal_seal_contract",
+        seal_contract_ok,
+        seal_contract_detail,
+    )
+    check(
+        checks,
+        "semantic_base_pending_permitted",
+        semantic_values.get("pending_field_count")
+        == str(sum(
+            value == "PENDING_REVIEW"
+            for records in (scope, symbols, abi, lifetimes)
+            for row in records
+            if (
+                ("id" in row and row.get("class") == "RUST_TRANSLATE")
+                or ("scope_id" in row)
+            )
+            for value in row.values()
+        )),
+        f"frozen_pending={semantic_values.get('pending_field_count')}",
     )
     check(
         checks,
@@ -2140,7 +2332,8 @@ def main() -> int:
     required_manifests = {
         "SCOPE.tsv", "FILE_MAP.tsv", "SYMBOLS.tsv", "ABI.tsv",
         "LIFETIMES.tsv", "DRIVER_ABI.tsv", "PORTING.md",
-        "BRANDING_ALLOWLIST.tsv",
+        "BRANDING_ALLOWLIST.tsv", "semantic-closure/SCHEMA.tsv",
+        "semantic-closure/BASE.tsv",
     }
     manifest_hash_errors = [
         name for name in sorted(required_manifests)
@@ -2248,6 +2441,7 @@ def main() -> int:
             )
             latest_fingerprint = ""
             quarantine_events: list[dict[str, object]] = []
+            reinitialized: dict[str, object] = {}
             if consuming:
                 reinitialized_index, reinitialized = consuming[0]
                 match = re.search(
@@ -2272,16 +2466,48 @@ def main() -> int:
                 in str(record.get("detail", ""))
                 for record in quarantine_events
             )
+            declared_counts = re.search(
+                r"quarantined_tasks=(\d+); quarantined_files=(\d+);",
+                str(reinitialized.get("detail", "")),
+            )
+            declared_tasks = int(declared_counts.group(1)) if declared_counts else -1
+            declared_files = int(declared_counts.group(2)) if declared_counts else -1
+            observed_files = int(summary.get("files", 0))
+            empty_generation = (
+                declared_tasks == 0
+                and declared_files == 0
+                and not quarantined_tasks
+                and not quarantine_events
+                and observed_files == 0
+            )
+            populated_generation = (
+                bool(quarantined_tasks)
+                and event_tasks == quarantined_tasks
+                and len(quarantine_events) == len(quarantined_tasks)
+                and declared_tasks == len(quarantined_tasks)
+                and declared_files == observed_files
+                and detail_matches
+            )
             check(
                 checks,
                 "task_evidence_quarantine_events",
                 bool(latest_fingerprint)
-                and bool(quarantined_tasks)
-                and event_tasks == quarantined_tasks
-                and len(quarantine_events) == len(quarantined_tasks)
-                and detail_matches,
+                and bool(declared_counts)
+                and (empty_generation or populated_generation),
                 f"fingerprint={latest_fingerprint} metadata_tasks={len(quarantined_tasks)} "
-                f"event_tasks={len(event_tasks)} files={summary.get('files', 0)}",
+                f"event_tasks={len(event_tasks)} files={observed_files} "
+                f"declared_tasks={declared_tasks} declared_files={declared_files}",
+            )
+            initial_semantic = semantic_closure.validate_generation_initial_state(
+                current_queue_rows,
+                canonical / "TRANSLATION_TASKS.sha256",
+                canonical / "semantic-closure/LEDGER.jsonl",
+            )
+            check(
+                checks,
+                "semantic_closure_new_generation_initial_state",
+                bool(initial_semantic.get("ok")),
+                initial_semantic,
             )
     else:
         check(
@@ -2292,8 +2518,27 @@ def main() -> int:
         )
 
     if args.stage == "pre-queue":
-        queue_absent = not (artifacts / "TRANSLATION_TASKS.tsv").exists() and not (artifacts / "TRANSLATION_TASKS.sha256").exists()
+        queue_absent = (
+            not (artifacts / "TRANSLATION_TASKS.tsv").exists()
+            and not (artifacts / "TRANSLATION_TASKS.sha256").exists()
+        )
+        if args.phase_gate_reopen:
+            # The invalidated snapshot remains byte-exact until the queue tool
+            # consumes its recorded reopen authorization.
+            queue_absent = (
+                (artifacts / "TRANSLATION_TASKS.tsv").is_file()
+                and (artifacts / "TRANSLATION_TASKS.sha256").is_file()
+            )
         check(checks, "queue_absent_before_init", queue_absent, artifacts)
+        ledger_records = semantic_closure.validate_ledger(
+            artifacts / "semantic-closure/LEDGER.jsonl"
+        )
+        check(
+            checks,
+            "semantic_closure_prequeue_clean",
+            not any(record.get("record_type") in {"PREPARE", "COMMIT"} for record in ledger_records),
+            f"ledger_records={len(ledger_records)}",
+        )
     else:
         identity_path = artifacts / "PHASE0_IDENTITY.tsv"
         identity_hash_path = artifacts / "PHASE0_IDENTITY.sha256"
@@ -2335,11 +2580,20 @@ def main() -> int:
             identity.get("queue_tool_version", {}).get("value") == queue_tool_identity,
             f"identity={identity.get('queue_tool_version', {}).get('value')} actual={queue_tool_identity}",
         )
+        semantic_tool_identity = f"semantic_closure.py:{digest(root / 'tools/semantic_closure.py')}"
+        check(
+            checks,
+            "semantic_closure_tool_identity",
+            identity.get("semantic_closure_tool_version", {}).get("value")
+            == semantic_tool_identity,
+            f"identity={identity.get('semantic_closure_tool_version', {}).get('value')} "
+            f"actual={semantic_tool_identity}",
+        )
         check(
             checks,
             "scope_schema_identity",
             identity.get("scope_schema_version", {}).get("value")
-            == "source-header-context-oracle-phase0-v7",
+            == "source-header-context-oracle-semantic-closure-phase0-v8",
             identity.get("scope_schema_version", {}).get("value"),
         )
         check(
@@ -2356,8 +2610,29 @@ def main() -> int:
             == "oracle-classification-v1",
             identity.get("oracle_classification_schema_version", {}).get("value"),
         )
+        semantic_identity_expected = {
+            "semantic_closure_schema_version": semantic_closure.SCHEMA_VERSION,
+            "semantic_closure_key_schema_version": semantic_closure.KEY_SCHEMA_VERSION,
+            "semantic_closure_schema_sha256": digest(artifacts / "semantic-closure/SCHEMA.tsv"),
+            "semantic_closure_base_sha256": digest(artifacts / "semantic-closure/BASE.tsv"),
+            "semantic_closure_task_keyset_sha256": semantic_values.get("task_keyset_sha256", ""),
+            "semantic_closure_pending_field_count": semantic_values.get("pending_field_count", ""),
+            "semantic_closure_ledger_binding": "MUTABLE_CONTENT_EXCLUDED",
+        }
+        semantic_identity_errors = {
+            key: {"identity": identity.get(key, {}).get("value"), "expected": expected}
+            for key, expected in semantic_identity_expected.items()
+            if identity.get(key, {}).get("value") != expected
+        }
+        check(
+            checks,
+            "semantic_closure_identity_binding",
+            not semantic_identity_errors,
+            semantic_identity_errors,
+        )
         identity_predicate_expected = {
             "compiler_predicates_sha256": digest(predicate_root / "COMPILER_PREDICATES.tsv"),
+            "compiler_predicates_validation_sha256": digest(predicate_root / "VALIDATION.tsv"),
             "compiler_predicates_schema_version": "compiler-predicates-v1",
             "compiler_predicates_count": str(len(predicate_rows)),
             "compiler_predicates_x86_64_count": str(predicate_counts["x86_64"]),
@@ -2478,15 +2753,23 @@ def main() -> int:
 
     report = {"ok": all(item["ok"] for item in checks.values()), "stage": args.stage, "checks": checks}
     if not args.no_write_report:
-        (artifacts / "PHASE0_VALIDATION.json").write_text(
+        json_report = artifacts / "PHASE0_VALIDATION.json"
+        tsv_report = artifacts / "PHASE0_VALIDATION.tsv"
+        checksum_report = artifacts / "PHASE0_VALIDATION.sha256"
+        json_report.write_text(
             json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-        with (artifacts / "PHASE0_VALIDATION.tsv").open("w", encoding="utf-8") as handle:
+        with tsv_report.open("w", encoding="utf-8") as handle:
             handle.write("check\tstatus\tdetail\n")
             for name, item in checks.items():
                 handle.write(
                     f"{name}\t{'PASS' if item['ok'] else 'FAIL'}\t{item['detail'].replace(chr(9), ' ')}\n"
                 )
+        checksum_report.write_text(
+            f"{digest(json_report)}  {json_report.name}\n"
+            f"{digest(tsv_report)}  {tsv_report.name}\n",
+            encoding="utf-8",
+        )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["ok"] else 1
 

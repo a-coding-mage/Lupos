@@ -154,10 +154,16 @@ def main() -> int:
     binding_path = artifacts / "metadata/compiler-predicates-binding.tsv"
     binding = {row["key"]: row["value"] for row in read_tsv(binding_path)}
     require(binding.get("compiler_predicates_sha256") == sha256(predicate_root / "COMPILER_PREDICATES.tsv"), "staged predicate binding mismatch")
+    require(
+        binding.get("compiler_predicates_validation_sha256")
+        == sha256(predicate_root / "VALIDATION.tsv"),
+        "staged predicate validation binding mismatch",
+    )
 
     manifest_paths = [
         "SCOPE.tsv", "FILE_MAP.tsv", "SYMBOLS.tsv", "ABI.tsv", "LIFETIMES.tsv",
         "DRIVER_ABI.tsv", "PORTING.md", "BRANDING_ALLOWLIST.tsv",
+        "semantic-closure/SCHEMA.tsv", "semantic-closure/BASE.tsv",
     ]
     for name in manifest_paths:
         require((artifacts / name).is_file(), f"missing authoritative manifest: {name}")
@@ -165,8 +171,25 @@ def main() -> int:
     metadata_manifest = artifacts / "metadata/manifest.tsv"
     require(authoritative_manifest.is_file() and metadata_manifest.is_file(), "missing staged metadata manifests")
 
+    semantic_schema = artifacts / "semantic-closure/SCHEMA.tsv"
+    semantic_base = artifacts / "semantic-closure/BASE.tsv"
+    semantic_base_values = {
+        row["key"]: row["value"] for row in read_tsv(semantic_base)
+    }
+    require(
+        semantic_base_values.get("semantic_schema_sha256") == sha256(semantic_schema),
+        "semantic closure base/schema binding mismatch",
+    )
+    require(
+        semantic_base_values.get("scope_sha256") == sha256(artifacts / "SCOPE.tsv")
+        and semantic_base_values.get("symbols_sha256") == sha256(artifacts / "SYMBOLS.tsv")
+        and semantic_base_values.get("abi_sha256") == sha256(artifacts / "ABI.tsv")
+        and semantic_base_values.get("lifetimes_sha256") == sha256(artifacts / "LIFETIMES.tsv"),
+        "semantic closure base manifest hashes mismatch",
+    )
+
     values: dict[str, str] = {
-        "identity_schema_version": "phase0-identity-v2",
+        "identity_schema_version": "phase0-identity-v3",
         "linux_commit": linux_sha,
         "x86_64_config_sha256": config_hashes["x86_64"],
         "aarch64_config_sha256": config_hashes["aarch64"],
@@ -189,12 +212,14 @@ def main() -> int:
         "extractor_version": f"phase0_extract.py:{sha256(root / 'tools/phase0_extract.py')}",
         "validator_version": f"phase0_validate.py:{sha256(root / 'tools/phase0_validate.py')}",
         "queue_tool_version": f"rewrite_queue.py:{sha256(root / 'tools/rewrite_queue.py')}",
+        "semantic_closure_tool_version": f"semantic_closure.py:{sha256(root / 'tools/semantic_closure.py')}",
         "predicate_extractor_version": f"compiler_predicates.py:{sha256(root / 'tools/compiler_predicates.py')}",
         "predicate_validator_version": f"validate_compiler_predicates.py:{sha256(root / 'tools/validate_compiler_predicates.py')}",
-        "scope_schema_version": "source-header-context-oracle-phase0-v7",
+        "scope_schema_version": "source-header-context-oracle-semantic-closure-phase0-v8",
         "header_dependency_schema_version": "header-provider-enumerator-graph-v3",
         "oracle_classification_schema_version": "oracle-classification-v1",
         "compiler_predicates_sha256": sha256(predicate_root / "COMPILER_PREDICATES.tsv"),
+        "compiler_predicates_validation_sha256": sha256(predicate_root / "VALIDATION.tsv"),
         "compiler_predicates_schema_version": "compiler-predicates-v1",
         "compiler_predicates_count": str(len(predicates)),
         "compiler_predicates_x86_64_count": str(counts["x86_64"]),
@@ -202,6 +227,13 @@ def main() -> int:
         "compiler_predicates_validation_status": "PASS",
         "authoritative_manifests_sha256": sha256(authoritative_manifest),
         "metadata_manifest_sha256": sha256(metadata_manifest),
+        "semantic_closure_schema_version": "semantic-closure-v1",
+        "semantic_closure_key_schema_version": "semantic-field-key-v1",
+        "semantic_closure_schema_sha256": sha256(semantic_schema),
+        "semantic_closure_base_sha256": sha256(semantic_base),
+        "semantic_closure_task_keyset_sha256": semantic_base_values["task_keyset_sha256"],
+        "semantic_closure_pending_field_count": semantic_base_values["pending_field_count"],
+        "semantic_closure_ledger_binding": "MUTABLE_CONTENT_EXCLUDED",
     }
     binding_digest = hashlib.sha256(
         json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")

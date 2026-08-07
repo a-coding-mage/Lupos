@@ -1,64 +1,27 @@
-# Application resolution — S014598
+# Applier resolution — S014598, attempt 3
 
-Task: `include/linux/pci_ids.h` → `src/include/linux/pci_ids.rs`  
-Pinned Linux revision: `425f94c2954b1fe80ebdbf9b29854e89750355df`  
-Disposition: all source-review findings resolved by source inspection; no compiler, formatter, linker, test, runtime tool, or historical Rust source was used.
+Pinned source reopened: `vendor/linux/include/linux/pci_ids.h` at Linux revision `425f94c2954b1fe80ebdbf9b29854e89750355df`. Queue task `S014598` remains `APPLYING` in `P01`; the frozen Phase-0 identity and queue fingerprint match the sealed proposal and both reviewer attestations.
 
-## 1. Duplicate/mismatched architecture provenance — RESOLVED
+## Findings
 
-Accepted.  The single architecture provenance line is now
-`//! architectures: common`.  `rewrite/SCOPE.tsv` and the immutable queue row
-for `S014598` both assign `common`; it is the task's protocol membership, even
-though the header is selected by both approved architectures.  This is also the
-exact string required by `tools/rewrite_queue.py` when it validates immutable
-provenance (`required_headers` includes `//! architectures: {row['architectures']}`).
-The duplicate `x86_64,aarch64` line was removed.  The other four required
-provenance lines match the task, source path, and `vendor/linux.SHA`.
+### P001 — DISPROVED
 
-## 2. Blanket `u32` constants — RESOLVED
+`semantic_closure.py` defines proposal `candidate_sha256` as `sha256_file(paths["candidate"])`, and `paths["candidate"]` is `rewrite/logs/tasks/S014598/candidate.diff` (tool lines 63–70, 487–496, 513–522, 717–743). The sealed digest `35cdc7e8196d9ac2bd382ca3a91a0b2a8e9266caea8f158ba48f8902616e66ce` equals that current evidence artifact. The proposal format does not define this field as a destination-source hash, so the differing `src/include/linux/pci_ids.rs` digest is not a stale-proposal defect.
 
-Accepted and corrected.  I reopened the complete pinned 3,270-line header and
-audited every non-guard object-like macro.  It contains exactly 2,902
-`#define NAME 0x...` replacement lists: every literal is unsuffixed hexadecimal,
-has no expression or configuration branch, and lies in the inclusive range
-`0x00000000..0x000d1010`, so each has the active signed 32-bit C `int` type on
-the frozen x86_64 and AArch64 targets identified by the fresh Rust review.
-`u32` changed that source integer type.  Every translated item is now an
-explicit `pub const NAME: i32 = 0x...;`; consumers must perform a conversion
-only where their corresponding C context performs one.
+### P002 — RESOLVED_CHANGED
 
-The final candidate is byte-for-byte equal to the deterministic projection of
-the pinned header after only these mechanical transformations: remove the
-C include guard, add the five immutable Rust provenance lines, and replace
-each macro definition with its same-name `i32` constant.  Projection/candidate
-SHA-256: `89db61b4b7e4030b9ec9c0ee3b10a42fc26520900612a23041c17a916c0fd653`.
+Upstream's only conditional is the include guard: `#ifndef _LINUX_PCI_IDS_H` at line 10, an empty `#define _LINUX_PCI_IDS_H` at line 11, and the closing `#endif` at line 3270. I removed the value-bearing `pub const _LINUX_PCI_IDS_H: core::ffi::c_int = 1`. Rust's path-module/import-once mechanism represents this non-value preprocessing guard; no exported typed surrogate remains. The closure's recorded upstream facts are unchanged, so its final semantic values require no alteration.
 
-## 3. Application audit: macros with trailing comments omitted from the prior candidate — RESOLVED
+### F1 — DISPROVED
 
-During application, the fresh reports' stated 2,902-candidate count was
-disproved: the prior file had 2,845 constants and omitted 57 definitions whose
-source lines carry trailing comments.  This was material missing behavior, so
-all 57 were restored in source order with identifier, literal, and comment
-unchanged.  Examples include `PCI_VENDOR_ID_COMPEX2` (pinned line 529),
-`PCI_DEVICE_ID_NEC_CBUS_1` (702), `PCI_VENDOR_ID_CREATIVE` (1413),
-`PCI_DEVICE_ID_INTEL_LIGHT_RIDGE` (2746), and
-`PCI_DEVICE_ID_INTEL_SBRIDGE_IMC_RAS` (3031).  The final candidate therefore
-has exactly 2,902 public `i32` constants, no extras, no omissions, and no
-name/value mismatch against the pinned source.
+Same disposition as P001: the sealed artifact binds `candidate.diff`, not the destination source file. The closure tool's validation accepts the current `candidate.diff` digest and defines no source-hash requirement for `candidate_sha256`.
 
-## Final task semantic evidence
+### F2 — RESOLVED_CHANGED
 
-`pci_ids.h` is a common, configuration-independent catalogue of integer
-macros: it has no functions, types, storage, ABI layout, ownership, lifetime,
-locking/RCU, refcount, allocation, callback, or error-path semantics.  The
-only C conditional is its include guard, represented by the Rust module
-boundary.  `SYMBOLS.tsv` contains 5,810 completed per-architecture records
-for this task and there are no matching ABI, lifetime, driver-ABI, or blocker
-records.  The frozen scope row's task-level `PENDING_REVIEW` field cannot be
-hand-edited in Phase 1; this resolution supplies its required source-level
-closure without changing the frozen manifest.
+Same source correction as P002. The final Rust file exports exactly the 2,902 value-bearing upstream PCI macro mappings and no `_LINUX_PCI_IDS_H` integer item. A source-only name/value comparison of all upstream `#define` entries excluding the guard against Rust constants returned zero deltas.
 
-Manual final checks established the exact required provenance, the complete
-2,902-to-2,902 mapping, absence of `todo!`, `unimplemented!`, and Rust test
-configuration, and clean focused patch whitespace.  This is a source-review
-completion only; it makes no compile, link, boot, runtime, or test claim.
+## Final source evidence
+
+- Upstream: 2,902 value-bearing `#define` entries; candidate: 2,902 `pub const` entries; normalized name/value delta: zero.
+- The header's only preprocessor conditional is its two-line opening/closing include guard.
+- No compiler, formatter, linker, test, runtime, benchmark, or rust-analyzer diagnostic was invoked.

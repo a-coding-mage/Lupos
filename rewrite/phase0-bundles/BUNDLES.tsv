@@ -1,6 +1,6 @@
 schema_version	archive_group	bundle	part	sha256	bytes	member_count
-phase0-materialized-bundles-v2-gzip	manifests.tar.gz	manifests.tar.gz.part000	0	32f305ef49f7c77433d818b9fa5b9a1d9e0895dad31211265ce5d340ac8e2039	37453287	6
+phase0-materialized-bundles-v2-gzip	manifests.tar.gz	manifests.tar.gz.part000	0	e7ade670feb304d58e72c48a43dbd7184dcab54032af53fdda4c72a5453b4335	37454723	8
 phase0-materialized-bundles-v2-gzip	metadata-aarch64.tar.gz	metadata-aarch64.tar.gz.part000	0	7c02f2d20c2c66f28e57233dac5eb9cc7cc1bbbad173ebe33552a6c511accf39	94371840	15
 phase0-materialized-bundles-v2-gzip	metadata-aarch64.tar.gz	metadata-aarch64.tar.gz.part001	1	42bfdf3fb9e2e4363674782b62033154b0099ceba1a41cc6a5b970b4060faae1	26896371	15
-phase0-materialized-bundles-v2-gzip	metadata-shared.tar.gz	metadata-shared.tar.gz.part000	0	dcacd725646afe3b1239a678f8661d04d8ef82eb11ebdd378de9be7f153cbfaa	1635476	10
+phase0-materialized-bundles-v2-gzip	metadata-shared.tar.gz	metadata-shared.tar.gz.part000	0	a4abdcde832996019aa9fff9a4815ccf9a928f0aca149e7063766bc0458421de	1635603	10
 phase0-materialized-bundles-v2-gzip	metadata-x86_64.tar.gz	metadata-x86_64.tar.gz.part000	0	41247e9adda809dc876a7da27b49584530a4b25be3c07f070babe86eb6bc5031	34952334	15

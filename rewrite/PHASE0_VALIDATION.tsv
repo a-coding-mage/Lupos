@@ -24,7 +24,7 @@ compiler_predicate_validation_schema	PASS	rows=72; missing_fields=[]
 compiler_predicates_proven	PASS	[]
 compiler_predicate_raw_evidence	PASS	[]
 compiler_predicate_binding_schema	PASS	rows=7; missing_fields=[]
-compiler_predicate_binding	PASS	{'compiler_predicates_aarch64_count': '36', 'compiler_predicates_count': '72', 'compiler_predicates_schema_version': 'compiler-predicates-v1', 'compiler_predicates_sha256': 'b4ba9a920520dc7b6f36d24347a9e3bf520b848aaf2843d84c31d521d5a23866', 'compiler_predicates_validation_sha256': 'f6f4ffb20d3e0fbc54463676a25b878008c14a55c921f68373df412daaa726a9', 'compiler_predicates_validation_status': 'PASS', 'compiler_predicates_x86_64_count': '36'}
+compiler_predicate_binding	PASS	{'compiler_predicates_aarch64_count': '36', 'compiler_predicates_count': '72', 'compiler_predicates_schema_version': 'compiler-predicates-v1', 'compiler_predicates_sha256': 'b4ba9a920520dc7b6f36d24347a9e3bf520b848aaf2843d84c31d521d5a23866', 'compiler_predicates_validation_sha256': 'a6cc44115dd5b2989cc989004bbf6aeff8ab3ae421c3c560c168f81c0898422c', 'compiler_predicates_validation_status': 'PASS', 'compiler_predicates_x86_64_count': '36'}
 scope_schema	PASS	rows=18957; missing_fields=[]
 file_map_schema	PASS	rows=23810; missing_fields=[]
 symbols_schema	PASS	rows=613184; missing_fields=[]
@@ -32,6 +32,11 @@ abi_schema	PASS	rows=351403; missing_fields=[]
 lifetimes_schema	PASS	rows=336623; missing_fields=[]
 driver_abi_schema	PASS	rows=8252; missing_fields=[]
 branding_allowlist_schema	PASS	rows=0; missing_fields=[]
+semantic_closure_schema	PASS	rows=20; missing_fields=[]
+semantic_closure_base_schema	PASS	rows=17; missing_fields=[]
+semantic_closure_stable_keys_and_base	PASS	tasks=5792; pending_fields=2745400; keyset=9348fd13ca44935e847cb943d8f69a5c3f13fef8bc8d8ecaf44cc142e80e3a4c
+semantic_closure_proposal_seal_contract	PASS	{'task_id': 'S000013', 'records': 5, 'proposal_sha256': 'ea69f62685ae09c8723f8116e48542b261e87128e4b89b062b874e69db1744f2', 'complete_bound': True, 'partial_rejected': True, 'mutated_rejected': True}
+semantic_base_pending_permitted	PASS	frozen_pending=2745400
 branding_allowlist_complete	PASS	rows=0
 porting_guidance_present	PASS	/home/fenhir/Projects/lupos/rewrite/PORTING.md
 header_closure_schema	PASS	rows=11880; missing_fields=[]
@@ -76,33 +81,36 @@ symbols_category_arch_coverage	PASS	[]
 abi_entity_coverage	PASS	[]
 lifetime_entity_coverage	PASS	[]
 driver_abi_mechanical_coverage	PASS	[]
-authoritative_manifest_index_schema	PASS	rows=8; missing_fields=[]
+authoritative_manifest_index_schema	PASS	rows=10; missing_fields=[]
 authoritative_manifest_hashes	PASS	[]
 metadata_manifest_schema	PASS	rows=39; missing_fields=[]
 metadata_manifest_hashes	PASS	[]
-phase_gate_reopen_authorized	PASS	events=2 archives=['rewrite/archive/phase0-s016270-s016294-dependency-defect-20260806T1414Z', 'rewrite/archive/phase0-evidence-isolation-defect-20260806T1539Z'] latest_consumers=1 event_errors=[] active=[]
+phase_gate_reopen_authorized	PASS	events=7 archives=['rewrite/archive/phase0-quarantine-schema-v1-defect-20260807T0247Z', 'rewrite/archive/phase0-zero-quarantine-validation-defect-20260807T0354Z', 'rewrite/archive/phase0-semantic-closure-seal-defect-20260807T0410Z'] latest_consumers=1 event_errors=[] active=[]
 src_preserved_during_phase_gate_reopen	PASS	/home/fenhir/Projects/lupos/src
 task_evidence_root_isolation	PASS	unexpected_root_files=[]
 task_evidence_quarantine_integrity	PASS	[]
-task_evidence_quarantine_events	PASS	fingerprint=d6c01f29edd048c73608fff2ed65f2485755023f85ffc0fec01e9f511fd6a72c metadata_tasks=153 event_tasks=153 files=760
+task_evidence_quarantine_events	PASS	fingerprint=dfb44135cbf69ccfb20f517c86810d3ff21add81a2dd130eeb19b94b8268af9c metadata_tasks=2 event_tasks=2 files=6 declared_tasks=2 declared_files=6
+semantic_closure_new_generation_initial_state	PASS	{'ok': True, 'opens': 1, 'prepares': 0, 'commits': 0, 'todo_zero': True}
 identity_hash	PASS	/home/fenhir/Projects/lupos/rewrite/PHASE0_IDENTITY.sha256
 x86_64_config_hash	PASS	identity=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4 actual=a1cdb40573726de54a174da53c2eac8811dd84ab0145532784a47ec1c5efa6b4
 aarch64_config_hash	PASS	identity=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578 actual=b374fc24835033cb3e317e45c89dd2ba3335ebac7ab81b2ac548fac5bffc1578
-extractor_identity	PASS	identity=phase0_extract.py:75704df1c2478336a7f4f968ee3f81b55595ba0294a96a5a50a7eed20eed4a3e actual=phase0_extract.py:75704df1c2478336a7f4f968ee3f81b55595ba0294a96a5a50a7eed20eed4a3e
-validator_identity	PASS	identity=phase0_validate.py:5f17060e25ad8fc56131228cf736e61348cb60ffcadf96c29194f9782ce69cbd actual=phase0_validate.py:5f17060e25ad8fc56131228cf736e61348cb60ffcadf96c29194f9782ce69cbd
-queue_tool_identity	PASS	identity=rewrite_queue.py:c572d2a5c57df96c1841b25a46f6df697d6ab8be7de236d3db989d37517f3aa1 actual=rewrite_queue.py:c572d2a5c57df96c1841b25a46f6df697d6ab8be7de236d3db989d37517f3aa1
-scope_schema_identity	PASS	source-header-context-oracle-phase0-v7
+extractor_identity	PASS	identity=phase0_extract.py:bc35ee9345e2d9386d866fece3f679cd8087ea870560e1fb3d6c05b57e9967d9 actual=phase0_extract.py:bc35ee9345e2d9386d866fece3f679cd8087ea870560e1fb3d6c05b57e9967d9
+validator_identity	PASS	identity=phase0_validate.py:c4205754ed3ca1378b0bb6995d281bc49af6fe31443520163901621b22ea2fbf actual=phase0_validate.py:c4205754ed3ca1378b0bb6995d281bc49af6fe31443520163901621b22ea2fbf
+queue_tool_identity	PASS	identity=rewrite_queue.py:fbceca5ca1362743d8bad4d7dbbf2f541631730a19d4a86a0b76a6d711698400 actual=rewrite_queue.py:fbceca5ca1362743d8bad4d7dbbf2f541631730a19d4a86a0b76a6d711698400
+semantic_closure_tool_identity	PASS	identity=semantic_closure.py:09ba07529d2e8cb7a892777925bac374283624b3d8abbf7c520f6f57ae8fe788 actual=semantic_closure.py:09ba07529d2e8cb7a892777925bac374283624b3d8abbf7c520f6f57ae8fe788
+scope_schema_identity	PASS	source-header-context-oracle-semantic-closure-phase0-v8
 header_dependency_schema_identity	PASS	header-provider-enumerator-graph-v3
 oracle_classification_schema_identity	PASS	oracle-classification-v1
+semantic_closure_identity_binding	PASS	{}
 compiler_predicate_identity	PASS	{}
-authoritative_manifests_identity	PASS	ea75b2acb61cf50a62e73098ca777cd4c4eaf73f907e9427c3a23bc6527bd0c8
-metadata_manifest_identity	PASS	d4ca8c0dbfac80a024f104647669720cf5b8fa77023aa2aec018b5aad70059c8
+authoritative_manifests_identity	PASS	b933417a15b0c1c516b7feb7ecefee304c9ab0815f814a1cf332df5c3361cbc6
+metadata_manifest_identity	PASS	9e0b180eeafe78ea90ad45fff7759a1acf5a0dbdb6e785f48e6f78952eee9b2e
 queue_schema	PASS	rows=5792; missing_fields=[]
 rust_task_bijection	PASS	scope=5792 tasks=5792 mismatches=[]
 queue_initial_state	PASS	all rows TODO, attempt zero, unleased, and without work-stage timestamps
 driver_exclusion	PASS	driver rows must not be queued
 oracle_excluded_from_queue	PASS	[]
-queue_verify	PASS	{"ok": true, "tasks": 5792, "sha256": "9fb31be9d78d9923c9541c26a34efe1502a66e5d0cca06dbd4776a756592cdc9"}
+queue_verify	PASS	{"ok": true, "tasks": 5792, "sha256": "943e5f2626a4c95a4f0d2e83171907bf6a5b5b86611106cd497ee846f13da0c0"}
 
-identity_queue_binding	PASS	identity=9fb31be9d78d9923c9541c26a34efe1502a66e5d0cca06dbd4776a756592cdc9 queue=9fb31be9d78d9923c9541c26a34efe1502a66e5d0cca06dbd4776a756592cdc9
-queue_phase0_identity_binding	PASS	queue=69a74b3e665cefce78c3e92cfcbca7e035fda30b1e435f151d205c163da34d87 identity=69a74b3e665cefce78c3e92cfcbca7e035fda30b1e435f151d205c163da34d87
+identity_queue_binding	PASS	identity=943e5f2626a4c95a4f0d2e83171907bf6a5b5b86611106cd497ee846f13da0c0 queue=943e5f2626a4c95a4f0d2e83171907bf6a5b5b86611106cd497ee846f13da0c0
+queue_phase0_identity_binding	PASS	queue=2e2117b1c1c14e3dbdb6b4ebde7459fd44c41dbcef33a7aeea1a1c730a28d303 identity=2e2117b1c1c14e3dbdb6b4ebde7459fd44c41dbcef33a7aeea1a1c730a28d303

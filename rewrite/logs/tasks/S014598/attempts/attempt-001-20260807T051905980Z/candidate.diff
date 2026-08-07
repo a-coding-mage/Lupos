@@ -1,0 +1,3 @@
+Fresh translation generated solely from `vendor/linux/include/linux/pci_ids.h` (pinned revision `425f94c2954b1fe80ebdbf9b29854e89750355df`).
+
+The destination contains one `pub const <macro>: u32 = <original expression>;` for each of the 2,902 object-like Linux definitions, preserving names and values.

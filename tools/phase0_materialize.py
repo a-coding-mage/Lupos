@@ -28,6 +28,7 @@ BUNDLE_LAYOUT: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("manifests.tar.gz", (
         "SCOPE.tsv", "FILE_MAP.tsv", "SYMBOLS.tsv", "ABI.tsv",
         "LIFETIMES.tsv", "DRIVER_ABI.tsv",
+        "semantic-closure/SCHEMA.tsv", "semantic-closure/BASE.tsv",
     )),
     ("metadata-x86_64.tar.gz", ("metadata/x86_64",)),
     ("metadata-aarch64.tar.gz", ("metadata/aarch64",)),
