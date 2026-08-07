@@ -3833,7 +3833,7 @@ S016228	src/include/uapi/linux/lockd_netlink.rs	2026-08-07T11:57:24.116Z			TODO	
 S016231	src/include/uapi/linux/lsm.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/lsm.h	common	include	9.3	low	S016223	luna		0								2026-08-07T11:57:24.116Z		
 S016232	src/include/uapi/linux/lwtunnel.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/lwtunnel.h	common	include	12.4	low	S016231	luna		0								2026-08-07T11:57:24.116Z		
 S016233	src/include/uapi/linux/magic.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/magic.h	common	include	10.9	low	S016014	luna		0								2026-08-07T11:57:24.116Z		
-S016234	src/include/uapi/linux/major.rs	2026-08-07T11:57:24.116Z	2026-08-07T14:38:34.768Z		IN_PROGRESS	include/uapi/linux/major.h	common	include	17.8	low		luna	P01	2	codex-root-clean-20260807-p01	2026-08-07T16:10:23.978Z						2026-08-07T14:40:23.978Z		
+S016234	src/include/uapi/linux/major.rs	2026-08-07T11:57:24.116Z	2026-08-07T14:38:34.768Z		PAUSED	include/uapi/linux/major.h	common	include	17.8	low		luna	P01	2								2026-08-07T14:45:05.871Z	IN_PROGRESS	User requested execution pause.
 S016235	src/include/uapi/linux/mctp.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/mctp.h	common	include	10.8	low	S018290	luna		0								2026-08-07T11:57:24.116Z		
 S016236	src/include/uapi/linux/mdio.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/mdio.h	common	include	52.2	low	S016232	luna		0								2026-08-07T11:57:24.116Z		
 S016240	src/include/uapi/linux/mei_uuid.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/mei_uuid.h	common	include	2.9	low	S016236	luna		0								2026-08-07T11:57:24.116Z		
@@ -3967,7 +3967,7 @@ S016380	src/include/uapi/linux/sev-guest.rs	2026-08-07T11:57:24.116Z			TODO	incl
 S016381	src/include/uapi/linux/shm.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/shm.h	common	include	10.8	low	S016377	luna		0								2026-08-07T11:57:24.116Z		
 S016382	src/include/uapi/linux/signal.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/signal.h	common	include	1.6	low	S016381	luna		0								2026-08-07T11:57:24.116Z		
 S016383	src/include/uapi/linux/signalfd.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/signalfd.h	common	include	5.7	low	S018290	luna		0								2026-08-07T11:57:24.116Z		
-S016384	src/include/uapi/linux/snmp.rs	2026-08-07T11:57:24.116Z	2026-08-07T13:30:57.502Z		APPLYING	include/uapi/linux/snmp.h	common	include	37.5	low		luna	P02	4	codex-root-clean-20260807-p02	2026-08-07T15:57:50.649Z	2026-08-07T14:33:18.958Z	2026-08-07T14:34:39.793Z	2026-08-07T14:38:34.487Z	2026-08-07T14:39:07.755Z	2026-08-07T14:40:00.959Z	2026-08-07T14:40:00.959Z		
+S016384	src/include/uapi/linux/snmp.rs	2026-08-07T11:57:24.116Z	2026-08-07T13:30:57.502Z		PAUSED	include/uapi/linux/snmp.h	common	include	37.5	low		luna	P02	4			2026-08-07T14:33:18.958Z	2026-08-07T14:34:39.793Z	2026-08-07T14:38:34.487Z	2026-08-07T14:39:07.755Z	2026-08-07T14:40:00.959Z	2026-08-07T14:45:11.743Z	APPLYING	User requested execution pause.
 S016385	src/include/uapi/linux/sock_diag.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/sock_diag.h	common	include	6.5	low	S016382	luna		0								2026-08-07T11:57:24.116Z		
 S016386	src/include/uapi/linux/socket.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/socket.h	common	include	3.8	low		luna		0								2026-08-07T11:57:24.116Z		
 S016387	src/include/uapi/linux/sockios.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/sockios.h	common	include	17.4	low	S016385	luna		0								2026-08-07T11:57:24.116Z		
