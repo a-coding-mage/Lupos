@@ -1,0 +1,5 @@
+# Candidate summary — S016267 attempt 1
+
+`src/include/uapi/linux/netdev.rs` is a fresh, path-preserving translation of the pinned UAPI header. It provides the two string macros, the family version, six named C-enum integer types and their global constants, all anonymous-enum netlink attribute and command constants, including their sparse values and computed maxima.
+
+No unrelated source or shared module index was changed.

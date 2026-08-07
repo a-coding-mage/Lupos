@@ -1,0 +1,86 @@
+# Rust review — S016105, attempt 2, slot 2
+
+Reviewed candidate: `src/include/uapi/linux/dpll.rs` (SHA-256
+`76f2e5e8089f528f363cc66814d3cf4fb2c31e692dfd894c717393b015283609`).
+Reviewed sealed semantic proposal: SHA-256
+`a652994449e0edd27a49f057d0f176248aeec6f3bf744a3859d7782a6c32a758`.
+
+This was a manual source review only. No compiler, formatter, test, build,
+rust-analyzer diagnostic, or runtime tool was used.
+
+## Findings
+
+### RUST-1 — source SPDX expression was replaced
+
+`vendor/linux/include/uapi/linux/dpll.h:1` specifies
+`((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)`, while candidate line 1
+states `GPL-2.0-only`. This is an unallowlisted license/provenance change to a
+UAPI header. Restore the exact upstream SPDX expression (and retain the source
+provenance fields). Proposal key: `SC1-da57082966bf194f0bc491eb57e798e85e58a9c79ea3b497f81d25fecc5a694c`.
+
+### RUST-2 — named C enum ABI/type semantics are not established by `u32` aliases
+
+Every C declaration is a distinct `enum dpll_*` type
+(`vendor/linux/include/uapi/linux/dpll.h:20,43,72,91,114,133,151,173,194,212,227,232,252,290`).
+The candidate instead makes each an unrestricted `u32` type alias (for example,
+candidate lines 10, 16, and 100). This both fixes unsigned semantics without
+source evidence and erases the distinct enum type at the Rust boundary. The
+types are used through value and pointer callback ABI positions in
+`vendor/linux/include/linux/dpll.h:24-58` and `:75-131`, including original
+driver callbacks, so the exact selected-target enum representation and the
+Rust FFI boundary must be explicitly resolved rather than assumed. Do not use
+Rust fieldless enums if they reject C-originated out-of-range values; use a
+representation that preserves the pinned C ABI and raw value domain.
+
+Affected proposal `ABI.tsv:layout` keys (both architectures):
+
+`SC1-bff487d92a441f04197b9cc9f4046e0acfdc3dd10e0d782a00a66e8903fc6cce`,
+`SC1-e2de6e047f5c1985b4d7f36e16ebdd742fe4bd02590bdfcd935c6f0b8eb664e7`,
+`SC1-0cf2c8b46a9bf0f095d51a68644e6957c74b4f4e05f5d77cf001a3a42541a6b6`,
+`SC1-d8eb639f346a67d8922b6c48821c1c0e92a4abf68e108d8e642294dd1f4c63e9`,
+`SC1-77e6e009cbb0c1d26f6a4a4a1fce30ff5ef631213e3f2052972834fdcee7a309`,
+`SC1-93cd83344854c784be52640e3fe7d55c503b607eb2b08509335f237616fb7143`,
+`SC1-70928022dd6f82f56547ace56e2684bd1000262ea32362f681186d8039eb15dd`,
+`SC1-0b44febe88d846b62da01d3c8553014daa0cc890ece8b31ed2e8e646a5a74910`,
+`SC1-65e05e8bb7cfed5914e32e47b6e12a3ab88aa9f25d34b5dad45f0036a875c523`,
+`SC1-fbe530003a5228dd4f2ef4ca8160740ada55539aa7143a8653ef329b302fc4b5`,
+`SC1-0421c57803c74e66dccdf643ae8c72e953cd75fc82f356e53ef7a1521c210356`,
+`SC1-47113c45ce66648dc2e043a566bdb98ef1b445bf115370997f89e5fe02774c0a`,
+`SC1-3fd751efd04c9a8cdcacef6cbd34ec0f27845cea3b519cd8c05442eed56364c3`,
+`SC1-6ea64ab840b940ef66d2e34f125ccbbc5bbde299025011f938e2d70151c54238`,
+`SC1-e69d82baf721e4e2294441975c97c8f72b7d0726864cbe5633330d3ac8847620`,
+`SC1-7a1ab0850b29664856db875735ef8f470a57137b1aa0594d4719cc2fa88f0b32`,
+`SC1-45894ced4ece69dd2b4bbeb54f19efea688aa8a32d7da2f415220ceb0461e73b`,
+`SC1-22d8fb1f68a1e8ecbb0e17a95254acaf7e93dd311f9b2690add4dbb0ea3b074f`,
+`SC1-608bd363eb9bb5216e3cd2c268a78712b41e7449acde7f531bc81285d4480405`,
+`SC1-50b8326475b699f98d90125819a01ee3357042abbf2af0ba2322992326d95f4d`,
+`SC1-cad017f762e5d11fb217a8a655671ad643a5bca5e852bb8ee666bffa873b16de`,
+`SC1-06bafbd33747976949276bacd0ae58fc6d032653c697fa59da65cbf22a34cf97`,
+`SC1-c894a698cf226d6312b60ddf61c6bc658c86aad7f68d822ae7fabb89a50bdfe7`,
+`SC1-d1b361725f4135b226e3efe75d7c3e47ddf9e3619a5c11555b56f47eb8b21d71`,
+`SC1-536de4c19cbe8f67b94f9b39aa43d0abaec7d5fd9b344d2ca2b5efdc241f8255`,
+`SC1-52a8ab0a2b7891f1e288959d1a990d88232277472ee19a98b2c45a12530d4cb5`,
+`SC1-acb236fb775279c410b860a48f3cbee575baa894684904085076936759ade489`,
+`SC1-b68224d03244dc3168819ca2c0e77089f03518092f603661308fc9a94327042d`.
+
+### RUST-3 — numeric/string macro substitutions do not preserve C macro type/category
+
+The candidate assigns `u32` to all unsuffixed integer macros (candidate lines
+8, 44, 68-71, 93-94), but the source uses ordinary unsuffixed C integer
+constants at `vendor/linux/include/uapi/linux/dpll.h:11,106,160-163,218-219`.
+It also turns C string-literal macro replacements at source lines 10 and 308
+into Rust reference constants at candidate lines 7 and 170. A C string-literal
+macro is an array lvalue that can decay to a pointer; a Rust reference constant
+has different type/category and must not be used as an ABI replacement without
+an explicit boundary conversion. Preserve the source integer expression types
+where they remain observable and provide the exact C-compatible string storage
+and pointer conversion required by consumers. Proposal key:
+`SC1-da57082966bf194f0bc491eb57e798e85e58a9c79ea3b497f81d25fecc5a694c`.
+
+## Checks without findings
+
+All fourteen enum ordinal sequences, explicit starts, and `*_MAX` expressions
+match the source: the zero-start feature-state enum is correctly 0/1, and the
+other enum sequences and private maxima have the expected values. This header
+defines no structs, unions, bitfields, functions, storage objects, locks, or
+unsafe operations; the candidate adds no panic path or Rust test.
