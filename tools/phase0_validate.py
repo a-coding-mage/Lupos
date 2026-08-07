@@ -302,6 +302,76 @@ def validate_semantic_proposal_seal_contract(
         }
 
 
+def validate_semantic_ledger_envelope_contract() -> tuple[bool, dict[str, object]]:
+    """Exercise PREPARE envelope construction and ledger replay in isolation."""
+
+    fingerprint = "4" * 64
+    transaction_input: dict[str, object] = {
+        "schema_version": semantic_closure.COMMIT_SCHEMA_VERSION,
+        "task_id": "S000013",
+        "attempt": 1,
+        "pipeline_id": "P01",
+        "queue_fingerprint": fingerprint,
+        "record_count": 0,
+        "finding_count": 0,
+    }
+    prepare = semantic_closure.prepare_ledger_record(
+        transaction_input,
+        transaction_id="SCTX-" + "5" * 64,
+        prepared_at="2026-01-01T00:00:00.000Z",
+        actor="applier",
+        model="gpt-5.6-terra",
+        reasoning_effort="high",
+        records=[],
+    )
+    prepare_hash = semantic_closure.sha256_bytes(
+        json.dumps(prepare, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    commit = semantic_closure.ledger_record("COMMIT", {
+        "transaction_id": prepare["transaction_id"],
+        "queue_fingerprint": fingerprint,
+        "prepare_sha256": prepare_hash,
+        "committed_at": "2026-01-01T00:00:00.001Z",
+    })
+    collision_rejected = False
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            semantic_closure.ledger_record("PREPARE", {
+                "schema_version": semantic_closure.COMMIT_SCHEMA_VERSION,
+            })
+        except SystemExit:
+            collision_rejected = True
+    with tempfile.TemporaryDirectory(prefix="lupos-semantic-ledger-") as directory:
+        ledger = Path(directory) / "LEDGER.jsonl"
+        ledger.write_text(
+            "".join(
+                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+                for record in (prepare, commit)
+            ),
+            encoding="utf-8",
+        )
+        records, prepares, commits = semantic_closure.ledger_state(
+            ledger, fingerprint
+        )
+    ok = (
+        prepare.get("schema_version") == semantic_closure.LEDGER_SCHEMA_VERSION
+        and prepare.get("schema_version") != semantic_closure.COMMIT_SCHEMA_VERSION
+        and prepare.get("task_id") == transaction_input["task_id"]
+        and len(records) == 2
+        and set(prepares) == {prepare["transaction_id"]}
+        and commits == {prepare["transaction_id"]}
+        and collision_rejected
+    )
+    return ok, {
+        "prepare_schema_version": prepare.get("schema_version"),
+        "commit_input_schema_version": transaction_input["schema_version"],
+        "records": len(records),
+        "prepares": len(prepares),
+        "commits": len(commits),
+        "collision_rejected": collision_rejected,
+    }
+
+
 def include_search_directories(command: str, directory: Path) -> list[Path]:
     """Independently recover frozen quote/angle include roots."""
 
@@ -1168,6 +1238,20 @@ def main() -> int:
         "semantic_closure_proposal_seal_contract",
         seal_contract_ok,
         seal_contract_detail,
+    )
+    ledger_contract_ok = False
+    ledger_contract_detail: object = "not run"
+    try:
+        ledger_contract_ok, ledger_contract_detail = (
+            validate_semantic_ledger_envelope_contract()
+        )
+    except (OSError, ValueError, SystemExit) as exc:
+        ledger_contract_detail = f"{type(exc).__name__}: {exc}"
+    check(
+        checks,
+        "semantic_closure_ledger_envelope_contract",
+        ledger_contract_ok,
+        ledger_contract_detail,
     )
     check(
         checks,

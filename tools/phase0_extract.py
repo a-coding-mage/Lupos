@@ -1343,8 +1343,38 @@ def enum_constant_entities(
     return result
 
 
+def compile_include_roots(command: str, directory: Path) -> tuple[Path, ...]:
+    """Return quoted-include search roots from an original compile command.
+
+    Quoted includes search the including file's directory first, followed by
+    ``-iquote`` and ``-I`` directories in command order.  The source-directory
+    case is handled by :func:`translation_source_units`; this helper retains
+    the command-derived roots needed by Linux wrappers such as the x86 vDSO
+    units which include ``common/*.c`` through an explicit parent ``-I``.
+    """
+
+    roots: list[Path] = []
+    tokens = shlex.split(command)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        value = ""
+        if token in {"-iquote", "-I"} and index + 1 < len(tokens):
+            index += 1
+            value = tokens[index]
+        elif token.startswith("-iquote") and token != "-iquote":
+            value = token[len("-iquote"):]
+        elif token.startswith("-I") and token != "-I":
+            value = token[2:]
+        if value:
+            path = Path(value)
+            roots.append((directory / path).resolve() if not path.is_absolute() else path.resolve())
+        index += 1
+    return tuple(roots)
+
+
 def translation_source_units(
-    source: Path, linux_root: Path, generated_root: Path
+    source: Path, linux_root: Path, generated_root: Path, compile_command: str
 ) -> list[tuple[Path, str, str]]:
     """Return a selected translation unit plus its direct quoted ``.c`` inputs.
 
@@ -1358,6 +1388,7 @@ def translation_source_units(
 
     units: list[tuple[Path, str, str]] = []
     seen: set[Path] = set()
+    command_include_roots = compile_include_roots(compile_command, generated_root)
 
     def source_label(path: Path) -> str:
         if path.is_relative_to(linux_root.resolve()):
@@ -1377,6 +1408,12 @@ def translation_source_units(
         units.append((resolved, text, source_label(resolved)))
         for include in INCLUDED_C_RE.findall(text):
             target = (resolved.parent / include).resolve()
+            if not target.is_file():
+                for root in command_include_roots:
+                    candidate = (root / include).resolve()
+                    if candidate.is_file():
+                        target = candidate
+                        break
             if not target.is_file() and resolved.is_relative_to(linux_root.resolve()):
                 target = (generated_root / resolved.relative_to(linux_root.resolve()).parent / include).resolve()
             visit(target)
@@ -1710,7 +1747,9 @@ def semantic_records(
     symbols: list[dict[str, str]] = []
     abi: list[dict[str, str]] = []
     lifetimes: list[dict[str, str]] = []
-    for unit, text, unit_label in translation_source_units(source, linux_root, generated_root):
+    for unit, text, unit_label in translation_source_units(
+        source, linux_root, generated_root, compile_command
+    ):
         active, selection, conditions, macros = selected_lines(
             text, arch, config_path, compile_command, predicates
         )

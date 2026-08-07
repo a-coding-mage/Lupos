@@ -211,6 +211,47 @@ def append_jsonl(path: Path, record: Mapping[str, object]) -> None:
         os.fsync(handle.fileno())
 
 
+def ledger_record(record_type: str, payload: Mapping[str, object]) -> dict[str, object]:
+    """Construct one ledger envelope without permitting schema-key collisions."""
+
+    reserved = {"schema_version", "record_type"} & set(payload)
+    if reserved:
+        die(f"semantic ledger payload attempts to replace envelope fields: {sorted(reserved)}")
+    return {
+        "schema_version": LEDGER_SCHEMA_VERSION,
+        "record_type": record_type,
+        **payload,
+    }
+
+
+def prepare_ledger_record(
+    transaction_input: Mapping[str, object], *, transaction_id: str,
+    prepared_at: str, actor: str, model: str, reasoning_effort: str,
+    records: list[dict[str, object]],
+) -> dict[str, object]:
+    """Wrap one semantic-commit transaction in a ledger PREPARE envelope."""
+
+    if transaction_input.get("schema_version") != COMMIT_SCHEMA_VERSION:
+        die("semantic PREPARE input has an invalid commit schema version")
+    payload = dict(transaction_input)
+    payload.pop("schema_version")
+    reserved = {
+        "record_type", "transaction_id", "prepared_at", "actor", "model",
+        "reasoning_effort", "records",
+    } & set(payload)
+    if reserved:
+        die(f"semantic PREPARE input attempts to replace envelope fields: {sorted(reserved)}")
+    payload.update({
+        "transaction_id": transaction_id,
+        "prepared_at": prepared_at,
+        "actor": actor,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "records": records,
+    })
+    return ledger_record("PREPARE", payload)
+
+
 class QueueLock:
     def __init__(self, queue: Path) -> None:
         self.path = queue.parent / ".translation_tasks.lock"
@@ -1027,16 +1068,14 @@ def cmd_commit(args: argparse.Namespace) -> None:
         ]
         if prior_for_task and prior_for_task != [transaction_id]:
             die(f"task attempt already has a different semantic transaction: {prior_for_task}")
-        prepare = {
-            "schema_version": LEDGER_SCHEMA_VERSION,
-            "record_type": "PREPARE",
-            "transaction_id": transaction_id,
-            "prepared_at": now_utc(),
-            **transaction_input,
-            "actor": args.actor,
-            "model": args.model,
-            "reasoning_effort": args.effort,
-            "records": [
+        prepare = prepare_ledger_record(
+            transaction_input,
+            transaction_id=transaction_id,
+            prepared_at=now_utc(),
+            actor=args.actor,
+            model=args.model,
+            reasoning_effort=args.effort,
+            records=[
                 {
                     "record_key": record["record_key"],
                     "manifest": record["manifest"],
@@ -1050,7 +1089,7 @@ def cmd_commit(args: argparse.Namespace) -> None:
                 }
                 for record in final
             ],
-        }
+        )
         prepare_hash = sha256_bytes(json.dumps(prepare, sort_keys=True, separators=(",", ":")).encode("utf-8"))
         matching_events = [
             record for record in event_records(events)
@@ -1084,14 +1123,12 @@ def cmd_commit(args: argparse.Namespace) -> None:
         elif len(matching_events) != 1:
             die(f"duplicate semantic closure commit events for {transaction_id}")
         if transaction_id not in commits:
-            append_jsonl(ledger, {
-                "schema_version": LEDGER_SCHEMA_VERSION,
-                "record_type": "COMMIT",
+            append_jsonl(ledger, ledger_record("COMMIT", {
                 "transaction_id": transaction_id,
                 "queue_fingerprint": hashes["fingerprint"],
                 "prepare_sha256": prepare_hash,
                 "committed_at": now_utc(),
-            })
+            }))
         receipt = {
             **transaction_input,
             "transaction_id": transaction_id,
@@ -1120,15 +1157,13 @@ def initialize_generation(
         die(f"new semantic closure generation is not clean: {fingerprint_digest}")
     if any(row.get("status") != "TODO" or (row.get("attempt", "0") or "0") != "0" for row in queue_rows):
         die("semantic closure generation can open only for an all-TODO attempt-zero queue")
-    record = {
-        "schema_version": LEDGER_SCHEMA_VERSION,
-        "record_type": "GENERATION_OPEN",
+    record = ledger_record("GENERATION_OPEN", {
         "transaction_id": "",
         "queue_fingerprint": fingerprint_digest,
         "phase0_identity_sha256": identity_digest,
         "opened_at": now_utc(),
         "tasks": len(queue_rows),
-    }
+    })
     append_jsonl(ledger, record)
     append_jsonl(events, {
         "ts": now_utc(), "phase": "phase0", "task_id": "", "path": "",
