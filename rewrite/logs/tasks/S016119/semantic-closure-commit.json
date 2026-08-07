@@ -1,0 +1,32 @@
+{
+  "attempt": 1,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "6b966e39d27a3430ad13a1b5b22192fcba44fda2257ea74f9f72f12cee93392d",
+  "committed_at": "2026-08-07T13:14:02.073Z",
+  "destination_sha256": "776c53e50ee59889d8d7fa35d1522227a8a77ae74b8e9fa5494a742ef90752a0",
+  "dispositions_sha256": "4ae104a282d4ef64efefe64b9d13a9766659095fdf369712480a21d946ae4f26",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "b4556b5641522ffbacaf2002b58301d8956db22a7198689e9b1dec17be4f1d42",
+  "finding_count": 2,
+  "implementation_sha256": "159fecbbda5cf806ffe509939d0e8792964f5194687e5a747bcc35857093e2bf",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "09b4bc73f2c9e5db866f29784e26d145bef20e76877a62991eb861d6c4c59607",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P01",
+  "prepare_sha256": "27ef4e6e0f90806bd4e57905a1dd83b64ba989bd4cd156dc7ff98b704104728a",
+  "proposal_sha256": "43423b2ba8e5299eabc389e70d3bf7c3e36bce521cb3b71d974b09874af90ef8",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 3977,
+  "resolution_sha256": "81ae3034a7a36222031411f1c60b93f53a11e77458060e3aa5b4b2b12ae5761c",
+  "review_1_sha256": "5b49020780b60dfcaf566a5ffd94213f5700d164ad151bf797f2ad966e3ea9b6",
+  "review_2_sha256": "a35591773f21708cff3eb6c3a4c1fd466cbc0dc505c34b60cf761b09dbd35fa9",
+  "rust_report_sha256": "6cbe3fd728de388ffa1dcec449c125c9c00af6611127e981686a1f8d4923c500",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S016119",
+  "transaction_id": "SCTX-c27c57c7b99372745964a83ca31c245d96ce4352d679dc27297660ba249736b3"
+}

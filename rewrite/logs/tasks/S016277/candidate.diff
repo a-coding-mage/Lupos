@@ -1,0 +1,6 @@
+S016277 candidate snapshot (attempt 3)
+source=include/uapi/linux/netfilter/nf_tables.h
+destination=src/include/uapi/linux/netfilter/nf_tables.rs
+linux_revision=425f94c2954b1fe80ebdbf9b29854e89750355df
+destination_sha256=448237c7b9a9582058e9faac8c61685a42d65f3dbed459a2e309cd65f4c0a973
+changes=complete fresh enum/macro translation; explicit enum values; nft_data_types u32; NFT_META_IIFTYPE alias; kernel-only NFT_REG32_MAX omitted per frozen NOT_APPLICABLE evidence

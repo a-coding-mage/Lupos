@@ -1,0 +1,32 @@
+{
+  "attempt": 3,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "35cdc7e8196d9ac2bd382ca3a91a0b2a8e9266caea8f158ba48f8902616e66ce",
+  "committed_at": "2026-08-07T05:49:49.018Z",
+  "destination_sha256": "bc0cac8f196a63b50ea42b138b36ea87b0e86bed84bd2e05b65a71ddacafb1f7",
+  "dispositions_sha256": "2384b1fbe830c08379703d4a0f7bb50ba2cc610ad5fcee6da2d73b429b2f1379",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "439bcfba6ecfc403726304a3ce0b6735a2f79fca7c40fd68f5e48b36e214c820",
+  "finding_count": 4,
+  "implementation_sha256": "b9c2b90acc3e388e91a5a1e712a3bcbd472d17746abee5ef121e11111561d3b6",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "89c3856245441a884713601fad2cd109add6a6af34b2c3fc1147cd154928d9f7",
+  "phase0_identity_sha256": "6e2df070e502b65ad41d9eeb061a402cf7b0c9c158bdc3428006babfd2917381",
+  "pipeline_id": "P01",
+  "prepare_sha256": "26a3b4ed0d9f1aeb70086e81b25423ca362efefffcae36d086f281dbe3dab973",
+  "proposal_sha256": "439bcfba6ecfc403726304a3ce0b6735a2f79fca7c40fd68f5e48b36e214c820",
+  "queue_fingerprint": "943e5f2626a4c95a4f0d2e83171907bf6a5b5b86611106cd497ee846f13da0c0",
+  "record_count": 11617,
+  "resolution_sha256": "a75d81b178645942d5b8908a49b81eaa26c47c8ff8d6ed0fdbc5d79fe481fe0f",
+  "review_1_sha256": "346aed11670047937526efe78db346c4c9a01d348ab6baf1ddaf18753df8a037",
+  "review_2_sha256": "5de0a1404341f8f4e21a2a8f758a0c1bda8f5258d381bf4a25238eebf5ba28f6",
+  "rust_report_sha256": "726c055fbfc829559013932b7c05357d4849dac55db4a0a2aeafd643c576755d",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S014598",
+  "transaction_id": "SCTX-3bcde7e9d8f0893c8e89ba1c4f2ced5dd0ccaee7cd6172d4291fc5eb40709dbe"
+}

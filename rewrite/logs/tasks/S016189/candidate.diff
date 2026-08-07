@@ -1,0 +1,7 @@
+S016189 candidate diff
+Source: vendor/linux/include/uapi/linux/input-event-codes.h
+Destination: src/include/uapi/linux/input-event-codes.rs
+Revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
+Architecture: common
+Transformation: 796 ordered #define directives to pub const NAME: u32 declarations; include guard retained as _UAPI_INPUT_EVENT_CODES_H = 1; comments and source expressions preserved.
+Destination SHA-256: de3aa54b04af8f418244bb208ab99eeb51c73f8ae91de80b83e446ae6a94a90c

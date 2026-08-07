@@ -1,0 +1,5 @@
+Task S016119 candidate diff summary
+
+vendor/linux/include/uapi/linux/ethtool_netlink_generated.h -> src/include/uapi/linux/ethtool_netlink_generated.rs
+
+Translated all 649 source enum constants plus ETHTOOL_GENL_NAME and ETHTOOL_GENL_VERSION (651 constants total), preserving source order and explicit/implicit value expressions. Added the four named C enum type aliases with i32 representation. Preserved the NUL-terminated generic-netlink name and generated-header comments/provenance.

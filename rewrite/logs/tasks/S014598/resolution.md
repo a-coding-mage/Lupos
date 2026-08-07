@@ -1,27 +1,31 @@
-# Applier resolution — S014598, attempt 3
+# Applier resolution — S014598 / attempt 1 / P01
 
-Pinned source reopened: `vendor/linux/include/linux/pci_ids.h` at Linux revision `425f94c2954b1fe80ebdbf9b29854e89750355df`. Queue task `S014598` remains `APPLYING` in `P01`; the frozen Phase-0 identity and queue fingerprint match the sealed proposal and both reviewer attestations.
+This resolution is source-only. No compiler, formatter, linker, test,
+runtime command, rust-analyzer diagnostic, or Git command was used directly.
 
-## Findings
+## F001 — DISPROVED; no source change
 
-### P001 — DISPROVED
+The finding assumes that the closure proposal's `candidate_sha256` must equal
+the digest of `src/include/linux/pci_ids.rs`. That binding is not defined by
+the current frozen closure tool. `fixed_task_paths` identifies `candidate` as
+`rewrite/logs/tasks/S014598/candidate.diff` (`tools/semantic_closure.py:524-538`),
+and `proposal_metadata` assigns `candidate_sha256` as
+`sha256_file(paths["candidate"])` (`tools/semantic_closure.py:548-565`).
+`validate_sealed_proposal` checks the same candidate evidence path
+(`tools/semantic_closure.py:758-790`). The proposal's recorded digest
+`828fb8678dd9f116da63365df7ee1c814ac09e502c64f7c50f6fba9f9fe59e9c`
+therefore correctly binds the current `candidate.diff`; it is not a required
+digest of the destination source. The current destination digest is separately
+captured by the semantic commit receipt.
 
-`semantic_closure.py` defines proposal `candidate_sha256` as `sha256_file(paths["candidate"])`, and `paths["candidate"]` is `rewrite/logs/tasks/S014598/candidate.diff` (tool lines 63–70, 487–496, 513–522, 717–743). The sealed digest `35cdc7e8196d9ac2bd382ca3a91a0b2a8e9266caea8f158ba48f8902616e66ce` equals that current evidence artifact. The proposal format does not define this field as a destination-source hash, so the differing `src/include/linux/pci_ids.rs` digest is not a stale-proposal defect.
+Independent full-file source review establishes that the only conditional
+directives in `vendor/linux/include/linux/pci_ids.h` are the include guard at
+lines 10-11 and its closing `#endif` at line 3270. The guard controls C
+preprocessing and has no Rust runtime, linkage, or constant analogue. Every
+one of the 2,902 active object-like numeric `#define` macros from lines 15-3268
+maps, in source order, to exactly one `pub const NAME: i32 = VALUE;` in the
+candidate. All literals are representable as C `int` and Rust `i32`; the
+candidate contains only required immutable provenance and those constants.
 
-### P002 — RESOLVED_CHANGED
-
-Upstream's only conditional is the include guard: `#ifndef _LINUX_PCI_IDS_H` at line 10, an empty `#define _LINUX_PCI_IDS_H` at line 11, and the closing `#endif` at line 3270. I removed the value-bearing `pub const _LINUX_PCI_IDS_H: core::ffi::c_int = 1`. Rust's path-module/import-once mechanism represents this non-value preprocessing guard; no exported typed surrogate remains. The closure's recorded upstream facts are unchanged, so its final semantic values require no alteration.
-
-### F1 — DISPROVED
-
-Same disposition as P001: the sealed artifact binds `candidate.diff`, not the destination source file. The closure tool's validation accepts the current `candidate.diff` digest and defines no source-hash requirement for `candidate_sha256`.
-
-### F2 — RESOLVED_CHANGED
-
-Same source correction as P002. The final Rust file exports exactly the 2,902 value-bearing upstream PCI macro mappings and no `_LINUX_PCI_IDS_H` integer item. A source-only name/value comparison of all upstream `#define` entries excluding the guard against Rust constants returned zero deltas.
-
-## Final source evidence
-
-- Upstream: 2,902 value-bearing `#define` entries; candidate: 2,902 `pub const` entries; normalized name/value delta: zero.
-- The header's only preprocessor conditional is its two-line opening/closing include guard.
-- No compiler, formatter, linker, test, runtime, benchmark, or rust-analyzer diagnostic was invoked.
+Accordingly, F001 is disproved, no source edit is warranted, and the copied
+final closure records remain unchanged from the sealed proposal.

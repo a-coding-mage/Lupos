@@ -1,0 +1,9 @@
+# Candidate summary — S016378 attempt 2
+
+The candidate freshly translates the complete selected UAPI header at
+`include/uapi/linux/serial_reg.h` into
+`src/include/uapi/linux/serial_reg.rs`. It retains the upstream SPDX identifier,
+copyright attribution, immutable Linux-source provenance, every object-like
+UART/RSA/OMAP/Altera definition, and the `UART_FCR_R_TRIG_BITS` computation.
+The empty C include guard is omitted because Rust modules provide the equivalent
+single-definition boundary.

@@ -1,0 +1,12 @@
++S016384 candidate summary — attempt 2
+
+Source: vendor/linux/include/uapi/linux/snmp.h
+Destination: src/include/uapi/linux/snmp.rs
+Linux revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
+
+Fresh translation replaces the destination with 290 public i32 constants:
+- 288 constants from eight anonymous C enum declarations, preserving explicit zero initializers and every following implicit increment;
+- 2 constants from the literal 512 macro definitions __ICMPMSG_MIB_MAX and __ICMP6MSG_MIB_MAX.
+
+The pinned source's semantic manifest count is 298: the 290 identifiers above plus 8 anonymous enum declaration records. It is not a count of 296 enumerators.
+

@@ -1,0 +1,9 @@
+# S016105 candidate summary
+
+`src/include/uapi/linux/dpll.rs` is a fresh, path-preserving translation of
+`include/uapi/linux/dpll.h`. It exposes the two family/multicast string values,
+all numeric macro values, the thirteen C enum domains represented as
+`core::ffi::c_int` aliases, and every selected enumerator including private and
+public maximum values.
+
+No source from an earlier Rust translation was consulted.

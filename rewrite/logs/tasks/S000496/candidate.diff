@@ -1,0 +1,4 @@
+Fresh destination content is recorded at `src/arch/x86/include/asm/cpufeatures.rs`.
+The file contains the complete pinned header translation with immutable
+provenance and no placeholders or tests.  The `CONFIG_X86_32` branch is
+explicitly retained around `X86_BUG_ESPFIX`.

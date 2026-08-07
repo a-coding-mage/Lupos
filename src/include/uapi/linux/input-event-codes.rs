@@ -1,10 +1,8 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
 //! linux-source: include/uapi/linux/input-event-codes.h
 //! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
 //! architectures: common
 //! rewrite-task: S016189
-
-//! Input event codes translated from the pinned Linux UAPI header.
 
 /* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
 /*
@@ -21,6 +19,8 @@
  * under the terms of the GNU General Public License version 2 as published by
  * the Free Software Foundation.
  */
+// The source header's empty C include guard is represented by this Rust
+// module's single-definition behavior; it does not create a numeric item.
 
 /*
  * Device properties and quirks
@@ -310,8 +310,8 @@ pub const KEY_BRIGHTNESSDOWN: i32 = 224;
 pub const KEY_BRIGHTNESSUP: i32 = 225;
 pub const KEY_MEDIA: i32 = 226;
 
-pub const KEY_SWITCHVIDEOMODE: i32 = 227	/* Cycle between available video;
-					   outputs (Monitor/LCD/TV-out/etc) */;
+// Cycle between available video outputs (Monitor/LCD/TV-out/etc).
+pub const KEY_SWITCHVIDEOMODE: i32 = 227;
 pub const KEY_KBDILLUMTOGGLE: i32 = 228;
 pub const KEY_KBDILLUMDOWN: i32 = 229;
 pub const KEY_KBDILLUMUP: i32 = 230;
@@ -333,9 +333,8 @@ pub const KEY_UNKNOWN: i32 = 240;
 pub const KEY_VIDEO_NEXT: i32 = 241	/* drive next video source */;
 pub const KEY_VIDEO_PREV: i32 = 242	/* drive previous video source */;
 pub const KEY_BRIGHTNESS_CYCLE: i32 = 243	/* brightness up, after max is min */;
-pub const KEY_BRIGHTNESS_AUTO: i32 = 244	/* Set Auto Brightness: manual;
-					  brightness control is off,
-					  rely on ambient */;
+// Set Auto Brightness: manual brightness control is off, rely on ambient.
+pub const KEY_BRIGHTNESS_AUTO: i32 = 244;
 pub const KEY_BRIGHTNESS_ZERO: i32 = KEY_BRIGHTNESS_AUTO;
 pub const KEY_DISPLAY_OFF: i32 = 245	/* display device to off state */;
 
@@ -941,8 +940,8 @@ pub const ABS_CNT: i32 = (ABS_MAX+1);
 pub const SW_LID: i32 = 0x00  /* set = lid shut */;
 pub const SW_TABLET_MODE: i32 = 0x01  /* set = tablet mode */;
 pub const SW_HEADPHONE_INSERT: i32 = 0x02  /* set = inserted */;
-pub const SW_RFKILL_ALL: i32 = 0x03  /* rfkill master switch, type "any";
-					 set = radio enabled */;
+// rfkill master switch, type "any"; set = radio enabled.
+pub const SW_RFKILL_ALL: i32 = 0x03;
 pub const SW_RADIO: i32 = SW_RFKILL_ALL	/* deprecated */;
 pub const SW_MICROPHONE_INSERT: i32 = 0x04  /* set = inserted */;
 pub const SW_DOCK: i32 = 0x05  /* set = plugged into dock */;
@@ -1018,3 +1017,5 @@ pub const SND_CNT: i32 = (SND_MAX+1);
 pub const SND_PROFILE_SILENT: i32 = 0x00;
 pub const SND_PROFILE_VIBRATE: i32 = 0x01;
 pub const SND_PROFILE_RING: i32 = 0x02;
+
+// #endif

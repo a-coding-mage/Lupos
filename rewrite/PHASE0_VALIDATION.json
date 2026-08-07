@@ -49,7 +49,7 @@
       "ok": true
     },
     "compiler_predicate_binding": {
-      "detail": "{'compiler_predicates_aarch64_count': '36', 'compiler_predicates_count': '72', 'compiler_predicates_schema_version': 'compiler-predicates-v1', 'compiler_predicates_sha256': 'b4ba9a920520dc7b6f36d24347a9e3bf520b848aaf2843d84c31d521d5a23866', 'compiler_predicates_validation_sha256': 'a6cc44115dd5b2989cc989004bbf6aeff8ab3ae421c3c560c168f81c0898422c', 'compiler_predicates_validation_status': 'PASS', 'compiler_predicates_x86_64_count': '36'}",
+      "detail": "{'compiler_predicates_aarch64_count': '36', 'compiler_predicates_count': '72', 'compiler_predicates_schema_version': 'compiler-predicates-v1', 'compiler_predicates_sha256': 'b4ba9a920520dc7b6f36d24347a9e3bf520b848aaf2843d84c31d521d5a23866', 'compiler_predicates_validation_sha256': 'cc61d152ad36244c15def511d80f4ab75d5d3fbd6d6853eb7272305c3db76000', 'compiler_predicates_validation_status': 'PASS', 'compiler_predicates_x86_64_count': '36'}",
       "ok": true
     },
     "compiler_predicate_binding_schema": {
@@ -97,7 +97,7 @@
       "ok": true
     },
     "extractor_identity": {
-      "detail": "identity=phase0_extract.py:bc35ee9345e2d9386d866fece3f679cd8087ea870560e1fb3d6c05b57e9967d9 actual=phase0_extract.py:bc35ee9345e2d9386d866fece3f679cd8087ea870560e1fb3d6c05b57e9967d9",
+      "detail": "identity=phase0_extract.py:3bc9ccd8c8f503101aaffdc0c966ddee9574fa2708e91f86a1433904e50e02ed actual=phase0_extract.py:3bc9ccd8c8f503101aaffdc0c966ddee9574fa2708e91f86a1433904e50e02ed",
       "ok": true
     },
     "file_map_schema": {
@@ -177,7 +177,7 @@
       "ok": true
     },
     "identity_queue_binding": {
-      "detail": "identity=943e5f2626a4c95a4f0d2e83171907bf6a5b5b86611106cd497ee846f13da0c0 queue=943e5f2626a4c95a4f0d2e83171907bf6a5b5b86611106cd497ee846f13da0c0",
+      "detail": "identity=cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f queue=cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
       "ok": true
     },
     "ip_ct_number_mechanical_value": {
@@ -209,11 +209,11 @@
       "ok": true
     },
     "metadata_manifest_identity": {
-      "detail": "9e0b180eeafe78ea90ad45fff7759a1acf5a0dbdb6e785f48e6f78952eee9b2e",
+      "detail": "e872b71c34061052ae59c72303caecfa38c5b9eaefd10bf7331ef8d90c0c54b7",
       "ok": true
     },
     "metadata_manifest_schema": {
-      "detail": "rows=39; missing_fields=[]",
+      "detail": "rows=37; missing_fields=[]",
       "ok": true
     },
     "object_inventory_matches_file_map": {
@@ -245,7 +245,7 @@
       "ok": true
     },
     "phase_gate_reopen_authorized": {
-      "detail": "events=7 archives=['rewrite/archive/phase0-quarantine-schema-v1-defect-20260807T0247Z', 'rewrite/archive/phase0-zero-quarantine-validation-defect-20260807T0354Z', 'rewrite/archive/phase0-semantic-closure-seal-defect-20260807T0410Z'] latest_consumers=1 event_errors=[] active=[]",
+      "detail": "events=8 archives=['rewrite/archive/phase0-zero-quarantine-validation-defect-20260807T0354Z', 'rewrite/archive/phase0-semantic-closure-seal-defect-20260807T0410Z', 'rewrite/archive/phase0-semantic-ledger-schema-overwrite-20260807T0551Z'] latest_consumers=1 event_errors=[] active=[]",
       "ok": true
     },
     "porting_guidance_present": {
@@ -257,7 +257,7 @@
       "ok": true
     },
     "queue_phase0_identity_binding": {
-      "detail": "queue=2e2117b1c1c14e3dbdb6b4ebde7459fd44c41dbcef33a7aeea1a1c730a28d303 identity=2e2117b1c1c14e3dbdb6b4ebde7459fd44c41dbcef33a7aeea1a1c730a28d303",
+      "detail": "queue=03f3c4afb3c7edc167ddeadac5493cbee736042cb7781182d4fdf43b2b79166d identity=03f3c4afb3c7edc167ddeadac5493cbee736042cb7781182d4fdf43b2b79166d",
       "ok": true
     },
     "queue_schema": {
@@ -269,7 +269,7 @@
       "ok": true
     },
     "queue_verify": {
-      "detail": "{\"ok\": true, \"tasks\": 5792, \"sha256\": \"943e5f2626a4c95a4f0d2e83171907bf6a5b5b86611106cd497ee846f13da0c0\"}\n",
+      "detail": "{\"ok\": true, \"tasks\": 5792, \"sha256\": \"cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f\"}\n",
       "ok": true
     },
     "rust_destination_unique": {
@@ -320,6 +320,10 @@
       "detail": "{}",
       "ok": true
     },
+    "semantic_closure_ledger_envelope_contract": {
+      "detail": "{'prepare_schema_version': 'semantic-ledger-v1', 'commit_input_schema_version': 'semantic-commit-v1', 'records': 2, 'prepares': 1, 'commits': 1, 'collision_rejected': True}",
+      "ok": true
+    },
     "semantic_closure_new_generation_initial_state": {
       "detail": "{'ok': True, 'opens': 1, 'prepares': 0, 'commits': 0, 'todo_zero': True}",
       "ok": true
@@ -337,7 +341,7 @@
       "ok": true
     },
     "semantic_closure_tool_identity": {
-      "detail": "identity=semantic_closure.py:09ba07529d2e8cb7a892777925bac374283624b3d8abbf7c520f6f57ae8fe788 actual=semantic_closure.py:09ba07529d2e8cb7a892777925bac374283624b3d8abbf7c520f6f57ae8fe788",
+      "detail": "identity=semantic_closure.py:2799b7e4bc1e758332ab36bb41aba371389432fa2c7ec6b2aa16d2b3e3b6683d actual=semantic_closure.py:2799b7e4bc1e758332ab36bb41aba371389432fa2c7ec6b2aa16d2b3e3b6683d",
       "ok": true
     },
     "semantic_no_file_placeholders": {
@@ -377,7 +381,7 @@
       "ok": true
     },
     "task_evidence_quarantine_events": {
-      "detail": "fingerprint=dfb44135cbf69ccfb20f517c86810d3ff21add81a2dd130eeb19b94b8268af9c metadata_tasks=2 event_tasks=2 files=6 declared_tasks=2 declared_files=6",
+      "detail": "fingerprint=943e5f2626a4c95a4f0d2e83171907bf6a5b5b86611106cd497ee846f13da0c0 metadata_tasks=1 event_tasks=1 files=12 declared_tasks=1 declared_files=12",
       "ok": true
     },
     "task_evidence_quarantine_integrity": {
@@ -429,7 +433,7 @@
       "ok": true
     },
     "validator_identity": {
-      "detail": "identity=phase0_validate.py:c4205754ed3ca1378b0bb6995d281bc49af6fe31443520163901621b22ea2fbf actual=phase0_validate.py:c4205754ed3ca1378b0bb6995d281bc49af6fe31443520163901621b22ea2fbf",
+      "detail": "identity=phase0_validate.py:d1b01aecc9111e544f648b3d827802fcf50f71ea8a1073b05bc257201d272caf actual=phase0_validate.py:d1b01aecc9111e544f648b3d827802fcf50f71ea8a1073b05bc257201d272caf",
       "ok": true
     },
     "x86_64_build_config": {

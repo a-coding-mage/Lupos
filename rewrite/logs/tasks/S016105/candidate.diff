@@ -1,0 +1,10 @@
+S016105 attempt 2 fresh candidate
+
+Destination: src/include/uapi/linux/dpll.rs
+Candidate SHA-256: 76f2e5e8089f528f363cc66814d3cf4fb2c31e692dfd894c717393b015283609
+
+The candidate contains immutable provenance plus the complete UAPI declaration
+surface from include/uapi/linux/dpll.h: fourteen named enum domains, their 94
+enumerator constants including private maxima, eight numeric macros, and two
+NUL-terminated string-literal macros. No test, stub, module index, or unrelated
+file was added.

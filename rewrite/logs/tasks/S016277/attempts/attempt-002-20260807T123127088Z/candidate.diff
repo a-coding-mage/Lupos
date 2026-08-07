@@ -1,0 +1,10 @@
+S016277 candidate snapshot (retry attempt 2)
+source: include/uapi/linux/netfilter/nf_tables.h
+destination: src/include/uapi/linux/netfilter/nf_tables.rs
+revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
+
+The destination was regenerated from the complete pinned header. The candidate
+preserves the exact SPDX identifier, all enum constants and object-like macros,
+unsigned nft_data_types (including 0xffffff00U), mask expressions with C
+continuations removed, NFT_NAME_MAXLEN aliases, NFT_META_IIFTYPE alias and
+NFT_META_OIFTYPE ordering, and the __KERNEL__/NFT_REG32_MAX conditional mapping.

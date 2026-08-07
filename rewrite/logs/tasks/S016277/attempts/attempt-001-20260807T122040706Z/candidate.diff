@@ -1,0 +1,13 @@
+S016277 candidate snapshot
+=========================
+Destination: src/include/uapi/linux/netfilter/nf_tables.rs
+Source SHA: 425f94c2954b1fe80ebdbf9b29854e89750355df
+
+The fresh destination contains the complete enum/macro translation. Representative exact mappings:
+
+  NFT_NAME_MAXLEN = 256
+  NFT_META_IFTYPE = 8, NFT_META_OIFTYPE = 9
+  NFT_REG32_MAX = NFT_REG32_15
+  NFT_DATA_VERDICT = 0xffffff00U (u32)
+
+All selected constants and aliases are emitted in source order; multiline C masks contain no line-continuation backslashes.

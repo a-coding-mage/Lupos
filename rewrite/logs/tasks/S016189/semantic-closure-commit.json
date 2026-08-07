@@ -1,0 +1,32 @@
+{
+  "attempt": 1,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "9937906354485fd12dbeef6173d96d49e1d544e951445d366311ed3125980181",
+  "committed_at": "2026-08-07T12:51:31.481Z",
+  "destination_sha256": "acba0f9a93f2c8efb4544a192eb71c8b9544efe4c5521f1c7171ac17c74821d2",
+  "dispositions_sha256": "9c272a1a2f258cdb3fc70ff03e71ae73462699968744a5ee0e8f97cd17d5cc35",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "66331fc30d505b7dc410d13736b10f739503ebe152d2e71e4d1d0d87ad11e5f7",
+  "finding_count": 6,
+  "implementation_sha256": "e8f335a05dae2af28d8561a8a44a39fb988e059cd65ad9cf9cdcbf01523b839b",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "7d04f29bfed71a59940c60fddb10549d9959b4ce422120896030a6506a45fa48",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P01",
+  "prepare_sha256": "161609e8466e65cb022b935376ee1c86380411c55f034d01e4f9f4198f768db8",
+  "proposal_sha256": "62e1c3464bcd646dd6fcbf2147e496d4cc2246d2c4973923159a0466349a6121",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 3189,
+  "resolution_sha256": "e033e99504172e165397def38c528dacfcd6ab10b1ab931843381ece86f112e0",
+  "review_1_sha256": "b8e23f07c68e9b2db66737458d866a7c788afe067876d8316c196b62b70a800d",
+  "review_2_sha256": "8d07b5224c918a205beaf0cd6a8b94b6b384628cf13f005d2ff9d43f2632ec5b",
+  "rust_report_sha256": "dd2d0aa538e5c717b83efb964b59191389daaa106c1b582482d686a581f26a60",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S016189",
+  "transaction_id": "SCTX-ddae89b93038f55240e7168fd390b894b901ed2b14cf982dcca5ee54c4608032"
+}
