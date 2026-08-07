@@ -1,9 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)
 //! linux-source: include/uapi/linux/ethtool_netlink_generated.h
 //! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
 //! architectures: common
 //! rewrite-task: S016119
-pub const ETHTOOL_GENL_NAME: &str = "ethtool";
+pub const ETHTOOL_GENL_NAME: &[u8; 8] = b"ethtool\0";
 pub const ETHTOOL_GENL_VERSION: i32 = 1;
 
 pub type ethtool_header_flags = i32;
@@ -727,4 +727,4 @@ pub const ETHTOOL_MSG_RSS_DELETE_NTF: i32 = 53;
 pub const ETHTOOL_MSG_MSE_GET_REPLY: i32 = 54;
 pub const __ETHTOOL_MSG_KERNEL_CNT: i32 = 55;
 pub const ETHTOOL_MSG_KERNEL_MAX: i32 = __ETHTOOL_MSG_KERNEL_CNT - 1;
-pub const ETHTOOL_MCGRP_MONITOR_NAME: &str = "monitor";
+pub const ETHTOOL_MCGRP_MONITOR_NAME: &[u8; 8] = b"monitor\0";

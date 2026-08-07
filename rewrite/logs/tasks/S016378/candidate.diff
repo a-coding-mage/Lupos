@@ -1,0 +1,4 @@
+Fresh implementation for S016378 from the pinned Linux header. The destination
+contains the complete 232-definition header surface (including the include
+guard represented by provenance/module structure), all 231 value constants,
+and the one parameterized trigger-bit macro equivalent.

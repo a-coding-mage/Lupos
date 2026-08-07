@@ -311,7 +311,7 @@ pub const KEY_BRIGHTNESSUP: i32 = 225;
 pub const KEY_MEDIA: i32 = 226;
 
 pub const KEY_SWITCHVIDEOMODE: i32 = 227	/* Cycle between available video;
-					   outputs (Monitor/LCD/TV-out/etc) */
+					   outputs (Monitor/LCD/TV-out/etc) */;
 pub const KEY_KBDILLUMTOGGLE: i32 = 228;
 pub const KEY_KBDILLUMDOWN: i32 = 229;
 pub const KEY_KBDILLUMUP: i32 = 230;
@@ -335,7 +335,7 @@ pub const KEY_VIDEO_PREV: i32 = 242	/* drive previous video source */;
 pub const KEY_BRIGHTNESS_CYCLE: i32 = 243	/* brightness up, after max is min */;
 pub const KEY_BRIGHTNESS_AUTO: i32 = 244	/* Set Auto Brightness: manual;
 					  brightness control is off,
-					  rely on ambient */
+					  rely on ambient */;
 pub const KEY_BRIGHTNESS_ZERO: i32 = KEY_BRIGHTNESS_AUTO;
 pub const KEY_DISPLAY_OFF: i32 = 245	/* display device to off state */;
 
@@ -942,7 +942,7 @@ pub const SW_LID: i32 = 0x00  /* set = lid shut */;
 pub const SW_TABLET_MODE: i32 = 0x01  /* set = tablet mode */;
 pub const SW_HEADPHONE_INSERT: i32 = 0x02  /* set = inserted */;
 pub const SW_RFKILL_ALL: i32 = 0x03  /* rfkill master switch, type "any";
-					 set = radio enabled */
+					 set = radio enabled */;
 pub const SW_RADIO: i32 = SW_RFKILL_ALL	/* deprecated */;
 pub const SW_MICROPHONE_INSERT: i32 = 0x04  /* set = inserted */;
 pub const SW_DOCK: i32 = 0x05  /* set = plugged into dock */;
@@ -1018,4 +1018,3 @@ pub const SND_CNT: i32 = (SND_MAX+1);
 pub const SND_PROFILE_SILENT: i32 = 0x00;
 pub const SND_PROFILE_VIBRATE: i32 = 0x01;
 pub const SND_PROFILE_RING: i32 = 0x02;
-

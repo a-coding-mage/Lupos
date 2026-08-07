@@ -1,0 +1,14 @@
+Fresh destination `src/arch/x86/include/asm/cpufeatures.rs` added from the
+complete pinned Linux header. Object-like defines are represented as typed
+constants with unchanged expressions and ordering; X86_BUG is a const function
+preserving the macro calculation. The CONFIG_X86_32 branch is retained as a
+target-architecture conditional. Provenance records the pinned revision,
+architecture, and task ID.
+
+Representative translation:
+```diff
+-#define NCAPINTS 22
++pub const NCAPINTS: usize = 22;
+-#define X86_BUG(x) (NCAPINTS*32 + (x))
++pub const fn X86_BUG(x: usize) -> usize { NCAPINTS * 32 + x }
+```
