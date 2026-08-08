@@ -1,0 +1,7 @@
+S016428 attempt 1 candidate summary
+
+Added src/include/uapi/linux/tty_flags.rs with immutable provenance for pinned
+Linux revision 425f94c2954b1fe80ebdbf9b29854e89750355df. The file translates
+all 61 non-guard macros from include/uapi/linux/tty_flags.h into same-named
+public Rust constants, retaining named mask expressions and unsigned 32-bit
+bit-mask arithmetic. No unrelated file was edited.

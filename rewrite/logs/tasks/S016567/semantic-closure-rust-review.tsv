@@ -1,0 +1,2 @@
+schema_version	task_id	attempt	pipeline_id	slot	proposal_sha256	report_path	report_sha256	review_status	reviewer	model	reasoning_effort	reviewed_at	finding_id	record_keys
+semantic-review-attestation-v1	S016567	2	P02	2	d5f45c7c71ae5cc690072188e2f4ee18e1ed26099a3b9e5aef5b962f2f67fff8	rewrite/logs/tasks/S016567/rust-review.md	3456b52564d2eeffc8c782ba047b97b509c95af855a1bf7134e2e2c3e5500990	APPROVE	rust_p02_s016567	gpt-5.6-terra	high	2026-08-08T05:12:55.302Z	NOT_APPLICABLE	

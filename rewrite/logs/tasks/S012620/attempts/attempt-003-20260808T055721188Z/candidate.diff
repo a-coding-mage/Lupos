@@ -1,0 +1,44 @@
+--- /dev/null
++++ b/src/include/crypto/dh.rs
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++//! linux-source: include/crypto/dh.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: aarch64
++//! rewrite-task: S012620
++
++//! Diffie-Hellman secret for the KPP API and its packet-key helpers.
++//!
++//! Copyright (c) 2016, Intel Corporation
++//! Authors: Salvatore Benedetto <salvatore.benedetto@intel.com>
++
++use core::ffi::{c_char, c_int, c_uint, c_void};
++
++/// A Diffie-Hellman private key and its parameters.
++///
++/// The pointed-to key, P, and G buffers retain the ownership and lifetime
++/// supplied by the caller, exactly as they do in `struct dh`.
++#[repr(C)]
++#[derive(Copy, Clone)]
++pub struct dh {
++    pub key: *const c_void,
++    pub p: *const c_void,
++    pub g: *const c_void,
++    pub key_size: c_uint,
++    pub p_size: c_uint,
++    pub g_size: c_uint,
++}
++
++unsafe extern "C" {
++    /// Returns the encoded packet-DH private-key size, in bytes.
++    pub fn crypto_dh_key_len(params: *const dh) -> c_uint;
++
++    /// Encodes `params` into the caller-provided packet-key buffer.
++    pub fn crypto_dh_encode_key(buf: *mut c_char, len: c_uint, params: *const dh) -> c_int;
++
++    /// Decodes a packet key and makes the output parameters point into `buf`.
++    pub fn crypto_dh_decode_key(buf: *const c_char, len: c_uint, params: *mut dh) -> c_int;
++
++    /// Decodes a packet key without the exported helper's parameter checks.
++    pub fn __crypto_dh_decode_key(buf: *const c_char, len: c_uint, params: *mut dh) -> c_int;
++}

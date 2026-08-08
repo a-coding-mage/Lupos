@@ -1,0 +1,7 @@
+# S016344 candidate summary
+
+New path: `src/include/uapi/linux/psp.rs`.
+
+The candidate maps all symbols selected in `rewrite/SYMBOLS.tsv` for both frozen architectures: UAPI family and multicast-group string macros; family version macro; the four `psp_version` enumerators; the association-device-info, device, association, key, statistics, and command anonymous-enum groups including their private sentinels and public maxima.
+
+No source outside the leased destination and this task's evidence directory was edited.

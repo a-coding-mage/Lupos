@@ -1,0 +1,14 @@
+# Candidate — S012620
+
+Fresh destination: `src/include/crypto/dh.rs`.
+
+- Adds immutable source/task/revision/aarch64 provenance.
+- Maps `struct dh` exactly as a C-layout six-field record.
+- Declares `crypto_dh_key_len`, `crypto_dh_encode_key`,
+  `crypto_dh_decode_key`, and `__crypto_dh_decode_key` with their source C ABI
+  categories and pointer mutability.
+- Retains the upstream Intel copyright and Salvatore Benedetto authorship
+  notice.
+
+Candidate SHA-256:
+`eca68d69b1f1c13d6cac030e0141367eab1531a1fb7625a257a98221b1641873`.

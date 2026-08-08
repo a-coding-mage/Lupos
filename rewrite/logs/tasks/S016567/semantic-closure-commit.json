@@ -1,0 +1,32 @@
+{
+  "attempt": 2,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "cc921049d63bfb0208ca2c79232cf3866e0074f8eaeb4c0b6e4d970f7179caa9",
+  "committed_at": "2026-08-08T05:19:14.666Z",
+  "destination_sha256": "187101b3fc8be267d98720b0e2dd78e750ed0b7c71d58ce861ff40ae1379df95",
+  "dispositions_sha256": "b746d6e48d2d041ca86eca8510ccfa588c885eaa8e5560073b4d7d20510aef6d",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "d5f45c7c71ae5cc690072188e2f4ee18e1ed26099a3b9e5aef5b962f2f67fff8",
+  "finding_count": 0,
+  "implementation_sha256": "d83cb4f8c5b302995d06acd08cc703be52f6c6667e69578b5eb40f9bf2253a6a",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "754cf6656794a1277912f681db7eae742dbbf8bfbecd4811db4246870c45f693",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P02",
+  "prepare_sha256": "7babffede4e99e6477f05edf378f0dfdde5714a133a4c397d65ace5df4d14869",
+  "proposal_sha256": "d5f45c7c71ae5cc690072188e2f4ee18e1ed26099a3b9e5aef5b962f2f67fff8",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 43,
+  "resolution_sha256": "ae3ee4db13ce5cc722e6b514752602d9df58185cb5a98edcfc36318f95f03a18",
+  "review_1_sha256": "e37e2973f8aecaddde3163f3c5970a85cdc70c95afca3a1ee76a9a7580b41bb3",
+  "review_2_sha256": "b5380da2a4e7cd9c1f7a9a7cb3df18c031cb787a642831ff70dafbbf1ddc6487",
+  "rust_report_sha256": "3456b52564d2eeffc8c782ba047b97b509c95af855a1bf7134e2e2c3e5500990",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S016567",
+  "transaction_id": "SCTX-85e04cc3862a2e462b7fee7b270784315c65e4bbcfff68a70349f65864c37491"
+}

@@ -1,0 +1,9 @@
+S016344 candidate summary
+
+New destination: src/include/uapi/linux/psp.rs
+Pinned source: vendor/linux/include/uapi/linux/psp.h
+
+The candidate preserves the exact dual SPDX expression, both family and
+multicast-group strings, the `psp_version` C representation and ordinal
+members, and every anonymous-enum UAPI identifier as a `c_int` constant with
+the source ordinal or `MAX - 1` relationship.

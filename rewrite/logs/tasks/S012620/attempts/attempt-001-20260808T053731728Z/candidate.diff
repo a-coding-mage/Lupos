@@ -1,0 +1,12 @@
+# S012620 candidate summary — attempt 1
+
+Fresh replacement of `src/include/crypto/dh.rs` from pinned
+`vendor/linux/include/crypto/dh.h` at
+`425f94c2954b1fe80ebdbf9b29854e89750355df`.
+
+- Added immutable provenance for task `S012620` and architecture `aarch64`.
+- Translated `struct dh` as `#[repr(C)]` with three `const void *` fields and
+  three `unsigned int` size fields in original declaration order.
+- Declared `crypto_dh_key_len`, `crypto_dh_encode_key`,
+  `crypto_dh_decode_key`, and `__crypto_dh_decode_key` with their original C
+  names, argument mutability, widths, and return types.

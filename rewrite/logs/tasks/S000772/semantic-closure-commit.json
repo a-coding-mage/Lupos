@@ -1,0 +1,32 @@
+{
+  "attempt": 1,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "e6458dac2e46644e3eb49f0d23f0b6832cf6e321891f0dac2dae3919a04619af",
+  "committed_at": "2026-08-08T05:17:23.824Z",
+  "destination_sha256": "a3c982c42a1441d3e6bf84531d84b2b0c48fc07c27d8628f579f5b8ac9fe26c5",
+  "dispositions_sha256": "b746d6e48d2d041ca86eca8510ccfa588c885eaa8e5560073b4d7d20510aef6d",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "cb3f92405c7604e6d8e3568cd687f6b07067e2238141b836101f1f06d9243d58",
+  "finding_count": 0,
+  "implementation_sha256": "0bbf91ea572b3b1bed5b013e1e5071818d7d95831be50ecd3e3dc3bc31254e2c",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "e1ff4786e369f764eeafa0ca3a29a5e78bf0d3774a243d8c52a183006688ac8f",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P01",
+  "prepare_sha256": "cfbd5f7475b54629ee1dca4a279e5ddf628e5e732584aafc392eceeeb9419ff4",
+  "proposal_sha256": "cb3f92405c7604e6d8e3568cd687f6b07067e2238141b836101f1f06d9243d58",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 74,
+  "resolution_sha256": "ba06e9887c5f93c26446ffcec99a76fbc7befcfa52232a14888492618ca6b851",
+  "review_1_sha256": "46b83064c99cba570112226b7bf0e2199e7891e735d155a98ae6e845151a8ee5",
+  "review_2_sha256": "73f4f89238dc0b10bcca1890d8a78641a564dd2b132b6c99578d1327d55a8bb6",
+  "rust_report_sha256": "59fae0b65b8d04b319bfe27c40b09518410c8174c52914d7812b6d2a2553ede9",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S000772",
+  "transaction_id": "SCTX-fd94f20ffe7b919385cac9119ba734d20f485c29fc8f5a5781aa260017fea6a0"
+}

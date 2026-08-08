@@ -1,0 +1,2 @@
+schema_version	task_id	attempt	pipeline_id	slot	proposal_sha256	report_path	report_sha256	review_status	reviewer	model	reasoning_effort	reviewed_at	finding_id	record_keys
+semantic-review-attestation-v1	S012620	1	P01	1	45fd6cbc3bd31ad7e52d1ade9df529f4ed518f2d51d899b5a54376fa148d21f4	rewrite/logs/tasks/S012620/parity-review.md	34a2400b5f095b01109ba4c205d1dfd78bac3c3388a8749e2181c8e01a69fde3	FINDINGS	parity_p01_s012620	gpt-5.6-terra	high	2026-08-08T05:34:54.608Z	PARITY-COPYRIGHT-001	SC1-149215b282f2bc1fa8b5552f471ffcff1f8521e8803f4bcdb5d94033ffb61329

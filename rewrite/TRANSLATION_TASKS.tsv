@@ -707,7 +707,7 @@ S000768	src/arch/x86/include/uapi/asm/auxvec.rs	2026-08-07T11:57:24.116Z			TODO	
 S000769	src/arch/x86/include/uapi/asm/bitsperlong.rs	2026-08-07T11:57:24.116Z			TODO	arch/x86/include/uapi/asm/bitsperlong.h	x86_64	arch	1.4	high	S000768	luna		0								2026-08-07T11:57:24.116Z		
 S000770	src/arch/x86/include/uapi/asm/bootparam.rs	2026-08-07T11:57:24.116Z			TODO	arch/x86/include/uapi/asm/bootparam.h	x86_64	arch	21.5	high	S000769	luna		0								2026-08-07T11:57:24.116Z		
 S000771	src/arch/x86/include/uapi/asm/byteorder.rs	2026-08-07T11:57:24.116Z			TODO	arch/x86/include/uapi/asm/byteorder.h	x86_64	arch	1.0	high	S000770	luna		0								2026-08-07T11:57:24.116Z		
-S000772	src/arch/x86/include/uapi/asm/debugreg.rs	2026-08-07T11:57:24.116Z	2026-08-08T05:01:58.308Z		IN_PROGRESS	arch/x86/include/uapi/asm/debugreg.h	x86_64	arch	10.1	high		luna	P01	1	implement_p01_next	2026-08-08T06:31:58.308Z						2026-08-08T05:01:58.308Z		
+S000772	src/arch/x86/include/uapi/asm/debugreg.rs	2026-08-07T11:57:24.116Z	2026-08-08T05:01:58.308Z	2026-08-08T05:18:30.917Z	DONE	arch/x86/include/uapi/asm/debugreg.h	x86_64	arch	10.1	high		luna	P01	1			2026-08-08T05:06:51.153Z	2026-08-08T05:07:15.279Z	2026-08-08T05:11:26.558Z	2026-08-08T05:11:38.066Z	2026-08-08T05:12:55.456Z	2026-08-08T05:18:30.917Z		
 S000773	src/arch/x86/include/uapi/asm/elf.rs	2026-08-07T11:57:24.116Z			TODO	arch/x86/include/uapi/asm/elf.h	x86_64	arch	1.6	high	S018290	luna		0								2026-08-07T11:57:24.116Z		
 S000774	src/arch/x86/include/uapi/asm/hw_breakpoint.rs	2026-08-07T11:57:24.116Z			TODO	arch/x86/include/uapi/asm/hw_breakpoint.h	x86_64	arch	1.0	high		luna		0								2026-08-07T11:57:24.116Z		
 S000775	src/arch/x86/include/uapi/asm/hwcap2.rs	2026-08-07T11:57:24.116Z			TODO	arch/x86/include/uapi/asm/hwcap2.h	x86_64	arch	1.3	high	S018290	luna		0								2026-08-07T11:57:24.116Z		
@@ -1925,7 +1925,7 @@ S012616	src/include/crypto/blake2s.rs	2026-08-07T11:57:24.116Z			TODO	include/cr
 S012617	src/include/crypto/chacha.rs	2026-08-07T11:57:24.116Z			TODO	include/crypto/chacha.h	common	include	10.2	low	S018290	luna		0								2026-08-07T11:57:24.116Z		
 S012618	src/include/crypto/ctr.rs	2026-08-07T11:57:24.116Z			TODO	include/crypto/ctr.h	common	include	1.5	low		luna		0								2026-08-07T11:57:24.116Z		
 S012619	src/include/crypto/des.rs	2026-08-07T11:57:24.116Z			TODO	include/crypto/des.h	aarch64	include	5.7	low	S018290	luna		0								2026-08-07T11:57:24.116Z		
-S012620	src/include/crypto/dh.rs	2026-08-07T11:57:24.116Z			TODO	include/crypto/dh.h	aarch64	include	9.8	low		luna		0								2026-08-07T11:57:24.116Z		
+S012620	src/include/crypto/dh.rs	2026-08-07T11:57:24.116Z	2026-08-08T05:24:04.760Z		REVIEWING	include/crypto/dh.h	aarch64	include	9.8	low		luna	P01	4	implement_final_p01_s012620	2026-08-08T07:27:45.527Z	2026-08-08T06:02:11.354Z	2026-08-08T06:02:30.321Z				2026-08-08T06:02:30.321Z		
 S012621	src/include/crypto/ecc_curve.rs	2026-08-07T11:57:24.116Z			TODO	include/crypto/ecc_curve.h	aarch64	include	6.2	low	S018290	luna		0								2026-08-07T11:57:24.116Z		
 S012622	src/include/crypto/ecdh.rs	2026-08-07T11:57:24.116Z			TODO	include/crypto/ecdh.h	aarch64	include	8.3	low		luna		0								2026-08-07T11:57:24.116Z		
 S012623	src/include/crypto/engine.rs	2026-08-07T11:57:24.116Z			TODO	include/crypto/engine.h	aarch64	include	10.6	low	S012610;S012648;S012662;S018290	luna		0								2026-08-07T11:57:24.116Z		
@@ -3739,7 +3739,7 @@ S016120	src/include/uapi/linux/eventfd.rs	2026-08-07T11:57:24.116Z			TODO	includ
 S016121	src/include/uapi/linux/eventpoll.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/eventpoll.h	common	include	10.1	low	S016120	luna		0								2026-08-07T11:57:24.116Z		
 S016122	src/include/uapi/linux/ext4.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/ext4.h	common	include	17.0	low	S016121	luna		0								2026-08-07T11:57:24.116Z		
 S016123	src/include/uapi/linux/fadvise.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/fadvise.h	common	include	2.2	low	S018290	luna		0								2026-08-07T11:57:24.116Z		
-S016124	src/include/uapi/linux/falloc.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/falloc.h	common	include	9.8	low		luna		0								2026-08-07T11:57:24.116Z		
+S016124	src/include/uapi/linux/falloc.rs	2026-08-07T11:57:24.116Z	2026-08-08T05:24:11.439Z		BLOCKED	include/uapi/linux/falloc.h	common	include	9.8	low		luna	P02	1			2026-08-08T05:28:41.932Z	2026-08-08T05:29:14.196Z	2026-08-08T05:32:43.654Z	2026-08-08T05:33:35.835Z	2026-08-08T05:33:48.057Z	2026-08-08T05:35:35.697Z		APPLIER-1: candidate SPDX GPL-2.0-only differs from pinned include/uapi/linux/falloc.h:1 GPL-2.0 WITH Linux-syscall-note; correction requires fresh candidate and independent reviews
 S016125	src/include/uapi/linux/fanotify.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/fanotify.h	common	include	27.4	low	S016122	luna		0								2026-08-07T11:57:24.116Z		
 S016126	src/include/uapi/linux/fb.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/fb.h	common	include	39.6	low	S013999;S016454;S018290	luna		0								2026-08-07T11:57:24.116Z		
 S016127	src/include/uapi/linux/fcntl.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/fcntl.h	common	include	19.3	low	S016125	luna		0								2026-08-07T11:57:24.116Z		
@@ -3932,7 +3932,7 @@ S016340	src/include/uapi/linux/pr.rs	2026-08-07T11:57:24.116Z			TODO	include/uap
 S016341	src/include/uapi/linux/prctl.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/prctl.h	common	include	41.9	low	S016340	luna		0								2026-08-07T11:57:24.116Z		
 S016342	src/include/uapi/linux/psample.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/psample.h	common	include	7.1	low		luna		0								2026-08-07T11:57:24.116Z		
 S016343	src/include/uapi/linux/psci.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/psci.h	aarch64	include	14.2	low	S013425	luna		0								2026-08-07T11:57:24.116Z		
-S016344	src/include/uapi/linux/psp.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/psp.h	common	include	9.8	low		luna		0								2026-08-07T11:57:24.116Z		
+S016344	src/include/uapi/linux/psp.rs	2026-08-07T11:57:24.116Z	2026-08-08T05:35:59.862Z		BLOCKED	include/uapi/linux/psp.h	common	include	9.8	low		luna	P02	2			2026-08-08T05:46:51.941Z	2026-08-08T05:47:26.274Z	2026-08-08T05:52:23.771Z	2026-08-08T05:52:18.177Z	2026-08-08T05:52:59.008Z	2026-08-08T05:56:06.964Z		Pinned source and frozen records establish enum psp_version enumerators but not its ABI size, alignment, or representation for either approved architecture; no source-proven Rust enum/alias ABI can be selected.
 S016345	src/include/uapi/linux/ptp_clock.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/ptp_clock.h	common	include	26.3	low	S018290	luna		0								2026-08-07T11:57:24.116Z		
 S016346	src/include/uapi/linux/ptrace.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/ptrace.h	common	include	19.1	low	S016341	luna		0								2026-08-07T11:57:24.116Z		
 S016348	src/include/uapi/linux/qrtr.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/qrtr.h	aarch64	include	4.9	low	S018290	luna		0								2026-08-07T11:57:24.116Z		
@@ -4004,7 +4004,7 @@ S016422	src/include/uapi/linux/timex.rs	2026-08-07T11:57:24.116Z			TODO	include/
 S016424	src/include/uapi/linux/tls.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/tls.h	common	include	20.8	low	S018290	luna		0								2026-08-07T11:57:24.116Z		
 S016426	src/include/uapi/linux/trace_mmap.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/trace_mmap.h	common	include	4.9	low	S016422	luna		0								2026-08-07T11:57:24.116Z		
 S016427	src/include/uapi/linux/tty.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/tty.h	common	include	4.6	low		luna		0								2026-08-07T11:57:24.116Z		
-S016428	src/include/uapi/linux/tty_flags.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/tty_flags.h	common	include	9.7	low		luna		0								2026-08-07T11:57:24.116Z		
+S016428	src/include/uapi/linux/tty_flags.rs	2026-08-07T11:57:24.116Z	2026-08-08T05:56:39.356Z		REVIEWING	include/uapi/linux/tty_flags.h	common	include	9.7	low		luna	P02	1	implement_p02_next	2026-08-08T07:26:39.356Z	2026-08-08T06:00:09.092Z	2026-08-08T06:00:51.311Z		2026-08-08T06:04:09.314Z		2026-08-08T06:04:09.314Z		
 S016429	src/include/uapi/linux/typelimits.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/typelimits.h	common	include	1.0	low		luna		0								2026-08-07T11:57:24.116Z		
 S016430	src/include/uapi/linux/types.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/types.h	common	include	6.3	low	S016426	luna		0								2026-08-07T11:57:24.116Z		
 S016431	src/include/uapi/linux/udp.rs	2026-08-07T11:57:24.116Z			TODO	include/uapi/linux/udp.h	common	include	5.0	low	S016430	luna		0								2026-08-07T11:57:24.116Z		
@@ -4074,7 +4074,7 @@ S016563	src/include/xen/grant_table.rs	2026-08-07T11:57:24.116Z			TODO	include/x
 S016564	src/include/xen/hvc-console.rs	2026-08-07T11:57:24.116Z			TODO	include/xen/hvc-console.h	common	include	1.9	low	S018290	luna		0								2026-08-07T11:57:24.116Z		
 S016565	src/include/xen/hvm.rs	2026-08-07T11:57:24.116Z			TODO	include/xen/hvm.h	aarch64	include	6.5	low	S000203;S016572	luna		0								2026-08-07T11:57:24.116Z		
 S016566	src/include/xen/interface/event_channel.rs	2026-08-07T11:57:24.116Z			TODO	include/xen/interface/event_channel.h	common	include	27.9	low	S018290	luna		0								2026-08-07T11:57:24.116Z		
-S016567	src/include/xen/interface/features.rs	2026-08-07T11:57:24.116Z	2026-08-08T04:55:38.135Z		IN_PROGRESS	include/xen/interface/features.h	aarch64	include	10.2	low		luna	P02	2	implement_clean_p02_s016567	2026-08-08T06:31:35.164Z						2026-08-08T05:01:35.164Z		
+S016567	src/include/xen/interface/features.rs	2026-08-07T11:57:24.116Z	2026-08-08T04:55:38.135Z	2026-08-08T05:23:45.570Z	DONE	include/xen/interface/features.h	aarch64	include	10.2	low		luna	P02	2			2026-08-08T05:06:18.147Z	2026-08-08T05:07:28.086Z	2026-08-08T05:14:20.848Z	2026-08-08T05:13:07.764Z	2026-08-08T05:14:33.546Z	2026-08-08T05:23:45.570Z		
 S016568	src/include/xen/interface/grant_table.rs	2026-08-07T11:57:24.116Z			TODO	include/xen/interface/grant_table.h	aarch64	include	59.0	low	S016560	luna		0								2026-08-07T11:57:24.116Z		
 S016570	src/include/xen/interface/hvm/hvm_op.rs	2026-08-07T11:57:24.116Z			TODO	include/xen/interface/hvm/hvm_op.h	aarch64	include	6.8	low	S018290	luna		0								2026-08-07T11:57:24.116Z		
 S016572	src/include/xen/interface/hvm/params.rs	2026-08-07T11:57:24.116Z			TODO	include/xen/interface/hvm/params.h	aarch64	include	10.9	low	S016570;S018290	luna		0								2026-08-07T11:57:24.116Z		

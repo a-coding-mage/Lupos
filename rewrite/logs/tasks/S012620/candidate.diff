@@ -1,0 +1,12 @@
+Fresh S012620 candidate recreated from pinned `include/crypto/dh.h`.
+
+Destination: `src/include/crypto/dh.rs`
+
+- Adds the immutable S012620 provenance header and upstream copyright notice.
+- Declares `#[repr(C)] #[derive(Copy, Clone)] pub struct dh` with three
+  `*const c_void` pointers followed by three `u32` length fields.
+- Declares `crypto_dh_key_len`, `crypto_dh_encode_key`,
+  `crypto_dh_decode_key`, and `__crypto_dh_decode_key` in an unsafe C extern
+  block with their Linux names and raw pointer types.
+- Records the source-derived readable, writable, aliasing, lifetime, and
+  synchronization obligations in the extern-function safety documentation.

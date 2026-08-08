@@ -1,0 +1,8 @@
+S016124 candidate summary
+
+New destination: src/include/uapi/linux/falloc.rs
+Pinned source: vendor/linux/include/uapi/linux/falloc.h
+
+The candidate maps every operative UAPI macro directly to a same-named i32
+constant with its source hexadecimal value. The C include guard is represented
+by the Rust module boundary and creates no runtime or ABI item.
