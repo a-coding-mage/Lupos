@@ -1,0 +1,32 @@
+{
+  "attempt": 1,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "fd01ec1dcf8e49ed6cf7095da4afdcdd85d796d4574cccedcdd879ce11c70fef",
+  "committed_at": "2026-08-08T07:32:27.083Z",
+  "destination_sha256": "0b05a335d509fbd634248828a55ce2f9f3a2624da0f567c4e35a18697e4761cc",
+  "dispositions_sha256": "b746d6e48d2d041ca86eca8510ccfa588c885eaa8e5560073b4d7d20510aef6d",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "78d9cc831728ab771db4dfb6aa797b8e7d96ed5a40785255a67d1d8ca8bf0737",
+  "finding_count": 0,
+  "implementation_sha256": "cacdbfaf4e6880ebbb510cf5c942180b48aa419f9235f1d43f4e4306edcba35a",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "25710a21169e536b65fb93c98f8a39406874b2899492dfef79fe8d27238ce47f",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P02",
+  "prepare_sha256": "ff00bfa24afef6b71c3c026626372f7b9d6ea8b255eed67517fb5fbf2a1120e8",
+  "proposal_sha256": "78d9cc831728ab771db4dfb6aa797b8e7d96ed5a40785255a67d1d8ca8bf0737",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 23,
+  "resolution_sha256": "db48f24574069e43cc1201c8e2aebe81554692a084ae2349b0446a2f8322062c",
+  "review_1_sha256": "cc23eefbe8351a24213938a2aafbb76fda9d9295919d6fdb2e4bb4073a5a6d6d",
+  "review_2_sha256": "80f7d569a57848e3015d2675abfdc05f4bd91450a769b14e1a164880d5fc5b5d",
+  "rust_report_sha256": "587fcf6e7806bc037612a12b21fb78e533563a4812286f23f99af66a63120e2d",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S012622",
+  "transaction_id": "SCTX-ef8bdb86058ba4dec664db94e56bd09008dc6f4445fbadb1283a5862e3e2a4d1"
+}

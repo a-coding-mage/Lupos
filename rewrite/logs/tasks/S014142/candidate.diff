@@ -1,0 +1,3 @@
+BLOCKED: exact enum object ABI (size, alignment, signedness) is not
+established by the pinned source and identity-bound manifests; no candidate
+diff is applicable.

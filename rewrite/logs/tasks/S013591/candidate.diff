@@ -1,0 +1,51 @@
+diff --git a/src/include/linux/circ_buf.rs b/src/include/linux/circ_buf.rs
+new file mode 100644
+--- /dev/null
++++ b/src/include/linux/circ_buf.rs
+@@
++// SPDX-License-Identifier: GPL-2.0-only
++//! linux-source: include/linux/circ_buf.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: common
++//! rewrite-task: S013591
++
++use core::ffi::c_char;
++
++#[repr(C)]
++pub struct circ_buf {
++    pub buf: *mut c_char,
++    pub head: i32,
++    pub tail: i32,
++}
++
++#[macro_export]
++macro_rules! CIRC_CNT {
++    ($head:expr, $tail:expr, $size:expr) => {
++        ($head).wrapping_sub($tail) & ($size).wrapping_sub(1)
++    };
++}
++
++#[macro_export]
++macro_rules! CIRC_SPACE {
++    ($head:expr, $tail:expr, $size:expr) => {
++        $crate::CIRC_CNT!($tail, ($head).wrapping_add(1), $size)
++    };
++}
++
++#[macro_export]
++macro_rules! CIRC_CNT_TO_END {
++    ($head:expr, $tail:expr, $size:expr) => {{
++        let end = ($size).wrapping_sub($tail);
++        let n = ($head).wrapping_add(end) & ($size).wrapping_sub(1);
++        if n < end { n } else { end }
++    }};
++}
++
++#[macro_export]
++macro_rules! CIRC_SPACE_TO_END {
++    ($head:expr, $tail:expr, $size:expr) => {{
++        let end = ($size).wrapping_sub(1).wrapping_sub($head);
++        let n = end.wrapping_add($tail) & ($size).wrapping_sub(1);
++        if n <= end { n } else { end.wrapping_add(1) }
++    }};
++}

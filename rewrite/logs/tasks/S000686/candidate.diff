@@ -1,0 +1,7 @@
+Fresh translation of `arch/x86/include/asm/shared/tdx_errno.h` to
+`src/arch/x86/include/asm/shared/tdx_errno.rs`.
+
+The candidate defines the exact TDX status-mask/status-code constants and
+operand-ID constants under their Linux names, retaining u64 for ULL literals
+and i32 for unsuffixed C integer literals. It carries the immutable Linux
+source, revision, architecture, and task provenance header.

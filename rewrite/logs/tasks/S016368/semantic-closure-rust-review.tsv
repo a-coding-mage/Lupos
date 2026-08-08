@@ -1,0 +1,2 @@
+schema_version	task_id	attempt	pipeline_id	slot	proposal_sha256	report_path	report_sha256	review_status	reviewer	model	reasoning_effort	reviewed_at	finding_id	record_keys
+semantic-review-attestation-v1	S016368	3	P01	2	1bb2c69e68cdea28ee22e9151e10514d7bf267e30557894c6ec0aaabdbdaf6ab	rewrite/logs/tasks/S016368/rust-review.md	f1e84f704d9d81726e532837278e04fd5d8f815b5c4762cd94ed1826bc439475	APPROVE	codex-root-rust-final3-p01-s016368	gpt-5.6-terra	high	2026-08-08T08:22:44.967Z	NOT_APPLICABLE	

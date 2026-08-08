@@ -1,0 +1,2 @@
+schema_version	task_id	attempt	pipeline_id	slot	proposal_sha256	report_path	report_sha256	review_status	reviewer	model	reasoning_effort	reviewed_at	finding_id	record_keys
+semantic-review-attestation-v1	S016146	1	P02	2	5f99913d500e7fceac4d0b2837ec747455fc28de9c5ddd899eaa5fa63843324a	rewrite/logs/tasks/S016146/rust-review.md	e4f9afaece84648158164da26c63d8a902bc2c299711f6b24f9c375187080af3	FINDINGS	codex-rust-reviewer-p02-s016146	gpt-5.6-terra	high	2026-08-08T08:05:40.873Z	RUST-001	

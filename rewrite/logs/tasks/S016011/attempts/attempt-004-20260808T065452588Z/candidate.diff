@@ -1,0 +1,8 @@
+--- /dev/null
++++ b/src/include/uapi/asm-generic/mman-common.rs
+@@
++Fresh path-preserving translation of the pinned 94-line UAPI header.
++54 Linux numeric macros map to `pub const ...: i32`; `PKEY_ACCESS_MASK` is
++computed from its two source constants; the include guard maps to module-once
++declaration semantics. Provenance is the required five-line immutable header.
+

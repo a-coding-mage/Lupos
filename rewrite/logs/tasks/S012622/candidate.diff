@@ -1,0 +1,4 @@
+New file: src/include/crypto/ecdh.rs
+
+Translated the pinned Linux ECDH header: four curve constants, the C-layout
+`Ecdh` parameter structure, and the three C-linkage packet-key declarations.

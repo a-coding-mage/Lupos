@@ -1,0 +1,32 @@
+{
+  "attempt": 1,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "661834d402ec88b9dd3bda4628ddbbed72837e397a3a99f87d7ab3ab5ab15121",
+  "committed_at": "2026-08-08T09:25:28.206Z",
+  "destination_sha256": "fa814b8d65cd87f271635841d5935282bea326a3e6d0825c636c171f1bea9bb0",
+  "dispositions_sha256": "b746d6e48d2d041ca86eca8510ccfa588c885eaa8e5560073b4d7d20510aef6d",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "d36bd122dcfb78bb999f059af539994cb0b4b25eb4bfe09e234ce57396e11f12",
+  "finding_count": 0,
+  "implementation_sha256": "ab9e1b04b3e0a9e0474bf76f69d67488d423401629a8dd5c1872fc3893ae4502",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "1515f2243d8c266b574ae1567724ad8920e7470a885d250b01759425a1df5335",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P01",
+  "prepare_sha256": "ff24470cd73e1ec5a67b4951fcebad8859820147ebdc292baef2b91a98b174dc",
+  "proposal_sha256": "d36bd122dcfb78bb999f059af539994cb0b4b25eb4bfe09e234ce57396e11f12",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 217,
+  "resolution_sha256": "5d96838a2a8160e649cb3e5e7fd62caae4ab89bbdec8f98791c4a4351bddc1f9",
+  "review_1_sha256": "b08475fb27f0cb9a887ba3eb585680267fb1ff2b495e98b07a5005223ec90324",
+  "review_2_sha256": "afbbe73fab6e918656d24b664b5d5123022ec471a27fa083c6f05c6bb9a9fab1",
+  "rust_report_sha256": "fef9a7f5ab42b7f3f2475c74fd0f7559acf8911f1506e2b43e4fd1bef2931557",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S015671",
+  "transaction_id": "SCTX-e7dd0d3d713fce543216dbbcf7e7b744ad5235df34d2c621204907869362151a"
+}

@@ -1,0 +1,2 @@
+schema_version	task_id	attempt	pipeline_id	slot	proposal_sha256	report_path	report_sha256	review_status	reviewer	model	reasoning_effort	reviewed_at	finding_id	record_keys
+semantic-review-attestation-v1	S015124	1	P02	2	f6f9fa39456cca9fd722fdf49ef48585c0195ff6c8a6f19fca8cca7d3fb3a1c1	rewrite/logs/tasks/S015124/rust-review.md	bbdd9d58aaae4749d70df7f36ba84c556bbfe1a28fb56805d8e8c92a934151f6	APPROVE	codex-rust_p02_s015124	gpt-5.6-terra	high	2026-08-08T12:09:45.229Z	NOT_APPLICABLE	

@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
+//! linux-source: include/uapi/linux/psample.h
+//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
+//! architectures: common
+//! rewrite-task: S016342
+
+pub const PSAMPLE_ATTR_IIFINDEX: i32 = 0;
+pub const PSAMPLE_ATTR_OIFINDEX: i32 = 1;
+pub const PSAMPLE_ATTR_ORIGSIZE: i32 = 2;
+pub const PSAMPLE_ATTR_SAMPLE_GROUP: i32 = 3;
+pub const PSAMPLE_ATTR_GROUP_SEQ: i32 = 4;
+pub const PSAMPLE_ATTR_SAMPLE_RATE: i32 = 5;
+pub const PSAMPLE_ATTR_DATA: i32 = 6;
+pub const PSAMPLE_ATTR_GROUP_REFCOUNT: i32 = 7;
+pub const PSAMPLE_ATTR_TUNNEL: i32 = 8;
+pub const PSAMPLE_ATTR_PAD: i32 = 9;
+pub const PSAMPLE_ATTR_OUT_TC: i32 = 10;
+pub const PSAMPLE_ATTR_OUT_TC_OCC: i32 = 11;
+pub const PSAMPLE_ATTR_LATENCY: i32 = 12;
+pub const PSAMPLE_ATTR_TIMESTAMP: i32 = 13;
+pub const PSAMPLE_ATTR_PROTO: i32 = 14;
+pub const PSAMPLE_ATTR_USER_COOKIE: i32 = 15;
+pub const PSAMPLE_ATTR_SAMPLE_PROBABILITY: i32 = 16;
+pub const __PSAMPLE_ATTR_MAX: i32 = 17;
+
+#[repr(i32)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum psample_command {
+    PSAMPLE_CMD_SAMPLE = 0,
+    PSAMPLE_CMD_GET_GROUP = 1,
+    PSAMPLE_CMD_NEW_GROUP = 2,
+    PSAMPLE_CMD_DEL_GROUP = 3,
+}
+
+#[repr(i32)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum psample_tunnel_key_attr {
+    PSAMPLE_TUNNEL_KEY_ATTR_ID = 0,
+    PSAMPLE_TUNNEL_KEY_ATTR_IPV4_SRC = 1,
+    PSAMPLE_TUNNEL_KEY_ATTR_IPV4_DST = 2,
+    PSAMPLE_TUNNEL_KEY_ATTR_TOS = 3,
+    PSAMPLE_TUNNEL_KEY_ATTR_TTL = 4,
+    PSAMPLE_TUNNEL_KEY_ATTR_DONT_FRAGMENT = 5,
+    PSAMPLE_TUNNEL_KEY_ATTR_CSUM = 6,
+    PSAMPLE_TUNNEL_KEY_ATTR_OAM = 7,
+    PSAMPLE_TUNNEL_KEY_ATTR_GENEVE_OPTS = 8,
+    PSAMPLE_TUNNEL_KEY_ATTR_TP_SRC = 9,
+    PSAMPLE_TUNNEL_KEY_ATTR_TP_DST = 10,
+    PSAMPLE_TUNNEL_KEY_ATTR_VXLAN_OPTS = 11,
+    PSAMPLE_TUNNEL_KEY_ATTR_IPV6_SRC = 12,
+    PSAMPLE_TUNNEL_KEY_ATTR_IPV6_DST = 13,
+    PSAMPLE_TUNNEL_KEY_ATTR_PAD = 14,
+    PSAMPLE_TUNNEL_KEY_ATTR_ERSPAN_OPTS = 15,
+    PSAMPLE_TUNNEL_KEY_ATTR_IPV4_INFO_BRIDGE = 16,
+    __PSAMPLE_TUNNEL_KEY_ATTR_MAX = 17,
+}
+
+pub const PSAMPLE_ATTR_MAX: i32 = __PSAMPLE_ATTR_MAX - 1;
+pub const PSAMPLE_NL_MCGRP_CONFIG_NAME: &str = "config";
+pub const PSAMPLE_NL_MCGRP_SAMPLE_NAME: &str = "packets";
+pub const PSAMPLE_GENL_NAME: &str = "psample";
+pub const PSAMPLE_GENL_VERSION: i32 = 1;

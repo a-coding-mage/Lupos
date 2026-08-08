@@ -1,0 +1,3 @@
+schema_version	task_id	attempt	pipeline_id	slot	proposal_sha256	report_path	report_sha256	review_status	reviewer	model	reasoning_effort	reviewed_at	finding_id	record_keys
+semantic-review-attestation-v1	S016005	1	P02	1	c1224c9023bf5234019eb46b10e4d2030c54c64287c18111751aca554d42d01d	rewrite/logs/tasks/S016005/parity-review.md	204e7b2d0652908d560dff23727b485a70e401a9f443e4509525ab177f8c44a6	FINDINGS	parity_reviewer	gpt-5.6-terra	high	2026-08-08T11:13:09.897Z	P1	
+semantic-review-attestation-v1	S016005	1	P02	1	c1224c9023bf5234019eb46b10e4d2030c54c64287c18111751aca554d42d01d	rewrite/logs/tasks/S016005/parity-review.md	204e7b2d0652908d560dff23727b485a70e401a9f443e4509525ab177f8c44a6	FINDINGS	parity_reviewer	gpt-5.6-terra	high	2026-08-08T11:13:09.897Z	P2	

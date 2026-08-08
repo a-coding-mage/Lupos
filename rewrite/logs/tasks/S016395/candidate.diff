@@ -1,0 +1,9 @@
+task_id: S016395
+attempt: 1
+source: vendor/linux/include/uapi/linux/sunrpc_netlink.h
+destination: src/include/uapi/linux/sunrpc_netlink.rs
+linux_sha: 425f94c2954b1fe80ebdbf9b29854e89750355df
+
+Fresh destination created. The Rust file maps the named C enum to a repr(i32)
+enum and each anonymous C enum member and macro to an exported i32 or string
+constant, retaining the original derived MAX expressions.

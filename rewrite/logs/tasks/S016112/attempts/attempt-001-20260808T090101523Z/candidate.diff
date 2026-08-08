@@ -1,0 +1,6 @@
+--- /dev/null
++++ b/src/include/uapi/linux/elf-em.rs
+@@
++Fresh path-preserving translation of include/uapi/linux/elf-em.h.
++49/49 selected EM_* macros mapped to pub const i32 with exact values.
++See destination file for the complete candidate; no existing file was overwritten.

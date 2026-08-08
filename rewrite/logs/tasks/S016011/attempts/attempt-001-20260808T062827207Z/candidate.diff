@@ -1,0 +1,8 @@
+Task S016011 candidate diff
+
+Added fresh path-preserving destination:
+`src/include/uapi/asm-generic/mman-common.rs`
+
+The file contains the Linux UAPI protection, mapping, locking, synchronization,
+advice, and protection-key constants from the pinned header. `PKEY_ACCESS_MASK`
+retains Linux's computed definition (`PKEY_DISABLE_ACCESS | PKEY_DISABLE_WRITE`).

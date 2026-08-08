@@ -1,0 +1,5 @@
+--- /dev/null
++++ b/src/include/uapi/linux/hsr_netlink.rs
+@@
++Fresh path-preserving translation of include/uapi/linux/hsr_netlink.h.
++Preserves all HSR_A_* and HSR_C_* enum constants and MAX expressions.

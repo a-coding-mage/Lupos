@@ -1,0 +1,72 @@
+diff --git a/src/include/uapi/linux/handshake.rs b/src/include/uapi/linux/handshake.rs
+new file mode 100644
+index 00000000..3c31654d
+--- /dev/null
++++ b/src/include/uapi/linux/handshake.rs
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)
++//! linux-source: include/uapi/linux/handshake.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: x86_64,aarch64
++//! rewrite-task: S016142
++
++/// Generic-netlink family name for handshake messages.
++pub const HANDSHAKE_FAMILY_NAME: &str = "handshake";
++pub const HANDSHAKE_FAMILY_VERSION: i32 = 1;
++
++#[repr(C)]
++#[derive(Copy, Clone, Eq, PartialEq)]
++pub enum handshake_handler_class {
++    HANDSHAKE_HANDLER_CLASS_NONE = 0,
++    HANDSHAKE_HANDLER_CLASS_TLSHD = 1,
++    HANDSHAKE_HANDLER_CLASS_MAX = 2,
++}
++
++#[repr(C)]
++#[derive(Copy, Clone, Eq, PartialEq)]
++pub enum handshake_msg_type {
++    HANDSHAKE_MSG_TYPE_UNSPEC = 0,
++    HANDSHAKE_MSG_TYPE_CLIENTHELLO = 1,
++    HANDSHAKE_MSG_TYPE_SERVERHELLO = 2,
++}
++
++#[repr(C)]
++#[derive(Copy, Clone, Eq, PartialEq)]
++pub enum handshake_auth {
++    HANDSHAKE_AUTH_UNSPEC = 0,
++    HANDSHAKE_AUTH_UNAUTH = 1,
++    HANDSHAKE_AUTH_PSK = 2,
++    HANDSHAKE_AUTH_X509 = 3,
++}
++
++pub const HANDSHAKE_A_X509_CERT: i32 = 1;
++pub const HANDSHAKE_A_X509_PRIVKEY: i32 = 2;
++pub const __HANDSHAKE_A_X509_MAX: i32 = 3;
++pub const HANDSHAKE_A_X509_MAX: i32 = __HANDSHAKE_A_X509_MAX - 1;
++
++pub const HANDSHAKE_A_ACCEPT_SOCKFD: i32 = 1;
++pub const HANDSHAKE_A_ACCEPT_HANDLER_CLASS: i32 = 2;
++pub const HANDSHAKE_A_ACCEPT_MESSAGE_TYPE: i32 = 3;
++pub const HANDSHAKE_A_ACCEPT_TIMEOUT: i32 = 4;
++pub const HANDSHAKE_A_ACCEPT_AUTH_MODE: i32 = 5;
++pub const HANDSHAKE_A_ACCEPT_PEER_IDENTITY: i32 = 6;
++pub const HANDSHAKE_A_ACCEPT_CERTIFICATE: i32 = 7;
++pub const HANDSHAKE_A_ACCEPT_PEERNAME: i32 = 8;
++pub const HANDSHAKE_A_ACCEPT_KEYRING: i32 = 9;
++pub const __HANDSHAKE_A_ACCEPT_MAX: i32 = 10;
++pub const HANDSHAKE_A_ACCEPT_MAX: i32 = __HANDSHAKE_A_ACCEPT_MAX - 1;
++
++pub const HANDSHAKE_A_DONE_STATUS: i32 = 1;
++pub const HANDSHAKE_A_DONE_SOCKFD: i32 = 2;
++pub const HANDSHAKE_A_DONE_REMOTE_AUTH: i32 = 3;
++pub const __HANDSHAKE_A_DONE_MAX: i32 = 4;
++pub const HANDSHAKE_A_DONE_MAX: i32 = __HANDSHAKE_A_DONE_MAX - 1;
++
++pub const HANDSHAKE_CMD_READY: i32 = 1;
++pub const HANDSHAKE_CMD_ACCEPT: i32 = 2;
++pub const HANDSHAKE_CMD_DONE: i32 = 3;
++pub const __HANDSHAKE_CMD_MAX: i32 = 4;
++pub const HANDSHAKE_CMD_MAX: i32 = __HANDSHAKE_CMD_MAX - 1;
++
++pub const HANDSHAKE_MCGRP_NONE: &str = "none";
++pub const HANDSHAKE_MCGRP_TLSHD: &str = "tlshd";

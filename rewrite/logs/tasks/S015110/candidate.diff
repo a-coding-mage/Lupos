@@ -1,0 +1,45 @@
+diff --git a/src/include/linux/sunrpc/xprtrdma.rs b/src/include/linux/sunrpc/xprtrdma.rs
+new file mode 100644
+index 00000000..c62b7290
+--- /dev/null
++++ b/src/include/linux/sunrpc/xprtrdma.rs
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
++//! linux-source: include/linux/sunrpc/xprtrdma.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: x86_64,aarch64
++//! rewrite-task: S015110
++
++/*
++ * Copyright (c) 2003-2007 Network Appliance, Inc. All rights reserved.
++ *
++ * This header is part of the kernel/user-space RPC-over-RDMA parameter API.
++ */
++
++/// Minimum number of RPC slots in an RDMA transport slot table.
++pub const RPCRDMA_MIN_SLOT_TABLE: u32 = 4;
++/// Default number of RPC slots in an RDMA transport slot table.
++pub const RPCRDMA_DEF_SLOT_TABLE: u32 = 128;
++/// Maximum number of RPC slots in an RDMA transport slot table.
++pub const RPCRDMA_MAX_SLOT_TABLE: u32 = 16_384;
++
++/// Minimum inline threshold, in bytes.
++pub const RPCRDMA_MIN_INLINE: i32 = 1_024;
++/// Default inline threshold, in bytes.
++pub const RPCRDMA_DEF_INLINE: i32 = 4_096;
++/// Maximum inline threshold, in bytes.
++pub const RPCRDMA_MAX_INLINE: i32 = 65_536;
++
++/// Memory registration strategy identifiers shared by kernel and user space.
++#[repr(C)]
++#[derive(Copy, Clone, Debug, Eq, PartialEq)]
++pub enum rpcrdma_memreg {
++    RPCRDMA_BOUNCEBUFFERS = 0,
++    RPCRDMA_REGISTER = 1,
++    RPCRDMA_MEMWINDOWS = 2,
++    RPCRDMA_MEMWINDOWS_ASYNC = 3,
++    RPCRDMA_MTHCAFMR = 4,
++    RPCRDMA_FRWR = 5,
++    RPCRDMA_ALLPHYSICAL = 6,
++    RPCRDMA_LAST = 7,
++}

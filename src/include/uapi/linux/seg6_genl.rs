@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
+//! linux-source: include/uapi/linux/seg6_genl.h
+//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
+//! architectures: common
+//! rewrite-task: S016371
+
+pub const SEG6_GENL_NAME: &str = "SEG6";
+pub const SEG6_GENL_VERSION: i32 = 0x1;
+
+pub const SEG6_ATTR_UNSPEC: i32 = 0;
+pub const SEG6_ATTR_DST: i32 = 1;
+pub const SEG6_ATTR_DSTLEN: i32 = 2;
+pub const SEG6_ATTR_HMACKEYID: i32 = 3;
+pub const SEG6_ATTR_SECRET: i32 = 4;
+pub const SEG6_ATTR_SECRETLEN: i32 = 5;
+pub const SEG6_ATTR_ALGID: i32 = 6;
+pub const SEG6_ATTR_HMACINFO: i32 = 7;
+pub const __SEG6_ATTR_MAX: i32 = 8;
+
+pub const SEG6_ATTR_MAX: i32 = __SEG6_ATTR_MAX - 1;
+
+pub const SEG6_CMD_UNSPEC: i32 = 0;
+pub const SEG6_CMD_SETHMAC: i32 = 1;
+pub const SEG6_CMD_DUMPHMAC: i32 = 2;
+pub const SEG6_CMD_SET_TUNSRC: i32 = 3;
+pub const SEG6_CMD_GET_TUNSRC: i32 = 4;
+pub const __SEG6_CMD_MAX: i32 = 5;
+
+pub const SEG6_CMD_MAX: i32 = __SEG6_CMD_MAX - 1;

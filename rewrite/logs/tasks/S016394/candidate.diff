@@ -1,0 +1,31 @@
+--- /dev/null
++++ b/src/include/uapi/linux/sunrpc/debug.rs
+@@
++// SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
++//! linux-source: include/uapi/linux/sunrpc/debug.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: common
++//! rewrite-task: S016394
++
++pub const RPCDBG_XPRT: i32 = 0x0001;
++pub const RPCDBG_CALL: i32 = 0x0002;
++pub const RPCDBG_DEBUG: i32 = 0x0004;
++pub const RPCDBG_NFS: i32 = 0x0008;
++pub const RPCDBG_AUTH: i32 = 0x0010;
++pub const RPCDBG_BIND: i32 = 0x0020;
++pub const RPCDBG_SCHED: i32 = 0x0040;
++pub const RPCDBG_TRANS: i32 = 0x0080;
++pub const RPCDBG_SVCXPRT: i32 = 0x0100;
++pub const RPCDBG_SVCDSP: i32 = 0x0200;
++pub const RPCDBG_MISC: i32 = 0x0400;
++pub const RPCDBG_CACHE: i32 = 0x0800;
++pub const RPCDBG_ALL: i32 = 0x7fff;
++
++pub const CTL_RPCDEBUG: i32 = 1;
++pub const CTL_NFSDEBUG: i32 = 2;
++pub const CTL_NFSDDEBUG: i32 = 3;
++pub const CTL_NLMDEBUG: i32 = 4;
++pub const CTL_SLOTTABLE_UDP: i32 = 5;
++pub const CTL_SLOTTABLE_TCP: i32 = 6;
++pub const CTL_MIN_RESVPORT: i32 = 7;
++pub const CTL_MAX_RESVPORT: i32 = 8;

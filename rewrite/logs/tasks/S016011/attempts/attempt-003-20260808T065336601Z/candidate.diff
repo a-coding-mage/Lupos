@@ -1,0 +1,7 @@
+--- /dev/null
++++ b/src/include/uapi/asm-generic/mman-common.rs
+@@
++Fresh path-preserving Rust translation of the pinned common UAPI memory
++mapping header. All selected numeric macros are signed `i32` constants;
++`PKEY_ACCESS_MASK` is computed from `PKEY_DISABLE_ACCESS` and
++`PKEY_DISABLE_WRITE`; the C include guard maps to the Rust module boundary.

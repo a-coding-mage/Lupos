@@ -1,0 +1,5 @@
+--- /dev/null
++++ b/src/include/uapi/asm-generic/mman-common.rs
+@@
++Fresh path-preserving translation of the pinned UAPI header: 54 numeric
++macros as i32 constants, computed PKEY_ACCESS_MASK, and module-once guard.

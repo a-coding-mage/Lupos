@@ -1,0 +1,11 @@
+--- /dev/null
++++ b/src/arch/x86/include/asm/vmxfeatures.rs
+@@
++// SPDX-License-Identifier: GPL-2.0
++//! linux-source: arch/x86/include/asm/vmxfeatures.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: x86_64
++//! rewrite-task: S000758
++
++// Complete translation of NVMXINTS and all selected VMX_FEATURE_* macros;
++// each constant retains the signed i32 arithmetic of its Linux definition.

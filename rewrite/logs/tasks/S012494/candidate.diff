@@ -1,0 +1,8 @@
+--- vendor/linux/include/acpi/proc_cap_intel.h
++++ src/include/acpi/proc_cap_intel.rs
+@@
+-#define ACPI_PROC_CAP_* ...
++pub const ACPI_PROC_CAP_*: u32 = ...;
+@@
++All source leaf masks and the three composed masks are represented explicitly;
++the Linux include guard is represented by the Rust module boundary.

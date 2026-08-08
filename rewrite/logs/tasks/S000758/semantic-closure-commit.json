@@ -1,0 +1,32 @@
+{
+  "attempt": 2,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "06d0d31e6d23c7193fb7081b52ed5198be4fc173bef366cc4d7aca501aeee4c8",
+  "committed_at": "2026-08-08T06:46:05.666Z",
+  "destination_sha256": "d9300432311ccc72b40acb87815ec40976f62925be45743fec85c57d66bd16a7",
+  "dispositions_sha256": "b746d6e48d2d041ca86eca8510ccfa588c885eaa8e5560073b4d7d20510aef6d",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "430ce844c12641d16a9a34c7fd5ab402b77784a2985968472768627ab6d6cebe",
+  "finding_count": 0,
+  "implementation_sha256": "4f9618f52e639afa12c0cf7eb10152adb7c510a31ddc320f312d7b4bd032a184",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "9ba51c22e7e86db6f1fd4e835e86de3280c46dc697778bccadb5a472cd3ca03e",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P02",
+  "prepare_sha256": "5a405bafcde6100461519417128e66f999aaf92c453103ca3d575b1dd175f1b6",
+  "proposal_sha256": "430ce844c12641d16a9a34c7fd5ab402b77784a2985968472768627ab6d6cebe",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 135,
+  "resolution_sha256": "65a59c32ec3048881364ff1001483c49bee310afddefbffa14bbaf0d39e04c8c",
+  "review_1_sha256": "ad3f3b4f4c780d235f209abbf9c542be5a50b80871ea381f99100b519ddc8c73",
+  "review_2_sha256": "b9ba3f5abfb8f8321440e4c2ca68ffbe458cf42f59aa54b76793ba67433ca68d",
+  "rust_report_sha256": "3b0da82c3177ccb3f21a7e986e62c9a4fd2e0c329273204d6fad11c81004eef8",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S000758",
+  "transaction_id": "SCTX-4d72df62a4838b62b262809bb3a2d08ddfe96075b41695916c26b3680c7b933a"
+}

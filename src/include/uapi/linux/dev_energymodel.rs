@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)
+//! linux-source: include/uapi/linux/dev_energymodel.h
+//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
+//! architectures: aarch64
+//! rewrite-task: S016099
+
+//! Do not edit directly, auto-generated from:
+//! Documentation/netlink/specs/dev-energymodel.yaml
+//! YNL-GEN uapi header
+//! To regenerate run: tools/net/ynl/ynl-regen.sh
+
+pub const DEV_ENERGYMODEL_FAMILY_NAME: &str = "dev-energymodel";
+pub const DEV_ENERGYMODEL_FAMILY_VERSION: i32 = 1;
+
+#[repr(i32)]
+pub enum DevEnergymodelPerfStateFlags {
+    DEV_ENERGYMODEL_PERF_STATE_FLAGS_PERF_STATE_INEFFICIENT = 1,
+}
+
+#[repr(i32)]
+pub enum DevEnergymodelPerfDomainFlags {
+    DEV_ENERGYMODEL_PERF_DOMAIN_FLAGS_PERF_DOMAIN_MICROWATTS = 1,
+    DEV_ENERGYMODEL_PERF_DOMAIN_FLAGS_PERF_DOMAIN_SKIP_INEFFICIENCIES = 2,
+    DEV_ENERGYMODEL_PERF_DOMAIN_FLAGS_PERF_DOMAIN_ARTIFICIAL = 4,
+}
+
+pub const DEV_ENERGYMODEL_A_PERF_DOMAIN_PAD: i32 = 1;
+pub const DEV_ENERGYMODEL_A_PERF_DOMAIN_PERF_DOMAIN_ID: i32 = 2;
+pub const DEV_ENERGYMODEL_A_PERF_DOMAIN_FLAGS: i32 = 3;
+pub const DEV_ENERGYMODEL_A_PERF_DOMAIN_CPUS: i32 = 4;
+pub const __DEV_ENERGYMODEL_A_PERF_DOMAIN_MAX: i32 = 5;
+pub const DEV_ENERGYMODEL_A_PERF_DOMAIN_MAX: i32 = __DEV_ENERGYMODEL_A_PERF_DOMAIN_MAX - 1;
+
+pub const DEV_ENERGYMODEL_A_PERF_TABLE_PERF_DOMAIN_ID: i32 = 1;
+pub const DEV_ENERGYMODEL_A_PERF_TABLE_PERF_STATE: i32 = 2;
+pub const __DEV_ENERGYMODEL_A_PERF_TABLE_MAX: i32 = 3;
+pub const DEV_ENERGYMODEL_A_PERF_TABLE_MAX: i32 = __DEV_ENERGYMODEL_A_PERF_TABLE_MAX - 1;
+
+pub const DEV_ENERGYMODEL_A_PERF_STATE_PAD: i32 = 1;
+pub const DEV_ENERGYMODEL_A_PERF_STATE_PERFORMANCE: i32 = 2;
+pub const DEV_ENERGYMODEL_A_PERF_STATE_FREQUENCY: i32 = 3;
+pub const DEV_ENERGYMODEL_A_PERF_STATE_POWER: i32 = 4;
+pub const DEV_ENERGYMODEL_A_PERF_STATE_COST: i32 = 5;
+pub const DEV_ENERGYMODEL_A_PERF_STATE_FLAGS: i32 = 6;
+pub const __DEV_ENERGYMODEL_A_PERF_STATE_MAX: i32 = 7;
+pub const DEV_ENERGYMODEL_A_PERF_STATE_MAX: i32 = __DEV_ENERGYMODEL_A_PERF_STATE_MAX - 1;
+
+pub const DEV_ENERGYMODEL_CMD_GET_PERF_DOMAINS: i32 = 1;
+pub const DEV_ENERGYMODEL_CMD_GET_PERF_TABLE: i32 = 2;
+pub const DEV_ENERGYMODEL_CMD_PERF_DOMAIN_CREATED: i32 = 3;
+pub const DEV_ENERGYMODEL_CMD_PERF_DOMAIN_UPDATED: i32 = 4;
+pub const DEV_ENERGYMODEL_CMD_PERF_DOMAIN_DELETED: i32 = 5;
+pub const __DEV_ENERGYMODEL_CMD_MAX: i32 = 6;
+pub const DEV_ENERGYMODEL_CMD_MAX: i32 = __DEV_ENERGYMODEL_CMD_MAX - 1;
+
+pub const DEV_ENERGYMODEL_MCGRP_EVENT: &str = "event";

@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: GPL-2.0
+//! linux-source: include/linux/decompress/generic.h
+//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
+//! architectures: common
+//! rewrite-task: S013677
+
+use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
+
+/// C `decompress_fn`: a decompressor callback and its streaming callbacks.
+pub type decompress_fn = Option<unsafe extern "C" fn(
+    inbuf: *mut u8,
+    len: c_long,
+    fill: Option<unsafe extern "C" fn(*mut c_void, c_ulong) -> c_long>,
+    flush: Option<unsafe extern "C" fn(*mut c_void, c_ulong) -> c_long>,
+    outbuf: *mut u8,
+    posp: *mut c_long,
+    error: Option<unsafe extern "C" fn(*mut c_char)>,
+) -> c_int>;
+
+extern "C" {
+    pub fn decompress_method(
+        inbuf: *const u8,
+        len: c_long,
+        name: *mut *const c_char,
+    ) -> decompress_fn;
+}

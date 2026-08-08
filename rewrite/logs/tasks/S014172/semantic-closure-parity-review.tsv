@@ -1,0 +1,2 @@
+schema_version	task_id	attempt	pipeline_id	slot	proposal_sha256	report_path	report_sha256	review_status	reviewer	model	reasoning_effort	reviewed_at	finding_id	record_keys
+semantic-review-attestation-v1	S014172	1	P02	1	67ad49db19477df4f622d14f632bd097b59e5eb18f3ef0d6fb1985afce2d89a6	rewrite/logs/tasks/S014172/parity-review.md	a73fc73623a41e875c958e1ecc124dfb1f29edbbe3571e84fb1e504ebf155322	APPROVE	parity_reviewer	gpt-5.6-terra	high	2026-08-08T10:53:47.936Z	NOT_APPLICABLE	

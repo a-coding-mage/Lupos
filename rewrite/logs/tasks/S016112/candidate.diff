@@ -1,0 +1,5 @@
+S016112 candidate: regenerated src/include/uapi/linux/elf-em.rs from the
+pinned include/uapi/linux/elf-em.h. The fresh destination contains the Linux
+SPDX notice, exact source/revision/task provenance, `architectures: common`,
+and one public constant for every selected EM_* macro with the original name
+and numeric value. No unrelated paths were changed.

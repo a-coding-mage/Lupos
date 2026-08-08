@@ -1,0 +1,32 @@
+{
+  "attempt": 4,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "697a537a1212e3dd097d00affdd93356b80d739844e7cb94641569b19bb8a895",
+  "committed_at": "2026-08-08T07:09:47.551Z",
+  "destination_sha256": "33b3b400770c65e3fe8ed2f02d7b7f4bdd62c44c4794bcaff36645b62adc7fe5",
+  "dispositions_sha256": "b746d6e48d2d041ca86eca8510ccfa588c885eaa8e5560073b4d7d20510aef6d",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "9bffef8baad96fad92d1f4bf8ac84b32a664d137609f790acce649b9e7a9182a",
+  "finding_count": 0,
+  "implementation_sha256": "84f6fde03ff08b3f41eaf3eef2644d1aab7ab0ca9af2f3383858acfa24701e00",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "f274133816cbf4d820d46c296099a4778d45c79927ae67c3384ad562f2367779",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P01",
+  "prepare_sha256": "51f0b9931035e3a52f40e9c099d67f4073a917fa17c45e4099f35935e52fd121",
+  "proposal_sha256": "9bffef8baad96fad92d1f4bf8ac84b32a664d137609f790acce649b9e7a9182a",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 221,
+  "resolution_sha256": "74defcb869f90b91c54c7c04e7686c0caaa69cf9832b2250235657d8c68b0f56",
+  "review_1_sha256": "5eccdee3b9e7aaae8145750bdb450274ad26b2c9a051612d7d059d17081b0a13",
+  "review_2_sha256": "a0e27cc6898ea400f48a64f87b8597b6284343d7ec632205430b687ccd3dffe0",
+  "rust_report_sha256": "4157b18c05a98682297526b59b6f74ef79727c0a1bca123c7af71a17eb0e7c60",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S016011",
+  "transaction_id": "SCTX-262651f096db2ae0a5a0d22aff7715e0edac2e4fcdc74bc38f49494dc9c5a12c"
+}

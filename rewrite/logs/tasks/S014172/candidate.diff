@@ -1,0 +1,7 @@
+Fresh destination created from `vendor/linux/include/linux/kern_levels.h` at
+`425f94c2954b1fe80ebdbf9b29854e89750355df`; no prior destination existed.
+
+The candidate adds the immutable provenance header, token-producing KERN_SOH,
+KERN_EMERG through KERN_DEBUG, KERN_DEFAULT and KERN_CONT macros, the SOH
+ASCII value, and all LOGLEVEL_* integer constants.  C preprocessor guard
+semantics are represented by the path-local Rust module boundary.

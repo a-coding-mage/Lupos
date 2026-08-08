@@ -1,0 +1,12 @@
+# S016099 candidate summary
+
+The candidate adds the path-preserving Rust translation for
+`include/uapi/linux/dev_energymodel.h`.
+
+- Preserves the SPDX licensing expression and generated-header provenance.
+- Preserves both named C enum namespaces with explicit `i32` representation.
+- Preserves all anonymous enum constants, source-order values, and max-sentinel
+  arithmetic.
+- Preserves family and multicast-group string macros and family version.
+- Contains only declarations; the upstream header has no executable behavior,
+  allocation, synchronization, ownership transfer, or ABI-visible storage.

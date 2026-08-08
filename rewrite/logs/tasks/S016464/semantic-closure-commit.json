@@ -1,0 +1,32 @@
+{
+  "attempt": 1,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "11d0c33d659c4a1ac42d07126a4e845abc78b31adf4ed3230b6c4182bfd7d3fb",
+  "committed_at": "2026-08-08T07:13:41.061Z",
+  "destination_sha256": "edb2e142832ab60e9649bfbafb07c3b84a6fc2073bcbfa20f6c97f7ed1c82bea",
+  "dispositions_sha256": "b746d6e48d2d041ca86eca8510ccfa588c885eaa8e5560073b4d7d20510aef6d",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "4fc2865a1b4466316e97f722c4c11760a19c73e3dd6c0f0cb789c0de17165e39",
+  "finding_count": 0,
+  "implementation_sha256": "12d295dd38a2d789ba88b7193e9b4a1bfd7dc5b3929849891d5c6fcfbd1c786d",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "f76f1d02640f8d3ee6351a8dd8fef3e8589aa052a1eadb054d63e23abbd6ceef",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P02",
+  "prepare_sha256": "7c5cf76b903a3dac5e6d5c6db89b74cc2ea4713e3f55688503eb9b93eefd47ad",
+  "proposal_sha256": "4fc2865a1b4466316e97f722c4c11760a19c73e3dd6c0f0cb789c0de17165e39",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 197,
+  "resolution_sha256": "5bbb090181db5f380262908403964474b4252fec17791e4164156ea9264915ab",
+  "review_1_sha256": "dfabfd1f1946e087a49f69b5f6b89d3765ef5b96555e71e066c151e84ca42d2b",
+  "review_2_sha256": "7e400ae9519324ae13cdb343e5de2671e178a2230e7af492109839acf1ee2826",
+  "rust_report_sha256": "f624271546c9bed65a0a99c57377c394be634ef1a89f534694a89835457438f3",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S016464",
+  "transaction_id": "SCTX-3e9e3682222b6fdcdd39b65a4b32966b530edc21f0bebb8252fd3001e54a0e98"
+}

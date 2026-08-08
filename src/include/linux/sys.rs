@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0
+//! linux-source: include/linux/sys.h
+//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
+//! architectures: x86_64
+//! rewrite-task: S015124
+//!
+//! This Linux header is no longer used or needed.  Its only conditional
+//! content is the historical `notdef` preprocessor block containing aliases
+//! for obsolete system calls.  The frozen x86_64 Kbuild configuration does
+//! not define `notdef`, so that block contributes no declarations, macros, or
+//! ABI symbols to the selected translation unit.  Accordingly this Rust
+//! module intentionally has no items: adding aliases or syscall declarations
+//! would create observable symbols that the pinned header does not provide.

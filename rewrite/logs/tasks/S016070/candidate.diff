@@ -1,0 +1,12 @@
+# Candidate summary — S016070
+
+Added `src/include/uapi/linux/bpf_common.rs` as the fresh path-preserving
+translation of `include/uapi/linux/bpf_common.h`.
+
+- Preserved the Linux SPDX identifier and immutable source/revision/
+  architecture/task provenance.
+- Preserved all classic BPF opcode class, size, mode, operation, and source
+  constants with explicit unsigned widths.
+- Preserved the four value-extracting macros as `const fn` operations with the
+  same masks and single argument evaluation.
+- Preserved the guarded `BPF_MAXINSNS` value as 4096 for this translation unit.

@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
+//! linux-source: include/uapi/linux/kernel-page-flags.h
+//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
+//! architectures: common
+//! rewrite-task: S016215
+
+/* Stable page flag bits exported to user space. */
+
+pub const KPF_LOCKED: i32 = 0;
+pub const KPF_ERROR: i32 = 1; // Now unused
+pub const KPF_REFERENCED: i32 = 2;
+pub const KPF_UPTODATE: i32 = 3;
+pub const KPF_DIRTY: i32 = 4;
+pub const KPF_LRU: i32 = 5;
+pub const KPF_ACTIVE: i32 = 6;
+pub const KPF_SLAB: i32 = 7;
+pub const KPF_WRITEBACK: i32 = 8;
+pub const KPF_RECLAIM: i32 = 9;
+pub const KPF_BUDDY: i32 = 10;
+
+/* 11-20: new additions in 2.6.31 */
+pub const KPF_MMAP: i32 = 11;
+pub const KPF_ANON: i32 = 12;
+pub const KPF_SWAPCACHE: i32 = 13;
+pub const KPF_SWAPBACKED: i32 = 14;
+pub const KPF_COMPOUND_HEAD: i32 = 15;
+pub const KPF_COMPOUND_TAIL: i32 = 16;
+pub const KPF_HUGE: i32 = 17;
+pub const KPF_UNEVICTABLE: i32 = 18;
+pub const KPF_HWPOISON: i32 = 19;
+pub const KPF_NOPAGE: i32 = 20;
+
+pub const KPF_KSM: i32 = 21;
+pub const KPF_THP: i32 = 22;
+pub const KPF_OFFLINE: i32 = 23;
+pub const KPF_ZERO_PAGE: i32 = 24;
+pub const KPF_IDLE: i32 = 25;
+pub const KPF_PGTABLE: i32 = 26;

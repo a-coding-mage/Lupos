@@ -1,0 +1,2 @@
+S000623 has no candidate: implementation is blocked on the frozen linker-symbol
+ABI and LINKER_SCRIPT conditional contract documented in implementation.md.

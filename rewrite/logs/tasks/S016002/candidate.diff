@@ -1,0 +1,4 @@
+Fresh destination created for S016002 from the pinned Linux header. It carries
+the required provenance and maps EPERM through ERANGE one-to-one to public i32
+constants with the exact values 1 through 34; no other implementation-bearing
+symbols are present in the source header.

@@ -1,0 +1,9 @@
+schema_version	semantic-proposal-v1
+sha256	bb72b227c85099d50dc4c1255e9ce0b4c691bd79d7a634c74a1db406e3c3bcca
+task_id	S016395
+attempt	1
+pipeline_id	P01
+records	333
+queue_fingerprint	cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f
+phase0_identity_sha256	0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2
+sealed_at	2026-08-08T07:23:47.196Z

@@ -1,0 +1,32 @@
+{
+  "attempt": 1,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "365fd3d490fd102efa6071c062160b37c0ed292ba0937e62682d803d39ce2a25",
+  "committed_at": "2026-08-08T10:35:33.370Z",
+  "destination_sha256": "e5c86d1bbec3e7acd0208d41bd2807988199533d608513d9c7d154311ecf21c0",
+  "dispositions_sha256": "b746d6e48d2d041ca86eca8510ccfa588c885eaa8e5560073b4d7d20510aef6d",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "ffcbdb094deeb153ca2010f05db2100738df59c890e54a59e412c5c4d7b02a77",
+  "finding_count": 0,
+  "implementation_sha256": "07c21f7adb2b764b6fd12bb78f02a5bb892e66860505380637bbf7bbd407533a",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "07e61ad2962083118d14b3d600de6305988205260c0226ed246edf8e2f29a49a",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P01",
+  "prepare_sha256": "c5f27eed9807e62e757f8c95dc58157fad4d3d13699654d6d21f25df05916b2a",
+  "proposal_sha256": "ffcbdb094deeb153ca2010f05db2100738df59c890e54a59e412c5c4d7b02a77",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 29,
+  "resolution_sha256": "64fe12f5f85c4e1ca2acf2bd32cf7cdc7ee138b37666adc2e153850a713a112b",
+  "review_1_sha256": "f905c5f42c97adce1850878cf2d13ecd1c276b5b0e740e77958b0e50b77cc86a",
+  "review_2_sha256": "dce41301e3b1ed06ff550dd675d6d6a2318bdaf458e83fb49ab111741064397b",
+  "rust_report_sha256": "3b92dbbb5880fefa30b236a33c76f521b25f769b2c50976d43dc4738c1c88019",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S013677",
+  "transaction_id": "SCTX-554663ac97fca35895cc9bdfbb746a7dafd0ebadcec0cad1e85b8268fb10b087"
+}

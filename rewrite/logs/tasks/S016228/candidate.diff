@@ -1,0 +1,7 @@
+# S016228 candidate summary
+
+Created `src/include/uapi/linux/lockd_netlink.rs` as a fresh path-preserving
+translation of the complete pinned UAPI header. It contains the immutable
+provenance, NUL-terminated family-name byte array, family version, all server
+attribute constants, both command constants, sentinel maxima, and derived
+public maxima. No symbols or branches from the selected header are omitted.

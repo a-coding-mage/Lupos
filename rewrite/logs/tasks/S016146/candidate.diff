@@ -1,0 +1,24 @@
+--- /dev/null
++++ b/src/include/uapi/linux/hid.rs
+@@
++// SPDX-License-Identifier: GPL-2.0+ WITH Linux-syscall-note
++//! linux-source: include/uapi/linux/hid.h
++//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
++//! architectures: common
++//! rewrite-task: S016146
+@@
++pub const USB_INTERFACE_CLASS_HID: core::ffi::c_int = 3;
++pub const USB_INTERFACE_SUBCLASS_BOOT: core::ffi::c_int = 1;
++pub const USB_INTERFACE_PROTOCOL_KEYBOARD: core::ffi::c_int = 1;
++pub const USB_INTERFACE_PROTOCOL_MOUSE: core::ffi::c_int = 2;
+@@
++#[repr(C)]
++pub enum hid_report_type { ... }
+@@
++#[repr(C)]
++pub enum hid_class_request { ... }
+@@
++pub const HID_DT_HID: core::ffi::c_int = ((0x01_i32) << 5) | 0x01;
++pub const HID_DT_REPORT: core::ffi::c_int = ((0x01_i32) << 5) | 0x02;
++pub const HID_DT_PHYSICAL: core::ffi::c_int = ((0x01_i32) << 5) | 0x03;
++pub const HID_MAX_DESCRIPTOR_SIZE: core::ffi::c_int = 4096;

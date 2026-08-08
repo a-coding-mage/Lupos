@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//! Virtio IDs.
+//!
+//! linux-source: include/uapi/linux/virtio_ids.h
+//! linux-revision: 425f94c2954b1fe80ebdbf9b29854e89750355df
+//! architectures: common
+//! rewrite-task: S016464
+
+// Virtio IDs.
+//
+// This header is BSD licensed so anyone can use the definitions to implement
+// compatible drivers/servers.
+
+pub const VIRTIO_ID_NET: i32 = 1;
+pub const VIRTIO_ID_BLOCK: i32 = 2;
+pub const VIRTIO_ID_CONSOLE: i32 = 3;
+pub const VIRTIO_ID_RNG: i32 = 4;
+pub const VIRTIO_ID_BALLOON: i32 = 5;
+pub const VIRTIO_ID_IOMEM: i32 = 6;
+pub const VIRTIO_ID_RPMSG: i32 = 7;
+pub const VIRTIO_ID_SCSI: i32 = 8;
+pub const VIRTIO_ID_9P: i32 = 9;
+pub const VIRTIO_ID_MAC80211_WLAN: i32 = 10;
+pub const VIRTIO_ID_RPROC_SERIAL: i32 = 11;
+pub const VIRTIO_ID_CAIF: i32 = 12;
+pub const VIRTIO_ID_MEMORY_BALLOON: i32 = 13;
+pub const VIRTIO_ID_GPU: i32 = 16;
+pub const VIRTIO_ID_CLOCK: i32 = 17;
+pub const VIRTIO_ID_INPUT: i32 = 18;
+pub const VIRTIO_ID_VSOCK: i32 = 19;
+pub const VIRTIO_ID_CRYPTO: i32 = 20;
+pub const VIRTIO_ID_SIGNAL_DIST: i32 = 21;
+pub const VIRTIO_ID_PSTORE: i32 = 22;
+pub const VIRTIO_ID_IOMMU: i32 = 23;
+pub const VIRTIO_ID_MEM: i32 = 24;
+pub const VIRTIO_ID_SOUND: i32 = 25;
+pub const VIRTIO_ID_FS: i32 = 26;
+pub const VIRTIO_ID_PMEM: i32 = 27;
+pub const VIRTIO_ID_RPMB: i32 = 28;
+pub const VIRTIO_ID_MAC80211_HWSIM: i32 = 29;
+pub const VIRTIO_ID_VIDEO_ENCODER: i32 = 30;
+pub const VIRTIO_ID_VIDEO_DECODER: i32 = 31;
+pub const VIRTIO_ID_SCMI: i32 = 32;
+pub const VIRTIO_ID_NITRO_SEC_MOD: i32 = 33;
+pub const VIRTIO_ID_I2C_ADAPTER: i32 = 34;
+pub const VIRTIO_ID_WATCHDOG: i32 = 35;
+pub const VIRTIO_ID_CAN: i32 = 36;
+pub const VIRTIO_ID_DMABUF: i32 = 37;
+pub const VIRTIO_ID_PARAM_SERV: i32 = 38;
+pub const VIRTIO_ID_AUDIO_POLICY: i32 = 39;
+pub const VIRTIO_ID_BT: i32 = 40;
+pub const VIRTIO_ID_GPIO: i32 = 41;
+pub const VIRTIO_ID_SPI: i32 = 45;
+
+// Virtio Transitional IDs.
+
+pub const VIRTIO_TRANS_ID_NET: i32 = 0x1000;
+pub const VIRTIO_TRANS_ID_BLOCK: i32 = 0x1001;
+pub const VIRTIO_TRANS_ID_BALLOON: i32 = 0x1002;
+pub const VIRTIO_TRANS_ID_CONSOLE: i32 = 0x1003;
+pub const VIRTIO_TRANS_ID_SCSI: i32 = 0x1004;
+pub const VIRTIO_TRANS_ID_RNG: i32 = 0x1005;
+pub const VIRTIO_TRANS_ID_9P: i32 = 0x1009;
