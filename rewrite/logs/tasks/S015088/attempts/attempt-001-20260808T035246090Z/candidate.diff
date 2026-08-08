@@ -1,0 +1,9 @@
+# Candidate diff: S015088 attempt 1
+
+`src/include/linux/sunrpc/gss_err.rs` is a fresh translation of the complete
+selected definition set in `include/linux/sunrpc/gss_err.h`.
+
+- `OM_uint32` maps to `u32`.
+- Object-like GSS definitions retain their unsigned 32-bit status/bit values.
+- Function-like GSS status masks and fields remain macros, preserving one
+  occurrence and one evaluation of the input expression.

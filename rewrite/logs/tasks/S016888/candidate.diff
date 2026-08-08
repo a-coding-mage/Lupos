@@ -1,0 +1,9 @@
+S016888 candidate summary
+
+Added `src/kernel/locking/lock_events_list.rs` with immutable provenance for
+`kernel/locking/lock_events_list.h`.  It provides `lock_events_list!`, a
+callback-driven ordered event list containing every selected upstream
+`LOCK_EVENT` invocation exactly once, preserving the frozen-union ordering.
+PV qspinlock-only events are excluded because both frozen configurations leave
+`CONFIG_PARAVIRT_SPINLOCKS` unset; queued-spinlock events are retained because
+both set `CONFIG_QUEUED_SPINLOCKS=y`.

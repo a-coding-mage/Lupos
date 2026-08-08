@@ -1,0 +1,12 @@
+# S015088 candidate summary
+
+Destination: `src/include/linux/sunrpc/gss_err.rs`
+
+- Added immutable task provenance and retained the relevant upstream copyright
+  and permission notices.
+- Translated `OM_uint32`, all GSS flag/status constants, status masks and
+  offsets, and the `GSS_S_CRED_UNAVAIL` alias.
+- Preserved each function-like status macro as a single-evaluation declarative
+  Rust macro.
+
+This is a source-only candidate; no build or test evidence was obtained.

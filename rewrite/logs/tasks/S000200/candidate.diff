@@ -1,0 +1,10 @@
+# Candidate summary — S000200 attempt 2
+
+`src/arch/arm64/include/asm/vncr_mapping.rs` is a fresh, path-preserving
+translation of `arch/arm64/include/asm/vncr_mapping.h`.
+
+- 104 pinned `VNCR_*` macro definitions map to 104 public Rust constants.
+- Identifier spelling and hexadecimal values are retained exactly.
+- Every constant uses explicit `i32`; no constant uses `usize`.
+- The immutable provenance names the pinned Linux source, revision, aarch64,
+  and rewrite task S000200.

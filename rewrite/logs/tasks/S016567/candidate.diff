@@ -1,0 +1,11 @@
+# S016567 candidate summary — attempt 2
+
+Fresh replacement of `src/include/xen/interface/features.rs` from pinned
+`vendor/linux/include/xen/interface/features.h` at
+`425f94c2954b1fe80ebdbf9b29854e89750355df`.
+
+- Added immutable provenance for task `S016567` and architecture `aarch64`.
+- Translated every active `XENFEAT_*` numeric macro, including
+  `XENFEAT_NR_SUBMAPS`, into a public `i32` constant with the same value.
+- Omitted only the source's commented-out deprecated
+  `XENFEAT_grant_map_identity`, which is not an active macro.

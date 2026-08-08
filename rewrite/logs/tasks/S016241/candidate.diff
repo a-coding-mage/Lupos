@@ -1,0 +1,9 @@
+S016241 candidate summary
+
+New file: `src/include/uapi/linux/membarrier.rs`.
+
+The candidate adds immutable task provenance, retains the upstream copyright
+notice, and maps the two selected C enum categories to signed `i32` aliases.
+It defines all eleven `membarrier_cmd` constants at their upstream values,
+including the `MEMBARRIER_CMD_SHARED` alias, and the one
+`membarrier_cmd_flag` constant.  No other source paths were changed.

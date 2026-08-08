@@ -1,0 +1,32 @@
+{
+  "attempt": 2,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "9fbc8f5c0a16dd8b496759c80c249f72966d3d61b79f25256578b184954041f7",
+  "committed_at": "2026-08-08T04:36:24.398Z",
+  "destination_sha256": "2ed8db7a0bfbcb1daaf836071378ad4ce03d6259e947f9ff3ef3f8d5f920df0b",
+  "dispositions_sha256": "b746d6e48d2d041ca86eca8510ccfa588c885eaa8e5560073b4d7d20510aef6d",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "a9ce015d7308e6bae7647a2d73435c2cdc3fabec0c157fcc1d4aef2c62b66eb8",
+  "finding_count": 0,
+  "implementation_sha256": "0005124cb1f88018441face1363962214eec03c77f108e9eb1b37cccce6f3a60",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "4acc7185cc95332295e3529ebc1f29b695efb57a03aaae5d3c9d7a0d263dfb7b",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P02",
+  "prepare_sha256": "19943b349be3a588a69d05973ae1aeeab19f497aa818c4d2fe9a7965bd6c2c34",
+  "proposal_sha256": "a9ce015d7308e6bae7647a2d73435c2cdc3fabec0c157fcc1d4aef2c62b66eb8",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 213,
+  "resolution_sha256": "55b9c51d9a79b93c187cd16b61c0a69ad581a83d10d6ea81129793648a60625c",
+  "review_1_sha256": "fb452362116d54f48a843309596878fd4f920eda92d84ac09da32bc07b69699d",
+  "review_2_sha256": "4d0090214c291520064d278a67ec2482f0e7f87925cb514b6eecc3c35a09768f",
+  "rust_report_sha256": "ad68c427788221ffcca510898dc71ebb5d3f8fc75d2800175dd4ca2a8c5aa088",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S000200",
+  "transaction_id": "SCTX-cc8fd683ea475b28094d68be1ff20697dcc283ebf335c3d980f87d2c7b5ee928"
+}

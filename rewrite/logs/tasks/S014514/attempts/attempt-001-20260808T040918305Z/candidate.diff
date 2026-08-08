@@ -1,0 +1,9 @@
+S014514 candidate summary (fresh translation)
+
+Source: vendor/linux/include/linux/nfs_iostat.h:22-122
+Destination: src/include/linux/nfs_iostat.rs
+
+* Recreated the include-guard marker and NFS_IOSTAT_VERS ("1.1").
+* Recreated enum nfs_stat_bytecounters with the nine C-order discriminants 0 through 8.
+* Recreated enum nfs_stat_eventcounters with the twenty-eight C-order discriminants 0 through 27.
+* Applied #[repr(C)] to both declaration-only enums to retain their C ABI representation.

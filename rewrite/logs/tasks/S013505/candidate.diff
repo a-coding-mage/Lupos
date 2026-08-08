@@ -1,0 +1,8 @@
+# Candidate summary — S013505
+
+Adds `src/include/linux/bcma/bcma_regs.rs` with immutable provenance for the
+pinned BCMA register header. The candidate maps all 74 object-like C macros to
+public Rust constants, preserving their names, literal values, C integer
+literal signedness (`i32` or `u32`), aliases, and the lone arithmetic
+expression (`64 * 1024 * 1024`). It has no executable logic or replacement
+mechanism.

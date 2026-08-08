@@ -1,0 +1,5 @@
+# S013171 candidate snapshot
+
+Leased destination: `src/include/dt-bindings/leds/common.rs`.
+
+The fresh candidate preserves all 70 selected public binding names and their upstream literal values from `include/dt-bindings/leds/common.h`. It contains no added behavior, dependencies, conditional branches, tests, placeholders, or module-index edits.

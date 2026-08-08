@@ -1,0 +1,32 @@
+{
+  "attempt": 2,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "3e1dbcffdc528f998e98ebd455723af10e20231caede3d4091c9ff69d7ea4b32",
+  "committed_at": "2026-08-08T03:28:40.186Z",
+  "destination_sha256": "5654a7ecce976fb0b02ff96c61208b26676bbeadfba41deec158ad6c6753e525",
+  "dispositions_sha256": "b746d6e48d2d041ca86eca8510ccfa588c885eaa8e5560073b4d7d20510aef6d",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "d8976d8c877bd25099551e653623d8a36fe524bd47bd962b95fd22c4ba1d094a",
+  "finding_count": 0,
+  "implementation_sha256": "05f1654b63cfaaf1efbb001cd9ec5ccb65b8e73c5c0b5f3e48e93b45f16463b3",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "e0033b71f5c1e7f27a7f11f1ac2ae8f0d1ea129717db3adb1f7f10c5c87df365",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P01",
+  "prepare_sha256": "734ccd405880b9dd6ae1a014dbd1ce6c72842f17f4fc16cc6987b93c344430e5",
+  "proposal_sha256": "d8976d8c877bd25099551e653623d8a36fe524bd47bd962b95fd22c4ba1d094a",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 565,
+  "resolution_sha256": "f9cf22387caf286d370a536bc735020f03ab18894da89199e298ee269240b3c8",
+  "review_1_sha256": "4ab436ae9d5e26376d2c51527d4fcf5eb94323957631d046cd4000ca78dff46a",
+  "review_2_sha256": "afa4d1760c8b8b04f171058d112298623395b8bb41a457adb09a1c11d2eea9d0",
+  "rust_report_sha256": "001afdec9f7cf094fcbc14d8b05aabf3c9d3e853027359df6105730136511c69",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S016234",
+  "transaction_id": "SCTX-68efca0dbd688bcd4fc7c41964b0967d96568a1c6e89e8b9598c5c115ade8cc7"
+}

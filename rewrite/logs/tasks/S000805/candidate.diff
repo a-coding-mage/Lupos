@@ -1,0 +1,13 @@
+S000805 candidate summary
+
+Added `src/arch/x86/include/uapi/asm/vmx.rs` with immutable task provenance.
+
+Focused mapping:
+- `vmx.h:29-30` -> typed VMX exit-reason flag constants.
+- `vmx.h:32-99` -> all 65 source-defined exit-reason constants, retaining
+  values and omitted numeric slots.
+- `vmx.h:101-166` -> `VMX_EXIT_REASONS!()` source-ordered expansion entries.
+- `vmx.h:168-169` -> `VMX_EXIT_REASON_FLAGS!()` expansion entry.
+- `vmx.h:171-173` -> all three VMX abort-reason constants.
+
+No unrelated path was changed.

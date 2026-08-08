@@ -1,0 +1,5 @@
+# S016252 candidate summary — attempt 2
+
+Added `src/include/uapi/linux/mptcp_pm.rs` as the path-preserving translation of `include/uapi/linux/mptcp_pm.h`.
+
+The candidate exports the MPTCP path-manager name/version, all MPTCP event, address-attribute, subflow-attribute, endpoint, path-manager attribute, event attribute, and path-manager command integer constants. Sentinel-derived maximum constants retain the upstream subtraction expressions.

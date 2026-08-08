@@ -1,0 +1,32 @@
+{
+  "attempt": 1,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "fab668e88976ede3b404e700a2adc1209992b2f258e1828724279ca4dc56aca3",
+  "committed_at": "2026-08-08T03:43:40.585Z",
+  "destination_sha256": "d0ec1a551b60ff766f09ae174474edc27cda28c67e00d0ae61998ee8a62ed696",
+  "dispositions_sha256": "b746d6e48d2d041ca86eca8510ccfa588c885eaa8e5560073b4d7d20510aef6d",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "39d3d3f156de79b106f4470053ea7f5cf99feaa031f7331eb97f69cc6764edf2",
+  "finding_count": 0,
+  "implementation_sha256": "024931491a2ff0416ab7238b916d8b8de07834f47aa159914ade0f76b249553a",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "63e31c1b5dc21d19c10c8c7d561e8315f7c0c127f1817d196b0f6f28ebf2b780",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P01",
+  "prepare_sha256": "b54cc119a599ad71a72613107375c5be87824006235235cc69f971837add6239",
+  "proposal_sha256": "39d3d3f156de79b106f4470053ea7f5cf99feaa031f7331eb97f69cc6764edf2",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 101,
+  "resolution_sha256": "a2c8f1e15a334f7cea32a0a9d82ec318f9739ac3ba1503625cf25ab86ad7c6e7",
+  "review_1_sha256": "dd9fcc64c7eb5a87fb17ece375db16c7336f5c0a3a2742faf652057a2035af63",
+  "review_2_sha256": "1f60c1628f1c25c3326d6ad2534c46257d7fe45a23f7f570c7db8a4e8d74f696",
+  "rust_report_sha256": "8843cfcff35236669e90c3b074687c04889cbd3d58dc59b944149a4eaf7f3205",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S016241",
+  "transaction_id": "SCTX-dc21370da177e0cf5b42e920a3de874cbffb58d0dc06aaae7dc992e5b238c815"
+}

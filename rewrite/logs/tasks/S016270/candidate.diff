@@ -1,0 +1,5 @@
+Candidate created for S016270.
+
+`src/include/uapi/linux/netfilter/nf_conntrack_common.rs` is a fresh path-preserving translation of `vendor/linux/include/uapi/linux/netfilter/nf_conntrack_common.h`.
+
+It introduces the four `i32` enum-tag aliases, all selected enumerator/flag constants, and the `NF_CT_STATE_BIT!` expression macro. No structs, functions, tests, placeholders, or driver code exist in the source header, so none were added.

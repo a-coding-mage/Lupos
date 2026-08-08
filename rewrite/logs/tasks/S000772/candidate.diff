@@ -1,0 +1,8 @@
+# Candidate summary
+
+Added `src/arch/x86/include/uapi/asm/debugreg.rs` as the one-to-one fresh Rust
+translation of the pinned UAPI header.  It contains the immutable provenance
+header and public definitions for all 29 selected constant macros.  The
+x86_64-only `DR_CONTROL_RESERVED` value is `0xFFFFFFFF0000FC00u64`.
+
+No unrelated paths were changed.

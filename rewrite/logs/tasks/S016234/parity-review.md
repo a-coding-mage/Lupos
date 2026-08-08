@@ -1,0 +1,15 @@
+# Parity review — S016234 attempt 2, slot 1
+
+Result: **APPROVE**. No parity findings.
+
+Reviewed the current candidate only against pinned `vendor/linux/include/uapi/linux/major.h` at Linux revision `425f94c2954b1fe80ebdbf9b29854e89750355df`, together with the sealed current semantic proposal. The candidate-diff binding is `3e1dbcffdc528f998e98ebd455723af10e20231caede3d4091c9ff69d7ea4b32`; the proposal seal binds 565 records and proposal hash `d8976d8c877bd25099551e653623d8a36fe524bd47bd962b95fd22c4ba1d094a` to attempt 2 / P01.
+
+Checks completed:
+
+- The source has 140 `#define` directives: one include guard at lines 2–3 and 139 non-guard major-number definitions at lines 10–176. The candidate has exactly 139 same-named public `i32` constants; a normalized name/value comparison found no missing, extra, or changed definition. All source numeric literals are unsuffixed decimal values from 0 through 260, hence have signed `int` type on both frozen 32-bit-`int` kernel ABIs; the Rust representation is consistently signed `i32`.
+- `HD_MAJOR` is preserved as the named alias of `IDE0_MAJOR` (source line 16; candidate line 15). Its current proposal records are `SC1-1163d4cfadf7858826fa90b6311c39788f754a2c4e2d395da98783b04c7088f1`, `SC1-83701e7fc4e85ebfd220c9386996d1f491d6ca03e237fc9b1ab6370bed28e1d6`, `SC1-4062ab02bbd7a8349e12b56b86ed81e7c5cad1219866f96ba478df076406016a`, and `SC1-7e737d22382fa0a298260e83f00dd61d32f829c651973cab93b259dfab1a512d`.
+- `UNIX98_PTY_SLAVE_MAJOR` retains the named `UNIX98_PTY_MASTER_MAJOR + UNIX98_PTY_MAJOR_COUNT` arithmetic (source line 147; candidate line 146). Its current proposal records are `SC1-385b4a04f2704c8e1b82a0faa53be41c0558f48cda1df84b647f7fb342a8b1d5`, `SC1-1959b9773c900541fe3ea06b778f620cf4e6437ab545fa3d3188285b716e77c0`, `SC1-95526247a5a6988f07d11465e1f82ad319d7f07a1f97bc37c6975454eaf39cac`, and `SC1-c80c4eebf75e0ac76e38bf15c743fd7bb84a90d2340d6cf8dc067b0a81cfff8e`.
+- The UAPI SPDX expression, Linux source path, pinned revision, architecture membership (`common`), and task provenance are present unchanged in candidate lines 1–5. The source contains no feature or architecture condition other than the C include guard; modelling that guard with no Rust item is correct for a Rust module. The scope record `SC1-b6d127d264de9711a181c9115ae5da495aa9402f047fad1a2269e23d92aee22f` is COMPLETE. The four guard records for the two frozen architectures are COMPLETE: `SC1-5a7398bbccd7a70836df244538704903ba9e2da7524cd6193fe4848a01603389`, `SC1-d8ca9332a74eb553b0632c0a1f94388fb48a9c966229d6592c6974ad2c1eeed6`, `SC1-740102c75dff911b18f7e8a0953f0d10da4e7015bf6efe19b070a3d823f5b019`, and `SC1-6c95eeaa7294e78bbb04ce477b26cedb6eb134a13600a9d018df73fc6d5461f5`.
+- The sealed proposal contains an operative-macro selection and status record for every source macro on both `aarch64` and `x86_64` (including the guard) and no non-complete final value. Since this review has no finding, no semantic-record finding mapping is applicable.
+
+No compiler, formatter, linker, test, runtime, or diagnostic was invoked.

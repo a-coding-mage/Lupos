@@ -1,0 +1,10 @@
+# S014514 candidate summary
+
+The candidate adds the path-preserving Rust translation for
+`include/linux/nfs_iostat.h`.
+
+- Preserves `NFS_IOSTAT_VERS` as `"1.1"`.
+- Preserves both C enum type namespaces as `i32` aliases and exposes all
+  enumerator names with source-order values, including the two max sentinels.
+- Contains only declarations; the upstream header has no executable behavior,
+  allocation, synchronization, ownership transfer, or ABI-visible storage.

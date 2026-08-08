@@ -1,0 +1,12 @@
+S016567 candidate mapping
+
+Source: vendor/linux/include/xen/interface/features.h
+Destination: src/include/xen/interface/features.rs
+
+- Each active `XENFEAT_*` object-like macro maps to one public Rust constant
+  with the same name and integer value.
+- The disabled `XENFEAT_grant_map_identity` text is retained only as an
+  explanatory comment because it is commented out upstream.
+- `XENFEAT_NR_SUBMAPS` maps to its public integer constant with value 1.
+- The C include guard has no emitted Rust item; Rust module loading supplies
+  the corresponding single-definition property.

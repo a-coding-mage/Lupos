@@ -1,0 +1,32 @@
+{
+  "attempt": 1,
+  "base_hashes": {
+    "abi": "ae0caca34fe9b6eb8097958d2fbb8d2b6a1fad60f91f3c2b8d948c43dbfcee39",
+    "lifetimes": "0e7e60940dd21c28f3d10965325f70644fc000495a2d61984437dec666da93d8",
+    "scope": "b83349e6731e17e5da5e04a0ea053487e8ac8d9269538dbdb367d83f77b17e0a",
+    "symbols": "7484d7b0dd80f45e18d726b04752827fe28555cc5c1af0e127948380e6688abf"
+  },
+  "candidate_sha256": "0a5c04c1745d949d883d60d952fa5d3c79fbdd6366b4ce5956855727a84dd5af",
+  "committed_at": "2026-08-08T04:52:24.877Z",
+  "destination_sha256": "d1b9ac189e36ee3b1dd08a73ca9f22a745a1cc213fb5084e20d8bd8dcb42eaa8",
+  "dispositions_sha256": "b746d6e48d2d041ca86eca8510ccfa588c885eaa8e5560073b4d7d20510aef6d",
+  "events": "rewrite/events.jsonl",
+  "final_sha256": "0ac1c6f3568e47af88a218f40ec51f306dd4322ad7e4ef6c6c1325c1fdad9c9d",
+  "finding_count": 0,
+  "implementation_sha256": "4f9f70848a0e084dc9659a695747e7a2dace5f3cf3c6d4a8248f73d144148e7c",
+  "ledger": "rewrite/semantic-closure/LEDGER.jsonl",
+  "parity_report_sha256": "45171c1a4862c66868420a392817b5f98d913cabafaafc1c7e0e7ac27ea24113",
+  "phase0_identity_sha256": "0123af9e96b58af4e98b91a2de5608d36b63c67864b9041d3340587f3dbe40d2",
+  "pipeline_id": "P02",
+  "prepare_sha256": "d51903eb632d23bd9636798b10cfa64ba983efc33a6301d1188f055a6c682298",
+  "proposal_sha256": "0ac1c6f3568e47af88a218f40ec51f306dd4322ad7e4ef6c6c1325c1fdad9c9d",
+  "queue_fingerprint": "cfa8dcf0d81c408de38d4202fe1ce9d9e5e301d1e67439c9530da94b1e64ee3f",
+  "record_count": 309,
+  "resolution_sha256": "5aafe5297405cea06c12d054cb45d99f76a49106413459575823a30a429e284a",
+  "review_1_sha256": "76f2bcd23967c9b6c86de31779de681e9a1e6a86ed87f284590bf50093342c15",
+  "review_2_sha256": "36afa8670ea8a21497e2cdc093e61c5a98f719eae1630f2e649ab0cc535c9f3e",
+  "rust_report_sha256": "bc849616b08f80f04d89c3172478146efc8aeb12c20de9c7dd41cbd38d241ba7",
+  "schema_version": "semantic-commit-v1",
+  "task_id": "S013505",
+  "transaction_id": "SCTX-4377da338bdc7cb5913efb818d56e16be7d2825c4e9ea885a8144011c97ed782"
+}

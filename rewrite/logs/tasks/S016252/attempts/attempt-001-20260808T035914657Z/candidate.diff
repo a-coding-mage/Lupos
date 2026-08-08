@@ -1,0 +1,11 @@
+# S016252 candidate summary
+
+Fresh destination: `src/include/uapi/linux/mptcp_pm.rs`.
+
+The candidate maps the two named C enum tags (`mptcp_event_type` and
+`mptcp_event_attr`) to 32-bit UAPI value namespaces and exposes all C enum
+constants by their original names. It also exposes all constants from the five
+anonymous enums and preserves the six arithmetic `*_MAX` macro aliases.
+
+There are no functions, structures, unions, attributes, conditional selected
+branches, or external headers in the pinned source.

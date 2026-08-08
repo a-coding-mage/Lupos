@@ -1,0 +1,2 @@
+schema_version	task_id	attempt	pipeline_id	slot	proposal_sha256	report_path	report_sha256	review_status	reviewer	model	reasoning_effort	reviewed_at	finding_id	record_keys
+semantic-review-attestation-v1	S016270	1	P02	1	984cf8da3dca422748bcff56cea18e03b0e3215d47f20b3945776aa3a92f1e4c	rewrite/logs/tasks/S016270/parity-review.md	843b368eb4d822122862d498336437dc063e2e1f2f1531a9f5a5f193c4383f7a	APPROVE	codex-root-parity-p02-s016270-attempt1	gpt-5.6-terra	high	2026-08-08T03:42:57.248Z	NOT_APPLICABLE	

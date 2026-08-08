@@ -1,0 +1,9 @@
+S000200 candidate summary
+
+New destination: src/arch/arm64/include/asm/vncr_mapping.rs
+Pinned source: vendor/linux/arch/arm64/include/asm/vncr_mapping.h
+
+The candidate mirrors all 104 selected VNCR byte-displacement macros as public
+usize constants, preserving each source identifier and hexadecimal value. It
+adds only immutable task provenance and the source comment's byte-offset
+meaning; no behavior, storage, or executable logic exists in this header.

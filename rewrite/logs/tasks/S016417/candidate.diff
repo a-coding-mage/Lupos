@@ -1,0 +1,5 @@
+--- /dev/null
++++ b/src/include/uapi/linux/thermal.rs
+@@
++Fresh translation of include/uapi/linux/thermal.h: C-compatible thermal UAPI
++enumerations, integer and string constants, and derived maximum constants.
